@@ -111,7 +111,7 @@ pub fn coalesce(
         if waited > Duration::ZERO {
             // The overload is reported rather than silent, and it is a *wait* rather than a loss: the pty's
             // own buffer is what fills behind this, which is backpressure reaching the process.
-            let throttled = Event::Throttled { session: session.clone(), waited_ms: waited.as_millis() as u64 };
+            let throttled = Event::Throttled { session: session.clone(), waited_ms: waited.as_millis() as u32 };
             if outgoing.send(Outgoing::answer(throttled)).is_err() {
                 return false;
             }

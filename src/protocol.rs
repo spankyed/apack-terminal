@@ -69,7 +69,9 @@ pub enum Event {
     /// behind it, and the process feels it — so this says a producer was throttled, which the goal requires
     /// be observable rather than silent. Sent as an answer, so reporting the overload never queues behind
     /// the output that caused it.
-    Throttled { session: SessionId, waited_ms: u64 },
+    /// `u32` rather than `u64`: ts-rs generates a `bigint` for 64 bits, and `JSON.parse` hands a client
+    /// a number — the type has to describe what arrives. Milliseconds of waiting fit either way.
+    Throttled { session: SessionId, waited_ms: u32 },
     /// A request could not be carried out. `session` is absent when the request named none.
     Failed {
         session: Option<SessionId>,
