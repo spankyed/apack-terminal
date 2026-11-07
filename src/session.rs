@@ -14,6 +14,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use crate::output::{Credit, Outgoing, coalesce};
 use crate::protocol::{ErrorCode, Event, SessionId};
 use crate::screen::{Screen, Snapshot};
+use crate::tree::Tree;
 
 /// A running session: the master side of its pty, its child, and the thread reading its output.
 struct Session {
@@ -24,6 +25,10 @@ struct Session {
     /// Shared with the reader thread, which waits on it at EOF so **nothing polls for an exit**: the pty
     /// closing *is* the process ending, and that is an event this already receives.
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
+    /// The process tree this session owns, on the platform that needs one owned (`tree.rs`). Dropped with
+    /// the session, which is what ends the tree on Windows — so a `kill`, a disconnect and a broker that
+    /// crashes all reap it by the same mechanism rather than by three paths remembering to.
+    _tree: Option<Tree>,
     /// The VT state, shared with the reader thread that feeds it. **It is fed before the bytes leave for the
     /// renderer**, so the authority is never behind the replica — the only direction in which a disagreement
     /// is merely stale rather than wrong.
@@ -192,6 +197,7 @@ impl Sessions {
                 master: pty.master,
                 writer,
                 child,
+                _tree: Tree::owning(pid),
                 screen,
             },
         );

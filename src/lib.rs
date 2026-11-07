@@ -9,3 +9,4 @@ pub mod output;
 pub mod protocol;
 pub mod screen;
 pub mod session;
+pub mod tree;
