@@ -189,13 +189,14 @@ fn a_saturating_producer_reports_that_it_was_throttled_rather_than_losing_output
     let (mut reading, mut writing) = greeted(&broker);
     let session = run(&mut reading, &mut writing, OVERLOAD);
 
-    // The reader deliberately does nothing for a while, so every buffer in the path fills and the channel's
-    // credit runs out
-    std::thread::sleep(std::time::Duration::from_secs(2));
-
+    // **A deliberately slow reader, not a reader that races the producer.** Saturation used to depend on the
+    // shell outrunning this thread, which a loaded machine reverses: the reader drains faster than the pty
+    // fills, nothing is ever throttled, and the case fails for the machine's reasons rather than the code's —
+    // which it did, once, with four other brokers of this file's running beside it. One event per 20 ms is
+    // slower than any shell writing to a pty, whatever else the machine is doing.
     let mut bytes = 0usize;
     let mut waits: Vec<u64> = Vec::new();
-    while waits.is_empty() && bytes < 67_108_864 {
+    for _ in 0..400 {
         let event = next(&mut reading);
         match event["kind"].as_str() {
             Some("output") if event["session"] == session.as_str() => {
@@ -206,6 +207,10 @@ fn a_saturating_producer_reports_that_it_was_throttled_rather_than_losing_output
             }
             _ => {}
         }
+        if !waits.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
 
     // The overload is reported rather than silent, which is what the goal requires of the bound
@@ -223,8 +228,8 @@ fn a_saturating_producer_reports_that_it_was_throttled_rather_than_losing_output
     );
 
     // **And it is a wait rather than a loss**, read after the throttle rather than in a case of its own: once
-    // this reader resumes it is faster than the shell, so a second run would not be throttled again and the
-    // no-loss assertion would be the one that went flaky. The throttle above has already happened.
+    // this reader stops sleeping it is faster than the shell, so a second run would not be throttled again and
+    // the no-loss assertion would be the one that went flaky. The throttle above has already happened.
     while bytes < 67_108_864 {
         let event = next(&mut reading);
         if event["kind"] == "output" && event["session"] == session.as_str() {
