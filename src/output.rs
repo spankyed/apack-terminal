@@ -53,14 +53,23 @@ impl Credit {
     }
 
     /// Waits for credit, answering how long it had to. A non-zero wait **is** the overload, observably.
+    ///
+    /// **Timed around the condvar and not around the lock.** It used to start the clock before acquiring the
+    /// mutex, so taking an uncontended lock — a few hundred nanoseconds — counted as waiting for credit, and
+    /// every single flush reported itself throttled. Driving `less` in the app put a line in the log for each
+    /// one, at a level that reads as an error, saying `waited 0ms`: a report firing constantly while its own
+    /// number said nothing had happened. What is being measured is time spent with no credit, which is
+    /// exactly the time inside `wait`.
     fn take(&self) -> Duration {
-        let waiting = Instant::now();
         let mut free = self.free.lock().expect("credit is not poisoned");
+        let mut waited = Duration::ZERO;
         while *free == 0 {
+            let waiting = Instant::now();
             free = self.returned.wait(free).expect("credit is not poisoned");
+            waited += waiting.elapsed();
         }
         *free -= 1;
-        waiting.elapsed()
+        waited
     }
 
     fn give(&self) {
@@ -118,7 +127,7 @@ pub fn coalesce(
             // own buffer is what fills behind this, which is backpressure reaching the process.
             let throttled = Event::Throttled {
                 session: session.clone(),
-                waited_ms: waited.as_millis() as u32,
+                waited_us: waited.as_micros().min(u32::MAX as u128) as u32,
             };
             if outgoing.send(Outgoing::answer(throttled)).is_err() {
                 return false;

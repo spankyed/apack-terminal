@@ -115,6 +115,17 @@ fn run(reading: &mut impl BufRead, writing: &mut impl Write, command: &str) -> S
 /// A megabyte, written as fast as the shell can
 const SATURATE: &str = "head -c 1048576 /dev/zero | tr '\\0' x\n";
 
+/// Enough to fill the channel's credit while nobody is reading, which a megabyte is not.
+///
+/// **The arithmetic is the point, and getting it wrong is how the overload case came to prove nothing.**
+/// Credit runs out only when `OUTPUT_CREDIT` coalesced messages are in flight, and a message holds up to
+/// `OUTPUT_CAP`, so the bound is about 4 MiB — on top of whatever the socket's own buffers absorb, which on
+/// macOS auto-tune into the megabytes. A megabyte of output arrives as sixteen messages and never touches
+/// any of it. The case passed anyway, because `take` was timing the mutex rather than the condvar and so
+/// reported every flush as throttled; with that fixed it reported nothing, which is what sent this number
+/// up. 64 MiB is past every buffer in the path.
+const OVERLOAD: &str = "head -c 67108864 /dev/zero | tr '\\0' x\n";
+
 #[test]
 fn a_megabyte_of_output_is_coalesced_into_far_fewer_messages_than_chunks() {
     let broker = start();
@@ -140,36 +151,90 @@ fn a_megabyte_of_output_is_coalesced_into_far_fewer_messages_than_chunks() {
     assert!(bytes >= 1_048_576, "every byte arrived: {bytes}");
 }
 
+/// A producer nobody is holding up reports no throttling at all — the half the saturating case cannot say.
+///
+/// **This is the one the app found.** `take` timed the mutex it holds to reach the credit rather than the
+/// condvar it waits on, so taking an uncontended lock — a few hundred nanoseconds — counted as waiting, and
+/// every flush reported itself throttled. Driving `less` put a line in the app's log for each one, at a level
+/// that reads as an error, saying it had waited `0ms`: a report firing constantly whose own number said
+/// nothing had happened. Saturating the channel cannot catch it, because then the waits are real.
 #[test]
-fn a_saturating_producer_reports_that_it_was_throttled_rather_than_losing_output() {
+fn a_producer_nobody_is_holding_up_reports_no_throttling() {
     let broker = start();
     let (mut reading, mut writing) = greeted(&broker);
     let session = run(&mut reading, &mut writing, SATURATE);
 
-    // The reader deliberately does nothing for a moment, so the channel's credit runs out
-    std::thread::sleep(std::time::Duration::from_millis(400));
-
     let mut bytes = 0usize;
-    let mut throttled = 0usize;
+    let mut throttles: Vec<u64> = Vec::new();
     while bytes < 1_048_576 {
         let event = next(&mut reading);
         match event["kind"].as_str() {
             Some("output") if event["session"] == session.as_str() => {
                 bytes += event["data"].as_str().unwrap_or_default().len();
             }
-            Some("throttled") => throttled += 1,
+            Some("throttled") => throttles.push(event["waited_us"].as_u64().unwrap_or_default()),
             _ => {}
         }
     }
 
-    // The overload is reported, and it is a wait rather than a loss: every byte still arrives
     assert!(
-        throttled > 0,
-        "a saturating producer reported no throttling"
+        throttles.is_empty(),
+        "a megabyte with a reader keeping up is not an overload, and reporting one makes the signal noise: {throttles:?}"
     );
+}
+
+#[test]
+fn a_saturating_producer_reports_that_it_was_throttled_rather_than_losing_output() {
+    let broker = start();
+    let (mut reading, mut writing) = greeted(&broker);
+    let session = run(&mut reading, &mut writing, OVERLOAD);
+
+    // The reader deliberately does nothing for a while, so every buffer in the path fills and the channel's
+    // credit runs out
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let mut bytes = 0usize;
+    let mut waits: Vec<u64> = Vec::new();
+    while waits.is_empty() && bytes < 67_108_864 {
+        let event = next(&mut reading);
+        match event["kind"].as_str() {
+            Some("output") if event["session"] == session.as_str() => {
+                bytes += event["data"].as_str().unwrap_or_default().len();
+            }
+            Some("throttled") => {
+                waits.push(event["waited_us"].as_u64().expect("a wait in microseconds"))
+            }
+            _ => {}
+        }
+    }
+
+    // The overload is reported rather than silent, which is what the goal requires of the bound
     assert!(
-        bytes >= 1_048_576,
-        "output was dropped: {bytes} of 1048576 bytes"
+        !waits.is_empty(),
+        "a saturating producer reported no throttling after {bytes} bytes"
+    );
+    // **And the report carries the wait it measured.** `as_millis` truncated a few hundred microseconds to
+    // `0`, so every report read as "no wait" — a number that says nothing is worse than no number, because
+    // whoever reads it concludes the mechanism misfired. That the waits are real is the other half of the
+    // same fix: `take` now times the condvar rather than the mutex it holds to reach it
+    assert!(
+        waits.iter().all(|wait| *wait > 0),
+        "a throttle reported a wait of zero, so its unit threw the measurement away: {waits:?}"
+    );
+
+    // **And it is a wait rather than a loss**, read after the throttle rather than in a case of its own: once
+    // this reader resumes it is faster than the shell, so a second run would not be throttled again and the
+    // no-loss assertion would be the one that went flaky. The throttle above has already happened.
+    while bytes < 67_108_864 {
+        let event = next(&mut reading);
+        if event["kind"] == "output" && event["session"] == session.as_str() {
+            bytes += event["data"].as_str().unwrap_or_default().len();
+        }
+    }
+    // At least, not exactly: the shell's prompt and its echo of the command are output too
+    assert!(
+        bytes >= 67_108_864,
+        "output was dropped: {bytes} of 67108864 bytes"
     );
 }
 

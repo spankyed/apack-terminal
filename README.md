@@ -77,6 +77,15 @@ has to be a clear refusal: every connection's first message is `hello` with a `p
 else is refused with `HANDSHAKE`, and nothing can be asked before it. `tests/broker.rs` drives all of that
 through a real socket in the real binary.
 
+**An overload is a wait on credit, and only that.** `Throttled` is reported when a flush had to wait for the
+channel's credit, with the microseconds it waited. Two things were wrong with the first version and the app
+found both: `take` timed the mutex it holds to reach the credit rather than the condvar it waits on, so every
+flush reported itself throttled, and `as_millis` truncated the few hundred microseconds it had "waited" to
+zero — a report firing constantly whose own number said nothing had happened. `tests/channel.rs` now has both
+halves: a producer nobody is holding up reports nothing, and a saturating one reports a real wait and loses no
+bytes. Saturating the channel takes 64 MiB, because the bound is about 4 MiB of coalesced messages on top of
+whatever the socket's buffers absorb.
+
 Newline-delimited JSON, because the first consumer is a Node client and a debuggable frame is worth more
 here than a compact one — Phase G's readings put the terminal's cost elsewhere. A length prefix is a change
 `src/protocol.rs` can make alone.

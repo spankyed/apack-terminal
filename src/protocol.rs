@@ -76,9 +76,13 @@ pub enum Event {
     /// behind it, and the process feels it — so this says a producer was throttled, which the goal requires
     /// be observable rather than silent. Sent as an answer, so reporting the overload never queues behind
     /// the output that caused it.
-    /// `u32` rather than `u64`: ts-rs generates a `bigint` for 64 bits, and `JSON.parse` hands a client
-    /// a number — the type has to describe what arrives. Milliseconds of waiting fit either way.
-    Throttled { session: SessionId, waited_ms: u32 },
+    ///
+    /// **Microseconds, because milliseconds threw the measurement away.** A full redraw by `less` fills the
+    /// credit for a few hundred microseconds, which truncated to `waited_ms: 0` — a report whose number said
+    /// no wait had happened, logged for every flush. The reading is kept whole here and what to make of it
+    /// is the client's; `u32` because ts-rs generates a `bigint` for 64 bits and `JSON.parse` hands a client
+    /// a number, and 71 minutes of waiting fits.
+    Throttled { session: SessionId, waited_us: u32 },
     /// The screen a `Screen` request asked for: the history it had, then the viewport, oldest first.
     ///
     /// Lines are text, not cells: a wide character appears once rather than beside the spacer cell it
