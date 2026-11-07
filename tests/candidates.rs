@@ -4,6 +4,13 @@
 //! settle the library questions by trying them. These are those attempts, kept as tests so the answers stay
 //! checked rather than becoming a note that rots: each one fails if the crate stops doing what it was picked
 //! for.
+//!
+//! **POSIX only.** These drive `/bin/sh` and a default-program pty to establish what each crate does; on
+//! Windows the same crates are exercised for real by `tests/broker.rs`, which passes there in full, so a
+//! second set of probes would add nothing and the shell differences would be the whole of what they
+//! measured. The pty probe in particular sends `\n`, which a Windows console echoes without running
+//! (X6), and then waits for an EOF a ConPTY never gives.
+#![cfg(unix)]
 
 use std::io::{Read, Write};
 
@@ -58,46 +65,6 @@ fn the_vt_core_parses_bytes_into_a_readable_screen() {
     assert_eq!(
         line, "redlo",
         "the screen is readable and a cursor move overwrote the start of the line"
-    );
-}
-
-/// `command-group` owns a process tree: a group on POSIX, a Job Object on Windows under one API.
-///
-/// **A dev-dependency, not a dependency, and the reason is a measurement.** The broker's spawn path does not
-/// use it: `tests/broker.rs` shows that killing a session reaps its grandchildren on POSIX without it,
-/// because the kernel sends SIGHUP to a pty's foreground group when its session leader dies — demonstrated,
-/// including with the master kept open, so it is the leader's death that carries it and not the pty's close.
-///
-/// Windows has no equivalent, which is what X1 and X2 are about, and
-/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is the answer there — the OS killing the tree when the handle
-/// closes. This test keeps the API retired so that change is a wiring job rather than a question, and it
-/// moves into `[dependencies]` in the change that can be run on Windows.
-#[test]
-fn a_child_is_spawned_into_a_group_this_process_owns() {
-    use command_group::CommandGroup;
-
-    let mut child = std::process::Command::new("/bin/sh")
-        .args(["-c", "sleep 30 & echo started; wait"])
-        .stdout(std::process::Stdio::piped())
-        .group_spawn()
-        .expect("a group spawn");
-
-    let mut started = [0u8; 7];
-    child
-        .inner()
-        .stdout
-        .as_mut()
-        .expect("piped stdout")
-        .read_exact(&mut started)
-        .expect("the child's first line");
-    assert_eq!(&started, b"started");
-
-    // Killing the group, not the shell: the `sleep` is the grandchild X1 is about
-    child.kill().expect("the group is killable");
-    let status = child.wait().expect("the group's exit is reaped");
-    assert!(
-        !status.success(),
-        "a killed group does not exit successfully"
     );
 }
 

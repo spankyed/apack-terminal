@@ -7,6 +7,18 @@
 //! gave answers output's credit passed every case written for them, because in this design an answer is
 //! never waiting on anything. What deadlocks is a shared *bounded* queue, which this is not and which no
 //! small mutation can make it.
+//!
+//! **POSIX only, and what that leaves unproven is stated rather than implied.** Every case here needs a
+//! shell that can produce a megabyte as fast as the pty will take it, which is `head -c /dev/zero | tr` —
+//! the subject is the broker's own coalescer and credit, and the shell is only a byte source. Windows ships
+//! no equivalent one-liner, and a `for /L` loop producing that much output is slower than the channel it is
+//! meant to saturate, so the cases would be measuring cmd.exe.
+//!
+//! What that leaves open there: the bound's arithmetic includes *"whatever the socket's buffers absorb"*,
+//! and a named pipe's buffering is not a Unix socket's. The coalescing and the credit are the broker's own
+//! code and platform-independent; how much output it takes to fill the pipe is not. The transport itself is
+//! covered on Windows by `tests/broker.rs`, which passes there in full.
+#![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};

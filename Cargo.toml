@@ -17,7 +17,6 @@ ts-rs = "12.0.1"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]
-command-group = "5.0.1"
 insta = "1.49.0"
 proptest = "1.12.0"
 tempfile = "3.27.0"
