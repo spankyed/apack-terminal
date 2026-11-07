@@ -5,15 +5,16 @@
 //! build the thinnest path through every seam before either consumer exists, so that the protocol is derived
 //! from its clients rather than proposed to them.
 
+mod output;
 mod protocol;
 mod session;
 
 use std::io::{BufRead, BufReader, Write};
-use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
 
 use interprocess::local_socket::{GenericFilePath, ListenerOptions, Stream, ToFsName, prelude::*};
 
+use output::channel_with_credit;
 use protocol::{ErrorCode, Event, PROTOCOL_VERSION, Request};
 use session::Sessions;
 
@@ -43,8 +44,8 @@ fn main() -> std::io::Result<()> {
 /// One client: its sessions live as long as the connection, which is the skeleton's lifetime and not the
 /// goal's — surviving a client is Phase B's, and nothing here is shaped to prevent it.
 fn serve(stream: Stream) {
-    let (events, outgoing) = channel::<Event>();
-    let sessions = Arc::new(Mutex::new(Sessions::new(events)));
+    let (events, outgoing, credit) = channel_with_credit();
+    let sessions = Arc::new(Mutex::new(Sessions::new(events, credit)));
 
     // **One stream in an `Arc`, not two halves.** `&Stream` implements `Read` and `Write`, which is what the
     // crate's deprecated `split` says to do instead — and dropping a half there does not shut it down, so
@@ -53,9 +54,13 @@ fn serve(stream: Stream) {
     // One writer: every event leaves on this thread, so nothing interleaves two frames
     let writing = Arc::clone(&stream);
     let writer = std::thread::spawn(move || {
-        for event in outgoing {
-            let Ok(frame) = serde_json::to_string(&event) else { continue };
-            if (&*writing).write_all(frame.as_bytes()).and_then(|()| (&*writing).write_all(b"\n")).is_err() {
+        for message in outgoing {
+            let Ok(frame) = serde_json::to_string(&message.event) else { continue };
+            let written = (&*writing).write_all(frame.as_bytes()).and_then(|()| (&*writing).write_all(b"\n"));
+            // **The credit returns once the bytes are gone**, not when the message was queued: that is what
+            // makes the bound mean "in flight to the window" rather than "allocated".
+            message.written();
+            if written.is_err() {
                 break;
             }
         }
@@ -116,7 +121,7 @@ fn carry_out(sessions: &Arc<Mutex<Sessions>>, request: Request) {
         Request::Hello { .. } => return,
         Request::Spawn { cols, rows, shell, cwd } => match live.spawn(cols, rows, shell, cwd) {
             Ok((session, pid)) => {
-                let _ = live.events().send(Event::Spawned { session, pid });
+                live.answer(Event::Spawned { session, pid });
                 Ok(())
             }
             Err(refusal) => Err((None, refusal)),
@@ -126,13 +131,13 @@ fn carry_out(sessions: &Arc<Mutex<Sessions>>, request: Request) {
         Request::Kill { session } => live.kill(&session).map_err(|refusal| (Some(session), refusal)),
     };
     if let Err((session, refusal)) = outcome {
-        let _ = live.events().send(Event::Failed { session, code: refusal.code, message: refusal.message });
+        live.answer(Event::Failed { session, code: refusal.code, message: refusal.message });
     }
 }
 
 fn send(sessions: &Arc<Mutex<Sessions>>, event: Event) {
     if let Ok(live) = sessions.lock() {
-        let _ = live.events().send(event);
+        live.answer(event);
     }
 }
 

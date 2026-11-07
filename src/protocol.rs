@@ -65,6 +65,11 @@ pub enum Event {
         session: SessionId,
         code: Option<i32>,
     },
+    /// **The channel was full and a flush had to wait.** Not a loss: output is held, the pty's buffer fills
+    /// behind it, and the process feels it — so this says a producer was throttled, which the goal requires
+    /// be observable rather than silent. Sent as an answer, so reporting the overload never queues behind
+    /// the output that caused it.
+    Throttled { session: SessionId, waited_ms: u64 },
     /// A request could not be carried out. `session` is absent when the request named none.
     Failed {
         session: Option<SessionId>,

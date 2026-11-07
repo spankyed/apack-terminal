@@ -6,12 +6,13 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex};
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::protocol::{ErrorCode, Event, SessionId};
+use crate::output::{Credit, Outgoing, coalesce};
 
 /// A running session: the master side of its pty, its child, and the thread reading its output.
 struct Session {
@@ -26,7 +27,10 @@ struct Session {
 pub struct Sessions {
     next: u64,
     live: HashMap<SessionId, Session>,
-    events: Sender<Event>,
+    /// Answers and reports: no credit, so none of them waits behind output
+    events: Sender<Outgoing>,
+    /// What output spends, which is the channel's bound
+    credit: Arc<Credit>,
 }
 
 /// A failure a request turns into a `Failed` event rather than a panic.
@@ -44,13 +48,13 @@ impl Refusal {
 type Outcome = Result<(), Refusal>;
 
 impl Sessions {
-    pub fn new(events: Sender<Event>) -> Self {
-        Self { next: 0, live: HashMap::new(), events }
+    pub fn new(events: Sender<Outgoing>, credit: Arc<Credit>) -> Self {
+        Self { next: 0, live: HashMap::new(), events, credit }
     }
 
-    /// Where this connection's events go, so a caller holding the lock can answer without a second one.
-    pub fn events(&self) -> &Sender<Event> {
-        &self.events
+    /// Answers this connection, which a caller holding the lock can do without taking a second one.
+    pub fn answer(&self, event: Event) {
+        let _ = self.events.send(Outgoing::answer(event));
     }
 
     /// Starts a shell in a new pty and begins reading it. The id is the broker's to mint.
@@ -96,9 +100,20 @@ impl Sessions {
 
         // One thread per session, which is what the skeleton needs; bounded I/O and backpressure are
         // Phase B's, and the goal says so rather than leaving it to be discovered here.
+        // **The reader does not decide what a message is.** It hands what one `read` returned to the
+        // coalescer, which flushes on a window or a cap — so N bytes of output no longer means N messages,
+        // which is F4. The internal hop is unbounded on purpose: the bound belongs at the coalescer, where
+        // credit is spent, and a reader blocked on this queue could not notice EOF.
+        let (chunks, incoming) = channel::<Vec<u8>>();
         let events = self.events.clone();
         let reading = session.clone();
         let waiting = Arc::clone(&child);
+        std::thread::spawn({
+            let session = session.clone();
+            let events = events.clone();
+            let credit = Arc::clone(&self.credit);
+            move || coalesce(session, incoming, events, credit)
+        });
         std::thread::spawn(move || {
             let mut reader = reader;
             let mut buffer = [0u8; 8 * 1024];
@@ -106,17 +121,18 @@ impl Sessions {
                 match reader.read(&mut buffer) {
                     Ok(0) | Err(_) => break,
                     Ok(read) => {
-                        let data = String::from_utf8_lossy(&buffer[..read]).into_owned();
-                        if events.send(Event::Output { session: reading.clone(), data }).is_err() {
+                        if chunks.send(buffer[..read].to_vec()).is_err() {
                             return;
                         }
                     }
                 }
             }
+            // The coalescer ends when this drops, flushing what it holds, so nothing is lost at EOF
+            drop(chunks);
             // EOF on the master: the process has ended, so its status is available without waiting for a
             // tick. A `kill` may have taken it already, in which case this reports nothing.
             let code = waiting.lock().ok().and_then(|mut child| child.wait().ok()).map(|status| status.exit_code() as i32);
-            let _ = events.send(Event::Exited { session: reading, code });
+            let _ = events.send(Outgoing::answer(Event::Exited { session: reading, code }));
         });
 
         self.live.insert(session.clone(), Session { master: pty.master, writer, child });

@@ -10,7 +10,7 @@ export type ErrorCode = "HANDSHAKE" | "MALFORMED" | "NO_SUCH_SESSION" | "PTY";
 /**
  * What the broker tells the app, unprompted or in answer.
  */
-export type Event = { "kind": "hello", protocol: number, } | { "kind": "spawned", session: string, pid: number, } | { "kind": "output", session: string, data: string, } | { "kind": "exited", session: string, code: number | null, } | { "kind": "failed", session: string | null, code: ErrorCode, message: string, };
+export type Event = { "kind": "hello", protocol: number, } | { "kind": "spawned", session: string, pid: number, } | { "kind": "output", session: string, data: string, } | { "kind": "exited", session: string, code: number | null, } | { "kind": "throttled", session: string, waited_ms: bigint, } | { "kind": "failed", session: string | null, code: ErrorCode, message: string, };
 
 /**
  * What the app asks the broker to do.
