@@ -32,6 +32,29 @@ that matters. `alacritty_terminal` stands, now on a checkable ground rather than
 answered by the kernel rather than by cleanup code. That is unreachable from macOS and belongs to a Windows
 run, as the goal's acceptance says.
 
+## The protocol
+
+Rust is the source of truth and `protocol/protocol.ts` is generated from it, which is
+`elmdb-node/protocol/`'s arrangement reused rather than chosen again:
+
+```sh
+TS_RS_EXPORT_DIR=protocol cargo test export_bindings
+```
+
+It is committed, so the app reads it without building Rust, and it is meant to be treated there as a
+recorded artifact with `check`/`update` halves — a protocol change nobody regenerated should fail a
+typecheck rather than become a strange bug. `ErrorCode` generates as a closed string union, so a caller
+switches on a value the compiler knows instead of matching a message that is free to be reworded.
+
+**It is a contract across a `.rev` boundary.** The monorepo pins a commit of this repository, so a stale pin
+has to be a clear refusal: every connection's first message is `hello` with a `protocol` number, anything
+else is refused with `HANDSHAKE`, and nothing can be asked before it. `tests/broker.rs` drives all of that
+through a real socket in the real binary.
+
+Newline-delimited JSON, because the first consumer is a Node client and a debuggable frame is worth more
+here than a compact one — Phase G's readings put the terminal's cost elsewhere. A length prefix is a change
+`src/protocol.rs` can make alone.
+
 ## The toolchain is pinned to the monorepo's
 
 `rust-toolchain.toml` names the channel `elmdb` names. The monorepo's `scripts/linux-runner.ts` derives one
