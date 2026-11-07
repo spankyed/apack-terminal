@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use interprocess::local_socket::{GenericFilePath, ListenerOptions, Stream, ToFsName, prelude::*};
 
 use apack_terminal::output::channel_with_credit;
-use apack_terminal::protocol::{ErrorCode, Event, PROTOCOL_VERSION, Request};
+use apack_terminal::protocol::{ErrorCode, Event, PROTOCOL_VERSION, Request, SearchMatch};
 use apack_terminal::session::Sessions;
 
 fn main() -> std::io::Result<()> {
@@ -189,6 +189,49 @@ fn carry_out(sessions: &Arc<Mutex<Sessions>>, request: Request) {
             }
             Err(refusal) => Err((Some(session), refusal)),
         },
+        Request::Facts { session } => match live.facts(&session) {
+            Ok(facts) => {
+                live.answer(Event::Facts {
+                    session,
+                    cwd: facts.cwd,
+                    command: facts.command,
+                    running: facts.running,
+                    exit_status: facts.exit_status,
+                });
+                Ok(())
+            }
+            Err(refusal) => Err((Some(session), refusal)),
+        },
+        Request::Search {
+            session,
+            text,
+            history,
+        } => match live.search(&session, &text, history) {
+            Ok(found) => {
+                live.answer(Event::Search {
+                    session,
+                    matches: found
+                        .into_iter()
+                        .map(|found| SearchMatch {
+                            line: found.line,
+                            column: found.column,
+                            text: found.text,
+                        })
+                        .collect(),
+                });
+                Ok(())
+            }
+            Err(refusal) => Err((Some(session), refusal)),
+        },
+        // The answer is the `Waited` the wait itself sends, whenever it ends — so unlike every other
+        // request this one is accepted here and answered later
+        Request::Wait {
+            session,
+            until,
+            timeout_ms,
+        } => live
+            .wait(&session, until, timeout_ms)
+            .map_err(|refusal| (Some(session), refusal)),
         Request::Kill { session } => live
             .kill(&session)
             .map_err(|refusal| (Some(session), refusal)),

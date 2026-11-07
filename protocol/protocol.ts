@@ -14,7 +14,7 @@ export type Event = { "kind": "hello", protocol: number, } | { "kind": "spawned"
 /**
  * Within the viewport, so `0` is its first line however much history came with it.
  */
-cursor_row: number, cursor_column: number, alt_screen: boolean, } | { "kind": "failed", session: string | null, code: ErrorCode, message: string, };
+cursor_row: number, cursor_column: number, alt_screen: boolean, } | { "kind": "facts", session: string, cwd: string | null, command: string | null, running: boolean, exit_status: number | null, } | { "kind": "search", session: string, matches: Array<SearchMatch>, } | { "kind": "waited", session: string, outcome: WaitOutcome, } | { "kind": "failed", session: string | null, code: ErrorCode, message: string, };
 
 /**
  * What the app asks the broker to do.
@@ -27,4 +27,31 @@ args: Array<string>,
 /**
  * Added to the environment the broker runs in, which is already stripped of the app's own
  */
-env: Array<[string, string]>, cwd: string | null, } | { "kind": "write", session: string, data: string, } | { "kind": "resize", session: string, cols: number, rows: number, } | { "kind": "screen", session: string, history: number, } | { "kind": "kill", session: string, };
+env: Array<[string, string]>, cwd: string | null, } | { "kind": "write", session: string, data: string, } | { "kind": "resize", session: string, cols: number, rows: number, } | { "kind": "screen", session: string, history: number, } | { "kind": "facts", session: string, } | { "kind": "search", session: string, text: string, history: number, } | { "kind": "wait", session: string, until: Until, timeout_ms: number, } | { "kind": "kill", session: string, };
+
+/**
+ * Where a search found what it was asked for.
+ */
+export type SearchMatch = { 
+/**
+ * Into the lines the same request's `Screen` would answer, oldest first.
+ */
+line: number, 
+/**
+ * Where in that line the match starts, in characters.
+ */
+column: number, 
+/**
+ * The whole line, so a caller sees the context without a second read.
+ */
+text: string, };
+
+/**
+ * What a `Wait` is waiting for.
+ */
+export type Until = { "kind": "idle" } | { "kind": "text", text: string, } | { "kind": "exit" };
+
+/**
+ * How a `Wait` ended.
+ */
+export type WaitOutcome = "MET" | "TIMEOUT" | "EXITED";

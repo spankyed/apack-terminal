@@ -836,3 +836,220 @@ fn a_shell_is_started_with_the_arguments_and_environment_it_was_asked_for() {
         "the argument ran and the variable reached it: {seen:?}"
     );
 }
+
+/// A command that makes the shell *print* an escape sequence, so the marker reaches the screen the way a
+/// shell with integration arranged emits it — and **does not appear in the echo of what was typed**, which
+/// is what makes these cases about the shell's report rather than about the console's echo. The typed text
+/// carries `\033`, three ordinary characters; only `printf`'s output carries the escape byte.
+///
+/// **POSIX only, deliberately.** `cmd.exe` has no `printf` and no way to write an escape byte that is not
+/// also echoed, so the Windows form of this case would assert the echo. PowerShell can, and arranging these
+/// markers there is X4 — which this goal admits only on the strength of a Windows run.
+#[cfg(unix)]
+fn prints(sequences: &str) -> String {
+    // `READ%s` in the typed text, `READY` in the output: a sentinel a case can wait for without matching
+    // the echo of the line that produces it
+    format!("printf '{sequences}READ%s\\n' Y{SUBMIT}")
+}
+
+/// Reads until the shell has printed the sentinel. **Seeing it means every marker before it is parsed**,
+/// because the screen is fed before the bytes leave for the client — the one direction in which the
+/// authority can never be behind.
+#[cfg(unix)]
+fn once_the_sentinel_is_printed(reading: &mut Events) {
+    let mut output = String::new();
+    for _ in 0..400 {
+        let event = next(reading);
+        if event["kind"] == "output" {
+            output.push_str(event["data"].as_str().unwrap_or_default());
+            if output.contains("READY") {
+                return;
+            }
+        }
+    }
+    panic!("the sentinel never arrived: {output:?}");
+}
+
+/// A session with a shell running, ready to be typed into.
+#[cfg(unix)]
+fn a_session(broker: &Broker) -> (Events, Wire, String) {
+    let (mut reading, mut writing) = connect(broker);
+    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    assert_eq!(next(&mut reading)["kind"], "hello");
+    ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
+    let session = next(&mut reading)["session"]
+        .as_str()
+        .expect("a session id")
+        .to_owned();
+    once_the_shell_is_listening(&mut reading);
+    (reading, writing, session)
+}
+
+#[cfg(unix)]
+fn types(writing: &mut impl Write, session: &str, data: &str) {
+    ask(
+        writing,
+        &format!(
+            r#"{{"kind":"write","session":"{session}","data":{}}}"#,
+            serde_json::to_string(data).expect("a JSON string")
+        ),
+    );
+}
+
+/// **The read Phase A exists for: a session nobody is drawing answers what its shell reported.**
+///
+/// No window, no attachment, no view — the facts come from the broker's own parse of the markers, which is
+/// the whole gain of the VT core living here. Every field is a claim the shell made, and the case asserts
+/// they are reported as made: a status of 3 is 3, not "it failed".
+#[cfg(unix)]
+#[test]
+fn a_session_nobody_is_drawing_answers_what_its_shell_reported() {
+    let broker = start();
+    let (mut reading, mut writing, session) = a_session(&broker);
+
+    types(
+        &mut writing,
+        &session,
+        &prints("\\033]633;E;ls -la\\007\\033]633;C\\007\\033]633;P;Cwd=/tmp\\007\\033]633;D;3\\007"),
+    );
+    once_the_sentinel_is_printed(&mut reading);
+
+    ask(&mut writing, &format!(r#"{{"kind":"facts","session":"{session}"}}"#));
+    let (facts, _) = until(&mut reading, "facts");
+    assert_eq!(facts["cwd"], "/tmp", "the directory the shell reported");
+    assert_eq!(facts["command"], "ls -la", "the command line it reported");
+    assert_eq!(facts["exit_status"], 3, "the status it reported, as reported");
+    assert_eq!(facts["running"], false, "the command finished");
+}
+
+/// A bounded search over a hidden session's history, which is the other read without a view.
+#[cfg(unix)]
+#[test]
+fn a_search_finds_text_in_a_hidden_sessions_history() {
+    let broker = start();
+    let (mut reading, mut writing, session) = a_session(&broker);
+
+    types(&mut writing, &session, &ten_lines());
+    types(&mut writing, &session, &prints(""));
+    once_the_sentinel_is_printed(&mut reading);
+
+    ask(
+        &mut writing,
+        &format!(r#"{{"kind":"search","session":"{session}","text":"line-7","history":1000}}"#),
+    );
+    let (found, _) = until(&mut reading, "search");
+    let matches = found["matches"].as_array().expect("matches");
+    assert!(
+        matches.iter().any(|m| m["text"] == "line-7"),
+        "the line it was asked for: {matches:?}"
+    );
+    // The whole line comes back, so a caller sees its context without a second read
+    assert!(
+        matches[0]["column"].as_u64().is_some(),
+        "with where in the line it starts"
+    );
+
+    // Text nothing wrote is not found, which is the half that fails if a search answers everything
+    ask(
+        &mut writing,
+        &format!(r#"{{"kind":"search","session":"{session}","text":"line-11","history":1000}}"#),
+    );
+    let (none, _) = until(&mut reading, "search");
+    assert_eq!(
+        none["matches"].as_array().expect("matches").len(),
+        0,
+        "nothing wrote it"
+    );
+}
+
+/// **A wait is answered when the state arrives, not on a timer.**
+///
+/// The shell reports a command starting and the session is busy; the wait registered then must not answer.
+/// It answers when the shell reports the command finished — from the bytes arriving, which is the whole
+/// point of checking the condition where they land.
+#[cfg(unix)]
+#[test]
+fn a_wait_for_idle_is_answered_when_the_command_finishes() {
+    let broker = start();
+    let (mut reading, mut writing, session) = a_session(&broker);
+
+    // Busy: a command started and nothing has finished it
+    types(&mut writing, &session, &prints("\\033]633;C\\007"));
+    once_the_sentinel_is_printed(&mut reading);
+
+    ask(
+        &mut writing,
+        &format!(r#"{{"kind":"wait","session":"{session}","until":{{"kind":"idle"}},"timeout_ms":10000}}"#),
+    );
+    // Nothing has finished the command, so nothing may answer yet
+    for _ in 0..3 {
+        if let Ok(line) = reading.0.recv_timeout(std::time::Duration::from_millis(300)) {
+            let event: serde_json::Value = serde_json::from_str(&line).expect("an event");
+            assert_ne!(event["kind"], "waited", "the session is still busy: {event}");
+        }
+    }
+
+    types(&mut writing, &session, &prints("\\033]633;D;0\\007"));
+    let (waited, _) = until(&mut reading, "waited");
+    assert_eq!(waited["outcome"], "MET", "the shell reported it finished");
+}
+
+/// A wait for something that never comes answers its deadline rather than lasting for ever.
+#[cfg(unix)]
+#[test]
+fn a_wait_that_is_never_met_answers_its_deadline() {
+    let broker = start();
+    let (mut reading, mut writing, session) = a_session(&broker);
+
+    ask(
+        &mut writing,
+        &format!(
+            r#"{{"kind":"wait","session":"{session}","until":{{"kind":"text","text":"nothing writes this"}},"timeout_ms":400}}"#
+        ),
+    );
+    let (waited, _) = until(&mut reading, "waited");
+    assert_eq!(waited["outcome"], "TIMEOUT");
+}
+
+/// **A session ending settles every wait on it, and each is answered exactly once.**
+///
+/// An `exit` wait has reached what it asked for; an `idle` wait has not and never will, which is neither
+/// `MET` nor a deadline that has not passed. Without this a caller waiting on a shell the user just exited
+/// waits out its whole timeout.
+#[cfg(unix)]
+#[test]
+fn a_session_ending_settles_both_kinds_of_wait() {
+    let broker = start();
+    let (mut reading, mut writing, session) = a_session(&broker);
+
+    // Busy, so the idle wait cannot be answered by the state it is in
+    types(&mut writing, &session, &prints("\\033]633;C\\007"));
+    once_the_sentinel_is_printed(&mut reading);
+
+    ask(
+        &mut writing,
+        &format!(r#"{{"kind":"wait","session":"{session}","until":{{"kind":"idle"}},"timeout_ms":30000}}"#),
+    );
+    ask(
+        &mut writing,
+        &format!(r#"{{"kind":"wait","session":"{session}","until":{{"kind":"exit"}},"timeout_ms":30000}}"#),
+    );
+    types(&mut writing, &session, &format!("exit{SUBMIT}"));
+
+    let mut outcomes = Vec::new();
+    for _ in 0..400 {
+        let event = next(&mut reading);
+        if event["kind"] == "waited" {
+            outcomes.push(event["outcome"].as_str().unwrap_or_default().to_owned());
+        }
+        if outcomes.len() == 2 {
+            break;
+        }
+    }
+    outcomes.sort();
+    assert_eq!(
+        outcomes,
+        vec!["EXITED".to_string(), "MET".to_string()],
+        "the exit wait is met and the idle wait is told the session ended"
+    );
+}

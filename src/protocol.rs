@@ -1,9 +1,11 @@
 //! The messages the app and the broker exchange, and the one place their shape is defined.
 //!
 //! **Rust is the source of truth and the TypeScript is generated**, which is `elmdb-node/protocol/`'s
-//! arrangement reused rather than chosen again: `cargo test -- --ignored export_protocol` writes
+//! arrangement reused rather than chosen again: `TS_RS_EXPORT_DIR=protocol cargo test` writes
 //! `protocol/protocol.ts`, and the app treats that file as a recorded artifact with `check`/`update` halves,
 //! so a protocol change that nobody regenerated fails a typecheck instead of becoming a strange bug.
+//! The variable is not optional — ts-rs writes to a gitignored `bindings/` without it, which is a second
+//! answer to the same question that nobody reads.
 //!
 //! **It is a contract across a `.rev` boundary**, not an internal detail: the monorepo pins a commit of this
 //! repository, so a message set that changes under a pinned app has to be a clear refusal. That is what
@@ -66,8 +68,79 @@ pub enum Request {
     /// answers. `history` is a ceiling and not a promise — a session that has scrolled less answers with
     /// less, and an alternate-screen app has no scrollback to answer with at all.
     Screen { session: SessionId, history: u32 },
+    /// **What the shell has reported about itself** — the working directory, the command line it last said
+    /// it was running, whether one is running, and the status the last one ended with.
+    ///
+    /// This is the read shell integration exists for, and it answers for a session nobody is drawing. Every
+    /// field is a claim the program in the pty made, so what a caller may do with a reported path is the
+    /// app's decision; the broker reports what was said.
+    Facts { session: SessionId },
+    /// Where `text` appears in the screen and the `history` lines above it, oldest first.
+    ///
+    /// A read of what is already parsed, bounded by the history asked for and by a cap on matches — so a
+    /// caller looking for a prompt or an error pays a snapshot rather than a scan of everything a session
+    /// ever wrote.
+    Search {
+        session: SessionId,
+        text: String,
+        history: u32,
+    },
+    /// **Waits for a session to reach a state, answering once.**
+    ///
+    /// The alternative is a caller asking `Facts` or `Screen` on a timer, which is the shape this repo
+    /// refuses: the broker already knows when something arrived, so the condition is checked where the bytes
+    /// land and nothing polls. `timeout_ms` is the caller's deadline — a wait that is never met answers
+    /// `Timeout` rather than lasting for ever — and the answer comes exactly once however the race goes.
+    Wait {
+        session: SessionId,
+        until: Until,
+        timeout_ms: u32,
+    },
     /// End the session and its process tree.
     Kill { session: SessionId },
+}
+
+/// What a `Wait` is waiting for.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export, export_to = "protocol.ts")]
+pub enum Until {
+    /// No command is running: the shell has reported a prompt or a finish. **Needs shell integration** —
+    /// without the markers nothing ever reports a command starting, so a session that emits none is idle
+    /// from the start and this answers at once. That is the honest answer for a session whose shell says
+    /// nothing, rather than a guess read off the screen.
+    Idle,
+    /// `text` appears in the screen or its history. The fallback for a program that reports nothing, and the
+    /// one a caller reaches for when waiting for something a shell has no marker for.
+    Text { text: String },
+    /// The process ended.
+    Exit,
+}
+
+/// How a `Wait` ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[ts(export, export_to = "protocol.ts")]
+pub enum WaitOutcome {
+    /// The condition held.
+    Met,
+    /// The deadline passed first.
+    Timeout,
+    /// The session ended before the condition held. Distinct from `Met` on an `Exit` wait, which that
+    /// session reaching its condition *is*, and distinct from `Timeout` because nothing is coming.
+    Exited,
+}
+
+/// Where a search found what it was asked for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "protocol.ts")]
+pub struct SearchMatch {
+    /// Into the lines the same request's `Screen` would answer, oldest first.
+    pub line: u32,
+    /// Where in that line the match starts, in characters.
+    pub column: u32,
+    /// The whole line, so a caller sees the context without a second read.
+    pub text: String,
 }
 
 /// What the broker tells the app, unprompted or in answer.
@@ -109,6 +182,24 @@ pub enum Event {
         cursor_row: u16,
         cursor_column: u16,
         alt_screen: bool,
+    },
+    /// What the shell reported about itself, answering `Facts`. Claims, not measurements.
+    Facts {
+        session: SessionId,
+        cwd: Option<String>,
+        command: Option<String>,
+        running: bool,
+        exit_status: Option<i32>,
+    },
+    /// Where a search found its text, answering `Search`.
+    Search {
+        session: SessionId,
+        matches: Vec<SearchMatch>,
+    },
+    /// How a `Wait` ended. Sent once per wait, whichever way it ended.
+    Waited {
+        session: SessionId,
+        outcome: WaitOutcome,
     },
     /// A request could not be carried out. `session` is absent when the request named none.
     Failed {

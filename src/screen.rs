@@ -5,9 +5,11 @@
 //! come from, and it exists whether or not a window is alive to hold one, which is the whole gain the
 //! refactor was for: a hidden session still has a screen.
 //!
-//! **What this is not.** It holds no agent status rules, no command semantics and no policy; those are
-//! Phase A's, over the OSC markers this parses. It is a grid, a cursor, which screen is showing, and a
-//! bounded run of lines above the viewport.
+//! **What this is not.** It holds no agent status rules and no policy — no notion of an agent being busy or
+//! idle, no rule that reads a drawn screen and decides what a program is doing. It is a grid, a cursor,
+//! which screen is showing, a bounded run of lines above the viewport, and the facts a shell *reported*
+//! about itself (`markers.rs`). The difference is provenance: a fact here was stated by the shell, and a
+//! status rule would be this file's guess about one.
 
 use std::sync::{Arc, Mutex};
 
@@ -17,6 +19,8 @@ use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
+
+use crate::markers::{Marker, Markers};
 
 /// Lines of scrollback a session keeps.
 ///
@@ -71,6 +75,45 @@ impl Dimensions for Size {
     }
 }
 
+/// How many matches a search answers.
+///
+/// **A ceiling, because the question a caller asks is "where is this" and not "every place it occurs"**: a
+/// one-character search over a full history would otherwise answer tens of thousands of positions, each
+/// carrying its line. A caller that hits the cap has asked too broad a question and the first hits are the
+/// ones it wanted.
+pub const SEARCH_MATCHES: usize = 100;
+
+/// What a shell has reported about itself, accumulated from the markers it emitted.
+///
+/// **Every field is a claim the shell made, not a measurement of the machine**, which is why there is no
+/// `pid` or `user` here: those the broker knows for itself. A program in the pty can emit any of these
+/// sequences, so what this carries is what was *said* — the app decides what a claimed path is good for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Facts {
+    /// The working directory the shell last reported.
+    pub cwd: Option<String>,
+    /// The command line the shell last said it was about to run.
+    pub command: Option<String>,
+    /// Between a command starting and finishing, so a caller can tell a busy session from one at a prompt
+    /// **without reading the screen**, which is the whole point of the markers.
+    pub running: bool,
+    /// The status the last finished command reported. `None` when none has finished, or when the shell
+    /// reported a finish without one — a shell that says nothing about how a command ended is not saying
+    /// it succeeded.
+    pub exit_status: Option<i32>,
+}
+
+/// Where a search found what it was asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Match {
+    /// Into the lines the same request would answer, oldest first.
+    pub line: u32,
+    /// Where in that line the match starts, in characters.
+    pub column: u32,
+    /// The whole line, so a caller matching a prompt or an error sees its context without a second read.
+    pub text: String,
+}
+
 /// What a bounded read answers: lines of text, where the cursor is, and which screen is showing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
@@ -93,6 +136,9 @@ pub struct Screen {
     parser: Processor,
     size: Size,
     replies: Replies,
+    /// Scans the markers out of the same bytes, because the grid drops the sequences they travel in
+    markers: Markers,
+    facts: Facts,
 }
 
 impl Screen {
@@ -115,6 +161,8 @@ impl Screen {
             parser: Processor::new(),
             size,
             replies,
+            markers: Markers::default(),
+            facts: Facts::default(),
         }
     }
 
@@ -124,7 +172,17 @@ impl Screen {
     /// `tests/parser.rs` splits the same stream at every boundary and demands the same screen: a wrapper
     /// that buffered a chunk, or reset anything per call, would pass every test that feeds a whole stream.
     pub fn feed(&mut self, bytes: &[u8]) {
+        // The markers first, from the untouched stream: the grid is handed the same bytes and ignores the
+        // sequences they travel in, so neither pass can take anything from the other
+        for marker in self.markers.feed(bytes) {
+            self.facts.apply(marker);
+        }
         self.parser.advance(&mut self.term, bytes);
+    }
+
+    /// What the shell has said about itself.
+    pub fn facts(&self) -> &Facts {
+        &self.facts
     }
 
     /// What the program asked for and must be told, taken rather than read: each reply is written once.
@@ -156,6 +214,56 @@ impl Screen {
             cursor_column: cursor.column.0 as u16,
             alt_screen: self.term.mode().contains(TermMode::ALT_SCREEN),
         }
+    }
+}
+
+impl Facts {
+    /// Takes one marker's word for it.
+    fn apply(&mut self, marker: Marker) {
+        match marker {
+            // A prompt being drawn means whatever ran has finished, whether or not a `D` said so
+            Marker::PromptStart => self.running = false,
+            Marker::PromptEnd => {}
+            Marker::CommandStart => self.running = true,
+            Marker::CommandDone(status) => {
+                self.running = false;
+                self.exit_status = status;
+            }
+            Marker::CommandLine(line) => self.command = Some(line),
+            Marker::Cwd(path) => self.cwd = Some(path),
+        }
+    }
+}
+
+impl Screen {
+    /// Where `text` appears, over the same lines a `snapshot(history)` would answer.
+    ///
+    /// **Bounded twice**: by the history asked for, and by `SEARCH_MATCHES`. A search is a read of what is
+    /// already parsed, so it costs no more than the snapshot it searches.
+    pub fn search(&self, text: &str, history: u32) -> Vec<Match> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        let snapshot = self.snapshot(history);
+        let mut found = Vec::new();
+        for (index, line) in snapshot.lines.iter().enumerate() {
+            let mut from = 0;
+            while let Some(at) = line[from..].find(text) {
+                let byte = from + at;
+                found.push(Match {
+                    line: index as u32,
+                    // Characters rather than bytes: a caller counting columns on a screen counts what was
+                    // drawn, and a multi-byte character is one column of it
+                    column: line[..byte].chars().count() as u32,
+                    text: line.clone(),
+                });
+                if found.len() >= SEARCH_MATCHES {
+                    return found;
+                }
+                from = byte + text.len();
+            }
+        }
+        found
     }
 }
 
