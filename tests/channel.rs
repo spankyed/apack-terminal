@@ -35,8 +35,14 @@ fn start() -> Broker {
         .spawn()
         .expect("the broker starts");
     let mut ready = String::new();
-    BufReader::new(process.stdout.as_mut().expect("piped stdout")).read_line(&mut ready).expect("a ready line");
-    Broker { process, socket, _directory: directory }
+    BufReader::new(process.stdout.as_mut().expect("piped stdout"))
+        .read_line(&mut ready)
+        .expect("a ready line");
+    Broker {
+        process,
+        socket,
+        _directory: directory,
+    }
 }
 
 #[derive(Clone)]
@@ -58,8 +64,15 @@ impl Write for Wire {
 }
 
 fn greeted(broker: &Broker) -> (BufReader<Wire>, Wire) {
-    let name = broker.socket.to_str().expect("utf-8").to_fs_name::<GenericFilePath>().expect("a name");
-    let wire = Wire(std::sync::Arc::new(Stream::connect(name).expect("the broker accepts")));
+    let name = broker
+        .socket
+        .to_str()
+        .expect("utf-8")
+        .to_fs_name::<GenericFilePath>()
+        .expect("a name");
+    let wire = Wire(std::sync::Arc::new(
+        Stream::connect(name).expect("the broker accepts"),
+    ));
     let (mut reading, mut writing) = (BufReader::new(wire.clone()), wire);
     ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
     let mut line = String::new();
@@ -81,9 +94,21 @@ fn next(reading: &mut impl BufRead) -> serde_json::Value {
 
 /// Opens a session and runs `command` in it, returning the session id
 fn run(reading: &mut impl BufRead, writing: &mut impl Write, command: &str) -> String {
-    ask(writing, r#"{"kind":"spawn","cols":80,"rows":24,"shell":null,"cwd":null}"#);
-    let session = next(reading)["session"].as_str().expect("a session").to_owned();
-    ask(writing, &format!(r#"{{"kind":"write","session":"{session}","data":{}}}"#, serde_json::to_string(command).unwrap()));
+    ask(
+        writing,
+        r#"{"kind":"spawn","cols":80,"rows":24,"shell":null,"cwd":null}"#,
+    );
+    let session = next(reading)["session"]
+        .as_str()
+        .expect("a session")
+        .to_owned();
+    ask(
+        writing,
+        &format!(
+            r#"{{"kind":"write","session":"{session}","data":{}}}"#,
+            serde_json::to_string(command).unwrap()
+        ),
+    );
     session
 }
 
@@ -108,7 +133,10 @@ fn a_megabyte_of_output_is_coalesced_into_far_fewer_messages_than_chunks() {
 
     // apack's Phase G measured one bus event per pty chunk: 115 messages for 64 KiB, so about 1,840 per MB
     // (F4). The budget this holds is the ceiling the coalescer buys, not a figure chosen for comfort.
-    assert!(messages < 200, "a megabyte arrived as {messages} messages, carrying {bytes} bytes");
+    assert!(
+        messages < 200,
+        "a megabyte arrived as {messages} messages, carrying {bytes} bytes"
+    );
     assert!(bytes >= 1_048_576, "every byte arrived: {bytes}");
 }
 
@@ -135,8 +163,14 @@ fn a_saturating_producer_reports_that_it_was_throttled_rather_than_losing_output
     }
 
     // The overload is reported, and it is a wait rather than a loss: every byte still arrives
-    assert!(throttled > 0, "a saturating producer reported no throttling");
-    assert!(bytes >= 1_048_576, "output was dropped: {bytes} of 1048576 bytes");
+    assert!(
+        throttled > 0,
+        "a saturating producer reported no throttling"
+    );
+    assert!(
+        bytes >= 1_048_576,
+        "output was dropped: {bytes} of 1048576 bytes"
+    );
 }
 
 #[test]
@@ -147,7 +181,10 @@ fn an_answer_arrives_while_a_producer_is_saturating_the_channel() {
 
     // Let the channel fill, then ask a question whose answer must not queue behind a megabyte of output
     std::thread::sleep(std::time::Duration::from_millis(400));
-    ask(&mut writing, r#"{"kind":"write","session":"s-404","data":"x"}"#);
+    ask(
+        &mut writing,
+        r#"{"kind":"write","session":"s-404","data":"x"}"#,
+    );
 
     // This shows an answer arriving during saturation, which is worth having — but it does **not** by
     // itself prove the credit split: an answer that spent output's credit was measured arriving just as
@@ -165,7 +202,9 @@ fn an_answer_arrives_while_a_producer_is_saturating_the_channel() {
                 );
                 return;
             }
-            Some("output") if event["session"] == flooding.as_str() => outputs_before_the_answer += 1,
+            Some("output") if event["session"] == flooding.as_str() => {
+                outputs_before_the_answer += 1
+            }
             _ => {}
         }
     }
@@ -183,7 +222,10 @@ fn a_request_is_still_carried_out_while_output_has_filled_the_channel() {
     // not distinguish the credit split — see the module comment — but it does catch a request loop that
     // comes to depend on output draining.
     std::thread::sleep(std::time::Duration::from_millis(500));
-    ask(&mut writing, &format!(r#"{{"kind":"kill","session":"{session}"}}"#));
+    ask(
+        &mut writing,
+        &format!(r#"{{"kind":"kill","session":"{session}"}}"#),
+    );
 
     // Now drain. The kill must already have been carried out while the channel was full
     for _ in 0..8000 {

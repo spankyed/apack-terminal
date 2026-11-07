@@ -76,7 +76,10 @@ impl Screen {
         };
         Self {
             term: Term::new(
-                Config { scrolling_history: HISTORY_LINES, ..Config::default() },
+                Config {
+                    scrolling_history: HISTORY_LINES,
+                    ..Config::default()
+                },
                 &size,
                 VoidListener,
             ),

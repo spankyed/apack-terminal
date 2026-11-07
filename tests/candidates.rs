@@ -39,7 +39,10 @@ fn the_vt_core_parses_bytes_into_a_readable_screen() {
 
     let mut term = Term::new(
         Config::default(),
-        &Size { columns: 20, screen_lines: 3 },
+        &Size {
+            columns: 20,
+            screen_lines: 3,
+        },
         VoidListener,
     );
     let mut parser: Processor = Processor::new();
@@ -48,9 +51,14 @@ fn the_vt_core_parses_bytes_into_a_readable_screen() {
     }
 
     let row = &term.grid()[alacritty_terminal::index::Line(0)];
-    let line: String = (0..5).map(|column| row[alacritty_terminal::index::Column(column)].c).collect();
+    let line: String = (0..5)
+        .map(|column| row[alacritty_terminal::index::Column(column)].c)
+        .collect();
     // "hello", then the cursor home and "red": three cells overwritten, the rest left alone
-    assert_eq!(line, "redlo", "the screen is readable and a cursor move overwrote the start of the line");
+    assert_eq!(
+        line, "redlo",
+        "the screen is readable and a cursor move overwrote the start of the line"
+    );
 }
 
 /// `command-group` owns a process tree: a group on POSIX, a Job Object on Windows under one API.
@@ -75,13 +83,22 @@ fn a_child_is_spawned_into_a_group_this_process_owns() {
         .expect("a group spawn");
 
     let mut started = [0u8; 7];
-    child.inner().stdout.as_mut().expect("piped stdout").read_exact(&mut started).expect("the child's first line");
+    child
+        .inner()
+        .stdout
+        .as_mut()
+        .expect("piped stdout")
+        .read_exact(&mut started)
+        .expect("the child's first line");
     assert_eq!(&started, b"started");
 
     // Killing the group, not the shell: the `sleep` is the grandchild X1 is about
     child.kill().expect("the group is killable");
     let status = child.wait().expect("the group's exit is reaped");
-    assert!(!status.success(), "a killed group does not exit successfully");
+    assert!(
+        !status.success(),
+        "a killed group does not exit successfully"
+    );
 }
 
 /// `portable-pty` is the process layer: a pty whose child's output comes back.
@@ -90,9 +107,17 @@ fn a_pty_runs_a_command_and_its_output_comes_back() {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
     let pty = native_pty_system()
-        .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
         .expect("a pty");
-    let mut child = pty.slave.spawn_command(CommandBuilder::new_default_prog()).expect("a shell");
+    let mut child = pty
+        .slave
+        .spawn_command(CommandBuilder::new_default_prog())
+        .expect("a shell");
     // **Drop the slave, or the master never sees EOF.** Holding it keeps the slave fd open, so the read loop
     // below blocks for ever after the shell exits instead of ending — which is what it did first, and is the
     // lifetime the broker's session has to get right too.
@@ -100,7 +125,9 @@ fn a_pty_runs_a_command_and_its_output_comes_back() {
     let mut reader = pty.master.try_clone_reader().expect("a reader");
     let mut writer = pty.master.take_writer().expect("a writer");
 
-    writer.write_all(b"printf apack-terminal-probe\nexit\n").expect("the write reaches the pty");
+    writer
+        .write_all(b"printf apack-terminal-probe\nexit\n")
+        .expect("the write reaches the pty");
     drop(writer);
 
     // Read to EOF, which the shell's exit produces now that nothing else holds the slave
@@ -114,7 +141,10 @@ fn a_pty_runs_a_command_and_its_output_comes_back() {
     }
     child.wait().expect("the shell exits");
 
-    assert!(output.contains("apack-terminal-probe"), "the child's output came back: {output:?}");
+    assert!(
+        output.contains("apack-terminal-probe"),
+        "the child's output came back: {output:?}"
+    );
 }
 
 /// `ts-rs` is the protocol's generator, arranged as elmdb's `crates/elmdb-node/protocol/` is.

@@ -34,7 +34,6 @@ pub const OUTPUT_CAP: usize = 64 * 1024;
 /// How many coalesced output messages may be in flight. Phase G's ceiling, in messages
 pub const OUTPUT_CREDIT: usize = 64;
 
-
 /// Credit for the output class: a producer takes one per message and the writer returns it.
 ///
 /// A plain bounded channel would do this for one producer, but the writer has to drain *two* classes and
@@ -47,7 +46,10 @@ pub struct Credit {
 
 impl Credit {
     pub fn new(total: usize) -> Arc<Self> {
-        Arc::new(Self { free: Mutex::new(total), returned: Condvar::new() })
+        Arc::new(Self {
+            free: Mutex::new(total),
+            returned: Condvar::new(),
+        })
     }
 
     /// Waits for credit, answering how long it had to. A non-zero wait **is** the overload, observably.
@@ -77,7 +79,10 @@ pub struct Outgoing {
 impl Outgoing {
     /// An answer: no credit, so it is never held behind output
     pub fn answer(event: Event) -> Self {
-        Self { event, credit: None }
+        Self {
+            event,
+            credit: None,
+        }
     }
 
     /// Returns the credit this message spent, once it has actually been written
@@ -111,12 +116,23 @@ pub fn coalesce(
         if waited > Duration::ZERO {
             // The overload is reported rather than silent, and it is a *wait* rather than a loss: the pty's
             // own buffer is what fills behind this, which is backpressure reaching the process.
-            let throttled = Event::Throttled { session: session.clone(), waited_ms: waited.as_millis() as u32 };
+            let throttled = Event::Throttled {
+                session: session.clone(),
+                waited_ms: waited.as_millis() as u32,
+            };
             if outgoing.send(Outgoing::answer(throttled)).is_err() {
                 return false;
             }
         }
-        outgoing.send(Outgoing { event: Event::Output { session: session.clone(), data }, credit: Some(Arc::clone(credit)) }).is_ok()
+        outgoing
+            .send(Outgoing {
+                event: Event::Output {
+                    session: session.clone(),
+                    data,
+                },
+                credit: Some(Arc::clone(credit)),
+            })
+            .is_ok()
     };
 
     loop {

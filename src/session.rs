@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
-use crate::protocol::{ErrorCode, Event, SessionId};
 use crate::output::{Credit, Outgoing, coalesce};
+use crate::protocol::{ErrorCode, Event, SessionId};
 use crate::screen::{Screen, Snapshot};
 
 /// A running session: the master side of its pty, its child, and the thread reading its output.
@@ -46,7 +46,10 @@ pub struct Refusal {
 
 impl Refusal {
     fn pty(what: &str, error: impl std::fmt::Display) -> Self {
-        Self { code: ErrorCode::Pty, message: format!("{what}: {error}") }
+        Self {
+            code: ErrorCode::Pty,
+            message: format!("{what}: {error}"),
+        }
     }
 }
 
@@ -54,7 +57,12 @@ type Outcome = Result<(), Refusal>;
 
 impl Sessions {
     pub fn new(events: Sender<Outgoing>, credit: Arc<Credit>) -> Self {
-        Self { next: 0, live: HashMap::new(), events, credit }
+        Self {
+            next: 0,
+            live: HashMap::new(),
+            events,
+            credit,
+        }
     }
 
     /// Answers this connection, which a caller holding the lock can do without taking a second one.
@@ -71,7 +79,12 @@ impl Sessions {
         cwd: Option<String>,
     ) -> Result<(SessionId, u32), Refusal> {
         let pty = native_pty_system()
-            .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
             .map_err(|error| Refusal::pty("opening a pty", error))?;
 
         let mut command = match shell {
@@ -142,11 +155,26 @@ impl Sessions {
             drop(chunks);
             // EOF on the master: the process has ended, so its status is available without waiting for a
             // tick. A `kill` may have taken it already, in which case this reports nothing.
-            let code = waiting.lock().ok().and_then(|mut child| child.wait().ok()).map(|status| status.exit_code() as i32);
-            let _ = events.send(Outgoing::answer(Event::Exited { session: reading, code }));
+            let code = waiting
+                .lock()
+                .ok()
+                .and_then(|mut child| child.wait().ok())
+                .map(|status| status.exit_code() as i32);
+            let _ = events.send(Outgoing::answer(Event::Exited {
+                session: reading,
+                code,
+            }));
         });
 
-        self.live.insert(session.clone(), Session { master: pty.master, writer, child, screen });
+        self.live.insert(
+            session.clone(),
+            Session {
+                master: pty.master,
+                writer,
+                child,
+                screen,
+            },
+        );
         Ok((session, pid))
     }
 
@@ -161,7 +189,12 @@ impl Sessions {
     pub fn resize(&mut self, session: &str, cols: u16, rows: u16) -> Outcome {
         let live = self.live.get_mut(session).ok_or_else(|| missing(session))?;
         live.master
-            .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
             .map_err(|error| Refusal::pty("resizing a pty", error))?;
         // The screen is resized too, or the authority would describe a viewport the process no longer has
         if let Ok(mut screen) = live.screen.lock() {
@@ -184,8 +217,13 @@ impl Sessions {
     /// one exit, one event, whichever way the process ended.
     pub fn kill(&mut self, session: &str) -> Outcome {
         let live = self.live.remove(session).ok_or_else(|| missing(session))?;
-        let mut child = live.child.lock().map_err(|_| Refusal::pty("killing a session", "the child's lock was poisoned"))?;
-        child.kill().map_err(|error| Refusal::pty("killing a session", error))
+        let mut child = live
+            .child
+            .lock()
+            .map_err(|_| Refusal::pty("killing a session", "the child's lock was poisoned"))?;
+        child
+            .kill()
+            .map_err(|error| Refusal::pty("killing a session", error))
     }
 
     /// Ends every session this owner holds. **The connection's end is what calls it**: a client that
@@ -206,5 +244,8 @@ impl Sessions {
 }
 
 fn missing(session: &str) -> Refusal {
-    Refusal { code: ErrorCode::NoSuchSession, message: format!("no session {session}") }
+    Refusal {
+        code: ErrorCode::NoSuchSession,
+        message: format!("no session {session}"),
+    }
 }
