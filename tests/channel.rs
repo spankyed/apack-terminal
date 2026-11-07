@@ -11,6 +11,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 
+use apack_terminal::output::{OUTPUT_CAP, OUTPUT_WINDOW};
 use interprocess::local_socket::{GenericFilePath, Stream, ToFsName, prelude::*};
 
 struct Broker {
@@ -132,6 +133,7 @@ fn a_megabyte_of_output_is_coalesced_into_far_fewer_messages_than_chunks() {
     let (mut reading, mut writing) = greeted(&broker);
     let session = run(&mut reading, &mut writing, SATURATE);
 
+    let started = std::time::Instant::now();
     let mut messages = 0usize;
     let mut bytes = 0usize;
     while bytes < 1_048_576 {
@@ -141,12 +143,23 @@ fn a_megabyte_of_output_is_coalesced_into_far_fewer_messages_than_chunks() {
             bytes += event["data"].as_str().unwrap_or_default().len();
         }
     }
+    let took = started.elapsed();
 
-    // apack's Phase G measured one bus event per pty chunk: 115 messages for 64 KiB, so about 1,840 per MB
-    // (F4). The budget this holds is the ceiling the coalescer buys, not a figure chosen for comfort.
+    // **The ceiling is derived from the two bounds, not chosen.** A message leaves when the window closes or
+    // the cap fills, so a run of this length cannot have produced more than one per window plus one per cap,
+    // and one more for whatever was held when the shell exited. That makes the budget load-independent: a
+    // slower machine takes more windows and is allowed more messages, where a round number would have been
+    // either slack on this machine or flaky on a busy one.
+    //
+    // apack's Phase G measured the before, one bus event per pty chunk: 115 messages for 64 KiB, about 1,840
+    // per MB (F4). The same corpus in the app now costs 6 messages for 64 KiB.
+    let budget = took.as_millis().div_ceil(OUTPUT_WINDOW.as_millis()) as usize
+        + bytes.div_ceil(OUTPUT_CAP)
+        + 1;
     assert!(
-        messages < 200,
-        "a megabyte arrived as {messages} messages, carrying {bytes} bytes"
+        messages <= budget,
+        "a megabyte arrived as {messages} messages carrying {bytes} bytes, past the {budget} that \
+         {took:?} of windows and {OUTPUT_CAP}-byte caps allow"
     );
     assert!(bytes >= 1_048_576, "every byte arrived: {bytes}");
 }
