@@ -66,7 +66,11 @@ impl Write for Wire {
 /// A connection to the broker, which every client must then greet.
 fn connect(broker: &Broker) -> (BufReader<Wire>, Wire) {
     let name = broker.socket.to_str().expect("a utf-8 socket path").to_fs_name::<GenericFilePath>().expect("a socket name");
-    let wire = Wire(std::sync::Arc::new(Stream::connect(name).expect("the broker accepts")));
+    let stream = Stream::connect(name).expect("the broker accepts");
+    // **Every read is bounded**, so a case waiting for something that will never come fails instead of
+    // hanging — which a mutation that stopped resizes reaching the pty turned into a ten-minute hang.
+    stream.set_recv_timeout(Some(std::time::Duration::from_secs(10))).expect("a receive timeout");
+    let wire = Wire(std::sync::Arc::new(stream));
     (BufReader::new(wire.clone()), wire)
 }
 
@@ -76,10 +80,16 @@ fn ask(writing: &mut impl Write, frame: &str) {
     writing.flush().expect("the request is flushed");
 }
 
+/// One event, or a failure saying none came. Bounded by the socket's own receive timeout, set on connect.
 fn next(reading: &mut impl BufRead) -> serde_json::Value {
     let mut line = String::new();
-    reading.read_line(&mut line).expect("an event");
-    serde_json::from_str(&line).unwrap_or_else(|error| panic!("{error}: {line:?}"))
+    match reading.read_line(&mut line) {
+        Ok(0) => panic!("the broker closed the connection"),
+        // A guard that hangs is worse than one that fails: a mutation that stopped resizes reaching the pty
+        // left `less` with nothing to redraw, and a blocking read turned that into a ten-minute hang
+        Err(error) => panic!("no event arrived within the socket's timeout ({error})"),
+        Ok(_) => serde_json::from_str(&line).unwrap_or_else(|error| panic!("{error}: {line:?}")),
+    }
 }
 
 /// Reads until an event of `kind` arrives, returning it with everything seen on the way.
@@ -212,11 +222,118 @@ fn a_client_that_disconnects_leaves_no_shell_running() {
 
     // The app cannot end its sessions on the way out — a pack's `onShutdown` is synchronous and runs in
     // `process.on('exit')`, where no socket write completes — so the broker has to be the backstop.
-    let gone = (0..200).any(|_| {
+    assert!(reaped(pid), "the shell for pid {pid} was still running after its client disconnected");
+}
+
+/// Whether `pid` is still a live process. Signal 0 asks without touching it.
+fn alive(pid: i32) -> bool {
+    let answer = unsafe { libc::kill(pid, 0) };
+    answer == 0
+}
+
+/// Waits up to ~5s for `pid` to go away, answering whether it did.
+fn reaped(pid: i32) -> bool {
+    (0..200).any(|_| {
         std::thread::sleep(std::time::Duration::from_millis(25));
-        // Signal 0 asks whether the process is still there without touching it
-        let alive = unsafe { libc::kill(pid, 0) } == 0;
-        !alive
+        !alive(pid)
+    })
+}
+
+#[test]
+fn killing_a_session_takes_the_whole_tree_with_it() {
+    let broker = start();
+    let (mut reading, mut writing) = connect(&broker);
+    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    next(&mut reading);
+    ask(&mut writing, r#"{"kind":"spawn","cols":80,"rows":24,"shell":null,"cwd":null}"#);
+    let session = next(&mut reading)["session"].as_str().expect("a session").to_owned();
+
+    // A grandchild that outlives its parent unless something owns the tree: this is X1 and X2's subject,
+    // and Phase B's acceptance says portable-pty is validated for containment rather than assumed.
+    ask(&mut writing, &format!(r#"{{"kind":"write","session":"{session}","data":"sleep 300 & echo $!\n"}}"#));
+    let mut seen = String::new();
+    let grandchild = (0..400)
+        .find_map(|_| {
+            let event = next(&mut reading);
+            if event["kind"] != "output" {
+                return None;
+            }
+            seen.push_str(event["data"].as_str().unwrap_or_default());
+            // The shell echoes the job's pid on its own line, after the command it echoed back
+            seen.lines()
+                .filter_map(|line| line.trim().parse::<i32>().ok())
+                .find(|pid| *pid > 1)
+        })
+        .unwrap_or_else(|| panic!("the shell never reported its background job's pid; saw {seen:?}"));
+    assert!(alive(grandchild), "the grandchild {grandchild} is running");
+
+    ask(&mut writing, &format!(r#"{{"kind":"kill","session":"{session}"}}"#));
+    until(&mut reading, "exited");
+
+    assert!(reaped(grandchild), "the grandchild {grandchild} outlived the session it belonged to");
+}
+
+#[test]
+fn a_session_is_cancellable_while_its_shell_is_busy() {
+    let broker = start();
+    let (mut reading, mut writing) = connect(&broker);
+    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    next(&mut reading);
+    ask(&mut writing, r#"{"kind":"spawn","cols":80,"rows":24,"shell":null,"cwd":null}"#);
+    let spawned = next(&mut reading);
+    let session = spawned["session"].as_str().expect("a session").to_owned();
+    let shell = spawned["pid"].as_u64().expect("a pid") as i32;
+
+    // A shell that ignores interruption and never reads its input again: cancellation must not depend on
+    // the process cooperating, which is what Phase B means by validating it rather than assuming it
+    ask(&mut writing, &format!(r#"{{"kind":"write","session":"{session}","data":"trap '' INT TERM; while true; do sleep 1; done\n"}}"#));
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    ask(&mut writing, &format!(r#"{{"kind":"kill","session":"{session}"}}"#));
+    assert!(reaped(shell), "the shell {shell} survived a kill while it was busy and trapping signals");
+}
+
+#[test]
+fn an_alternate_screen_app_survives_a_resize_and_keeps_answering() {
+    let broker = start();
+    let (mut reading, mut writing) = connect(&broker);
+    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    next(&mut reading);
+    ask(&mut writing, r#"{"kind":"spawn","cols":80,"rows":24,"shell":null,"cwd":null}"#);
+    let spawned = next(&mut reading);
+    let session = spawned["session"].as_str().expect("a session").to_owned();
+    let shell = spawned["pid"].as_u64().expect("a pid") as i32;
+
+    // `less` on the alternate screen: Phase B names this as where resize mistakes surface, because an app
+    // that owns the whole screen redraws it on SIGWINCH rather than carrying on at a prompt. `vim` is the
+    // other case and needs an installed vim; `less` ships with the OS.
+    ask(&mut writing, &format!(
+        r#"{{"kind":"write","session":"{session}","data":"seq 1 500 | less\n"}}"#
+    ));
+    let entered = (0..600).any(|_| {
+        let event = next(&mut reading);
+        // `\x1b[?1049h` is the alternate screen; `\x1b[?47h` is the older form some builds use
+        event["kind"] == "output"
+            && event["data"].as_str().is_some_and(|data| data.contains("[?1049h") || data.contains("[?47h"))
     });
-    assert!(gone, "the shell for pid {pid} was still running after its client disconnected");
+    assert!(entered, "less never switched to the alternate screen");
+
+    // Resize while it owns the screen. A pty has one size, so this is one message, and the app must redraw
+    for (cols, rows) in [(100u16, 30u16), (60, 20), (120, 40)] {
+        ask(&mut writing, &format!(r#"{{"kind":"resize","session":"{session}","cols":{cols},"rows":{rows}}}"#));
+    }
+
+    // It redrew rather than dying: output arrives after the resizes, and the shell is still there
+    let redrew = (0..600).any(|_| next(&mut reading)["kind"] == "output");
+    assert!(redrew, "nothing was drawn after the resize");
+    assert!(alive(shell), "the shell did not survive a resize under an alternate-screen app");
+
+    // And it is still taking input: `q` leaves less, which ends the shell's foreground job
+    ask(&mut writing, &format!(r#"{{"kind":"write","session":"{session}","data":"q"}}"#));
+    let left = (0..600).any(|_| {
+        let event = next(&mut reading);
+        event["kind"] == "output"
+            && event["data"].as_str().is_some_and(|data| data.contains("[?1049l") || data.contains("[?47l"))
+    });
+    assert!(left, "less never left the alternate screen, so it had stopped reading input");
 }

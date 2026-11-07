@@ -55,9 +55,15 @@ fn the_vt_core_parses_bytes_into_a_readable_screen() {
 
 /// `command-group` owns a process tree: a group on POSIX, a Job Object on Windows under one API.
 ///
-/// The primitive Phase B needs is `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, which this test cannot reach from
-/// macOS — what it establishes is that the API exists, spawns, and reaps a tree's exit status, so X1's
-/// answer can be the kernel's rather than cleanup code's.
+/// **A dev-dependency, not a dependency, and the reason is a measurement.** The broker's spawn path does not
+/// use it: `tests/broker.rs` shows that killing a session reaps its grandchildren on POSIX without it,
+/// because the kernel sends SIGHUP to a pty's foreground group when its session leader dies — demonstrated,
+/// including with the master kept open, so it is the leader's death that carries it and not the pty's close.
+///
+/// Windows has no equivalent, which is what X1 and X2 are about, and
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is the answer there — the OS killing the tree when the handle
+/// closes. This test keeps the API retired so that change is a wiring job rather than a question, and it
+/// moves into `[dependencies]` in the change that can be run on Windows.
 #[test]
 fn a_child_is_spawned_into_a_group_this_process_owns() {
     use command_group::CommandGroup;
