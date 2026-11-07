@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex};
 
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::output::{Credit, Outgoing, coalesce};
 use crate::protocol::{ErrorCode, Event, SessionId};
@@ -22,9 +22,10 @@ struct Session {
     /// Shared with the reader thread, which writes the terminal's own replies back through it — see
     /// `Replies` in `screen.rs` for why a session that answers nothing does not start on Windows
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    /// Shared with the reader thread, which waits on it at EOF so **nothing polls for an exit**: the pty
-    /// closing *is* the process ending, and that is an event this already receives.
-    child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
+    /// How a session is ended from here. **The child itself belongs to the thread waiting on it**, which is
+    /// what lets that wait block: a killer is a handle of its own, so ending a session never queues behind
+    /// the wait that will observe the ending.
+    killer: Box<dyn ChildKiller + Send + Sync>,
     /// The process tree this session owns, on the platform that needs one owned (`tree.rs`). Dropped with
     /// the session, which is what ends the tree on Windows — so a `kill`, a disconnect and a broker that
     /// crashes all reap it by the same mechanism rather than by three paths remembering to.
@@ -101,7 +102,7 @@ impl Sessions {
         if let Some(directory) = cwd {
             command.cwd(directory);
         }
-        let child = pty
+        let mut child = pty
             .slave
             .spawn_command(command)
             .map_err(|error| Refusal::pty("spawning a shell", error))?;
@@ -122,7 +123,6 @@ impl Sessions {
         self.next += 1;
         let session = format!("s-{}", self.next);
         let pid = child.process_id().unwrap_or_default();
-        let child = Arc::new(Mutex::new(child));
 
         // One thread per session, which is what the skeleton needs; bounded I/O and backpressure are
         // Phase B's, and the goal says so rather than leaving it to be discovered here.
@@ -133,10 +133,17 @@ impl Sessions {
         let (chunks, incoming) = channel::<Vec<u8>>();
         let events = self.events.clone();
         let reading = session.clone();
-        let waiting = Arc::clone(&child);
         let screen = Arc::new(Mutex::new(Screen::new(cols, rows)));
         let parsing = Arc::clone(&screen);
         let answering = Arc::clone(&writer);
+        let killer = child.clone_killer();
+
+        // One thread per session, which is what the skeleton needs; bounded I/O and backpressure are
+        // Phase B's, and the goal says so rather than leaving it to be discovered here.
+        // **The reader does not decide what a message is.** It hands what one `read` returned to the
+        // coalescer, which flushes on a window or a cap — so N bytes of output no longer means N messages,
+        // which is F4. The internal hop is unbounded on purpose: the bound belongs at the coalescer, where
+        // credit is spent, and a reader blocked on this queue could not notice EOF.
         std::thread::spawn({
             let session = session.clone();
             let events = events.clone();
@@ -178,13 +185,16 @@ impl Sessions {
             }
             // The coalescer ends when this drops, flushing what it holds, so nothing is lost at EOF
             drop(chunks);
-            // EOF on the master: the process has ended, so its status is available without waiting for a
-            // tick. A `kill` may have taken it already, in which case this reports nothing.
-            let code = waiting
-                .lock()
-                .ok()
-                .and_then(|mut child| child.wait().ok())
-                .map(|status| status.exit_code() as i32);
+        });
+
+        // **The exit is waited for, not inferred from the output ending.** A POSIX pty gives EOF on the
+        // master when the last slave closes, so the reader could report it; a ConPTY does not, because this
+        // process still holds the pseudoconsole — so on Windows the read simply never returned and a shell
+        // the user exited was never reported at all. The terminal stayed on screen with nothing behind it,
+        // which is what X2 calls an undead terminal. Waiting on the child is the one signal both platforms
+        // give, and it still polls nothing.
+        std::thread::spawn(move || {
+            let code = child.wait().ok().map(|status| status.exit_code() as i32);
             let _ = events.send(Outgoing::answer(Event::Exited {
                 session: reading,
                 code,
@@ -196,7 +206,7 @@ impl Sessions {
             Session {
                 master: pty.master,
                 writer,
-                child,
+                killer,
                 _tree: Tree::owning(pid),
                 screen,
             },
@@ -246,14 +256,16 @@ impl Sessions {
     /// Ends the session. The reader thread sees the pty close and reports `Exited`, so this reports nothing:
     /// one exit, one event, whichever way the process ended.
     pub fn kill(&mut self, session: &str) -> Outcome {
-        let live = self.live.remove(session).ok_or_else(|| missing(session))?;
-        let mut child = live
-            .child
-            .lock()
-            .map_err(|_| Refusal::pty("killing a session", "the child's lock was poisoned"))?;
-        child
+        let mut live = self.live.remove(session).ok_or_else(|| missing(session))?;
+        live.killer
             .kill()
             .map_err(|error| Refusal::pty("killing a session", error))
+    }
+
+    /// Drops the record of a session whose process has ended, which the writer thread does when it sees the
+    /// `Exited` it is about to send. Nothing is killed here: the process is already gone.
+    pub fn forget(&mut self, session: &str) {
+        self.live.remove(session);
     }
 
     /// Ends every session this owner holds. **The connection's end is what calls it**: a client that
@@ -265,10 +277,8 @@ impl Sessions {
     /// Sessions outliving their client is Phase B's, and nothing here is shaped to prevent it: this is where
     /// that policy will be stated instead of assumed.
     pub fn end_all(&mut self) {
-        for (_, live) in self.live.drain() {
-            if let Ok(mut child) = live.child.lock() {
-                let _ = child.kill();
-            }
+        for (_, mut live) in self.live.drain() {
+            let _ = live.killer.kill();
         }
     }
 }

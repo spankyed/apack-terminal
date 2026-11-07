@@ -191,22 +191,29 @@ fn a_keystroke_reaches_a_pty_and_its_output_comes_back() {
     );
 
     // The keystroke, and the output it causes
+    once_the_shell_is_listening(&mut reading);
     ask(
         &mut writing,
-        &format!(r#"{{"kind":"write","session":"{session}","data":"printf skeleton-probe\n"}}"#),
+        &format!(
+            r#"{{"kind":"write","session":"{session}","data":{}}}"#,
+            serde_json::to_string(&format!("echo skeleton-probe{SUBMIT}")).expect("a JSON string")
+        ),
     );
     let mut output = String::new();
     for _ in 0..200 {
         let event = next(&mut reading);
         if event["kind"] == "output" {
             output.push_str(event["data"].as_str().unwrap_or_default());
-            if output.contains("skeleton-probe") {
+            if output.matches("skeleton-probe").count() >= 2 {
                 break;
             }
         }
     }
+    // **Twice**: once as the console echoes what was typed, once as the command's own output. Asserting it
+    // appears at all is a case a Windows console passes without running anything, which is how `\n` looked
+    // like working input (X6)
     assert!(
-        output.contains("skeleton-probe"),
+        output.matches("skeleton-probe").count() >= 2,
         "the pty's output came back: {output:?}"
     );
 
@@ -312,7 +319,10 @@ fn a_shell_that_exits_on_its_own_is_reported_without_anything_polling_for_it() {
 
     ask(
         &mut writing,
-        &format!(r#"{{"kind":"write","session":"{session}","data":"exit\n"}}"#),
+        &format!(
+            r#"{{"kind":"write","session":"{session}","data":{}}}"#,
+            serde_json::to_string(&format!("exit{SUBMIT}")).expect("a JSON string")
+        ),
     );
     let (exited, _) = until(&mut reading, "exited");
     assert_eq!(exited["session"].as_str(), Some(session.as_str()));
@@ -366,6 +376,40 @@ fn alive(pid: i32) -> bool {
     }
 }
 
+/// The shell this platform's default session runs, where a case needs to name one.
+///
+/// `portable-pty`'s default program is the login shell on POSIX and `ComSpec` on Windows — which is
+/// `cmd.exe`, not PowerShell, and typing one's syntax into the other is how a case can look like a broken
+/// pty when it is only a bad command.
+#[cfg(unix)]
+const DEFAULT_SHELL: &str = "/bin/sh";
+#[cfg(windows)]
+const DEFAULT_SHELL: &str = "cmd.exe";
+
+/// **What submits a line, which is not the same two bytes on both platforms** — X6's subject, measured
+/// rather than assumed.
+///
+/// Typed into a Windows console: `\n` is echoed and never runs, `\r` alone does not get that far, and
+/// `\r\n` both echoes and runs. So the app's run-script path sending `\n` leaves the command on the screen
+/// looking typed and never executed, which is exactly what the finding describes.
+///
+/// It is the control characters themselves, so anything embedding them in a frame serialises the frame
+/// rather than pasting into one — a raw newline inside a JSON string is not JSON.
+#[cfg(unix)]
+const SUBMIT: &str = "\n";
+#[cfg(windows)]
+const SUBMIT: &str = "\r\n";
+
+/// Ten numbered lines, which a case counts rather than reads.
+#[cfg(unix)]
+fn ten_lines() -> String {
+    format!("for i in 1 2 3 4 5 6 7 8 9 10; do printf 'line-%s\\n' $i; done{SUBMIT}")
+}
+#[cfg(windows)]
+fn ten_lines() -> String {
+    format!("for /L %i in (1,1,10) do @echo line-%i{SUBMIT}")
+}
+
 /// Waits until the shell has said something, which is the only sign a pty gives that it is listening.
 ///
 /// **Input sent before that is not kept on every platform.** A POSIX pty's line discipline holds what was
@@ -407,8 +451,10 @@ fn long_lived_grandchild(pid_file: &std::path::Path) -> String {
         ),
     )
     .expect("a script for the grandchild");
-    // **A carriage return submits**, which is the Windows half of X6: a line feed does not.
-    format!("powershell -NoProfile -File \"{}\"\r", script.display())
+    format!(
+        "powershell -NoProfile -File \"{}\"{SUBMIT}",
+        script.display()
+    )
 }
 
 /// The pid that process wrote, waiting up to ~10s for the shell to get that far.
@@ -512,6 +558,12 @@ fn a_session_is_cancellable_while_its_shell_is_busy() {
     );
 }
 
+/// **POSIX only, and `tests/parser.rs` is why that is not a gap.** An alternate-screen app has to be one the
+/// OS ships — this drives `less` for that reason — and Windows ships no pager that uses the alternate
+/// screen, so there is nothing here to drive. What the case is *about* is the VT core's handling of a resize
+/// under the alternate screen, which `an_alternate_screen_survives_a_resize` covers as a parser, on every
+/// platform and without a shell.
+#[cfg(unix)]
 #[test]
 fn an_alternate_screen_app_survives_a_resize_and_keeps_answering() {
     let broker = start();
@@ -591,7 +643,7 @@ fn a_session_answers_a_bounded_screen_read() {
 
     ask(
         &mut writing,
-        r#"{"kind":"spawn","cols":40,"rows":6,"shell":"/bin/sh","cwd":null}"#,
+        &format!(r#"{{"kind":"spawn","cols":40,"rows":6,"shell":"{DEFAULT_SHELL}","cwd":null}}"#),
     );
     let session = next(&mut reading)["session"]
         .as_str()
@@ -602,7 +654,8 @@ fn a_session_answers_a_bounded_screen_read() {
     ask(
         &mut writing,
         &format!(
-            r#"{{"kind":"write","session":"{session}","data":"for i in 1 2 3 4 5 6 7 8 9 10; do printf 'line-%s\\n' $i; done\n"}}"#
+            r#"{{"kind":"write","session":"{session}","data":{}}}"#,
+            serde_json::to_string(&ten_lines()).expect("a JSON string")
         ),
     );
     let mut seen = String::new();
@@ -692,4 +745,58 @@ fn a_screen_read_for_a_session_that_does_not_exist_is_refused_by_code() {
     let failed = next(&mut reading);
     assert_eq!(failed["kind"], "failed");
     assert_eq!(failed["code"], "NO_SUCH_SESSION");
+}
+
+/// Writing to and resizing a session whose shell has just exited is refused, not a crash — which is **X9**.
+///
+/// ConPTY throws for about a second after a console's process ends, where a POSIX pty write to a closed
+/// master is an ordinary `EIO`. Either way the session is gone and the answer the app needs is the same one:
+/// a refusal naming the session, in time for the window that asked to be told. What this pins is that the
+/// broker produces one rather than dying, on whichever platform is running it.
+#[test]
+fn writing_to_a_session_whose_shell_has_gone_is_refused() {
+    let broker = start();
+    let (mut reading, mut writing) = connect(&broker);
+    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    next(&mut reading);
+    ask(
+        &mut writing,
+        r#"{"kind":"spawn","cols":80,"rows":24,"shell":null,"cwd":null}"#,
+    );
+    let session = next(&mut reading)["session"]
+        .as_str()
+        .expect("a session")
+        .to_owned();
+
+    once_the_shell_is_listening(&mut reading);
+    ask(
+        &mut writing,
+        &format!(
+            r#"{{"kind":"write","session":"{session}","data":{}}}"#,
+            serde_json::to_string(&format!("exit{SUBMIT}")).expect("a JSON string")
+        ),
+    );
+    until(&mut reading, "exited");
+
+    // Straight after the exit, which is the window ConPTY is documented to be unhappy in
+    ask(
+        &mut writing,
+        &format!(r#"{{"kind":"write","session":"{session}","data":"x"}}"#),
+    );
+    let refused = until(&mut reading, "failed").0;
+    assert_eq!(refused["code"], "NO_SUCH_SESSION");
+
+    ask(
+        &mut writing,
+        &format!(r#"{{"kind":"resize","session":"{session}","cols":100,"rows":30}}"#),
+    );
+    let refused = until(&mut reading, "failed").0;
+    assert_eq!(refused["code"], "NO_SUCH_SESSION");
+
+    // And the broker is still there to answer the next thing asked of it
+    ask(
+        &mut writing,
+        r#"{"kind":"screen","session":"s-404","history":0}"#,
+    );
+    assert_eq!(until(&mut reading, "failed").0["code"], "NO_SUCH_SESSION");
 }

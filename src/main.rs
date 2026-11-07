@@ -52,8 +52,22 @@ fn serve(stream: Stream) {
     let stream = Arc::new(stream);
     // One writer: every event leaves on this thread, so nothing interleaves two frames
     let writing = Arc::clone(&stream);
+    let ending = Arc::clone(&sessions);
     let writer = std::thread::spawn(move || {
         for message in outgoing {
+            // **A shell that ended of its own accord is gone from here too.** Only `kill` used to remove a
+            // session, so a user typing `exit` left its record behind: the map grew with every shell they
+            // closed, and a later write answered `PTY` — the OS refusing a dead handle — where the true
+            // answer is that there is no such session. On Windows that is X9's window, where ConPTY throws
+            // for about a second after the console goes; the same wrong answer, louder.
+            //
+            // It is done here because this thread already sees every event, and nothing holding the
+            // sessions lock ever waits on this thread: an answer costs no credit, so it cannot block.
+            if let Event::Exited { session, .. } = &message.event
+                && let Ok(mut live) = ending.lock()
+            {
+                live.forget(session);
+            }
             let Ok(frame) = serde_json::to_string(&message.event) else {
                 continue;
             };
