@@ -50,6 +50,7 @@ dependencies = [
  "command-group",
  "insta",
  "interprocess",
+ "libc",
  "portable-pty",
  "proptest",
  "serde",

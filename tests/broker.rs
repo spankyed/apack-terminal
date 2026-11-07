@@ -196,3 +196,27 @@ fn a_shell_that_exits_on_its_own_is_reported_without_anything_polling_for_it() {
     let (exited, _) = until(&mut reading, "exited");
     assert_eq!(exited["session"].as_str(), Some(session.as_str()));
 }
+
+#[test]
+fn a_client_that_disconnects_leaves_no_shell_running() {
+    let broker = start();
+    let pid = {
+        let (mut reading, mut writing) = connect(&broker);
+        ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+        next(&mut reading);
+        ask(&mut writing, r#"{"kind":"spawn","cols":80,"rows":24,"shell":null,"cwd":null}"#);
+        let spawned = next(&mut reading);
+        spawned["pid"].as_u64().expect("a pid") as i32
+        // The connection drops here, which is what an app that quit, crashed or was killed looks like
+    };
+
+    // The app cannot end its sessions on the way out — a pack's `onShutdown` is synchronous and runs in
+    // `process.on('exit')`, where no socket write completes — so the broker has to be the backstop.
+    let gone = (0..200).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        // Signal 0 asks whether the process is still there without touching it
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        !alive
+    });
+    assert!(gone, "the shell for pid {pid} was still running after its client disconnected");
+}

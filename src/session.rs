@@ -145,6 +145,22 @@ impl Sessions {
         let mut child = live.child.lock().map_err(|_| Refusal::pty("killing a session", "the child's lock was poisoned"))?;
         child.kill().map_err(|error| Refusal::pty("killing a session", error))
     }
+
+    /// Ends every session this owner holds. **The connection's end is what calls it**: a client that
+    /// disconnects must not leave its shells running, and the app cannot do it on the way out — a pack's
+    /// `onShutdown` is synchronous and runs in `process.on('exit')`, where no socket write can complete. So
+    /// the broker is the backstop for an app that quits, crashes or is killed, and the app's own `killAll`
+    /// is only the orderly path.
+    ///
+    /// Sessions outliving their client is Phase B's, and nothing here is shaped to prevent it: this is where
+    /// that policy will be stated instead of assumed.
+    pub fn end_all(&mut self) {
+        for (_, live) in self.live.drain() {
+            if let Ok(mut child) = live.child.lock() {
+                let _ = child.kill();
+            }
+        }
+    }
 }
 
 fn missing(session: &str) -> Refusal {

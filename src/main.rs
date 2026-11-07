@@ -97,6 +97,12 @@ fn serve(stream: Stream) {
         carry_out(&sessions, request);
     }
 
+    // **A client that disconnects leaves no shells running.** Its sessions are its own for now, and the app
+    // cannot end them on the way out: a pack's `onShutdown` is synchronous and runs in `process.on('exit')`,
+    // where no socket write completes. So this is the backstop for an app that quits, crashes or is killed.
+    if let Ok(mut live) = sessions.lock() {
+        live.end_all();
+    }
     drop(sessions);
     let _ = writer.join();
 }
