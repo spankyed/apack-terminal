@@ -19,7 +19,7 @@ checked instead of becoming a note that rots. Resolved against Rust 1.99.1 and b
 | `command-group` | 5.0.1 | a child spawns into a group this process owns, and killing the group reaps it |
 | `ts-rs` | 12.0.1 | a Rust type generates its TypeScript declaration |
 | `interprocess` | 2.4.7 | resolves and builds; the transport is not chosen yet |
-| `insta`, `proptest` | 1.x | resolve and build, for the snapshot and boundary-splitting tests Phase P asks for |
+| `insta`, `proptest` | 1.x | the grid snapshots and the byte-boundary property test in `tests/parser.rs` |
 
 **`termwiz` was a candidate and is not a dependency.** It is wezterm's terminal crate, from the same project
 as `portable-pty`, and the question was whether a matched pair beat two ecosystems. The registry answered it:
@@ -31,6 +31,32 @@ that matters. `alacritty_terminal` stands, now on a checkable ground rather than
 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, where the OS kills the tree when the handle closes — so that X1 is
 answered by the kernel rather than by cleanup code. That is unreachable from macOS and belongs to a Windows
 run, as the goal's acceptance says.
+
+## The two layers
+
+The process layer is `session.rs` and `output.rs`: spawn, the pty, the lifetime, and the bounded coalesced
+output channel. Nothing there knows what a screen is. The terminal capability over it is `screen.rs`: the VT
+core, the cursor, which screen is showing and a bounded run of lines above the viewport.
+
+**Both the broker and the renderer parse, and only one is right.** The renderer keeps xterm.js because it
+owns interaction — selection, reflow, IME — and nothing in the app may read that copy as a fact. This one is
+the authority, and it is fed **before** the bytes leave for the renderer, which is the only direction in
+which a disagreement is merely stale rather than wrong. A session nobody is drawing still has a screen, which
+is the whole gain the refactor is for: `screen` answers whether or not a window ever opened.
+
+`src/lib.rs` exists so the parser can be tested as a parser. `tests/parser.rs` does two things:
+
+- **snapshots the grid** a byte stream produces (`insta`), so a change in what the parser does to a stream is
+  a reviewable diff rather than an assertion someone has to word;
+- **splits the same stream at every byte boundary** and demands the same grid — exhaustively for one cut, one
+  byte at a time, and at arbitrary cuts with `proptest`. Output arrives in whatever sizes a `read` returned,
+  so an escape sequence, a UTF-8 code point or an OSC string is routinely delivered in pieces, and this is
+  where VT parsers break. The streams carry UTF-8, CSI, OSC, DCS, APC, an alternate-screen round trip and a
+  scroll region, because each is parsed by a different part of the state machine.
+
+The first snapshot of the UTF-8 stream is what found the one defect here: a wide character occupies two
+cells and the second holds a space, so the grid read as text said `日 本 語`. Right to draw, wrong to match
+against — and matching is what a bounded read is for.
 
 ## The protocol
 

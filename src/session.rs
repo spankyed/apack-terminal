@@ -13,6 +13,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 
 use crate::protocol::{ErrorCode, Event, SessionId};
 use crate::output::{Credit, Outgoing, coalesce};
+use crate::screen::{Screen, Snapshot};
 
 /// A running session: the master side of its pty, its child, and the thread reading its output.
 struct Session {
@@ -21,6 +22,10 @@ struct Session {
     /// Shared with the reader thread, which waits on it at EOF so **nothing polls for an exit**: the pty
     /// closing *is* the process ending, and that is an event this already receives.
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
+    /// The VT state, shared with the reader thread that feeds it. **It is fed before the bytes leave for the
+    /// renderer**, so the authority is never behind the replica — the only direction in which a disagreement
+    /// is merely stale rather than wrong.
+    screen: Arc<Mutex<Screen>>,
 }
 
 /// Every session this broker owns, and where their output goes.
@@ -108,6 +113,8 @@ impl Sessions {
         let events = self.events.clone();
         let reading = session.clone();
         let waiting = Arc::clone(&child);
+        let screen = Arc::new(Mutex::new(Screen::new(cols, rows)));
+        let parsing = Arc::clone(&screen);
         std::thread::spawn({
             let session = session.clone();
             let events = events.clone();
@@ -121,6 +128,10 @@ impl Sessions {
                 match reader.read(&mut buffer) {
                     Ok(0) | Err(_) => break,
                     Ok(read) => {
+                        // The authority first, then the renderer's copy
+                        if let Ok(mut screen) = parsing.lock() {
+                            screen.feed(&buffer[..read]);
+                        }
                         if chunks.send(buffer[..read].to_vec()).is_err() {
                             return;
                         }
@@ -135,7 +146,7 @@ impl Sessions {
             let _ = events.send(Outgoing::answer(Event::Exited { session: reading, code }));
         });
 
-        self.live.insert(session.clone(), Session { master: pty.master, writer, child });
+        self.live.insert(session.clone(), Session { master: pty.master, writer, child, screen });
         Ok((session, pid))
     }
 
@@ -151,7 +162,22 @@ impl Sessions {
         let live = self.live.get_mut(session).ok_or_else(|| missing(session))?;
         live.master
             .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
-            .map_err(|error| Refusal::pty("resizing a pty", error))
+            .map_err(|error| Refusal::pty("resizing a pty", error))?;
+        // The screen is resized too, or the authority would describe a viewport the process no longer has
+        if let Ok(mut screen) = live.screen.lock() {
+            screen.resize(cols, rows);
+        }
+        Ok(())
+    }
+
+    /// The screen as this session has it, with up to `history` lines above the viewport.
+    pub fn snapshot(&self, session: &str, history: u32) -> Result<Snapshot, Refusal> {
+        let live = self.live.get(session).ok_or_else(|| missing(session))?;
+        let screen = live
+            .screen
+            .lock()
+            .map_err(|_| Refusal::pty("reading a screen", "the screen's lock was poisoned"))?;
+        Ok(screen.snapshot(history))
     }
 
     /// Ends the session. The reader thread sees the pty close and reports `Exited`, so this reports nothing:

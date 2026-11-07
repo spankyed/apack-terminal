@@ -5,18 +5,15 @@
 //! build the thinnest path through every seam before either consumer exists, so that the protocol is derived
 //! from its clients rather than proposed to them.
 
-mod output;
-mod protocol;
-mod session;
 
 use std::io::{BufRead, BufReader, Write};
 use std::sync::{Arc, Mutex};
 
 use interprocess::local_socket::{GenericFilePath, ListenerOptions, Stream, ToFsName, prelude::*};
 
-use output::channel_with_credit;
-use protocol::{ErrorCode, Event, PROTOCOL_VERSION, Request};
-use session::Sessions;
+use apack_terminal::output::channel_with_credit;
+use apack_terminal::protocol::{ErrorCode, Event, PROTOCOL_VERSION, Request};
+use apack_terminal::session::Sessions;
 
 fn main() -> std::io::Result<()> {
     let Some(socket) = std::env::args().nth(1) else {
@@ -128,6 +125,19 @@ fn carry_out(sessions: &Arc<Mutex<Sessions>>, request: Request) {
         },
         Request::Write { session, data } => live.write(&session, &data).map_err(|refusal| (Some(session), refusal)),
         Request::Resize { session, cols, rows } => live.resize(&session, cols, rows).map_err(|refusal| (Some(session), refusal)),
+        Request::Screen { session, history } => match live.snapshot(&session, history) {
+            Ok(snapshot) => {
+                live.answer(Event::Screen {
+                    session,
+                    lines: snapshot.lines,
+                    cursor_row: snapshot.cursor_row,
+                    cursor_column: snapshot.cursor_column,
+                    alt_screen: snapshot.alt_screen,
+                });
+                Ok(())
+            }
+            Err(refusal) => Err((Some(session), refusal)),
+        },
         Request::Kill { session } => live.kill(&session).map_err(|refusal| (Some(session), refusal)),
     };
     if let Err((session, refusal)) = outcome {

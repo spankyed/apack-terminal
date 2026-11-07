@@ -1,3 +1,8 @@
 # Cargo's build output. The apack monorepo's janitor holds it to a budget (`npm run janitor` there, which
 # derives its subject from the `vendor/*` links rather than naming a checkout), so it is rebuildable by design.
 /target
+
+# ts-rs' default export directory. The protocol's home is `protocol/`, which `TS_RS_EXPORT_DIR=protocol`
+# writes; a bare `cargo test` writes here instead, and a tracked copy of a generated contract is a second
+# answer that goes stale without anyone reading it.
+/bindings

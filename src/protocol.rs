@@ -45,6 +45,13 @@ pub enum Request {
         cols: u16,
         rows: u16,
     },
+    /// **The screen as the broker has it**, with up to `history` lines above the viewport.
+    ///
+    /// This is the read that makes a session's state independent of a window: the broker parses the same
+    /// bytes the renderer draws and is the authority on them (D9), so a session nobody is looking at still
+    /// answers. `history` is a ceiling and not a promise — a session that has scrolled less answers with
+    /// less, and an alternate-screen app has no scrollback to answer with at all.
+    Screen { session: SessionId, history: u32 },
     /// End the session and its process tree.
     Kill { session: SessionId },
 }
@@ -72,6 +79,19 @@ pub enum Event {
     /// `u32` rather than `u64`: ts-rs generates a `bigint` for 64 bits, and `JSON.parse` hands a client
     /// a number — the type has to describe what arrives. Milliseconds of waiting fit either way.
     Throttled { session: SessionId, waited_ms: u32 },
+    /// The screen a `Screen` request asked for: the history it had, then the viewport, oldest first.
+    ///
+    /// Lines are text, not cells: a wide character appears once rather than beside the spacer cell it
+    /// occupies, and the padding a row carries to its full width is not there. What this answers is what was
+    /// written, which is what a caller matching against it means.
+    Screen {
+        session: SessionId,
+        lines: Vec<String>,
+        /// Within the viewport, so `0` is its first line however much history came with it.
+        cursor_row: u16,
+        cursor_column: u16,
+        alt_screen: bool,
+    },
     /// A request could not be carried out. `session` is absent when the request named none.
     Failed {
         session: Option<SessionId>,

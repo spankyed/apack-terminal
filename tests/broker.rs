@@ -337,3 +337,71 @@ fn an_alternate_screen_app_survives_a_resize_and_keeps_answering() {
     });
     assert!(left, "less never left the alternate screen, so it had stopped reading input");
 }
+
+/// A session nobody is drawing still has a screen, which is the gain the whole refactor is for.
+///
+/// **No client holds any of this state.** The app asks for the screen after the output has arrived and the
+/// broker answers from its own parse — so a window that never opened, or one that closed, changes nothing
+/// about what a session knows about itself. Phase A's facts are read from this same screen.
+#[test]
+fn a_session_answers_a_bounded_screen_read() {
+    let broker = start();
+    let (mut reading, mut writing) = connect(&broker);
+    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    next(&mut reading);
+
+    ask(&mut writing, r#"{"kind":"spawn","cols":40,"rows":6,"shell":"/bin/sh","cwd":null}"#);
+    let session = next(&mut reading)["session"].as_str().expect("a session id").to_owned();
+
+    // Enough lines to push some off a six-row viewport, so the history is doing work
+    ask(&mut writing, &format!(
+        r#"{{"kind":"write","session":"{session}","data":"for i in 1 2 3 4 5 6 7 8 9 10; do printf 'line-%s\\n' $i; done\n"}}"#
+    ));
+    let mut seen = String::new();
+    for _ in 0..400 {
+        let event = next(&mut reading);
+        if event["kind"] == "output" {
+            seen.push_str(event["data"].as_str().unwrap_or_default());
+            if seen.contains("line-10") {
+                break;
+            }
+        }
+    }
+    assert!(seen.contains("line-10"), "the output arrived: {seen:?}");
+
+    // The viewport alone: six rows, and the last lines written are among them
+    ask(&mut writing, &format!(r#"{{"kind":"screen","session":"{session}","history":0}}"#));
+    let (screen, _) = until(&mut reading, "screen");
+    let viewport = screen["lines"].as_array().expect("lines").clone();
+    assert_eq!(viewport.len(), 6, "the viewport is the size the session was spawned with");
+    let text = |lines: &[serde_json::Value]| lines.iter().filter_map(|line| line.as_str()).collect::<Vec<_>>().join("\n");
+    assert!(text(&viewport).contains("line-10"), "the viewport holds the last output: {:?}", text(&viewport));
+    assert_eq!(screen["alt_screen"], false, "a shell prompt is the primary screen");
+
+    // And with history, the lines that scrolled off — which only the broker still has
+    ask(&mut writing, &format!(r#"{{"kind":"screen","session":"{session}","history":50}}"#));
+    let (with_history, _) = until(&mut reading, "screen");
+    let all = with_history["lines"].as_array().expect("lines").clone();
+    assert!(all.len() > viewport.len(), "history came with it: {} lines", all.len());
+    assert!(text(&all).contains("line-1\n"), "a line that scrolled off the viewport: {:?}", text(&all));
+
+    // A ceiling, not a promise: asking for more history than there is answers with what there is
+    assert!(all.len() <= 6 + 50, "history is bounded by what was asked for");
+
+    ask(&mut writing, &format!(r#"{{"kind":"kill","session":"{session}"}}"#));
+    until(&mut reading, "exited");
+}
+
+/// The screen a session no longer has is a refusal by code, like every other request naming one.
+#[test]
+fn a_screen_read_for_a_session_that_does_not_exist_is_refused_by_code() {
+    let broker = start();
+    let (mut reading, mut writing) = connect(&broker);
+    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    next(&mut reading);
+
+    ask(&mut writing, r#"{"kind":"screen","session":"s-404","history":10}"#);
+    let failed = next(&mut reading);
+    assert_eq!(failed["kind"], "failed");
+    assert_eq!(failed["code"], "NO_SUCH_SESSION");
+}

@@ -1,0 +1,15 @@
+---
+source: tests/parser.rs
+expression: "format!(\"alt_screen: {}\\ncursor: {},{}\\nrows: {}\\n---\\n{grid}\",\nsnapshot.alt_screen, snapshot.cursor_row, snapshot.cursor_column,\nsnapshot.lines.len(),)"
+---
+alt_screen: false
+cursor: 2,0
+rows: 7
+---
+|one|
+|two|
+|three|
+|four|
+|five|
+||
+||

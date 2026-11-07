@@ -10,9 +10,13 @@ export type ErrorCode = "HANDSHAKE" | "MALFORMED" | "NO_SUCH_SESSION" | "PTY";
 /**
  * What the broker tells the app, unprompted or in answer.
  */
-export type Event = { "kind": "hello", protocol: number, } | { "kind": "spawned", session: string, pid: number, } | { "kind": "output", session: string, data: string, } | { "kind": "exited", session: string, code: number | null, } | { "kind": "throttled", session: string, waited_ms: number, } | { "kind": "failed", session: string | null, code: ErrorCode, message: string, };
+export type Event = { "kind": "hello", protocol: number, } | { "kind": "spawned", session: string, pid: number, } | { "kind": "output", session: string, data: string, } | { "kind": "exited", session: string, code: number | null, } | { "kind": "throttled", session: string, waited_ms: number, } | { "kind": "screen", session: string, lines: Array<string>, 
+/**
+ * Within the viewport, so `0` is its first line however much history came with it.
+ */
+cursor_row: number, cursor_column: number, alt_screen: boolean, } | { "kind": "failed", session: string | null, code: ErrorCode, message: string, };
 
 /**
  * What the app asks the broker to do.
  */
-export type Request = { "kind": "hello", protocol: number, } | { "kind": "spawn", cols: number, rows: number, shell: string | null, cwd: string | null, } | { "kind": "write", session: string, data: string, } | { "kind": "resize", session: string, cols: number, rows: number, } | { "kind": "kill", session: string, };
+export type Request = { "kind": "hello", protocol: number, } | { "kind": "spawn", cols: number, rows: number, shell: string | null, cwd: string | null, } | { "kind": "write", session: string, data: string, } | { "kind": "resize", session: string, cols: number, rows: number, } | { "kind": "screen", session: string, history: number, } | { "kind": "kill", session: string, };
