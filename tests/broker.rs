@@ -27,7 +27,7 @@ impl Drop for Broker {
 /// prints where it is listening before its first accept, which is what makes a parent's start deterministic.
 fn start() -> Broker {
     let directory = tempfile::tempdir().expect("a directory for the socket");
-    let socket = directory.path().join("broker.sock");
+    let socket = socket_in(directory.path());
     let mut process = Command::new(env!("CARGO_BIN_EXE_apack-terminal"))
         .arg(&socket)
         .stdout(Stdio::piped())
@@ -45,6 +45,29 @@ fn start() -> Broker {
         socket,
         _directory: directory,
     }
+}
+
+/// Where a broker listens, which is **a name rather than a path, and the spelling differs**.
+///
+/// `interprocess` maps a filesystem path to a Unix socket on POSIX; on Windows it refuses one, the local
+/// namespace there being named pipes — *"expected a named pipe path"*, which is what the first Windows run
+/// of this suite got instead of a broker. The caller chooses the spelling and the broker takes what it is
+/// handed, so this is the only thing the two platforms disagree about.
+#[cfg(unix)]
+fn socket_in(directory: &std::path::Path) -> std::path::PathBuf {
+    directory.join("broker.sock")
+}
+
+#[cfg(windows)]
+fn socket_in(_directory: &std::path::Path) -> std::path::PathBuf {
+    // One namespace for the whole machine, so the name carries this process and a counter rather than
+    // leaning on the private directory a path would have given it
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let nth = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::path::PathBuf::from(format!(
+        r"\\.\pipe\apack-terminal-test-{}-{nth}",
+        std::process::id()
+    ))
 }
 
 /// One connection, readable and writable from two places: `&Stream` implements both, so an `Arc` is what
@@ -68,7 +91,7 @@ impl Write for Wire {
 }
 
 /// A connection to the broker, which every client must then greet.
-fn connect(broker: &Broker) -> (BufReader<Wire>, Wire) {
+fn connect(broker: &Broker) -> (Events, Wire) {
     let name = broker
         .socket
         .to_str()
@@ -76,13 +99,34 @@ fn connect(broker: &Broker) -> (BufReader<Wire>, Wire) {
         .to_fs_name::<GenericFilePath>()
         .expect("a socket name");
     let stream = Stream::connect(name).expect("the broker accepts");
-    // **Every read is bounded**, so a case waiting for something that will never come fails instead of
-    // hanging — which a mutation that stopped resizes reaching the pty turned into a ten-minute hang.
-    stream
-        .set_recv_timeout(Some(std::time::Duration::from_secs(10)))
-        .expect("a receive timeout");
     let wire = Wire(std::sync::Arc::new(stream));
-    (BufReader::new(wire.clone()), wire)
+    (Events::reading(wire.clone()), wire)
+}
+
+/// A connection's events, read on a thread of their own so that **every wait is bounded**.
+///
+/// A case waiting for something that will never come has to fail rather than hang — a mutation that stopped
+/// resizes reaching the pty turned a blocking read into a ten-minute wait, which is why this file bounds
+/// them at all. It used to ask the socket, with `set_recv_timeout`; `interprocess` refuses that for a
+/// Windows named pipe, and the first Windows run of this suite hung for want of it.
+///
+/// So the bound moved off the socket: a reader thread and a channel do it the same way on both platforms,
+/// which is one mechanism rather than one per platform and a guard that cannot quietly not apply.
+struct Events(std::sync::mpsc::Receiver<String>);
+
+impl Events {
+    fn reading(wire: Wire) -> Self {
+        let (lines, events) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(wire).lines() {
+                // A send that fails means the case has finished with this connection
+                if line.is_err() || lines.send(line.unwrap_or_default()).is_err() {
+                    return;
+                }
+            }
+        });
+        Self(events)
+    }
 }
 
 fn ask(writing: &mut impl Write, frame: &str) {
@@ -93,20 +137,21 @@ fn ask(writing: &mut impl Write, frame: &str) {
     writing.flush().expect("the request is flushed");
 }
 
-/// One event, or a failure saying none came. Bounded by the socket's own receive timeout, set on connect.
-fn next(reading: &mut impl BufRead) -> serde_json::Value {
-    let mut line = String::new();
-    match reading.read_line(&mut line) {
-        Ok(0) => panic!("the broker closed the connection"),
+/// One event, or a failure saying none came. Bounded by the reader thread's channel.
+fn next(reading: &mut Events) -> serde_json::Value {
+    match reading.0.recv_timeout(std::time::Duration::from_secs(10)) {
         // A guard that hangs is worse than one that fails: a mutation that stopped resizes reaching the pty
         // left `less` with nothing to redraw, and a blocking read turned that into a ten-minute hang
-        Err(error) => panic!("no event arrived within the socket's timeout ({error})"),
-        Ok(_) => serde_json::from_str(&line).unwrap_or_else(|error| panic!("{error}: {line:?}")),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("no event arrived within 10s"),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("the broker closed the connection")
+        }
+        Ok(line) => serde_json::from_str(&line).unwrap_or_else(|error| panic!("{error}: {line:?}")),
     }
 }
 
 /// Reads until an event of `kind` arrives, returning it with everything seen on the way.
-fn until(reading: &mut impl BufRead, kind: &str) -> (serde_json::Value, Vec<serde_json::Value>) {
+fn until(reading: &mut Events, kind: &str) -> (serde_json::Value, Vec<serde_json::Value>) {
     let mut seen = Vec::new();
     for _ in 0..4000 {
         let event = next(reading);
@@ -297,10 +342,90 @@ fn a_client_that_disconnects_leaves_no_shell_running() {
     );
 }
 
-/// Whether `pid` is still a live process. Signal 0 asks without touching it.
+/// Whether `pid` is still a live process.
+///
+/// **Two questions with one name, because the platforms answer it differently.** POSIX has signal 0, which
+/// asks without touching the process. Windows has no signal at all, and `OpenProcess` would be a dependency
+/// for one call, so the OS's own list is asked instead — `tasklist` is on every Windows Server image and its
+/// filter answers with the row or with "no tasks".
+#[cfg(unix)]
 fn alive(pid: i32) -> bool {
-    let answer = unsafe { libc::kill(pid, 0) };
-    answer == 0
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+#[cfg(windows)]
+fn alive(pid: i32) -> bool {
+    let listed = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .output();
+    match listed {
+        // A filter that matches nothing prints "INFO: No tasks are running..." rather than failing, so the
+        // pid's own digits are what says it is there
+        Ok(output) => String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\"")),
+        Err(_) => false,
+    }
+}
+
+/// Waits until the shell has said something, which is the only sign a pty gives that it is listening.
+///
+/// **Input sent before that is not kept on every platform.** A POSIX pty's line discipline holds what was
+/// typed until the shell reads it, so a case could write immediately and be right by accident; ConPTY
+/// discards it, and PowerShell takes seconds to reach a prompt. The first Windows run of the tree-kill case
+/// failed here — its command never ran at all.
+fn once_the_shell_is_listening(reading: &mut Events) {
+    for _ in 0..400 {
+        if next(reading)["kind"] == "output" {
+            return;
+        }
+    }
+    panic!("the shell said nothing, so nothing could be typed into it");
+}
+
+/// What to type to start a process that outlives the shell, and where it writes its pid.
+///
+/// **The pid comes from a file rather than from the screen.** Reading it out of the session's output means
+/// parsing what a shell echoed back through a pty — a prompt, the command coming back, and on Windows a
+/// stream of cursor positioning around both — which is a different problem on each platform and none of it
+/// the subject here. A file is the same on both.
+#[cfg(unix)]
+fn long_lived_grandchild(pid_file: &std::path::Path) -> String {
+    format!("sleep 300 & echo $! > {}\n", pid_file.display())
+}
+
+#[cfg(windows)]
+fn long_lived_grandchild(pid_file: &std::path::Path) -> String {
+    // **A file to run, not a line to type, and `cmd` is what runs it.** `portable-pty`'s default program on
+    // Windows is `ComSpec`, so a session spawned with no shell is `cmd.exe` — PowerShell syntax typed into
+    // it is just a bad command. One short `powershell -File` line is what cmd understands, and it keeps the
+    // quoting out of the pty, which the VM guide recommends for the same reason.
+    let script = pid_file.with_extension("ps1");
+    std::fs::write(
+        &script,
+        format!(
+            "$p = Start-Process powershell -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 300' -PassThru -WindowStyle Hidden\r\nSet-Content -Path '{}' -Value $p.Id\r\n",
+            pid_file.display()
+        ),
+    )
+    .expect("a script for the grandchild");
+    // **A carriage return submits**, which is the Windows half of X6: a line feed does not.
+    format!("powershell -NoProfile -File \"{}\"\r", script.display())
+}
+
+/// The pid that process wrote, waiting up to ~10s for the shell to get that far.
+fn pid_written_to(pid_file: &std::path::Path) -> i32 {
+    for _ in 0..400 {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        let Ok(text) = std::fs::read_to_string(pid_file) else {
+            continue;
+        };
+        if let Ok(pid) = text.trim().parse::<i32>() {
+            return pid;
+        }
+    }
+    panic!(
+        "the shell never wrote its background job's pid to {}",
+        pid_file.display()
+    );
 }
 
 /// Waits up to ~5s for `pid` to go away, answering whether it did.
@@ -328,26 +453,17 @@ fn killing_a_session_takes_the_whole_tree_with_it() {
 
     // A grandchild that outlives its parent unless something owns the tree: this is X1 and X2's subject,
     // and Phase B's acceptance says portable-pty is validated for containment rather than assumed.
+    once_the_shell_is_listening(&mut reading);
+    let notes = tempfile::tempdir().expect("a directory for the grandchild's pid");
+    let pid_file = notes.path().join("grandchild.pid");
     ask(
         &mut writing,
-        &format!(r#"{{"kind":"write","session":"{session}","data":"sleep 300 & echo $!\n"}}"#),
+        &format!(
+            r#"{{"kind":"write","session":"{session}","data":{}}}"#,
+            serde_json::to_string(&long_lived_grandchild(&pid_file)).expect("a JSON string")
+        ),
     );
-    let mut seen = String::new();
-    let grandchild = (0..400)
-        .find_map(|_| {
-            let event = next(&mut reading);
-            if event["kind"] != "output" {
-                return None;
-            }
-            seen.push_str(event["data"].as_str().unwrap_or_default());
-            // The shell echoes the job's pid on its own line, after the command it echoed back
-            seen.lines()
-                .filter_map(|line| line.trim().parse::<i32>().ok())
-                .find(|pid| *pid > 1)
-        })
-        .unwrap_or_else(|| {
-            panic!("the shell never reported its background job's pid; saw {seen:?}")
-        });
+    let grandchild = pid_written_to(&pid_file);
     assert!(alive(grandchild), "the grandchild {grandchild} is running");
 
     ask(

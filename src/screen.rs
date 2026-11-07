@@ -9,7 +9,9 @@
 //! Phase A's, over the OSC markers this parses. It is a grid, a cursor, which screen is showing, and a
 //! bounded run of lines above the viewport.
 
-use alacritty_terminal::event::VoidListener;
+use std::sync::{Arc, Mutex};
+
+use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::Flags;
@@ -23,6 +25,31 @@ use alacritty_terminal::vte::ansi::Processor;
 /// not this number's business — that copy is a bounded replica serving one window's scrollbar, while this one
 /// serves a reattach and a bounded read, and the two have no reason to agree.
 pub const HISTORY_LINES: usize = 1_000;
+
+/// What the terminal wants said back to the program, collected rather than discarded.
+///
+/// **A terminal answers questions, and a session that answers none does not start on Windows.** ConPTY's
+/// first act is a cursor-position report request (`ESC [ 6 n`) and it waits for the reply before
+/// initialising; a POSIX pty asks nothing, so this was invisible until the suite first ran on Windows and
+/// every session sat there having emitted exactly those four bytes.
+///
+/// `alacritty_terminal` already computes these replies and hands them over as `Event::PtyWrite` — the
+/// listener this replaced was `VoidListener`, which drops them. **It has to be the broker that answers**,
+/// not the window: a session nobody is drawing still has to run, which is the whole of why the broker owns
+/// one, and the renderer's own parse is a replica that must not be in the loop for a program's control
+/// queries.
+#[derive(Clone, Default)]
+struct Replies(Arc<Mutex<Vec<String>>>);
+
+impl EventListener for Replies {
+    fn send_event(&self, event: Event) {
+        if let Event::PtyWrite(text) = event
+            && let Ok(mut replies) = self.0.lock()
+        {
+            replies.push(text);
+        }
+    }
+}
 
 /// A screen's dimensions, which is all `Term` needs of a window.
 #[derive(Clone, Copy)]
@@ -62,9 +89,10 @@ pub struct Snapshot {
 
 /// One session's VT state.
 pub struct Screen {
-    term: Term<VoidListener>,
+    term: Term<Replies>,
     parser: Processor,
     size: Size,
+    replies: Replies,
 }
 
 impl Screen {
@@ -74,6 +102,7 @@ impl Screen {
             screen_lines: rows.max(1) as usize,
             history: HISTORY_LINES,
         };
+        let replies = Replies::default();
         Self {
             term: Term::new(
                 Config {
@@ -81,10 +110,11 @@ impl Screen {
                     ..Config::default()
                 },
                 &size,
-                VoidListener,
+                replies.clone(),
             ),
             parser: Processor::new(),
             size,
+            replies,
         }
     }
 
@@ -95,6 +125,15 @@ impl Screen {
     /// that buffered a chunk, or reset anything per call, would pass every test that feeds a whole stream.
     pub fn feed(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.term, bytes);
+    }
+
+    /// What the program asked for and must be told, taken rather than read: each reply is written once.
+    pub fn take_replies(&mut self) -> Vec<String> {
+        self.replies
+            .0
+            .lock()
+            .map(|mut replies| std::mem::take(&mut *replies))
+            .unwrap_or_default()
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
@@ -127,7 +166,7 @@ impl Screen {
 /// and reading as text is what this is for: a bounded screen read an agent matches against must see what was
 /// written. So the spacers are skipped, and the trailing padding a row carries to its full width goes with
 /// them, being the grid's shape rather than the program's output.
-fn row_text(term: &Term<VoidListener>, line: Line, columns: usize) -> String {
+fn row_text(term: &Term<Replies>, line: Line, columns: usize) -> String {
     let row = &term.grid()[line];
     let spacers = Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
     let mut text: String = (0..columns)

@@ -18,7 +18,9 @@ use crate::screen::{Screen, Snapshot};
 /// A running session: the master side of its pty, its child, and the thread reading its output.
 struct Session {
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    /// Shared with the reader thread, which writes the terminal's own replies back through it — see
+    /// `Replies` in `screen.rs` for why a session that answers nothing does not start on Windows
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     /// Shared with the reader thread, which waits on it at EOF so **nothing polls for an exit**: the pty
     /// closing *is* the process ending, and that is an event this already receives.
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
@@ -106,10 +108,11 @@ impl Sessions {
             .master
             .try_clone_reader()
             .map_err(|error| Refusal::pty("reading a pty", error))?;
-        let writer = pty
-            .master
-            .take_writer()
-            .map_err(|error| Refusal::pty("writing to a pty", error))?;
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(
+            pty.master
+                .take_writer()
+                .map_err(|error| Refusal::pty("writing to a pty", error))?,
+        ));
 
         self.next += 1;
         let session = format!("s-{}", self.next);
@@ -128,6 +131,7 @@ impl Sessions {
         let waiting = Arc::clone(&child);
         let screen = Arc::new(Mutex::new(Screen::new(cols, rows)));
         let parsing = Arc::clone(&screen);
+        let answering = Arc::clone(&writer);
         std::thread::spawn({
             let session = session.clone();
             let events = events.clone();
@@ -142,8 +146,24 @@ impl Sessions {
                     Ok(0) | Err(_) => break,
                     Ok(read) => {
                         // The authority first, then the renderer's copy
-                        if let Ok(mut screen) = parsing.lock() {
-                            screen.feed(&buffer[..read]);
+                        let replies = match parsing.lock() {
+                            Ok(mut screen) => {
+                                screen.feed(&buffer[..read]);
+                                screen.take_replies()
+                            }
+                            Err(_) => Vec::new(),
+                        };
+                        // **What the program asked the terminal, answered by the terminal that is here.**
+                        // ConPTY opens with a cursor-position request and waits for the reply before it
+                        // initialises, so a session nobody answers never starts at all — which is invisible
+                        // on a POSIX pty, where nothing asks. It cannot be the window's job: a session with
+                        // no window has to run, which is why the broker owns one.
+                        for reply in replies {
+                            if let Ok(mut writer) = answering.lock() {
+                                let _ = writer
+                                    .write_all(reply.as_bytes())
+                                    .and_then(|()| writer.flush());
+                            }
                         }
                         if chunks.send(buffer[..read].to_vec()).is_err() {
                             return;
@@ -180,9 +200,13 @@ impl Sessions {
 
     pub fn write(&mut self, session: &str, data: &str) -> Outcome {
         let live = self.live.get_mut(session).ok_or_else(|| missing(session))?;
-        live.writer
+        let mut writer = live
+            .writer
+            .lock()
+            .map_err(|_| Refusal::pty("writing to a pty", "the writer's lock was poisoned"))?;
+        writer
             .write_all(data.as_bytes())
-            .and_then(|()| live.writer.flush())
+            .and_then(|()| writer.flush())
             .map_err(|error| Refusal::pty("writing to a pty", error))
     }
 
