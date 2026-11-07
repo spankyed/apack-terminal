@@ -1,0 +1,3 @@
+# Cargo's build output. The apack monorepo's janitor holds it to a budget (`npm run janitor` there, which
+# derives its subject from the `vendor/*` links rather than naming a checkout), so it is rebuildable by design.
+/target

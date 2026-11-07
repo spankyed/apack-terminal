@@ -1,0 +1,15 @@
+[package]
+name = "apack-terminal"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+alacritty_terminal = "0.26.0"
+command-group = "5.0.1"
+interprocess = "2.4.7"
+portable-pty = "0.9.0"
+ts-rs = "12.0.1"
+
+[dev-dependencies]
+insta = "1.49.0"
+proptest = "1.12.0"

@@ -1,0 +1,7 @@
+# Pinned to the channel the apack monorepo's elmdb checkout pins. `scripts/linux-runner.ts` there derives one
+# toolchain from every Rust checkout linked under `vendor/` and refuses a disagreement, naming both paths, because
+# the Linux test container builds them all with one image. Moving this means moving elmdb's in the same change.
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
