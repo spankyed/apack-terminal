@@ -109,7 +109,11 @@ fn next(reading: &mut impl BufRead) -> serde_json::Value {
 fn run(reading: &mut impl BufRead, writing: &mut impl Write, command: &str) -> String {
     ask(
         writing,
-        r#"{"kind":"spawn","cols":80,"rows":24,"shell":null,"cwd":null}"#,
+        &serde_json::json!({
+            "kind": "spawn", "cols": 80, "rows": 24, "shell": null,
+            "args": [], "env": [], "cwd": null,
+        })
+        .to_string(),
     );
     let session = next(reading)["session"]
         .as_str()

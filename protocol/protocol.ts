@@ -19,4 +19,12 @@ cursor_row: number, cursor_column: number, alt_screen: boolean, } | { "kind": "f
 /**
  * What the app asks the broker to do.
  */
-export type Request = { "kind": "hello", protocol: number, } | { "kind": "spawn", cols: number, rows: number, shell: string | null, cwd: string | null, } | { "kind": "write", session: string, data: string, } | { "kind": "resize", session: string, cols: number, rows: number, } | { "kind": "screen", session: string, history: number, } | { "kind": "kill", session: string, };
+export type Request = { "kind": "hello", protocol: number, } | { "kind": "spawn", cols: number, rows: number, shell: string | null, 
+/**
+ * The shell's own launch arguments, in order. Empty starts it as the user would.
+ */
+args: Array<string>, 
+/**
+ * Added to the environment the broker runs in, which is already stripped of the app's own
+ */
+env: Array<[string, string]>, cwd: string | null, } | { "kind": "write", session: string, data: string, } | { "kind": "resize", session: string, cols: number, rows: number, } | { "kind": "screen", session: string, history: number, } | { "kind": "kill", session: string, };

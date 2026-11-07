@@ -31,10 +31,24 @@ pub enum Request {
     /// The first message on a connection; the broker answers `Hello` or refuses.
     Hello { protocol: u32 },
     /// Start a shell in a pty. `shell` absent means the platform's default.
+    ///
+    /// **`args` and `env` are how shell integration is arranged**, and why they exist at all: the markers a
+    /// terminal reads facts from — the working directory, prompt and command boundaries — come from code the
+    /// shell runs at startup, and every shell takes that a different way. bash wants `--init-file` and
+    /// PowerShell `-NoExit`, which are arguments; zsh wants `ZDOTDIR` and fish `XDG_DATA_DIRS`, which are
+    /// environment. The alternative is typing into the user's interactive shell after it starts, which
+    /// echoes, races startup and needs a branch per shell — and has no branch at all for PowerShell or cmd.
+    ///
+    /// The broker chooses neither: it spawns what it is handed. What each shell needs is the app's to know,
+    /// because the rc files it points at are the app's to ship.
     Spawn {
         cols: u16,
         rows: u16,
         shell: Option<String>,
+        /// The shell's own launch arguments, in order. Empty starts it as the user would.
+        args: Vec<String>,
+        /// Added to the environment the broker runs in, which is already stripped of the app's own
+        env: Vec<(String, String)>,
         cwd: Option<String>,
     },
     /// Bytes the user typed.

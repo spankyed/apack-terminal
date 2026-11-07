@@ -84,6 +84,8 @@ impl Sessions {
         cols: u16,
         rows: u16,
         shell: Option<String>,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
         cwd: Option<String>,
     ) -> Result<(SessionId, u32), Refusal> {
         let pty = native_pty_system()
@@ -99,6 +101,14 @@ impl Sessions {
             Some(program) => CommandBuilder::new(program),
             None => CommandBuilder::new_default_prog(),
         };
+        for arg in args {
+            command.arg(arg);
+        }
+        // Added rather than replacing: the broker's own environment is what a shell inherits, and it has
+        // already had the app's identity taken out of it (`brokerEnvironment`, app side)
+        for (name, value) in env {
+            command.env(name, value);
+        }
         if let Some(directory) = cwd {
             command.cwd(directory);
         }

@@ -129,6 +129,21 @@ impl Events {
     }
 }
 
+/// A spawn frame: the default shell at a given size, with no launch arguments and nothing added to the
+/// environment. **One builder**, so a field added to `Request::Spawn` is one edit here and not ten.
+fn spawn_frame(cols: u16, rows: u16, shell: Option<&str>) -> String {
+    serde_json::json!({
+        "kind": "spawn",
+        "cols": cols,
+        "rows": rows,
+        "shell": shell,
+        "args": [],
+        "env": [],
+        "cwd": null,
+    })
+    .to_string()
+}
+
 fn ask(writing: &mut impl Write, frame: &str) {
     writing
         .write_all(frame.as_bytes())
@@ -175,10 +190,7 @@ fn a_keystroke_reaches_a_pty_and_its_output_comes_back() {
         "the handshake is answered before anything else"
     );
 
-    ask(
-        &mut writing,
-        r#"{"kind":"spawn","cols":80,"rows":24,"shell":null,"cwd":null}"#,
-    );
+    ask(&mut writing, &spawn_frame(80, 24, None));
     let spawned = next(&mut reading);
     assert_eq!(spawned["kind"], "spawned");
     let session = spawned["session"]
@@ -264,10 +276,7 @@ fn a_frame_that_is_not_a_request_is_refused_and_the_connection_survives() {
     assert_eq!(next(&mut reading)["code"], "MALFORMED");
 
     // Still usable: one bad frame is not a broken connection
-    ask(
-        &mut writing,
-        r#"{"kind":"spawn","cols":80,"rows":24,"shell":null,"cwd":null}"#,
-    );
+    ask(&mut writing, &spawn_frame(80, 24, None));
     assert_eq!(next(&mut reading)["kind"], "spawned");
 }
 
@@ -294,10 +303,7 @@ fn nothing_can_be_asked_before_the_handshake() {
     let broker = start();
     let (mut reading, mut writing) = connect(&broker);
 
-    ask(
-        &mut writing,
-        r#"{"kind":"spawn","cols":80,"rows":24,"shell":null,"cwd":null}"#,
-    );
+    ask(&mut writing, &spawn_frame(80, 24, None));
     assert_eq!(next(&mut reading)["code"], "HANDSHAKE");
 }
 
@@ -308,10 +314,7 @@ fn a_shell_that_exits_on_its_own_is_reported_without_anything_polling_for_it() {
     ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
     next(&mut reading);
 
-    ask(
-        &mut writing,
-        r#"{"kind":"spawn","cols":80,"rows":24,"shell":null,"cwd":null}"#,
-    );
+    ask(&mut writing, &spawn_frame(80, 24, None));
     let session = next(&mut reading)["session"]
         .as_str()
         .expect("a session")
@@ -335,10 +338,7 @@ fn a_client_that_disconnects_leaves_no_shell_running() {
         let (mut reading, mut writing) = connect(&broker);
         ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
         next(&mut reading);
-        ask(
-            &mut writing,
-            r#"{"kind":"spawn","cols":80,"rows":24,"shell":null,"cwd":null}"#,
-        );
+        ask(&mut writing, &spawn_frame(80, 24, None));
         let spawned = next(&mut reading);
         spawned["pid"].as_u64().expect("a pid") as i32
         // The connection drops here, which is what an app that quit, crashed or was killed looks like
@@ -488,10 +488,7 @@ fn killing_a_session_takes_the_whole_tree_with_it() {
     let (mut reading, mut writing) = connect(&broker);
     ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
     next(&mut reading);
-    ask(
-        &mut writing,
-        r#"{"kind":"spawn","cols":80,"rows":24,"shell":null,"cwd":null}"#,
-    );
+    ask(&mut writing, &spawn_frame(80, 24, None));
     let session = next(&mut reading)["session"]
         .as_str()
         .expect("a session")
@@ -530,10 +527,7 @@ fn a_session_is_cancellable_while_its_shell_is_busy() {
     let (mut reading, mut writing) = connect(&broker);
     ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
     next(&mut reading);
-    ask(
-        &mut writing,
-        r#"{"kind":"spawn","cols":80,"rows":24,"shell":null,"cwd":null}"#,
-    );
+    ask(&mut writing, &spawn_frame(80, 24, None));
     let spawned = next(&mut reading);
     let session = spawned["session"].as_str().expect("a session").to_owned();
     let shell = spawned["pid"].as_u64().expect("a pid") as i32;
@@ -570,10 +564,7 @@ fn an_alternate_screen_app_survives_a_resize_and_keeps_answering() {
     let (mut reading, mut writing) = connect(&broker);
     ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
     next(&mut reading);
-    ask(
-        &mut writing,
-        r#"{"kind":"spawn","cols":80,"rows":24,"shell":null,"cwd":null}"#,
-    );
+    ask(&mut writing, &spawn_frame(80, 24, None));
     let spawned = next(&mut reading);
     let session = spawned["session"].as_str().expect("a session").to_owned();
     let shell = spawned["pid"].as_u64().expect("a pid") as i32;
@@ -641,10 +632,7 @@ fn a_session_answers_a_bounded_screen_read() {
     ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
     next(&mut reading);
 
-    ask(
-        &mut writing,
-        &format!(r#"{{"kind":"spawn","cols":40,"rows":6,"shell":"{DEFAULT_SHELL}","cwd":null}}"#),
-    );
+    ask(&mut writing, &spawn_frame(40, 6, Some(DEFAULT_SHELL)));
     let session = next(&mut reading)["session"]
         .as_str()
         .expect("a session id")
@@ -759,10 +747,7 @@ fn writing_to_a_session_whose_shell_has_gone_is_refused() {
     let (mut reading, mut writing) = connect(&broker);
     ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
     next(&mut reading);
-    ask(
-        &mut writing,
-        r#"{"kind":"spawn","cols":80,"rows":24,"shell":null,"cwd":null}"#,
-    );
+    ask(&mut writing, &spawn_frame(80, 24, None));
     let session = next(&mut reading)["session"]
         .as_str()
         .expect("a session")
@@ -799,4 +784,55 @@ fn writing_to_a_session_whose_shell_has_gone_is_refused() {
         r#"{"kind":"screen","session":"s-404","history":0}"#,
     );
     assert_eq!(until(&mut reading, "failed").0["code"], "NO_SUCH_SESSION");
+}
+
+/// A shell is started with the arguments and environment it was asked for — which is what shell integration
+/// is arranged out of (D3).
+///
+/// The markers a terminal reads facts from come from code the shell runs at startup, and every shell takes
+/// that a different way: bash wants `--init-file` and PowerShell `-NoExit`, which are arguments; zsh wants
+/// `ZDOTDIR` and fish `XDG_DATA_DIRS`, which are environment. The broker chooses neither — what each shell
+/// needs is the app's to know, because the rc files it points at are the app's to ship — so what this pins
+/// is only that both arrive.
+#[cfg(unix)]
+#[test]
+fn a_shell_is_started_with_the_arguments_and_environment_it_was_asked_for() {
+    let broker = start();
+    let (mut reading, mut writing) = connect(&broker);
+    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    next(&mut reading);
+
+    // `-c` runs a command and exits, which is an argument doing something observable; the variable it
+    // prints is the other half
+    let frame = serde_json::json!({
+        "kind": "spawn",
+        "cols": 80,
+        "rows": 24,
+        "shell": "/bin/sh",
+        "args": ["-c", "printf 'marker=%s\\n' \"$APACK_PROBE\""],
+        "env": [["APACK_PROBE", "arranged"]],
+        "cwd": null,
+    })
+    .to_string();
+    ask(&mut writing, &frame);
+    let session = next(&mut reading)["session"]
+        .as_str()
+        .expect("a session")
+        .to_owned();
+
+    let mut seen = String::new();
+    for _ in 0..200 {
+        let event = next(&mut reading);
+        if event["kind"] == "output" && event["session"] == session.as_str() {
+            seen.push_str(event["data"].as_str().unwrap_or_default());
+        }
+        if seen.contains("marker=") {
+            break;
+        }
+    }
+
+    assert!(
+        seen.contains("marker=arranged"),
+        "the argument ran and the variable reached it: {seen:?}"
+    );
 }

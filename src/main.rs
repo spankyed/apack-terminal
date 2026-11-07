@@ -156,8 +156,10 @@ fn carry_out(sessions: &Arc<Mutex<Sessions>>, request: Request) {
             cols,
             rows,
             shell,
+            args,
+            env,
             cwd,
-        } => match live.spawn(cols, rows, shell, cwd) {
+        } => match live.spawn(cols, rows, shell, args, env, cwd) {
             Ok((session, pid)) => {
                 live.answer(Event::Spawned { session, pid });
                 Ok(())
