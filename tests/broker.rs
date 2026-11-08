@@ -1302,3 +1302,87 @@ fn a_broker_an_owner_holds_keeps_listening_between_clients() {
     assert_eq!(next(&mut reading)["kind"], "spawned");
     let _ = &mut writing;
 }
+
+/// **X4: a Windows shell reports itself when it is started pointing at an integration file.**
+///
+/// Shell integration on Windows was inert — `integrationFor` answered nothing there, so the markers the
+/// working directory and the command status come from were never emitted whatever the setting said. The
+/// question this answers is the one that cannot be answered from a Mac: does PowerShell, launched the way
+/// the app would launch it, emit OSC 633, and does the broker read it?
+///
+/// It is written here rather than against the app because the broker is where the markers are parsed, and
+/// because this is the layer a Windows run can reach without an Electron build.
+#[cfg(windows)]
+#[test]
+fn a_windows_shell_reports_itself_when_started_with_an_integration_file() {
+    let directory = tempfile::tempdir().expect("a directory for the integration file");
+    let script = directory.path().join("apack.ps1");
+    // The prompt is the one hook every PowerShell has: it runs after each command and before the next line
+    // is read, which is exactly the boundary the markers describe
+    std::fs::write(
+        &script,
+        "$Global:__apackPrompt = $function:prompt\r\n\
+         function Global:prompt {\r\n\
+         $status = $LASTEXITCODE\r\n\
+         if ($null -eq $status) { $status = 0 }\r\n\
+         $e = [char]27\r\n\
+         $bel = [char]7\r\n\
+         $theirs = if ($Global:__apackPrompt) { & $Global:__apackPrompt } else { \"PS> \" }\r\n\
+         \"$e]633;D;$status$bel\" + \"$e]633;P;Cwd=$($PWD.Path)$bel\" + \"$e]633;A$bel\" + $theirs + \"$e]633;B$bel\"\r\n\
+         }\r\n",
+    )
+    .expect("the integration file is written");
+
+    let broker = start();
+    let (mut reading, mut writing) = greet(&broker, "client");
+    let frame = serde_json::json!({
+        "kind": "spawn", "cols": 120, "rows": 30, "shell": "powershell.exe",
+        "args": ["-NoExit", "-Command", format!(". '{}'", script.display())],
+        "env": [], "cwd": null,
+    })
+    .to_string();
+    ask(&mut writing, &frame);
+    let session = next(&mut reading)["session"]
+        .as_str()
+        .expect("a session id")
+        .to_owned();
+
+    // The first prompt is where the markers are drawn, so nothing is typed until one has been
+    let mut output = String::new();
+    for _ in 0..600 {
+        let event = next(&mut reading);
+        if event["kind"] == "output" {
+            output.push_str(event["data"].as_str().unwrap_or_default());
+            if output.contains("\u{1b}]633;B") {
+                break;
+            }
+        }
+    }
+    assert!(
+        output.contains("\u{1b}]633;P;Cwd="),
+        "PowerShell emitted no working-directory marker: {output:?}"
+    );
+
+    // **`\r` alone, not `\r\n`.** A trailing newline opens PowerShell's continuation prompt — the command
+    // is taken and then the parser waits for more, so nothing runs. Measured here, not assumed.
+    types(&mut writing, &session, "cd C:\\Windows\r");
+    for _ in 0..600 {
+        let event = next(&mut reading);
+        if event["kind"] == "output" {
+            output.push_str(event["data"].as_str().unwrap_or_default());
+            if output.matches("\u{1b}]633;P;Cwd=").count() >= 2 {
+                break;
+            }
+        }
+    }
+
+    ask(
+        &mut writing,
+        &format!(r#"{{"kind":"facts","session":"{session}"}}"#),
+    );
+    let (facts, _) = until(&mut reading, "facts");
+    assert_eq!(
+        facts["cwd"], "C:\\Windows",
+        "the shell moved and said so, and the broker read it: {output:?}"
+    );
+}
