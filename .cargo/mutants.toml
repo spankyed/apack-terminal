@@ -16,3 +16,11 @@ timeout_multiplier = 3.0
 output = "target"
 # Without debug info (`Cargo.toml`, profile.mutants): each job's copy is a fraction of a debug build's
 profile = "mutants"
+
+# Mutants that answer exactly what the code answers, each with why
+exclude_re = [
+    # `sendable`'s ASCII arm gives 1 and so does the `_` fallback, so deleting it changes no answer. It is
+    # there to say that ASCII is one byte, where `_` says "not a lead byte at all" — removing the arm to kill
+    # the mutant would make that comment wrong about every ASCII byte
+    "output.rs:.*delete match arm 0x00..= 0x7F in sendable",
+]

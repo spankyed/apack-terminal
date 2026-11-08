@@ -96,6 +96,38 @@ impl Outgoing {
     }
 }
 
+/// Where to cut a buffer so the part sent holds no half-arrived character.
+///
+/// **A pty read is bytes, and a character can straddle two of them.** `read` returns whatever the kernel
+/// had, so a multi-byte sequence is split whenever the boundary falls inside it — and a flush between the
+/// two reads used to convert each half on its own, replacing both with U+FFFD. `é` written as `a\xC3` then
+/// `\xA9b` arrived as `a..b`. Every TUI's box drawing, all CJK and every emoji were exposed; ASCII never
+/// was, which is why it went unnoticed.
+///
+/// So a trailing sequence that has not all arrived stays in the buffer for the next read. Only a trailing
+/// one: bytes that are invalid rather than incomplete can never become valid by waiting, so they are sent
+/// and replaced as before. A sequence is at most four bytes, so at most three are ever held back.
+fn sendable(bytes: &[u8]) -> usize {
+    // Only the last three bytes can begin a sequence that is still arriving
+    for at in (bytes.len().saturating_sub(3)..bytes.len()).rev() {
+        let byte = bytes[at];
+        // A continuation byte: its lead is further back, so keep looking
+        if byte & 0b1100_0000 == 0b1000_0000 {
+            continue;
+        }
+        let needed = match byte {
+            0x00..=0x7F => 1,
+            0xC2..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF4 => 4,
+            // Not a lead byte at all (0xC0, 0xC1, 0xF5..): invalid, and waiting cannot mend it
+            _ => 1,
+        };
+        return if bytes.len() - at < needed { at } else { bytes.len() };
+    }
+    bytes.len()
+}
+
 /// Coalesces one session's output and sends it under credit.
 ///
 /// Runs as its own thread because the reader's `read` blocks: a time-based flush needs something that can
@@ -104,13 +136,16 @@ pub fn coalesce(session: String, chunks: Receiver<Vec<u8>>, outgoing: Sender<Out
     let mut buffer: Vec<u8> = Vec::new();
     let mut opened = Instant::now();
 
-    let flush = |buffer: &mut Vec<u8>, credit: &Arc<Credit>| -> bool {
-        if buffer.is_empty() {
+    // `ending` is the stream's last flush, where a partial character will never be completed and holding it
+    // back would lose it outright
+    let flush = |buffer: &mut Vec<u8>, credit: &Arc<Credit>, ending: bool| -> bool {
+        let cut = if ending { buffer.len() } else { sendable(buffer) };
+        if cut == 0 {
             return true;
         }
         let waited = credit.take();
-        let data = String::from_utf8_lossy(buffer).into_owned();
-        buffer.clear();
+        let data = String::from_utf8_lossy(&buffer[..cut]).into_owned();
+        buffer.drain(..cut);
         if waited > Duration::ZERO {
             // The overload is reported rather than silent, and it is a *wait* rather than a loss: the pty's
             // own buffer is what fills behind this, which is backpressure reaching the process.
@@ -138,20 +173,20 @@ pub fn coalesce(session: String, chunks: Receiver<Vec<u8>>, outgoing: Sender<Out
                 // A fast producer fills the cap before the window elapses; flushing on size keeps the
                 // window from becoming a latency floor under saturation
                 if buffer.len() >= OUTPUT_CAP {
-                    if !flush(&mut buffer, &credit) {
+                    if !flush(&mut buffer, &credit, false) {
                         return;
                     }
                     opened = Instant::now();
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
-                if !flush(&mut buffer, &credit) {
+                if !flush(&mut buffer, &credit, false) {
                     return;
                 }
                 opened = Instant::now();
             }
             Err(RecvTimeoutError::Disconnected) => {
-                let _ = flush(&mut buffer, &credit);
+                let _ = flush(&mut buffer, &credit, true);
                 return;
             }
         }

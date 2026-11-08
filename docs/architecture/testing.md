@@ -91,7 +91,9 @@ A survivor is answered one of two ways, and never left:
 
 - **killed** — the case that should have caught it is written, which is the normal answer.
 - **excluded** — in [`.cargo/mutants.toml`](../../.cargo/mutants.toml) with the reason, for a mutant that
-  answers exactly what the code answers. There are none yet.
+  answers exactly what the code answers. There is one: `sendable`'s ASCII arm returns 1 and so does the `_`
+  fallback, so deleting the arm changes no answer. It is kept because it says ASCII is one byte, where `_`
+  says *not a lead byte at all* — removing it to kill the mutant would make that comment wrong.
 
 `.github/workflows/mutants.yml` runs the same thing on a pull request and fails on a survivor. It runs twice:
 Windows-only code compiles on no other platform, so a Linux run reports every mutant of `src/tree.rs` and of
