@@ -24,12 +24,14 @@ slow-timeout = { period = "30s", terminate-after = 2 }
 # of them reads back a file another had just emptied. It failed on the first full run after this file existed.
 # A group of one thread is the fix rather than a lock in the tests: nothing about these is concurrent on
 # purpose, and `cargo xtask generate` runs them for their side effect alone.
+#
+# **There is one profile on purpose.** A `[profile.ci]` whose only setting was `fail-fast = false` carried
+# none of the overrides above — nextest does not merge a profile's overrides with the default's, which
+# `cargo nextest show-config test-groups --profile ci` says plainly — so every CI job raced here while every
+# local run was fine. `--no-fail-fast` is a flag, and a flag cannot silently lack an override.
 [test-groups]
 protocol-export = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = "test(/^protocol::export_bindings_/)"
 test-group = "protocol-export"
-
-[profile.ci]
-fail-fast = false

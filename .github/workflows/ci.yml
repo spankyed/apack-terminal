@@ -87,7 +87,7 @@ jobs:
           tool: cargo-nextest@0.9.148
       # Each test in its own process, killed at `.config/nextest.toml`'s deadline: a regression here loses a
       # signal, which is a read that never returns rather than a wrong answer
-      - run: cargo nextest run --workspace --profile ci
+      - run: cargo nextest run --workspace --no-fail-fast
       # The npm package with this platform's binary in it, which is how the broker reaches a packaged app.
       # Staged on every platform because the binary's *name* is what was wrong before: `cargo` writes
       # `apack-terminal.exe` on Windows, and a consumer looking for the extensionless name there found

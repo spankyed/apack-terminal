@@ -22,7 +22,11 @@ pub const COMMITTED_DIR: &str = "node";
 /// Asks ts-rs to generate the declarations again, into `into`
 pub fn write(root: &Path, into: &Path) -> Result<(), String> {
     let output = Command::new(env!("CARGO"))
-        .args(["test", "export_bindings"])
+        // **One thread, because the four tests write one file.** ts-rs generates a test per exported type
+        // and every one of them writes `protocol.ts`; run together they truncate and write over each other,
+        // and one reads back what another had just emptied. It passed on a fast laptop and failed on CI's
+        // first run of this check.
+        .args(["test", "export_bindings", "--", "--test-threads=1"])
         .env("TS_RS_EXPORT_DIR", into)
         .current_dir(root)
         .output()
