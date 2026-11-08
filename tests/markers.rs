@@ -10,11 +10,7 @@ fn markers(stream: &str) -> Vec<Marker> {
 /// The same stream, fed one byte at a time.
 fn byte_at_a_time(stream: &str) -> Vec<Marker> {
     let mut scanner = Markers::default();
-    stream
-        .as_bytes()
-        .iter()
-        .flat_map(|byte| scanner.feed(&[*byte]))
-        .collect()
+    stream.as_bytes().iter().flat_map(|byte| scanner.feed(&[*byte])).collect()
 }
 
 /// The same stream, split at `at`.
@@ -49,18 +45,9 @@ fn reads_the_markers_a_prompt_and_a_command_emit() {
 /// `D` with no argument says the command ended and says nothing about how.
 #[test]
 fn tells_a_missing_status_from_a_zero_one() {
-    assert_eq!(
-        markers(&format!("\x1b]633;D{BEL}")),
-        vec![Marker::CommandDone(None)]
-    );
-    assert_eq!(
-        markers(&format!("\x1b]633;D;0{BEL}")),
-        vec![Marker::CommandDone(Some(0))]
-    );
-    assert_eq!(
-        markers(&format!("\x1b]633;D;130{BEL}")),
-        vec![Marker::CommandDone(Some(130))]
-    );
+    assert_eq!(markers(&format!("\x1b]633;D{BEL}")), vec![Marker::CommandDone(None)]);
+    assert_eq!(markers(&format!("\x1b]633;D;0{BEL}")), vec![Marker::CommandDone(Some(0))]);
+    assert_eq!(markers(&format!("\x1b]633;D;130{BEL}")), vec![Marker::CommandDone(Some(130))]);
 }
 
 #[test]
@@ -76,29 +63,20 @@ fn reads_a_working_directory_from_every_sequence_that_carries_one() {
         vec![Marker::Cwd("/home/me/a project".into())]
     );
     // iTerm2's, for a user whose configuration already emits it
-    assert_eq!(
-        markers(&format!("\x1b]1337;CurrentDir=/tmp{BEL}")),
-        vec![Marker::Cwd("/tmp".into())]
-    );
+    assert_eq!(markers(&format!("\x1b]1337;CurrentDir=/tmp{BEL}")), vec![Marker::Cwd("/tmp".into())]);
 }
 
 /// A Windows OSC 7 URL keeps the shape the app's own reader expects, slash and drive letter included: the
 /// scanner reports what was claimed and does not rewrite it into a path for a platform it is not on.
 #[test]
 fn leaves_a_windows_url_as_the_claim_it_is() {
-    assert_eq!(
-        markers(&format!("\x1b]7;file://PC/C:/Users/me{BEL}")),
-        vec![Marker::Cwd("/C:/Users/me".into())]
-    );
+    assert_eq!(markers(&format!("\x1b]7;file://PC/C:/Users/me{BEL}")), vec![Marker::Cwd("/C:/Users/me".into())]);
 }
 
 /// **ST terminates a string as well as BEL**, and a shell that uses it is not unusual.
 #[test]
 fn reads_a_string_terminated_the_other_way() {
-    assert_eq!(
-        markers("\x1b]633;P;Cwd=/tmp\x1b\\"),
-        vec![Marker::Cwd("/tmp".into())]
-    );
+    assert_eq!(markers("\x1b]633;P;Cwd=/tmp\x1b\\"), vec![Marker::Cwd("/tmp".into())]);
 }
 
 /// An `ESC` inside a payload that is not a terminator is payload.
@@ -145,10 +123,7 @@ fn reads_the_same_markers_however_the_stream_is_chunked() {
          \x1b]633;P;Cwd=/home/me/w%20d{BEL}\x1b]633;D;1\x1b\\done"
     );
     let whole = markers(&stream);
-    assert!(
-        whole.len() == 6,
-        "the stream carries six markers: {whole:?}"
-    );
+    assert!(whole.len() == 6, "the stream carries six markers: {whole:?}");
 
     assert_eq!(byte_at_a_time(&stream), whole, "one byte at a time");
     for at in 0..=stream.len() {

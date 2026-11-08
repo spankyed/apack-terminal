@@ -143,21 +143,10 @@ pub struct Screen {
 
 impl Screen {
     pub fn new(cols: u16, rows: u16) -> Self {
-        let size = Size {
-            columns: cols.max(1) as usize,
-            screen_lines: rows.max(1) as usize,
-            history: HISTORY_LINES,
-        };
+        let size = Size { columns: cols.max(1) as usize, screen_lines: rows.max(1) as usize, history: HISTORY_LINES };
         let replies = Replies::default();
         Self {
-            term: Term::new(
-                Config {
-                    scrolling_history: HISTORY_LINES,
-                    ..Config::default()
-                },
-                &size,
-                replies.clone(),
-            ),
+            term: Term::new(Config { scrolling_history: HISTORY_LINES, ..Config::default() }, &size, replies.clone()),
             parser: Processor::new(),
             size,
             replies,
@@ -187,11 +176,7 @@ impl Screen {
 
     /// What the program asked for and must be told, taken rather than read: each reply is written once.
     pub fn take_replies(&mut self) -> Vec<String> {
-        self.replies
-            .0
-            .lock()
-            .map(|mut replies| std::mem::take(&mut *replies))
-            .unwrap_or_default()
+        self.replies.0.lock().map(|mut replies| std::mem::take(&mut *replies)).unwrap_or_default()
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {

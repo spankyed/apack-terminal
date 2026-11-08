@@ -46,10 +46,7 @@ pub struct Credit {
 
 impl Credit {
     pub fn new(total: usize) -> Arc<Self> {
-        Arc::new(Self {
-            free: Mutex::new(total),
-            returned: Condvar::new(),
-        })
+        Arc::new(Self { free: Mutex::new(total), returned: Condvar::new() })
     }
 
     /// Waits for credit, answering how long it had to. A non-zero wait **is** the overload, observably.
@@ -88,10 +85,7 @@ pub struct Outgoing {
 impl Outgoing {
     /// An answer: no credit, so it is never held behind output
     pub fn answer(event: Event) -> Self {
-        Self {
-            event,
-            credit: None,
-        }
+        Self { event, credit: None }
     }
 
     /// Returns the credit this message spent, once it has actually been written
@@ -106,12 +100,7 @@ impl Outgoing {
 ///
 /// Runs as its own thread because the reader's `read` blocks: a time-based flush needs something that can
 /// wait *with a deadline*, which `recv_timeout` is and a blocking read is not.
-pub fn coalesce(
-    session: String,
-    chunks: Receiver<Vec<u8>>,
-    outgoing: Sender<Outgoing>,
-    credit: Arc<Credit>,
-) {
+pub fn coalesce(session: String, chunks: Receiver<Vec<u8>>, outgoing: Sender<Outgoing>, credit: Arc<Credit>) {
     let mut buffer: Vec<u8> = Vec::new();
     let mut opened = Instant::now();
 
@@ -135,10 +124,7 @@ pub fn coalesce(
         }
         outgoing
             .send(Outgoing {
-                event: Event::Output {
-                    session: session.clone(),
-                    data,
-                },
+                event: Event::Output { session: session.clone(), data },
                 credit: Some(Arc::clone(credit)),
             })
             .is_ok()

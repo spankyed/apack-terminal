@@ -1,0 +1,4 @@
+# As the apack monorepo's elmdb checkout formats, so a reader moving between the two Rust repositories reads
+# one layout.
+max_width = 120
+use_small_heuristics = "Max"

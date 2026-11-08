@@ -40,11 +40,7 @@ fn start() -> Broker {
         .expect("the broker says where it is listening");
     assert!(ready.starts_with("listening "), "{ready:?}");
 
-    Broker {
-        process,
-        socket,
-        _directory: directory,
-    }
+    Broker { process, socket, _directory: directory }
 }
 
 /// Where a broker listens, which is **a name rather than a path, and the spelling differs**.
@@ -64,10 +60,7 @@ fn socket_in(_directory: &std::path::Path) -> std::path::PathBuf {
     // leaning on the private directory a path would have given it
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let nth = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    std::path::PathBuf::from(format!(
-        r"\\.\pipe\apack-terminal-test-{}-{nth}",
-        std::process::id()
-    ))
+    std::path::PathBuf::from(format!(r"\\.\pipe\apack-terminal-test-{}-{nth}", std::process::id()))
 }
 
 /// One connection, readable and writable from two places: `&Stream` implements both, so an `Arc` is what
@@ -92,12 +85,8 @@ impl Write for Wire {
 
 /// A connection to the broker, which every client must then greet.
 fn connect(broker: &Broker) -> (Events, Wire) {
-    let name = broker
-        .socket
-        .to_str()
-        .expect("a utf-8 socket path")
-        .to_fs_name::<GenericFilePath>()
-        .expect("a socket name");
+    let name =
+        broker.socket.to_str().expect("a utf-8 socket path").to_fs_name::<GenericFilePath>().expect("a socket name");
     let stream = Stream::connect(name).expect("the broker accepts");
     let wire = Wire(std::sync::Arc::new(stream));
     (Events::reading(wire.clone()), wire)
@@ -165,9 +154,7 @@ fn spawn_frame(cols: u16, rows: u16, shell: Option<&str>) -> String {
 }
 
 fn ask(writing: &mut impl Write, frame: &str) {
-    writing
-        .write_all(frame.as_bytes())
-        .expect("the request is written");
+    writing.write_all(frame.as_bytes()).expect("the request is written");
     writing.write_all(b"\n").expect("the frame ends");
     writing.flush().expect("the request is flushed");
 }
@@ -204,23 +191,13 @@ fn a_keystroke_reaches_a_pty_and_its_output_comes_back() {
     let (mut reading, mut writing) = connect(&broker);
 
     ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
-    assert_eq!(
-        next(&mut reading)["kind"],
-        "hello",
-        "the handshake is answered before anything else"
-    );
+    assert_eq!(next(&mut reading)["kind"], "hello", "the handshake is answered before anything else");
 
     ask(&mut writing, &spawn_frame(80, 24, None));
     let spawned = next(&mut reading);
     assert_eq!(spawned["kind"], "spawned");
-    let session = spawned["session"]
-        .as_str()
-        .expect("a session id")
-        .to_owned();
-    assert!(
-        spawned["pid"].as_u64().expect("a pid") > 0,
-        "the broker owns a real process"
-    );
+    let session = spawned["session"].as_str().expect("a session id").to_owned();
+    assert!(spawned["pid"].as_u64().expect("a pid") > 0, "the broker owns a real process");
 
     // The keystroke, and the output it causes
     once_the_shell_is_listening(&mut reading);
@@ -244,27 +221,14 @@ fn a_keystroke_reaches_a_pty_and_its_output_comes_back() {
     // **Twice**: once as the console echoes what was typed, once as the command's own output. Asserting it
     // appears at all is a case a Windows console passes without running anything, which is how `\n` looked
     // like working input (X6)
-    assert!(
-        output.matches("skeleton-probe").count() >= 2,
-        "the pty's output came back: {output:?}"
-    );
+    assert!(output.matches("skeleton-probe").count() >= 2, "the pty's output came back: {output:?}");
 
     // A resize is accepted; a pty has one size, so there is nothing to answer
-    ask(
-        &mut writing,
-        &format!(r#"{{"kind":"resize","session":"{session}","cols":100,"rows":30}}"#),
-    );
+    ask(&mut writing, &format!(r#"{{"kind":"resize","session":"{session}","cols":100,"rows":30}}"#));
 
-    ask(
-        &mut writing,
-        &format!(r#"{{"kind":"kill","session":"{session}"}}"#),
-    );
+    ask(&mut writing, &format!(r#"{{"kind":"kill","session":"{session}"}}"#));
     let (exited, _) = until(&mut reading, "exited");
-    assert_eq!(
-        exited["session"].as_str(),
-        Some(session.as_str()),
-        "one exit, reported once"
-    );
+    assert_eq!(exited["session"].as_str(), Some(session.as_str()), "one exit, reported once");
 }
 
 #[test]
@@ -274,10 +238,7 @@ fn a_request_for_a_session_that_does_not_exist_is_refused_by_code() {
     ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
     next(&mut reading);
 
-    ask(
-        &mut writing,
-        r#"{"kind":"write","session":"s-404","data":"x"}"#,
-    );
+    ask(&mut writing, r#"{"kind":"write","session":"s-404","data":"x"}"#);
     let failed = next(&mut reading);
     assert_eq!(failed["kind"], "failed");
     // A code, not a message: a caller switches on something the compiler knows
@@ -309,13 +270,7 @@ fn a_mismatched_protocol_is_refused_at_the_handshake() {
     ask(&mut writing, r#"{"kind":"hello","protocol":999}"#);
     let failed = next(&mut reading);
     assert_eq!(failed["code"], "HANDSHAKE");
-    assert!(
-        failed["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("999"),
-        "{failed}"
-    );
+    assert!(failed["message"].as_str().unwrap_or_default().contains("999"), "{failed}");
 }
 
 #[test]
@@ -335,10 +290,7 @@ fn a_shell_that_exits_on_its_own_is_reported_without_anything_polling_for_it() {
     next(&mut reading);
 
     ask(&mut writing, &spawn_frame(80, 24, None));
-    let session = next(&mut reading)["session"]
-        .as_str()
-        .expect("a session")
-        .to_owned();
+    let session = next(&mut reading)["session"].as_str().expect("a session").to_owned();
 
     ask(
         &mut writing,
@@ -364,10 +316,7 @@ fn a_client_that_disconnects_leaves_no_shell_running() {
 
     // The app cannot end its sessions on the way out — a pack's `onShutdown` is synchronous and runs in
     // `process.on('exit')`, where no socket write completes — so the broker has to be the backstop.
-    assert!(
-        reaped(pid),
-        "the shell for pid {pid} was still running after its client disconnected"
-    );
+    assert!(reaped(pid), "the shell for pid {pid} was still running after its client disconnected");
 }
 
 /// Whether `pid` is still a live process.
@@ -383,9 +332,8 @@ fn alive(pid: i32) -> bool {
 
 #[cfg(windows)]
 fn alive(pid: i32) -> bool {
-    let listed = std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-        .output();
+    let listed =
+        std::process::Command::new("tasklist").args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"]).output();
     match listed {
         // A filter that matches nothing prints "INFO: No tasks are running..." rather than failing, so the
         // pid's own digits are what says it is there
@@ -469,10 +417,7 @@ fn long_lived_grandchild(pid_file: &std::path::Path) -> String {
         ),
     )
     .expect("a script for the grandchild");
-    format!(
-        "powershell -NoProfile -File \"{}\"{SUBMIT}",
-        script.display()
-    )
+    format!("powershell -NoProfile -File \"{}\"{SUBMIT}", script.display())
 }
 
 /// The pid that process wrote, waiting up to ~10s for the shell to get that far.
@@ -486,10 +431,7 @@ fn pid_written_to(pid_file: &std::path::Path) -> i32 {
             return pid;
         }
     }
-    panic!(
-        "the shell never wrote its background job's pid to {}",
-        pid_file.display()
-    );
+    panic!("the shell never wrote its background job's pid to {}", pid_file.display());
 }
 
 /// Waits up to ~5s for `pid` to go away, answering whether it did.
@@ -507,10 +449,7 @@ fn killing_a_session_takes_the_whole_tree_with_it() {
     ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
     next(&mut reading);
     ask(&mut writing, &spawn_frame(80, 24, None));
-    let session = next(&mut reading)["session"]
-        .as_str()
-        .expect("a session")
-        .to_owned();
+    let session = next(&mut reading)["session"].as_str().expect("a session").to_owned();
 
     // A grandchild that outlives its parent unless something owns the tree: this is X1 and X2's subject,
     // and Phase B's acceptance says portable-pty is validated for containment rather than assumed.
@@ -527,16 +466,10 @@ fn killing_a_session_takes_the_whole_tree_with_it() {
     let grandchild = pid_written_to(&pid_file);
     assert!(alive(grandchild), "the grandchild {grandchild} is running");
 
-    ask(
-        &mut writing,
-        &format!(r#"{{"kind":"kill","session":"{session}"}}"#),
-    );
+    ask(&mut writing, &format!(r#"{{"kind":"kill","session":"{session}"}}"#));
     until(&mut reading, "exited");
 
-    assert!(
-        reaped(grandchild),
-        "the grandchild {grandchild} outlived the session it belonged to"
-    );
+    assert!(reaped(grandchild), "the grandchild {grandchild} outlived the session it belonged to");
 }
 
 #[test]
@@ -560,14 +493,8 @@ fn a_session_is_cancellable_while_its_shell_is_busy() {
     );
     std::thread::sleep(std::time::Duration::from_millis(400));
 
-    ask(
-        &mut writing,
-        &format!(r#"{{"kind":"kill","session":"{session}"}}"#),
-    );
-    assert!(
-        reaped(shell),
-        "the shell {shell} survived a kill while it was busy and trapping signals"
-    );
+    ask(&mut writing, &format!(r#"{{"kind":"kill","session":"{session}"}}"#));
+    assert!(reaped(shell), "the shell {shell} survived a kill while it was busy and trapping signals");
 }
 
 /// **POSIX only, and `tests/parser.rs` is why that is not a gap.** An alternate-screen app has to be one the
@@ -590,52 +517,33 @@ fn an_alternate_screen_app_survives_a_resize_and_keeps_answering() {
     // `less` on the alternate screen: Phase B names this as where resize mistakes surface, because an app
     // that owns the whole screen redraws it on SIGWINCH rather than carrying on at a prompt. `vim` is the
     // other case and needs an installed vim; `less` ships with the OS.
-    ask(
-        &mut writing,
-        &format!(r#"{{"kind":"write","session":"{session}","data":"seq 1 500 | less\n"}}"#),
-    );
+    ask(&mut writing, &format!(r#"{{"kind":"write","session":"{session}","data":"seq 1 500 | less\n"}}"#));
     let entered = (0..600).any(|_| {
         let event = next(&mut reading);
         // `\x1b[?1049h` is the alternate screen; `\x1b[?47h` is the older form some builds use
         event["kind"] == "output"
-            && event["data"]
-                .as_str()
-                .is_some_and(|data| data.contains("[?1049h") || data.contains("[?47h"))
+            && event["data"].as_str().is_some_and(|data| data.contains("[?1049h") || data.contains("[?47h"))
     });
     assert!(entered, "less never switched to the alternate screen");
 
     // Resize while it owns the screen. A pty has one size, so this is one message, and the app must redraw
     for (cols, rows) in [(100u16, 30u16), (60, 20), (120, 40)] {
-        ask(
-            &mut writing,
-            &format!(r#"{{"kind":"resize","session":"{session}","cols":{cols},"rows":{rows}}}"#),
-        );
+        ask(&mut writing, &format!(r#"{{"kind":"resize","session":"{session}","cols":{cols},"rows":{rows}}}"#));
     }
 
     // It redrew rather than dying: output arrives after the resizes, and the shell is still there
     let redrew = (0..600).any(|_| next(&mut reading)["kind"] == "output");
     assert!(redrew, "nothing was drawn after the resize");
-    assert!(
-        alive(shell),
-        "the shell did not survive a resize under an alternate-screen app"
-    );
+    assert!(alive(shell), "the shell did not survive a resize under an alternate-screen app");
 
     // And it is still taking input: `q` leaves less, which ends the shell's foreground job
-    ask(
-        &mut writing,
-        &format!(r#"{{"kind":"write","session":"{session}","data":"q"}}"#),
-    );
+    ask(&mut writing, &format!(r#"{{"kind":"write","session":"{session}","data":"q"}}"#));
     let left = (0..600).any(|_| {
         let event = next(&mut reading);
         event["kind"] == "output"
-            && event["data"]
-                .as_str()
-                .is_some_and(|data| data.contains("[?1049l") || data.contains("[?47l"))
+            && event["data"].as_str().is_some_and(|data| data.contains("[?1049l") || data.contains("[?47l"))
     });
-    assert!(
-        left,
-        "less never left the alternate screen, so it had stopped reading input"
-    );
+    assert!(left, "less never left the alternate screen, so it had stopped reading input");
 }
 
 /// A session nobody is drawing still has a screen, which is the gain the whole refactor is for.
@@ -651,10 +559,7 @@ fn a_session_answers_a_bounded_screen_read() {
     next(&mut reading);
 
     ask(&mut writing, &spawn_frame(40, 6, Some(DEFAULT_SHELL)));
-    let session = next(&mut reading)["session"]
-        .as_str()
-        .expect("a session id")
-        .to_owned();
+    let session = next(&mut reading)["session"].as_str().expect("a session id").to_owned();
 
     // Enough lines to push some off a six-row viewport, so the history is doing work
     ask(
@@ -677,62 +582,26 @@ fn a_session_answers_a_bounded_screen_read() {
     assert!(seen.contains("line-10"), "the output arrived: {seen:?}");
 
     // The viewport alone: six rows, and the last lines written are among them
-    ask(
-        &mut writing,
-        &format!(r#"{{"kind":"screen","session":"{session}","history":0}}"#),
-    );
+    ask(&mut writing, &format!(r#"{{"kind":"screen","session":"{session}","history":0}}"#));
     let (screen, _) = until(&mut reading, "screen");
     let viewport = screen["lines"].as_array().expect("lines").clone();
-    assert_eq!(
-        viewport.len(),
-        6,
-        "the viewport is the size the session was spawned with"
-    );
-    let text = |lines: &[serde_json::Value]| {
-        lines
-            .iter()
-            .filter_map(|line| line.as_str())
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    assert!(
-        text(&viewport).contains("line-10"),
-        "the viewport holds the last output: {:?}",
-        text(&viewport)
-    );
-    assert_eq!(
-        screen["alt_screen"], false,
-        "a shell prompt is the primary screen"
-    );
+    assert_eq!(viewport.len(), 6, "the viewport is the size the session was spawned with");
+    let text =
+        |lines: &[serde_json::Value]| lines.iter().filter_map(|line| line.as_str()).collect::<Vec<_>>().join("\n");
+    assert!(text(&viewport).contains("line-10"), "the viewport holds the last output: {:?}", text(&viewport));
+    assert_eq!(screen["alt_screen"], false, "a shell prompt is the primary screen");
 
     // And with history, the lines that scrolled off — which only the broker still has
-    ask(
-        &mut writing,
-        &format!(r#"{{"kind":"screen","session":"{session}","history":50}}"#),
-    );
+    ask(&mut writing, &format!(r#"{{"kind":"screen","session":"{session}","history":50}}"#));
     let (with_history, _) = until(&mut reading, "screen");
     let all = with_history["lines"].as_array().expect("lines").clone();
-    assert!(
-        all.len() > viewport.len(),
-        "history came with it: {} lines",
-        all.len()
-    );
-    assert!(
-        text(&all).contains("line-1\n"),
-        "a line that scrolled off the viewport: {:?}",
-        text(&all)
-    );
+    assert!(all.len() > viewport.len(), "history came with it: {} lines", all.len());
+    assert!(text(&all).contains("line-1\n"), "a line that scrolled off the viewport: {:?}", text(&all));
 
     // A ceiling, not a promise: asking for more history than there is answers with what there is
-    assert!(
-        all.len() <= 6 + 50,
-        "history is bounded by what was asked for"
-    );
+    assert!(all.len() <= 6 + 50, "history is bounded by what was asked for");
 
-    ask(
-        &mut writing,
-        &format!(r#"{{"kind":"kill","session":"{session}"}}"#),
-    );
+    ask(&mut writing, &format!(r#"{{"kind":"kill","session":"{session}"}}"#));
     until(&mut reading, "exited");
 }
 
@@ -744,10 +613,7 @@ fn a_screen_read_for_a_session_that_does_not_exist_is_refused_by_code() {
     ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
     next(&mut reading);
 
-    ask(
-        &mut writing,
-        r#"{"kind":"screen","session":"s-404","history":10}"#,
-    );
+    ask(&mut writing, r#"{"kind":"screen","session":"s-404","history":10}"#);
     let failed = next(&mut reading);
     assert_eq!(failed["kind"], "failed");
     assert_eq!(failed["code"], "NO_SUCH_SESSION");
@@ -766,10 +632,7 @@ fn writing_to_a_session_whose_shell_has_gone_is_refused() {
     ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
     next(&mut reading);
     ask(&mut writing, &spawn_frame(80, 24, None));
-    let session = next(&mut reading)["session"]
-        .as_str()
-        .expect("a session")
-        .to_owned();
+    let session = next(&mut reading)["session"].as_str().expect("a session").to_owned();
 
     once_the_shell_is_listening(&mut reading);
     ask(
@@ -782,25 +645,16 @@ fn writing_to_a_session_whose_shell_has_gone_is_refused() {
     until(&mut reading, "exited");
 
     // Straight after the exit, which is the window ConPTY is documented to be unhappy in
-    ask(
-        &mut writing,
-        &format!(r#"{{"kind":"write","session":"{session}","data":"x"}}"#),
-    );
+    ask(&mut writing, &format!(r#"{{"kind":"write","session":"{session}","data":"x"}}"#));
     let refused = until(&mut reading, "failed").0;
     assert_eq!(refused["code"], "NO_SUCH_SESSION");
 
-    ask(
-        &mut writing,
-        &format!(r#"{{"kind":"resize","session":"{session}","cols":100,"rows":30}}"#),
-    );
+    ask(&mut writing, &format!(r#"{{"kind":"resize","session":"{session}","cols":100,"rows":30}}"#));
     let refused = until(&mut reading, "failed").0;
     assert_eq!(refused["code"], "NO_SUCH_SESSION");
 
     // And the broker is still there to answer the next thing asked of it
-    ask(
-        &mut writing,
-        r#"{"kind":"screen","session":"s-404","history":0}"#,
-    );
+    ask(&mut writing, r#"{"kind":"screen","session":"s-404","history":0}"#);
     assert_eq!(until(&mut reading, "failed").0["code"], "NO_SUCH_SESSION");
 }
 
@@ -833,10 +687,7 @@ fn a_shell_is_started_with_the_arguments_and_environment_it_was_asked_for() {
     })
     .to_string();
     ask(&mut writing, &frame);
-    let session = next(&mut reading)["session"]
-        .as_str()
-        .expect("a session")
-        .to_owned();
+    let session = next(&mut reading)["session"].as_str().expect("a session").to_owned();
 
     let mut seen = String::new();
     for _ in 0..200 {
@@ -849,10 +700,7 @@ fn a_shell_is_started_with_the_arguments_and_environment_it_was_asked_for() {
         }
     }
 
-    assert!(
-        seen.contains("marker=arranged"),
-        "the argument ran and the variable reached it: {seen:?}"
-    );
+    assert!(seen.contains("marker=arranged"), "the argument ran and the variable reached it: {seen:?}");
 }
 
 /// A command that makes the shell *print* an escape sequence, so the marker reaches the screen the way a
@@ -895,10 +743,7 @@ fn a_session(broker: &Broker) -> (Events, Wire, String) {
     ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
     assert_eq!(next(&mut reading)["kind"], "hello");
     ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
-    let session = next(&mut reading)["session"]
-        .as_str()
-        .expect("a session id")
-        .to_owned();
+    let session = next(&mut reading)["session"].as_str().expect("a session id").to_owned();
     once_the_shell_is_listening(&mut reading);
     (reading, writing, session)
 }
@@ -927,23 +772,15 @@ fn a_session_nobody_is_drawing_answers_what_its_shell_reported() {
     types(
         &mut writing,
         &session,
-        &prints(
-            "\\033]633;E;ls -la\\007\\033]633;C\\007\\033]633;P;Cwd=/tmp\\007\\033]633;D;3\\007",
-        ),
+        &prints("\\033]633;E;ls -la\\007\\033]633;C\\007\\033]633;P;Cwd=/tmp\\007\\033]633;D;3\\007"),
     );
     once_the_sentinel_is_printed(&mut reading);
 
-    ask(
-        &mut writing,
-        &format!(r#"{{"kind":"facts","session":"{session}"}}"#),
-    );
+    ask(&mut writing, &format!(r#"{{"kind":"facts","session":"{session}"}}"#));
     let (facts, _) = until(&mut reading, "facts");
     assert_eq!(facts["cwd"], "/tmp", "the directory the shell reported");
     assert_eq!(facts["command"], "ls -la", "the command line it reported");
-    assert_eq!(
-        facts["exit_status"], 3,
-        "the status it reported, as reported"
-    );
+    assert_eq!(facts["exit_status"], 3, "the status it reported, as reported");
     assert_eq!(facts["running"], false, "the command finished");
 }
 
@@ -958,33 +795,17 @@ fn a_search_finds_text_in_a_hidden_sessions_history() {
     types(&mut writing, &session, &prints(""));
     once_the_sentinel_is_printed(&mut reading);
 
-    ask(
-        &mut writing,
-        &format!(r#"{{"kind":"search","session":"{session}","text":"line-7","history":1000}}"#),
-    );
+    ask(&mut writing, &format!(r#"{{"kind":"search","session":"{session}","text":"line-7","history":1000}}"#));
     let (found, _) = until(&mut reading, "search");
     let matches = found["matches"].as_array().expect("matches");
-    assert!(
-        matches.iter().any(|m| m["text"] == "line-7"),
-        "the line it was asked for: {matches:?}"
-    );
+    assert!(matches.iter().any(|m| m["text"] == "line-7"), "the line it was asked for: {matches:?}");
     // The whole line comes back, so a caller sees its context without a second read
-    assert!(
-        matches[0]["column"].as_u64().is_some(),
-        "with where in the line it starts"
-    );
+    assert!(matches[0]["column"].as_u64().is_some(), "with where in the line it starts");
 
     // Text nothing wrote is not found, which is the half that fails if a search answers everything
-    ask(
-        &mut writing,
-        &format!(r#"{{"kind":"search","session":"{session}","text":"line-11","history":1000}}"#),
-    );
+    ask(&mut writing, &format!(r#"{{"kind":"search","session":"{session}","text":"line-11","history":1000}}"#));
     let (none, _) = until(&mut reading, "search");
-    assert_eq!(
-        none["matches"].as_array().expect("matches").len(),
-        0,
-        "nothing wrote it"
-    );
+    assert_eq!(none["matches"].as_array().expect("matches").len(), 0, "nothing wrote it");
 }
 
 /// **A wait is answered when the state arrives, not on a timer.**
@@ -1004,21 +825,13 @@ fn a_wait_for_idle_is_answered_when_the_command_finishes() {
 
     ask(
         &mut writing,
-        &format!(
-            r#"{{"kind":"wait","session":"{session}","until":{{"kind":"idle"}},"timeout_ms":10000}}"#
-        ),
+        &format!(r#"{{"kind":"wait","session":"{session}","until":{{"kind":"idle"}},"timeout_ms":10000}}"#),
     );
     // Nothing has finished the command, so nothing may answer yet
     for _ in 0..3 {
-        if let Ok(line) = reading
-            .0
-            .recv_timeout(std::time::Duration::from_millis(300))
-        {
+        if let Ok(line) = reading.0.recv_timeout(std::time::Duration::from_millis(300)) {
             let event: serde_json::Value = serde_json::from_str(&line).expect("an event");
-            assert_ne!(
-                event["kind"], "waited",
-                "the session is still busy: {event}"
-            );
+            assert_ne!(event["kind"], "waited", "the session is still busy: {event}");
         }
     }
 
@@ -1061,15 +874,11 @@ fn a_session_ending_settles_both_kinds_of_wait() {
 
     ask(
         &mut writing,
-        &format!(
-            r#"{{"kind":"wait","session":"{session}","until":{{"kind":"idle"}},"timeout_ms":30000}}"#
-        ),
+        &format!(r#"{{"kind":"wait","session":"{session}","until":{{"kind":"idle"}},"timeout_ms":30000}}"#),
     );
     ask(
         &mut writing,
-        &format!(
-            r#"{{"kind":"wait","session":"{session}","until":{{"kind":"exit"}},"timeout_ms":30000}}"#
-        ),
+        &format!(r#"{{"kind":"wait","session":"{session}","until":{{"kind":"exit"}},"timeout_ms":30000}}"#),
     );
     types(&mut writing, &session, &format!("exit{SUBMIT}"));
 
@@ -1094,10 +903,7 @@ fn a_session_ending_settles_both_kinds_of_wait() {
 /// Greets as a given role, answering the connection and its id.
 fn greet(broker: &Broker, role: &str) -> (Events, Wire) {
     let (mut reading, mut writing) = connect(broker);
-    ask(
-        &mut writing,
-        &format!(r#"{{"kind":"hello","protocol":1,"role":"{role}"}}"#),
-    );
+    ask(&mut writing, &format!(r#"{{"kind":"hello","protocol":1,"role":"{role}"}}"#));
     assert_eq!(next(&mut reading)["kind"], "hello", "greeted as {role}");
     (reading, writing)
 }
@@ -1115,32 +921,19 @@ fn a_session_outlives_its_client_while_an_owner_holds_the_broker() {
     let (mut reading, mut writing) = greet(&broker, "client");
     ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
     let spawned = next(&mut reading);
-    let session = spawned["session"]
-        .as_str()
-        .expect("a session id")
-        .to_owned();
+    let session = spawned["session"].as_str().expect("a session id").to_owned();
     let pid = spawned["pid"].as_u64().expect("a pid") as i32;
     once_the_shell_is_listening(&mut reading);
 
     // The client is gone, socket and all
     disconnect(reading, writing);
-    assert!(
-        alive(pid),
-        "the shell outlives the client that asked for it"
-    );
+    assert!(alive(pid), "the shell outlives the client that asked for it");
 
     // And a client that comes back can still use it, which is what "still running" has to mean
     let (mut reading, mut writing) = greet(&broker, "client");
-    ask(
-        &mut writing,
-        &format!(r#"{{"kind":"facts","session":"{session}"}}"#),
-    );
+    ask(&mut writing, &format!(r#"{{"kind":"facts","session":"{session}"}}"#));
     let (facts, _) = until(&mut reading, "facts");
-    assert_eq!(
-        facts["session"],
-        session.as_str(),
-        "the same session answers the new client"
-    );
+    assert_eq!(facts["session"], session.as_str(), "the same session answers the new client");
 }
 
 /// **The owner going away ends them**, which is what stops a quit leaving shells behind.
@@ -1174,19 +967,12 @@ fn output_follows_the_client_that_came_back() {
 
     let (mut reading, mut writing) = greet(&broker, "client");
     ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
-    let session = next(&mut reading)["session"]
-        .as_str()
-        .expect("a session id")
-        .to_owned();
+    let session = next(&mut reading)["session"].as_str().expect("a session id").to_owned();
     once_the_shell_is_listening(&mut reading);
     disconnect(reading, writing);
 
     let (mut reading, mut writing) = greet(&broker, "client");
-    types(
-        &mut writing,
-        &session,
-        &format!("echo back-on-the-feed{SUBMIT}"),
-    );
+    types(&mut writing, &session, &format!("echo back-on-the-feed{SUBMIT}"));
     let mut output = String::new();
     for _ in 0..400 {
         let event = next(&mut reading);
@@ -1233,10 +1019,7 @@ fn an_owner_arriving_does_not_take_the_feed_from_a_client() {
     let broker = start();
     let (mut reading, mut writing) = greet(&broker, "client");
     ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
-    let session = next(&mut reading)["session"]
-        .as_str()
-        .expect("a session id")
-        .to_owned();
+    let session = next(&mut reading)["session"].as_str().expect("a session id").to_owned();
     once_the_shell_is_listening(&mut reading);
 
     // The app takes its hold *after* the terminal is already running
@@ -1292,10 +1075,7 @@ fn a_broker_an_owner_holds_keeps_listening_between_clients() {
     disconnect(reading, writing);
 
     std::thread::sleep(std::time::Duration::from_millis(500));
-    assert!(
-        matches!(broker.process.try_wait(), Ok(None)),
-        "the broker exited while the app still held it"
-    );
+    assert!(matches!(broker.process.try_wait(), Ok(None)), "the broker exited while the app still held it");
     // And it still answers, which is what "listening" has to mean
     let (mut reading, mut writing) = greet(&broker, "client");
     ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
@@ -1342,10 +1122,7 @@ fn a_windows_shell_reports_itself_when_started_with_an_integration_file() {
     })
     .to_string();
     ask(&mut writing, &frame);
-    let session = next(&mut reading)["session"]
-        .as_str()
-        .expect("a session id")
-        .to_owned();
+    let session = next(&mut reading)["session"].as_str().expect("a session id").to_owned();
 
     // The first prompt is where the markers are drawn, so nothing is typed until one has been
     let mut output = String::new();
@@ -1358,10 +1135,7 @@ fn a_windows_shell_reports_itself_when_started_with_an_integration_file() {
             }
         }
     }
-    assert!(
-        output.contains("\u{1b}]633;P;Cwd="),
-        "PowerShell emitted no working-directory marker: {output:?}"
-    );
+    assert!(output.contains("\u{1b}]633;P;Cwd="), "PowerShell emitted no working-directory marker: {output:?}");
 
     // **`\r` alone, not `\r\n`.** A trailing newline opens PowerShell's continuation prompt — the command
     // is taken and then the parser waits for more, so nothing runs. Measured here, not assumed.
@@ -1376,13 +1150,7 @@ fn a_windows_shell_reports_itself_when_started_with_an_integration_file() {
         }
     }
 
-    ask(
-        &mut writing,
-        &format!(r#"{{"kind":"facts","session":"{session}"}}"#),
-    );
+    ask(&mut writing, &format!(r#"{{"kind":"facts","session":"{session}"}}"#));
     let (facts, _) = until(&mut reading, "facts");
-    assert_eq!(
-        facts["cwd"], "C:\\Windows",
-        "the shell moved and said so, and the broker read it: {output:?}"
-    );
+    assert_eq!(facts["cwd"], "C:\\Windows", "the shell moved and said so, and the broker read it: {output:?}");
 }

@@ -163,14 +163,10 @@ fn marker(payload: &[u8]) -> Option<Marker> {
             ("B", _) => Some(Marker::PromptEnd),
             ("C", _) => Some(Marker::CommandStart),
             // A shell that reports no status is reporting that it has none, which is not the same as zero
-            ("D", status) => Some(Marker::CommandDone(
-                status.and_then(|status| status.trim().parse().ok()),
-            )),
+            ("D", status) => Some(Marker::CommandDone(status.and_then(|status| status.trim().parse().ok()))),
             ("E", Some(line)) => Some(Marker::CommandLine(decode(line))),
             // `P` carries `key=value` properties, of which the cwd is the one with a fact in it
-            ("P", Some(property)) => property
-                .strip_prefix("Cwd=")
-                .map(|path| Marker::Cwd(decode(path))),
+            ("P", Some(property)) => property.strip_prefix("Cwd=").map(|path| Marker::Cwd(decode(path))),
             _ => None,
         };
     }

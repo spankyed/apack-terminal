@@ -48,14 +48,8 @@ fn start() -> Broker {
         .spawn()
         .expect("the broker starts");
     let mut ready = String::new();
-    BufReader::new(process.stdout.as_mut().expect("piped stdout"))
-        .read_line(&mut ready)
-        .expect("a ready line");
-    Broker {
-        process,
-        socket,
-        _directory: directory,
-    }
+    BufReader::new(process.stdout.as_mut().expect("piped stdout")).read_line(&mut ready).expect("a ready line");
+    Broker { process, socket, _directory: directory }
 }
 
 #[derive(Clone)]
@@ -77,15 +71,8 @@ impl Write for Wire {
 }
 
 fn greeted(broker: &Broker) -> (BufReader<Wire>, Wire) {
-    let name = broker
-        .socket
-        .to_str()
-        .expect("utf-8")
-        .to_fs_name::<GenericFilePath>()
-        .expect("a name");
-    let wire = Wire(std::sync::Arc::new(
-        Stream::connect(name).expect("the broker accepts"),
-    ));
+    let name = broker.socket.to_str().expect("utf-8").to_fs_name::<GenericFilePath>().expect("a name");
+    let wire = Wire(std::sync::Arc::new(Stream::connect(name).expect("the broker accepts")));
     let (mut reading, mut writing) = (BufReader::new(wire.clone()), wire);
     ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
     let mut line = String::new();
@@ -115,16 +102,10 @@ fn run(reading: &mut impl BufRead, writing: &mut impl Write, command: &str) -> S
         })
         .to_string(),
     );
-    let session = next(reading)["session"]
-        .as_str()
-        .expect("a session")
-        .to_owned();
+    let session = next(reading)["session"].as_str().expect("a session").to_owned();
     ask(
         writing,
-        &format!(
-            r#"{{"kind":"write","session":"{session}","data":{}}}"#,
-            serde_json::to_string(command).unwrap()
-        ),
+        &format!(r#"{{"kind":"write","session":"{session}","data":{}}}"#, serde_json::to_string(command).unwrap()),
     );
     session
 }
@@ -169,9 +150,7 @@ fn a_megabyte_of_output_is_coalesced_into_far_fewer_messages_than_chunks() {
     //
     // apack's Phase G measured the before, one bus event per pty chunk: 115 messages for 64 KiB, about 1,840
     // per MB (F4). The same corpus in the app now costs 6 messages for 64 KiB.
-    let budget = took.as_millis().div_ceil(OUTPUT_WINDOW.as_millis()) as usize
-        + bytes.div_ceil(OUTPUT_CAP)
-        + 1;
+    let budget = took.as_millis().div_ceil(OUTPUT_WINDOW.as_millis()) as usize + bytes.div_ceil(OUTPUT_CAP) + 1;
     assert!(
         messages <= budget,
         "a megabyte arrived as {messages} messages carrying {bytes} bytes, past the {budget} that \
@@ -231,9 +210,7 @@ fn a_saturating_producer_reports_that_it_was_throttled_rather_than_losing_output
             Some("output") if event["session"] == session.as_str() => {
                 bytes += event["data"].as_str().unwrap_or_default().len();
             }
-            Some("throttled") => {
-                waits.push(event["waited_us"].as_u64().expect("a wait in microseconds"))
-            }
+            Some("throttled") => waits.push(event["waited_us"].as_u64().expect("a wait in microseconds")),
             _ => {}
         }
         if !waits.is_empty() {
@@ -243,10 +220,7 @@ fn a_saturating_producer_reports_that_it_was_throttled_rather_than_losing_output
     }
 
     // The overload is reported rather than silent, which is what the goal requires of the bound
-    assert!(
-        !waits.is_empty(),
-        "a saturating producer reported no throttling after {bytes} bytes"
-    );
+    assert!(!waits.is_empty(), "a saturating producer reported no throttling after {bytes} bytes");
     // **And the report carries the wait it measured.** `as_millis` truncated a few hundred microseconds to
     // `0`, so every report read as "no wait" — a number that says nothing is worse than no number, because
     // whoever reads it concludes the mechanism misfired. That the waits are real is the other half of the
@@ -266,10 +240,7 @@ fn a_saturating_producer_reports_that_it_was_throttled_rather_than_losing_output
         }
     }
     // At least, not exactly: the shell's prompt and its echo of the command are output too
-    assert!(
-        bytes >= 67_108_864,
-        "output was dropped: {bytes} of 67108864 bytes"
-    );
+    assert!(bytes >= 67_108_864, "output was dropped: {bytes} of 67108864 bytes");
 }
 
 #[test]
@@ -280,10 +251,7 @@ fn an_answer_arrives_while_a_producer_is_saturating_the_channel() {
 
     // Let the channel fill, then ask a question whose answer must not queue behind a megabyte of output
     std::thread::sleep(std::time::Duration::from_millis(400));
-    ask(
-        &mut writing,
-        r#"{"kind":"write","session":"s-404","data":"x"}"#,
-    );
+    ask(&mut writing, r#"{"kind":"write","session":"s-404","data":"x"}"#);
 
     // This shows an answer arriving during saturation, which is worth having — but it does **not** by
     // itself prove the credit split: an answer that spent output's credit was measured arriving just as
@@ -301,9 +269,7 @@ fn an_answer_arrives_while_a_producer_is_saturating_the_channel() {
                 );
                 return;
             }
-            Some("output") if event["session"] == flooding.as_str() => {
-                outputs_before_the_answer += 1
-            }
+            Some("output") if event["session"] == flooding.as_str() => outputs_before_the_answer += 1,
             _ => {}
         }
     }
@@ -321,10 +287,7 @@ fn a_request_is_still_carried_out_while_output_has_filled_the_channel() {
     // not distinguish the credit split — see the module comment — but it does catch a request loop that
     // comes to depend on output draining.
     std::thread::sleep(std::time::Duration::from_millis(500));
-    ask(
-        &mut writing,
-        &format!(r#"{{"kind":"kill","session":"{session}"}}"#),
-    );
+    ask(&mut writing, &format!(r#"{{"kind":"kill","session":"{session}"}}"#));
 
     // Now drain. The kill must already have been carried out while the channel was full
     for _ in 0..8000 {

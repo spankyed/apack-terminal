@@ -63,11 +63,7 @@ pub enum Request {
     /// Bytes the user typed.
     Write { session: SessionId, data: String },
     /// The viewport changed. One size per session: a pty has one.
-    Resize {
-        session: SessionId,
-        cols: u16,
-        rows: u16,
-    },
+    Resize { session: SessionId, cols: u16, rows: u16 },
     /// **The screen as the broker has it**, with up to `history` lines above the viewport.
     ///
     /// This is the read that makes a session's state independent of a window: the broker parses the same
@@ -87,22 +83,14 @@ pub enum Request {
     /// A read of what is already parsed, bounded by the history asked for and by a cap on matches — so a
     /// caller looking for a prompt or an error pays a snapshot rather than a scan of everything a session
     /// ever wrote.
-    Search {
-        session: SessionId,
-        text: String,
-        history: u32,
-    },
+    Search { session: SessionId, text: String, history: u32 },
     /// **Waits for a session to reach a state, answering once.**
     ///
     /// The alternative is a caller asking `Facts` or `Screen` on a timer, which is the shape this repo
     /// refuses: the broker already knows when something arrived, so the condition is checked where the bytes
     /// land and nothing polls. `timeout_ms` is the caller's deadline — a wait that is never met answers
     /// `Timeout` rather than lasting for ever — and the answer comes exactly once however the race goes.
-    Wait {
-        session: SessionId,
-        until: Until,
-        timeout_ms: u32,
-    },
+    Wait { session: SessionId, until: Until, timeout_ms: u32 },
     /// End the session and its process tree.
     Kill { session: SessionId },
 }
@@ -184,10 +172,7 @@ pub enum Event {
     /// Bytes the process wrote. A feed: unprompted, and nobody asked for it.
     Output { session: SessionId, data: String },
     /// The process ended. `code` is absent when it was killed by a signal.
-    Exited {
-        session: SessionId,
-        code: Option<i32>,
-    },
+    Exited { session: SessionId, code: Option<i32> },
     /// **The channel was full and a flush had to wait.** Not a loss: output is held, the pty's buffer fills
     /// behind it, and the process feels it — so this says a producer was throttled, which the goal requires
     /// be observable rather than silent. Sent as an answer, so reporting the overload never queues behind
@@ -213,29 +198,13 @@ pub enum Event {
         alt_screen: bool,
     },
     /// What the shell reported about itself, answering `Facts`. Claims, not measurements.
-    Facts {
-        session: SessionId,
-        cwd: Option<String>,
-        command: Option<String>,
-        running: bool,
-        exit_status: Option<i32>,
-    },
+    Facts { session: SessionId, cwd: Option<String>, command: Option<String>, running: bool, exit_status: Option<i32> },
     /// Where a search found its text, answering `Search`.
-    Search {
-        session: SessionId,
-        matches: Vec<SearchMatch>,
-    },
+    Search { session: SessionId, matches: Vec<SearchMatch> },
     /// How a `Wait` ended. Sent once per wait, whichever way it ended.
-    Waited {
-        session: SessionId,
-        outcome: WaitOutcome,
-    },
+    Waited { session: SessionId, outcome: WaitOutcome },
     /// A request could not be carried out. `session` is absent when the request named none.
-    Failed {
-        session: Option<SessionId>,
-        code: ErrorCode,
-        message: String,
-    },
+    Failed { session: Option<SessionId>, code: ErrorCode, message: String },
 }
 
 /// **A closed set, generated into the TypeScript as a string union** — elmdb's `ErrorCode` arrangement, and

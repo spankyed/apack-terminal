@@ -105,10 +105,7 @@ pub struct Refusal {
 
 impl Refusal {
     fn pty(what: &str, error: impl std::fmt::Display) -> Self {
-        Self {
-            code: ErrorCode::Pty,
-            message: format!("{what}: {error}"),
-        }
+        Self { code: ErrorCode::Pty, message: format!("{what}: {error}") }
     }
 }
 
@@ -116,12 +113,7 @@ type Outcome = Result<(), Refusal>;
 
 impl Sessions {
     pub fn new(events: Sender<Outgoing>, credit: Arc<Credit>) -> Self {
-        Self {
-            next: 0,
-            live: HashMap::new(),
-            events,
-            credit,
-        }
+        Self { next: 0, live: HashMap::new(), events, credit }
     }
 
     /// Answers this connection, which a caller holding the lock can do without taking a second one.
@@ -140,12 +132,7 @@ impl Sessions {
         cwd: Option<String>,
     ) -> Result<(SessionId, u32), Refusal> {
         let pty = native_pty_system()
-            .openpty(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
+            .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
             .map_err(|error| Refusal::pty("opening a pty", error))?;
 
         let mut command = match shell {
@@ -163,23 +150,14 @@ impl Sessions {
         if let Some(directory) = cwd {
             command.cwd(directory);
         }
-        let mut child = pty
-            .slave
-            .spawn_command(command)
-            .map_err(|error| Refusal::pty("spawning a shell", error))?;
+        let mut child = pty.slave.spawn_command(command).map_err(|error| Refusal::pty("spawning a shell", error))?;
         // **The slave is dropped here on purpose**: holding it keeps its fd open, so the master never sees
         // EOF and the reader below would block for ever after the process exits.
         drop(pty.slave);
 
-        let reader = pty
-            .master
-            .try_clone_reader()
-            .map_err(|error| Refusal::pty("reading a pty", error))?;
-        let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(
-            pty.master
-                .take_writer()
-                .map_err(|error| Refusal::pty("writing to a pty", error))?,
-        ));
+        let reader = pty.master.try_clone_reader().map_err(|error| Refusal::pty("reading a pty", error))?;
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> =
+            Arc::new(Mutex::new(pty.master.take_writer().map_err(|error| Refusal::pty("writing to a pty", error))?));
 
         self.next += 1;
         let session = format!("s-{}", self.next);
@@ -250,9 +228,7 @@ impl Sessions {
                         // no window has to run, which is why the broker owns one.
                         for reply in replies {
                             if let Ok(mut writer) = answering.lock() {
-                                let _ = writer
-                                    .write_all(reply.as_bytes())
-                                    .and_then(|()| writer.flush());
+                                let _ = writer.write_all(reply.as_bytes()).and_then(|()| writer.flush());
                             }
                         }
                         if chunks.send(buffer[..read].to_vec()).is_err() {
@@ -285,38 +261,23 @@ impl Sessions {
                         Until::Exit => WaitOutcome::Met,
                         _ => WaitOutcome::Exited,
                     };
-                    let _ = exiting.send(Outgoing::answer(Event::Waited {
-                        session: waited.clone(),
-                        outcome,
-                    }));
+                    let _ = exiting.send(Outgoing::answer(Event::Waited { session: waited.clone(), outcome }));
                 }
             }
-            let _ = events.send(Outgoing::answer(Event::Exited {
-                session: reading,
-                code,
-            }));
+            let _ = events.send(Outgoing::answer(Event::Exited { session: reading, code }));
         });
 
         self.live.insert(
             session.clone(),
-            Session {
-                master: pty.master,
-                writer,
-                killer,
-                _tree: Tree::owning(pid),
-                waiters,
-                screen,
-            },
+            Session { master: pty.master, writer, killer, _tree: Tree::owning(pid), waiters, screen },
         );
         Ok((session, pid))
     }
 
     pub fn write(&mut self, session: &str, data: &str) -> Outcome {
         let live = self.live.get_mut(session).ok_or_else(|| missing(session))?;
-        let mut writer = live
-            .writer
-            .lock()
-            .map_err(|_| Refusal::pty("writing to a pty", "the writer's lock was poisoned"))?;
+        let mut writer =
+            live.writer.lock().map_err(|_| Refusal::pty("writing to a pty", "the writer's lock was poisoned"))?;
         writer
             .write_all(data.as_bytes())
             .and_then(|()| writer.flush())
@@ -326,12 +287,7 @@ impl Sessions {
     pub fn resize(&mut self, session: &str, cols: u16, rows: u16) -> Outcome {
         let live = self.live.get_mut(session).ok_or_else(|| missing(session))?;
         live.master
-            .resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
+            .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
             .map_err(|error| Refusal::pty("resizing a pty", error))?;
         // The screen is resized too, or the authority would describe a viewport the process no longer has
         if let Ok(mut screen) = live.screen.lock() {
@@ -343,32 +299,26 @@ impl Sessions {
     /// The screen as this session has it, with up to `history` lines above the viewport.
     pub fn snapshot(&self, session: &str, history: u32) -> Result<Snapshot, Refusal> {
         let live = self.live.get(session).ok_or_else(|| missing(session))?;
-        let screen = live
-            .screen
-            .lock()
-            .map_err(|_| Refusal::pty("reading a screen", "the screen's lock was poisoned"))?;
+        let screen =
+            live.screen.lock().map_err(|_| Refusal::pty("reading a screen", "the screen's lock was poisoned"))?;
         Ok(screen.snapshot(history))
     }
 
     /// What the shell has reported about itself.
     pub fn facts(&self, session: &str) -> Result<Facts, Refusal> {
         let live = self.live.get(session).ok_or_else(|| missing(session))?;
-        let screen = live.screen.lock().map_err(|_| {
-            Refusal::pty(
-                "reading a session's facts",
-                "the screen's lock was poisoned",
-            )
-        })?;
+        let screen = live
+            .screen
+            .lock()
+            .map_err(|_| Refusal::pty("reading a session's facts", "the screen's lock was poisoned"))?;
         Ok(screen.facts().clone())
     }
 
     /// Where `text` appears in the screen and the `history` lines above it.
     pub fn search(&self, session: &str, text: &str, history: u32) -> Result<Vec<Match>, Refusal> {
         let live = self.live.get(session).ok_or_else(|| missing(session))?;
-        let screen = live
-            .screen
-            .lock()
-            .map_err(|_| Refusal::pty("searching a screen", "the screen's lock was poisoned"))?;
+        let screen =
+            live.screen.lock().map_err(|_| Refusal::pty("searching a screen", "the screen's lock was poisoned"))?;
         Ok(screen.search(text, history))
     }
 
@@ -381,23 +331,18 @@ impl Sessions {
     pub fn wait(&mut self, session: &str, until: Until, timeout_ms: u32) -> Outcome {
         let live = self.live.get(session).ok_or_else(|| missing(session))?;
         let settled = Arc::new(AtomicBool::new(false));
-        let waiter = Waiter {
-            until,
-            settled: Arc::clone(&settled),
-        };
+        let waiter = Waiter { until, settled: Arc::clone(&settled) };
 
         let holds = {
-            let screen = live.screen.lock().map_err(|_| {
-                Refusal::pty("waiting on a session", "the screen's lock was poisoned")
-            })?;
+            let screen = live
+                .screen
+                .lock()
+                .map_err(|_| Refusal::pty("waiting on a session", "the screen's lock was poisoned"))?;
             waiter.holds(&screen)
         };
         if holds {
             settled.store(true, Ordering::SeqCst);
-            self.answer(Event::Waited {
-                session: session.to_string(),
-                outcome: WaitOutcome::Met,
-            });
+            self.answer(Event::Waited { session: session.to_string(), outcome: WaitOutcome::Met });
             return Ok(());
         }
 
@@ -413,10 +358,7 @@ impl Sessions {
             if settled.swap(true, Ordering::SeqCst) {
                 return;
             }
-            let _ = events.send(Outgoing::answer(Event::Waited {
-                session: deadline,
-                outcome: WaitOutcome::Timeout,
-            }));
+            let _ = events.send(Outgoing::answer(Event::Waited { session: deadline, outcome: WaitOutcome::Timeout }));
         });
         Ok(())
     }
@@ -425,9 +367,7 @@ impl Sessions {
     /// one exit, one event, whichever way the process ended.
     pub fn kill(&mut self, session: &str) -> Outcome {
         let mut live = self.live.remove(session).ok_or_else(|| missing(session))?;
-        live.killer
-            .kill()
-            .map_err(|error| Refusal::pty("killing a session", error))
+        live.killer.kill().map_err(|error| Refusal::pty("killing a session", error))
     }
 
     /// Drops the record of a session whose process has ended, which the writer thread does when it sees the
@@ -452,8 +392,5 @@ impl Sessions {
 }
 
 fn missing(session: &str) -> Refusal {
-    Refusal {
-        code: ErrorCode::NoSuchSession,
-        message: format!("no session {session}"),
-    }
+    Refusal { code: ErrorCode::NoSuchSession, message: format!("no session {session}") }
 }

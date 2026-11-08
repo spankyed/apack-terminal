@@ -30,10 +30,7 @@ fn main() -> std::io::Result<()> {
     let name = socket.as_str().to_fs_name::<GenericFilePath>()?;
     // `try_overwrite` replaces the socket a previous run left behind, which would otherwise refuse the bind:
     // the app owns one broker per data dir, so the path is ours to replace rather than to share
-    let listener = ListenerOptions::new()
-        .name(name)
-        .try_overwrite(true)
-        .create_sync()?;
+    let listener = ListenerOptions::new().name(name).try_overwrite(true).create_sync()?;
 
     // Ready on stdout before the first accept, so a parent knows when to connect rather than retrying
     println!("listening {socket}");
@@ -102,10 +99,7 @@ fn write_out(outgoing: Receiver<Outgoing>, broker: Broker) {
         let frame = serde_json::to_string(&message.event).ok();
         let attached = broker.feed.lock().ok().and_then(|feed| feed.clone());
         if let (Some(frame), Some(stream)) = (frame, attached.as_ref())
-            && (&**stream)
-                .write_all(frame.as_bytes())
-                .and_then(|()| (&**stream).write_all(b"\n"))
-                .is_err()
+            && (&**stream).write_all(frame.as_bytes()).and_then(|()| (&**stream).write_all(b"\n")).is_err()
         {
             // That client is gone; the next one to greet installs itself. Nothing is ended here, because
             // whether a client leaving ends the sessions is `Role`'s question and is answered in `serve`
@@ -121,9 +115,7 @@ fn write_out(outgoing: Receiver<Outgoing>, broker: Broker) {
 /// Takes `stream` out of the feed, if it is still the one attached.
 fn detach(broker: &Broker, stream: &Arc<Stream>) {
     if let Ok(mut feed) = broker.feed.lock()
-        && feed
-            .as_ref()
-            .is_some_and(|attached| Arc::ptr_eq(attached, stream))
+        && feed.as_ref().is_some_and(|attached| Arc::ptr_eq(attached, stream))
     {
         *feed = None;
     }
@@ -136,9 +128,7 @@ fn detach(broker: &Broker, stream: &Arc<Stream>) {
 /// refusal of the lifetime connection's malformed frame to whichever client happened to be attached.
 fn say(stream: &Arc<Stream>, event: &Event) {
     if let Ok(frame) = serde_json::to_string(event) {
-        let _ = (&**stream)
-            .write_all(frame.as_bytes())
-            .and_then(|()| (&**stream).write_all(b"\n"));
+        let _ = (&**stream).write_all(frame.as_bytes()).and_then(|()| (&**stream).write_all(b"\n"));
     }
 }
 
@@ -162,27 +152,14 @@ fn serve(stream: Stream, broker: Broker) {
         let request = match serde_json::from_str::<Request>(&line) {
             Ok(request) => request,
             Err(error) => {
-                say(
-                    &stream,
-                    &Event::Failed {
-                        session: None,
-                        code: ErrorCode::Malformed,
-                        message: format!("{error}"),
-                    },
-                );
+                say(&stream, &Event::Failed { session: None, code: ErrorCode::Malformed, message: format!("{error}") });
                 continue;
             }
         };
         // **The handshake is first or the connection is refused**, because the monorepo pins a commit of this
         // repository: a stale pin has to be a clear refusal rather than a message that means something else.
         match (&request, role) {
-            (
-                Request::Hello {
-                    protocol,
-                    role: asked,
-                },
-                _,
-            ) => {
+            (Request::Hello { protocol, role: asked }, _) => {
                 if *protocol != PROTOCOL_VERSION {
                     say(
                         &stream,
@@ -208,12 +185,7 @@ fn serve(stream: Stream, broker: Broker) {
                     }
                     Role::Lifetime => broker.owned.store(true, Ordering::SeqCst),
                 }
-                say(
-                    &stream,
-                    &Event::Hello {
-                        protocol: PROTOCOL_VERSION,
-                    },
-                );
+                say(&stream, &Event::Hello { protocol: PROTOCOL_VERSION });
                 continue;
             }
             (_, None) => {
@@ -276,30 +248,17 @@ fn carry_out(sessions: &Arc<Mutex<Sessions>>, request: Request) {
     };
     let outcome = match request {
         Request::Hello { .. } => return,
-        Request::Spawn {
-            cols,
-            rows,
-            shell,
-            args,
-            env,
-            cwd,
-        } => match live.spawn(cols, rows, shell, args, env, cwd) {
+        Request::Spawn { cols, rows, shell, args, env, cwd } => match live.spawn(cols, rows, shell, args, env, cwd) {
             Ok((session, pid)) => {
                 live.answer(Event::Spawned { session, pid });
                 Ok(())
             }
             Err(refusal) => Err((None, refusal)),
         },
-        Request::Write { session, data } => live
-            .write(&session, &data)
-            .map_err(|refusal| (Some(session), refusal)),
-        Request::Resize {
-            session,
-            cols,
-            rows,
-        } => live
-            .resize(&session, cols, rows)
-            .map_err(|refusal| (Some(session), refusal)),
+        Request::Write { session, data } => live.write(&session, &data).map_err(|refusal| (Some(session), refusal)),
+        Request::Resize { session, cols, rows } => {
+            live.resize(&session, cols, rows).map_err(|refusal| (Some(session), refusal))
+        }
         Request::Screen { session, history } => match live.snapshot(&session, history) {
             Ok(snapshot) => {
                 live.answer(Event::Screen {
@@ -326,21 +285,13 @@ fn carry_out(sessions: &Arc<Mutex<Sessions>>, request: Request) {
             }
             Err(refusal) => Err((Some(session), refusal)),
         },
-        Request::Search {
-            session,
-            text,
-            history,
-        } => match live.search(&session, &text, history) {
+        Request::Search { session, text, history } => match live.search(&session, &text, history) {
             Ok(found) => {
                 live.answer(Event::Search {
                     session,
                     matches: found
                         .into_iter()
-                        .map(|found| SearchMatch {
-                            line: found.line,
-                            column: found.column,
-                            text: found.text,
-                        })
+                        .map(|found| SearchMatch { line: found.line, column: found.column, text: found.text })
                         .collect(),
                 });
                 Ok(())
@@ -349,22 +300,12 @@ fn carry_out(sessions: &Arc<Mutex<Sessions>>, request: Request) {
         },
         // The answer is the `Waited` the wait itself sends, whenever it ends — so unlike every other
         // request this one is accepted here and answered later
-        Request::Wait {
-            session,
-            until,
-            timeout_ms,
-        } => live
-            .wait(&session, until, timeout_ms)
-            .map_err(|refusal| (Some(session), refusal)),
-        Request::Kill { session } => live
-            .kill(&session)
-            .map_err(|refusal| (Some(session), refusal)),
+        Request::Wait { session, until, timeout_ms } => {
+            live.wait(&session, until, timeout_ms).map_err(|refusal| (Some(session), refusal))
+        }
+        Request::Kill { session } => live.kill(&session).map_err(|refusal| (Some(session), refusal)),
     };
     if let Err((session, refusal)) = outcome {
-        live.answer(Event::Failed {
-            session,
-            code: refusal.code,
-            message: refusal.message,
-        });
+        live.answer(Event::Failed { session, code: refusal.code, message: refusal.message });
     }
 }
