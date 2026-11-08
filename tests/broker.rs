@@ -141,13 +141,19 @@ fn disconnect(reading: Events, mut writing: Wire) {
 /// A spawn frame: the default shell at a given size, with no launch arguments and nothing added to the
 /// environment. **One builder**, so a field added to `Request::Spawn` is one edit here and not ten.
 fn spawn_frame(cols: u16, rows: u16, shell: Option<&str>) -> String {
+    spawn_frame_with_env(cols, rows, shell, &[])
+}
+
+/// The same, with environment the shell needs. A case that drives a program which reads terminfo declares
+/// `TERM` here rather than inheriting whatever ran it — see the alternate-screen case.
+fn spawn_frame_with_env(cols: u16, rows: u16, shell: Option<&str>, env: &[(&str, &str)]) -> String {
     serde_json::json!({
         "kind": "spawn",
         "cols": cols,
         "rows": rows,
         "shell": shell,
         "args": [],
-        "env": [],
+        "env": env.iter().map(|(name, value)| [*name, *value]).collect::<Vec<_>>(),
         "cwd": null,
     })
     .to_string()
@@ -193,7 +199,13 @@ fn a_keystroke_reaches_a_pty_and_its_output_comes_back() {
     ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
     assert_eq!(next(&mut reading)["kind"], "hello", "the handshake is answered before anything else");
 
-    ask(&mut writing, &spawn_frame(80, 24, None));
+    // **A named shell, because this case is about the round trip and not about shell discovery.** Spawning
+    // the platform's default made it depend on whatever shell the machine's account points at and whatever
+    // that shell does on a profile it has never seen — a first-run wizard swallows the keystroke, and the
+    // case times out waiting for an echo that was never coming. It failed on macOS CI and on no developer's
+    // machine. `a_shell_is_started_with_the_arguments_and_environment_it_was_asked_for` is the case whose
+    // subject *is* the shell.
+    ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
     let spawned = next(&mut reading);
     assert_eq!(spawned["kind"], "spawned");
     let session = spawned["session"].as_str().expect("a session id").to_owned();
@@ -509,7 +521,13 @@ fn an_alternate_screen_app_survives_a_resize_and_keeps_answering() {
     let (mut reading, mut writing) = connect(&broker);
     ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
     next(&mut reading);
-    ask(&mut writing, &spawn_frame(80, 24, None));
+    // **`TERM` is declared rather than inherited, and that is the whole of what made this case
+    // environment-dependent.** `less` reads terminfo to decide whether it may use the alternate screen at
+    // all: with `TERM` unset or `dumb` it stays on the primary one and emits no `[?1049h`, so the case
+    // times out waiting for a switch that was never going to happen. A developer's run inherited their
+    // terminal's `TERM` and passed; CI has no terminal, and this failed on the first run there. The app
+    // declares the same variable for the same reason (X13).
+    ask(&mut writing, &spawn_frame_with_env(80, 24, Some(DEFAULT_SHELL), &[("TERM", "xterm-256color")]));
     let spawned = next(&mut reading);
     let session = spawned["session"].as_str().expect("a session").to_owned();
     let shell = spawned["pid"].as_u64().expect("a pid") as i32;

@@ -1,0 +1,6 @@
+# **`cargo xtask <task>` is this alias and nothing else.** Without it the command does not exist, which is
+# how the first CI run failed: every document here says to run `cargo xtask pre-push` before a push, and
+# locally it had only ever been run as `cargo run -p xtask --`, so nothing had exercised the spelling that
+# was written down. `error: no such command: xtask`.
+[alias]
+xtask = "run --quiet --package xtask --"
