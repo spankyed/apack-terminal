@@ -52,6 +52,13 @@ A broker nobody is connected to exits. The count is taken from the accept rather
 which is what makes zero a safe moment: a caller that has connected and not yet greeted is already counted,
 so it cannot be hung up on by a broker deciding nobody wants it.
 
+## Output is text, and the scrollback is one number
+
+Both are in [protocol.md](protocol.md): the broker forwards decoded text because both ends replace an
+invalid sequence identically and nothing here consumes bytes (base64 was measured and is *larger* on real
+output), and `hello` answers the history the broker keeps so a consumer's scrollback is derived rather than
+pinned a second time.
+
 ## Output is coalesced and bounded
 
 The reader does not decide what a message is. It hands what one `read` returned to the coalescer, which

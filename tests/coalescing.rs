@@ -33,8 +33,8 @@ fn seen(chunks: &[&[u8]], ending: bool) -> String {
 
     let mut text = String::new();
     while let Ok(out) = answers.recv_timeout(Duration::from_secs(2)) {
-        if let Event::Output { data, .. } = out.event {
-            text.push_str(&data);
+        if let Event::Output { text: chunk, .. } = out.event {
+            text.push_str(&chunk);
         }
     }
     text

@@ -10,7 +10,7 @@ export type ErrorCode = "HANDSHAKE" | "MALFORMED" | "NO_SUCH_SESSION" | "PTY";
 /**
  * What the broker tells the app, unprompted or in answer.
  */
-export type Event = { "kind": "hello", protocol: number, } | { "kind": "spawned", session: string, pid: number, } | { "kind": "output", session: string, data: string, } | { "kind": "exited", session: string, code: number | null, } | { "kind": "throttled", session: string, waited_us: number, } | { "kind": "screen", session: string, lines: Array<string>, 
+export type Event = { "kind": "hello", protocol: number, history: number, } | { "kind": "spawned", session: string, pid: number, } | { "kind": "output", session: string, text: string, } | { "kind": "exited", session: string, code: number | null, } | { "kind": "throttled", session: string, waited_us: number, } | { "kind": "screen", session: string, lines: Array<string>, 
 /**
  * Within the viewport, so `0` is its first line however much history came with it.
  */
@@ -27,7 +27,7 @@ args: Array<string>,
 /**
  * Added to the environment the broker runs in, which is already stripped of the app's own
  */
-env: Array<[string, string]>, cwd: string | null, } | { "kind": "write", session: string, data: string, } | { "kind": "resize", session: string, cols: number, rows: number, } | { "kind": "screen", session: string, history: number, } | { "kind": "facts", session: string, } | { "kind": "search", session: string, text: string, history: number, } | { "kind": "wait", session: string, until: Until, timeout_ms: number, } | { "kind": "kill", session: string, };
+env: Array<[string, string]>, cwd: string | null, } | { "kind": "write", session: string, text: string, } | { "kind": "resize", session: string, cols: number, rows: number, } | { "kind": "screen", session: string, history: number, } | { "kind": "facts", session: string, } | { "kind": "search", session: string, text: string, history: number, } | { "kind": "wait", session: string, until: Until, timeout_ms: number, } | { "kind": "kill", session: string, };
 
 /**
  * What a connection is for.

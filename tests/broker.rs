@@ -216,7 +216,7 @@ fn a_keystroke_reaches_a_pty_and_its_output_comes_back() {
     ask(
         &mut writing,
         &format!(
-            r#"{{"kind":"write","session":"{session}","data":{}}}"#,
+            r#"{{"kind":"write","session":"{session}","text":{}}}"#,
             serde_json::to_string(&format!("echo skeleton-probe{SUBMIT}")).expect("a JSON string")
         ),
     );
@@ -224,7 +224,7 @@ fn a_keystroke_reaches_a_pty_and_its_output_comes_back() {
     for _ in 0..200 {
         let event = next(&mut reading);
         if event["kind"] == "output" {
-            output.push_str(event["data"].as_str().unwrap_or_default());
+            output.push_str(event["text"].as_str().unwrap_or_default());
             if output.matches("skeleton-probe").count() >= 2 {
                 break;
             }
@@ -250,7 +250,7 @@ fn a_request_for_a_session_that_does_not_exist_is_refused_by_code() {
     ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
     next(&mut reading);
 
-    ask(&mut writing, r#"{"kind":"write","session":"s-404","data":"x"}"#);
+    ask(&mut writing, r#"{"kind":"write","session":"s-404","text":"x"}"#);
     let failed = next(&mut reading);
     assert_eq!(failed["kind"], "failed");
     // A code, not a message: a caller switches on something the compiler knows
@@ -285,6 +285,27 @@ fn a_mismatched_protocol_is_refused_at_the_handshake() {
     assert!(failed["message"].as_str().unwrap_or_default().contains("999"), "{failed}");
 }
 
+/// **The handshake answers the one scrollback number**, which is the broker's because the broker is what
+/// has to answer for it: a consumer's emulator holds whatever it was sent while attached, and this holds
+/// every session's whether or not anyone is drawing one. Two independent constants is what this replaced —
+/// 10,000 in the window against 1,000 here, so closing and reopening a window silently lost nine tenths of
+/// the scrollback. Asserted against `HISTORY_LINES` so the wire cannot drift from what the screen keeps.
+#[test]
+fn the_handshake_says_how_much_history_the_broker_keeps() {
+    let broker = start();
+    let (mut reading, mut writing) = connect(&broker);
+
+    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    let greeting = next(&mut reading);
+
+    assert_eq!(greeting["kind"], "hello");
+    assert_eq!(
+        greeting["history"].as_u64(),
+        Some(apack_terminal::screen::HISTORY_LINES as u64),
+        "the handshake's history is not what the screen keeps: {greeting}"
+    );
+}
+
 #[test]
 fn nothing_can_be_asked_before_the_handshake() {
     let broker = start();
@@ -307,7 +328,7 @@ fn a_shell_that_exits_on_its_own_is_reported_without_anything_polling_for_it() {
     ask(
         &mut writing,
         &format!(
-            r#"{{"kind":"write","session":"{session}","data":{}}}"#,
+            r#"{{"kind":"write","session":"{session}","text":{}}}"#,
             serde_json::to_string(&format!("exit{SUBMIT}")).expect("a JSON string")
         ),
     );
@@ -471,7 +492,7 @@ fn killing_a_session_takes_the_whole_tree_with_it() {
     ask(
         &mut writing,
         &format!(
-            r#"{{"kind":"write","session":"{session}","data":{}}}"#,
+            r#"{{"kind":"write","session":"{session}","text":{}}}"#,
             serde_json::to_string(&long_lived_grandchild(&pid_file)).expect("a JSON string")
         ),
     );
@@ -500,7 +521,7 @@ fn a_session_is_cancellable_while_its_shell_is_busy() {
     ask(
         &mut writing,
         &format!(
-            r#"{{"kind":"write","session":"{session}","data":"trap '' INT TERM; while true; do sleep 1; done\n"}}"#
+            r#"{{"kind":"write","session":"{session}","text":"trap '' INT TERM; while true; do sleep 1; done\n"}}"#
         ),
     );
     std::thread::sleep(std::time::Duration::from_millis(400));
@@ -535,12 +556,12 @@ fn an_alternate_screen_app_survives_a_resize_and_keeps_answering() {
     // `less` on the alternate screen: Phase B names this as where resize mistakes surface, because an app
     // that owns the whole screen redraws it on SIGWINCH rather than carrying on at a prompt. `vim` is the
     // other case and needs an installed vim; `less` ships with the OS.
-    ask(&mut writing, &format!(r#"{{"kind":"write","session":"{session}","data":"seq 1 500 | less\n"}}"#));
+    ask(&mut writing, &format!(r#"{{"kind":"write","session":"{session}","text":"seq 1 500 | less\n"}}"#));
     let entered = (0..600).any(|_| {
         let event = next(&mut reading);
         // `\x1b[?1049h` is the alternate screen; `\x1b[?47h` is the older form some builds use
         event["kind"] == "output"
-            && event["data"].as_str().is_some_and(|data| data.contains("[?1049h") || data.contains("[?47h"))
+            && event["text"].as_str().is_some_and(|data| data.contains("[?1049h") || data.contains("[?47h"))
     });
     assert!(entered, "less never switched to the alternate screen");
 
@@ -555,11 +576,11 @@ fn an_alternate_screen_app_survives_a_resize_and_keeps_answering() {
     assert!(alive(shell), "the shell did not survive a resize under an alternate-screen app");
 
     // And it is still taking input: `q` leaves less, which ends the shell's foreground job
-    ask(&mut writing, &format!(r#"{{"kind":"write","session":"{session}","data":"q"}}"#));
+    ask(&mut writing, &format!(r#"{{"kind":"write","session":"{session}","text":"q"}}"#));
     let left = (0..600).any(|_| {
         let event = next(&mut reading);
         event["kind"] == "output"
-            && event["data"].as_str().is_some_and(|data| data.contains("[?1049l") || data.contains("[?47l"))
+            && event["text"].as_str().is_some_and(|data| data.contains("[?1049l") || data.contains("[?47l"))
     });
     assert!(left, "less never left the alternate screen, so it had stopped reading input");
 }
@@ -583,7 +604,7 @@ fn a_session_answers_a_bounded_screen_read() {
     ask(
         &mut writing,
         &format!(
-            r#"{{"kind":"write","session":"{session}","data":{}}}"#,
+            r#"{{"kind":"write","session":"{session}","text":{}}}"#,
             serde_json::to_string(&ten_lines()).expect("a JSON string")
         ),
     );
@@ -591,7 +612,7 @@ fn a_session_answers_a_bounded_screen_read() {
     for _ in 0..400 {
         let event = next(&mut reading);
         if event["kind"] == "output" {
-            seen.push_str(event["data"].as_str().unwrap_or_default());
+            seen.push_str(event["text"].as_str().unwrap_or_default());
             if seen.contains("line-10") {
                 break;
             }
@@ -656,14 +677,14 @@ fn writing_to_a_session_whose_shell_has_gone_is_refused() {
     ask(
         &mut writing,
         &format!(
-            r#"{{"kind":"write","session":"{session}","data":{}}}"#,
+            r#"{{"kind":"write","session":"{session}","text":{}}}"#,
             serde_json::to_string(&format!("exit{SUBMIT}")).expect("a JSON string")
         ),
     );
     until(&mut reading, "exited");
 
     // Straight after the exit, which is the window ConPTY is documented to be unhappy in
-    ask(&mut writing, &format!(r#"{{"kind":"write","session":"{session}","data":"x"}}"#));
+    ask(&mut writing, &format!(r#"{{"kind":"write","session":"{session}","text":"x"}}"#));
     let refused = until(&mut reading, "failed").0;
     assert_eq!(refused["code"], "NO_SUCH_SESSION");
 
@@ -711,7 +732,7 @@ fn a_shell_is_started_with_the_arguments_and_environment_it_was_asked_for() {
     for _ in 0..200 {
         let event = next(&mut reading);
         if event["kind"] == "output" && event["session"] == session.as_str() {
-            seen.push_str(event["data"].as_str().unwrap_or_default());
+            seen.push_str(event["text"].as_str().unwrap_or_default());
         }
         if seen.contains("marker=") {
             break;
@@ -745,7 +766,7 @@ fn once_the_sentinel_is_printed(reading: &mut Events) {
     for _ in 0..400 {
         let event = next(reading);
         if event["kind"] == "output" {
-            output.push_str(event["data"].as_str().unwrap_or_default());
+            output.push_str(event["text"].as_str().unwrap_or_default());
             if output.contains("READY") {
                 return;
             }
@@ -770,7 +791,7 @@ fn types(writing: &mut impl Write, session: &str, data: &str) {
     ask(
         writing,
         &format!(
-            r#"{{"kind":"write","session":"{session}","data":{}}}"#,
+            r#"{{"kind":"write","session":"{session}","text":{}}}"#,
             serde_json::to_string(data).expect("a JSON string")
         ),
     );
@@ -995,7 +1016,7 @@ fn output_follows_the_client_that_came_back() {
     for _ in 0..400 {
         let event = next(&mut reading);
         if event["kind"] == "output" {
-            output.push_str(event["data"].as_str().unwrap_or_default());
+            output.push_str(event["text"].as_str().unwrap_or_default());
             if output.contains("back-on-the-feed") {
                 return;
             }
@@ -1048,7 +1069,7 @@ fn an_owner_arriving_does_not_take_the_feed_from_a_client() {
     for _ in 0..400 {
         let event = next(&mut reading);
         if event["kind"] == "output" {
-            output.push_str(event["data"].as_str().unwrap_or_default());
+            output.push_str(event["text"].as_str().unwrap_or_default());
             if output.contains("still-mine") {
                 return;
             }
@@ -1147,7 +1168,7 @@ fn a_windows_shell_reports_itself_when_started_with_an_integration_file() {
     for _ in 0..600 {
         let event = next(&mut reading);
         if event["kind"] == "output" {
-            output.push_str(event["data"].as_str().unwrap_or_default());
+            output.push_str(event["text"].as_str().unwrap_or_default());
             if output.contains("\u{1b}]633;B") {
                 break;
             }
@@ -1161,7 +1182,7 @@ fn a_windows_shell_reports_itself_when_started_with_an_integration_file() {
     for _ in 0..600 {
         let event = next(&mut reading);
         if event["kind"] == "output" {
-            output.push_str(event["data"].as_str().unwrap_or_default());
+            output.push_str(event["text"].as_str().unwrap_or_default());
             if output.matches("\u{1b}]633;P;Cwd=").count() >= 2 {
                 break;
             }

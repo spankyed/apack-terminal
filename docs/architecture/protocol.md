@@ -75,6 +75,43 @@ Lines in a `screen` are **text, not cells**: a wide character appears once rathe
 it occupies, and the padding a row carries to its full width is not there. What it answers is what was
 written, which is what matching against it means.
 
+## What crosses as output is text, and that is a decision
+
+**The broker forwards decoded text, not bytes.** Both ends are terminal emulators — `alacritty_terminal`
+here, the consumer's in its window — and both replace an invalid UTF-8 sequence with U+FFFD independently,
+so a byte-exact pipe would show the user exactly what this does. Nothing in this protocol consumes raw
+bytes either: `screen` answers lines, a search is over text, a marker is a claim. The field is named `text`
+for that reason; it was `data`, which reads as bytes to everyone.
+
+A sequence **split across two reads** is a different matter and is not lossy: the coalescer holds an
+incomplete trailing sequence back until it completes (`output::sendable`), so the only thing ever replaced
+is what was never valid. Before that, `é` arriving as `a\xC3` then `\xA9b` was delivered with both halves
+replaced.
+
+**Why not base64 or a binary frame — measured 2026-11-08.** JSON escapes a control byte as `\u001b`, six
+bytes for one, so its cost is `1 + 5 ×` the control-byte fraction, against base64's flat 1.33×. The
+crossover is 6.7% control bytes, and real terminal output sits below it:
+
+| sample | control bytes | JSON | base64 |
+|---|---|---|---|
+| ordinary build output | 1.1% | **1.01×** | 1.33× |
+| `ls --color` | 6.5% | **1.22×** | 1.33× |
+| a full-screen TUI redraw | 2.4% | **1.12×** | 1.33× |
+
+So base64 would make every one of those *larger* and cost the frames their readability, which this protocol
+values. Revisit only with a measurement showing sustained output above that crossover.
+
+## The scrollback is one number, and the handshake answers it
+
+`hello` carries `history`: how many lines the broker keeps for every session, drawn or not. A consumer sets
+its emulator's scrollback from it rather than pinning its own, because anything beyond it cannot survive a
+reattach — the broker is what answers a `screen` read when no window holds the bytes.
+
+Two independent constants is what this replaced: 10,000 in apack's window against `HISTORY_LINES` of 1,000
+here, so closing and reopening a window silently lost nine tenths of the scrollback. Raising the broker's is
+a measured decision about its own memory — `alacritty_terminal` holds a grid per session — not a number to
+pick twice.
+
 ## Errors are a closed set
 
 `ErrorCode` generates as a TypeScript string union, so a caller switches on a value the compiler knows

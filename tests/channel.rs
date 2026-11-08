@@ -105,7 +105,7 @@ fn run(reading: &mut impl BufRead, writing: &mut impl Write, command: &str) -> S
     let session = next(reading)["session"].as_str().expect("a session").to_owned();
     ask(
         writing,
-        &format!(r#"{{"kind":"write","session":"{session}","data":{}}}"#, serde_json::to_string(command).unwrap()),
+        &format!(r#"{{"kind":"write","session":"{session}","text":{}}}"#, serde_json::to_string(command).unwrap()),
     );
     session
 }
@@ -149,7 +149,7 @@ fn output_is_coalesced_up_to_the_cap_rather_than_to_some_smaller_size() {
     while bytes < 1_048_576 {
         let event = next(&mut reading);
         if event["kind"] == "output" && event["session"] == session.as_str() {
-            let held = event["data"].as_str().unwrap_or_default().len();
+            let held = event["text"].as_str().unwrap_or_default().len();
             bytes += held;
             largest = largest.max(held);
         }
@@ -175,7 +175,7 @@ fn a_megabyte_of_output_is_coalesced_into_far_fewer_messages_than_chunks() {
         let event = next(&mut reading);
         if event["kind"] == "output" && event["session"] == session.as_str() {
             messages += 1;
-            bytes += event["data"].as_str().unwrap_or_default().len();
+            bytes += event["text"].as_str().unwrap_or_default().len();
         }
     }
     let took = started.elapsed();
@@ -216,7 +216,7 @@ fn a_producer_nobody_is_holding_up_reports_no_throttling() {
         let event = next(&mut reading);
         match event["kind"].as_str() {
             Some("output") if event["session"] == session.as_str() => {
-                bytes += event["data"].as_str().unwrap_or_default().len();
+                bytes += event["text"].as_str().unwrap_or_default().len();
             }
             Some("throttled") => throttles.push(event["waited_us"].as_u64().unwrap_or_default()),
             _ => {}
@@ -246,7 +246,7 @@ fn a_saturating_producer_reports_that_it_was_throttled_rather_than_losing_output
         let event = next(&mut reading);
         match event["kind"].as_str() {
             Some("output") if event["session"] == session.as_str() => {
-                bytes += event["data"].as_str().unwrap_or_default().len();
+                bytes += event["text"].as_str().unwrap_or_default().len();
             }
             Some("throttled") => waits.push(event["waited_us"].as_u64().expect("a wait in microseconds")),
             _ => {}
@@ -274,7 +274,7 @@ fn a_saturating_producer_reports_that_it_was_throttled_rather_than_losing_output
     while bytes < 67_108_864 {
         let event = next(&mut reading);
         if event["kind"] == "output" && event["session"] == session.as_str() {
-            bytes += event["data"].as_str().unwrap_or_default().len();
+            bytes += event["text"].as_str().unwrap_or_default().len();
         }
     }
     // At least, not exactly: the shell's prompt and its echo of the command are output too
@@ -289,7 +289,7 @@ fn an_answer_arrives_while_a_producer_is_saturating_the_channel() {
 
     // Let the channel fill, then ask a question whose answer must not queue behind a megabyte of output
     std::thread::sleep(std::time::Duration::from_millis(400));
-    ask(&mut writing, r#"{"kind":"write","session":"s-404","data":"x"}"#);
+    ask(&mut writing, r#"{"kind":"write","session":"s-404","text":"x"}"#);
 
     // This shows an answer arriving during saturation, which is worth having — but it does **not** by
     // itself prove the credit split: an answer that spent output's credit was measured arriving just as

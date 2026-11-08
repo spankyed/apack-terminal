@@ -20,6 +20,7 @@ use interprocess::local_socket::{GenericFilePath, ListenerOptions, Stream, ToFsN
 
 use apack_terminal::output::{Outgoing, channel_with_credit};
 use apack_terminal::protocol::{ErrorCode, Event, PROTOCOL_VERSION, Request, Role, SearchMatch};
+use apack_terminal::screen::HISTORY_LINES;
 use apack_terminal::session::Sessions;
 
 fn main() -> std::io::Result<()> {
@@ -185,7 +186,7 @@ fn serve(stream: Stream, broker: Broker) {
                     }
                     Role::Lifetime => broker.owned.store(true, Ordering::SeqCst),
                 }
-                say(&stream, &Event::Hello { protocol: PROTOCOL_VERSION });
+                say(&stream, &Event::Hello { protocol: PROTOCOL_VERSION, history: HISTORY_LINES as u32 });
                 continue;
             }
             (_, None) => {
@@ -255,7 +256,7 @@ fn carry_out(sessions: &Arc<Mutex<Sessions>>, request: Request) {
             }
             Err(refusal) => Err((None, refusal)),
         },
-        Request::Write { session, data } => live.write(&session, &data).map_err(|refusal| (Some(session), refusal)),
+        Request::Write { session, text } => live.write(&session, &text).map_err(|refusal| (Some(session), refusal)),
         Request::Resize { session, cols, rows } => {
             live.resize(&session, cols, rows).map_err(|refusal| (Some(session), refusal))
         }

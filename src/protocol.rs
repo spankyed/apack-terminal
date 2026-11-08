@@ -59,7 +59,9 @@ pub enum Request {
         cwd: Option<String>,
     },
     /// Bytes the user typed.
-    Write { session: SessionId, data: String },
+    /// `text`, not `data`: what crosses here is decoded text, which is the contract and not an accident.
+    /// See `Event::Output`.
+    Write { session: SessionId, text: String },
     /// The viewport changed. One size per session: a pty has one.
     Resize { session: SessionId, cols: u16, rows: u16 },
     /// **The screen as the broker has it**, with up to `history` lines above the viewport.
@@ -164,11 +166,34 @@ pub struct SearchMatch {
 #[ts(export, export_to = "protocol.ts")]
 pub enum Event {
     /// The broker's own version, answering `Hello`.
-    Hello { protocol: u32 },
+    /// The broker's own version, and the history it keeps.
+    ///
+    /// **`history` is the one scrollback number, and it is the broker's because the broker is what has to
+    /// answer for it.** A consumer's emulator holds whatever it was sent while attached; the broker holds
+    /// `HISTORY_LINES` for every session whether or not anyone is drawing one. A consumer that scrolled
+    /// further back than this would be showing lines that cannot survive a reattach — which is what two
+    /// independent constants produced: 10,000 in the window against 1,000 here, so closing and reopening a
+    /// window silently lost nine tenths of the scrollback. Taken from the handshake rather than pinned in
+    /// both places, so the two cannot drift.
+    Hello { protocol: u32, history: u32 },
     /// A session exists and its process is running.
     Spawned { session: SessionId, pid: u32 },
     /// Bytes the process wrote. A feed: unprompted, and nobody asked for it.
-    Output { session: SessionId, data: String },
+    /// Bytes the process wrote, **as text**.
+    ///
+    /// **The broker forwards decoded text, not bytes, and that is a decision rather than a compromise.**
+    /// Both ends are terminal emulators — `alacritty_terminal` here, the consumer's in its window — and both
+    /// replace an invalid sequence with U+FFFD independently, so a byte-exact pipe would show the user
+    /// exactly what this does. Nothing in this protocol consumes raw bytes either: `Screen` answers lines,
+    /// a search is over text, and a marker is a claim. A sequence split across two reads is held back until
+    /// it completes (`output::sendable`), so the only thing replaced is what was never valid.
+    ///
+    /// **Measured 2026-11-08, which is why this is not base64 or a binary frame.** JSON escapes a control
+    /// byte as `\u001b`, six bytes for one, so its cost is `1 + 5 x` the control-byte fraction; base64 is a
+    /// flat 1.33x. The crossover is 6.7% control bytes, and real terminal output sits below it: ordinary
+    /// build output 1.1% (1.01x), `ls --color` 6.5% (1.22x), a full-screen TUI redraw 2.4% (1.12x). Base64
+    /// would make every one of those *larger*, and cost the frames their readability.
+    Output { session: SessionId, text: String },
     /// The process ended. `code` is absent when it was killed by a signal.
     Exited { session: SessionId, code: Option<i32> },
     /// **The channel was full and a flush had to wait.** Not a loss: output is held, the pty's buffer fills

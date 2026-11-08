@@ -144,7 +144,7 @@ pub fn coalesce(session: String, chunks: Receiver<Vec<u8>>, outgoing: Sender<Out
             return true;
         }
         let waited = credit.take();
-        let data = String::from_utf8_lossy(&buffer[..cut]).into_owned();
+        let text = String::from_utf8_lossy(&buffer[..cut]).into_owned();
         buffer.drain(..cut);
         if waited > Duration::ZERO {
             // The overload is reported rather than silent, and it is a *wait* rather than a loss: the pty's
@@ -159,7 +159,7 @@ pub fn coalesce(session: String, chunks: Receiver<Vec<u8>>, outgoing: Sender<Out
         }
         outgoing
             .send(Outgoing {
-                event: Event::Output { session: session.clone(), data },
+                event: Event::Output { session: session.clone(), text },
                 credit: Some(Arc::clone(credit)),
             })
             .is_ok()
