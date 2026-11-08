@@ -18,5 +18,18 @@ slow-timeout = { period = "10s", terminate-after = 2 }
 filter = "test(=a_saturating_producer_reports_that_it_was_throttled_rather_than_losing_output)"
 slow-timeout = { period = "30s", terminate-after = 2 }
 
+# **ts-rs generates one `export_bindings_*` test per exported type, and every one of them writes the same
+# file.** Under `cargo test` they were threads in one process and the writes interleaved harmlessly often
+# enough; as separate processes they truncate and write `bindings/protocol.ts` on top of each other, and one
+# of them reads back a file another had just emptied. It failed on the first full run after this file existed.
+# A group of one thread is the fix rather than a lock in the tests: nothing about these is concurrent on
+# purpose, and `cargo xtask generate` runs them for their side effect alone.
+[test-groups]
+protocol-export = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = "test(/^protocol::export_bindings_/)"
+test-group = "protocol-export"
+
 [profile.ci]
 fail-fast = false
