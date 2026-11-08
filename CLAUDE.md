@@ -17,6 +17,7 @@ holds.
 | `src/lib.rs` | so the parser can be tested as a parser |
 | `protocol/protocol.ts` | **generated** from `src/protocol.rs`; never edited by hand |
 | `xtask/` | the repository's own tasks (`cargo xtask <task>`): the protocol's derivation, and pre-push |
+| `node/` | the npm package a consumer installs: where the binary is, and the binary `cargo xtask package` stages into it |
 
 ## Checks
 
@@ -32,6 +33,7 @@ cargo clippy --workspace --all-targets -- -D warnings    # the gate is zero warn
 cargo fmt --all --check                      # the layout rustfmt.toml pins, which is elmdb's
 cargo xtask generate                         # re-derive protocol/protocol.ts from src/protocol.rs
 cargo xtask check-generated                  # fails when that file has fallen behind
+cargo xtask package                          # release build, staged into the npm package in node/
 ```
 
 - **Changed a protocol type?** `cargo xtask generate`, and commit `protocol/protocol.ts`. It is one place
@@ -41,6 +43,12 @@ cargo xtask check-generated                  # fails when that file has fallen b
   there), so a stale copy here is a stale copy in both.
 - **Changed anything a consumer pins?** The pin is a commit of this repository, so a stale pin has to fail
   loudly rather than behave strangely. That is what `PROTOCOL_VERSION` and the `hello` exchange are for.
+- **The broker reaches a consumer as an npm package**, `node/`, whose one job is answering where the binary
+  is: the name differs by platform and a consumer that derived the path itself was wrong about the
+  extension on Windows, so the terminal never started there. `cargo xtask package` stages a release build
+  into it; the binary is gitignored, as elmdb gitignores the `*.node` its own package ships. A development
+  checkout does not use it — the consumer prefers the debug build in `target/`, which is what a
+  contributor editing the broker has.
 - **Each test runs in its own process**, so a regression that loses a signal is killed at its deadline
   instead of hanging the run (`.config/nextest.toml`). A deadline there is several times the slowest
   reading, never near it: it is for a test that has stopped ending at all.

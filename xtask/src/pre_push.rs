@@ -2,7 +2,8 @@
 //! fails. What a push would have CI find is found here instead, the change's mutants included, which nothing
 //! else runs before a push.
 //!
-//! What it cannot run is CI's alone: the Windows and Linux suites. Everything in `src/tree.rs` and every
+//! What it cannot run is CI's alone: the Windows and Linux suites, and the stage of this platform's binary
+//! on each of the others. Everything in `src/tree.rs` and every
 //! ConPTY claim is Windows-only by construction, so a change there is proven by a Windows run or not at all
 //! (`CLAUDE.md`, "A platform claim is made on that platform").
 
@@ -121,6 +122,11 @@ pub fn pre_push(root: &Path, args: &[String], checks: &[Check<'_>]) -> Result<()
     for step in THEN {
         run(root, step)?;
     }
+    // The release build and the stage, which is how the broker reaches a packaged app. Last of the checks
+    // because it is the longest, and before the mutants because a mutants run that cannot build is a
+    // failure about the build
+    println!("pre-push: npm package");
+    crate::package::package(root)?;
     mutants_of_the_change(root, &base)?;
     println!("pre-push: everything passed in {:.0?}", started.elapsed());
     Ok(())

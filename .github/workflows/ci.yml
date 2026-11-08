@@ -88,6 +88,14 @@ jobs:
       # Each test in its own process, killed at `.config/nextest.toml`'s deadline: a regression here loses a
       # signal, which is a read that never returns rather than a wrong answer
       - run: cargo nextest run --workspace --profile ci
+      # The npm package with this platform's binary in it, which is how the broker reaches a packaged app.
+      # Staged on every platform because the binary's *name* is what was wrong before: `cargo` writes
+      # `apack-terminal.exe` on Windows, and a consumer looking for the extensionless name there found
+      # nothing and started no terminal
+      - run: cargo xtask package
+      - name: the package holds a binary
+        run: test -x "node/apack-terminal" || test -f "node/apack-terminal.exe"
+        shell: bash
 
   # The one check a merge waits on: every job above passed or was skipped (a documentation-only change)
   ci-pass:

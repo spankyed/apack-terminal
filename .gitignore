@@ -6,3 +6,9 @@
 # writes; a bare `cargo test` writes here instead, and a tracked copy of a generated contract is a second
 # answer that goes stale without anyone reading it.
 /bindings
+
+# The broker binary `cargo xtask package` stages into the npm package (`node/`). It is a build output like
+# anything under `target/`, and which platform's binary a checkout holds is a fact about that machine — as
+# elmdb gitignores the `*.node` its own package ships.
+/node/apack-terminal
+/node/apack-terminal.exe

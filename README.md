@@ -56,6 +56,17 @@ cargo test
 Consumed by pinning a commit: apack keeps a gitignored `vendor/apack-terminal` symlink beside a committed
 `vendor/apack-terminal.rev`, and derives one Rust toolchain across every checkout linked that way.
 
+**The binary reaches a consumer as an npm package.** `node/` is that package, and its one job is answering
+where the binary is — the name differs by platform, and a consumer that derived the path itself was wrong
+about `apack-terminal.exe` and started no terminal on Windows. `cargo xtask package` stages a release build
+into it; apack installs it as `file:…/vendor/apack-terminal/node`, so its packaged app collects the binary
+with every other dependency rather than needing a rule of its own.
+
+```js
+const { brokerBinary } = require('apack-terminal');
+brokerBinary(); // the path, or undefined when this checkout has not staged one
+```
+
 ## Docs
 
 See the [docs map](docs/README.md). The ones most people want:
@@ -70,12 +81,19 @@ See the [docs map](docs/README.md). The ones most people want:
 Needs Rust, which `rust-toolchain.toml` pins. `CLAUDE.md` has the repository's rules.
 
 ```sh
-cargo test                                   # every suite
-cargo clippy --all-targets -- -D warnings
+cargo xtask pre-push                         # before a push: every check CI runs, and the change's mutants
+cargo nextest run --workspace                # every suite, each test in its own process
+cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
-TS_RS_EXPORT_DIR=protocol cargo test         # regenerate the protocol's TypeScript; commit it if it moved
+cargo xtask generate                         # regenerate the protocol's TypeScript; commit it if it moved
+cargo xtask package                          # release build, staged into the npm package in node/
 cargo run -- /tmp/apack-terminal.sock        # run one, and talk to it
 ```
+
+`cargo xtask pre-push` is the one to run before a push: it is every check
+[CI](.github/workflows/ci.yml) fails a change on, cheapest first, and it refuses a dirty tree because what
+is checked has to be what is pushed. A mutant of the change that survives is killed, or excluded in
+`.cargo/mutants.toml` with the reason.
 
 ## License
 
