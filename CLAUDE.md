@@ -15,9 +15,9 @@ holds.
 | `src/protocol.rs` | every message, and the one place their shape is defined |
 | `src/main.rs` | the process: a socket, a handshake, the request loop |
 | `src/lib.rs` | so the parser can be tested as a parser |
-| `protocol/protocol.ts` | **generated** from `src/protocol.rs`; never edited by hand |
+| `node/protocol.ts` | **generated** from `src/protocol.rs`; never edited by hand, and shipped by the package |
 | `xtask/` | the repository's own tasks (`cargo xtask <task>`): the protocol's derivation, and pre-push |
-| `node/` | the npm package a consumer installs: where the binary is, and the binary `cargo xtask package` stages into it |
+| `node/` | the npm package a consumer installs: the protocol's types, where the binary is, and the binary `cargo xtask package` stages into it |
 
 ## Checks
 
@@ -31,22 +31,23 @@ cargo xtask pre-push                         # before a push: everything below, 
 cargo nextest run --workspace                # every suite, each test in its own process
 cargo clippy --workspace --all-targets -- -D warnings    # the gate is zero warnings
 cargo fmt --all --check                      # the layout rustfmt.toml pins, which is elmdb's
-cargo xtask generate                         # re-derive protocol/protocol.ts from src/protocol.rs
+cargo xtask generate                         # re-derive node/protocol.ts from src/protocol.rs
 cargo xtask check-generated                  # fails when that file has fallen behind
 cargo xtask package                          # release build, staged into the npm package in node/
 ```
 
-- **Changed a protocol type?** `cargo xtask generate`, and commit `protocol/protocol.ts`. It is one place
-  rather than the `TS_RS_EXPORT_DIR=protocol cargo test` it replaced, because without that variable `ts-rs`
-  writes to a gitignored `bindings/`, which is a second answer to the same question that nobody reads. The
-  apack monorepo keeps its own copy of that file and re-derives it the same way (`npm run protocol:check`
-  there), so a stale copy here is a stale copy in both.
+- **Changed a protocol type?** `cargo xtask generate`, and commit `node/protocol.ts`. It is one place
+  rather than the `TS_RS_EXPORT_DIR=protocol cargo test` it replaced, because without that variable ts-rs
+  writes to a gitignored `bindings/`, which is a second answer to the same question that nobody reads. It
+  lives *inside* the npm package, which is what ships it: a consumer imports the types from
+  `apack-terminal` like any dependency's, rather than keeping a copy and a script to keep it fresh.
 - **Changed anything a consumer pins?** The pin is a commit of this repository, so a stale pin has to fail
   loudly rather than behave strangely. That is what `PROTOCOL_VERSION` and the `hello` exchange are for.
 - **The broker reaches a consumer as an npm package**, `node/`, whose one job is answering where the binary
   is: the name differs by platform and a consumer that derived the path itself was wrong about the
   extension on Windows, so the terminal never started there. `cargo xtask package` stages a release build
-  into it; the binary is gitignored, as elmdb gitignores the `*.node` its own package ships. A development
+  into it, beside the protocol's types; the binary is gitignored, as elmdb gitignores the `*.node` its own
+  package ships. A development
   checkout does not use it — the consumer prefers the debug build in `target/`, which is what a
   contributor editing the broker has.
 - **Each test runs in its own process**, so a regression that loses a signal is killed at its deadline

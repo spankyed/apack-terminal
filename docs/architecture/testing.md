@@ -5,7 +5,7 @@ cargo xtask pre-push                           # before a push: every check CI r
 cargo nextest run --workspace                  # everything, each test in its own process
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
-cargo xtask generate                           # regenerates protocol/protocol.ts; commit it if it moved
+cargo xtask generate                           # regenerates node/protocol.ts; commit it if it moved
 cargo xtask check-generated                    # fails when it has fallen behind
 ```
 

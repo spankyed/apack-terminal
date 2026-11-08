@@ -3,16 +3,18 @@
 Newline-delimited JSON, both ways, over a Unix socket — or a named pipe on Windows, where the transport
 refuses a filesystem path outright.
 
-**Rust is the source of truth and `protocol/protocol.ts` is generated from it**:
+**Rust is the source of truth and `node/protocol.ts` is generated from it**:
 
 ```sh
-TS_RS_EXPORT_DIR=protocol cargo test
+cargo xtask generate         # re-derive it
+cargo xtask check-generated  # fail when it has fallen behind
 ```
 
-The variable is not optional: `ts-rs` writes to a gitignored `bindings/` without it, which is a second
-answer to the same question that nobody reads. The generated file is committed so a consumer reads it
-without building Rust, and is meant to be treated there as a recorded artifact with `check` and `update`
-halves — a protocol change nobody regenerated should fail a typecheck rather than become a strange bug.
+It is written **inside the npm package**, which is what ships it: a consumer imports these types from
+`apack-terminal` like any dependency's, rather than keeping its own copy and a script to keep that copy
+fresh. The file is committed, so reading it needs no Rust toolchain. `cargo xtask generate` rather than
+`TS_RS_EXPORT_DIR=… cargo test`, because without that variable ts-rs writes to a gitignored `bindings/`,
+which is a second answer to the same question that nobody reads.
 
 JSON rather than a length prefix because the first consumer is a Node client and a debuggable frame is worth
 more than a compact one. Nothing in the traffic makes framing the bottleneck. A length prefix is a change

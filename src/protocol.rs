@@ -1,11 +1,9 @@
 //! The messages the app and the broker exchange, and the one place their shape is defined.
 //!
 //! **Rust is the source of truth and the TypeScript is generated**, which is `elmdb-node/protocol/`'s
-//! arrangement reused rather than chosen again: `TS_RS_EXPORT_DIR=protocol cargo test` writes
-//! `protocol/protocol.ts`, and the app treats that file as a recorded artifact with `check`/`update` halves,
-//! so a protocol change that nobody regenerated fails a typecheck instead of becoming a strange bug.
-//! The variable is not optional — ts-rs writes to a gitignored `bindings/` without it, which is a second
-//! answer to the same question that nobody reads.
+//! arrangement reused rather than chosen again: `cargo xtask generate` writes `node/protocol.ts`, inside the
+//! npm package, which ships it — so a consumer imports these types from `apack-terminal` like any
+//! dependency's, and `cargo xtask check-generated` fails when the file has fallen behind the Rust.
 //!
 //! **It is a contract across a `.rev` boundary**, not an internal detail: the monorepo pins a commit of this
 //! repository, so a message set that changes under a pinned app has to be a clear refusal. That is what

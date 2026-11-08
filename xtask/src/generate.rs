@@ -11,8 +11,13 @@ use std::process::Command;
 
 /// The one file the protocol's types generate, and where it is committed
 pub const GENERATED: &str = "protocol.ts";
-/// Where it is committed, relative to the workspace root
-pub const COMMITTED_DIR: &str = "protocol";
+/// **Inside the npm package, which is what ships it.** A consumer reads these types without building Rust,
+/// and it reads them the way it reads any dependency's types — `node/package.json` names this file under
+/// `files` and `index.d.ts` re-exports it. It was a `protocol/` directory of its own, hand-carried into the
+/// consumer and kept fresh there by a script that re-derived and compared; a package with the file in it
+/// leaves nothing to carry. elmdb's binding keeps its generated TypeScript in its package dir for the same
+/// reason.
+pub const COMMITTED_DIR: &str = "node";
 
 /// Asks ts-rs to generate the declarations again, into `into`
 pub fn write(root: &Path, into: &Path) -> Result<(), String> {

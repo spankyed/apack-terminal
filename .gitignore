@@ -2,9 +2,9 @@
 # derives its subject from the `vendor/*` links rather than naming a checkout), so it is rebuildable by design.
 /target
 
-# ts-rs' default export directory. The protocol's home is `protocol/`, which `TS_RS_EXPORT_DIR=protocol`
-# writes; a bare `cargo test` writes here instead, and a tracked copy of a generated contract is a second
-# answer that goes stale without anyone reading it.
+# ts-rs' default export directory. The protocol's home is `node/protocol.ts`, inside the package that ships
+# it, which `cargo xtask generate` writes; a bare `cargo test` writes here instead, and a second copy of a
+# generated contract goes stale without anyone reading it.
 /bindings
 
 # The broker binary `cargo xtask package` stages into the npm package (`node/`). It is a build output like

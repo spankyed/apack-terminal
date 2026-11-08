@@ -19,8 +19,8 @@ survives that process restarting, and ends when the app that claimed it goes.
 
 ## The protocol
 
-Newline-delimited JSON. Rust is the source of truth and `protocol/protocol.ts` is generated from it, so a
-consumer reads the types without building Rust.
+Newline-delimited JSON. Rust is the source of truth and `node/protocol.ts` is generated from it and shipped
+by the npm package, so a consumer imports the types without building Rust.
 
 ```jsonc
 → {"kind":"hello","protocol":1,"role":"client"}
@@ -59,8 +59,9 @@ Consumed by pinning a commit: apack keeps a gitignored `vendor/apack-terminal` s
 **The binary reaches a consumer as an npm package.** `node/` is that package, and its one job is answering
 where the binary is — the name differs by platform, and a consumer that derived the path itself was wrong
 about `apack-terminal.exe` and started no terminal on Windows. `cargo xtask package` stages a release build
-into it; apack installs it as `file:…/vendor/apack-terminal/node`, so its packaged app collects the binary
-with every other dependency rather than needing a rule of its own.
+into it, beside the generated protocol types; apack installs it as `file:…/vendor/apack-terminal/node`, so
+its packaged app collects the binary with every other dependency rather than needing a rule of its own, and
+imports the protocol's types from the package rather than keeping a copy of them.
 
 ```js
 const { brokerBinary } = require('apack-terminal');
