@@ -93,10 +93,35 @@ fn mutants_of_the_change(root: &Path, base: &str) -> Result<(), String> {
         return Ok(());
     }
     std::fs::write(&diff, &output.stdout).map_err(|e| format!("{CHANGE_DIFF}: {e}"))?;
-    run(
-        root,
-        &Step { name: "mutants of the change", command: &["cargo", "mutants", "--in-diff", CHANGE_DIFF], env: &[] },
-    )
+
+    // **A timeout is a kill, so this fails on a survivor and not on one.** cargo-mutants exits 2 for a
+    // mutant the suite passed and 3 for one that made it stop ending — and the second is nextest's deadline
+    // catching it, which is what `.config/nextest.toml` is for: the credit-accounting mutants in
+    // `output.rs` hang the writer every time, by design. Treating any non-zero exit as failure made this
+    // refuse a change whose every mutant was accounted for (15 caught, 3 timed out, none missed), which is
+    // how it was found. `.github/workflows/mutants.yml` tolerates the same code for the same reason.
+    let started = Instant::now();
+    println!("pre-push: mutants of the change");
+    let status = Command::new("cargo")
+        .args(["mutants", "--in-diff", CHANGE_DIFF])
+        .current_dir(root)
+        .status()
+        .map_err(|e| format!("pre-push: mutants of the change didn't start: {e}"))?;
+    match status.code() {
+        Some(0) => println!("pre-push: mutants of the change passed in {:.0?}", started.elapsed()),
+        Some(3) => println!(
+            "pre-push: mutants of the change passed in {:.0?}; some timed out, which is the suite's deadline \
+             catching them rather than a survivor",
+            started.elapsed()
+        ),
+        _ => {
+            return Err(format!(
+                "pre-push: mutants of the change failed ({status}): the push would fail CI. A survivor is \
+                 killed, or excluded in .cargo/mutants.toml with the reason"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `cargo xtask pre-push [--base REF]`: REF is what the change merges into, origin/master unless given,
