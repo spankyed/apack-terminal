@@ -31,7 +31,14 @@ pub type SessionId = String;
 #[ts(export, export_to = "protocol.ts")]
 pub enum Request {
     /// The first message on a connection; the broker answers `Hello` or refuses.
-    Hello { protocol: u32 },
+    ///
+    /// `role` says what this connection is for, and a caller that omits it is a `client` — so a raw caller,
+    /// a probe or an older client behaves exactly as before.
+    Hello {
+        protocol: u32,
+        #[serde(default)]
+        role: Role,
+    },
     /// Start a shell in a pty. `shell` absent means the platform's default.
     ///
     /// **`args` and `env` are how shell integration is arranged**, and why they exist at all: the markers a
@@ -98,6 +105,28 @@ pub enum Request {
     },
     /// End the session and its process tree.
     Kill { session: SessionId },
+}
+
+/// What a connection is for.
+///
+/// **A session's lifetime belongs to whoever claims it, not to the connection that asked for the session.**
+/// The app's own process holds a `lifetime` connection for as long as the app is running, so a restart of
+/// the service that *opened* a session does not end it, while quitting the app does — by the kernel, since
+/// a descriptor closes on process death however the process died.
+///
+/// **Absent a `lifetime` connection the broker ends its sessions when the last client leaves**, which is
+/// what it has always done. So persistence is something a caller takes responsibility for rather than
+/// something it can acquire by accident: the failure mode of getting this wrong is a session that does not
+/// outlive its client, never a shell left running after the app is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "protocol.ts")]
+pub enum Role {
+    /// Asks for sessions and receives their output. The default.
+    #[default]
+    Client,
+    /// Holds the broker's sessions alive and receives no output. Ending this connection ends them all.
+    Lifetime,
 }
 
 /// What a `Wait` is waiting for.

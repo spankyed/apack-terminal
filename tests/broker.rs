@@ -129,6 +129,26 @@ impl Events {
     }
 }
 
+/// Ends a connection, the way a client process going away ends one.
+///
+/// **Dropping the handles is not enough, and the case that relied on it passed by luck.** `Events` moved a
+/// clone of the socket into its reader thread, which is blocked in `read` and so cannot notice that its
+/// channel is gone — it holds the socket open until something wakes it, which is pending output and
+/// nothing else. A case that drained the output first then dropped would wait for ever for a shell the
+/// broker never ended, and read as the lifetime rule being wrong.
+///
+/// So this wakes it on purpose: the receiver goes first, then one malformed frame the broker is certain to
+/// answer. The reader thread takes that answer, fails to send it, returns, and drops the last reference —
+/// which is when the socket actually closes and the broker sees the client leave.
+fn disconnect(reading: Events, mut writing: Wire) {
+    drop(reading);
+    let _ = writing.write_all(b"not a frame\n");
+    let _ = writing.flush();
+    drop(writing);
+    // The broker's own side of the close is what the caller is about to assert on
+    std::thread::sleep(std::time::Duration::from_millis(100));
+}
+
 /// A spawn frame: the default shell at a given size, with no launch arguments and nothing added to the
 /// environment. **One builder**, so a field added to `Request::Spawn` is one edit here and not ten.
 fn spawn_frame(cols: u16, rows: u16, shell: Option<&str>) -> String {
@@ -334,15 +354,13 @@ fn a_shell_that_exits_on_its_own_is_reported_without_anything_polling_for_it() {
 #[test]
 fn a_client_that_disconnects_leaves_no_shell_running() {
     let broker = start();
-    let pid = {
-        let (mut reading, mut writing) = connect(&broker);
-        ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
-        next(&mut reading);
-        ask(&mut writing, &spawn_frame(80, 24, None));
-        let spawned = next(&mut reading);
-        spawned["pid"].as_u64().expect("a pid") as i32
-        // The connection drops here, which is what an app that quit, crashed or was killed looks like
-    };
+    let (mut reading, mut writing) = connect(&broker);
+    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    next(&mut reading);
+    ask(&mut writing, &spawn_frame(80, 24, None));
+    let pid = next(&mut reading)["pid"].as_u64().expect("a pid") as i32;
+    // What an app that quit, crashed or was killed looks like from here
+    disconnect(reading, writing);
 
     // The app cannot end its sessions on the way out — a pack's `onShutdown` is synchronous and runs in
     // `process.on('exit')`, where no socket write completes — so the broker has to be the backstop.
@@ -1052,4 +1070,148 @@ fn a_session_ending_settles_both_kinds_of_wait() {
         vec!["EXITED".to_string(), "MET".to_string()],
         "the exit wait is met and the idle wait is told the session ended"
     );
+}
+
+/// Greets as a given role, answering the connection and its id.
+fn greet(broker: &Broker, role: &str) -> (Events, Wire) {
+    let (mut reading, mut writing) = connect(broker);
+    ask(&mut writing, &format!(r#"{{"kind":"hello","protocol":1,"role":"{role}"}}"#));
+    assert_eq!(next(&mut reading)["kind"], "hello", "greeted as {role}");
+    (reading, writing)
+}
+
+/// **A session outlives the client that opened it, while an owner holds the broker.**
+///
+/// This is what the whole lifetime rule is for: restarting the service that opened a session must not end
+/// it. The client here goes away entirely — its socket is dropped — and the shell is still there to answer
+/// a second client afterwards.
+#[cfg(unix)]
+#[test]
+fn a_session_outlives_its_client_while_an_owner_holds_the_broker() {
+    let broker = start();
+    let (_owner_events, _owner) = greet(&broker, "lifetime");
+
+    let (mut reading, mut writing) = greet(&broker, "client");
+    ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
+    let spawned = next(&mut reading);
+    let session = spawned["session"].as_str().expect("a session id").to_owned();
+    let pid = spawned["pid"].as_u64().expect("a pid") as i32;
+    once_the_shell_is_listening(&mut reading);
+
+    // The client is gone, socket and all
+    disconnect(reading, writing);
+    assert!(alive(pid), "the shell outlives the client that asked for it");
+
+    // And a client that comes back can still use it, which is what "still running" has to mean
+    let (mut reading, mut writing) = greet(&broker, "client");
+    ask(&mut writing, &format!(r#"{{"kind":"facts","session":"{session}"}}"#));
+    let (facts, _) = until(&mut reading, "facts");
+    assert_eq!(facts["session"], session.as_str(), "the same session answers the new client");
+}
+
+/// **The owner going away ends them**, which is what stops a quit leaving shells behind.
+#[cfg(unix)]
+#[test]
+fn the_owner_leaving_ends_every_session() {
+    let broker = start();
+    let (owner_events, owner) = greet(&broker, "lifetime");
+
+    let (mut reading, mut writing) = greet(&broker, "client");
+    ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
+    let pid = next(&mut reading)["pid"].as_u64().expect("a pid") as i32;
+    once_the_shell_is_listening(&mut reading);
+    assert!(alive(pid));
+
+    disconnect(owner_events, owner);
+    for _ in 0..40 {
+        if !alive(pid) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("the shell outlived the owner of the broker");
+}
+
+/// **A client reconnecting receives the feed again**, which is the other half of surviving a restart: the
+/// session is useless if its output still goes to a socket nobody holds.
+#[cfg(unix)]
+#[test]
+fn output_follows_the_client_that_came_back() {
+    let broker = start();
+    let (_owner_events, _owner) = greet(&broker, "lifetime");
+
+    let (mut reading, mut writing) = greet(&broker, "client");
+    ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
+    let session = next(&mut reading)["session"].as_str().expect("a session id").to_owned();
+    once_the_shell_is_listening(&mut reading);
+    disconnect(reading, writing);
+
+    let (mut reading, mut writing) = greet(&broker, "client");
+    types(&mut writing, &session, &format!("echo back-on-the-feed{SUBMIT}"));
+    let mut output = String::new();
+    for _ in 0..400 {
+        let event = next(&mut reading);
+        if event["kind"] == "output" {
+            output.push_str(event["data"].as_str().unwrap_or_default());
+            if output.contains("back-on-the-feed") {
+                return;
+            }
+        }
+    }
+    panic!("the new client never received the session's output: {output:?}");
+}
+
+/// A caller that names no role is a client, so nothing that spoke the old handshake changes behaviour.
+#[cfg(unix)]
+#[test]
+fn a_connection_that_names_no_role_is_a_client() {
+    let broker = start();
+    let (mut reading, mut writing) = connect(&broker);
+    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    assert_eq!(next(&mut reading)["kind"], "hello");
+
+    ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
+    let pid = next(&mut reading)["pid"].as_u64().expect("a pid") as i32;
+    once_the_shell_is_listening(&mut reading);
+
+    // No owner, so the old rule stands: this client leaving ends it
+    disconnect(reading, writing);
+    for _ in 0..40 {
+        if !alive(pid) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("a client with no owner left its shell running");
+}
+
+/// **An owner asks for nothing and is sent nothing**, which is what makes holding the broker's lifetime
+/// free. The order here is the one that matters: a client is already attached when the owner arrives, so an
+/// owner that installed itself as the feed would take the output away from a terminal someone is using. The
+/// cheap reading — owner first, client second — hides it, because the client's own greeting takes the feed
+/// back.
+#[cfg(unix)]
+#[test]
+fn an_owner_arriving_does_not_take_the_feed_from_a_client() {
+    let broker = start();
+    let (mut reading, mut writing) = greet(&broker, "client");
+    ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
+    let session = next(&mut reading)["session"].as_str().expect("a session id").to_owned();
+    once_the_shell_is_listening(&mut reading);
+
+    // The app takes its hold *after* the terminal is already running
+    let (_owner_events, _owner) = greet(&broker, "lifetime");
+
+    types(&mut writing, &session, &format!("echo still-mine{SUBMIT}"));
+    let mut output = String::new();
+    for _ in 0..400 {
+        let event = next(&mut reading);
+        if event["kind"] == "output" {
+            output.push_str(event["data"].as_str().unwrap_or_default());
+            if output.contains("still-mine") {
+                return;
+            }
+        }
+    }
+    panic!("the owner took the feed from the client: {output:?}");
 }

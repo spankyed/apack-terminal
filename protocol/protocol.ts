@@ -19,7 +19,7 @@ cursor_row: number, cursor_column: number, alt_screen: boolean, } | { "kind": "f
 /**
  * What the app asks the broker to do.
  */
-export type Request = { "kind": "hello", protocol: number, } | { "kind": "spawn", cols: number, rows: number, shell: string | null, 
+export type Request = { "kind": "hello", protocol: number, role: Role, } | { "kind": "spawn", cols: number, rows: number, shell: string | null, 
 /**
  * The shell's own launch arguments, in order. Empty starts it as the user would.
  */
@@ -28,6 +28,21 @@ args: Array<string>,
  * Added to the environment the broker runs in, which is already stripped of the app's own
  */
 env: Array<[string, string]>, cwd: string | null, } | { "kind": "write", session: string, data: string, } | { "kind": "resize", session: string, cols: number, rows: number, } | { "kind": "screen", session: string, history: number, } | { "kind": "facts", session: string, } | { "kind": "search", session: string, text: string, history: number, } | { "kind": "wait", session: string, until: Until, timeout_ms: number, } | { "kind": "kill", session: string, };
+
+/**
+ * What a connection is for.
+ *
+ * **A session's lifetime belongs to whoever claims it, not to the connection that asked for the session.**
+ * The app's own process holds a `lifetime` connection for as long as the app is running, so a restart of
+ * the service that *opened* a session does not end it, while quitting the app does — by the kernel, since
+ * a descriptor closes on process death however the process died.
+ *
+ * **Absent a `lifetime` connection the broker ends its sessions when the last client leaves**, which is
+ * what it has always done. So persistence is something a caller takes responsibility for rather than
+ * something it can acquire by accident: the failure mode of getting this wrong is a session that does not
+ * outlive its client, never a shell left running after the app is gone.
+ */
+export type Role = "client" | "lifetime";
 
 /**
  * Where a search found what it was asked for.

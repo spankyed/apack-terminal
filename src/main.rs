@@ -1,17 +1,25 @@
 //! The apack terminal broker: one process that owns ptys so no session's lifetime is the app's.
 //!
-//! `apack-terminal <socket>` listens there and speaks newline-delimited JSON (`protocol`). The skeleton this
-//! phase asks for serves **one connection at a time**: a second client is Phase B's, and the goal says to
-//! build the thinnest path through every seam before either consumer exists, so that the protocol is derived
-//! from its clients rather than proposed to them.
+//! `apack-terminal <socket>` listens there and speaks newline-delimited JSON (`protocol`).
+//!
+//! **The sessions are the broker's, not a connection's.** They were a connection's while the only question
+//! was whether the seam worked; keeping them there made a session's lifetime the lifetime of whichever
+//! process opened it, which is the thing this component exists to stop. So one `Sessions` and one writer
+//! live for the broker's life, and a connection is a thing that comes and goes beside them.
+//!
+//! **Who ends them is `Role`.** A `lifetime` connection holds them and ending it ends them all; absent one,
+//! the last `client` leaving does, as it always has. The app's own process holds the former, so restarting
+//! the service that opened a session does not end it and quitting the app does.
 
 use std::io::{BufRead, BufReader, Write};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
 use interprocess::local_socket::{GenericFilePath, ListenerOptions, Stream, ToFsName, prelude::*};
 
-use apack_terminal::output::channel_with_credit;
-use apack_terminal::protocol::{ErrorCode, Event, PROTOCOL_VERSION, Request, SearchMatch};
+use apack_terminal::output::{Outgoing, channel_with_credit};
+use apack_terminal::protocol::{ErrorCode, Event, PROTOCOL_VERSION, Request, Role, SearchMatch};
 use apack_terminal::session::Sessions;
 
 fn main() -> std::io::Result<()> {
@@ -31,61 +39,114 @@ fn main() -> std::io::Result<()> {
     println!("listening {socket}");
     std::io::stdout().flush()?;
 
+    let (events, outgoing, credit) = channel_with_credit();
+    let broker = Broker {
+        sessions: Arc::new(Mutex::new(Sessions::new(events, credit))),
+        feed: Arc::new(Mutex::new(None)),
+        owned: Arc::new(AtomicBool::new(false)),
+        clients: Arc::new(AtomicUsize::new(0)),
+    };
+    // One writer for the broker's life: every event leaves on this thread, so nothing interleaves two
+    // frames, and a client arriving or leaving changes where they go rather than who writes them
+    std::thread::spawn({
+        let broker = broker.clone();
+        move || write_out(outgoing, broker)
+    });
+
     for connection in listener.incoming() {
         match connection {
-            Ok(stream) => serve(stream),
+            // **A thread per connection**, because a lifetime connection and a client now coexist: serving
+            // them in turn would mean the app's own hold on the broker blocked every session request
+            Ok(stream) => {
+                let broker = broker.clone();
+                std::thread::spawn(move || serve(stream, broker));
+            }
             Err(error) => eprintln!("accept failed: {error}"),
         }
     }
     Ok(())
 }
 
-/// One client: its sessions live as long as the connection, which is the skeleton's lifetime and not the
-/// goal's — surviving a client is Phase B's, and nothing here is shaped to prevent it.
-fn serve(stream: Stream) {
-    let (events, outgoing, credit) = channel_with_credit();
-    let sessions = Arc::new(Mutex::new(Sessions::new(events, credit)));
+/// What every connection shares: the sessions, where their output currently goes, and who holds them.
+#[derive(Clone)]
+struct Broker {
+    sessions: Arc<Mutex<Sessions>>,
+    /// The client receiving the feed. A `lifetime` connection never installs itself here — it asks for
+    /// nothing and is sent nothing, which is what makes holding one cost no output.
+    feed: Arc<Mutex<Option<Arc<Stream>>>>,
+    /// Whether a `lifetime` connection is open.
+    owned: Arc<AtomicBool>,
+    /// How many `client` connections are open.
+    clients: Arc<AtomicUsize>,
+}
 
+/// Writes every event to whichever client is attached, for as long as the broker runs.
+fn write_out(outgoing: Receiver<Outgoing>, broker: Broker) {
+    for message in outgoing {
+        // **A shell that ended of its own accord is gone from here too.** Only `kill` used to remove a
+        // session, so a user typing `exit` left its record behind: the map grew with every shell they
+        // closed, and a later write answered `PTY` — the OS refusing a dead handle — where the true answer
+        // is that there is no such session. On Windows that is X9's window, where ConPTY throws for about a
+        // second after the console goes; the same wrong answer, louder.
+        if let Event::Exited { session, .. } = &message.event
+            && let Ok(mut live) = broker.sessions.lock()
+        {
+            live.forget(session);
+        }
+        let frame = serde_json::to_string(&message.event).ok();
+        let attached = broker.feed.lock().ok().and_then(|feed| feed.clone());
+        if let (Some(frame), Some(stream)) = (frame, attached.as_ref())
+            && (&**stream)
+                .write_all(frame.as_bytes())
+                .and_then(|()| (&**stream).write_all(b"\n"))
+                .is_err()
+        {
+            // That client is gone; the next one to greet installs itself. Nothing is ended here, because
+            // whether a client leaving ends the sessions is `Role`'s question and is answered in `serve`
+            detach(&broker, stream);
+        }
+        // **The credit returns whether or not anyone was listening.** It is what bounds the channel, so a
+        // frame dropped for want of a client must not hold a slot — otherwise a restart of the service that
+        // was attached would leave the broker permanently short of credit and its output would stall.
+        message.written();
+    }
+}
+
+/// Takes `stream` out of the feed, if it is still the one attached.
+fn detach(broker: &Broker, stream: &Arc<Stream>) {
+    if let Ok(mut feed) = broker.feed.lock()
+        && feed.as_ref().is_some_and(|attached| Arc::ptr_eq(attached, stream))
+    {
+        *feed = None;
+    }
+}
+
+/// Answers this connection directly, rather than through the feed.
+///
+/// **A handshake is between the broker and one caller**, so its answer — and a refusal of a frame that
+/// never named a session — goes to whoever asked. Sending those through the shared channel would deliver a
+/// refusal of the lifetime connection's malformed frame to whichever client happened to be attached.
+fn say(stream: &Arc<Stream>, event: &Event) {
+    if let Ok(frame) = serde_json::to_string(event) {
+        let _ = (&**stream)
+            .write_all(frame.as_bytes())
+            .and_then(|()| (&**stream).write_all(b"\n"));
+    }
+}
+
+/// One connection, for as long as it is open.
+///
+/// What it does on the way out is the whole of the lifetime rule: a `lifetime` connection ending ends every
+/// session, and a `client` ending does only when no lifetime connection is open and it was the last client.
+fn serve(stream: Stream, broker: Broker) {
     // **One stream in an `Arc`, not two halves.** `&Stream` implements `Read` and `Write`, which is what the
     // crate's deprecated `split` says to do instead — and dropping a half there does not shut it down, so
     // the halves were a shape that reads like a socket's and is not one.
     let stream = Arc::new(stream);
-    // One writer: every event leaves on this thread, so nothing interleaves two frames
-    let writing = Arc::clone(&stream);
-    let ending = Arc::clone(&sessions);
-    let writer = std::thread::spawn(move || {
-        for message in outgoing {
-            // **A shell that ended of its own accord is gone from here too.** Only `kill` used to remove a
-            // session, so a user typing `exit` left its record behind: the map grew with every shell they
-            // closed, and a later write answered `PTY` — the OS refusing a dead handle — where the true
-            // answer is that there is no such session. On Windows that is X9's window, where ConPTY throws
-            // for about a second after the console goes; the same wrong answer, louder.
-            //
-            // It is done here because this thread already sees every event, and nothing holding the
-            // sessions lock ever waits on this thread: an answer costs no credit, so it cannot block.
-            if let Event::Exited { session, .. } = &message.event
-                && let Ok(mut live) = ending.lock()
-            {
-                live.forget(session);
-            }
-            let Ok(frame) = serde_json::to_string(&message.event) else {
-                continue;
-            };
-            let written = (&*writing)
-                .write_all(frame.as_bytes())
-                .and_then(|()| (&*writing).write_all(b"\n"));
-            // **The credit returns once the bytes are gone**, not when the message was queued: that is what
-            // makes the bound mean "in flight to the window" rather than "allocated".
-            message.written();
-            if written.is_err() {
-                break;
-            }
-        }
-    });
-
     let reading = Arc::clone(&stream);
     let mut lines = BufReader::new(&*reading).lines();
-    let mut greeted = false;
+    let mut role: Option<Role> = None;
+
     while let Some(Ok(line)) = lines.next() {
         if line.trim().is_empty() {
             continue;
@@ -93,56 +154,82 @@ fn serve(stream: Stream) {
         let request = match serde_json::from_str::<Request>(&line) {
             Ok(request) => request,
             Err(error) => {
-                refuse(&sessions, None, ErrorCode::Malformed, format!("{error}"));
+                say(&stream, &Event::Failed {
+                    session: None,
+                    code: ErrorCode::Malformed,
+                    message: format!("{error}"),
+                });
                 continue;
             }
         };
         // **The handshake is first or the connection is refused**, because the monorepo pins a commit of this
         // repository: a stale pin has to be a clear refusal rather than a message that means something else.
-        match (&request, greeted) {
-            (Request::Hello { protocol }, _) => {
+        match (&request, role) {
+            (Request::Hello { protocol, role: asked }, _) => {
                 if *protocol != PROTOCOL_VERSION {
-                    refuse(
-                        &sessions,
-                        None,
-                        ErrorCode::Handshake,
-                        format!(
+                    say(&stream, &Event::Failed {
+                        session: None,
+                        code: ErrorCode::Handshake,
+                        message: format!(
                             "the app speaks protocol {protocol}; this broker speaks {PROTOCOL_VERSION}"
                         ),
-                    );
+                    });
                     break;
                 }
-                greeted = true;
-                send(
-                    &sessions,
-                    Event::Hello {
-                        protocol: PROTOCOL_VERSION,
-                    },
-                );
+                role = Some(*asked);
+                match asked {
+                    Role::Client => {
+                        broker.clients.fetch_add(1, Ordering::SeqCst);
+                        // Last greeting wins the feed: one app, one broker per data dir, and a client that
+                        // reconnects after its service restarted is the one that should be receiving
+                        if let Ok(mut feed) = broker.feed.lock() {
+                            *feed = Some(Arc::clone(&stream));
+                        }
+                    }
+                    Role::Lifetime => broker.owned.store(true, Ordering::SeqCst),
+                }
+                say(&stream, &Event::Hello { protocol: PROTOCOL_VERSION });
                 continue;
             }
-            (_, false) => {
-                refuse(
-                    &sessions,
-                    None,
-                    ErrorCode::Handshake,
-                    "the first message must be hello".to_owned(),
-                );
+            (_, None) => {
+                say(&stream, &Event::Failed {
+                    session: None,
+                    code: ErrorCode::Handshake,
+                    message: "the first message must be hello".to_owned(),
+                });
                 break;
             }
             _ => {}
         }
-        carry_out(&sessions, request);
+        carry_out(&broker.sessions, request);
     }
 
-    // **A client that disconnects leaves no shells running.** Its sessions are its own for now, and the app
-    // cannot end them on the way out: a pack's `onShutdown` is synchronous and runs in `process.on('exit')`,
-    // where no socket write completes. So this is the backstop for an app that quits, crashes or is killed.
-    if let Ok(mut live) = sessions.lock() {
+    match role {
+        // **The app is gone, so its shells are.** The descriptor closed, which it does however the process
+        // died — quit, crash or kill — so this is reached without anything having remembered to call it.
+        Some(Role::Lifetime) => {
+            broker.owned.store(false, Ordering::SeqCst);
+            end_everything(&broker);
+        }
+        // **A client leaving ends nothing while an owner holds the broker**, which is what lets the service
+        // that opened a session restart without taking it down. With no owner this is the behaviour the
+        // broker has always had, and it is what keeps a standalone run — the suite, tooling — from leaving
+        // shells behind.
+        Some(Role::Client) => {
+            detach(&broker, &stream);
+            let left = broker.clients.fetch_sub(1, Ordering::SeqCst) - 1;
+            if left == 0 && !broker.owned.load(Ordering::SeqCst) {
+                end_everything(&broker);
+            }
+        }
+        None => {}
+    }
+}
+
+fn end_everything(broker: &Broker) {
+    if let Ok(mut live) = broker.sessions.lock() {
         live.end_all();
     }
-    drop(sessions);
-    let _ = writer.join();
 }
 
 fn carry_out(sessions: &Arc<Mutex<Sessions>>, request: Request) {
@@ -243,26 +330,4 @@ fn carry_out(sessions: &Arc<Mutex<Sessions>>, request: Request) {
             message: refusal.message,
         });
     }
-}
-
-fn send(sessions: &Arc<Mutex<Sessions>>, event: Event) {
-    if let Ok(live) = sessions.lock() {
-        live.answer(event);
-    }
-}
-
-fn refuse(
-    sessions: &Arc<Mutex<Sessions>>,
-    session: Option<String>,
-    code: ErrorCode,
-    message: String,
-) {
-    send(
-        sessions,
-        Event::Failed {
-            session,
-            code,
-            message,
-        },
-    );
 }
