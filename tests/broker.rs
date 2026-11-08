@@ -903,7 +903,6 @@ fn a_session(broker: &Broker) -> (Events, Wire, String) {
     (reading, writing, session)
 }
 
-#[cfg(unix)]
 fn types(writing: &mut impl Write, session: &str, data: &str) {
     ask(
         writing,
@@ -1108,7 +1107,6 @@ fn greet(broker: &Broker, role: &str) -> (Events, Wire) {
 /// This is what the whole lifetime rule is for: restarting the service that opened a session must not end
 /// it. The client here goes away entirely — its socket is dropped — and the shell is still there to answer
 /// a second client afterwards.
-#[cfg(unix)]
 #[test]
 fn a_session_outlives_its_client_while_an_owner_holds_the_broker() {
     let broker = start();
@@ -1146,7 +1144,6 @@ fn a_session_outlives_its_client_while_an_owner_holds_the_broker() {
 }
 
 /// **The owner going away ends them**, which is what stops a quit leaving shells behind.
-#[cfg(unix)]
 #[test]
 fn the_owner_leaving_ends_every_session() {
     let broker = start();
@@ -1170,7 +1167,6 @@ fn the_owner_leaving_ends_every_session() {
 
 /// **A client reconnecting receives the feed again**, which is the other half of surviving a restart: the
 /// session is useless if its output still goes to a socket nobody holds.
-#[cfg(unix)]
 #[test]
 fn output_follows_the_client_that_came_back() {
     let broker = start();
@@ -1205,7 +1201,6 @@ fn output_follows_the_client_that_came_back() {
 }
 
 /// A caller that names no role is a client, so nothing that spoke the old handshake changes behaviour.
-#[cfg(unix)]
 #[test]
 fn a_connection_that_names_no_role_is_a_client() {
     let broker = start();
@@ -1233,7 +1228,6 @@ fn a_connection_that_names_no_role_is_a_client() {
 /// owner that installed itself as the feed would take the output away from a terminal someone is using. The
 /// cheap reading — owner first, client second — hides it, because the client's own greeting takes the feed
 /// back.
-#[cfg(unix)]
 #[test]
 fn an_owner_arriving_does_not_take_the_feed_from_a_client() {
     let broker = start();
@@ -1265,7 +1259,6 @@ fn an_owner_arriving_does_not_take_the_feed_from_a_client() {
 /// **A broker nobody is connected to exits**, which is the difference between a process per app launch and
 /// none. It used to listen for ever: its sessions were ended, so nothing leaked that a user could feel, and
 /// one process accumulated every time the app started.
-#[cfg(unix)]
 #[test]
 fn a_broker_nobody_is_connected_to_exits() {
     let mut broker = start();
@@ -1287,7 +1280,6 @@ fn a_broker_nobody_is_connected_to_exits() {
 
 /// The other direction, so the case above cannot be satisfied by a broker that exits whenever it feels
 /// like it: while an owner holds it, a client coming and going leaves it listening.
-#[cfg(unix)]
 #[test]
 fn a_broker_an_owner_holds_keeps_listening_between_clients() {
     let mut broker = start();
