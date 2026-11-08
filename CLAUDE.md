@@ -16,20 +16,34 @@ holds.
 | `src/main.rs` | the process: a socket, a handshake, the request loop |
 | `src/lib.rs` | so the parser can be tested as a parser |
 | `protocol/protocol.ts` | **generated** from `src/protocol.rs`; never edited by hand |
+| `xtask/` | the repository's own tasks (`cargo xtask <task>`): the protocol's derivation, and pre-push |
 
 ## Checks
 
+**Run `cargo xtask pre-push` before every push.** It is every check CI fails a change on, the change's
+mutants included, cheapest first, stopping at the first that fails — and it refuses a dirty tree, because
+what is checked has to be what is pushed. A surviving mutant is killed, or excluded in `.cargo/mutants.toml`
+with why. What it cannot run is CI's alone: the Windows and Linux suites.
+
 ```sh
-cargo test                                   # every suite
-cargo clippy --all-targets -- -D warnings    # the gate is zero warnings
-cargo fmt --all --check
+cargo xtask pre-push                         # before a push: everything below, and the change's mutants
+cargo nextest run --workspace                # every suite, each test in its own process
+cargo clippy --workspace --all-targets -- -D warnings    # the gate is zero warnings
+cargo fmt --all --check                      # the layout rustfmt.toml pins, which is elmdb's
+cargo xtask generate                         # re-derive protocol/protocol.ts from src/protocol.rs
+cargo xtask check-generated                  # fails when that file has fallen behind
 ```
 
-- **Changed a protocol type?** `TS_RS_EXPORT_DIR=protocol cargo test`, and commit `protocol/protocol.ts`.
-  The variable is not optional — `ts-rs` writes to a gitignored `bindings/` without it, which is a second
-  answer to the same question that nobody reads.
+- **Changed a protocol type?** `cargo xtask generate`, and commit `protocol/protocol.ts`. It is one place
+  rather than the `TS_RS_EXPORT_DIR=protocol cargo test` it replaced, because without that variable `ts-rs`
+  writes to a gitignored `bindings/`, which is a second answer to the same question that nobody reads. The
+  apack monorepo keeps its own copy of that file and re-derives it the same way (`npm run protocol:check`
+  there), so a stale copy here is a stale copy in both.
 - **Changed anything a consumer pins?** The pin is a commit of this repository, so a stale pin has to fail
   loudly rather than behave strangely. That is what `PROTOCOL_VERSION` and the `hello` exchange are for.
+- **Each test runs in its own process**, so a regression that loses a signal is killed at its deadline
+  instead of hanging the run (`.config/nextest.toml`). A deadline there is several times the slowest
+  reading, never near it: it is for a test that has stopped ending at all.
 
 ## Rules
 

@@ -1,10 +1,12 @@
 # Testing
 
 ```sh
-cargo test                                     # everything
-cargo clippy --all-targets -- -D warnings
+cargo xtask pre-push                           # before a push: every check CI runs, and the change's mutants
+cargo nextest run --workspace                  # everything, each test in its own process
+cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
-TS_RS_EXPORT_DIR=protocol cargo test           # regenerates protocol/protocol.ts; commit it if it moved
+cargo xtask generate                           # regenerates protocol/protocol.ts; commit it if it moved
+cargo xtask check-generated                    # fails when it has fallen behind
 ```
 
 ## What each suite is for
@@ -65,3 +67,39 @@ correctly.
 
 `disconnect` wakes it on purpose — the receiver goes, then one malformed frame the broker is certain to
 answer. This is worth knowing before writing a case about a client going away.
+
+## A test runs in its own process, and has a deadline
+
+`cargo nextest run` runs each test in a process of its own, so a test that has stopped ending is killed at
+its deadline and the rest run on. That matters more here than in most suites: nearly every case waits for a
+frame the broker sends *when something happened*, so the shape of a lost signal is a `read` that never
+returns rather than a wrong answer — and under `cargo test` one such case holds the whole run.
+
+The deadlines are in [`.config/nextest.toml`](../../.config/nextest.toml). Each is several times the slowest
+reading rather than near it, because what it is for is a test that has stopped ending at all: the whole
+suite is 8.5 s and its slowest case 7.2 s on an Apple-silicon laptop (55 tests, 2026-11-08), against a
+default deadline of 20 s. **A reading, never a bound** — a slower machine reports, it does not fail.
+
+## Mutation testing
+
+`cargo xtask pre-push` ends with the change's mutants: cargo-mutants edits each line the change touched into
+something that still compiles, and a mutant the suite still passes is a line no case holds. The run is
+scoped to the change (`--in-diff`) rather than the repository, because a survivor nobody edited is not this
+push's to answer for, and a whole-repository run is minutes of them.
+
+A survivor is answered one of two ways, and never left:
+
+- **killed** — the case that should have caught it is written, which is the normal answer.
+- **excluded** — in [`.cargo/mutants.toml`](../../.cargo/mutants.toml) with the reason, for a mutant that
+  answers exactly what the code answers. There are none yet.
+
+`.github/workflows/mutants.yml` runs the same thing on a pull request and fails on a survivor. It runs twice:
+Windows-only code compiles on no other platform, so a Linux run reports every mutant of `src/tree.rs` and of
+every `cfg(windows)` arm as unviable, and the Windows job is where those are actually tested.
+
+## The suite runs on all three platforms
+
+[`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) runs the whole suite on Linux, macOS and
+Windows, and the cheap checks — format, clippy, the generated protocol, the doc tests — on Linux alone.
+Three platforms is the point rather than thoroughness: a pty, a process tree and a shell's own reports are
+each the platform's answer, and the rule above holds for every one of them.

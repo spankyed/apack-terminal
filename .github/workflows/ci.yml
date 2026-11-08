@@ -1,0 +1,102 @@
+name: CI
+
+# Every push to main and every pull request runs the checks on Linux and the suite on all three platforms.
+# **All three is the point, not thoroughness**: everything in `src/tree.rs`, ConPTY's missing EOF, its
+# cursor-position request and `\r\n` submitting a line are reachable from no Mac, and every one of them was
+# wrong before it was run on Windows (`CLAUDE.md`, "A platform claim is made on that platform"). A change to
+# documentation alone runs nothing past `changes`, and a newer push to the same pull request or branch cancels
+# the run before it. `ci-pass` is the one check a merge waits on. Mutants of a pull request's change run beside
+# this in mutants.yml, which a surviving mutant fails.
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Whether the change holds anything but documentation, which no check reads
+  changes:
+    runs-on: ubuntu-24.04
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      # A pull request's merge commit and its first parent, the base it merges into
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - id: diff
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          case "$GITHUB_EVENT_NAME" in
+            pull_request) base=HEAD^1 ;;
+            push) base=$BEFORE; git fetch --depth=1 origin "$base" 2>/dev/null || base= ;;
+            *) base= ;;
+          esac
+          if [ -n "$base" ] && ! git diff --name-only "$base" HEAD | grep -qvE '^docs/|\.md$'; then
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # The cheap checks and the repository's own, which need one platform: a format, a lint and the generated
+  # protocol, which the apack monorepo keeps a second copy of and re-derives the same way
+  checks:
+    name: checks (Linux x64)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml names the toolchain; rustup installs it on first use
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fetch --locked
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo xtask check-generated
+      - run: cargo test --workspace --doc
+
+  # The suite on each platform the broker runs on. A pty, a process tree and a shell's own reports are the
+  # platform's answers, so each one is asked here
+  platforms:
+    name: tests (${{ matrix.name }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Linux x64, runner: ubuntu-24.04 }
+          - { name: macOS arm64, runner: macos-15 }
+          - { name: Windows x64, runner: windows-latest }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.148
+      # Each test in its own process, killed at `.config/nextest.toml`'s deadline: a regression here loses a
+      # signal, which is a read that never returns rather than a wrong answer
+      - run: cargo nextest run --workspace --profile ci
+
+  # The one check a merge waits on: every job above passed or was skipped (a documentation-only change)
+  ci-pass:
+    if: always()
+    needs: [changes, checks, platforms]
+    runs-on: ubuntu-24.04
+    steps:
+      - env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "$RESULTS"
+          case " $RESULTS " in *" failure "*|*" cancelled "*) exit 1 ;; esac

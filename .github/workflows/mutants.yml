@@ -1,0 +1,91 @@
+name: mutants
+
+# Mutants of what a pull request changes, against the broker's own suite: a survivor fails the job, reported
+# on its line and in the job's summary. The run is scoped to the change (`--in-diff`), because a
+# whole-repository run is minutes of mutants nobody edited and a survivor outside the change is not this pull
+# request's to answer for. `cargo xtask pre-push` runs the same thing before a push, so a survivor is normally
+# found before CI sees it.
+#
+# Windows-only code is mutated on Windows, and nowhere else: `src/tree.rs`'s Job Objects and every
+# `cfg(windows)` arm compile on no other platform, so a Linux run reports every one of their mutants as
+# unviable. A change with none installs nothing there.
+on:
+  pull_request:
+
+concurrency:
+  group: mutants-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: mutants in the change (Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      # The merge commit and its first parent, the base it merges into
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - id: scope
+        run: |
+          git diff --merge-base HEAD^1 -- '*.rs' > change.diff
+          if [ -s change.diff ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "The change touches no Rust" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - if: steps.scope.outputs.code == 'true'
+        run: rustup show active-toolchain
+      - if: steps.scope.outputs.code == 'true'
+        uses: Swatinem/rust-cache@v2
+      - if: steps.scope.outputs.code == 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants@27.1.0,cargo-nextest@0.9.148
+      - if: steps.scope.outputs.code == 'true'
+        run: cargo mutants --in-diff change.diff
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.scope.outputs.code == 'true'
+        with:
+          name: mutants-in-diff-linux
+          path: target/mutants.out
+          if-no-files-found: ignore
+
+  windows:
+    name: mutants in the change (Windows-only code)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      # Only the changed files holding a Windows-only arm, so a change with none installs nothing
+      - id: scope
+        run: |
+          mapfile -t files < <(git diff --merge-base --name-only --diff-filter=d HEAD^1 -- '*.rs')
+          if [ ${#files[@]} -gt 0 ] && grep -lE 'cfg\(windows\)|target_os = "windows"' "${files[@]}"; then
+            git diff --merge-base HEAD^1 -- '*.rs' > change.diff
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "The change holds no Windows-only code to mutate" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - if: steps.scope.outputs.code == 'true'
+        run: rustup show active-toolchain
+      - if: steps.scope.outputs.code == 'true'
+        uses: Swatinem/rust-cache@v2
+      - if: steps.scope.outputs.code == 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants@27.1.0,cargo-nextest@0.9.148
+      - if: steps.scope.outputs.code == 'true'
+        run: cargo mutants --in-diff change.diff
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.scope.outputs.code == 'true'
+        with:
+          name: mutants-in-diff-windows
+          path: target/mutants.out
+          if-no-files-found: ignore

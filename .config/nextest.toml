@@ -1,0 +1,22 @@
+# Each test runs in its own process, so a test that hangs is killed at its deadline and the rest run on. That
+# matters more here than the deadline being tight: nearly every suite waits on a frame the broker sends when
+# something happened, and a regression that loses the signal is a blocking read that never returns rather
+# than a wrong answer. Under `cargo test` one such test holds the whole run.
+
+# What CI installs, and the oldest that reads this file as written
+nextest-version = "0.9.148"
+
+# A reading, not a bound: the whole suite is 8.5 s and its slowest test 7.2 s on an Apple-silicon laptop
+# (55 tests, 2026-11-08). The deadline below is for a test that has stopped ending at all, so it is several
+# times the slowest rather than near it.
+[profile.default]
+slow-timeout = { period = "10s", terminate-after = 2 }
+
+# The one test that waits for a producer to saturate the bounded channel and for the throttle to be reported:
+# 7.2 s of real output on that laptop, and the only test whose work is the volume rather than a round trip
+[[profile.default.overrides]]
+filter = "test(=a_saturating_producer_reports_that_it_was_throttled_rather_than_losing_output)"
+slow-timeout = { period = "30s", terminate-after = 2 }
+
+[profile.ci]
+fail-fast = false

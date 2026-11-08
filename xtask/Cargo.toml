@@ -1,0 +1,9 @@
+[package]
+name = "xtask"
+description = "The repository's own tasks: cargo xtask <task>"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+tempfile = "3.27.0"

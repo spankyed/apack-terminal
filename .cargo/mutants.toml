@@ -1,0 +1,18 @@
+# cargo-mutants: what it mutates and how it tests each mutant. A run is scoped to a change (`--in-diff`),
+# which `cargo xtask pre-push` and `.github/workflows/mutants.yml` both do: a whole-repository run is minutes
+# of mutants nobody edited, and a survivor outside the change is not this push's to answer for.
+
+# The tests themselves, and the repository's own tasks, which no suite of the broker's covers
+exclude_globs = [
+    "tests/**",
+    "xtask/**",
+]
+# Each test in its own process under `.config/nextest.toml`'s deadlines, so a mutant that makes the broker
+# stop answering is caught at one rather than hanging the run
+test_tool = "nextest"
+# Under the machine's other load a suite can run several times its baseline
+timeout_multiplier = 3.0
+# Inside target/, which is gitignored and which cargo-mutants doesn't copy
+output = "target"
+# Without debug info (`Cargo.toml`, profile.mutants): each job's copy is a fraction of a debug build's
+profile = "mutants"
