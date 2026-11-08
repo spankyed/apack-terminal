@@ -124,6 +124,44 @@ const SATURATE: &str = "head -c 1048576 /dev/zero | tr '\\0' x\n";
 /// up. 64 MiB is past every buffer in the path.
 const OVERLOAD: &str = "head -c 67108864 /dev/zero | tr '\\0' x\n";
 
+/// **A flush reaches the cap, which is the one thing the case below cannot say.**
+///
+/// That case derives its budget *from* `OUTPUT_CAP`, deliberately, so that a slower machine is allowed more
+/// windows and the budget stays load-independent. The cost is that it cannot notice the cap itself moving:
+/// shrink it sixtyfold and the expected message count shrinks with it, and the case still passes — which a
+/// mutation run found, `64 * 1024` surviving as `64 + 1024`.
+///
+/// So this asserts a size rather than a count, against a literal, and the direction is what makes it safe:
+/// coalescing can only put *more* into a message than the window alone would, never less, and nothing above
+/// the cap is ever held back. A busy machine therefore pushes this measurement up. A cap of 1,088 bytes caps
+/// every message at 1,088 and fails here; the real cap clears the floor sixteenfold.
+#[test]
+fn output_is_coalesced_up_to_the_cap_rather_than_to_some_smaller_size() {
+    let broker = start();
+    let (mut reading, mut writing) = greeted(&broker);
+    let session = run(&mut reading, &mut writing, SATURATE);
+
+    /// A sixteenth of the real cap: past any plausible window's worth at this rate, and far under 64 KiB
+    const FLOOR: usize = 4 * 1024;
+
+    let mut largest = 0usize;
+    let mut bytes = 0usize;
+    while bytes < 1_048_576 {
+        let event = next(&mut reading);
+        if event["kind"] == "output" && event["session"] == session.as_str() {
+            let held = event["data"].as_str().unwrap_or_default().len();
+            bytes += held;
+            largest = largest.max(held);
+        }
+    }
+
+    assert!(
+        largest > FLOOR,
+        "a megabyte arrived in messages of at most {largest} bytes, under the {FLOOR} a cap of \
+         {OUTPUT_CAP} has to clear: the cap is not what is bounding a flush"
+    );
+}
+
 #[test]
 fn a_megabyte_of_output_is_coalesced_into_far_fewer_messages_than_chunks() {
     let broker = start();
