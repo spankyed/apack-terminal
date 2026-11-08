@@ -1215,3 +1215,52 @@ fn an_owner_arriving_does_not_take_the_feed_from_a_client() {
     }
     panic!("the owner took the feed from the client: {output:?}");
 }
+
+/// **A broker nobody is connected to exits**, which is the difference between a process per app launch and
+/// none. It used to listen for ever: its sessions were ended, so nothing leaked that a user could feel, and
+/// one process accumulated every time the app started.
+#[cfg(unix)]
+#[test]
+fn a_broker_nobody_is_connected_to_exits() {
+    let mut broker = start();
+    let (mut reading, mut writing) = greet(&broker, "client");
+    ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
+    next(&mut reading);
+    once_the_shell_is_listening(&mut reading);
+
+    disconnect(reading, writing);
+
+    for _ in 0..100 {
+        if let Ok(Some(_)) = broker.process.try_wait() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("the broker went on listening with nobody connected");
+}
+
+/// The other direction, so the case above cannot be satisfied by a broker that exits whenever it feels
+/// like it: while an owner holds it, a client coming and going leaves it listening.
+#[cfg(unix)]
+#[test]
+fn a_broker_an_owner_holds_keeps_listening_between_clients() {
+    let mut broker = start();
+    let (_owner_events, _owner) = greet(&broker, "lifetime");
+
+    let (mut reading, mut writing) = greet(&broker, "client");
+    ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
+    next(&mut reading);
+    once_the_shell_is_listening(&mut reading);
+    disconnect(reading, writing);
+
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(
+        matches!(broker.process.try_wait(), Ok(None)),
+        "the broker exited while the app still held it"
+    );
+    // And it still answers, which is what "listening" has to mean
+    let (mut reading, mut writing) = greet(&broker, "client");
+    ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
+    assert_eq!(next(&mut reading)["kind"], "spawned");
+    let _ = &mut writing;
+}

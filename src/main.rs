@@ -45,6 +45,7 @@ fn main() -> std::io::Result<()> {
         feed: Arc::new(Mutex::new(None)),
         owned: Arc::new(AtomicBool::new(false)),
         clients: Arc::new(AtomicUsize::new(0)),
+        connections: Arc::new(AtomicUsize::new(0)),
     };
     // One writer for the broker's life: every event leaves on this thread, so nothing interleaves two
     // frames, and a client arriving or leaving changes where they go rather than who writes them
@@ -59,6 +60,7 @@ fn main() -> std::io::Result<()> {
             // them in turn would mean the app's own hold on the broker blocked every session request
             Ok(stream) => {
                 let broker = broker.clone();
+                broker.connections.fetch_add(1, Ordering::SeqCst);
                 std::thread::spawn(move || serve(stream, broker));
             }
             Err(error) => eprintln!("accept failed: {error}"),
@@ -78,6 +80,10 @@ struct Broker {
     owned: Arc<AtomicBool>,
     /// How many `client` connections are open.
     clients: Arc<AtomicUsize>,
+    /// How many connections of any kind are open, **counted from the accept and not from the handshake**.
+    /// That is what makes exiting at zero safe: a caller that has connected but not yet greeted is already
+    /// counted, so it cannot be hung up on by a broker deciding nobody wants it.
+    connections: Arc<AtomicUsize>,
 }
 
 /// Writes every event to whichever client is attached, for as long as the broker runs.
@@ -223,6 +229,15 @@ fn serve(stream: Stream, broker: Broker) {
             }
         }
         None => {}
+    }
+
+    // **A broker nobody is connected to has nothing left to be**, and exiting is the whole of its cleanup:
+    // the socket goes with the process, and so does the memory every screen was holding. It used to listen
+    // for ever instead, so each run of the app left one behind — harmless on its own, since its sessions
+    // were already ended, and a process per launch all the same.
+    if broker.connections.fetch_sub(1, Ordering::SeqCst) == 1 {
+        end_everything(&broker);
+        std::process::exit(0);
     }
 }
 
