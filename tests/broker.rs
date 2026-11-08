@@ -928,15 +928,23 @@ fn a_session_nobody_is_drawing_answers_what_its_shell_reported() {
     types(
         &mut writing,
         &session,
-        &prints("\\033]633;E;ls -la\\007\\033]633;C\\007\\033]633;P;Cwd=/tmp\\007\\033]633;D;3\\007"),
+        &prints(
+            "\\033]633;E;ls -la\\007\\033]633;C\\007\\033]633;P;Cwd=/tmp\\007\\033]633;D;3\\007",
+        ),
     );
     once_the_sentinel_is_printed(&mut reading);
 
-    ask(&mut writing, &format!(r#"{{"kind":"facts","session":"{session}"}}"#));
+    ask(
+        &mut writing,
+        &format!(r#"{{"kind":"facts","session":"{session}"}}"#),
+    );
     let (facts, _) = until(&mut reading, "facts");
     assert_eq!(facts["cwd"], "/tmp", "the directory the shell reported");
     assert_eq!(facts["command"], "ls -la", "the command line it reported");
-    assert_eq!(facts["exit_status"], 3, "the status it reported, as reported");
+    assert_eq!(
+        facts["exit_status"], 3,
+        "the status it reported, as reported"
+    );
     assert_eq!(facts["running"], false, "the command finished");
 }
 
@@ -997,13 +1005,21 @@ fn a_wait_for_idle_is_answered_when_the_command_finishes() {
 
     ask(
         &mut writing,
-        &format!(r#"{{"kind":"wait","session":"{session}","until":{{"kind":"idle"}},"timeout_ms":10000}}"#),
+        &format!(
+            r#"{{"kind":"wait","session":"{session}","until":{{"kind":"idle"}},"timeout_ms":10000}}"#
+        ),
     );
     // Nothing has finished the command, so nothing may answer yet
     for _ in 0..3 {
-        if let Ok(line) = reading.0.recv_timeout(std::time::Duration::from_millis(300)) {
+        if let Ok(line) = reading
+            .0
+            .recv_timeout(std::time::Duration::from_millis(300))
+        {
             let event: serde_json::Value = serde_json::from_str(&line).expect("an event");
-            assert_ne!(event["kind"], "waited", "the session is still busy: {event}");
+            assert_ne!(
+                event["kind"], "waited",
+                "the session is still busy: {event}"
+            );
         }
     }
 
@@ -1046,11 +1062,15 @@ fn a_session_ending_settles_both_kinds_of_wait() {
 
     ask(
         &mut writing,
-        &format!(r#"{{"kind":"wait","session":"{session}","until":{{"kind":"idle"}},"timeout_ms":30000}}"#),
+        &format!(
+            r#"{{"kind":"wait","session":"{session}","until":{{"kind":"idle"}},"timeout_ms":30000}}"#
+        ),
     );
     ask(
         &mut writing,
-        &format!(r#"{{"kind":"wait","session":"{session}","until":{{"kind":"exit"}},"timeout_ms":30000}}"#),
+        &format!(
+            r#"{{"kind":"wait","session":"{session}","until":{{"kind":"exit"}},"timeout_ms":30000}}"#
+        ),
     );
     types(&mut writing, &session, &format!("exit{SUBMIT}"));
 
@@ -1075,7 +1095,10 @@ fn a_session_ending_settles_both_kinds_of_wait() {
 /// Greets as a given role, answering the connection and its id.
 fn greet(broker: &Broker, role: &str) -> (Events, Wire) {
     let (mut reading, mut writing) = connect(broker);
-    ask(&mut writing, &format!(r#"{{"kind":"hello","protocol":1,"role":"{role}"}}"#));
+    ask(
+        &mut writing,
+        &format!(r#"{{"kind":"hello","protocol":1,"role":"{role}"}}"#),
+    );
     assert_eq!(next(&mut reading)["kind"], "hello", "greeted as {role}");
     (reading, writing)
 }
@@ -1094,19 +1117,32 @@ fn a_session_outlives_its_client_while_an_owner_holds_the_broker() {
     let (mut reading, mut writing) = greet(&broker, "client");
     ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
     let spawned = next(&mut reading);
-    let session = spawned["session"].as_str().expect("a session id").to_owned();
+    let session = spawned["session"]
+        .as_str()
+        .expect("a session id")
+        .to_owned();
     let pid = spawned["pid"].as_u64().expect("a pid") as i32;
     once_the_shell_is_listening(&mut reading);
 
     // The client is gone, socket and all
     disconnect(reading, writing);
-    assert!(alive(pid), "the shell outlives the client that asked for it");
+    assert!(
+        alive(pid),
+        "the shell outlives the client that asked for it"
+    );
 
     // And a client that comes back can still use it, which is what "still running" has to mean
     let (mut reading, mut writing) = greet(&broker, "client");
-    ask(&mut writing, &format!(r#"{{"kind":"facts","session":"{session}"}}"#));
+    ask(
+        &mut writing,
+        &format!(r#"{{"kind":"facts","session":"{session}"}}"#),
+    );
     let (facts, _) = until(&mut reading, "facts");
-    assert_eq!(facts["session"], session.as_str(), "the same session answers the new client");
+    assert_eq!(
+        facts["session"],
+        session.as_str(),
+        "the same session answers the new client"
+    );
 }
 
 /// **The owner going away ends them**, which is what stops a quit leaving shells behind.
@@ -1142,12 +1178,19 @@ fn output_follows_the_client_that_came_back() {
 
     let (mut reading, mut writing) = greet(&broker, "client");
     ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
-    let session = next(&mut reading)["session"].as_str().expect("a session id").to_owned();
+    let session = next(&mut reading)["session"]
+        .as_str()
+        .expect("a session id")
+        .to_owned();
     once_the_shell_is_listening(&mut reading);
     disconnect(reading, writing);
 
     let (mut reading, mut writing) = greet(&broker, "client");
-    types(&mut writing, &session, &format!("echo back-on-the-feed{SUBMIT}"));
+    types(
+        &mut writing,
+        &session,
+        &format!("echo back-on-the-feed{SUBMIT}"),
+    );
     let mut output = String::new();
     for _ in 0..400 {
         let event = next(&mut reading);
@@ -1196,7 +1239,10 @@ fn an_owner_arriving_does_not_take_the_feed_from_a_client() {
     let broker = start();
     let (mut reading, mut writing) = greet(&broker, "client");
     ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
-    let session = next(&mut reading)["session"].as_str().expect("a session id").to_owned();
+    let session = next(&mut reading)["session"]
+        .as_str()
+        .expect("a session id")
+        .to_owned();
     once_the_shell_is_listening(&mut reading);
 
     // The app takes its hold *after* the terminal is already running

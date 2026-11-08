@@ -145,7 +145,10 @@ fn reads_the_same_markers_however_the_stream_is_chunked() {
          \x1b]633;P;Cwd=/home/me/w%20d{BEL}\x1b]633;D;1\x1b\\done"
     );
     let whole = markers(&stream);
-    assert!(whole.len() == 6, "the stream carries six markers: {whole:?}");
+    assert!(
+        whole.len() == 6,
+        "the stream carries six markers: {whole:?}"
+    );
 
     assert_eq!(byte_at_a_time(&stream), whole, "one byte at a time");
     for at in 0..=stream.len() {

@@ -353,10 +353,12 @@ impl Sessions {
     /// What the shell has reported about itself.
     pub fn facts(&self, session: &str) -> Result<Facts, Refusal> {
         let live = self.live.get(session).ok_or_else(|| missing(session))?;
-        let screen = live
-            .screen
-            .lock()
-            .map_err(|_| Refusal::pty("reading a session's facts", "the screen's lock was poisoned"))?;
+        let screen = live.screen.lock().map_err(|_| {
+            Refusal::pty(
+                "reading a session's facts",
+                "the screen's lock was poisoned",
+            )
+        })?;
         Ok(screen.facts().clone())
     }
 
@@ -385,10 +387,9 @@ impl Sessions {
         };
 
         let holds = {
-            let screen = live
-                .screen
-                .lock()
-                .map_err(|_| Refusal::pty("waiting on a session", "the screen's lock was poisoned"))?;
+            let screen = live.screen.lock().map_err(|_| {
+                Refusal::pty("waiting on a session", "the screen's lock was poisoned")
+            })?;
             waiter.holds(&screen)
         };
         if holds {

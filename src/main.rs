@@ -121,7 +121,9 @@ fn write_out(outgoing: Receiver<Outgoing>, broker: Broker) {
 /// Takes `stream` out of the feed, if it is still the one attached.
 fn detach(broker: &Broker, stream: &Arc<Stream>) {
     if let Ok(mut feed) = broker.feed.lock()
-        && feed.as_ref().is_some_and(|attached| Arc::ptr_eq(attached, stream))
+        && feed
+            .as_ref()
+            .is_some_and(|attached| Arc::ptr_eq(attached, stream))
     {
         *feed = None;
     }
@@ -160,26 +162,38 @@ fn serve(stream: Stream, broker: Broker) {
         let request = match serde_json::from_str::<Request>(&line) {
             Ok(request) => request,
             Err(error) => {
-                say(&stream, &Event::Failed {
-                    session: None,
-                    code: ErrorCode::Malformed,
-                    message: format!("{error}"),
-                });
+                say(
+                    &stream,
+                    &Event::Failed {
+                        session: None,
+                        code: ErrorCode::Malformed,
+                        message: format!("{error}"),
+                    },
+                );
                 continue;
             }
         };
         // **The handshake is first or the connection is refused**, because the monorepo pins a commit of this
         // repository: a stale pin has to be a clear refusal rather than a message that means something else.
         match (&request, role) {
-            (Request::Hello { protocol, role: asked }, _) => {
+            (
+                Request::Hello {
+                    protocol,
+                    role: asked,
+                },
+                _,
+            ) => {
                 if *protocol != PROTOCOL_VERSION {
-                    say(&stream, &Event::Failed {
-                        session: None,
-                        code: ErrorCode::Handshake,
-                        message: format!(
-                            "the app speaks protocol {protocol}; this broker speaks {PROTOCOL_VERSION}"
-                        ),
-                    });
+                    say(
+                        &stream,
+                        &Event::Failed {
+                            session: None,
+                            code: ErrorCode::Handshake,
+                            message: format!(
+                                "the app speaks protocol {protocol}; this broker speaks {PROTOCOL_VERSION}"
+                            ),
+                        },
+                    );
                     break;
                 }
                 role = Some(*asked);
@@ -194,15 +208,23 @@ fn serve(stream: Stream, broker: Broker) {
                     }
                     Role::Lifetime => broker.owned.store(true, Ordering::SeqCst),
                 }
-                say(&stream, &Event::Hello { protocol: PROTOCOL_VERSION });
+                say(
+                    &stream,
+                    &Event::Hello {
+                        protocol: PROTOCOL_VERSION,
+                    },
+                );
                 continue;
             }
             (_, None) => {
-                say(&stream, &Event::Failed {
-                    session: None,
-                    code: ErrorCode::Handshake,
-                    message: "the first message must be hello".to_owned(),
-                });
+                say(
+                    &stream,
+                    &Event::Failed {
+                        session: None,
+                        code: ErrorCode::Handshake,
+                        message: "the first message must be hello".to_owned(),
+                    },
+                );
                 break;
             }
             _ => {}
