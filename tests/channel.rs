@@ -98,7 +98,7 @@ fn run(reading: &mut impl BufRead, writing: &mut impl Write, command: &str) -> S
         writing,
         &serde_json::json!({
             "kind": "spawn", "cols": 80, "rows": 24, "shell": null,
-            "args": [], "env": [], "cwd": null,
+            "args": [], "env": [], "unset": [], "cwd": null,
         })
         .to_string(),
     );

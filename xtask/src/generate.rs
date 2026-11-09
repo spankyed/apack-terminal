@@ -74,7 +74,8 @@ pub fn check(root: &Path) -> Result<(), String> {
     }
     Err(format!(
         "{COMMITTED_DIR}/{GENERATED} is not what src/protocol.rs generates; run `cargo xtask generate` and \
-         commit the result. The apack monorepo keeps its own copy of this file and re-derives it the same way \
-         (`npm run protocol:check` there), so a stale copy here is a stale copy in both"
+         commit the result. It ships inside the npm package, so a consumer imports these types from \
+         `apack-terminal` like any dependency's — a stale file here is the contract a pinned consumer \
+         compiles against"
     ))
 }

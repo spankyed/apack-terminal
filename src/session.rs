@@ -348,6 +348,20 @@ pub struct Sessions {
     credit: Arc<Credit>,
 }
 
+/// What a spawn is asked for: `Request::Spawn`'s own fields, as one value.
+///
+/// The wire shape is the request's and unchanged — this exists because the method took eight arguments
+/// once `unset` joined them, and a list of seven positional values is a call site nobody can read.
+pub struct Spawning {
+    pub cols: u16,
+    pub rows: u16,
+    pub shell: Option<String>,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub unset: Vec<String>,
+    pub cwd: Option<String>,
+}
+
 /// A failure a request turns into a `Failed` event rather than a panic.
 #[derive(Debug)]
 pub struct Refusal {
@@ -411,15 +425,8 @@ impl Sessions {
     }
 
     /// Starts a shell in a new pty and begins reading it. The id is the broker's to mint.
-    pub fn spawn(
-        &mut self,
-        cols: u16,
-        rows: u16,
-        shell: Option<String>,
-        args: Vec<String>,
-        env: Vec<(String, String)>,
-        cwd: Option<String>,
-    ) -> Result<(SessionId, u32), Refusal> {
+    pub fn spawn(&mut self, asked: Spawning) -> Result<(SessionId, u32), Refusal> {
+        let Spawning { cols, rows, shell, args, env, unset, cwd } = asked;
         let (cols, rows) = grid(cols, rows);
         let pty = native_pty_system()
             .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
@@ -439,6 +446,13 @@ impl Sessions {
         // already had the app's identity taken out of it (`brokerEnvironment`, app side)
         for (name, value) in env {
             command.env(name, value);
+        }
+        // **After the overrides, so asking for a name to be absent is what a caller gets.** A session
+        // inherits this process's environment, which a caller cannot subtract from by adding entries — and
+        // what it is usually subtracting is a credential the app carries and its child must not: a CLI that
+        // found one would authenticate as the app rather than as whoever the user signed in as.
+        for name in unset {
+            command.env_remove(name);
         }
         if let Some(directory) = cwd {
             command.cwd(directory);

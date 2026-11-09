@@ -22,7 +22,7 @@ use apack_terminal::frames::{Frame, read_frame};
 use apack_terminal::output::{Outgoing, channel_with_credit};
 use apack_terminal::protocol::{ErrorCode, Event, PROTOCOL_VERSION, Request, Role, SearchMatch};
 use apack_terminal::screen::HISTORY_LINES;
-use apack_terminal::session::Sessions;
+use apack_terminal::session::{Sessions, Spawning};
 
 fn main() -> std::io::Result<()> {
     let Some(socket) = std::env::args().nth(1) else {
@@ -284,13 +284,15 @@ fn carry_out(sessions: &Arc<Mutex<Sessions>>, request: Request) {
     };
     let outcome = match request {
         Request::Hello { .. } => return,
-        Request::Spawn { cols, rows, shell, args, env, cwd } => match live.spawn(cols, rows, shell, args, env, cwd) {
-            Ok((session, pid)) => {
-                live.answer(Event::Spawned { session, pid });
-                Ok(())
+        Request::Spawn { cols, rows, shell, args, env, unset, cwd } => {
+            match live.spawn(Spawning { cols, rows, shell, args, env, unset, cwd }) {
+                Ok((session, pid)) => {
+                    live.answer(Event::Spawned { session, pid });
+                    Ok(())
+                }
+                Err(refusal) => Err((None, refusal)),
             }
-            Err(refusal) => Err((None, refusal)),
-        },
+        }
         Request::Write { session, text } => live.write(&session, &text).map_err(|refusal| (Some(session), refusal)),
         Request::Resize { session, cols, rows } => {
             live.resize(&session, cols, rows).map_err(|refusal| (Some(session), refusal))

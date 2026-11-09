@@ -63,6 +63,13 @@ pub enum Request {
         args: Vec<String>,
         /// Added to the environment the broker runs in, which is already stripped of the app's own
         env: Vec<(String, String)>,
+        /// **Taken out of it, which `env` cannot express.** A session inherits the broker's environment, so
+        /// a caller that wants a name *absent* from its child cannot do it by adding entries — and a caller
+        /// spawning a program rather than the user's shell often does: a CLI handed an API key the app
+        /// happens to carry would authenticate as the app rather than as whoever the user signed in as.
+        ///
+        /// Applied after `env`, so the absence is what a caller gets when it asks for both.
+        unset: Vec<String>,
         cwd: Option<String>,
     },
     /// Bytes the user typed.

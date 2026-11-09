@@ -189,6 +189,7 @@ fn spawn_frame_with_env(cols: u16, rows: u16, shell: Option<&str>, env: &[(&str,
         "shell": shell,
         "args": [],
         "env": env.iter().map(|(name, value)| [*name, *value]).collect::<Vec<_>>(),
+        "unset": [],
         "cwd": null,
     })
     .to_string()
@@ -817,6 +818,7 @@ fn a_shell_is_started_with_the_arguments_and_environment_it_was_asked_for() {
         "shell": "/bin/sh",
         "args": ["-c", "printf 'marker=%s\\n' \"$APACK_PROBE\""],
         "env": [["APACK_PROBE", "arranged"]],
+        "unset": [],
         "cwd": null,
     })
     .to_string();
@@ -1243,7 +1245,7 @@ fn a_windows_shell_reports_itself_when_started_with_an_integration_file() {
     let frame = serde_json::json!({
         "kind": "spawn", "cols": 120, "rows": 30, "shell": "powershell.exe",
         "args": ["-NoExit", "-Command", format!(". '{}'", script.display())],
-        "env": [], "cwd": null,
+        "env": [], "unset": [], "cwd": null,
     })
     .to_string();
     ask(&mut writing, &frame);
@@ -1345,7 +1347,10 @@ fn a_grid_nothing_could_draw_is_capped_rather_than_attempted() {
 
     ask(&mut writing, &hello(None));
     next(&mut reading);
-    ask(&mut writing, r#"{"kind":"spawn","cols":65535,"rows":65535,"shell":null,"args":[],"env":[],"cwd":null}"#);
+    ask(
+        &mut writing,
+        r#"{"kind":"spawn","cols":65535,"rows":65535,"shell":null,"args":[],"env":[],"unset":[],"cwd":null}"#,
+    );
 
     let spawned = next(&mut reading);
     assert_eq!(spawned["kind"], "spawned", "an impossible grid was refused rather than capped: {spawned}");
@@ -1387,6 +1392,7 @@ fn a_shell_is_told_what_terminal_it_is_in() {
         "shell": shell,
         "args": args,
         "env": [],
+        "unset": [],
         "cwd": null,
     })
     .to_string();
@@ -1425,6 +1431,7 @@ fn what_is_running_in_a_session_is_measured_rather_than_claimed() {
         "shell": "/bin/cat",
         "args": [],
         "env": [],
+        "unset": [],
         "cwd": null,
     })
     .to_string();
@@ -1858,4 +1865,77 @@ fn asking_what_a_session_that_does_not_exist_owns_is_refused_by_code() {
     ask(&mut writing, r#"{"kind":"owns","session":"s-404","pid":2}"#);
     let failed = next(&mut reading);
     assert_eq!(failed["code"], "NO_SUCH_SESSION", "{failed:?}");
+}
+
+/// **A caller can keep a name out of its child, which adding entries cannot do** (`unset`).
+///
+/// A session inherits the broker's environment, so a consumer spawning a *program* rather than the user's
+/// shell has no way to subtract from it — and what it is usually subtracting is a credential the app
+/// carries and the program must not see: a CLI that found one would authenticate as the app rather than as
+/// whoever the user signed in as.
+///
+/// The broker's own environment is arranged here on purpose. Without that the case passes whether or not
+/// anything was removed, which is the asymmetry `start_with_env` exists for.
+#[cfg(unix)]
+#[test]
+fn a_name_the_request_unsets_is_absent_from_the_child_even_though_the_broker_has_it() {
+    const PRINTS_SECRET: (&str, [&str; 2]) = ("/bin/sh", ["-c", "printf 'secret=[%s]\\n' \"$A_CREDENTIAL\""]);
+    let broker = start_with_env(|command| {
+        command.env("A_CREDENTIAL", "the-app-s-own");
+    });
+    let (mut reading, mut writing) = connect(&broker);
+    ask(&mut writing, &hello(None));
+    next(&mut reading);
+    let (shell, args) = PRINTS_SECRET;
+
+    // Inherited, which is what makes the other half of this case mean anything
+    let inherited = serde_json::json!({
+        "kind": "spawn", "cols": 80, "rows": 24, "shell": shell, "args": args,
+        "env": [], "unset": [], "cwd": null,
+    })
+    .to_string();
+    ask(&mut writing, &inherited);
+    // **`until` rather than `next`**: this program exits as soon as it has printed, so its `exited` frame is
+    // in flight beside the next `spawned` — and `next` would hand back whichever arrived, whose `session`
+    // field reads perfectly well and names a session that has already finished
+    let (spawned, _) = until(&mut reading, "spawned");
+    let first = spawned["session"].as_str().expect("a session").to_owned();
+    let seen = output_until(&mut reading, Some(&first), |seen| seen.contains("secret=["));
+    assert!(seen.contains("secret=[the-app-s-own]"), "the broker's own environment reaches a child: {seen:?}");
+
+    let without = serde_json::json!({
+        "kind": "spawn", "cols": 80, "rows": 24, "shell": shell, "args": args,
+        "env": [], "unset": ["A_CREDENTIAL"], "cwd": null,
+    })
+    .to_string();
+    ask(&mut writing, &without);
+    let (second_spawned, _) = until(&mut reading, "spawned");
+    let second = second_spawned["session"].as_str().expect("a session").to_owned();
+    let gone = output_until(&mut reading, Some(&second), |seen| seen.contains("secret=["));
+    assert!(gone.contains("secret=[]"), "the name was still in the child's environment: {gone:?}");
+}
+
+/// **Absence is what a caller gets when it asks for both**, because a name it asked to be rid of is one it
+/// means to be rid of — an override that also named it would otherwise be the one place the guarantee broke.
+#[cfg(unix)]
+#[test]
+fn unsetting_a_name_wins_over_setting_it() {
+    const PRINTS_SECRET: (&str, [&str; 2]) = ("/bin/sh", ["-c", "printf 'secret=[%s]\\n' \"$A_CREDENTIAL\""]);
+    let broker = start();
+    let (mut reading, mut writing) = connect(&broker);
+    ask(&mut writing, &hello(None));
+    next(&mut reading);
+    let (shell, args) = PRINTS_SECRET;
+
+    let frame = serde_json::json!({
+        "kind": "spawn", "cols": 80, "rows": 24, "shell": shell, "args": args,
+        "env": [["A_CREDENTIAL", "set-by-the-caller"]], "unset": ["A_CREDENTIAL"], "cwd": null,
+    })
+    .to_string();
+    ask(&mut writing, &frame);
+    let (spawned, _) = until(&mut reading, "spawned");
+    let session = spawned["session"].as_str().expect("a session").to_owned();
+
+    let seen = output_until(&mut reading, Some(&session), |seen| seen.contains("secret=["));
+    assert!(seen.contains("secret=[]"), "an override outlived the unset that named it: {seen:?}");
 }

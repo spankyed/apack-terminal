@@ -50,7 +50,16 @@ args: Array<string>,
 /**
  * Added to the environment the broker runs in, which is already stripped of the app's own
  */
-env: Array<[string, string]>, cwd: string | null, } | { "kind": "write", session: string, text: string, } | { "kind": "resize", session: string, cols: number, rows: number, } | { "kind": "pause", session: string, } | { "kind": "resume", session: string, } | { "kind": "signal", session: string, signal: Signal, scope: Scope, } | { "kind": "owns", session: string, pid: number, } | { "kind": "screen", session: string, history: number, } | { "kind": "facts", session: string, } | { "kind": "search", session: string, text: string, history: number, } | { "kind": "wait", session: string, until: Until, timeout_ms: number, } | { "kind": "kill", session: string, };
+env: Array<[string, string]>, 
+/**
+ * **Taken out of it, which `env` cannot express.** A session inherits the broker's environment, so
+ * a caller that wants a name *absent* from its child cannot do it by adding entries — and a caller
+ * spawning a program rather than the user's shell often does: a CLI handed an API key the app
+ * happens to carry would authenticate as the app rather than as whoever the user signed in as.
+ *
+ * Applied after `env`, so the absence is what a caller gets when it asks for both.
+ */
+unset: Array<string>, cwd: string | null, } | { "kind": "write", session: string, text: string, } | { "kind": "resize", session: string, cols: number, rows: number, } | { "kind": "pause", session: string, } | { "kind": "resume", session: string, } | { "kind": "signal", session: string, signal: Signal, scope: Scope, } | { "kind": "owns", session: string, pid: number, } | { "kind": "screen", session: string, history: number, } | { "kind": "facts", session: string, } | { "kind": "search", session: string, text: string, history: number, } | { "kind": "wait", session: string, until: Until, timeout_ms: number, } | { "kind": "kill", session: string, };
 
 /**
  * What a connection is for.

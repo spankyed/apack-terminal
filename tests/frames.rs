@@ -75,14 +75,16 @@ fn requests() -> impl Strategy<Value = Request> {
             proptest::option::of("[^\u{0}]{0,20}"),
             proptest::collection::vec("[^\u{0}]{0,10}", 0..4),
             proptest::collection::vec(("[A-Z_]{1,8}", "[^\u{0}]{0,10}"), 0..4),
+            proptest::collection::vec("[A-Z_]{1,8}", 0..4),
             proptest::option::of("[^\u{0}]{0,20}"),
         )
-            .prop_map(|(cols, rows, shell, args, env, cwd)| Request::Spawn {
+            .prop_map(|(cols, rows, shell, args, env, unset, cwd)| Request::Spawn {
                 cols,
                 rows,
                 shell,
                 args,
                 env,
+                unset,
                 cwd
             }),
         ("[^\u{0}]{0,40}", "(?s).{0,40}").prop_map(|(session, text)| Request::Write { session, text }),

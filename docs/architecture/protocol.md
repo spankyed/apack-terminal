@@ -41,7 +41,7 @@ means for a session's lifetime.
 | kind | asks for |
 |---|---|
 | `hello` | the handshake, with a protocol version and a role |
-| `spawn` | a shell in a new pty: `cols`, `rows`, `shell`, `args`, `env`, `cwd` |
+| `spawn` | a shell in a new pty: `cols`, `rows`, `shell`, `args`, `env`, `unset`, `cwd` |
 | `write` | bytes the user typed |
 | `resize` | the viewport changed; one size per session, because a pty has one |
 | `pause` | stop reading this session's pty, so its process feels the reader stop |
@@ -59,6 +59,12 @@ code the shell runs at startup, and every shell takes that a different way — b
 PowerShell `-NoExit`, which are arguments; zsh wants `ZDOTDIR` and fish `XDG_DATA_DIRS`, which are
 environment. **The broker chooses neither**: it spawns what it is handed, because the files those point at
 belong to whoever ships them.
+
+`unset` is the other half of that, and it is what `env` cannot express: a session inherits the broker's
+environment, so adding entries cannot make a name *absent*. A consumer spawning a program rather than the
+user's shell often needs exactly that — a CLI handed a credential the app happens to carry would
+authenticate as the app rather than as whoever the user signed in as. It is applied after `env`, so absence
+is what a caller gets when it asks for both.
 
 ## Events
 
