@@ -14,46 +14,34 @@
 
 use std::io::{Read, Write};
 
-/// `alacritty_terminal` is the VT core: bytes in, a screen that can be read back.
+/// `libghostty-vt` is the VT core: bytes in, a screen that can be read back.
 ///
-/// The question D11 settled on lineage and Phase S re-asked on pairing — `termwiz` is from the same project
-/// as `portable-pty` — is answered by the registry rather than by taste: **`wezterm-term`, wezterm's actual
-/// terminal model, is not published to crates.io**, so the matched pair covers the parser and not the
-/// emulation. `termwiz` would mean vendoring or a git dependency for the part that matters.
+/// **It replaced `alacritty_terminal`, and the question that settled it was not taste.** D11 chose a Rust
+/// VT crate because one engine across the broker and the window was unbuyable; `libghostty-vt` 1.0's
+/// stable C ABI made it buyable, and Phase 0a measured the two as producing identical grids over every
+/// stream in `tests/parser.rs`. The snapshots there were recorded from the old parser and still pass
+/// unchanged, which is the evidence rather than this case.
+///
+/// What this case is for is the same thing every case in this file is for: it fails if the crate stops
+/// doing the one thing it was picked for.
 #[test]
 fn the_vt_core_parses_bytes_into_a_readable_screen() {
-    use alacritty_terminal::event::VoidListener;
-    use alacritty_terminal::grid::Dimensions;
-    use alacritty_terminal::term::{Config, Term};
-    use alacritty_terminal::vte::ansi::Processor;
+    use apack_terminal::vt::Terminal;
 
-    #[derive(Clone, Copy)]
-    struct Size {
-        columns: usize,
-        screen_lines: usize,
-    }
-    impl Dimensions for Size {
-        fn total_lines(&self) -> usize {
-            self.screen_lines
-        }
-        fn screen_lines(&self) -> usize {
-            self.screen_lines
-        }
-        fn columns(&self) -> usize {
-            self.columns
-        }
-    }
-
-    let mut term = Term::new(Config::default(), &Size { columns: 20, screen_lines: 3 }, VoidListener);
-    let mut parser: Processor = Processor::new();
+    let mut terminal = Terminal::new(20, 3).expect("a terminal");
+    // One byte at a time, because a parser that only works on whole writes is the failure this would miss
     for byte in b"hello\x1b[1;1H\x1b[31mred" {
-        parser.advance(&mut term, &[*byte]);
+        terminal.feed(&[*byte]);
     }
 
-    let row = &term.grid()[alacritty_terminal::index::Line(0)];
-    let line: String = (0..5).map(|column| row[alacritty_terminal::index::Column(column)].c).collect();
+    let row: String = (0..5)
+        .map(|column| {
+            let cell = terminal.cell(column, 0).expect("a cell read").expect("a cell");
+            char::from_u32(terminal.cell_codepoint(cell).expect("a codepoint")).unwrap_or(' ')
+        })
+        .collect();
     // "hello", then the cursor home and "red": three cells overwritten, the rest left alone
-    assert_eq!(line, "redlo", "the screen is readable and a cursor move overwrote the start of the line");
+    assert_eq!(row, "redlo", "the screen is readable and a cursor move overwrote the start of the line");
 }
 
 /// `portable-pty` is the process layer: a pty whose child's output comes back.

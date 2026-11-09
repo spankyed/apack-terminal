@@ -11,16 +11,8 @@
 //! about itself (`markers.rs`). The difference is provenance: a fact here was stated by the shell, and a
 //! status rule would be this file's guess about one.
 
-use std::sync::{Arc, Mutex};
-
-use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::index::{Column, Line};
-use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::{Config, Term, TermMode};
-use alacritty_terminal::vte::ansi::Processor;
-
 use crate::markers::{Marker, Markers};
+use crate::vt::{Failed, Reported, Terminal};
 
 /// Lines of scrollback a session keeps.
 ///
@@ -30,57 +22,8 @@ use crate::markers::{Marker, Markers};
 /// serves a reattach and a bounded read, and the two have no reason to agree.
 pub const HISTORY_LINES: usize = 1_000;
 
-/// What the terminal wants said back to the program, collected rather than discarded.
-///
-/// **A terminal answers questions, and a session that answers none does not start on Windows.** ConPTY's
-/// first act is a cursor-position report request (`ESC [ 6 n`) and it waits for the reply before
-/// initialising; a POSIX pty asks nothing, so this was invisible until the suite first ran on Windows and
-/// every session sat there having emitted exactly those four bytes.
-///
-/// `alacritty_terminal` already computes these replies and hands them over as `Event::PtyWrite` — the
-/// listener this replaced was `VoidListener`, which drops them. **It has to be the broker that answers**,
-/// not the window: a session nobody is drawing still has to run, which is the whole of why the broker owns
-/// one, and the renderer's own parse is a replica that must not be in the loop for a program's control
-/// queries.
-#[derive(Clone, Default)]
-struct Replies(Arc<Mutex<Vec<String>>>);
-
-impl EventListener for Replies {
-    fn send_event(&self, event: Event) {
-        if let Event::PtyWrite(text) = event
-            && let Ok(mut replies) = self.0.lock()
-        {
-            replies.push(text);
-        }
-    }
-}
-
-/// A screen's dimensions, which is all `Term` needs of a window.
-#[derive(Clone, Copy)]
-struct Size {
-    columns: usize,
-    screen_lines: usize,
-    history: usize,
-}
-
-impl Dimensions for Size {
-    /// **This is not what bounds the scrollback, and the obvious reading of it is wrong.**
-    ///
-    /// `Term::new` reads `columns()` and `screen_lines()` from this and takes the history from
-    /// `Config::scrolling_history` instead, so nothing in this crate's behaviour reads this method —
-    /// a whole-repository mutation run makes every mutant of it survive, which is how that was established
-    /// rather than assumed. It answers for the trait, correctly, because the grid will hold this many
-    /// lines; it decides nothing. `HISTORY_LINES` reaching the config in `Screen::new` is what decides.
-    fn total_lines(&self) -> usize {
-        self.screen_lines + self.history
-    }
-    fn screen_lines(&self) -> usize {
-        self.screen_lines
-    }
-    fn columns(&self) -> usize {
-        self.columns
-    }
-}
+/// The terminal advertised to a program, which has to be what the pty says.
+pub const TERMINFO_NAME: &str = "xterm-256color";
 
 /// How many matches a search answers.
 ///
@@ -139,27 +82,45 @@ pub struct Snapshot {
 
 /// One session's VT state.
 pub struct Screen {
-    term: Term<Replies>,
-    parser: Processor,
-    size: Size,
-    replies: Replies,
-    /// Scans the markers out of the same bytes, because the grid drops the sequences they travel in
+    /// Declared first so it is dropped first: the collector below is reachable from the library while this
+    /// handle lives, and freeing it behind a live terminal would leave a dangling callback.
+    terminal: Terminal,
+    /// What the library reports — the replies it makes for a program, and the facts its own callbacks read.
+    /// Boxed because its address is what the library was handed.
+    reported: Box<Reported>,
+    /// **The sequences the core does not read.** It reports OSC 133 and the working directory; this scans
+    /// OSC 633, which is VS Code's shell integration and which no version of the core reads. Measured in
+    /// Phase 0a: the two families are disjoint, so the union is strictly more than either and neither
+    /// double-reports a fact the other already has.
     markers: Markers,
-    facts: Facts,
+    cols: u16,
+    rows: u16,
 }
 
 impl Screen {
     pub fn new(cols: u16, rows: u16) -> Self {
-        let size = Size { columns: cols.max(1) as usize, screen_lines: rows.max(1) as usize, history: HISTORY_LINES };
-        let replies = Replies::default();
-        Self {
-            term: Term::new(Config { scrolling_history: HISTORY_LINES, ..Config::default() }, &size, replies.clone()),
-            parser: Processor::new(),
-            size,
-            replies,
-            markers: Markers::default(),
-            facts: Facts::default(),
-        }
+        Self::build(cols, rows).expect("libghostty-vt could not make a terminal")
+    }
+
+    /// **Three settings, each a default the core and this broker do not share.**
+    ///
+    /// The core keeps *no* scrollback limit of its own, where `HISTORY_LINES` is a ceiling on memory per
+    /// session; its byte ceiling has no counterpart here, so the line limit is left as the only rule
+    /// bounding history; and the advertised terminal has to be the one the pty says, because a program
+    /// decides what to emit from `TERM` and answers a query differently when told something else.
+    fn build(cols: u16, rows: u16) -> Result<Self, Failed> {
+        let cols = cols.max(1);
+        let rows = rows.max(1);
+        let terminal = Terminal::new(cols, rows)?;
+        terminal.set_scrollback_lines(HISTORY_LINES)?;
+        terminal.set_scrollback_unbounded_bytes()?;
+        terminal.set_terminfo_name(TERMINFO_NAME)?;
+
+        let mut reported = Box::new(Reported::default());
+        // SAFETY: the box outlives the handle, which this struct's field order guarantees
+        unsafe { terminal.route_reports(&raw mut *reported) }?;
+
+        Ok(Self { terminal, reported, markers: Markers::default(), cols, rows })
     }
 
     /// Feeds bytes as they arrived.
@@ -167,51 +128,89 @@ impl Screen {
     /// **Chunk boundaries are the parser's problem and it carries state across them**, which is why
     /// `tests/parser.rs` splits the same stream at every boundary and demands the same screen: a wrapper
     /// that buffered a chunk, or reset anything per call, would pass every test that feeds a whole stream.
+    ///
+    /// The core first, because its callbacks run inside the write; then the 633 scan over the same
+    /// untouched bytes, so neither pass can take anything from the other.
     pub fn feed(&mut self, bytes: &[u8]) {
-        // The markers first, from the untouched stream: the grid is handed the same bytes and ignores the
-        // sequences they travel in, so neither pass can take anything from the other
+        self.terminal.feed(bytes);
         for marker in self.markers.feed(bytes) {
-            self.facts.apply(marker);
+            self.reported.apply(marker);
         }
-        self.parser.advance(&mut self.term, bytes);
     }
 
     /// What the shell has said about itself.
     pub fn facts(&self) -> &Facts {
-        &self.facts
+        self.reported.facts()
     }
 
     /// What the program asked for and must be told, taken rather than read: each reply is written once.
     pub fn take_replies(&mut self) -> Vec<String> {
-        self.replies.0.lock().map(|mut replies| std::mem::take(&mut *replies)).unwrap_or_default()
+        self.reported.take_replies()
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
-        self.size.columns = cols.max(1) as usize;
-        self.size.screen_lines = rows.max(1) as usize;
-        self.term.resize(self.size);
+        self.cols = cols.max(1);
+        self.rows = rows.max(1);
+        let _ = self.terminal.resize(self.cols, self.rows);
     }
 
     /// The viewport, with up to `history` lines above it.
+    ///
+    /// **Addressed in screen coordinates**, where row zero is the oldest line still held, so the history
+    /// and the viewport are one range rather than two reads that could disagree about where they meet. An
+    /// alternate screen has no scrollback, so a history request over one answers the viewport alone, which
+    /// is the terminal's behaviour rather than a limitation of this read.
     pub fn snapshot(&self, history: u32) -> Snapshot {
-        let grid = self.term.grid();
-        let above = (history as usize).min(grid.history_size()) as i32;
-        let lines = (-above..self.size.screen_lines as i32)
-            .map(|line| row_text(&self.term, Line(line), self.size.columns))
-            .collect();
-        let cursor = grid.cursor.point;
-        Snapshot {
-            lines,
-            cursor_row: cursor.line.0.max(0) as u16,
-            cursor_column: cursor.column.0 as u16,
-            alt_screen: self.term.mode().contains(TermMode::ALT_SCREEN),
+        self.read(history).unwrap_or_else(|_| Snapshot {
+            lines: vec![String::new(); self.rows as usize],
+            cursor_row: 0,
+            cursor_column: 0,
+            alt_screen: false,
+        })
+    }
+
+    fn read(&self, history: u32) -> Result<Snapshot, Failed> {
+        let scrollback = self.terminal.scrollback_rows()?;
+        let above = history.min(scrollback);
+        let mut lines = Vec::with_capacity((above + u32::from(self.rows)) as usize);
+        for row in scrollback - above..scrollback + u32::from(self.rows) {
+            lines.push(self.row_text(row)?);
         }
+        Ok(Snapshot {
+            lines,
+            cursor_row: self.terminal.cursor_row()?,
+            cursor_column: self.terminal.cursor_column()?,
+            alt_screen: self.terminal.alt_screen()?,
+        })
+    }
+
+    /// One row as text.
+    ///
+    /// **A wide character occupies two cells and the second holds no codepoint of its own**, which read as
+    /// text gives `日 本 語`. Drawn that is right — the glyph is two columns wide — but reading as text is
+    /// what this is for: a bounded screen read an agent matches against must see what was written. So both
+    /// spacer kinds are skipped, and the trailing padding a row carries to its full width goes with them,
+    /// being the grid's shape rather than the program's output.
+    fn row_text(&self, row: u32) -> Result<String, Failed> {
+        let mut text = String::with_capacity(self.cols as usize);
+        for column in 0..self.cols {
+            let Some(cell) = self.terminal.cell(column, row)? else { continue };
+            if self.terminal.cell_is_spacer(cell)? {
+                continue;
+            }
+            let codepoint = self.terminal.cell_codepoint(cell)?;
+            text.push(char::from_u32(codepoint).filter(|found| *found != '\0').unwrap_or(' '));
+        }
+        while text.ends_with(' ') {
+            text.pop();
+        }
+        Ok(text)
     }
 }
 
 impl Facts {
     /// Takes one marker's word for it.
-    fn apply(&mut self, marker: Marker) {
+    pub(crate) fn apply(&mut self, marker: Marker) {
         match marker {
             // A prompt being drawn means whatever ran has finished, whether or not a `D` said so
             Marker::PromptStart => self.running = false,
@@ -257,25 +256,4 @@ impl Screen {
         }
         found
     }
-}
-
-/// One row as text.
-///
-/// **A wide character occupies two cells and the second holds a space**, which the first snapshot of this
-/// showed as `日 本 語`. Drawn that is right — the glyph is two columns wide — but read as text it is wrong,
-/// and reading as text is what this is for: a bounded screen read an agent matches against must see what was
-/// written. So the spacers are skipped, and the trailing padding a row carries to its full width goes with
-/// them, being the grid's shape rather than the program's output.
-fn row_text(term: &Term<Replies>, line: Line, columns: usize) -> String {
-    let row = &term.grid()[line];
-    let spacers = Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
-    let mut text: String = (0..columns)
-        .map(|column| &row[Column(column)])
-        .filter(|cell| !cell.flags.intersects(spacers))
-        .map(|cell| cell.c)
-        .collect();
-    while text.ends_with(' ') {
-        text.pop();
-    }
-    text
 }

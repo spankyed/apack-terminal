@@ -176,6 +176,66 @@ impl Terminal {
         Ok(wide)
     }
 
+    /// Bounds the scrollback to `lines`, which the core does not do by default.
+    pub fn set_scrollback_lines(&self, lines: usize) -> Result<(), Failed> {
+        self.set_usize(sys::TerminalOption::SCROLLBACK_MAX_LINES, lines, "ghostty_terminal_set(SCROLLBACK_MAX_LINES)")
+    }
+
+    /// Lifts the byte ceiling, so the line limit is the only rule bounding history.
+    ///
+    /// **The core's default is 10,000 bytes, and a null value does not remove it** — measured by reading
+    /// the limits back, after a null was assumed to work because the *line* option documents one as
+    /// removing its limit. Left at the default, a session held 757 lines of short output where this broker
+    /// promises `HISTORY_LINES`, and fewer the longer the lines were; a reattach would then read back less
+    /// than the window was told it could have. `alacritty_terminal` had no byte rule at all, so this is
+    /// what keeps the bound the one the snapshots in `tests/parser.rs` were recorded under.
+    pub fn set_scrollback_unbounded_bytes(&self) -> Result<(), Failed> {
+        self.set_usize(
+            sys::TerminalOption::SCROLLBACK_MAX_BYTES,
+            usize::MAX,
+            "ghostty_terminal_set(SCROLLBACK_MAX_BYTES)",
+        )
+    }
+
+    /// The terminal name a program reads from `TERM`, which decides what it emits.
+    pub fn set_terminfo_name(&self, name: &str) -> Result<(), Failed> {
+        self.set_str(sys::TerminalOption::TERMINFO_NAME, name, "ghostty_terminal_set(TERMINFO_NAME)")
+    }
+
+    /// Whether a cell is one of the two spacers a wide character leaves beside itself, holding no
+    /// codepoint of its own.
+    pub fn cell_is_spacer(&self, cell: sys::Cell) -> Result<bool, Failed> {
+        let wide = self.cell_wide(cell)?;
+        Ok(wide == sys::CellWide::SPACER_TAIL || wide == sys::CellWide::SPACER_HEAD)
+    }
+
+    /// How many rows the terminal holds in all, viewport included.
+    pub fn total_rows(&self) -> Result<u32, Failed> {
+        let mut rows: usize = 0;
+        // SAFETY: TOTAL_ROWS writes a `size_t`
+        let result = unsafe {
+            sys::ghostty_terminal_get(
+                self.handle,
+                sys::TerminalData::TOTAL_ROWS,
+                (&raw mut rows).cast::<std::ffi::c_void>(),
+            )
+        };
+        Failed::check("ghostty_terminal_get(TOTAL_ROWS)", result)?;
+        Ok(u32::try_from(rows).unwrap_or(u32::MAX))
+    }
+
+    /// What the terminal says its own limits are, for a diagnostic.
+    pub fn configured_limits(&self) -> (Option<usize>, Option<usize>) {
+        let read = |key: sys::TerminalData::Type| {
+            let mut value: usize = 0;
+            // SAFETY: both keys write a `size_t`
+            let result =
+                unsafe { sys::ghostty_terminal_get(self.handle, key, (&raw mut value).cast::<std::ffi::c_void>()) };
+            (result == sys::Result::SUCCESS).then_some(value)
+        };
+        (read(sys::TerminalData::SCROLLBACK_MAX_LINES), read(sys::TerminalData::SCROLLBACK_MAX_BYTES))
+    }
+
     /// Sets an option whose value is a `size_t`.
     fn set_usize(&self, option: sys::TerminalOption::Type, value: usize, what: &'static str) -> Result<(), Failed> {
         // SAFETY: the caller names an option documented as taking a `size_t*`
@@ -203,7 +263,7 @@ impl Terminal {
     /// `collector` must point at a live `Replies` for as long as this terminal can parse, which means it
     /// must outlive the handle. `GhosttyScreen` owns both and declares the terminal first so it is freed
     /// first.
-    unsafe fn route_reports(&self, collector: *mut Reported) -> Result<(), Failed> {
+    pub(crate) unsafe fn route_reports(&self, collector: *mut Reported) -> Result<(), Failed> {
         // SAFETY: userdata is an untyped pointer the library only ever hands back to the callback below
         let result = unsafe { sys::ghostty_terminal_set(self.handle, sys::TerminalOption::USERDATA, collector.cast()) };
         Failed::check("ghostty_terminal_set(USERDATA)", result)?;
@@ -303,6 +363,12 @@ impl Reported {
 
     pub fn facts(&self) -> &Facts {
         &self.facts
+    }
+
+    /// Takes a marker the core does not read — the OSC 633 family — into the same facts its own callbacks
+    /// fill, so a caller has one account of the shell rather than two to merge.
+    pub fn apply(&mut self, marker: crate::markers::Marker) {
+        self.facts.apply(marker);
     }
 }
 

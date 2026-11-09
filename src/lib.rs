@@ -14,7 +14,6 @@ pub mod security;
 pub mod session;
 pub mod tree;
 
-/// The `libghostty-vt` core, for Phase 0a's comparison against `screen`. Off by default: the feature
-/// exists so the measurement can be built without the default build acquiring a native archive.
-#[cfg(feature = "ghostty")]
+/// The `libghostty-vt` core `screen` is built on: the terminal handle, the collector its callbacks fill,
+/// and the safe layer over the C ABI that this repository owns rather than takes from a wrapper.
 pub mod vt;
