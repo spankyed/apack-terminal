@@ -26,13 +26,22 @@ impl Drop for Broker {
 /// Starts the built binary and **waits for its ready line** rather than retrying a connect: the broker
 /// prints where it is listening before its first accept, which is what makes a parent's start deterministic.
 fn start() -> Broker {
+    start_with_env(|_| {})
+}
+
+/// The same, with the broker's **own** environment arranged first.
+///
+/// For a case whose subject is what the broker passes on rather than what it happened to inherit. Without
+/// it such a case cannot fail where it matters: a developer's shell exports `TERM`, so a test that asserts
+/// a spawned shell has one passes whether the broker set it or the runner did — which is the same asymmetry
+/// as a check that is green locally and red on a runner, read the other way round.
+fn start_with_env(arrange: impl FnOnce(&mut Command)) -> Broker {
     let directory = tempfile::tempdir().expect("a directory for the socket");
     let socket = socket_in(directory.path());
-    let mut process = Command::new(env!("CARGO_BIN_EXE_apack-terminal"))
-        .arg(&socket)
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("the broker starts");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_apack-terminal"));
+    command.arg(&socket).stdout(Stdio::piped());
+    arrange(&mut command);
+    let mut process = command.spawn().expect("the broker starts");
 
     let mut ready = String::new();
     BufReader::new(process.stdout.as_mut().expect("piped stdout"))
@@ -1192,4 +1201,134 @@ fn a_windows_shell_reports_itself_when_started_with_an_integration_file() {
     ask(&mut writing, &format!(r#"{{"kind":"facts","session":"{session}"}}"#));
     let (facts, _) = until(&mut reading, "facts");
     assert_eq!(facts["cwd"], "C:\\Windows", "the shell moved and said so, and the broker read it: {output:?}");
+}
+
+/// **A frame is read before it is understood, so what may be read has to be bounded.**
+///
+/// `lines()` grows its buffer until a newline arrives. A client that writes and never sends one is therefore
+/// unbounded by construction — and this process owns every terminal in the app, so being killable by a
+/// sender that declines to finish a sentence is every session gone at once. The cap is the answer, and what
+/// makes it a cap rather than a comment is that the broker is still there afterwards.
+#[test]
+fn a_frame_without_end_is_refused_and_the_broker_survives() {
+    let broker = start();
+    // The app's own hold, so that the client below leaving does not end the broker for the ordinary reason:
+    // what is under test is a frame closing one connection, not the lifetime rule
+    let (_owner_events, _owner) = greet(&broker, "lifetime");
+    let (mut reading, mut writing) = connect(&broker);
+
+    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    assert_eq!(next(&mut reading)["kind"], "hello");
+
+    // A megabyte and one byte, with no newline anywhere in it
+    writing.write_all(&vec![b'x'; (1 << 20) + 1]).expect("the broker takes the bytes");
+    writing.flush().expect("flushed");
+
+    let refusal = next(&mut reading);
+    assert_eq!(refusal["kind"], "failed", "an unbounded frame was not refused: {refusal}");
+    assert_eq!(refusal["code"], "MALFORMED", "{refusal}");
+    // Named, because `serde_json` refuses a megabyte of `x` with `MALFORMED` too: what this case is about
+    // is the cap answering first, and only its own message says so
+    assert!(
+        refusal["message"].as_str().is_some_and(|said| said.contains("at most")),
+        "the refusal was the parser's rather than the cap's: {refusal}"
+    );
+
+    // The half that makes this a bound rather than a crash: another client is still served
+    let (mut again, mut writing_again) = connect(&broker);
+    ask(&mut writing_again, r#"{"kind":"hello","protocol":1}"#);
+    assert_eq!(next(&mut again)["kind"], "hello", "the broker did not survive the oversized frame");
+}
+
+/// **A frame of exactly the cap is inside it**, which is the boundary the case above cannot see.
+///
+/// That one sends a byte past the cap, so it passes whether the comparison is `>` or `>=` — a cap one byte
+/// tight refuses a legal frame and nothing would have said so. Found by mutating the comparison, which is
+/// the only way an off-by-one on a bound ever announces itself.
+#[test]
+fn a_frame_of_exactly_the_cap_is_taken() {
+    let broker = start();
+    let (_owner_events, _owner) = greet(&broker, "lifetime");
+    let (mut reading, mut writing) = connect(&broker);
+
+    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    assert_eq!(next(&mut reading)["kind"], "hello");
+
+    // A valid frame for a session that does not exist, padded so the line — the frame and the newline
+    // `ask` adds — is exactly the cap. Its refusal names the session, not the cap, which is the assertion.
+    const CAP: usize = 1 << 20;
+    let around = r#"{"kind":"write","session":"nope","text":""}"#.len() + 1;
+    let padded = "x".repeat(CAP - around);
+    let frame = format!(r#"{{"kind":"write","session":"nope","text":"{padded}"}}"#);
+    assert_eq!(frame.len() + 1, CAP, "the frame is not exactly the cap");
+    ask(&mut writing, &frame);
+
+    let refusal = next(&mut reading);
+    assert_eq!(refusal["kind"], "failed", "{refusal}");
+    assert!(
+        !refusal["message"].as_str().is_some_and(|said| said.contains("at most")),
+        "a frame of exactly the cap was refused by the cap: {refusal}"
+    );
+}
+
+/// **A grid nothing could draw is answered rather than attempted.**
+///
+/// `cols` and `rows` are `u16`, so a frame may ask for 65535 by 65535 — four billion cells, allocated per
+/// session by a process that owns every terminal in the app. This is the firing case for the cap: without
+/// it the broker attempts the allocation and dies, taking every other session with it, and the suite sees
+/// its connection close rather than an answer.
+#[test]
+fn a_grid_nothing_could_draw_is_capped_rather_than_attempted() {
+    let broker = start();
+    let (_owner_events, _owner) = greet(&broker, "lifetime");
+    let (mut reading, mut writing) = connect(&broker);
+
+    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    next(&mut reading);
+    ask(&mut writing, r#"{"kind":"spawn","cols":65535,"rows":65535,"shell":null,"args":[],"env":[],"cwd":null}"#);
+
+    let spawned = next(&mut reading);
+    assert_eq!(spawned["kind"], "spawned", "an impossible grid was refused rather than capped: {spawned}");
+}
+
+/// **A shell is told what terminal it is in, whoever launched the app** (X13).
+///
+/// Nothing in the request names `TERM` here, so what the shell prints is what the broker put there. An app
+/// started from the Dock or the Start menu has none to pass on, and a shell with no `TERM` reads no terminfo
+/// — which is how this suite's own alternate-screen case came to wait ten seconds on a CI runner.
+#[cfg(unix)]
+#[test]
+fn a_shell_is_told_what_terminal_it_is_in() {
+    // No `TERM` for the broker to pass on, so what the shell prints is what the broker decided
+    let broker = start_with_env(|command| {
+        command.env_remove("TERM");
+    });
+    let (mut reading, mut writing) = connect(&broker);
+    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    next(&mut reading);
+
+    let frame = serde_json::json!({
+        "kind": "spawn",
+        "cols": 80,
+        "rows": 24,
+        "shell": "/bin/sh",
+        "args": ["-c", "printf 'term=%s\\n' \"$TERM\""],
+        "env": [],
+        "cwd": null,
+    })
+    .to_string();
+    ask(&mut writing, &frame);
+    let session = next(&mut reading)["session"].as_str().expect("a session").to_owned();
+
+    let mut seen = String::new();
+    for _ in 0..200 {
+        let event = next(&mut reading);
+        if event["kind"] == "output" && event["session"] == session.as_str() {
+            seen.push_str(event["text"].as_str().unwrap_or_default());
+        }
+        if seen.contains("term=") {
+            break;
+        }
+    }
+    assert!(seen.contains("term=xterm-256color"), "the shell was given no terminal to be: {seen:?}");
 }

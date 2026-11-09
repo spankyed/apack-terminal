@@ -88,6 +88,20 @@ fn settle_met(waiters: &Mutex<Vec<Waiter>>, screen: &Screen) -> usize {
 }
 
 /// Every session this broker owns, and where their output goes.
+///
+/// **The lock order is `Sessions` then a session's `screen`, and nothing else is ever held with either.**
+/// Written down because the only way to get a deadlock out of this design is to invert it, and an inversion
+/// typechecks. As it stands: the methods here take a session's `screen` while their caller holds the
+/// `Sessions` mutex, so that pair always goes one way; the reader thread per session takes `screen`, the
+/// pty's `writer` and its `waiters`, and never takes `Sessions` at all; and `main`'s writer loop releases
+/// the `Sessions` guard before it touches the feed, so those two are never held together.
+///
+/// **What would make this fire is a second lock taken in the other order** — a `Sessions` method reached
+/// while a `screen` guard is alive, or the reader thread asking the broker for a session. Nothing checks
+/// it, which is why it is here rather than implied: there is no loom harness in this crate, deliberately,
+/// because every piece of shared state is behind a coarse mutex rather than a lock-free structure, and the
+/// credit semaphore returns exactly one unit per `notify_one` so the lost-wakeup a bulk return invites
+/// cannot arise. A harness exploring two mutexes held in one order would be exercising this comment.
 pub struct Sessions {
     next: u64,
     live: HashMap<SessionId, Session>,
@@ -111,6 +125,43 @@ impl Refusal {
 
 type Outcome = Result<(), Refusal>;
 
+/// What the broker tells a shell its terminal is.
+///
+/// **The broker names it because the broker *is* it.** A shell inherits the environment of whatever started
+/// the app, and an app launched from the Dock or the Start menu has no `TERM` at all — so `less`, `vim` and
+/// `top` read no terminfo and fall back to a dumb terminal or stall looking for one. That is not a theory:
+/// the alternate-screen case in this repository's own suite waited ten seconds for a switch that never came
+/// the first time it ran on a runner with no `TERM`, and had to declare one to pass.
+///
+/// `xterm-256color` is what the emulator on the other end answers to. A caller may still override it, since
+/// the requested environment is applied after this.
+const DEFAULT_TERM: &str = "xterm-256color";
+
+/// The widest and tallest grid a client may ask for.
+///
+/// **A frame arrives from whatever opened the socket, and the grid it names is allocated.** `cols` and `rows`
+/// are `u16`, so a request could ask for 65535 by 65535 — four billion cells, held per session, which is an
+/// out-of-memory kill for a process that owns every terminal in the app.
+///
+/// **The figure is the memory rather than the display.** A session holds its viewport *and*
+/// `HISTORY_LINES` of scrollback, and the broker holds up to a session per terminal the app has open, so a
+/// cap multiplies three times over: at a thousand it is about two million cells a session, and at the
+/// two thousand this first was, four times that — which is gigabytes across a full app for a grid nothing
+/// could be drawing. The widest real display at the smallest usable font is a few hundred columns, so a
+/// thousand is headroom nobody meets rather than a limit anyone notices.
+const MAX_GRID: u16 = 1_000;
+
+/// The grid a request gets, which is the one it asked for unless nothing could draw it.
+///
+/// **Capped rather than refused**, because a client that asked cannot do anything useful with a refusal and
+/// the honest reading of an impossible number is "as big as you can". There is deliberately no floor: a
+/// zero was probed unguarded and is benign — a `0x0` spawn, its `screen` and a resize back all answer
+/// normally, `portable_pty` and the VT core each tolerating it — so a floor would be a guard with nothing
+/// behind it.
+fn grid(cols: u16, rows: u16) -> (u16, u16) {
+    (cols.min(MAX_GRID), rows.min(MAX_GRID))
+}
+
 impl Sessions {
     pub fn new(events: Sender<Outgoing>, credit: Arc<Credit>) -> Self {
         Self { next: 0, live: HashMap::new(), events, credit }
@@ -131,6 +182,7 @@ impl Sessions {
         env: Vec<(String, String)>,
         cwd: Option<String>,
     ) -> Result<(SessionId, u32), Refusal> {
+        let (cols, rows) = grid(cols, rows);
         let pty = native_pty_system()
             .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
             .map_err(|error| Refusal::pty("opening a pty", error))?;
@@ -142,6 +194,9 @@ impl Sessions {
         for arg in args {
             command.arg(arg);
         }
+        // Before the requested environment, so a caller that names its own `TERM` wins and this is only the
+        // answer for the common case of nobody saying
+        command.env("TERM", DEFAULT_TERM);
         // Added rather than replacing: the broker's own environment is what a shell inherits, and it has
         // already had the app's identity taken out of it (`brokerEnvironment`, app side)
         for (name, value) in env {
@@ -285,6 +340,7 @@ impl Sessions {
     }
 
     pub fn resize(&mut self, session: &str, cols: u16, rows: u16) -> Outcome {
+        let (cols, rows) = grid(cols, rows);
         let live = self.live.get_mut(session).ok_or_else(|| missing(session))?;
         live.master
             .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
