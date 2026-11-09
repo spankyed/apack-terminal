@@ -15,9 +15,6 @@ use ghostty_vt_rs_sys as sys;
 use crate::markers::cwd_from_url;
 use crate::screen::Facts;
 
-pub mod screen;
-pub use screen::GhosttyScreen;
-
 /// One terminal, freed with the value.
 pub struct Terminal {
     handle: sys::Terminal,
@@ -236,21 +233,6 @@ impl Terminal {
         (read(sys::TerminalData::SCROLLBACK_MAX_LINES), read(sys::TerminalData::SCROLLBACK_MAX_BYTES))
     }
 
-    /// Sets an option whose value is a `size_t`.
-    fn set_usize(&self, option: sys::TerminalOption::Type, value: usize, what: &'static str) -> Result<(), Failed> {
-        // SAFETY: the caller names an option documented as taking a `size_t*`
-        let result =
-            unsafe { sys::ghostty_terminal_set(self.handle, option, (&raw const value).cast::<std::ffi::c_void>()) };
-        Failed::check(what, result)
-    }
-
-    /// Sets an option to no value, which is how its limit is removed.
-    fn set_null(&self, option: sys::TerminalOption::Type, what: &'static str) -> Result<(), Failed> {
-        // SAFETY: a null value is what the option's documentation says removes a limit
-        let result = unsafe { sys::ghostty_terminal_set(self.handle, option, std::ptr::null()) };
-        Failed::check(what, result)
-    }
-
     /// Routes the replies the terminal makes on a program's behalf to `collector`.
     ///
     /// **A terminal answers questions, and a session that answers none does not start on Windows**:
@@ -290,6 +272,14 @@ impl Terminal {
         // SAFETY: the signature matches `GhosttyTerminalPwdChangedFn`
         let result = unsafe { sys::ghostty_terminal_set(self.handle, sys::TerminalOption::PWD_CHANGED, pwd) };
         Failed::check("ghostty_terminal_set(PWD_CHANGED)", result)
+    }
+
+    /// Sets an option whose value is a `size_t`.
+    fn set_usize(&self, option: sys::TerminalOption::Type, value: usize, what: &'static str) -> Result<(), Failed> {
+        // SAFETY: the caller names an option documented as taking a `size_t*`
+        let result =
+            unsafe { sys::ghostty_terminal_set(self.handle, option, (&raw const value).cast::<std::ffi::c_void>()) };
+        Failed::check(what, result)
     }
 
     /// Sets an option whose value is a borrowed string.
