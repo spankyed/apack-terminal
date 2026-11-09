@@ -12,6 +12,9 @@
 //! library memory.
 use ghostty_vt_rs_sys as sys;
 
+pub mod screen;
+pub use screen::GhosttyScreen;
+
 /// One terminal, freed with the value.
 pub struct Terminal {
     handle: sys::Terminal,
@@ -67,6 +70,131 @@ impl Terminal {
     /// The grid's height in cells.
     pub fn rows(&self) -> Result<u16, Failed> {
         self.read_u16(sys::TerminalData::ROWS, "ghostty_terminal_get(ROWS)")
+    }
+
+    /// Where the cursor is **within the active area**, which is what the key answers and what the wrapper
+    /// beside this reports: a snapshot's history does not move it.
+    pub fn cursor_row(&self) -> Result<u16, Failed> {
+        self.read_u16(sys::TerminalData::CURSOR_Y, "ghostty_terminal_get(CURSOR_Y)")
+    }
+
+    pub fn cursor_column(&self) -> Result<u16, Failed> {
+        self.read_u16(sys::TerminalData::CURSOR_X, "ghostty_terminal_get(CURSOR_X)")
+    }
+
+    /// Whether an alternate-screen application is showing.
+    pub fn alt_screen(&self) -> Result<bool, Failed> {
+        let mut screen: sys::TerminalScreen::Type = sys::TerminalScreen::PRIMARY;
+        // SAFETY: ACTIVE_SCREEN writes a `GhosttyTerminalScreen`, which is what `screen` is
+        let result = unsafe {
+            sys::ghostty_terminal_get(
+                self.handle,
+                sys::TerminalData::ACTIVE_SCREEN,
+                (&raw mut screen).cast::<std::ffi::c_void>(),
+            )
+        };
+        Failed::check("ghostty_terminal_get(ACTIVE_SCREEN)", result)?;
+        Ok(screen == sys::TerminalScreen::ALTERNATE)
+    }
+
+    /// How many rows of scrollback the terminal is holding, which is where a screen row zero is.
+    pub fn scrollback_rows(&self) -> Result<u32, Failed> {
+        let mut rows: usize = 0;
+        // SAFETY: SCROLLBACK_ROWS writes a `size_t`
+        let result = unsafe {
+            sys::ghostty_terminal_get(
+                self.handle,
+                sys::TerminalData::SCROLLBACK_ROWS,
+                (&raw mut rows).cast::<std::ffi::c_void>(),
+            )
+        };
+        Failed::check("ghostty_terminal_get(SCROLLBACK_ROWS)", result)?;
+        Ok(u32::try_from(rows).unwrap_or(u32::MAX))
+    }
+
+    /// Resizes the grid. The primary screen reflows if wraparound is on; the alternate screen does not.
+    ///
+    /// **The cell size in pixels is zero on purpose.** The core takes it so that a renderer can report
+    /// what a program asks for in pixels, and this broker has no renderer: it owns the pty and the grid,
+    /// and a window's cell metrics are that window's. `screen::Screen` has no equivalent parameter, so
+    /// passing a made-up figure here would be inventing a fact to make a signature match.
+    pub fn resize(&mut self, cols: u16, rows: u16) -> Result<(), Failed> {
+        // SAFETY: the handle is live for `&mut self`
+        let result = unsafe { sys::ghostty_terminal_resize(self.handle, cols.max(1), rows.max(1), 0, 0) };
+        Failed::check("ghostty_terminal_resize", result)
+    }
+
+    /// The cell at a **screen** coordinate, where row zero is the oldest line still held.
+    ///
+    /// `None` for a coordinate the terminal has no cell at, which a caller reading a rectangle will hit:
+    /// a row shorter than the grid's width is not an error.
+    ///
+    /// **The handle is read and dropped inside this call.** A grid reference points into the library's
+    /// page list and the next write invalidates it, so one must never be held across a `feed`; returning
+    /// the cell value rather than the reference is what makes that impossible here.
+    pub fn cell(&self, column: u16, row: u32) -> Result<Option<sys::Cell>, Failed> {
+        let point = sys::Point {
+            tag: sys::PointTag::SCREEN,
+            value: sys::PointValue { coordinate: sys::PointCoordinate { x: column, y: row } },
+        };
+        let mut reference = sys::GridRef::default();
+        // SAFETY: `reference` is a valid out-pointer and the point is by value
+        let found = unsafe { sys::ghostty_terminal_grid_ref(self.handle, point, &raw mut reference) };
+        if found != sys::Result::SUCCESS {
+            return Ok(None);
+        }
+        let mut cell: sys::Cell = 0;
+        // SAFETY: the reference was just filled by the call above and nothing has written since
+        let result = unsafe { sys::ghostty_grid_ref_cell(&raw const reference, &raw mut cell) };
+        if result != sys::Result::SUCCESS {
+            return Ok(None);
+        }
+        Ok(Some(cell))
+    }
+
+    /// A cell's primary codepoint. Zero is an empty cell.
+    pub fn cell_codepoint(&self, cell: sys::Cell) -> Result<u32, Failed> {
+        let mut codepoint: u32 = 0;
+        // SAFETY: CODEPOINT writes a `uint32_t`
+        let result = unsafe {
+            sys::ghostty_cell_get(cell, sys::CellData::CODEPOINT, (&raw mut codepoint).cast::<std::ffi::c_void>())
+        };
+        Failed::check("ghostty_cell_get(CODEPOINT)", result)?;
+        Ok(codepoint)
+    }
+
+    /// Whether a cell is narrow, wide, or one of the two spacers a wide character leaves beside itself.
+    pub fn cell_wide(&self, cell: sys::Cell) -> Result<sys::CellWide::Type, Failed> {
+        let mut wide: sys::CellWide::Type = sys::CellWide::NARROW;
+        // SAFETY: WIDE writes a `GhosttyCellWide`
+        let result =
+            unsafe { sys::ghostty_cell_get(cell, sys::CellData::WIDE, (&raw mut wide).cast::<std::ffi::c_void>()) };
+        Failed::check("ghostty_cell_get(WIDE)", result)?;
+        Ok(wide)
+    }
+
+    /// Sets an option whose value is a `size_t`.
+    fn set_usize(&self, option: sys::TerminalOption::Type, value: usize, what: &'static str) -> Result<(), Failed> {
+        // SAFETY: the caller names an option documented as taking a `size_t*`
+        let result =
+            unsafe { sys::ghostty_terminal_set(self.handle, option, (&raw const value).cast::<std::ffi::c_void>()) };
+        Failed::check(what, result)
+    }
+
+    /// Sets an option to no value, which is how its limit is removed.
+    fn set_null(&self, option: sys::TerminalOption::Type, what: &'static str) -> Result<(), Failed> {
+        // SAFETY: a null value is what the option's documentation says removes a limit
+        let result = unsafe { sys::ghostty_terminal_set(self.handle, option, std::ptr::null()) };
+        Failed::check(what, result)
+    }
+
+    /// Sets an option whose value is a borrowed string.
+    fn set_str(&self, option: sys::TerminalOption::Type, value: &str, what: &'static str) -> Result<(), Failed> {
+        let text = sys::String::from(value);
+        // SAFETY: `text` borrows `value`, which outlives the call
+        let result =
+            unsafe { sys::ghostty_terminal_set(self.handle, option, (&raw const text).cast::<std::ffi::c_void>()) };
+        Failed::check(what, result)
     }
 }
 
