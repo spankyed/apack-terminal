@@ -9,5 +9,6 @@ pub mod markers;
 pub mod output;
 pub mod protocol;
 pub mod screen;
+pub mod security;
 pub mod session;
 pub mod tree;

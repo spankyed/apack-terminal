@@ -57,6 +57,7 @@ dependencies = [
  "sysinfo",
  "tempfile",
  "ts-rs",
+ "widestring",
  "windows-sys 0.61.2",
 ]
 

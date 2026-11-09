@@ -38,7 +38,18 @@ fn main() -> std::io::Result<()> {
     let name = socket.as_str().to_fs_name::<GenericFilePath>()?;
     // `try_overwrite` replaces the socket a previous run left behind, which would otherwise refuse the bind:
     // the app owns one broker per data dir, so the path is ours to replace rather than to share
-    let listener = ListenerOptions::new().name(name).try_overwrite(true).create_sync()?;
+    let options = ListenerOptions::new().name(name).try_overwrite(true);
+    // **On Windows the pipe is created with a descriptor of its own**, because the default one grants read
+    // access to Everyone and what crosses here is the user's terminal output (`security.rs`). On a Unix
+    // system the socket is a file in the user's own data directory and the filesystem has already answered
+    // this, so there is nothing to add. A descriptor that cannot be built refuses the listen: the
+    // alternative is serving every local account a terminal because a token could not be read
+    #[cfg(windows)]
+    let options = {
+        use interprocess::os::windows::local_socket::ListenerOptionsExt;
+        options.security_descriptor(apack_terminal::security::owner_only()?)
+    };
+    let listener = options.create_sync()?;
 
     // Ready on stdout before the first accept, so a parent knows when to connect rather than retrying
     println!("listening {socket}");

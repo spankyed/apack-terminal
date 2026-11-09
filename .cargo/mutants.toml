@@ -36,6 +36,14 @@ exclude_re = [
     # `WIDE_CHAR_SPACER` and `LEADING_WIDE_CHAR_SPACER` are distinct single bits, so `|` and `^` build the
     # same set and the filter skips the same cells. Nothing distinguishes them to test
     "screen.rs:.*replace \\| with \\^ in row_text",
+    # The two halves of the pipe's access are split so that the one that decides anything is testable: the
+    # SDDL string is built on every platform and `tests/security.rs` reads it back. What is left here is
+    # `#[cfg(windows)]` FFI — reading the token's SID and handing the string to the OS — which nothing off
+    # Windows compiles, and which on Windows needs a second local account connecting to the pipe to observe
+    # at all. No job has one, so this is skipped rather than killed, and the claim is made by hand on the
+    # development VM. A mutant here that mattered would be caught by the pipe failing to open at all
+    "security.rs:.*in current_user_sid",
+    "security.rs:.*in owner_only",
 ]
 
 # **`src/tree.rs` is not excluded, and a whole-repository run on a Mac or on Linux will report its mutants

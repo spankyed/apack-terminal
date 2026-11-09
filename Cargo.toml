@@ -15,13 +15,20 @@ interprocess = "2.4.7"
 portable-pty = "0.9.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-sysinfo = { version = "0.40.1", default-features = false, features = ["system"] }
 ts-rs = "12.0.1"
 
 # Windows only: Job Objects, which is how a session owns its process tree there (`src/tree.rs`). POSIX needs
 # none — the kernel's SIGHUP to a pty's foreground group does it.
+# POSIX only: the name of the process reading a session's pty. The pid comes from `portable-pty`, whose
+# `process_group_leader` is `#[cfg(unix)]`, so there is nothing to turn into a name on Windows and this
+# would otherwise pull the `windows` crate into that build for a call it cannot make.
+[target.'cfg(unix)'.dependencies]
+sysinfo = { version = "0.40.1", default-features = false, features = ["system"] }
+
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_JobObjects", "Win32_System_Threading"] }
+# The SDDL string the pipe's security descriptor is built from, which `interprocess` takes as a `U16CStr`
+widestring = "1.0.2"
 
 [dev-dependencies]
 insta = "1.49.0"
