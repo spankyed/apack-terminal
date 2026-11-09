@@ -1291,12 +1291,24 @@ fn a_grid_nothing_could_draw_is_capped_rather_than_attempted() {
     assert_eq!(spawned["kind"], "spawned", "an impossible grid was refused rather than capped: {spawned}");
 }
 
+/// What prints `TERM` and nothing else, per platform. The shell differs; the question does not.
+#[cfg(unix)]
+const PRINTS_TERM: (&str, [&str; 2]) = ("/bin/sh", ["-c", "printf 'term=%s\\n' \"$TERM\""]);
+/// `cmd.exe` rather than PowerShell: `%TERM%` expands in one pass with no profile to load and no quoting
+/// rules to get wrong, and this case is about the variable rather than about any shell's syntax.
+#[cfg(windows)]
+const PRINTS_TERM: (&str, [&str; 2]) = ("cmd.exe", ["/c", "echo term=%TERM%"]);
+
 /// **A shell is told what terminal it is in, whoever launched the app** (X13).
 ///
 /// Nothing in the request names `TERM` here, so what the shell prints is what the broker put there. An app
 /// started from the Dock or the Start menu has none to pass on, and a shell with no `TERM` reads no terminfo
 /// — which is how this suite's own alternate-screen case came to wait ten seconds on a CI runner.
-#[cfg(unix)]
+///
+/// **It runs on both platforms**, because the claim is the broker's and not a POSIX one: the broker sets
+/// `TERM` in `spawn` with no `cfg` around it, so a case that only ever ran on a Mac left the half that
+/// matters most unasserted — a Windows app is the one most likely to be launched from a shortcut with no
+/// environment at all.
 #[test]
 fn a_shell_is_told_what_terminal_it_is_in() {
     // No `TERM` for the broker to pass on, so what the shell prints is what the broker decided
@@ -1307,12 +1319,13 @@ fn a_shell_is_told_what_terminal_it_is_in() {
     ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
     next(&mut reading);
 
+    let (shell, args) = PRINTS_TERM;
     let frame = serde_json::json!({
         "kind": "spawn",
         "cols": 80,
         "rows": 24,
-        "shell": "/bin/sh",
-        "args": ["-c", "printf 'term=%s\\n' \"$TERM\""],
+        "shell": shell,
+        "args": args,
         "env": [],
         "cwd": null,
     })
@@ -1326,10 +1339,12 @@ fn a_shell_is_told_what_terminal_it_is_in() {
         if event["kind"] == "output" && event["session"] == session.as_str() {
             seen.push_str(event["text"].as_str().unwrap_or_default());
         }
-        if seen.contains("term=") {
+        if seen.contains("term=xterm-256color") {
             break;
         }
     }
+    // `cmd.exe` echoes the command before running it, so the value has to be matched rather than the label:
+    // `echo term=%TERM%` appears in the output whatever TERM is, including when it is unset
     assert!(seen.contains("term=xterm-256color"), "the shell was given no terminal to be: {seen:?}");
 }
 
