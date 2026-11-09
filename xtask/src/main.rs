@@ -6,11 +6,13 @@
 //!   reaches a packaged app: the apack monorepo resolves that package as an ordinary dependency.
 //! - `pre-push`: every check CI runs on a change, the change's mutants included, cheapest first, stopping at
 //!   the first that fails: what to run before a push.
+//! - `vt-prebuilt`: fetches and verifies the `libghostty-vt` archive the `ghostty` feature links, so the
+//!   build itself reaches no network.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use xtask::{generate, mutants, package, pre_push};
+use xtask::{generate, mutants, package, pre_push, vt_prebuilt};
 
 fn main() -> ExitCode {
     let task = std::env::args().nth(1);
@@ -20,6 +22,7 @@ fn main() -> ExitCode {
         Some("check-generated") => generate::check(&root),
         Some("check-exclusions") => mutants::check_exclusions(&root),
         Some("package") => package::package(&root),
+        Some("vt-prebuilt") => vt_prebuilt::fetch(&root),
         Some("pre-push") => pre_push::pre_push(
             &root,
             &std::env::args().skip(2).collect::<Vec<_>>(),
@@ -28,7 +31,10 @@ fn main() -> ExitCode {
                 ("mutant exclusions", &|| mutants::check_exclusions(&root)),
             ],
         ),
-        _ => Err("usage: cargo xtask <generate | check-generated | check-exclusions | package | pre-push>".to_owned()),
+        _ => {
+            Err("usage: cargo xtask <generate | check-generated | check-exclusions | package | vt-prebuilt | pre-push>"
+                .to_owned())
+        }
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

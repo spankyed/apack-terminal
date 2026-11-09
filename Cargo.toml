@@ -34,6 +34,23 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 # The SDDL string the pipe's security descriptor is built from, which `interprocess` takes as a `U16CStr`
 widestring = "1.0.2"
 
+# **Phase 0a's spike, off by default.** `libghostty-vt` is the VT core this broker is being measured
+# against (`docs/goals/goal-one-vt-core.md` in the monorepo): one implementation parsing a session's bytes
+# instead of two that can disagree. The feature exists so the comparison can be built and run without the
+# default build acquiring a native archive, and it goes away with the measurement — either because the core
+# replaces `alacritty_terminal`, or because 0a said no and the dependency comes back out.
+#
+# **The crate is bindings only and brings no build of its own**: its bindgen output is committed, so nothing
+# runs `libclang`, and it links a prebuilt static library that `cargo xtask vt-prebuilt` fetches and
+# verifies. `GHOSTTY_VT_RS_SYS_BUILD=prebuilt` makes a build-from-source a refusal rather than a silent
+# attempt that needs a Zig this repository does not pin.
+[features]
+ghostty = ["dep:ghostty-vt-rs-sys"]
+
+[dependencies.ghostty-vt-rs-sys]
+version = "0.3.0"
+optional = true
+
 [dev-dependencies]
 insta = "1.49.0"
 proptest = "1.12.0"

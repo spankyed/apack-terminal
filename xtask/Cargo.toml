@@ -7,6 +7,9 @@ publish = false
 
 [dependencies]
 tempfile = "3.27.0"
+# For `vt-prebuilt`'s one digest. A platform branch between `shasum` and `sha256sum` is what this replaces,
+# and neither is reliably present on the Windows VM where Phase B has to run this task.
+sha2 = "0.10.9"
 
 # The binary is the entry point and the library is what its own tests reach: `check-exclusions`'s decision
 # is driven with counts of its own there, which is the only way to watch it fail without committing a dead
