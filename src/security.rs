@@ -17,18 +17,28 @@
 
 /// The access the broker's pipe grants, as SDDL, and nothing else.
 ///
-/// - `O:`/`G:` — the user who started the broker owns it.
+/// - `O:` — the user who started the broker owns it.
 /// - `D:P` — a DACL that inherits nothing, so no container's ACEs are added to it.
 /// - `(A;;GA;;;{sid})` — that user may do everything.
 /// - `(A;;GA;;;SY)` — and so may `SYSTEM`, which could take ownership regardless; saying so keeps a service
 ///   context from being refused by a descriptor that merely forgot about it.
 ///
 /// Everyone else is denied by absence, which is what makes the `P` load-bearing.
+///
+/// **No group.** Nothing here references one — no ACE names it and the pipe is inherited into by nothing —
+/// and the object does not hold the one a descriptor asks for: read back off a live pipe, its group is the
+/// starting token's primary group whatever this string says. So naming one was a claim about the object
+/// that was not true of it (`docs/architecture/windows-pipe-access.md`).
+///
 /// **Not `#[cfg(windows)]`, deliberately.** This string is the whole of the access decision and the part
 /// most easily got wrong, so it is built where every platform's suite can read it back. What needs Windows
 /// is turning it into a descriptor and asking the OS to accept one, below.
+///
+/// **What the kernel reports is not this string back.** `GA` is a generic right, which the object resolves
+/// against its own mapping, so a live pipe reads as `FA` — full access to a file object, the same grant
+/// under the name that object type uses for it.
 pub fn access_for(sid: &str) -> String {
-    format!("O:{sid}G:{sid}D:P(A;;GA;;;{sid})(A;;GA;;;SY)")
+    format!("O:{sid}D:P(A;;GA;;;{sid})(A;;GA;;;SY)")
 }
 
 /// The security descriptor the broker's pipe is created with: the starting user, and nobody else.

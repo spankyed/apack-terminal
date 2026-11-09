@@ -12,6 +12,8 @@ What each directory is for, so you know how far to trust what you're reading.
 - [design.md](architecture/design.md): the two layers, who owns a session, and what the broker will not do.
   Start here.
 - [protocol.md](architecture/protocol.md): every message, the handshake, the roles, and the closed error set.
+- [windows-pipe-access.md](architecture/windows-pipe-access.md): who may open the pipe there, and the
+  descriptor read back off a live one.
 - [testing.md](architecture/testing.md): what proves it correct, and the command for each check.
 
 [background.md](background.md) is why the broker exists, and

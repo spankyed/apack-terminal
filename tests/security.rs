@@ -17,6 +17,9 @@ fn the_pipe_is_the_starting_user_s_and_nobody_broader() {
     assert!(sddl.starts_with(&format!("O:{USER}")), "the user owns it: {sddl}");
     assert!(sddl.contains(&format!("(A;;GA;;;{USER})")), "and may do everything with it: {sddl}");
     assert!(sddl.contains("D:P("), "the DACL is protected, so nothing is inherited into it: {sddl}");
+    // No group: no ACE names one, nothing inherits from the pipe, and a live pipe's group is the starting
+    // token's primary group whatever the descriptor asked for — so naming one described nothing
+    assert!(!sddl.contains("G:"), "the descriptor claims no group: {sddl}");
 
     // The accounts that make a pipe readable by someone else. `WD` is Everyone — the default descriptor's
     // own grant and the whole reason this exists — `AN` the anonymous logon, `BU` the local Users group,
