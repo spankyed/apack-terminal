@@ -198,15 +198,28 @@ pub enum Event {
     Hello { protocol: u32, history: u32 },
     /// A session exists and its process is running.
     Spawned { session: SessionId, pid: u32 },
-    /// Bytes the process wrote. A feed: unprompted, and nobody asked for it.
-    /// Bytes the process wrote, **as text**.
+    /// Bytes the process wrote, **as text**. A feed: unprompted, and nobody asked for it.
     ///
     /// **The broker forwards decoded text, not bytes, and that is a decision rather than a compromise.**
     /// Both ends are terminal emulators — `alacritty_terminal` here, the consumer's in its window — and both
     /// replace an invalid sequence with U+FFFD independently, so a byte-exact pipe would show the user
     /// exactly what this does. Nothing in this protocol consumes raw bytes either: `Screen` answers lines,
-    /// a search is over text, and a marker is a claim. A sequence split across two reads is held back until
-    /// it completes (`output::sendable`), so the only thing replaced is what was never valid.
+    /// a search is over text, and a marker is a claim. A *UTF-8* sequence split across two reads is held
+    /// back until it completes (`output::sendable`), so the only thing replaced is what was never valid.
+    ///
+    /// **An event is a fragment of a stream and not a unit of anything, and that is the whole contract.**
+    /// The only boundary promised is a whole character: at most three bytes are ever held back, because
+    /// that is the longest tail of an incomplete one. An *escape* sequence is not covered and cannot be —
+    /// `\x1b[?1049h` is eight bytes of valid ASCII, and an OSC string's payload has no length at all, so
+    /// holding a partial one means either stalling the feed on a sequence that never terminates or
+    /// inventing a cap. That would trade a feed every incremental parser already handles for latency and a
+    /// new way to fail.
+    ///
+    /// So **a consumer must never match a pattern against one event.** Both ends that read this feed are
+    /// already right: a VT parser is a state machine, and this broker's own marker scanner carries its
+    /// state across chunks (`markers.rs`, cut at every boundary in `tests/markers.rs`). Anything else
+    /// accumulates first. `tests/coalescing.rs`'s
+    /// `an_escape_sequence_is_not_held_back_the_way_a_character_is` is that asserted rather than said.
     ///
     /// **Measured 2026-11-08, which is why this is not base64 or a binary frame.** JSON escapes a control
     /// byte as `\u001b`, six bytes for one, so its cost is `1 + 5 x` the control-byte fraction; base64 is a

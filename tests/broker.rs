@@ -110,7 +110,20 @@ fn connect(broker: &Broker) -> (Events, Wire) {
 ///
 /// So the bound moved off the socket: a reader thread and a channel do it the same way on both platforms,
 /// which is one mechanism rather than one per platform and a guard that cannot quietly not apply.
+///
+/// **Its receiver is private, and that is load-bearing rather than tidy.** Reaching it is how a case comes
+/// to match a pattern against one `output` event, which the protocol promises nothing about: an escape
+/// sequence splits across two whenever a flush falls inside it (`tests/coalescing.rs`). Everything here
+/// reads through `output_until`, which accumulates first, or through `event`, which is for the one-answer
+/// events — `spawned`, `exited`, `facts` — where a single frame *is* the unit.
 struct Events(std::sync::mpsc::Receiver<String>);
+
+impl Events {
+    /// The next line, waiting at most `step`. The one accessor, so the receiver stays private.
+    fn line(&mut self, step: std::time::Duration) -> Result<String, std::sync::mpsc::RecvTimeoutError> {
+        self.0.recv_timeout(step)
+    }
+}
 
 impl Events {
     fn reading(wire: Wire) -> Self {
@@ -185,7 +198,7 @@ const QUIET: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The next event, or `None` once the broker has said nothing for `QUIET`.
 fn event(reading: &mut Events) -> Option<serde_json::Value> {
-    match reading.0.recv_timeout(QUIET) {
+    match reading.line(QUIET) {
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             panic!("the broker closed the connection")
@@ -510,7 +523,7 @@ fn pid_written_to(reading: &mut Events, pid_file: &std::path::Path) -> i32 {
         {
             return pid;
         }
-        match reading.0.recv_timeout(STEP) {
+        match reading.line(STEP) {
             // The shell is still working, so the wait starts over: progress, not elapsed time
             Ok(_) => silence = std::time::Duration::ZERO,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -928,7 +941,7 @@ fn a_wait_for_idle_is_answered_when_the_command_finishes() {
     );
     // Nothing has finished the command, so nothing may answer yet
     for _ in 0..3 {
-        if let Ok(line) = reading.0.recv_timeout(std::time::Duration::from_millis(300)) {
+        if let Ok(line) = reading.line(std::time::Duration::from_millis(300)) {
             let event: serde_json::Value = serde_json::from_str(&line).expect("an event");
             assert_ne!(event["kind"], "waited", "the session is still busy: {event}");
         }

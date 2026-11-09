@@ -11,8 +11,13 @@ use std::time::Duration;
 use apack_terminal::output::{Credit, OUTPUT_CREDIT, coalesce};
 use apack_terminal::protocol::Event;
 
-/// What a client would see, reading until the coalescer has nothing more to say
+/// What a client would see, as one string
 fn seen(chunks: &[&[u8]], ending: bool) -> String {
+    events(chunks, ending).concat()
+}
+
+/// The same, **as the events it arrived in** — which is the thing a consumer may not assume anything about
+fn events(chunks: &[&[u8]], ending: bool) -> Vec<String> {
     let (sending, incoming) = channel::<Vec<u8>>();
     let (outgoing, answers) = channel();
     let credit = Credit::new(OUTPUT_CREDIT);
@@ -31,13 +36,13 @@ fn seen(chunks: &[&[u8]], ending: bool) -> String {
         std::thread::sleep(Duration::from_millis(60));
     }
 
-    let mut text = String::new();
+    let mut arrived = Vec::new();
     while let Ok(out) = answers.recv_timeout(Duration::from_secs(2)) {
         if let Event::Output { text: chunk, .. } = out.event {
-            text.push_str(&chunk);
+            arrived.push(chunk);
         }
     }
-    text
+    arrived
 }
 
 /// The defect, with the bytes that showed it: `é` is `C3 A9`, and a read can end between them
@@ -79,4 +84,32 @@ fn a_byte_that_is_invalid_rather_than_incomplete_is_not_held_back() {
 #[test]
 fn a_complete_character_is_sent_at_once() {
     assert_eq!(seen(&[b"ab\xC3\xA9"], false), "abé");
+}
+
+/// **An escape sequence may arrive in pieces, and this is what says so out loud.**
+///
+/// What is held back is a partial *UTF-8* sequence — at most three bytes, because that is the longest tail
+/// of an incomplete character (`output::sendable`). An escape sequence is not that: `\x1b[?1049h` is eight
+/// bytes of perfectly valid ASCII, so a flush falling inside it sends the first half immediately and the
+/// rest in the next event.
+///
+/// Both ends that consume this feed are fine with it — a VT parser is a state machine, and the broker's own
+/// marker scanner carries its state across chunks (`tests/markers.rs` cuts every one) — so the contract
+/// stays where it is rather than growing. What it costs is that **a consumer must never match a pattern
+/// against one event**, and a comment saying so is weaker than a case: this is the behaviour, asserted, next
+/// to the helper that would otherwise look safe.
+///
+/// A test in this repository's own suite matched `\x1b[?1049h` against a single event and passed for weeks,
+/// until a loaded CI runner fragmented the read and it waited ten seconds for a match that could no longer
+/// happen.
+#[test]
+fn an_escape_sequence_is_not_held_back_the_way_a_character_is() {
+    let halves = events(&[b"before\x1b[?10", b"49hafter"], true);
+
+    assert_eq!(halves.len(), 2, "each flush is its own event: {halves:?}");
+    assert_eq!(halves.concat(), "before\u{1b}[?1049hafter", "and the stream is whole across them");
+    assert!(
+        !halves.iter().any(|event| event.contains("\u{1b}[?1049h")),
+        "no single event holds the sequence, which is the whole point: {halves:?}"
+    );
 }

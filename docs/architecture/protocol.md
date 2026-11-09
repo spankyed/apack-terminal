@@ -83,10 +83,21 @@ so a byte-exact pipe would show the user exactly what this does. Nothing in this
 bytes either: `screen` answers lines, a search is over text, a marker is a claim. The field is named `text`
 for that reason; it was `data`, which reads as bytes to everyone.
 
-A sequence **split across two reads** is a different matter and is not lossy: the coalescer holds an
+A **UTF-8** sequence split across two reads is a different matter and is not lossy: the coalescer holds an
 incomplete trailing sequence back until it completes (`output::sendable`), so the only thing ever replaced
 is what was never valid. Before that, `é` arriving as `a\xC3` then `\xA9b` was delivered with both halves
 replaced.
+
+**An event is a fragment of a stream, not a unit of anything.** A whole character is the only boundary
+promised — at most three bytes are ever held back, that being the longest tail of an incomplete one — and an
+*escape* sequence is neither covered nor coverable: `\x1b[?1049h` is eight bytes of valid ASCII, and an OSC
+payload has no length at all, so holding a partial one means stalling the feed on a sequence that may never
+terminate, or inventing a cap. That trades a feed every incremental parser already handles for latency and a
+new way to fail, so the contract stays where it is.
+
+What it costs a consumer is one rule: **never match a pattern against a single event.** Both ends that read
+this feed already obey it — a VT parser is a state machine, and the marker scanner carries state across
+chunks — and anything else accumulates first.
 
 **Why not base64 or a binary frame — measured 2026-11-08.** JSON escapes a control byte as `\u001b`, six
 bytes for one, so its cost is `1 + 5 ×` the control-byte fraction, against base64's flat 1.33×. The
