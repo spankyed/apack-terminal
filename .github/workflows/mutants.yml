@@ -85,8 +85,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      # A dispatch names its files; a change contributes only those holding a Windows-only arm, so a change
-      # with none installs nothing here
+      # A dispatch names its files; a push or a pull request contributes only the files whose mutants this
+      # platform is the one that can answer, so a change with none installs nothing here
       - id: scope
         # Through the environment rather than interpolated into the script: a dispatch input is a string
         # somebody typed, and `${{ }}` would paste it into a shell
@@ -102,13 +102,25 @@ jobs:
             exit 0
           fi
           base="$(bash .github/base.sh)"
-          mapfile -t files < <(git diff --name-only --diff-filter=d $base -- '*.rs')
-          if [ ${#files[@]} -gt 0 ] && grep -lE 'cfg\(windows\)|target_os = "windows"' "${files[@]}"; then
-            git diff $base -- '*.rs' > change.diff
-            echo "args=--in-diff change.diff" >> "$GITHUB_OUTPUT"
+          # **The files whose mutants only Windows can answer**, which is what this job is for. A file like
+          # `src/session.rs` holds Windows arms and POSIX code together, and `#[cfg(unix)]` code is not
+          # compiled here — so a mutation of it changes nothing, the suite passes, and the mutant is
+          # reported missed. A job scoped to the whole change is red whenever POSIX-only code moves, and
+          # says nothing about Windows either way.
+          #
+          # A mixed file's Windows arms are answered by a dispatch (`-f files=src/session.rs`): nothing here
+          # can tell a Windows mutant from a POSIX one inside one file, and a developer naming the file is
+          # the claim being made deliberately rather than by a grep.
+          windows_only="src/tree.rs"
+          mapfile -t files < <(git diff --name-only --diff-filter=d "$base" -- $windows_only)
+          if [ ${#files[@]} -gt 0 ]; then
+            args=""
+            for file in "${files[@]}"; do args="$args --file $file"; done
+            printf 'Mutating %s\n' "${files[*]}" >> "$GITHUB_STEP_SUMMARY"
+            echo "args=$args" >> "$GITHUB_OUTPUT"
             echo "code=true" >> "$GITHUB_OUTPUT"
           else
-            echo "The change holds no Windows-only code to mutate" >> "$GITHUB_STEP_SUMMARY"
+            echo "The change touches no file whose mutants need Windows; dispatch with -f files=… for one" >> "$GITHUB_STEP_SUMMARY"
           fi
       - if: steps.scope.outputs.code == 'true'
         run: rustup show active-toolchain
