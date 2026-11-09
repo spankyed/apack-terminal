@@ -12,9 +12,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 use crate::output::{Credit, Outgoing, coalesce};
-use crate::protocol::{ErrorCode, Event, SessionId, Until, WaitOutcome};
+use crate::protocol::{ErrorCode, Event, Foreground, SessionId, Until, WaitOutcome};
 use crate::screen::{Facts, HISTORY_LINES, Match, Screen, Snapshot};
 use crate::tree::Tree;
 
@@ -85,6 +86,27 @@ fn settle_met(waiters: &Mutex<Vec<Waiter>>, screen: &Screen) -> usize {
         true
     });
     met
+}
+
+/// The pty's foreground process group, and what that process is called.
+///
+/// **Two questions with a gap between them**, which is why the name is optional and the pid is not: the
+/// answer describes the moment it was taken, and nothing holds the process still while it is taken. A
+/// caller that sees a pid and no name has been told the truth.
+///
+/// **A fresh `System` per call rather than one kept in `Sessions`.** It is refreshed for one pid and asked
+/// for nothing else, `Facts` is a request a caller makes when something happened rather than on a timer,
+/// and a shared one would add a third lock to the order documented on `Sessions` in exchange for nothing.
+fn foreground_of(master: &(dyn MasterPty + Send)) -> Option<Foreground> {
+    // Annotated rather than cast: a platform whose `pid_t` is not an `i32` is a compile error here instead
+    // of a silent truncation on the wire
+    let pid: i32 = master.process_group_leader()?;
+    let of = Pid::from_u32(u32::try_from(pid).ok()?);
+    // A `System` that cannot be created is one more way the OS declines to say, which is what `None` is for
+    let mut system = System::new().ok()?;
+    system.refresh_processes_specifics(ProcessesToUpdate::Some(&[of]), true, ProcessRefreshKind::nothing());
+    let name = system.process(of).map(|process| process.name().to_string_lossy().into_owned());
+    Some(Foreground { pid, name })
 }
 
 /// Every session this broker owns, and where their output goes.
@@ -358,6 +380,12 @@ impl Sessions {
         let screen =
             live.screen.lock().map_err(|_| Refusal::pty("reading a screen", "the screen's lock was poisoned"))?;
         Ok(screen.snapshot(history))
+    }
+
+    /// What is running in a session's pty now, measured rather than claimed.
+    pub fn foreground(&self, session: &str) -> Result<Option<Foreground>, Refusal> {
+        let live = self.live.get(session).ok_or_else(|| missing(session))?;
+        Ok(foreground_of(live.master.as_ref()))
     }
 
     /// What the shell has reported about itself.

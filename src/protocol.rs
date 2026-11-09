@@ -148,6 +148,26 @@ pub enum WaitOutcome {
     Exited,
 }
 
+/// What the kernel says is reading the pty, as against what the shell claims about itself.
+///
+/// **The foreground process group is the one answer that does not need the shell's cooperation.** A shell
+/// with no integration installed emits no markers, so every field of `Facts` is empty for it and a caller
+/// cannot tell a session sitting at a prompt from one three minutes into a build — which is the question a
+/// tab title and a confirmation before closing are both asking.
+///
+/// **Absent on Windows**, which has no foreground process group: a ConPTY has no equivalent, and the route
+/// there is the job object `tree.rs` already holds (`JobObjectBasicProcessIdList`). Unimplemented rather
+/// than approximated, because a platform claim is made on that platform.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "protocol.ts")]
+pub struct Foreground {
+    /// The process group leader reading the pty.
+    pub pid: i32,
+    /// Its name as the OS reports it. `None` when the process ended between being named and being looked
+    /// up, which is ordinary rather than a failure.
+    pub name: Option<String>,
+}
+
 /// Where a search found what it was asked for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "protocol.ts")]
@@ -220,8 +240,20 @@ pub enum Event {
         cursor_column: u16,
         alt_screen: bool,
     },
-    /// What the shell reported about itself, answering `Facts`. Claims, not measurements.
-    Facts { session: SessionId, cwd: Option<String>, command: Option<String>, running: bool, exit_status: Option<i32> },
+    /// What the shell reported about itself and what is running in the pty, answering `Facts`.
+    ///
+    /// **`cwd`, `command`, `running` and `exit_status` are claims; `foreground` is a measurement**, and the
+    /// two are not interchangeable — a shell with no integration installed claims nothing at all, and a
+    /// program in the pty may claim whatever it likes. They travel in one event because a caller asking
+    /// what a session is doing wants both and should not pay two round trips to find out.
+    Facts {
+        session: SessionId,
+        cwd: Option<String>,
+        command: Option<String>,
+        running: bool,
+        exit_status: Option<i32>,
+        foreground: Option<Foreground>,
+    },
     /// Where a search found its text, answering `Search`.
     Search { session: SessionId, matches: Vec<SearchMatch> },
     /// How a `Wait` ended. Sent once per wait, whichever way it ended.

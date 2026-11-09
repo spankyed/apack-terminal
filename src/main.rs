@@ -307,12 +307,16 @@ fn carry_out(sessions: &Arc<Mutex<Sessions>>, request: Request) {
         },
         Request::Facts { session } => match live.facts(&session) {
             Ok(facts) => {
+                // The measurement is taken under the same `Sessions` guard as the claims, so the two
+                // halves of one answer describe one moment rather than two
+                let foreground = live.foreground(&session).unwrap_or(None);
                 live.answer(Event::Facts {
                     session,
                     cwd: facts.cwd,
                     command: facts.command,
                     running: facts.running,
                     exit_status: facts.exit_status,
+                    foreground,
                 });
                 Ok(())
             }

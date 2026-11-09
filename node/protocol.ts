@@ -14,7 +14,30 @@ export type Event = { "kind": "hello", protocol: number, history: number, } | { 
 /**
  * Within the viewport, so `0` is its first line however much history came with it.
  */
-cursor_row: number, cursor_column: number, alt_screen: boolean, } | { "kind": "facts", session: string, cwd: string | null, command: string | null, running: boolean, exit_status: number | null, } | { "kind": "search", session: string, matches: Array<SearchMatch>, } | { "kind": "waited", session: string, outcome: WaitOutcome, } | { "kind": "failed", session: string | null, code: ErrorCode, message: string, };
+cursor_row: number, cursor_column: number, alt_screen: boolean, } | { "kind": "facts", session: string, cwd: string | null, command: string | null, running: boolean, exit_status: number | null, foreground: Foreground | null, } | { "kind": "search", session: string, matches: Array<SearchMatch>, } | { "kind": "waited", session: string, outcome: WaitOutcome, } | { "kind": "failed", session: string | null, code: ErrorCode, message: string, };
+
+/**
+ * What the kernel says is reading the pty, as against what the shell claims about itself.
+ *
+ * **The foreground process group is the one answer that does not need the shell's cooperation.** A shell
+ * with no integration installed emits no markers, so every field of `Facts` is empty for it and a caller
+ * cannot tell a session sitting at a prompt from one three minutes into a build — which is the question a
+ * tab title and a confirmation before closing are both asking.
+ *
+ * **Absent on Windows**, which has no foreground process group: a ConPTY has no equivalent, and the route
+ * there is the job object `tree.rs` already holds (`JobObjectBasicProcessIdList`). Unimplemented rather
+ * than approximated, because a platform claim is made on that platform.
+ */
+export type Foreground = { 
+/**
+ * The process group leader reading the pty.
+ */
+pid: number, 
+/**
+ * Its name as the OS reports it. `None` when the process ended between being named and being looked
+ * up, which is ordinary rather than a failure.
+ */
+name: string | null, };
 
 /**
  * What the app asks the broker to do.

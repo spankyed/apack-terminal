@@ -1332,3 +1332,61 @@ fn a_shell_is_told_what_terminal_it_is_in() {
     }
     assert!(seen.contains("term=xterm-256color"), "the shell was given no terminal to be: {seen:?}");
 }
+
+/// **What is running in a session is measured, not asked of the shell** (`Foreground`).
+///
+/// A shell with no integration installed emits no markers, so every claim in `Facts` is empty for it and a
+/// caller cannot tell a session sitting at a prompt from one three minutes into a build. The pty's
+/// foreground process group needs no cooperation from whatever is running in it, which is why this is the
+/// field a tab title and a confirmation before closing can actually be built on.
+///
+/// **`cat` rather than a shell, and its own echo as the sync point.** A shell's reported name is not
+/// portable — macOS answers `bash` for `/bin/sh` — and asking straight after `spawn` would read a process
+/// that may still be between `fork` and `execve`, which is a case that passes on a quiet machine. Writing a
+/// line and waiting for it back proves the program is running before anything is measured.
+#[cfg(unix)]
+#[test]
+fn what_is_running_in_a_session_is_measured_rather_than_claimed() {
+    let broker = start();
+    let (mut reading, mut writing) = connect(&broker);
+    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    next(&mut reading);
+
+    let frame = serde_json::json!({
+        "kind": "spawn",
+        "cols": 80,
+        "rows": 24,
+        "shell": "/bin/cat",
+        "args": [],
+        "env": [],
+        "cwd": null,
+    })
+    .to_string();
+    ask(&mut writing, &frame);
+    let session = next(&mut reading)["session"].as_str().expect("a session").to_owned();
+    ask(&mut writing, &serde_json::json!({ "kind": "write", "session": session, "text": "ready\n" }).to_string());
+
+    let mut seen = String::new();
+    for _ in 0..200 {
+        let event = next(&mut reading);
+        if event["kind"] == "output" && event["session"] == session.as_str() {
+            seen.push_str(event["text"].as_str().unwrap_or_default());
+        }
+        if seen.contains("ready") {
+            break;
+        }
+    }
+    assert!(seen.contains("ready"), "the program is running: {seen:?}");
+
+    ask(&mut writing, &serde_json::json!({ "kind": "facts", "session": session }).to_string());
+    let facts = loop {
+        let event = next(&mut reading);
+        if event["kind"] == "facts" {
+            break event;
+        }
+    };
+
+    assert_eq!(facts["command"], serde_json::Value::Null, "this program claimed nothing, which is the case");
+    assert_eq!(facts["foreground"]["name"], "cat", "so the kernel was asked instead");
+    assert!(facts["foreground"]["pid"].as_i64().unwrap_or_default() > 0, "and it named a live process");
+}
