@@ -11,24 +11,18 @@
 //! the last `client` leaving does, as it always has. The app's own process holds the former, so restarting
 //! the service that opened a session does not end it and quitting the app does.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
 use interprocess::local_socket::{GenericFilePath, ListenerOptions, Stream, ToFsName, prelude::*};
 
+use apack_terminal::frames::{Frame, read_frame};
 use apack_terminal::output::{Outgoing, channel_with_credit};
 use apack_terminal::protocol::{ErrorCode, Event, PROTOCOL_VERSION, Request, Role, SearchMatch};
 use apack_terminal::screen::HISTORY_LINES;
 use apack_terminal::session::Sessions;
-
-/// The largest frame a client may send.
-///
-/// **A ceiling on what is read before it is parsed**, not a judgement about any request's size. The biggest
-/// frame the app sends is a `write` carrying a paste, and a megabyte is far past any of them; what this is
-/// here for is the sender that never sends a newline at all, which is unbounded by construction.
-const MAX_FRAME_BYTES: usize = 1 << 20;
 
 fn main() -> std::io::Result<()> {
     let Some(socket) = std::env::args().nth(1) else {
@@ -166,39 +160,22 @@ fn serve(stream: Stream, broker: Broker) {
     let mut line = String::new();
 
     loop {
-        line.clear();
-        // **Bounded, because a frame is read before it is understood.** `lines()` grows its string until a
-        // newline arrives, so one client writing without ever sending one takes the broker's memory and every
-        // session with it — a process that owns the app's terminals must not be killable by a sender that
-        // declines to finish a sentence. Taking a byte more than the cap is what tells a frame at the limit
-        // from one past it.
-        match (&mut reader).take(MAX_FRAME_BYTES as u64 + 1).read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {}
-            // Invalid UTF-8, or the connection going away mid-frame. Neither leaves anything to answer:
-            // the sender is not speaking the protocol, and the refusal would be read by nobody.
-            Err(_) => break,
-        }
-        if line.len() > MAX_FRAME_BYTES {
-            say(
-                &stream,
-                &Event::Failed {
-                    session: None,
-                    code: ErrorCode::Malformed,
-                    message: format!("a frame may be at most {MAX_FRAME_BYTES} bytes"),
-                },
-            );
-            break;
-        }
-        if line.trim().is_empty() {
-            continue;
-        }
-        let request = match serde_json::from_str::<Request>(&line) {
-            Ok(request) => request,
-            Err(error) => {
-                say(&stream, &Event::Failed { session: None, code: ErrorCode::Malformed, message: format!("{error}") });
+        // **Bounded, because a frame is read before it is understood** (`frames`): one client writing
+        // without ever sending a newline would otherwise take the broker's memory and every session with
+        // it, and a process that owns the app's terminals must not be killable by a sender that declines to
+        // finish a sentence.
+        let request = match read_frame(&mut reader, &mut line) {
+            Frame::Request(request) => request,
+            Frame::Blank => continue,
+            Frame::Malformed(message) => {
+                say(&stream, &Event::Failed { session: None, code: ErrorCode::Malformed, message });
                 continue;
             }
+            Frame::TooLong(message) => {
+                say(&stream, &Event::Failed { session: None, code: ErrorCode::Malformed, message });
+                break;
+            }
+            Frame::Ended => break,
         };
         // **The handshake is first or the connection is refused**, because the monorepo pins a commit of this
         // repository: a stale pin has to be a clear refusal rather than a message that means something else.

@@ -16,11 +16,15 @@ cargo xtask check-generated                    # fails when it has fallen behind
 | `tests/broker.rs` | the broker driven as a consumer drives it: a real socket, the real binary |
 | `tests/parser.rs` | the VT core as a parser — grid snapshots, and the byte-boundary property |
 | `tests/markers.rs` | the OSC scanner, including every chunk boundary |
+| `tests/frames.rs` | the frame decoder as a decoder — arbitrary bytes, mutated frames, the round trip |
+| `tests/screen.rs` | what a snapshot answers: the viewport, the history asked for, the alternate screen |
 | `tests/channel.rs` | the bounded output channel and what an overload reports |
+| `tests/coalescing.rs` | output gathered into one event rather than one per read |
+| `tests/security.rs` | the pipe's descriptor as a string, on every platform |
 | `tests/candidates.rs` | the crates that were tried, kept as tests so the answers stay checked |
 
-`src/lib.rs` exists so the parser can be tested as a parser. Neither the grid nor the scanner is a thing you
-write through a pty and a socket.
+`src/lib.rs` exists so the parser can be tested as a parser and the decoder as a decoder. Neither the grid,
+the scanner nor the bytes a stranger sends is a thing you write through a pty and a socket.
 
 ## The property that catches what examples do not
 
@@ -37,6 +41,28 @@ each is parsed by a different part of the state machine.
 The first snapshot of the UTF-8 stream is what found the one defect in the grid read: a wide character
 occupies two cells and the second holds a space, so the row read as text said `日 本 語`. Right to draw,
 wrong to match against — and matching is what a bounded read is for.
+
+## The bytes a stranger sends
+
+The frame decoder (`src/frames.rs`) is the only part of the protocol an unknown sender reaches: everything
+else in the broker runs on a `Request` that already parsed. A panic there ends every terminal the app has
+open, so the claim is not that a bad frame is reported well — it is that **no byte string gets anything
+other than one of five answers**, which is a property rather than a list of the malformed frames whoever
+wrote the test thought of.
+
+Three strategies, in increasing order of what they find:
+
+- **Arbitrary bytes**, which cover the reader: the cap, a newline that never comes, UTF-8 that is not.
+- **A valid frame with one byte changed**, which is the half that reaches the deserializer in a state it has
+  to decide about — `"kind":"spaw"`, a number where a string belongs, a string cut off mid-escape. Random
+  bytes are never nearly-valid JSON, so without this the deserializer is barely exercised.
+- **Every request serialized and read back**, which is the app's half of the seam: a `Serialize` and a
+  `Deserialize` that disagree is a frame the app can send and the broker cannot read, and no amount of
+  fuzzing the broker's side would show it. `node/protocol.ts` is generated from the same derives.
+
+Beside them the cap's boundary is asserted by example, because it is one byte and not a distribution: a
+frame whose line is exactly `MAX_FRAME_BYTES` is read, and one byte longer is refused. That is what the
+reader's `take(cap + 1)` is for, and nothing had asserted it.
 
 ## Snapshots
 
