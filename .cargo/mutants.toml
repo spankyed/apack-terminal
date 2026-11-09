@@ -60,6 +60,18 @@ exclude_re = [
     # for 257. There is nothing to distinguish. Its sibling `| with &` asks for 0 and is caught, because a
     # handle opened with no access cannot be assigned to the job
     "tree.rs:.*replace \\| with \\^ in Tree::owning",
+    # The POSIX arm of `Tree::owning`, which answers `None` because POSIX needs no job: nothing observes a
+    # `Tree` there — the type has no fields off Windows and nothing reads it — so `None` and `Some` are the
+    # same answer, and off Windows the mutant does not even compile, there being no `Default` for `Tree`
+    # (measured: `cargo mutants --no-config --file src/tree.rs --re tree.rs:94` is 1 unviable here). On
+    # Windows that arm is not compiled at all, so the mutation changes nothing and the run reports it
+    # missed, which is what the first Windows mutation of this file found.
+    #
+    # **The line number is pinned on purpose, and it is `check-exclusions` that makes that safe**: the two
+    # `Some(Default::default())` mutants in this file print identically but for the line, so there is
+    # nothing else to match on, and a pattern left behind by an edit above it matches no mutant and fails
+    # that check rather than going quiet.
+    "tree.rs:94:.*with Some\\(Default::default\\(\\)\\)",
 ]
 
 # **`src/tree.rs` is not excluded, and a whole-repository run on a Mac or on Linux will report its mutants

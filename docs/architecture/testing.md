@@ -109,6 +109,13 @@ default deadline of 20 s. **A reading, never a bound** — a slower machine repo
 
 ## Mutation testing
 
+**`src/tree.rs` is answered on Windows, and only there.** It is `#[cfg(windows)]` in its entirety, so a
+Mac or a Linux run compiles none of it and cannot kill any of its mutants — which is why it is excluded
+from no run and why `mutants.yml` takes a dispatch: `gh workflow run mutants.yml -f files=src/tree.rs`.
+The first such run, 2026-11-09, tested 7 and reported 5 caught, 1 unviable and 1 missed. The missed one is
+the POSIX arm of `Tree::owning`, which Windows does not compile and which does not build off Windows
+either, and it is excluded by name with that reading.
+
 **Every exclusion excludes something**, which `cargo xtask check-exclusions` asks cargo-mutants rather than
 deciding for itself (`--re` filters by the same matching `--exclude-re` uses). A pattern that matches no
 mutant is worse than no pattern: the gate goes on reporting the survivor it was written for while the comment

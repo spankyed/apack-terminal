@@ -1,0 +1,15 @@
+--- src/tree.rs
++++ replace Tree::owning -> Option<Self> with Some(Default::default())
+@@ -86,11 +86,11 @@
+         unsafe { windows_sys::Win32::Foundation::CloseHandle(self.job) };
+     }
+ }
+ 
+ #[cfg(not(windows))]
+ impl Tree {
+     /// POSIX needs none: the kernel's SIGHUP to the pty's foreground group reaps the tree.
+     pub fn owning(_pid: u32) -> Option<Self> {
+-        None
++        Some(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ }

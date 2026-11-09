@@ -1,0 +1,129 @@
+
+*** src/tree.rs:94:9: replace Tree::owning -> Option<Self> with Some(Default::default())
+
+*** mutation diff:
+--- src/tree.rs
++++ replace Tree::owning -> Option<Self> with Some(Default::default())
+@@ -86,11 +86,11 @@
+         unsafe { windows_sys::Win32::Foundation::CloseHandle(self.job) };
+     }
+ }
+ 
+ #[cfg(not(windows))]
+ impl Tree {
+     /// POSIX needs none: the kernel's SIGHUP to the pty's foreground group reaps the tree.
+     pub fn owning(_pid: u32) -> Option<Self> {
+-        None
++        Some(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ }
+
+
+*** /Users/spankyed/.rustup/toolchains/1.99.1-aarch64-apple-darwin/bin/cargo test --no-run --verbose --package=apack-terminal@0.1.0
+       Fresh unicode-ident v1.0.27
+       Fresh cfg-if v1.0.5
+       Fresh memchr v2.8.3
+       Fresh rand_core v0.10.1
+       Fresh libc v0.2.191
+       Fresh cfg_aliases v0.1.1
+       Fresh serde_core v1.0.229
+       Fresh proc-macro2 v1.0.107
+       Fresh errno v0.3.14
+       Fresh getrandom v0.4.3
+       Fresh regex-syntax v0.8.11
+       Fresh log v0.4.35
+       Fresh quote v1.0.47
+       Fresh bitflags v2.13.2
+       Fresh smallvec v1.16.5
+       Fresh scopeguard v1.2.0
+       Fresh signal-hook-registry v1.4.8
+       Fresh aho-corasick v1.1.5
+       Fresh rustix v1.1.6
+       Fresh syn v3.0.9
+       Fresh syn v2.0.119
+       Fresh parking_lot_core v0.9.12
+       Fresh lock_api v0.4.14
+       Fresh objc2-core-foundation v0.3.2
+       Fresh arrayvec v0.7.8
+       Fresh autocfg v1.5.1
+       Fresh fastrand v2.5.0
+       Fresh thiserror-impl v1.0.69
+       Fresh serde_derive v1.0.229
+       Fresh thiserror-impl v2.0.21
+       Fresh termcolor v1.4.1
+       Fresh once_cell v1.21.4
+       Fresh cursor-icon v1.2.0
+       Fresh rustix-openpty v0.2.0
+       Fresh objc2-io-kit v0.3.2
+       Fresh polling v3.11.0
+       Fresh zmij v1.0.23
+       Fresh thiserror v1.0.69
+       Fresh serde v1.0.229
+       Fresh tempfile v3.27.0
+       Fresh ts-rs-macros v12.0.1
+       Fresh thiserror v2.0.21
+       Fresh parking_lot v0.12.5
+       Fresh anyhow v1.0.104
+       Fresh signal-hook v0.4.6
+       Fresh regex-automata v0.4.18
+       Fresh nix v0.28.0
+       Fresh filedescriptor v0.8.3
+       Fresh vte v0.15.0
+       Fresh serial2 v0.2.39
+       Fresh base64 v0.22.1
+       Fresh itoa v1.0.18
+       Fresh downcast-rs v1.2.1
+       Fresh doctest-file v1.1.1
+       Fresh unicode-width v0.2.3
+       Fresh shell-words v1.1.1
+       Fresh home v0.5.12
+       Fresh ts-rs v12.0.1
+       Fresh interprocess v2.4.7
+       Fresh serde_json v1.0.154
+       Fresh portable-pty v0.9.0
+       Fresh alacritty_terminal v0.26.0
+       Fresh sysinfo v0.40.1
+       Fresh wait-timeout v0.2.1
+       Fresh quick-error v1.2.3
+       Fresh fnv v1.0.7
+       Fresh bit-vec v0.10.1
+       Fresh rand v0.10.3
+       Fresh rusty-fork v0.3.1
+       Fresh num-traits v0.2.19
+       Fresh bit-set v0.11.1
+       Fresh console v0.16.6
+       Fresh rand_xorshift v0.5.0
+       Fresh chacha20 v0.10.2
+       Fresh similar v2.7.0
+       Fresh core_detect v1.0.0
+       Fresh unarray v0.1.4
+       Dirty apack-terminal v0.1.0 (/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp): the file `src/tree.rs` has changed (1794207483.194101394s, 17s after last build at 1794207466.164740532s)
+   Compiling apack-terminal v0.1.0 (/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp)
+       Fresh insta v1.49.0
+       Fresh proptest v1.12.0
+     Running `/Users/spankyed/.rustup/toolchains/1.99.1-aarch64-apple-darwin/bin/rustc --crate-name apack_terminal --edition=2024 src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=9c1f2854e6e003bf -C extra-filename=-560c73de626d3fee --out-dir /private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps -C incremental=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/incremental -L dependency=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps --extern alacritty_terminal=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libalacritty_terminal-e22166a2dd582af7.rlib --extern insta=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libinsta-9b8081c4d9243622.rlib --extern interprocess=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libinterprocess-0eb3c4f0d5046c11.rlib --extern libc=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/liblibc-57e3d4331ab41dea.rlib --extern portable_pty=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libportable_pty-ae7291963f490958.rlib --extern proptest=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libproptest-9dc89dc96661b762.rlib --extern serde=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libserde-85cf078be3437511.rlib --extern serde_json=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libserde_json-d4a3bf3e325ccd01.rlib --extern sysinfo=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libsysinfo-7a7b45fb7bb561e0.rlib --extern tempfile=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libtempfile-f6557ea2fe12190d.rlib --extern ts_rs=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libts_rs-25b4765298d256ec.rlib`
+     Running `/Users/spankyed/.rustup/toolchains/1.99.1-aarch64-apple-darwin/bin/rustc --crate-name apack_terminal --edition=2024 src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=5fd784727d8191fd -C extra-filename=-2a5c7153ddea6bf0 --out-dir /private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps -C incremental=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/incremental -L dependency=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps --extern alacritty_terminal=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libalacritty_terminal-e22166a2dd582af7.rmeta --extern interprocess=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libinterprocess-0eb3c4f0d5046c11.rmeta --extern portable_pty=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libportable_pty-ae7291963f490958.rmeta --extern serde=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libserde-85cf078be3437511.rmeta --extern serde_json=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libserde_json-d4a3bf3e325ccd01.rmeta --extern sysinfo=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libsysinfo-7a7b45fb7bb561e0.rmeta --extern ts_rs=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libts_rs-25b4765298d256ec.rmeta`
+error[E0277]: the trait bound `Tree: std::default::Default` is not satisfied
+  --> src/tree.rs:94:14
+   |
+94 |         Some(Default::default()) /* ~ changed by cargo-mutants ~ */
+   |              ^^^^^^^^^^^^^^^^^^ the trait `std::default::Default` is not implemented for `Tree`
+   |
+help: consider annotating `Tree` with `#[derive(Default)]`
+   |
+20 + #[derive(Default)]
+21 | pub struct Tree {
+   |
+
+For more information about this error, try `rustc --explain E0277`.
+error: could not compile `apack-terminal` (lib test) due to 1 previous error
+
+Caused by:
+  process didn't exit successfully: `/Users/spankyed/.rustup/toolchains/1.99.1-aarch64-apple-darwin/bin/rustc --crate-name apack_terminal --edition=2024 src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=9c1f2854e6e003bf -C extra-filename=-560c73de626d3fee --out-dir /private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps -C incremental=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/incremental -L dependency=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps --extern alacritty_terminal=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libalacritty_terminal-e22166a2dd582af7.rlib --extern insta=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libinsta-9b8081c4d9243622.rlib --extern interprocess=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libinterprocess-0eb3c4f0d5046c11.rlib --extern libc=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/liblibc-57e3d4331ab41dea.rlib --extern portable_pty=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libportable_pty-ae7291963f490958.rlib --extern proptest=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libproptest-9dc89dc96661b762.rlib --extern serde=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libserde-85cf078be3437511.rlib --extern serde_json=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libserde_json-d4a3bf3e325ccd01.rlib --extern sysinfo=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libsysinfo-7a7b45fb7bb561e0.rlib --extern tempfile=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libtempfile-f6557ea2fe12190d.rlib --extern ts_rs=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libts_rs-25b4765298d256ec.rlib` (exit status: 1)
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `apack-terminal` (lib) due to 1 previous error
+
+Caused by:
+  process didn't exit successfully: `/Users/spankyed/.rustup/toolchains/1.99.1-aarch64-apple-darwin/bin/rustc --crate-name apack_terminal --edition=2024 src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=5fd784727d8191fd -C extra-filename=-2a5c7153ddea6bf0 --out-dir /private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps -C incremental=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/incremental -L dependency=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps --extern alacritty_terminal=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libalacritty_terminal-e22166a2dd582af7.rmeta --extern interprocess=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libinterprocess-0eb3c4f0d5046c11.rmeta --extern portable_pty=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libportable_pty-ae7291963f490958.rmeta --extern serde=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libserde-85cf078be3437511.rmeta --extern serde_json=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libserde_json-d4a3bf3e325ccd01.rmeta --extern sysinfo=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libsysinfo-7a7b45fb7bb561e0.rmeta --extern ts_rs=/private/var/folders/4p/krfrhcfn4497f_6_ks06f9dr0000gn/T/cargo-mutants-apack-terminal-yKBVFn.tmp/target/debug/deps/libts_rs-25b4765298d256ec.rmeta` (exit status: 1)
+
+*** result: Failure(101)
