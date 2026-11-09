@@ -12,7 +12,7 @@
 use ghostty_vt_rs_sys as sys;
 
 use crate::screen::{Facts, HISTORY_LINES, Snapshot};
-use crate::vt::{Failed, Terminal};
+use crate::vt::{Failed, Replies, Terminal};
 
 /// The terminal advertised to the program, which has to match what the broker's pty says.
 ///
@@ -22,7 +22,10 @@ const TERMINFO_NAME: &str = "xterm-256color";
 
 /// `screen::Screen`'s surface, over the core.
 pub struct GhosttyScreen {
+    /// Declared first so it is dropped first: the replies below are reachable from the library while this
+    /// handle lives, and a freed collector behind a live terminal would be a dangling callback.
     terminal: Terminal,
+    replies: Box<Replies>,
     cols: u16,
     rows: u16,
 }
@@ -51,7 +54,11 @@ impl GhosttyScreen {
         terminal.set_null(sys::TerminalOption::SCROLLBACK_MAX_BYTES, "SCROLLBACK_MAX_BYTES")?;
         terminal.set_str(sys::TerminalOption::TERMINFO_NAME, TERMINFO_NAME, "TERMINFO_NAME")?;
 
-        Ok(Self { terminal, cols, rows })
+        let mut replies = Box::new(Replies::default());
+        // SAFETY: the box outlives the handle, which `Self`'s field order guarantees
+        unsafe { terminal.route_replies(&raw mut *replies) }?;
+
+        Ok(Self { terminal, replies, cols, rows })
     }
 
     /// Feeds bytes as they arrived, chunk boundaries included.
@@ -73,6 +80,11 @@ impl GhosttyScreen {
     /// `Facts` would differ for a reason that says nothing about either parser.
     pub fn facts(&self) -> Facts {
         Facts::default()
+    }
+
+    /// What the program asked for and must be told, taken rather than read: each reply is written once.
+    pub fn take_replies(&mut self) -> Vec<String> {
+        self.replies.take()
     }
 
     /// The viewport, with up to `history` lines above it.

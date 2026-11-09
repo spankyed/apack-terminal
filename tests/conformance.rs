@@ -179,3 +179,90 @@ fn a_planted_difference_is_reported() {
     assert_eq!(screen.len(), 1, "the wrong screen is one difference: {screen:?}");
     assert!(screen[0].contains("alt_screen"), "it says so: {}", screen[0]);
 }
+
+/// **A terminal answers questions, and the broker is what answers them.**
+///
+/// ConPTY's first act is a cursor-position request and it waits for the reply before initialising, so a
+/// session that answers nothing does not start on Windows — which is invisible on POSIX and is why this is
+/// compared in 0a rather than met in Phase B. The stream is a device status report and a primary device
+/// attributes request, the two a shell or a TUI actually sends.
+#[test]
+fn both_answer_what_a_program_asks() {
+    let asks: &[(&str, &[u8])] = &[
+        ("cursor position (DSR 6)", b"\x1b[6n"),
+        ("primary device attributes", b"\x1b[c"),
+        ("both, after output", b"before\x1b[6n\x1b[cafter"),
+    ];
+    let mut found = Vec::new();
+    for (what, stream) in asks {
+        let mut ours = Screen::new(20, 4);
+        let mut theirs = GhosttyScreen::new(20, 4).expect("a ghostty terminal");
+        ours.feed(stream);
+        theirs.feed(stream);
+        let (ours, theirs) = (ours.take_replies(), theirs.take_replies());
+        // Compared as one string: the two may split a reply across callbacks differently, and where a
+        // boundary falls is not something a program can observe
+        let (mut ours, theirs) = (ours.concat(), theirs.concat());
+        assert!(!ours.is_empty(), "{what}: the wrapper answered nothing, so there is nothing to compare");
+        // The decided difference is rewritten to what the core says, so everything else in the same
+        // answer is still compared rather than the whole case being skipped
+        for (from, to) in DECIDED_REPLIES {
+            ours = ours.replace(from, to);
+        }
+        if ours != theirs {
+            found.push(format!("{what}: ours={ours:?} theirs={theirs:?}"));
+        }
+    }
+    assert!(found.is_empty(), "{} difference(s):\n{}", found.len(), found.join("\n"));
+}
+
+/// **The one answer the two parsers give differently, and the core is right.**
+///
+/// Primary device attributes. `alacritty_terminal` answers `CSI ?6c`, a VT102; the core answers
+/// `CSI ?62;22c`, a VT220 with ANSI colour. The broker advertises `TERM=xterm-256color`, and a program
+/// that asks what it is talking to and hears "VT102" may turn off features the terminal has — so this is
+/// a difference where adopting the core *fixes* something, which is the decision recorded in
+/// `docs/references/evidence/one-vt-core.md` rather than a divergence to preserve.
+///
+/// Written as a rewrite rather than a skipped case so that everything else in the same answer — the
+/// cursor report beside it in the third stream — is still compared.
+const DECIDED_REPLIES: &[(&str, &str)] = &[("\u{1b}[?6c", "\u{1b}[?62;22c")];
+
+/// The rewrite above is not hiding a disagreement that has since changed.
+///
+/// If either parser's answer moves, the entry stops matching and the case above reports the whole reply
+/// as a difference. This one fails sooner and says why: an entry that no longer describes either side is
+/// dead text, and dead text in an exceptions table is what this repo refuses.
+#[test]
+fn the_decided_reply_is_still_what_each_parser_says() {
+    let mut ours = Screen::new(20, 4);
+    let mut theirs = GhosttyScreen::new(20, 4).expect("a ghostty terminal");
+    ours.feed(b"\x1b[c");
+    theirs.feed(b"\x1b[c");
+    let (from, to) = DECIDED_REPLIES[0];
+    assert_eq!(ours.take_replies().concat(), from, "the wrapper's device attributes answer moved");
+    assert_eq!(theirs.take_replies().concat(), to, "the core's device attributes answer moved");
+}
+
+/// An alternate-screen application, resized under it, and left: the case `parser.rs` drives a real `less`
+/// through. **Resize is where a reflow difference would show**, and the corpus above never resizes.
+#[test]
+fn both_survive_a_resize_under_an_alternate_screen() {
+    let mut ours = Screen::new(40, 10);
+    let mut theirs = GhosttyScreen::new(40, 10).expect("a ghostty terminal");
+    for chunk in [&b"shell scrollback\r\n"[..], &b"\x1b[?1049h\x1b[2J\x1b[HTUI content here"[..]] {
+        ours.feed(chunk);
+        theirs.feed(chunk);
+    }
+    let mut found = differences("on the alternate screen", &ours.snapshot(0), &theirs.snapshot(0).expect("a snapshot"));
+
+    ours.resize(20, 5);
+    theirs.resize(20, 5).expect("a resize");
+    found.extend(differences("resized under it", &ours.snapshot(0), &theirs.snapshot(0).expect("a snapshot")));
+
+    ours.feed(b"\x1b[?1049l");
+    theirs.feed(b"\x1b[?1049l");
+    found.extend(differences("after leaving it", &ours.snapshot(20), &theirs.snapshot(20).expect("a snapshot")));
+
+    assert!(found.is_empty(), "{} difference(s):\n{}", found.len(), found.join("\n"));
+}

@@ -188,6 +188,33 @@ impl Terminal {
         Failed::check(what, result)
     }
 
+    /// Routes the replies the terminal makes on a program's behalf to `collector`.
+    ///
+    /// **A terminal answers questions, and a session that answers none does not start on Windows**:
+    /// ConPTY's first act is a cursor-position request and it waits for the reply before initialising.
+    /// `screen::Screen` collects these too, and the broker is what has to answer — not the window, whose
+    /// parse is a replica that must not be in the loop for a program's control queries.
+    ///
+    /// # Safety
+    ///
+    /// `collector` must point at a live `Replies` for as long as this terminal can parse, which means it
+    /// must outlive the handle. `GhosttyScreen` owns both and declares the terminal first so it is freed
+    /// first.
+    unsafe fn route_replies(&self, collector: *mut Replies) -> Result<(), Failed> {
+        // SAFETY: userdata is an untyped pointer the library only ever hands back to the callback below
+        let result = unsafe { sys::ghostty_terminal_set(self.handle, sys::TerminalOption::USERDATA, collector.cast()) };
+        Failed::check("ghostty_terminal_set(USERDATA)", result)?;
+
+        // **The function pointer itself, not a pointer to it.** A callback option is documented that way
+        // and the difference is not subtle: passing `&callback` had the library call the address of a stack
+        // local, which is a SIGBUS rather than a wrong answer.
+        let callback = collect_reply as *const std::ffi::c_void;
+        // SAFETY: `collect_reply` has the signature `GhosttyTerminalWritePtyFn` declares, and the library
+        // only calls it with the userdata set above
+        let result = unsafe { sys::ghostty_terminal_set(self.handle, sys::TerminalOption::WRITE_PTY, callback) };
+        Failed::check("ghostty_terminal_set(WRITE_PTY)", result)
+    }
+
     /// Sets an option whose value is a borrowed string.
     fn set_str(&self, option: sys::TerminalOption::Type, value: &str, what: &'static str) -> Result<(), Failed> {
         let text = sys::String::from(value);
@@ -239,3 +266,36 @@ impl std::fmt::Display for Failed {
 }
 
 impl std::error::Error for Failed {}
+
+/// What the terminal wants said back to the program, collected rather than discarded.
+///
+/// Boxed and owned by the screen that routed it, because its address is handed to the library.
+#[derive(Default)]
+pub struct Replies(Vec<String>);
+
+impl Replies {
+    /// Each reply is written once, so they are taken rather than read.
+    pub fn take(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+/// The library's callback, which copies before returning because the data is only valid for the call.
+///
+/// A reply is a control sequence rather than text, but `screen::Screen` collects these as strings and the
+/// comparison is against that, so the conversion is the same one: lossy, since a sequence is ASCII in
+/// practice and a replacement character is a visible difference rather than a silent one.
+unsafe extern "C" fn collect_reply(
+    _terminal: sys::Terminal,
+    userdata: *mut std::ffi::c_void,
+    data: *const u8,
+    len: usize,
+) {
+    if userdata.is_null() || data.is_null() || len == 0 {
+        return;
+    }
+    // SAFETY: `userdata` is the pointer `route_replies` was given, which its caller keeps alive for the
+    // terminal's life; `data` and `len` describe a slice the library promises for the duration of the call
+    let (replies, bytes) = unsafe { (&mut *userdata.cast::<Replies>(), std::slice::from_raw_parts(data, len)) };
+    replies.0.push(String::from_utf8_lossy(bytes).into_owned());
+}
