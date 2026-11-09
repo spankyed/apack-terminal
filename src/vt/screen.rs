@@ -12,7 +12,7 @@
 use ghostty_vt_rs_sys as sys;
 
 use crate::screen::{Facts, HISTORY_LINES, Snapshot};
-use crate::vt::{Failed, Replies, Terminal};
+use crate::vt::{Failed, Reported, Terminal};
 
 /// The terminal advertised to the program, which has to match what the broker's pty says.
 ///
@@ -25,7 +25,7 @@ pub struct GhosttyScreen {
     /// Declared first so it is dropped first: the replies below are reachable from the library while this
     /// handle lives, and a freed collector behind a live terminal would be a dangling callback.
     terminal: Terminal,
-    replies: Box<Replies>,
+    reported: Box<Reported>,
     cols: u16,
     rows: u16,
 }
@@ -54,11 +54,11 @@ impl GhosttyScreen {
         terminal.set_null(sys::TerminalOption::SCROLLBACK_MAX_BYTES, "SCROLLBACK_MAX_BYTES")?;
         terminal.set_str(sys::TerminalOption::TERMINFO_NAME, TERMINFO_NAME, "TERMINFO_NAME")?;
 
-        let mut replies = Box::new(Replies::default());
+        let mut reported = Box::new(Reported::default());
         // SAFETY: the box outlives the handle, which `Self`'s field order guarantees
-        unsafe { terminal.route_replies(&raw mut *replies) }?;
+        unsafe { terminal.route_reports(&raw mut *reported) }?;
 
-        Ok(Self { terminal, replies, cols, rows })
+        Ok(Self { terminal, reported, cols, rows })
     }
 
     /// Feeds bytes as they arrived, chunk boundaries included.
@@ -72,19 +72,14 @@ impl GhosttyScreen {
         self.terminal.resize(self.cols, self.rows)
     }
 
-    /// What the shell has said about itself — **nothing yet**, by design.
-    ///
-    /// The core answers all of it (`OPT_SEMANTIC_PROMPT` for a command and the status it finished with,
-    /// `OPT_PWD_CHANGED` for the reported directory, `DATA_CURSOR_AT_PROMPT` beside them), and wiring those
-    /// callbacks is Phase B. Returning the default here keeps 0a's comparison about the grid: a half-wired
-    /// `Facts` would differ for a reason that says nothing about either parser.
-    pub fn facts(&self) -> Facts {
-        Facts::default()
+    /// What the shell has said about itself, from the core's own events rather than a second scan.
+    pub fn facts(&self) -> &Facts {
+        self.reported.facts()
     }
 
     /// What the program asked for and must be told, taken rather than read: each reply is written once.
     pub fn take_replies(&mut self) -> Vec<String> {
-        self.replies.take()
+        self.reported.take_replies()
     }
 
     /// The viewport, with up to `history` lines above it.

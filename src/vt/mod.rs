@@ -12,6 +12,9 @@
 //! library memory.
 use ghostty_vt_rs_sys as sys;
 
+use crate::markers::cwd_from_url;
+use crate::screen::Facts;
+
 pub mod screen;
 pub use screen::GhosttyScreen;
 
@@ -200,7 +203,7 @@ impl Terminal {
     /// `collector` must point at a live `Replies` for as long as this terminal can parse, which means it
     /// must outlive the handle. `GhosttyScreen` owns both and declares the terminal first so it is freed
     /// first.
-    unsafe fn route_replies(&self, collector: *mut Replies) -> Result<(), Failed> {
+    unsafe fn route_reports(&self, collector: *mut Reported) -> Result<(), Failed> {
         // SAFETY: userdata is an untyped pointer the library only ever hands back to the callback below
         let result = unsafe { sys::ghostty_terminal_set(self.handle, sys::TerminalOption::USERDATA, collector.cast()) };
         Failed::check("ghostty_terminal_set(USERDATA)", result)?;
@@ -212,7 +215,21 @@ impl Terminal {
         // SAFETY: `collect_reply` has the signature `GhosttyTerminalWritePtyFn` declares, and the library
         // only calls it with the userdata set above
         let result = unsafe { sys::ghostty_terminal_set(self.handle, sys::TerminalOption::WRITE_PTY, callback) };
-        Failed::check("ghostty_terminal_set(WRITE_PTY)", result)
+        Failed::check("ghostty_terminal_set(WRITE_PTY)", result)?;
+
+        // **The shell's own account of itself**, which is what `markers.rs` scans the byte stream for
+        // today. The core reports each step of a command as an event and decodes the command line for us;
+        // what it does not do is interpret, so the mapping below is the broker's contract rather than the
+        // core's reading of it.
+        let semantic = note_semantic_prompt as *const std::ffi::c_void;
+        // SAFETY: the signature matches `GhosttyTerminalSemanticPromptFn`
+        let result = unsafe { sys::ghostty_terminal_set(self.handle, sys::TerminalOption::SEMANTIC_PROMPT, semantic) };
+        Failed::check("ghostty_terminal_set(SEMANTIC_PROMPT)", result)?;
+
+        let pwd = note_pwd as *const std::ffi::c_void;
+        // SAFETY: the signature matches `GhosttyTerminalPwdChangedFn`
+        let result = unsafe { sys::ghostty_terminal_set(self.handle, sys::TerminalOption::PWD_CHANGED, pwd) };
+        Failed::check("ghostty_terminal_set(PWD_CHANGED)", result)
     }
 
     /// Sets an option whose value is a borrowed string.
@@ -267,16 +284,25 @@ impl std::fmt::Display for Failed {
 
 impl std::error::Error for Failed {}
 
-/// What the terminal wants said back to the program, collected rather than discarded.
+/// Everything the library reports to its host, collected as it arrives.
 ///
-/// Boxed and owned by the screen that routed it, because its address is handed to the library.
+/// Boxed and owned by the screen that routed it, because its address is what the library is handed.
 #[derive(Default)]
-pub struct Replies(Vec<String>);
+pub struct Reported {
+    /// What the terminal wants said back to the program, kept rather than discarded.
+    replies: Vec<String>,
+    /// What the shell has claimed about itself, in `screen`'s own vocabulary.
+    facts: Facts,
+}
 
-impl Replies {
+impl Reported {
     /// Each reply is written once, so they are taken rather than read.
-    pub fn take(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.0)
+    pub fn take_replies(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.replies)
+    }
+
+    pub fn facts(&self) -> &Facts {
+        &self.facts
     }
 }
 
@@ -296,6 +322,78 @@ unsafe extern "C" fn collect_reply(
     }
     // SAFETY: `userdata` is the pointer `route_replies` was given, which its caller keeps alive for the
     // terminal's life; `data` and `len` describe a slice the library promises for the duration of the call
-    let (replies, bytes) = unsafe { (&mut *userdata.cast::<Replies>(), std::slice::from_raw_parts(data, len)) };
-    replies.0.push(String::from_utf8_lossy(bytes).into_owned());
+    let (reported, bytes) = unsafe { (&mut *userdata.cast::<Reported>(), std::slice::from_raw_parts(data, len)) };
+    reported.replies.push(String::from_utf8_lossy(bytes).into_owned());
+}
+
+/// One step of a command, as the shell reported it.
+///
+/// **The mapping is the broker's, not the core's.** A prompt being drawn means whatever ran has finished
+/// whether or not the shell said so, and an exit status is absent rather than zero when the shell reported
+/// none — a shell that says nothing about how a command ended is not saying it succeeded. Both of those
+/// are `screen::Facts`' contract and `markers.rs` already holds them; this reads the core's event into the
+/// same shape instead of inventing a second one.
+unsafe extern "C" fn note_semantic_prompt(
+    _terminal: sys::Terminal,
+    userdata: *mut std::ffi::c_void,
+    event: *const sys::TerminalSemanticPrompt,
+) {
+    if userdata.is_null() || event.is_null() {
+        return;
+    }
+    // SAFETY: both pointers are the library's, valid for this call
+    let (reported, event) = unsafe { (&mut *userdata.cast::<Reported>(), &*event) };
+    match event.kind {
+        sys::SemanticPromptKind::GHOSTTY_SEMANTIC_PROMPT_PROMPT_START => reported.facts.running = false,
+        sys::SemanticPromptKind::GHOSTTY_SEMANTIC_PROMPT_OUTPUT_START => {
+            reported.facts.running = true;
+            // SAFETY: the library owns the bytes for this call, and this copies them
+            if let Some(line) = unsafe { text_of(&event.command) } {
+                reported.facts.command = Some(line);
+            }
+        }
+        sys::SemanticPromptKind::GHOSTTY_SEMANTIC_PROMPT_COMMAND_END => {
+            reported.facts.running = false;
+            reported.facts.exit_status = event.has_exit_code.then_some(event.exit_code);
+        }
+        _ => {}
+    }
+}
+
+/// The working directory the shell reported, read back inside the callback as the option requires.
+///
+/// **The core stores the raw bytes and says so**: for OSC 7 that is a `file://` URI, which this decodes
+/// with the broker's own decoder. A cleared pwd arrives as a zero-length string and is left alone rather
+/// than recorded as an empty path.
+unsafe extern "C" fn note_pwd(terminal: sys::Terminal, userdata: *mut std::ffi::c_void) {
+    if userdata.is_null() {
+        return;
+    }
+    let mut value = sys::String::default();
+    // SAFETY: PWD writes a `GhosttyString`, and the call is inside the callback the option documents
+    let result = unsafe {
+        sys::ghostty_terminal_get(terminal, sys::TerminalData::PWD, (&raw mut value).cast::<std::ffi::c_void>())
+    };
+    if result != sys::Result::SUCCESS {
+        return;
+    }
+    // SAFETY: `userdata` is the collector, and `value` was just filled by the library
+    let (reported, text) = unsafe { (&mut *userdata.cast::<Reported>(), text_of(&value)) };
+    let Some(text) = text else { return };
+    // A bare path (OSC 9, OSC 1337) is already one; only OSC 7's URI needs taking apart
+    reported.facts.cwd = Some(cwd_from_url(&text).unwrap_or(text));
+}
+
+/// A `GhosttyString` copied out, or `None` when it is empty.
+///
+/// # Safety
+///
+/// `text` must be a string the library filled and still owns for this call.
+unsafe fn text_of(text: &sys::String) -> Option<String> {
+    if text.ptr.is_null() || text.len == 0 {
+        return None;
+    }
+    // SAFETY: the caller promises the pointer and length describe live bytes
+    let bytes = unsafe { std::slice::from_raw_parts(text.ptr, text.len) };
+    Some(String::from_utf8_lossy(bytes).into_owned())
 }

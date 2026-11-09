@@ -188,9 +188,13 @@ fn marker(payload: &[u8]) -> Option<Marker> {
 
 /// The path out of OSC 7's `file://<host>/<path>`.
 ///
+/// **Shared with the `vt` path rather than written twice.** The core stores whatever bytes the shell
+/// emitted for OSC 7 without parsing them, which its own documentation says, so this decode is the
+/// broker's either way — one of the pieces of `markers.rs` that stays when the scanning goes.
+///
 /// The host is whatever the shell believes it is called and is not checked against anything: a path is a
 /// claim either way, and a session is local by construction — the broker spawned the process itself.
-fn cwd_from_url(url: &str) -> Option<String> {
+pub(crate) fn cwd_from_url(url: &str) -> Option<String> {
     let rest = url.strip_prefix("file://")?;
     let slash = rest.find('/')?;
     Some(decode(&rest[slash..]))

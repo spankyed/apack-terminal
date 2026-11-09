@@ -266,3 +266,65 @@ fn both_survive_a_resize_under_an_alternate_screen() {
 
     assert!(found.is_empty(), "{} difference(s):\n{}", found.len(), found.join("\n"));
 }
+
+/// **The two fields `markers.rs` exists for — and the finding that the two read different sequences.**
+///
+/// OSC 133 draws no cells, so a stream carrying it would earn a committed grid snapshot that is a blank
+/// picture: a recorded file that does not derive the thing it is about. The assertion it deserves is
+/// `Facts` equality, so it belongs here with the comparison.
+///
+/// **What the comparison found is that neither side reads the other's family.** `markers.rs` reads
+/// OSC 633, which is VS Code's shell integration; `libghostty-vt` 1.0 reads OSC 133, which is the
+/// FinalTerm sequence iTerm2, Ghostty's own integration and most shell scripts emit. Each reports nothing
+/// for the other. So this case asserts each side against the family it reads, rather than against the
+/// other side, and the consequence for Phase B is recorded in the goal's evidence: the union is strictly
+/// better than either, so `markers.rs` keeps its 633 scanning and gains 133 from the core.
+#[test]
+fn each_parser_reads_the_shell_integration_it_knows() {
+    /// What a reporting shell says, in both families: the same four steps either way.
+    fn run(prefix: &str, line: &str) -> Vec<u8> {
+        // 633 carries the command line in `E`, 133 as `C`'s `cmdline` property
+        let command = if prefix == "633" { format!("\x1b]633;E;{line}\x07") } else { String::new() };
+        let starting =
+            if prefix == "633" { "\x1b]633;C\x07".to_owned() } else { format!("\x1b]133;C;cmdline={line}\x07") };
+        format!("\x1b]{prefix};A\x07\x1b]{prefix};B\x07{command}{starting}").replace("\\x1b", "\x1b").into_bytes()
+    }
+
+    // Ours reads 633 and the core reads 133, so each is driven with its own and asserted to read it.
+    // A case driven with the family a side ignores would pass by reading nothing, which is why these
+    // assert values rather than equality.
+    let mut ours = Screen::new(20, 4);
+    ours.feed(&run("633", "ls -la"));
+    assert!(ours.facts().running, "the wrapper reads OSC 633's command start");
+    assert_eq!(ours.facts().command.as_deref(), Some("ls -la"), "and its command line");
+    ours.feed(b"\x1b]633;D;1\x07");
+    assert!(!ours.facts().running, "and its command end");
+    assert_eq!(ours.facts().exit_status, Some(1), "with the status it reported");
+
+    let mut theirs = GhosttyScreen::new(20, 4).expect("a ghostty terminal");
+    theirs.feed(&run("133", "ls -la"));
+    assert!(theirs.facts().running, "the core reads OSC 133's command start");
+    assert_eq!(theirs.facts().command.as_deref(), Some("ls -la"), "and its command line");
+    theirs.feed(b"\x1b]133;D;1\x07");
+    assert!(!theirs.facts().running, "and its command end");
+    assert_eq!(theirs.facts().exit_status, Some(1), "with the status it reported");
+
+    // **A finish with no status is absent rather than zero**, which is the contract both keep: a shell
+    // that says nothing about how a command ended is not saying it succeeded.
+    let mut ours = Screen::new(20, 4);
+    ours.feed(b"\x1b]633;C\x07\x1b]633;D\x07");
+    assert_eq!(ours.facts().exit_status, None, "the wrapper reports no status as none");
+    let mut theirs = GhosttyScreen::new(20, 4).expect("a ghostty terminal");
+    theirs.feed(b"\x1b]133;C\x07\x1b]133;D\x07");
+    assert_eq!(theirs.facts().exit_status, None, "and so does the core");
+
+    // **OSC 7 is the one both read, and the decode is the broker's either way**: the core stores the raw
+    // URI and says so, so `cwd_from_url` is shared rather than written twice.
+    let reported = b"\x1b]7;file:///tmp/some%20where\x1b\\";
+    let mut ours = Screen::new(20, 4);
+    let mut theirs = GhosttyScreen::new(20, 4).expect("a ghostty terminal");
+    ours.feed(reported);
+    theirs.feed(reported);
+    assert_eq!(ours.facts().cwd.as_deref(), Some("/tmp/some where"), "the wrapper decodes the URI");
+    assert_eq!(theirs.facts().cwd, ours.facts().cwd, "and the core agrees once it is decoded");
+}
