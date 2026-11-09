@@ -75,6 +75,18 @@ diff rather than an assertion someone has to word. `cargo insta review` accepts 
 `killing_a_session_takes_the_whole_tree_with_it` spawns a grandchild that outlives its shell and asks the OS
 whether it is gone — with a pid captured at spawn, never by matching a process by name.
 
+**It runs on both platforms**, which is what makes X1 a claim about Windows and not only about POSIX: the
+grandchild is `sleep 300 &` on POSIX and a hidden detached PowerShell started with `Start-Process -PassThru`
+on Windows, and the first Windows mutation of `src/tree.rs` showed the assertion is load-bearing there —
+break the Job Object in any of the ways that matter and this case fails.
+
+**Its two waits are different kinds, and only one of them can be bound by progress.** Waiting for the shell
+to run a line and write a file is a wait on another process's *work*, and output arriving on the session is
+the signal that it is still happening, so that is the bound. Waiting for a killed tree to be reaped has no
+such signal — a process being torn down reports nothing and the only observable is its absence — so it stays
+a counted grace, said out loud rather than converted. On Windows each probe runs `tasklist`, so that grace
+stretches with load by itself.
+
 On Windows that is the Job Object doing it (`tree.rs`); on POSIX it is the kernel's SIGHUP to the pty's
 foreground group. **The Windows half is claimed on a Windows run or not at all**, which is why the suite
 runs there rather than being reasoned about from a Mac.

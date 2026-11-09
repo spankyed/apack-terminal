@@ -492,21 +492,53 @@ fn long_lived_grandchild(pid_file: &std::path::Path) -> String {
     format!("powershell -NoProfile -File \"{}\"{SUBMIT}", script.display())
 }
 
-/// The pid that process wrote, waiting up to ~10s for the shell to get that far.
-fn pid_written_to(pid_file: &std::path::Path) -> i32 {
-    for _ in 0..400 {
-        std::thread::sleep(std::time::Duration::from_millis(25));
-        let Ok(text) = std::fs::read_to_string(pid_file) else {
-            continue;
-        };
-        if let Ok(pid) = text.trim().parse::<i32>() {
+/// The pid that process wrote, **waited for by the session's own output** rather than by a clock.
+///
+/// The shell has to start, read a line and run it before that file exists, and on Windows that line starts
+/// another PowerShell — work whose duration is the machine's to decide, not this case's. What says it is
+/// still happening is output arriving on the session, so that is the bound: the file is checked often,
+/// which costs nothing, and the wait gives up only after `QUIET` with no output *and* no file. A fixed ten
+/// seconds fails correct code on a busy box, which is the whole defect this shape avoids. A shell that
+/// talks forever without writing the file is ended by `.config/nextest.toml`'s deadline, as any test that
+/// has stopped ending is.
+fn pid_written_to(reading: &mut Events, pid_file: &std::path::Path) -> i32 {
+    const STEP: std::time::Duration = std::time::Duration::from_millis(25);
+    let mut silence = std::time::Duration::ZERO;
+    loop {
+        if let Ok(text) = std::fs::read_to_string(pid_file)
+            && let Ok(pid) = text.trim().parse::<i32>()
+        {
             return pid;
         }
+        match reading.0.recv_timeout(STEP) {
+            // The shell is still working, so the wait starts over: progress, not elapsed time
+            Ok(_) => silence = std::time::Duration::ZERO,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                silence += STEP;
+                assert!(
+                    silence < QUIET,
+                    "the shell said nothing for {QUIET:?} and never wrote its background job's pid to {}",
+                    pid_file.display()
+                );
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the broker closed the connection before the pid arrived")
+            }
+        }
     }
-    panic!("the shell never wrote its background job's pid to {}", pid_file.display());
 }
 
-/// Waits up to ~5s for `pid` to go away, answering whether it did.
+/// Whether `pid` went away, within a grace of about two hundred probes.
+///
+/// **A kill grace, and deliberately not progress-bounded**, because there is no progress to read: a process
+/// being torn down by the OS reports nothing, and the only observable is its absence. That is the one class
+/// of wait this repository keeps on a count rather than converting, and saying so is the point — the
+/// neighbouring `pid_written_to` waits on another process's *work*, which does have a signal, and is bound
+/// by it.
+///
+/// What is counted is probes rather than seconds, which matters on Windows: `alive` there runs `tasklist`,
+/// so each probe costs what the machine charges for one and the grace stretches with load by itself. On
+/// POSIX the probe is a signal-0 and free, so this is about five seconds of them.
 fn reaped(pid: i32) -> bool {
     (0..200).any(|_| {
         std::thread::sleep(std::time::Duration::from_millis(25));
@@ -535,7 +567,7 @@ fn killing_a_session_takes_the_whole_tree_with_it() {
             serde_json::to_string(&long_lived_grandchild(&pid_file)).expect("a JSON string")
         ),
     );
-    let grandchild = pid_written_to(&pid_file);
+    let grandchild = pid_written_to(&mut reading, &pid_file);
     assert!(alive(grandchild), "the grandchild {grandchild} is running");
 
     ask(&mut writing, &format!(r#"{{"kind":"kill","session":"{session}"}}"#));
