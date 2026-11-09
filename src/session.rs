@@ -194,6 +194,46 @@ fn described(number: i32) -> Option<String> {
     Some(unsafe { std::ffi::CStr::from_ptr(prose) }.to_string_lossy().into_owned())
 }
 
+/// A number `kill(2)` may be given: one process, or one process group, and never every process.
+///
+/// **A private field and no `Default`, both deliberately.** The two numbers that must never reach `kill` are
+/// `0` — every process in *this* process's group — and `-1`, every process the user owns. A mutation tester
+/// builds its replacements from `Default::default()` and small literals, so a return type it cannot
+/// construct is a mutant that does not compile and therefore never *runs*; for a function whose wrong
+/// answer is "signal everything", not running is the only safe outcome. This exists because it happened: a
+/// run of `cargo xtask pre-push` on a developer's machine sent `kill(-1, SIGKILL)` and killed every
+/// application the user had open.
+///
+/// **The guard is in the constructor**, so there is no state in which an unsafe target exists — rather than
+/// in the caller, where each new call site is another chance to forget it. `.cargo/mutants.toml` excludes
+/// it, because a mutant of a guard is the guard gone.
+#[derive(Debug, Clone, Copy)]
+#[cfg(unix)]
+pub struct SignalTarget(i32);
+
+#[cfg(unix)]
+impl SignalTarget {
+    /// Refuses the two that broadcast; everything else is one process or one group.
+    pub fn at(target: i32) -> Result<Self, Refusal> {
+        if target == 0 {
+            return Err(Self::refused(0, "every process in this broker's own group"));
+        }
+        if target == -1 {
+            return Err(Self::refused(1, "every process the user owns"));
+        }
+        Ok(Self(target))
+    }
+
+    /// What `kill` is given. Read inside this module without it, so a mutant of this cannot aim a signal.
+    pub fn number(self) -> i32 {
+        self.0
+    }
+
+    fn refused(pid: u32, what: &str) -> Refusal {
+        Refusal { code: ErrorCode::Pty, message: format!("{pid} is not a process this broker can signal ({what})") }
+    }
+}
+
 /// The pid `kill(2)` is given for a scope, or a refusal.
 ///
 /// **A pid below 2 is refused, and that is the whole reason this is a function of its own.** `kill(0, …)`
@@ -206,22 +246,18 @@ fn described(number: i32) -> Option<String> {
 /// would make this fire is one where `process_id()` answers `None`, which is why the arithmetic is here
 /// rather than inline, where it cannot be tested without signalling something.
 #[cfg(unix)]
-pub fn signal_target(leader: u32, scope: Scope) -> Result<i32, Refusal> {
-    let unusable = |what: &str, pid: u32| Refusal {
-        code: ErrorCode::Pty,
-        message: format!("{pid} is not a process this broker can signal ({what})"),
-    };
+pub fn signal_target(leader: u32, scope: Scope) -> Result<SignalTarget, Refusal> {
     let real = |pid: u32| -> Result<i32, Refusal> {
         if pid < 2 {
-            return Err(unusable("a session whose process id is unknown, or init", pid));
+            return Err(SignalTarget::refused(pid, "a session whose process id is unknown, or init"));
         }
-        i32::try_from(pid).map_err(|_| unusable("the pid does not fit a signal", pid))
+        i32::try_from(pid).map_err(|_| SignalTarget::refused(pid, "the pid does not fit a signal"))
     };
     match scope {
-        Scope::Leader => real(leader),
+        Scope::Leader => SignalTarget::at(real(leader)?),
         // A negative pid is its process group, which `portable-pty` made this process the leader of
-        Scope::Group => Ok(-real(leader)?),
-        Scope::Pid { pid } => real(pid),
+        Scope::Group => SignalTarget::at(-real(leader)?),
+        Scope::Pid { pid } => SignalTarget::at(real(pid)?),
     }
 }
 
@@ -260,7 +296,9 @@ fn deliver(leader: u32, signal: Signal, scope: Scope) -> Outcome {
         }
         let target = signal_target(leader, scope)?;
         // SAFETY: `kill` takes two integers and answers an error through errno, which is read below.
-        if unsafe { libc::kill(target, signal.number()) } == 0 {
+        // `target.0` rather than `number()`: an accessor between the guard and the syscall is one more
+        // expression a mutation could replace with a broadcast
+        if unsafe { libc::kill(target.0, signal.number()) } == 0 {
             return Ok(());
         }
         Err(Refusal::pty("signalling a session", std::io::Error::last_os_error()))

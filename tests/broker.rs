@@ -42,6 +42,25 @@ fn start_with_env(arrange: impl FnOnce(&mut Command)) -> Broker {
     let socket = socket_in(directory.path());
     let mut command = Command::new(env!("CARGO_BIN_EXE_apack-terminal"));
     command.arg(&socket).stdout(Stdio::piped());
+    // **A session of its own, so a signal from the broker cannot leave this test.** The broker under test
+    // signals process groups, and without this it inherits the group of `cargo nextest`, which inherits the
+    // developer's shell: a broker that aimed at its group — which a mutation of the aiming can make it do —
+    // would reach the test runner and everything beside it. It bounds a group signal and nothing else;
+    // `kill(-1)` is bounded by the type a target is built through (`SignalTarget`), which is where that
+    // belongs.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: runs in the child between fork and exec, and `setsid` touches nothing this process owns
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            })
+        };
+    }
     arrange(&mut command);
     let mut process = command.spawn().expect("the broker starts");
 
@@ -1667,7 +1686,10 @@ fn a_signal_reaches_a_process_inside_the_session_s_tree_and_nothing_outside_it()
     );
     let grandchild = pid_written_to(&mut reading, &pid_file);
 
-    // This process is the broker's parent, so it is certainly not inside any session's tree
+    // **This process, which is the safest pid to name and not only a convenient one.** It is the broker's
+    // parent, so it is certainly outside every session's tree — and if a mutation of the tree walk ever
+    // admits it, what the broker then signals is this test's own process and nothing else. Naming any other
+    // real process would make a mutant's blast radius the user's.
     let outside = std::process::id();
     ask(
         &mut writing,

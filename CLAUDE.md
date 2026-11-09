@@ -26,6 +26,26 @@ mutants included, cheapest first, stopping at the first that fails — and it re
 what is checked has to be what is pushed. A surviving mutant is killed, or excluded in `.cargo/mutants.toml`
 with why. What it cannot run is CI's alone: the Windows and Linux suites.
 
+**A mutant of process control is not a finding, it is the damage.** This broker signals processes, and the
+suite asks it to — so a mutation of *where* a signal is aimed makes the real binary execute the broadcast on
+whatever machine the gate is running on. `kill(0, …)` is every process in this process's group and
+`kill(-1, …)` is every process the user owns; a run on a developer's machine sent the second and SIGKILLed
+every application they had open, and no assertion written afterwards undoes that. Three things keep it from
+recurring, and a change to this area keeps all three:
+
+- **The unsafe value is unrepresentable.** A signal's target is a `SignalTarget`, whose field is private and
+  which has no `Default`, so every `Ok(…)` replacement of a function returning one fails to compile — a
+  mutant that does not compile never runs, which is the only safe outcome here.
+- **The guard is excluded from mutation, with that reason** (`.cargo/mutants.toml`). A mutant of a guard is
+  the guard gone, so this is the one exclusion in that file that is not about two expressions answering
+  alike.
+- **The suite's broker runs in a session of its own** (`setsid` in `tests/broker.rs`), so a group signal
+  cannot reach the test runner or the shell that started it.
+
+**Anything new here gets the same three before its first gate run** — a primitive that ends processes, empties
+a directory or execs, mutated, runs on the machine you are sitting at. If it cannot be made unrepresentable,
+the mutants step for it belongs in a container, not on a workstation.
+
 ```sh
 cargo xtask pre-push                         # before a push: everything below, and the change's mutants
 cargo nextest run --workspace                # every suite, each test in its own process

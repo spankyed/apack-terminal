@@ -8,13 +8,13 @@
 #![cfg(unix)]
 
 use apack_terminal::protocol::Scope;
-use apack_terminal::session::signal_target;
+use apack_terminal::session::{SignalTarget, signal_target};
 
 #[test]
 fn a_real_pid_is_itself_and_its_group_is_the_negative_of_it() {
-    assert_eq!(signal_target(4242, Scope::Leader).expect("a leader"), 4242);
-    assert_eq!(signal_target(4242, Scope::Group).expect("a group"), -4242);
-    assert_eq!(signal_target(4242, Scope::Pid { pid: 4243 }).expect("a pid"), 4243);
+    assert_eq!(signal_target(4242, Scope::Leader).expect("a leader").number(), 4242);
+    assert_eq!(signal_target(4242, Scope::Group).expect("a group").number(), -4242);
+    assert_eq!(signal_target(4242, Scope::Pid { pid: 4243 }).expect("a pid").number(), 4243);
 }
 
 #[test]
@@ -32,4 +32,18 @@ fn init_is_refused_too_because_its_group_is_every_process_the_user_may_signal() 
     signal_target(1, Scope::Group).expect_err("-1 is every process");
     signal_target(1, Scope::Leader).expect_err("1 is init");
     signal_target(4242, Scope::Pid { pid: 1 }).expect_err("1 is init");
+}
+
+/// **The two numbers that must never reach `kill`**, refused where a target is built rather than where one
+/// is used — so there is no state in which an unsafe target exists.
+///
+/// `0` is every process in the broker's own group and `-1` is every process the user owns. This is not a
+/// hypothetical: a mutation run on a developer's machine returned `-1` here and SIGKILLed every application
+/// they had open.
+#[test]
+fn a_target_that_would_broadcast_cannot_be_built() {
+    SignalTarget::at(0).expect_err("0 is every process in this group");
+    SignalTarget::at(-1).expect_err("-1 is every process the user owns");
+    assert_eq!(SignalTarget::at(4242).expect("one process").number(), 4242);
+    assert_eq!(SignalTarget::at(-4242).expect("one group").number(), -4242);
 }

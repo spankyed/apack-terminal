@@ -19,8 +19,20 @@ output = "target"
 # Without debug info (`Cargo.toml`, profile.mutants): each job's copy is a fraction of a debug build's
 profile = "mutants"
 
-# Mutants that answer exactly what the code answers, each with why
+# **The one exclusion that is not about an answer: running the mutant is the damage.**
+#
+# `SignalTarget::at` refuses the two numbers that must never reach `kill(2)` — `0`, every process in this
+# broker's own group, and `-1`, every process the user owns. A mutant of a guard is the guard gone, and the
+# suite asks the broker to signal a session, so the mutated broker *executes* the broadcast. That is not a
+# survivor to be killed by a better case: a run on a developer's machine sent `kill(-1, SIGKILL)` and killed
+# every application they had open, and no assertion written afterwards can undo it.
+#
+# The type is what makes the rest of the function safe to mutate: `SignalTarget` has a private field and no
+# `Default`, so a mutation tester cannot construct one and every `Ok(…)` replacement of a function returning
+# it fails to compile. This covers what is left — the comparisons inside the constructor.
 exclude_re = [
+    "session.rs:.*in SignalTarget::at",
+
     # `sendable`'s ASCII arm gives 1 and so does the `_` fallback, so deleting it changes no answer. It is
     # there to say that ASCII is one byte, where `_` says "not a lead byte at all" — removing the arm to kill
     # the mutant would make that comment wrong about every ASCII byte
