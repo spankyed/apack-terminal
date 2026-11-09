@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
-use crate::output::{Credit, Outgoing, coalesce};
-use crate::protocol::{ErrorCode, Event, Foreground, SessionId, Until, WaitOutcome};
+use crate::output::{Credit, Flow, Outgoing, coalesce};
+use crate::protocol::{ErrorCode, Event, Foreground, Scope, SessionId, Signal, Until, WaitOutcome};
 use crate::screen::{Facts, HISTORY_LINES, Match, Screen, Snapshot};
 use crate::tree::Tree;
 
@@ -40,6 +40,13 @@ struct Session {
     /// renderer**, so the authority is never behind the replica — the only direction in which a disagreement
     /// is merely stale rather than wrong.
     screen: Arc<Mutex<Screen>>,
+    /// Whether this session's pty is being read, shared with the reader thread it parks (`output::Flow`).
+    /// Closed when the session goes, so a reader parked on a pause nobody is left to lift still ends.
+    flow: Arc<Flow>,
+    /// The process the broker started, kept because a `Signal` names it — the leader, its group, or a pid
+    /// this is the root of. The spawn answers it once and nothing else here needs it, which is why it was
+    /// not held before.
+    pid: u32,
 }
 
 /// One outstanding wait.
@@ -125,6 +132,143 @@ fn foreground_of(master: &(dyn MasterPty + Send)) -> Option<Foreground> {
         let name = system.process(of).map(|process| process.name().to_string_lossy().into_owned());
         Some(Foreground { pid, name })
     }
+}
+
+/// The name of the signal the system described as `described`, or that description when it is not one of
+/// these.
+///
+/// **The description is what `portable-pty` hands back and a name is what a contract can carry.** It calls
+/// `strsignal`, which answers prose written for a person — *Terminated* — and translated with the system's
+/// locale, so a consumer cannot switch on it. The inversion is exact rather than a guess: the same
+/// `strsignal`, in this same process, is asked what it calls each signal this broker knows the name of, and
+/// the answers are compared. Anything else is carried through as worded, which is the honest answer for a
+/// signal with no name here.
+///
+/// **Built once.** `strsignal` is not required to be thread-safe, and a child exiting is the only caller —
+/// so the table is derived behind a `OnceLock`, and every lookup after the first compares strings.
+fn signal_named(described: &str) -> String {
+    #[cfg(unix)]
+    {
+        if let Some(name) = descriptions().iter().find(|(_, prose)| prose == described).map(|(name, _)| *name) {
+            return name.to_owned();
+        }
+    }
+    described.to_owned()
+}
+
+/// The signals this broker names, which are the ones a `Signal` may send and the ones that kill a program.
+#[cfg(unix)]
+const NAMED_SIGNALS: &[(&str, i32)] = &[
+    ("SIGHUP", libc::SIGHUP),
+    ("SIGINT", libc::SIGINT),
+    ("SIGQUIT", libc::SIGQUIT),
+    ("SIGILL", libc::SIGILL),
+    ("SIGABRT", libc::SIGABRT),
+    ("SIGFPE", libc::SIGFPE),
+    ("SIGKILL", libc::SIGKILL),
+    ("SIGBUS", libc::SIGBUS),
+    ("SIGSEGV", libc::SIGSEGV),
+    ("SIGPIPE", libc::SIGPIPE),
+    ("SIGALRM", libc::SIGALRM),
+    ("SIGTERM", libc::SIGTERM),
+];
+
+#[cfg(unix)]
+fn descriptions() -> &'static [(&'static str, String)] {
+    static NAMED: std::sync::OnceLock<Vec<(&'static str, String)>> = std::sync::OnceLock::new();
+    NAMED.get_or_init(|| {
+        NAMED_SIGNALS.iter().filter_map(|(name, number)| described(*number).map(|prose| (*name, prose))).collect()
+    })
+}
+
+/// What the system calls this signal, or nothing when it declines to say.
+#[cfg(unix)]
+fn described(number: i32) -> Option<String> {
+    // SAFETY: `strsignal` takes a signal number and answers a pointer to a string it owns; the result is
+    // copied before anything else can ask, and a null is the documented "no description".
+    let prose = unsafe { libc::strsignal(number) };
+    if prose.is_null() {
+        return None;
+    }
+    // SAFETY: non-null, and `strsignal`'s answer is a NUL-terminated C string.
+    Some(unsafe { std::ffi::CStr::from_ptr(prose) }.to_string_lossy().into_owned())
+}
+
+/// Delivers a signal to a session's process, its group, or one process inside its tree.
+///
+/// **The pid scope is checked against the tree**, because a pid is a number any caller can name: without
+/// the check this request is `kill(2)` over a socket, which would hand whatever can reach the broker the
+/// ability to signal any process the user owns. The walk is bounded, so a parent chain that lies cannot
+/// hang the broker.
+///
+/// **Windows has no signals**, and the job object `tree.rs` holds cannot express what this asks for, so
+/// there it is a refusal rather than an approximation.
+///
+/// **One function with the branch inside it rather than two definitions**, for the reason `foreground_of`
+/// gives above: off a platform the second definition is not compiled, so every mutant of it survives a
+/// suite that cannot reach it and a run on any developer's machine reports a survivor nothing can kill.
+/// Measured here — the two-definition version left `replace deliver with Default::default()` missed.
+fn deliver(leader: u32, signal: Signal, scope: Scope) -> Outcome {
+    #[cfg(not(unix))]
+    {
+        let _ = (leader, signal, scope);
+        Err(Refusal {
+            code: ErrorCode::Unsupported,
+            message: "this platform has no signals; end the session with kill".to_owned(),
+        })
+    }
+    #[cfg(unix)]
+    {
+        let leader_pid =
+            i32::try_from(leader).map_err(|_| Refusal::pty("signalling a session", "the pid does not fit"))?;
+        let target = match scope {
+            Scope::Leader => leader_pid,
+            // A negative pid is its process group, which `portable-pty` made this process the leader of
+            Scope::Group => -leader_pid,
+            Scope::Pid { pid } => {
+                if !inside_tree(leader, pid) {
+                    return Err(Refusal {
+                        code: ErrorCode::OutsideSession,
+                        message: format!("{pid} is not in the process tree of the session led by {leader}"),
+                    });
+                }
+                i32::try_from(pid).map_err(|_| Refusal::pty("signalling a process", "the pid does not fit"))?
+            }
+        };
+        // SAFETY: `kill` takes two integers and answers an error through errno, which is read below.
+        if unsafe { libc::kill(target, signal.number()) } == 0 {
+            return Ok(());
+        }
+        Err(Refusal::pty("signalling a session", std::io::Error::last_os_error()))
+    }
+}
+
+/// Whether `pid` is `leader` or something it started, however deep.
+///
+/// **Bounded at a depth no real tree reaches**, because the parent chain is read from the OS a process at a
+/// time and a process that has been reparented while this walks could otherwise be followed in a circle.
+#[cfg(unix)]
+fn inside_tree(leader: u32, pid: u32) -> bool {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+
+    if pid == leader {
+        return true;
+    }
+    let Ok(mut system) = System::new() else {
+        return false;
+    };
+    let mut at = Pid::from_u32(pid);
+    for _ in 0..64 {
+        system.refresh_processes_specifics(ProcessesToUpdate::Some(&[at]), true, ProcessRefreshKind::nothing());
+        let Some(parent) = system.process(at).and_then(sysinfo::Process::parent) else {
+            return false;
+        };
+        if parent.as_u32() == leader {
+            return true;
+        }
+        at = parent;
+    }
+    false
 }
 
 /// Every session this broker owns, and where their output goes.
@@ -268,6 +412,7 @@ impl Sessions {
         let events = self.events.clone();
         let reading = session.clone();
         let screen = Arc::new(Mutex::new(Screen::new(cols, rows)));
+        let flow = Flow::reading();
         let parsing = Arc::clone(&screen);
         let waiters: Arc<Mutex<Vec<Waiter>>> = Arc::new(Mutex::new(Vec::new()));
         let waiting = Arc::clone(&waiters);
@@ -291,10 +436,15 @@ impl Sessions {
         });
         let reader_events = events.clone();
         let reader_session = session.clone();
+        let reading_flow = Arc::clone(&flow);
         std::thread::spawn(move || {
             let mut reader = reader;
             let mut buffer = [0u8; 8 * 1024];
             loop {
+                // **Before the read, which is what makes a pause backpressure.** Parked here the pty is not
+                // read, its buffer fills and the process blocks on its own write; nothing is held in the
+                // broker. A session whose record is gone closes the gate, so this is never parked for ever
+                reading_flow.wait_while_paused();
                 match reader.read(&mut buffer) {
                     Ok(0) | Err(_) => break,
                     Ok(read) => {
@@ -343,7 +493,17 @@ impl Sessions {
         // which is what X2 calls an undead terminal. Waiting on the child is the one signal both platforms
         // give, and it still polls nothing.
         std::thread::spawn(move || {
-            let code = child.wait().ok().map(|status| status.exit_code() as i32);
+            // **A signal and an exit code are different answers, and never both.** `portable-pty` reports a
+            // killed child as code 1 with the system's description of the signal, which read on its own says
+            // a program exited with a failure — so a consumer could not tell the shutdown it asked for from
+            // a crash. What is reported here is one or the other, and the signal by name
+            let (code, signal) = match child.wait().ok() {
+                Some(status) => match status.signal() {
+                    Some(described) => (None, Some(signal_named(described))),
+                    None => (Some(status.exit_code() as i32), None),
+                },
+                None => (None, None),
+            };
             // **A session ending settles every wait on it**, because nothing is coming: an `Exit` wait has
             // reached what it asked for and every other has not and never will. Without this a caller
             // waiting for a prompt from a shell the user just exited waits out its whole deadline.
@@ -359,12 +519,12 @@ impl Sessions {
                     let _ = exiting.send(Outgoing::answer(Event::Waited { session: waited.clone(), outcome }));
                 }
             }
-            let _ = events.send(Outgoing::answer(Event::Exited { session: reading, code }));
+            let _ = events.send(Outgoing::answer(Event::Exited { session: reading, code, signal }));
         });
 
         self.live.insert(
             session.clone(),
-            Session { master: pty.master, writer, killer, _tree: Tree::owning(pid), waiters, screen },
+            Session { master: pty.master, writer, killer, _tree: Tree::owning(pid), waiters, screen, flow, pid },
         );
         Ok((session, pid))
     }
@@ -390,6 +550,33 @@ impl Sessions {
             screen.resize(cols, rows);
         }
         Ok(())
+    }
+
+    /// Stops reading this session's pty, so its process feels the reader stop (`output::Flow`).
+    pub fn pause(&mut self, session: &str) -> Outcome {
+        self.live.get(session).ok_or_else(|| missing(session))?.flow.pause();
+        Ok(())
+    }
+
+    /// Reads it again, and sends what arrived while it was not being read.
+    pub fn resume(&mut self, session: &str) -> Outcome {
+        self.live.get(session).ok_or_else(|| missing(session))?.flow.resume();
+        Ok(())
+    }
+
+    /// Lets every session be read again. **What a client leaving calls**: a pause belongs to the client that
+    /// asked for one, and the next client to attach never did — so inheriting a session nobody is reading,
+    /// with no way to know it, is the one outcome this must not have.
+    pub fn resume_all(&mut self) {
+        for live in self.live.values() {
+            live.flow.resume();
+        }
+    }
+
+    /// Sends a signal to a session's process, its group, or one process inside its tree.
+    pub fn signal(&mut self, session: &str, signal: Signal, scope: Scope) -> Outcome {
+        let live = self.live.get(session).ok_or_else(|| missing(session))?;
+        deliver(live.pid, signal, scope)
     }
 
     /// The screen as this session has it, with up to `history` lines above the viewport.
@@ -469,13 +656,18 @@ impl Sessions {
     /// one exit, one event, whichever way the process ended.
     pub fn kill(&mut self, session: &str) -> Outcome {
         let mut live = self.live.remove(session).ok_or_else(|| missing(session))?;
+        // A reader parked on a pause has nobody left to lift it, and its thread would never reach the EOF
+        // that ends it
+        live.flow.close();
         live.killer.kill().map_err(|error| Refusal::pty("killing a session", error))
     }
 
     /// Drops the record of a session whose process has ended, which the writer thread does when it sees the
     /// `Exited` it is about to send. Nothing is killed here: the process is already gone.
     pub fn forget(&mut self, session: &str) {
-        self.live.remove(session);
+        if let Some(live) = self.live.remove(session) {
+            live.flow.close();
+        }
     }
 
     /// Ends every session this owner holds. **The connection's end is what calls it**: a client that
@@ -488,6 +680,7 @@ impl Sessions {
     /// that policy will be stated instead of assumed.
     pub fn end_all(&mut self) {
         for (_, mut live) in self.live.drain() {
+            live.flow.close();
             let _ = live.killer.kill();
         }
     }

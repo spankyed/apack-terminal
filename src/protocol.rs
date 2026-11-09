@@ -18,6 +18,13 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 /// Bumped when a message's meaning changes. The app refuses a broker that does not answer with its own.
+///
+/// **Still 1, and a change to what a message means is not by itself a reason to move it.** The consumer
+/// pins a commit of this repository and the two move in one change, so there is no pinned app reading an
+/// older shape to protect — and nothing is published, so there is no third party either. What this is for
+/// is the case that *can* happen: a checkout whose link points at a build from before the change, where a
+/// clear refusal naming both numbers beats a message that means something else. It moves when a consumer
+/// exists that cannot move with it.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// A session's identity, minted by the broker: the app never invents one.
@@ -64,6 +71,45 @@ pub enum Request {
     Write { session: SessionId, text: String },
     /// The viewport changed. One size per session: a pty has one.
     Resize { session: SessionId, cols: u16, rows: u16 },
+    /// **Stop reading this session's pty**, so the process feels the reader stop.
+    ///
+    /// This is flow control for a consumer whose own sink is slower than a shell can write — the app's
+    /// Claude integration drives a TUI through an image transport it has to let drain before the next
+    /// frame. The alternative is a consumer that buffers whatever arrives, which moves the unbounded
+    /// growth into it rather than removing it.
+    ///
+    /// **Per session, which is the whole reason it is a request.** A consumer could stop reading its
+    /// socket instead and the existing credit would throttle the producer — but one socket carries every
+    /// session, so that stalls all of them to slow one down.
+    ///
+    /// **The pty is not read while paused, rather than read and held.** The bytes stay in the kernel's
+    /// buffer, it fills, and the process blocks on its own write; nothing accumulates here. So a pause is
+    /// backpressure reaching the program, which is what a consumer asking for one means. What follows from
+    /// that, and is the honest cost: a paused session's screen stops being fed, so `Screen`, `Facts` and a
+    /// `Text` wait all describe the session as it was when it was paused. An exit is unaffected — that is
+    /// waited for on the child rather than read off the pty.
+    ///
+    /// Pausing a session that is already paused does nothing, and a pause does not survive the client that
+    /// asked for it: a connection leaving resumes everything, because the next client never asked.
+    Pause { session: SessionId },
+    /// Read this session's pty again, and send what has arrived since. Resuming a running session does nothing.
+    Resume { session: SessionId },
+    /// **Send a signal to a session's process, its process group, or one process inside its tree.**
+    ///
+    /// `Kill` ends a session and its tree, which is the whole of what a terminal needs. This is for a
+    /// consumer driving a particular program and shutting it down the way that program documents: the
+    /// app's Claude integration signals the CLI so the servers it owns outlive its own shutdown handlers,
+    /// then the group, then the group harder — three signals to two targets, which one `Kill` cannot say.
+    ///
+    /// **The broker checks the target is its own**, which is why `Scope::Pid` is here rather than left to a
+    /// caller holding a pid and a kill of its own: a pid is a number anyone can name, and a socket that
+    /// signals an arbitrary one on request is a privilege escalation wearing a terminal's clothes. A pid
+    /// that is not inside the named session's tree is refused by code (`ErrorCode::OutsideSession`).
+    ///
+    /// **POSIX only, and refused rather than approximated elsewhere.** Windows has no signals; its route to
+    /// the same end is the job object `tree.rs` already holds, and what that can express is not this. A
+    /// platform claim is made on that platform, so there it answers `ErrorCode::Unsupported`.
+    Signal { session: SessionId, signal: Signal, scope: Scope },
     /// **The screen as the broker has it**, with up to `history` lines above the viewport.
     ///
     /// This is the read that makes a session's state independent of a window: the broker parses the same
@@ -115,6 +161,61 @@ pub enum Role {
     Client,
     /// Holds the broker's sessions alive and receives no output. Ending this connection ends them all.
     Lifetime,
+}
+
+/// A signal a `Signal` request may send.
+///
+/// **A closed set, because the point is a caller that cannot name something else.** An arbitrary number
+/// would make this an interface to `kill(2)` rather than to a session, and the five here are what shutting
+/// a program down is written with: hang up, interrupt, quit, terminate, and the one that cannot be caught.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[ts(export, export_to = "protocol.ts")]
+pub enum Signal {
+    Sighup,
+    Sigint,
+    Sigquit,
+    Sigterm,
+    Sigkill,
+}
+
+impl Signal {
+    /// The number this is on this platform, from libc rather than written out here.
+    #[cfg(unix)]
+    pub fn number(self) -> i32 {
+        match self {
+            Self::Sighup => libc::SIGHUP,
+            Self::Sigint => libc::SIGINT,
+            Self::Sigquit => libc::SIGQUIT,
+            Self::Sigterm => libc::SIGTERM,
+            Self::Sigkill => libc::SIGKILL,
+        }
+    }
+}
+
+/// What a signal is sent to.
+///
+/// **The three are different questions, and a consumer needs all three.** Signalling the shell alone lets
+/// it run its own shutdown; signalling the group is what reaches whatever it started; naming one process is
+/// for a consumer that knows which of a tree's processes it means — the CLI's own pid, where the group
+/// would take the servers it is still tidying up with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export, export_to = "protocol.ts")]
+pub enum Scope {
+    /// The process the broker started for this session.
+    Leader,
+    /// The process group it leads, which is `kill(-pid)` and no more than that.
+    ///
+    /// **Not the whole tree, and the difference bites.** A shell with job control puts each background job
+    /// in a process group of its own, so a signal to the leader's group does not reach one — `Kill` is what
+    /// ends a session and everything under it, by the mechanism each platform gives (the kernel's SIGHUP to
+    /// the session on POSIX, the job object on Windows). What the group *is* for is a program the broker
+    /// started directly and the children it left in its own group, which is the case a consumer driving one
+    /// CLI is in.
+    Group,
+    /// One process, which must be inside this session's tree or the request is refused.
+    Pid { pid: u32 },
 }
 
 /// What a `Wait` is waiting for.
@@ -227,8 +328,17 @@ pub enum Event {
     /// build output 1.1% (1.01x), `ls --color` 6.5% (1.22x), a full-screen TUI redraw 2.4% (1.12x). Base64
     /// would make every one of those *larger*, and cost the frames their readability.
     Output { session: SessionId, text: String },
-    /// The process ended. `code` is absent when it was killed by a signal.
-    Exited { session: SessionId, code: Option<i32> },
+    /// The process ended: `code` when it exited, `signal` when something killed it, and never both.
+    ///
+    /// **A signal is not an exit code, and reporting one as the other loses the only thing a consumer
+    /// wanted to know.** A shell the user quit and a CLI the app terminated are the same `1` otherwise, so
+    /// a window cannot tell a crash it should draw a seam for from the shutdown it asked for itself.
+    ///
+    /// `signal` is its name — `SIGTERM` — rather than a number, because a number is not the same number
+    /// everywhere, and rather than the system's description of it, which is written for a person and
+    /// translated. An unrecognised one is carried through as the system worded it, which is the honest
+    /// answer for a signal this protocol has no name for.
+    Exited { session: SessionId, code: Option<i32>, signal: Option<String> },
     /// **The channel was full and a flush had to wait.** Not a loss: output is held, the pty's buffer fills
     /// behind it, and the process feels it — so this says a producer was throttled, which the goal requires
     /// be observable rather than silent. Sent as an answer, so reporting the overload never queues behind
@@ -290,4 +400,11 @@ pub enum ErrorCode {
     NoSuchSession,
     /// The pty or the process refused: spawn, resize or write failed at the OS.
     Pty,
+    /// A `Signal` named a pid that is not in that session's process tree, so the broker would be signalling
+    /// a process it does not own. Refused by code, because a caller may legitimately race a process ending
+    /// and should be able to tell that from having asked for the wrong thing.
+    OutsideSession,
+    /// This platform has no such operation — signals, on Windows. Distinct from a refusal by the OS: the
+    /// request can never succeed here, however it is retried.
+    Unsupported,
 }

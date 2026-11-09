@@ -43,7 +43,14 @@ cargo xtask package                          # release build, staged into the np
   lives *inside* the npm package, which is what ships it: a consumer imports the types from
   `apack-terminal` like any dependency's, rather than keeping a copy and a script to keep it fresh.
 - **Changed anything a consumer pins?** The pin is a commit of this repository, so a stale pin has to fail
-  loudly rather than behave strangely. That is what `PROTOCOL_VERSION` and the `hello` exchange are for.
+  loudly rather than behave strangely. That is what the `hello` exchange is for.
+- **`PROTOCOL_VERSION` is 1 and a change to what a message means is not a reason to move it.** The consumer
+  pins a commit of this repository and the two halves move in one change, so there is no consumer left
+  reading an older shape; nothing here is published, so there is no third party either. A bump buys a number
+  and costs a round of edits on both sides. What the handshake catches is a *link* pointing at a build from
+  before the change, and it catches that by the numbers disagreeing — which works at 1 and does not need 1
+  to become 2. **It moves when a consumer exists that cannot move with it**: a published package, or a
+  release in someone else's hands. That is the condition, and it is a fact to check rather than assume.
 - **The broker reaches a consumer as an npm package**, `node/`, whose one job is answering where the binary
   is: the name differs by platform and a consumer that derived the path itself was wrong about the
   extension on Windows, so the terminal never started there. `cargo xtask package` stages a release build

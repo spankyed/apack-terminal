@@ -25,12 +25,6 @@ exclude_re = [
     # there to say that ASCII is one byte, where `_` says "not a lead byte at all" — removing the arm to kill
     # the mutant would make that comment wrong about every ASCII byte
     "output.rs:.*delete match arm 0x00..= 0x7F in sendable",
-    # `detach` takes a departed client's stream out of the feed, and nothing can observe whether it did.
-    # The next client to greet installs itself over whatever is there ("last greeting wins"), the credit for
-    # a frame returns whether or not anyone was listening, and a write to a dead stream fails without
-    # ending anything. It is there so the broker stops attempting that write and lets the stream go, which
-    # is work rather than an answer
-    "main.rs:.*replace detach with \\(\\)",
     # The reader's buffer is how much one `read` may return, not how much a message carries: the coalescer
     # decides that, on a window and a cap, and a character split across two reads is already a case of its
     # own. A smaller buffer reads the same bytes in more passes and answers identically

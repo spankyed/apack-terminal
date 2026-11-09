@@ -5,12 +5,12 @@
  * what #372's name-matching should become. A caller switches on a value the compiler knows, rather than
  * matching on a message that is free to be reworded.
  */
-export type ErrorCode = "HANDSHAKE" | "MALFORMED" | "NO_SUCH_SESSION" | "PTY";
+export type ErrorCode = "HANDSHAKE" | "MALFORMED" | "NO_SUCH_SESSION" | "PTY" | "OUTSIDE_SESSION" | "UNSUPPORTED";
 
 /**
  * What the broker tells the app, unprompted or in answer.
  */
-export type Event = { "kind": "hello", protocol: number, history: number, } | { "kind": "spawned", session: string, pid: number, } | { "kind": "output", session: string, text: string, } | { "kind": "exited", session: string, code: number | null, } | { "kind": "throttled", session: string, waited_us: number, } | { "kind": "screen", session: string, lines: Array<string>, 
+export type Event = { "kind": "hello", protocol: number, history: number, } | { "kind": "spawned", session: string, pid: number, } | { "kind": "output", session: string, text: string, } | { "kind": "exited", session: string, code: number | null, signal: string | null, } | { "kind": "throttled", session: string, waited_us: number, } | { "kind": "screen", session: string, lines: Array<string>, 
 /**
  * Within the viewport, so `0` is its first line however much history came with it.
  */
@@ -50,7 +50,7 @@ args: Array<string>,
 /**
  * Added to the environment the broker runs in, which is already stripped of the app's own
  */
-env: Array<[string, string]>, cwd: string | null, } | { "kind": "write", session: string, text: string, } | { "kind": "resize", session: string, cols: number, rows: number, } | { "kind": "screen", session: string, history: number, } | { "kind": "facts", session: string, } | { "kind": "search", session: string, text: string, history: number, } | { "kind": "wait", session: string, until: Until, timeout_ms: number, } | { "kind": "kill", session: string, };
+env: Array<[string, string]>, cwd: string | null, } | { "kind": "write", session: string, text: string, } | { "kind": "resize", session: string, cols: number, rows: number, } | { "kind": "pause", session: string, } | { "kind": "resume", session: string, } | { "kind": "signal", session: string, signal: Signal, scope: Scope, } | { "kind": "screen", session: string, history: number, } | { "kind": "facts", session: string, } | { "kind": "search", session: string, text: string, history: number, } | { "kind": "wait", session: string, until: Until, timeout_ms: number, } | { "kind": "kill", session: string, };
 
 /**
  * What a connection is for.
@@ -68,6 +68,16 @@ env: Array<[string, string]>, cwd: string | null, } | { "kind": "write", session
 export type Role = "client" | "lifetime";
 
 /**
+ * What a signal is sent to.
+ *
+ * **The three are different questions, and a consumer needs all three.** Signalling the shell alone lets
+ * it run its own shutdown; signalling the group is what reaches whatever it started; naming one process is
+ * for a consumer that knows which of a tree's processes it means — the CLI's own pid, where the group
+ * would take the servers it is still tidying up with it.
+ */
+export type Scope = { "kind": "leader" } | { "kind": "group" } | { "kind": "pid", pid: number, };
+
+/**
  * Where a search found what it was asked for.
  */
 export type SearchMatch = { 
@@ -83,6 +93,15 @@ column: number,
  * The whole line, so a caller sees the context without a second read.
  */
 text: string, };
+
+/**
+ * A signal a `Signal` request may send.
+ *
+ * **A closed set, because the point is a caller that cannot name something else.** An arbitrary number
+ * would make this an interface to `kill(2)` rather than to a session, and the five here are what shutting
+ * a program down is written with: hang up, interrupt, quit, terminate, and the one that cannot be caught.
+ */
+export type Signal = "SIGHUP" | "SIGINT" | "SIGQUIT" | "SIGTERM" | "SIGKILL";
 
 /**
  * What a `Wait` is waiting for.

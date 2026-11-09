@@ -125,12 +125,27 @@ fn write_out(outgoing: Receiver<Outgoing>, broker: Broker) {
     }
 }
 
-/// Takes `stream` out of the feed, if it is still the one attached.
+/// Takes `stream` out of the feed, if it is still the one attached, **and lets every session be read
+/// again**.
+///
+/// A pause belongs to the client that asked for one (`Request::Pause`). The next client to attach never
+/// asked and has no way to find out, so a session nobody is reading would look like a shell that had
+/// stopped writing. The client that paused it is gone; the pause goes with it.
+///
+/// **The two locks are taken one after the other and never together.** The order written down on
+/// `Sessions` is sessions then a session's screen, and the writer loop releases its `Sessions` guard before
+/// it touches the feed — so nothing holds sessions and wants the feed. Resuming inside the feed guard would
+/// be the first place that went the other way.
 fn detach(broker: &Broker, stream: &Arc<Stream>) {
-    if let Ok(mut feed) = broker.feed.lock()
-        && feed.as_ref().is_some_and(|attached| Arc::ptr_eq(attached, stream))
-    {
-        *feed = None;
+    let was_attached = match broker.feed.lock() {
+        Ok(mut feed) if feed.as_ref().is_some_and(|attached| Arc::ptr_eq(attached, stream)) => {
+            *feed = None;
+            true
+        }
+        _ => false,
+    };
+    if was_attached && let Ok(mut live) = broker.sessions.lock() {
+        live.resume_all();
     }
 }
 
@@ -279,6 +294,11 @@ fn carry_out(sessions: &Arc<Mutex<Sessions>>, request: Request) {
         Request::Write { session, text } => live.write(&session, &text).map_err(|refusal| (Some(session), refusal)),
         Request::Resize { session, cols, rows } => {
             live.resize(&session, cols, rows).map_err(|refusal| (Some(session), refusal))
+        }
+        Request::Pause { session } => live.pause(&session).map_err(|refusal| (Some(session), refusal)),
+        Request::Resume { session } => live.resume(&session).map_err(|refusal| (Some(session), refusal)),
+        Request::Signal { session, signal, scope } => {
+            live.signal(&session, signal, scope).map_err(|refusal| (Some(session), refusal))
         }
         Request::Screen { session, history } => match live.snapshot(&session, history) {
             Ok(snapshot) => {

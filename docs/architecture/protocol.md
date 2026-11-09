@@ -44,6 +44,9 @@ means for a session's lifetime.
 | `spawn` | a shell in a new pty: `cols`, `rows`, `shell`, `args`, `env`, `cwd` |
 | `write` | bytes the user typed |
 | `resize` | the viewport changed; one size per session, because a pty has one |
+| `pause` | stop reading this session's pty, so its process feels the reader stop |
+| `resume` | read it again, and send what arrived while it was not being read |
+| `signal` | a signal to the session's process, its process group, or one process inside its tree |
 | `screen` | the screen as the broker has it, with up to `history` lines above the viewport |
 | `facts` | what the shell reported about itself: directory, command line, whether one is running, last status |
 | `search` | where text appears in the screen and the history above it |
@@ -63,7 +66,7 @@ belong to whoever ships them.
 | `hello` | the broker's own protocol version |
 | `spawned` | a session exists and its process is running, with its pid |
 | `output` | bytes the process wrote. A feed: unprompted, and nobody asked |
-| `exited` | the process ended; `code` is absent when a signal ended it |
+| `exited` | the process ended: `code` when it exited, `signal` by name when one killed it, never both |
 | `throttled` | a flush waited for credit, with the microseconds it waited. Not a loss |
 | `screen` | the lines a `screen` asked for, the cursor, and whether an alternate-screen app is showing |
 | `facts` | the shell's claims about itself |
@@ -74,6 +77,50 @@ belong to whoever ships them.
 Lines in a `screen` are **text, not cells**: a wide character appears once rather than beside the spacer cell
 it occupies, and the padding a row carries to its full width is not there. What it answers is what was
 written, which is what matching against it means.
+
+## Flow control has two classes, and a `pause` is the second
+
+Credit bounds how much output may be in flight **for every session at once**, because one socket carries
+them all; a consumer reading its socket more slowly gets that for free and stalls every terminal in the app
+to slow one of them down. `pause` is the other class: one session stops being read because *its* consumer
+asked.
+
+**A paused session's pty is not read, rather than read and held.** The bytes stay in the kernel's buffer, it
+fills, and the process blocks on its own write — so a pause is backpressure reaching the program, and
+nothing accumulates in the broker. Two things follow, and both are the contract rather than a limitation:
+
+- **A read already outstanding still lands.** The reader is parked before a `read`, so the chunk the
+  outstanding one returns arrives after the pause was asked for. `node-pty`'s `pause()` is the same, and it
+  is what a consumer handling a chunk means by pausing.
+- **A paused session's screen stops being fed**, so `screen`, `facts` and a `text` wait describe it as it was
+  when it was paused. An `exit` is unaffected: that is waited for on the child, not read off the pty.
+
+**A pause does not outlive the client that asked for one.** A connection leaving resumes everything, because
+the next client never asked and has no way to find out.
+
+## A signal is for driving one program, and the broker checks the target is its own
+
+`kill` ends a session and its tree, which is the whole of what a terminal needs. `signal` is for a consumer
+driving a particular program and shutting it down the way that program documents — signal the CLI so the
+servers it owns outlive its own shutdown handlers, then its group, then the group harder.
+
+| scope | reaches |
+|---|---|
+| `leader` | the process the broker started for the session |
+| `group` | the process group it leads, which is `kill(-pid)` and no more |
+| `pid` | one process, which must be inside that session's tree |
+
+**`group` is not the whole tree.** A shell with job control puts each background job in a process group of
+its own, so a group signal does not reach one; `kill` is what ends everything, by the mechanism each
+platform gives. What `group` is for is a program the broker started directly and the children it left in
+its own group.
+
+**The pid scope is checked, and that check is why it can be offered at all.** A pid is a number any caller
+can name, so a socket that signals an arbitrary one on request is `kill(2)` for whatever can reach the
+broker. A pid outside the named session's tree is refused with `OUTSIDE_SESSION`.
+
+**POSIX only.** Windows has no signals, and what the job object can express is not this, so it answers
+`UNSUPPORTED` rather than approximating it.
 
 ## What crosses as output is text, and that is a decision
 
@@ -134,6 +181,8 @@ rather than matching a message that is free to be reworded.
 | `MALFORMED` | a frame did not parse as a request |
 | `NO_SUCH_SESSION` | no session has that id — it never existed, or it has already exited |
 | `PTY` | the pty or the process refused: spawn, resize or write failed at the OS |
+| `OUTSIDE_SESSION` | a `signal` named a pid that is not in that session's tree |
+| `UNSUPPORTED` | this platform has no such operation — signals, on Windows |
 
 ## Correlation
 

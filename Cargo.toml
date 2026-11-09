@@ -24,6 +24,10 @@ ts-rs = "12.0.1"
 # would otherwise pull the `windows` crate into that build for a call it cannot make.
 [target.'cfg(unix)'.dependencies]
 sysinfo = { version = "0.40.1", default-features = false, features = ["system"] }
+# POSIX only: the signal numbers a `Signal` request names, and the system's own description of a signal, which
+# is what `portable-pty` hands back for a child that was killed and what naming it again has to be inverted
+# from. Windows has neither, and a `Signal` request is refused there.
+libc = "0.2.191"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_JobObjects", "Win32_System_Threading"] }

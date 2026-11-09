@@ -113,3 +113,67 @@ fn an_escape_sequence_is_not_held_back_the_way_a_character_is() {
         "no single event holds the sequence, which is the whole point: {halves:?}"
     );
 }
+
+/// **The flow gate, driven directly**, because what it does to a reader is not observable through a socket.
+///
+/// A paused session is one whose pty is not read, and the only witness to that from outside is output that
+/// does not arrive — which a case can only assert by waiting. Here the parked thread says so itself.
+mod flow {
+    use std::sync::mpsc::{RecvTimeoutError, channel};
+    use std::time::Duration;
+
+    use apack_terminal::output::Flow;
+
+    /// Long enough that a reader which was never parked has certainly got through, short enough that a case
+    /// asserting it did not ends quickly. Load can only make a parked reader later, never earlier
+    const SHORT: Duration = Duration::from_millis(250);
+
+    /// A thread that parks on `flow` and says when it got through.
+    fn reader(flow: &std::sync::Arc<Flow>) -> std::sync::mpsc::Receiver<()> {
+        let (through, got) = channel();
+        let flow = std::sync::Arc::clone(flow);
+        std::thread::spawn(move || {
+            flow.wait_while_paused();
+            let _ = through.send(());
+        });
+        got
+    }
+
+    #[test]
+    fn a_reader_is_parked_while_paused_and_goes_through_on_a_resume() {
+        let flow = Flow::reading();
+        flow.pause();
+        let got = reader(&flow);
+
+        assert_eq!(got.recv_timeout(SHORT), Err(RecvTimeoutError::Timeout), "a paused reader was not parked");
+
+        flow.resume();
+        assert_eq!(got.recv_timeout(SHORT), Ok(()), "a resumed reader is still parked");
+    }
+
+    #[test]
+    fn a_reader_goes_straight_through_when_nothing_paused_it() {
+        let flow = Flow::reading();
+
+        assert_eq!(reader(&flow).recv_timeout(SHORT), Ok(()), "an unpaused reader was parked");
+    }
+
+    /// **The session is gone and nobody is left to resume it.** Without this the reader thread of a session
+    /// that was paused when it ended parks for ever: its `Exited` still arrives, since that is waited for on
+    /// the child, so nothing else says anything is wrong — a thread per such session, held until the broker
+    /// exits.
+    #[test]
+    fn closing_wakes_a_parked_reader_and_never_parks_another() {
+        let flow = Flow::reading();
+        flow.pause();
+        let got = reader(&flow);
+        assert_eq!(got.recv_timeout(SHORT), Err(RecvTimeoutError::Timeout), "a paused reader was not parked");
+
+        flow.close();
+
+        assert_eq!(got.recv_timeout(SHORT), Ok(()), "closing left a reader parked with nobody to resume it");
+        // And a pause after the close cannot park the next pass of that same reader on its way to EOF
+        flow.pause();
+        assert_eq!(reader(&flow).recv_timeout(SHORT), Ok(()), "a closed session's reader was parked again");
+    }
+}

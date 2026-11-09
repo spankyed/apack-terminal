@@ -76,6 +76,74 @@ impl Credit {
     }
 }
 
+/// Whether a session's pty is being read, and the wait that parks its reader while it is not.
+///
+/// **A second class of flow control, and it is not the credit above.** Credit bounds how much output may be
+/// in flight for *all* sessions, because one socket carries them; this stops one session being read at all,
+/// because its consumer asked. A consumer with a slow sink of its own — an image transport that has to
+/// drain before the next frame — needs the second and cannot get it from the first without stalling every
+/// other terminal in the app.
+///
+/// **Parking the reader is what makes it backpressure rather than buffering.** The bytes stay in the
+/// kernel's pty buffer, which fills, and the process blocks on its own write. Nothing accumulates in the
+/// broker, so a consumer that pauses and never resumes costs memory that is already bounded by the pty.
+///
+/// **`closed` is why a dead session's reader is not parked for ever.** A session ends while paused — killed,
+/// or its process exited and the record was dropped — and its reader is sitting on this condvar with nobody
+/// left to resume it. Closing wakes it and refuses to park it again, so the thread reaches its EOF and ends.
+pub struct Flow {
+    state: Mutex<Reading>,
+    changed: Condvar,
+}
+
+struct Reading {
+    paused: bool,
+    closed: bool,
+}
+
+impl Flow {
+    pub fn reading() -> Arc<Self> {
+        Arc::new(Self { state: Mutex::new(Reading { paused: false, closed: false }), changed: Condvar::new() })
+    }
+
+    pub fn pause(&self) {
+        self.set(true);
+    }
+
+    pub fn resume(&self) {
+        self.set(false);
+    }
+
+    /// Wakes a parked reader and keeps it awake: the session this belonged to is gone.
+    pub fn close(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.closed = true;
+            self.changed.notify_all();
+        }
+    }
+
+    fn set(&self, paused: bool) {
+        if let Ok(mut state) = self.state.lock() {
+            state.paused = paused;
+            self.changed.notify_all();
+        }
+    }
+
+    /// Parks the caller for as long as the session is paused. A poisoned lock reads as "not paused", which
+    /// keeps a session readable rather than stalling it over a lock nothing else can mend.
+    pub fn wait_while_paused(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        while state.paused && !state.closed {
+            let Ok(waited) = self.changed.wait(state) else {
+                return;
+            };
+            state = waited;
+        }
+    }
+}
+
 /// What the writer takes off the queue: an event, and the credit to return once it is written.
 pub struct Outgoing {
     pub event: Event,

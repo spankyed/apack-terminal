@@ -9,6 +9,8 @@ use std::process::{Child, Command, Stdio};
 
 use interprocess::local_socket::{GenericFilePath, Stream, ToFsName, prelude::*};
 
+use apack_terminal::protocol::PROTOCOL_VERSION;
+
 /// The broker, listening, with the socket it said it was listening on.
 struct Broker {
     process: Child,
@@ -160,6 +162,17 @@ fn disconnect(reading: Events, mut writing: Wire) {
     std::thread::sleep(std::time::Duration::from_millis(100));
 }
 
+/// The greeting every client sends first, **built from the constant rather than written out**.
+///
+/// One place, for `spawn_frame`'s reason: a protocol bump is an edit here and not in twenty cases, none of
+/// which is about the version. The one case that *is* about it names its own number on purpose.
+fn hello(role: Option<&str>) -> String {
+    match role {
+        Some(role) => format!(r#"{{"kind":"hello","protocol":{PROTOCOL_VERSION},"role":"{role}"}}"#),
+        None => format!(r#"{{"kind":"hello","protocol":{PROTOCOL_VERSION}}}"#),
+    }
+}
+
 /// A spawn frame: the default shell at a given size, with no launch arguments and nothing added to the
 /// environment. **One builder**, so a field added to `Request::Spawn` is one edit here and not ten.
 fn spawn_frame(cols: u16, rows: u16, shell: Option<&str>) -> String {
@@ -257,7 +270,7 @@ fn a_keystroke_reaches_a_pty_and_its_output_comes_back() {
     let broker = start();
     let (mut reading, mut writing) = connect(&broker);
 
-    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    ask(&mut writing, &hello(None));
     assert_eq!(next(&mut reading)["kind"], "hello", "the handshake is answered before anything else");
 
     // **A named shell, because this case is about the round trip and not about shell discovery.** Spawning
@@ -299,7 +312,7 @@ fn a_keystroke_reaches_a_pty_and_its_output_comes_back() {
 fn a_request_for_a_session_that_does_not_exist_is_refused_by_code() {
     let broker = start();
     let (mut reading, mut writing) = connect(&broker);
-    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    ask(&mut writing, &hello(None));
     next(&mut reading);
 
     ask(&mut writing, r#"{"kind":"write","session":"s-404","text":"x"}"#);
@@ -314,7 +327,7 @@ fn a_request_for_a_session_that_does_not_exist_is_refused_by_code() {
 fn a_frame_that_is_not_a_request_is_refused_and_the_connection_survives() {
     let broker = start();
     let (mut reading, mut writing) = connect(&broker);
-    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    ask(&mut writing, &hello(None));
     next(&mut reading);
 
     ask(&mut writing, r#"{"kind":"nonsense"}"#);
@@ -347,7 +360,7 @@ fn the_handshake_says_how_much_history_the_broker_keeps() {
     let broker = start();
     let (mut reading, mut writing) = connect(&broker);
 
-    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    ask(&mut writing, &hello(None));
     let greeting = next(&mut reading);
 
     assert_eq!(greeting["kind"], "hello");
@@ -371,7 +384,7 @@ fn nothing_can_be_asked_before_the_handshake() {
 fn a_shell_that_exits_on_its_own_is_reported_without_anything_polling_for_it() {
     let broker = start();
     let (mut reading, mut writing) = connect(&broker);
-    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    ask(&mut writing, &hello(None));
     next(&mut reading);
 
     ask(&mut writing, &spawn_frame(80, 24, None));
@@ -392,7 +405,7 @@ fn a_shell_that_exits_on_its_own_is_reported_without_anything_polling_for_it() {
 fn a_client_that_disconnects_leaves_no_shell_running() {
     let broker = start();
     let (mut reading, mut writing) = connect(&broker);
-    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    ask(&mut writing, &hello(None));
     next(&mut reading);
     ask(&mut writing, &spawn_frame(80, 24, None));
     let pid = next(&mut reading)["pid"].as_u64().expect("a pid") as i32;
@@ -563,7 +576,7 @@ fn reaped(pid: i32) -> bool {
 fn killing_a_session_takes_the_whole_tree_with_it() {
     let broker = start();
     let (mut reading, mut writing) = connect(&broker);
-    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    ask(&mut writing, &hello(None));
     next(&mut reading);
     ask(&mut writing, &spawn_frame(80, 24, None));
     let session = next(&mut reading)["session"].as_str().expect("a session").to_owned();
@@ -593,7 +606,7 @@ fn killing_a_session_takes_the_whole_tree_with_it() {
 fn a_session_is_cancellable_while_its_shell_is_busy() {
     let broker = start();
     let (mut reading, mut writing) = connect(&broker);
-    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    ask(&mut writing, &hello(None));
     next(&mut reading);
     ask(&mut writing, &spawn_frame(80, 24, None));
     let spawned = next(&mut reading);
@@ -624,7 +637,7 @@ fn a_session_is_cancellable_while_its_shell_is_busy() {
 fn an_alternate_screen_app_survives_a_resize_and_keeps_answering() {
     let broker = start();
     let (mut reading, mut writing) = connect(&broker);
-    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    ask(&mut writing, &hello(None));
     next(&mut reading);
     // **`TERM` is declared rather than inherited, and that is the whole of what made this case
     // environment-dependent.** `less` reads terminfo to decide whether it may use the alternate screen at
@@ -676,7 +689,7 @@ fn an_alternate_screen_app_survives_a_resize_and_keeps_answering() {
 fn a_session_answers_a_bounded_screen_read() {
     let broker = start();
     let (mut reading, mut writing) = connect(&broker);
-    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    ask(&mut writing, &hello(None));
     next(&mut reading);
 
     ask(&mut writing, &spawn_frame(40, 6, Some(DEFAULT_SHELL)));
@@ -731,7 +744,7 @@ fn a_session_answers_a_bounded_screen_read() {
 fn a_screen_read_for_a_session_that_does_not_exist_is_refused_by_code() {
     let broker = start();
     let (mut reading, mut writing) = connect(&broker);
-    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    ask(&mut writing, &hello(None));
     next(&mut reading);
 
     ask(&mut writing, r#"{"kind":"screen","session":"s-404","history":10}"#);
@@ -750,7 +763,7 @@ fn a_screen_read_for_a_session_that_does_not_exist_is_refused_by_code() {
 fn writing_to_a_session_whose_shell_has_gone_is_refused() {
     let broker = start();
     let (mut reading, mut writing) = connect(&broker);
-    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    ask(&mut writing, &hello(None));
     next(&mut reading);
     ask(&mut writing, &spawn_frame(80, 24, None));
     let session = next(&mut reading)["session"].as_str().expect("a session").to_owned();
@@ -792,7 +805,7 @@ fn writing_to_a_session_whose_shell_has_gone_is_refused() {
 fn a_shell_is_started_with_the_arguments_and_environment_it_was_asked_for() {
     let broker = start();
     let (mut reading, mut writing) = connect(&broker);
-    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    ask(&mut writing, &hello(None));
     next(&mut reading);
 
     // `-c` runs a command and exits, which is an argument doing something observable; the variable it
@@ -852,7 +865,7 @@ fn once_the_sentinel_is_printed(reading: &mut Events) {
 #[cfg(unix)]
 fn a_session(broker: &Broker) -> (Events, Wire, String) {
     let (mut reading, mut writing) = connect(broker);
-    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    ask(&mut writing, &hello(None));
     assert_eq!(next(&mut reading)["kind"], "hello");
     ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
     let session = next(&mut reading)["session"].as_str().expect("a session id").to_owned();
@@ -1015,7 +1028,7 @@ fn a_session_ending_settles_both_kinds_of_wait() {
 /// Greets as a given role, answering the connection and its id.
 fn greet(broker: &Broker, role: &str) -> (Events, Wire) {
     let (mut reading, mut writing) = connect(broker);
-    ask(&mut writing, &format!(r#"{{"kind":"hello","protocol":1,"role":"{role}"}}"#));
+    ask(&mut writing, &hello(Some(role)));
     assert_eq!(next(&mut reading)["kind"], "hello", "greeted as {role}");
     (reading, writing)
 }
@@ -1103,7 +1116,7 @@ fn output_follows_the_client_that_came_back() {
 fn a_connection_that_names_no_role_is_a_client() {
     let broker = start();
     let (mut reading, mut writing) = connect(&broker);
-    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    ask(&mut writing, &hello(None));
     assert_eq!(next(&mut reading)["kind"], "hello");
 
     ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
@@ -1264,7 +1277,7 @@ fn a_frame_without_end_is_refused_and_the_broker_survives() {
     let (_owner_events, _owner) = greet(&broker, "lifetime");
     let (mut reading, mut writing) = connect(&broker);
 
-    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    ask(&mut writing, &hello(None));
     assert_eq!(next(&mut reading)["kind"], "hello");
 
     // A megabyte and one byte, with no newline anywhere in it
@@ -1283,7 +1296,7 @@ fn a_frame_without_end_is_refused_and_the_broker_survives() {
 
     // The half that makes this a bound rather than a crash: another client is still served
     let (mut again, mut writing_again) = connect(&broker);
-    ask(&mut writing_again, r#"{"kind":"hello","protocol":1}"#);
+    ask(&mut writing_again, &hello(None));
     assert_eq!(next(&mut again)["kind"], "hello", "the broker did not survive the oversized frame");
 }
 
@@ -1298,7 +1311,7 @@ fn a_frame_of_exactly_the_cap_is_taken() {
     let (_owner_events, _owner) = greet(&broker, "lifetime");
     let (mut reading, mut writing) = connect(&broker);
 
-    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    ask(&mut writing, &hello(None));
     assert_eq!(next(&mut reading)["kind"], "hello");
 
     // A valid frame for a session that does not exist, padded so the line — the frame and the newline
@@ -1330,7 +1343,7 @@ fn a_grid_nothing_could_draw_is_capped_rather_than_attempted() {
     let (_owner_events, _owner) = greet(&broker, "lifetime");
     let (mut reading, mut writing) = connect(&broker);
 
-    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    ask(&mut writing, &hello(None));
     next(&mut reading);
     ask(&mut writing, r#"{"kind":"spawn","cols":65535,"rows":65535,"shell":null,"args":[],"env":[],"cwd":null}"#);
 
@@ -1363,7 +1376,7 @@ fn a_shell_is_told_what_terminal_it_is_in() {
         command.env_remove("TERM");
     });
     let (mut reading, mut writing) = connect(&broker);
-    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    ask(&mut writing, &hello(None));
     next(&mut reading);
 
     let (shell, args) = PRINTS_TERM;
@@ -1402,7 +1415,7 @@ fn a_shell_is_told_what_terminal_it_is_in() {
 fn what_is_running_in_a_session_is_measured_rather_than_claimed() {
     let broker = start();
     let (mut reading, mut writing) = connect(&broker);
-    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    ask(&mut writing, &hello(None));
     next(&mut reading);
 
     let frame = serde_json::json!({
@@ -1445,7 +1458,7 @@ fn what_is_running_in_a_session_is_measured_rather_than_claimed() {
 fn the_last_client_leaving_ends_its_sessions_while_another_connection_holds_the_broker() {
     let broker = start();
     let (mut reading, mut writing) = connect(&broker);
-    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    ask(&mut writing, &hello(None));
     next(&mut reading);
     ask(&mut writing, &spawn_frame(80, 24, None));
     let (spawned, _) = until(&mut reading, "spawned");
@@ -1468,7 +1481,7 @@ fn the_last_client_leaving_ends_its_sessions_while_another_connection_holds_the_
 fn two_sessions_are_told_apart() {
     let broker = start();
     let (mut reading, mut writing) = connect(&broker);
-    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    ask(&mut writing, &hello(None));
     next(&mut reading);
 
     ask(&mut writing, &spawn_frame(80, 24, None));
@@ -1480,5 +1493,281 @@ fn two_sessions_are_told_apart() {
         first["session"].as_str().expect("a session"),
         second["session"].as_str().expect("a session"),
         "the second shell took the first one's id"
+    );
+}
+
+/// **Flow control, which is a second class from the credit that bounds the channel.**
+///
+/// Credit bounds how much output may be in flight for every session at once, because one socket carries
+/// them all. These cases are about one session being stopped because *its* consumer asked — an image
+/// transport that has to drain before the next frame — which a consumer cannot get by reading its socket
+/// more slowly without stalling every other terminal in the app.
+///
+/// **A read already outstanding still lands.** The reader is parked before a `read`, and when the pause
+/// arrives it is usually inside one — so the chunk that read returns is delivered and the parking happens
+/// after it. That is `node-pty`'s `pause()` too, and what a consumer handling a chunk means by pausing.
+#[cfg(unix)]
+#[test]
+fn a_paused_session_stops_being_read_and_a_resume_delivers_what_it_missed() {
+    let broker = start();
+    let (mut reading, mut writing) = connect(&broker);
+    ask(&mut writing, &hello(None));
+    next(&mut reading);
+    ask(&mut writing, &spawn_frame(80, 24, None));
+    let session = next(&mut reading)["session"].as_str().expect("a session").to_owned();
+    once_the_shell_is_listening(&mut reading);
+
+    ask(&mut writing, &format!(r#"{{"kind":"pause","session":"{session}"}}"#));
+    // More than one `read` of output, so the whole of it cannot arrive in the one chunk a pause may still
+    // deliver: four thousand lines against an 8 KiB buffer
+    ask(
+        &mut writing,
+        &format!(
+            r#"{{"kind":"write","session":"{session}","text":{}}}"#,
+            serde_json::to_string(&format!("seq 1 4000 | sed 's/^/probe-/'{SUBMIT}")).expect("a JSON string")
+        ),
+    );
+
+    // What a feed that was *not* paused would certainly have delivered by now. A slow machine can only make
+    // this read less, which cannot fail the case falsely — it is the tail arriving *after* the resume that
+    // the assertion is about
+    let mut before = String::new();
+    while let Ok(line) = reading.line(std::time::Duration::from_millis(500)) {
+        let event: serde_json::Value = serde_json::from_str(&line).expect("an event");
+        if event["kind"] == "output" {
+            before.push_str(event["text"].as_str().unwrap_or_default());
+        }
+    }
+    assert!(!before.contains("probe-4000"), "a paused session went on being read: {} bytes arrived", before.len());
+
+    ask(&mut writing, &format!(r#"{{"kind":"resume","session":"{session}"}}"#));
+    let after = output_until(&mut reading, Some(&session), |seen| seen.contains("probe-4000"));
+    assert!(after.contains("probe-4000"), "the resumed session never delivered its tail: {after:?}");
+    // Held in the kernel's buffer rather than dropped, which is what makes a pause backpressure: the lines
+    // written while nobody was reading are still there to be read
+    let whole = format!("{before}{after}");
+    assert!(whole.contains("probe-1\r\n"), "the start of the output was lost over the pause");
+    assert!(whole.contains("probe-2000"), "the middle of the output was lost over the pause");
+}
+
+/// A pause belongs to the client that asked for one: the next client never did, and has no way to find out.
+#[cfg(unix)]
+#[test]
+fn a_pause_does_not_outlive_the_client_that_asked_for_it() {
+    let broker = start();
+    // An owner, so the session survives the client leaving and there is something left to be stuck
+    let (mut owning, mut owner) = connect(&broker);
+    ask(&mut owner, &hello(Some("lifetime")));
+    next(&mut owning);
+
+    let (mut reading, mut writing) = connect(&broker);
+    ask(&mut writing, &hello(None));
+    next(&mut reading);
+    ask(&mut writing, &spawn_frame(80, 24, None));
+    let session = next(&mut reading)["session"].as_str().expect("a session").to_owned();
+    once_the_shell_is_listening(&mut reading);
+    ask(&mut writing, &format!(r#"{{"kind":"pause","session":"{session}"}}"#));
+    disconnect(reading, writing);
+
+    let (mut again, mut writing_again) = connect(&broker);
+    ask(&mut writing_again, &hello(None));
+    next(&mut again);
+    ask(
+        &mut writing_again,
+        &format!(
+            r#"{{"kind":"write","session":"{session}","text":{}}}"#,
+            serde_json::to_string(&format!("echo inherited-probe{SUBMIT}")).expect("a JSON string")
+        ),
+    );
+
+    let output = output_until(&mut again, Some(&session), |seen| seen.matches("inherited-probe").count() >= 2);
+    assert!(
+        output.matches("inherited-probe").count() >= 2,
+        "the new client inherited a pause it never asked for: {output:?}"
+    );
+}
+
+/// **An exit and a signal are different answers.** Reported as one they are the same `1`, so a window
+/// cannot tell the shutdown the app asked for from a crash it should draw a seam for.
+#[cfg(unix)]
+#[test]
+fn a_session_killed_by_a_signal_names_it_and_reports_no_code() {
+    let broker = start();
+    let (mut reading, mut writing) = connect(&broker);
+    ask(&mut writing, &hello(None));
+    next(&mut reading);
+    ask(&mut writing, &spawn_frame(80, 24, None));
+    let session = next(&mut reading)["session"].as_str().expect("a session").to_owned();
+    once_the_shell_is_listening(&mut reading);
+
+    // SIGKILL rather than SIGTERM: an interactive shell ignores termination, and what this case is about is
+    // the answer rather than the shell's manners
+    ask(
+        &mut writing,
+        &format!(r#"{{"kind":"signal","session":"{session}","signal":"SIGKILL","scope":{{"kind":"leader"}}}}"#),
+    );
+
+    let (exited, _) = until(&mut reading, "exited");
+    assert_eq!(exited["signal"], "SIGKILL", "the signal is named: {exited:?}");
+    assert!(exited["code"].is_null(), "a signal is not an exit code: {exited:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_session_that_exits_of_its_own_accord_reports_a_code_and_no_signal() {
+    let broker = start();
+    let (mut reading, mut writing) = connect(&broker);
+    ask(&mut writing, &hello(None));
+    next(&mut reading);
+    ask(&mut writing, &spawn_frame(80, 24, None));
+    let session = next(&mut reading)["session"].as_str().expect("a session").to_owned();
+    once_the_shell_is_listening(&mut reading);
+
+    ask(
+        &mut writing,
+        &format!(
+            r#"{{"kind":"write","session":"{session}","text":{}}}"#,
+            serde_json::to_string(&format!("exit 7{SUBMIT}")).expect("a JSON string")
+        ),
+    );
+
+    let (exited, _) = until(&mut reading, "exited");
+    assert_eq!(exited["code"], 7, "the code the shell exited with: {exited:?}");
+    assert!(exited["signal"].is_null(), "nothing signalled it: {exited:?}");
+}
+
+/// **The pid scope is what a consumer driving one program needs, and the check is what makes it safe to
+/// offer.** A pid is a number any caller can name, so without the tree check this request is `kill(2)` over
+/// a socket.
+#[cfg(unix)]
+#[test]
+fn a_signal_reaches_a_process_inside_the_session_s_tree_and_nothing_outside_it() {
+    let broker = start();
+    let (mut reading, mut writing) = connect(&broker);
+    ask(&mut writing, &hello(None));
+    next(&mut reading);
+    ask(&mut writing, &spawn_frame(80, 24, None));
+    let session = next(&mut reading)["session"].as_str().expect("a session").to_owned();
+    once_the_shell_is_listening(&mut reading);
+    let notes = tempfile::tempdir().expect("a directory for the grandchild's pid");
+    let pid_file = notes.path().join("grandchild.pid");
+    ask(
+        &mut writing,
+        &format!(
+            r#"{{"kind":"write","session":"{session}","text":{}}}"#,
+            serde_json::to_string(&long_lived_grandchild(&pid_file)).expect("a JSON string")
+        ),
+    );
+    let grandchild = pid_written_to(&mut reading, &pid_file);
+
+    // This process is the broker's parent, so it is certainly not inside any session's tree
+    let outside = std::process::id();
+    ask(
+        &mut writing,
+        &format!(
+            r#"{{"kind":"signal","session":"{session}","signal":"SIGKILL","scope":{{"kind":"pid","pid":{outside}}}}}"#
+        ),
+    );
+    let (failed, _) = until(&mut reading, "failed");
+    assert_eq!(failed["code"], "OUTSIDE_SESSION", "a pid outside the tree was signalled: {failed:?}");
+    assert!(alive(outside as i32), "the broker signalled a process it does not own");
+
+    ask(
+        &mut writing,
+        &format!(
+            r#"{{"kind":"signal","session":"{session}","signal":"SIGTERM","scope":{{"kind":"pid","pid":{grandchild}}}}}"#
+        ),
+    );
+    assert!(reaped(grandchild), "the grandchild {grandchild} was not reached by a signal to its own pid");
+}
+
+/// **A child in the leader's own process group**, which is what `kill(-pid)` reaches.
+///
+/// `set +m` turns the shell's job monitor off, so the background job stays in the shell's process group
+/// instead of being given one of its own. That is deliberate and is the subject: with job control on, a
+/// group signal does *not* reach a job, which is why `Scope::Group` says so and why `Kill` is what ends a
+/// whole tree. A consumer driving one CLI is in this case rather than that one.
+#[cfg(unix)]
+fn grandchild_in_the_leaders_group(pid_file: &std::path::Path) -> String {
+    format!("set +m; sleep 300 & echo $! > {}\n", pid_file.display())
+}
+
+/// The group is what reaches whatever the leader started in it, which is the scope a shutdown escalates to.
+#[cfg(unix)]
+#[test]
+fn a_signal_to_the_group_reaches_what_the_shell_started() {
+    let broker = start();
+    let (mut reading, mut writing) = connect(&broker);
+    ask(&mut writing, &hello(None));
+    next(&mut reading);
+    ask(&mut writing, &spawn_frame(80, 24, None));
+    let session = next(&mut reading)["session"].as_str().expect("a session").to_owned();
+    once_the_shell_is_listening(&mut reading);
+    let notes = tempfile::tempdir().expect("a directory for the grandchild's pid");
+    let pid_file = notes.path().join("grandchild.pid");
+    ask(
+        &mut writing,
+        &format!(
+            r#"{{"kind":"write","session":"{session}","text":{}}}"#,
+            serde_json::to_string(&grandchild_in_the_leaders_group(&pid_file)).expect("a JSON string")
+        ),
+    );
+    let grandchild = pid_written_to(&mut reading, &pid_file);
+    assert!(alive(grandchild), "the grandchild {grandchild} is running");
+
+    ask(
+        &mut writing,
+        &format!(r#"{{"kind":"signal","session":"{session}","signal":"SIGKILL","scope":{{"kind":"group"}}}}"#),
+    );
+
+    assert!(reaped(grandchild), "a signal to the group left the grandchild {grandchild} running");
+}
+
+#[test]
+fn pausing_a_session_that_does_not_exist_is_refused_by_code() {
+    let broker = start();
+    let (mut reading, mut writing) = connect(&broker);
+    ask(&mut writing, &hello(None));
+    next(&mut reading);
+
+    ask(&mut writing, r#"{"kind":"pause","session":"s-404"}"#);
+    let failed = next(&mut reading);
+    assert_eq!(failed["code"], "NO_SUCH_SESSION", "{failed:?}");
+}
+
+/// **A client leaving takes the feed away only if it had it**, which is what "last greeting wins" means
+/// from the other side.
+///
+/// The departing one is not the attached one here, and what it must not do is unhook the client that is —
+/// nor lift a pause that client is relying on, now that a departure resumes what it paused.
+#[cfg(unix)]
+#[test]
+fn a_client_that_is_not_the_attached_one_leaving_takes_nothing_with_it() {
+    let broker = start();
+    let (first, mut opening) = connect(&broker);
+    ask(&mut opening, &hello(None));
+    let mut first = first;
+    next(&mut first);
+    ask(&mut opening, &spawn_frame(80, 24, None));
+    let session = next(&mut first)["session"].as_str().expect("a session").to_owned();
+
+    // Last greeting wins the feed, so this one is now the attached client
+    let (mut attached, mut writing) = connect(&broker);
+    ask(&mut writing, &hello(None));
+    next(&mut attached);
+
+    disconnect(first, opening);
+
+    ask(
+        &mut writing,
+        &format!(
+            r#"{{"kind":"write","session":"{session}","text":{}}}"#,
+            serde_json::to_string(&format!("echo still-attached{SUBMIT}")).expect("a JSON string")
+        ),
+    );
+    let output = output_until(&mut attached, Some(&session), |seen| seen.matches("still-attached").count() >= 2);
+    assert!(
+        output.matches("still-attached").count() >= 2,
+        "another client leaving took the feed from the attached one: {output:?}"
     );
 }

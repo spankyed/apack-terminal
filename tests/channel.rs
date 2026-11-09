@@ -74,7 +74,7 @@ fn greeted(broker: &Broker) -> (BufReader<Wire>, Wire) {
     let name = broker.socket.to_str().expect("utf-8").to_fs_name::<GenericFilePath>().expect("a name");
     let wire = Wire(std::sync::Arc::new(Stream::connect(name).expect("the broker accepts")));
     let (mut reading, mut writing) = (BufReader::new(wire.clone()), wire);
-    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    ask(&mut writing, &format!(r#"{{"kind":"hello","protocol":{}}}"#, apack_terminal::protocol::PROTOCOL_VERSION));
     let mut line = String::new();
     reading.read_line(&mut line).expect("the greeting");
     (reading, writing)

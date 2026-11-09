@@ -24,11 +24,11 @@ by the npm package, so a consumer imports the types without building Rust.
 
 ```jsonc
 → {"kind":"hello","protocol":1,"role":"client"}
-← {"kind":"hello","protocol":1}
+← {"kind":"hello","protocol":1,"history":1000}
 → {"kind":"spawn","cols":80,"rows":24,"shell":null,"args":[],"env":[],"cwd":null}
 ← {"kind":"spawned","session":"s-1","pid":4242}
-→ {"kind":"write","session":"s-1","data":"echo hi\n"}
-← {"kind":"output","session":"s-1","data":"echo hi\r\nhi\r\n"}
+→ {"kind":"write","session":"s-1","text":"echo hi\n"}
+← {"kind":"output","session":"s-1","text":"echo hi\r\nhi\r\n"}
 → {"kind":"facts","session":"s-1"}
 ← {"kind":"facts","session":"s-1","cwd":"/home/me","command":"echo hi","running":false,"exit_status":0}
 ```
