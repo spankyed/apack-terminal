@@ -41,9 +41,6 @@ exclude_re = [
     # decides that, on a window and a cap, and a character split across two reads is already a case of its
     # own. A smaller buffer reads the same bytes in more passes and answers identically
     "session.rs:.*replace \\* with \\+ in Sessions::spawn",
-    # `WIDE_CHAR_SPACER` and `LEADING_WIDE_CHAR_SPACER` are distinct single bits, so `|` and `^` build the
-    # same set and the filter skips the same cells. Nothing distinguishes them to test
-    "screen.rs:.*replace \\| with \\^ in row_text",
     # The two halves of the pipe's access are split so that the one that decides anything is testable: the
     # SDDL string is built on every platform and `tests/security.rs` reads it back. What is left here is
     # `#[cfg(windows)]` FFI — reading the token's SID and handing the string to the OS — which nothing off
@@ -55,12 +52,6 @@ exclude_re = [
     # the gate went on reporting them. A pattern that excludes nothing is worse than no pattern, since it
     # reads as a decision that was taken
     "security.rs:.*(owner_only|current_user_sid)",
-    # `Size::total_lines` answers for `Dimensions` and nothing reads it: `Term::new` takes the columns and
-    # the screen lines from this and the history from `Config::scrolling_history`, which is what
-    # `Screen::new` passes `HISTORY_LINES` to. The scrollback bound is covered — `tests/screen.rs` holds a
-    # session to it in both directions — by the config, not by this. The method's own doc comment says so,
-    # because assuming otherwise is the natural mistake
-    "screen.rs:.*in <impl Dimensions for Size>::total_lines",
     # `PROCESS_SET_QUOTA` is 256 and `PROCESS_TERMINATE` is 1 (`windows-sys` 0.61's
     # `Win32::System::Threading`), so they are distinct single bits and `|` and `^` both ask `OpenProcess`
     # for 257. There is nothing to distinguish. Its sibling `| with &` asks for 0 and is caught, because a

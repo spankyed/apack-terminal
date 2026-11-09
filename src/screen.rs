@@ -22,6 +22,21 @@ use crate::vt::{Failed, Reported, Terminal};
 /// serves a reattach and a bounded read, and the two have no reason to agree.
 pub const HISTORY_LINES: usize = 1_000;
 
+/// What the core is *asked* for, which is deliberately more than is promised.
+///
+/// **The core's line limit is a page-granular heuristic and its floor is the ask minus one page.** It
+/// prunes whole historical pages and never the page holding the active area
+/// (`PageList.Limits.enforce`), so the rows retained oscillate between roughly the ask and the ask less a
+/// page. Measured at 80x24: asking 1,000 held between 441 and 793 rows, which would answer a reattach
+/// with less than half what the window was told it could scroll back; asking 2,000 held between 1,625 and
+/// 1,977.
+///
+/// So the promise is kept by asking for twice it and reading back no more than it. A page holds at most
+/// about 750 rows at any width a terminal is plausibly opened at — `page.std_capacity` is 215 rows at 215
+/// columns and grows as columns shrink — so a margin of `HISTORY_LINES` clears one page comfortably at
+/// every width. `tests/screen.rs` asserts both halves rather than trusting this arithmetic.
+const SCROLLBACK_ASKED: usize = HISTORY_LINES * 2;
+
 /// The terminal advertised to a program, which has to be what the pty says.
 pub const TERMINFO_NAME: &str = "xterm-256color";
 
@@ -112,7 +127,7 @@ impl Screen {
         let cols = cols.max(1);
         let rows = rows.max(1);
         let terminal = Terminal::new(cols, rows)?;
-        terminal.set_scrollback_lines(HISTORY_LINES)?;
+        terminal.set_scrollback_lines(SCROLLBACK_ASKED)?;
         terminal.set_scrollback_unbounded_bytes()?;
         terminal.set_terminfo_name(TERMINFO_NAME)?;
 
@@ -171,7 +186,11 @@ impl Screen {
 
     fn read(&self, history: u32) -> Result<Snapshot, Failed> {
         let scrollback = self.terminal.scrollback_rows()?;
-        let above = history.min(scrollback);
+        // **Never more than was promised.** The core holds more than `HISTORY_LINES` most of the time, by
+        // the page arithmetic above; answering with it would show a window lines its own scrollbar was
+        // never sized for, and the broker's handshake is the one number both sides agree on.
+        let held = scrollback.min(u32::try_from(HISTORY_LINES).unwrap_or(u32::MAX));
+        let above = history.min(held);
         let mut lines = Vec::with_capacity((above + u32::from(self.rows)) as usize);
         for row in scrollback - above..scrollback + u32::from(self.rows) {
             lines.push(self.row_text(row)?);

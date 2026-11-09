@@ -30,6 +30,35 @@ fn a_query_the_terminal_answers_itself_is_collected_for_the_pty() {
 /// A session nobody is drawing still parses everything its program writes, so what the grid will hold is
 /// the whole of the broker's memory per session — and the `Dimensions` this screen reports is the only place
 /// that is decided. A caller asking for more history than exists is answered with what there is.
+/// **The promise holds for a session that has written far more than it, which is where it first broke.**
+///
+/// The core's line limit is page-granular and its floor is the ask less one page, so a session asked for
+/// exactly `HISTORY_LINES` settles *below* it — measured at 441 rows against a promised 1,000 after 20,000
+/// lines at 80 columns. A window is told that figure in the broker's handshake so it never draws lines a
+/// reattach cannot reproduce, so the floor is the half that matters and the half a short case misses:
+/// feeding barely past the bound leaves one page still unpruned and passes either way.
+#[test]
+fn a_long_running_session_still_answers_the_scrollback_it_promised() {
+    let rows = 24;
+    let mut screen = Screen::new(80, rows);
+    for line in 0..20_000 {
+        screen.feed(format!("line {line} of a session that has been running a while\r\n").as_bytes());
+    }
+
+    let asked = screen.snapshot(u32::MAX);
+    assert_eq!(
+        asked.lines.len(),
+        HISTORY_LINES + usize::from(rows),
+        "a session that has written twenty times its scrollback still answers all of it, and no more",
+    );
+    // The oldest line retained is not the oldest ever written: what scrolled past the bound is gone
+    assert!(
+        !asked.lines[0].contains("line 0 "),
+        "the first line ever written is past the bound and must not still be here: {:?}",
+        asked.lines[0],
+    );
+}
+
 #[test]
 fn a_session_keeps_its_declared_scrollback_and_not_more() {
     let rows = 4;
