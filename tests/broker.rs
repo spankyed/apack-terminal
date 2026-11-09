@@ -174,30 +174,69 @@ fn ask(writing: &mut impl Write, frame: &str) {
     writing.flush().expect("the request is flushed");
 }
 
-/// One event, or a failure saying none came. Bounded by the reader thread's channel.
-fn next(reading: &mut Events) -> serde_json::Value {
-    match reading.0.recv_timeout(std::time::Duration::from_secs(10)) {
-        // A guard that hangs is worse than one that fails: a mutation that stopped resizes reaching the pty
-        // left `less` with nothing to redraw, and a blocking read turned that into a ten-minute hang
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("no event arrived within 10s"),
+/// How long the broker may say **nothing at all** before a read gives up.
+///
+/// **A window of silence, not a budget for a read.** Every event resets it, so a slow machine — a CI runner
+/// with three cores and another case's pty on each — makes a read take longer and never makes it fail. What
+/// spends this is a broker that has stopped answering, which is the thing worth failing over, and a guard
+/// that hangs is worse than one that fails: a mutation that stopped resizes reaching the pty left `less`
+/// with nothing to redraw, and a blocking read turned that into a ten-minute wait.
+const QUIET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The next event, or `None` once the broker has said nothing for `QUIET`.
+fn event(reading: &mut Events) -> Option<serde_json::Value> {
+    match reading.0.recv_timeout(QUIET) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             panic!("the broker closed the connection")
         }
-        Ok(line) => serde_json::from_str(&line).unwrap_or_else(|error| panic!("{error}: {line:?}")),
+        Ok(line) => Some(serde_json::from_str(&line).unwrap_or_else(|error| panic!("{error}: {line:?}"))),
     }
+}
+
+/// One event, or a failure saying none came.
+fn next(reading: &mut Events) -> serde_json::Value {
+    event(reading).unwrap_or_else(|| panic!("no event arrived within {QUIET:?}"))
+}
+
+/// **A session's output, read until `enough` is true of all of it**, or until the broker goes quiet.
+///
+/// Accumulating before deciding is the point, and not a convenience. Output arrives in whatever sizes a
+/// `read` returned, so an escape sequence is routinely delivered in pieces — which is the whole subject of
+/// `tests/parser.rs`. A case that asked whether *one* event contained `\x1b[?1049h` was therefore asking
+/// whether the sequence happened to arrive whole, and on a loaded machine, where reads fragment, it does
+/// not: the case then drained the stream looking for a match that could no longer appear and died on the
+/// silence window with a message about a clock rather than its own.
+///
+/// It answers with everything it read either way, so the caller's own assertion is what fails and says
+/// what came instead.
+fn output_until(reading: &mut Events, session: Option<&str>, enough: impl Fn(&str) -> bool) -> String {
+    let mut seen = String::new();
+    while let Some(event) = event(reading) {
+        if event["kind"] != "output" {
+            continue;
+        }
+        if session.is_some_and(|wanted| event["session"] != wanted) {
+            continue;
+        }
+        seen.push_str(event["text"].as_str().unwrap_or_default());
+        if enough(&seen) {
+            break;
+        }
+    }
+    seen
 }
 
 /// Reads until an event of `kind` arrives, returning it with everything seen on the way.
 fn until(reading: &mut Events, kind: &str) -> (serde_json::Value, Vec<serde_json::Value>) {
     let mut seen = Vec::new();
-    for _ in 0..4000 {
-        let event = next(reading);
+    while let Some(event) = event(reading) {
         if event["kind"] == kind {
             return (event, seen);
         }
         seen.push(event);
     }
-    panic!("no {kind} arrived; saw {} events", seen.len());
+    panic!("no {kind} arrived; saw {} events: {seen:?}", seen.len());
 }
 
 #[test]
@@ -229,16 +268,7 @@ fn a_keystroke_reaches_a_pty_and_its_output_comes_back() {
             serde_json::to_string(&format!("echo skeleton-probe{SUBMIT}")).expect("a JSON string")
         ),
     );
-    let mut output = String::new();
-    for _ in 0..200 {
-        let event = next(&mut reading);
-        if event["kind"] == "output" {
-            output.push_str(event["text"].as_str().unwrap_or_default());
-            if output.matches("skeleton-probe").count() >= 2 {
-                break;
-            }
-        }
-    }
+    let output = output_until(&mut reading, None, |seen| seen.matches("skeleton-probe").count() >= 2);
     // **Twice**: once as the console echoes what was typed, once as the command's own output. Asserting it
     // appears at all is a case a Windows console passes without running anything, which is how `\n` looked
     // like working input (X6)
@@ -566,13 +596,12 @@ fn an_alternate_screen_app_survives_a_resize_and_keeps_answering() {
     // that owns the whole screen redraws it on SIGWINCH rather than carrying on at a prompt. `vim` is the
     // other case and needs an installed vim; `less` ships with the OS.
     ask(&mut writing, &format!(r#"{{"kind":"write","session":"{session}","text":"seq 1 500 | less\n"}}"#));
-    let entered = (0..600).any(|_| {
-        let event = next(&mut reading);
-        // `\x1b[?1049h` is the alternate screen; `\x1b[?47h` is the older form some builds use
-        event["kind"] == "output"
-            && event["text"].as_str().is_some_and(|data| data.contains("[?1049h") || data.contains("[?47h"))
-    });
-    assert!(entered, "less never switched to the alternate screen");
+    // `\x1b[?1049h` is the alternate screen; `\x1b[?47h` is the older form some builds use
+    let entered = output_until(&mut reading, None, |seen| seen.contains("[?1049h") || seen.contains("[?47h"));
+    assert!(
+        entered.contains("[?1049h") || entered.contains("[?47h"),
+        "less never switched to the alternate screen: {entered:?}"
+    );
 
     // Resize while it owns the screen. A pty has one size, so this is one message, and the app must redraw
     for (cols, rows) in [(100u16, 30u16), (60, 20), (120, 40)] {
@@ -580,18 +609,17 @@ fn an_alternate_screen_app_survives_a_resize_and_keeps_answering() {
     }
 
     // It redrew rather than dying: output arrives after the resizes, and the shell is still there
-    let redrew = (0..600).any(|_| next(&mut reading)["kind"] == "output");
-    assert!(redrew, "nothing was drawn after the resize");
+    let redrew = output_until(&mut reading, None, |seen| !seen.is_empty());
+    assert!(!redrew.is_empty(), "nothing was drawn after the resize");
     assert!(alive(shell), "the shell did not survive a resize under an alternate-screen app");
 
     // And it is still taking input: `q` leaves less, which ends the shell's foreground job
     ask(&mut writing, &format!(r#"{{"kind":"write","session":"{session}","text":"q"}}"#));
-    let left = (0..600).any(|_| {
-        let event = next(&mut reading);
-        event["kind"] == "output"
-            && event["text"].as_str().is_some_and(|data| data.contains("[?1049l") || data.contains("[?47l"))
-    });
-    assert!(left, "less never left the alternate screen, so it had stopped reading input");
+    let left = output_until(&mut reading, None, |seen| seen.contains("[?1049l") || seen.contains("[?47l"));
+    assert!(
+        left.contains("[?1049l") || left.contains("[?47l"),
+        "less never left the alternate screen, so it had stopped reading input: {left:?}"
+    );
 }
 
 /// A session nobody is drawing still has a screen, which is the gain the whole refactor is for.
@@ -737,16 +765,7 @@ fn a_shell_is_started_with_the_arguments_and_environment_it_was_asked_for() {
     ask(&mut writing, &frame);
     let session = next(&mut reading)["session"].as_str().expect("a session").to_owned();
 
-    let mut seen = String::new();
-    for _ in 0..200 {
-        let event = next(&mut reading);
-        if event["kind"] == "output" && event["session"] == session.as_str() {
-            seen.push_str(event["text"].as_str().unwrap_or_default());
-        }
-        if seen.contains("marker=") {
-            break;
-        }
-    }
+    let seen = output_until(&mut reading, Some(&session), |seen| seen.contains("marker="));
 
     assert!(seen.contains("marker=arranged"), "the argument ran and the variable reached it: {seen:?}");
 }
@@ -1173,30 +1192,13 @@ fn a_windows_shell_reports_itself_when_started_with_an_integration_file() {
     let session = next(&mut reading)["session"].as_str().expect("a session id").to_owned();
 
     // The first prompt is where the markers are drawn, so nothing is typed until one has been
-    let mut output = String::new();
-    for _ in 0..600 {
-        let event = next(&mut reading);
-        if event["kind"] == "output" {
-            output.push_str(event["text"].as_str().unwrap_or_default());
-            if output.contains("\u{1b}]633;B") {
-                break;
-            }
-        }
-    }
+    let mut output = output_until(&mut reading, None, |seen| seen.contains("\u{1b}]633;B"));
     assert!(output.contains("\u{1b}]633;P;Cwd="), "PowerShell emitted no working-directory marker: {output:?}");
 
     // **`\r` alone, not `\r\n`.** A trailing newline opens PowerShell's continuation prompt — the command
     // is taken and then the parser waits for more, so nothing runs. Measured here, not assumed.
     types(&mut writing, &session, "cd C:\\Windows\r");
-    for _ in 0..600 {
-        let event = next(&mut reading);
-        if event["kind"] == "output" {
-            output.push_str(event["text"].as_str().unwrap_or_default());
-            if output.matches("\u{1b}]633;P;Cwd=").count() >= 2 {
-                break;
-            }
-        }
-    }
+    output.push_str(&output_until(&mut reading, None, |seen| seen.matches("\u{1b}]633;P;Cwd=").count() >= 1));
 
     ask(&mut writing, &format!(r#"{{"kind":"facts","session":"{session}"}}"#));
     let (facts, _) = until(&mut reading, "facts");
@@ -1333,16 +1335,7 @@ fn a_shell_is_told_what_terminal_it_is_in() {
     ask(&mut writing, &frame);
     let session = next(&mut reading)["session"].as_str().expect("a session").to_owned();
 
-    let mut seen = String::new();
-    for _ in 0..200 {
-        let event = next(&mut reading);
-        if event["kind"] == "output" && event["session"] == session.as_str() {
-            seen.push_str(event["text"].as_str().unwrap_or_default());
-        }
-        if seen.contains("term=xterm-256color") {
-            break;
-        }
-    }
+    let seen = output_until(&mut reading, Some(&session), |seen| seen.contains("term=xterm-256color"));
     // `cmd.exe` echoes the command before running it, so the value has to be matched rather than the label:
     // `echo term=%TERM%` appears in the output whatever TERM is, including when it is unset
     assert!(seen.contains("term=xterm-256color"), "the shell was given no terminal to be: {seen:?}");
@@ -1381,16 +1374,7 @@ fn what_is_running_in_a_session_is_measured_rather_than_claimed() {
     let session = next(&mut reading)["session"].as_str().expect("a session").to_owned();
     ask(&mut writing, &serde_json::json!({ "kind": "write", "session": session, "text": "ready\n" }).to_string());
 
-    let mut seen = String::new();
-    for _ in 0..200 {
-        let event = next(&mut reading);
-        if event["kind"] == "output" && event["session"] == session.as_str() {
-            seen.push_str(event["text"].as_str().unwrap_or_default());
-        }
-        if seen.contains("ready") {
-            break;
-        }
-    }
+    let seen = output_until(&mut reading, Some(&session), |seen| seen.contains("ready"));
     assert!(seen.contains("ready"), "the program is running: {seen:?}");
 
     ask(&mut writing, &serde_json::json!({ "kind": "facts", "session": session }).to_string());
