@@ -53,6 +53,11 @@ exclude_re = [
     # session to it in both directions — by the config, not by this. The method's own doc comment says so,
     # because assuming otherwise is the natural mistake
     "screen.rs:.*in <impl Dimensions for Size>::total_lines",
+    # `PROCESS_SET_QUOTA` is 256 and `PROCESS_TERMINATE` is 1 (`windows-sys` 0.61's
+    # `Win32::System::Threading`), so they are distinct single bits and `|` and `^` both ask `OpenProcess`
+    # for 257. There is nothing to distinguish. Its sibling `| with &` asks for 0 and is caught, because a
+    # handle opened with no access cannot be assigned to the job
+    "tree.rs:.*replace \| with \^ in Tree::owning",
 ]
 
 # **`src/tree.rs` is not excluded, and a whole-repository run on a Mac or on Linux will report its mutants
@@ -60,3 +65,10 @@ exclude_re = [
 # suite that does not build it cannot kill it. `.github/workflows/mutants.yml` runs a second job on
 # `windows-latest` for exactly this code, so a change to it is answered where the claim is made. Excluding
 # it here would turn that job into a no-op.
+#
+# **A change is not the only way that job runs, and it had to stop being the only way.** `tree.rs` changes
+# rarely, so a gate scoped to a change answers it rarely — and on a pull-request trigger alone, in a
+# repository whose work lands on `master` directly, it had never answered it at all. The workflow takes a
+# push and a dispatch now, and the dispatch mutates a file rather than a change:
+# `gh workflow run mutants.yml -f files=src/tree.rs`. What the code claims about where it is checked is
+# only worth reading if the check has run.

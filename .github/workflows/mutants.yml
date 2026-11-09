@@ -1,20 +1,39 @@
 name: mutants
 
-# Mutants of what a pull request changes, against the broker's own suite: a survivor fails the job, reported
-# on its line and in the job's summary. The run is scoped to the change (`--in-diff`), because a
-# whole-repository run is minutes of mutants nobody edited and a survivor outside the change is not this pull
-# request's to answer for. `cargo xtask pre-push` runs the same thing before a push, so a survivor is normally
-# found before CI sees it.
+# Mutants of what a change changes, against the broker's own suite: a survivor fails the job, reported on its
+# line and in the job's summary. A run is scoped to the change (`--in-diff`), because a whole-repository run
+# is minutes of mutants nobody edited and a survivor outside the change is not this change's to answer for.
+# `cargo xtask pre-push` runs the same thing before a push, so a survivor is normally found before CI sees it.
 #
 # Windows-only code is mutated on Windows, and nowhere else: `src/tree.rs`'s Job Objects and every
 # `cfg(windows)` arm compile on no other platform, so a Linux run reports every one of their mutants as
 # unviable. A change with none installs nothing there.
+#
+# **It runs on a push too, and that is not belt and braces.** This repository's work lands on `master`
+# directly, so a gate that fires only on a pull request had never fired at all — and `.cargo/mutants.toml`
+# says this job is what answers `src/tree.rs`. A claim about where a check is made has to be true of the
+# record and not only of the design. The Linux half duplicates `cargo xtask pre-push` and is cheap; the
+# Windows half is the one no developer here can run, which is the point of having it.
+#
+# **A dispatch is for a file rather than a change**, which is how Windows-only code gets answered at all:
+# `src/tree.rs` is `#[cfg(windows)]` in its entirety and is excluded from no run, so until something mutates
+# it on Windows its mutants are missed everywhere. The Linux half sits a dispatch out, since a
+# whole-repository Linux run would report exactly those as missed.
 on:
   pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      files:
+        description: The files to mutate on Windows, space separated
+        default: src/tree.rs
+        required: true
 
 concurrency:
-  group: mutants-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  # One per pull request, or per push; a dispatch is deliberate and cancels nothing
+  group: mutants-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -22,15 +41,16 @@ env:
 jobs:
   linux:
     name: mutants in the change (Linux)
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-24.04
     steps:
-      # The merge commit and its first parent, the base it merges into
+      # Deep, because the base a change is measured against is the merge base or a pushed-over commit
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 0
       - id: scope
         run: |
-          git diff --merge-base HEAD^1 -- '*.rs' > change.diff
+          git diff $(bash .github/base.sh) -- '*.rs' > change.diff
           if [ -s change.diff ]; then
             echo "code=true" >> "$GITHUB_OUTPUT"
           else
@@ -64,13 +84,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
-      # Only the changed files holding a Windows-only arm, so a change with none installs nothing
+          fetch-depth: 0
+      # A dispatch names its files; a change contributes only those holding a Windows-only arm, so a change
+      # with none installs nothing here
       - id: scope
+        # Through the environment rather than interpolated into the script: a dispatch input is a string
+        # somebody typed, and `${{ }}` would paste it into a shell
+        env:
+          WANTED: ${{ inputs.files }}
         run: |
-          mapfile -t files < <(git diff --merge-base --name-only --diff-filter=d HEAD^1 -- '*.rs')
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            printf 'Mutating %s\n' "$WANTED" >> "$GITHUB_STEP_SUMMARY"
+            args=""
+            for file in $WANTED; do args="$args --file $file"; done
+            echo "args=$args" >> "$GITHUB_OUTPUT"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          base="$(bash .github/base.sh)"
+          mapfile -t files < <(git diff --name-only --diff-filter=d $base -- '*.rs')
           if [ ${#files[@]} -gt 0 ] && grep -lE 'cfg\(windows\)|target_os = "windows"' "${files[@]}"; then
-            git diff --merge-base HEAD^1 -- '*.rs' > change.diff
+            git diff $base -- '*.rs' > change.diff
+            echo "args=--in-diff change.diff" >> "$GITHUB_OUTPUT"
             echo "code=true" >> "$GITHUB_OUTPUT"
           else
             echo "The change holds no Windows-only code to mutate" >> "$GITHUB_STEP_SUMMARY"
@@ -84,7 +119,9 @@ jobs:
         with:
           tool: cargo-mutants@27.1.0,cargo-nextest@0.9.148
       - if: steps.scope.outputs.code == 'true'
-        run: cargo mutants --in-diff change.diff || [ $? = 3 ]
+        env:
+          ARGS: ${{ steps.scope.outputs.args }}
+        run: cargo mutants $ARGS || [ $? = 3 ]
       - uses: actions/upload-artifact@v4
         if: always() && steps.scope.outputs.code == 'true'
         with:
