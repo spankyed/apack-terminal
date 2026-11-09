@@ -206,33 +206,6 @@ impl Terminal {
         Ok(wide == sys::CellWide::SPACER_TAIL || wide == sys::CellWide::SPACER_HEAD)
     }
 
-    /// How many rows the terminal holds in all, viewport included.
-    pub fn total_rows(&self) -> Result<u32, Failed> {
-        let mut rows: usize = 0;
-        // SAFETY: TOTAL_ROWS writes a `size_t`
-        let result = unsafe {
-            sys::ghostty_terminal_get(
-                self.handle,
-                sys::TerminalData::TOTAL_ROWS,
-                (&raw mut rows).cast::<std::ffi::c_void>(),
-            )
-        };
-        Failed::check("ghostty_terminal_get(TOTAL_ROWS)", result)?;
-        Ok(u32::try_from(rows).unwrap_or(u32::MAX))
-    }
-
-    /// What the terminal says its own limits are, for a diagnostic.
-    pub fn configured_limits(&self) -> (Option<usize>, Option<usize>) {
-        let read = |key: sys::TerminalData::Type| {
-            let mut value: usize = 0;
-            // SAFETY: both keys write a `size_t`
-            let result =
-                unsafe { sys::ghostty_terminal_get(self.handle, key, (&raw mut value).cast::<std::ffi::c_void>()) };
-            (result == sys::Result::SUCCESS).then_some(value)
-        };
-        (read(sys::TerminalData::SCROLLBACK_MAX_LINES), read(sys::TerminalData::SCROLLBACK_MAX_BYTES))
-    }
-
     /// Routes the replies the terminal makes on a program's behalf to `collector`.
     ///
     /// **A terminal answers questions, and a session that answers none does not start on Windows**:

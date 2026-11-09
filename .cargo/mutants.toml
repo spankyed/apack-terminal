@@ -69,6 +69,15 @@ exclude_re = [
     # nothing else to match on, and a pattern left behind by an edit above it matches no mutant and fails
     # that check rather than going quiet.
     "tree.rs:94:.*with Some\\(Default::default\\(\\)\\)",
+    # Freeing the terminal handle. A mutant of this leaks it, and a leak is not an answer any case here can
+    # read: the suite would pass, the process would exit, and the operating system would reclaim it. Killing
+    # it would mean a leak checker in the suite — which this repository does not have and which would be a
+    # large thing to acquire for one line whose body is a single documented call. What makes the omission
+    # small is that the handle has exactly one owner by construction: `Terminal` has no `Clone`, the pointer
+    # never leaves the type, and `Screen` holds the only one a session has
+    # Matched without `in`, for the reason `security.rs`' entry above records: this mutant replaces the
+    # function rather than something inside it, and `in <fn>` prints only for the latter
+    "vt/mod.rs:.*<impl Drop for Terminal>::drop",
 ]
 
 # **`src/tree.rs` is not excluded, and a whole-repository run on a Mac or on Linux will report its mutants

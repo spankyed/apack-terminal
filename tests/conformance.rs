@@ -9,7 +9,7 @@
 //!
 //! What is left is what was never a comparison: the values this broker depends on, each of which a case
 //! would have to be written to notice if the core stopped answering it.
-use apack_terminal::screen::Screen;
+use apack_terminal::screen::{Screen, TERMINFO_NAME};
 
 /// **The union of the two shell-integration families, which is the whole of D5's claim.**
 ///
@@ -80,4 +80,22 @@ fn the_terminal_answers_what_a_program_asks() {
         "primary device attributes: a VT220 with ANSI colour, which is what xterm-256color claims to be",
     );
     assert!(screen.take_replies().is_empty(), "and taking them leaves none to send twice");
+}
+
+/// The advertised terminal, which a program can ask for and which decides what it emits.
+///
+/// XTGETTCAP's `TN` capability — `DCS + q 544E ST`, where `544E` is the hex of "TN" — is answered with the
+/// configured name, hex-encoded. **The core answers nothing when no name was set**, rather than claiming
+/// to be Ghostty's own entry, so a name that never reached it shows up here as silence: this case needs no
+/// negative half, because a setter that did nothing would fail the assertion below.
+#[test]
+fn a_program_asking_what_terminal_this_is_is_told_what_the_pty_says() {
+    let encoded: String = TERMINFO_NAME.bytes().map(|byte| format!("{byte:02X}")).collect();
+    let mut screen = Screen::new(20, 4);
+    screen.feed(b"\x1bP+q544E\x1b\\");
+    let answer = screen.take_replies().concat();
+    assert!(
+        answer.contains(&encoded),
+        "the terminfo name was not answered: wanted the hex of {TERMINFO_NAME} ({encoded}) in {answer:?}",
+    );
 }
