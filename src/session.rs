@@ -96,29 +96,35 @@ fn settle_met(waiters: &Mutex<Vec<Waiter>>, screen: &Screen) -> usize {
 /// **A fresh `System` per call rather than one kept in `Sessions`.** It is refreshed for one pid and asked
 /// for nothing else, `Facts` is a request a caller makes when something happened rather than on a timer,
 /// and a shared one would add a third lock to the order documented on `Sessions` in exchange for nothing.
-#[cfg(unix)]
+///
+/// **Windows answers `None`, and the branch is inside this function rather than a second definition of
+/// it.** There is nothing to ask there: `portable-pty`'s `process_group_leader` is `#[cfg(unix)]` in the
+/// crate, and a ConPTY has no foreground process group — its equivalent is the job object `tree.rs` already
+/// holds per session, whose `JobObjectBasicProcessIdList` lists what is in it, unwritten because a platform
+/// claim is made on that platform. Two `#[cfg]` definitions put the mutation gate in an impossible
+/// position: off Windows the second one is not compiled, so every mutant of it survives a suite that cannot
+/// reach it, and a run on any developer's machine reports a survivor nothing can kill. One function has one
+/// set of mutants, and they land in code the suite runs.
 fn foreground_of(master: &(dyn MasterPty + Send)) -> Option<Foreground> {
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    #[cfg(not(unix))]
+    {
+        let _ = master;
+        None
+    }
+    #[cfg(unix)]
+    {
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
-    // Annotated rather than cast: a platform whose `pid_t` is not an `i32` is a compile error here instead
-    // of a silent truncation on the wire
-    let pid: i32 = master.process_group_leader()?;
-    let of = Pid::from_u32(u32::try_from(pid).ok()?);
-    // A `System` that cannot be created is one more way the OS declines to say, which is what `None` is for
-    let mut system = System::new().ok()?;
-    system.refresh_processes_specifics(ProcessesToUpdate::Some(&[of]), true, ProcessRefreshKind::nothing());
-    let name = system.process(of).map(|process| process.name().to_string_lossy().into_owned());
-    Some(Foreground { pid, name })
-}
-
-/// **Windows has no foreground process group, and `portable-pty` does not offer one there**: the method
-/// above is `#[cfg(unix)]` in the crate, so this is not a decision to answer `None` but the absence of
-/// anything to ask. A ConPTY's equivalent is the job object `tree.rs` already holds for each session, whose
-/// `JobObjectBasicProcessIdList` lists the processes in it — unwritten, because a platform claim is made on
-/// that platform and this one cannot be.
-#[cfg(windows)]
-fn foreground_of(_master: &(dyn MasterPty + Send)) -> Option<Foreground> {
-    None
+        // Annotated rather than cast: a platform whose `pid_t` is not an `i32` is a compile error here
+        // instead of a silent truncation on the wire
+        let pid: i32 = master.process_group_leader()?;
+        let of = Pid::from_u32(u32::try_from(pid).ok()?);
+        // A `System` that cannot be created is one more way the OS declines to say, which `None` carries
+        let mut system = System::new().ok()?;
+        system.refresh_processes_specifics(ProcessesToUpdate::Some(&[of]), true, ProcessRefreshKind::nothing());
+        let name = system.process(of).map(|process| process.name().to_string_lossy().into_owned());
+        Some(Foreground { pid, name })
+    }
 }
 
 /// Every session this broker owns, and where their output goes.

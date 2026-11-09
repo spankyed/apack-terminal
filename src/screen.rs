@@ -64,6 +64,13 @@ struct Size {
 }
 
 impl Dimensions for Size {
+    /// **This is not what bounds the scrollback, and the obvious reading of it is wrong.**
+    ///
+    /// `Term::new` reads `columns()` and `screen_lines()` from this and takes the history from
+    /// `Config::scrolling_history` instead, so nothing in this crate's behaviour reads this method —
+    /// a whole-repository mutation run makes every mutant of it survive, which is how that was established
+    /// rather than assumed. It answers for the trait, correctly, because the grid will hold this many
+    /// lines; it decides nothing. `HISTORY_LINES` reaching the config in `Screen::new` is what decides.
     fn total_lines(&self) -> usize {
         self.screen_lines + self.history
     }

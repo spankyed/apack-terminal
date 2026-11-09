@@ -134,9 +134,16 @@ fn reads_the_same_markers_however_the_stream_is_chunked() {
 /// **A payload with a real length is kept.** The cap is for a program that emits no terminator at all; a
 /// deep working directory or a long command line has to arrive whole, or the scanner loses exactly the
 /// facts it exists to read.
+///
+/// **The length is a number and not `PAYLOAD_CAP / 2`**, which is the whole point of the case. A bound
+/// derived from the constant it is protecting scales with it: halve the cap and a relative case halves its
+/// payload too, and goes on passing while paths this long start being dropped. 2000 characters is a real
+/// path — a deep `node_modules`, a worktree under a long home directory — so it says what has to work
+/// rather than restating what the code currently allows.
 #[test]
 fn a_long_but_terminated_payload_is_kept() {
-    let deep = "/d".repeat(PAYLOAD_CAP / 4);
+    let deep = "/dddddddddd".repeat(200);
+    assert_eq!(deep.len(), 2_200, "a path of a length a user really has");
     let stream = format!("\x1b]633;P;Cwd={deep}{BEL}");
 
     assert_eq!(markers(&stream), vec![Marker::Cwd(deep)]);

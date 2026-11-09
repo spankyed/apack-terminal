@@ -42,8 +42,17 @@ exclude_re = [
     # Windows compiles, and which on Windows needs a second local account connecting to the pipe to observe
     # at all. No job has one, so this is skipped rather than killed, and the claim is made by hand on the
     # development VM. A mutant here that mattered would be caught by the pipe failing to open at all
-    "security.rs:.*in current_user_sid",
-    "security.rs:.*in owner_only",
+    # Matched without `in`, because these mutants replace the function rather than something inside it:
+    # `in <fn>` appears only for the latter, so the two patterns this replaced matched nothing at all and
+    # the gate went on reporting them. A pattern that excludes nothing is worse than no pattern, since it
+    # reads as a decision that was taken
+    "security.rs:.*(owner_only|current_user_sid)",
+    # `Size::total_lines` answers for `Dimensions` and nothing reads it: `Term::new` takes the columns and
+    # the screen lines from this and the history from `Config::scrolling_history`, which is what
+    # `Screen::new` passes `HISTORY_LINES` to. The scrollback bound is covered — `tests/screen.rs` holds a
+    # session to it in both directions — by the config, not by this. The method's own doc comment says so,
+    # because assuming otherwise is the natural mistake
+    "screen.rs:.*in <impl Dimensions for Size>::total_lines",
 ]
 
 # **`src/tree.rs` is not excluded, and a whole-repository run on a Mac or on Linux will report its mutants
