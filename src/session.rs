@@ -194,6 +194,37 @@ fn described(number: i32) -> Option<String> {
     Some(unsafe { std::ffi::CStr::from_ptr(prose) }.to_string_lossy().into_owned())
 }
 
+/// The pid `kill(2)` is given for a scope, or a refusal.
+///
+/// **A pid below 2 is refused, and that is the whole reason this is a function of its own.** `kill(0, …)`
+/// signals every process in the *caller's* own process group — the broker's — and `kill(-0, …)` is the same
+/// call written the other way. A session records `child.process_id().unwrap_or_default()`, so a spawn that
+/// could not report a pid records 0, and one stop request would then take the broker and every session it
+/// owns. Pid 1 is refused for the neighbouring reason: `-1` is every process the user may signal.
+///
+/// **Nothing produces that today**, every platform `portable-pty` spawns on answering a pid; the edit that
+/// would make this fire is one where `process_id()` answers `None`, which is why the arithmetic is here
+/// rather than inline, where it cannot be tested without signalling something.
+#[cfg(unix)]
+pub fn signal_target(leader: u32, scope: Scope) -> Result<i32, Refusal> {
+    let unusable = |what: &str, pid: u32| Refusal {
+        code: ErrorCode::Pty,
+        message: format!("{pid} is not a process this broker can signal ({what})"),
+    };
+    let real = |pid: u32| -> Result<i32, Refusal> {
+        if pid < 2 {
+            return Err(unusable("a session whose process id is unknown, or init", pid));
+        }
+        i32::try_from(pid).map_err(|_| unusable("the pid does not fit a signal", pid))
+    };
+    match scope {
+        Scope::Leader => real(leader),
+        // A negative pid is its process group, which `portable-pty` made this process the leader of
+        Scope::Group => Ok(-real(leader)?),
+        Scope::Pid { pid } => real(pid),
+    }
+}
+
 /// Delivers a signal to a session's process, its group, or one process inside its tree.
 ///
 /// **The pid scope is checked against the tree**, because a pid is a number any caller can name: without
@@ -219,22 +250,15 @@ fn deliver(leader: u32, signal: Signal, scope: Scope) -> Outcome {
     }
     #[cfg(unix)]
     {
-        let leader_pid =
-            i32::try_from(leader).map_err(|_| Refusal::pty("signalling a session", "the pid does not fit"))?;
-        let target = match scope {
-            Scope::Leader => leader_pid,
-            // A negative pid is its process group, which `portable-pty` made this process the leader of
-            Scope::Group => -leader_pid,
-            Scope::Pid { pid } => {
-                if !inside_tree(leader, pid) {
-                    return Err(Refusal {
-                        code: ErrorCode::OutsideSession,
-                        message: format!("{pid} is not in the process tree of the session led by {leader}"),
-                    });
-                }
-                i32::try_from(pid).map_err(|_| Refusal::pty("signalling a process", "the pid does not fit"))?
-            }
-        };
+        if let Scope::Pid { pid } = scope
+            && !inside_tree(leader, pid)
+        {
+            return Err(Refusal {
+                code: ErrorCode::OutsideSession,
+                message: format!("{pid} is not in the process tree of the session led by {leader}"),
+            });
+        }
+        let target = signal_target(leader, scope)?;
         // SAFETY: `kill` takes two integers and answers an error through errno, which is read below.
         if unsafe { libc::kill(target, signal.number()) } == 0 {
             return Ok(());
@@ -276,6 +300,10 @@ fn owned_by(leader: u32, pid: u32) -> Result<bool, Refusal> {
 fn inside_tree(leader: u32, pid: u32) -> bool {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
+    // Neither is a process a session could own: 0 is what an unknown pid records as, and 1 is init
+    if pid < 2 || leader < 2 {
+        return false;
+    }
     if pid == leader {
         return true;
     }
@@ -321,6 +349,7 @@ pub struct Sessions {
 }
 
 /// A failure a request turns into a `Failed` event rather than a panic.
+#[derive(Debug)]
 pub struct Refusal {
     pub code: ErrorCode,
     pub message: String,
