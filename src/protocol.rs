@@ -110,6 +110,21 @@ pub enum Request {
     /// the same end is the job object `tree.rs` already holds, and what that can express is not this. A
     /// platform claim is made on that platform, so there it answers `ErrorCode::Unsupported`.
     Signal { session: SessionId, signal: Signal, scope: Scope },
+    /// **Whether a pid is inside this session's process tree** — the session's own process, or anything it
+    /// started, however deep.
+    ///
+    /// **A question, which is why it is a request of its own rather than a signal's refusal.** The broker
+    /// checks exactly this before it signals a pid (`Scope::Pid`), but a signal is an act: a caller that
+    /// wanted the answer rather than the effect had nothing to ask, and reaching for the act to learn the
+    /// answer is the mistake this prevents. Both come from one walk, so the two cannot disagree.
+    ///
+    /// **What it is for is a claim a caller cannot check itself.** A process says *"I am yours, pid N"* over
+    /// a socket, and the pid is whatever it chose to write; a consumer that walks the parent chain from
+    /// outside is answering about a tree the broker owns, with a second implementation that can disagree
+    /// with the one the refusal uses.
+    ///
+    /// The answer names the pid it is about, because a session may have more than one of these outstanding.
+    Owns { session: SessionId, pid: u32 },
     /// **The screen as the broker has it**, with up to `history` lines above the viewport.
     ///
     /// This is the read that makes a session's state independent of a window: the broker parses the same
@@ -363,6 +378,11 @@ pub enum Event {
         cursor_column: u16,
         alt_screen: bool,
     },
+    /// Whether that pid is inside the session's tree, answering `Owns`.
+    ///
+    /// **`pid` is the correlation**, as the session is for every other answer: a caller may ask about
+    /// several at once, and an answer taken for another pid's is a claim admitted or refused wrongly.
+    Owns { session: SessionId, pid: u32, owned: bool },
     /// What the shell reported about itself and what is running in the pty, answering `Facts`.
     ///
     /// **`cwd`, `command`, `running` and `exit_status` are claims; `foreground` is a measurement**, and the

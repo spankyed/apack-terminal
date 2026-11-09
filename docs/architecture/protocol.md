@@ -47,6 +47,7 @@ means for a session's lifetime.
 | `pause` | stop reading this session's pty, so its process feels the reader stop |
 | `resume` | read it again, and send what arrived while it was not being read |
 | `signal` | a signal to the session's process, its process group, or one process inside its tree |
+| `owns` | whether a pid is inside this session's process tree |
 | `screen` | the screen as the broker has it, with up to `history` lines above the viewport |
 | `facts` | what the shell reported about itself: directory, command line, whether one is running, last status |
 | `search` | where text appears in the screen and the history above it |
@@ -69,6 +70,7 @@ belong to whoever ships them.
 | `exited` | the process ended: `code` when it exited, `signal` by name when one killed it, never both |
 | `throttled` | a flush waited for credit, with the microseconds it waited. Not a loss |
 | `screen` | the lines a `screen` asked for, the cursor, and whether an alternate-screen app is showing |
+| `owns` | whether that pid is inside the session's tree; the pid is the correlation |
 | `facts` | the shell's claims about itself |
 | `search` | where the text was found, with the whole line for context |
 | `waited` | how a wait ended: `MET`, `TIMEOUT` or `EXITED`. Once per wait, however it ended |
@@ -121,6 +123,26 @@ broker. A pid outside the named session's tree is refused with `OUTSIDE_SESSION`
 
 **POSIX only.** Windows has no signals, and what the job object can express is not this, so it answers
 `UNSUPPORTED` rather than approximating it.
+
+## The question the refusal answers is also a request of its own
+
+`owns` asks whether a pid is inside a session's tree, and it is the same walk the `pid` scope refuses with —
+so what a caller reads and what it would have been refused cannot disagree.
+
+**It exists because a signal is an act.** A caller that wanted the answer rather than the effect had nothing
+to ask, and reaching for the act to learn the answer is the mistake this removes. What needs the answer is a
+claim a caller cannot check itself: a process says *"I am yours, pid N"* over a socket, where the pid is
+whatever it chose to write. The alternative is a consumer walking the parent chain from outside — a second
+implementation of the broker's own invariant, which can disagree with it.
+
+**The pid is the correlation**, as the session is for every other answer: a consumer may have several claims
+to admit at once, and an answer taken for another pid's is one admitted or refused wrongly.
+
+**Windows answers `UNSUPPORTED` for now.** The route there is the job object `tree.rs` already holds —
+`JobObjectBasicProcessIdList` lists what is in it — and a platform claim is made on that platform, so it is
+unwritten rather than guessed. A refusal a caller can see is still the better of the two answers available:
+a parent walk with `/bin/ps` finds no `ps` there, answers *not owned* for everything, and refuses every
+claim without saying why.
 
 ## What crosses as output is text, and that is a decision
 

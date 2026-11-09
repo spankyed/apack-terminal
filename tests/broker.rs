@@ -1771,3 +1771,91 @@ fn a_client_that_is_not_the_attached_one_leaving_takes_nothing_with_it() {
         "another client leaving took the feed from the attached one: {output:?}"
     );
 }
+
+/// **The question the `Pid` scope's refusal answers by acting**, asked without acting.
+///
+/// A consumer admits a process that claims to be its own — *"I am yours, pid N"* over a socket, where the
+/// pid is whatever that process chose to write. Walking the parent chain from outside is a second
+/// implementation of what the broker checks before it signals, and two implementations of one invariant can
+/// disagree. These cases are that both come from the same walk.
+#[cfg(unix)]
+#[test]
+fn a_session_says_which_pids_are_inside_its_own_tree() {
+    let broker = start();
+    let (mut reading, mut writing) = connect(&broker);
+    ask(&mut writing, &hello(None));
+    next(&mut reading);
+    ask(&mut writing, &spawn_frame(80, 24, None));
+    let spawned = next(&mut reading);
+    let session = spawned["session"].as_str().expect("a session").to_owned();
+    let leader = spawned["pid"].as_u64().expect("a pid");
+    once_the_shell_is_listening(&mut reading);
+    let notes = tempfile::tempdir().expect("a directory for the grandchild's pid");
+    let pid_file = notes.path().join("grandchild.pid");
+    ask(
+        &mut writing,
+        &format!(
+            r#"{{"kind":"write","session":"{session}","text":{}}}"#,
+            serde_json::to_string(&long_lived_grandchild(&pid_file)).expect("a JSON string")
+        ),
+    );
+    let grandchild = pid_written_to(&mut reading, &pid_file);
+
+    // The process it started, however the shell arranged it
+    ask(&mut writing, &format!(r#"{{"kind":"owns","session":"{session}","pid":{grandchild}}}"#));
+    let (answer, _) = until(&mut reading, "owns");
+    assert_eq!(answer["pid"].as_u64(), Some(grandchild as u64), "the answer names the pid it is about");
+    assert_eq!(answer["owned"], true, "a process the session started is its own: {answer:?}");
+
+    // Its own process, which is the edge a walk gets wrong by starting one hop up
+    ask(&mut writing, &format!(r#"{{"kind":"owns","session":"{session}","pid":{leader}}}"#));
+    let (own, _) = until(&mut reading, "owns");
+    assert_eq!(own["owned"], true, "the session's own process is inside its tree: {own:?}");
+
+    // This process is the broker's parent, so it is outside every session's tree
+    let outside = std::process::id();
+    ask(&mut writing, &format!(r#"{{"kind":"owns","session":"{session}","pid":{outside}}}"#));
+    let (foreign, _) = until(&mut reading, "owns");
+    assert_eq!(foreign["pid"].as_u64(), Some(outside as u64));
+    assert_eq!(foreign["owned"], false, "a process outside the tree is not owned: {foreign:?}");
+}
+
+/// **The pid is the correlation**, as the session is everywhere else: a consumer may have several claims to
+/// admit at once, and an answer taken for another pid's is one admitted or refused wrongly.
+#[cfg(unix)]
+#[test]
+fn two_questions_about_one_session_are_each_answered_about_their_own_pid() {
+    let broker = start();
+    let (mut reading, mut writing) = connect(&broker);
+    ask(&mut writing, &hello(None));
+    next(&mut reading);
+    ask(&mut writing, &spawn_frame(80, 24, None));
+    let spawned = next(&mut reading);
+    let session = spawned["session"].as_str().expect("a session").to_owned();
+    let leader = spawned["pid"].as_u64().expect("a pid");
+    let outside = std::process::id() as u64;
+
+    ask(&mut writing, &format!(r#"{{"kind":"owns","session":"{session}","pid":{leader}}}"#));
+    ask(&mut writing, &format!(r#"{{"kind":"owns","session":"{session}","pid":{outside}}}"#));
+
+    let (first, _) = until(&mut reading, "owns");
+    let (second, _) = until(&mut reading, "owns");
+    let mut answers =
+        [(first["pid"].as_u64(), first["owned"].as_bool()), (second["pid"].as_u64(), second["owned"].as_bool())];
+    answers.sort();
+    let mut wanted = [(Some(leader), Some(true)), (Some(outside), Some(false))];
+    wanted.sort();
+    assert_eq!(answers, wanted, "each answer carries the pid it is about");
+}
+
+#[test]
+fn asking_what_a_session_that_does_not_exist_owns_is_refused_by_code() {
+    let broker = start();
+    let (mut reading, mut writing) = connect(&broker);
+    ask(&mut writing, &hello(None));
+    next(&mut reading);
+
+    ask(&mut writing, r#"{"kind":"owns","session":"s-404","pid":2}"#);
+    let failed = next(&mut reading);
+    assert_eq!(failed["code"], "NO_SUCH_SESSION", "{failed:?}");
+}

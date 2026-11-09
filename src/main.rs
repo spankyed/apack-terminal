@@ -313,6 +313,13 @@ fn carry_out(sessions: &Arc<Mutex<Sessions>>, request: Request) {
             }
             Err(refusal) => Err((Some(session), refusal)),
         },
+        Request::Owns { session, pid } => match live.owns(&session, pid) {
+            Ok(owned) => {
+                live.answer(Event::Owns { session, pid, owned });
+                Ok(())
+            }
+            Err(refusal) => Err((Some(session), refusal)),
+        },
         Request::Facts { session } => match live.facts(&session) {
             Ok(facts) => {
                 // The measurement is taken under the same `Sessions` guard as the claims, so the two

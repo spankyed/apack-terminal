@@ -14,7 +14,7 @@ export type Event = { "kind": "hello", protocol: number, history: number, } | { 
 /**
  * Within the viewport, so `0` is its first line however much history came with it.
  */
-cursor_row: number, cursor_column: number, alt_screen: boolean, } | { "kind": "facts", session: string, cwd: string | null, command: string | null, running: boolean, exit_status: number | null, foreground: Foreground | null, } | { "kind": "search", session: string, matches: Array<SearchMatch>, } | { "kind": "waited", session: string, outcome: WaitOutcome, } | { "kind": "failed", session: string | null, code: ErrorCode, message: string, };
+cursor_row: number, cursor_column: number, alt_screen: boolean, } | { "kind": "owns", session: string, pid: number, owned: boolean, } | { "kind": "facts", session: string, cwd: string | null, command: string | null, running: boolean, exit_status: number | null, foreground: Foreground | null, } | { "kind": "search", session: string, matches: Array<SearchMatch>, } | { "kind": "waited", session: string, outcome: WaitOutcome, } | { "kind": "failed", session: string | null, code: ErrorCode, message: string, };
 
 /**
  * What the kernel says is reading the pty, as against what the shell claims about itself.
@@ -50,7 +50,7 @@ args: Array<string>,
 /**
  * Added to the environment the broker runs in, which is already stripped of the app's own
  */
-env: Array<[string, string]>, cwd: string | null, } | { "kind": "write", session: string, text: string, } | { "kind": "resize", session: string, cols: number, rows: number, } | { "kind": "pause", session: string, } | { "kind": "resume", session: string, } | { "kind": "signal", session: string, signal: Signal, scope: Scope, } | { "kind": "screen", session: string, history: number, } | { "kind": "facts", session: string, } | { "kind": "search", session: string, text: string, history: number, } | { "kind": "wait", session: string, until: Until, timeout_ms: number, } | { "kind": "kill", session: string, };
+env: Array<[string, string]>, cwd: string | null, } | { "kind": "write", session: string, text: string, } | { "kind": "resize", session: string, cols: number, rows: number, } | { "kind": "pause", session: string, } | { "kind": "resume", session: string, } | { "kind": "signal", session: string, signal: Signal, scope: Scope, } | { "kind": "owns", session: string, pid: number, } | { "kind": "screen", session: string, history: number, } | { "kind": "facts", session: string, } | { "kind": "search", session: string, text: string, history: number, } | { "kind": "wait", session: string, until: Until, timeout_ms: number, } | { "kind": "kill", session: string, };
 
 /**
  * What a connection is for.

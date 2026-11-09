@@ -243,6 +243,31 @@ fn deliver(leader: u32, signal: Signal, scope: Scope) -> Outcome {
     }
 }
 
+/// Whether `pid` is `leader` or something it started, as an answer rather than a signal.
+///
+/// **Windows has no answer here yet, and saying so is the honest one.** The route there is the job object
+/// `tree.rs` already holds per session — `JobObjectBasicProcessIdList` lists what is in it — and a platform
+/// claim is made on that platform, so it is unwritten rather than guessed. A refusal a caller can see beats
+/// the alternative a consumer had before this: a parent walk with `/bin/ps`, which on Windows finds no `ps`,
+/// answers *not owned* for everything, and refuses every claim without saying why.
+///
+/// **One function with the branch inside it**, for the reason `deliver` and `foreground_of` both give: two
+/// `#[cfg]` definitions leave every mutant of the uncompiled one surviving a suite that cannot reach it.
+fn owned_by(leader: u32, pid: u32) -> Result<bool, Refusal> {
+    #[cfg(not(unix))]
+    {
+        let _ = (leader, pid);
+        Err(Refusal {
+            code: ErrorCode::Unsupported,
+            message: "this platform cannot be asked what is in a session's tree".to_owned(),
+        })
+    }
+    #[cfg(unix)]
+    {
+        Ok(inside_tree(leader, pid))
+    }
+}
+
 /// Whether `pid` is `leader` or something it started, however deep.
 ///
 /// **Bounded at a depth no real tree reaches**, because the parent chain is read from the OS a process at a
@@ -571,6 +596,16 @@ impl Sessions {
         for live in self.live.values() {
             live.flow.resume();
         }
+    }
+
+    /// Whether `pid` is this session's own process or something it started.
+    ///
+    /// **The same walk the `Pid` scope refuses with**, so the answer a caller reads and the refusal it would
+    /// have got cannot disagree — which is the whole reason this is a request rather than something a
+    /// caller infers from trying to signal.
+    pub fn owns(&self, session: &str, pid: u32) -> Result<bool, Refusal> {
+        let live = self.live.get(session).ok_or_else(|| missing(session))?;
+        owned_by(live.pid, pid)
     }
 
     /// Sends a signal to a session's process, its group, or one process inside its tree.
