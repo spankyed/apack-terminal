@@ -1,6 +1,6 @@
 //! What a shell says about itself, read out of the bytes it wrote.
 
-use apack_terminal::markers::{Marker, Markers};
+use apack_terminal::markers::{Marker, Markers, PAYLOAD_CAP};
 
 /// Everything the scanner finds in one stream, fed whole.
 fn markers(stream: &str) -> Vec<Marker> {
@@ -129,4 +129,73 @@ fn reads_the_same_markers_however_the_stream_is_chunked() {
     for at in 0..=stream.len() {
         assert_eq!(split_at(&stream, at), whole, "split at {at}");
     }
+}
+
+/// **A payload with a real length is kept.** The cap is for a program that emits no terminator at all; a
+/// deep working directory or a long command line has to arrive whole, or the scanner loses exactly the
+/// facts it exists to read.
+#[test]
+fn a_long_but_terminated_payload_is_kept() {
+    let deep = "/d".repeat(PAYLOAD_CAP / 4);
+    let stream = format!("\x1b]633;P;Cwd={deep}{BEL}");
+
+    assert_eq!(markers(&stream), vec![Marker::Cwd(deep)]);
+}
+
+/// **A payload of exactly the cap is taken**, which is the boundary its comparison decides. One byte
+/// tighter and a legal payload is dropped with nothing said about it — the failure a cap always invites,
+/// and the reason this case is written at the edge rather than near it.
+#[test]
+fn a_payload_of_exactly_the_cap_is_taken() {
+    let prefix = "633;P;Cwd=";
+    let path = "x".repeat(PAYLOAD_CAP - prefix.len());
+    let stream = format!("\x1b]{prefix}{path}{BEL}");
+
+    assert_eq!(markers(&stream), vec![Marker::Cwd(path)]);
+}
+
+/// An `ESC` after an `ESC` still begins a sequence. A terminal writes them back to back often enough —
+/// two sequences with nothing between them — and reading the second as text loses the marker it introduces.
+#[test]
+fn a_repeated_escape_still_begins_a_sequence() {
+    let stream = format!("\x1b\x1b]633;A{BEL}");
+
+    assert_eq!(markers(&stream), vec![Marker::PromptStart]);
+    assert_eq!(byte_at_a_time(&stream), vec![Marker::PromptStart], "and arriving a byte at a time");
+}
+
+/// **An abandoned payload ends at its terminator however many escapes precede it.** A scanner that cannot
+/// leave the overrun state loses every marker for the rest of the session, which is a worse outcome than
+/// the unbounded buffer the overrun state exists to prevent.
+#[test]
+fn an_abandoned_payload_recovers_after_a_repeated_escape() {
+    let overlong = "y".repeat(PAYLOAD_CAP + 1);
+    let stream = format!("\x1b]633;P;Cwd={overlong}\x1b\x1b\\\x1b]633;A{BEL}");
+
+    assert_eq!(markers(&stream), vec![Marker::PromptStart], "the scanner came back");
+}
+
+/// A percent escape at the very start of a value is decoded like one anywhere else.
+#[test]
+fn a_value_that_begins_with_an_escape_is_decoded() {
+    let stream = format!("\x1b]633;E;%41bc{BEL}");
+
+    assert_eq!(markers(&stream), vec![Marker::CommandLine("Abc".to_owned())]);
+}
+
+/// **A `%` without a full pair after it is the character it is**, and reading one is never a read past the
+/// end of the payload. A shell that encoded nothing wrote a literal `%`, and `git commit -m '50%'` is the
+/// ordinary way to arrive here.
+#[test]
+fn a_percent_with_no_pair_after_it_is_kept_as_itself() {
+    assert_eq!(
+        markers(&format!("\x1b]633;E;cd 50%4{BEL}")),
+        vec![Marker::CommandLine("cd 50%4".to_owned())],
+        "one character after the percent: the pair it would read runs past the end"
+    );
+    assert_eq!(
+        markers(&format!("\x1b]633;E;cd 50%{BEL}")),
+        vec![Marker::CommandLine("cd 50%".to_owned())],
+        "and nothing after it at all"
+    );
 }

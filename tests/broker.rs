@@ -1390,3 +1390,51 @@ fn what_is_running_in_a_session_is_measured_rather_than_claimed() {
     assert_eq!(facts["foreground"]["name"], "cat", "so the kernel was asked instead");
     assert!(facts["foreground"]["pid"].as_i64().unwrap_or_default() > 0, "and it named a live process");
 }
+
+/// **The last client leaving ends its sessions even while something else holds the broker open.**
+///
+/// A connection that has not greeted yet is counted as a connection and not as a client, so it keeps the
+/// process alive while the client count falls to zero — which is the one window in which that count decides
+/// on its own, and the window a probe, a health check or a reconnect racing a quit actually opens. Without
+/// it the only thing left to end a user's shells is the broker exiting, and here it does not.
+#[test]
+fn the_last_client_leaving_ends_its_sessions_while_another_connection_holds_the_broker() {
+    let broker = start();
+    let (mut reading, mut writing) = connect(&broker);
+    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    next(&mut reading);
+    ask(&mut writing, &spawn_frame(80, 24, None));
+    let (spawned, _) = until(&mut reading, "spawned");
+    let pid = spawned["pid"].as_u64().expect("a pid") as i32;
+
+    // Connected and silent. The broker is not exiting after this disconnect, so ending the sessions is the
+    // client count's own work rather than something the process teardown would have done anyway
+    let holding = connect(&broker);
+
+    disconnect(reading, writing);
+
+    assert!(reaped(pid), "the shell for pid {pid} outlived every client of it");
+    drop(holding);
+}
+
+/// Two sessions are two sessions. The id is how every later request names one, so a second shell answering
+/// to the first one's id puts `write`, `resize` and `kill` on whichever the map happens to be holding — and
+/// a keystroke meant for one shell reaches another.
+#[test]
+fn two_sessions_are_told_apart() {
+    let broker = start();
+    let (mut reading, mut writing) = connect(&broker);
+    ask(&mut writing, r#"{"kind":"hello","protocol":1}"#);
+    next(&mut reading);
+
+    ask(&mut writing, &spawn_frame(80, 24, None));
+    let (first, _) = until(&mut reading, "spawned");
+    ask(&mut writing, &spawn_frame(80, 24, None));
+    let (second, _) = until(&mut reading, "spawned");
+
+    assert_ne!(
+        first["session"].as_str().expect("a session"),
+        second["session"].as_str().expect("a session"),
+        "the second shell took the first one's id"
+    );
+}

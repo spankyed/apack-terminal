@@ -22,7 +22,11 @@
 /// OSC string ends with BEL or ST, and a program that emits neither would otherwise grow this buffer for as
 /// long as it kept writing. Paths and command lines are the payloads with a real length, and both are far
 /// inside this.
-const PAYLOAD_CAP: usize = 4 * 1024;
+///
+/// **Public because it is a contract rather than a tuning knob**: it says how long a payload a shell may
+/// emit and still be read, so the case that proves a payload of exactly this length is taken has to be able
+/// to name it rather than restate the number.
+pub const PAYLOAD_CAP: usize = 4 * 1024;
 
 /// One thing a shell said about itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
