@@ -10,9 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-mod generate;
-mod package;
-mod pre_push;
+use xtask::{generate, mutants, package, pre_push};
 
 fn main() -> ExitCode {
     let task = std::env::args().nth(1);
@@ -20,13 +18,17 @@ fn main() -> ExitCode {
     let result = match task.as_deref() {
         Some("generate") => generate::update(&root),
         Some("check-generated") => generate::check(&root),
+        Some("check-exclusions") => mutants::check_exclusions(&root),
         Some("package") => package::package(&root),
         Some("pre-push") => pre_push::pre_push(
             &root,
             &std::env::args().skip(2).collect::<Vec<_>>(),
-            &[("generated protocol", &|| generate::check(&root))],
+            &[
+                ("generated protocol", &|| generate::check(&root)),
+                ("mutant exclusions", &|| mutants::check_exclusions(&root)),
+            ],
         ),
-        _ => Err("usage: cargo xtask <generate | check-generated | package | pre-push>".to_owned()),
+        _ => Err("usage: cargo xtask <generate | check-generated | check-exclusions | package | pre-push>".to_owned()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

@@ -7,3 +7,14 @@ publish = false
 
 [dependencies]
 tempfile = "3.27.0"
+
+# The binary is the entry point and the library is what its own tests reach: `check-exclusions`'s decision
+# is driven with counts of its own there, which is the only way to watch it fail without committing a dead
+# pattern to the file it reads.
+[lib]
+name = "xtask"
+path = "src/lib.rs"
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"

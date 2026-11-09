@@ -7,6 +7,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 cargo xtask generate                           # regenerates node/protocol.ts; commit it if it moved
 cargo xtask check-generated                    # fails when it has fallen behind
+cargo xtask check-exclusions                   # fails when a mutants exclusion excludes nothing
 ```
 
 ## What each suite is for
@@ -107,6 +108,15 @@ suite is 8.5 s and its slowest case 7.2 s on an Apple-silicon laptop (55 tests, 
 default deadline of 20 s. **A reading, never a bound** — a slower machine reports, it does not fail.
 
 ## Mutation testing
+
+**Every exclusion excludes something**, which `cargo xtask check-exclusions` asks cargo-mutants rather than
+deciding for itself (`--re` filters by the same matching `--exclude-re` uses). A pattern that matches no
+mutant is worse than no pattern: the gate goes on reporting the survivor it was written for while the comment
+above it reads as a settled question. It has happened twice — `security.rs`'s patterns were written as
+`in <fn>`, which cargo-mutants prints only for a mutant inside a function, and `tree.rs`'s was written with
+one backslash, which is not a TOML escape and stopped the file parsing at all. Both were found by CI rather
+than by the author. `xtask/tests/exclusions.rs` drives the check's decision with counts of its own, so it can
+be watched failing without a dead pattern committed to the file it reads.
 
 `cargo xtask pre-push` ends with the change's mutants: cargo-mutants edits each line the change touched into
 something that still compiles, and a mutant the suite still passes is a line no case holds. The run is

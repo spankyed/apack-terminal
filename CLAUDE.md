@@ -16,7 +16,7 @@ holds.
 | `src/main.rs` | the process: a socket, a handshake, the request loop |
 | `src/lib.rs` | so the parser can be tested as a parser |
 | `node/protocol.ts` | **generated** from `src/protocol.rs`; never edited by hand, and shipped by the package |
-| `xtask/` | the repository's own tasks (`cargo xtask <task>`): the protocol's derivation, and pre-push |
+| `xtask/` | the repository's own tasks (`cargo xtask <task>`): the protocol's derivation, the mutation gate's own checks, and pre-push |
 | `node/` | the npm package a consumer installs: the protocol's types, where the binary is, and the binary `cargo xtask package` stages into it |
 
 ## Checks
@@ -33,6 +33,7 @@ cargo clippy --workspace --all-targets -- -D warnings    # the gate is zero warn
 cargo fmt --all --check                      # the layout rustfmt.toml pins, which is elmdb's
 cargo xtask generate                         # re-derive node/protocol.ts from src/protocol.rs
 cargo xtask check-generated                  # fails when that file has fallen behind
+cargo xtask check-exclusions                 # fails when a mutants exclusion excludes nothing
 cargo xtask package                          # release build, staged into the npm package in node/
 ```
 

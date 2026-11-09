@@ -1,0 +1,6 @@
+//! The repository's own tasks, as a library so each can be driven without the binary.
+
+pub mod generate;
+pub mod mutants;
+pub mod package;
+pub mod pre_push;

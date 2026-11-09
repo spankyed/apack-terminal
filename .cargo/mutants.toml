@@ -2,7 +2,9 @@
 # which `cargo xtask pre-push` and `.github/workflows/mutants.yml` both do: a whole-repository run is minutes
 # of mutants nobody edited, and a survivor outside the change is not this push's to answer for.
 
-# The tests themselves, and the repository's own tasks, which no suite of the broker's covers
+# The tests themselves, and the repository's own tasks. `xtask/` has cases of its own
+# (`xtask/tests/`) and is still not mutated here: the gate's subject is the broker, and mutating a task
+# would report survivors in code whose only caller is a developer typing its name
 exclude_globs = [
     "tests/**",
     "xtask/**",
@@ -57,7 +59,7 @@ exclude_re = [
     # `Win32::System::Threading`), so they are distinct single bits and `|` and `^` both ask `OpenProcess`
     # for 257. There is nothing to distinguish. Its sibling `| with &` asks for 0 and is caught, because a
     # handle opened with no access cannot be assigned to the job
-    "tree.rs:.*replace \| with \^ in Tree::owning",
+    "tree.rs:.*replace \\| with \\^ in Tree::owning",
 ]
 
 # **`src/tree.rs` is not excluded, and a whole-repository run on a Mac or on Linux will report its mutants

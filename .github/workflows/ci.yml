@@ -62,6 +62,15 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo xtask check-generated
+      # **The mutation gate's own exclusions, checked where every change is checked.** A pattern matching no
+      # mutant leaves the survivor it was written for reported while reading as a settled question, and the
+      # gate cannot notice that about itself. It belongs here rather than in `mutants.yml`, whose jobs are
+      # scoped to the Rust a change touches: an exclusion is edited in a `.toml`, which that scope skips.
+      # The binary is installed for this one step; `install-action` fetches a prebuilt one.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants@27.1.0
+      - run: cargo xtask check-exclusions
       - run: cargo test --workspace --doc
 
   # The suite on each platform the broker runs on. A pty, a process tree and a shell's own reports are the
