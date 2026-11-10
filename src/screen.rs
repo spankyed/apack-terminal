@@ -258,9 +258,8 @@ impl Screen {
         while whole_lines && above < held && self.terminal.row_wraps(scrollback - above - 1)? {
             above += 1;
         }
-        let count = (above + u32::from(self.rows)) as usize;
-        let mut lines = Vec::with_capacity(count);
-        let mut wrapped = Vec::with_capacity(count);
+        let mut lines = Vec::new();
+        let mut wrapped = Vec::new();
         for row in scrollback - above..scrollback + u32::from(self.rows) {
             let wraps = self.terminal.row_wraps(row)?;
             lines.push(self.row_text(row, wraps)?);
@@ -359,9 +358,12 @@ impl Screen {
         while row < snapshot.lines.len() {
             let start = row;
             let mut line = snapshot.lines[row].clone();
-            while snapshot.wrapped.get(row).copied().unwrap_or(false) && row + 1 < snapshot.lines.len() {
+            // A row that runs on is joined to the one below, for as long as there is one below
+            while snapshot.wrapped.get(row).copied().unwrap_or(false)
+                && let Some(below) = snapshot.lines.get(row + 1)
+            {
+                line.push_str(below);
                 row += 1;
-                line.push_str(&snapshot.lines[row]);
             }
             row += 1;
             let mut from = 0;

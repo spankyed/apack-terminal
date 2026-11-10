@@ -280,9 +280,10 @@ pub fn coalesce_within(
         } else {
             Some(flushed.map_or(Duration::ZERO, |at| window.saturating_sub(at.elapsed())))
         };
+        // A wait of nothing left is still asked of the queue: it answers `Timeout` when nothing is there,
+        // which is the flush, and hands over a chunk that already is
         let next = match wait {
             None => chunks.recv().map_err(|_| RecvTimeoutError::Disconnected),
-            Some(left) if left.is_zero() => Err(RecvTimeoutError::Timeout),
             Some(left) => chunks.recv_timeout(left),
         };
         match next {

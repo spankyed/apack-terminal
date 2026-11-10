@@ -288,3 +288,44 @@ fn the_rows_a_read_could_add_are_counted_from_its_bytes() {
     assert_eq!(rows_added(&[b'x'; 200], 80), 3, "two wraps in two hundred characters at eighty columns");
     assert_eq!(rows_added(&[b'\n'; 5], 0), 11, "a grid of no width is read as one column");
 }
+
+/// **A cell is known only when both of its sides are**, and a resize that knows neither changes nothing a
+/// program was told. Half a cell is not a size.
+#[test]
+fn a_cell_with_a_side_missing_is_not_a_cell() {
+    let mut screen = Screen::new(80, 24);
+    // Neither given, on a screen that has never been told: still nothing to report
+    screen.resize(80, 24, 0, 0);
+    assert_eq!(answered(&mut screen, b"\x1b[16t"), "", "a cell of nothing was reported as a size");
+
+    screen.resize(80, 24, 9, 18);
+    for (width, height) in [(0, 20), (10, 0)] {
+        screen.resize(80, 24, width, height);
+        assert_eq!(answered(&mut screen, b"\x1b[16t"), "\u{1b}[6;18;9t", "half a cell replaced a whole one");
+    }
+}
+
+/// The width a caller bounds a read by is the grid's, and follows a resize.
+#[test]
+fn the_width_is_the_grids() {
+    let mut screen = Screen::new(80, 24);
+    assert_eq!(screen.cols(), 80);
+    screen.resize(132, 24, 0, 0);
+    assert_eq!(screen.cols(), 132);
+}
+
+/// **A wrapped line is read from its start however far above the rows asked for that is**, and with real
+/// history above it: the row before the ones asked for is the one that says whether to reach further.
+#[test]
+fn a_wrapped_line_is_read_from_its_start_with_history_above_it() {
+    let mut screen = Screen::new(10, 2);
+    for line in 0..12 {
+        screen.feed(format!("old {line}\r\n").as_bytes());
+    }
+    // Four rows of one line, then two short lines that push all but its tail above the viewport
+    screen.feed(b"aaaaaaaaaaBBBBBBBBBBccccccccccDDDD\r\ny\r\n");
+
+    assert!(screen.shows_recently("aaBB", 1), "the line's first rows are above the one row asked for");
+    assert!(screen.shows_recently("ccDD", 1));
+    assert!(!screen.shows_recently("old 3", 1), "and nothing above the line's start is read");
+}
