@@ -16,6 +16,7 @@
     "index.js",
     "index.d.ts",
     "protocol.ts",
+    "view-vectors.json",
     "apack-terminal",
     "apack-terminal.exe"
   ],
