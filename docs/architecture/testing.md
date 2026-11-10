@@ -160,6 +160,13 @@ A survivor is answered one of two ways, and never left:
   fallback, so deleting the arm changes no answer. It is kept because it says ASCII is one byte, where `_`
   says *not a lead byte at all* — removing it to kill the mutant would make that comment wrong.
 
+**A property that can fail by chance makes the run's verdicts false.** `proptest` saves a failing case
+beside the test and replays it first on every later run, and cargo-mutants tests every mutant in one copy of
+the tree per job. So a property that fails once for an input the code handles correctly fails again for
+every mutant after it in that copy, and each of those is reported caught by a case that never looked at it.
+A property here holds for every input its strategy can produce; when a run's logs show one test failing
+across mutants it cannot reach, that test is the defect and the run is not a result.
+
 `.github/workflows/mutants.yml` runs the same thing on a pull request and fails on a survivor. It runs twice:
 Windows-only code compiles on no other platform, so a Linux run reports every mutant of `src/tree.rs` and of
 every `cfg(windows)` arm as unviable, and the Windows job is where those are actually tested.

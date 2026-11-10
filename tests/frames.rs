@@ -220,7 +220,9 @@ proptest! {
             Frame::Malformed(_) => MALFORMED_BIT,
             // A byte mutation can leave the line invalid UTF-8, which the reader cannot hand on as text
             Frame::Ended => ENDED_BIT,
-            // A mutation cannot reach the cap, and at least one byte is always kept
+            // A line break put first is an empty line ahead of the frame, which the loop reads past
+            Frame::Blank if written.first() == Some(&b'\n') => return Ok(()),
+            // A mutation cannot reach the cap, and nothing else leaves a line with nothing on it
             other => return Err(TestCaseError::fail(format!("a mutated frame read as {}", kind_of(&other)))),
         };
         MUTATED_KINDS.fetch_or(bit, Ordering::Relaxed);
