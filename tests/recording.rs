@@ -204,3 +204,38 @@ fn a_replay_tells_nobody_anything_and_a_restored_screen_is_ready_for_a_shell() {
     assert!(!restored.mouse_reported().expect("the modes read"));
     assert!(restored.take_effects().is_empty());
 }
+
+/// A shell that was not inside an application is left where it was: its cursor under what it printed,
+/// however long ago some program saved a cursor position of its own.
+#[test]
+fn a_restored_shell_screen_keeps_its_cursor_under_what_was_printed() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let path = directory.path().join("one.recording");
+    let mut live = Screen::new(40, 10);
+    live.start_recording(&path).expect("the recording starts");
+    // A cursor saved on the first row, as a prompt theme does, and then four lines printed under it
+    live.feed(b"first\x1b7\r\nsecond\r\nthird\r\nfourth\r\n$ ");
+
+    let mut restored = Screen::new(40, 10);
+    assert!(restored.resume_recording(&path).expect("the recording is picked up"));
+    let snapshot = restored.snapshot(0);
+    assert_eq!(snapshot.lines[..5], ["first", "second", "third", "fourth", "$"]);
+    assert_eq!((snapshot.cursor_row, snapshot.cursor_column), (5, 0), "the new shell would draw over what is there");
+}
+
+/// A session ended on purpose stops writing its recording at once, so whatever its program prints on the
+/// way out cannot land in a file the next session has already picked up.
+#[test]
+fn a_recording_that_was_stopped_is_written_no_more() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let path = directory.path().join("one.recording");
+    let mut ending = Screen::new(40, 10);
+    ending.start_recording(&path).expect("the recording starts");
+    ending.feed(b"kept\r\n");
+    ending.stop_recording();
+    let before = std::fs::read(&path).expect("the recording reads");
+    ending.feed(b"printed on the way out\r\n");
+    ending.resize(50, 12, 0, 0);
+    assert!(std::fs::read(&path).expect("the recording reads") == before);
+    assert!(!ending.recorded());
+}

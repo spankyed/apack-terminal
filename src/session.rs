@@ -911,6 +911,11 @@ impl Sessions {
         // that ends it
         live.flow.close();
         end_views(&live);
+        // Its reader goes on until the pty closes, and the session that replaces this one may pick its
+        // recording up before then
+        if let Ok(mut screen) = live.screen.lock() {
+            screen.stop_recording();
+        }
         live.killer.kill().map_err(|error| Refusal::pty("killing a session", error))
     }
 

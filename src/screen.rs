@@ -302,6 +302,12 @@ impl Screen {
         Ok(true)
     }
 
+    /// Stops recording. For a session that is being ended: whatever its program still prints on its way
+    /// out must not be written into a file the session replacing it has already picked up.
+    pub fn stop_recording(&mut self) {
+        self.recorder = None;
+    }
+
     /// Whether what is fed here is being recorded.
     pub fn recorded(&self) -> bool {
         self.recorder.is_some()
@@ -426,11 +432,16 @@ impl Screen {
     /// the mouse was being reported, that the keypad was in application mode — and would be typed at
     /// through all of it.
     pub fn settle_restored(&mut self) {
-        // Out of the alternate screen; no mouse reporting, bracketed paste or focus reports; a soft reset
-        // for the rest (keypad, cursor keys, margins, attributes); the cursor shown, on a fresh line
-        self.feed(
-            b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[!p\x1b[?25h\x1b[0m\r\n",
-        );
+        // **Out of the alternate screen only when on it.** Leaving it also puts the cursor back where it
+        // was saved, which is right for an application that was showing — that is where the shell's cursor
+        // was — and wrong for a shell that was not in one: the cursor would go to wherever some program
+        // last saved it, and the new shell would draw over what the last one printed.
+        if self.terminal.alt_screen().unwrap_or(false) {
+            self.feed(b"\x1b[?1049l");
+        }
+        // No mouse reporting, bracketed paste or focus reports; a soft reset for the rest (keypad, cursor
+        // keys, margins, attributes); the cursor shown, on a fresh line
+        self.feed(b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[!p\x1b[?25h\x1b[0m\r\n");
         self.reported.forget_the_shell();
     }
 
