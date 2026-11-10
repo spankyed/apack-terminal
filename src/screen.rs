@@ -16,6 +16,7 @@ use std::sync::mpsc::Sender;
 
 use crate::view::publish::{Publication, ViewId};
 use crate::view::wire::Block;
+use crate::vt::input::{self, Encoders, Key, Pasted, Pointer};
 use crate::vt::rows::{RowRead, Space};
 use crate::vt::{Failed, Reported, Terminal};
 
@@ -130,6 +131,8 @@ pub struct Screen {
     rows: u16,
     /// One cell in pixels, as the window drawing this session measured it. Zero until one has.
     cell: (u16, u16),
+    /// The core's input encoders, from the first input a view sends.
+    encoders: Option<Encoders>,
     /// What this session's views have been sent, from the first one that attaches. A session nothing
     /// views keeps none, so being viewable costs a session that is not viewed nothing.
     publication: Option<Publication>,
@@ -180,7 +183,16 @@ impl Screen {
         // SAFETY: the box outlives the handle, which this struct's field order guarantees
         unsafe { terminal.route_reports(&raw mut *reported) }?;
 
-        Ok(Self { terminal, reported, markers: Markers::default(), cols, rows, cell: (0, 0), publication: None })
+        Ok(Self {
+            terminal,
+            reported,
+            markers: Markers::default(),
+            cols,
+            rows,
+            cell: (0, 0),
+            encoders: None,
+            publication: None,
+        })
     }
 
     /// Feeds bytes as they arrived.
@@ -232,6 +244,48 @@ impl Screen {
             cell_width,
             cell_height,
         }));
+    }
+
+    fn encoders(&mut self) -> Result<&mut Encoders, Failed> {
+        if self.encoders.is_none() {
+            self.encoders = Some(Encoders::new()?);
+        }
+        // Just filled, so the error is unreachable; it keeps this from being a panic if that changes
+        self.encoders.as_mut().ok_or(Failed { call: "ghostty_key_encoder_new", code: 0 })
+    }
+
+    /// What a key sends the program now, given the modes it has set.
+    pub fn key(&mut self, key: &Key<'_>) -> Result<Vec<u8>, Failed> {
+        self.encoders()?;
+        match &mut self.encoders {
+            Some(encoders) => encoders.key(&self.terminal, key),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Whether the option key is alt for this session's keys, which on a Mac it is not unless chosen.
+    pub fn set_option_as_alt(&mut self, as_alt: bool) -> Result<(), Failed> {
+        self.encoders()?.set_option_as_alt(as_alt);
+        Ok(())
+    }
+
+    /// What the pointer sends the program now, which is nothing unless it asked for the mouse.
+    pub fn pointer(&mut self, pointer: &Pointer) -> Result<Vec<u8>, Failed> {
+        self.encoders()?;
+        match &mut self.encoders {
+            Some(encoders) => encoders.pointer(&self.terminal, pointer),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Pasted text as the program should receive it, or a refusal when it could run a command.
+    pub fn paste(&self, text: &str, allow_unsafe: bool) -> Result<Pasted, Failed> {
+        input::paste(&self.terminal, text, allow_unsafe)
+    }
+
+    /// What the program is told about its terminal gaining or losing focus.
+    pub fn focus(&self, gained: bool) -> Result<Vec<u8>, Failed> {
+        input::focus(&self.terminal, gained)
     }
 
     /// Starts sending a view this session's frames through `sink`, beginning with the whole screen.
