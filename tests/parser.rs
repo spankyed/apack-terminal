@@ -100,7 +100,7 @@ fn an_alternate_screen_survives_a_resize() {
     screen.feed(b"\x1b[?1049h\x1b[2J\x1b[HTUI content here");
     assert!(screen.snapshot(0).alt_screen, "the alternate screen is showing");
 
-    screen.resize(20, 5);
+    screen.resize(20, 5, 0, 0);
     let resized = screen.snapshot(0);
     assert_screen_holds(&resized.lines, "TUI content");
     assert!(resized.alt_screen, "still on the alternate screen after a resize");

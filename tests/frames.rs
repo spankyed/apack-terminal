@@ -22,7 +22,7 @@ use std::io::BufReader;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use apack_terminal::frames::{Frame, MAX_FRAME_BYTES, read_frame};
-use apack_terminal::protocol::{Request, Role, Until};
+use apack_terminal::protocol::{Colors, Request, Role, Until};
 use proptest::prelude::*;
 
 /// Read one frame out of a buffer, as the broker's loop does.
@@ -77,22 +77,38 @@ fn requests() -> impl Strategy<Value = Request> {
             proptest::collection::vec(("[A-Z_]{1,8}", "[^\u{0}]{0,10}"), 0..4),
             proptest::collection::vec("[A-Z_]{1,8}", 0..4),
             proptest::option::of("[^\u{0}]{0,20}"),
+            proptest::option::of((
+                any::<[u8; 3]>(),
+                any::<[u8; 3]>(),
+                proptest::option::of(any::<[u8; 3]>()),
+                proptest::collection::vec(any::<[u8; 3]>(), 0..17),
+            )),
         )
-            .prop_map(|(cols, rows, shell, args, env, unset, cwd)| Request::Spawn {
+            .prop_map(|(cols, rows, shell, args, env, unset, cwd, colors)| Request::Spawn {
                 cols,
                 rows,
                 shell,
                 args,
                 env,
                 unset,
-                cwd
+                cwd,
+                colors: colors.map(|(foreground, background, cursor, ansi)| Colors {
+                    foreground,
+                    background,
+                    cursor,
+                    ansi
+                }),
             }),
         ("[^\u{0}]{0,40}", "(?s).{0,40}").prop_map(|(session, text)| Request::Write { session, text }),
-        ("[^\u{0}]{0,40}", any::<u16>(), any::<u16>()).prop_map(|(session, cols, rows)| Request::Resize {
-            session,
-            cols,
-            rows
-        }),
+        ("[^\u{0}]{0,40}", any::<u16>(), any::<u16>(), any::<u16>(), any::<u16>()).prop_map(
+            |(session, cols, rows, cell_width, cell_height)| Request::Resize {
+                session,
+                cols,
+                rows,
+                cell_width,
+                cell_height
+            }
+        ),
         ("[^\u{0}]{0,40}", any::<u32>()).prop_map(|(session, history)| Request::Screen { session, history }),
         "[^\u{0}]{0,40}".prop_map(|session| Request::Facts { session }),
         ("[^\u{0}]{0,40}", "(?s).{0,20}", any::<u32>()).prop_map(|(session, text, history)| Request::Search {

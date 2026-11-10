@@ -7,22 +7,22 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::{Sender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
-use crate::output::{Credit, Flow, Outgoing, coalesce};
+use crate::output::{Credit, Flow, Outgoing, READ_AHEAD, coalesce};
 use crate::protocol::{ErrorCode, Event, Foreground, Scope, SessionId, Signal, Until, WaitOutcome};
-use crate::screen::{Facts, HISTORY_LINES, Match, Screen, Snapshot};
+use crate::screen::{Colors, Facts, HISTORY_LINES, Match, Screen, Snapshot};
 use crate::tree::Tree;
 
 /// A running session: the master side of its pty, its child, and the thread reading its output.
 struct Session {
     master: Box<dyn MasterPty + Send>,
     /// Shared with the reader thread, which writes the terminal's own replies back through it — see
-    /// `Replies` in `screen.rs` for why a session that answers nothing does not start on Windows
+    /// `route_reports` in `vt/mod.rs` for why a session that answers nothing does not start on Windows
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     /// How a session is ended from here. **The child itself belongs to the thread waiting on it**, which is
     /// what lets that wait block: a killer is a handle of its own, so ending a session never queues behind
@@ -62,20 +62,23 @@ struct Waiter {
 impl Waiter {
     /// Whether the condition holds now. `Exit` is not asked here: nothing a screen holds says a process
     /// ended, so that one is settled by the thread that waits on the child.
-    fn holds(&self, screen: &Screen) -> bool {
+    ///
+    /// **`recent` is how far above the viewport a `Text` wait looks**, and it is what keeps a wait from
+    /// costing the whole history on every read. A caller waiting for text means text that has been
+    /// written rather than text still on screen, so the first ask covers everything held; after that a
+    /// read can only have changed the viewport and the rows it scrolled off, and the reader says how many
+    /// those could be. With no `Text` waiter nothing searches at all.
+    fn holds(&self, screen: &Screen, recent: u32) -> bool {
         match &self.until {
             Until::Idle => !screen.facts().running,
-            // The whole history, because a caller waiting for text means text that has been written rather
-            // than text still on screen. **The cost is confined to an outstanding wait**: with no `Text`
-            // waiter nothing searches, so a session nobody is waiting on pays nothing per read.
-            Until::Text { text } => !screen.search(text, HISTORY_LINES as u32).is_empty(),
+            Until::Text { text } => screen.shows_recently(text, recent),
             Until::Exit => false,
         }
     }
 }
 
 /// Settles the waits the screen now satisfies, answering each once. The count is what to report.
-fn settle_met(waiters: &Mutex<Vec<Waiter>>, screen: &Screen) -> usize {
+fn settle_met(waiters: &Mutex<Vec<Waiter>>, screen: &Screen, recent: u32) -> usize {
     let Ok(mut waiters) = waiters.lock() else {
         return 0;
     };
@@ -84,7 +87,7 @@ fn settle_met(waiters: &Mutex<Vec<Waiter>>, screen: &Screen) -> usize {
         if waiter.settled.load(Ordering::SeqCst) {
             return false;
         }
-        if waiter.holds(screen) {
+        if waiter.holds(screen, recent) {
             waiter.settled.store(true, Ordering::SeqCst);
             met += 1;
             return false;
@@ -92,6 +95,18 @@ fn settle_met(waiters: &Mutex<Vec<Waiter>>, screen: &Screen) -> usize {
         true
     });
     met
+}
+
+/// The most rows a run of `bytes` can have scrolled off a grid `cols` wide.
+///
+/// A row leaves the viewport when a line feed moves past its last row or a character wraps there, so the
+/// bound is every line feed plus every wrap the bytes could have caused if each were a character — and
+/// one more, for the row the cursor was already on. It is a ceiling: most bytes in a real stream are
+/// escape sequences and continuation bytes that add no row.
+pub fn rows_added(bytes: &[u8], cols: u16) -> u32 {
+    let feeds = bytes.iter().filter(|byte| **byte == b'\n').count();
+    let wraps = bytes.len() / usize::from(cols.max(1));
+    u32::try_from(feeds + wraps + 1).unwrap_or(u32::MAX)
 }
 
 /// The pty's foreground process group, and what that process is called.
@@ -398,6 +413,8 @@ pub struct Spawning {
     pub env: Vec<(String, String)>,
     pub unset: Vec<String>,
     pub cwd: Option<String>,
+    /// What the session is drawn in, when the caller knows.
+    pub colors: Option<Colors>,
 }
 
 /// A failure a request turns into a `Failed` event rather than a panic.
@@ -464,7 +481,7 @@ impl Sessions {
 
     /// Starts a shell in a new pty and begins reading it. The id is the broker's to mint.
     pub fn spawn(&mut self, asked: Spawning) -> Result<(SessionId, u32), Refusal> {
-        let Spawning { cols, rows, shell, args, env, unset, cwd } = asked;
+        let Spawning { cols, rows, shell, args, env, unset, cwd, colors } = asked;
         let (cols, rows) = grid(cols, rows);
         let pty = native_pty_system()
             .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
@@ -508,16 +525,23 @@ impl Sessions {
         let session = format!("s-{}", self.next);
         let pid = child.process_id().unwrap_or_default();
 
-        // One thread per session, which is what the skeleton needs; bounded I/O and backpressure are
-        // Phase B's, and the goal says so rather than leaving it to be discovered here.
         // **The reader does not decide what a message is.** It hands what one `read` returned to the
-        // coalescer, which flushes on a window or a cap — so N bytes of output no longer means N messages,
-        // which is F4. The internal hop is unbounded on purpose: the bound belongs at the coalescer, where
-        // credit is spent, and a reader blocked on this queue could not notice EOF.
-        let (chunks, incoming) = channel::<Vec<u8>>();
+        // coalescer, which flushes on a window or a cap — so N bytes of output is not N messages.
+        //
+        // **The hop is bounded, and that is what makes a slow consumer the program's problem rather than
+        // this process's.** When the coalescer is out of credit it stops taking chunks, this queue fills,
+        // the reader blocks on it and stops reading the pty, and the program blocks on its own write. An
+        // unbounded queue here grew by everything a program wrote while its consumer was stalled. A reader
+        // blocked on it still ends: the exit is waited for on the child, and the coalescer drains what is
+        // queued whenever credit returns.
+        let (chunks, incoming) = sync_channel::<Vec<u8>>(READ_AHEAD);
         let events = self.events.clone();
         let reading = session.clone();
-        let screen = Arc::new(Mutex::new(Screen::new(cols, rows)));
+        let mut screen = Screen::new(cols, rows);
+        if let Some(colors) = &colors {
+            screen.set_colors(colors);
+        }
+        let screen = Arc::new(Mutex::new(screen));
         let flow = Flow::reading();
         let parsing = Arc::clone(&screen);
         let waiters: Arc<Mutex<Vec<Waiter>>> = Arc::new(Mutex::new(Vec::new()));
@@ -528,12 +552,6 @@ impl Sessions {
         let waited = session.clone();
         let exiting = self.events.clone();
 
-        // One thread per session, which is what the skeleton needs; bounded I/O and backpressure are
-        // Phase B's, and the goal says so rather than leaving it to be discovered here.
-        // **The reader does not decide what a message is.** It hands what one `read` returned to the
-        // coalescer, which flushes on a window or a cap — so N bytes of output no longer means N messages,
-        // which is F4. The internal hop is unbounded on purpose: the bound belongs at the coalescer, where
-        // credit is spent, and a reader blocked on this queue could not notice EOF.
         std::thread::spawn({
             let session = session.clone();
             let events = events.clone();
@@ -561,7 +579,8 @@ impl Sessions {
                             Ok(mut screen) => {
                                 screen.feed(&buffer[..read]);
                                 let replies = screen.take_replies();
-                                let met = settle_met(&waiting, &screen);
+                                let recent = rows_added(&buffer[..read], screen.cols());
+                                let met = settle_met(&waiting, &screen, recent);
                                 (replies, met)
                             }
                             Err(_) => (Vec::new(), 0),
@@ -645,15 +664,23 @@ impl Sessions {
             .map_err(|error| Refusal::pty("writing to a pty", error))
     }
 
-    pub fn resize(&mut self, session: &str, cols: u16, rows: u16) -> Outcome {
+    /// `cell_width` and `cell_height` are one cell in pixels as the window measured it, or zero from a
+    /// caller that measures nothing.
+    pub fn resize(&mut self, session: &str, cols: u16, rows: u16, cell_width: u16, cell_height: u16) -> Outcome {
         let (cols, rows) = grid(cols, rows);
         let live = self.live.get_mut(session).ok_or_else(|| missing(session))?;
         live.master
-            .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .resize(PtySize {
+                rows,
+                cols,
+                // The pty carries the same fact for a program that asks the kernel rather than the terminal
+                pixel_width: cols.saturating_mul(cell_width),
+                pixel_height: rows.saturating_mul(cell_height),
+            })
             .map_err(|error| Refusal::pty("resizing a pty", error))?;
         // The screen is resized too, or the authority would describe a viewport the process no longer has
         if let Ok(mut screen) = live.screen.lock() {
-            screen.resize(cols, rows);
+            screen.resize(cols, rows, cell_width, cell_height);
         }
         Ok(())
     }
@@ -743,7 +770,7 @@ impl Sessions {
                 .screen
                 .lock()
                 .map_err(|_| Refusal::pty("waiting on a session", "the screen's lock was poisoned"))?;
-            waiter.holds(&screen)
+            waiter.holds(&screen, HISTORY_LINES as u32)
         };
         if holds {
             settled.store(true, Ordering::SeqCst);
@@ -792,8 +819,8 @@ impl Sessions {
     /// the broker is the backstop for an app that quits, crashes or is killed, and the app's own `killAll`
     /// is only the orderly path.
     ///
-    /// Sessions outliving their client is Phase B's, and nothing here is shaped to prevent it: this is where
-    /// that policy will be stated instead of assumed.
+    /// Whether a client leaving ends its sessions is `Role`'s question (`main.rs`); this is what it calls
+    /// when the answer is yes.
     pub fn end_all(&mut self) {
         for (_, mut live) in self.live.drain() {
             live.flow.close();

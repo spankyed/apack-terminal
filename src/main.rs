@@ -21,7 +21,7 @@ use interprocess::local_socket::{GenericFilePath, ListenerOptions, Stream, ToFsN
 use apack_terminal::frames::{Frame, read_frame};
 use apack_terminal::output::{Outgoing, channel_with_credit};
 use apack_terminal::protocol::{ErrorCode, Event, PROTOCOL_VERSION, Request, Role, SearchMatch};
-use apack_terminal::screen::HISTORY_LINES;
+use apack_terminal::screen::{Colors, HISTORY_LINES};
 use apack_terminal::session::{Sessions, Spawning};
 
 fn main() -> std::io::Result<()> {
@@ -284,8 +284,14 @@ fn carry_out(sessions: &Arc<Mutex<Sessions>>, request: Request) {
     };
     let outcome = match request {
         Request::Hello { .. } => return,
-        Request::Spawn { cols, rows, shell, args, env, unset, cwd } => {
-            match live.spawn(Spawning { cols, rows, shell, args, env, unset, cwd }) {
+        Request::Spawn { cols, rows, shell, args, env, unset, cwd, colors } => {
+            let colors = colors.map(|colors| Colors {
+                foreground: colors.foreground,
+                background: colors.background,
+                cursor: colors.cursor,
+                ansi: colors.ansi,
+            });
+            match live.spawn(Spawning { cols, rows, shell, args, env, unset, cwd, colors }) {
                 Ok((session, pid)) => {
                     live.answer(Event::Spawned { session, pid });
                     Ok(())
@@ -294,8 +300,8 @@ fn carry_out(sessions: &Arc<Mutex<Sessions>>, request: Request) {
             }
         }
         Request::Write { session, text } => live.write(&session, &text).map_err(|refusal| (Some(session), refusal)),
-        Request::Resize { session, cols, rows } => {
-            live.resize(&session, cols, rows).map_err(|refusal| (Some(session), refusal))
+        Request::Resize { session, cols, rows, cell_width, cell_height } => {
+            live.resize(&session, cols, rows, cell_width, cell_height).map_err(|refusal| (Some(session), refusal))
         }
         Request::Pause { session } => live.pause(&session).map_err(|refusal| (Some(session), refusal)),
         Request::Resume { session } => live.resume(&session).map_err(|refusal| (Some(session), refusal)),
@@ -307,6 +313,7 @@ fn carry_out(sessions: &Arc<Mutex<Sessions>>, request: Request) {
                 live.answer(Event::Screen {
                     session,
                     lines: snapshot.lines,
+                    wrapped: snapshot.wrapped,
                     cursor_row: snapshot.cursor_row,
                     cursor_column: snapshot.cursor_column,
                     alt_screen: snapshot.alt_screen,

@@ -1,9 +1,9 @@
-//! The terminal capability's screen: the same bytes the renderer draws, parsed here as the authority.
+//! The terminal capability's screen: the same bytes the window draws, parsed here as the authority.
 //!
-//! **Both sides parse, and only one is right** (D9). The renderer keeps xterm.js because it owns interaction
-//! — selection, reflow, IME — and nothing in the app may read that copy as a fact. This is the copy facts
-//! come from, and it exists whether or not a window is alive to hold one, which is the whole gain the
-//! refactor was for: a hidden session still has a screen.
+//! **Both sides parse, and only one is right.** The window keeps an emulator of its own because it owns
+//! interaction — selection, scrolling, text input — and nothing in the app may read that copy as a fact.
+//! This is the copy facts come from, and it exists whether or not a window is alive to hold one: a hidden
+//! session still has a screen, and a program that asks the terminal a question is answered from here.
 //!
 //! **What this is not.** It holds no agent status rules and no policy — no notion of an agent being busy or
 //! idle, no rule that reads a drawn screen and decides what a program is doing. It is a grid, a cursor,
@@ -17,9 +17,8 @@ use crate::vt::{Failed, Reported, Terminal};
 /// Lines of scrollback a session keeps.
 ///
 /// **Declared rather than derived, and it is a ceiling on memory per session**: 1,000 lines of 80 columns is
-/// about 80k cells, and a cell is wider than a byte. The renderer's own scrollback is 10,000 lines and is
-/// not this number's business — that copy is a bounded replica serving one window's scrollbar, while this one
-/// serves a reattach and a bounded read, and the two have no reason to agree.
+/// about 80k cells, and a cell is wider than a byte. It is also the number a client is told in the
+/// handshake, so a window sizes its own scrollback from this rather than from a constant of its own.
 pub const HISTORY_LINES: usize = 1_000;
 
 /// What the core is *asked* for, which is deliberately more than is promised.
@@ -80,11 +79,13 @@ pub struct Facts {
 /// Where a search found what it was asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Match {
-    /// Into the lines the same request would answer, oldest first.
+    /// The row the matching line starts on, into the lines the same request's `snapshot` would answer.
     pub line: u32,
-    /// Where in that line the match starts, in characters.
+    /// Where in that line the match starts, in characters, counted from the line's start — which is past
+    /// the grid's width for a match on a row the line wrapped onto.
     pub column: u32,
-    /// The whole line, so a caller matching a prompt or an error sees its context without a second read.
+    /// The whole line, wrapped rows joined, so a caller matching a prompt or an error sees its context
+    /// without a second read.
     pub text: String,
 }
 
@@ -95,6 +96,9 @@ pub struct Snapshot {
     /// because a terminal row is space-padded to its width and those spaces are the grid's shape rather
     /// than the program's output.
     pub lines: Vec<String>,
+    /// For each line, whether it runs on into the next: a line longer than the grid is wide is drawn over
+    /// several rows, and this is what says they are one line. Always as long as `lines`.
+    pub wrapped: Vec<bool>,
     /// Within the viewport, so `0` is its first line however much history came with it.
     pub cursor_row: u16,
     pub cursor_column: u16,
@@ -113,12 +117,27 @@ pub struct Screen {
     /// Boxed because its address is what the library was handed.
     reported: Box<Reported>,
     /// **The sequences the core does not read.** It reports OSC 133 and the working directory; this scans
-    /// OSC 633, which is VS Code's shell integration and which no version of the core reads. Measured in
-    /// Phase 0a: the two families are disjoint, so the union is strictly more than either and neither
-    /// double-reports a fact the other already has.
+    /// OSC 633, which is VS Code's shell integration and which no version of the core reads. The two
+    /// families are disjoint, so the union is strictly more than either and neither double-reports a fact
+    /// the other already has (`tests/conformance.rs`).
     markers: Markers,
     cols: u16,
     rows: u16,
+    /// One cell in pixels, as the window drawing this session measured it. Zero until one has.
+    cell: (u16, u16),
+}
+
+/// DEC private mode 2027: a character made of several code points occupies the cells of one character.
+const GRAPHEME_CLUSTERING: u16 = 2027;
+
+/// The colours a session is drawn in, which is what it answers when a program asks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Colors {
+    pub foreground: [u8; 3],
+    pub background: [u8; 3],
+    pub cursor: Option<[u8; 3]>,
+    /// The first entries of the palette — the sixteen a theme names. Shorter leaves the rest alone.
+    pub ansi: Vec<[u8; 3]>,
 }
 
 impl Screen {
@@ -126,12 +145,19 @@ impl Screen {
         Self::build(cols, rows).expect("libghostty-vt could not make a terminal")
     }
 
-    /// **Three settings, each a default the core and this broker do not share.**
+    /// **Five settings, each a default the core and this broker do not share.**
     ///
     /// The core keeps *no* scrollback limit of its own, where `HISTORY_LINES` is a ceiling on memory per
     /// session; its byte ceiling has no counterpart here, so the line limit is left as the only rule
     /// bounding history; and the advertised terminal has to be the one the pty says, because a program
     /// decides what to emit from `TERM` and answers a query differently when told something else.
+    ///
+    /// **The last two are about the window, which is what draws the session.** An emoji built from
+    /// several code points is one character there, so it has to be one here: with clustering off this
+    /// screen put the cursor four columns further right after a family emoji than the window drew it, and
+    /// the cursor position a program is told comes from this screen. And the window draws no images, so
+    /// the image protocol is off rather than answered `OK` on behalf of a renderer that would show
+    /// nothing.
     fn build(cols: u16, rows: u16) -> Result<Self, Failed> {
         let cols = cols.max(1);
         let rows = rows.max(1);
@@ -139,12 +165,14 @@ impl Screen {
         terminal.set_scrollback_lines(SCROLLBACK_ASKED)?;
         terminal.set_scrollback_unbounded_bytes()?;
         terminal.set_terminfo_name(TERMINFO_NAME)?;
+        terminal.set_mode(GRAPHEME_CLUSTERING, true)?;
+        terminal.refuse_images()?;
 
         let mut reported = Box::new(Reported::default());
         // SAFETY: the box outlives the handle, which this struct's field order guarantees
         unsafe { terminal.route_reports(&raw mut *reported) }?;
 
-        Ok(Self { terminal, reported, markers: Markers::default(), cols, rows })
+        Ok(Self { terminal, reported, markers: Markers::default(), cols, rows, cell: (0, 0) })
     }
 
     /// Feeds bytes as they arrived.
@@ -172,10 +200,34 @@ impl Screen {
         self.reported.take_replies()
     }
 
-    pub fn resize(&mut self, cols: u16, rows: u16) {
+    /// The grid changed, and perhaps the size of a cell with it.
+    ///
+    /// **A cell size of zero means the caller does not know one, and the last one known stands.** Only a
+    /// window measures a cell, and not every resize comes from one.
+    pub fn resize(&mut self, cols: u16, rows: u16, cell_width: u16, cell_height: u16) {
         self.cols = cols.max(1);
         self.rows = rows.max(1);
-        let _ = self.terminal.resize(self.cols, self.rows);
+        if cell_width > 0 && cell_height > 0 {
+            self.cell = (cell_width, cell_height);
+        }
+        let (cell_width, cell_height) = self.cell;
+        let _ = self.terminal.resize(self.cols, self.rows, cell_width, cell_height);
+        self.reported.set_size((cell_width > 0).then_some(crate::vt::Size {
+            cols: self.cols,
+            rows: self.rows,
+            cell_width,
+            cell_height,
+        }));
+    }
+
+    /// The grid's width, which bounds how many rows a run of bytes can have added.
+    pub fn cols(&self) -> u16 {
+        self.cols
+    }
+
+    /// What this session is drawn in, so a program asking for a colour hears the one on the screen.
+    pub fn set_colors(&mut self, colors: &Colors) {
+        let _ = self.terminal.set_colors(colors.foreground, colors.background, colors.cursor, &colors.ansi);
     }
 
     /// The viewport, with up to `history` lines above it.
@@ -185,27 +237,38 @@ impl Screen {
     /// alternate screen has no scrollback, so a history request over one answers the viewport alone, which
     /// is the terminal's behaviour rather than a limitation of this read.
     pub fn snapshot(&self, history: u32) -> Snapshot {
-        self.read(history).unwrap_or_else(|_| Snapshot {
+        self.read(history, false).unwrap_or_else(|_| Snapshot {
             lines: vec![String::new(); self.rows as usize],
+            wrapped: vec![false; self.rows as usize],
             cursor_row: 0,
             cursor_column: 0,
             alt_screen: false,
         })
     }
 
-    fn read(&self, history: u32) -> Result<Snapshot, Failed> {
+    /// `whole_lines` reaches further up than `history` when the first row asked for is the middle of a
+    /// wrapped line, so that line is read from its start.
+    fn read(&self, history: u32, whole_lines: bool) -> Result<Snapshot, Failed> {
         let scrollback = self.terminal.scrollback_rows()?;
         // **Never more than was promised.** The core holds more than `HISTORY_LINES` most of the time, by
         // the page arithmetic above; answering with it would show a window lines its own scrollbar was
         // never sized for, and the broker's handshake is the one number both sides agree on.
         let held = scrollback.min(u32::try_from(HISTORY_LINES).unwrap_or(u32::MAX));
-        let above = history.min(held);
-        let mut lines = Vec::with_capacity((above + u32::from(self.rows)) as usize);
+        let mut above = history.min(held);
+        while whole_lines && above < held && self.terminal.row_wraps(scrollback - above - 1)? {
+            above += 1;
+        }
+        let count = (above + u32::from(self.rows)) as usize;
+        let mut lines = Vec::with_capacity(count);
+        let mut wrapped = Vec::with_capacity(count);
         for row in scrollback - above..scrollback + u32::from(self.rows) {
-            lines.push(self.row_text(row)?);
+            let wraps = self.terminal.row_wraps(row)?;
+            lines.push(self.row_text(row, wraps)?);
+            wrapped.push(wraps);
         }
         Ok(Snapshot {
             lines,
+            wrapped,
             cursor_row: self.terminal.cursor_row()?,
             cursor_column: self.terminal.cursor_column()?,
             alt_screen: self.terminal.alt_screen()?,
@@ -214,22 +277,20 @@ impl Screen {
 
     /// One row as text.
     ///
-    /// **A wide character occupies two cells and the second holds no codepoint of its own**, which read as
-    /// text gives `日 本 語`. Drawn that is right — the glyph is two columns wide — but reading as text is
+    /// **A wide character occupies two cells and the second holds no character of its own**, which read
+    /// as text gives `日 本 語`. Drawn that is right — the glyph is two columns wide — but reading as text is
     /// what this is for: a bounded screen read an agent matches against must see what was written. So both
     /// spacer kinds are skipped, and the trailing padding a row carries to its full width goes with them,
     /// being the grid's shape rather than the program's output.
-    fn row_text(&self, row: u32) -> Result<String, Failed> {
+    ///
+    /// **A row that wraps keeps its trailing spaces**, because there they are the program's: the row is
+    /// full, the line goes on below, and dropping them would join two words that had a space between.
+    fn row_text(&self, row: u32, wraps: bool) -> Result<String, Failed> {
         let mut text = String::with_capacity(self.cols as usize);
         for column in 0..self.cols {
-            let Some(cell) = self.terminal.cell(column, row)? else { continue };
-            if self.terminal.cell_is_spacer(cell)? {
-                continue;
-            }
-            let codepoint = self.terminal.cell_codepoint(cell)?;
-            text.push(char::from_u32(codepoint).filter(|found| *found != '\0').unwrap_or(' '));
+            self.terminal.push_cell_text(column, row, &mut text)?;
         }
-        while text.ends_with(' ') {
+        while !wraps && text.ends_with(' ') {
             text.pop();
         }
         Ok(text)
@@ -273,14 +334,41 @@ impl Screen {
         if text.is_empty() {
             return Vec::new();
         }
-        let snapshot = self.snapshot(history);
+        Self::matches(text, &self.snapshot(history))
+    }
+
+    /// Whether `text` is in the viewport or the `recent` rows above it, reading a wrapped line whole.
+    ///
+    /// **For a wait, which asks after every read and must not pay for the whole history each time.** A
+    /// read can only have changed the viewport and whatever it scrolled off, so the caller passes how many
+    /// rows that could be and this looks no further. It reaches up to the start of a wrapped line because
+    /// a match may begin above the rows that changed.
+    pub fn shows_recently(&self, text: &str, recent: u32) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+        self.read(recent, true).is_ok_and(|snapshot| !Self::matches(text, &snapshot).is_empty())
+    }
+
+    /// **Matched against lines as they were written, not rows as they were drawn.** Rows a line wrapped
+    /// onto are joined before the search, so a path that reached the right edge is found whole. `line` is
+    /// the row the line starts on, `column` counts from there, and `text` is the whole line.
+    fn matches(text: &str, snapshot: &Snapshot) -> Vec<Match> {
         let mut found = Vec::new();
-        for (index, line) in snapshot.lines.iter().enumerate() {
+        let mut row = 0;
+        while row < snapshot.lines.len() {
+            let start = row;
+            let mut line = snapshot.lines[row].clone();
+            while snapshot.wrapped.get(row).copied().unwrap_or(false) && row + 1 < snapshot.lines.len() {
+                row += 1;
+                line.push_str(&snapshot.lines[row]);
+            }
+            row += 1;
             let mut from = 0;
             while let Some(at) = line[from..].find(text) {
                 let byte = from + at;
                 found.push(Match {
-                    line: index as u32,
+                    line: start as u32,
                     // Characters rather than bytes: a caller counting columns on a screen counts what was
                     // drawn, and a multi-byte character is one column of it
                     column: line[..byte].chars().count() as u32,

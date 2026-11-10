@@ -20,6 +20,16 @@
 //! pipe writing small pieces. The window is one frame at 60 Hz, which is the next value up from that
 //! interval and the shortest one a window could act on; the cap is what a fast producer fills before the
 //! window elapses, so saturation flushes on size rather than waiting.
+//!
+//! **The window bounds how often a busy session sends, not how soon a quiet one does.** It is measured
+//! from the last flush, so the first bytes after a pause leave immediately and a keystroke's echo is not
+//! held; batching starts only when more arrives inside the window. A session with nothing to send waits on
+//! its reader and nothing else, so it costs no timer.
+//!
+//! **The bound reaches the program, and it does so through the hop before this one.** The reader hands
+//! its chunks over a queue of `READ_AHEAD` (`session.rs`); when credit runs out this stops taking them,
+//! that queue fills, the reader blocks, the pty's own buffer fills and the program blocks on its write.
+//! With that hop unbounded the same stall grew this process by everything the program wrote.
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
@@ -33,6 +43,12 @@ pub const OUTPUT_WINDOW: Duration = Duration::from_millis(16);
 pub const OUTPUT_CAP: usize = 64 * 1024;
 /// How many coalesced output messages may be in flight. Phase G's ceiling, in messages
 pub const OUTPUT_CREDIT: usize = 64;
+/// How many of the reader's chunks may wait for the coalescer.
+///
+/// **This is what turns a stalled consumer into a blocked program rather than a growing broker.** The
+/// reader blocks on a full queue, so it stops reading the pty, whose buffer fills. One cap's worth: a read
+/// returns at most 8 KiB, so eight of them are what a single flush can carry.
+pub const READ_AHEAD: usize = 8;
 
 /// Credit for the output class: a producer takes one per message and the writer returns it.
 ///
@@ -201,8 +217,24 @@ fn sendable(bytes: &[u8]) -> usize {
 /// Runs as its own thread because the reader's `read` blocks: a time-based flush needs something that can
 /// wait *with a deadline*, which `recv_timeout` is and a blocking read is not.
 pub fn coalesce(session: String, chunks: Receiver<Vec<u8>>, outgoing: Sender<Outgoing>, credit: Arc<Credit>) {
+    coalesce_within(OUTPUT_WINDOW, session, chunks, outgoing, credit);
+}
+
+/// `coalesce`, with the window given.
+///
+/// **The window is a parameter so a case can tell "sent at once" from "held for the window" without
+/// racing a 16 ms clock**: with a window of seconds the two are far enough apart that a loaded machine
+/// cannot confuse them, which a case timing the real one could never promise.
+pub fn coalesce_within(
+    window: Duration,
+    session: String,
+    chunks: Receiver<Vec<u8>>,
+    outgoing: Sender<Outgoing>,
+    credit: Arc<Credit>,
+) {
     let mut buffer: Vec<u8> = Vec::new();
-    let mut opened = Instant::now();
+    // When the last flush left, which is what the window is measured from. None before the first
+    let mut flushed: Option<Instant> = None;
 
     // `ending` is the stream's last flush, where a partial character will never be completed and holding it
     // back would lose it outright
@@ -215,8 +247,9 @@ pub fn coalesce(session: String, chunks: Receiver<Vec<u8>>, outgoing: Sender<Out
         let text = String::from_utf8_lossy(&buffer[..cut]).into_owned();
         buffer.drain(..cut);
         if waited > Duration::ZERO {
-            // The overload is reported rather than silent, and it is a *wait* rather than a loss: the pty's
-            // own buffer is what fills behind this, which is backpressure reaching the process.
+            // The overload is reported rather than silent, and it is a *wait* rather than a loss: the
+            // reader's bounded queue fills behind this and then the pty's own buffer, which is
+            // backpressure reaching the process.
             let throttled = Event::Throttled {
                 session: session.clone(),
                 waited_us: waited.as_micros().min(u32::MAX as u128) as u32,
@@ -234,8 +267,25 @@ pub fn coalesce(session: String, chunks: Receiver<Vec<u8>>, outgoing: Sender<Out
     };
 
     loop {
-        let remaining = OUTPUT_WINDOW.saturating_sub(opened.elapsed());
-        match chunks.recv_timeout(remaining) {
+        // **A quiet session's bytes leave at once, and only a busy one is batched.** The window exists to
+        // turn a burst into a few messages; applied to a keystroke's echo it is nothing but delay, a mean
+        // of half the window on every character typed. So what is held waits out only what is left of the
+        // window since the last flush, which for a session that has been quiet is nothing.
+        //
+        // **And nothing held is nothing to wake for.** With no sendable byte this blocks until a chunk
+        // arrives, however long that is: an idle session costs no timer. A trailing partial character
+        // counts as nothing held, because only the next read can complete it.
+        let wait = if sendable(&buffer) == 0 {
+            None
+        } else {
+            Some(flushed.map_or(Duration::ZERO, |at| window.saturating_sub(at.elapsed())))
+        };
+        let next = match wait {
+            None => chunks.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            Some(left) if left.is_zero() => Err(RecvTimeoutError::Timeout),
+            Some(left) => chunks.recv_timeout(left),
+        };
+        match next {
             Ok(chunk) => {
                 buffer.extend_from_slice(&chunk);
                 // A fast producer fills the cap before the window elapses; flushing on size keeps the
@@ -244,14 +294,14 @@ pub fn coalesce(session: String, chunks: Receiver<Vec<u8>>, outgoing: Sender<Out
                     if !flush(&mut buffer, &credit, false) {
                         return;
                     }
-                    opened = Instant::now();
+                    flushed = Some(Instant::now());
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
                 if !flush(&mut buffer, &credit, false) {
                     return;
                 }
-                opened = Instant::now();
+                flushed = Some(Instant::now());
             }
             Err(RecvTimeoutError::Disconnected) => {
                 let _ = flush(&mut buffer, &credit, true);

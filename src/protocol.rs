@@ -71,13 +71,31 @@ pub enum Request {
         /// Applied after `env`, so the absence is what a caller gets when it asks for both.
         unset: Vec<String>,
         cwd: Option<String>,
+        /// **What the session is drawn in**, so a program that asks the terminal for its colours — to pick
+        /// a light or a dark theme, usually — is told the ones on the screen. The broker answers that
+        /// question and draws nothing, so without this it answers with a palette nobody is looking at.
+        /// Absent leaves the terminal's own, which is what a caller with no window has.
+        #[serde(default)]
+        colors: Option<Colors>,
     },
     /// Bytes the user typed.
     /// `text`, not `data`: what crosses here is decoded text, which is the contract and not an accident.
     /// See `Event::Output`.
     Write { session: SessionId, text: String },
     /// The viewport changed. One size per session: a pty has one.
-    Resize { session: SessionId, cols: u16, rows: u16 },
+    ///
+    /// `cell_width` and `cell_height` are one cell in pixels, as the window drawing the session measured
+    /// it — what a program asking for the terminal's size in pixels is told. Zero, which is what an absent
+    /// field reads as, means the caller measures nothing and whatever was last known stands.
+    Resize {
+        session: SessionId,
+        cols: u16,
+        rows: u16,
+        #[serde(default)]
+        cell_width: u16,
+        #[serde(default)]
+        cell_height: u16,
+    },
     /// **Stop reading this session's pty**, so the process feels the reader stop.
     ///
     /// This is flow control for a consumer whose own sink is slower than a shell can write — the app's
@@ -135,7 +153,7 @@ pub enum Request {
     /// **The screen as the broker has it**, with up to `history` lines above the viewport.
     ///
     /// This is the read that makes a session's state independent of a window: the broker parses the same
-    /// bytes the renderer draws and is the authority on them (D9), so a session nobody is looking at still
+    /// bytes the renderer draws and is the authority on them, so a session nobody is looking at still
     /// answers. `history` is a ceiling and not a promise — a session that has scrolled less answers with
     /// less, and an alternate-screen app has no scrollback to answer with at all.
     Screen { session: SessionId, history: u32 },
@@ -161,6 +179,18 @@ pub enum Request {
     Wait { session: SessionId, until: Until, timeout_ms: u32 },
     /// End the session and its process tree.
     Kill { session: SessionId },
+}
+
+/// The colours a session is drawn in, each as red, green and blue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "protocol.ts")]
+pub struct Colors {
+    pub foreground: [u8; 3],
+    pub background: [u8; 3],
+    pub cursor: Option<[u8; 3]>,
+    /// The first entries of the palette, in order — the sixteen a theme names. Entries past what is given
+    /// keep the terminal's own.
+    pub ansi: Vec<[u8; 3]>,
 }
 
 /// What a connection is for.
@@ -295,11 +325,12 @@ pub struct Foreground {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "protocol.ts")]
 pub struct SearchMatch {
-    /// Into the lines the same request's `Screen` would answer, oldest first.
+    /// The row the matching line starts on, into the lines the same request's `Screen` would answer.
     pub line: u32,
-    /// Where in that line the match starts, in characters.
+    /// Where in that line the match starts, in characters from the line's start.
     pub column: u32,
-    /// The whole line, so a caller sees the context without a second read.
+    /// The whole line, with the rows it wrapped onto joined, so a caller sees the context without a
+    /// second read.
     pub text: String,
 }
 
@@ -324,7 +355,7 @@ pub enum Event {
     /// Bytes the process wrote, **as text**. A feed: unprompted, and nobody asked for it.
     ///
     /// **The broker forwards decoded text, not bytes, and that is a decision rather than a compromise.**
-    /// Both ends are terminal emulators — `alacritty_terminal` here, the consumer's in its window — and both
+    /// Both ends are terminal emulators — `libghostty-vt` here, the consumer's in its window — and both
     /// replace an invalid sequence with U+FFFD independently, so a byte-exact pipe would show the user
     /// exactly what this does. Nothing in this protocol consumes raw bytes either: `Screen` answers lines,
     /// a search is over text, and a marker is a claim. A *UTF-8* sequence split across two reads is held
@@ -380,6 +411,9 @@ pub enum Event {
     Screen {
         session: SessionId,
         lines: Vec<String>,
+        /// For each line, whether it runs on into the next. A line longer than the grid is wide is drawn
+        /// over several rows, and a caller reading them as text joins the ones this marks.
+        wrapped: Vec<bool>,
         /// Within the viewport, so `0` is its first line however much history came with it.
         cursor_row: u16,
         cursor_column: u16,

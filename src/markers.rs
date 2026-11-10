@@ -1,10 +1,10 @@
 //! The markers a shell emits about itself, scanned out of the byte stream the screen parses.
 //!
-//! **Why these are not the grid's job.** `alacritty_terminal` implements the OSC codes a terminal acts on —
-//! a title, a colour, the clipboard — and drops the rest, which is correct: a sequence the terminal has no
-//! behaviour for must not disturb the screen. But shell integration *is* those dropped sequences, so the
-//! facts they carry have to be taken before the grid ignores them. This scans the same bytes, in parallel,
-//! and the stream reaches the grid untouched.
+//! **Why these are scanned here and not left to the core.** The core reports the standard prompt marks
+//! (OSC 133) and the working directory through callbacks of its own (`vt/mod.rs`). It does not read OSC 633,
+//! which is the family most shells already emit, and a sequence a terminal has no behaviour for is dropped
+//! without disturbing the screen — correctly. So those facts are taken from the same bytes, in parallel,
+//! and the stream reaches the core untouched.
 //!
 //! **OSC 633, because VS Code's set is the one shells already emit.** Its rc scripts are MIT and readable,
 //! other tools emit it, and anything a terminal invents here buys nothing and loses interop. OSC 7 and

@@ -1,10 +1,8 @@
-//! The `libghostty-vt` side of Phase 0a's comparison: a terminal held safely, so the conformance runner
-//! can drive it the way it drives `screen::Screen`.
+//! `libghostty-vt`, held safely: the one place this crate calls the core's C API.
 //!
-//! **This exists to be measured, not to ship.** The goal it serves (`goal-one-vt-core.md`) adopts one VT
-//! core on both sides of the broker/renderer split, and its first phase is the question of whether this
-//! core produces the same screen as the `alacritty_terminal` wrapper beside it. Phase B promotes what is
-//! here into `screen.rs`; a *no* takes the whole module and its dependency back out.
+//! `screen::Screen` is what the broker reads a session through; this is what it is made of. Everything
+//! unsafe about the library is here, so nothing outside this module holds a raw handle or a borrow of
+//! library memory.
 //!
 //! **The handle is owned and the pointer never leaves.** A `GhosttyTerminal` is a raw pointer the library
 //! allocates, and reading a cell hands back a reference into its page list that the next write invalidates
@@ -14,6 +12,12 @@ use ghostty_vt_rs_sys as sys;
 
 use crate::markers::cwd_from_url;
 use crate::screen::Facts;
+
+/// The most code points one cell's character is read as.
+///
+/// A family emoji is seven and the longest sequences in use are around ten; a cluster past this is read
+/// as its first code point rather than refused.
+const CLUSTER_CODEPOINTS: usize = 16;
 
 /// One terminal, freed with the value.
 pub struct Terminal {
@@ -114,13 +118,21 @@ impl Terminal {
 
     /// Resizes the grid. The primary screen reflows if wraparound is on; the alternate screen does not.
     ///
-    /// **The cell size in pixels is zero on purpose.** The core takes it so that a renderer can report
-    /// what a program asks for in pixels, and this broker has no renderer: it owns the pty and the grid,
-    /// and a window's cell metrics are that window's. `screen::Screen` has no equivalent parameter, so
-    /// passing a made-up figure here would be inventing a fact to make a signature match.
-    pub fn resize(&mut self, cols: u16, rows: u16) -> Result<(), Failed> {
+    /// **The cell size is the window's, and zero when no window has said.** The core takes it so a program
+    /// asking for the terminal's size in pixels can be told; this broker has no renderer of its own, so
+    /// the figure is whatever the window drawing the session measured, passed through a resize. A made-up
+    /// one would be inventing a fact to make a signature match.
+    pub fn resize(&mut self, cols: u16, rows: u16, cell_width: u16, cell_height: u16) -> Result<(), Failed> {
         // SAFETY: the handle is live for `&mut self`
-        let result = unsafe { sys::ghostty_terminal_resize(self.handle, cols.max(1), rows.max(1), 0, 0) };
+        let result = unsafe {
+            sys::ghostty_terminal_resize(
+                self.handle,
+                cols.max(1),
+                rows.max(1),
+                u32::from(cell_width),
+                u32::from(cell_height),
+            )
+        };
         Failed::check("ghostty_terminal_resize", result)
     }
 
@@ -184,8 +196,8 @@ impl Terminal {
     /// the limits back, after a null was assumed to work because the *line* option documents one as
     /// removing its limit. Left at the default, a session held 757 lines of short output where this broker
     /// promises `HISTORY_LINES`, and fewer the longer the lines were; a reattach would then read back less
-    /// than the window was told it could have. `alacritty_terminal` had no byte rule at all, so this is
-    /// what keeps the bound the one the snapshots in `tests/parser.rs` were recorded under.
+    /// than the window was told it could have. Lifting it is what makes the line limit the one bound the
+    /// snapshots in `tests/parser.rs` were recorded under.
     pub fn set_scrollback_unbounded_bytes(&self) -> Result<(), Failed> {
         self.set_usize(
             sys::TerminalOption::SCROLLBACK_MAX_BYTES,
@@ -210,13 +222,13 @@ impl Terminal {
     ///
     /// **A terminal answers questions, and a session that answers none does not start on Windows**:
     /// ConPTY's first act is a cursor-position request and it waits for the reply before initialising.
-    /// `screen::Screen` collects these too, and the broker is what has to answer — not the window, whose
-    /// parse is a replica that must not be in the loop for a program's control queries.
+    /// The broker is what has to answer — not the window, whose parse is a replica that must not be in
+    /// the loop for a program's control queries.
     ///
     /// # Safety
     ///
     /// `collector` must point at a live `Replies` for as long as this terminal can parse, which means it
-    /// must outlive the handle. `GhosttyScreen` owns both and declares the terminal first so it is freed
+    /// must outlive the handle. `screen::Screen` owns both and declares the terminal first so it is freed
     /// first.
     pub(crate) unsafe fn route_reports(&self, collector: *mut Reported) -> Result<(), Failed> {
         // SAFETY: userdata is an untyped pointer the library only ever hands back to the callback below
@@ -244,7 +256,193 @@ impl Terminal {
         let pwd = note_pwd as *const std::ffi::c_void;
         // SAFETY: the signature matches `GhosttyTerminalPwdChangedFn`
         let result = unsafe { sys::ghostty_terminal_set(self.handle, sys::TerminalOption::PWD_CHANGED, pwd) };
-        Failed::check("ghostty_terminal_set(PWD_CHANGED)", result)
+        Failed::check("ghostty_terminal_set(PWD_CHANGED)", result)?;
+
+        let size = report_size as *const std::ffi::c_void;
+        // SAFETY: the signature matches `GhosttyTerminalSizeFn`
+        let result = unsafe { sys::ghostty_terminal_set(self.handle, sys::TerminalOption::SIZE, size) };
+        Failed::check("ghostty_terminal_set(SIZE)", result)
+    }
+
+    /// Whether the row at a **screen** coordinate runs on into the next one.
+    ///
+    /// A line longer than the grid is wide is drawn over several rows, and only this says they are one
+    /// line: read as text without it, a path or an error message that reached the right edge is two
+    /// strings, and a search for it finds neither.
+    pub fn row_wraps(&self, row: u32) -> Result<bool, Failed> {
+        let Some(reference) = self.reference(0, row) else { return Ok(false) };
+        let mut raw: sys::Row = 0;
+        // SAFETY: the reference was just filled and nothing has written since
+        let result = unsafe { sys::ghostty_grid_ref_row(&raw const reference, &raw mut raw) };
+        if result != sys::Result::SUCCESS {
+            return Ok(false);
+        }
+        let mut wraps = false;
+        // SAFETY: WRAP writes a `bool`
+        let result =
+            unsafe { sys::ghostty_row_get(raw, sys::RowData::WRAP, (&raw mut wraps).cast::<std::ffi::c_void>()) };
+        Failed::check("ghostty_row_get(WRAP)", result)?;
+        Ok(wraps)
+    }
+
+    /// Appends what one cell holds to `text`: every code point of its character, a space for an empty
+    /// cell, and nothing for the spacer a wide character leaves beside itself.
+    ///
+    /// **Every code point, not the first.** A cell holds a whole character and a character is often
+    /// several code points — a letter and its accent, an emoji and its skin tone, a flag. Reading only the
+    /// first gives text nobody wrote, so a search for what is on the screen misses it.
+    pub fn push_cell_text(&self, column: u16, row: u32, text: &mut String) -> Result<(), Failed> {
+        let Some(reference) = self.reference(column, row) else { return Ok(()) };
+        let mut cell: sys::Cell = 0;
+        // SAFETY: the reference was just filled and nothing has written since
+        if unsafe { sys::ghostty_grid_ref_cell(&raw const reference, &raw mut cell) } != sys::Result::SUCCESS {
+            return Ok(());
+        }
+        if self.cell_is_spacer(cell)? {
+            return Ok(());
+        }
+        let mut codepoints = [0u32; CLUSTER_CODEPOINTS];
+        let mut written: usize = 0;
+        // SAFETY: the buffer is `CLUSTER_CODEPOINTS` long, which is the length passed
+        let result = unsafe {
+            sys::ghostty_grid_ref_graphemes(
+                &raw const reference,
+                codepoints.as_mut_ptr(),
+                codepoints.len(),
+                &raw mut written,
+            )
+        };
+        // A cluster longer than the buffer is answered with its first code point, which is what this read
+        // gave for every cell before it read clusters at all: degraded, never wrong about the cell's place
+        if result != sys::Result::SUCCESS {
+            let codepoint = self.cell_codepoint(cell)?;
+            text.push(char::from_u32(codepoint).filter(|found| *found != '\0').unwrap_or(' '));
+            return Ok(());
+        }
+        let held = &codepoints[..written.min(codepoints.len())];
+        if held.first().is_none_or(|first| *first == 0) {
+            text.push(' ');
+            return Ok(());
+        }
+        text.extend(held.iter().filter_map(|codepoint| char::from_u32(*codepoint)));
+        Ok(())
+    }
+
+    /// A grid reference for a screen coordinate, or `None` where the terminal has no cell.
+    fn reference(&self, column: u16, row: u32) -> Option<sys::GridRef> {
+        let point = sys::Point {
+            tag: sys::PointTag::SCREEN,
+            value: sys::PointValue { coordinate: sys::PointCoordinate { x: column, y: row } },
+        };
+        let mut reference = sys::GridRef::default();
+        // SAFETY: `reference` is a valid out-pointer and the point is by value
+        let found = unsafe { sys::ghostty_terminal_grid_ref(self.handle, point, &raw mut reference) };
+        (found == sys::Result::SUCCESS).then_some(reference)
+    }
+
+    /// Turns a mode on or off, now and after a reset.
+    ///
+    /// **Both, because a reset is something a program can send.** Setting only the current value would
+    /// hold until the first `reset` typed at a shell, and then the terminal would quietly go back to a
+    /// default the window drawing it does not share.
+    pub fn set_mode(&self, mode: u16, value: bool) -> Result<(), Failed> {
+        let config = sys::TerminalModeConfig { mode, value };
+        for (option, what) in [
+            (sys::TerminalOption::MODE_DEFAULT, "ghostty_terminal_set(MODE_DEFAULT)"),
+            (sys::TerminalOption::MODE, "ghostty_terminal_set(MODE)"),
+        ] {
+            // SAFETY: both options take a `GhosttyTerminalModeConfig*`, which `config` is
+            let result = unsafe {
+                sys::ghostty_terminal_set(self.handle, option, (&raw const config).cast::<std::ffi::c_void>())
+            };
+            Failed::check(what, result)?;
+        }
+        Ok(())
+    }
+
+    /// Turns the Kitty graphics protocol off, so a program asking whether it may send images is not told
+    /// yes by a terminal with nothing to draw them.
+    ///
+    /// A build of the library without the protocol answers `UNSUPPORTED`, which is the same outcome and so
+    /// is not a failure.
+    pub fn refuse_images(&self) -> Result<(), Failed> {
+        let limit: u64 = 0;
+        // SAFETY: KITTY_IMAGE_STORAGE_LIMIT takes a `uint64_t*`
+        let result = unsafe {
+            sys::ghostty_terminal_set(
+                self.handle,
+                sys::TerminalOption::KITTY_IMAGE_STORAGE_LIMIT,
+                (&raw const limit).cast::<std::ffi::c_void>(),
+            )
+        };
+        if result == sys::Result::UNSUPPORTED {
+            return Ok(());
+        }
+        Failed::check("ghostty_terminal_set(KITTY_IMAGE_STORAGE_LIMIT)", result)
+    }
+
+    /// Tells the terminal what colours it is drawn in, which is what it answers when a program asks.
+    ///
+    /// `ansi` replaces the first entries of the palette — the sixteen a theme names — and leaves the rest
+    /// at the library's, which are the standard cube and greys no theme redefines.
+    pub fn set_colors(
+        &self,
+        foreground: [u8; 3],
+        background: [u8; 3],
+        cursor: Option<[u8; 3]>,
+        ansi: &[[u8; 3]],
+    ) -> Result<(), Failed> {
+        let rgb = |[r, g, b]: [u8; 3]| sys::ColorRgb { r, g, b };
+        self.set_color(
+            sys::TerminalOption::COLOR_FOREGROUND,
+            rgb(foreground),
+            "ghostty_terminal_set(COLOR_FOREGROUND)",
+        )?;
+        self.set_color(
+            sys::TerminalOption::COLOR_BACKGROUND,
+            rgb(background),
+            "ghostty_terminal_set(COLOR_BACKGROUND)",
+        )?;
+        if let Some(cursor) = cursor {
+            self.set_color(sys::TerminalOption::COLOR_CURSOR, rgb(cursor), "ghostty_terminal_set(COLOR_CURSOR)")?;
+        }
+        if ansi.is_empty() {
+            return Ok(());
+        }
+        let mut palette = [sys::ColorRgb { r: 0, g: 0, b: 0 }; 256];
+        // SAFETY: COLOR_PALETTE_DEFAULT writes exactly 256 `GhosttyColorRgb`, which is what `palette` is
+        let result = unsafe {
+            sys::ghostty_terminal_get(
+                self.handle,
+                sys::TerminalData::COLOR_PALETTE_DEFAULT,
+                palette.as_mut_ptr().cast::<std::ffi::c_void>(),
+            )
+        };
+        Failed::check("ghostty_terminal_get(COLOR_PALETTE_DEFAULT)", result)?;
+        for (slot, color) in palette.iter_mut().zip(ansi) {
+            *slot = rgb(*color);
+        }
+        // SAFETY: COLOR_PALETTE takes a pointer to exactly 256 `GhosttyColorRgb`
+        let result = unsafe {
+            sys::ghostty_terminal_set(
+                self.handle,
+                sys::TerminalOption::COLOR_PALETTE,
+                palette.as_ptr().cast::<std::ffi::c_void>(),
+            )
+        };
+        Failed::check("ghostty_terminal_set(COLOR_PALETTE)", result)
+    }
+
+    fn set_color(
+        &self,
+        option: sys::TerminalOption::Type,
+        color: sys::ColorRgb,
+        what: &'static str,
+    ) -> Result<(), Failed> {
+        // SAFETY: the caller names an option documented as taking a `GhosttyColorRgb*`
+        let result =
+            unsafe { sys::ghostty_terminal_set(self.handle, option, (&raw const color).cast::<std::ffi::c_void>()) };
+        Failed::check(what, result)
     }
 
     /// Sets an option whose value is a `size_t`.
@@ -297,9 +495,8 @@ impl std::fmt::Display for Failed {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // **`UNSUPPORTED` is called out rather than left as a number**, because it means something a
         // reader would otherwise have to look up: the library returns it for a key an older build does not
-        // know and for a feature compiled out, with the function exported either way. Phase B's feature
-        // assertion is what will refuse that for a capability the broker relies on (the goal's D7); here it
-        // is the difference between "this build lacks it" and "the arguments were wrong".
+        // know and for a feature compiled out, with the function exported either way. Here it is the
+        // difference between "this build lacks it" and "the arguments were wrong".
         let note = if self.code == sys::Result::UNSUPPORTED { " (this build does not provide it)" } else { "" };
         write!(out, "{} failed with {}{note}", self.call, self.code)
     }
@@ -316,6 +513,18 @@ pub struct Reported {
     replies: Vec<String>,
     /// What the shell has claimed about itself, in `screen`'s own vocabulary.
     facts: Facts,
+    /// The grid and the size of one cell in pixels, for a program that asks. `None` until a window has
+    /// said how big a cell is: the grid alone the broker always knows, a cell it never measures.
+    size: Option<Size>,
+}
+
+/// The size a program is told when it asks: the grid, and one cell in pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Size {
+    pub cols: u16,
+    pub rows: u16,
+    pub cell_width: u16,
+    pub cell_height: u16,
 }
 
 impl Reported {
@@ -328,6 +537,12 @@ impl Reported {
         &self.facts
     }
 
+    /// What a program asking for the terminal's size is told from now on, or nothing when no window has
+    /// measured a cell.
+    pub fn set_size(&mut self, size: Option<Size>) {
+        self.size = size;
+    }
+
     /// Takes a marker the core does not read — the OSC 633 family — into the same facts its own callbacks
     /// fill, so a caller has one account of the shell rather than two to merge.
     pub fn apply(&mut self, marker: crate::markers::Marker) {
@@ -337,9 +552,8 @@ impl Reported {
 
 /// The library's callback, which copies before returning because the data is only valid for the call.
 ///
-/// A reply is a control sequence rather than text, but `screen::Screen` collects these as strings and the
-/// comparison is against that, so the conversion is the same one: lossy, since a sequence is ASCII in
-/// practice and a replacement character is a visible difference rather than a silent one.
+/// A reply is a control sequence rather than text, and it is kept as a string: lossy, since a sequence
+/// is ASCII in practice and a replacement character is a visible difference rather than a silent one.
 unsafe extern "C" fn collect_reply(
     _terminal: sys::Terminal,
     userdata: *mut std::ffi::c_void,
@@ -387,6 +601,29 @@ unsafe extern "C" fn note_semantic_prompt(
         }
         _ => {}
     }
+}
+
+/// What a program asking how big the terminal is gets told (`CSI 14 t`, `16 t`, `18 t`).
+///
+/// **Unanswered until a window has measured a cell.** The reply carries pixels, and a reply of zero pixels
+/// is a wrong answer where silence is an honest one: a program that hears nothing falls back, and one told
+/// the window is zero pixels wide divides by it.
+unsafe extern "C" fn report_size(
+    _terminal: sys::Terminal,
+    userdata: *mut std::ffi::c_void,
+    out_size: *mut sys::SizeReportSize,
+) -> bool {
+    if userdata.is_null() || out_size.is_null() {
+        return false;
+    }
+    // SAFETY: `userdata` is the collector and `out_size` is the library's, valid for this call
+    let (reported, out) = unsafe { (&*userdata.cast::<Reported>(), &mut *out_size) };
+    let Some(size) = reported.size else { return false };
+    out.rows = size.rows;
+    out.columns = size.cols;
+    out.cell_width = u32::from(size.cell_width);
+    out.cell_height = u32::from(size.cell_height);
+    true
 }
 
 /// The working directory the shell reported, read back inside the callback as the option requires.

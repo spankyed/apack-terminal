@@ -11,7 +11,7 @@ fn a_terminal_has_the_size_it_was_built_with_and_the_size_it_was_resized_to() {
     let mut terminal = Terminal::new(20, 4).expect("a terminal");
     assert_eq!((terminal.cols().expect("cols"), terminal.rows().expect("rows")), (20, 4));
 
-    terminal.resize(40, 10).expect("a resize");
+    terminal.resize(40, 10, 0, 0).expect("a resize");
     assert_eq!(
         (terminal.cols().expect("cols"), terminal.rows().expect("rows")),
         (40, 10),

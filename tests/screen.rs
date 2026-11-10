@@ -4,7 +4,7 @@
 //! the replies the terminal owes the program in its pty, how much scrollback it keeps, and where a search
 //! finds its text. None of them needs a pty or a socket, which is why `screen` is a library module.
 
-use apack_terminal::screen::{HISTORY_LINES, SEARCH_MATCHES, Screen};
+use apack_terminal::screen::{Colors, HISTORY_LINES, SEARCH_MATCHES, Screen};
 
 /// **The terminal answers for itself, and the answer has to leave the screen.**
 ///
@@ -122,4 +122,169 @@ fn a_search_for_nothing_finds_nothing() {
     screen.feed(b"something\r\n");
 
     assert!(screen.search("", 0).is_empty());
+}
+
+/// What the terminal said back to the program, as one string.
+fn answered(screen: &mut Screen, asked: &[u8]) -> String {
+    screen.feed(asked);
+    screen.take_replies().concat()
+}
+
+/// Where the cursor is after `written`, as the terminal reports it to a program that asks.
+fn column_after(written: &str) -> String {
+    let mut screen = Screen::new(80, 24);
+    screen.feed(written.as_bytes());
+    answered(&mut screen, b"\x1b[6n")
+}
+
+/// **An emoji made of several code points is one character here, because it is one where it is drawn.**
+///
+/// The window's emulator clusters by default and this screen did not, so after a family emoji the cursor
+/// this screen reported was four columns to the right of where the window drew it — and the position a
+/// program is told comes from here. Each of these is two cells wide, so the cursor ends in column three.
+#[test]
+fn a_character_of_several_code_points_takes_the_cells_of_one() {
+    for (what, written) in [
+        ("a family joined by zero-width joiners", "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"),
+        ("a flag", "\u{1F1EF}\u{1F1F5}"),
+        ("a thumb with a skin tone", "\u{1F44D}\u{1F3FD}"),
+        ("a heart with an emoji selector", "\u{2764}\u{FE0F}"),
+    ] {
+        assert_eq!(column_after(written), "\u{1b}[1;3R", "{what} is one two-cell character");
+    }
+}
+
+/// And a program that asks whether clustering is on is told it is, so what it lays out matches.
+#[test]
+fn a_program_asking_about_clustering_is_told_it_is_on() {
+    let mut screen = Screen::new(80, 24);
+    assert_eq!(answered(&mut screen, b"\x1b[?2027$p"), "\u{1b}[?2027;1$y");
+}
+
+/// **A reset does not turn it back off.** `reset` is something a user types, and a default set only for
+/// now would leave the terminal disagreeing with its window from then on.
+#[test]
+fn clustering_survives_a_reset() {
+    let mut screen = Screen::new(80, 24);
+    screen.feed(b"\x1bc");
+    screen.feed("\u{1F1EF}\u{1F1F5}".as_bytes());
+    assert_eq!(answered(&mut screen, b"\x1b[6n"), "\u{1b}[1;3R");
+}
+
+/// **A program asking whether it may send images is not told yes.** Nothing that draws a session draws
+/// one, so an `OK` here has the program write image data a user sees as nothing, or as noise.
+#[test]
+fn a_program_asking_to_send_images_is_not_told_it_may() {
+    let mut screen = Screen::new(80, 24);
+    let reply = answered(&mut screen, b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\");
+    assert!(!reply.contains("OK"), "the image protocol was offered: {reply:?}");
+}
+
+/// **A program asking for the terminal's colours hears the ones the session is drawn in.**
+///
+/// That is how a program picks a light or a dark theme. The broker answers the question and draws
+/// nothing, so before it was told it answered with a palette nobody was looking at.
+#[test]
+fn a_program_asking_for_a_colour_is_told_the_one_on_the_screen() {
+    let mut screen = Screen::new(80, 24);
+    assert_eq!(answered(&mut screen, b"\x1b]11;?\x1b\\"), "", "with no colours given there is none to report");
+
+    screen.set_colors(&Colors {
+        foreground: [0xd4, 0xd4, 0xd4],
+        background: [0x1e, 0x1e, 0x1e],
+        cursor: None,
+        ansi: vec![[0, 0, 0], [0xcd, 0x31, 0x31]],
+    });
+
+    assert!(answered(&mut screen, b"\x1b]11;?\x1b\\").contains("rgb:1e1e/1e1e/1e1e"), "the background");
+    assert!(answered(&mut screen, b"\x1b]10;?\x1b\\").contains("rgb:d4d4/d4d4/d4d4"), "the foreground");
+    assert!(answered(&mut screen, b"\x1b]4;1;?\x1b\\").contains("rgb:cdcd/3131/3131"), "palette entry one");
+    // An entry the theme did not name keeps the terminal's own rather than becoming black
+    assert!(!answered(&mut screen, b"\x1b]4;2;?\x1b\\").contains("rgb:0000/0000/0000"), "entry two is untouched");
+}
+
+/// **A size in pixels is reported once a window has measured a cell, and not before.** A reply of zero
+/// pixels is a wrong answer where silence is an honest one.
+#[test]
+fn a_program_asking_for_the_size_in_pixels_is_told_once_a_cell_has_been_measured() {
+    let mut screen = Screen::new(80, 24);
+    assert_eq!(answered(&mut screen, b"\x1b[16t"), "", "no cell measured, so nothing to report");
+
+    screen.resize(100, 30, 9, 18);
+    assert_eq!(answered(&mut screen, b"\x1b[16t"), "\u{1b}[6;18;9t", "one cell, height then width");
+    assert_eq!(answered(&mut screen, b"\x1b[14t"), "\u{1b}[4;540;900t", "the whole grid, height then width");
+
+    // A later resize from a caller that measures nothing keeps the cell the window gave
+    screen.resize(50, 10, 0, 0);
+    assert_eq!(answered(&mut screen, b"\x1b[14t"), "\u{1b}[4;180;450t");
+}
+
+/// **A line longer than the grid is one line, and is found whole.** Drawn it is two rows; read as text it
+/// has to be what was written, or a path that reached the right edge is two strings and a search for it
+/// finds neither.
+#[test]
+fn a_line_that_wrapped_is_read_and_searched_as_one_line() {
+    let mut screen = Screen::new(10, 4);
+    screen.feed(b"0123456789abcdef\r\nnext\r\n");
+
+    let read = screen.snapshot(0);
+    assert_eq!(&read.lines[..3], ["0123456789", "abcdef", "next"]);
+    assert_eq!(&read.wrapped[..3], [true, false, false], "only the first row runs on");
+
+    let found = screen.search("89ab", 0);
+    assert_eq!(found.len(), 1, "the match spans the wrap: {found:?}");
+    assert_eq!((found[0].line, found[0].column), (0, 8), "it starts on the first row, at its ninth character");
+    assert_eq!(found[0].text, "0123456789abcdef", "and the line comes back joined");
+}
+
+/// A space at the end of a full row belongs to the line, so the words either side of the wrap stay apart.
+#[test]
+fn a_space_at_a_wrap_is_kept() {
+    let mut screen = Screen::new(10, 4);
+    screen.feed(b"012345678 abc\r\n");
+
+    assert_eq!(screen.search("8 a", 0).len(), 1, "the space the row ended on is part of the line");
+}
+
+/// **A character is read whole.** A cell holds one character and a character is often several code points;
+/// reading the first alone gives text nobody wrote.
+#[test]
+fn a_character_of_several_code_points_is_read_whole() {
+    let mut screen = Screen::new(40, 4);
+    screen.feed("cafe\u{301} \u{1F44D}\u{1F3FD} ok\r\n".as_bytes());
+
+    assert_eq!(screen.snapshot(0).lines[0], "cafe\u{301} \u{1F44D}\u{1F3FD} ok");
+    assert_eq!(screen.search("e\u{301}", 0).len(), 1, "the accent is there to be matched");
+}
+
+/// **A wait looks only where a read could have put its text**, and still finds a match that begins above
+/// that: the rows are few, and a wrapped line is read from its start.
+#[test]
+fn text_is_found_in_the_rows_a_read_added_and_not_above_them() {
+    let mut screen = Screen::new(10, 3);
+    screen.feed(b"needle\r\n");
+    for line in 0..20 {
+        screen.feed(format!("line {line}\r\n").as_bytes());
+    }
+    assert!(!screen.shows_recently("needle", 2), "twenty rows up is outside the two rows asked for");
+    assert!(screen.shows_recently("needle", 30), "and inside thirty");
+
+    // The match starts on a row above the ones asked for, on a line that wrapped into them
+    let mut screen = Screen::new(10, 2);
+    screen.feed(b"abcdefghijKLMNOPQRSTuvw\r\nx\r\ny\r\n");
+    assert!(screen.shows_recently("jKLM", 2), "the line is read from its start, above the rows asked for");
+    assert!(!screen.shows_recently("", 2), "and nothing is not a match");
+}
+
+/// **The rows a read can have scrolled off are bounded by what was in it**: a line feed each, a wrap for
+/// every grid-width of bytes, and the row the cursor was on. A wait scans that many and no more, so the
+/// bound has to be a ceiling — a short one makes a wait miss text that is there.
+#[test]
+fn the_rows_a_read_could_add_are_counted_from_its_bytes() {
+    use apack_terminal::session::rows_added;
+
+    assert_eq!(rows_added(b"", 80), 1, "the row the cursor is on");
+    assert_eq!(rows_added(b"a\nb\nc\n", 80), 4, "one per line feed");
+    assert_eq!(rows_added(&[b'x'; 200], 80), 3, "two wraps in two hundred characters at eighty columns");
+    assert_eq!(rows_added(&[b'\n'; 5], 0), 11, "a grid of no width is read as one column");
 }

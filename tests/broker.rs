@@ -1989,3 +1989,60 @@ fn unsetting_a_name_wins_over_setting_it() {
     let seen = output_until(&mut reading, Some(&session), |seen| seen.contains("secret=["));
     assert!(seen.contains("secret=[]"), "an override outlived the unset that named it: {seen:?}");
 }
+
+/// **A consumer that stops reading stops the program, and the broker holds almost nothing.**
+///
+/// Output is bounded by credit, but the hop before the credit was not: the reader kept taking the pty's
+/// bytes into an unbounded queue, so a client that stalled — an app whose event loop was busy — grew this
+/// process by everything the program wrote, 190 MiB a second under `yes`, while the program never felt it.
+/// The queue is bounded now, so the reader blocks, the pty fills and the program blocks on its own write.
+///
+/// **What is asserted is how much was waiting when the client came back**, which is the only witness from
+/// outside: a broker that buffered has hundreds of megabytes to hand over, and one that pushed back has
+/// what credit, the queue, the socket and the pty hold between them.
+#[cfg(unix)]
+#[test]
+fn a_client_that_stops_reading_stalls_the_program_rather_than_filling_the_broker() {
+    let broker = start();
+    let name =
+        broker.socket.to_str().expect("a utf-8 socket path").to_fs_name::<GenericFilePath>().expect("a socket name");
+    let mut wire = Wire(std::sync::Arc::new(Stream::connect(name).expect("the broker accepts")));
+
+    // Read by hand up to `spawned`, so that nothing is reading once the program starts writing
+    let mut greeting = BufReader::new(wire.clone());
+    ask(&mut wire, &hello(None));
+    let mut line = String::new();
+    greeting.read_line(&mut line).expect("the greeting is answered");
+    let spawn = serde_json::json!({
+        "kind": "spawn", "cols": 80, "rows": 24, "shell": "/bin/sh",
+        "args": ["-c", "yes a-line-of-output-that-a-program-writes-as-fast-as-it-can"],
+        "env": [], "unset": [], "cwd": null,
+    });
+    ask(&mut wire, &spawn.to_string());
+    let session = loop {
+        line.clear();
+        greeting.read_line(&mut line).expect("the spawn is answered");
+        let event: serde_json::Value = serde_json::from_str(&line).expect("a frame");
+        if event["kind"] == "spawned" {
+            break event["session"].as_str().expect("a session id").to_owned();
+        }
+    };
+    drop(greeting);
+
+    // Nobody reads. A broker that buffers takes everything `yes` writes in this time
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    ask(&mut wire, &format!(r#"{{"kind":"kill","session":"{session}"}}"#));
+
+    // Now read what had been waiting. Bytes, not frames: the first read starts mid-line
+    const BOUNDED: usize = 24 * 1024 * 1024;
+    let mut events = Events::reading(wire.clone());
+    let mut waiting = 0usize;
+    while let Ok(line) = events.line(std::time::Duration::from_secs(3)) {
+        waiting += line.len();
+        assert!(
+            waiting < BOUNDED,
+            "more than {BOUNDED} bytes were waiting for a client that had stopped reading: the broker buffered \
+             what the program wrote instead of letting the program block",
+        );
+    }
+}
