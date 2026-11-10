@@ -73,11 +73,11 @@ describe('the styles and links of kept rows', () => {
 })
 
 describe('what a view has to ask for', () => {
-  it('is every held line it does not have, as runs', () => {
+  it('is every line of history it does not have, as runs', () => {
     const store = new RowStore()
     store.apply(frame({ firstActive: 10, scrollback: 10, rows: [row(3, 'x'), row(4, 'y'), row(10, 's')] }))
 
-    expect(store.missing(0, 14)).toEqual([[0, 3], [5, 5], [11, 3]])
+    expect(store.missing(0, 14), 'history it lacks, and none of the screen').toEqual([[0, 3], [5, 5]])
     expect(store.missing(3, 2), 'lines it holds were asked for').toEqual([])
   })
 
@@ -85,7 +85,7 @@ describe('what a view has to ask for', () => {
     const store = new RowStore()
     store.apply(frame({ firstActive: 10, scrollback: 2 }))
 
-    expect(store.missing(0, 100), 'asked below the oldest line, or past the screen').toEqual([[8, 6]])
+    expect(store.missing(0, 100), 'asked below the oldest line, or for the screen').toEqual([[8, 2]])
   })
 })
 

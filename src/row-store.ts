@@ -98,12 +98,15 @@ export class RowStore {
   }
 
   /**
-   * The runs of lines in `first .. first + count` that are held by the owner and not here, each as
+   * The runs of history lines in `first .. first + count` that the owner holds and this does not, each as
    * `[first, count]`.
+   *
+   * **History only.** The screen is told by frames and by nothing else, so a line of it that is not here
+   * is one the owner has yet to send, not one to ask for.
    */
   missing(first: number, count: number): Array<[number, number]> {
     const from = Math.max(first, this.oldest)
-    const to = Math.min(first + count, this.end)
+    const to = Math.min(first + count, this.firstActive)
     const runs: Array<[number, number]> = []
     let start = -1
     for (let line = from; line < to; line += 1) {
@@ -116,6 +119,16 @@ export class RowStore {
     }
     if (start !== -1) runs.push([start, to - start])
     return runs
+  }
+
+  /**
+   * Lets go of every line from `line` up. For a view that stopped listening: the lines that were on the
+   * screen then may have changed and scrolled into history since, and nothing said so.
+   */
+  forgetFrom(line: number): void {
+    for (const held of this.rows.keys()) {
+      if (held >= line) this.rows.delete(held)
+    }
   }
 
   /** Keeps `rows`, with their styles and links moved onto this store's own tables */

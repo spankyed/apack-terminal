@@ -1,3 +1,7 @@
 export * from './source.ts'
 export { KEPT_LINES, RowStore } from './row-store.ts'
 export { Viewport } from './viewport.ts'
+export { drawRow, type LineKind, type RowDrawing, type SelectedCells, type Theme } from './draw.ts'
+export { css, fontOf, measure, type Font, type Metrics, type Painter, type Scene } from './painter.ts'
+export { CanvasPainter } from './canvas-painter.ts'
+export { BLINK_MS, TerminalView, type ViewOptions } from './view.ts'
