@@ -135,6 +135,8 @@ export interface Frame extends Rows {
   readonly screenRows: number
   /** How many lines of history are held below `firstActive` */
   readonly scrollback: number
+  /** Moves whenever the shell reports a command, which is when `commands()` has something new to say */
+  readonly commands: number
   /** Absent while the program has hidden it */
   readonly cursor: Cursor | null
   readonly modes: Modes
@@ -143,6 +145,28 @@ export interface Frame extends Rows {
    * view that kept any of them must let them go. Absent when none did.
    */
   readonly staleFrom?: number
+}
+
+/**
+ * A command the shell ran, as far as the shell reported it. Every field but `id` is the shell's claim.
+ *
+ * `prompt`, `output` and `end` are the lines the command's prompt, its output and its end are on, in the
+ * epoch the answer came in. One is `null` where the shell never marked that moment, or where the row has
+ * left the history.
+ */
+export interface Command {
+  /** Counts from one in a session, and is never reused */
+  readonly id: number
+  readonly command: string | null
+  readonly cwd: string | null
+  /** Milliseconds since the Unix epoch. `finishedMs` is `null` while it runs */
+  readonly startedMs: number | null
+  readonly finishedMs: number | null
+  /** `null` while it runs, and when the shell reported none — which is not zero */
+  readonly exitStatus: number | null
+  readonly prompt: number | null
+  readonly output: number | null
+  readonly end: number | null
 }
 
 /** A cell on an absolute line */
@@ -236,4 +260,6 @@ export interface TerminalSource {
   textOf(span: Span): Promise<string>
   /** Every place `needle` appears, newest first */
   search(needle: string): Promise<readonly Span[]>
+  /** The commands the shell has reported, oldest first. Empty for a shell that marks none */
+  commands(): Promise<readonly Command[]>
 }

@@ -17,6 +17,7 @@ import {
   PLAIN,
   paletteColor,
   type Color,
+  type Command,
   type Cursor,
   type Frame,
   type KeyInput,
@@ -46,6 +47,7 @@ export type ToBroker =
   | { readonly kind: 'wordAt' | 'lineAt'; readonly channel: number; readonly request: number; readonly epoch: number; readonly at: Position }
   | { readonly kind: 'textOf'; readonly channel: number; readonly request: number; readonly epoch: number; readonly span: Span }
   | { readonly kind: 'search'; readonly channel: number; readonly request: number; readonly needle: string }
+  | { readonly kind: 'commands'; readonly channel: number; readonly request: number }
 
 /** What a view is sent */
 export type ToView =
@@ -57,13 +59,14 @@ export type ToView =
   | { readonly kind: 'text'; readonly channel: number; readonly request: number; readonly text: string }
   | { readonly kind: 'spans'; readonly channel: number; readonly request: number; readonly epoch: number; readonly spans: readonly Span[] }
   | { readonly kind: 'failed'; readonly channel: number; readonly request: number; readonly message: string }
+  | { readonly kind: 'commands'; readonly channel: number; readonly request: number; readonly epoch: number; readonly commands: readonly Command[] }
 
 /** Bytes that are not a message. A view that reads one cannot trust what follows it either */
 export class Malformed extends Error {}
 
 const KIND = {
   attach: 1, detach: 2, acknowledge: 3, fetch: 4, key: 5, text: 6, pointer: 7, paste: 8, focus: 9,
-  wordAt: 10, lineAt: 11, textOf: 12, search: 13,
+  wordAt: 10, lineAt: 11, textOf: 12, search: 13, commands: 14,
 } as const
 
 const FRAME = 65
@@ -74,6 +77,7 @@ const SPAN = 69
 const TEXT = 70
 const SPANS = 71
 const FAILED = 72
+const COMMANDS = 73
 
 const FRAME_CURSOR = 1
 const FRAME_ALTERNATE = 2
@@ -210,6 +214,9 @@ export function encodeToBroker(message: ToBroker): Uint8Array {
       out.number(message.request)
       out.text(message.needle)
       break
+    case 'commands':
+      out.number(message.request)
+      break
   }
   return out.finish()
 }
@@ -275,6 +282,26 @@ class Reader {
 
   span(): Span {
     return { start: this.position(), end: this.position() }
+  }
+
+  /** A command: a byte saying which of its fields it has, then those fields in order */
+  command(): Command {
+    const id = this.number()
+    const has = this.byte()
+    const text = (bit: number) => (has & bit ? this.text() : null)
+    const number = (bit: number) => (has & bit ? this.number() : null)
+    const command = text(1)
+    const cwd = text(2)
+    const startedMs = number(4)
+    const finishedMs = number(8)
+    let exitStatus: number | null = null
+    if (has & 16) {
+      // Zigzag, as the broker writes it: the low bit is the sign
+      const zigzag = this.number()
+      if (zigzag > 0xffffffff) throw new Malformed('an integer did not fit its field')
+      exitStatus = zigzag % 2 === 0 ? zigzag / 2 : -(zigzag + 1) / 2
+    }
+    return { id, command, cwd, startedMs, finishedMs, exitStatus, prompt: number(32), output: number(64), end: number(128) }
   }
 
   color(): Color {
@@ -377,6 +404,7 @@ export function decodeToView(body: Uint8Array): ToView {
       const columns = read.number()
       const screenRows = read.number()
       const scrollback = read.number()
+      const commands = read.number()
       const flags = read.byte()
       if (flags >= 32) throw new Malformed("a frame's flags are outside what the format defines")
       let cursor: Cursor | null = null
@@ -389,7 +417,7 @@ export function decodeToView(body: Uint8Array): ToView {
       }
       const staleFrom = flags & FRAME_STALE ? read.number() : undefined
       const frame: Frame = {
-        sequence, epoch, firstActive, columns, screenRows, scrollback, cursor,
+        sequence, epoch, firstActive, columns, screenRows, scrollback, commands, cursor,
         modes: { alternateScreen: (flags & FRAME_ALTERNATE) !== 0, mouse: (flags & FRAME_MOUSE) !== 0 },
         ...(staleFrom === undefined ? {} : { staleFrom }),
         ...read.rows(),
@@ -428,6 +456,13 @@ export function decodeToView(body: Uint8Array): ToView {
     case FAILED: {
       const request = read.number()
       return read.finish({ kind: 'failed', channel, request, message: read.text() })
+    }
+    case COMMANDS: {
+      const request = read.number()
+      const epoch = read.number()
+      const commands: Command[] = []
+      for (let more = read.count(); more > 0; more -= 1) commands.push(read.command())
+      return read.finish({ kind: 'commands', channel, request, epoch, commands })
     }
     default:
       throw new Malformed(`no message has kind ${kind}`)

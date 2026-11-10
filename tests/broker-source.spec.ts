@@ -187,3 +187,28 @@ describe('an ending', () => {
     expect(frames).toEqual([])
   })
 })
+
+describe('the commands of a session', () => {
+  const ran = { id: 4, command: 'make', cwd: '/src', startedMs: 10, finishedMs: 20, exitStatus: -2, prompt: 7, output: 8, end: 12 }
+
+  it('are answered with the lines each is on', async () => {
+    const { broker, source } = attached()
+    broker.say({ kind: 'frame', channel: 1, frame: frame({ epoch: 6 }) })
+    broker.taken()
+    const asked = source.commands()
+    expect(broker.taken()).toEqual([{ kind: 'commands', channel: 1, request: 1 }])
+    broker.say({ kind: 'commands', channel: 1, request: 1, epoch: 6, commands: [ran] })
+    expect(await asked).toEqual([ran])
+  })
+
+  it('keep what is known of them and lose their lines when the answer is from before a reflow', async () => {
+    const { broker, source } = attached()
+    broker.say({ kind: 'frame', channel: 1, frame: frame({ epoch: 6 }) })
+    const asked = source.commands()
+    broker.say(
+      { kind: 'frame', channel: 1, frame: frame({ epoch: 7 }) },
+      { kind: 'commands', channel: 1, request: 1, epoch: 6, commands: [ran] },
+    )
+    expect(await asked).toEqual([{ ...ran, prompt: null, output: null, end: null }])
+  })
+})

@@ -9,6 +9,7 @@
  * in a test, or a recording played back.
  */
 import type {
+  Command,
   KeyInput,
   PasteOutcome,
   PointerInput,
@@ -223,5 +224,16 @@ class SessionSource implements TerminalSource {
     const { channel } = this
     const answer = await this.ask('spans', (request) => ({ kind: 'search', channel, request, needle }))
     return answer.epoch === this.epoch ? answer.spans : []
+  }
+
+  /**
+   * What is known of each command is true in any epoch; the lines it is on are not, so an answer from
+   * before a reflow keeps its commands and loses their lines.
+   */
+  async commands(): Promise<readonly Command[]> {
+    const { channel } = this
+    const answer = await this.ask('commands', (request) => ({ kind: 'commands', channel, request }))
+    if (answer.epoch === this.epoch) return answer.commands
+    return answer.commands.map((command) => ({ ...command, prompt: null, output: null, end: null }))
   }
 }

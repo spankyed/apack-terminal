@@ -1,7 +1,7 @@
 // A view, used: what a click, a drag, a wheel and a pointer over a link each do — and who they are for,
 // which changes when a program asks for the mouse.
 import { beforeEach, describe, expect, it } from 'vitest'
-import type { Span } from '../src/source.ts'
+import type { Command, Span } from '../src/source.ts'
 import { installFrames, runFrames } from './_frames.ts'
 import { FakeSource } from './_source.ts'
 import { frame, row } from './_support.ts'
@@ -252,5 +252,99 @@ describe('clearing', () => {
     showing(view)
     view.view.clear()
     expect(view.source.keys).toEqual([{ action: 'press', code: 'KeyL', modifiers: 2, text: '', unshifted: 108 }])
+  })
+})
+
+describe('the commands a shell ran', () => {
+  const command = (id: number, prompt: number, parts: Partial<Command> = {}): Command => ({
+    id, command: `cmd ${id}`, cwd: '/src', startedMs: 1000, finishedMs: 2000, exitStatus: 0, prompt, output: prompt + 1, end: prompt + 3, ...parts,
+  })
+  /** A view over a screen at lines 100 to 103 with a hundred lines of history, and three commands in it */
+  async function withCommands(options: Parameters<typeof mountedView>[0] = {}) {
+    const view = mountedView({ gutter: 6, ...options })
+    view.source.commandList = [
+      command(1, 20),
+      command(2, 60, { exitStatus: 2 }),
+      command(3, 101, { finishedMs: null, exitStatus: null, end: null }),
+    ]
+    showing(view, { firstActive: 100, scrollback: 100, commands: 1 })
+    await settled()
+    return view
+  }
+
+  it('are asked for when a frame says there is something new, and not for a frame that does not', async () => {
+    const view = await withCommands()
+    expect(view.source.commandsAsked).toBe(1)
+    view.source.send(frame({ sequence: 2, firstActive: 100, scrollback: 100, commands: 1 }))
+    await settled()
+    expect(view.source.commandsAsked, 'asked again though nothing was new').toBe(1)
+    view.source.send(frame({ sequence: 3, firstActive: 100, scrollback: 100, commands: 2 }))
+    await settled()
+    expect(view.source.commandsAsked).toBe(2)
+  })
+
+  it('are asked for again after a reflow, since the lines they were on are gone', async () => {
+    const view = await withCommands()
+    view.source.send(frame({ sequence: 2, epoch: 2, firstActive: 100, scrollback: 100, commands: 1 }))
+    await settled()
+    expect(view.source.commandsAsked).toBe(2)
+  })
+
+  it('are marked beside their prompts in the gutter, coloured by how each ended', async () => {
+    const view = await withCommands()
+    // On screen: only the third, which is still running
+    expect(view.painted().marks).toEqual([{ row: 1, color: theme.palette[4] }])
+
+    view.view.scrollTo(58)
+    expect(view.painted().marks, 'a command that failed').toEqual([{ row: 2, color: theme.palette[1] }])
+    view.view.scrollTo(20)
+    expect(view.painted().marks, 'a command that succeeded').toEqual([{ row: 0, color: theme.palette[2] }])
+  })
+
+  it('are not marked where the view was given no gutter to mark them in', async () => {
+    const view = await withCommands({ gutter: 0 })
+    expect(view.painted().marks).toEqual([])
+  })
+
+  it('are stepped between, from prompt to prompt, and past the newest back to the screen', async () => {
+    const view = await withCommands()
+    view.view.scrollToCommand(-1)
+    expect(view.view.viewport.top).toBe(60)
+    view.view.scrollToCommand(-1)
+    expect(view.view.viewport.top).toBe(20)
+    view.view.scrollToCommand(-1)
+    expect(view.view.viewport.top, 'there is none before the oldest').toBe(20)
+
+    view.view.scrollToCommand(1)
+    expect(view.view.viewport.top).toBe(60)
+    view.view.scrollToCommand(1)
+    view.view.scrollToCommand(1)
+    expect(view.view.viewport.following, 'forward from the newest did not return to the screen').toBe(true)
+  })
+
+  it('are stepped between by the keyboard, with a key the program is not sent', async () => {
+    const view = await withCommands()
+    const pressed = view.key('keydown', { code: 'ArrowUp', key: 'ArrowUp', metaKey: true })
+    expect(view.view.viewport.top).toBe(60)
+    expect(pressed.defaultPrevented).toBe(true)
+    expect(view.source.keys).toEqual([])
+  })
+
+  it('are found from any line of theirs, and their output is what lies between where it began and ended', async () => {
+    const view = await withCommands()
+    expect(view.view.commandAt(10), 'above the first command').toBeNull()
+    expect(view.view.commandAt(20)?.id).toBe(1)
+    expect(view.view.commandAt(59)?.id, 'the lines after a command, up to the next, are its').toBe(1)
+    expect(view.view.commandAt(60)?.id).toBe(2)
+
+    const second = view.view.commandAt(61)!
+    expect(view.view.outputOf(second)).toEqual({ start: { line: 61, column: 0 }, end: { line: 62, column: 19 } })
+    expect(view.view.selectOutput(second)).toBe(true)
+    expect(view.view.selection.span).toEqual({ start: { line: 61, column: 0 }, end: { line: 62, column: 19 } })
+
+    // One still running has printed down to the bottom of the screen so far
+    expect(view.view.outputOf(view.view.commandAt(103)!)).toEqual({ start: { line: 102, column: 0 }, end: { line: 103, column: 19 } })
+    // And one that printed nothing has nothing to select
+    expect(view.view.selectOutput(command(9, 30, { end: 31 }))).toBe(false)
   })
 })

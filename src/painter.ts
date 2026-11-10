@@ -23,6 +23,11 @@ export interface Scene {
   readonly rows: ReadonlyArray<RowDrawing | null>
   /** How far the grid is shifted up, as a fraction of a row: the view is between two lines */
   readonly offset: number
+  /**
+   * Rows marked in the gutter, each in a colour: where a command began, coloured by how it ended. Drawn
+   * only where the painter was given a gutter to draw them in.
+   */
+  readonly marks?: ReadonlyArray<{ readonly row: number; readonly color: number }>
   /** Absent when there is none to draw: hidden by the program, off the view, or in the off half of a blink */
   readonly cursor?: {
     readonly column: number
@@ -43,7 +48,8 @@ export interface Painter {
   readonly canvas: HTMLCanvasElement
   readonly metrics: Metrics
   /** The view is `columns` by `rows` cells, on a display with `pixelRatio` device pixels to a CSS pixel */
-  resize(columns: number, rows: number, pixelRatio: number): void
+  /** `gutter` is a strip of that many pixels left of the first column, which rows are not drawn in */
+  resize(columns: number, rows: number, pixelRatio: number, gutter?: number): void
   paint(scene: Scene): void
   dispose(): void
 }

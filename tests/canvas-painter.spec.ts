@@ -120,3 +120,26 @@ describe('the cursor', () => {
     expect(drawn.at(-1)?.kind).toBe('strokeRect')
   })
 })
+
+describe('a gutter', () => {
+  it('is a strip left of the first column that rows are drawn clear of, with a bar beside each marked row', () => {
+    const { canvas, drawn } = recordingContext()
+    const made = new CanvasPainter(font, canvas)
+    made.resize(20, 4, 1, 6)
+    expect(made.canvas.style.width, 'the gutter is not part of the canvas').toBe('206px')
+
+    made.paint({ theme, rows: [drawRow(row(0, 'hi'), [PLAIN], theme), null, drawRow(row(2, 'x'), [PLAIN], theme)], offset: 0, marks: [{ row: 2, color: 0x00ff00 }] })
+
+    expect(drawn[0]).toMatchObject({ kind: 'rect', x: 0, width: 206 })
+    expect(drawn.find((call) => call.color === css(0x00ff00))).toMatchObject({ kind: 'rect', x: 1, y: 42, width: 3, height: 16 })
+    expect(drawn.find((call) => call.text === 'h')).toMatchObject({ x: 6 })
+    expect(drawn.find((call) => call.text === 'x')).toMatchObject({ x: 6, y: 56 })
+  })
+
+  it('is not there unless asked for, and then nothing is marked', () => {
+    const { painter: made, drawn } = painter()
+    made.paint({ theme, rows: [drawRow(row(0, 'hi'), [PLAIN], theme)], offset: 0, marks: [{ row: 0, color: 0x00ff00 }] })
+    expect(drawn.some((call) => call.color === css(0x00ff00))).toBe(false)
+    expect(drawn.find((call) => call.text === 'h')).toMatchObject({ x: 0 })
+  })
+})

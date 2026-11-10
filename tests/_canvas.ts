@@ -18,24 +18,27 @@ export interface Drawn {
 export function recordingContext(cellWidth = 10) {
   const drawn: Drawn[] = []
   let path: Array<[number, number]> = []
+  let shift: [number, number] = [0, 0]
   const context = {
     fillStyle: '',
     strokeStyle: '',
     font: '',
     lineWidth: 1,
     textBaseline: 'alphabetic',
-    setTransform() {},
+    // Where the origin has been moved to, which every call after it is recorded relative to the canvas by
+    setTransform() { shift = [0, 0] },
+    translate(x: number, y: number) { shift = [shift[0] + x, shift[1] + y] },
     setLineDash() {},
     // Every character is one cell wide, and the font box is twenty tall with sixteen above the baseline
     measureText: (text: string) => ({ width: text.length * cellWidth, fontBoundingBoxAscent: 16, fontBoundingBoxDescent: 4 }),
     fillRect(x: number, y: number, width: number, height: number) {
-      drawn.push({ kind: 'rect', x, y, width, height, color: context.fillStyle })
+      drawn.push({ kind: 'rect', x: x + shift[0], y: y + shift[1], width, height, color: context.fillStyle })
     },
     strokeRect(x: number, y: number, width: number, height: number) {
-      drawn.push({ kind: 'strokeRect', x, y, width, height, color: context.strokeStyle })
+      drawn.push({ kind: 'strokeRect', x: x + shift[0], y: y + shift[1], width, height, color: context.strokeStyle })
     },
     fillText(text: string, x: number, y: number) {
-      drawn.push({ kind: 'text', x, y, text, color: context.fillStyle, font: context.font })
+      drawn.push({ kind: 'text', x: x + shift[0], y: y + shift[1], text, color: context.fillStyle, font: context.font })
     },
     beginPath() { path = [] },
     moveTo(x: number, y: number) { path.push([x, y]) },

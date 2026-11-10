@@ -75,13 +75,13 @@ class Out {
 /** A message for a view, as the broker encodes one */
 export function encodeToView(message: ToView): Uint8Array {
   const out = new Out()
-  const kinds = { frame: 65, rows: 66, ended: 67, pasted: 68, span: 69, text: 70, spans: 71, failed: 72 } as const
+  const kinds = { frame: 65, rows: 66, ended: 67, pasted: 68, span: 69, text: 70, spans: 71, failed: 72, commands: 73 } as const
   out.byte(kinds[message.kind])
   out.number(message.channel)
   switch (message.kind) {
     case 'frame': {
       const { frame } = message
-      for (const value of [frame.sequence, frame.epoch, frame.firstActive, frame.columns, frame.screenRows, frame.scrollback]) out.number(value)
+      for (const value of [frame.sequence, frame.epoch, frame.firstActive, frame.columns, frame.screenRows, frame.scrollback, frame.commands]) out.number(value)
       out.byte((frame.cursor ? 1 : 0) | (frame.modes.alternateScreen ? 2 : 0) | (frame.modes.mouse ? 4 : 0)
         | (frame.staleFrom === undefined ? 0 : 8) | (frame.cursor?.blinking ? 16 : 0))
       if (frame.cursor) { out.number(frame.cursor.column); out.number(frame.cursor.row); out.byte(CURSOR_SHAPES.indexOf(frame.cursor.shape)) }
@@ -102,6 +102,19 @@ export function encodeToView(message: ToView): Uint8Array {
       for (const span of message.spans) { out.position(span.start); out.position(span.end) }
       break
     case 'failed': out.number(message.request); out.text(message.message); break
+    case 'commands':
+      out.number(message.request); out.number(message.epoch); out.number(message.commands.length)
+      for (const command of message.commands) {
+        out.number(command.id)
+        const fields = [command.command, command.cwd, command.startedMs, command.finishedMs, command.exitStatus, command.prompt, command.output, command.end]
+        out.byte(fields.reduce<number>((flags, field, bit) => flags | (field === null ? 0 : 1 << bit), 0))
+        if (command.command !== null) out.text(command.command)
+        if (command.cwd !== null) out.text(command.cwd)
+        for (const time of [command.startedMs, command.finishedMs]) if (time !== null) out.number(time)
+        if (command.exitStatus !== null) out.number(command.exitStatus >= 0 ? command.exitStatus * 2 : -command.exitStatus * 2 - 1)
+        for (const line of [command.prompt, command.output, command.end]) if (line !== null) out.number(line)
+      }
+      break
   }
   return out.finish()
 }
@@ -148,6 +161,7 @@ export function decodeToBroker(body: Uint8Array): ToBroker {
     case 11: return { kind: 'lineAt', channel, request: number(), epoch: number(), at: position() }
     case 12: return { kind: 'textOf', channel, request: number(), epoch: number(), span: { start: position(), end: position() } }
     case 13: return { kind: 'search', channel, request: number(), needle: text() }
+    case 14: return { kind: 'commands', channel, request: number() }
     default: throw new Error(`a view sent kind ${kind}`)
   }
 }

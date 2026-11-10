@@ -15,6 +15,7 @@ export class CanvasPainter implements Painter {
   private pixelRatio = 1
   private columns = 0
   private rows = 0
+  private gutter = 0
 
   constructor(private readonly font: Font, canvas = document.createElement('canvas')) {
     const context = canvas.getContext('2d')
@@ -24,12 +25,13 @@ export class CanvasPainter implements Painter {
     this.metrics = measure(context, font, this.pixelRatio)
   }
 
-  resize(columns: number, rows: number, pixelRatio: number): void {
+  resize(columns: number, rows: number, pixelRatio: number, gutter = 0): void {
     this.columns = columns
     this.rows = rows
     this.pixelRatio = pixelRatio
+    this.gutter = gutter
     this.metrics = measure(this.context, this.font, pixelRatio)
-    const width = columns * this.metrics.cellWidth
+    const width = columns * this.metrics.cellWidth + gutter
     const height = rows * this.metrics.cellHeight
     this.canvas.width = Math.round(width * pixelRatio)
     this.canvas.height = Math.round(height * pixelRatio)
@@ -43,7 +45,17 @@ export class CanvasPainter implements Painter {
     // Sizing a canvas resets its transform, so the scale is set per frame rather than once
     context.setTransform(this.pixelRatio, 0, 0, this.pixelRatio, 0, 0)
     context.fillStyle = css(scene.theme.background)
-    context.fillRect(0, 0, this.columns * cellWidth, this.rows * cellHeight)
+    context.fillRect(0, 0, this.columns * cellWidth + this.gutter, this.rows * cellHeight)
+
+    // In the gutter, before the rows are moved clear of it: a bar beside each marked row
+    if (this.gutter > 0) {
+      for (const mark of scene.marks ?? []) {
+        context.fillStyle = css(mark.color)
+        context.fillRect(1, (mark.row - scene.offset) * cellHeight + 2, Math.max(2, this.gutter - 3), cellHeight - 4)
+      }
+    }
+    // Everything after this is drawn in cells, the first of which starts where the gutter ends
+    context.translate(this.gutter, 0)
 
     // Backgrounds first across every row, so a tall character is never cut by the row below being filled
     scene.rows.forEach((row, index) => {

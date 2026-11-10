@@ -28,6 +28,7 @@ export function frame(parts: Partial<Frame> & { rows?: Row[]; styles?: Style[] }
     columns: 20,
     screenRows: 4,
     scrollback: 0,
+    commands: 0,
     cursor: null,
     modes: { alternateScreen: false, mouse: false },
     styles: [PLAIN],

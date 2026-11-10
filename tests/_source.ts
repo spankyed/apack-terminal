@@ -1,4 +1,4 @@
-import { PLAIN, type Frame, type KeyInput, type PasteOutcome, type PointerInput, type Position, type Row, type Rows, type SourceListener, type Span, type TerminalSource } from '../src/source.ts'
+import { PLAIN, type Command, type Frame, type KeyInput, type PasteOutcome, type PointerInput, type Position, type Row, type Rows, type SourceListener, type Span, type TerminalSource } from '../src/source.ts'
 
 /** A source a case drives by hand: it sends what the case tells it to and records what the view asked of it */
 export class FakeSource implements TerminalSource {
@@ -51,4 +51,8 @@ export class FakeSource implements TerminalSource {
   async lineAt(_position: Position): Promise<Span | null> { return null }
   async textOf(_span: Span): Promise<string> { return '' }
   async search(_needle: string): Promise<readonly Span[]> { return [] }
+  /** What the source answers when asked for its commands, and how many times it was asked */
+  commandList: Command[] = []
+  commandsAsked = 0
+  async commands(): Promise<readonly Command[]> { this.commandsAsked += 1; return this.commandList }
 }

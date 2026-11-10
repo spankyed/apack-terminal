@@ -5,7 +5,7 @@ import { linkAt, urls, type Detector, type Link } from './links.ts'
 import type { Font, Painter, Scene } from './painter.ts'
 import { RowStore } from './row-store.ts'
 import { Selection, type Granularity } from './selection.ts'
-import { Modifier, type Frame, type PointerInput, type Position, type Row, type TerminalSource } from './source.ts'
+import { Modifier, type Command, type Frame, type PointerInput, type Position, type Row, type Span, type TerminalSource } from './source.ts'
 import { Viewport } from './viewport.ts'
 
 /** How long the cursor is shown, and then hidden, while it blinks */
@@ -49,6 +49,11 @@ export interface ViewOptions {
   readonly onCopy?: (text: string) => void
   /** Whether this is a Mac, where the command key is the app's. Left out, asked of the browser */
   readonly mac?: boolean
+  /**
+   * A strip this many pixels wide left of the first column, where each command the shell ran is marked
+   * beside its prompt, coloured by how it ended. Left out, there is none and nothing is marked.
+   */
+  readonly gutter?: number
 }
 
 interface Kept {
@@ -86,6 +91,10 @@ export class TerminalView {
   private wasFollowing = true
   private disposed = false
   private wasSelected = false
+  private readonly gutter: number
+  /** The commands the shell has reported, and the frame's count that said to ask for them */
+  private commandList: readonly Command[] = []
+  private commandsSeen = -1
   private readonly mac: boolean
   private readonly detectors: readonly Detector[]
   private readonly input: Input
@@ -104,6 +113,7 @@ export class TerminalView {
 
   constructor(private readonly source: TerminalSource, private readonly options: ViewOptions) {
     this.mac = options.mac ?? /Mac|iPhone|iPad/.test(navigator.platform)
+    this.gutter = options.gutter ?? 0
     this.detectors = [urls, ...(options.detectors ?? [])]
     this.element = document.createElement('div')
     this.element.style.cssText = 'position:relative;width:100%;height:100%;overflow:hidden;cursor:text'
@@ -122,7 +132,7 @@ export class TerminalView {
     })
     this.input = new Input(source, {
       mac: this.mac,
-      intercept: options.onKey,
+      intercept: (event) => this.shortcut(event) || (options.onKey?.(event) ?? false),
       paste: (text) => { void this.paste(text) },
       copy: () => { void this.copy() },
       focused: (focused) => this.setFocused(focused),
@@ -160,6 +170,77 @@ export class TerminalView {
       start: { line: this.store.oldest, column: 0 },
       end: { line: this.store.firstActive + this.rows - 1, column: Math.max(0, this.columns - 1) },
     })
+  }
+
+  /** The commands the shell has reported, as the view last heard them */
+  get commands(): readonly Command[] {
+    return this.commandList
+  }
+
+  /**
+   * The command whose prompt, line or output is on `line`: the last one that began at or before it.
+   * `null` above the first command, and for a shell that marks none.
+   */
+  commandAt(line: number): Command | null {
+    let found: Command | null = null
+    for (const command of this.commandList) {
+      const begins = command.prompt ?? command.output
+      if (begins !== null && begins <= line) found = command
+    }
+    return found
+  }
+
+  /** The cells a command's output covers, or `null` where it printed nothing or its rows are gone */
+  outputOf(command: Command): Span | null {
+    if (command.output === null || !this.frame) return null
+    // To where it ended; while it runs, and where its end was never marked, to the bottom of the screen
+    const last = command.end !== null ? command.end - 1 : this.store.firstActive + this.rows - 1
+    if (last < command.output) return null
+    return { start: { line: command.output, column: 0 }, end: { line: last, column: Math.max(0, this.columns - 1) } }
+  }
+
+  /** Selects what a command printed. Answers whether there was anything to select */
+  selectOutput(command: Command): boolean {
+    const span = this.outputOf(command)
+    if (span) this.selection.select(span)
+    return span !== null
+  }
+
+  /**
+   * Scrolls to the prompt of the command before or after what is at the top of the view. From the
+   * oldest, back stays there; from the newest, forward returns to the screen and follows it.
+   */
+  scrollToCommand(direction: -1 | 1): void {
+    const top = Math.floor(this.viewport.top)
+    const prompts = this.commandList.map((command) => command.prompt).filter((line): line is number => line !== null)
+    const target = direction === -1 ? prompts.filter((line) => line < top).at(-1) : prompts.find((line) => line > top)
+    if (target !== undefined) this.scrollTo(target)
+    else if (direction === 1) this.follow()
+  }
+
+  /** The keys that are the view's own: moving between commands */
+  private shortcut(event: KeyboardEvent): boolean {
+    const held = this.mac ? event.metaKey && !event.ctrlKey : event.ctrlKey && event.shiftKey
+    if (!held || event.altKey || (event.code !== 'ArrowUp' && event.code !== 'ArrowDown')) return false
+    this.scrollToCommand(event.code === 'ArrowUp' ? -1 : 1)
+    return true
+  }
+
+  /** A mark for each command whose prompt is in view, coloured by how the command ended */
+  private marksIn(first: number, count: number): NonNullable<Scene['marks']> {
+    if (this.gutter === 0) return []
+    const { palette } = this.options.theme
+    const marks: Array<{ row: number; color: number }> = []
+    for (const command of this.commandList) {
+      const line = command.prompt
+      if (line === null || line < first || line >= first + count) continue
+      // Still to run, running, succeeded, failed — and ended with the shell not saying how
+      const color = command.startedMs === null ? palette[8]
+        : command.finishedMs === null ? palette[4]
+          : command.exitStatus === null ? palette[8] : command.exitStatus === 0 ? palette[2] : palette[1]
+      marks.push({ row: line - first, color: color ?? this.options.theme.foreground })
+    }
+    return marks
   }
 
   /** Asks the program to clear its screen, the way the keyboard does: control and L */
@@ -225,7 +306,7 @@ export class TerminalView {
     const host = this.element.parentElement
     if (!host) return
     const { cellWidth, cellHeight } = this.painter.metrics
-    const columns = Math.max(1, Math.floor(host.clientWidth / cellWidth))
+    const columns = Math.max(1, Math.floor((host.clientWidth - this.gutter) / cellWidth))
     const rows = Math.max(1, Math.floor(host.clientHeight / cellHeight))
     this.options.onFit?.({ columns, rows, cellWidth, cellHeight })
   }
@@ -307,6 +388,9 @@ export class TerminalView {
       // Every line number changed, so what was selected and hovered names lines that are gone
       this.selection.reset()
       this.hovered = null
+      // And the lines its commands were on: asked for again, in this epoch
+      this.commandList = []
+      this.commandsSeen = -1
     } else {
       for (const line of changed) this.drawings.delete(line)
     }
@@ -317,12 +401,21 @@ export class TerminalView {
       this.cursorShown = true
       if (blinking) this.startBlinking()
     }
+    if (frame.commands !== this.commandsSeen) {
+      this.commandsSeen = frame.commands
+      const epoch = frame.epoch
+      void this.source.commands().then((commands) => {
+        if (this.disposed || epoch !== this.store.epoch) return
+        this.commandList = commands
+        this.schedule()
+      }, () => {})
+    }
     this.frame = frame
     this.unacknowledged = frame.sequence
     if (frame.columns !== this.columns || frame.screenRows !== this.rows) {
       this.columns = frame.columns
       this.rows = frame.screenRows
-      this.painter.resize(frame.columns, frame.screenRows, window.devicePixelRatio || 1)
+      this.painter.resize(frame.columns, frame.screenRows, window.devicePixelRatio || 1, this.gutter)
     }
     this.followingMayHaveChanged()
     this.schedule()
@@ -383,7 +476,7 @@ export class TerminalView {
   /** Where the pointer is, in pixels from the grid's corner */
   private pointIn(event: MouseEvent): { x: number; y: number } {
     const box = this.painter.canvas.getBoundingClientRect()
-    return { x: event.clientX - box.left, y: event.clientY - box.top }
+    return { x: event.clientX - box.left - this.gutter, y: event.clientY - box.top }
   }
 
   /** The cell the pointer is over, as a line and a column */
@@ -527,7 +620,7 @@ export class TerminalView {
     this.ask(first, count)
 
     const cursor = this.cursorIn(frame, first, count)
-    const scene: Scene = { theme: this.options.theme, rows, offset: this.viewport.offset, cursor }
+    const scene: Scene = { theme: this.options.theme, rows, offset: this.viewport.offset, cursor, marks: this.marksIn(first, count) }
     this.painter.paint(scene)
     this.afterPaint(frame, first, count)
 
