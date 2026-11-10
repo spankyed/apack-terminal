@@ -6,6 +6,7 @@
 // is encoded and compared.
 import { describe, expect, it } from 'vitest'
 import recorded from './vectors/view-vectors.json'
+import { decodeToBroker, encodeToView } from './_broker.ts'
 import { Malformed, Messages, decodeToView, encodeToBroker, type ToBroker, type ToView } from '../src/broker/wire.ts'
 import { paletteIndex, type Color, type Rows } from '../src/source.ts'
 
@@ -82,6 +83,21 @@ describe('the bytes a view and a broker exchange', () => {
       expect(hexOf(encodeToBroker(vector.message as unknown as ToBroker))).toBe(vector.hex)
     })
   }
+})
+
+describe('the fake broker the rest of this suite is driven by', () => {
+  it('writes the bytes the real one does', () => {
+    for (const vector of vectors.filter((vector) => vector.to === 'view')) {
+      const [body] = new Messages().push(bytesOf(vector.hex))
+      expect(hexOf(encodeToView(decodeToView(body!))), vector.name).toBe(vector.hex)
+    }
+  })
+
+  it('reads what the real one would', () => {
+    for (const vector of vectors.filter((vector) => vector.to === 'broker')) {
+      expect(decodeToBroker(bytesOf(vector.hex).subarray(4)), vector.name).toEqual(vector.message)
+    }
+  })
 })
 
 describe('messages in a stream', () => {
