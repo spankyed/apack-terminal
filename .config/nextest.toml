@@ -18,6 +18,12 @@ slow-timeout = { period = "10s", terminate-after = 2 }
 filter = "test(=a_saturating_producer_reports_that_it_was_throttled_rather_than_losing_output)"
 slow-timeout = { period = "30s", terminate-after = 2 }
 
+# The one test that waits out a deadline rather than a round trip: a proxy gives a claim somebody else left
+# `START_WAIT` (`src/proxy.rs`, ten seconds) before taking it over, so that wait is the test
+[[profile.default.overrides]]
+filter = "test(=a_claim_left_by_a_proxy_that_died_is_taken_over)"
+slow-timeout = { period = "30s", terminate-after = 2 }
+
 # **ts-rs generates one `export_bindings_*` test per exported type, and every one of them writes the same
 # file.** Under `cargo test` they were threads in one process and the writes interleaved harmlessly often
 # enough; as separate processes they truncate and write `bindings/protocol.ts` on top of each other, and one

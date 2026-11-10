@@ -176,3 +176,49 @@ fn focus_is_reported_only_to_a_program_that_asked() {
     assert_eq!(screen.focus(true).expect("focus encodes"), b"\x1b[I");
     assert_eq!(screen.focus(false).expect("focus encodes"), b"\x1b[O");
 }
+
+/// Shift that went into what was typed is spent, and shift held with control is not: control never
+/// composes, so the key is still the letter with both down. A program that asked for the keyboard
+/// protocol is where the two are told apart.
+#[test]
+fn shift_is_spent_on_what_it_typed_and_held_beside_control() {
+    let mut screen = Screen::new(80, 24);
+    assert_eq!(sent(&mut screen, &key("KeyA", SHIFT | CONTROL, "A", 'a')), "\x1b[97;6u");
+    assert_eq!(sent(&mut screen, &key("Digit1", SHIFT | CONTROL, "!", '1')), "\x1b[33;5u");
+
+    screen.feed(b"\x1b[>1u");
+    assert_eq!(sent(&mut screen, &key("Digit1", SHIFT, "!", '1')), "!");
+    assert_eq!(sent(&mut screen, &key("KeyA", SHIFT, "A", 'a')), "A");
+    assert_eq!(sent(&mut screen, &key("KeyA", SHIFT | CONTROL, "A", 'a')), "\x1b[97;6u");
+    assert_eq!(sent(&mut screen, &key("KeyB", ALT, "\u{222b}", 'b')), "\u{222b}");
+}
+
+/// **A drag that leaves the grid is still a drag.** The pointer goes on being reported, held to the
+/// nearest edge, for as long as a button is down — which is what lets a selection in a full-screen
+/// program run past the window's side. With nothing held, a pointer outside the grid is nobody's.
+#[test]
+fn a_drag_past_the_edge_is_reported_at_the_edge_while_a_button_is_held() {
+    let mut screen = Screen::new(80, 24);
+    screen.feed(b"\x1b[?1002h\x1b[?1006h");
+    // Eighty columns of ten pixels: 900 is past the right edge, and -30 past the left
+    let outside = |button: u8, x: f32| Pointer { x, ..click(2, button, 0.0, 1.0) };
+    assert_eq!(pointed(&mut screen, &outside(0, 900.0)), "", "nothing is held");
+
+    assert_eq!(pointed(&mut screen, &click(0, 2, 1.0, 1.0)), "\x1b[<2;2;2M");
+    assert_eq!(pointed(&mut screen, &outside(2, 900.0)), "\x1b[<34;80;2M", "held to the last column");
+    assert_eq!(pointed(&mut screen, &outside(2, -30.0)), "\x1b[<34;1;2M", "and to the first");
+    assert_eq!(pointed(&mut screen, &click(1, 2, 1.0, 1.0)), "\x1b[<2;2;2m");
+    assert_eq!(pointed(&mut screen, &outside(2, 900.0)), "", "released");
+
+    // Two down and one let go: the other still holds it
+    assert_eq!(pointed(&mut screen, &click(0, 0, 1.0, 1.0)), "\x1b[<0;2;2M");
+    assert_eq!(pointed(&mut screen, &click(0, 1, 1.0, 1.0)), "\x1b[<1;2;2M");
+    assert_eq!(pointed(&mut screen, &click(1, 1, 1.0, 1.0)), "\x1b[<1;2;2m");
+    assert_eq!(pointed(&mut screen, &outside(0, 900.0)), "\x1b[<32;80;2M");
+    assert_eq!(pointed(&mut screen, &click(1, 0, 1.0, 1.0)), "\x1b[<0;2;2m");
+    assert_eq!(pointed(&mut screen, &outside(0, 950.0)), "");
+
+    // A button the core has no name for is not one that can be held
+    assert_eq!(pointed(&mut screen, &click(0, 8, 1.0, 1.0)), "");
+    assert_eq!(pointed(&mut screen, &outside(0, 900.0)), "");
+}

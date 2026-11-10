@@ -126,3 +126,24 @@ fn the_generation_says_when_to_ask_again() {
     screen.feed(ran("x", "", 0).as_bytes());
     assert_ne!(screen.command_generation(), before);
 }
+
+/// A command whose last line had no newline ended part way along a row, and the shell's next prompt is
+/// drawn on from there: the output stops at the column the command ended on.
+#[test]
+fn output_that_ended_part_way_along_a_row_stops_where_the_command_did() {
+    let mut screen = Screen::new(40, 10);
+    screen.feed(
+        format!("\x1b]133;A{BEL}$ \x1b]133;B{BEL}printf abc\r\n\x1b]133;C{BEL}abc\x1b]133;D;0{BEL}%  next").as_bytes(),
+    );
+    assert_eq!(screen.command_output(1).expect("output reads").as_deref(), Some("abc"));
+}
+
+/// A program still running can move the cursor above where its output began — a redraw from the top of
+/// the screen does. There is nothing between the two to read then, rather than the rows above read
+/// backwards.
+#[test]
+fn a_running_command_whose_cursor_is_above_where_it_began_has_printed_nothing_yet() {
+    let mut screen = Screen::new(40, 10);
+    screen.feed(format!("earlier line\r\n\x1b]133;A{BEL}$ \x1b]133;B{BEL}top\r\n\x1b]133;C{BEL}\x1b[H").as_bytes());
+    assert_eq!(screen.command_output(1).expect("output reads").as_deref(), Some(""));
+}

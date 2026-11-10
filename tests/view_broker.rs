@@ -100,6 +100,11 @@ impl Client {
 
     /// A shell whose bytes nobody reads: it is there to be viewed.
     fn shell(&self) -> String {
+        self.shell_taking(false)
+    }
+
+    /// The same, saying whether a program in it may place images.
+    fn shell_taking(&self, images: bool) -> String {
         say(
             &self.stream,
             &Request::Spawn {
@@ -115,7 +120,7 @@ impl Client {
                 output: false,
                 record: None,
                 restore: false,
-                images: false,
+                images,
             },
         );
         loop {
@@ -469,4 +474,72 @@ fn the_commands_a_shell_marks_are_listed_with_their_lines_and_their_output_is_re
         }
     };
     assert_eq!(text.as_deref(), Some("first\nsecond"));
+}
+
+/// The line under a cell, asked for over the connection: all of what wrapped, from its first row to its
+/// last.
+#[test]
+fn the_line_at_a_cell_is_answered_to_the_view_that_asked() {
+    let broker = start();
+    let client = Client::greeting(&broker);
+    let session = client.shell();
+    let mut view = View::attached(&broker, &session);
+    view.until_shows("$ ");
+    // Sixty columns: seventy characters wrap onto a second row
+    view.type_line(&format!("echo st$((1+1))art-{}", "w".repeat(70)));
+    view.until_shows("st2art-");
+
+    view.send(&ToBroker::Search { channel: 1, request: 5, needle: "st2art-".to_owned() });
+    let found = view.answer(|message| match message {
+        ToView::Spans { request: 5, spans, .. } => Some(spans.clone()),
+        _ => None,
+    });
+    let start = found.last().expect("the search found the line").start;
+    let below = Position { line: start.line + 1, column: 3 };
+    view.send(&ToBroker::LineAt { channel: 1, request: 6, epoch: 0, at: below });
+    let line = view
+        .answer(|message| match message {
+            ToView::Span { request: 6, span, .. } => Some(*span),
+            _ => None,
+        })
+        .expect("there is a line there");
+    assert_eq!((line.start.line, line.start.column), (start.line, 0));
+    assert_eq!((line.end.line, line.end.column), (start.line + 1, 16));
+}
+
+/// An image a program places is told to a view that asks where the images are, and its pixels to one that
+/// asks for them — in a session that was started taking images, with cells whose size is known.
+#[test]
+fn a_placed_image_and_its_pixels_are_answered_to_the_view_that_asked() {
+    let broker = start();
+    let client = Client::greeting(&broker);
+    let session = client.shell_taking(true);
+    say(
+        &client.stream,
+        &Request::Resize { session: session.clone(), cols: 60, rows: 8, cell_width: 10, cell_height: 20 },
+    );
+    let mut view = View::attached(&broker, &session);
+    view.until_shows("$ ");
+    // One red pixel, sent whole and shown where the cursor is
+    view.type_line("printf '\\033_Ga=T,f=32,i=7,s=1,v=1,q=2;/wAA/w==\\033\\\\'; echo sh$((1+1))own");
+    view.until_shows("sh2own");
+
+    view.send(&ToBroker::Images { channel: 1, request: 9 });
+    let (cell, placed) = view.answer(|message| match message {
+        ToView::Images { request: 9, cell_width, cell_height, placements, .. } => {
+            Some(((*cell_width, *cell_height), placements.clone()))
+        }
+        _ => None,
+    });
+    assert_eq!(cell, (10, 20));
+    assert_eq!(placed.iter().map(|placement| placement.image).collect::<Vec<_>>(), [7]);
+
+    view.send(&ToBroker::Image { channel: 1, request: 10, image: 7, offset: 0 });
+    let pixels = view.answer(|message| match message {
+        ToView::Image { request: 10, width, height, channels, total, bytes, .. } => {
+            Some((*width, *height, *channels, *total, bytes.clone()))
+        }
+        _ => None,
+    });
+    assert_eq!(pixels, (1, 1, 4, 4, vec![255, 0, 0, 255]));
 }

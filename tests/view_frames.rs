@@ -402,3 +402,65 @@ fn one_fetch_answers_with_no_more_than_its_limit() {
     let (_, block) = screen.fetch(first, u32::MAX).expect("a fetch reads");
     assert_eq!(block.rows.len(), FETCH_LINES as usize);
 }
+
+/// A shell's mark moves nothing on the screen, and is still something a view is told of: the frame's
+/// command count is how it knows to ask which commands there are now.
+#[test]
+fn a_mark_that_draws_nothing_is_still_a_frame() {
+    let mut screen = Screen::new(20, 4);
+    write(&mut screen, "$ make\r\n");
+    let view = View::attached(&mut screen, 1, 1);
+    let first = view.frame();
+    screen.acknowledge(view.id, first.sequence).expect("an acknowledgement is taken");
+    view.nothing();
+
+    write(&mut screen, "\x1b]133;C\x07");
+    let marked = view.frame();
+    assert_ne!(marked.commands, first.commands);
+    assert!(marked.block.rows.is_empty(), "no row changed, so none is sent");
+}
+
+/// Lines that scroll off a history already full leave it the same length, and when they are all alike
+/// they leave the screen looking the same too. The line the screen starts on has still moved, which is
+/// what a view numbers everything by.
+#[test]
+fn lines_alike_scrolling_through_a_full_history_still_move_the_first_line() {
+    let mut screen = Screen::with_history(8, 3, 5);
+    for _ in 0..400 {
+        screen.feed(b"y\r\n");
+    }
+    let view = View::attached(&mut screen, 1, 1);
+    let mut last = view.frame();
+    for _ in 0..40 {
+        screen.acknowledge(view.id, last.sequence).expect("an acknowledgement is taken");
+        write(&mut screen, "y\r\n");
+        let next = view.frame();
+        assert_eq!(next.first_active, last.first_active + 1);
+        last = next;
+    }
+}
+
+/// One answer holds as many lines as were asked for when each brings a style of its own: the styles a
+/// block can index run to tens of thousands, and a few hundred long rows are nowhere near that.
+#[test]
+fn a_fetch_of_rows_each_in_its_own_colour_is_answered_whole() {
+    let mut screen = Screen::with_history(120, 2, 2_000);
+    let written: String =
+        (0..900u32).map(|line| format!("\x1b[38;2;{};{};7m{}\r\n", line / 256, line % 256, "x".repeat(110))).collect();
+    screen.feed(written.as_bytes());
+    let first = screen.view_position().expect("a position reads").1 - u64::from(screen.scrollback_rows());
+    let (_, block) = screen.fetch(first, 900).expect("a fetch reads");
+    assert_eq!(block.rows.len(), 900);
+    assert!(block.styles.len() >= 900, "{} styles", block.styles.len());
+}
+
+/// A link is read whole however long it is, up to the length nothing real reaches.
+#[test]
+fn a_link_longer_than_the_first_read_allows_for_is_read_whole() {
+    let address = format!("https://example.com/{}", "a".repeat(700));
+    let mut screen = Screen::new(30, 3);
+    screen.feed(format!("\x1b]8;;{address}\x1b\\here\x1b]8;;\x1b\\").as_bytes());
+    let view = View::attached(&mut screen, 1, 1);
+    let frame = view.frame();
+    assert!(frame.block.links.contains(&address), "{:?}", frame.block.links);
+}

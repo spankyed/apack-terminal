@@ -358,3 +358,15 @@ fn a_kind_no_message_has_is_named() {
     assert_eq!(ToBroker::decode(&[200]), Err(Malformed::UnknownKind(200)));
     assert_eq!(ToView::decode(&[1]), Err(Malformed::UnknownKind(1)));
 }
+
+/// A number is at most ten bytes, the tenth holding the one bit left of sixty-four. Anything more in it
+/// is a value that does not fit, and is refused rather than read as its low bits.
+#[test]
+fn a_number_with_more_than_sixty_four_bits_is_refused() {
+    let encoded = ToBroker::Detach { channel: 3 }.encode();
+    let kind = body(&encoded)[0];
+    let mut forged = vec![kind, 0x83];
+    forged.extend([0x80; 8]);
+    forged.push(0x02);
+    assert_eq!(ToBroker::decode(&forged), Err(Malformed::Overflow));
+}

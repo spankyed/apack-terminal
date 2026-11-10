@@ -127,10 +127,6 @@ impl Publication {
         self.first_active
     }
 
-    pub fn has_viewers(&self) -> bool {
-        !self.viewers.is_empty()
-    }
-
     /// The terminal has been written to or resized: what is held here may no longer be what it shows.
     pub fn touch(&mut self) {
         self.stale = true;

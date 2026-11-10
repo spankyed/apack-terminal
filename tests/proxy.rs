@@ -192,3 +192,17 @@ fn only_the_word_proxy_asks_for_one() {
     assert_eq!(status.code(), Some(2));
     assert!(!socket.exists(), "a broker was started for an invocation that asked for none");
 }
+
+/// A proxy that died while starting a broker leaves its claim behind, and nothing listening. The next
+/// proxy waits for the broker that claim promises, and when none comes takes the claim over and starts
+/// one — rather than waiting on a file nobody is going to remove.
+#[test]
+fn a_claim_left_by_a_proxy_that_died_is_taken_over() {
+    let directory = tempfile::tempdir().expect("a directory for the socket");
+    let socket = directory.path().join("broker.sock");
+    let claim = directory.path().join("broker.sock.starting");
+    std::fs::write(&claim, b"").expect("the claim is left");
+    let mut late = proxy(&socket);
+    late.greet(Role::Client);
+    assert!(!claim.exists(), "the claim outlived the broker it was for");
+}

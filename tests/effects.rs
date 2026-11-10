@@ -83,3 +83,16 @@ fn effects_are_taken_once() {
     assert_eq!(screen.take_effects(), vec![Effect::Bell]);
     assert_eq!(screen.take_effects(), vec![]);
 }
+
+/// The last name a program gave is kept for whoever lists the sessions, and a name taken back leaves none.
+#[test]
+fn the_last_title_is_remembered_until_the_program_takes_it_back() {
+    let mut screen = Screen::new(80, 24);
+    assert_eq!(screen.title(), None);
+    screen.feed(b"\x1b]0;first\x07\x1b]2;second\x07");
+    screen.take_effects();
+    assert_eq!(screen.title(), Some("second"));
+    screen.feed(b"\x1b]2;\x07");
+    screen.take_effects();
+    assert_eq!(screen.title(), None);
+}

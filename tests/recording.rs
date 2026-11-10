@@ -239,3 +239,94 @@ fn a_recording_that_was_stopped_is_written_no_more() {
     assert!(std::fs::read(&path).expect("the recording reads") == before);
     assert!(!ending.recorded());
 }
+
+/// What a recording on `budget` holds once it has been written a keyframe, some output and a second keyframe.
+fn two_keyframes(path: &std::path::Path, budget: u64) -> Vec<Timed> {
+    let mut recorder = Recorder::start_with(path, budget, u64::MAX).expect("the recording starts");
+    recorder.keyframe(20, 4, vec![b'k'; 300]).expect("a keyframe is written");
+    recorder.output(&[b'o'; 500]).expect("output is written");
+    recorder.keyframe(20, 4, vec![b'K'; 300]).expect("a keyframe is written");
+    recording::read(path)
+}
+
+/// **The budget is the size a recording may be, and the byte past it is what lets its oldest part go.** A
+/// recording exactly at its budget is whole; one byte over starts at its second keyframe.
+#[test]
+fn a_recording_at_its_budget_is_kept_whole_and_one_byte_past_it_loses_its_oldest_part() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let path = directory.path().join("one.recording");
+    let whole = two_keyframes(&path, u64::MAX);
+    assert_eq!(whole.len(), 3);
+    let length = std::fs::metadata(&path).expect("the recording is there").len();
+
+    let at_the_budget = two_keyframes(&path, length);
+    assert_eq!(at_the_budget.len(), 3, "a recording at its budget dropped something");
+    assert!(matches!(&at_the_budget[0].entry, Entry::Keyframe { redraw, .. } if redraw[0] == b'k'));
+
+    let past_it = two_keyframes(&path, length - 1);
+    assert_eq!(past_it.len(), 1, "a recording past its budget kept its oldest part");
+    assert!(matches!(&past_it[0].entry, Entry::Keyframe { redraw, .. } if redraw[0] == b'K'));
+}
+
+/// A keyframe is put off while an application has the screen. Past its budget a recording stops putting it
+/// off — but only once something has been written since the last, or every write would take another.
+#[test]
+fn a_recording_past_its_budget_can_no_longer_put_a_keyframe_off() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let path = directory.path().join("one.recording");
+    let mut recorder = Recorder::start_with(&path, 1_000, u64::MAX).expect("the recording starts");
+    recorder.keyframe(20, 4, vec![b'k'; 100]).expect("a keyframe is written");
+    recorder.output(&[b'o'; 400]).expect("output is written");
+    assert!(!recorder.keyframe_overdue(), "inside its budget");
+    // The same on a budget of exactly what that wrote: at it, and not past it
+    let length = std::fs::metadata(&path).expect("the recording is there").len();
+    let exact = directory.path().join("exact.recording");
+    let mut at_its_budget = Recorder::start_with(&exact, length, u64::MAX).expect("the recording starts");
+    at_its_budget.keyframe(20, 4, vec![b'k'; 100]).expect("a keyframe is written");
+    at_its_budget.output(&[b'o'; 400]).expect("output is written");
+    assert!(!at_its_budget.keyframe_overdue(), "at its budget");
+    recorder.output(&[b'o'; 600]).expect("output is written");
+    assert!(recorder.keyframe_overdue(), "past its budget, with output since the keyframe");
+
+    // A keyframe larger than the budget leaves the recording past it with nothing written since
+    recorder.keyframe(20, 4, vec![b'K'; 2_000]).expect("a keyframe is written");
+    assert!(!recorder.keyframe_overdue(), "a keyframe was just taken");
+    recorder.output(b"more").expect("output is written");
+    assert!(recorder.keyframe_overdue());
+}
+
+/// The same through a screen: an application that never leaves the alternate screen does not grow its
+/// recording without bound, which waiting for the shell's screen alone would let it.
+#[test]
+fn an_application_that_keeps_the_screen_does_not_grow_the_recording_without_bound() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let path = directory.path().join("one.recording");
+    let budget = 64_000;
+    let mut live = Screen::new(40, 10);
+    live.start_recording_with(Recorder::start_with(&path, budget, 4_000).expect("the recording starts"))
+        .expect("the first keyframe is written");
+    live.feed(b"\x1b[?1049h\x1b[2J");
+    let mut largest = 0;
+    for round in 0..6_000 {
+        live.feed(format!("\x1b[{};1H{}", 1 + round % 10, "x".repeat(39)).as_bytes());
+        largest = largest.max(std::fs::metadata(&path).expect("the recording is there").len());
+    }
+    assert!(largest < budget * 2, "the recording reached {largest} bytes on a budget of {budget}");
+}
+
+/// A recording carried on knows how much was written since its last keyframe, so the next one comes when
+/// it would have and not a whole distance later.
+#[test]
+fn a_recording_carried_on_counts_what_was_written_since_its_last_keyframe() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let path = directory.path().join("one.recording");
+    {
+        let mut recorder = Recorder::start_with(&path, u64::MAX, u64::MAX).expect("the recording starts");
+        recorder.keyframe(20, 4, vec![b'k'; 100]).expect("a keyframe is written");
+        recorder.output(&vec![b'o'; (1 << 20) - 1]).expect("output is written");
+    }
+    let (mut resumed, entries) = Recorder::resume(&path).expect("the recording is carried on");
+    assert_eq!(entries.len(), 2);
+    assert!(!resumed.keyframe_due(), "a byte short of the distance between keyframes");
+    assert!(resumed.output(b"o").expect("output is written"), "and the byte that reaches it");
+}
