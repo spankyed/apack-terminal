@@ -39,10 +39,19 @@ widestring = "1.0.2"
 # measured the two as producing identical grids over this repository's own corpus.
 #
 # **The crate is bindings only and brings no build of its own**: its bindgen output is committed, so nothing
-# runs `libclang`, and it links a prebuilt static library that `cargo xtask vt-prebuilt` fetches and
-# verifies against the checksum the crate pins. `GHOSTTY_VT_RS_SYS_BUILD=prebuilt` makes a build from
-# source a refusal rather than a silent attempt needing a Zig this repository does not pin, and with
-# `GHOSTTY_VT_RS_SYS_PREBUILT_DIR` set the build fetches nothing at all.
+# runs `libclang`, and it links a static library this repository supplies rather than one the build makes.
+# `GHOSTTY_VT_RS_SYS_BUILD=prebuilt` makes a build from source a refusal rather than a silent attempt
+# needing a Zig this repository does not pin, and with `GHOSTTY_VT_RS_SYS_PREBUILT_DIR` set the build
+# fetches nothing at all.
+#
+# **Where that library comes from is not the same on every target.** On the targets upstream or the crate
+# publish one, `cargo xtask vt-prebuilt` fetches the archive and verifies it against the checksum the crate
+# pins. **For Windows nobody publishes one**, so it is built from the release's signed source and dependency
+# tarballs with Zig 0.17.0 and `--system` — out of band, once, never during a build here. Two things about
+# the crate make that less tidy than it reads, both measured: its source build passes `zig build` a
+# `--global-cache-dir` that Zig 0.17.0 rejects, and `GHOSTTY_VT_RS_SYS_PREBUILT_DIR` asserts a
+# `lib/libghostty-vt.a` that no Windows build produces, Zig installing `ghostty-vt-static.lib` — which is
+# the name the crate's own link directive uses on that target.
 [dependencies.ghostty-vt-rs-sys]
 version = "0.3.0"
 
