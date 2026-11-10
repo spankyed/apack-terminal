@@ -348,3 +348,90 @@ describe('the commands a shell ran', () => {
     expect(view.view.selectOutput(command(9, 30, { end: 31 }))).toBe(false)
   })
 })
+
+describe('finding text', () => {
+  class Searchable extends FakeSource {
+    asked: string[] = []
+    found: Span[] = []
+    override async search(needle: string): Promise<readonly Span[]> { this.asked.push(needle); return this.found }
+  }
+  const span = (line: number, from: number, to: number, endLine = line): Span => ({ start: { line, column: from }, end: { line: endLine, column: to } })
+  /** The cells a painted row draws behind a match, with the colour of each */
+  const matchedOn = (view: ReturnType<typeof mountedView>, index: number) =>
+    view.painted().rows[index]?.backgrounds.filter((run) => run.color === 0x623315 || run.color === 0x9e6a03).map((run) => [run.column, run.column + run.cells, run.color === 0x9e6a03 ? 'current' : 'other'])
+
+  function searching(found: Span[]) {
+    const source = new Searchable()
+    source.found = found
+    const view = mountedView({}, source)
+    showing(view, { firstActive: 100, scrollback: 100 })
+    return { view, source }
+  }
+
+  it('asks the source, which searches the history as well, and says how many there are', async () => {
+    const { view, source } = searching([span(101, 0, 4), span(100, 6, 9), span(30, 2, 5)])
+    expect(await view.view.find('beta')).toBe(3)
+    expect(source.asked).toEqual(['beta'])
+    expect(view.view.found).toEqual({ current: 1, total: 3 })
+  })
+
+  it('draws every match on screen, and the one the person is on differently', async () => {
+    const { view } = searching([span(101, 0, 4), span(100, 6, 9)])
+    await view.view.find('a')
+    expect(matchedOn(view, 1)).toEqual([[0, 5, 'current']])
+    expect(matchedOn(view, 0)).toEqual([[6, 10, 'other']])
+  })
+
+  it('draws a match that runs across the end of a row on both rows', async () => {
+    const { view } = searching([span(100, 17, 2, 101)])
+    await view.view.find('wrapped')
+    expect(matchedOn(view, 0)).toEqual([[17, 20, 'current']])
+    expect(matchedOn(view, 1)).toEqual([[0, 3, 'current']])
+  })
+
+  it('steps to older matches, scrolling one that is out of view into the middle, and round again', async () => {
+    const { view } = searching([span(101, 0, 4), span(100, 6, 9), span(30, 2, 5)])
+    await view.view.find('a')
+    expect(view.view.viewport.following, 'a match already on screen scrolled the view').toBe(true)
+
+    view.view.findNext()
+    view.view.findNext()
+    expect(view.view.found.current).toBe(3)
+    expect(view.view.viewport.top, 'the oldest match is not in the middle of the view').toBe(28)
+
+    view.view.findNext()
+    expect(view.view.found.current, 'past the oldest is the newest again').toBe(1)
+    view.view.findNext(-1)
+    expect(view.view.found.current).toBe(3)
+  })
+
+  it('is cleared by an empty needle, and forgotten when the screen is reflowed', async () => {
+    const { view, source } = searching([span(101, 0, 4)])
+    await view.view.find('a')
+    expect(await view.view.find('')).toBe(0)
+    expect(source.asked, 'an empty needle was searched for').toEqual(['a'])
+    expect(matchedOn(view, 1)).toEqual([])
+
+    await view.view.find('a')
+    showing(view, { epoch: 2, sequence: 5, firstActive: 100, scrollback: 100 })
+    expect(view.view.found).toEqual({ current: 0, total: 0 })
+  })
+
+  it('takes the answer to the latest search, whichever answer arrives last', async () => {
+    const source = new (class extends Searchable {
+      waiting: Array<(found: Span[]) => void> = []
+      override search(needle: string): Promise<readonly Span[]> {
+        this.asked.push(needle)
+        return new Promise((resolve) => { this.waiting.push(resolve) })
+      }
+    })()
+    const view = mountedView({}, source)
+    showing(view, { firstActive: 100, scrollback: 100 })
+    const first = view.view.find('a')
+    const second = view.view.find('ab')
+    source.waiting[1]!([span(100, 0, 1)])
+    source.waiting[0]!([span(100, 0, 1), span(101, 0, 1), span(102, 0, 1)])
+    await Promise.all([first, second])
+    expect(view.view.found.total, 'an earlier search overwrote a later one').toBe(1)
+  })
+})

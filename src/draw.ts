@@ -15,6 +15,9 @@ export interface Theme {
   readonly selectionBackground: number
   /** The colour of selected text, or `null` to leave each character its own */
   readonly selectionForeground: number | null
+  /** Behind every place a search found its text, and behind the one the person is on. Left out, a view's own */
+  readonly matchBackground?: number
+  readonly currentMatchBackground?: number
 }
 
 export type LineKind = Exclude<Underline, 'none'> | 'strikethrough' | 'overline'

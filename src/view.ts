@@ -91,6 +91,10 @@ export class TerminalView {
   private wasFollowing = true
   private disposed = false
   private wasSelected = false
+  /** Where a search found its text, newest first, and which of them the person is on */
+  private matches: readonly Span[] = []
+  private currentMatch = -1
+  private finding = 0
   private readonly gutter: number
   /** The commands the shell has reported, and the frame's count that said to ask for them */
   private commandList: readonly Command[] = []
@@ -170,6 +174,68 @@ export class TerminalView {
       start: { line: this.store.oldest, column: 0 },
       end: { line: this.store.firstActive + this.rows - 1, column: Math.max(0, this.columns - 1) },
     })
+  }
+
+  /**
+   * Finds every place `needle` appears, in the screen and all of its history, and goes to the newest.
+   * Answers how many there are. An empty needle clears the search.
+   */
+  async find(needle: string): Promise<number> {
+    const asked = (this.finding += 1)
+    let found: readonly Span[] = []
+    if (needle !== '') {
+      try {
+        found = await this.source.search(needle)
+      } catch {
+        found = []
+      }
+    }
+    // A search that was overtaken by a later one has nothing to say
+    if (asked !== this.finding) return this.matches.length
+    this.matches = found
+    this.currentMatch = found.length > 0 ? 0 : -1
+    this.drawings.clear()
+    this.showMatch()
+    return found.length
+  }
+
+  /** Which match the person is on, counting from one at the newest, and how many there are */
+  get found(): { current: number; total: number } {
+    return { current: this.currentMatch + 1, total: this.matches.length }
+  }
+
+  /** Goes to the next match: an older one for `1`, a newer one for `-1`, round to the other end past the last */
+  findNext(direction: -1 | 1 = 1): void {
+    if (this.matches.length === 0) return
+    this.currentMatch = (this.currentMatch + direction + this.matches.length) % this.matches.length
+    this.drawings.clear()
+    this.showMatch()
+  }
+
+  /** Brings the match the person is on into view, in the middle where there is room */
+  private showMatch(): void {
+    const match = this.matches[this.currentMatch]
+    if (match) {
+      const [first, count] = this.viewport.visible
+      if (match.start.line < first || match.start.line >= first + count) {
+        this.scrollTo(match.start.line - Math.floor(this.rows / 2))
+      }
+    }
+    this.schedule()
+  }
+
+  /** The cells of `line` that matches cover, each with whether it is the match the person is on */
+  private matchesOn(line: number): Array<{ from: number; to: number; current: boolean }> {
+    const on: Array<{ from: number; to: number; current: boolean }> = []
+    this.matches.forEach((match, index) => {
+      if (line < match.start.line || line > match.end.line) return
+      on.push({
+        from: line === match.start.line ? match.start.column : 0,
+        to: line === match.end.line ? match.end.column + 1 : this.columns,
+        current: index === this.currentMatch,
+      })
+    })
+    return on
   }
 
   /** The commands the shell has reported, as the view last heard them */
@@ -391,6 +457,9 @@ export class TerminalView {
       // And the lines its commands were on: asked for again, in this epoch
       this.commandList = []
       this.commandsSeen = -1
+      this.matches = []
+      this.currentMatch = -1
+      this.finding += 1
     } else {
       for (const line of changed) this.drawings.delete(line)
     }
@@ -667,10 +736,23 @@ export class TerminalView {
     if (!row) return null
     const selected: SelectedCells | undefined = this.selection.on(line)
     const hovered = this.hovered?.line === line ? this.hovered.link : null
+    const matched = this.matches.length > 0 ? this.matchesOn(line) : []
     const key = `${selected ? `${selected.from}-${selected.to}` : ''}|${hovered ? `${hovered.from}-${hovered.to}` : ''}`
+      + `|${matched.map((match) => `${match.from}-${match.to}${match.current ? '!' : ''}`).join(',')}`
     const kept = this.drawings.get(line)
     if (kept && kept.row === row && kept.selected === key) return kept.drawing
     let drawing = drawRow(row, this.store.styles, this.options.theme, selected)
+    // Behind what a search found, over whatever background the cells had: later rectangles cover earlier
+    if (matched.length > 0) {
+      const { matchBackground = 0x623315, currentMatchBackground = 0x9e6a03 } = this.options.theme
+      drawing = {
+        ...drawing,
+        backgrounds: [
+          ...drawing.backgrounds,
+          ...matched.map((match) => ({ column: match.from, cells: match.to - match.from, color: match.current ? currentMatchBackground : matchBackground })),
+        ],
+      }
+    }
     // A link under the pointer is underlined, whatever it looked like before
     if (hovered) {
       drawing = {
