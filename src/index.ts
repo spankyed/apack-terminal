@@ -6,5 +6,7 @@ export { drawRow, type LineKind, type RowDrawing, type SelectedCells, type Theme
 export { css, fontOf, measure, type Font, type Metrics, type Painter, type Scene } from './painter.ts'
 export { CanvasPainter } from './canvas-painter.ts'
 export { BLINK_MS, TerminalView, type ViewOptions } from './view.ts'
+export { Selection, type Granularity } from './selection.ts'
+export { linkAt, urls, type Detector, type Link } from './links.ts'
 export { BrokerViews, Unanswered, type ByteStream } from './broker/source.ts'
 export { MAX_MESSAGE_BYTES, Malformed, Messages, decodeToView, encodeToBroker, type ToBroker, type ToView } from './broker/wire.ts'

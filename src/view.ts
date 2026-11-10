@@ -1,8 +1,11 @@
 import { CanvasPainter } from './canvas-painter.ts'
 import { drawRow, type RowDrawing, type SelectedCells, type Theme } from './draw.ts'
+import { Input, modifiersOf } from './input.ts'
+import { linkAt, urls, type Detector, type Link } from './links.ts'
 import type { Font, Painter, Scene } from './painter.ts'
 import { RowStore } from './row-store.ts'
-import type { Frame, Row, TerminalSource } from './source.ts'
+import { Selection, type Granularity } from './selection.ts'
+import type { Frame, PointerInput, Position, Row, TerminalSource } from './source.ts'
 import { Viewport } from './viewport.ts'
 
 /** How long the cursor is shown, and then hidden, while it blinks */
@@ -26,6 +29,24 @@ export interface ViewOptions {
   readonly onFollowingChange?: (following: boolean) => void
   /** The session ended */
   readonly onEnded?: () => void
+  /**
+   * A key the host wants for itself. Answering `true` keeps it from the program. Asked before anything
+   * else, for every key.
+   */
+  readonly onKey?: (event: KeyboardEvent) => boolean
+  /**
+   * A paste holds what could run a command. Answer whether the person, shown the text, said to paste it
+   * anyway. Left out, such a paste is dropped.
+   */
+  readonly confirmPaste?: (text: string) => Promise<boolean>
+  /** The person opened a link: clicked it with the platform's modifier held */
+  readonly onLink?: (link: Link, event: MouseEvent) => void
+  /** What else on a row can be opened, beyond URLs and what a program declared */
+  readonly detectors?: readonly Detector[]
+  /** Text was copied. Left out, it is written to the clipboard the page has */
+  readonly onCopy?: (text: string) => void
+  /** Whether this is a Mac, where the command key is the app's. Left out, asked of the browser */
+  readonly mac?: boolean
 }
 
 interface Kept {
@@ -62,17 +83,97 @@ export class TerminalView {
   private focused = false
   private wasFollowing = true
   private disposed = false
-  /** What is selected on each line, for `selectionOn`. Set by the selection, which is the only writer */
-  selectionOn: (line: number) => SelectedCells | undefined = () => undefined
+  private readonly mac: boolean
+  private readonly detectors: readonly Detector[]
+  private readonly input: Input
+  /** The rows on screen as text, for whatever reads a page rather than looks at it */
+  private readonly mirror: HTMLDivElement
+  private readonly mirrored: Array<Row | null | undefined> = []
+  private readonly thumb: HTMLDivElement
+  /** The link the pointer is over, and the line it is on */
+  private hovered: { line: number; link: Link } | null = null
+  /** A button is down: what it is doing, and where it went down */
+  private pressed: { button: number; reporting: boolean; at: Position; moved: boolean } | null = null
+  /** Fractions of a wheel notch not yet sent to a program that takes whole ones */
+  private wheelOwed = 0
+  /** What is selected. It asks the source what a word or a line is and draws nothing itself */
+  readonly selection: Selection
 
   constructor(private readonly source: TerminalSource, private readonly options: ViewOptions) {
+    this.mac = options.mac ?? /Mac|iPhone|iPad/.test(navigator.platform)
+    this.detectors = [urls, ...(options.detectors ?? [])]
     this.element = document.createElement('div')
-    this.element.style.cssText = 'position:relative;width:100%;height:100%;overflow:hidden'
+    this.element.style.cssText = 'position:relative;width:100%;height:100%;overflow:hidden;cursor:text'
     this.element.style.background = `#${options.theme.background.toString(16).padStart(6, '0')}`
     this.painter = (options.painter ?? ((font) => new CanvasPainter(font)))(options.font)
     this.painter.canvas.style.display = 'block'
     this.element.appendChild(this.painter.canvas)
+
+    this.selection = new Selection(source, () => this.columns, () => this.schedule())
+    this.input = new Input(source, {
+      mac: this.mac,
+      intercept: options.onKey,
+      paste: (text) => { void this.paste(text) },
+      copy: () => { void this.copy() },
+      focused: (focused) => this.setFocused(focused),
+    })
+    this.element.appendChild(this.input.field)
+
+    this.mirror = document.createElement('div')
+    this.mirror.setAttribute('role', 'document')
+    this.mirror.setAttribute('aria-label', 'Terminal')
+    this.mirror.dataset.terminalText = ''
+    // Read, not seen: the canvas is what is looked at
+    this.mirror.style.cssText = 'position:absolute;left:0;top:0;width:1px;height:1px;overflow:hidden;'
+      + 'clip-path:inset(50%);white-space:pre;pointer-events:none;user-select:none'
+    this.element.appendChild(this.mirror)
+
+    this.thumb = document.createElement('div')
+    this.thumb.style.cssText = 'position:absolute;right:2px;width:6px;border-radius:3px;top:0;height:0;'
+      + 'background:currentColor;opacity:0;transition:opacity 120ms;cursor:default;z-index:2'
+    this.thumb.style.color = `#${options.theme.foreground.toString(16).padStart(6, '0')}`
+    this.element.appendChild(this.thumb)
+
     this.element.addEventListener('wheel', this.wheel, { passive: false })
+    this.element.addEventListener('pointerdown', this.pointerDown)
+    this.element.addEventListener('pointermove', this.pointerMove)
+    this.element.addEventListener('pointerup', this.pointerUp)
+    this.element.addEventListener('pointerleave', this.pointerLeave)
+    this.element.addEventListener('contextmenu', this.contextMenu)
+    this.thumb.addEventListener('pointerdown', this.thumbDown)
+  }
+
+  /** Gives the view the keyboard */
+  focus(): void {
+    this.input.field.focus({ preventScroll: true })
+  }
+
+  /**
+   * Pastes text into the program. Text that could run a command — a line ending where the program takes
+   * them as typed — goes only if the host's `confirmPaste` says the person agreed.
+   */
+  async paste(text: string): Promise<void> {
+    try {
+      if ((await this.source.paste(text)) !== 'unsafe') return
+      if (await this.options.confirmPaste?.(text)) await this.source.paste(text, { allowUnsafe: true })
+    } catch {
+      // The session ended while the paste was on its way: there is nothing to paste into
+    }
+  }
+
+  /** Copies what is selected, as a program wrote it. Answers whether there was anything to copy */
+  async copy(): Promise<boolean> {
+    if (!this.selection.span) return false
+    let text: string
+    try {
+      text = await this.selection.text()
+    } catch {
+      return false
+    }
+    if (text === '') return false
+    if (this.options.onCopy) this.options.onCopy(text)
+    else await navigator.clipboard?.writeText(text).catch(() => {})
+    return true
   }
 
   /** Puts the view in `host` and starts its frames */
@@ -107,6 +208,7 @@ export class TerminalView {
 
   /** The view has, or has lost, the keyboard: an unfocused terminal shows a hollow cursor that does not blink */
   setFocused(focused: boolean): void {
+    if (focused === this.focused) return
     this.focused = focused
     this.cursorShown = true
     if (this.blink) clearInterval(this.blink)
@@ -142,7 +244,13 @@ export class TerminalView {
     this.disposed = true
     this.unmount()
     this.element.removeEventListener('wheel', this.wheel)
+    this.element.removeEventListener('pointerdown', this.pointerDown)
+    this.element.removeEventListener('pointermove', this.pointerMove)
+    this.element.removeEventListener('pointerup', this.pointerUp)
+    this.element.removeEventListener('pointerleave', this.pointerLeave)
+    this.element.removeEventListener('contextmenu', this.contextMenu)
     if (this.blink) clearInterval(this.blink)
+    this.input.dispose()
     this.painter.dispose()
   }
 
@@ -172,6 +280,9 @@ export class TerminalView {
     if (reset) {
       this.drawings.clear()
       this.asked.clear()
+      // Every line number changed, so what was selected and hovered names lines that are gone
+      this.selection.reset()
+      this.hovered = null
     } else {
       for (const line of changed) this.drawings.delete(line)
     }
@@ -215,14 +326,164 @@ export class TerminalView {
     this.options.onFollowingChange?.(following)
   }
 
+  /**
+   * The wheel scrolls history where there is some. A program that asked for the mouse is sent the wheel
+   * instead, and a full-screen program that did not is sent arrow keys, which is what makes `less` and
+   * `man` scroll under a wheel in every terminal.
+   */
   private readonly wheel = (event: WheelEvent) => {
-    if (this.store.scrollback === 0) return
-    event.preventDefault()
+    const frame = this.frame
+    if (!frame) return
     const { cellHeight } = this.painter.metrics
     // A wheel reports pixels, lines or pages; a trackpad reports pixels, which is what makes the view move
     // by fractions of a row
     const lines = event.deltaMode === 1 ? event.deltaY : event.deltaMode === 2 ? event.deltaY * this.rows : event.deltaY / cellHeight
-    this.scrollBy(lines)
+    const toProgram = frame.modes.mouse && !event.shiftKey
+    if (!toProgram && !frame.modes.alternateScreen) {
+      if (this.store.scrollback === 0) return
+      event.preventDefault()
+      this.scrollBy(lines)
+      return
+    }
+    event.preventDefault()
+    // A program is told about whole notches, so fractions are kept until they add up to one
+    this.wheelOwed += lines
+    const notches = Math.trunc(this.wheelOwed)
+    this.wheelOwed -= notches
+    for (let sent = 0; sent < Math.min(Math.abs(notches), 20); sent += 1) {
+      if (toProgram) this.source.pointer(this.pointerInput(event, notches < 0 ? 'wheelUp' : 'wheelDown', -1))
+      else this.source.key({ action: 'press', code: notches < 0 ? 'ArrowUp' : 'ArrowDown', modifiers: 0, text: '', unshifted: 0 })
+    }
+  }
+
+  /** Where the pointer is, in pixels from the grid's corner */
+  private pointIn(event: MouseEvent): { x: number; y: number } {
+    const box = this.painter.canvas.getBoundingClientRect()
+    return { x: event.clientX - box.left, y: event.clientY - box.top }
+  }
+
+  /** The cell the pointer is over, as a line and a column */
+  private positionOf(event: MouseEvent): Position {
+    const { cellWidth, cellHeight } = this.painter.metrics
+    const { x, y } = this.pointIn(event)
+    const [first] = this.viewport.visible
+    const row = Math.floor(y / cellHeight + this.viewport.offset)
+    return {
+      line: first + Math.max(0, Math.min(row, this.rows)),
+      column: Math.max(0, Math.min(Math.floor(x / cellWidth), Math.max(0, this.columns - 1))),
+    }
+  }
+
+  private pointerInput(event: MouseEvent, action: PointerInput['action'], button: number): PointerInput {
+    const { cellWidth, cellHeight } = this.painter.metrics
+    const { x, y } = this.pointIn(event)
+    return { action, button, modifiers: modifiersOf(event), x: Math.max(0, x), y: Math.max(0, y), cellWidth, cellHeight }
+  }
+
+  /** `0` left, `1` middle, `2` right, as a source numbers them — which is how the page does too */
+  private readonly pointerDown = (event: PointerEvent) => {
+    if (event.target === this.thumb) return
+    this.focus()
+    // Keeps the focus this just gave from going to whatever the page would otherwise focus on a click
+    event.preventDefault()
+    const at = this.positionOf(event)
+    // A program that asked for the mouse owns it, where the screen is showing; shift takes it back
+    const reporting = this.frame?.modes.mouse === true && !event.shiftKey && this.viewport.following
+    this.pressed = { button: event.button, reporting, at, moved: false }
+    this.element.setPointerCapture?.(event.pointerId)
+    if (reporting) {
+      this.source.pointer(this.pointerInput(event, 'press', event.button))
+      return
+    }
+    if (event.button !== 0) return
+    if (event.shiftKey && this.selection.span) {
+      this.selection.extendTo(at)
+      return
+    }
+    const granularity: Granularity = event.detail >= 3 ? 'line' : event.detail === 2 ? 'word' : 'cell'
+    if (granularity === 'cell') this.selection.clear()
+    else this.selection.begin(at, granularity)
+  }
+
+  private readonly pointerMove = (event: PointerEvent) => {
+    const pressed = this.pressed
+    if (pressed?.reporting) {
+      this.source.pointer(this.pointerInput(event, 'move', pressed.button))
+      return
+    }
+    if (!pressed && this.frame?.modes.mouse && !event.shiftKey && this.viewport.following) {
+      this.source.pointer(this.pointerInput(event, 'move', -1))
+    }
+    const at = this.positionOf(event)
+    if (pressed?.button === 0) {
+      // The first move off the cell that was pressed is where a selection starts: a click selects nothing
+      if (!pressed.moved && (at.line !== pressed.at.line || at.column !== pressed.at.column)) {
+        pressed.moved = true
+        if (!this.selection.span) this.selection.begin(pressed.at, 'cell')
+      }
+      if (pressed.moved) this.selection.extendTo(at)
+      return
+    }
+    this.hover(at)
+  }
+
+  private readonly pointerUp = (event: PointerEvent) => {
+    const pressed = this.pressed
+    this.pressed = null
+    this.element.releasePointerCapture?.(event.pointerId)
+    if (!pressed) return
+    if (pressed.reporting) {
+      this.source.pointer(this.pointerInput(event, 'release', pressed.button))
+      return
+    }
+    // A click that did not drag, with the platform's modifier held, opens what it is on
+    const opening = this.mac ? event.metaKey : event.ctrlKey
+    if (pressed.button === 0 && !pressed.moved && opening) {
+      const link = this.linkOn(this.positionOf(event))
+      if (link) this.options.onLink?.(link, event)
+    }
+  }
+
+  private readonly pointerLeave = () => this.hover(null)
+
+  /** A program that owns the mouse is sent the right button; otherwise the page's menu is the host's to show */
+  private readonly contextMenu = (event: MouseEvent) => {
+    if (this.frame?.modes.mouse && !event.shiftKey) event.preventDefault()
+  }
+
+  private linkOn(at: Position): Link | null {
+    const row = this.store.row(at.line)
+    return row ? linkAt(row, this.store.links, at.column, this.detectors) : null
+  }
+
+  /** Marks the link under the pointer, which is how a person finds out a piece of text opens something */
+  private hover(at: Position | null): void {
+    const link = at ? this.linkOn(at) : null
+    const before = this.hovered
+    const same = before !== null && link !== null && at !== null && before.line === at.line && before.link.from === link.from && before.link.to === link.to
+    if (same || (!before && !link)) return
+    this.hovered = link && at ? { line: at.line, link } : null
+    this.element.style.cursor = link ? 'pointer' : 'text'
+    this.element.title = link ? link.target : ''
+    this.schedule()
+  }
+
+  /** Dragging the scrollbar's thumb moves through history in proportion */
+  private readonly thumbDown = (event: PointerEvent) => {
+    event.preventDefault()
+    event.stopPropagation()
+    const start = { y: event.clientY, top: this.viewport.top }
+    const move = (moved: PointerEvent) => {
+      const { total } = this.viewport.extent
+      const lines = ((moved.clientY - start.y) / Math.max(1, this.element.clientHeight)) * total
+      this.scrollTo(start.top + lines)
+    }
+    const up = () => {
+      window.removeEventListener('pointermove', move)
+      window.removeEventListener('pointerup', up)
+    }
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', up)
   }
 
   private schedule(): void {
@@ -241,8 +502,10 @@ export class TerminalView {
     for (let line = first; line < first + count; line += 1) rows.push(this.drawingOf(line))
     this.ask(first, count)
 
-    const scene: Scene = { theme: this.options.theme, rows, offset: this.viewport.offset, cursor: this.cursorIn(frame, first, count) }
+    const cursor = this.cursorIn(frame, first, count)
+    const scene: Scene = { theme: this.options.theme, rows, offset: this.viewport.offset, cursor }
     this.painter.paint(scene)
+    this.afterPaint(frame, first, count)
 
     if (this.unacknowledged !== null) {
       this.source.acknowledge(this.unacknowledged)
@@ -250,14 +513,54 @@ export class TerminalView {
     }
   }
 
+  /**
+   * What follows a paint and is not paint: the text a page reader reads, the scrollbar, where an input
+   * method's window goes, and the mark that says how far has been drawn.
+   */
+  private afterPaint(frame: Frame, first: number, count: number): void {
+    // One element a row, touched only when its row is a different one from what it last showed
+    while (this.mirror.childElementCount < count) this.mirror.appendChild(document.createElement('div'))
+    while (this.mirror.childElementCount > count) this.mirror.lastElementChild!.remove()
+    this.mirrored.length = count
+    for (let index = 0; index < count; index += 1) {
+      const row = this.store.row(first + index) ?? null
+      if (this.mirrored[index] === row) continue
+      this.mirrored[index] = row
+      this.mirror.children[index]!.textContent = row ? textOf(row) : ''
+    }
+
+    const { total, position, shown } = this.viewport.extent
+    const scrollable = total > shown
+    const height = this.element.clientHeight
+    this.thumb.style.height = scrollable ? `${Math.max(20, (shown / total) * height)}px` : '0'
+    this.thumb.style.top = scrollable ? `${(position / total) * height}px` : '0'
+    this.thumb.style.opacity = scrollable && !this.viewport.following ? '0.35' : '0'
+
+    const { cellWidth, cellHeight } = this.painter.metrics
+    if (frame.cursor) {
+      const row = frame.firstActive + frame.cursor.row - first
+      this.input.moveTo(frame.cursor.column * cellWidth, Math.max(0, row - this.viewport.offset) * cellHeight, cellHeight)
+    }
+    // How far a page looking for output to be on screen can count on: this frame, and these lines
+    this.element.dataset.terminalDrawn = String(frame.sequence)
+  }
+
   private drawingOf(line: number): RowDrawing | null {
     const row = this.store.row(line)
     if (!row) return null
-    const selected = this.selectionOn(line)
-    const key = selected ? `${selected.from}-${selected.to}` : ''
+    const selected: SelectedCells | undefined = this.selection.on(line)
+    const hovered = this.hovered?.line === line ? this.hovered.link : null
+    const key = `${selected ? `${selected.from}-${selected.to}` : ''}|${hovered ? `${hovered.from}-${hovered.to}` : ''}`
     const kept = this.drawings.get(line)
     if (kept && kept.row === row && kept.selected === key) return kept.drawing
-    const drawing = drawRow(row, this.store.styles, this.options.theme, selected)
+    let drawing = drawRow(row, this.store.styles, this.options.theme, selected)
+    // A link under the pointer is underlined, whatever it looked like before
+    if (hovered) {
+      drawing = {
+        ...drawing,
+        lines: [...drawing.lines, { kind: 'single', column: hovered.from, cells: hovered.to - hovered.from, color: this.options.theme.foreground }],
+      }
+    }
     this.drawings.set(line, { row, selected: key, drawing })
     return drawing
   }
@@ -293,4 +596,17 @@ export class TerminalView {
       text: row && at !== -1 ? { text: row.text[at]!, bold: ((style?.flags ?? 0) & 1) !== 0, italic: ((style?.flags ?? 0) & 2) !== 0 } : undefined,
     }
   }
+}
+
+/** A row as the text on it, with the blank cells between its characters as spaces */
+function textOf(row: Row): string {
+  let text = ''
+  let column = 0
+  for (let index = 0; index < row.text.length; index += 1) {
+    const start = row.column[index]!
+    if (start > column) text += ' '.repeat(start - column)
+    text += row.text[index]!
+    column = start + row.width[index]!
+  }
+  return text
 }
