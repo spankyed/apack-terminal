@@ -29,9 +29,15 @@ use apack_terminal::view::wire::{CommandRow, Incoming, ToBroker, ToView, read_me
 use apack_terminal::vt::input::{Key, Pointer};
 
 fn main() -> std::io::Result<()> {
-    let Some(socket) = std::env::args().nth(1) else {
-        eprintln!("usage: apack-terminal <socket>");
-        std::process::exit(2);
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    let socket = match arguments.as_slice() {
+        // This process's stdin and stdout as a connection to the broker there (`proxy`)
+        [mode, socket] if mode == "proxy" => return apack_terminal::proxy::run(socket),
+        [socket] => socket.clone(),
+        _ => {
+            eprintln!("usage: apack-terminal <socket>\n       apack-terminal proxy <socket>");
+            std::process::exit(2);
+        }
     };
     let name = socket.as_str().to_fs_name::<GenericFilePath>()?;
     // `try_overwrite` replaces the socket a previous run left behind, which would otherwise refuse the bind:
