@@ -1,4 +1,8 @@
+import { xtermPalette } from '../src/palette.ts'
 import { PLAIN, type Frame, type Row, type Style } from '../src/source.ts'
+
+/** A palette whose sixteen themed colours are each recognisable: entry `n` is `0xA000n0` */
+export const PALETTE = xtermPalette(Array.from({ length: 16 }, (_, index) => 0xa00000 | (index << 4)))
 
 /** A row of plain ASCII, one character a cell, all in one style */
 export function row(line: number, text: string, options: { style?: number; wrapped?: boolean; prompt?: boolean } = {}): Row {

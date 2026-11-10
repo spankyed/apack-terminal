@@ -5,10 +5,10 @@ import { drawRow, type Theme } from '../src/draw.ts'
 import { css } from '../src/painter.ts'
 import { PLAIN, type Style } from '../src/source.ts'
 import { recordingContext } from './_canvas.ts'
-import { row } from './_support.ts'
+import { row, PALETTE } from './_support.ts'
 
 const theme: Theme = {
-  background: 0x1e1e1e, foreground: 0xd4d4d4, cursor: 0xffffff, cursorText: 0x000000,
+  background: 0x1e1e1e, palette: PALETTE, foreground: 0xd4d4d4, cursor: 0xffffff, cursorText: 0x000000,
   selectionBackground: 0x264f78, selectionForeground: null,
 }
 const font = { family: 'monospace', size: 14 }

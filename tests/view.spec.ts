@@ -5,10 +5,10 @@ import type { Painter, Scene } from '../src/painter.ts'
 import { TerminalView } from '../src/view.ts'
 import { framesWaiting, installFrames, runFrames } from './_frames.ts'
 import { FakeSource } from './_source.ts'
-import { frame, row } from './_support.ts'
+import { frame, row, PALETTE } from './_support.ts'
 
 const theme: Theme = {
-  background: 0x1e1e1e, foreground: 0xd4d4d4, cursor: 0xffffff, cursorText: 0x000000,
+  background: 0x1e1e1e, palette: PALETTE, foreground: 0xd4d4d4, cursor: 0xffffff, cursorText: 0x000000,
   selectionBackground: 0x264f78, selectionForeground: null,
 }
 

@@ -1,12 +1,14 @@
-import { StyleFlag, underlineOf, type Row, type Style, type Underline } from './source.ts'
+import { StyleFlag, paletteIndex, underlineOf, type Color, type Row, type Style, type Underline } from './source.ts'
 
 /**
- * The colours a view supplies. Everything a program chose arrives already resolved to a colour; these are
- * what is left — the defaults a program did not override, and what belongs to the view itself.
+ * The colours a view supplies: the defaults a program did not override, the palette its numbered colours
+ * name, and what belongs to the view itself.
  */
 export interface Theme {
   readonly background: number
   readonly foreground: number
+  /** What each of the 256 numbered colours is (`xtermPalette`) */
+  readonly palette: readonly number[]
   readonly cursor: number
   /** The colour of a character under a block cursor */
   readonly cursorText: number
@@ -46,6 +48,13 @@ export interface SelectedCells {
   readonly to: number
 }
 
+/** A colour as the theme has it: a numbered one looked up, any other as it is */
+function colorIn(theme: Theme, color: Color): number | null {
+  if (color === null) return null
+  const index = paletteIndex(color)
+  return index === null ? color : (theme.palette[index] ?? theme.foreground)
+}
+
 /**
  * What to draw for `row`.
  *
@@ -72,8 +81,8 @@ export function drawRow(row: Row, styles: readonly Style[], theme: Theme, select
     const style = styles[row.style[index]!] ?? styles[0]!
     const flags = style.flags
 
-    let fg = style.fg ?? theme.foreground
-    let bg = style.bg
+    let fg = colorIn(theme, style.fg) ?? theme.foreground
+    let bg = colorIn(theme, style.bg)
     if (flags & StyleFlag.inverse) [fg, bg] = [bg ?? theme.background, fg]
     const isSelected = selected !== undefined && column < selected.to && column + cells > selected.from
     if (isSelected) {
@@ -101,7 +110,7 @@ export function drawRow(row: Row, styles: readonly Style[], theme: Theme, select
     if (!visible) continue
     const underline = underlineOf(style)
     if (underline !== 'none') {
-      const color = style.underlineColor ?? fg
+      const color = colorIn(theme, style.underlineColor) ?? fg
       extend(lines, { kind: underline, column, cells, color }, (last) => last.kind === underline && last.color === color)
     }
     if (flags & StyleFlag.strikethrough) {

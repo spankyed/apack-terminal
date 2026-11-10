@@ -1,0 +1,745 @@
+[
+  {
+    "hex": "8800000041032902e8075018e807110417010201010000010212345601fa02ff00808206011968747470733a2f2f6578616d706c652e636f6d2f613f623d630400020300000000012402010000026c730502010002787901010200000001030203e4b896010365cc81020bf09f91a8e2808df09f91a90500000002c3a9020000959aef3a00014f000000017a",
+    "message": {
+      "alternateScreen": false,
+      "channel": 3,
+      "columns": 80,
+      "cursor": {
+        "blinking": true,
+        "column": 4,
+        "row": 23,
+        "shape": "bar"
+      },
+      "epoch": 2,
+      "firstActive": 1000,
+      "kind": "frame",
+      "links": [
+        "",
+        "https://example.com/a?b=c"
+      ],
+      "mouse": false,
+      "rows": [
+        {
+          "glyphs": [
+            {
+              "column": 0,
+              "link": 0,
+              "style": 0,
+              "text": "$",
+              "width": 1
+            },
+            {
+              "column": 2,
+              "link": 0,
+              "style": 1,
+              "text": "l",
+              "width": 1
+            },
+            {
+              "column": 3,
+              "link": 0,
+              "style": 1,
+              "text": "s",
+              "width": 1
+            },
+            {
+              "column": 5,
+              "link": 1,
+              "style": 2,
+              "text": "x",
+              "width": 1
+            },
+            {
+              "column": 6,
+              "link": 1,
+              "style": 2,
+              "text": "y",
+              "width": 1
+            }
+          ],
+          "line": 0,
+          "prompt": true,
+          "wrapped": false
+        },
+        {
+          "glyphs": [
+            {
+              "column": 0,
+              "link": 0,
+              "style": 0,
+              "text": "世",
+              "width": 2
+            },
+            {
+              "column": 2,
+              "link": 0,
+              "style": 0,
+              "text": "é",
+              "width": 1
+            },
+            {
+              "column": 3,
+              "link": 0,
+              "style": 0,
+              "text": "👨‍👩",
+              "width": 2
+            },
+            {
+              "column": 5,
+              "link": 0,
+              "style": 0,
+              "text": "é",
+              "width": 1
+            }
+          ],
+          "line": 1,
+          "prompt": false,
+          "wrapped": true
+        },
+        {
+          "glyphs": [],
+          "line": 2,
+          "prompt": false,
+          "wrapped": false
+        },
+        {
+          "glyphs": [
+            {
+              "column": 79,
+              "link": 0,
+              "style": 0,
+              "text": "z",
+              "width": 1
+            }
+          ],
+          "line": 123456789,
+          "prompt": false,
+          "wrapped": false
+        }
+      ],
+      "screenRows": 24,
+      "scrollback": 1000,
+      "sequence": 41,
+      "staleFrom": null,
+      "styles": [
+        {
+          "bg": null,
+          "fg": null,
+          "flags": 0,
+          "underline": null
+        },
+        {
+          "bg": null,
+          "fg": {
+            "palette": 1
+          },
+          "flags": 1,
+          "underline": null
+        },
+        {
+          "bg": {
+            "palette": 250
+          },
+          "fg": {
+            "rgb": 1193046
+          },
+          "flags": 770,
+          "underline": {
+            "rgb": 16711808
+          }
+        }
+      ]
+    },
+    "name": "a frame with one of everything a row can hold",
+    "to": "view"
+  },
+  {
+    "hex": "0e00000041032902e8075018e80704000000",
+    "message": {
+      "alternateScreen": false,
+      "channel": 3,
+      "columns": 80,
+      "cursor": null,
+      "epoch": 2,
+      "firstActive": 1000,
+      "kind": "frame",
+      "links": [
+        ""
+      ],
+      "mouse": true,
+      "rows": [],
+      "screenRows": 24,
+      "scrollback": 1000,
+      "sequence": 41,
+      "staleFrom": null,
+      "styles": [
+        {
+          "bg": null,
+          "fg": null,
+          "flags": 0,
+          "underline": null
+        }
+      ]
+    },
+    "name": "a frame with no cursor and nothing changed",
+    "to": "view"
+  },
+  {
+    "hex": "1300000041032902e8075018e8070b000002de07000000",
+    "message": {
+      "alternateScreen": true,
+      "channel": 3,
+      "columns": 80,
+      "cursor": {
+        "blinking": false,
+        "column": 0,
+        "row": 0,
+        "shape": "underline"
+      },
+      "epoch": 2,
+      "firstActive": 1000,
+      "kind": "frame",
+      "links": [
+        ""
+      ],
+      "mouse": false,
+      "rows": [],
+      "screenRows": 24,
+      "scrollback": 1000,
+      "sequence": 41,
+      "staleFrom": 990,
+      "styles": [
+        {
+          "bg": null,
+          "fg": null,
+          "flags": 0,
+          "underline": null
+        }
+      ]
+    },
+    "name": "a frame naming stale history, with a steady underline cursor",
+    "to": "view"
+  },
+  {
+    "hex": "7e000000420307020201010000010212345601fa02ff00808206011968747470733a2f2f6578616d706c652e636f6d2f613f623d630400020300000000012402010000026c730502010002787901010200000001030203e4b896010365cc81020bf09f91a8e2808df09f91a90500000002c3a9020000959aef3a00014f000000017a",
+    "message": {
+      "channel": 3,
+      "epoch": 2,
+      "kind": "rows",
+      "links": [
+        "",
+        "https://example.com/a?b=c"
+      ],
+      "request": 7,
+      "rows": [
+        {
+          "glyphs": [
+            {
+              "column": 0,
+              "link": 0,
+              "style": 0,
+              "text": "$",
+              "width": 1
+            },
+            {
+              "column": 2,
+              "link": 0,
+              "style": 1,
+              "text": "l",
+              "width": 1
+            },
+            {
+              "column": 3,
+              "link": 0,
+              "style": 1,
+              "text": "s",
+              "width": 1
+            },
+            {
+              "column": 5,
+              "link": 1,
+              "style": 2,
+              "text": "x",
+              "width": 1
+            },
+            {
+              "column": 6,
+              "link": 1,
+              "style": 2,
+              "text": "y",
+              "width": 1
+            }
+          ],
+          "line": 0,
+          "prompt": true,
+          "wrapped": false
+        },
+        {
+          "glyphs": [
+            {
+              "column": 0,
+              "link": 0,
+              "style": 0,
+              "text": "世",
+              "width": 2
+            },
+            {
+              "column": 2,
+              "link": 0,
+              "style": 0,
+              "text": "é",
+              "width": 1
+            },
+            {
+              "column": 3,
+              "link": 0,
+              "style": 0,
+              "text": "👨‍👩",
+              "width": 2
+            },
+            {
+              "column": 5,
+              "link": 0,
+              "style": 0,
+              "text": "é",
+              "width": 1
+            }
+          ],
+          "line": 1,
+          "prompt": false,
+          "wrapped": true
+        },
+        {
+          "glyphs": [],
+          "line": 2,
+          "prompt": false,
+          "wrapped": false
+        },
+        {
+          "glyphs": [
+            {
+              "column": 79,
+              "link": 0,
+              "style": 0,
+              "text": "z",
+              "width": 1
+            }
+          ],
+          "line": 123456789,
+          "prompt": false,
+          "wrapped": false
+        }
+      ],
+      "styles": [
+        {
+          "bg": null,
+          "fg": null,
+          "flags": 0,
+          "underline": null
+        },
+        {
+          "bg": null,
+          "fg": {
+            "palette": 1
+          },
+          "flags": 1,
+          "underline": null
+        },
+        {
+          "bg": {
+            "palette": 250
+          },
+          "fg": {
+            "rgb": 1193046
+          },
+          "flags": 770,
+          "underline": {
+            "rgb": 16711808
+          }
+        }
+      ]
+    },
+    "name": "fetched rows",
+    "to": "view"
+  },
+  {
+    "hex": "020000004303",
+    "message": {
+      "channel": 3,
+      "kind": "ended"
+    },
+    "name": "a session ending",
+    "to": "view"
+  },
+  {
+    "hex": "0400000044030800",
+    "message": {
+      "channel": 3,
+      "kind": "pasted",
+      "outcome": "pasted",
+      "request": 8
+    },
+    "name": "a paste that went",
+    "to": "view"
+  },
+  {
+    "hex": "0400000044030901",
+    "message": {
+      "channel": 3,
+      "kind": "pasted",
+      "outcome": "unsafe",
+      "request": 9
+    },
+    "name": "a paste refused",
+    "to": "view"
+  },
+  {
+    "hex": "0900000045030a020109000b4f",
+    "message": {
+      "channel": 3,
+      "epoch": 2,
+      "kind": "span",
+      "request": 10,
+      "span": {
+        "end": {
+          "column": 79,
+          "line": 11
+        },
+        "start": {
+          "column": 0,
+          "line": 9
+        }
+      }
+    },
+    "name": "a word",
+    "to": "view"
+  },
+  {
+    "hex": "0500000045030b0200",
+    "message": {
+      "channel": 3,
+      "epoch": 2,
+      "kind": "span",
+      "request": 11,
+      "span": null
+    },
+    "name": "no word",
+    "to": "view"
+  },
+  {
+    "hex": "0f00000046030c0b6f6e650a74776f20e4b896",
+    "message": {
+      "channel": 3,
+      "kind": "text",
+      "request": 12,
+      "text": "one\ntwo 世"
+    },
+    "name": "text",
+    "to": "view"
+  },
+  {
+    "hex": "1100000047030d020209000b4ff0a2040cf0a2040c",
+    "message": {
+      "channel": 3,
+      "epoch": 2,
+      "kind": "spans",
+      "request": 13,
+      "spans": [
+        {
+          "end": {
+            "column": 79,
+            "line": 11
+          },
+          "start": {
+            "column": 0,
+            "line": 9
+          }
+        },
+        {
+          "end": {
+            "column": 12,
+            "line": 70000
+          },
+          "start": {
+            "column": 12,
+            "line": 70000
+          }
+        }
+      ]
+    },
+    "name": "matches",
+    "to": "view"
+  },
+  {
+    "hex": "0500000047030e0200",
+    "message": {
+      "channel": 3,
+      "epoch": 2,
+      "kind": "spans",
+      "request": 14,
+      "spans": []
+    },
+    "name": "no matches",
+    "to": "view"
+  },
+  {
+    "hex": "1200000048030f0e6e6f2073657373696f6e20732d39",
+    "message": {
+      "channel": 3,
+      "kind": "failed",
+      "message": "no session s-9",
+      "request": 15
+    },
+    "name": "a refusal",
+    "to": "view"
+  },
+  {
+    "hex": "07000000010304732d3132",
+    "message": {
+      "channel": 3,
+      "kind": "attach",
+      "session": "s-12"
+    },
+    "name": "attaching",
+    "to": "broker"
+  },
+  {
+    "hex": "020000000203",
+    "message": {
+      "channel": 3,
+      "kind": "detach"
+    },
+    "name": "detaching",
+    "to": "broker"
+  },
+  {
+    "hex": "03000000030329",
+    "message": {
+      "channel": 3,
+      "kind": "acknowledge",
+      "sequence": 41
+    },
+    "name": "acknowledging",
+    "to": "broker"
+  },
+  {
+    "hex": "0900000004030702889b04c801",
+    "message": {
+      "channel": 3,
+      "count": 200,
+      "epoch": 2,
+      "first": 69000,
+      "kind": "fetch",
+      "request": 7
+    },
+    "name": "fetching",
+    "to": "broker"
+  },
+  {
+    "hex": "0c00000005030001044b657941014161",
+    "message": {
+      "action": "press",
+      "channel": 3,
+      "code": "KeyA",
+      "kind": "key",
+      "modifiers": 1,
+      "text": "A",
+      "unshifted": 97
+    },
+    "name": "a letter with shift",
+    "to": "broker"
+  },
+  {
+    "hex": "0e00000005030206074172726f7755700000",
+    "message": {
+      "action": "release",
+      "channel": 3,
+      "code": "ArrowUp",
+      "kind": "key",
+      "modifiers": 6,
+      "text": "",
+      "unshifted": 0
+    },
+    "name": "an arrow released with control and alt",
+    "to": "broker"
+  },
+  {
+    "hex": "0c00000005030100044b65794a016a6a",
+    "message": {
+      "action": "repeat",
+      "channel": 3,
+      "code": "KeyJ",
+      "kind": "key",
+      "modifiers": 0,
+      "text": "j",
+      "unshifted": 106
+    },
+    "name": "a key held",
+    "to": "broker"
+  },
+  {
+    "hex": "0c000000060309e697a5e69cace8aa9e",
+    "message": {
+      "channel": 3,
+      "kind": "text",
+      "text": "日本語"
+    },
+    "name": "composed text",
+    "to": "broker"
+  },
+  {
+    "hex": "1500000007030000000000d142000015420000084100008841",
+    "message": {
+      "action": "press",
+      "button": 0,
+      "cellHeight": 17.0,
+      "cellWidth": 8.5,
+      "channel": 3,
+      "kind": "pointer",
+      "modifiers": 0,
+      "x": 104.5,
+      "y": 37.25
+    },
+    "name": "a click",
+    "to": "broker"
+  },
+  {
+    "hex": "15000000070302ff0000000000000000000000004100008041",
+    "message": {
+      "action": "move",
+      "button": -1,
+      "cellHeight": 16.0,
+      "cellWidth": 8.0,
+      "channel": 3,
+      "kind": "pointer",
+      "modifiers": 0,
+      "x": 0.0,
+      "y": 0.0
+    },
+    "name": "a move with nothing held",
+    "to": "broker"
+  },
+  {
+    "hex": "15000000070304ff0100004041000096430000004100008041",
+    "message": {
+      "action": "wheelDown",
+      "button": -1,
+      "cellHeight": 16.0,
+      "cellWidth": 8.0,
+      "channel": 3,
+      "kind": "pointer",
+      "modifiers": 1,
+      "x": 12.0,
+      "y": 300.0
+    },
+    "name": "the wheel with shift",
+    "to": "broker"
+  },
+  {
+    "hex": "0c00000008030800076c73202d6c610a",
+    "message": {
+      "allowUnsafe": false,
+      "channel": 3,
+      "kind": "paste",
+      "request": 8,
+      "text": "ls -la\n"
+    },
+    "name": "a paste",
+    "to": "broker"
+  },
+  {
+    "hex": "06000000080309010178",
+    "message": {
+      "allowUnsafe": true,
+      "channel": 3,
+      "kind": "paste",
+      "request": 9,
+      "text": "x"
+    },
+    "name": "a paste the person allowed",
+    "to": "broker"
+  },
+  {
+    "hex": "03000000090301",
+    "message": {
+      "channel": 3,
+      "gained": true,
+      "kind": "focus"
+    },
+    "name": "focus gained",
+    "to": "broker"
+  },
+  {
+    "hex": "03000000090300",
+    "message": {
+      "channel": 3,
+      "gained": false,
+      "kind": "focus"
+    },
+    "name": "focus lost",
+    "to": "broker"
+  },
+  {
+    "hex": "080000000a030a02f0a2040c",
+    "message": {
+      "at": {
+        "column": 12,
+        "line": 70000
+      },
+      "channel": 3,
+      "epoch": 2,
+      "kind": "wordAt",
+      "request": 10
+    },
+    "name": "asking for a word",
+    "to": "broker"
+  },
+  {
+    "hex": "080000000b031002f0a2040c",
+    "message": {
+      "at": {
+        "column": 12,
+        "line": 70000
+      },
+      "channel": 3,
+      "epoch": 2,
+      "kind": "lineAt",
+      "request": 16
+    },
+    "name": "asking for a line",
+    "to": "broker"
+  },
+  {
+    "hex": "080000000c030c0209000b4f",
+    "message": {
+      "channel": 3,
+      "epoch": 2,
+      "kind": "textOf",
+      "request": 12,
+      "span": {
+        "end": {
+          "column": 79,
+          "line": 11
+        },
+        "start": {
+          "column": 0,
+          "line": 9
+        }
+      }
+    },
+    "name": "asking for text",
+    "to": "broker"
+  },
+  {
+    "hex": "0a0000000d030d066572726f723a",
+    "message": {
+      "channel": 3,
+      "kind": "search",
+      "needle": "error:",
+      "request": 13
+    },
+    "name": "searching",
+    "to": "broker"
+  }
+]

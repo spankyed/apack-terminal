@@ -1,11 +1,12 @@
 // A row as things to draw: the rules a terminal's styles follow, and what a selection does to them.
 import { describe, expect, it } from 'vitest'
 import { drawRow, type Theme } from '../src/draw.ts'
-import { PLAIN, StyleFlag, type Row, type Style } from '../src/source.ts'
-import { row } from './_support.ts'
+import { xtermPalette } from '../src/palette.ts'
+import { PLAIN, StyleFlag, paletteColor, type Row, type Style } from '../src/source.ts'
+import { row, PALETTE } from './_support.ts'
 
 const theme: Theme = {
-  background: 0x1e1e1e,
+  background: 0x1e1e1e, palette: PALETTE,
   foreground: 0xd4d4d4,
   cursor: 0xd4d4d4,
   cursorText: 0x1e1e1e,
@@ -148,5 +149,33 @@ describe('a selection', () => {
     const wide: Row = { ...row(0, '日'), column: Uint16Array.from([0]), width: Uint8Array.from([2]) }
 
     expect(drawRow(wide, [PLAIN], theme, { from: 1, to: 2 }).backgrounds[0]).toMatchObject({ column: 0, cells: 2 })
+  })
+})
+
+describe('a numbered colour', () => {
+  it('is looked up in the theme when the row is drawn, so a theme decides what red is', () => {
+    const styles: Style[] = [PLAIN, { fg: paletteColor(1), bg: paletteColor(4), underlineColor: paletteColor(200), flags: 1 << 8 }]
+    const drawing = drawRow(row(0, 'a', { style: 1 }), styles, theme)
+    expect(drawing.glyphs[0]!.color).toBe(PALETTE[1])
+    expect(drawing.backgrounds[0]!.color).toBe(PALETTE[4])
+    expect(drawing.lines[0]!.color).toBe(PALETTE[200])
+
+    const other = { ...theme, palette: PALETTE.map((color) => color ^ 0xffffff) }
+    expect(drawRow(row(0, 'a', { style: 1 }), styles, other).glyphs[0]!.color).toBe(PALETTE[1]! ^ 0xffffff)
+  })
+
+  it('keeps a colour a program gave exactly, whatever the theme', () => {
+    const styles: Style[] = [PLAIN, { fg: 0x010203, bg: null, underlineColor: null, flags: 0 }]
+    expect(drawRow(row(0, 'a', { style: 1 }), styles, theme).glyphs[0]!.color).toBe(0x010203)
+  })
+})
+
+describe('the 256 colours', () => {
+  it('are the theme\'s sixteen, then the cube and the greys every terminal shares', () => {
+    const palette = xtermPalette([0x111111, 0x222222])
+    expect(palette).toHaveLength(256)
+    expect(palette.slice(0, 3)).toEqual([0x111111, 0x222222, 0])
+    expect([palette[16], palette[21], palette[196], palette[231]]).toEqual([0x000000, 0x0000ff, 0xff0000, 0xffffff])
+    expect([palette[17], palette[232], palette[255]]).toEqual([0x00005f, 0x080808, 0xeeeeee])
   })
 })

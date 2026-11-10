@@ -13,8 +13,28 @@
  * position.
  */
 
-/** A colour as `0xRRGGBB`, or `null` where the terminal's own default applies */
+/**
+ * A colour a character asks for: `null` for the terminal's own default, one of the 256 a palette names
+ * (`paletteColor`), or exactly `0xRRGGBB`.
+ *
+ * **A palette colour stays a name.** Which red "red" is belongs to the theme a view is drawn in, so it is
+ * looked up when a row is drawn, not when it is sent — and a change of theme repaints every row a view
+ * holds without asking anyone for them again.
+ */
 export type Color = number | null
+
+/** The bit that says a colour is a palette index rather than a colour */
+const PALETTE = 0x1000000
+
+/** The colour the palette's entry `index` names, whatever that turns out to be */
+export function paletteColor(index: number): number {
+  return PALETTE | (index & 0xff)
+}
+
+/** The palette entry a colour names, or `null` when it is a colour of its own */
+export function paletteIndex(color: number): number | null {
+  return color & PALETTE ? color & 0xff : null
+}
 
 /**
  * How a run of characters is drawn. `flags` is a set of `StyleFlag` bits with the underline kind above them
