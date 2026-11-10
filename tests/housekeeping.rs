@@ -96,3 +96,33 @@ fn a_session_that_ended_while_it_waited_is_forgotten() {
     housekeeping.for_session("alive", &screen).wrote();
     assert_eq!(said.recv_timeout(PATIENCE).as_deref(), Ok("alive"));
 }
+
+/// One session's turn is not another's. A session written to a moment ago is left alone for its own quiet
+/// period, though the housekeeper is awake and at work on a session beside it.
+#[test]
+fn a_session_just_written_to_waits_its_own_time_while_another_is_compressed() {
+    let quiet_for = Duration::from_millis(300);
+    let (compressed, said) = channel();
+    let housekeeping = Housekeeping::start_with(quiet_for, Some(compressed));
+
+    // Enough history that compressing it takes the housekeeper more than one look
+    let long = Arc::new(Mutex::new(Screen::new(80, 24)));
+    long.lock().expect("the screen locks").feed(&lines(30_000));
+    housekeeping.for_session("long", &long).wrote();
+
+    // Written to just before the first session's compression begins
+    std::thread::sleep(quiet_for * 19 / 10);
+    let recent = Arc::new(Mutex::new(Screen::new(80, 24)));
+    recent.lock().expect("the screen locks").feed(&lines(2_000));
+    let written = std::time::Instant::now();
+    housekeeping.for_session("recent", &recent).wrote();
+
+    let mut left_alone_for = None;
+    for _ in 0..2 {
+        if said.recv_timeout(PATIENCE).as_deref() == Ok("recent") {
+            left_alone_for = Some(written.elapsed());
+        }
+    }
+    let left_alone_for = left_alone_for.expect("the session written to last was compressed");
+    assert!(left_alone_for >= quiet_for, "compressed {left_alone_for:?} after it was written to");
+}

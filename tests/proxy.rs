@@ -174,3 +174,21 @@ fn proxies_arriving_together_start_one_broker() {
         }
     }
 }
+
+/// `proxy` is a word, not a position: two arguments of which the first is anything else are not a request
+/// to be one, and are refused as any other mistyped invocation is.
+#[test]
+fn only_the_word_proxy_asks_for_one() {
+    let directory = tempfile::tempdir().expect("a directory for the socket");
+    let socket = directory.path().join("broker.sock");
+    let status = Command::new(env!("CARGO_BIN_EXE_apack-terminal"))
+        .arg("serve")
+        .arg(&socket)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("the binary runs");
+    assert_eq!(status.code(), Some(2));
+    assert!(!socket.exists(), "a broker was started for an invocation that asked for none");
+}
