@@ -77,6 +77,26 @@ fn lifting_the_byte_ceiling_is_what_lets_a_session_hold_its_lines() {
     assert!(kept > 1_000, "with the ceiling lifted a 2,000-line limit should hold well over a thousand: {kept}");
 }
 
+/// **A call the core refuses is reported, and this is the case that proves the result is read at all.**
+///
+/// The core caps a terminfo name at 128 bytes and refuses a longer one. That matters on its own — a broker
+/// that accepted one silently would leave a program's XTGETTCAP query unanswered with nothing said about
+/// why — and it is the one failure in this layer that reaches only the result check. `Terminal::new` cannot
+/// show that: it guards twice, on the result *and* on a null handle, so dropping the first leaves the
+/// second reporting the same error, and a case built on it passes either way.
+#[test]
+fn a_call_the_core_refuses_is_reported_rather_than_passed_over() {
+    let terminal = Terminal::new(20, 4).expect("a terminal");
+    let too_long = "x".repeat(200);
+    let Err(failed) = terminal.set_terminfo_name(&too_long) else {
+        panic!("a terminfo name of 200 bytes is past the core's 128-byte cap and must be refused")
+    };
+    assert_eq!(failed.call, "ghostty_terminal_set(TERMINFO_NAME)", "the refusal names its call: {failed}");
+
+    // And a name within the cap is accepted, so the case above is about the length rather than the call
+    terminal.set_terminfo_name("xterm-256color").expect("a name within the cap");
+}
+
 /// A refusal names the call it came from, and says nothing about an unsupported build unless it was one.
 ///
 /// Zero columns is refused by `ghostty_terminal_new` — the one failure this layer can provoke without a
