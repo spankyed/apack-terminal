@@ -5,7 +5,7 @@ import { linkAt, urls, type Detector, type Link } from './links.ts'
 import type { Font, Painter, Scene } from './painter.ts'
 import { RowStore } from './row-store.ts'
 import { Selection, type Granularity } from './selection.ts'
-import type { Frame, PointerInput, Position, Row, TerminalSource } from './source.ts'
+import { Modifier, type Frame, type PointerInput, type Position, type Row, type TerminalSource } from './source.ts'
 import { Viewport } from './viewport.ts'
 
 /** How long the cursor is shown, and then hidden, while it blinks */
@@ -160,6 +160,11 @@ export class TerminalView {
       start: { line: this.store.oldest, column: 0 },
       end: { line: this.store.firstActive + this.rows - 1, column: Math.max(0, this.columns - 1) },
     })
+  }
+
+  /** Asks the program to clear its screen, the way the keyboard does: control and L */
+  clear(): void {
+    this.source.key({ action: 'press', code: 'KeyL', modifiers: Modifier.control, text: '', unshifted: 108 })
   }
 
   /** Gives the view the keyboard */

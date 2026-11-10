@@ -245,3 +245,12 @@ describe('what a host is told about the selection', () => {
     expect(view.view.selection.span).toEqual({ start: { line: 60, column: 0 }, end: { line: 103, column: 19 } })
   })
 })
+
+describe('clearing', () => {
+  it('asks the program, with the key a person would press', () => {
+    const view = mountedView()
+    showing(view)
+    view.view.clear()
+    expect(view.source.keys).toEqual([{ action: 'press', code: 'KeyL', modifiers: 2, text: '', unshifted: 108 }])
+  })
+})
