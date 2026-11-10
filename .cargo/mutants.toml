@@ -28,10 +28,33 @@ profile = "mutants"
 # every application they had open, and no assertion written afterwards can undo it.
 #
 # The type is what makes the rest of the function safe to mutate: `SignalTarget` has a private field and no
-# `Default`, so a mutation tester cannot construct one and every `Ok(…)` replacement of a function returning
-# it fails to compile. This covers what is left — the comparisons inside the constructor.
+# `Default`, so a mutation tester cannot construct one and `Ok(Default::default())` — the replacement for
+# `SignalTarget::at` and for `signal_target` themselves — does not compile. Those two are reported unviable,
+# which is why neither is named here. `SignalTarget::number` is not named either, and deliberately: the
+# syscall is handed `target.0` rather than the accessor, so a mutant of it aims nothing, and
+# `tests/signals.rs` reads it and kills all three.
+#
+# What is left to exclude is the comparisons *inside* the constructor, which the pattern below matches
+# because `in <fn>` appears for a mutation of something within a function and not for a replacement of the
+# function itself.
 exclude_re = [
     "session.rs:.*in SignalTarget::at",
+
+    # **`inside_tree`'s guard is cost and clarity, not an answer.** It refuses a pid below 2, and so does the
+    # walk it skips: `sysinfo` has no process 0, and 1 is init, whose ancestry ends at itself. So for every
+    # pid a session's tree can hold, `<` and `<=`, `<` and `==`, and `||` and `&&` answer the same, and only
+    # the number of reads differs. `leader < 2` is the same claim from the other side: a session records
+    # `child.process_id().unwrap_or_default()`, and no platform `portable-pty` spawns on answers `None`, so
+    # nothing produces a leader of 0 to tell them apart — a case that killed these would have to invent a
+    # session whose leader is init, which the broker cannot be asked for.
+    #
+    # **Exactly the five, by line and by replacement**, because the two beside them are real and are killed:
+    # `< with >` admits no real pid at all, and `== with !=` at the line below answers for the wrong
+    # process. Excluding the guard wholesale would have taken both with it. The lines are pinned, which
+    # `cargo xtask check-exclusions` is what makes safe: a pattern left behind by an edit above matches
+    # nothing and fails that check.
+    "session.rs:342:(12|26): replace < with (==|<=) in inside_tree",
+    "session.rs:342:16: replace \\|\\| with && in inside_tree",
 
     # `sendable`'s ASCII arm gives 1 and so does the `_` fallback, so deleting it changes no answer. It is
     # there to say that ASCII is one byte, where `_` says "not a lead byte at all" — removing the arm to kill

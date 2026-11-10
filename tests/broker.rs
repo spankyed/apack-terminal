@@ -229,6 +229,25 @@ fn ask(writing: &mut impl Write, frame: &str) {
 /// with nothing to redraw, and a blocking read turned that into a ten-minute wait.
 const QUIET: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// A command whose *output* is `token` while the line the shell echoes back is not.
+///
+/// **A case cannot count the echo.** The shell writes the typed line back at the terminal's width, so on a
+/// host whose prompt is long — a CI runner's is its hostname — it wraps mid-word, and `still-attached`
+/// arrives as `still-att \rached`, which no `matches` finds. Splitting the token with an empty-string quote
+/// leaves the echo unmatched and the command's own output, on a line of its own, as the one occurrence a
+/// case waits for. Counting both was the assumption, and it held only where the prompt was short.
+///
+/// It also keeps what the count was *for*: a case that matches the echo passes on a console that ran
+/// nothing, which is how `\n` once looked like working input. Here the only thing that can produce the
+/// token is the command.
+///
+/// **POSIX shells only** — the empty-string quote is how `sh`, `bash` and `zsh` read it, and `cmd.exe`
+/// prints it back. The cross-platform case above counts occurrences for that reason.
+fn probe(token: &str) -> String {
+    let (first, rest) = token.split_at(1);
+    format!("echo {first}''{rest}{SUBMIT}")
+}
+
 /// The next event, or `None` once the broker has said nothing for `QUIET`.
 fn event(reading: &mut Events) -> Option<serde_json::Value> {
     match reading.line(QUIET) {
@@ -1602,15 +1621,12 @@ fn a_pause_does_not_outlive_the_client_that_asked_for_it() {
         &mut writing_again,
         &format!(
             r#"{{"kind":"write","session":"{session}","text":{}}}"#,
-            serde_json::to_string(&format!("echo inherited-probe{SUBMIT}")).expect("a JSON string")
+            serde_json::to_string(&probe("inherited-probe")).expect("a JSON string")
         ),
     );
 
-    let output = output_until(&mut again, Some(&session), |seen| seen.matches("inherited-probe").count() >= 2);
-    assert!(
-        output.matches("inherited-probe").count() >= 2,
-        "the new client inherited a pause it never asked for: {output:?}"
-    );
+    let output = output_until(&mut again, Some(&session), |seen| seen.contains("inherited-probe"));
+    assert!(output.contains("inherited-probe"), "the new client inherited a pause it never asked for: {output:?}");
 }
 
 /// **An exit and a signal are different answers.** Reported as one they are the same `1`, so a window
@@ -1708,6 +1724,17 @@ fn a_signal_reaches_a_process_inside_the_session_s_tree_and_nothing_outside_it()
         ),
     );
     assert!(reaped(grandchild), "the grandchild {grandchild} was not reached by a signal to its own pid");
+
+    // **The answer, and not only the effect.** A mutation of the syscall's success test leaves the signal
+    // delivered and reports a failure for it, which `reaped` cannot see. A `screen` request is what makes
+    // the absence of one observable without waiting out the silence window: `until` hands back everything
+    // the broker said before the answer it waits for, so a spurious `failed` arrives inside it.
+    ask(&mut writing, &format!(r#"{{"kind":"screen","session":"{session}","history":0}}"#));
+    let (_, before) = until(&mut reading, "screen");
+    assert!(
+        before.iter().all(|event| event["kind"] != "failed"),
+        "a signal that was delivered was reported as a failure: {before:?}"
+    );
 }
 
 /// **A child in the leader's own process group**, which is what `kill(-pid)` reaches.
@@ -1791,12 +1818,12 @@ fn a_client_that_is_not_the_attached_one_leaving_takes_nothing_with_it() {
         &mut writing,
         &format!(
             r#"{{"kind":"write","session":"{session}","text":{}}}"#,
-            serde_json::to_string(&format!("echo still-attached{SUBMIT}")).expect("a JSON string")
+            serde_json::to_string(&probe("still-attached")).expect("a JSON string")
         ),
     );
-    let output = output_until(&mut attached, Some(&session), |seen| seen.matches("still-attached").count() >= 2);
+    let output = output_until(&mut attached, Some(&session), |seen| seen.contains("still-attached"));
     assert!(
-        output.matches("still-attached").count() >= 2,
+        output.contains("still-attached"),
         "another client leaving took the feed from the attached one: {output:?}"
     );
 }

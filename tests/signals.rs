@@ -17,6 +17,17 @@ fn a_real_pid_is_itself_and_its_group_is_the_negative_of_it() {
     assert_eq!(signal_target(4242, Scope::Pid { pid: 4243 }).expect("a pid").number(), 4243);
 }
 
+/// **2 is the smallest pid a session can have**, so the refusal is below it rather than at it.
+///
+/// The boundary is its own case because nothing else distinguishes `< 2` from `<= 2`: both refuse 0 and 1,
+/// and a mutation to the second takes init's neighbour with them while every case above still passes.
+#[test]
+fn the_smallest_real_pid_is_signalled_rather_than_refused() {
+    assert_eq!(signal_target(2, Scope::Leader).expect("2 is a pid").number(), 2);
+    assert_eq!(signal_target(2, Scope::Group).expect("2 is a pid").number(), -2);
+    assert_eq!(signal_target(4242, Scope::Pid { pid: 2 }).expect("2 is a pid").number(), 2);
+}
+
 #[test]
 fn a_session_whose_process_id_is_unknown_is_refused_rather_than_aimed_at_everything() {
     for scope in [Scope::Leader, Scope::Group] {
