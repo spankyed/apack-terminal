@@ -462,8 +462,45 @@ pub enum Event {
     Search { session: SessionId, matches: Vec<SearchMatch> },
     /// How a `Wait` ended. Sent once per wait, whichever way it ended.
     Waited { session: SessionId, outcome: WaitOutcome },
+    /// The program named its terminal (OSC 0, OSC 2). Empty when it took the name back.
+    Title { session: SessionId, title: String },
+    /// The program rang the bell.
+    Bell { session: SessionId },
+    /// **The program asked for text to be put on the clipboard** (OSC 52 and its relatives).
+    ///
+    /// A claim like every other a program makes: the broker reports what was asked, and whether it
+    /// reaches a clipboard is the app's decision, made where the person is.
+    Clipboard { session: SessionId, text: String },
+    /// The program asked for the person to be told something (OSC 9, OSC 777).
+    Notification { session: SessionId, title: String, body: String },
+    /// How far along the program says it is (OSC 9;4). `percent` is absent where it gave none.
+    Progress { session: SessionId, state: ProgressState, percent: Option<u8> },
+    /// **The shell is about to run a command**, with the line it read where it said.
+    ///
+    /// Pushed, as the two below are, because each is a moment: a caller asking `Facts` on a timer learns
+    /// that a command ran and not when, and one that asks between two commands misses the first.
+    CommandStarted { session: SessionId, command: Option<String> },
+    /// What was running ended. `exit_status` is absent when the shell reported none, which is not zero.
+    CommandFinished { session: SessionId, exit_status: Option<i32> },
+    /// The shell's working directory changed, as the shell reported it.
+    CwdChanged { session: SessionId, cwd: String },
     /// A request could not be carried out. `session` is absent when the request named none.
     Failed { session: Option<SessionId>, code: ErrorCode, message: String },
+}
+
+/// What a program says about how far along it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "protocol.ts")]
+pub enum ProgressState {
+    /// Nothing to report any more
+    None,
+    /// Working, perhaps with a percentage
+    Running,
+    Error,
+    /// Working, with no way to say how far along
+    Indeterminate,
+    Paused,
 }
 
 /// **A closed set, generated into the TypeScript as a string union** — elmdb's `ErrorCode` arrangement, and

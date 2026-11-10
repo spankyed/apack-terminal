@@ -14,12 +14,13 @@ use std::time::Duration;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::output::{Credit, Flow, Outgoing, READ_AHEAD, coalesce};
-use crate::protocol::{ErrorCode, Event, Foreground, Scope, SessionId, Signal, Until, WaitOutcome};
+use crate::protocol::{ErrorCode, Event, Foreground, ProgressState, Scope, SessionId, Signal, Until, WaitOutcome};
 use crate::screen::{Colors, Facts, HISTORY_LINES, Match, Screen, Snapshot};
 use crate::tree::Tree;
 use crate::view::publish::ViewId;
 use crate::view::wire::{Block, Position, Span};
 use crate::vt::input::{Key, Pasted, Pointer};
+use crate::vt::{Effect, Progress};
 
 /// How long a session's exit waits for its output to finish being read.
 ///
@@ -599,19 +600,23 @@ impl Sessions {
                         // The authority first, then the renderer's copy. The waits are settled inside this
                         // same lock, in one order everywhere — screen, then waiters — so the two threads
                         // that take both cannot deadlock on each other
-                        let (replies, met) = match parsing.lock() {
+                        let (replies, met, effects) = match parsing.lock() {
                             Ok(mut screen) => {
                                 screen.feed(&buffer[..read]);
                                 let replies = screen.take_replies();
+                                let effects = screen.take_effects();
                                 let recent = rows_added(&buffer[..read], screen.cols());
                                 let met = settle_met(&waiting, &screen, recent);
                                 // Each view that has drawn its last frame is sent what changed, here
                                 // where the change landed
                                 screen.publish();
-                                (replies, met)
+                                (replies, met, effects)
                             }
-                            Err(_) => (Vec::new(), 0),
+                            Err(_) => (Vec::new(), 0, Vec::new()),
                         };
+                        for effect in effects {
+                            let _ = reader_events.send(Outgoing::answer(event_of(&reader_session, effect)));
+                        }
                         for _ in 0..met {
                             let _ = reader_events.send(Outgoing::answer(Event::Waited {
                                 session: reader_session.clone(),
@@ -955,6 +960,31 @@ impl Sessions {
 
     pub fn find(&self, session: &str, needle: &str) -> Result<(u32, Vec<Span>), Refusal> {
         self.screen(session)?.find(needle).map_err(core)
+    }
+}
+
+/// Something a program did that is not on its screen, as the event a client is told it with.
+fn event_of(session: &str, effect: Effect) -> Event {
+    let session = session.to_owned();
+    match effect {
+        Effect::Title(title) => Event::Title { session, title },
+        Effect::Bell => Event::Bell { session },
+        Effect::Clipboard(text) => Event::Clipboard { session, text },
+        Effect::Notification { title, body } => Event::Notification { session, title, body },
+        Effect::Progress { state, percent } => Event::Progress {
+            session,
+            state: match state {
+                Progress::None => ProgressState::None,
+                Progress::Running => ProgressState::Running,
+                Progress::Error => ProgressState::Error,
+                Progress::Indeterminate => ProgressState::Indeterminate,
+                Progress::Paused => ProgressState::Paused,
+            },
+            percent,
+        },
+        Effect::CommandStarted { command } => Event::CommandStarted { session, command },
+        Effect::CommandFinished { exit_status } => Event::CommandFinished { session, exit_status },
+        Effect::CwdChanged(cwd) => Event::CwdChanged { session, cwd },
     }
 }
 

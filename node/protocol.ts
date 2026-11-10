@@ -35,7 +35,7 @@ cursor_row: number, cursor_column: number, alt_screen: boolean, } | { "kind": "o
  * command has already ended learns one ran by this differing from what it last read; it is not
  * an exact number of commands and it wraps, so it is compared for a difference only.
  */
-finished: number, foreground: Foreground | null, } | { "kind": "search", session: string, matches: Array<SearchMatch>, } | { "kind": "waited", session: string, outcome: WaitOutcome, } | { "kind": "failed", session: string | null, code: ErrorCode, message: string, };
+finished: number, foreground: Foreground | null, } | { "kind": "search", session: string, matches: Array<SearchMatch>, } | { "kind": "waited", session: string, outcome: WaitOutcome, } | { "kind": "title", session: string, title: string, } | { "kind": "bell", session: string, } | { "kind": "clipboard", session: string, text: string, } | { "kind": "notification", session: string, title: string, body: string, } | { "kind": "progress", session: string, state: ProgressState, percent: number | null, } | { "kind": "command_started", session: string, command: string | null, } | { "kind": "command_finished", session: string, exit_status: number | null, } | { "kind": "cwd_changed", session: string, cwd: string, } | { "kind": "failed", session: string | null, code: ErrorCode, message: string, };
 
 /**
  * What the kernel says is reading the pty, as against what the shell claims about itself.
@@ -59,6 +59,11 @@ pid: number,
  * up, which is ordinary rather than a failure.
  */
 name: string | null, };
+
+/**
+ * What a program says about how far along it is.
+ */
+export type ProgressState = "none" | "running" | "error" | "indeterminate" | "paused";
 
 /**
  * What the app asks the broker to do.

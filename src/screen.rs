@@ -11,7 +11,6 @@
 //! about itself (`markers.rs`). The difference is provenance: a fact here was stated by the shell, and a
 //! status rule would be this file's guess about one.
 
-use crate::markers::{Marker, Markers};
 use std::sync::mpsc::Sender;
 
 use crate::view::publish::{Publication, ViewId};
@@ -19,7 +18,7 @@ use crate::view::wire::{Block, Position, Span};
 use crate::vt::input::{self, Encoders, Key, Pasted, Pointer};
 use crate::vt::reads;
 use crate::vt::rows::{RowRead, Space};
-use crate::vt::{Failed, Reported, Terminal};
+use crate::vt::{Effect, Failed, Reported, Terminal};
 
 /// Lines of scrollback a session keeps.
 ///
@@ -123,11 +122,6 @@ pub struct Screen {
     /// What the library reports — the replies it makes for a program, and the facts its own callbacks read.
     /// Boxed because its address is what the library was handed.
     reported: Box<Reported>,
-    /// **The sequences the core does not read.** It reports OSC 133 and the working directory; this scans
-    /// OSC 633, which is VS Code's shell integration and which no version of the core reads. The two
-    /// families are disjoint, so the union is strictly more than either and neither double-reports a fact
-    /// the other already has (`tests/conformance.rs`).
-    markers: Markers,
     cols: u16,
     rows: u16,
     /// One cell in pixels, as the window drawing this session measured it. Zero until one has.
@@ -184,16 +178,7 @@ impl Screen {
         // SAFETY: the box outlives the handle, which this struct's field order guarantees
         unsafe { terminal.route_reports(&raw mut *reported) }?;
 
-        Ok(Self {
-            terminal,
-            reported,
-            markers: Markers::default(),
-            cols,
-            rows,
-            cell: (0, 0),
-            encoders: None,
-            publication: None,
-        })
+        Ok(Self { terminal, reported, cols, rows, cell: (0, 0), encoders: None, publication: None })
     }
 
     /// Feeds bytes as they arrived.
@@ -202,16 +187,18 @@ impl Screen {
     /// `tests/parser.rs` splits the same stream at every boundary and demands the same screen: a wrapper
     /// that buffered a chunk, or reset anything per call, would pass every test that feeds a whole stream.
     ///
-    /// The core first, because its callbacks run inside the write; then the 633 scan over the same
-    /// untouched bytes, so neither pass can take anything from the other.
+    /// Everything the core reports — replies, the shell's markers, what the program asked of the world
+    /// outside — is collected by callbacks that run inside this write, and taken afterwards.
     pub fn feed(&mut self, bytes: &[u8]) {
         self.terminal.feed(bytes);
         if let Some(publication) = &mut self.publication {
             publication.touch();
         }
-        for marker in self.markers.feed(bytes) {
-            self.reported.apply(marker);
-        }
+    }
+
+    /// What the program did that is not on its screen, since this was last taken.
+    pub fn take_effects(&mut self) -> Vec<Effect> {
+        self.reported.take_effects()
     }
 
     /// What the shell has said about itself.
@@ -509,22 +496,6 @@ impl Screen {
 }
 
 impl Facts {
-    /// Takes one marker's word for it.
-    pub(crate) fn apply(&mut self, marker: Marker) {
-        match marker {
-            // A prompt being drawn means whatever ran has finished, whether or not a `D` said so
-            Marker::PromptStart => self.ended(),
-            Marker::PromptEnd => {}
-            Marker::CommandStart => self.running = true,
-            Marker::CommandDone(status) => {
-                self.ended();
-                self.exit_status = status;
-            }
-            Marker::CommandLine(line) => self.command = Some(line),
-            Marker::Cwd(path) => self.cwd = Some(path),
-        }
-    }
-
     /// Whatever was running has ended.
     ///
     /// **Counted here and nowhere else**, so a shell that reports an end twice — a `D` and then the

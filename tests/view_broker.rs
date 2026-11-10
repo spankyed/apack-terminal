@@ -390,3 +390,27 @@ fn a_view_leaving_or_sending_nonsense_leaves_the_session_running() {
     second.type_line("echo sti$((1+1))ll");
     second.until_shows("sti2ll");
 }
+
+/// What a program asks of the world outside its screen reaches the app's own connection, as it happens —
+/// from a session whose bytes are not sent at all.
+#[test]
+fn a_programs_title_clipboard_and_commands_are_told_to_the_client() {
+    let broker = start();
+    let client = Client::greeting(&broker);
+    let session = client.shell();
+    let write = |text: &str| say(&client.stream, &Request::Write { session: session.clone(), text: text.to_owned() });
+    write("printf '\\033]0;a title\\007\\033]52;c;aGk=\\007\\033]633;E;make\\007\\033]633;C\\007\\033]633;D;2\\007'\n");
+
+    let mut told = Vec::new();
+    while told.len() < 4 {
+        match client.event() {
+            Event::Title { title, .. } => told.push(format!("title {title}")),
+            Event::Clipboard { text, .. } => told.push(format!("clipboard {text}")),
+            Event::CommandStarted { command, .. } => told.push(format!("started {command:?}")),
+            Event::CommandFinished { exit_status, .. } => told.push(format!("finished {exit_status:?}")),
+            Event::Output { .. } => panic!("this session's bytes are not sent"),
+            _ => {}
+        }
+    }
+    assert_eq!(told, ["title a title", "clipboard hi", "started Some(\"make\")", "finished Some(2)"]);
+}

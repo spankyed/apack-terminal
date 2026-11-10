@@ -14,7 +14,7 @@ pub mod input;
 pub mod reads;
 pub mod rows;
 
-use crate::markers::cwd_from_url;
+use crate::markers::{self, Marker, PAYLOAD_CAP, cwd_from_url};
 use crate::screen::Facts;
 
 /// The most code points one cell's character is read as.
@@ -303,7 +303,44 @@ impl Terminal {
         let size = report_size as *const std::ffi::c_void;
         // SAFETY: the signature matches `GhosttyTerminalSizeFn`
         let result = unsafe { sys::ghostty_terminal_set(self.handle, sys::TerminalOption::SIZE, size) };
-        Failed::check("ghostty_terminal_set(SIZE)", result)
+        Failed::check("ghostty_terminal_set(SIZE)", result)?;
+
+        // **What a program asks of the world outside its screen**: a title, a bell, the clipboard, a
+        // notification, how far along it is. The core reads each and reports it; none of them is drawn
+        // here, so each is handed on as something that happened.
+        for (option, callback, what) in [
+            (
+                sys::TerminalOption::TITLE_CHANGED,
+                note_title as *const std::ffi::c_void,
+                "ghostty_terminal_set(TITLE_CHANGED)",
+            ),
+            (sys::TerminalOption::BELL, note_bell as *const std::ffi::c_void, "ghostty_terminal_set(BELL)"),
+            (
+                sys::TerminalOption::CLIPBOARD_WRITE,
+                note_clipboard_write as *const std::ffi::c_void,
+                "ghostty_terminal_set(CLIPBOARD_WRITE)",
+            ),
+            (
+                sys::TerminalOption::DESKTOP_NOTIFICATION,
+                note_notification as *const std::ffi::c_void,
+                "ghostty_terminal_set(DESKTOP_NOTIFICATION)",
+            ),
+            (
+                sys::TerminalOption::PROGRESS_REPORT,
+                note_progress as *const std::ffi::c_void,
+                "ghostty_terminal_set(PROGRESS_REPORT)",
+            ),
+            (
+                sys::TerminalOption::UNKNOWN_SEQUENCE,
+                note_unknown_sequence as *const std::ffi::c_void,
+                "ghostty_terminal_set(UNKNOWN_SEQUENCE)",
+            ),
+        ] {
+            // SAFETY: each function has the signature its option documents
+            Failed::check(what, unsafe { sys::ghostty_terminal_set(self.handle, option, callback) })?;
+        }
+        // Without a limit the core keeps nothing of a sequence it does not read, and reports none
+        self.set_usize(sys::TerminalOption::UNKNOWN_MAX_BYTES, PAYLOAD_CAP, "ghostty_terminal_set(UNKNOWN_MAX_BYTES)")
     }
 
     /// Whether the row at a **screen** coordinate runs on into the next one.
@@ -551,6 +588,52 @@ pub struct Reported {
     /// The grid and the size of one cell in pixels, for a program that asks. `None` until a window has
     /// said how big a cell is: the grid alone the broker always knows, a cell it never measures.
     size: Option<Size>,
+    /// What has happened that somebody outside should hear of, in the order it happened.
+    effects: Vec<Effect>,
+}
+
+/// Something a program did that is not on its screen.
+///
+/// **Reported as it happens rather than read when asked**, because each is an event: a bell rung is gone,
+/// and a command that finished did so at a moment a caller polling for it can only approximate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Effect {
+    /// The program named its terminal
+    Title(String),
+    Bell,
+    /// The program asked for this text to be put on the clipboard. A claim like any other: whether to do
+    /// it is the app's
+    Clipboard(String),
+    Notification {
+        title: String,
+        body: String,
+    },
+    Progress {
+        state: Progress,
+        percent: Option<u8>,
+    },
+    /// The shell is about to run a command, and the line it read if it said
+    CommandStarted {
+        command: Option<String>,
+    },
+    /// What was running ended, and how if the shell said
+    CommandFinished {
+        exit_status: Option<i32>,
+    },
+    CwdChanged(String),
+}
+
+/// What a program says about how far along it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Progress {
+    /// Nothing to report any more
+    None,
+    /// Working, perhaps with a percentage
+    Running,
+    Error,
+    /// Working, with no way to say how far along
+    Indeterminate,
+    Paused,
 }
 
 /// The size a program is told when it asks: the grid, and one cell in pixels.
@@ -578,10 +661,52 @@ impl Reported {
         self.size = size;
     }
 
+    /// What has happened since this was last taken.
+    pub fn take_effects(&mut self) -> Vec<Effect> {
+        std::mem::take(&mut self.effects)
+    }
+
     /// Takes a marker the core does not read — the OSC 633 family — into the same facts its own callbacks
     /// fill, so a caller has one account of the shell rather than two to merge.
-    pub fn apply(&mut self, marker: crate::markers::Marker) {
-        self.facts.apply(marker);
+    fn apply(&mut self, marker: Marker) {
+        match marker {
+            // A prompt being drawn means whatever ran has finished, whether or not a `D` said so
+            Marker::PromptStart => self.ended(None),
+            Marker::PromptEnd => {}
+            Marker::CommandStart => self.started(None),
+            Marker::CommandDone(status) => self.ended(status),
+            Marker::CommandLine(line) => self.facts.command = Some(line),
+            Marker::Cwd(path) => self.moved(path),
+        }
+    }
+
+    /// A command is running. `command` is its line where the report carried one; a shell that named it
+    /// in an earlier report has it in the facts already.
+    fn started(&mut self, command: Option<String>) {
+        if let Some(command) = command {
+            self.facts.command = Some(command);
+        }
+        self.facts.running = true;
+        self.effects.push(Effect::CommandStarted { command: self.facts.command.clone() });
+    }
+
+    /// Whatever was running has ended. Said once per command: a shell that reports an end and then draws
+    /// its prompt has ended one command, not two.
+    fn ended(&mut self, exit_status: Option<i32>) {
+        if !self.facts.running {
+            return;
+        }
+        self.facts.ended();
+        self.facts.exit_status = exit_status;
+        self.effects.push(Effect::CommandFinished { exit_status });
+    }
+
+    fn moved(&mut self, cwd: String) {
+        if self.facts.cwd.as_deref() == Some(cwd.as_str()) {
+            return;
+        }
+        self.facts.cwd = Some(cwd.clone());
+        self.effects.push(Effect::CwdChanged(cwd));
     }
 }
 
@@ -622,17 +747,13 @@ unsafe extern "C" fn note_semantic_prompt(
     // SAFETY: both pointers are the library's, valid for this call
     let (reported, event) = unsafe { (&mut *userdata.cast::<Reported>(), &*event) };
     match event.kind {
-        sys::SemanticPromptKind::GHOSTTY_SEMANTIC_PROMPT_PROMPT_START => reported.facts.ended(),
+        sys::SemanticPromptKind::GHOSTTY_SEMANTIC_PROMPT_PROMPT_START => reported.ended(None),
         sys::SemanticPromptKind::GHOSTTY_SEMANTIC_PROMPT_OUTPUT_START => {
-            reported.facts.running = true;
             // SAFETY: the library owns the bytes for this call, and this copies them
-            if let Some(line) = unsafe { text_of(&event.command) } {
-                reported.facts.command = Some(line);
-            }
+            reported.started(unsafe { text_of(&event.command) });
         }
         sys::SemanticPromptKind::GHOSTTY_SEMANTIC_PROMPT_COMMAND_END => {
-            reported.facts.ended();
-            reported.facts.exit_status = event.has_exit_code.then_some(event.exit_code);
+            reported.ended(event.has_exit_code.then_some(event.exit_code));
         }
         _ => {}
     }
@@ -682,7 +803,136 @@ unsafe extern "C" fn note_pwd(terminal: sys::Terminal, userdata: *mut std::ffi::
     let (reported, text) = unsafe { (&mut *userdata.cast::<Reported>(), text_of(&value)) };
     let Some(text) = text else { return };
     // A bare path (OSC 9, OSC 1337) is already one; only OSC 7's URI needs taking apart
-    reported.facts.cwd = Some(cwd_from_url(&text).unwrap_or(text));
+    reported.moved(cwd_from_url(&text).unwrap_or(text));
+}
+
+/// The title a program gave its terminal, read back inside the callback as the option requires.
+unsafe extern "C" fn note_title(terminal: sys::Terminal, userdata: *mut std::ffi::c_void) {
+    if userdata.is_null() {
+        return;
+    }
+    let mut value = sys::String::default();
+    // SAFETY: TITLE writes a `GhosttyString`, and the call is inside the callback the option documents
+    let result = unsafe {
+        sys::ghostty_terminal_get(terminal, sys::TerminalData::TITLE, (&raw mut value).cast::<std::ffi::c_void>())
+    };
+    if result != sys::Result::SUCCESS {
+        return;
+    }
+    // SAFETY: `userdata` is the collector, and `value` was just filled by the library
+    let (reported, title) = unsafe { (&mut *userdata.cast::<Reported>(), text_of(&value)) };
+    // A title set to nothing is a title all the same: the program took its name back
+    reported.effects.push(Effect::Title(title.unwrap_or_default()));
+}
+
+unsafe extern "C" fn note_bell(_terminal: sys::Terminal, userdata: *mut std::ffi::c_void) {
+    if userdata.is_null() {
+        return;
+    }
+    // SAFETY: `userdata` is the collector
+    unsafe { &mut *userdata.cast::<Reported>() }.effects.push(Effect::Bell);
+}
+
+/// A program asking for something to be put on the clipboard (OSC 52 and its relatives).
+///
+/// **Only text, and only reported.** The first representation with a text type is handed on; whether it
+/// reaches a clipboard is the app's decision, made where the person is. The program is told the write was
+/// taken, which is the only answer that does not teach it to retry.
+unsafe extern "C" fn note_clipboard_write(
+    _terminal: sys::Terminal,
+    userdata: *mut std::ffi::c_void,
+    write: *const sys::ClipboardWrite,
+) {
+    if userdata.is_null() || write.is_null() {
+        return;
+    }
+    // SAFETY: both pointers are the library's, valid for this call
+    let (reported, request) = unsafe { (&mut *userdata.cast::<Reported>(), &*write) };
+    if !request.contents.is_null() {
+        // SAFETY: the library promises `contents_len` entries at `contents` for this call
+        let contents = unsafe { std::slice::from_raw_parts(request.contents, request.contents_len) };
+        let text = contents.iter().find_map(|content| {
+            // SAFETY: each string is the library's, valid for this call, and is copied
+            let mime = unsafe { text_of(&content.mime) }?;
+            mime.starts_with("text/").then(|| unsafe { text_of(&content.data) }.unwrap_or_default())
+        });
+        if let Some(text) = text {
+            reported.effects.push(Effect::Clipboard(text));
+        }
+    }
+    if let Some(reply) = request.reply {
+        let answer = sys::ClipboardWriteReply {
+            size: std::mem::size_of::<sys::ClipboardWriteReply>(),
+            result: sys::ClipboardWriteResult::SUCCESS,
+            remember: false,
+        };
+        // SAFETY: called inside the callback, with the request it was given and a sized reply
+        unsafe { reply(write, &raw const answer) };
+    }
+}
+
+unsafe extern "C" fn note_notification(
+    _terminal: sys::Terminal,
+    userdata: *mut std::ffi::c_void,
+    notification: *const sys::TerminalDesktopNotification,
+) {
+    if userdata.is_null() || notification.is_null() {
+        return;
+    }
+    // SAFETY: both pointers are the library's, valid for this call, and the strings are copied
+    let (reported, title, body) = unsafe {
+        let notification = &*notification;
+        (&mut *userdata.cast::<Reported>(), text_of(&notification.title), text_of(&notification.body))
+    };
+    reported.effects.push(Effect::Notification { title: title.unwrap_or_default(), body: body.unwrap_or_default() });
+}
+
+unsafe extern "C" fn note_progress(
+    _terminal: sys::Terminal,
+    userdata: *mut std::ffi::c_void,
+    report: *const sys::TerminalProgressReport,
+) {
+    if userdata.is_null() || report.is_null() {
+        return;
+    }
+    // SAFETY: both pointers are the library's, valid for this call
+    let (reported, report) = unsafe { (&mut *userdata.cast::<Reported>(), &*report) };
+    let state = match report.state {
+        sys::TerminalProgressState::SET => Progress::Running,
+        sys::TerminalProgressState::ERROR => Progress::Error,
+        sys::TerminalProgressState::INDETERMINATE => Progress::Indeterminate,
+        sys::TerminalProgressState::PAUSE => Progress::Paused,
+        _ => Progress::None,
+    };
+    reported.effects.push(Effect::Progress { state, percent: u8::try_from(report.progress).ok() });
+}
+
+/// A sequence the core has no behaviour for, which is where the shell's OSC 633 markers arrive.
+///
+/// One cut short by the limit is not read: half a path is not a claim about a directory.
+unsafe extern "C" fn note_unknown_sequence(
+    _terminal: sys::Terminal,
+    userdata: *mut std::ffi::c_void,
+    sequence: *const sys::TerminalUnknownSequence,
+) {
+    if userdata.is_null() || sequence.is_null() {
+        return;
+    }
+    // SAFETY: both pointers are the library's, valid for this call
+    let (reported, sequence) = unsafe { (&mut *userdata.cast::<Reported>(), &*sequence) };
+    if sequence.tag != sys::TerminalUnknownSequenceTag::GHOSTTY_TERMINAL_UNKNOWN_SEQUENCE_OSC {
+        return;
+    }
+    // SAFETY: the tag says `osc` is the member that was written
+    let osc = unsafe { &sequence.value.osc };
+    if osc.truncated || osc.content.ptr.is_null() {
+        return;
+    }
+    // SAFETY: the library promises `len` bytes at `ptr` for this call
+    let content = unsafe { std::slice::from_raw_parts(osc.content.ptr, osc.content.len) };
+    if let Some(marker) = markers::read(content) {
+        reported.apply(marker);
+    }
 }
 
 /// A `GhosttyString` copied out, or `None` when it is empty.

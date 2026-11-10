@@ -1,31 +1,25 @@
-//! The markers a shell emits about itself, scanned out of the byte stream the screen parses.
+//! The markers a shell emits about itself that the core does not read.
 //!
-//! **Why these are scanned here and not left to the core.** The core reports the standard prompt marks
-//! (OSC 133) and the working directory through callbacks of its own (`vt/mod.rs`). It does not read OSC 633,
-//! which is the family most shells already emit, and a sequence a terminal has no behaviour for is dropped
-//! without disturbing the screen — correctly. So those facts are taken from the same bytes, in parallel,
-//! and the stream reaches the core untouched.
+//! **The core reads the standard ones.** The prompt marks (OSC 133) and the working directory (OSC 7, and
+//! iTerm2's 1337) arrive through callbacks of its own (`vt/mod.rs`). It does not read OSC 633, which is
+//! VS Code's family and the one most shells already emit — its rc scripts are MIT and readable, other
+//! tools emit it, and anything a terminal invented in its place would buy nothing and lose interop.
 //!
-//! **OSC 633, because VS Code's set is the one shells already emit.** Its rc scripts are MIT and readable,
-//! other tools emit it, and anything a terminal invents here buys nothing and loses interop. OSC 7 and
-//! iTerm2's 1337 are read too, for a user whose own configuration already emits one.
+//! **So the core hands those over whole, and this reads them.** A sequence it has no behaviour for is
+//! reported through its unknown-sequence callback, already parsed out of the stream: where one starts and
+//! ends, how it is split across reads and how long one may be are the parser's answers, once, rather than
+//! a second scanner's beside it.
 //!
-//! **Everything here is untrusted.** A marker's payload is written by whatever is running in the pty, which
-//! may be a hostile program rather than the shell, so a payload is length-capped while it is being
-//! collected, carries no authority, and is a report of what was *claimed* rather than a fact about the
-//! machine. Deciding what to do about a claimed path is the app's; refusing to accumulate an unbounded one
-//! is this scanner's.
+//! **Everything here is untrusted.** A marker's content is written by whatever is running in the pty, which
+//! may be a hostile program rather than the shell, so it is length-capped by the core as it is collected
+//! (`PAYLOAD_CAP`), carries no authority, and is a report of what was *claimed* rather than a fact about
+//! the machine. Deciding what to do about a claimed path is the app's.
 
-/// How much of one OSC payload is collected before the sequence is abandoned.
+/// How much of one sequence the core keeps for this to read.
 ///
-/// **A ceiling on what a hostile program can make the broker hold**, which is the whole reason it exists: an
-/// OSC string ends with BEL or ST, and a program that emits neither would otherwise grow this buffer for as
-/// long as it kept writing. Paths and command lines are the payloads with a real length, and both are far
-/// inside this.
-///
-/// **Public because it is a contract rather than a tuning knob**: it says how long a payload a shell may
-/// emit and still be read, so the case that proves a payload of exactly this length is taken has to be able
-/// to name it rather than restate the number.
+/// **A ceiling on what a hostile program can make the broker hold.** Paths and command lines are the
+/// contents with a real length, and both are far inside this; a longer one arrives cut short and marked
+/// so, and is not read as a marker at all.
 pub const PAYLOAD_CAP: usize = 4 * 1024;
 
 /// One thing a shell said about itself.
@@ -41,121 +35,16 @@ pub enum Marker {
     CommandDone(Option<i32>),
     /// `633;E;<line>` — the command line the shell is about to run, as the shell read it.
     CommandLine(String),
-    /// A working directory: `633;P;Cwd=`, OSC 7's `file://` URL, or 1337's `CurrentDir=`.
+    /// `633;P;Cwd=<path>` — the shell's working directory.
     Cwd(String),
 }
 
-/// Where the scanner is in the stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Scan {
-    /// Ordinary output.
-    Text,
-    /// An `ESC` was seen and what follows decides whether this is an OSC at all.
-    Escape,
-    /// Inside an OSC payload.
-    Payload,
-    /// Inside a payload, having just seen an `ESC`: `\` ends the string, anything else is payload.
-    PayloadEscape,
-    /// The payload overran `PAYLOAD_CAP`; bytes are discarded until the string ends.
-    Overrun,
-    /// Inside an abandoned payload, having just seen an `ESC`. **Its own state rather than
-    /// `PayloadEscape`**, so that an `ESC` which turns out not to terminate puts the scanner back to
-    /// discarding instead of starting to collect the tail of a string it has already given up on.
-    OverrunEscape,
-}
-
-/// Scans OSC strings out of a byte stream.
-///
-/// **State is carried across calls, because a chunk boundary falls wherever `read` returned.** A marker
-/// split down the middle — and a 23-byte `ESC ] 6 3 3 ; P ; C w d = …` very often is — must be read the same
-/// as one that arrived whole. `tests/markers.rs` feeds every stream at every boundary and demands the same
-/// markers, which is the only way this is checkable.
-#[derive(Debug, Default)]
-pub struct Markers {
-    state: Option<Scan>,
-    payload: Vec<u8>,
-}
-
-impl Markers {
-    /// Feeds bytes and answers the markers that completed in them.
-    pub fn feed(&mut self, bytes: &[u8]) -> Vec<Marker> {
-        let mut found = Vec::new();
-        for &byte in bytes {
-            match self.state.unwrap_or(Scan::Text) {
-                Scan::Text => {
-                    if byte == 0x1b {
-                        self.state = Some(Scan::Escape);
-                    }
-                }
-                Scan::Escape => {
-                    // `ESC ]` opens an OSC string; `ESC ESC` leaves us waiting on the next byte, and
-                    // anything else is some other escape sequence that is none of this scanner's business
-                    self.state = match byte {
-                        b']' => {
-                            self.payload.clear();
-                            Some(Scan::Payload)
-                        }
-                        0x1b => Some(Scan::Escape),
-                        _ => Some(Scan::Text),
-                    };
-                }
-                Scan::Payload => match byte {
-                    // BEL ends an OSC string, and so does ST (`ESC \`)
-                    0x07 => {
-                        if let Some(marker) = marker(&self.payload) {
-                            found.push(marker);
-                        }
-                        self.payload.clear();
-                        self.state = Some(Scan::Text);
-                    }
-                    0x1b => self.state = Some(Scan::PayloadEscape),
-                    _ => {
-                        self.payload.push(byte);
-                        if self.payload.len() > PAYLOAD_CAP {
-                            self.payload.clear();
-                            self.state = Some(Scan::Overrun);
-                        }
-                    }
-                },
-                Scan::PayloadEscape => {
-                    if byte == b'\\' {
-                        if let Some(marker) = marker(&self.payload) {
-                            found.push(marker);
-                        }
-                        self.payload.clear();
-                        self.state = Some(Scan::Text);
-                    } else {
-                        // Not a string terminator, so the ESC was payload after all
-                        self.payload.push(0x1b);
-                        self.payload.push(byte);
-                        self.state = Some(Scan::Payload);
-                    }
-                }
-                Scan::Overrun => {
-                    self.state = Some(match byte {
-                        0x07 => Scan::Text,
-                        0x1b => Scan::OverrunEscape,
-                        _ => Scan::Overrun,
-                    });
-                }
-                Scan::OverrunEscape => {
-                    self.state = Some(match byte {
-                        b'\\' => Scan::Text,
-                        0x1b => Scan::OverrunEscape,
-                        _ => Scan::Overrun,
-                    });
-                }
-            }
-        }
-        found
-    }
-}
-
-/// What one completed OSC payload says, or nothing when it says none of our business.
-fn marker(payload: &[u8]) -> Option<Marker> {
-    // Lossy on purpose: a payload is whatever a program wrote, and invalid UTF-8 in a path is a claim to be
+/// What one sequence the core did not read says, or nothing when it says none of our business. `content`
+/// is everything between the sequence's introducer and its terminator, number included.
+pub fn read(content: &[u8]) -> Option<Marker> {
+    // Lossy on purpose: content is whatever a program wrote, and invalid UTF-8 in a path is a claim to be
     // read and reported rather than a reason to drop the marker
-    let text = String::from_utf8_lossy(payload);
+    let text = String::from_utf8_lossy(content);
 
     if let Some(rest) = text.strip_prefix("633;") {
         let (code, argument) = match rest.split_once(';') {
@@ -175,22 +64,13 @@ fn marker(payload: &[u8]) -> Option<Marker> {
         };
     }
 
-    if let Some(url) = text.strip_prefix("7;") {
-        return cwd_from_url(url).map(Marker::Cwd);
-    }
-
-    if let Some(path) = text.strip_prefix("1337;CurrentDir=") {
-        return Some(Marker::Cwd(decode(path)));
-    }
-
     None
 }
 
 /// The path out of OSC 7's `file://<host>/<path>`.
 ///
-/// **Shared with the `vt` path rather than written twice.** The core stores whatever bytes the shell
-/// emitted for OSC 7 without parsing them, which its own documentation says, so this decode is the
-/// broker's either way — one of the pieces of `markers.rs` that stays when the scanning goes.
+/// The core stores whatever bytes the shell emitted for OSC 7 without parsing them, which its own
+/// documentation says, so taking the path out of the URL is the broker's (`vt/mod.rs`, `note_pwd`).
 ///
 /// The host is whatever the shell believes it is called and is not checked against anything: a path is a
 /// claim either way, and a session is local by construction — the broker spawned the process itself.
