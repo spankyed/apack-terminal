@@ -5,6 +5,7 @@
 //! remembering to take it out again.
 
 use xtask::mutants::{exclusions, verdict};
+use xtask::pre_push::survivors;
 
 /// Counts by a table, so a case says exactly which patterns match what.
 fn counting<'a>(table: &'a [(&'a str, usize)]) -> impl Fn(&str) -> Result<usize, String> + 'a {
@@ -73,4 +74,16 @@ fn the_repositorys_own_exclusions_parse() {
     let patterns = exclusions(&config).expect("the repository's own block parses");
     assert!(patterns.len() >= 5, "every exclusion is read: {patterns:?}");
     assert!(patterns.iter().all(|p| !p.contains("\\\\")), "no pattern is left double-escaped: {patterns:?}");
+}
+
+/// **A run with a hung mutant and a survivor exits as a run with only the hung one**, so the gate reads the
+/// list cargo-mutants writes. This is that list as a run left it: two alive behind seven timeouts.
+#[test]
+fn a_survivor_is_read_from_the_list_whatever_the_run_exited_with() {
+    let listed = "src/vt/mod.rs:319:71: replace != with == in Terminal::push_cell_text\n\
+                  src/vt/mod.rs:378:19: replace == with != in Terminal::refuse_images\n";
+    assert_eq!(survivors(listed).len(), 2);
+    assert!(survivors(listed)[1].contains("refuse_images"));
+    assert!(survivors("").is_empty(), "an empty list is a run nothing survived");
+    assert!(survivors("\n  \n").is_empty(), "and blank lines are not mutants");
 }

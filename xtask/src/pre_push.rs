@@ -14,6 +14,18 @@ use std::time::Instant;
 /// Where the diff a mutants run reads goes
 const CHANGE_DIFF: &str = "target/pre-push/change.diff";
 
+/// Where cargo-mutants lists the mutants the suite passed, one a line (`output` in `.cargo/mutants.toml`)
+const SURVIVORS: &str = "target/mutants.out/missed.txt";
+
+/// The mutants a run left alive, from the list it wrote.
+///
+/// **The list, because the exit code cannot say.** cargo-mutants exits 3 when any mutant timed out and 2
+/// when any survived, and 3 wins when a run has both: a change with a hung mutant and a survivor exits
+/// exactly as a change with only the hung one does.
+pub fn survivors(listed: &str) -> Vec<&str> {
+    listed.lines().map(str::trim).filter(|line| !line.is_empty()).collect()
+}
+
 /// One check: what it is called, the command it runs from the workspace root, and what it adds to the
 /// environment
 struct Step {
@@ -107,20 +119,37 @@ fn mutants_of_the_change(root: &Path, base: &str) -> Result<(), String> {
         .current_dir(root)
         .status()
         .map_err(|e| format!("pre-push: mutants of the change didn't start: {e}"))?;
-    match status.code() {
-        Some(0) => println!("pre-push: mutants of the change passed in {:.0?}", started.elapsed()),
-        Some(3) => println!(
-            "pre-push: mutants of the change passed in {:.0?}; some timed out, which is the suite's deadline \
-             catching them rather than a survivor",
-            started.elapsed()
-        ),
+    let timed_out = match status.code() {
+        Some(0) => false,
+        Some(3) => true,
         _ => {
             return Err(format!(
                 "pre-push: mutants of the change failed ({status}): the push would fail CI. A survivor is \
                  killed, or excluded in .cargo/mutants.toml with the reason"
             ));
         }
+    };
+    // A run that wrote no list is not a run with no survivors
+    let listed = std::fs::read_to_string(root.join(SURVIVORS))
+        .map_err(|e| format!("pre-push: {SURVIVORS}: {e}; the mutants run left nothing to read a survivor from"))?;
+    let alive = survivors(&listed);
+    if !alive.is_empty() {
+        return Err(format!(
+            "pre-push: {} of the change's mutants survived, behind a timeout's exit code:\n  {}\nA survivor is \
+             killed, or excluded in .cargo/mutants.toml with the reason",
+            alive.len(),
+            alive.join("\n  ")
+        ));
     }
+    println!(
+        "pre-push: mutants of the change passed in {:.0?}{}",
+        started.elapsed(),
+        if timed_out {
+            "; some timed out, which is the suite's deadline catching them rather than a survivor"
+        } else {
+            ""
+        }
+    );
     Ok(())
 }
 

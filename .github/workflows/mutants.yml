@@ -65,9 +65,12 @@ jobs:
         with:
           tool: cargo-mutants@27.1.0,cargo-nextest@0.9.148
       # Exit 3 is a timeout, which is the suite's deadline catching a mutant rather than a survivor — the
-      # credit-accounting mutants in `output.rs` hang the writer by design. Exit 2, a survivor, still fails.
+      # credit-accounting mutants in `output.rs` hang the writer by design. It is also what a run with a
+      # timeout *and* a survivor exits with, so the survivors are read from the list rather than the code.
       - if: steps.scope.outputs.code == 'true'
-        run: cargo mutants --in-diff change.diff || [ $? = 3 ]
+        run: |
+          cargo mutants --in-diff change.diff || [ $? = 3 ]
+          if [ -s target/mutants.out/missed.txt ]; then cat target/mutants.out/missed.txt; exit 1; fi
       - uses: actions/upload-artifact@v4
         if: always() && steps.scope.outputs.code == 'true'
         with:
@@ -133,7 +136,9 @@ jobs:
       - if: steps.scope.outputs.code == 'true'
         env:
           ARGS: ${{ steps.scope.outputs.args }}
-        run: cargo mutants $ARGS || [ $? = 3 ]
+        run: |
+          cargo mutants $ARGS || [ $? = 3 ]
+          if [ -s target/mutants.out/missed.txt ]; then cat target/mutants.out/missed.txt; exit 1; fi
       - uses: actions/upload-artifact@v4
         if: always() && steps.scope.outputs.code == 'true'
         with:
