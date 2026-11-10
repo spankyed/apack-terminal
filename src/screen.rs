@@ -66,6 +66,15 @@ pub struct Facts {
     /// reported a finish without one — a shell that says nothing about how a command ended is not saying
     /// it succeeded.
     pub exit_status: Option<i32>,
+    /// How many commands the shell has reported starting and then ending.
+    ///
+    /// **A count rather than a flag, because a caller asks after the fact.** A command that starts and ends
+    /// between two reads leaves `running` false at both, so nothing else here says one ran; this has moved.
+    /// It moves once per command, whichever marker ended it, and not for a prompt drawn with nothing
+    /// running. **It says that commands ended, not how many**: the two marker families are read as two
+    /// passes over each chunk, so a shell emitting both has each command read twice, and it wraps. It is
+    /// compared for a difference and never for an order or an amount.
+    pub finished: u32,
 }
 
 /// Where a search found what it was asked for.
@@ -232,15 +241,25 @@ impl Facts {
     pub(crate) fn apply(&mut self, marker: Marker) {
         match marker {
             // A prompt being drawn means whatever ran has finished, whether or not a `D` said so
-            Marker::PromptStart => self.running = false,
+            Marker::PromptStart => self.ended(),
             Marker::PromptEnd => {}
             Marker::CommandStart => self.running = true,
             Marker::CommandDone(status) => {
-                self.running = false;
+                self.ended();
                 self.exit_status = status;
             }
             Marker::CommandLine(line) => self.command = Some(line),
             Marker::Cwd(path) => self.cwd = Some(path),
+        }
+    }
+
+    /// Whatever was running has ended.
+    ///
+    /// **Counted here and nowhere else**, so a shell that reports an end twice — a `D` and then the
+    /// prompt — has ended one command and not two.
+    pub(crate) fn ended(&mut self) {
+        if std::mem::take(&mut self.running) {
+            self.finished = self.finished.wrapping_add(1);
         }
     }
 }

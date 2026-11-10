@@ -373,7 +373,7 @@ unsafe extern "C" fn note_semantic_prompt(
     // SAFETY: both pointers are the library's, valid for this call
     let (reported, event) = unsafe { (&mut *userdata.cast::<Reported>(), &*event) };
     match event.kind {
-        sys::SemanticPromptKind::GHOSTTY_SEMANTIC_PROMPT_PROMPT_START => reported.facts.running = false,
+        sys::SemanticPromptKind::GHOSTTY_SEMANTIC_PROMPT_PROMPT_START => reported.facts.ended(),
         sys::SemanticPromptKind::GHOSTTY_SEMANTIC_PROMPT_OUTPUT_START => {
             reported.facts.running = true;
             // SAFETY: the library owns the bytes for this call, and this copies them
@@ -382,7 +382,7 @@ unsafe extern "C" fn note_semantic_prompt(
             }
         }
         sys::SemanticPromptKind::GHOSTTY_SEMANTIC_PROMPT_COMMAND_END => {
-            reported.facts.running = false;
+            reported.facts.ended();
             reported.facts.exit_status = event.has_exit_code.then_some(event.exit_code);
         }
         _ => {}

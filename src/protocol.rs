@@ -140,7 +140,7 @@ pub enum Request {
     /// less, and an alternate-screen app has no scrollback to answer with at all.
     Screen { session: SessionId, history: u32 },
     /// **What the shell has reported about itself** — the working directory, the command line it last said
-    /// it was running, whether one is running, and the status the last one ended with.
+    /// it was running, whether one is running, the status the last one ended with, and how many have ended.
     ///
     /// This is the read shell integration exists for, and it answers for a session nobody is drawing. Every
     /// field is a claim the program in the pty made, so what a caller may do with a reported path is the
@@ -392,7 +392,8 @@ pub enum Event {
     Owns { session: SessionId, pid: u32, owned: bool },
     /// What the shell reported about itself and what is running in the pty, answering `Facts`.
     ///
-    /// **`cwd`, `command`, `running` and `exit_status` are claims; `foreground` is a measurement**, and the
+    /// **`cwd`, `command`, `running`, `exit_status` and `finished` are claims; `foreground` is a
+    /// measurement**, and the
     /// two are not interchangeable — a shell with no integration installed claims nothing at all, and a
     /// program in the pty may claim whatever it likes. They travel in one event because a caller asking
     /// what a session is doing wants both and should not pay two round trips to find out.
@@ -402,6 +403,10 @@ pub enum Event {
         command: Option<String>,
         running: bool,
         exit_status: Option<i32>,
+        /// Moves each time the shell reports a command it started has ended. A caller that asks after a
+        /// command has already ended learns one ran by this differing from what it last read; it is not
+        /// an exact number of commands and it wraps, so it is compared for a difference only.
+        finished: u32,
         foreground: Option<Foreground>,
     },
     /// Where a search found its text, answering `Search`.

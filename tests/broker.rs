@@ -947,6 +947,7 @@ fn a_session_nobody_is_drawing_answers_what_its_shell_reported() {
     assert_eq!(facts["command"], "ls -la", "the command line it reported");
     assert_eq!(facts["exit_status"], 3, "the status it reported, as reported");
     assert_eq!(facts["running"], false, "the command finished");
+    assert_eq!(facts["finished"], 1, "and it is counted, for a caller that asks after it ended");
 }
 
 /// A bounded search over a hidden session's history, which is the other read without a view.

@@ -30,7 +30,7 @@ by the npm package, so a consumer imports the types without building Rust.
 → {"kind":"write","session":"s-1","text":"echo hi\n"}
 ← {"kind":"output","session":"s-1","text":"echo hi\r\nhi\r\n"}
 → {"kind":"facts","session":"s-1"}
-← {"kind":"facts","session":"s-1","cwd":"/home/me","command":"echo hi","running":false,"exit_status":0}
+← {"kind":"facts","session":"s-1","cwd":"/home/me","command":"echo hi","running":false,"exit_status":0,"finished":1}
 ```
 
 [protocol.md](docs/architecture/protocol.md) has every message, the roles, and the closed error set.

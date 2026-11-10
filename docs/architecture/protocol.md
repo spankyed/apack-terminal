@@ -49,7 +49,7 @@ means for a session's lifetime.
 | `signal` | a signal to the session's process, its process group, or one process inside its tree |
 | `owns` | whether a pid is inside this session's process tree |
 | `screen` | the screen as the broker has it, with up to `history` lines above the viewport |
-| `facts` | what the shell reported about itself: directory, command line, whether one is running, last status |
+| `facts` | what the shell reported about itself: directory, command line, whether one is running, last status, how many have finished |
 | `search` | where text appears in the screen and the history above it |
 | `wait` | until idle, until text appears, or until the process ends, with a deadline |
 | `kill` | end the session and its process tree |
@@ -77,7 +77,7 @@ is what a caller gets when it asks for both.
 | `throttled` | a flush waited for credit, with the microseconds it waited. Not a loss |
 | `screen` | the lines a `screen` asked for, the cursor, and whether an alternate-screen app is showing |
 | `owns` | whether that pid is inside the session's tree; the pid is the correlation |
-| `facts` | the shell's claims about itself |
+| `facts` | the shell's claims about itself. `finished` moves each time a command it reported starting has ended, so a caller that asks after a quick command has ended still learns one ran. It is compared for a difference only: it wraps, and a shell emitting both marker families moves it twice per command |
 | `search` | where the text was found, with the whole line for context |
 | `waited` | how a wait ended: `MET`, `TIMEOUT` or `EXITED`. Once per wait, however it ended |
 | `failed` | a request could not be carried out |

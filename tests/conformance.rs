@@ -32,6 +32,29 @@ fn a_shell_is_understood_whichever_integration_it_speaks() {
     }
 }
 
+/// **A command is counted once, however its end was reported, so a caller asking afterwards learns one ran.**
+///
+/// `running` is false both before a quick command and after it, which is why the count exists. Each family
+/// is driven through the ways a shell ends a command: a `D`, a `D` followed by the prompt, and a prompt with
+/// no `D` at all. A prompt or a `D` with nothing running is not a command.
+#[test]
+fn a_finished_command_is_counted_once_in_either_family() {
+    for family in ["633", "133"] {
+        let mut screen = Screen::new(20, 4);
+        let mut says = |code: &str| {
+            screen.feed(format!("\x1b]{family};{code}\x07").as_bytes());
+            screen.facts().finished
+        };
+        assert_eq!(says("A"), 0, "OSC {family}: the first prompt is not a command ending");
+        assert_eq!(says("D"), 0, "OSC {family}: a finish with nothing running is not a command");
+        assert_eq!(says("C"), 0, "OSC {family}: a command starting has not finished");
+        assert_eq!(says("D;0"), 1, "OSC {family}: the command finished");
+        assert_eq!(says("A"), 1, "OSC {family}: the prompt after a finish is the same command");
+        assert_eq!(says("C"), 1);
+        assert_eq!(says("A"), 2, "OSC {family}: a prompt ends a command whose finish was never reported");
+    }
+}
+
 /// A finish with no status is absent rather than zero: a shell that says nothing about how a command
 /// ended is not saying it succeeded, which is `Facts`' stated contract and easy to lose in a mapping.
 #[test]

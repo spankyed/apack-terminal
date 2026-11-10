@@ -14,7 +14,13 @@ export type Event = { "kind": "hello", protocol: number, history: number, } | { 
 /**
  * Within the viewport, so `0` is its first line however much history came with it.
  */
-cursor_row: number, cursor_column: number, alt_screen: boolean, } | { "kind": "owns", session: string, pid: number, owned: boolean, } | { "kind": "facts", session: string, cwd: string | null, command: string | null, running: boolean, exit_status: number | null, foreground: Foreground | null, } | { "kind": "search", session: string, matches: Array<SearchMatch>, } | { "kind": "waited", session: string, outcome: WaitOutcome, } | { "kind": "failed", session: string | null, code: ErrorCode, message: string, };
+cursor_row: number, cursor_column: number, alt_screen: boolean, } | { "kind": "owns", session: string, pid: number, owned: boolean, } | { "kind": "facts", session: string, cwd: string | null, command: string | null, running: boolean, exit_status: number | null, 
+/**
+ * Moves each time the shell reports a command it started has ended. A caller that asks after a
+ * command has already ended learns one ran by this differing from what it last read; it is not
+ * an exact number of commands and it wraps, so it is compared for a difference only.
+ */
+finished: number, foreground: Foreground | null, } | { "kind": "search", session: string, matches: Array<SearchMatch>, } | { "kind": "waited", session: string, outcome: WaitOutcome, } | { "kind": "failed", session: string | null, code: ErrorCode, message: string, };
 
 /**
  * What the kernel says is reading the pty, as against what the shell claims about itself.

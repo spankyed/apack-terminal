@@ -333,6 +333,7 @@ fn carry_out(sessions: &Arc<Mutex<Sessions>>, request: Request) {
                     command: facts.command,
                     running: facts.running,
                     exit_status: facts.exit_status,
+                    finished: facts.finished,
                     foreground,
                 });
                 Ok(())
