@@ -188,6 +188,13 @@ pub enum Request {
     /// land and nothing polls. `timeout_ms` is the caller's deadline — a wait that is never met answers
     /// `Timeout` rather than lasting for ever — and the answer comes exactly once however the race goes.
     Wait { session: SessionId, until: Until, timeout_ms: u32 },
+    /// The commands the session's shell has reported, oldest first.
+    ///
+    /// What `Facts` cannot say: not the command running now, but each one that ran — so a caller that
+    /// started something can find *its* record, and read what it printed with `CommandOutput`.
+    Commands { session: SessionId },
+    /// What one command printed, as text, by the id `Commands` gave it.
+    CommandOutput { session: SessionId, command: u32 },
     /// End the session and its process tree.
     Kill { session: SessionId },
 }
@@ -462,6 +469,11 @@ pub enum Event {
     Search { session: SessionId, matches: Vec<SearchMatch> },
     /// How a `Wait` ended. Sent once per wait, whichever way it ended.
     Waited { session: SessionId, outcome: WaitOutcome },
+    /// The session's commands, answering `Commands`.
+    Commands { session: SessionId, commands: Vec<CommandRecord> },
+    /// What a command printed, answering `CommandOutput`. `text` is absent for a command that is not
+    /// kept, or whose output has left the history — which is not the same as having printed nothing.
+    CommandOutput { session: SessionId, command: u32, text: Option<String> },
     /// The program named its terminal (OSC 0, OSC 2). Empty when it took the name back.
     Title { session: SessionId, title: String },
     /// The program rang the bell.
@@ -486,6 +498,25 @@ pub enum Event {
     CwdChanged { session: SessionId, cwd: String },
     /// A request could not be carried out. `session` is absent when the request named none.
     Failed { session: Option<SessionId>, code: ErrorCode, message: String },
+}
+
+/// One command a session's shell reported. Every field but the id is a claim the shell made.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "protocol.ts")]
+pub struct CommandRecord {
+    /// Counts from one in a session, and is never reused
+    pub id: u32,
+    /// The line the shell read, where it said
+    pub command: Option<String>,
+    /// Where the shell was when the command began
+    pub cwd: Option<String>,
+    /// When it began and ended, in milliseconds since the Unix epoch. `finished_ms` is absent while it runs
+    #[ts(type = "number | null")]
+    pub started_ms: Option<u64>,
+    #[ts(type = "number | null")]
+    pub finished_ms: Option<u64>,
+    /// Absent while it runs, and when the shell reported none — which is not zero
+    pub exit_status: Option<i32>,
 }
 
 /// What a program says about how far along it is.

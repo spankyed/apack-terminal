@@ -10,8 +10,8 @@
 //!   with one byte changed, never panic and never allocate from a count the payload could not hold.
 
 use apack_terminal::view::wire::{
-    Block, Color, Cursor, Frame, Glyph, Incoming, MAX_MESSAGE_BYTES, Malformed, Position, Row, Span, Style, ToBroker,
-    ToView, body, read_message,
+    Block, Color, CommandRow, Cursor, Frame, Glyph, Incoming, MAX_MESSAGE_BYTES, Malformed, Position, Row, Span, Style,
+    ToBroker, ToView, body, read_message,
 };
 use proptest::prelude::*;
 
@@ -79,6 +79,19 @@ fn span() -> impl Strategy<Value = Span> {
     (position(), position()).prop_map(|(start, end)| Span { start, end })
 }
 
+/// A command with any of its fields present or absent, and a status of either sign.
+fn command() -> impl Strategy<Value = CommandRow> {
+    (
+        any::<u64>(),
+        (prop::option::of(".{0,12}"), prop::option::of("[a-z/]{0,12}")),
+        (prop::option::of(any::<u64>()), prop::option::of(any::<u64>()), prop::option::of(any::<i32>())),
+        (prop::option::of(any::<u64>()), prop::option::of(any::<u64>()), prop::option::of(any::<u64>())),
+    )
+        .prop_map(|(id, (command, cwd), (started_ms, finished_ms, exit_status), (prompt, output, end))| {
+            CommandRow { id, command, cwd, started_ms, finished_ms, exit_status, prompt, output, end }
+        })
+}
+
 fn to_view() -> impl Strategy<Value = ToView> {
     let cursor = prop::option::of(
         (any::<u16>(), any::<u16>(), 0u8..4, any::<bool>()).prop_map(|(column, row, shape, blinking)| Cursor {
@@ -90,7 +103,7 @@ fn to_view() -> impl Strategy<Value = ToView> {
     );
     let frame = (
         (any::<u32>(), any::<u64>(), any::<u32>(), any::<u64>()),
-        (any::<u16>(), any::<u16>(), any::<u32>()),
+        (any::<u16>(), any::<u16>(), any::<u32>(), any::<u32>()),
         (cursor, any::<bool>(), any::<bool>(), prop::option::of(any::<u64>())),
         block(),
     )
@@ -103,6 +116,7 @@ fn to_view() -> impl Strategy<Value = ToView> {
                 columns: grid.0,
                 screen_rows: grid.1,
                 scrollback: grid.2,
+                commands: grid.3,
                 cursor: state.0,
                 alternate_screen: state.1,
                 mouse: state.2,
@@ -138,6 +152,8 @@ fn to_view() -> impl Strategy<Value = ToView> {
             request,
             message
         }),
+        (any::<u32>(), any::<u32>(), any::<u32>(), prop::collection::vec(command(), 0..4))
+            .prop_map(|(channel, request, epoch, commands)| ToView::Commands { channel, request, epoch, commands }),
     ]
 }
 
@@ -186,6 +202,7 @@ fn to_broker() -> impl Strategy<Value = ToBroker> {
             request,
             needle
         }),
+        (any::<u32>(), any::<u32>()).prop_map(|(channel, request)| ToBroker::Commands { channel, request }),
     ]
 }
 

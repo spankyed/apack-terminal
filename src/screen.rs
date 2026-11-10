@@ -308,8 +308,9 @@ impl Screen {
         if self.publication.is_none() {
             self.publication = Some(Publication::new(&self.terminal)?);
         }
+        let commands = self.reported.commands().generation();
         match &mut self.publication {
-            Some(publication) => publication.attach(&self.terminal, id, sink),
+            Some(publication) => publication.attach(&self.terminal, commands, id, sink),
             None => Ok(()),
         }
     }
@@ -329,8 +330,9 @@ impl Screen {
 
     /// A view drew the frame with this sequence.
     pub fn acknowledge(&mut self, id: ViewId, sequence: u64) -> Result<(), Failed> {
+        let commands = self.reported.commands().generation();
         match &mut self.publication {
-            Some(publication) => publication.acknowledge(&self.terminal, id, sequence),
+            Some(publication) => publication.acknowledge(&self.terminal, commands, id, sequence),
             None => Ok(()),
         }
     }
@@ -338,8 +340,9 @@ impl Screen {
     /// Sends each view that is waiting for one the frame it is owed. Called where bytes land and where a
     /// view acknowledges, which between them are every moment a frame can become due.
     pub fn publish(&mut self) {
+        let commands = self.reported.commands().generation();
         if let Some(publication) = &mut self.publication {
-            let _ = publication.pump(&self.terminal);
+            let _ = publication.pump(&self.terminal, commands);
         }
     }
 
@@ -496,8 +499,9 @@ impl Screen {
 
     /// Tells every view the session is over, after the screen as it ended.
     pub fn end_views(&mut self) {
+        let commands = self.reported.commands().generation();
         if let Some(mut publication) = self.publication.take() {
-            publication.end(&self.terminal);
+            publication.end(&self.terminal, commands);
         }
     }
 

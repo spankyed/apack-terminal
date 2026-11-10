@@ -125,6 +125,8 @@ fn requests() -> impl Strategy<Value = Request> {
         )
             .prop_map(|(session, until, timeout_ms)| Request::Wait { session, until, timeout_ms }),
         "[^\u{0}]{0,40}".prop_map(|session| Request::Kill { session }),
+        "[^\u{0}]{0,40}".prop_map(|session| Request::Commands { session }),
+        ("[^\u{0}]{0,40}", any::<u32>()).prop_map(|(session, command)| Request::CommandOutput { session, command }),
     ]
 }
 

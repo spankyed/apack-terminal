@@ -11,6 +11,31 @@ export type Colors = { foreground: [number, number, number], background: [number
 ansi: Array<[number, number, number]>, };
 
 /**
+ * One command a session's shell reported. Every field but the id is a claim the shell made.
+ */
+export type CommandRecord = { 
+/**
+ * Counts from one in a session, and is never reused
+ */
+id: number, 
+/**
+ * The line the shell read, where it said
+ */
+command: string | null, 
+/**
+ * Where the shell was when the command began
+ */
+cwd: string | null, 
+/**
+ * When it began and ended, in milliseconds since the Unix epoch. `finished_ms` is absent while it runs
+ */
+started_ms: number | null, finished_ms: number | null, 
+/**
+ * Absent while it runs, and when the shell reported none — which is not zero
+ */
+exit_status: number | null, };
+
+/**
  * **A closed set, generated into the TypeScript as a string union** — elmdb's `ErrorCode` arrangement, and
  * what #372's name-matching should become. A caller switches on a value the compiler knows, rather than
  * matching on a message that is free to be reworded.
@@ -35,7 +60,7 @@ cursor_row: number, cursor_column: number, alt_screen: boolean, } | { "kind": "o
  * command has already ended learns one ran by this differing from what it last read; it is not
  * an exact number of commands and it wraps, so it is compared for a difference only.
  */
-finished: number, foreground: Foreground | null, } | { "kind": "search", session: string, matches: Array<SearchMatch>, } | { "kind": "waited", session: string, outcome: WaitOutcome, } | { "kind": "title", session: string, title: string, } | { "kind": "bell", session: string, } | { "kind": "clipboard", session: string, text: string, } | { "kind": "notification", session: string, title: string, body: string, } | { "kind": "progress", session: string, state: ProgressState, percent: number | null, } | { "kind": "command_started", session: string, command: string | null, } | { "kind": "command_finished", session: string, exit_status: number | null, } | { "kind": "cwd_changed", session: string, cwd: string, } | { "kind": "failed", session: string | null, code: ErrorCode, message: string, };
+finished: number, foreground: Foreground | null, } | { "kind": "search", session: string, matches: Array<SearchMatch>, } | { "kind": "waited", session: string, outcome: WaitOutcome, } | { "kind": "commands", session: string, commands: Array<CommandRecord>, } | { "kind": "command_output", session: string, command: number, text: string | null, } | { "kind": "title", session: string, title: string, } | { "kind": "bell", session: string, } | { "kind": "clipboard", session: string, text: string, } | { "kind": "notification", session: string, title: string, body: string, } | { "kind": "progress", session: string, state: ProgressState, percent: number | null, } | { "kind": "command_started", session: string, command: string | null, } | { "kind": "command_finished", session: string, exit_status: number | null, } | { "kind": "cwd_changed", session: string, cwd: string, } | { "kind": "failed", session: string | null, code: ErrorCode, message: string, };
 
 /**
  * What the kernel says is reading the pty, as against what the shell claims about itself.
@@ -99,7 +124,7 @@ colors: Colors | null,
  * is sent rows, and its bytes would cross the socket to be thrown away; worse, they are bounded
  * by credit, so an unread stream would stall the program. Absent means sent, as it always was.
  */
-output: boolean, } | { "kind": "write", session: string, text: string, } | { "kind": "resize", session: string, cols: number, rows: number, cell_width: number, cell_height: number, } | { "kind": "pause", session: string, } | { "kind": "resume", session: string, } | { "kind": "signal", session: string, signal: Signal, scope: Scope, } | { "kind": "owns", session: string, pid: number, } | { "kind": "screen", session: string, history: number, } | { "kind": "facts", session: string, } | { "kind": "search", session: string, text: string, history: number, } | { "kind": "wait", session: string, until: Until, timeout_ms: number, } | { "kind": "kill", session: string, };
+output: boolean, } | { "kind": "write", session: string, text: string, } | { "kind": "resize", session: string, cols: number, rows: number, cell_width: number, cell_height: number, } | { "kind": "pause", session: string, } | { "kind": "resume", session: string, } | { "kind": "signal", session: string, signal: Signal, scope: Scope, } | { "kind": "owns", session: string, pid: number, } | { "kind": "screen", session: string, history: number, } | { "kind": "facts", session: string, } | { "kind": "search", session: string, text: string, history: number, } | { "kind": "wait", session: string, until: Until, timeout_ms: number, } | { "kind": "commands", session: string, } | { "kind": "command_output", session: string, command: number, } | { "kind": "kill", session: string, };
 
 /**
  * What a connection is for.

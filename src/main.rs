@@ -21,11 +21,11 @@ use interprocess::local_socket::{GenericFilePath, ListenerOptions, Stream, ToFsN
 
 use apack_terminal::frames::{Frame, read_frame};
 use apack_terminal::output::{Outgoing, channel_with_credit};
-use apack_terminal::protocol::{ErrorCode, Event, PROTOCOL_VERSION, Request, Role, SearchMatch};
+use apack_terminal::protocol::{CommandRecord, ErrorCode, Event, PROTOCOL_VERSION, Request, Role, SearchMatch};
 use apack_terminal::screen::{Colors, HISTORY_LINES};
 use apack_terminal::session::{Refusal, Sessions, Spawning};
 use apack_terminal::view::publish::ViewId;
-use apack_terminal::view::wire::{Incoming, ToBroker, ToView, read_message};
+use apack_terminal::view::wire::{CommandRow, Incoming, ToBroker, ToView, read_message};
 use apack_terminal::vt::input::{Key, Pointer};
 
 fn main() -> std::io::Result<()> {
@@ -423,6 +423,28 @@ fn carry_out_view(
                 Err(refusal) => failed(channel, request, refusal),
             }
         }
+        ToBroker::Commands { channel, request } => {
+            match session_of(channel).and_then(|session| live.commands(&session)) {
+                Ok((epoch, commands)) => {
+                    let commands = commands
+                        .into_iter()
+                        .map(|one| CommandRow {
+                            id: one.id,
+                            command: one.command,
+                            cwd: one.cwd,
+                            started_ms: one.started_ms,
+                            finished_ms: one.finished_ms,
+                            exit_status: one.exit_status,
+                            prompt: one.prompt,
+                            output: one.output,
+                            end: one.end,
+                        })
+                        .collect();
+                    answer(ToView::Commands { channel, request, epoch, commands });
+                }
+                Err(refusal) => failed(channel, request, refusal),
+            }
+        }
     }
 }
 
@@ -511,6 +533,33 @@ fn carry_out(sessions: &Arc<Mutex<Sessions>>, request: Request) {
                         .map(|found| SearchMatch { line: found.line, column: found.column, text: found.text })
                         .collect(),
                 });
+                Ok(())
+            }
+            Err(refusal) => Err((Some(session), refusal)),
+        },
+        Request::Commands { session } => match live.commands(&session) {
+            Ok((_, commands)) => {
+                live.answer(Event::Commands {
+                    session,
+                    commands: commands
+                        .into_iter()
+                        .map(|one| CommandRecord {
+                            id: u32::try_from(one.id).unwrap_or(u32::MAX),
+                            command: one.command,
+                            cwd: one.cwd,
+                            started_ms: one.started_ms,
+                            finished_ms: one.finished_ms,
+                            exit_status: one.exit_status,
+                        })
+                        .collect(),
+                });
+                Ok(())
+            }
+            Err(refusal) => Err((Some(session), refusal)),
+        },
+        Request::CommandOutput { session, command } => match live.command_output(&session, u64::from(command)) {
+            Ok(text) => {
+                live.answer(Event::CommandOutput { session, command, text });
                 Ok(())
             }
             Err(refusal) => Err((Some(session), refusal)),

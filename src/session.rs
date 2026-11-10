@@ -15,7 +15,7 @@ use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_s
 
 use crate::output::{Credit, Flow, Outgoing, READ_AHEAD, coalesce};
 use crate::protocol::{ErrorCode, Event, Foreground, ProgressState, Scope, SessionId, Signal, Until, WaitOutcome};
-use crate::screen::{Colors, Facts, HISTORY_LINES, Match, Screen, Snapshot};
+use crate::screen::{Colors, CommandAt, Facts, HISTORY_LINES, Match, Screen, Snapshot};
 use crate::tree::Tree;
 use crate::view::publish::ViewId;
 use crate::view::wire::{Block, Position, Span};
@@ -960,6 +960,16 @@ impl Sessions {
 
     pub fn find(&self, session: &str, needle: &str) -> Result<(u32, Vec<Span>), Refusal> {
         self.screen(session)?.find(needle).map_err(core)
+    }
+
+    /// The commands the session's shell has reported, with the epoch their lines are in.
+    pub fn commands(&self, session: &str) -> Result<(u32, Vec<CommandAt>), Refusal> {
+        self.screen(session)?.commands().map_err(core)
+    }
+
+    /// What one command printed, or `None` for one that is not kept or whose output has left the history.
+    pub fn command_output(&self, session: &str, command: u64) -> Result<Option<String>, Refusal> {
+        self.screen(session)?.command_output(command).map_err(core)
     }
 }
 

@@ -1,10 +1,11 @@
 [
   {
-    "hex": "8800000041032902e8075018e807110417010201010000010212345601fa02ff00808206011968747470733a2f2f6578616d706c652e636f6d2f613f623d630400020300000000012402010000026c730502010002787901010200000001030203e4b896010365cc81020bf09f91a8e2808df09f91a90500000002c3a9020000959aef3a00014f000000017a",
+    "hex": "8900000041032902e8075018e80707110417010201010000010212345601fa02ff00808206011968747470733a2f2f6578616d706c652e636f6d2f613f623d630400020300000000012402010000026c730502010002787901010200000001030203e4b896010365cc81020bf09f91a8e2808df09f91a90500000002c3a9020000959aef3a00014f000000017a",
     "message": {
       "alternateScreen": false,
       "channel": 3,
       "columns": 80,
+      "commands": 7,
       "cursor": {
         "blinking": true,
         "column": 4,
@@ -155,11 +156,12 @@
     "to": "view"
   },
   {
-    "hex": "0e00000041032902e8075018e80704000000",
+    "hex": "0f00000041032902e8075018e8070704000000",
     "message": {
       "alternateScreen": false,
       "channel": 3,
       "columns": 80,
+      "commands": 7,
       "cursor": null,
       "epoch": 2,
       "firstActive": 1000,
@@ -186,11 +188,12 @@
     "to": "view"
   },
   {
-    "hex": "1300000041032902e8075018e8070b000002de07000000",
+    "hex": "1400000041032902e8075018e807070b000002de07000000",
     "message": {
       "alternateScreen": true,
       "channel": 3,
       "columns": 80,
+      "commands": 7,
       "cursor": {
         "blinking": false,
         "column": 0,
@@ -495,6 +498,52 @@
     "to": "view"
   },
   {
+    "hex": "3f000000490311020301ff0a636172676f2074657374082f7372632f61707080a8ee959b34b988ef959b340028295a029ca0c4ef959b3494c8ef959b34015fac02205f",
+    "message": {
+      "channel": 3,
+      "commands": [
+        {
+          "command": "cargo test",
+          "cwd": "/src/app",
+          "end": 90,
+          "exitStatus": 0,
+          "finishedMs": 1794000012345,
+          "id": 1,
+          "output": 41,
+          "prompt": 40,
+          "startedMs": 1794000000000
+        },
+        {
+          "command": null,
+          "cwd": null,
+          "end": 95,
+          "exitStatus": -1,
+          "finishedMs": 1794000020500,
+          "id": 2,
+          "output": null,
+          "prompt": null,
+          "startedMs": 1794000020000
+        },
+        {
+          "command": null,
+          "cwd": null,
+          "end": null,
+          "exitStatus": null,
+          "finishedMs": null,
+          "id": 300,
+          "output": null,
+          "prompt": 95,
+          "startedMs": null
+        }
+      ],
+      "epoch": 2,
+      "kind": "commands",
+      "request": 17
+    },
+    "name": "commands: one finished with everything known, one that failed with a negative status, one waiting",
+    "to": "view"
+  },
+  {
     "hex": "07000000010304732d3132",
     "message": {
       "channel": 3,
@@ -740,6 +789,16 @@
       "request": 13
     },
     "name": "searching",
+    "to": "broker"
+  },
+  {
+    "hex": "030000000e0311",
+    "message": {
+      "channel": 3,
+      "kind": "commands",
+      "request": 17
+    },
+    "name": "asking for the commands",
     "to": "broker"
   }
 ]

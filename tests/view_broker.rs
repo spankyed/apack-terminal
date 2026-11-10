@@ -414,3 +414,56 @@ fn a_programs_title_clipboard_and_commands_are_told_to_the_client() {
     }
     assert_eq!(told, ["title a title", "clipboard hi", "started Some(\"make\")", "finished Some(2)"]);
 }
+
+/// A shell that marks its commands is remembered: a view is told when there is something new to ask for and
+/// is answered with each command and the lines that are its, and the app's own connection can read what
+/// one printed.
+#[test]
+fn the_commands_a_shell_marks_are_listed_with_their_lines_and_their_output_is_read() {
+    let broker = start();
+    let client = Client::greeting(&broker);
+    let session = client.shell();
+    let mut view = View::attached(&broker, &session);
+    view.until_shows("$ ");
+    let before = view.last.as_ref().expect("a frame arrived").commands;
+
+    // The marks a shell's integration writes around a command, written here by hand: its prompt, the
+    // start of its output and its end with a status
+    view.type_line("printf '\\033]133;A\\007\\033]133;C\\007first\\nsecond\\n\\033]133;D;3\\007'; echo mar$((1+1))ked");
+    view.until_shows("mar2ked");
+    assert_ne!(view.last.as_ref().expect("a frame arrived").commands, before, "a view was not told to ask again");
+
+    view.send(&ToBroker::Commands { channel: 1, request: 21 });
+    let commands = view.answer(|message| match message {
+        ToView::Commands { request: 21, commands, .. } => Some(commands.clone()),
+        _ => None,
+    });
+    let [command] = commands.as_slice() else { panic!("expected one command, was told {commands:?}") };
+    assert_eq!(command.exit_status, Some(3));
+    let (output, end) = (command.output.expect("its output has a line"), command.end.expect("its end has a line"));
+    assert_eq!(end - output, 2, "two lines of output between where it began and where it ended");
+
+    view.send(&ToBroker::Fetch { channel: 1, request: 22, epoch: 0, first: output, count: 2 });
+    let printed = view.answer(|message| match message {
+        ToView::Rows { request: 22, block, .. } => Some(block.rows.iter().map(text).collect::<Vec<_>>()),
+        _ => None,
+    });
+    assert_eq!(printed, vec!["first", "second"]);
+
+    // And the same command, asked for by the connection that owns the session
+    say(&client.stream, &Request::Commands { session: session.clone() });
+    let id = loop {
+        if let Event::Commands { commands, .. } = client.event() {
+            let [record] = commands.as_slice() else { panic!("expected one command, was told {commands:?}") };
+            assert_eq!(record.exit_status, Some(3));
+            break record.id;
+        }
+    };
+    say(&client.stream, &Request::CommandOutput { session: session.clone(), command: id });
+    let text = loop {
+        if let Event::CommandOutput { text, .. } = client.event() {
+            break text;
+        }
+    };
+    assert_eq!(text.as_deref(), Some("first\nsecond"));
+}

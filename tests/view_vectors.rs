@@ -10,7 +10,7 @@
 //! line of it is a change a view has to be taught.
 
 use apack_terminal::view::wire::{
-    Block, Color, Cursor, Frame, Glyph, NO_BUTTON, Position, Row, Span, Style, ToBroker, ToView, body,
+    Block, Color, CommandRow, Cursor, Frame, Glyph, NO_BUTTON, Position, Row, Span, Style, ToBroker, ToView, body,
 };
 use serde_json::{Value, json};
 
@@ -77,7 +77,8 @@ fn to_view(message: &ToView) -> Value {
             json!({
                 "kind": "frame", "channel": frame.channel, "sequence": frame.sequence, "epoch": frame.epoch,
                 "firstActive": frame.first_active, "columns": frame.columns, "screenRows": frame.screen_rows,
-                "scrollback": frame.scrollback, "cursor": cursor, "alternateScreen": frame.alternate_screen,
+                "scrollback": frame.scrollback, "commands": frame.commands, "cursor": cursor,
+                "alternateScreen": frame.alternate_screen,
                 "mouse": frame.mouse, "staleFrom": frame.stale_from, "styles": styles, "links": links, "rows": rows,
             })
         }
@@ -101,6 +102,19 @@ fn to_view(message: &ToView) -> Value {
         }
         ToView::Failed { channel, request, message } => {
             json!({ "kind": "failed", "channel": channel, "request": request, "message": message })
+        }
+        ToView::Commands { channel, request, epoch, commands } => {
+            let commands: Vec<Value> = commands
+                .iter()
+                .map(|one| {
+                    json!({
+                        "id": one.id, "command": one.command, "cwd": one.cwd, "startedMs": one.started_ms,
+                        "finishedMs": one.finished_ms, "exitStatus": one.exit_status, "prompt": one.prompt,
+                        "output": one.output, "end": one.end,
+                    })
+                })
+                .collect();
+            json!({ "kind": "commands", "channel": channel, "request": request, "epoch": epoch, "commands": commands })
         }
     }
 }
@@ -141,6 +155,9 @@ fn to_broker(message: &ToBroker) -> Value {
         }
         ToBroker::Search { channel, request, needle } => {
             json!({ "kind": "search", "channel": channel, "request": request, "needle": needle })
+        }
+        ToBroker::Commands { channel, request } => {
+            json!({ "kind": "commands", "channel": channel, "request": request })
         }
     }
 }
@@ -209,6 +226,7 @@ fn vectors() -> Value {
             columns: 80,
             screen_rows: 24,
             scrollback: 1_000,
+            commands: 7,
             cursor,
             alternate_screen: stale_from.is_some(),
             mouse: cursor.is_none(),
@@ -241,6 +259,39 @@ fn vectors() -> Value {
         ),
         ("no matches", ToView::Spans { channel: 3, request: 14, epoch: 2, spans: Vec::new() }),
         ("a refusal", ToView::Failed { channel: 3, request: 15, message: "no session s-9".to_owned() }),
+        (
+            "commands: one finished with everything known, one that failed with a negative status, one waiting",
+            ToView::Commands {
+                channel: 3,
+                request: 17,
+                epoch: 2,
+                commands: vec![
+                    CommandRow {
+                        id: 1,
+                        command: Some("cargo test".to_owned()),
+                        cwd: Some("/src/app".to_owned()),
+                        started_ms: Some(1_794_000_000_000),
+                        finished_ms: Some(1_794_000_012_345),
+                        exit_status: Some(0),
+                        prompt: Some(40),
+                        output: Some(41),
+                        end: Some(90),
+                    },
+                    CommandRow {
+                        id: 2,
+                        command: None,
+                        cwd: None,
+                        started_ms: Some(1_794_000_020_000),
+                        finished_ms: Some(1_794_000_020_500),
+                        exit_status: Some(-1),
+                        prompt: None,
+                        output: None,
+                        end: Some(95),
+                    },
+                    CommandRow { id: 300, prompt: Some(95), ..CommandRow::default() },
+                ],
+            },
+        ),
     ];
     let for_the_broker: Vec<(&str, ToBroker)> = vec![
         ("attaching", ToBroker::Attach { channel: 3, session: "s-12".to_owned() }),
@@ -331,6 +382,7 @@ fn vectors() -> Value {
         ("asking for a line", ToBroker::LineAt { channel: 3, request: 16, epoch: 2, at }),
         ("asking for text", ToBroker::TextOf { channel: 3, request: 12, epoch: 2, span: across }),
         ("searching", ToBroker::Search { channel: 3, request: 13, needle: "error:".to_owned() }),
+        ("asking for the commands", ToBroker::Commands { channel: 3, request: 17 }),
     ];
 
     let mut all: Vec<Value> = Vec::new();
@@ -377,6 +429,7 @@ fn every_kind_of_message_has_a_vector() {
     let expected = [
         "broker:acknowledge",
         "broker:attach",
+        "broker:commands",
         "broker:detach",
         "broker:fetch",
         "broker:focus",
@@ -388,6 +441,7 @@ fn every_kind_of_message_has_a_vector() {
         "broker:text",
         "broker:textOf",
         "broker:wordAt",
+        "view:commands",
         "view:ended",
         "view:failed",
         "view:frame",

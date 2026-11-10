@@ -100,11 +100,29 @@ pub struct Frame {
     pub columns: u16,
     pub screen_rows: u16,
     pub scrollback: u32,
+    /// Moves whenever the shell reports a command, so a view knows to ask for them again
+    pub commands: u32,
     pub cursor: Option<Cursor>,
     pub alternate_screen: bool,
     pub mouse: bool,
     pub stale_from: Option<u64>,
     pub block: Block,
+}
+
+/// A command the shell reported, with the line each of its moments is on. A moment whose row has left
+/// the history has no line.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CommandRow {
+    pub id: u64,
+    pub command: Option<String>,
+    pub cwd: Option<String>,
+    /// Milliseconds since the Unix epoch
+    pub started_ms: Option<u64>,
+    pub finished_ms: Option<u64>,
+    pub exit_status: Option<i32>,
+    pub prompt: Option<u64>,
+    pub output: Option<u64>,
+    pub end: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,6 +223,11 @@ pub enum ToBroker {
         request: u32,
         needle: String,
     },
+    /// The commands the shell has reported in this session.
+    Commands {
+        channel: u32,
+        request: u32,
+    },
 }
 
 /// What a view is sent.
@@ -244,6 +267,13 @@ pub enum ToView {
         request: u32,
         epoch: u32,
         spans: Vec<Span>,
+    },
+    /// The answer to `Commands`, oldest first.
+    Commands {
+        channel: u32,
+        request: u32,
+        epoch: u32,
+        commands: Vec<CommandRow>,
     },
     /// A request that could not be answered, and why.
     Failed {
@@ -358,6 +388,38 @@ impl Writer {
     fn position(&mut self, at: Position) {
         self.number(at.line);
         self.number(at.column);
+    }
+
+    /// A command, as a byte saying which of its fields it has and then those fields in order.
+    fn command(&mut self, command: &CommandRow) {
+        self.number(command.id);
+        let has = [
+            command.command.is_some(),
+            command.cwd.is_some(),
+            command.started_ms.is_some(),
+            command.finished_ms.is_some(),
+            command.exit_status.is_some(),
+            command.prompt.is_some(),
+            command.output.is_some(),
+            command.end.is_some(),
+        ];
+        self.byte(has.iter().enumerate().fold(0u8, |flags, (bit, set)| flags | (u8::from(*set) << bit)));
+        if let Some(text) = &command.command {
+            self.text(text);
+        }
+        if let Some(text) = &command.cwd {
+            self.text(text);
+        }
+        for time in [command.started_ms, command.finished_ms].into_iter().flatten() {
+            self.number(time);
+        }
+        if let Some(status) = command.exit_status {
+            // Zigzag, so a small negative status is as short as a small positive one
+            self.number(((status << 1) ^ (status >> 31)) as u32);
+        }
+        for line in [command.prompt, command.output, command.end].into_iter().flatten() {
+            self.number(line);
+        }
     }
 
     fn span(&mut self, span: Span) {
@@ -543,6 +605,38 @@ impl<'a> Reader<'a> {
         Ok(Span { start: self.position()?, end: self.position()? })
     }
 
+    fn command(&mut self) -> Result<CommandRow, Malformed> {
+        let id = self.number()?;
+        let has = self.byte()?;
+        let mut command = CommandRow { id, ..CommandRow::default() };
+        if has & 1 != 0 {
+            command.command = Some(self.text()?);
+        }
+        if has & 2 != 0 {
+            command.cwd = Some(self.text()?);
+        }
+        if has & 4 != 0 {
+            command.started_ms = Some(self.number()?);
+        }
+        if has & 8 != 0 {
+            command.finished_ms = Some(self.number()?);
+        }
+        if has & 16 != 0 {
+            let zigzag = self.u32()?;
+            command.exit_status = Some(((zigzag >> 1) as i32) ^ -((zigzag & 1) as i32));
+        }
+        if has & 32 != 0 {
+            command.prompt = Some(self.number()?);
+        }
+        if has & 64 != 0 {
+            command.output = Some(self.number()?);
+        }
+        if has & 128 != 0 {
+            command.end = Some(self.number()?);
+        }
+        Ok(command)
+    }
+
     fn color(&mut self) -> Result<Color, Malformed> {
         match self.byte()? {
             0 => Ok(Color::Default),
@@ -632,6 +726,7 @@ mod kind {
     pub const LINE_AT: u8 = 11;
     pub const TEXT_OF: u8 = 12;
     pub const SEARCH: u8 = 13;
+    pub const COMMANDS: u8 = 14;
 
     pub const FRAME: u8 = 65;
     pub const ROWS: u8 = 66;
@@ -641,6 +736,7 @@ mod kind {
     pub const TEXT: u8 = 70;
     pub const SPANS: u8 = 71;
     pub const FAILED: u8 = 72;
+    pub const COMMAND_LIST: u8 = 73;
 }
 
 const FRAME_CURSOR: u8 = 1;
@@ -726,6 +822,10 @@ impl ToBroker {
                 out.number(*request);
                 out.text(needle);
             }),
+            Self::Commands { channel, request } => framed(kind::COMMANDS, |out| {
+                out.number(*channel);
+                out.number(*request);
+            }),
         }
     }
 
@@ -779,6 +879,7 @@ impl ToBroker {
                 Self::TextOf { channel: read.u32()?, request: read.u32()?, epoch: read.u32()?, span: read.span()? }
             }
             kind::SEARCH => Self::Search { channel: read.u32()?, request: read.u32()?, needle: read.text()? },
+            kind::COMMANDS => Self::Commands { channel: read.u32()?, request: read.u32()? },
             other => return Err(Malformed::UnknownKind(other)),
         };
         read.finish(message)
@@ -797,6 +898,7 @@ impl ToView {
                 out.number(frame.columns);
                 out.number(frame.screen_rows);
                 out.number(frame.scrollback);
+                out.number(frame.commands);
                 let blinking = frame.cursor.is_some_and(|cursor| cursor.blinking);
                 out.byte(
                     if frame.cursor.is_some() { FRAME_CURSOR } else { 0 }
@@ -855,6 +957,15 @@ impl ToView {
                 out.number(*request);
                 out.text(message);
             }),
+            Self::Commands { channel, request, epoch, commands } => framed(kind::COMMAND_LIST, |out| {
+                out.number(*channel);
+                out.number(*request);
+                out.number(*epoch);
+                out.number(commands.len() as u64);
+                for command in commands {
+                    out.command(command);
+                }
+            }),
         }
     }
 
@@ -870,6 +981,7 @@ impl ToView {
                 let columns = read.u16()?;
                 let screen_rows = read.u16()?;
                 let scrollback = read.u32()?;
+                let commands = read.u32()?;
                 let flags = read.byte()?;
                 if flags >= 32 {
                     return Err(Malformed::Value("a frame's flags"));
@@ -893,6 +1005,7 @@ impl ToView {
                     columns,
                     screen_rows,
                     scrollback,
+                    commands,
                     cursor,
                     alternate_screen: flags & FRAME_ALTERNATE != 0,
                     mouse: flags & FRAME_MOUSE != 0,
@@ -921,6 +1034,15 @@ impl ToView {
                 Self::Spans { channel, request, epoch, spans }
             }
             kind::FAILED => Self::Failed { channel: read.u32()?, request: read.u32()?, message: read.text()? },
+            kind::COMMAND_LIST => {
+                let (channel, request, epoch) = (read.u32()?, read.u32()?, read.u32()?);
+                let mut commands = Vec::new();
+                // An id and a byte of flags, at the least
+                for _ in 0..read.count()? {
+                    commands.push(read.command()?);
+                }
+                Self::Commands { channel, request, epoch, commands }
+            }
             other => return Err(Malformed::UnknownKind(other)),
         };
         read.finish(message)

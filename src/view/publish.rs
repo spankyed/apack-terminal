@@ -82,6 +82,8 @@ pub struct Publication {
     active: Vec<Held>,
     cursor: Option<Cursor>,
     mouse: bool,
+    /// The shell's command generation when the screen was last read
+    commands: u32,
     /// Bytes have been fed since the terminal was last looked at
     stale: bool,
     /// When the program was first seen holding the screen
@@ -107,6 +109,7 @@ impl Publication {
             active: Vec::new(),
             cursor: None,
             mouse: false,
+            commands: 0,
             stale: true,
             held_since: None,
             viewers: Vec::new(),
@@ -158,7 +161,7 @@ impl Publication {
     }
 
     /// Reads the screen and notes what changed. Answers whether a program is holding it instead.
-    fn capture(&mut self, terminal: &Terminal) -> Result<bool, Failed> {
+    fn capture(&mut self, terminal: &Terminal, commands: u32) -> Result<bool, Failed> {
         self.advance(terminal)?;
         if terminal.mode(SYNCHRONIZED_OUTPUT)? {
             let since = *self.held_since.get_or_insert_with(Instant::now);
@@ -200,10 +203,10 @@ impl Publication {
             blinking: read.blinking,
         });
         let mouse = terminal.mouse_tracking()?;
-        if cursor != self.cursor || mouse != self.mouse {
+        if cursor != self.cursor || mouse != self.mouse || commands != self.commands {
             changed = true;
         }
-        (self.cursor, self.mouse) = (cursor, mouse);
+        (self.cursor, self.mouse, self.commands) = (cursor, mouse, commands);
         if changed {
             self.sequence = next;
         }
@@ -212,12 +215,14 @@ impl Publication {
     }
 
     /// Sends every view that has drawn its last frame the one it is owed, if it is owed one.
-    pub fn pump(&mut self, terminal: &Terminal) -> Result<(), Failed> {
+    ///
+    /// `commands` is the shell's command generation, which is a change a view is told of like any other.
+    pub fn pump(&mut self, terminal: &Terminal, commands: u32) -> Result<(), Failed> {
         let waiting = |viewer: &Viewer| !viewer.in_flight;
         if !self.viewers.iter().any(waiting) {
             return Ok(());
         }
-        if self.stale && self.capture(terminal)? {
+        if self.stale && self.capture(terminal, commands)? {
             return Ok(());
         }
         for index in 0..self.viewers.len() {
@@ -278,6 +283,7 @@ impl Publication {
             columns: self.columns,
             screen_rows: self.rows,
             scrollback: self.scrollback,
+            commands: self.commands,
             cursor: self.cursor,
             alternate_screen: self.alternate,
             mouse: self.mouse,
@@ -323,11 +329,17 @@ impl Publication {
     }
 
     /// Starts sending a view this session's frames, beginning with the whole screen.
-    pub fn attach(&mut self, terminal: &Terminal, id: ViewId, sink: Sender<Vec<u8>>) -> Result<(), Failed> {
+    pub fn attach(
+        &mut self,
+        terminal: &Terminal,
+        commands: u32,
+        id: ViewId,
+        sink: Sender<Vec<u8>>,
+    ) -> Result<(), Failed> {
         self.viewers.retain(|viewer| viewer.id != id);
         self.viewers.push(Viewer { id, sink, sent: None, in_flight: false, gone: false });
         self.stale = true;
-        self.pump(terminal)
+        self.pump(terminal, commands)
     }
 
     pub fn detach(&mut self, id: ViewId) {
@@ -343,21 +355,21 @@ impl Publication {
     ///
     /// An acknowledgement of anything but the frame in flight is ignored: it is late, for a frame since
     /// superseded, and the one in flight has still to be drawn.
-    pub fn acknowledge(&mut self, terminal: &Terminal, id: ViewId, sequence: u64) -> Result<(), Failed> {
+    pub fn acknowledge(&mut self, terminal: &Terminal, commands: u32, id: ViewId, sequence: u64) -> Result<(), Failed> {
         if let Some(viewer) = self.viewers.iter_mut().find(|viewer| viewer.id == id)
             && viewer.sent.is_some_and(|sent| sent.sequence == sequence)
         {
             viewer.in_flight = false;
         }
-        self.pump(terminal)
+        self.pump(terminal, commands)
     }
 
     /// The session is over: every view is sent the screen as it ended, whether or not it had drawn its
     /// last frame, and told there will be no more.
-    pub fn end(&mut self, terminal: &Terminal) {
+    pub fn end(&mut self, terminal: &Terminal, commands: u32) {
         self.held_since = Some(Instant::now() - HOLD_LIMIT);
         self.stale = true;
-        let captured = self.capture(terminal).is_ok();
+        let captured = self.capture(terminal, commands).is_ok();
         for index in 0..self.viewers.len() {
             let (channel, sent) = (self.viewers[index].id.channel, self.viewers[index].sent);
             let behind = sent.is_none_or(|sent| sent.epoch != self.epoch || sent.sequence != self.sequence);
