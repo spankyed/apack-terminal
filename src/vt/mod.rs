@@ -19,6 +19,44 @@ use crate::screen::Facts;
 /// as its first code point rather than refused.
 const CLUSTER_CODEPOINTS: usize = 16;
 
+/// What the linked build of the core was compiled with.
+///
+/// **Asked rather than assumed, because the functions are exported either way.** A feature left out of a
+/// build still links: its calls answer `UNSUPPORTED` at run time. This broker links a prebuilt library it
+/// does not build, so which features that archive carries is a fact about a download, and
+/// `tests/core_features.rs` is what refuses an archive missing one the broker is written against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Features {
+    pub render_state: bool,
+    pub formatter: bool,
+    pub selection: bool,
+    pub search: bool,
+    pub input_encode: bool,
+    pub grid_introspection: bool,
+    pub snapshot: bool,
+    pub kitty_graphics: bool,
+}
+
+/// What this build provides, read from the library itself.
+pub fn features() -> Features {
+    let has = |key: sys::BuildInfo::Type| {
+        let mut present = false;
+        // SAFETY: every key passed below is documented as writing a `bool`
+        let result = unsafe { sys::ghostty_build_info(key, (&raw mut present).cast::<std::ffi::c_void>()) };
+        result == sys::Result::SUCCESS && present
+    };
+    Features {
+        render_state: has(sys::BuildInfo::FEATURE_RENDER_STATE),
+        formatter: has(sys::BuildInfo::FEATURE_FORMATTER),
+        selection: has(sys::BuildInfo::FEATURE_SELECTION),
+        search: has(sys::BuildInfo::FEATURE_SEARCH),
+        input_encode: has(sys::BuildInfo::FEATURE_INPUT_ENCODE),
+        grid_introspection: has(sys::BuildInfo::FEATURE_GRID_INTROSPECTION),
+        snapshot: has(sys::BuildInfo::FEATURE_SNAPSHOT),
+        kitty_graphics: has(sys::BuildInfo::KITTY_GRAPHICS),
+    }
+}
+
 /// One terminal, freed with the value.
 pub struct Terminal {
     handle: sys::Terminal,
