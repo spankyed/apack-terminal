@@ -353,8 +353,7 @@ impl Terminal {
         // A cluster longer than the buffer is answered with its first code point, which is what this read
         // gave for every cell before it read clusters at all: degraded, never wrong about the cell's place
         if result != sys::Result::SUCCESS {
-            let codepoint = self.cell_codepoint(cell)?;
-            text.push(char::from_u32(codepoint).filter(|found| *found != '\0').unwrap_or(' '));
+            text.push(char::from_u32(self.cell_codepoint(cell)?).unwrap_or(' '));
             return Ok(());
         }
         let held = &codepoints[..written.min(codepoints.len())];
@@ -400,9 +399,6 @@ impl Terminal {
 
     /// Turns the Kitty graphics protocol off, so a program asking whether it may send images is not told
     /// yes by a terminal with nothing to draw them.
-    ///
-    /// A build of the library without the protocol answers `UNSUPPORTED`, which is the same outcome and so
-    /// is not a failure.
     pub fn refuse_images(&self) -> Result<(), Failed> {
         let limit: u64 = 0;
         // SAFETY: KITTY_IMAGE_STORAGE_LIMIT takes a `uint64_t*`
@@ -413,9 +409,6 @@ impl Terminal {
                 (&raw const limit).cast::<std::ffi::c_void>(),
             )
         };
-        if result == sys::Result::UNSUPPORTED {
-            return Ok(());
-        }
         Failed::check("ghostty_terminal_set(KITTY_IMAGE_STORAGE_LIMIT)", result)
     }
 
