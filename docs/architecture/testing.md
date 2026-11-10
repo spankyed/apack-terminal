@@ -16,7 +16,17 @@ cargo xtask check-exclusions                   # fails when a mutants exclusion 
 |---|---|
 | `tests/broker.rs` | the broker driven as a consumer drives it: a real socket, the real binary |
 | `tests/parser.rs` | the VT core as a parser — grid snapshots, and the byte-boundary property |
-| `tests/markers.rs` | the OSC scanner, including every chunk boundary |
+| `tests/markers.rs` | what a shell's markers say, read through the screen, including every chunk boundary |
+| `tests/view_wire.rs`, `tests/view_vectors.rs` | the view protocol's bytes: the round trip over generated messages, arbitrary bytes, and the vectors a view in another repository is held to |
+| `tests/view_model.rs` | the invariant a view rests on: a model that applies every frame it is sent holds exactly the terminal's screen and history, over generated streams |
+| `tests/view_frames.rs`, `tests/view_input.rs`, `tests/view_reads.rs` | what a frame carries and when one is sent; keys, pointer and paste as the core encodes them; words, lines, text and search |
+| `tests/view_broker.rs` | a view driven as a window drives one: a real socket, the real binary, a real shell |
+| `tests/effects.rs`, `tests/commands.rs`, `tests/command_rows.rs` | what a program does that is not on its screen; the ring of commands a shell marked, and the lines each is on |
+| `tests/recording.rs`, `tests/keeping.rs` | a recording replayed, bounded and picked up from; sessions kept past their holder, restored and rewound, against the real binary |
+| `tests/images.rs` | images a program places: where each is told to be, and its pixels in parts |
+| `tests/housekeeping.rs` | history compressed once a session has gone quiet |
+| `tests/proxy.rs` | a broker reached through a process's stdin and stdout, and proxies arriving together starting one |
+| `tests/core_features.rs` | that the core this was built against has what the broker uses |
 | `tests/frames.rs` | the frame decoder as a decoder — arbitrary bytes, mutated frames, the round trip |
 | `tests/screen.rs` | what a snapshot answers: the viewport, the history asked for, the alternate screen |
 | `tests/channel.rs` | the bounded output channel and what an overload reports |

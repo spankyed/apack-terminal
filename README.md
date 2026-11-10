@@ -35,6 +35,12 @@ by the npm package, so a consumer imports the types without building Rust.
 
 [protocol.md](docs/architecture/protocol.md) has every message, the roles, and the closed error set.
 
+A window draws a session over a connection of its own, greeting as a `view`: it is sent the rows that
+changed and paints them, interpreting nothing ([views.md](docs/architecture/views.md)). And
+`apack-terminal proxy <socket>` is a process's stdin and stdout as a connection to the broker on that
+socket, started first if there is none — so `ssh host apack-terminal proxy /tmp/t.sock` is a connection
+to a broker on another machine.
+
 ## Status
 
 Built for apack and not published, so build it from source. Nothing here is a stable API yet: the protocol
@@ -74,6 +80,7 @@ See the [docs map](docs/README.md). The ones most people want:
 
 - [design.md](docs/architecture/design.md): the two layers, who owns a session, and what the broker won't do
 - [protocol.md](docs/architecture/protocol.md): every message, the handshake, the roles, the errors
+- [views.md](docs/architecture/views.md): how a window draws a session, and the protocol a view speaks
 - [testing.md](docs/architecture/testing.md): what proves it correct, and the command for each check
 - [background.md](docs/background.md): why the broker exists
 

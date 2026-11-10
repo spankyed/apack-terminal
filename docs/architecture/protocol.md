@@ -41,7 +41,7 @@ means for a session's lifetime.
 | kind | asks for |
 |---|---|
 | `hello` | the handshake, with a protocol version and a role |
-| `spawn` | a shell in a new pty: `cols`, `rows`, `shell`, `args`, `env`, `unset`, `cwd` |
+| `spawn` | a shell in a new pty: `cols`, `rows`, `shell`, `args`, `env`, `unset`, `cwd`, and optionally `colors`, `output`, `record`, `restore`, `images` |
 | `write` | bytes the user typed |
 | `resize` | the viewport changed; one size per session, because a pty has one |
 | `pause` | stop reading this session's pty, so its process feels the reader stop |
@@ -52,7 +52,26 @@ means for a session's lifetime.
 | `facts` | what the shell reported about itself: directory, command line, whether one is running, last status, how many have finished |
 | `search` | where text appears in the screen and the history above it |
 | `wait` | until idle, until text appears, or until the process ends, with a deadline |
-| `kill` | end the session and its process tree |
+| `commands` | the commands the session's shell has marked, oldest first |
+| `command_output` | what one of them printed, as text |
+| `keep` | whether the session outlives whoever holds the broker |
+| `sessions` | every session the broker has |
+| `rewind` | a recording, opened as a session with no process |
+| `seek` | show a rewound session's recording as it was at a moment |
+| `kill` | end the session and its process tree; for a rewound session, close it |
+
+`output` says whether the session's bytes are sent as `output` at all. A caller that reads a program's
+bytes wants them; a terminal a person looks at is drawn by a view, which is sent rows
+([views.md](views.md)), and its bytes would cross the socket to be thrown away and stall the program on
+their credit. `record` and `restore` are a file to record the session in and whether to begin with what it
+holds; `images` is whether its programs may send any ([design.md](design.md)).
+
+A connection that greets with `role: "view"` leaves this protocol after the handshake: what it speaks is
+[views.md](views.md).
+
+**A kept session is a reason for the broker to stay.** A session is ended when the holder's connection
+closes, and when the last client leaves a broker nobody holds; one that was asked to be kept is not, and
+the broker exits only when nobody is connected and no session is left.
 
 `args` and `env` are how shell integration is arranged: the markers a terminal reads facts from come from
 code the shell runs at startup, and every shell takes that a different way — bash wants `--init-file` and
@@ -80,6 +99,13 @@ is what a caller gets when it asks for both.
 | `facts` | the shell's claims about itself. `finished` moves each time a command it reported starting has ended, so a caller that asks after a quick command has ended still learns one ran. It is compared for a difference only: it wraps, and a shell emitting both marker families moves it twice per command |
 | `search` | where the text was found, with the whole line for context |
 | `waited` | how a wait ended: `MET`, `TIMEOUT` or `EXITED`. Once per wait, however it ended |
+| `title`, `bell`, `clipboard`, `notification`, `progress` | what the program did that is not on its screen. Reported, never acted on |
+| `command_started`, `command_finished`, `cwd_changed` | what the shell marked, as it happened |
+| `commands`, `command_output` | the answers to the requests of those names |
+| `kept` | whether the session outlives the broker's holder, answering `keep` |
+| `sessions` | every session there is: its size, whether it is kept and recorded, its title and its shell's claims |
+| `rewound` | a recording opened as a session, with the moments it runs between |
+| `sought` | the moment a rewound session now shows |
 | `failed` | a request could not be carried out |
 
 Lines in a `screen` are **text, not cells**: a wide character appears once rather than beside the spacer cell
@@ -152,9 +178,9 @@ claim without saying why.
 
 ## What crosses as output is text, and that is a decision
 
-**The broker forwards decoded text, not bytes.** Both ends are terminal emulators — `alacritty_terminal`
-here, the consumer's in its window — and both replace an invalid UTF-8 sequence with U+FFFD independently,
-so a byte-exact pipe would show the user exactly what this does. Nothing in this protocol consumes raw
+**The broker forwards decoded text, not bytes.** The terminal here replaces an invalid UTF-8 sequence with
+U+FFFD, and so does anything a consumer would draw the bytes with, so a byte-exact pipe would show the user
+exactly what this does. Nothing in this protocol consumes raw
 bytes either: `screen` answers lines, a search is over text, a marker is a claim. The field is named `text`
 for that reason; it was `data`, which reads as bytes to everyone.
 
@@ -195,8 +221,7 @@ reattach — the broker is what answers a `screen` read when no window holds the
 
 Two independent constants is what this replaced: 10,000 in apack's window against `HISTORY_LINES` of 1,000
 here, so closing and reopening a window silently lost nine tenths of the scrollback. Raising the broker's is
-a measured decision about its own memory — `alacritty_terminal` holds a grid per session — not a number to
-pick twice.
+a measured decision about its own memory — the core holds a grid per session — not a number to pick twice.
 
 ## Errors are a closed set
 
