@@ -15,7 +15,10 @@ use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_s
 
 use crate::housekeeping::Housekeeping;
 use crate::output::{Credit, Flow, Outgoing, READ_AHEAD, coalesce};
-use crate::protocol::{ErrorCode, Event, Foreground, ProgressState, Scope, SessionId, Signal, Until, WaitOutcome};
+use crate::protocol::{
+    ErrorCode, Event, Foreground, ProgressState, Scope, SessionId, SessionSummary, Signal, Until, WaitOutcome,
+};
+use crate::recording::{self, Entry, Timed};
 use crate::screen::{Colors, CommandAt, Facts, HISTORY_LINES, Match, Screen, Snapshot};
 use crate::tree::Tree;
 use crate::view::publish::ViewId;
@@ -63,6 +66,16 @@ struct Session {
     /// this is the root of. The spawn answers it once and nothing else here needs it, which is why it was
     /// not held before.
     pid: u32,
+    /// Whether this session outlives whoever holds the broker (`Request::Keep`).
+    kept: bool,
+}
+
+/// A recording opened to be looked at: a screen with no process behind it.
+struct Rewound {
+    screen: Arc<Mutex<Screen>>,
+    entries: Vec<Timed>,
+    /// The size its viewer has, which a seek puts back after replaying at the sizes the recording had.
+    size: (u16, u16),
 }
 
 /// One outstanding wait.
@@ -417,6 +430,8 @@ pub struct Sessions {
     credit: Arc<Credit>,
     /// Compresses the history of a session that has gone quiet
     housekeeping: Housekeeping,
+    /// Recordings opened as sessions (`Request::Rewind`), by the id each was given.
+    rewound: HashMap<SessionId, Rewound>,
 }
 
 /// What a spawn is asked for: `Request::Spawn`'s own fields, as one value.
@@ -435,6 +450,9 @@ pub struct Spawning {
     pub colors: Option<Colors>,
     /// Whether its bytes are sent as `Output` (`Request::Spawn`)
     pub output: bool,
+    /// Where to record it, if anywhere, and whether to begin with what is recorded there.
+    pub record: Option<String>,
+    pub restore: bool,
 }
 
 /// A failure a request turns into a `Failed` event rather than a panic.
@@ -491,7 +509,14 @@ fn grid(cols: u16, rows: u16) -> (u16, u16) {
 
 impl Sessions {
     pub fn new(events: Sender<Outgoing>, credit: Arc<Credit>) -> Self {
-        Self { next: 0, live: HashMap::new(), events, credit, housekeeping: Housekeeping::start() }
+        Self {
+            next: 0,
+            live: HashMap::new(),
+            events,
+            credit,
+            housekeeping: Housekeeping::start(),
+            rewound: HashMap::new(),
+        }
     }
 
     /// Answers this connection, which a caller holding the lock can do without taking a second one.
@@ -501,7 +526,7 @@ impl Sessions {
 
     /// Starts a shell in a new pty and begins reading it. The id is the broker's to mint.
     pub fn spawn(&mut self, asked: Spawning) -> Result<(SessionId, u32), Refusal> {
-        let Spawning { cols, rows, shell, args, env, unset, cwd, colors, output } = asked;
+        let Spawning { cols, rows, shell, args, env, unset, cwd, colors, output, record, restore } = asked;
         let (cols, rows) = grid(cols, rows);
         let pty = native_pty_system()
             .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
@@ -564,6 +589,13 @@ impl Sessions {
         let mut screen = Screen::new(cols, rows);
         if let Some(colors) = &colors {
             screen.set_colors(colors);
+        }
+        // **Before the process is read**, so what it prints lands after what the last session left and
+        // is recorded from its first byte. A recording that cannot be opened leaves the session without
+        // one rather than without a shell: `Sessions` says which it is.
+        if let Some(path) = &record {
+            let path = std::path::Path::new(path);
+            let _ = if restore { screen.resume_recording(path).map(|_| ()) } else { screen.start_recording(path) };
         }
         let screen = Arc::new(Mutex::new(screen));
         let flow = Flow::reading();
@@ -694,7 +726,17 @@ impl Sessions {
 
         self.live.insert(
             session.clone(),
-            Session { master: pty.master, writer, killer, _tree: Tree::owning(pid), waiters, screen, flow, pid },
+            Session {
+                master: pty.master,
+                writer,
+                killer,
+                _tree: Tree::owning(pid),
+                waiters,
+                screen,
+                flow,
+                pid,
+                kept: false,
+            },
         );
         Ok((session, pid))
     }
@@ -713,6 +755,15 @@ impl Sessions {
     /// caller that measures nothing.
     pub fn resize(&mut self, session: &str, cols: u16, rows: u16, cell_width: u16, cell_height: u16) -> Outcome {
         let (cols, rows) = grid(cols, rows);
+        // A recording has no pty; its screen is the whole of what a resize changes
+        if let Some(rewound) = self.rewound.get_mut(session) {
+            rewound.size = (cols, rows);
+            if let Ok(mut screen) = rewound.screen.lock() {
+                screen.resize(cols, rows, cell_width, cell_height);
+                screen.publish();
+            }
+            return Ok(());
+        }
         let live = self.live.get_mut(session).ok_or_else(|| missing(session))?;
         live.master
             .resize(PtySize {
@@ -843,6 +894,12 @@ impl Sessions {
     /// Ends the session. The reader thread sees the pty close and reports `Exited`, so this reports nothing:
     /// one exit, one event, whichever way the process ended.
     pub fn kill(&mut self, session: &str) -> Outcome {
+        if let Some(rewound) = self.rewound.remove(session) {
+            if let Ok(mut screen) = rewound.screen.lock() {
+                screen.end_views();
+            }
+            return Ok(());
+        }
         let mut live = self.live.remove(session).ok_or_else(|| missing(session))?;
         // A reader parked on a pause has nobody left to lift it, and its thread would never reach the EOF
         // that ends it
@@ -868,23 +925,119 @@ impl Sessions {
     ///
     /// Whether a client leaving ends its sessions is `Role`'s question (`main.rs`); this is what it calls
     /// when the answer is yes.
-    pub fn end_all(&mut self) {
-        for (_, mut live) in self.live.drain() {
-            live.flow.close();
-            end_views(&live);
-            let _ = live.killer.kill();
+    ///
+    /// **A session that was asked to be kept is not ended** (`Request::Keep`): it is what its name says.
+    pub fn end_unkept(&mut self) {
+        let ending: Vec<SessionId> =
+            self.live.iter().filter(|(_, live)| !live.kept).map(|(session, _)| session.clone()).collect();
+        for session in ending {
+            if let Some(mut live) = self.live.remove(&session) {
+                live.flow.close();
+                end_views(&live);
+                let _ = live.killer.kill();
+            }
         }
+        // A recording being looked at is looked at by somebody, and they have gone
+        for (_, rewound) in self.rewound.drain() {
+            if let Ok(mut screen) = rewound.screen.lock() {
+                screen.end_views();
+            }
+        }
+    }
+
+    /// Whether no session with a process is left, which is when a broker nobody is connected to has
+    /// nothing to stay for.
+    pub fn none_live(&self) -> bool {
+        self.live.is_empty()
+    }
+
+    /// Says whether a session outlives the broker's holder.
+    pub fn keep(&mut self, session: &str, kept: bool) -> Outcome {
+        self.live.get_mut(session).ok_or_else(|| missing(session))?.kept = kept;
+        Ok(())
+    }
+
+    /// Every session with a process, oldest first.
+    pub fn summaries(&self) -> Vec<SessionSummary> {
+        let mut all: Vec<SessionSummary> = self
+            .live
+            .iter()
+            .filter_map(|(session, live)| {
+                let screen = live.screen.lock().ok()?;
+                let facts = screen.facts();
+                Some(SessionSummary {
+                    session: session.clone(),
+                    pid: live.pid,
+                    cols: screen.cols(),
+                    rows: screen.rows(),
+                    kept: live.kept,
+                    recorded: screen.recorded(),
+                    title: screen.title().map(str::to_owned),
+                    cwd: facts.cwd.clone(),
+                    command: facts.command.clone(),
+                    running: facts.running,
+                })
+            })
+            .collect();
+        // `s-<n>`, in the order they were started
+        all.sort_by_key(|summary| summary.session.trim_start_matches("s-").parse::<u64>().unwrap_or(u64::MAX));
+        all
+    }
+
+    /// Opens a recording as a session showing its end, answering the id and the moments it runs between.
+    pub fn rewind(&mut self, recording: &str, cols: u16, rows: u16) -> Result<(SessionId, u64, u64), Refusal> {
+        let entries = recording::read(std::path::Path::new(recording));
+        let first = entries.iter().find(|timed| matches!(timed.entry, Entry::Keyframe { .. })).map(|timed| timed.at);
+        let (Some(first), Some(last)) = (first, entries.last().map(|timed| timed.at)) else {
+            return Err(Refusal {
+                code: ErrorCode::NoSuchSession,
+                message: format!("{recording} holds no recording to look back through"),
+            });
+        };
+        let (cols, rows) = grid(cols, rows);
+        let mut screen = Screen::new(cols, rows);
+        screen.replay(&entries, last);
+        screen.resize(cols, rows, 0, 0);
+        self.next += 1;
+        let session = format!("r-{}", self.next);
+        self.rewound
+            .insert(session.clone(), Rewound { screen: Arc::new(Mutex::new(screen)), entries, size: (cols, rows) });
+        Ok((session, first, last))
+    }
+
+    /// Shows a rewound session's recording as it was at `at`, answering the moment shown: `at`, held to
+    /// what the recording covers.
+    pub fn seek(&mut self, session: &str, at: u64) -> Result<u64, Refusal> {
+        let rewound = self.rewound.get(session).ok_or_else(|| missing(session))?;
+        let first = rewound
+            .entries
+            .iter()
+            .find(|timed| matches!(timed.entry, Entry::Keyframe { .. }))
+            .map_or(at, |timed| timed.at);
+        let at = at.max(first);
+        let mut screen =
+            rewound.screen.lock().map_err(|_| Refusal::pty("reading a screen", "the screen's lock was poisoned"))?;
+        screen.replay(&rewound.entries, at);
+        screen.resize(rewound.size.0, rewound.size.1, 0, 0);
+        // Its views are sent the moment now showing, as they would be anything else that changed
+        screen.publish();
+        Ok(at)
     }
 
     /// A session's screen, locked, or the refusal for a session that is not there.
     fn screen(&self, session: &str) -> Result<std::sync::MutexGuard<'_, Screen>, Refusal> {
-        let live = self.live.get(session).ok_or_else(|| missing(session))?;
-        live.screen.lock().map_err(|_| Refusal::pty("reading a screen", "the screen's lock was poisoned"))
+        let screen = match (self.live.get(session), self.rewound.get(session)) {
+            (Some(live), _) => &live.screen,
+            (None, Some(rewound)) => &rewound.screen,
+            (None, None) => return Err(missing(session)),
+        };
+        screen.lock().map_err(|_| Refusal::pty("reading a screen", "the screen's lock was poisoned"))
     }
 
     /// Bytes for the program, which is where a view's input ends up once it is encoded.
     fn send(&self, session: &str, bytes: &[u8]) -> Outcome {
-        if bytes.is_empty() {
+        // A recording has no program to be typed at: what a view sends it goes nowhere
+        if bytes.is_empty() || self.rewound.contains_key(session) {
             return Ok(());
         }
         let live = self.live.get(session).ok_or_else(|| missing(session))?;
@@ -906,8 +1059,9 @@ impl Sessions {
 
     /// Every view a connection had, in every session, when the connection goes.
     pub fn detach_connection(&self, connection: u64) {
-        for live in self.live.values() {
-            if let Ok(mut screen) = live.screen.lock() {
+        let screens = self.live.values().map(|live| &live.screen).chain(self.rewound.values().map(|one| &one.screen));
+        for screen in screens {
+            if let Ok(mut screen) = screen.lock() {
                 screen.detach_connection(connection);
             }
         }

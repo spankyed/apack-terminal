@@ -127,6 +127,70 @@ impl Terminal {
         Ok(copied)
     }
 
+    /// The terminal — its screen, the history above it from `from` on, and the state a program left it in —
+    /// as the sequences that redraw it in another terminal of the same size. `from` is a row counted from
+    /// the oldest line held, and `last` the bottom-right cell.
+    ///
+    /// **Wrapped rows are written as the one line they are**, so the terminal redrawing them wraps them
+    /// itself and knows they are one line: written a row at a time, each would arrive as a line of its own
+    /// and a later resize would no longer rejoin them.
+    pub fn redraw(&self, from: u32, last: Cell) -> Result<Vec<u8>, Failed> {
+        let (Some(first), Some(last)) = (self.reference_at((0, from)), self.reference_at(last)) else {
+            return Ok(Vec::new());
+        };
+        let selection = sys::Selection { start: first, end: last, rectangle: false };
+        let mut formatter: sys::Formatter = std::ptr::null_mut();
+        // SAFETY: `formatter` is a valid out-pointer and the terminal outlives it: it is freed below
+        Failed::check("ghostty_formatter_terminal_new", unsafe {
+            sys::ghostty_formatter_terminal_new(std::ptr::null(), &raw mut formatter, self.handle)
+        })?;
+        let emit: sys::FormatterFormat::Type = sys::FormatterFormat::VT;
+        let extras: sys::FormatterExtras = sys::FORMATTER_EXTRAS_ALL;
+        let unwrap = true;
+        // Untrimmed, so the blank rows below the last line are written too and the cursor lands where it was
+        let trim = false;
+        let mut text: *mut u8 = std::ptr::null_mut();
+        let mut length: usize = 0;
+        // SAFETY: each option's value is the type the core documents for it — EMIT a
+        // `GhosttyFormatterFormat*`, EXTRAS a `GhosttyFormatterExtras*`, SELECTION a `GhosttySelection*`,
+        // UNWRAP and TRIM a `bool*` — and is copied by the call; the output pointers are valid, and what
+        // they are given is freed below with the same allocator
+        let result = unsafe {
+            let options: [(sys::FormatterOption::Type, *const std::ffi::c_void); 5] = [
+                (sys::FormatterOption::EMIT, (&raw const emit).cast()),
+                (sys::FormatterOption::EXTRAS, (&raw const extras).cast()),
+                (sys::FormatterOption::UNWRAP, (&raw const unwrap).cast()),
+                (sys::FormatterOption::TRIM, (&raw const trim).cast()),
+                (sys::FormatterOption::SELECTION, (&raw const selection).cast()),
+            ];
+            let mut result = sys::Result::SUCCESS;
+            for (option, value) in options {
+                // The whole of what is held needs no selection, and is then written with the state before it
+                if result == sys::Result::SUCCESS && !(option == sys::FormatterOption::SELECTION && from == 0) {
+                    result = sys::ghostty_formatter_set(formatter, option, value);
+                }
+            }
+            if result == sys::Result::SUCCESS {
+                result =
+                    sys::ghostty_formatter_format_alloc(formatter, std::ptr::null(), &raw mut text, &raw mut length);
+            }
+            result
+        };
+        let copied = if result == sys::Result::SUCCESS && !text.is_null() {
+            // SAFETY: the library wrote `length` bytes at `text`
+            unsafe { std::slice::from_raw_parts(text, length) }.to_vec()
+        } else {
+            Vec::new()
+        };
+        // SAFETY: each is freed once; a null buffer is one `ghostty_free` takes
+        unsafe {
+            sys::ghostty_free(std::ptr::null(), text, length);
+            sys::ghostty_formatter_free(formatter);
+        }
+        Failed::check("ghostty_formatter_format_alloc", result)?;
+        Ok(copied)
+    }
+
     /// Every place `needle` appears, newest first, as the cells each match covers. Letters match in either
     /// case, which is the core's rule.
     pub fn find(&self, needle: &str) -> Result<Vec<(Cell, Cell)>, Failed> {

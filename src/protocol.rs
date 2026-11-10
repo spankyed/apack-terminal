@@ -88,6 +88,16 @@ pub enum Request {
         /// by credit, so an unread stream would stall the program. Absent means sent, as it always was.
         #[serde(default = "sent")]
         output: bool,
+        /// **A file to record the session in** (`recording`): what its program writes, so the screen can
+        /// be rebuilt after the session is gone and looked back through while it runs. Absent records
+        /// nothing, which is what a session is unless someone asks — a recording holds everything the
+        /// program printed, including what it printed once and erased.
+        #[serde(default)]
+        record: Option<String>,
+        /// Whether to begin with the screen `record` already holds, as a terminal reopened where its last
+        /// session left off. The recording carries on in the same file.
+        #[serde(default)]
+        restore: bool,
     },
     /// Bytes the user typed.
     /// `text`, not `data`: what crosses here is decoded text, which is the contract and not an accident.
@@ -195,6 +205,24 @@ pub enum Request {
     Commands { session: SessionId },
     /// What one command printed, as text, by the id `Commands` gave it.
     CommandOutput { session: SessionId, command: u32 },
+    /// **Whether the session outlives whoever holds the broker.** A session is ended when the app's hold
+    /// on the broker ends, and when the last client leaves a broker nobody holds; one that is kept is
+    /// not, and the broker stays for as long as it has one. It ends when its own process does or when
+    /// it is killed.
+    Keep { session: SessionId, kept: bool },
+    /// Every session the broker has, which is how an app that has just started finds the ones a previous
+    /// run kept.
+    Sessions,
+    /// **A recording, as a session to look at.** Answers `Rewound` with a session that has no process: a
+    /// view attaches to it like any other and is sent the screen as the recording had it, at the moment
+    /// `Seek` names — the recording's end, to begin with. What a view types at it goes nowhere.
+    Rewind { recording: String, cols: u16, rows: u16 },
+    /// Shows a rewound session's recording as it was at `at`, in milliseconds since the Unix epoch.
+    Seek {
+        session: SessionId,
+        #[ts(type = "number")]
+        at: u64,
+    },
     /// End the session and its process tree.
     Kill { session: SessionId },
 }
@@ -471,6 +499,24 @@ pub enum Event {
     Waited { session: SessionId, outcome: WaitOutcome },
     /// The session's commands, answering `Commands`.
     Commands { session: SessionId, commands: Vec<CommandRecord> },
+    /// Whether the session outlives the broker's holder, answering `Keep`.
+    Kept { session: SessionId, kept: bool },
+    /// Every session there is, answering `Sessions`.
+    Sessions { sessions: Vec<SessionSummary> },
+    /// A recording opened as a session, answering `Rewind`, with the moments it runs from and to.
+    Rewound {
+        session: SessionId,
+        #[ts(type = "number")]
+        first: u64,
+        #[ts(type = "number")]
+        last: u64,
+    },
+    /// The rewound session shows the moment asked for, answering `Seek`.
+    Sought {
+        session: SessionId,
+        #[ts(type = "number")]
+        at: u64,
+    },
     /// What a command printed, answering `CommandOutput`. `text` is absent for a command that is not
     /// kept, or whose output has left the history — which is not the same as having printed nothing.
     CommandOutput { session: SessionId, command: u32, text: Option<String> },
@@ -498,6 +544,26 @@ pub enum Event {
     CwdChanged { session: SessionId, cwd: String },
     /// A request could not be carried out. `session` is absent when the request named none.
     Failed { session: Option<SessionId>, code: ErrorCode, message: String },
+}
+
+/// A session, as a caller that did not start it needs to know it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "protocol.ts")]
+pub struct SessionSummary {
+    pub session: SessionId,
+    pub pid: u32,
+    pub cols: u16,
+    pub rows: u16,
+    /// Whether it outlives the broker's holder (`Request::Keep`)
+    pub kept: bool,
+    /// Whether what it prints is being recorded
+    pub recorded: bool,
+    /// What its program last named the terminal
+    pub title: Option<String>,
+    /// Where its shell last said it was, and what it last said it was running: claims, as in `Facts`
+    pub cwd: Option<String>,
+    pub command: Option<String>,
+    pub running: bool,
 }
 
 /// One command a session's shell reported. Every field but the id is a claim the shell made.

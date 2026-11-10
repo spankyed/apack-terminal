@@ -83,24 +83,36 @@ fn requests() -> impl Strategy<Value = Request> {
                 proptest::option::of(any::<[u8; 3]>()),
                 proptest::collection::vec(any::<[u8; 3]>(), 0..17),
             )),
-            any::<bool>(),
+            (any::<bool>(), proptest::option::of("[^\u{0}]{0,20}"), any::<bool>()),
         )
-            .prop_map(|(cols, rows, shell, args, env, unset, cwd, colors, output)| Request::Spawn {
-                cols,
-                rows,
-                shell,
-                args,
-                env,
-                unset,
-                cwd,
-                colors: colors.map(|(foreground, background, cursor, ansi)| Colors {
-                    foreground,
-                    background,
-                    cursor,
-                    ansi
-                }),
-                output,
+            .prop_map(|(cols, rows, shell, args, env, unset, cwd, colors, (output, record, restore))| {
+                Request::Spawn {
+                    cols,
+                    rows,
+                    shell,
+                    args,
+                    env,
+                    unset,
+                    cwd,
+                    colors: colors.map(|(foreground, background, cursor, ansi)| Colors {
+                        foreground,
+                        background,
+                        cursor,
+                        ansi,
+                    }),
+                    output,
+                    record,
+                    restore,
+                }
             }),
+        ("[^\u{0}]{0,40}", any::<bool>()).prop_map(|(session, kept)| Request::Keep { session, kept }),
+        Just(Request::Sessions),
+        ("[^\u{0}]{0,40}", any::<u16>(), any::<u16>()).prop_map(|(recording, cols, rows)| Request::Rewind {
+            recording,
+            cols,
+            rows
+        }),
+        ("[^\u{0}]{0,40}", any::<u64>()).prop_map(|(session, at)| Request::Seek { session, at }),
         ("[^\u{0}]{0,40}", "(?s).{0,40}").prop_map(|(session, text)| Request::Write { session, text }),
         ("[^\u{0}]{0,40}", any::<u16>(), any::<u16>(), any::<u16>(), any::<u16>()).prop_map(
             |(session, cols, rows, cell_width, cell_height)| Request::Resize {

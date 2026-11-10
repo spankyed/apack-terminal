@@ -113,6 +113,8 @@ impl Client {
                 cwd: None,
                 colors: None,
                 output: false,
+                record: None,
+                restore: false,
             },
         );
         loop {

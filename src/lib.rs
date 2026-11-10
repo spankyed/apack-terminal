@@ -12,6 +12,7 @@ pub mod markers;
 pub mod output;
 pub mod protocol;
 pub mod proxy;
+pub mod recording;
 pub mod screen;
 pub mod security;
 pub mod session;

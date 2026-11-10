@@ -117,10 +117,18 @@ fn write_out(outgoing: Receiver<Outgoing>, broker: Broker) {
         // closed, and a later write answered `PTY` — the OS refusing a dead handle — where the true answer
         // is that there is no such session. On Windows that is X9's window, where ConPTY throws for about a
         // second after the console goes; the same wrong answer, louder.
-        if let Event::Exited { session, .. } = &message.event
+        let exited = if let Event::Exited { session, .. } = &message.event
             && let Ok(mut live) = broker.sessions.lock()
         {
             live.forget(session);
+            true
+        } else {
+            false
+        };
+        // The last kept session ending with nobody connected is the other way a broker runs out of
+        // reasons to stay (`nothing_left`)
+        if exited && nothing_left(&broker) {
+            std::process::exit(0);
         }
         let frame = serde_json::to_string(&message.event).ok();
         let attached = broker.feed.lock().ok().and_then(|feed| feed.clone());
@@ -288,7 +296,9 @@ fn serve(stream: Stream, broker: Broker) {
     // were already ended, and a process per launch all the same.
     if broker.connections.fetch_sub(1, Ordering::SeqCst) == 1 {
         end_everything(&broker);
-        std::process::exit(0);
+        if nothing_left(&broker) {
+            std::process::exit(0);
+        }
     }
 }
 
@@ -456,8 +466,17 @@ fn carry_out_view(
 
 fn end_everything(broker: &Broker) {
     if let Ok(mut live) = broker.sessions.lock() {
-        live.end_all();
+        live.end_unkept();
     }
+}
+
+/// Whether the broker has nothing left to be: nobody connected, and no session still running.
+///
+/// **A session that was asked to be kept is a reason to stay** (`Request::Keep`), so a broker nobody is
+/// connected to is not on its own a broker with nothing to do. It is asked at the two moments either half
+/// can become true: a connection closing, and a session's process ending.
+fn nothing_left(broker: &Broker) -> bool {
+    broker.connections.load(Ordering::SeqCst) == 0 && broker.sessions.lock().is_ok_and(|live| live.none_live())
 }
 
 fn carry_out(sessions: &Arc<Mutex<Sessions>>, request: Request) {
@@ -467,14 +486,14 @@ fn carry_out(sessions: &Arc<Mutex<Sessions>>, request: Request) {
     };
     let outcome = match request {
         Request::Hello { .. } => return,
-        Request::Spawn { cols, rows, shell, args, env, unset, cwd, colors, output } => {
+        Request::Spawn { cols, rows, shell, args, env, unset, cwd, colors, output, record, restore } => {
             let colors = colors.map(|colors| Colors {
                 foreground: colors.foreground,
                 background: colors.background,
                 cursor: colors.cursor,
                 ansi: colors.ansi,
             });
-            match live.spawn(Spawning { cols, rows, shell, args, env, unset, cwd, colors, output }) {
+            match live.spawn(Spawning { cols, rows, shell, args, env, unset, cwd, colors, output, record, restore }) {
                 Ok((session, pid)) => {
                     live.answer(Event::Spawned { session, pid });
                     Ok(())
@@ -575,6 +594,32 @@ fn carry_out(sessions: &Arc<Mutex<Sessions>>, request: Request) {
         Request::Wait { session, until, timeout_ms } => {
             live.wait(&session, until, timeout_ms).map_err(|refusal| (Some(session), refusal))
         }
+        Request::Keep { session, kept } => match live.keep(&session, kept) {
+            Ok(()) => {
+                live.answer(Event::Kept { session, kept });
+                Ok(())
+            }
+            Err(refusal) => Err((Some(session), refusal)),
+        },
+        Request::Sessions => {
+            let sessions = live.summaries();
+            live.answer(Event::Sessions { sessions });
+            Ok(())
+        }
+        Request::Rewind { recording, cols, rows } => match live.rewind(&recording, cols, rows) {
+            Ok((session, first, last)) => {
+                live.answer(Event::Rewound { session, first, last });
+                Ok(())
+            }
+            Err(refusal) => Err((None, refusal)),
+        },
+        Request::Seek { session, at } => match live.seek(&session, at) {
+            Ok(at) => {
+                live.answer(Event::Sought { session, at });
+                Ok(())
+            }
+            Err(refusal) => Err((Some(session), refusal)),
+        },
         Request::Kill { session } => live.kill(&session).map_err(|refusal| (Some(session), refusal)),
     };
     if let Err((session, refusal)) = outcome {

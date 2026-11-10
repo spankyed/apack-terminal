@@ -781,6 +781,15 @@ impl Reported {
         self.size = size;
     }
 
+    /// Forgets what the shell said about itself and what is waiting to be told, keeping the commands and
+    /// their rows: what a screen rebuilt from a recording holds is the past, and the shell that said those
+    /// things is not the one about to be read.
+    pub fn forget_the_shell(&mut self) {
+        self.facts = Facts::default();
+        self.effects.clear();
+        self.replies.clear();
+    }
+
     /// What has happened since this was last taken.
     pub fn take_effects(&mut self) -> Vec<Effect> {
         std::mem::take(&mut self.effects)

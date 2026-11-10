@@ -11,7 +11,10 @@
 //! about itself (`markers.rs`). The difference is provenance: a fact here was stated by the shell, and a
 //! status rule would be this file's guess about one.
 
+use std::path::Path;
 use std::sync::mpsc::Sender;
+
+use crate::recording::{self, Entry, Recorder, Timed};
 
 use crate::view::publish::{Publication, ViewId};
 use crate::view::wire::{Block, Position, Span};
@@ -56,6 +59,9 @@ const SCROLLBACK_ASKED: usize = HISTORY_LINES * 2;
 /// `HISTORY_LINES` is a different number on purpose: it is what a client asking for a screen as text is
 /// promised, and it does not grow because a view can scroll further.
 pub const VIEW_HISTORY_LINES: usize = 100_000;
+
+/// How many lines of history a recording's keyframe carries above the screen (`recording`).
+pub const KEYFRAME_HISTORY_LINES: u32 = 1_000;
 
 /// The most memory one session's history may hold, whatever its line limit allows.
 ///
@@ -154,6 +160,10 @@ pub struct Screen {
     /// What this session's views have been sent, from the first one that attaches. A session nothing
     /// views keeps none, so being viewable costs a session that is not viewed nothing.
     publication: Option<Publication>,
+    /// Where what is fed here is also written, for a session that asked to be recorded (`recording`).
+    recorder: Option<Recorder>,
+    /// What the program last named its terminal, for a caller that was not there to be told.
+    title: Option<String>,
 }
 
 /// A command the shell reported, with the line each of its moments is on.
@@ -227,7 +237,17 @@ impl Screen {
         // SAFETY: the box outlives the handle, which this struct's field order guarantees
         unsafe { terminal.route_reports(&raw mut *reported) }?;
 
-        Ok(Self { terminal, reported, cols, rows, cell: (0, 0), encoders: None, publication: None })
+        Ok(Self {
+            terminal,
+            reported,
+            cols,
+            rows,
+            cell: (0, 0),
+            encoders: None,
+            publication: None,
+            recorder: None,
+            title: None,
+        })
     }
 
     /// Feeds bytes as they arrived.
@@ -250,11 +270,180 @@ impl Screen {
         if let Some(publication) = &mut self.publication {
             publication.touch();
         }
+        self.record(|recorder| recorder.output(bytes));
+    }
+
+    /// Records every byte fed and every resize from here on at `path`, starting with the screen as it is.
+    pub fn start_recording(&mut self, path: &Path) -> std::io::Result<()> {
+        self.start_recording_with(Recorder::start(path)?)
+    }
+
+    /// Picks up the recording at `path`: the screen rebuilt from all of it and made ready for a new shell,
+    /// and everything from here on appended to it. Answers whether there was anything to rebuild from.
+    ///
+    /// **Appended to rather than started again**, so the history a recording covers is not cut down to a
+    /// keyframe's each time the app restarts.
+    pub fn resume_recording(&mut self, path: &Path) -> std::io::Result<bool> {
+        let (cols, rows) = (self.cols, self.rows);
+        let (recorder, entries) = Recorder::resume(path)?;
+        let restored = self.replay_all(&entries);
+        if !restored {
+            self.start_recording_with(recorder)?;
+            return Ok(false);
+        }
+        self.recorder = Some(recorder);
+        // Recorded like anything else fed: a later replay passes through this moment too
+        self.settle_restored();
+        self.resize(cols, rows, 0, 0);
+        Ok(true)
+    }
+
+    /// Whether what is fed here is being recorded.
+    pub fn recorded(&self) -> bool {
+        self.recorder.is_some()
+    }
+
+    /// The grid's height.
+    pub fn rows(&self) -> u16 {
+        self.rows
+    }
+
+    /// What the program last named its terminal, if it has.
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    /// The same into a recorder of the caller's making.
+    pub fn start_recording_with(&mut self, mut recorder: Recorder) -> std::io::Result<()> {
+        let redraw = self.redraw().map_err(|failed| std::io::Error::other(failed.to_string()))?;
+        recorder.keyframe(self.cols, self.rows, redraw)?;
+        self.recorder = Some(recorder);
+        Ok(())
+    }
+
+    /// Writes to the recording, when there is one, and the keyframe that write made due.
+    ///
+    /// **A keyframe waits for the primary screen**, because one taken while `vim` is showing would hold the
+    /// editor and not the shell history under it — and a replay starting there would have lost it. The
+    /// bytes are still recorded, so nothing is missing; the keyframe is only later. It stops waiting when
+    /// the recording is past its budget, where a keyframe is the only way its oldest part can go.
+    ///
+    /// **A recording that cannot be written stops**, rather than failing the session it is of: the disk
+    /// filling must not be what ends a shell.
+    fn record(&mut self, write: impl FnOnce(&mut Recorder) -> std::io::Result<bool>) {
+        let Some(mut recorder) = self.recorder.take() else { return };
+        let written = write(&mut recorder).and_then(|due| {
+            let primary = !self.terminal.alt_screen().unwrap_or(false);
+            if (due && primary) || recorder.keyframe_overdue() {
+                let redraw = self.redraw().map_err(|failed| std::io::Error::other(failed.to_string()))?;
+                recorder.keyframe(self.cols, self.rows, redraw)?;
+            }
+            Ok(())
+        });
+        if written.is_ok() {
+            self.recorder = Some(recorder);
+        }
+    }
+
+    /// The screen and the `KEYFRAME_HISTORY_LINES` above it, as the sequences that redraw them.
+    ///
+    /// **Not the whole history**, which a keyframe would then write out again every `KEYFRAME_EVERY` bytes:
+    /// at a hundred thousand lines that is tens of megabytes a time. What a keyframe leaves out is still
+    /// in the recording, as the bytes that printed it, for as far back as the recording goes.
+    fn redraw(&self) -> Result<Vec<u8>, Failed> {
+        let scrollback = self.terminal.scrollback_rows()?;
+        let from = scrollback.saturating_sub(KEYFRAME_HISTORY_LINES);
+        let last = (self.cols.saturating_sub(1), scrollback + u32::from(self.rows) - 1);
+        self.terminal.redraw(from, last)
+    }
+
+    /// Rebuilds this screen as a recording had it at `until`: the last keyframe at or before then, and
+    /// what was fed after it. `false` when the recording holds nothing that early, and the screen is as it
+    /// was.
+    ///
+    /// **Nothing the replay provokes leaves here.** A program that asked the terminal a question was
+    /// answered when it asked; its clipboard write, its bell and its title were told then. Told again they
+    /// would be a second answer to a program that is no longer there and a clipboard overwritten by the
+    /// past.
+    pub fn replay(&mut self, entries: &[Timed], until: u64) -> bool {
+        let Some((start, end)) = recording::span(entries, until) else { return false };
+        // The recording is of another moment: writing the replay into it would record the past as now
+        let recorder = self.recorder.take();
+        // A full reset, and the history it leaves erased: the keyframe redraws both
+        self.feed(b"\x1bc\x1b[3J");
+        for timed in &entries[start..end] {
+            match &timed.entry {
+                Entry::Keyframe { cols, rows, redraw } => {
+                    self.resize(*cols, *rows, 0, 0);
+                    self.feed(redraw);
+                }
+                Entry::Output(bytes) => self.feed(bytes),
+                Entry::Resize { cols, rows } => self.resize(*cols, *rows, 0, 0),
+            }
+        }
+        self.reported.forget_the_shell();
+        self.recorder = recorder;
+        true
+    }
+
+    /// Rebuilds this screen from everything a recording holds: its first keyframe and all that was fed
+    /// after it. `false` for a recording with no keyframe, and the screen is as it was.
+    ///
+    /// **From the first keyframe rather than the last**, which is what a session picking up where one left
+    /// off wants and a rewind does not: a keyframe carries a bounded history, and the bytes after the
+    /// first one rebuild all the history the recording covers. The later keyframes are passed over — each
+    /// says again what the bytes before it already drew.
+    pub fn replay_all(&mut self, entries: &[Timed]) -> bool {
+        let Some(first) = entries.iter().position(|timed| matches!(timed.entry, Entry::Keyframe { .. })) else {
+            return false;
+        };
+        let recorder = self.recorder.take();
+        self.feed(b"\x1bc\x1b[3J");
+        for (index, timed) in entries[first..].iter().enumerate() {
+            match &timed.entry {
+                Entry::Keyframe { cols, rows, redraw } if index == 0 => {
+                    self.resize(*cols, *rows, 0, 0);
+                    self.feed(redraw);
+                }
+                Entry::Keyframe { .. } => {}
+                Entry::Output(bytes) => self.feed(bytes),
+                Entry::Resize { cols, rows } => self.resize(*cols, *rows, 0, 0),
+            }
+        }
+        self.reported.forget_the_shell();
+        self.recorder = recorder;
+        true
+    }
+
+    /// Leaves a screen rebuilt from a recording ready for a new shell: out of whatever application was
+    /// showing, the modes a program set put back, and the cursor on a line of its own.
+    ///
+    /// The shell about to start knows none of what the last one's programs asked of the terminal — that
+    /// the mouse was being reported, that the keypad was in application mode — and would be typed at
+    /// through all of it.
+    pub fn settle_restored(&mut self) {
+        // Out of the alternate screen; no mouse reporting, bracketed paste or focus reports; a soft reset
+        // for the rest (keypad, cursor keys, margins, attributes); the cursor shown, on a fresh line
+        self.feed(
+            b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[!p\x1b[?25h\x1b[0m\r\n",
+        );
+        self.reported.forget_the_shell();
+    }
+
+    /// Whether the program has asked to be told about the mouse.
+    pub fn mouse_reported(&self) -> Result<bool, Failed> {
+        self.terminal.mouse_tracking()
     }
 
     /// What the program did that is not on its screen, since this was last taken.
     pub fn take_effects(&mut self) -> Vec<Effect> {
-        self.reported.take_effects()
+        let effects = self.reported.take_effects();
+        for effect in &effects {
+            if let Effect::Title(title) = effect {
+                self.title = (!title.is_empty()).then(|| title.clone());
+            }
+        }
+        effects
     }
 
     /// What the shell has said about itself.
@@ -282,6 +471,8 @@ impl Screen {
         if let Some(publication) = &mut self.publication {
             publication.touch();
         }
+        let (cols, rows) = (self.cols, self.rows);
+        self.record(|recorder| recorder.resize(cols, rows).map(|()| false));
         self.reported.set_size((cell_width > 0).then_some(crate::vt::Size {
             cols: self.cols,
             rows: self.rows,
