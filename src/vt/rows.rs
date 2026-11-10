@@ -293,6 +293,22 @@ impl Mark {
         Ok(Self { handle })
     }
 
+    /// A mark on the row the cursor is on.
+    pub fn at_cursor(terminal: &Terminal) -> Result<Self, Failed> {
+        let point = sys::Point {
+            tag: sys::PointTag::ACTIVE,
+            value: sys::PointValue { coordinate: sys::PointCoordinate { x: 0, y: u32::from(terminal.cursor_row()?) } },
+        };
+        let mut handle: sys::TrackedGridRef = std::ptr::null_mut();
+        // SAFETY: `handle` is a valid out-pointer and the terminal is live
+        let result = unsafe { sys::ghostty_terminal_grid_ref_track(terminal.handle, point, &raw mut handle) };
+        Failed::check("ghostty_terminal_grid_ref_track", result)?;
+        if handle.is_null() {
+            return Err(Failed { call: "ghostty_terminal_grid_ref_track", code: sys::Result::SUCCESS });
+        }
+        Ok(Self { handle })
+    }
+
     /// Moves the mark back to the first row a program can write to, on whichever screen is showing.
     pub fn reset(&mut self, terminal: &Terminal) -> Result<(), Failed> {
         // SAFETY: both handles are live

@@ -5,6 +5,7 @@
 //! the parser has to be testable as a parser. Phase P of apack's terminal-ownership goal asks for grid
 //! snapshots and a byte-boundary property test, and neither is a thing you write through a pty and a socket.
 
+pub mod commands;
 pub mod frames;
 pub mod markers;
 pub mod output;

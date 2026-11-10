@@ -8,14 +8,18 @@
 //! allocates, and reading a cell hands back a reference into its page list that the next write invalidates
 //! — so every read here copies out before returning, and nothing in the module's surface is a borrow of
 //! library memory.
+use std::time::SystemTime;
+
 use ghostty_vt_rs_sys as sys;
 
 pub mod input;
 pub mod reads;
 pub mod rows;
 
+use crate::commands::Commands;
 use crate::markers::{self, Marker, PAYLOAD_CAP, cwd_from_url};
 use crate::screen::Facts;
+use rows::Mark;
 
 /// The most code points one cell's character is read as.
 ///
@@ -94,6 +98,41 @@ impl Terminal {
         }
         // SAFETY: the handle is live for `&mut self`, and the slice outlives the call
         unsafe { sys::ghostty_terminal_vt_write(self.handle, bytes.as_ptr(), bytes.len()) };
+    }
+
+    /// Parses `bytes` up to and including the byte that ends the next OSC string, answering how many were
+    /// taken. All of them, when no OSC ends in what was given.
+    ///
+    /// **This is how the terminal is caught at the moment a marker was written.** A shell reports a prompt
+    /// or a command with an OSC sequence, and the callbacks for it have run by the time this returns — with
+    /// the cursor where the shell left it, rather than wherever the rest of the read moved it to. Every
+    /// byte is parsed exactly as `feed` parses it; what differs is only where the call returns.
+    pub fn feed_to_osc_end(&mut self, bytes: &[u8]) -> usize {
+        if bytes.is_empty() {
+            return 0;
+        }
+        let mut stop =
+            sys::TerminalWriteStop { size: std::mem::size_of::<sys::TerminalWriteStop>(), ..Default::default() };
+        // SAFETY: the handle is live for `&mut self`, the slice outlives the call, and `stop` is sized
+        let result = unsafe {
+            sys::ghostty_terminal_vt_write_until(
+                self.handle,
+                bytes.as_ptr(),
+                bytes.len(),
+                sys::TerminalBoundary::OSC_END,
+                &raw mut stop,
+            )
+        };
+        match result {
+            sys::Result::SUCCESS => stop.consumed.clamp(1, bytes.len()),
+            // No OSC ended in these bytes, and all of them were parsed
+            sys::Result::NO_VALUE => bytes.len(),
+            // Refused outright, with nothing parsed: parsed the plain way, so a byte is never lost to it
+            _ => {
+                self.feed(bytes);
+                bytes.len()
+            }
+        }
     }
 
     /// A `u16` the terminal answers for, by key.
@@ -590,6 +629,14 @@ pub struct Reported {
     size: Option<Size>,
     /// What has happened that somebody outside should hear of, in the order it happened.
     effects: Vec<Effect>,
+    /// Every command the shell has reported, with the rows that are its
+    commands: Commands<Placed>,
+}
+
+/// Where the cursor was at a moment in a command's life: a mark on its row, and its column.
+pub struct Placed {
+    pub mark: Mark,
+    pub column: u16,
 }
 
 /// Something a program did that is not on its screen.
@@ -666,12 +713,26 @@ impl Reported {
         std::mem::take(&mut self.effects)
     }
 
+    /// The commands the shell has reported.
+    pub fn commands(&self) -> &Commands<Placed> {
+        &self.commands
+    }
+
+    /// Marks the cursor's row for each moment of a command reported since the last call. Called where the
+    /// parse stopped at the marker that reported it, which is what makes the row the right one.
+    pub fn place_marks(&mut self, terminal: &Terminal) {
+        if self.commands.moments_waiting() {
+            self.commands.place(|| {
+                Some(Placed { mark: Mark::at_cursor(terminal).ok()?, column: terminal.cursor_column().ok()? })
+            });
+        }
+    }
+
     /// Takes a marker the core does not read — the OSC 633 family — into the same facts its own callbacks
     /// fill, so a caller has one account of the shell rather than two to merge.
     fn apply(&mut self, marker: Marker) {
         match marker {
-            // A prompt being drawn means whatever ran has finished, whether or not a `D` said so
-            Marker::PromptStart => self.ended(None),
+            Marker::PromptStart => self.prompted(),
             Marker::PromptEnd => {}
             Marker::CommandStart => self.started(None),
             Marker::CommandDone(status) => self.ended(status),
@@ -687,7 +748,14 @@ impl Reported {
             self.facts.command = Some(command);
         }
         self.facts.running = true;
+        self.commands.output_started(self.facts.command.clone(), self.facts.cwd.clone(), SystemTime::now());
         self.effects.push(Effect::CommandStarted { command: self.facts.command.clone() });
+    }
+
+    /// The shell is drawing a prompt, which means whatever ran has finished, whether or not it said so.
+    fn prompted(&mut self) {
+        self.ended(None);
+        self.commands.prompt_started(SystemTime::now());
     }
 
     /// Whatever was running has ended. Said once per command: a shell that reports an end and then draws
@@ -698,6 +766,7 @@ impl Reported {
         }
         self.facts.ended();
         self.facts.exit_status = exit_status;
+        self.commands.ended(exit_status, SystemTime::now());
         self.effects.push(Effect::CommandFinished { exit_status });
     }
 
@@ -747,7 +816,7 @@ unsafe extern "C" fn note_semantic_prompt(
     // SAFETY: both pointers are the library's, valid for this call
     let (reported, event) = unsafe { (&mut *userdata.cast::<Reported>(), &*event) };
     match event.kind {
-        sys::SemanticPromptKind::GHOSTTY_SEMANTIC_PROMPT_PROMPT_START => reported.ended(None),
+        sys::SemanticPromptKind::GHOSTTY_SEMANTIC_PROMPT_PROMPT_START => reported.prompted(),
         sys::SemanticPromptKind::GHOSTTY_SEMANTIC_PROMPT_OUTPUT_START => {
             // SAFETY: the library owns the bytes for this call, and this copies them
             reported.started(unsafe { text_of(&event.command) });

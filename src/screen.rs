@@ -18,7 +18,9 @@ use crate::view::wire::{Block, Position, Span};
 use crate::vt::input::{self, Encoders, Key, Pasted, Pointer};
 use crate::vt::reads;
 use crate::vt::rows::{RowRead, Space};
-use crate::vt::{Effect, Failed, Reported, Terminal};
+use std::time::SystemTime;
+
+use crate::vt::{Effect, Failed, Placed, Reported, Terminal};
 
 /// Lines of scrollback a session keeps.
 ///
@@ -133,6 +135,24 @@ pub struct Screen {
     publication: Option<Publication>,
 }
 
+/// A command the shell reported, with the line each of its moments is on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandAt {
+    pub id: u64,
+    pub command: Option<String>,
+    pub cwd: Option<String>,
+    /// Milliseconds since the Unix epoch
+    pub started_ms: Option<u64>,
+    pub finished_ms: Option<u64>,
+    pub exit_status: Option<i32>,
+    /// The line its prompt began on
+    pub prompt: Option<u64>,
+    /// The line its output began on
+    pub output: Option<u64>,
+    /// The line the cursor was on when it ended
+    pub end: Option<u64>,
+}
+
 /// DEC private mode 2027: a character made of several code points occupies the cells of one character.
 const GRAPHEME_CLUSTERING: u16 = 2027;
 
@@ -190,7 +210,14 @@ impl Screen {
     /// Everything the core reports — replies, the shell's markers, what the program asked of the world
     /// outside — is collected by callbacks that run inside this write, and taken afterwards.
     pub fn feed(&mut self, bytes: &[u8]) {
-        self.terminal.feed(bytes);
+        // Stopped after each sequence a shell's marker can be, so the row a command's prompt, output or
+        // end was at is marked while the cursor is still on it (`commands`)
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            let taken = self.terminal.feed_to_osc_end(rest);
+            rest = &rest[taken..];
+            self.reported.place_marks(&self.terminal);
+        }
         if let Some(publication) = &mut self.publication {
             publication.touch();
         }
@@ -386,6 +413,71 @@ impl Screen {
         let found = self.terminal.find(needle)?;
         let publication = self.positioned()?;
         Ok((publication.epoch(), found.into_iter().map(|cells| Self::span_of(publication, cells)).collect()))
+    }
+
+    /// Moves whenever a command is reported, so something watching knows to ask for them again.
+    pub fn command_generation(&self) -> u32 {
+        self.reported.commands().generation()
+    }
+
+    /// Every command the shell has reported, with the line each of its moments is on now, and the epoch
+    /// those numbers are in. A moment whose row has left the history has no line.
+    pub fn commands(&mut self) -> Result<(u32, Vec<CommandAt>), Failed> {
+        self.positioned()?;
+        let Some(publication) = &self.publication else { return Ok((0, Vec::new())) };
+        let line = |placed: &Option<Placed>| {
+            placed.as_ref().and_then(|placed| placed.mark.screen_row()).map(|row| publication.line_of(row))
+        };
+        let since_epoch = |time: Option<SystemTime>| {
+            time.and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        };
+        let commands = self
+            .reported
+            .commands()
+            .iter()
+            .map(|command| CommandAt {
+                id: command.id,
+                command: command.command.clone(),
+                cwd: command.cwd.clone(),
+                started_ms: since_epoch(command.started),
+                finished_ms: since_epoch(command.finished),
+                exit_status: command.exit_status,
+                prompt: line(&command.prompt),
+                output: line(&command.output),
+                end: line(&command.end),
+            })
+            .collect();
+        Ok((publication.epoch(), commands))
+    }
+
+    /// What a command printed, as text, or `None` for a command that is not kept or whose output has
+    /// left the history.
+    ///
+    /// From the row its output began on to where it ended — or, while it runs, to the cursor. A command
+    /// that ended part way along a row printed that row too: a last line with no newline is still output.
+    pub fn command_output(&self, id: u64) -> Result<Option<String>, Failed> {
+        let Some(command) = self.reported.commands().get(id) else { return Ok(None) };
+        let Some(first) = command.output.as_ref().and_then(|placed| placed.mark.screen_row()) else { return Ok(None) };
+        let columns = self.terminal.cols()?;
+        let last: Option<(u16, u32)> = match &command.end {
+            Some(end) => match end.mark.screen_row() {
+                Some(row) if end.column > 0 => Some((end.column - 1, row)),
+                Some(row) if row > first => Some((columns.saturating_sub(1), row - 1)),
+                // It ended where it began, having printed nothing
+                Some(_) => None,
+                None => return Ok(None),
+            },
+            // Still running, or its end was never marked: everything down to the cursor
+            None => {
+                let row = self.terminal.scrollback_rows()? + u32::from(self.terminal.cursor_row()?);
+                Some((columns.saturating_sub(1), row))
+            }
+        };
+        match last {
+            Some(last) if last.1 >= first => self.terminal.text_between((0, first), last).map(Some),
+            _ => Ok(Some(String::new())),
+        }
     }
 
     /// The epoch line numbers are in and the line the screen's first row is, as of now.
