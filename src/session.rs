@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Sender, sync_channel};
+use std::sync::mpsc::{Sender, channel, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -17,6 +17,20 @@ use crate::output::{Credit, Flow, Outgoing, READ_AHEAD, coalesce};
 use crate::protocol::{ErrorCode, Event, Foreground, Scope, SessionId, Signal, Until, WaitOutcome};
 use crate::screen::{Colors, Facts, HISTORY_LINES, Match, Screen, Snapshot};
 use crate::tree::Tree;
+use crate::view::publish::ViewId;
+use crate::view::wire::{Block, Position, Span};
+use crate::vt::input::{Key, Pasted, Pointer};
+
+/// How long a session's exit waits for its output to finish being read.
+///
+/// **The exit and the last of the output are two events on two threads**, and a view told the session is
+/// over is sent the screen as it ended — so the ending has to come second. On a POSIX pty the reader sees
+/// the end of the stream as soon as the process is gone and this wait is over in microseconds. It is
+/// bounded for the case where it never does: a background job the shell left behind still holds the pty
+/// open, and a session whose shell has exited must not wait on it. Not on the clock for any other reason,
+/// and not waited at all on Windows, where the read of a closed console never returns.
+#[cfg(unix)]
+const EXIT_DRAIN: Duration = Duration::from_millis(250);
 
 /// A running session: the master side of its pty, its child, and the thread reading its output.
 struct Session {
@@ -415,6 +429,8 @@ pub struct Spawning {
     pub cwd: Option<String>,
     /// What the session is drawn in, when the caller knows.
     pub colors: Option<Colors>,
+    /// Whether its bytes are sent as `Output` (`Request::Spawn`)
+    pub output: bool,
 }
 
 /// A failure a request turns into a `Failed` event rather than a panic.
@@ -481,7 +497,7 @@ impl Sessions {
 
     /// Starts a shell in a new pty and begins reading it. The id is the broker's to mint.
     pub fn spawn(&mut self, asked: Spawning) -> Result<(SessionId, u32), Refusal> {
-        let Spawning { cols, rows, shell, args, env, unset, cwd, colors } = asked;
+        let Spawning { cols, rows, shell, args, env, unset, cwd, colors, output } = asked;
         let (cols, rows) = grid(cols, rows);
         let pty = native_pty_system()
             .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
@@ -534,7 +550,11 @@ impl Sessions {
         // unbounded queue here grew by everything a program wrote while its consumer was stalled. A reader
         // blocked on it still ends: the exit is waited for on the child, and the coalescer drains what is
         // queued whenever credit returns.
+        //
+        // **A session nobody reads the bytes of has no such hop at all.** Its screen is still fed, which
+        // is what its views are drawn from, and nothing stands between the program and the parser.
         let (chunks, incoming) = sync_channel::<Vec<u8>>(READ_AHEAD);
+        let chunks = output.then_some(chunks);
         let events = self.events.clone();
         let reading = session.clone();
         let mut screen = Screen::new(cols, rows);
@@ -552,12 +572,16 @@ impl Sessions {
         let waited = session.clone();
         let exiting = self.events.clone();
 
-        std::thread::spawn({
-            let session = session.clone();
-            let events = events.clone();
-            let credit = Arc::clone(&self.credit);
-            move || coalesce(session, incoming, events, credit)
-        });
+        if output {
+            std::thread::spawn({
+                let session = session.clone();
+                let events = events.clone();
+                let credit = Arc::clone(&self.credit);
+                move || coalesce(session, incoming, events, credit)
+            });
+        }
+        // Told when the reader has read the last of the output, which is what the exit waits for
+        let (drained, draining) = channel::<()>();
         let reader_events = events.clone();
         let reader_session = session.clone();
         let reading_flow = Arc::clone(&flow);
@@ -581,6 +605,9 @@ impl Sessions {
                                 let replies = screen.take_replies();
                                 let recent = rows_added(&buffer[..read], screen.cols());
                                 let met = settle_met(&waiting, &screen, recent);
+                                // Each view that has drawn its last frame is sent what changed, here
+                                // where the change landed
+                                screen.publish();
                                 (replies, met)
                             }
                             Err(_) => (Vec::new(), 0),
@@ -601,14 +628,17 @@ impl Sessions {
                                 let _ = writer.write_all(reply.as_bytes()).and_then(|()| writer.flush());
                             }
                         }
-                        if chunks.send(buffer[..read].to_vec()).is_err() {
-                            return;
+                        if let Some(chunks) = &chunks
+                            && chunks.send(buffer[..read].to_vec()).is_err()
+                        {
+                            break;
                         }
                     }
                 }
             }
             // The coalescer ends when this drops, flushing what it holds, so nothing is lost at EOF
             drop(chunks);
+            let _ = drained.send(());
         });
 
         // **The exit is waited for, not inferred from the output ending.** A POSIX pty gives EOF on the
@@ -629,6 +659,10 @@ impl Sessions {
                 },
                 None => (None, None),
             };
+            #[cfg(unix)]
+            let _ = draining.recv_timeout(EXIT_DRAIN);
+            #[cfg(not(unix))]
+            drop(draining);
             // **A session ending settles every wait on it**, because nothing is coming: an `Exit` wait has
             // reached what it asked for and every other has not and never will. Without this a caller
             // waiting for a prompt from a shell the user just exited waits out its whole deadline.
@@ -802,6 +836,7 @@ impl Sessions {
         // A reader parked on a pause has nobody left to lift it, and its thread would never reach the EOF
         // that ends it
         live.flow.close();
+        end_views(&live);
         live.killer.kill().map_err(|error| Refusal::pty("killing a session", error))
     }
 
@@ -810,6 +845,7 @@ impl Sessions {
     pub fn forget(&mut self, session: &str) {
         if let Some(live) = self.live.remove(session) {
             live.flow.close();
+            end_views(&live);
         }
     }
 
@@ -824,9 +860,114 @@ impl Sessions {
     pub fn end_all(&mut self) {
         for (_, mut live) in self.live.drain() {
             live.flow.close();
+            end_views(&live);
             let _ = live.killer.kill();
         }
     }
+
+    /// A session's screen, locked, or the refusal for a session that is not there.
+    fn screen(&self, session: &str) -> Result<std::sync::MutexGuard<'_, Screen>, Refusal> {
+        let live = self.live.get(session).ok_or_else(|| missing(session))?;
+        live.screen.lock().map_err(|_| Refusal::pty("reading a screen", "the screen's lock was poisoned"))
+    }
+
+    /// Bytes for the program, which is where a view's input ends up once it is encoded.
+    fn send(&self, session: &str, bytes: &[u8]) -> Outcome {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let live = self.live.get(session).ok_or_else(|| missing(session))?;
+        let mut writer =
+            live.writer.lock().map_err(|_| Refusal::pty("writing to a pty", "the writer's lock was poisoned"))?;
+        writer.write_all(bytes).and_then(|()| writer.flush()).map_err(|error| Refusal::pty("writing to a pty", error))
+    }
+
+    /// Starts sending a view this session's frames through `sink`.
+    pub fn attach_view(&self, session: &str, id: ViewId, sink: Sender<Vec<u8>>) -> Outcome {
+        self.screen(session)?.attach_view(id, sink).map_err(core)
+    }
+
+    pub fn detach_view(&self, session: &str, id: ViewId) {
+        if let Ok(mut screen) = self.screen(session) {
+            screen.detach_view(id);
+        }
+    }
+
+    /// Every view a connection had, in every session, when the connection goes.
+    pub fn detach_connection(&self, connection: u64) {
+        for live in self.live.values() {
+            if let Ok(mut screen) = live.screen.lock() {
+                screen.detach_connection(connection);
+            }
+        }
+    }
+
+    /// A view drew the frame with this sequence.
+    pub fn acknowledge(&self, session: &str, id: ViewId, sequence: u64) -> Outcome {
+        self.screen(session)?.acknowledge(id, sequence).map_err(core)
+    }
+
+    /// Lines by number, with the epoch the numbers are in.
+    pub fn fetch(&self, session: &str, first: u64, count: u32) -> Result<(u32, Block), Refusal> {
+        self.screen(session)?.fetch(first, count).map_err(core)
+    }
+
+    /// A key from a view, sent as whatever the terminal's modes make of it.
+    pub fn key(&self, session: &str, key: &Key<'_>) -> Outcome {
+        let bytes = self.screen(session)?.key(key).map_err(core)?;
+        self.send(session, &bytes)
+    }
+
+    /// Text that did not come from a key — what an input method composed — sent as it is.
+    pub fn text(&self, session: &str, text: &str) -> Outcome {
+        self.send(session, text.as_bytes())
+    }
+
+    pub fn pointer(&self, session: &str, pointer: &Pointer) -> Outcome {
+        let bytes = self.screen(session)?.pointer(pointer).map_err(core)?;
+        self.send(session, &bytes)
+    }
+
+    /// Pastes, answering whether it went: `false` is text that could run a command and was not allowed to.
+    pub fn paste(&self, session: &str, text: &str, allow_unsafe: bool) -> Result<bool, Refusal> {
+        match self.screen(session)?.paste(text, allow_unsafe).map_err(core)? {
+            Pasted::Encoded(bytes) => self.send(session, &bytes).map(|()| true),
+            Pasted::Unsafe => Ok(false),
+        }
+    }
+
+    pub fn focus(&self, session: &str, gained: bool) -> Outcome {
+        let bytes = self.screen(session)?.focus(gained).map_err(core)?;
+        self.send(session, &bytes)
+    }
+
+    pub fn word_at(&self, session: &str, at: Position) -> Result<(u32, Option<Span>), Refusal> {
+        self.screen(session)?.word_at(at).map_err(core)
+    }
+
+    pub fn line_at(&self, session: &str, at: Position) -> Result<(u32, Option<Span>), Refusal> {
+        self.screen(session)?.line_at(at).map_err(core)
+    }
+
+    pub fn text_of(&self, session: &str, span: Span) -> Result<String, Refusal> {
+        self.screen(session)?.text_of(span).map_err(core)
+    }
+
+    pub fn find(&self, session: &str, needle: &str) -> Result<(u32, Vec<Span>), Refusal> {
+        self.screen(session)?.find(needle).map_err(core)
+    }
+}
+
+/// Tells a session's views it is over, after the screen as it ended.
+fn end_views(live: &Session) {
+    if let Ok(mut screen) = live.screen.lock() {
+        screen.end_views();
+    }
+}
+
+/// A call the core refused, as the refusal a request is answered with.
+fn core(failed: crate::vt::Failed) -> Refusal {
+    Refusal { code: ErrorCode::Pty, message: failed.to_string() }
 }
 
 fn missing(session: &str) -> Refusal {

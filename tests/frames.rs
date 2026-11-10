@@ -67,7 +67,7 @@ fn says_why(frame: &Frame) -> bool {
 /// One of every request, so the round trip covers the whole message set rather than the easy variants.
 fn requests() -> impl Strategy<Value = Request> {
     prop_oneof![
-        (any::<u32>(), prop_oneof![Just(Role::Client), Just(Role::Lifetime)])
+        (any::<u32>(), prop_oneof![Just(Role::Client), Just(Role::Lifetime), Just(Role::View)])
             .prop_map(|(protocol, role)| Request::Hello { protocol, role }),
         (
             any::<u16>(),
@@ -83,8 +83,9 @@ fn requests() -> impl Strategy<Value = Request> {
                 proptest::option::of(any::<[u8; 3]>()),
                 proptest::collection::vec(any::<[u8; 3]>(), 0..17),
             )),
+            any::<bool>(),
         )
-            .prop_map(|(cols, rows, shell, args, env, unset, cwd, colors)| Request::Spawn {
+            .prop_map(|(cols, rows, shell, args, env, unset, cwd, colors, output)| Request::Spawn {
                 cols,
                 rows,
                 shell,
@@ -98,6 +99,7 @@ fn requests() -> impl Strategy<Value = Request> {
                     cursor,
                     ansi
                 }),
+                output,
             }),
         ("[^\u{0}]{0,40}", "(?s).{0,40}").prop_map(|(session, text)| Request::Write { session, text }),
         ("[^\u{0}]{0,40}", any::<u16>(), any::<u16>(), any::<u16>(), any::<u16>()).prop_map(

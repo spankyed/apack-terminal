@@ -87,7 +87,14 @@ unset: Array<string>, cwd: string | null,
  * question and draws nothing, so without this it answers with a palette nobody is looking at.
  * Absent leaves the terminal's own, which is what a caller with no window has.
  */
-colors: Colors | null, } | { "kind": "write", session: string, text: string, } | { "kind": "resize", session: string, cols: number, rows: number, cell_width: number, cell_height: number, } | { "kind": "pause", session: string, } | { "kind": "resume", session: string, } | { "kind": "signal", session: string, signal: Signal, scope: Scope, } | { "kind": "owns", session: string, pid: number, } | { "kind": "screen", session: string, history: number, } | { "kind": "facts", session: string, } | { "kind": "search", session: string, text: string, history: number, } | { "kind": "wait", session: string, until: Until, timeout_ms: number, } | { "kind": "kill", session: string, };
+colors: Colors | null, 
+/**
+ * **Whether the session's bytes are sent as `Output`.** A caller that reads a program's output —
+ * to parse it, to forward it — wants them. A terminal a person looks at is drawn by a view, which
+ * is sent rows, and its bytes would cross the socket to be thrown away; worse, they are bounded
+ * by credit, so an unread stream would stall the program. Absent means sent, as it always was.
+ */
+output: boolean, } | { "kind": "write", session: string, text: string, } | { "kind": "resize", session: string, cols: number, rows: number, cell_width: number, cell_height: number, } | { "kind": "pause", session: string, } | { "kind": "resume", session: string, } | { "kind": "signal", session: string, signal: Signal, scope: Scope, } | { "kind": "owns", session: string, pid: number, } | { "kind": "screen", session: string, history: number, } | { "kind": "facts", session: string, } | { "kind": "search", session: string, text: string, history: number, } | { "kind": "wait", session: string, until: Until, timeout_ms: number, } | { "kind": "kill", session: string, };
 
 /**
  * What a connection is for.
@@ -102,7 +109,7 @@ colors: Colors | null, } | { "kind": "write", session: string, text: string, } |
  * something it can acquire by accident: the failure mode of getting this wrong is a session that does not
  * outlive its client, never a shell left running after the app is gone.
  */
-export type Role = "client" | "lifetime";
+export type Role = "client" | "lifetime" | "view";
 
 /**
  * What a signal is sent to.

@@ -30,6 +30,11 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// A session's identity, minted by the broker: the app never invents one.
 pub type SessionId = String;
 
+/// What an absent `Spawn::output` reads as.
+fn sent() -> bool {
+    true
+}
+
 /// What the app asks the broker to do.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -77,6 +82,12 @@ pub enum Request {
         /// Absent leaves the terminal's own, which is what a caller with no window has.
         #[serde(default)]
         colors: Option<Colors>,
+        /// **Whether the session's bytes are sent as `Output`.** A caller that reads a program's output —
+        /// to parse it, to forward it — wants them. A terminal a person looks at is drawn by a view, which
+        /// is sent rows, and its bytes would cross the socket to be thrown away; worse, they are bounded
+        /// by credit, so an unread stream would stall the program. Absent means sent, as it always was.
+        #[serde(default = "sent")]
+        output: bool,
     },
     /// Bytes the user typed.
     /// `text`, not `data`: what crosses here is decoded text, which is the contract and not an accident.
@@ -213,6 +224,10 @@ pub enum Role {
     Client,
     /// Holds the broker's sessions alive and receives no output. Ending this connection ends them all.
     Lifetime,
+    /// Draws sessions. After the handshake this connection speaks `view::wire` rather than these
+    /// messages: it attaches to sessions by id, is sent their rows, and sends their input. It asks for no
+    /// session and ends none, so one coming or going changes nothing but what is drawn.
+    View,
 }
 
 /// A signal a `Signal` request may send.

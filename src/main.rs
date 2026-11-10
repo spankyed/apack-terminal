@@ -11,9 +11,10 @@
 //! the last `client` leaving does, as it always has. The app's own process holds the former, so restarting
 //! the service that opened a session does not end it and quitting the app does.
 
+use std::collections::HashMap;
 use std::io::{BufReader, Write};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::Receiver;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
 use interprocess::local_socket::{GenericFilePath, ListenerOptions, Stream, ToFsName, prelude::*};
@@ -22,7 +23,10 @@ use apack_terminal::frames::{Frame, read_frame};
 use apack_terminal::output::{Outgoing, channel_with_credit};
 use apack_terminal::protocol::{ErrorCode, Event, PROTOCOL_VERSION, Request, Role, SearchMatch};
 use apack_terminal::screen::{Colors, HISTORY_LINES};
-use apack_terminal::session::{Sessions, Spawning};
+use apack_terminal::session::{Refusal, Sessions, Spawning};
+use apack_terminal::view::publish::ViewId;
+use apack_terminal::view::wire::{Incoming, ToBroker, ToView, read_message};
+use apack_terminal::vt::input::{Key, Pointer};
 
 fn main() -> std::io::Result<()> {
     let Some(socket) = std::env::args().nth(1) else {
@@ -56,6 +60,7 @@ fn main() -> std::io::Result<()> {
         owned: Arc::new(AtomicBool::new(false)),
         clients: Arc::new(AtomicUsize::new(0)),
         connections: Arc::new(AtomicUsize::new(0)),
+        views: Arc::new(AtomicU64::new(0)),
     };
     // One writer for the broker's life: every event leaves on this thread, so nothing interleaves two
     // frames, and a client arriving or leaving changes where they go rather than who writes them
@@ -94,6 +99,8 @@ struct Broker {
     /// That is what makes exiting at zero safe: a caller that has connected but not yet greeted is already
     /// counted, so it cannot be hung up on by a broker deciding nobody wants it.
     connections: Arc<AtomicUsize>,
+    /// How many view connections there have been, which is what tells one's views from another's.
+    views: Arc<AtomicU64>,
 }
 
 /// Writes every event to whichever client is attached, for as long as the broker runs.
@@ -220,8 +227,15 @@ fn serve(stream: Stream, broker: Broker) {
                         }
                     }
                     Role::Lifetime => broker.owned.store(true, Ordering::SeqCst),
+                    Role::View => {}
                 }
                 say(&stream, &Event::Hello { protocol: PROTOCOL_VERSION, history: HISTORY_LINES as u32 });
+                if *asked == Role::View {
+                    // From here the connection speaks `view::wire`, on the reader that already holds
+                    // whatever arrived behind the handshake
+                    serve_view(&mut reader, &stream, &broker);
+                    break;
+                }
                 continue;
             }
             (_, None) => {
@@ -258,7 +272,8 @@ fn serve(stream: Stream, broker: Broker) {
                 end_everything(&broker);
             }
         }
-        None => {}
+        // A view asked for no session and ends none
+        Some(Role::View) | None => {}
     }
 
     // **A broker nobody is connected to has nothing left to be**, and exiting is the whole of its cleanup:
@@ -268,6 +283,146 @@ fn serve(stream: Stream, broker: Broker) {
     if broker.connections.fetch_sub(1, Ordering::SeqCst) == 1 {
         end_everything(&broker);
         std::process::exit(0);
+    }
+}
+
+/// One view connection, from its handshake until it closes.
+///
+/// **Its own writer, and its own queue.** A client's events share one queue because one client receives
+/// them; a view's frames are for that view, and a view that has stopped reading must not hold up another's
+/// screen or a client's answer. The queue needs no bound of its own: a session sends a view one frame and
+/// then waits to be told it was drawn, so what can be waiting is a frame per attachment and the answers to
+/// what the view itself asked.
+fn serve_view(reader: &mut BufReader<&Stream>, stream: &Arc<Stream>, broker: &Broker) {
+    let connection = broker.views.fetch_add(1, Ordering::SeqCst);
+    let (sink, outgoing) = channel::<Vec<u8>>();
+    std::thread::spawn({
+        let stream = Arc::clone(stream);
+        move || {
+            for message in outgoing {
+                if (&*stream).write_all(&message).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    // The session each of this connection's channels is attached to
+    let mut attached: HashMap<u32, String> = HashMap::new();
+    // Until nothing more is coming, or a message so long that where the next one starts is not known
+    while let Incoming::Message(body) = read_message(reader) {
+        match ToBroker::decode(&body) {
+            Ok(message) => carry_out_view(broker, connection, &sink, &mut attached, message),
+            // Not the protocol: there is no telling what the rest of the stream is either
+            Err(_) => break,
+        }
+    }
+    if let Ok(live) = broker.sessions.lock() {
+        live.detach_connection(connection);
+    }
+}
+
+/// One message from a view. Whatever it asked, it is answered on its own connection.
+fn carry_out_view(
+    broker: &Broker,
+    connection: u64,
+    sink: &Sender<Vec<u8>>,
+    attached: &mut HashMap<u32, String>,
+    message: ToBroker,
+) {
+    let Ok(live) = broker.sessions.lock() else { return };
+    let answer = |message: ToView| {
+        let _ = sink.send(message.encode());
+    };
+    let failed = |channel: u32, request: u32, refusal: Refusal| {
+        let _ = sink.send(ToView::Failed { channel, request, message: refusal.message }.encode());
+    };
+    let unattached =
+        || Refusal { code: ErrorCode::NoSuchSession, message: "this channel is not attached to a session".to_owned() };
+    let id = |channel: u32| ViewId { connection, channel };
+    let session_of = |channel: u32| attached.get(&channel).cloned().ok_or_else(unattached);
+
+    match message {
+        ToBroker::Attach { channel, session } => {
+            if let Some(previous) = attached.remove(&channel) {
+                live.detach_view(&previous, id(channel));
+            }
+            match live.attach_view(&session, id(channel), sink.clone()) {
+                Ok(()) => {
+                    attached.insert(channel, session);
+                }
+                // A session that is not there is one that ended: the view is told what it would have been
+                // told had it been attached when it did
+                Err(_) => answer(ToView::Ended { channel }),
+            }
+        }
+        ToBroker::Detach { channel } => {
+            if let Some(session) = attached.remove(&channel) {
+                live.detach_view(&session, id(channel));
+            }
+        }
+        ToBroker::Acknowledge { channel, sequence } => {
+            if let Ok(session) = session_of(channel) {
+                let _ = live.acknowledge(&session, id(channel), sequence);
+            }
+        }
+        ToBroker::Fetch { channel, request, epoch: _, first, count } => {
+            match session_of(channel).and_then(|session| live.fetch(&session, first, count)) {
+                Ok((epoch, block)) => answer(ToView::Rows { channel, request, epoch, block }),
+                Err(refusal) => failed(channel, request, refusal),
+            }
+        }
+        // Input has no answer: a key that could not be sent is a session that has ended, which the view
+        // is told about on its own
+        ToBroker::Key { channel, action, modifiers, code, text, unshifted } => {
+            if let Ok(session) = session_of(channel) {
+                let _ = live.key(&session, &Key { action, code: &code, modifiers, text: &text, unshifted });
+            }
+        }
+        ToBroker::Text { channel, text } => {
+            if let Ok(session) = session_of(channel) {
+                let _ = live.text(&session, &text);
+            }
+        }
+        ToBroker::Pointer { channel, action, button, modifiers, x, y, cell_width, cell_height } => {
+            if let Ok(session) = session_of(channel) {
+                let _ = live.pointer(&session, &Pointer { action, button, modifiers, x, y, cell_width, cell_height });
+            }
+        }
+        ToBroker::Focus { channel, gained } => {
+            if let Ok(session) = session_of(channel) {
+                let _ = live.focus(&session, gained);
+            }
+        }
+        ToBroker::Paste { channel, request, allow_unsafe, text } => {
+            match session_of(channel).and_then(|session| live.paste(&session, &text, allow_unsafe)) {
+                Ok(pasted) => answer(ToView::Pasted { channel, request, outcome: u8::from(!pasted) }),
+                Err(refusal) => failed(channel, request, refusal),
+            }
+        }
+        ToBroker::WordAt { channel, request, epoch: _, at } => {
+            match session_of(channel).and_then(|session| live.word_at(&session, at)) {
+                Ok((epoch, span)) => answer(ToView::Span { channel, request, epoch, span }),
+                Err(refusal) => failed(channel, request, refusal),
+            }
+        }
+        ToBroker::LineAt { channel, request, epoch: _, at } => {
+            match session_of(channel).and_then(|session| live.line_at(&session, at)) {
+                Ok((epoch, span)) => answer(ToView::Span { channel, request, epoch, span }),
+                Err(refusal) => failed(channel, request, refusal),
+            }
+        }
+        ToBroker::TextOf { channel, request, epoch: _, span } => {
+            match session_of(channel).and_then(|session| live.text_of(&session, span)) {
+                Ok(text) => answer(ToView::Text { channel, request, text }),
+                Err(refusal) => failed(channel, request, refusal),
+            }
+        }
+        ToBroker::Search { channel, request, needle } => {
+            match session_of(channel).and_then(|session| live.find(&session, &needle)) {
+                Ok((epoch, spans)) => answer(ToView::Spans { channel, request, epoch, spans }),
+                Err(refusal) => failed(channel, request, refusal),
+            }
+        }
     }
 }
 
@@ -284,14 +439,14 @@ fn carry_out(sessions: &Arc<Mutex<Sessions>>, request: Request) {
     };
     let outcome = match request {
         Request::Hello { .. } => return,
-        Request::Spawn { cols, rows, shell, args, env, unset, cwd, colors } => {
+        Request::Spawn { cols, rows, shell, args, env, unset, cwd, colors, output } => {
             let colors = colors.map(|colors| Colors {
                 foreground: colors.foreground,
                 background: colors.background,
                 cursor: colors.cursor,
                 ansi: colors.ansi,
             });
-            match live.spawn(Spawning { cols, rows, shell, args, env, unset, cwd, colors }) {
+            match live.spawn(Spawning { cols, rows, shell, args, env, unset, cwd, colors, output }) {
                 Ok((session, pid)) => {
                     live.answer(Event::Spawned { session, pid });
                     Ok(())
