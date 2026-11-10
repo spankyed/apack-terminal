@@ -10,6 +10,8 @@
 //! library memory.
 use ghostty_vt_rs_sys as sys;
 
+pub mod rows;
+
 use crate::markers::cwd_from_url;
 use crate::screen::Facts;
 

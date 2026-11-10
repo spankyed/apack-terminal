@@ -12,6 +12,11 @@
 //! status rule would be this file's guess about one.
 
 use crate::markers::{Marker, Markers};
+use std::sync::mpsc::Sender;
+
+use crate::view::publish::{Publication, ViewId};
+use crate::view::wire::Block;
+use crate::vt::rows::{RowRead, Space};
 use crate::vt::{Failed, Reported, Terminal};
 
 /// Lines of scrollback a session keeps.
@@ -125,6 +130,9 @@ pub struct Screen {
     rows: u16,
     /// One cell in pixels, as the window drawing this session measured it. Zero until one has.
     cell: (u16, u16),
+    /// What this session's views have been sent, from the first one that attaches. A session nothing
+    /// views keeps none, so being viewable costs a session that is not viewed nothing.
+    publication: Option<Publication>,
 }
 
 /// DEC private mode 2027: a character made of several code points occupies the cells of one character.
@@ -172,7 +180,7 @@ impl Screen {
         // SAFETY: the box outlives the handle, which this struct's field order guarantees
         unsafe { terminal.route_reports(&raw mut *reported) }?;
 
-        Ok(Self { terminal, reported, markers: Markers::default(), cols, rows, cell: (0, 0) })
+        Ok(Self { terminal, reported, markers: Markers::default(), cols, rows, cell: (0, 0), publication: None })
     }
 
     /// Feeds bytes as they arrived.
@@ -185,6 +193,9 @@ impl Screen {
     /// untouched bytes, so neither pass can take anything from the other.
     pub fn feed(&mut self, bytes: &[u8]) {
         self.terminal.feed(bytes);
+        if let Some(publication) = &mut self.publication {
+            publication.touch();
+        }
         for marker in self.markers.feed(bytes) {
             self.reported.apply(marker);
         }
@@ -212,12 +223,100 @@ impl Screen {
         }
         let (cell_width, cell_height) = self.cell;
         let _ = self.terminal.resize(self.cols, self.rows, cell_width, cell_height);
+        if let Some(publication) = &mut self.publication {
+            publication.touch();
+        }
         self.reported.set_size((cell_width > 0).then_some(crate::vt::Size {
             cols: self.cols,
             rows: self.rows,
             cell_width,
             cell_height,
         }));
+    }
+
+    /// Starts sending a view this session's frames through `sink`, beginning with the whole screen.
+    pub fn attach_view(&mut self, id: ViewId, sink: Sender<Vec<u8>>) -> Result<(), Failed> {
+        if self.publication.is_none() {
+            self.publication = Some(Publication::new(&self.terminal)?);
+        }
+        match &mut self.publication {
+            Some(publication) => publication.attach(&self.terminal, id, sink),
+            None => Ok(()),
+        }
+    }
+
+    pub fn detach_view(&mut self, id: ViewId) {
+        if let Some(publication) = &mut self.publication {
+            publication.detach(id);
+        }
+    }
+
+    /// Every view a connection had, when the connection goes.
+    pub fn detach_connection(&mut self, connection: u64) {
+        if let Some(publication) = &mut self.publication {
+            publication.detach_connection(connection);
+        }
+    }
+
+    /// A view drew the frame with this sequence.
+    pub fn acknowledge(&mut self, id: ViewId, sequence: u64) -> Result<(), Failed> {
+        match &mut self.publication {
+            Some(publication) => publication.acknowledge(&self.terminal, id, sequence),
+            None => Ok(()),
+        }
+    }
+
+    /// Sends each view that is waiting for one the frame it is owed. Called where bytes land and where a
+    /// view acknowledges, which between them are every moment a frame can become due.
+    pub fn publish(&mut self) {
+        if let Some(publication) = &mut self.publication {
+            let _ = publication.pump(&self.terminal);
+        }
+    }
+
+    /// Lines by number, for a view that does not hold them, with the epoch the numbers belong to.
+    pub fn fetch(&mut self, first: u64, count: u32) -> Result<(u32, Block), Failed> {
+        if self.publication.is_none() {
+            self.publication = Some(Publication::new(&self.terminal)?);
+        }
+        match &mut self.publication {
+            Some(publication) => {
+                let block = publication.fetch(&self.terminal, first, count)?;
+                Ok((publication.epoch(), block))
+            }
+            None => Ok((0, Block::default())),
+        }
+    }
+
+    /// The epoch line numbers are in and the line the screen's first row is, as of now.
+    pub fn view_position(&mut self) -> Result<(u32, u64), Failed> {
+        if self.publication.is_none() {
+            self.publication = Some(Publication::new(&self.terminal)?);
+        }
+        match &mut self.publication {
+            Some(publication) => {
+                publication.advance(&self.terminal)?;
+                Ok((publication.epoch(), publication.first_active()))
+            }
+            None => Ok((0, 0)),
+        }
+    }
+
+    /// Tells every view the session is over, after the screen as it ended.
+    pub fn end_views(&mut self) {
+        if let Some(mut publication) = self.publication.take() {
+            publication.end(&self.terminal);
+        }
+    }
+
+    /// A row as the grid holds it, in the core's own coordinates.
+    pub fn row(&self, space: Space, row: u32) -> Result<Option<RowRead>, Failed> {
+        self.terminal.read_row(space, row)
+    }
+
+    /// How many rows of history the terminal is holding.
+    pub fn scrollback_rows(&self) -> u32 {
+        self.terminal.scrollback_rows().unwrap_or(0)
     }
 
     /// The grid's width, which bounds how many rows a run of bytes can have added.
