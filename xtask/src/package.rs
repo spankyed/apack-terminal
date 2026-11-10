@@ -35,7 +35,25 @@ pub fn package(root: &Path) -> Result<(), String> {
         return Err(format!("cargo build --release wrote no {}", built.display()));
     }
     let into = root.join("node").join(BINARY);
-    std::fs::copy(&built, &into).map_err(|e| format!("{} -> {}: {e}", built.display(), into.display()))?;
+
+    // **Staged by rename, never written over.** macOS caches a binary's code signature against the file it
+    // executed, so overwriting an executable in place at a path that has already been run leaves the cache
+    // pointing at bytes that are no longer there — and every later `exec` of it is SIGKILLed by AMFI
+    // before `main`. It is not a signature problem anyone can see: the file verifies, `codesign -v` passes,
+    // and a byte-identical copy at any other path runs. Measured here: after this step overwrote a binary
+    // the app had already spawned, `node/apack-terminal` exited 137 for every argument while
+    // `target/release/apack-terminal`, the same SHA-256, ran — and the app reported only "the broker exited
+    // with null before it was listening".
+    //
+    // A rename gives the path a new inode, so there is no stale cache entry to match against. The temporary
+    // lives beside the destination because a rename across filesystems is not atomic and would fall back to
+    // a copy, which is the thing being avoided.
+    let staging = into.with_extension("staging");
+    std::fs::copy(&built, &staging).map_err(|e| format!("{} -> {}: {e}", built.display(), staging.display()))?;
+    std::fs::rename(&staging, &into).map_err(|e| {
+        std::fs::remove_file(&staging).ok();
+        format!("{} -> {}: {e}", staging.display(), into.display())
+    })?;
     println!("staged {} ({} bytes)", into.display(), std::fs::metadata(&into).map_err(|e| e.to_string())?.len());
     Ok(())
 }
