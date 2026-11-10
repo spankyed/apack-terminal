@@ -158,13 +158,13 @@ export interface KeyInput {
   readonly unshifted: number
 }
 
-export const POINTER_ACTIONS = ['press', 'release', 'move'] as const
+export const POINTER_ACTIONS = ['press', 'release', 'move', 'wheelUp', 'wheelDown'] as const
 export type PointerAction = (typeof POINTER_ACTIONS)[number]
 
 /** The pointer, for a program that asked for it. Positions are pixels from the grid's top-left corner */
 export interface PointerInput {
   readonly action: PointerAction
-  /** `0` left, `1` middle, `2` right, `3` and up as the browser numbers them; `-1` for a move with none down */
+  /** `0` left, `1` middle, `2` right; `-1` where no button is part of it — a move with none down, a wheel */
   readonly button: number
   readonly modifiers: number
   readonly x: number
