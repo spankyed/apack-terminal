@@ -94,7 +94,9 @@ its end are on; a frame's `commands` counter moves when one is added, and a view
 last 256 are kept.
 
 A session asked to take images (`Spawn.images`) accepts the Kitty graphics protocol, as bytes in the
-stream only. A frame's `images` counter moves when one is sent, placed, replaced or deleted. A view asks
+stream only: raw pixels, or a PNG, which the broker decodes for the core (`rgba_of_png`) since the core
+leaves that to whoever embeds it. A frame's `images` counter moves when one is sent, placed, replaced or
+deleted. A view asks
 where they are and is told each by the line it is on, which stays true as the screen scrolls; it asks for
 an image's pixels once per generation, in parts of 4 MiB. A placement shown through placeholder cells has
 no place of its own and is not told. Animations are not advanced.

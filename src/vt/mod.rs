@@ -78,6 +78,7 @@ unsafe impl Send for Terminal {}
 impl Terminal {
     /// A terminal of `cols` by `rows`, with the library's default allocator.
     pub fn new(cols: u16, rows: u16) -> Result<Self, Failed> {
+        images::install_decoders();
         let mut handle: sys::Terminal = std::ptr::null_mut();
         // SAFETY: `handle` is a valid out-pointer, and a null allocator asks for the library's own
         let result = unsafe { sys::ghostty_terminal_new(std::ptr::null(), &raw mut handle, cols, rows) };

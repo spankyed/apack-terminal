@@ -150,3 +150,116 @@ fn a_session_not_asked_to_take_images_takes_none() {
     assert!(screen.images().expect("the images read").2.is_empty());
     assert!(screen.image(7, 0).is_none());
 }
+
+/// A PNG of `width` by `height`, written with the colour type and depth named from the samples given.
+fn png_of(width: u32, height: u32, colour: png::ColorType, depth: png::BitDepth, samples: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    let mut encoder = png::Encoder::new(&mut encoded, width, height);
+    encoder.set_color(colour);
+    encoder.set_depth(depth);
+    let mut writer = encoder.write_header().expect("a header is written");
+    writer.write_image_data(samples).expect("the pixels are written");
+    writer.finish().expect("the file is finished");
+    encoded
+}
+
+/// A PNG sent and shown where the cursor is, in pieces as `shown` sends raw pixels.
+fn shown_png(id: u32, encoded: &[u8]) -> Vec<u8> {
+    let text = base64(encoded);
+    let pieces: Vec<&[u8]> = text.as_bytes().chunks(4096).collect();
+    let mut bytes = Vec::new();
+    for (index, piece) in pieces.iter().enumerate() {
+        let last = index + 1 == pieces.len();
+        let control = if index == 0 {
+            format!("a=T,f=100,i={id},q=2,m={}", u8::from(!last))
+        } else {
+            format!("m={}", u8::from(!last))
+        };
+        bytes.extend_from_slice(format!("\x1b_G{control};").as_bytes());
+        bytes.extend_from_slice(piece);
+        bytes.extend_from_slice(b"\x1b\\");
+    }
+    bytes
+}
+
+/// **Most pictures arrive as a PNG**, which is what an image viewer sends when the file is one. The core
+/// leaves decoding to whoever embeds it, so a PNG is a picture only because this decodes it — to the same
+/// red, green, blue and alpha a view is sent for any other.
+#[test]
+fn a_png_is_decoded_into_the_pixels_a_view_is_sent() {
+    let (mut screen, _sent) = viewed(40, 10);
+    let pixels = picture(40, 60);
+    screen.feed(&shown_png(5, &png_of(40, 60, png::ColorType::Rgba, png::BitDepth::Eight, &pixels)));
+
+    let (_, _, placed) = screen.images().expect("the images read");
+    assert_eq!(
+        placed.iter().map(|(_, placement)| (placement.image, placement.size)).collect::<Vec<_>>(),
+        [(5, (40, 60))]
+    );
+    let read = screen.image(5, 0).expect("the image is there");
+    assert_eq!((read.width, read.height, read.channels), (40, 60, 4));
+    assert!(read.bytes == pixels, "the pixels are not the picture that was sent");
+}
+
+/// Whatever a PNG holds — no alpha, grey, sixteen bits a sample, a palette — comes out as four bytes a
+/// pixel, which is the one layout the core takes from a decoder.
+#[test]
+fn a_png_of_any_kind_becomes_four_bytes_a_pixel() {
+    use apack_terminal::vt::images::rgba_of_png;
+    use png::{
+        BitDepth::{Eight, Sixteen},
+        ColorType,
+    };
+
+    let rgb = png_of(2, 1, ColorType::Rgb, Eight, &[10, 20, 30, 40, 50, 60]);
+    assert_eq!(rgba_of_png(&rgb), Some((2, 1, vec![10, 20, 30, 255, 40, 50, 60, 255])));
+
+    let grey = png_of(2, 1, ColorType::Grayscale, Eight, &[7, 200]);
+    assert_eq!(rgba_of_png(&grey), Some((2, 1, vec![7, 7, 7, 255, 200, 200, 200, 255])));
+
+    let grey_alpha = png_of(1, 2, ColorType::GrayscaleAlpha, Eight, &[9, 100, 250, 0]);
+    assert_eq!(rgba_of_png(&grey_alpha), Some((1, 2, vec![9, 9, 9, 100, 250, 250, 250, 0])));
+
+    // Sixteen bits a sample, most significant byte first: the high byte is the one kept
+    let deep = png_of(1, 1, ColorType::Rgba, Sixteen, &[0xAB, 0x01, 0xCD, 0x02, 0xEF, 0x03, 0x80, 0x04]);
+    assert_eq!(rgba_of_png(&deep), Some((1, 1, vec![0xAB, 0xCD, 0xEF, 0x80])));
+
+    let mut indexed = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut indexed, 2, 1);
+        encoder.set_color(ColorType::Indexed);
+        encoder.set_depth(Eight);
+        encoder.set_palette(vec![1, 2, 3, 4, 5, 6]);
+        encoder.set_trns(vec![255, 128]);
+        let mut writer = encoder.write_header().expect("a header is written");
+        writer.write_image_data(&[1, 0]).expect("the pixels are written");
+        writer.finish().expect("the file is finished");
+    }
+    assert_eq!(rgba_of_png(&indexed), Some((2, 1, vec![4, 5, 6, 128, 1, 2, 3, 255])));
+}
+
+/// Bytes that are not a PNG, a PNG cut short, and one whose header claims more pixels than a session may
+/// hold are each no picture — and the terminal carries on, taking the next one.
+#[test]
+fn what_is_not_a_whole_png_of_a_size_a_session_may_hold_is_no_picture() {
+    use apack_terminal::vt::images::rgba_of_png;
+
+    let whole = png_of(40, 60, png::ColorType::Rgba, png::BitDepth::Eight, &picture(40, 60));
+    assert_eq!(rgba_of_png(b"not a picture at all"), None);
+    assert_eq!(rgba_of_png(&whole[..whole.len() / 2]), None);
+    // 4,097 by 4,096 is one row past the sixty-four megabytes a session's images may hold; one row
+    // fewer is exactly at it, and is a picture
+    let large = |width: u32| {
+        png_of(width, 4_096, png::ColorType::Grayscale, png::BitDepth::Eight, &vec![0u8; (width * 4_096) as usize])
+    };
+    assert_eq!(rgba_of_png(&large(4_097)), None);
+    assert!(rgba_of_png(&large(4_096)).is_some());
+
+    let (mut screen, _sent) = viewed(40, 10);
+    screen.feed(&shown_png(5, b"not a picture at all"));
+    screen.feed(&shown_png(6, &whole[..whole.len() / 2]));
+    assert!(screen.images().expect("the images read").2.is_empty());
+    screen.feed(&shown_png(7, &whole));
+    assert_eq!(screen.images().expect("the images read").2.len(), 1);
+    assert!(screen.image(7, 0).is_some());
+}

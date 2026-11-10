@@ -53,6 +53,88 @@ pub struct ImageRead {
     pub bytes: Vec<u8>,
 }
 
+/// A PNG as rows of red, green, blue and alpha, a byte each, with its width and height.
+///
+/// `None` for bytes that are not a PNG, and for one whose pixels would be more than a session's images may
+/// hold altogether: its header says how large it is before anything is allocated for it.
+pub fn rgba_of_png(encoded: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(encoded));
+    // A palette or a few bits a pixel widened to bytes, sixteen bits narrowed to eight, and an alpha
+    // channel added where there is none: what is left is grey and alpha, or red green blue and alpha
+    decoder.set_transformations(
+        png::Transformations::EXPAND | png::Transformations::STRIP_16 | png::Transformations::ALPHA,
+    );
+    let mut reader = decoder.read_info().ok()?;
+    let (width, height) = (reader.info().width, reader.info().height);
+    let pixels = u64::from(width).checked_mul(u64::from(height))?;
+    if pixels.checked_mul(4)? > IMAGE_STORAGE_BYTES {
+        return None;
+    }
+    let mut decoded = vec![0u8; reader.output_buffer_size()?];
+    let frame = reader.next_frame(&mut decoded).ok()?;
+    decoded.truncate(frame.buffer_size());
+    let rgba = match frame.color_type {
+        png::ColorType::Rgba => decoded,
+        png::ColorType::GrayscaleAlpha => {
+            decoded.as_chunks::<2>().0.iter().flat_map(|[grey, alpha]| [*grey, *grey, *grey, *alpha]).collect()
+        }
+        _ => return None,
+    };
+    (rgba.len() as u64 == pixels * 4).then_some((width, height, rgba))
+}
+
+/// The core's callback for a PNG: decoded here, into memory the core hands out and then owns.
+unsafe extern "C" fn decode_png(
+    _userdata: *mut std::ffi::c_void,
+    allocator: *const sys::Allocator,
+    data: *const u8,
+    data_len: usize,
+    out: *mut sys::SysImage,
+) -> bool {
+    if data.is_null() {
+        return false;
+    }
+    // SAFETY: the core passes `data_len` readable bytes at `data`, valid for this call
+    let encoded = unsafe { std::slice::from_raw_parts(data, data_len) };
+    // A panic may not cross into the core, and a program chose these bytes
+    let Ok(Some((width, height, rgba))) = std::panic::catch_unwind(|| rgba_of_png(encoded)) else { return false };
+    // SAFETY: the allocator is the one the core passed for exactly this
+    let buffer = unsafe { sys::ghostty_alloc(allocator, rgba.len()) };
+    if buffer.is_null() {
+        return false;
+    }
+    // SAFETY: `buffer` is `rgba.len()` bytes just allocated, `out` is the core's to be filled in, and the
+    // core frees the buffer with the length recorded here
+    unsafe {
+        std::ptr::copy_nonoverlapping(rgba.as_ptr(), buffer, rgba.len());
+        (*out).width = width;
+        (*out).height = height;
+        (*out).data = buffer;
+        (*out).data_len = rgba.len();
+    }
+    true
+}
+
+/// Gives the core its PNG decoder, once for the process.
+///
+/// **Before the first terminal exists**, because the core's hooks are process-wide and may not be set
+/// while another thread is using it: every use of the core here begins with a terminal, and a second
+/// thread making its first waits for this to finish.
+pub(super) fn install_decoders() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let decoder: sys::SysDecodePngFn = Some(decode_png);
+        // SAFETY: DECODE_PNG takes the function itself as its value, which a `SysDecodePngFn` holding one
+        // is. A build that does not know the option refuses it, and PNGs are then refused as before
+        unsafe {
+            sys::ghostty_sys_set(
+                sys::SysOption::GHOSTTY_SYS_OPT_DECODE_PNG,
+                std::mem::transmute::<sys::SysDecodePngFn, *const std::ffi::c_void>(decoder),
+            );
+        }
+    });
+}
+
 impl Terminal {
     /// Lets programs send images, up to `IMAGE_STORAGE_BYTES` of them.
     ///
