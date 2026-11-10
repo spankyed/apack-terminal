@@ -61,14 +61,28 @@ export class CanvasPainter implements Painter {
     scene.rows.forEach((row, index) => {
       if (row) this.backgrounds(row, (index - scene.offset) * cellHeight)
     })
+    this.images(scene, false)
     scene.rows.forEach((row, index) => {
       if (row) this.foreground(row, (index - scene.offset) * cellHeight)
     })
+    this.images(scene, true)
     if (scene.cursor) this.cursor(scene)
   }
 
   dispose(): void {
     this.canvas.remove()
+  }
+
+  /** The images on one side of the text: over the cell backgrounds and under the characters, or over both */
+  private images(scene: Scene, above: boolean): void {
+    for (const image of scene.images ?? []) {
+      if (image.above !== above || image.source.width <= 0 || image.source.height <= 0) continue
+      this.context.drawImage(
+        image.picture,
+        image.source.x, image.source.y, image.source.width, image.source.height,
+        image.x, image.y - scene.offset * this.metrics.cellHeight, image.width, image.height,
+      )
+    }
   }
 
   private backgrounds(row: RowDrawing, y: number): void {

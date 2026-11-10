@@ -1,4 +1,4 @@
-import { PLAIN, type Command, type Frame, type KeyInput, type PasteOutcome, type PointerInput, type Position, type Row, type Rows, type SourceListener, type Span, type TerminalSource } from '../src/source.ts'
+import { PLAIN, type Command, type Frame, type Picture, type Placements, type KeyInput, type PasteOutcome, type PointerInput, type Position, type Row, type Rows, type SourceListener, type Span, type TerminalSource } from '../src/source.ts'
 
 /** A source a case drives by hand: it sends what the case tells it to and records what the view asked of it */
 export class FakeSource implements TerminalSource {
@@ -55,4 +55,11 @@ export class FakeSource implements TerminalSource {
   commandList: Command[] = []
   commandsAsked = 0
   async commands(): Promise<readonly Command[]> { this.commandsAsked += 1; return this.commandList }
+  /** Where the source says its images are, how many times it was asked, and the pixels it answers with */
+  placed: Placements = { cellWidth: 0, cellHeight: 0, placements: [] }
+  imagesAsked = 0
+  readonly pictures = new Map<number, Picture>()
+  readonly picturesAsked: number[] = []
+  async images(): Promise<Placements> { this.imagesAsked += 1; return this.placed }
+  async image(id: number): Promise<Picture | null> { this.picturesAsked.push(id); return this.pictures.get(id) ?? null }
 }

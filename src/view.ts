@@ -5,7 +5,7 @@ import { linkAt, urls, type Detector, type Link } from './links.ts'
 import type { Font, Painter, Scene } from './painter.ts'
 import { RowStore } from './row-store.ts'
 import { Selection, type Granularity } from './selection.ts'
-import { Modifier, type Command, type Frame, type PointerInput, type Position, type Row, type Span, type TerminalSource } from './source.ts'
+import { Modifier, type Command, type Frame, type Picture, type Placements, type PointerInput, type Position, type Row, type Span, type TerminalSource } from './source.ts'
 import { Viewport } from './viewport.ts'
 
 /** How long the cursor is shown, and then hidden, while it blinks */
@@ -14,6 +14,11 @@ export const BLINK_MS = 530
 export interface ViewOptions {
   readonly font: Font
   readonly theme: Theme
+  /**
+   * Turns an image's pixels into something the painter draws. The default makes a bitmap; a painter that
+   * draws another way gives its own, and so does a page with no canvas to make one on.
+   */
+  readonly picture?: (read: Picture) => Promise<CanvasImageSource | null>
   /**
    * Makes the painter. Left out, a view draws on a 2D canvas; a host that has a GPU painter passes it, and
    * a case passes one that records.
@@ -99,6 +104,11 @@ export class TerminalView {
   /** The commands the shell has reported, and the frame's count that said to ask for them */
   private commandList: readonly Command[] = []
   private commandsSeen = -1
+  /** Where the session's images are, as last told, and the generation of the frame that prompted asking */
+  private placed: Placements = { cellWidth: 0, cellHeight: 0, placements: [] }
+  private imagesSeen = -1
+  /** Pictures by image, each with the generation it is of: `null` while its pixels are on their way */
+  private readonly pictures = new Map<number, { generation: number; picture: CanvasImageSource | null }>()
   private readonly mac: boolean
   private readonly detectors: readonly Detector[]
   private readonly input: Input
@@ -292,6 +302,51 @@ export class TerminalView {
     return true
   }
 
+  /**
+   * Asks for the pixels of every placed image this view does not hold at the generation placed, and lets
+   * go of the ones nothing places any more.
+   */
+  private fetchPictures(): void {
+    const wanted = new Map(this.placed.placements.map((placement) => [placement.image, placement.generation]))
+    for (const image of this.pictures.keys()) if (!wanted.has(image)) this.pictures.delete(image)
+    for (const [image, generation] of wanted) {
+      if (this.pictures.get(image)?.generation === generation) continue
+      const entry = { generation, picture: null as CanvasImageSource | null }
+      this.pictures.set(image, entry)
+      void this.source.image(image).then(async (read) => {
+        if (!read || this.disposed || this.pictures.get(image) !== entry) return
+        entry.picture = await (this.options.picture ?? pictureOf)(read)
+        if (!this.disposed) this.schedule()
+      }, () => {})
+    }
+  }
+
+  /** The images with any part in view, lowest first, in the pixels this view draws a cell in */
+  private imagesIn(first: number, count: number): NonNullable<Scene['images']> {
+    if (this.placed.placements.length === 0) return []
+    const { cellWidth, cellHeight } = this.painter.metrics
+    // What the terminal measured an image in, against what this view draws: the same, where it was not told
+    const scaleX = this.placed.cellWidth > 0 ? cellWidth / this.placed.cellWidth : 1
+    const scaleY = this.placed.cellHeight > 0 ? cellHeight / this.placed.cellHeight : 1
+    const images: Array<NonNullable<Scene['images']>[number] & { z: number }> = []
+    for (const placement of this.placed.placements) {
+      if (placement.line + placement.rows <= first || placement.line >= first + count) continue
+      const picture = this.pictures.get(placement.image)?.picture
+      if (!picture) continue
+      images.push({
+        picture,
+        x: placement.column * cellWidth + placement.offsetX * scaleX,
+        y: (placement.line - first) * cellHeight + placement.offsetY * scaleY,
+        width: placement.width * scaleX,
+        height: placement.height * scaleY,
+        source: { x: placement.sourceX, y: placement.sourceY, width: placement.sourceWidth, height: placement.sourceHeight },
+        above: placement.z >= 0,
+        z: placement.z,
+      })
+    }
+    return images.sort((one, other) => one.z - other.z)
+  }
+
   /** A mark for each command whose prompt is in view, coloured by how the command ended */
   private marksIn(first: number, count: number): NonNullable<Scene['marks']> {
     if (this.gutter === 0) return []
@@ -457,6 +512,9 @@ export class TerminalView {
       // And the lines its commands were on: asked for again, in this epoch
       this.commandList = []
       this.commandsSeen = -1
+      // And the lines its images were on. Their pixels are the same pictures wherever they are now
+      this.placed = { ...this.placed, placements: [] }
+      this.imagesSeen = -1
       this.matches = []
       this.currentMatch = -1
       this.finding += 1
@@ -476,6 +534,16 @@ export class TerminalView {
       void this.source.commands().then((commands) => {
         if (this.disposed || epoch !== this.store.epoch) return
         this.commandList = commands
+        this.schedule()
+      }, () => {})
+    }
+    if (frame.images !== this.imagesSeen) {
+      this.imagesSeen = frame.images
+      const epoch = frame.epoch
+      void this.source.images().then((placed) => {
+        if (this.disposed || epoch !== this.store.epoch) return
+        this.placed = placed
+        this.fetchPictures()
         this.schedule()
       }, () => {})
     }
@@ -689,7 +757,10 @@ export class TerminalView {
     this.ask(first, count)
 
     const cursor = this.cursorIn(frame, first, count)
-    const scene: Scene = { theme: this.options.theme, rows, offset: this.viewport.offset, cursor, marks: this.marksIn(first, count) }
+    const scene: Scene = {
+      theme: this.options.theme, rows, offset: this.viewport.offset, cursor,
+      marks: this.marksIn(first, count), images: this.imagesIn(first, count),
+    }
     this.painter.paint(scene)
     this.afterPaint(frame, first, count)
 
@@ -808,4 +879,19 @@ function textOf(row: Row): string {
     column = start + row.width[index]!
   }
   return text
+}
+
+/**
+ * Pixels as something a canvas draws. A bitmap where the browser makes them — decoded off the thread that
+ * paints, and drawn from the GPU — and a canvas holding the pixels where it does not.
+ */
+async function pictureOf(read: Picture): Promise<CanvasImageSource | null> {
+  if (read.width <= 0 || read.height <= 0 || read.pixels.length < read.width * read.height * 4) return null
+  const data = new ImageData(read.pixels as Uint8ClampedArray<ArrayBuffer>, read.width, read.height)
+  if (typeof createImageBitmap === 'function') return createImageBitmap(data)
+  const canvas = document.createElement('canvas')
+  canvas.width = read.width
+  canvas.height = read.height
+  canvas.getContext('2d')?.putImageData(data, 0, 0)
+  return canvas
 }

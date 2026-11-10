@@ -28,6 +28,20 @@ export interface Scene {
    * only where the painter was given a gutter to draw them in.
    */
   readonly marks?: ReadonlyArray<{ readonly row: number; readonly color: number }>
+  /**
+   * Images a program placed, in the order to draw them. Positions and sizes are in CSS pixels from the
+   * top-left of the first row, before `offset` is applied; `source` is the part of the picture drawn.
+   */
+  readonly images?: ReadonlyArray<{
+    readonly picture: CanvasImageSource
+    readonly x: number
+    readonly y: number
+    readonly width: number
+    readonly height: number
+    readonly source: { readonly x: number; readonly y: number; readonly width: number; readonly height: number }
+    /** Drawn under the text when false: the program put it behind what it prints */
+    readonly above: boolean
+  }>
   /** Absent when there is none to draw: hidden by the program, off the view, or in the off half of a blink */
   readonly cursor?: {
     readonly column: number

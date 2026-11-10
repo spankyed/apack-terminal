@@ -22,6 +22,8 @@ import {
   type Frame,
   type KeyInput,
   type PasteOutcome,
+  type Placement,
+  type Placements,
   type PointerInput,
   type Position,
   type Row,
@@ -48,6 +50,8 @@ export type ToBroker =
   | { readonly kind: 'textOf'; readonly channel: number; readonly request: number; readonly epoch: number; readonly span: Span }
   | { readonly kind: 'search'; readonly channel: number; readonly request: number; readonly needle: string }
   | { readonly kind: 'commands'; readonly channel: number; readonly request: number }
+  | { readonly kind: 'images'; readonly channel: number; readonly request: number }
+  | { readonly kind: 'image'; readonly channel: number; readonly request: number; readonly image: number; readonly offset: number }
 
 /** What a view is sent */
 export type ToView =
@@ -60,13 +64,15 @@ export type ToView =
   | { readonly kind: 'spans'; readonly channel: number; readonly request: number; readonly epoch: number; readonly spans: readonly Span[] }
   | { readonly kind: 'failed'; readonly channel: number; readonly request: number; readonly message: string }
   | { readonly kind: 'commands'; readonly channel: number; readonly request: number; readonly epoch: number; readonly commands: readonly Command[] }
+  | ({ readonly kind: 'images'; readonly channel: number; readonly request: number; readonly epoch: number } & Placements)
+  | { readonly kind: 'image'; readonly channel: number; readonly request: number; readonly image: number; readonly generation: number; readonly width: number; readonly height: number; readonly channels: number; readonly total: number; readonly offset: number; readonly bytes: Uint8Array }
 
 /** Bytes that are not a message. A view that reads one cannot trust what follows it either */
 export class Malformed extends Error {}
 
 const KIND = {
   attach: 1, detach: 2, acknowledge: 3, fetch: 4, key: 5, text: 6, pointer: 7, paste: 8, focus: 9,
-  wordAt: 10, lineAt: 11, textOf: 12, search: 13, commands: 14,
+  wordAt: 10, lineAt: 11, textOf: 12, search: 13, commands: 14, images: 15, image: 16,
 } as const
 
 const FRAME = 65
@@ -78,6 +84,8 @@ const TEXT = 70
 const SPANS = 71
 const FAILED = 72
 const COMMANDS = 73
+const IMAGES = 74
+const IMAGE = 75
 
 const FRAME_CURSOR = 1
 const FRAME_ALTERNATE = 2
@@ -215,7 +223,13 @@ export function encodeToBroker(message: ToBroker): Uint8Array {
       out.text(message.needle)
       break
     case 'commands':
+    case 'images':
       out.number(message.request)
+      break
+    case 'image':
+      out.number(message.request)
+      out.number(message.image)
+      out.number(message.offset)
       break
   }
   return out.finish()
@@ -405,6 +419,7 @@ export function decodeToView(body: Uint8Array): ToView {
       const screenRows = read.number()
       const scrollback = read.number()
       const commands = read.number()
+      const images = read.number()
       const flags = read.byte()
       if (flags >= 32) throw new Malformed("a frame's flags are outside what the format defines")
       let cursor: Cursor | null = null
@@ -417,7 +432,7 @@ export function decodeToView(body: Uint8Array): ToView {
       }
       const staleFrom = flags & FRAME_STALE ? read.number() : undefined
       const frame: Frame = {
-        sequence, epoch, firstActive, columns, screenRows, scrollback, commands, cursor,
+        sequence, epoch, firstActive, columns, screenRows, scrollback, commands, images, cursor,
         modes: { alternateScreen: (flags & FRAME_ALTERNATE) !== 0, mouse: (flags & FRAME_MOUSE) !== 0 },
         ...(staleFrom === undefined ? {} : { staleFrom }),
         ...read.rows(),
@@ -463,6 +478,40 @@ export function decodeToView(body: Uint8Array): ToView {
       const commands: Command[] = []
       for (let more = read.count(); more > 0; more -= 1) commands.push(read.command())
       return read.finish({ kind: 'commands', channel, request, epoch, commands })
+    }
+    case IMAGES: {
+      const request = read.number()
+      const epoch = read.number()
+      const cellWidth = read.number()
+      const cellHeight = read.number()
+      const placements: Placement[] = []
+      for (let more = read.count(); more > 0; more -= 1) {
+        const image = read.number()
+        const generation = read.number()
+        const zigzag = read.number()
+        if (zigzag > 0xffffffff) throw new Malformed('an integer did not fit its field')
+        placements.push({
+          image, generation, z: zigzag % 2 === 0 ? zigzag / 2 : -(zigzag + 1) / 2,
+          line: read.number(), column: read.number(), columns: read.number(), rows: read.number(),
+          offsetX: read.number(), offsetY: read.number(), width: read.number(), height: read.number(),
+          sourceX: read.number(), sourceY: read.number(), sourceWidth: read.number(), sourceHeight: read.number(),
+        })
+      }
+      return read.finish({ kind: 'images', channel, request, epoch, cellWidth, cellHeight, placements })
+    }
+    case IMAGE: {
+      const request = read.number()
+      const image = read.number()
+      const generation = read.number()
+      const width = read.number()
+      const height = read.number()
+      const channels = read.byte()
+      if (channels < 1 || channels > 4) throw new Malformed("an image's channels are outside what the format defines")
+      const total = read.number()
+      const offset = read.number()
+      // Copied, because the bytes it was read from are the stream's and are reused
+      const bytes = read.take(read.count()).slice()
+      return read.finish({ kind: 'image', channel, request, image, generation, width, height, channels, total, offset, bytes })
     }
     default:
       throw new Malformed(`no message has kind ${kind}`)

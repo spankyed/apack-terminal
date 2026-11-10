@@ -137,6 +137,8 @@ export interface Frame extends Rows {
   readonly scrollback: number
   /** Moves whenever the shell reports a command, which is when `commands()` has something new to say */
   readonly commands: number
+  /** Moves whenever an image is sent, placed, replaced or deleted: the cue to ask where they are again */
+  readonly images: number
   /** Absent while the program has hidden it */
   readonly cursor: Cursor | null
   readonly modes: Modes
@@ -167,6 +169,49 @@ export interface Command {
   readonly prompt: number | null
   readonly output: number | null
   readonly end: number | null
+}
+
+/**
+ * One image where a program put it: its top-left cell, how much of the picture is drawn, and how large.
+ *
+ * `offsetX`, `offsetY`, `width` and `height` are in the pixels of a cell as the terminal was told one is
+ * (`Placements.cellWidth`), which a view scales to the cell it draws.
+ */
+export interface Placement {
+  readonly image: number
+  /** Moves when the image's pixels do, so the ones a view holds are known stale */
+  readonly generation: number
+  /** Orders images that overlap; below zero is under the text */
+  readonly z: number
+  readonly line: number
+  readonly column: number
+  /** How many cells it covers */
+  readonly columns: number
+  readonly rows: number
+  readonly offsetX: number
+  readonly offsetY: number
+  readonly width: number
+  readonly height: number
+  /** The part of the picture drawn, in its own pixels */
+  readonly sourceX: number
+  readonly sourceY: number
+  readonly sourceWidth: number
+  readonly sourceHeight: number
+}
+
+/** Every image in a session, and one cell in pixels as the terminal was told it is: zero when it was not */
+export interface Placements {
+  readonly cellWidth: number
+  readonly cellHeight: number
+  readonly placements: readonly Placement[]
+}
+
+/** An image's pixels: red, green, blue and alpha for each, rows top to bottom */
+export interface Picture {
+  readonly generation: number
+  readonly width: number
+  readonly height: number
+  readonly pixels: Uint8ClampedArray
 }
 
 /** A cell on an absolute line */
@@ -262,4 +307,8 @@ export interface TerminalSource {
   search(needle: string): Promise<readonly Span[]>
   /** The commands the shell has reported, oldest first. Empty for a shell that marks none */
   commands(): Promise<readonly Command[]>
+  /** Where every image is. Their lines are in the epoch of the frame that prompted the question */
+  images(): Promise<Placements>
+  /** An image's pixels, or `null` for one that is gone */
+  image(id: number): Promise<Picture | null>
 }

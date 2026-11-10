@@ -1,6 +1,6 @@
 [
   {
-    "hex": "8900000041032902e8075018e80707110417010201010000010212345601fa02ff00808206011968747470733a2f2f6578616d706c652e636f6d2f613f623d630400020300000000012402010000026c730502010002787901010200000001030203e4b896010365cc81020bf09f91a8e2808df09f91a90500000002c3a9020000959aef3a00014f000000017a",
+    "hex": "8a00000041032902e8075018e8070704110417010201010000010212345601fa02ff00808206011968747470733a2f2f6578616d706c652e636f6d2f613f623d630400020300000000012402010000026c730502010002787901010200000001030203e4b896010365cc81020bf09f91a8e2808df09f91a90500000002c3a9020000959aef3a00014f000000017a",
     "message": {
       "alternateScreen": false,
       "channel": 3,
@@ -14,6 +14,7 @@
       },
       "epoch": 2,
       "firstActive": 1000,
+      "images": 4,
       "kind": "frame",
       "links": [
         "",
@@ -156,7 +157,7 @@
     "to": "view"
   },
   {
-    "hex": "0f00000041032902e8075018e8070704000000",
+    "hex": "1000000041032902e8075018e807070404000000",
     "message": {
       "alternateScreen": false,
       "channel": 3,
@@ -165,6 +166,7 @@
       "cursor": null,
       "epoch": 2,
       "firstActive": 1000,
+      "images": 4,
       "kind": "frame",
       "links": [
         ""
@@ -188,7 +190,7 @@
     "to": "view"
   },
   {
-    "hex": "1400000041032902e8075018e807070b000002de07000000",
+    "hex": "1500000041032902e8075018e80707040b000002de07000000",
     "message": {
       "alternateScreen": true,
       "channel": 3,
@@ -202,6 +204,7 @@
       },
       "epoch": 2,
       "firstActive": 1000,
+      "images": 4,
       "kind": "frame",
       "links": [
         ""
@@ -544,6 +547,96 @@
     "to": "view"
   },
   {
+    "hex": "2e0000004a0312020912020780e497d01201de070414060305b101670a14b4016cac020104f2070001010000000000000000",
+    "message": {
+      "cellHeight": 18,
+      "cellWidth": 9,
+      "channel": 3,
+      "epoch": 2,
+      "kind": "images",
+      "placements": [
+        {
+          "column": 4,
+          "columns": 20,
+          "generation": 5000000000,
+          "height": 103,
+          "image": 7,
+          "line": 990,
+          "offsetX": 3,
+          "offsetY": 5,
+          "rows": 6,
+          "sourceHeight": 108,
+          "sourceWidth": 180,
+          "sourceX": 10,
+          "sourceY": 20,
+          "width": 177,
+          "z": -1
+        },
+        {
+          "column": 0,
+          "columns": 1,
+          "generation": 1,
+          "height": 0,
+          "image": 300,
+          "line": 1010,
+          "offsetX": 0,
+          "offsetY": 0,
+          "rows": 1,
+          "sourceHeight": 0,
+          "sourceWidth": 0,
+          "sourceX": 0,
+          "sourceY": 0,
+          "width": 0,
+          "z": 2
+        }
+      ],
+      "request": 18
+    },
+    "name": "images: one under the text and cut from a larger picture, one over it and placed whole",
+    "to": "view"
+  },
+  {
+    "hex": "070000004a031302000000",
+    "message": {
+      "cellHeight": 0,
+      "cellWidth": 0,
+      "channel": 3,
+      "epoch": 2,
+      "kind": "images",
+      "placements": [],
+      "request": 19
+    },
+    "name": "no images",
+    "to": "view"
+  },
+  {
+    "hex": "170000004b03140780e497d0120202041008080000ffffffffff80",
+    "message": {
+      "bytes": [
+        0,
+        0,
+        255,
+        255,
+        255,
+        255,
+        255,
+        128
+      ],
+      "channel": 3,
+      "channels": 4,
+      "generation": 5000000000,
+      "height": 2,
+      "image": 7,
+      "kind": "image",
+      "offset": 8,
+      "request": 20,
+      "total": 16,
+      "width": 2
+    },
+    "name": "an image's pixels: the second part of a two by two picture in red, green, blue and alpha",
+    "to": "view"
+  },
+  {
     "hex": "07000000010304732d3132",
     "message": {
       "channel": 3,
@@ -799,6 +892,28 @@
       "request": 17
     },
     "name": "asking for the commands",
+    "to": "broker"
+  },
+  {
+    "hex": "030000000f0312",
+    "message": {
+      "channel": 3,
+      "kind": "images",
+      "request": 18
+    },
+    "name": "asking where the images are",
+    "to": "broker"
+  },
+  {
+    "hex": "050000001003140708",
+    "message": {
+      "channel": 3,
+      "image": 7,
+      "kind": "image",
+      "offset": 8,
+      "request": 20
+    },
+    "name": "asking for an image's pixels",
     "to": "broker"
   }
 ]

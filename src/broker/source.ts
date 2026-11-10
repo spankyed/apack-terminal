@@ -12,6 +12,8 @@ import type {
   Command,
   KeyInput,
   PasteOutcome,
+  Picture,
+  Placements,
   PointerInput,
   Position,
   Rows,
@@ -236,4 +238,67 @@ class SessionSource implements TerminalSource {
     if (answer.epoch === this.epoch) return answer.commands
     return answer.commands.map((command) => ({ ...command, prompt: null, output: null, end: null }))
   }
+
+  /** An answer from before a reflow names lines that are no longer where the images are: it is none */
+  async images(): Promise<Placements> {
+    const { channel } = this
+    const answer = await this.ask('images', (request) => ({ kind: 'images', channel, request }))
+    const { cellWidth, cellHeight } = answer
+    return { cellWidth, cellHeight, placements: answer.epoch === this.epoch ? answer.placements : [] }
+  }
+
+  /**
+   * An image arrives in parts, each asked for from where the last ended. A part of another generation is
+   * a different picture — the program replaced it between two answers — so the parts so far are dropped
+   * and it is read again from its start.
+   */
+  async image(id: number): Promise<Picture | null> {
+    const { channel } = this
+    let whole: Uint8Array | null = null
+    let generation = -1
+    let read = 0
+    for (;;) {
+      const offset = read
+      let part
+      try {
+        part = await this.ask('image', (request) => ({ kind: 'image', channel, request, image: id, offset }))
+      } catch (error) {
+        if (error instanceof Unanswered) return null
+        throw error
+      }
+      if (whole && (part.generation !== generation || part.total !== whole.length)) {
+        whole = null
+        read = 0
+        continue
+      }
+      generation = part.generation
+      whole ??= new Uint8Array(part.total)
+      whole.set(part.bytes.subarray(0, Math.max(0, whole.length - part.offset)), part.offset)
+      read = part.offset + part.bytes.length
+      // An empty part of a picture not yet whole would be asked for again for ever
+      if (read >= whole.length || part.bytes.length === 0) {
+        return { generation, width: part.width, height: part.height, pixels: rgbaOf(part.channels, whole, part.width * part.height) }
+      }
+    }
+  }
+}
+
+/** Pixels of one to four bytes each — grey, grey and alpha, colour, colour and alpha — as colour and alpha */
+export function rgbaOf(channels: number, bytes: Uint8Array, pixels: number): Uint8ClampedArray {
+  const rgba = new Uint8ClampedArray(pixels * 4)
+  if (channels === 4) {
+    rgba.set(bytes.subarray(0, rgba.length))
+    return rgba
+  }
+  const count = Math.min(pixels, Math.floor(bytes.length / channels))
+  for (let pixel = 0; pixel < count; pixel += 1) {
+    const from = pixel * channels
+    const to = pixel * 4
+    const grey = channels < 3
+    rgba[to] = bytes[from]!
+    rgba[to + 1] = grey ? bytes[from]! : bytes[from + 1]!
+    rgba[to + 2] = grey ? bytes[from]! : bytes[from + 2]!
+    rgba[to + 3] = channels === 2 ? bytes[from + 1]! : 255
+  }
+  return rgba
 }

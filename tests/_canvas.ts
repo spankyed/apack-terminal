@@ -5,7 +5,7 @@
  * exactly, and which pixels would only say after a rasteriser nobody here is testing.
  */
 export interface Drawn {
-  readonly kind: 'rect' | 'text' | 'stroke' | 'strokeRect'
+  readonly kind: 'rect' | 'text' | 'stroke' | 'strokeRect' | 'image'
   readonly x: number
   readonly y: number
   readonly width?: number
@@ -13,6 +13,9 @@ export interface Drawn {
   readonly text?: string
   readonly color: string
   readonly font?: string
+  /** For an image: the picture drawn and the part of it, as left, top, width, height */
+  readonly picture?: unknown
+  readonly source?: readonly [number, number, number, number]
 }
 
 export function recordingContext(cellWidth = 10) {
@@ -39,6 +42,9 @@ export function recordingContext(cellWidth = 10) {
     },
     fillText(text: string, x: number, y: number) {
       drawn.push({ kind: 'text', x: x + shift[0], y: y + shift[1], text, color: context.fillStyle, font: context.font })
+    },
+    drawImage(picture: unknown, sx: number, sy: number, sw: number, sh: number, x: number, y: number, width: number, height: number) {
+      drawn.push({ kind: 'image', x: x + shift[0], y: y + shift[1], width, height, color: '', picture, source: [sx, sy, sw, sh] })
     },
     beginPath() { path = [] },
     moveTo(x: number, y: number) { path.push([x, y]) },

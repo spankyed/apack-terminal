@@ -53,12 +53,14 @@ function written(message: ToView): Record<string, unknown> {
       return {
         kind: 'frame', channel: message.channel, sequence: frame.sequence, epoch: frame.epoch,
         firstActive: frame.firstActive, columns: frame.columns, screenRows: frame.screenRows,
-        scrollback: frame.scrollback, commands: frame.commands, cursor: frame.cursor, alternateScreen: frame.modes.alternateScreen,
+        scrollback: frame.scrollback, commands: frame.commands, images: frame.images, cursor: frame.cursor, alternateScreen: frame.modes.alternateScreen,
         mouse: frame.modes.mouse, staleFrom: frame.staleFrom ?? null, ...rows(frame),
       }
     }
     case 'rows':
       return { kind: 'rows', channel: message.channel, request: message.request, epoch: message.epoch, ...rows(message.rows) }
+    case 'image':
+      return { ...message, bytes: Array.from(message.bytes) }
     default:
       return { ...message }
   }
@@ -67,7 +69,7 @@ function written(message: ToView): Record<string, unknown> {
 describe('the bytes a view and a broker exchange', () => {
   it('covers every kind of message the protocol has', () => {
     const kinds = new Set(vectors.map((vector) => `${vector.to}:${String(vector.message.kind)}`))
-    expect(kinds.size).toBe(23)
+    expect(kinds.size).toBe(27)
   })
 
   for (const vector of vectors.filter((vector) => vector.to === 'view')) {

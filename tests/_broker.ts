@@ -75,13 +75,13 @@ class Out {
 /** A message for a view, as the broker encodes one */
 export function encodeToView(message: ToView): Uint8Array {
   const out = new Out()
-  const kinds = { frame: 65, rows: 66, ended: 67, pasted: 68, span: 69, text: 70, spans: 71, failed: 72, commands: 73 } as const
+  const kinds = { frame: 65, rows: 66, ended: 67, pasted: 68, span: 69, text: 70, spans: 71, failed: 72, commands: 73, images: 74, image: 75 } as const
   out.byte(kinds[message.kind])
   out.number(message.channel)
   switch (message.kind) {
     case 'frame': {
       const { frame } = message
-      for (const value of [frame.sequence, frame.epoch, frame.firstActive, frame.columns, frame.screenRows, frame.scrollback, frame.commands]) out.number(value)
+      for (const value of [frame.sequence, frame.epoch, frame.firstActive, frame.columns, frame.screenRows, frame.scrollback, frame.commands, frame.images]) out.number(value)
       out.byte((frame.cursor ? 1 : 0) | (frame.modes.alternateScreen ? 2 : 0) | (frame.modes.mouse ? 4 : 0)
         | (frame.staleFrom === undefined ? 0 : 8) | (frame.cursor?.blinking ? 16 : 0))
       if (frame.cursor) { out.number(frame.cursor.column); out.number(frame.cursor.row); out.byte(CURSOR_SHAPES.indexOf(frame.cursor.shape)) }
@@ -114,6 +114,23 @@ export function encodeToView(message: ToView): Uint8Array {
         if (command.exitStatus !== null) out.number(command.exitStatus >= 0 ? command.exitStatus * 2 : -command.exitStatus * 2 - 1)
         for (const line of [command.prompt, command.output, command.end]) if (line !== null) out.number(line)
       }
+      break
+    case 'images':
+      for (const value of [message.request, message.epoch, message.cellWidth, message.cellHeight, message.placements.length]) out.number(value)
+      for (const placed of message.placements) {
+        out.number(placed.image); out.number(placed.generation)
+        out.number(placed.z >= 0 ? placed.z * 2 : -placed.z * 2 - 1)
+        for (const value of [
+          placed.line, placed.column, placed.columns, placed.rows, placed.offsetX, placed.offsetY, placed.width, placed.height,
+          placed.sourceX, placed.sourceY, placed.sourceWidth, placed.sourceHeight,
+        ]) out.number(value)
+      }
+      break
+    case 'image':
+      for (const value of [message.request, message.image, message.generation, message.width, message.height]) out.number(value)
+      out.byte(message.channels)
+      for (const value of [message.total, message.offset, message.bytes.length]) out.number(value)
+      for (const byte of message.bytes) out.byte(byte)
       break
   }
   return out.finish()
@@ -162,6 +179,8 @@ export function decodeToBroker(body: Uint8Array): ToBroker {
     case 12: return { kind: 'textOf', channel, request: number(), epoch: number(), span: { start: position(), end: position() } }
     case 13: return { kind: 'search', channel, request: number(), needle: text() }
     case 14: return { kind: 'commands', channel, request: number() }
+    case 15: return { kind: 'images', channel, request: number() }
+    case 16: return { kind: 'image', channel, request: number(), image: number(), offset: number() }
     default: throw new Error(`a view sent kind ${kind}`)
   }
 }
