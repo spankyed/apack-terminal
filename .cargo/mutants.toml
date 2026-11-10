@@ -40,6 +40,13 @@ profile = "mutants"
 exclude_re = [
     "session.rs:.*in SignalTarget::at",
 
+    # **Starting a process is not mutated from the inside either.** `start_broker` runs this binary as a
+    # broker in a session of its own, which is what lets it outlive the proxy that started it — and is also
+    # what would let a mutant of how it is started outlive the run that made it, on a developer's machine,
+    # holding a socket. The function replaced whole starts nothing and is caught (`tests/proxy.rs`: a proxy
+    # with nothing to connect to), so what is excluded is only what is inside it.
+    "proxy.rs:.*in start_broker",
+
     # **`inside_tree`'s guard is cost and clarity, not an answer.** It refuses a pid below 2, and so does the
     # walk it skips: `sysinfo` has no process 0, and 1 is init, whose ancestry ends at itself. So for every
     # pid a session's tree can hold, `<` and `<=`, `<` and `==`, and `||` and `&&` answer the same, and only
