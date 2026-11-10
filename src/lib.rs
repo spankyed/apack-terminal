@@ -7,6 +7,7 @@
 
 pub mod commands;
 pub mod frames;
+pub mod housekeeping;
 pub mod markers;
 pub mod output;
 pub mod protocol;

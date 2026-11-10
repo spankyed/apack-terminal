@@ -266,6 +266,48 @@ impl Terminal {
         Ok(wide)
     }
 
+    /// What the terminal's screens and history cost in memory now, in bytes actually held: a compressed
+    /// page counts as its compressed size.
+    pub fn resident_bytes(&self) -> Result<u64, Failed> {
+        let mut usage =
+            sys::TerminalMemoryUsage { size: std::mem::size_of::<sys::TerminalMemoryUsage>(), ..Default::default() };
+        // SAFETY: MEMORY_USAGE writes a sized `GhosttyTerminalMemoryUsage`, whose size was just set
+        let result =
+            unsafe { sys::ghostty_terminal_get(self.handle, sys::TerminalData::MEMORY_USAGE, (&raw mut usage).cast()) };
+        Failed::check("ghostty_terminal_get(MEMORY_USAGE)", result)?;
+        Ok(usage.primary_resident_bytes)
+    }
+
+    /// A number that moves whenever the terminal does something that makes history worth compressing
+    /// again. Only whether it has changed means anything.
+    pub fn compression_activity(&self) -> Result<u64, Failed> {
+        let mut activity: u64 = 0;
+        // SAFETY: the handle is live and `activity` is a valid out-pointer
+        let result = unsafe { sys::ghostty_terminal_compression_activity(self.handle, &raw mut activity) };
+        Failed::check("ghostty_terminal_compression_activity", result)?;
+        Ok(activity)
+    }
+
+    /// Bounds the history's memory, whatever its line limit would allow at the grid's width.
+    pub fn set_scrollback_bytes(&self, bytes: usize) -> Result<(), Failed> {
+        self.set_usize(sys::TerminalOption::SCROLLBACK_MAX_BYTES, bytes, "ghostty_terminal_set(SCROLLBACK_MAX_BYTES)")
+    }
+
+    /// Compresses history that is not being looked at. Answers whether there is more to do.
+    ///
+    /// **A step, sized for being called while nothing else is happening.** Compression changes how history
+    /// is stored and nothing about what it holds: a row read afterwards is the same row, restored as it
+    /// is read. Where the platform cannot give memory back, there is never more to do.
+    pub fn compress_step(&mut self) -> Result<bool, Failed> {
+        let mut outcome: sys::TerminalCompressionResult::Type = sys::TerminalCompressionResult::COMPLETE;
+        // SAFETY: the handle is live for `&mut self` and `outcome` is a valid out-pointer
+        let result = unsafe {
+            sys::ghostty_terminal_compress(self.handle, sys::TerminalCompressionMode::INCREMENTAL, &raw mut outcome)
+        };
+        Failed::check("ghostty_terminal_compress", result)?;
+        Ok(outcome == sys::TerminalCompressionResult::PENDING)
+    }
+
     /// Bounds the scrollback to `lines`, which the core does not do by default.
     pub fn set_scrollback_lines(&self, lines: usize) -> Result<(), Failed> {
         self.set_usize(sys::TerminalOption::SCROLLBACK_MAX_LINES, lines, "ghostty_terminal_set(SCROLLBACK_MAX_LINES)")
@@ -474,6 +516,37 @@ impl Terminal {
             };
             Failed::check(what, result)?;
         }
+        Ok(())
+    }
+
+    /// The cursor a program gets when it asks for the default one: a bar, blinking.
+    ///
+    /// **And the one it starts with**, which takes saying so: the option is what a reset to the default
+    /// means, not what the terminal is showing, so the reset is written once here, before any program has
+    /// written a byte.
+    pub fn default_cursor_is_a_blinking_bar(&mut self) -> Result<(), Failed> {
+        let style: sys::CursorStyle::Type = sys::CursorStyle::BAR;
+        let blink = true;
+        // SAFETY: DEFAULT_CURSOR_STYLE takes a `GhosttyCursorStyle*` and DEFAULT_CURSOR_BLINK a `bool*`
+        unsafe {
+            Failed::check(
+                "ghostty_terminal_set(DEFAULT_CURSOR_STYLE)",
+                sys::ghostty_terminal_set(
+                    self.handle,
+                    sys::TerminalOption::DEFAULT_CURSOR_STYLE,
+                    (&raw const style).cast(),
+                ),
+            )?;
+            Failed::check(
+                "ghostty_terminal_set(DEFAULT_CURSOR_BLINK)",
+                sys::ghostty_terminal_set(
+                    self.handle,
+                    sys::TerminalOption::DEFAULT_CURSOR_BLINK,
+                    (&raw const blink).cast(),
+                ),
+            )?;
+        }
+        self.feed(b"\x1b[0 q");
         Ok(())
     }
 

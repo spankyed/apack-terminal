@@ -241,14 +241,20 @@ fn a_frame_says_how_the_cursor_is_drawn_and_whether_the_program_took_the_mouse()
     let mut screen = Screen::new(20, 4);
     let view = View::attached(&mut screen, 1, 1);
     let mut last = view.frame();
-    assert_eq!(last.cursor.map(|cursor| cursor.shape), Some(0), "a block until a program says otherwise");
+    assert_eq!(
+        last.cursor.map(|cursor| (cursor.shape, cursor.blinking)),
+        Some((1, true)),
+        "a blinking bar until a program says otherwise"
+    );
 
     for (written, check) in [
         (
-            "\x1b[5 q",
-            Box::new(|frame: &Frame| frame.cursor.is_some_and(|cursor| cursor.shape == 1 && cursor.blinking))
+            "\x1b[2 q",
+            Box::new(|frame: &Frame| frame.cursor.is_some_and(|cursor| cursor.shape == 0 && !cursor.blinking))
                 as Box<dyn Fn(&Frame) -> bool>,
         ),
+        // Asking for the default again is asking for the bar
+        ("\x1b[0 q", Box::new(|frame: &Frame| frame.cursor.is_some_and(|cursor| cursor.shape == 1 && cursor.blinking))),
         (
             "\x1b[4 q",
             Box::new(|frame: &Frame| frame.cursor.is_some_and(|cursor| cursor.shape == 2 && !cursor.blinking)),

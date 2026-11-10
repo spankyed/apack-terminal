@@ -212,7 +212,9 @@ proptest! {
         steps in prop::collection::vec(step(), 1..60),
         late in 0usize..40,
     ) {
-        let mut screen = Screen::new(40, 12);
+        // A history short enough that a flood runs it out, which is what makes a row mark go missing and
+        // every line number start again
+        let mut screen = Screen::with_history(40, 12, 2_000);
         // One view from the start; another arriving part way through, which is sent the screen whole
         let mut viewers = vec![Viewer::attached(&mut screen, 1)];
         viewers[0].take(&screen, "on attaching")?;

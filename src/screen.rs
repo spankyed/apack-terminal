@@ -44,6 +44,27 @@ pub const HISTORY_LINES: usize = 1_000;
 /// every width. `tests/screen.rs` asserts both halves rather than trusting this arithmetic.
 const SCROLLBACK_ASKED: usize = HISTORY_LINES * 2;
 
+/// How far back a view can scroll: the lines of history a session keeps for whatever draws it.
+///
+/// **A hundred thousand, which is what a long build or a day of work in one shell is, and affordable
+/// because of what it costs when nobody is looking.** Measured on 2026-11-10 with a release build: a
+/// hundred thousand 80-column lines are 66 MiB while they are being written and 1.3 MiB once compressed,
+/// which takes 9 ms and which `housekeeping` does to a session that has gone quiet; the oldest row is
+/// still read in 60 µs afterwards. That text repeated, so what a real session compresses to is more —
+/// the claim is the order of magnitude, not the figure.
+///
+/// `HISTORY_LINES` is a different number on purpose: it is what a client asking for a screen as text is
+/// promised, and it does not grow because a view can scroll further.
+pub const VIEW_HISTORY_LINES: usize = 100_000;
+
+/// The most memory one session's history may hold, whatever its line limit allows.
+///
+/// **Lines bound a narrow terminal and bytes bound a wide one.** A row costs what its width does, so a
+/// hundred thousand rows of a very wide grid is several times the memory of the same rows at 80 columns —
+/// and a program can fill them as fast as it can write. This is what such a session holds at most while
+/// it is being written to; quiet, it is compressed like any other.
+const HISTORY_BYTES: usize = 256 << 20;
+
 /// The terminal advertised to a program, which has to be what the pty says.
 pub const TERMINFO_NAME: &str = "xterm-256color";
 
@@ -168,15 +189,21 @@ pub struct Colors {
 
 impl Screen {
     pub fn new(cols: u16, rows: u16) -> Self {
-        Self::build(cols, rows).expect("libghostty-vt could not make a terminal")
+        Self::with_history(cols, rows, VIEW_HISTORY_LINES)
+    }
+
+    /// A screen that keeps `lines` of history rather than what a session keeps. For a case about what
+    /// happens when history runs out, which at a session's size takes a hundred thousand lines to reach.
+    pub fn with_history(cols: u16, rows: u16, lines: usize) -> Self {
+        Self::build(cols, rows, lines).expect("libghostty-vt could not make a terminal")
     }
 
     /// **Five settings, each a default the core and this broker do not share.**
     ///
-    /// The core keeps *no* scrollback limit of its own, where `HISTORY_LINES` is a ceiling on memory per
-    /// session; its byte ceiling has no counterpart here, so the line limit is left as the only rule
-    /// bounding history; and the advertised terminal has to be the one the pty says, because a program
-    /// decides what to emit from `TERM` and answers a query differently when told something else.
+    /// The core keeps *no* scrollback limit of its own, where a session's history is bounded twice — in
+    /// lines, which is what a narrow terminal reaches first, and in bytes, which is what a wide one does;
+    /// and the advertised terminal has to be the one the pty says, because a program decides what to
+    /// emit from `TERM` and answers a query differently when told something else.
     ///
     /// **The last two are about the window, which is what draws the session.** An emoji built from
     /// several code points is one character there, so it has to be one here: with clustering off this
@@ -184,12 +211,14 @@ impl Screen {
     /// the cursor position a program is told comes from this screen. And the window draws no images, so
     /// the image protocol is off rather than answered `OK` on behalf of a renderer that would show
     /// nothing.
-    fn build(cols: u16, rows: u16) -> Result<Self, Failed> {
+    fn build(cols: u16, rows: u16, history: usize) -> Result<Self, Failed> {
         let cols = cols.max(1);
         let rows = rows.max(1);
-        let terminal = Terminal::new(cols, rows)?;
-        terminal.set_scrollback_lines(SCROLLBACK_ASKED)?;
-        terminal.set_scrollback_unbounded_bytes()?;
+        let mut terminal = Terminal::new(cols, rows)?;
+        terminal.default_cursor_is_a_blinking_bar()?;
+        // Never less than what a client reading the screen as text is promised (`SCROLLBACK_ASKED`)
+        terminal.set_scrollback_lines(history.max(SCROLLBACK_ASKED))?;
+        terminal.set_scrollback_bytes(HISTORY_BYTES)?;
         terminal.set_terminfo_name(TERMINFO_NAME)?;
         terminal.set_mode(GRAPHEME_CLUSTERING, true)?;
         terminal.refuse_images()?;
@@ -416,6 +445,21 @@ impl Screen {
         let found = self.terminal.find(needle)?;
         let publication = self.positioned()?;
         Ok((publication.epoch(), found.into_iter().map(|cells| Self::span_of(publication, cells)).collect()))
+    }
+
+    /// What this session's screens and history hold in memory now.
+    pub fn resident_bytes(&self) -> u64 {
+        self.terminal.resident_bytes().unwrap_or(0)
+    }
+
+    /// A number that moves whenever history becomes worth compressing again (`housekeeping`).
+    pub fn compression_activity(&self) -> u64 {
+        self.terminal.compression_activity().unwrap_or(0)
+    }
+
+    /// Compresses some of the history nobody is looking at. Answers whether there is more to do.
+    pub fn compress_step(&mut self) -> bool {
+        self.terminal.compress_step().unwrap_or(false)
     }
 
     /// Moves whenever a command is reported, so something watching knows to ask for them again.

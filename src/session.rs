@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
+use crate::housekeeping::Housekeeping;
 use crate::output::{Credit, Flow, Outgoing, READ_AHEAD, coalesce};
 use crate::protocol::{ErrorCode, Event, Foreground, ProgressState, Scope, SessionId, Signal, Until, WaitOutcome};
 use crate::screen::{Colors, CommandAt, Facts, HISTORY_LINES, Match, Screen, Snapshot};
@@ -414,6 +415,8 @@ pub struct Sessions {
     events: Sender<Outgoing>,
     /// What output spends, which is the channel's bound
     credit: Arc<Credit>,
+    /// Compresses the history of a session that has gone quiet
+    housekeeping: Housekeeping,
 }
 
 /// What a spawn is asked for: `Request::Spawn`'s own fields, as one value.
@@ -488,7 +491,7 @@ fn grid(cols: u16, rows: u16) -> (u16, u16) {
 
 impl Sessions {
     pub fn new(events: Sender<Outgoing>, credit: Arc<Credit>) -> Self {
-        Self { next: 0, live: HashMap::new(), events, credit }
+        Self { next: 0, live: HashMap::new(), events, credit, housekeeping: Housekeeping::start() }
     }
 
     /// Answers this connection, which a caller holding the lock can do without taking a second one.
@@ -565,6 +568,7 @@ impl Sessions {
         let screen = Arc::new(Mutex::new(screen));
         let flow = Flow::reading();
         let parsing = Arc::clone(&screen);
+        let quiet = self.housekeeping.for_session(&session, &screen);
         let waiters: Arc<Mutex<Vec<Waiter>>> = Arc::new(Mutex::new(Vec::new()));
         let waiting = Arc::clone(&waiters);
         let ending = Arc::clone(&waiters);
@@ -614,6 +618,8 @@ impl Sessions {
                             }
                             Err(_) => (Vec::new(), 0, Vec::new()),
                         };
+                        // Written to, so not quiet: its history is compressed once it has been (`housekeeping`)
+                        quiet.wrote();
                         for effect in effects {
                             let _ = reader_events.send(Outgoing::answer(event_of(&reader_session, effect)));
                         }
