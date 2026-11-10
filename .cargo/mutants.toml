@@ -53,8 +53,8 @@ exclude_re = [
     # process. Excluding the guard wholesale would have taken both with it. The lines are pinned, which
     # `cargo xtask check-exclusions` is what makes safe: a pattern left behind by an edit above matches
     # nothing and fails that check.
-    "session.rs:342:(12|26): replace < with (==|<=) in inside_tree",
-    "session.rs:342:16: replace \\|\\| with && in inside_tree",
+    "session.rs:357:(12|26): replace < with (==|<=) in inside_tree",
+    "session.rs:357:16: replace \\|\\| with && in inside_tree",
 
     # `sendable`'s ASCII arm gives 1 and so does the `_` fallback, so deleting it changes no answer. It is
     # there to say that ASCII is one byte, where `_` says "not a lead byte at all" — removing the arm to kill
