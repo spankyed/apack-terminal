@@ -69,6 +69,15 @@ export class Selection {
     void this.widen(position, (span) => { this.head = span })
   }
 
+  /** Selects exactly these cells, from the first to the last */
+  select(span: Span): void {
+    this.asked += 1
+    this.granularity = 'cell'
+    this.anchor = { start: span.start, end: span.start }
+    this.head = { start: span.end, end: span.end }
+    this.changed()
+  }
+
   clear(): void {
     if (!this.anchor) return
     this.asked += 1

@@ -43,6 +43,8 @@ export interface ViewOptions {
   readonly onLink?: (link: Link, event: MouseEvent) => void
   /** What else on a row can be opened, beyond URLs and what a program declared */
   readonly detectors?: readonly Detector[]
+  /** Whether anything is selected changed, which a host draws its copy control from */
+  readonly onSelectionChange?: (selected: boolean) => void
   /** Text was copied. Left out, it is written to the clipboard the page has */
   readonly onCopy?: (text: string) => void
   /** Whether this is a Mac, where the command key is the app's. Left out, asked of the browser */
@@ -83,6 +85,7 @@ export class TerminalView {
   private focused = false
   private wasFollowing = true
   private disposed = false
+  private wasSelected = false
   private readonly mac: boolean
   private readonly detectors: readonly Detector[]
   private readonly input: Input
@@ -109,7 +112,14 @@ export class TerminalView {
     this.painter.canvas.style.display = 'block'
     this.element.appendChild(this.painter.canvas)
 
-    this.selection = new Selection(source, () => this.columns, () => this.schedule())
+    this.selection = new Selection(source, () => this.columns, () => {
+      const selected = this.selection.span !== null
+      if (selected !== this.wasSelected) {
+        this.wasSelected = selected
+        this.options.onSelectionChange?.(selected)
+      }
+      this.schedule()
+    })
     this.input = new Input(source, {
       mac: this.mac,
       intercept: options.onKey,
@@ -141,6 +151,15 @@ export class TerminalView {
     this.element.addEventListener('pointerleave', this.pointerLeave)
     this.element.addEventListener('contextmenu', this.contextMenu)
     this.thumb.addEventListener('pointerdown', this.thumbDown)
+  }
+
+  /** Selects everything the terminal holds, history included */
+  selectAll(): void {
+    if (!this.frame) return
+    this.selection.select({
+      start: { line: this.store.oldest, column: 0 },
+      end: { line: this.store.firstActive + this.rows - 1, column: Math.max(0, this.columns - 1) },
+    })
   }
 
   /** Gives the view the keyboard */

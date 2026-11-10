@@ -222,3 +222,26 @@ describe('what a page can read of a view', () => {
     expect(view.view.element.dataset.terminalDrawn).toBe('41')
   })
 })
+
+describe('what a host is told about the selection', () => {
+  it('is whether there is one, each time that changes and not otherwise', () => {
+    const told: boolean[] = []
+    const view = mountedView({ onSelectionChange: (selected) => { told.push(selected) } })
+    showing(view)
+    view.point('pointerdown', 1, 0)
+    view.point('pointermove', 4, 0)
+    view.point('pointermove', 6, 0)
+    view.point('pointerup', 6, 0)
+    expect(told).toEqual([true])
+    view.point('pointerdown', 2, 1)
+    view.point('pointerup', 2, 1)
+    expect(told).toEqual([true, false])
+  })
+
+  it('covers everything held, history included, when the person selects all', () => {
+    const view = mountedView()
+    showing(view, { firstActive: 100, scrollback: 40 })
+    view.view.selectAll()
+    expect(view.view.selection.span).toEqual({ start: { line: 60, column: 0 }, end: { line: 103, column: 19 } })
+  })
+})
