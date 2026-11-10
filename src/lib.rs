@@ -13,6 +13,7 @@ pub mod screen;
 pub mod security;
 pub mod session;
 pub mod tree;
+pub mod view;
 
 /// The `libghostty-vt` core `screen` is built on: the terminal handle, the collector its callbacks fill,
 /// and the safe layer over the C ABI that this repository owns rather than takes from a wrapper.
