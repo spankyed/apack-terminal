@@ -15,8 +15,9 @@ use crate::markers::{Marker, Markers};
 use std::sync::mpsc::Sender;
 
 use crate::view::publish::{Publication, ViewId};
-use crate::view::wire::Block;
+use crate::view::wire::{Block, Position, Span};
 use crate::vt::input::{self, Encoders, Key, Pasted, Pointer};
+use crate::vt::reads;
 use crate::vt::rows::{RowRead, Space};
 use crate::vt::{Failed, Reported, Terminal};
 
@@ -340,6 +341,64 @@ impl Screen {
             }
             None => Ok((0, Block::default())),
         }
+    }
+
+    /// The publication brought up to the terminal, which is what turns a line number into a row of it.
+    fn positioned(&mut self) -> Result<&Publication, Failed> {
+        if self.publication.is_none() {
+            self.publication = Some(Publication::new(&self.terminal)?);
+        }
+        match &mut self.publication {
+            Some(publication) => {
+                publication.advance(&self.terminal)?;
+                Ok(publication)
+            }
+            None => Err(Failed { call: "ghostty_terminal_grid_ref_track", code: 0 }),
+        }
+    }
+
+    fn span_of(publication: &Publication, cells: (reads::Cell, reads::Cell)) -> Span {
+        let position = |cell: reads::Cell| Position { line: publication.line_of(cell.1), column: cell.0 };
+        Span { start: position(cells.0), end: position(cells.1) }
+    }
+
+    /// The word at a cell, with the epoch its line numbers are in. `None` where there is no word, or no
+    /// such line any more.
+    pub fn word_at(&mut self, at: Position) -> Result<(u32, Option<Span>), Failed> {
+        let publication = self.positioned()?;
+        let epoch = publication.epoch();
+        let Some(row) = publication.screen_row(at.line) else { return Ok((epoch, None)) };
+        let found = self.terminal.word_at((at.column, row))?;
+        let publication = self.positioned()?;
+        Ok((epoch, found.map(|cells| Self::span_of(publication, cells))))
+    }
+
+    /// The whole line a cell is on, across the rows it wrapped onto.
+    pub fn line_at(&mut self, at: Position) -> Result<(u32, Option<Span>), Failed> {
+        let publication = self.positioned()?;
+        let epoch = publication.epoch();
+        let Some(row) = publication.screen_row(at.line) else { return Ok((epoch, None)) };
+        let found = self.terminal.line_at((at.column, row))?;
+        let publication = self.positioned()?;
+        Ok((epoch, found.map(|cells| Self::span_of(publication, cells))))
+    }
+
+    /// The text of a span as a program wrote it. Empty when either end is a line no longer held.
+    pub fn text_of(&mut self, span: Span) -> Result<String, Failed> {
+        let publication = self.positioned()?;
+        let (Some(first), Some(last)) =
+            (publication.screen_row(span.start.line), publication.screen_row(span.end.line))
+        else {
+            return Ok(String::new());
+        };
+        self.terminal.text_between((span.start.column, first), (span.end.column, last))
+    }
+
+    /// Every place `needle` appears, newest first, with the epoch the line numbers are in.
+    pub fn find(&mut self, needle: &str) -> Result<(u32, Vec<Span>), Failed> {
+        let found = self.terminal.find(needle)?;
+        let publication = self.positioned()?;
+        Ok((publication.epoch(), found.into_iter().map(|cells| Self::span_of(publication, cells)).collect()))
     }
 
     /// The epoch line numbers are in and the line the screen's first row is, as of now.

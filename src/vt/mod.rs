@@ -11,6 +11,7 @@
 use ghostty_vt_rs_sys as sys;
 
 pub mod input;
+pub mod reads;
 pub mod rows;
 
 use crate::markers::cwd_from_url;
