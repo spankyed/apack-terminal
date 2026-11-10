@@ -84,6 +84,8 @@ pub struct Publication {
     mouse: bool,
     /// The shell's command generation when the screen was last read
     commands: u32,
+    /// The image storage's generation when the screen was last read, as much of it as a view compares
+    images: u32,
     /// Bytes have been fed since the terminal was last looked at
     stale: bool,
     /// When the program was first seen holding the screen
@@ -110,6 +112,7 @@ impl Publication {
             cursor: None,
             mouse: false,
             commands: 0,
+            images: 0,
             stale: true,
             held_since: None,
             viewers: Vec::new(),
@@ -203,10 +206,12 @@ impl Publication {
             blinking: read.blinking,
         });
         let mouse = terminal.mouse_tracking()?;
-        if cursor != self.cursor || mouse != self.mouse || commands != self.commands {
+        // Compared and never ordered, so the low half is all of it a view needs
+        let images = terminal.images_generation() as u32;
+        if cursor != self.cursor || mouse != self.mouse || commands != self.commands || images != self.images {
             changed = true;
         }
-        (self.cursor, self.mouse, self.commands) = (cursor, mouse, commands);
+        (self.cursor, self.mouse, self.commands, self.images) = (cursor, mouse, commands, images);
         if changed {
             self.sequence = next;
         }
@@ -284,6 +289,7 @@ impl Publication {
             screen_rows: self.rows,
             scrollback: self.scrollback,
             commands: self.commands,
+            images: self.images,
             cursor: self.cursor,
             alternate_screen: self.alternate,
             mouse: self.mouse,

@@ -10,7 +10,8 @@
 //! line of it is a change a view has to be taught.
 
 use apack_terminal::view::wire::{
-    Block, Color, CommandRow, Cursor, Frame, Glyph, NO_BUTTON, Position, Row, Span, Style, ToBroker, ToView, body,
+    Block, Color, CommandRow, Cursor, Frame, Glyph, NO_BUTTON, Placement, Position, Row, Span, Style, ToBroker, ToView,
+    body,
 };
 use serde_json::{Value, json};
 
@@ -77,7 +78,7 @@ fn to_view(message: &ToView) -> Value {
             json!({
                 "kind": "frame", "channel": frame.channel, "sequence": frame.sequence, "epoch": frame.epoch,
                 "firstActive": frame.first_active, "columns": frame.columns, "screenRows": frame.screen_rows,
-                "scrollback": frame.scrollback, "commands": frame.commands, "cursor": cursor,
+                "scrollback": frame.scrollback, "commands": frame.commands, "images": frame.images, "cursor": cursor,
                 "alternateScreen": frame.alternate_screen,
                 "mouse": frame.mouse, "staleFrom": frame.stale_from, "styles": styles, "links": links, "rows": rows,
             })
@@ -115,6 +116,30 @@ fn to_view(message: &ToView) -> Value {
                 })
                 .collect();
             json!({ "kind": "commands", "channel": channel, "request": request, "epoch": epoch, "commands": commands })
+        }
+        ToView::Images { channel, request, epoch, cell_width, cell_height, placements } => {
+            let placements: Vec<Value> = placements
+                .iter()
+                .map(|one| {
+                    json!({
+                        "image": one.image, "generation": one.generation, "z": one.z, "line": one.line,
+                        "column": one.column, "columns": one.columns, "rows": one.rows, "offsetX": one.offset_x,
+                        "offsetY": one.offset_y, "width": one.width, "height": one.height, "sourceX": one.source_x, "sourceY": one.source_y,
+                        "sourceWidth": one.source_width, "sourceHeight": one.source_height,
+                    })
+                })
+                .collect();
+            json!({
+                "kind": "images", "channel": channel, "request": request, "epoch": epoch, "cellWidth": cell_width,
+                "cellHeight": cell_height, "placements": placements,
+            })
+        }
+        ToView::Image { channel, request, image, generation, width, height, channels, total, offset, bytes } => {
+            json!({
+                "kind": "image", "channel": channel, "request": request, "image": image, "generation": generation,
+                "width": width, "height": height, "channels": channels, "total": total, "offset": offset,
+                "bytes": bytes,
+            })
         }
     }
 }
@@ -158,6 +183,12 @@ fn to_broker(message: &ToBroker) -> Value {
         }
         ToBroker::Commands { channel, request } => {
             json!({ "kind": "commands", "channel": channel, "request": request })
+        }
+        ToBroker::Images { channel, request } => {
+            json!({ "kind": "images", "channel": channel, "request": request })
+        }
+        ToBroker::Image { channel, request, image, offset } => {
+            json!({ "kind": "image", "channel": channel, "request": request, "image": image, "offset": offset })
         }
     }
 }
@@ -227,6 +258,7 @@ fn vectors() -> Value {
             screen_rows: 24,
             scrollback: 1_000,
             commands: 7,
+            images: 4,
             cursor,
             alternate_screen: stale_from.is_some(),
             mouse: cursor.is_none(),
@@ -290,6 +322,63 @@ fn vectors() -> Value {
                     },
                     CommandRow { id: 300, prompt: Some(95), ..CommandRow::default() },
                 ],
+            },
+        ),
+        (
+            "images: one under the text and cut from a larger picture, one over it and placed whole",
+            ToView::Images {
+                channel: 3,
+                request: 18,
+                epoch: 2,
+                cell_width: 9,
+                cell_height: 18,
+                placements: vec![
+                    Placement {
+                        image: 7,
+                        generation: 5_000_000_000,
+                        z: -1,
+                        line: 990,
+                        column: 4,
+                        columns: 20,
+                        rows: 6,
+                        offset_x: 3,
+                        offset_y: 5,
+                        width: 177,
+                        height: 103,
+                        source_x: 10,
+                        source_y: 20,
+                        source_width: 180,
+                        source_height: 108,
+                    },
+                    Placement {
+                        image: 300,
+                        generation: 1,
+                        z: 2,
+                        line: 1_010,
+                        columns: 1,
+                        rows: 1,
+                        ..Placement::default()
+                    },
+                ],
+            },
+        ),
+        (
+            "no images",
+            ToView::Images { channel: 3, request: 19, epoch: 2, cell_width: 0, cell_height: 0, placements: Vec::new() },
+        ),
+        (
+            "an image's pixels: the second part of a two by two picture in red, green, blue and alpha",
+            ToView::Image {
+                channel: 3,
+                request: 20,
+                image: 7,
+                generation: 5_000_000_000,
+                width: 2,
+                height: 2,
+                channels: 4,
+                total: 16,
+                offset: 8,
+                bytes: vec![0, 0, 255, 255, 255, 255, 255, 128],
             },
         ),
     ];
@@ -383,6 +472,8 @@ fn vectors() -> Value {
         ("asking for text", ToBroker::TextOf { channel: 3, request: 12, epoch: 2, span: across }),
         ("searching", ToBroker::Search { channel: 3, request: 13, needle: "error:".to_owned() }),
         ("asking for the commands", ToBroker::Commands { channel: 3, request: 17 }),
+        ("asking where the images are", ToBroker::Images { channel: 3, request: 18 }),
+        ("asking for an image's pixels", ToBroker::Image { channel: 3, request: 20, image: 7, offset: 8 }),
     ];
 
     let mut all: Vec<Value> = Vec::new();
@@ -433,6 +524,8 @@ fn every_kind_of_message_has_a_vector() {
         "broker:detach",
         "broker:fetch",
         "broker:focus",
+        "broker:image",
+        "broker:images",
         "broker:key",
         "broker:lineAt",
         "broker:paste",
@@ -445,6 +538,8 @@ fn every_kind_of_message_has_a_vector() {
         "view:ended",
         "view:failed",
         "view:frame",
+        "view:image",
+        "view:images",
         "view:pasted",
         "view:rows",
         "view:span",

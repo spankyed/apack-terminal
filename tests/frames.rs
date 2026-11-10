@@ -83,28 +83,31 @@ fn requests() -> impl Strategy<Value = Request> {
                 proptest::option::of(any::<[u8; 3]>()),
                 proptest::collection::vec(any::<[u8; 3]>(), 0..17),
             )),
-            (any::<bool>(), proptest::option::of("[^\u{0}]{0,20}"), any::<bool>()),
+            (any::<bool>(), proptest::option::of("[^\u{0}]{0,20}"), any::<bool>(), any::<bool>()),
         )
-            .prop_map(|(cols, rows, shell, args, env, unset, cwd, colors, (output, record, restore))| {
-                Request::Spawn {
-                    cols,
-                    rows,
-                    shell,
-                    args,
-                    env,
-                    unset,
-                    cwd,
-                    colors: colors.map(|(foreground, background, cursor, ansi)| Colors {
-                        foreground,
-                        background,
-                        cursor,
-                        ansi,
-                    }),
-                    output,
-                    record,
-                    restore,
+            .prop_map(
+                |(cols, rows, shell, args, env, unset, cwd, colors, (output, record, restore, images))| {
+                    Request::Spawn {
+                        cols,
+                        rows,
+                        shell,
+                        args,
+                        env,
+                        unset,
+                        cwd,
+                        colors: colors.map(|(foreground, background, cursor, ansi)| Colors {
+                            foreground,
+                            background,
+                            cursor,
+                            ansi,
+                        }),
+                        output,
+                        record,
+                        restore,
+                        images,
+                    }
                 }
-            }),
+            ),
         ("[^\u{0}]{0,40}", any::<bool>()).prop_map(|(session, kept)| Request::Keep { session, kept }),
         Just(Request::Sessions),
         ("[^\u{0}]{0,40}", any::<u16>(), any::<u16>()).prop_map(|(recording, cols, rows)| Request::Rewind {

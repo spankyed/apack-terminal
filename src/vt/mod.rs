@@ -12,6 +12,7 @@ use std::time::SystemTime;
 
 use ghostty_vt_rs_sys as sys;
 
+pub mod images;
 pub mod input;
 pub mod reads;
 pub mod rows;

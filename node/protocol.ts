@@ -136,7 +136,13 @@ record: string | null,
  * Whether to begin with the screen `record` already holds, as a terminal reopened where its last
  * session left off. The recording carries on in the same file.
  */
-restore: boolean, } | { "kind": "write", session: string, text: string, } | { "kind": "resize", session: string, cols: number, rows: number, cell_width: number, cell_height: number, } | { "kind": "pause", session: string, } | { "kind": "resume", session: string, } | { "kind": "signal", session: string, signal: Signal, scope: Scope, } | { "kind": "owns", session: string, pid: number, } | { "kind": "screen", session: string, history: number, } | { "kind": "facts", session: string, } | { "kind": "search", session: string, text: string, history: number, } | { "kind": "wait", session: string, until: Until, timeout_ms: number, } | { "kind": "commands", session: string, } | { "kind": "command_output", session: string, command: number, } | { "kind": "keep", session: string, kept: boolean, } | { "kind": "sessions" } | { "kind": "rewind", recording: string, cols: number, rows: number, } | { "kind": "seek", session: string, at: number, } | { "kind": "kill", session: string, };
+restore: boolean, 
+/**
+ * **Whether the session's programs may send images** (the Kitty graphics protocol). A program
+ * asks the terminal whether it can before it sends one, so this is yes only for a session whose
+ * views draw them; absent, a program is told no and prints what it would have otherwise.
+ */
+images: boolean, } | { "kind": "write", session: string, text: string, } | { "kind": "resize", session: string, cols: number, rows: number, cell_width: number, cell_height: number, } | { "kind": "pause", session: string, } | { "kind": "resume", session: string, } | { "kind": "signal", session: string, signal: Signal, scope: Scope, } | { "kind": "owns", session: string, pid: number, } | { "kind": "screen", session: string, history: number, } | { "kind": "facts", session: string, } | { "kind": "search", session: string, text: string, history: number, } | { "kind": "wait", session: string, until: Until, timeout_ms: number, } | { "kind": "commands", session: string, } | { "kind": "command_output", session: string, command: number, } | { "kind": "keep", session: string, kept: boolean, } | { "kind": "sessions" } | { "kind": "rewind", recording: string, cols: number, rows: number, } | { "kind": "seek", session: string, at: number, } | { "kind": "kill", session: string, };
 
 /**
  * What a connection is for.

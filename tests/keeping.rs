@@ -135,6 +135,7 @@ impl Connection {
             output: false,
             record: record.map(|path| path.to_str().expect("a utf-8 path").to_owned()),
             restore,
+            images: false,
         });
         self.answer(|event| if let Event::Spawned { session, .. } = event { Some(session) } else { None })
     }

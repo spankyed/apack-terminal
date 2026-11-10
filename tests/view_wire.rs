@@ -10,8 +10,8 @@
 //!   with one byte changed, never panic and never allocate from a count the payload could not hold.
 
 use apack_terminal::view::wire::{
-    Block, Color, CommandRow, Cursor, Frame, Glyph, Incoming, MAX_MESSAGE_BYTES, Malformed, Position, Row, Span, Style,
-    ToBroker, ToView, body, read_message,
+    Block, Color, CommandRow, Cursor, Frame, Glyph, Incoming, MAX_MESSAGE_BYTES, Malformed, Placement, Position, Row,
+    Span, Style, ToBroker, ToView, body, read_message,
 };
 use proptest::prelude::*;
 
@@ -103,7 +103,7 @@ fn to_view() -> impl Strategy<Value = ToView> {
     );
     let frame = (
         (any::<u32>(), any::<u64>(), any::<u32>(), any::<u64>()),
-        (any::<u16>(), any::<u16>(), any::<u32>(), any::<u32>()),
+        (any::<u16>(), any::<u16>(), any::<u32>(), any::<u32>(), any::<u32>()),
         (cursor, any::<bool>(), any::<bool>(), prop::option::of(any::<u64>())),
         block(),
     )
@@ -117,6 +117,7 @@ fn to_view() -> impl Strategy<Value = ToView> {
                 screen_rows: grid.1,
                 scrollback: grid.2,
                 commands: grid.3,
+                images: grid.4,
                 cursor: state.0,
                 alternate_screen: state.1,
                 mouse: state.2,
@@ -154,7 +155,55 @@ fn to_view() -> impl Strategy<Value = ToView> {
         }),
         (any::<u32>(), any::<u32>(), any::<u32>(), prop::collection::vec(command(), 0..4))
             .prop_map(|(channel, request, epoch, commands)| ToView::Commands { channel, request, epoch, commands }),
+        (
+            (any::<u32>(), any::<u32>(), any::<u32>()),
+            (any::<u16>(), any::<u16>()),
+            prop::collection::vec(placement(), 0..4)
+        )
+            .prop_map(|((channel, request, epoch), (cell_width, cell_height), placements)| ToView::Images {
+                channel,
+                request,
+                epoch,
+                cell_width,
+                cell_height,
+                placements,
+            }),
+        (
+            (any::<u32>(), any::<u32>(), any::<u32>(), any::<u64>()),
+            (any::<u32>(), any::<u32>(), 1u8..=4, any::<u32>(), any::<u32>()),
+            prop::collection::vec(any::<u8>(), 0..64),
+        )
+            .prop_map(
+                |((channel, request, image, generation), (width, height, channels, total, offset), bytes)| {
+                    ToView::Image { channel, request, image, generation, width, height, channels, total, offset, bytes }
+                }
+            ),
     ]
+}
+
+fn placement() -> impl Strategy<Value = Placement> {
+    (
+        (any::<u32>(), any::<u64>(), any::<i32>(), any::<u64>(), any::<u16>()),
+        (any::<u32>(), any::<u32>(), any::<u32>(), any::<u32>(), any::<u32>(), any::<u32>()),
+        (any::<u32>(), any::<u32>(), any::<u32>(), any::<u32>()),
+    )
+        .prop_map(|(at, grid, source)| Placement {
+            image: at.0,
+            generation: at.1,
+            z: at.2,
+            line: at.3,
+            column: at.4,
+            columns: grid.0,
+            rows: grid.1,
+            offset_x: grid.2,
+            offset_y: grid.3,
+            width: grid.4,
+            height: grid.5,
+            source_x: source.0,
+            source_y: source.1,
+            source_width: source.2,
+            source_height: source.3,
+        })
 }
 
 fn to_broker() -> impl Strategy<Value = ToBroker> {
@@ -203,6 +252,9 @@ fn to_broker() -> impl Strategy<Value = ToBroker> {
             needle
         }),
         (any::<u32>(), any::<u32>()).prop_map(|(channel, request)| ToBroker::Commands { channel, request }),
+        (any::<u32>(), any::<u32>()).prop_map(|(channel, request)| ToBroker::Images { channel, request }),
+        (any::<u32>(), any::<u32>(), any::<u32>(), any::<u32>())
+            .prop_map(|(channel, request, image, offset)| ToBroker::Image { channel, request, image, offset }),
     ]
 }
 

@@ -19,10 +19,11 @@ use crate::protocol::{
     ErrorCode, Event, Foreground, ProgressState, Scope, SessionId, SessionSummary, Signal, Until, WaitOutcome,
 };
 use crate::recording::{self, Entry, Timed};
-use crate::screen::{Colors, CommandAt, Facts, HISTORY_LINES, Match, Screen, Snapshot};
+use crate::screen::{Colors, CommandAt, Facts, HISTORY_LINES, ImagesAt, Match, Screen, Snapshot};
 use crate::tree::Tree;
 use crate::view::publish::ViewId;
 use crate::view::wire::{Block, Position, Span};
+use crate::vt::images::ImageRead;
 use crate::vt::input::{Key, Pasted, Pointer};
 use crate::vt::{Effect, Progress};
 
@@ -453,6 +454,8 @@ pub struct Spawning {
     /// Where to record it, if anywhere, and whether to begin with what is recorded there.
     pub record: Option<String>,
     pub restore: bool,
+    /// Whether its programs may send images (`Request::Spawn`)
+    pub images: bool,
 }
 
 /// A failure a request turns into a `Failed` event rather than a panic.
@@ -526,7 +529,7 @@ impl Sessions {
 
     /// Starts a shell in a new pty and begins reading it. The id is the broker's to mint.
     pub fn spawn(&mut self, asked: Spawning) -> Result<(SessionId, u32), Refusal> {
-        let Spawning { cols, rows, shell, args, env, unset, cwd, colors, output, record, restore } = asked;
+        let Spawning { cols, rows, shell, args, env, unset, cwd, colors, output, record, restore, images } = asked;
         let (cols, rows) = grid(cols, rows);
         let pty = native_pty_system()
             .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
@@ -589,6 +592,9 @@ impl Sessions {
         let mut screen = Screen::new(cols, rows);
         if let Some(colors) = &colors {
             screen.set_colors(colors);
+        }
+        if images {
+            let _ = screen.allow_images();
         }
         // **Before the process is read**, so what it prints lands after what the last session left and
         // is recorded from its first byte. A recording that cannot be opened leaves the session without
@@ -1120,6 +1126,16 @@ impl Sessions {
 
     pub fn find(&self, session: &str, needle: &str) -> Result<(u32, Vec<Span>), Refusal> {
         self.screen(session)?.find(needle).map_err(core)
+    }
+
+    /// Every image in a session, with the epoch their lines are in and one cell in pixels.
+    pub fn images(&self, session: &str) -> Result<ImagesAt, Refusal> {
+        self.screen(session)?.images().map_err(core)
+    }
+
+    /// Part of an image's pixels, or `None` for an image that is not there.
+    pub fn image(&self, session: &str, image: u32, offset: u32) -> Result<Option<ImageRead>, Refusal> {
+        Ok(self.screen(session)?.image(image, offset))
     }
 
     /// The commands the session's shell has reported, with the epoch their lines are in.

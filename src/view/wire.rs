@@ -102,6 +102,8 @@ pub struct Frame {
     pub scrollback: u32,
     /// Moves whenever the shell reports a command, so a view knows to ask for them again
     pub commands: u32,
+    /// Moves whenever an image is sent, placed, replaced or deleted, so a view knows to ask for them again
+    pub images: u32,
     pub cursor: Option<Cursor>,
     pub alternate_screen: bool,
     pub mouse: bool,
@@ -228,6 +230,19 @@ pub enum ToBroker {
         channel: u32,
         request: u32,
     },
+    /// Where every image in this session is.
+    Images {
+        channel: u32,
+        request: u32,
+    },
+    /// One image's pixels, from `offset` on. An image larger than one answer holds is asked for again
+    /// from where the last answer ended.
+    Image {
+        channel: u32,
+        request: u32,
+        image: u32,
+        offset: u32,
+    },
 }
 
 /// What a view is sent.
@@ -275,12 +290,64 @@ pub enum ToView {
         epoch: u32,
         commands: Vec<CommandRow>,
     },
+    /// The answer to `Images`: each image where it is, and one cell in pixels as the terminal was told
+    /// it is — what an image's offset into its first cell is measured in. Zero when no window has said.
+    Images {
+        channel: u32,
+        request: u32,
+        epoch: u32,
+        cell_width: u16,
+        cell_height: u16,
+        placements: Vec<Placement>,
+    },
+    /// The answer to `Image`: part of its pixels, rows top to bottom, `channels` bytes each pixel — `1`
+    /// grey, `2` grey and alpha, `3` red green blue, `4` those and alpha. `total` is the whole image's
+    /// size, and `offset` where these bytes begin in it.
+    Image {
+        channel: u32,
+        request: u32,
+        image: u32,
+        generation: u64,
+        width: u32,
+        height: u32,
+        channels: u8,
+        total: u32,
+        offset: u32,
+        bytes: Vec<u8>,
+    },
     /// A request that could not be answered, and why.
     Failed {
         channel: u32,
         request: u32,
         message: String,
     },
+}
+
+/// One image where a program put it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Placement {
+    pub image: u32,
+    /// Moves when the image's pixels do
+    pub generation: u64,
+    /// Orders images that overlap; below zero is under the text
+    pub z: i32,
+    /// The top-left cell
+    pub line: u64,
+    pub column: u16,
+    /// How many cells it covers
+    pub columns: u32,
+    pub rows: u32,
+    /// How far into its first cell it starts, and how large it is drawn, in pixels of the cell `Images`
+    /// gives
+    pub offset_x: u32,
+    pub offset_y: u32,
+    pub width: u32,
+    pub height: u32,
+    /// The part of the image drawn, in the image's own pixels
+    pub source_x: u32,
+    pub source_y: u32,
+    pub source_width: u32,
+    pub source_height: u32,
 }
 
 /// Why bytes were not a message.
@@ -727,6 +794,8 @@ mod kind {
     pub const TEXT_OF: u8 = 12;
     pub const SEARCH: u8 = 13;
     pub const COMMANDS: u8 = 14;
+    pub const IMAGES: u8 = 15;
+    pub const IMAGE: u8 = 16;
 
     pub const FRAME: u8 = 65;
     pub const ROWS: u8 = 66;
@@ -737,6 +806,8 @@ mod kind {
     pub const SPANS: u8 = 71;
     pub const FAILED: u8 = 72;
     pub const COMMAND_LIST: u8 = 73;
+    pub const IMAGE_LIST: u8 = 74;
+    pub const IMAGE_PIXELS: u8 = 75;
 }
 
 const FRAME_CURSOR: u8 = 1;
@@ -826,6 +897,16 @@ impl ToBroker {
                 out.number(*channel);
                 out.number(*request);
             }),
+            Self::Images { channel, request } => framed(kind::IMAGES, |out| {
+                out.number(*channel);
+                out.number(*request);
+            }),
+            Self::Image { channel, request, image, offset } => framed(kind::IMAGE, |out| {
+                out.number(*channel);
+                out.number(*request);
+                out.number(*image);
+                out.number(*offset);
+            }),
         }
     }
 
@@ -880,6 +961,10 @@ impl ToBroker {
             }
             kind::SEARCH => Self::Search { channel: read.u32()?, request: read.u32()?, needle: read.text()? },
             kind::COMMANDS => Self::Commands { channel: read.u32()?, request: read.u32()? },
+            kind::IMAGES => Self::Images { channel: read.u32()?, request: read.u32()? },
+            kind::IMAGE => {
+                Self::Image { channel: read.u32()?, request: read.u32()?, image: read.u32()?, offset: read.u32()? }
+            }
             other => return Err(Malformed::UnknownKind(other)),
         };
         read.finish(message)
@@ -899,6 +984,7 @@ impl ToView {
                 out.number(frame.screen_rows);
                 out.number(frame.scrollback);
                 out.number(frame.commands);
+                out.number(frame.images);
                 let blinking = frame.cursor.is_some_and(|cursor| cursor.blinking);
                 out.byte(
                     if frame.cursor.is_some() { FRAME_CURSOR } else { 0 }
@@ -966,6 +1052,49 @@ impl ToView {
                     out.command(command);
                 }
             }),
+            Self::Images { channel, request, epoch, cell_width, cell_height, placements } => {
+                framed(kind::IMAGE_LIST, |out| {
+                    out.number(*channel);
+                    out.number(*request);
+                    out.number(*epoch);
+                    out.number(*cell_width);
+                    out.number(*cell_height);
+                    out.number(placements.len() as u64);
+                    for placement in placements {
+                        out.number(placement.image);
+                        out.number(placement.generation);
+                        // Zigzag, so a small depth either side of zero is one byte
+                        out.number(((placement.z << 1) ^ (placement.z >> 31)) as u32);
+                        out.number(placement.line);
+                        out.number(placement.column);
+                        out.number(placement.columns);
+                        out.number(placement.rows);
+                        out.number(placement.offset_x);
+                        out.number(placement.offset_y);
+                        out.number(placement.width);
+                        out.number(placement.height);
+                        out.number(placement.source_x);
+                        out.number(placement.source_y);
+                        out.number(placement.source_width);
+                        out.number(placement.source_height);
+                    }
+                })
+            }
+            Self::Image { channel, request, image, generation, width, height, channels, total, offset, bytes } => {
+                framed(kind::IMAGE_PIXELS, |out| {
+                    out.number(*channel);
+                    out.number(*request);
+                    out.number(*image);
+                    out.number(*generation);
+                    out.number(*width);
+                    out.number(*height);
+                    out.byte(*channels);
+                    out.number(*total);
+                    out.number(*offset);
+                    out.number(bytes.len() as u64);
+                    out.bytes.extend_from_slice(bytes);
+                })
+            }
         }
     }
 
@@ -982,6 +1111,7 @@ impl ToView {
                 let screen_rows = read.u16()?;
                 let scrollback = read.u32()?;
                 let commands = read.u32()?;
+                let images = read.u32()?;
                 let flags = read.byte()?;
                 if flags >= 32 {
                     return Err(Malformed::Value("a frame's flags"));
@@ -1006,6 +1136,7 @@ impl ToView {
                     screen_rows,
                     scrollback,
                     commands,
+                    images,
                     cursor,
                     alternate_screen: flags & FRAME_ALTERNATE != 0,
                     mouse: flags & FRAME_MOUSE != 0,
@@ -1042,6 +1173,47 @@ impl ToView {
                     commands.push(read.command()?);
                 }
                 Self::Commands { channel, request, epoch, commands }
+            }
+            kind::IMAGE_LIST => {
+                let (channel, request, epoch) = (read.u32()?, read.u32()?, read.u32()?);
+                let (cell_width, cell_height) = (read.u16()?, read.u16()?);
+                let count = read.count()?;
+                let mut placements = Vec::new();
+                for _ in 0..count {
+                    let (image, generation) = (read.u32()?, read.number()?);
+                    let zigzag = read.u32()?;
+                    placements.push(Placement {
+                        image,
+                        generation,
+                        z: ((zigzag >> 1) as i32) ^ -((zigzag & 1) as i32),
+                        line: read.number()?,
+                        column: read.u16()?,
+                        columns: read.u32()?,
+                        rows: read.u32()?,
+                        offset_x: read.u32()?,
+                        offset_y: read.u32()?,
+                        width: read.u32()?,
+                        height: read.u32()?,
+                        source_x: read.u32()?,
+                        source_y: read.u32()?,
+                        source_width: read.u32()?,
+                        source_height: read.u32()?,
+                    });
+                }
+                Self::Images { channel, request, epoch, cell_width, cell_height, placements }
+            }
+            kind::IMAGE_PIXELS => {
+                let (channel, request, image) = (read.u32()?, read.u32()?, read.u32()?);
+                let generation = read.number()?;
+                let (width, height) = (read.u32()?, read.u32()?);
+                let channels = read.byte()?;
+                if !(1..=4).contains(&channels) {
+                    return Err(Malformed::Value("an image's channels"));
+                }
+                let (total, offset) = (read.u32()?, read.u32()?);
+                let length = read.count()?;
+                let bytes = read.take(length)?.to_vec();
+                Self::Image { channel, request, image, generation, width, height, channels, total, offset, bytes }
             }
             other => return Err(Malformed::UnknownKind(other)),
         };

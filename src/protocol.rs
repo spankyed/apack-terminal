@@ -98,6 +98,11 @@ pub enum Request {
         /// session left off. The recording carries on in the same file.
         #[serde(default)]
         restore: bool,
+        /// **Whether the session's programs may send images** (the Kitty graphics protocol). A program
+        /// asks the terminal whether it can before it sends one, so this is yes only for a session whose
+        /// views draw them; absent, a program is told no and prints what it would have otherwise.
+        #[serde(default)]
+        images: bool,
     },
     /// Bytes the user typed.
     /// `text`, not `data`: what crosses here is decoded text, which is the contract and not an accident.

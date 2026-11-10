@@ -31,7 +31,7 @@ impl Terminal {
         (found == sys::Result::SUCCESS).then_some(reference)
     }
 
-    fn cell_of(&self, reference: &sys::GridRef) -> Option<Cell> {
+    pub(super) fn cell_of(&self, reference: &sys::GridRef) -> Option<Cell> {
         let mut point = sys::PointCoordinate { x: 0, y: 0 };
         // SAFETY: the reference came from this terminal and nothing has written since
         let result = unsafe {

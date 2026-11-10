@@ -18,6 +18,7 @@ use crate::recording::{self, Entry, Recorder, Timed};
 
 use crate::view::publish::{Publication, ViewId};
 use crate::view::wire::{Block, Position, Span};
+use crate::vt::images::{ImageRead, PlacementRead};
 use crate::vt::input::{self, Encoders, Key, Pasted, Pointer};
 use crate::vt::reads;
 use crate::vt::rows::{RowRead, Space};
@@ -165,6 +166,9 @@ pub struct Screen {
     /// What the program last named its terminal, for a caller that was not there to be told.
     title: Option<String>,
 }
+
+/// The epoch a session's lines are in, one cell in pixels, and each image with the line it is on.
+pub type ImagesAt = (u32, (u16, u16), Vec<(u64, PlacementRead)>);
 
 /// A command the shell reported, with the line each of its moments is on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -651,6 +655,27 @@ impl Screen {
     /// Compresses some of the history nobody is looking at. Answers whether there is more to do.
     pub fn compress_step(&mut self) -> bool {
         self.terminal.compress_step().unwrap_or(false)
+    }
+
+    /// Lets programs in this session send images (`vt::images`). Off unless asked for, so a program
+    /// asking whether it may is not told yes by a session nothing is drawing.
+    pub fn allow_images(&mut self) -> Result<(), Failed> {
+        self.terminal.allow_images()
+    }
+
+    /// Every image in this session with the line it is on, the epoch those lines are in, and one cell
+    /// in pixels as a window last measured it.
+    pub fn images(&mut self) -> Result<ImagesAt, Failed> {
+        let placements = self.terminal.placements()?;
+        let cell = self.cell;
+        let publication = self.positioned()?;
+        let placed = placements.into_iter().map(|placement| (publication.line_of(placement.row), placement)).collect();
+        Ok((publication.epoch(), cell, placed))
+    }
+
+    /// Part of an image's pixels, or `None` for an image that is not there.
+    pub fn image(&self, id: u32, offset: u32) -> Option<ImageRead> {
+        self.terminal.image(id, offset as usize)
     }
 
     /// Moves whenever a command is reported, so something watching knows to ask for them again.

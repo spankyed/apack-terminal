@@ -25,7 +25,7 @@ use apack_terminal::protocol::{CommandRecord, ErrorCode, Event, PROTOCOL_VERSION
 use apack_terminal::screen::{Colors, HISTORY_LINES};
 use apack_terminal::session::{Refusal, Sessions, Spawning};
 use apack_terminal::view::publish::ViewId;
-use apack_terminal::view::wire::{CommandRow, Incoming, ToBroker, ToView, read_message};
+use apack_terminal::view::wire::{CommandRow, Incoming, Placement, ToBroker, ToView, read_message};
 use apack_terminal::vt::input::{Key, Pointer};
 
 fn main() -> std::io::Result<()> {
@@ -461,6 +461,50 @@ fn carry_out_view(
                 Err(refusal) => failed(channel, request, refusal),
             }
         }
+        ToBroker::Images { channel, request } => match session_of(channel).and_then(|session| live.images(&session)) {
+            Ok((epoch, (cell_width, cell_height), placed)) => {
+                let placements = placed
+                    .into_iter()
+                    .map(|(line, one)| Placement {
+                        image: one.image,
+                        generation: one.generation,
+                        z: one.z,
+                        line,
+                        column: one.column,
+                        columns: one.columns,
+                        rows: one.rows,
+                        offset_x: one.offset.0,
+                        offset_y: one.offset.1,
+                        width: one.size.0,
+                        height: one.size.1,
+                        source_x: one.source.0,
+                        source_y: one.source.1,
+                        source_width: one.source.2,
+                        source_height: one.source.3,
+                    })
+                    .collect();
+                answer(ToView::Images { channel, request, epoch, cell_width, cell_height, placements });
+            }
+            Err(refusal) => failed(channel, request, refusal),
+        },
+        ToBroker::Image { channel, request, image, offset } => {
+            match session_of(channel).and_then(|session| live.image(&session, image, offset)) {
+                Ok(Some(read)) => answer(ToView::Image {
+                    channel,
+                    request,
+                    image,
+                    generation: read.generation,
+                    width: read.width,
+                    height: read.height,
+                    channels: read.channels,
+                    total: read.total,
+                    offset,
+                    bytes: read.bytes,
+                }),
+                Ok(None) => answer(ToView::Failed { channel, request, message: format!("no image {image}") }),
+                Err(refusal) => failed(channel, request, refusal),
+            }
+        }
     }
 }
 
@@ -486,14 +530,27 @@ fn carry_out(sessions: &Arc<Mutex<Sessions>>, request: Request) {
     };
     let outcome = match request {
         Request::Hello { .. } => return,
-        Request::Spawn { cols, rows, shell, args, env, unset, cwd, colors, output, record, restore } => {
+        Request::Spawn { cols, rows, shell, args, env, unset, cwd, colors, output, record, restore, images } => {
             let colors = colors.map(|colors| Colors {
                 foreground: colors.foreground,
                 background: colors.background,
                 cursor: colors.cursor,
                 ansi: colors.ansi,
             });
-            match live.spawn(Spawning { cols, rows, shell, args, env, unset, cwd, colors, output, record, restore }) {
+            match live.spawn(Spawning {
+                cols,
+                rows,
+                shell,
+                args,
+                env,
+                unset,
+                cwd,
+                colors,
+                output,
+                record,
+                restore,
+                images,
+            }) {
                 Ok((session, pid)) => {
                     live.answer(Event::Spawned { session, pid });
                     Ok(())

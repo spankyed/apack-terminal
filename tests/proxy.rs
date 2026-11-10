@@ -84,6 +84,7 @@ impl Proxy {
             output: true,
             record: None,
             restore: false,
+            images: false,
         });
         loop {
             if let Event::Spawned { session, .. } = self.event() {

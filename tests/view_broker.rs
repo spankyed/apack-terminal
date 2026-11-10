@@ -115,6 +115,7 @@ impl Client {
                 output: false,
                 record: None,
                 restore: false,
+                images: false,
             },
         );
         loop {
