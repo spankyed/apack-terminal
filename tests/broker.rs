@@ -716,12 +716,34 @@ fn an_alternate_screen_app_survives_a_resize_and_keeps_answering() {
     assert!(!redrew.is_empty(), "nothing was drawn after the resize");
     assert!(alive(shell), "the shell did not survive a resize under an alternate-screen app");
 
-    // And it is still taking input: `q` leaves less, which ends the shell's foreground job
-    ask(&mut writing, &format!(r#"{{"kind":"write","session":"{session}","text":"q"}}"#));
-    let left = output_until(&mut reading, None, |seen| seen.contains("[?1049l") || seen.contains("[?47l"));
+    // And it is still taking input: `q` leaves less, which ends the shell's foreground job.
+    //
+    // **Typed until it is read as a command.** Three resizes are three redraws, and a key that reaches
+    // `less` while it is drawing is spent on stopping the drawing — it prints `...skipping...` and waits
+    // for the next. Which redraw a key lands in is the machine's to decide, so the key is typed again
+    // each time `less` has gone quiet without leaving
+    const TYPED: usize = 20;
+    let leaving = |seen: &str| seen.contains("[?1049l") || seen.contains("[?47l");
+    let mut left = String::new();
+    for _ in 0..TYPED {
+        ask(&mut writing, &format!(r#"{{"kind":"write","session":"{session}","text":"q"}}"#));
+        while let Ok(line) = reading.line(std::time::Duration::from_millis(500)) {
+            let event: serde_json::Value = serde_json::from_str(&line).expect("an event");
+            if event["kind"] == "output" {
+                left.push_str(event["text"].as_str().unwrap_or_default());
+            }
+            if leaving(&left) {
+                break;
+            }
+        }
+        if leaving(&left) {
+            break;
+        }
+    }
     assert!(
-        left.contains("[?1049l") || left.contains("[?47l"),
-        "less never left the alternate screen, so it had stopped reading input: {left:?}"
+        leaving(&left),
+        "less never left the alternate screen after `q` was typed {TYPED} times, so it had stopped reading \
+         input: {left:?}"
     );
 }
 
