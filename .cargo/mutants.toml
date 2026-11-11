@@ -12,6 +12,12 @@ exclude_globs = [
 # Each test in its own process under `.config/nextest.toml`'s deadlines, so a mutant that makes the broker
 # stop answering is caught at one rather than hanging the run
 test_tool = "nextest"
+# **A mutant is caught by the first case that fails, so the run ends there.** Left to itself the runner
+# stops starting cases and waits for the ones already running, which is the suite's longest case for
+# nearly every mutant: a run of 1,505 spent 21 s testing each mutant it caught and 23 s each one it
+# missed. A flag rather than a profile, since a second profile would carry none of the first's overrides
+# (`.config/nextest.toml`)
+additional_cargo_test_args = ["--max-fail=1:immediate"]
 # Under the machine's other load a suite can run several times its baseline
 timeout_multiplier = 3.0
 # Inside target/, which is gitignored and which cargo-mutants doesn't copy

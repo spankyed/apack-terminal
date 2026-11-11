@@ -4,7 +4,6 @@
 //! proven here is the part that needs one: that a connection greeting as a view is served, that its keys
 //! reach a program and the program's output comes back as rows, and that a view coming, going or
 //! misbehaving costs the session nothing.
-#![cfg(unix)]
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -28,10 +27,13 @@ struct Broker {
     process: Child,
     socket: std::path::PathBuf,
     _directory: tempfile::TempDir,
+    /// What stops the broker if this case is ended before it can (`tests/reaper.rs`)
+    reaper: crate::reaper::Reaper,
 }
 
 impl Drop for Broker {
     fn drop(&mut self) {
+        self.reaper.stand_down();
         let _ = self.process.kill();
         let _ = self.process.wait();
     }
@@ -54,7 +56,8 @@ fn start() -> Broker {
     let mut ready = String::new();
     BufReader::new(process.stdout.as_mut().expect("piped stdout")).read_line(&mut ready).expect("a ready line");
     assert!(ready.starts_with("listening "), "{ready:?}");
-    Broker { process, socket, _directory: directory }
+    let reaper = crate::reaper::watching(&process, env!("CARGO_BIN_EXE_apack-terminal"));
+    Broker { process, socket, _directory: directory, reaper }
 }
 
 fn connect(broker: &Broker) -> Arc<Stream> {

@@ -18,7 +18,6 @@
 //! and a named pipe's buffering is not a Unix socket's. The coalescing and the credit are the broker's own
 //! code and platform-independent; how much output it takes to fill the pipe is not. The transport itself is
 //! covered on Windows by `tests/broker.rs`, which passes there in full.
-#![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
@@ -30,10 +29,13 @@ struct Broker {
     process: Child,
     socket: std::path::PathBuf,
     _directory: tempfile::TempDir,
+    /// What stops the broker if this case is ended before it can (`tests/reaper.rs`)
+    reaper: crate::reaper::Reaper,
 }
 
 impl Drop for Broker {
     fn drop(&mut self) {
+        self.reaper.stand_down();
         let _ = self.process.kill();
         let _ = self.process.wait();
     }
@@ -49,7 +51,8 @@ fn start() -> Broker {
         .expect("the broker starts");
     let mut ready = String::new();
     BufReader::new(process.stdout.as_mut().expect("piped stdout")).read_line(&mut ready).expect("a ready line");
-    Broker { process, socket, _directory: directory }
+    let reaper = crate::reaper::watching(&process, env!("CARGO_BIN_EXE_apack-terminal"));
+    Broker { process, socket, _directory: directory, reaper }
 }
 
 #[derive(Clone)]

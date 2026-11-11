@@ -22,7 +22,7 @@ use std::time::Duration;
 use interprocess::local_socket::{GenericFilePath, Stream, ToFsName, prelude::*};
 
 use apack_terminal::frames::{Frame, read_frame};
-use apack_terminal::listening::{self, HELD_EXIT, Refused, START_GRACE};
+use apack_terminal::listening::{self, HELD_EXIT, Refused, START_GRACE_ENV};
 use apack_terminal::output::{Outgoing, channel_with_credit};
 use apack_terminal::protocol::{CommandRecord, ErrorCode, Event, PROTOCOL_VERSION, Request, Role, SearchMatch};
 use apack_terminal::recording;
@@ -115,7 +115,7 @@ fn main() -> std::io::Result<()> {
     std::thread::spawn({
         let (broker, socket) = (broker.clone(), socket.clone());
         move || {
-            std::thread::sleep(START_GRACE);
+            std::thread::sleep(listening::start_grace(std::env::var(START_GRACE_ENV).ok().as_deref()));
             if broker.accepted.load(Ordering::SeqCst) != 0 {
                 return;
             }

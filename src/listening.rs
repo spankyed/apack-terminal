@@ -34,6 +34,20 @@ pub const HELD_EXIT: i32 = 3;
 /// says it is listening, which is far inside this however slowly either runs.
 pub const START_GRACE: Duration = Duration::from_secs(10);
 
+/// The variable a broker is told a grace other than `START_GRACE` by, in milliseconds.
+///
+/// **For a case whose subject is the wait.** That a broker nothing connects to leaves when the grace is
+/// over, and not before, is the same claim at three hundred milliseconds as at ten seconds; a suite
+/// that waited out the real one twice was two thirds of its own length, and every mutant a run of it
+/// tests pays that again. Nothing that starts a broker for use sets it.
+pub const START_GRACE_ENV: &str = "APACK_TERMINAL_START_GRACE_MS";
+
+/// The grace a broker was started with: what `START_GRACE_ENV` holds when it is a number of
+/// milliseconds, and `START_GRACE` when it is unset or anything else.
+pub fn start_grace(asked: Option<&str>) -> Duration {
+    asked.and_then(|asked| asked.parse().ok()).map_or(START_GRACE, Duration::from_millis)
+}
+
 /// Where a broker is when nobody says where: `$XDG_RUNTIME_DIR/apack-terminal/broker.sock` on a system
 /// that gives each user a runtime directory, and `~/.apack-terminal/broker.sock` otherwise. `None` with
 /// neither that nor a home directory.

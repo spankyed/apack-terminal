@@ -8,6 +8,12 @@ resolver = "3"
 name = "apack-terminal"
 version = "0.1.0"
 edition = "2024"
+# One test program, whose modules are the files under `tests/` (`tests/suite.rs` on why)
+autotests = false
+
+[[test]]
+name = "suite"
+path = "tests/suite.rs"
 
 [dependencies]
 interprocess = "2.4.7"

@@ -55,7 +55,8 @@ after the app is gone.
 A broker nobody is connected to exits. The count is taken from the accept rather than from the handshake,
 which is what makes zero a safe moment: a caller that has connected and not yet greeted is already counted,
 so it cannot be hung up on by a broker deciding nobody wants it. A broker nothing *ever* connects to has no
-connection closing to tell it so, and exits ten seconds after it began listening — by connecting to
+connection closing to tell it so, and exits ten seconds after it began listening (`START_GRACE`; a case
+about the wait gives it a shorter one through `APACK_TERMINAL_START_GRACE_MS`) — by connecting to
 itself and hanging up, so the decision is taken where every other is, or outright when its own socket
 cannot be reached, since then nothing else can reach it either.
 

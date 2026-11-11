@@ -31,18 +31,30 @@ on:
         required: true
 
 concurrency:
-  # One per pull request, or per push; a dispatch is deliberate and cancels nothing
+  # One per pull request, or per push. **A pass that has started finishes**: a push to a pull request
+  # waits for the one running and replaces only one that was still waiting. Cancelling on every push
+  # meant a branch pushed to more often than a pass takes was never mutated at all
   group: mutants-${{ github.event.pull_request.number || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  linux:
-    name: mutants in the change (Linux)
+  # **The change's mutants, dealt out across runners.** A mutant is a build and a run of the suite, and
+  # they are independent of each other, so the time a pass takes is the number of mutants over the number
+  # of runners. Dealt round-robin rather than in runs: consecutive mutants are in one file, and a file
+  # whose mutants are slow would otherwise all land on one runner. A change with fewer mutants than
+  # shards leaves some with none, which pass having had nothing to do.
+  shard:
+    name: mutants in the change (Linux, shard ${{ matrix.shard }} of 8)
     if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-24.04
+    strategy:
+      # Every shard's survivors are wanted, not the first shard's
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
       # Deep, because the base a change is measured against is the merge base or a pushed-over commit
       - uses: actions/checkout@v4
@@ -67,16 +79,32 @@ jobs:
       # Exit 3 is a timeout, which is the suite's deadline catching a mutant rather than a survivor — the
       # credit-accounting mutants in `output.rs` hang the writer by design. It is also what a run with a
       # timeout *and* a survivor exits with, so the survivors are read from the list rather than the code.
+      # Two at a time: a runner has four cores, and the suite under one mutant uses more than one
       - if: steps.scope.outputs.code == 'true'
+        env:
+          SHARD: ${{ matrix.shard }}
         run: |
-          cargo mutants --in-diff change.diff || [ $? = 3 ]
+          cargo mutants --in-diff change.diff --shard "$SHARD/8" --sharding round-robin --jobs 2 || [ $? = 3 ]
           if [ -s target/mutants.out/missed.txt ]; then cat target/mutants.out/missed.txt; exit 1; fi
       - uses: actions/upload-artifact@v4
         if: always() && steps.scope.outputs.code == 'true'
         with:
-          name: mutants-in-diff-linux
+          name: mutants-in-diff-linux-${{ matrix.shard }}
           path: target/mutants.out
           if-no-files-found: ignore
+
+  # One name for the eight, so whatever requires this check requires all of them
+  linux:
+    name: mutants in the change (Linux)
+    if: always() && github.event_name != 'workflow_dispatch'
+    needs: shard
+    runs-on: ubuntu-24.04
+    steps:
+      - env:
+          SHARDS: ${{ needs.shard.result }}
+        run: |
+          echo "The shards: $SHARDS"
+          [ "$SHARDS" = success ]
 
   windows:
     name: mutants in the change (Windows-only code)
