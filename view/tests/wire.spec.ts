@@ -1,11 +1,12 @@
 // The view protocol's bytes, read against what the broker's own encoder wrote.
 //
-// `vectors/view-vectors.json` is written by `apack-terminal` (`tests/view_vectors.rs`): each kind of message
-// as the bytes its Rust encoder produces and as the value they mean. This is the only place the two halves
-// of the protocol meet, so every vector is used: one for a view is decoded and compared, one for the broker
-// is encoded and compared.
+// `node/view-vectors.json` is written by the broker's suite (`tests/view_vectors.rs`): each kind of message
+// as the bytes its Rust encoder produces and as the value they mean. It is read where it is written, so
+// there is one file and no copy to fall behind. This is the only place the two halves of the protocol
+// meet, so every vector is used: one for a view is decoded and compared, one for the broker is encoded
+// and compared.
 import { describe, expect, it } from 'vitest'
-import recorded from './vectors/view-vectors.json'
+import recorded from '../../node/view-vectors.json'
 import { decodeToBroker, encodeToView } from './_broker.ts'
 import { MAX_MESSAGE_BYTES, Malformed, Messages, decodeToView, encodeToBroker, type ToBroker, type ToView } from '../src/broker/wire.ts'
 import { TooLarge, paletteIndex, type Color, type Rows } from '../src/source.ts'

@@ -72,11 +72,12 @@ npm run build
 
 ## The protocol's two halves
 
-`src/broker/wire.ts` is the view's half of `apack-terminal`'s view protocol; the other half is in Rust, in
-that repository. Neither suite can see both, so they are held together by
-`tests/vectors/view-vectors.json`, which the broker writes from its encoder: `tests/wire.spec.ts` decodes
-every vector for a view and encodes every one for the broker. When the broker's protocol changes, its
-re-recorded file is copied here, and this suite fails until the codec reads it.
+`src/broker/wire.ts` is the view's half of the broker's view protocol; the other half is in Rust, at this
+repository's root (`src/view/wire.rs`). Neither suite can run both, so they are held together by
+`node/view-vectors.json`, which the broker's suite writes from its encoder: `tests/wire.spec.ts` reads that
+file where it lies, decodes every vector for a view and encodes every one for the broker. When the
+protocol changes, the re-recorded file fails this suite until the codec reads it — in the same commit,
+since both halves are in it.
 
 Began as a clone of [coder/ghostty-web](https://github.com/coder/ghostty-web) (MIT), whose input handling it
 draws on.

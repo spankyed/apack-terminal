@@ -1,10 +1,10 @@
 /**
  * What a view and a broker say to each other, as bytes.
  *
- * This is the view's half of `apack-terminal`'s view protocol (`src/view/wire.rs` there): it decodes what
- * a view is sent and encodes what a view sends, and nothing else. The other half is in Rust, in another
- * repository, so neither suite can see both — what holds them together is `tests/vectors/view-vectors.json`,
- * which the broker writes from its encoder and this reads.
+ * This is the view's half of the broker's view protocol (`src/view/wire.rs`, at this repository's root):
+ * it decodes what a view is sent and encodes what a view sends, and nothing else. The other half is in
+ * Rust, so neither suite can run both — what holds them together is `node/view-vectors.json`, which the
+ * broker's suite writes from its encoder and this package's suite reads where it lies.
  *
  * **A message is a length, a kind and a payload**: a `u32` little-endian count of what follows, one byte
  * saying which message, and that message's fields in order. Integers are LEB128; a string is its length

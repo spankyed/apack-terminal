@@ -20,7 +20,8 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/spankyed/apack-terminal-view.git"
+    "url": "git+https://github.com/spankyed/apack-terminal.git",
+    "directory": "view"
   },
   "engines": {
     "node": ">=24.12.0"
