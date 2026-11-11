@@ -60,6 +60,7 @@ cargo fmt --all --check                      # the layout rustfmt.toml pins, whi
 cargo xtask generate                         # re-derive node/protocol.ts from src/protocol.rs
 cargo xtask check-generated                  # fails when that file has fallen behind
 cargo xtask check-exclusions                 # fails when a mutants exclusion excludes nothing
+cargo xtask clear-mutants                    # removes the working copies a mutants run that was ended left behind
 cargo xtask package                          # release build, staged into the npm package in node/
 npm --prefix view test                       # the view's suite (also: run typecheck, run build)
 ```

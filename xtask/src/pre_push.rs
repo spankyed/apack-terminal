@@ -118,6 +118,11 @@ fn mutants_of_the_change(root: &Path, base: &str) -> Result<(), String> {
     // `output.rs` hang the writer every time, by design. Treating any non-zero exit as failure made this
     // refuse a change whose every mutant was accounted for (15 caught, 3 timed out, none missed), which is
     // how it was found. `.github/workflows/mutants.yml` tolerates the same code for the same reason.
+    // What a pass that was ended left in the system's temporary directory, which nothing else removes
+    let cleared = crate::leftovers::clear_in(root, &std::env::temp_dir())?;
+    if cleared > 0 {
+        println!("pre-push: removed {cleared} working copies an earlier mutants run left behind");
+    }
     let started = Instant::now();
     println!("pre-push: mutants of the change");
     let status = Command::new("cargo")

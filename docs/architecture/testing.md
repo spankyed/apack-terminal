@@ -8,6 +8,7 @@ cargo fmt --all --check
 cargo xtask generate                           # regenerates node/protocol.ts; commit it if it moved
 cargo xtask check-generated                    # fails when it has fallen behind
 cargo xtask check-exclusions                   # fails when a mutants exclusion excludes nothing
+cargo xtask clear-mutants                      # removes the working copies a mutants run that was ended left behind
 ```
 
 ## What each suite is for
