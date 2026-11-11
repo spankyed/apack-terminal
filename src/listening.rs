@@ -83,6 +83,7 @@ impl From<io::Error> for Refused {
 }
 
 /// Where the lock for a socket is: beside it, under its name.
+#[cfg(unix)]
 fn lock_file(socket: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("{socket}.lock"))
 }

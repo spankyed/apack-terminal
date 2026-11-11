@@ -1,0 +1,4 @@
+# What is generated here and read byte for byte elsewhere keeps the line endings it was written with,
+# whatever a checkout's platform would make of them
+node/view-vectors.json text eol=lf
+node/protocol.ts text eol=lf

@@ -37,6 +37,11 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # **The terminal core is built for speed wherever it is built.** The library a Mac or a Linux build
+  # links was built that way whatever this build's own profile is; where the core is built from source —
+  # Windows — its crate otherwise follows the profile, and a debug core under a debug suite is slow enough
+  # that the cases holding a hundred thousand lines of history do not finish
+  GHOSTTY_VT_RS_SYS_OPTIMIZE: fast
 
 jobs:
   linux:

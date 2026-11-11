@@ -243,6 +243,7 @@ const QUIET: std::time::Duration = std::time::Duration::from_secs(10);
 ///
 /// **POSIX shells only** — the empty-string quote is how `sh`, `bash` and `zsh` read it, and `cmd.exe`
 /// prints it back. The cross-platform case above counts occurrences for that reason.
+#[cfg(unix)]
 fn probe(token: &str) -> String {
     let (first, rest) = token.split_at(1);
     format!("echo {first}''{rest}{SUBMIT}")
