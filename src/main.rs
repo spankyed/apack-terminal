@@ -22,7 +22,7 @@ use std::time::Duration;
 use interprocess::local_socket::{GenericFilePath, Stream, ToFsName, prelude::*};
 
 use apack_terminal::frames::{Frame, read_frame};
-use apack_terminal::listening::{self, HELD_EXIT, Refused, START_GRACE_ENV};
+use apack_terminal::listening::{self, HELD_EXIT, Refused, START_GRACE_ENV, hang_up};
 use apack_terminal::output::{Outgoing, channel_with_credit};
 use apack_terminal::protocol::{CommandRecord, ErrorCode, Event, PROTOCOL_VERSION, Request, Role, SearchMatch};
 use apack_terminal::recording;
@@ -415,6 +415,13 @@ fn converse(wire: &Arc<Wire>, connection: u64, broker: &Broker, role: &mut Optio
                         if let Ok(mut feed) = broker.feed.lock() {
                             *feed = Some(Arc::clone(wire));
                         }
+                        // **A pause was the last reader's, and this is the reader now.** It asked for none
+                        // and has no way to learn of one, and the client that did is no longer the one a
+                        // session's output goes to — so nothing it could do would be held up by lifting
+                        // it. Left to the old client's leaving, a pause outlived it whenever the new one
+                        // greeted first: by then the one leaving is not the attached one, and `detach`
+                        // resumes nothing. Outside the feed's lock, as there
+                        broker.sessions.resume_all();
                     }
                     Role::View => {
                         // From here the connection speaks `view::wire`, on the reader that already holds
@@ -550,18 +557,6 @@ impl Drop for ViewLeaving<'_> {
         {
             let _ = writing.join();
         }
-    }
-}
-
-/// Closes a connection in both directions, whoever else still holds it, so a thread parked in a read or
-/// a write of it is let go. `false` where a connection cannot be closed from under its users, which is a
-/// named pipe: there the thread is left to the far end's closing.
-fn hang_up(stream: &Stream) -> bool {
-    match stream {
-        #[cfg(unix)]
-        Stream::UdSocket(socket) => socket.inner().shutdown(std::net::Shutdown::Both).is_ok(),
-        #[cfg(windows)]
-        Stream::NamedPipe(_) => false,
     }
 }
 

@@ -526,3 +526,30 @@ fn a_proxy_told_no_socket_uses_the_users_own() {
     assert!(runtime.path().join("apack-terminal").join("broker.sock").exists());
     assert_eq!(mode(&runtime.path().join("apack-terminal")), 0o700);
 }
+
+/// **A connection whose far end has said all it will can still be hung up on.** A caller that has
+/// finished speaking closes the side it sends on and may go on being owed answers; one that then stops
+/// reading has whatever writes to it parked, and hanging up is what lets that go. The far end's half
+/// being closed already is the state a hang-up most often finds a connection in.
+#[test]
+fn a_connection_whose_far_end_has_stopped_sending_is_hung_up_on_and_a_write_to_it_ends() {
+    use apack_terminal::listening::hang_up;
+    use interprocess::local_socket::{GenericFilePath, ListenerOptions, ToFsName, prelude::*};
+
+    let directory = tempfile::tempdir().expect("a directory for the socket");
+    let path = directory.path().join("heard.sock");
+    let name = path.to_str().expect("a utf-8 path").to_fs_name::<GenericFilePath>().expect("a socket name");
+    let listener = ListenerOptions::new().name(name).create_sync().expect("a socket to listen on");
+    let far = UnixStream::connect(&path).expect("the far end connects");
+    let near = listener.accept().expect("and is accepted");
+
+    far.shutdown(std::net::Shutdown::Write).expect("the far end closes the side it sends on");
+    let mut heard = [0u8; 1];
+    assert_eq!((&near).read(&mut heard).expect("the near end reads"), 0, "the near end hears that it finished");
+
+    assert!(hang_up(&near), "a connection half closed by its far end could not be hung up on");
+    // Far more than a socket holds, to a far end that reads none of it: a write left open would park here
+    let written = (&near).write_all(&vec![0u8; 8 << 20]);
+    assert!(written.is_err(), "megabytes were written to a connection that had been hung up on");
+    drop(far);
+}
