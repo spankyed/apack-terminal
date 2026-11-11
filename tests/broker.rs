@@ -16,10 +16,13 @@ struct Broker {
     process: Child,
     socket: std::path::PathBuf,
     _directory: tempfile::TempDir,
+    /// What stops the broker if this case is ended before it can (`tests/reaper.rs`)
+    reaper: crate::reaper::Reaper,
 }
 
 impl Drop for Broker {
     fn drop(&mut self) {
+        self.reaper.stand_down();
         let _ = self.process.kill();
         let _ = self.process.wait();
     }
@@ -70,7 +73,8 @@ fn start_with_env(arrange: impl FnOnce(&mut Command)) -> Broker {
         .expect("the broker says where it is listening");
     assert!(ready.starts_with("listening "), "{ready:?}");
 
-    Broker { process, socket, _directory: directory }
+    let reaper = crate::reaper::watching(&process, env!("CARGO_BIN_EXE_apack-terminal"));
+    Broker { process, socket, _directory: directory, reaper }
 }
 
 /// Where a broker listens, which is **a name rather than a path, and the spelling differs**.

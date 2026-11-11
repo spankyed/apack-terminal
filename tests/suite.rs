@@ -28,6 +28,7 @@ mod markers;
 mod parser;
 #[cfg(unix)]
 mod proxy;
+mod reaper;
 mod recording;
 mod screen;
 mod security;

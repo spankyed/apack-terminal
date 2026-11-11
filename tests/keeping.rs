@@ -25,10 +25,13 @@ struct Broker {
     process: Child,
     socket: PathBuf,
     directory: tempfile::TempDir,
+    /// What stops the broker if this case is ended before it can (`tests/reaper.rs`)
+    reaper: crate::reaper::Reaper,
 }
 
 impl Drop for Broker {
     fn drop(&mut self) {
+        self.reaper.stand_down();
         let _ = self.process.kill();
         let _ = self.process.wait();
     }
@@ -52,7 +55,8 @@ impl Broker {
         let mut ready = String::new();
         BufReader::new(process.stdout.as_mut().expect("piped stdout")).read_line(&mut ready).expect("a ready line");
         assert!(ready.starts_with("listening "), "{ready:?}");
-        Self { process, socket, directory }
+        let reaper = crate::reaper::watching(&process, env!("CARGO_BIN_EXE_apack-terminal"));
+        Self { process, socket, directory, reaper }
     }
 
     /// Whether the broker's process ends within the time a working one takes to.

@@ -205,10 +205,13 @@ fn only_the_word_proxy_asks_for_one() {
 struct Broker {
     process: Child,
     said: String,
+    /// What stops the broker if this case is ended before it can (`tests/reaper.rs`)
+    reaper: crate::reaper::Reaper,
 }
 
 impl Drop for Broker {
     fn drop(&mut self) {
+        self.reaper.stand_down();
         let _ = self.process.kill();
         let _ = self.process.wait();
     }
@@ -237,7 +240,8 @@ fn broker_given(socket: &Path, grace: Option<Duration>) -> Broker {
     BufReader::new(process.stdout.take().expect("piped stdout"))
         .read_line(&mut said)
         .expect("the broker's stdout reads");
-    Broker { process, said }
+    let reaper = crate::reaper::watching(&process, env!("CARGO_BIN_EXE_apack-terminal"));
+    Broker { process, said, reaper }
 }
 
 impl Broker {
