@@ -385,9 +385,12 @@ fn a_view_that_stops_acknowledging_does_not_hold_up_another() {
     live.type_line("echo sec$((1+1))ond");
     live.until_shows("sec2ond");
 
-    // The stuck view was sent its first frame and, never having acknowledged it, nothing since
-    let sent: Vec<ToView> = stuck.incoming.try_iter().collect();
-    assert_eq!(sent.len(), 1, "{sent:?}");
+    // The stuck view was sent its first frame and, never having acknowledged it, nothing since. The
+    // frame is waited for: it was sent before the live view's, and is read by a thread of its own
+    let first = stuck.incoming.recv_timeout(PATIENCE).expect("the stuck view's first frame");
+    assert!(matches!(first, ToView::Frame { .. }), "{first:?}");
+    let since: Vec<ToView> = stuck.incoming.try_iter().collect();
+    assert!(since.is_empty(), "{since:?}");
 }
 
 #[test]
