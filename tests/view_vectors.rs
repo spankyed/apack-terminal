@@ -1,10 +1,10 @@
 //! The view protocol's bytes, written down for the other side to read.
 //!
-//! **The broker encodes in Rust and a view decodes in TypeScript**, in another repository, so neither
-//! suite can see the other's half. What they share is `node/view-vectors.json`: each message here as the
-//! bytes this encoder produces and as the value those bytes mean. This case fails when the file is not
-//! what the encoder now writes; the view's own suite decodes every vector for a view and encodes every
-//! one for the broker, and fails the same way from its side.
+//! **The broker encodes in Rust and a view decodes in TypeScript** (`view/`), so neither suite can run
+//! the other's half. What they share is `node/view-vectors.json`: each message here as the bytes this
+//! encoder produces and as the value those bytes mean. This case fails when the file is not what the
+//! encoder now writes; the view's own suite (`view/tests/wire.spec.ts`) reads the same file, decodes
+//! every vector for a view and encodes every one for the broker, and fails the same way from its side.
 //!
 //! Re-record with `APACK_UPDATE_VECTORS=1 cargo nextest run --test view_vectors`, and read the diff: every
 //! line of it is a change a view has to be taught.
@@ -589,8 +589,8 @@ fn the_vectors_a_view_reads_are_what_this_encoder_writes() {
     let committed = std::fs::read_to_string(VECTORS).unwrap_or_default();
     assert!(
         committed == written,
-        "node/view-vectors.json is not what the encoder writes. A view in another repository reads these \
-         bytes: re-record with APACK_UPDATE_VECTORS=1, read the diff, and take the new file to it"
+        "node/view-vectors.json is not what the encoder writes. The view's suite (view/) reads these \
+         bytes: re-record with APACK_UPDATE_VECTORS=1, read the diff, and teach the view's codec each line"
     );
 }
 

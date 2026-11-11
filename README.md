@@ -36,7 +36,8 @@ by the npm package, so a consumer imports the types without building Rust.
 [protocol.md](docs/architecture/protocol.md) has every message, the roles, and the closed error set.
 
 A window draws a session over a connection of its own, greeting as a `view`: it is sent the rows that
-changed and paints them, interpreting nothing ([views.md](docs/architecture/views.md)). And
+changed and paints them, interpreting nothing ([views.md](docs/architecture/views.md)). What paints them
+is the `apack-terminal-view` package in [`view/`](view), whose codec is the other half of that protocol. And
 `apack-terminal proxy [<socket>]` is a process's stdin and stdout as a connection to the broker on that
 socket, started first if there is none — so `ssh host apack-terminal proxy` is a connection to a broker
 on another machine. With no socket named it is the user's own: `$XDG_RUNTIME_DIR/apack-terminal/broker.sock`
