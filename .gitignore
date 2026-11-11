@@ -12,3 +12,4 @@
 # elmdb gitignores the `*.node` its own package ships.
 /node/apack-terminal
 /node/apack-terminal.exe
+mutants.out/

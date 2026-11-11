@@ -154,6 +154,17 @@ fn a_character_of_several_code_points_takes_the_cells_of_one() {
     }
 }
 
+/// **A character of more code points than a read holds is read as its first**, and the cells after it
+/// are where they were: a letter under a pile of accents is still that letter, in that column.
+#[test]
+fn a_character_too_long_to_read_whole_is_read_as_its_base() {
+    let mut screen = Screen::new(80, 24);
+    let piled = format!("e{}z", "\u{301}".repeat(40));
+    screen.feed(piled.as_bytes());
+    let line = &screen.snapshot(0).lines[0];
+    assert!(line.starts_with("ez"), "read {line:?}");
+}
+
 /// And a program that asks whether clustering is on is told it is, so what it lays out matches.
 #[test]
 fn a_program_asking_about_clustering_is_told_it_is_on() {

@@ -243,6 +243,7 @@ const QUIET: std::time::Duration = std::time::Duration::from_secs(10);
 ///
 /// **POSIX shells only** — the empty-string quote is how `sh`, `bash` and `zsh` read it, and `cmd.exe`
 /// prints it back. The cross-platform case above counts occurrences for that reason.
+#[cfg(unix)]
 fn probe(token: &str) -> String {
     let (first, rest) = token.split_at(1);
     format!("echo {first}''{rest}{SUBMIT}")
@@ -534,9 +535,13 @@ fn once_the_shell_is_listening(reading: &mut Events) {
 /// parsing what a shell echoed back through a pty — a prompt, the command coming back, and on Windows a
 /// stream of cursor positioning around both — which is a different problem on each platform and none of it
 /// the subject here. A file is the same on both.
+///
+/// **Written by the program itself, once it is one.** `$!` is known from the moment the shell forks,
+/// when what has that pid is still a copy of the shell on its way to becoming the job; a case that read
+/// it there would be asking about a process its subject does not include yet.
 #[cfg(unix)]
 fn long_lived_grandchild(pid_file: &std::path::Path) -> String {
-    format!("sleep 300 & echo $! > {}\n", pid_file.display())
+    format!("sh -c 'echo $$ > {}; exec sleep 300' &\n", pid_file.display())
 }
 
 #[cfg(windows)]
@@ -618,7 +623,8 @@ fn killing_a_session_takes_the_whole_tree_with_it() {
     ask(&mut writing, &hello(None));
     next(&mut reading);
     ask(&mut writing, &spawn_frame(80, 24, None));
-    let session = next(&mut reading)["session"].as_str().expect("a session").to_owned();
+    let answered = next(&mut reading);
+    let session = answered["session"].as_str().unwrap_or_else(|| panic!("a spawn was answered {answered}")).to_owned();
 
     // A grandchild that outlives its parent unless something owns the tree: this is X1 and X2's subject,
     // and Phase B's acceptance says portable-pty is validated for containment rather than assumed.
@@ -710,12 +716,34 @@ fn an_alternate_screen_app_survives_a_resize_and_keeps_answering() {
     assert!(!redrew.is_empty(), "nothing was drawn after the resize");
     assert!(alive(shell), "the shell did not survive a resize under an alternate-screen app");
 
-    // And it is still taking input: `q` leaves less, which ends the shell's foreground job
-    ask(&mut writing, &format!(r#"{{"kind":"write","session":"{session}","text":"q"}}"#));
-    let left = output_until(&mut reading, None, |seen| seen.contains("[?1049l") || seen.contains("[?47l"));
+    // And it is still taking input: `q` leaves less, which ends the shell's foreground job.
+    //
+    // **Typed until it is read as a command.** Three resizes are three redraws, and a key that reaches
+    // `less` while it is drawing is spent on stopping the drawing — it prints `...skipping...` and waits
+    // for the next. Which redraw a key lands in is the machine's to decide, so the key is typed again
+    // each time `less` has gone quiet without leaving
+    const TYPED: usize = 20;
+    let leaving = |seen: &str| seen.contains("[?1049l") || seen.contains("[?47l");
+    let mut left = String::new();
+    for _ in 0..TYPED {
+        ask(&mut writing, &format!(r#"{{"kind":"write","session":"{session}","text":"q"}}"#));
+        while let Ok(line) = reading.line(std::time::Duration::from_millis(500)) {
+            let event: serde_json::Value = serde_json::from_str(&line).expect("an event");
+            if event["kind"] == "output" {
+                left.push_str(event["text"].as_str().unwrap_or_default());
+            }
+            if leaving(&left) {
+                break;
+            }
+        }
+        if leaving(&left) {
+            break;
+        }
+    }
     assert!(
-        left.contains("[?1049l") || left.contains("[?47l"),
-        "less never left the alternate screen, so it had stopped reading input: {left:?}"
+        leaving(&left),
+        "less never left the alternate screen after `q` was typed {TYPED} times, so it had stopped reading \
+         input: {left:?}"
     );
 }
 
@@ -1454,7 +1482,7 @@ fn a_shell_is_told_what_terminal_it_is_in() {
 /// **`cat` rather than a shell, and its own echo as the sync point.** A shell's reported name is not
 /// portable — macOS answers `bash` for `/bin/sh` — and asking straight after `spawn` would read a process
 /// that may still be between `fork` and `execve`, which is a case that passes on a quiet machine. Writing a
-/// line and waiting for it back proves the program is running before anything is measured.
+/// line and waiting for the program to write it back proves it is running before anything is measured.
 #[cfg(unix)]
 #[test]
 fn what_is_running_in_a_session_is_measured_rather_than_claimed() {
@@ -1478,8 +1506,11 @@ fn what_is_running_in_a_session_is_measured_rather_than_claimed() {
     let session = next(&mut reading)["session"].as_str().expect("a session").to_owned();
     ask(&mut writing, &serde_json::json!({ "kind": "write", "session": session, "text": "ready\n" }).to_string());
 
-    let seen = output_until(&mut reading, Some(&session), |seen| seen.contains("ready"));
-    assert!(seen.contains("ready"), "the program is running: {seen:?}");
+    // **Twice: once as the terminal echoes what was typed, and once as the program writes it back.** The
+    // echo is the pty's own and comes whether or not anything is reading yet, so the first one says
+    // nothing about the program; the second is the program's
+    let seen = output_until(&mut reading, Some(&session), |seen| seen.matches("ready").count() >= 2);
+    assert!(seen.matches("ready").count() >= 2, "the program is running: {seen:?}");
 
     ask(&mut writing, &serde_json::json!({ "kind": "facts", "session": session }).to_string());
     let facts = loop {
@@ -2045,4 +2076,78 @@ fn a_client_that_stops_reading_stalls_the_program_rather_than_filling_the_broker
              what the program wrote instead of letting the program block",
         );
     }
+}
+
+/// A session that never stops having something to report, and the client that started it.
+///
+/// What the two cases below are about happens between two of the broker's threads — the one that writes
+/// every session's events to whoever is attached, and a connection's own — so each needs the first of
+/// them writing for the whole of the case. **A title, because each one is an event of its own**: output
+/// is gathered into a message per window, which leaves that thread idle most of the time however much a
+/// program prints.
+#[cfg(unix)]
+fn a_session_that_keeps_talking(broker: &Broker) -> (Events, Wire) {
+    let (mut reading, mut writing) = connect(broker);
+    ask(&mut writing, &hello(None));
+    next(&mut reading);
+    ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
+    let (spawned, _) = until(&mut reading, "spawned");
+    let session = spawned["session"].as_str().expect("a session").to_owned();
+    let naming = r"i=0; while :; do i=$((i+1)); printf '\033]0;%s\007' $i; done";
+    ask(
+        &mut writing,
+        &serde_json::json!({ "kind": "write", "session": session, "text": format!("{naming}\n") }).to_string(),
+    );
+    let mut titles = 0;
+    while titles < 50 {
+        if next(&mut reading)["kind"] == "title" {
+            titles += 1;
+        }
+    }
+    (reading, writing)
+}
+
+/// **The first thing a client hears is the answer to its greeting.** Greeting is what makes a client the
+/// one its broker's sessions are reported to, and a session can have something to report at that very
+/// moment; a client that heard it first would be reading an event about a session before the handshake
+/// that says what the events mean.
+#[cfg(unix)]
+#[test]
+fn a_greeting_is_answered_before_anything_else_is_said_to_that_client() {
+    let broker = start();
+    let _talking = a_session_that_keeps_talking(&broker);
+
+    for arrival in 0..60 {
+        let (mut reading, mut writing) = connect(&broker);
+        ask(&mut writing, &hello(None));
+        let first = next(&mut reading);
+        assert_eq!(first["kind"], "hello", "arrival {arrival} was told this before its greeting was answered: {first}");
+    }
+}
+
+/// **What a client is told is whole lines, whichever of the broker's threads is telling it.** A refusal of
+/// something the client sent is written by the thread reading that client, while its sessions' events are
+/// written by another; a line of one landing inside a line of the other is two events a client can read
+/// neither of.
+#[cfg(unix)]
+#[test]
+fn a_refusal_and_a_session_talking_reach_a_client_as_lines_of_their_own() {
+    const REFUSALS: usize = 300;
+    let broker = start();
+    let (mut reading, mut writing) = a_session_that_keeps_talking(&broker);
+
+    let asking = std::thread::spawn(move || {
+        for _ in 0..REFUSALS {
+            ask(&mut writing, "not a request");
+        }
+        writing
+    });
+    let mut refused = 0;
+    while refused < REFUSALS {
+        // `next` fails on a line that is not one event, which is the failure this case is for
+        if next(&mut reading)["kind"] == "failed" {
+            refused += 1;
+        }
+    }
+    drop(asking.join().expect("the requests were written"));
 }

@@ -90,6 +90,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup show active-toolchain
+      # **Windows builds the terminal core, because nobody publishes one for it.** The core's crate links a
+      # prebuilt library where one exists for the target — Apple and Linux — and otherwise builds Ghostty at
+      # its pinned commit with Zig, whose version has to be the one that commit wants. Without Zig on the
+      # path that build fails before a line of this repository is compiled
+      - if: runner.os == 'Windows'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      # **And built for speed, as the library a Mac or a Linux build links was.** The crate otherwise
+      # follows this build's profile, and a debug core under a debug suite is slow enough that the cases
+      # holding a hundred thousand lines of history do not finish. Said on Windows alone: naming a mode at
+      # all is what tells the crate to build from source, which no other platform here does
+      - if: runner.os == 'Windows'
+        shell: bash
+        run: echo "GHOSTTY_VT_RS_SYS_OPTIMIZE=fast" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
@@ -106,10 +121,32 @@ jobs:
         run: test -x "node/apack-terminal" || test -f "node/apack-terminal.exe"
         shell: bash
 
+  # The view (`view/`): its types, its suite and the build a consumer bundles. One platform, since it is
+  # TypeScript drawing on a canvas and nothing in it asks the operating system anything. Its suite reads
+  # `node/view-vectors.json` where the broker's suite writes it, so a change to the wire that taught only
+  # one half fails here or in `platforms`, in the same run
+  view:
+    name: view (Linux x64)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: view
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
   # The one check a merge waits on: every job above passed or was skipped (a documentation-only change)
   ci-pass:
     if: always()
-    needs: [changes, checks, platforms]
+    needs: [changes, checks, platforms, view]
     runs-on: ubuntu-24.04
     steps:
       - env:

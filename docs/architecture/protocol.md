@@ -27,7 +27,8 @@ more than a compact one. Nothing in the traffic makes framing the bottleneck. A 
 ```
 
 The broker answers `hello` with its own version, or refuses with `HANDSHAKE`. Nothing can be asked before
-it.
+it, and it is said once: a second `hello` on a connection is refused with `HANDSHAKE` and changes nothing,
+the connection's role being what it is counted as and how it is spoken to from the first.
 
 **It is a contract across a pin boundary.** A consumer pins a commit of this repository, so a stale pin has
 to be a clear refusal rather than a message that means something else.
@@ -41,7 +42,7 @@ means for a session's lifetime.
 | kind | asks for |
 |---|---|
 | `hello` | the handshake, with a protocol version and a role |
-| `spawn` | a shell in a new pty: `cols`, `rows`, `shell`, `args`, `env`, `unset`, `cwd` |
+| `spawn` | a shell in a new pty: `cols`, `rows`, `shell`, `args`, `env`, `unset`, `cwd`, and optionally `colors`, `output`, `record`, `restore`, `images` |
 | `write` | bytes the user typed |
 | `resize` | the viewport changed; one size per session, because a pty has one |
 | `pause` | stop reading this session's pty, so its process feels the reader stop |
@@ -52,7 +53,37 @@ means for a session's lifetime.
 | `facts` | what the shell reported about itself: directory, command line, whether one is running, last status, how many have finished |
 | `search` | where text appears in the screen and the history above it |
 | `wait` | until idle, until text appears, or until the process ends, with a deadline |
-| `kill` | end the session and its process tree |
+| `commands` | the commands the session's shell has marked, oldest first |
+| `command_output` | what one of them printed, as text |
+| `keep` | whether the session outlives whoever holds the broker |
+| `sessions` | every session the broker has |
+| `rewind` | a recording, opened as a session with no process |
+| `seek` | show a rewound session's recording as it was at a moment |
+| `kill` | end the session and its process tree; for a rewound session, close it. The process is asked first (a hangup) and killed two seconds later if it is still there, so `exited` always follows |
+
+`output` says whether the session's bytes are sent as `output` at all. A caller that reads a program's
+bytes wants them; a terminal a person looks at is drawn by a view, which is sent rows
+([views.md](views.md)), and its bytes would cross the socket to be thrown away and stall the program on
+their credit. `record` and `restore` are a file to record the session in and whether to begin with what it
+holds; `images` is whether its programs may send any ([design.md](design.md)).
+
+**A `write` is queued, not written.** What is bound for a program — a `write`, and everything a view
+types, pastes or points at — waits its turn for the program to read it, and the request is answered
+without waiting: a program that has stopped reading holds up its own input and nothing else. Up to 16 MiB
+may wait for one session; a `write` past that is refused with `PTY` rather than dropped or held.
+
+**A rewound session lists the commands since its keyframe.** `commands` on one answers those the shell
+marked between the keyframe the moment shown was replayed from and that moment, with the times they ran.
+
+**A rewound session is its opener's.** It ends when the connection that asked for it closes, as well as
+when it is killed: it is no process, nothing else knows its id, and a client that reconnects asks again.
+
+A connection that greets with `role: "view"` leaves this protocol after the handshake: what it speaks is
+[views.md](views.md).
+
+**A kept session is a reason for the broker to stay.** A session is ended when the holder's connection
+closes, and when the last client leaves a broker nobody holds; one that was asked to be kept is not, and
+the broker exits only when nobody is connected and no session is left.
 
 `args` and `env` are how shell integration is arranged: the markers a terminal reads facts from come from
 code the shell runs at startup, and every shell takes that a different way — bash wants `--init-file` and
@@ -71,7 +102,7 @@ is what a caller gets when it asks for both.
 | kind | says |
 |---|---|
 | `hello` | the broker's own protocol version |
-| `spawned` | a session exists and its process is running, with its pid |
+| `spawned` | a session exists and its process is running, with its pid. `recorded` says whether it is being recorded and `restored` whether its screen began as what the recording held — each `false` when it was not asked for, and when it was asked for and not got: a file that is not a recording is left alone, a file another session is recording to has one writer, and a file the session before is still writing the last of is waited for five seconds and no longer |
 | `output` | bytes the process wrote. A feed: unprompted, and nobody asked |
 | `exited` | the process ended: `code` when it exited, `signal` by name when one killed it, never both |
 | `throttled` | a flush waited for credit, with the microseconds it waited. Not a loss |
@@ -80,6 +111,13 @@ is what a caller gets when it asks for both.
 | `facts` | the shell's claims about itself. `finished` moves each time a command it reported starting has ended, so a caller that asks after a quick command has ended still learns one ran. It is compared for a difference only: it wraps, and a shell emitting both marker families moves it twice per command |
 | `search` | where the text was found, with the whole line for context |
 | `waited` | how a wait ended: `MET`, `TIMEOUT` or `EXITED`. Once per wait, however it ended |
+| `title`, `bell`, `clipboard`, `notification`, `progress` | what the program did that is not on its screen. Reported, never acted on |
+| `command_started`, `command_finished`, `cwd_changed` | what the shell marked, as it happened |
+| `commands`, `command_output` | the answers to the requests of those names |
+| `kept` | whether the session outlives the broker's holder, answering `keep` |
+| `sessions` | every session there is: its size, whether it is kept and recorded, its title and its shell's claims |
+| `rewound` | a recording opened as a session, with the moments it runs between |
+| `sought` | the moment a rewound session now shows |
 | `failed` | a request could not be carried out |
 
 Lines in a `screen` are **text, not cells**: a wide character appears once rather than beside the spacer cell
@@ -152,9 +190,9 @@ claim without saying why.
 
 ## What crosses as output is text, and that is a decision
 
-**The broker forwards decoded text, not bytes.** Both ends are terminal emulators — `alacritty_terminal`
-here, the consumer's in its window — and both replace an invalid UTF-8 sequence with U+FFFD independently,
-so a byte-exact pipe would show the user exactly what this does. Nothing in this protocol consumes raw
+**The broker forwards decoded text, not bytes.** The terminal here replaces an invalid UTF-8 sequence with
+U+FFFD, and so does anything a consumer would draw the bytes with, so a byte-exact pipe would show the user
+exactly what this does. Nothing in this protocol consumes raw
 bytes either: `screen` answers lines, a search is over text, a marker is a claim. The field is named `text`
 for that reason; it was `data`, which reads as bytes to everyone.
 
@@ -195,8 +233,7 @@ reattach — the broker is what answers a `screen` read when no window holds the
 
 Two independent constants is what this replaced: 10,000 in apack's window against `HISTORY_LINES` of 1,000
 here, so closing and reopening a window silently lost nine tenths of the scrollback. Raising the broker's is
-a measured decision about its own memory — `alacritty_terminal` holds a grid per session — not a number to
-pick twice.
+a measured decision about its own memory — the core holds a grid per session — not a number to pick twice.
 
 ## Errors are a closed set
 
@@ -205,10 +242,10 @@ rather than matching a message that is free to be reworded.
 
 | code | means |
 |---|---|
-| `HANDSHAKE` | the first message was not `hello`, or its version is not ours |
+| `HANDSHAKE` | the first message was not `hello`, its version is not ours, or `hello` was said a second time |
 | `MALFORMED` | a frame did not parse as a request |
 | `NO_SUCH_SESSION` | no session has that id — it never existed, or it has already exited |
-| `PTY` | the pty or the process refused: spawn, resize or write failed at the OS |
+| `PTY` | the pty or the process refused: spawn or resize failed at the OS, or more is already waiting for the program to read than a session holds |
 | `OUTSIDE_SESSION` | a `signal` named a pid that is not in that session's tree |
 | `UNSUPPORTED` | this platform has no such operation — signals, on Windows |
 

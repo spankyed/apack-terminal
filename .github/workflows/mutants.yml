@@ -65,9 +65,12 @@ jobs:
         with:
           tool: cargo-mutants@27.1.0,cargo-nextest@0.9.148
       # Exit 3 is a timeout, which is the suite's deadline catching a mutant rather than a survivor — the
-      # credit-accounting mutants in `output.rs` hang the writer by design. Exit 2, a survivor, still fails.
+      # credit-accounting mutants in `output.rs` hang the writer by design. It is also what a run with a
+      # timeout *and* a survivor exits with, so the survivors are read from the list rather than the code.
       - if: steps.scope.outputs.code == 'true'
-        run: cargo mutants --in-diff change.diff || [ $? = 3 ]
+        run: |
+          cargo mutants --in-diff change.diff || [ $? = 3 ]
+          if [ -s target/mutants.out/missed.txt ]; then cat target/mutants.out/missed.txt; exit 1; fi
       - uses: actions/upload-artifact@v4
         if: always() && steps.scope.outputs.code == 'true'
         with:
@@ -78,6 +81,9 @@ jobs:
   windows:
     name: mutants in the change (Windows-only code)
     runs-on: windows-latest
+    env:
+      # Built for speed, as the library every other platform links was (`ci.yml`)
+      GHOSTTY_VT_RS_SYS_OPTIMIZE: fast
     defaults:
       run:
         shell: bash
@@ -124,6 +130,11 @@ jobs:
           fi
       - if: steps.scope.outputs.code == 'true'
         run: rustup show active-toolchain
+      # The terminal core is built here, there being none published for Windows (`ci.yml`)
+      - if: steps.scope.outputs.code == 'true'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
       - if: steps.scope.outputs.code == 'true'
         uses: Swatinem/rust-cache@v2
       - if: steps.scope.outputs.code == 'true'
@@ -133,7 +144,9 @@ jobs:
       - if: steps.scope.outputs.code == 'true'
         env:
           ARGS: ${{ steps.scope.outputs.args }}
-        run: cargo mutants $ARGS || [ $? = 3 ]
+        run: |
+          cargo mutants $ARGS || [ $? = 3 ]
+          if [ -s target/mutants.out/missed.txt ]; then cat target/mutants.out/missed.txt; exit 1; fi
       - uses: actions/upload-artifact@v4
         if: always() && steps.scope.outputs.code == 'true'
         with:

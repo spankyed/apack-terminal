@@ -30,6 +30,11 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// A session's identity, minted by the broker: the app never invents one.
 pub type SessionId = String;
 
+/// What an absent `Spawn::output` reads as.
+fn sent() -> bool {
+    true
+}
+
 /// What the app asks the broker to do.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -77,6 +82,27 @@ pub enum Request {
         /// Absent leaves the terminal's own, which is what a caller with no window has.
         #[serde(default)]
         colors: Option<Colors>,
+        /// **Whether the session's bytes are sent as `Output`.** A caller that reads a program's output —
+        /// to parse it, to forward it — wants them. A terminal a person looks at is drawn by a view, which
+        /// is sent rows, and its bytes would cross the socket to be thrown away; worse, they are bounded
+        /// by credit, so an unread stream would stall the program. Absent means sent, as it always was.
+        #[serde(default = "sent")]
+        output: bool,
+        /// **A file to record the session in** (`recording`): what its program writes, so the screen can
+        /// be rebuilt after the session is gone and looked back through while it runs. Absent records
+        /// nothing, which is what a session is unless someone asks — a recording holds everything the
+        /// program printed, including what it printed once and erased.
+        #[serde(default)]
+        record: Option<String>,
+        /// Whether to begin with the screen `record` already holds, as a terminal reopened where its last
+        /// session left off. The recording carries on in the same file.
+        #[serde(default)]
+        restore: bool,
+        /// **Whether the session's programs may send images** (the Kitty graphics protocol). A program
+        /// asks the terminal whether it can before it sends one, so this is yes only for a session whose
+        /// views draw them; absent, a program is told no and prints what it would have otherwise.
+        #[serde(default)]
+        images: bool,
     },
     /// Bytes the user typed.
     /// `text`, not `data`: what crosses here is decoded text, which is the contract and not an accident.
@@ -177,6 +203,31 @@ pub enum Request {
     /// land and nothing polls. `timeout_ms` is the caller's deadline — a wait that is never met answers
     /// `Timeout` rather than lasting for ever — and the answer comes exactly once however the race goes.
     Wait { session: SessionId, until: Until, timeout_ms: u32 },
+    /// The commands the session's shell has reported, oldest first.
+    ///
+    /// What `Facts` cannot say: not the command running now, but each one that ran — so a caller that
+    /// started something can find *its* record, and read what it printed with `CommandOutput`.
+    Commands { session: SessionId },
+    /// What one command printed, as text, by the id `Commands` gave it.
+    CommandOutput { session: SessionId, command: u32 },
+    /// **Whether the session outlives whoever holds the broker.** A session is ended when the app's hold
+    /// on the broker ends, and when the last client leaves a broker nobody holds; one that is kept is
+    /// not, and the broker stays for as long as it has one. It ends when its own process does or when
+    /// it is killed.
+    Keep { session: SessionId, kept: bool },
+    /// Every session the broker has, which is how an app that has just started finds the ones a previous
+    /// run kept.
+    Sessions,
+    /// **A recording, as a session to look at.** Answers `Rewound` with a session that has no process: a
+    /// view attaches to it like any other and is sent the screen as the recording had it, at the moment
+    /// `Seek` names — the recording's end, to begin with. What a view types at it goes nowhere.
+    Rewind { recording: String, cols: u16, rows: u16 },
+    /// Shows a rewound session's recording as it was at `at`, in milliseconds since the Unix epoch.
+    Seek {
+        session: SessionId,
+        #[ts(type = "number")]
+        at: u64,
+    },
     /// End the session and its process tree.
     Kill { session: SessionId },
 }
@@ -213,6 +264,10 @@ pub enum Role {
     Client,
     /// Holds the broker's sessions alive and receives no output. Ending this connection ends them all.
     Lifetime,
+    /// Draws sessions. After the handshake this connection speaks `view::wire` rather than these
+    /// messages: it attaches to sessions by id, is sent their rows, and sends their input. It asks for no
+    /// session and ends none, so one coming or going changes nothing but what is drawn.
+    View,
 }
 
 /// A signal a `Signal` request may send.
@@ -351,7 +406,14 @@ pub enum Event {
     /// both places, so the two cannot drift.
     Hello { protocol: u32, history: u32 },
     /// A session exists and its process is running.
-    Spawned { session: SessionId, pid: u32 },
+    ///
+    /// **What was asked for and what was got are both said.** `recorded` is whether the session is being
+    /// recorded: `false` when no `record` was asked for, when the recording could not be opened — a file
+    /// that is there and is not a recording is left alone rather than emptied — and when another session
+    /// is already recording to that file. `restored` is whether its screen began as what the recording
+    /// held: `false` when `restore` was not asked for, was asked for without `record`, or found nothing
+    /// to restore. A session is started either way; a caller that needed the recording reads these.
+    Spawned { session: SessionId, pid: u32, recorded: bool, restored: bool },
     /// Bytes the process wrote, **as text**. A feed: unprompted, and nobody asked for it.
     ///
     /// **The broker forwards decoded text, not bytes, and that is a decision rather than a compromise.**
@@ -447,8 +509,107 @@ pub enum Event {
     Search { session: SessionId, matches: Vec<SearchMatch> },
     /// How a `Wait` ended. Sent once per wait, whichever way it ended.
     Waited { session: SessionId, outcome: WaitOutcome },
+    /// The session's commands, answering `Commands`.
+    Commands { session: SessionId, commands: Vec<CommandRecord> },
+    /// Whether the session outlives the broker's holder, answering `Keep`.
+    Kept { session: SessionId, kept: bool },
+    /// Every session there is, answering `Sessions`.
+    Sessions { sessions: Vec<SessionSummary> },
+    /// A recording opened as a session, answering `Rewind`, with the moments it runs from and to.
+    Rewound {
+        session: SessionId,
+        #[ts(type = "number")]
+        first: u64,
+        #[ts(type = "number")]
+        last: u64,
+    },
+    /// The rewound session shows the moment asked for, answering `Seek`.
+    Sought {
+        session: SessionId,
+        #[ts(type = "number")]
+        at: u64,
+    },
+    /// What a command printed, answering `CommandOutput`. `text` is absent for a command that is not
+    /// kept, or whose output has left the history — which is not the same as having printed nothing.
+    CommandOutput { session: SessionId, command: u32, text: Option<String> },
+    /// The program named its terminal (OSC 0, OSC 2). Empty when it took the name back.
+    Title { session: SessionId, title: String },
+    /// The program rang the bell.
+    Bell { session: SessionId },
+    /// **The program asked for text to be put on the clipboard** (OSC 52 and its relatives).
+    ///
+    /// A claim like every other a program makes: the broker reports what was asked, and whether it
+    /// reaches a clipboard is the app's decision, made where the person is.
+    Clipboard { session: SessionId, text: String },
+    /// The program asked for the person to be told something (OSC 9, OSC 777).
+    Notification { session: SessionId, title: String, body: String },
+    /// How far along the program says it is (OSC 9;4). `percent` is absent where it gave none.
+    Progress { session: SessionId, state: ProgressState, percent: Option<u8> },
+    /// **The shell is about to run a command**, with the line it read where it said.
+    ///
+    /// Pushed, as the two below are, because each is a moment: a caller asking `Facts` on a timer learns
+    /// that a command ran and not when, and one that asks between two commands misses the first.
+    CommandStarted { session: SessionId, command: Option<String> },
+    /// What was running ended. `exit_status` is absent when the shell reported none, which is not zero.
+    CommandFinished { session: SessionId, exit_status: Option<i32> },
+    /// The shell's working directory changed, as the shell reported it.
+    CwdChanged { session: SessionId, cwd: String },
     /// A request could not be carried out. `session` is absent when the request named none.
     Failed { session: Option<SessionId>, code: ErrorCode, message: String },
+}
+
+/// A session, as a caller that did not start it needs to know it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "protocol.ts")]
+pub struct SessionSummary {
+    pub session: SessionId,
+    pub pid: u32,
+    pub cols: u16,
+    pub rows: u16,
+    /// Whether it outlives the broker's holder (`Request::Keep`)
+    pub kept: bool,
+    /// Whether what it prints is being recorded
+    pub recorded: bool,
+    /// What its program last named the terminal
+    pub title: Option<String>,
+    /// Where its shell last said it was, and what it last said it was running: claims, as in `Facts`
+    pub cwd: Option<String>,
+    pub command: Option<String>,
+    pub running: bool,
+}
+
+/// One command a session's shell reported. Every field but the id is a claim the shell made.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "protocol.ts")]
+pub struct CommandRecord {
+    /// Counts from one in a session, and is never reused
+    pub id: u32,
+    /// The line the shell read, where it said
+    pub command: Option<String>,
+    /// Where the shell was when the command began
+    pub cwd: Option<String>,
+    /// When it began and ended, in milliseconds since the Unix epoch. `finished_ms` is absent while it runs
+    #[ts(type = "number | null")]
+    pub started_ms: Option<u64>,
+    #[ts(type = "number | null")]
+    pub finished_ms: Option<u64>,
+    /// Absent while it runs, and when the shell reported none — which is not zero
+    pub exit_status: Option<i32>,
+}
+
+/// What a program says about how far along it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "protocol.ts")]
+pub enum ProgressState {
+    /// Nothing to report any more
+    None,
+    /// Working, perhaps with a percentage
+    Running,
+    Error,
+    /// Working, with no way to say how far along
+    Indeterminate,
+    Paused,
 }
 
 /// **A closed set, generated into the TypeScript as a string union** — elmdb's `ErrorCode` arrangement, and

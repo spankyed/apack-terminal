@@ -67,7 +67,7 @@ fn says_why(frame: &Frame) -> bool {
 /// One of every request, so the round trip covers the whole message set rather than the easy variants.
 fn requests() -> impl Strategy<Value = Request> {
     prop_oneof![
-        (any::<u32>(), prop_oneof![Just(Role::Client), Just(Role::Lifetime)])
+        (any::<u32>(), prop_oneof![Just(Role::Client), Just(Role::Lifetime), Just(Role::View)])
             .prop_map(|(protocol, role)| Request::Hello { protocol, role }),
         (
             any::<u16>(),
@@ -83,22 +83,39 @@ fn requests() -> impl Strategy<Value = Request> {
                 proptest::option::of(any::<[u8; 3]>()),
                 proptest::collection::vec(any::<[u8; 3]>(), 0..17),
             )),
+            (any::<bool>(), proptest::option::of("[^\u{0}]{0,20}"), any::<bool>(), any::<bool>()),
         )
-            .prop_map(|(cols, rows, shell, args, env, unset, cwd, colors)| Request::Spawn {
-                cols,
-                rows,
-                shell,
-                args,
-                env,
-                unset,
-                cwd,
-                colors: colors.map(|(foreground, background, cursor, ansi)| Colors {
-                    foreground,
-                    background,
-                    cursor,
-                    ansi
-                }),
-            }),
+            .prop_map(
+                |(cols, rows, shell, args, env, unset, cwd, colors, (output, record, restore, images))| {
+                    Request::Spawn {
+                        cols,
+                        rows,
+                        shell,
+                        args,
+                        env,
+                        unset,
+                        cwd,
+                        colors: colors.map(|(foreground, background, cursor, ansi)| Colors {
+                            foreground,
+                            background,
+                            cursor,
+                            ansi,
+                        }),
+                        output,
+                        record,
+                        restore,
+                        images,
+                    }
+                }
+            ),
+        ("[^\u{0}]{0,40}", any::<bool>()).prop_map(|(session, kept)| Request::Keep { session, kept }),
+        Just(Request::Sessions),
+        ("[^\u{0}]{0,40}", any::<u16>(), any::<u16>()).prop_map(|(recording, cols, rows)| Request::Rewind {
+            recording,
+            cols,
+            rows
+        }),
+        ("[^\u{0}]{0,40}", any::<u64>()).prop_map(|(session, at)| Request::Seek { session, at }),
         ("[^\u{0}]{0,40}", "(?s).{0,40}").prop_map(|(session, text)| Request::Write { session, text }),
         ("[^\u{0}]{0,40}", any::<u16>(), any::<u16>(), any::<u16>(), any::<u16>()).prop_map(
             |(session, cols, rows, cell_width, cell_height)| Request::Resize {
@@ -123,6 +140,8 @@ fn requests() -> impl Strategy<Value = Request> {
         )
             .prop_map(|(session, until, timeout_ms)| Request::Wait { session, until, timeout_ms }),
         "[^\u{0}]{0,40}".prop_map(|session| Request::Kill { session }),
+        "[^\u{0}]{0,40}".prop_map(|session| Request::Commands { session }),
+        ("[^\u{0}]{0,40}", any::<u32>()).prop_map(|(session, command)| Request::CommandOutput { session, command }),
     ]
 }
 
@@ -201,7 +220,9 @@ proptest! {
             Frame::Malformed(_) => MALFORMED_BIT,
             // A byte mutation can leave the line invalid UTF-8, which the reader cannot hand on as text
             Frame::Ended => ENDED_BIT,
-            // A mutation cannot reach the cap, and at least one byte is always kept
+            // A line break put first is an empty line ahead of the frame, which the loop reads past
+            Frame::Blank if written.first() == Some(&b'\n') => return Ok(()),
+            // A mutation cannot reach the cap, and nothing else leaves a line with nothing on it
             other => return Err(TestCaseError::fail(format!("a mutated frame read as {}", kind_of(&other)))),
         };
         MUTATED_KINDS.fetch_or(bit, Ordering::Relaxed);

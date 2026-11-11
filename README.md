@@ -26,7 +26,7 @@ by the npm package, so a consumer imports the types without building Rust.
 → {"kind":"hello","protocol":1,"role":"client"}
 ← {"kind":"hello","protocol":1,"history":1000}
 → {"kind":"spawn","cols":80,"rows":24,"shell":null,"args":[],"env":[],"unset":[],"cwd":null}
-← {"kind":"spawned","session":"s-1","pid":4242}
+← {"kind":"spawned","session":"s-1","pid":4242,"recorded":false,"restored":false}
 → {"kind":"write","session":"s-1","text":"echo hi\n"}
 ← {"kind":"output","session":"s-1","text":"echo hi\r\nhi\r\n"}
 → {"kind":"facts","session":"s-1"}
@@ -34,6 +34,15 @@ by the npm package, so a consumer imports the types without building Rust.
 ```
 
 [protocol.md](docs/architecture/protocol.md) has every message, the roles, and the closed error set.
+
+A window draws a session over a connection of its own, greeting as a `view`: it is sent the rows that
+changed and paints them, interpreting nothing ([views.md](docs/architecture/views.md)). What paints them
+is the `apack-terminal-view` package in [`view/`](view), whose codec is the other half of that protocol. And
+`apack-terminal proxy [<socket>]` is a process's stdin and stdout as a connection to the broker on that
+socket, started first if there is none — so `ssh host apack-terminal proxy` is a connection to a broker
+on another machine. With no socket named it is the user's own: `$XDG_RUNTIME_DIR/apack-terminal/broker.sock`
+where the system gives a runtime directory, and `~/.apack-terminal/broker.sock` otherwise. A socket goes
+in a directory that is its user's alone: one other users can write to, `/tmp` among them, is refused.
 
 ## Status
 
@@ -74,6 +83,7 @@ See the [docs map](docs/README.md). The ones most people want:
 
 - [design.md](docs/architecture/design.md): the two layers, who owns a session, and what the broker won't do
 - [protocol.md](docs/architecture/protocol.md): every message, the handshake, the roles, the errors
+- [views.md](docs/architecture/views.md): how a window draws a session, and the protocol a view speaks
 - [testing.md](docs/architecture/testing.md): what proves it correct, and the command for each check
 - [background.md](docs/background.md): why the broker exists
 
@@ -88,7 +98,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 cargo xtask generate                         # regenerate the protocol's TypeScript; commit it if it moved
 cargo xtask package                          # release build, staged into the npm package in node/
-cargo run -- /tmp/apack-terminal.sock        # run one, and talk to it
+cargo run -- ~/.apack-terminal/broker.sock   # run one, and talk to it
 ```
 
 `cargo xtask pre-push` is the one to run before a push: it is every check

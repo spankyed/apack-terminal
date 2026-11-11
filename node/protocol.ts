@@ -11,6 +11,31 @@ export type Colors = { foreground: [number, number, number], background: [number
 ansi: Array<[number, number, number]>, };
 
 /**
+ * One command a session's shell reported. Every field but the id is a claim the shell made.
+ */
+export type CommandRecord = { 
+/**
+ * Counts from one in a session, and is never reused
+ */
+id: number, 
+/**
+ * The line the shell read, where it said
+ */
+command: string | null, 
+/**
+ * Where the shell was when the command began
+ */
+cwd: string | null, 
+/**
+ * When it began and ended, in milliseconds since the Unix epoch. `finished_ms` is absent while it runs
+ */
+started_ms: number | null, finished_ms: number | null, 
+/**
+ * Absent while it runs, and when the shell reported none — which is not zero
+ */
+exit_status: number | null, };
+
+/**
  * **A closed set, generated into the TypeScript as a string union** — elmdb's `ErrorCode` arrangement, and
  * what #372's name-matching should become. A caller switches on a value the compiler knows, rather than
  * matching on a message that is free to be reworded.
@@ -20,7 +45,7 @@ export type ErrorCode = "HANDSHAKE" | "MALFORMED" | "NO_SUCH_SESSION" | "PTY" | 
 /**
  * What the broker tells the app, unprompted or in answer.
  */
-export type Event = { "kind": "hello", protocol: number, history: number, } | { "kind": "spawned", session: string, pid: number, } | { "kind": "output", session: string, text: string, } | { "kind": "exited", session: string, code: number | null, signal: string | null, } | { "kind": "throttled", session: string, waited_us: number, } | { "kind": "screen", session: string, lines: Array<string>, 
+export type Event = { "kind": "hello", protocol: number, history: number, } | { "kind": "spawned", session: string, pid: number, recorded: boolean, restored: boolean, } | { "kind": "output", session: string, text: string, } | { "kind": "exited", session: string, code: number | null, signal: string | null, } | { "kind": "throttled", session: string, waited_us: number, } | { "kind": "screen", session: string, lines: Array<string>, 
 /**
  * For each line, whether it runs on into the next. A line longer than the grid is wide is drawn
  * over several rows, and a caller reading them as text joins the ones this marks.
@@ -35,7 +60,7 @@ cursor_row: number, cursor_column: number, alt_screen: boolean, } | { "kind": "o
  * command has already ended learns one ran by this differing from what it last read; it is not
  * an exact number of commands and it wraps, so it is compared for a difference only.
  */
-finished: number, foreground: Foreground | null, } | { "kind": "search", session: string, matches: Array<SearchMatch>, } | { "kind": "waited", session: string, outcome: WaitOutcome, } | { "kind": "failed", session: string | null, code: ErrorCode, message: string, };
+finished: number, foreground: Foreground | null, } | { "kind": "search", session: string, matches: Array<SearchMatch>, } | { "kind": "waited", session: string, outcome: WaitOutcome, } | { "kind": "commands", session: string, commands: Array<CommandRecord>, } | { "kind": "kept", session: string, kept: boolean, } | { "kind": "sessions", sessions: Array<SessionSummary>, } | { "kind": "rewound", session: string, first: number, last: number, } | { "kind": "sought", session: string, at: number, } | { "kind": "command_output", session: string, command: number, text: string | null, } | { "kind": "title", session: string, title: string, } | { "kind": "bell", session: string, } | { "kind": "clipboard", session: string, text: string, } | { "kind": "notification", session: string, title: string, body: string, } | { "kind": "progress", session: string, state: ProgressState, percent: number | null, } | { "kind": "command_started", session: string, command: string | null, } | { "kind": "command_finished", session: string, exit_status: number | null, } | { "kind": "cwd_changed", session: string, cwd: string, } | { "kind": "failed", session: string | null, code: ErrorCode, message: string, };
 
 /**
  * What the kernel says is reading the pty, as against what the shell claims about itself.
@@ -59,6 +84,11 @@ pid: number,
  * up, which is ordinary rather than a failure.
  */
 name: string | null, };
+
+/**
+ * What a program says about how far along it is.
+ */
+export type ProgressState = "none" | "running" | "error" | "indeterminate" | "paused";
 
 /**
  * What the app asks the broker to do.
@@ -87,7 +117,32 @@ unset: Array<string>, cwd: string | null,
  * question and draws nothing, so without this it answers with a palette nobody is looking at.
  * Absent leaves the terminal's own, which is what a caller with no window has.
  */
-colors: Colors | null, } | { "kind": "write", session: string, text: string, } | { "kind": "resize", session: string, cols: number, rows: number, cell_width: number, cell_height: number, } | { "kind": "pause", session: string, } | { "kind": "resume", session: string, } | { "kind": "signal", session: string, signal: Signal, scope: Scope, } | { "kind": "owns", session: string, pid: number, } | { "kind": "screen", session: string, history: number, } | { "kind": "facts", session: string, } | { "kind": "search", session: string, text: string, history: number, } | { "kind": "wait", session: string, until: Until, timeout_ms: number, } | { "kind": "kill", session: string, };
+colors: Colors | null, 
+/**
+ * **Whether the session's bytes are sent as `Output`.** A caller that reads a program's output —
+ * to parse it, to forward it — wants them. A terminal a person looks at is drawn by a view, which
+ * is sent rows, and its bytes would cross the socket to be thrown away; worse, they are bounded
+ * by credit, so an unread stream would stall the program. Absent means sent, as it always was.
+ */
+output: boolean, 
+/**
+ * **A file to record the session in** (`recording`): what its program writes, so the screen can
+ * be rebuilt after the session is gone and looked back through while it runs. Absent records
+ * nothing, which is what a session is unless someone asks — a recording holds everything the
+ * program printed, including what it printed once and erased.
+ */
+record: string | null, 
+/**
+ * Whether to begin with the screen `record` already holds, as a terminal reopened where its last
+ * session left off. The recording carries on in the same file.
+ */
+restore: boolean, 
+/**
+ * **Whether the session's programs may send images** (the Kitty graphics protocol). A program
+ * asks the terminal whether it can before it sends one, so this is yes only for a session whose
+ * views draw them; absent, a program is told no and prints what it would have otherwise.
+ */
+images: boolean, } | { "kind": "write", session: string, text: string, } | { "kind": "resize", session: string, cols: number, rows: number, cell_width: number, cell_height: number, } | { "kind": "pause", session: string, } | { "kind": "resume", session: string, } | { "kind": "signal", session: string, signal: Signal, scope: Scope, } | { "kind": "owns", session: string, pid: number, } | { "kind": "screen", session: string, history: number, } | { "kind": "facts", session: string, } | { "kind": "search", session: string, text: string, history: number, } | { "kind": "wait", session: string, until: Until, timeout_ms: number, } | { "kind": "commands", session: string, } | { "kind": "command_output", session: string, command: number, } | { "kind": "keep", session: string, kept: boolean, } | { "kind": "sessions" } | { "kind": "rewind", recording: string, cols: number, rows: number, } | { "kind": "seek", session: string, at: number, } | { "kind": "kill", session: string, };
 
 /**
  * What a connection is for.
@@ -102,7 +157,7 @@ colors: Colors | null, } | { "kind": "write", session: string, text: string, } |
  * something it can acquire by accident: the failure mode of getting this wrong is a session that does not
  * outlive its client, never a shell left running after the app is gone.
  */
-export type Role = "client" | "lifetime";
+export type Role = "client" | "lifetime" | "view";
 
 /**
  * What a signal is sent to.
@@ -131,6 +186,27 @@ column: number,
  * second read.
  */
 text: string, };
+
+/**
+ * A session, as a caller that did not start it needs to know it.
+ */
+export type SessionSummary = { session: string, pid: number, cols: number, rows: number, 
+/**
+ * Whether it outlives the broker's holder (`Request::Keep`)
+ */
+kept: boolean, 
+/**
+ * Whether what it prints is being recorded
+ */
+recorded: boolean, 
+/**
+ * What its program last named the terminal
+ */
+title: string | null, 
+/**
+ * Where its shell last said it was, and what it last said it was running: claims, as in `Facts`
+ */
+cwd: string | null, command: string | null, running: boolean, };
 
 /**
  * A signal a `Signal` request may send.
