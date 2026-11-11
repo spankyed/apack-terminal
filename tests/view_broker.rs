@@ -18,9 +18,11 @@ use interprocess::local_socket::{GenericFilePath, Stream, ToFsName, prelude::*};
 use apack_terminal::protocol::{Event, PROTOCOL_VERSION, Request, Role};
 use apack_terminal::view::wire::{Frame, Incoming, Position, Row, Span, ToBroker, ToView, read_message};
 
-/// How long a case waits for something a working broker does at once. A bound, so a broken one fails
-/// rather than hangs; generous, so a busy machine does not.
-const PATIENCE: Duration = Duration::from_secs(20);
+/// How long a case waits for something a working broker does at once: generous, so a busy machine does
+/// not fail one. **Shorter than the runner's deadline for a
+/// case** (`.config/nextest.toml`), so a wait that runs out fails saying what it was waiting for, where
+/// one as long as the deadline is ended by the runner saying nothing.
+const PATIENCE: Duration = Duration::from_secs(15);
 
 struct Broker {
     process: Child,
