@@ -128,9 +128,19 @@ returns rather than a wrong answer — and under `cargo test` one such case hold
 
 The deadlines are in [`.config/nextest.toml`](../../.config/nextest.toml). Each is several times the slowest
 reading rather than near it, because what it is for is a test that has stopped ending at all: the whole
-suite is 15 s on an Apple-silicon laptop (345 tests, 2026-11-10), and its slowest case 7.7 s against a
-default deadline of 20 s — but for the one that waits out a broker's ten-second grace, which has a
+suite is 8 s on an Apple-silicon laptop (352 tests, 2026-11-11), and its slowest case 7.2 s against a
 deadline of its own. **A reading, never a bound** — a slower machine reports, it does not fail.
+
+**The suite is one program** (`tests/suite.rs`), whose modules are the files beside it: a file of its own
+under `tests/` would be a binary of its own, linked against the whole library, and thirty of those were
+most of what a changed line cost to build. **Its cases run cheapest first** (the priorities in
+`.config/nextest.toml`): the ones that are a function call before the ones that start the broker and a
+shell, with the two longest started at the beginning so the run does not end waiting for them. **A case
+names its shell.** A spawn that names none runs the login shell of whoever ran the suite, with their
+configuration, which is seconds where `/bin/sh` is milliseconds and is what made cases go quiet on a busy
+machine; `tests/channel.rs` is where the default is run. **A case about a wait gives the broker a short
+one** (`APACK_TERMINAL_START_GRACE_MS`): that a broker nothing connects to leaves when its grace is over
+is the same claim at half a second as at ten.
 
 ## Mutation testing
 
@@ -170,7 +180,16 @@ every mutant after it in that copy, and each of those is reported caught by a ca
 A property here holds for every input its strategy can produce; when a run's logs show one test failing
 across mutants it cannot reach, that test is the defect and the run is not a result.
 
-`.github/workflows/mutants.yml` runs the same thing on a pull request and fails on a survivor. It runs twice:
+**What a mutant costs is a build and the suite up to its first failure**, and each of those is kept
+small on purpose: one test program to link, the cheap cases first, and a run that ends at the first case
+to fail rather than waiting for the ones in flight (`additional_cargo_test_args`, `.cargo/mutants.toml`).
+Measured on one sample of 51 mutants, four at a time (2026-11-11): a mutant the suite caught took 3.2 s
+to test, where it had taken 21.4 s, and a pass over a branch of 1,505 had run for three hours without
+finishing. **Run one pass at a time on a machine**: two at once left real-process cases waiting ten
+seconds on a shell, and they failed for mutants in code they never reach — which reads as *caught*.
+
+`.github/workflows/mutants.yml` runs the same thing on a pull request and fails on a survivor, dealt across
+eight runners, and a pass that has started finishes rather than being cancelled by the next push. It runs twice:
 Windows-only code compiles on no other platform, so a Linux run reports every mutant of `src/tree.rs` and of
 every `cfg(windows)` arm as unviable, and the Windows job is where those are actually tested.
 

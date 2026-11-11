@@ -18,7 +18,6 @@
 //! and a named pipe's buffering is not a Unix socket's. The coalescing and the credit are the broker's own
 //! code and platform-independent; how much output it takes to fill the pipe is not. The transport itself is
 //! covered on Windows by `tests/broker.rs`, which passes there in full.
-#![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};

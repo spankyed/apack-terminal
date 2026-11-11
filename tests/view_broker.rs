@@ -4,7 +4,6 @@
 //! proven here is the part that needs one: that a connection greeting as a view is served, that its keys
 //! reach a program and the program's output comes back as rows, and that a view coming, going or
 //! misbehaving costs the session nothing.
-#![cfg(unix)]
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};

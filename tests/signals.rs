@@ -5,7 +5,6 @@
 //! (`child.process_id().unwrap_or_default()`), would turn one stop request into the broker killing itself
 //! and every session it owns. These cases are the refusal that cannot be tested through the socket: a
 //! session with a real pid would have to be signalled to see where the signal went.
-#![cfg(unix)]
 
 use apack_terminal::protocol::Scope;
 use apack_terminal::session::{SignalTarget, signal_target};

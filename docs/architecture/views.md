@@ -178,6 +178,6 @@ no place of its own and is not told. Animations are not advanced.
 `node/view-vectors.json` holds every kind of message as the bytes this encoder writes and the value they
 mean. `tests/view_vectors.rs` fails when the file is not what the encoder writes now; the view's suite
 decodes every vector for a view and encodes every one for the broker. Re-record with
-`APACK_UPDATE_VECTORS=1 cargo nextest run --test view_vectors` and read the diff: every line of it is a
+`APACK_UPDATE_VECTORS=1 cargo nextest run -E 'test(/^view_vectors::/)'` and read the diff: every line of it is a
 change the view's codec (`view/src/broker/wire.ts`) has to be taught, in the same commit. The view's suite
 reads the file where it lies, so there is no copy of it to carry anywhere.

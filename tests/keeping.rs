@@ -3,7 +3,6 @@
 //!
 //! Against the real binary and a real shell, over connections that are hung up the way an app quitting
 //! hangs them up.
-#![cfg(unix)]
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};

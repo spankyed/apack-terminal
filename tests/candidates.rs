@@ -10,7 +10,6 @@
 //! second set of probes would add nothing and the shell differences would be the whole of what they
 //! measured. The pty probe in particular sends `\n`, which a Windows console echoes without running
 //! (X6), and then waits for an EOF a ConPTY never gives.
-#![cfg(unix)]
 
 use std::io::{Read, Write};
 

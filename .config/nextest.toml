@@ -6,23 +6,15 @@
 # What CI installs, and the oldest that reads this file as written
 nextest-version = "0.9.148"
 
-# A reading, not a bound: the whole suite is 15 s and its slowest test 10 s on an Apple-silicon laptop
-# (354 tests, 2026-11-10) — that one waits out a ten-second grace and has a deadline of its own below; the
-# slowest of the rest is 7.7 s. The deadline here is for a test that has stopped ending at all, so it is
-# several times the slowest rather than near it.
+# The deadline is for a test that has stopped ending at all, so it is several times the slowest test
+# rather than near it: `cargo nextest run` prints what each one took.
 [profile.default]
 slow-timeout = { period = "10s", terminate-after = 2 }
 
 # The one test that waits for a producer to saturate the bounded channel and for the throttle to be reported:
-# 7.2 s of real output on that laptop, and the only test whose work is the volume rather than a round trip
+# 7.2 s of real output on an Apple-silicon laptop, and the only test whose work is the volume rather than a round trip
 [[profile.default.overrides]]
-filter = "test(=a_saturating_producer_reports_that_it_was_throttled_rather_than_losing_output)"
-slow-timeout = { period = "30s", terminate-after = 2 }
-
-# The two tests that wait out a deadline rather than a round trip: a broker nothing connects to gives
-# whatever started it `START_GRACE` (`src/listening.rs`, ten seconds) to arrive, so that wait is the test
-[[profile.default.overrides]]
-filter = "test(=a_broker_nothing_ever_connects_to_exits) | test(=a_broker_nothing_can_reach_exits)"
+filter = "test(=channel::a_saturating_producer_reports_that_it_was_throttled_rather_than_losing_output)"
 slow-timeout = { period = "30s", terminate-after = 2 }
 
 # **ts-rs generates one `export_bindings_*` test per exported type, and every one of them writes the same
@@ -42,3 +34,21 @@ protocol-export = { max-threads = 1 }
 [[profile.default.overrides]]
 filter = "test(/^protocol::export_bindings_/)"
 test-group = "protocol-export"
+
+# **The two longest cases start first.** Each is seconds of real output by design, so left to the end
+# they are what a whole run waits for after everything else has finished; started first they are over
+# when the rest is. Above the override that puts their modules last, because the first override that
+# matches a case is the one that sets its priority
+[[profile.default.overrides]]
+filter = "test(=channel::a_saturating_producer_reports_that_it_was_throttled_rather_than_losing_output) | test(=broker::a_client_that_stops_reading_stalls_the_program_rather_than_filling_the_broker)"
+priority = 50
+
+# **Of the rest, the cases that are a function call run before the ones that are a process.** A case that feeds a
+# parser or reads a row back answers in milliseconds, and is what fails first for most of what can go
+# wrong in this crate; the modules below start the real broker and a shell, and take the suite's whole
+# length between them. Run in the order of their names, those came first — so a run that stops at its
+# first failure, which a mutation run does once a mutant (`.cargo/mutants.toml`), waited through seconds
+# of processes to reach a case that took none.
+[[profile.default.overrides]]
+filter = "test(/^(broker|candidates|channel|coalescing|housekeeping|keeping|proxy|view_broker)::/)"
+priority = -50

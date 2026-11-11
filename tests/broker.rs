@@ -374,7 +374,7 @@ fn a_frame_that_is_not_a_request_is_refused_and_the_connection_survives() {
     assert_eq!(next(&mut reading)["code"], "MALFORMED");
 
     // Still usable: one bad frame is not a broken connection
-    ask(&mut writing, &spawn_frame(80, 24, None));
+    ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
     assert_eq!(next(&mut reading)["kind"], "spawned");
 }
 
@@ -416,7 +416,7 @@ fn nothing_can_be_asked_before_the_handshake() {
     let broker = start();
     let (mut reading, mut writing) = connect(&broker);
 
-    ask(&mut writing, &spawn_frame(80, 24, None));
+    ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
     assert_eq!(next(&mut reading)["code"], "HANDSHAKE");
 }
 
@@ -427,7 +427,7 @@ fn a_shell_that_exits_on_its_own_is_reported_without_anything_polling_for_it() {
     ask(&mut writing, &hello(None));
     next(&mut reading);
 
-    ask(&mut writing, &spawn_frame(80, 24, None));
+    ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
     let session = next(&mut reading)["session"].as_str().expect("a session").to_owned();
 
     ask(
@@ -447,7 +447,7 @@ fn a_client_that_disconnects_leaves_no_shell_running() {
     let (mut reading, mut writing) = connect(&broker);
     ask(&mut writing, &hello(None));
     next(&mut reading);
-    ask(&mut writing, &spawn_frame(80, 24, None));
+    ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
     let pid = next(&mut reading)["pid"].as_u64().expect("a pid") as i32;
     // What an app that quit, crashed or was killed looks like from here
     disconnect(reading, writing);
@@ -480,7 +480,12 @@ fn alive(pid: i32) -> bool {
     }
 }
 
-/// The shell this platform's default session runs, where a case needs to name one.
+/// The shell a case's session runs.
+///
+/// **Named rather than left to the default, in every case here.** A spawn that names none runs the login
+/// shell of whoever ran the suite, with their configuration: seconds to reach a prompt where this takes
+/// milliseconds, a line typed before then lost, and a suite whose length and whose failures on a busy
+/// machine were those of somebody's prompt. `tests/channel.rs` is where a spawn naming no shell is run.
 ///
 /// `portable-pty`'s default program is the login shell on POSIX and `ComSpec` on Windows — which is
 /// `cmd.exe`, not PowerShell, and typing one's syntax into the other is how a case can look like a broken
@@ -622,7 +627,7 @@ fn killing_a_session_takes_the_whole_tree_with_it() {
     let (mut reading, mut writing) = connect(&broker);
     ask(&mut writing, &hello(None));
     next(&mut reading);
-    ask(&mut writing, &spawn_frame(80, 24, None));
+    ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
     let answered = next(&mut reading);
     let session = answered["session"].as_str().unwrap_or_else(|| panic!("a spawn was answered {answered}")).to_owned();
 
@@ -653,7 +658,7 @@ fn a_session_is_cancellable_while_its_shell_is_busy() {
     let (mut reading, mut writing) = connect(&broker);
     ask(&mut writing, &hello(None));
     next(&mut reading);
-    ask(&mut writing, &spawn_frame(80, 24, None));
+    ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
     let spawned = next(&mut reading);
     let session = spawned["session"].as_str().expect("a session").to_owned();
     let shell = spawned["pid"].as_u64().expect("a pid") as i32;
@@ -832,7 +837,7 @@ fn writing_to_a_session_whose_shell_has_gone_is_refused() {
     let (mut reading, mut writing) = connect(&broker);
     ask(&mut writing, &hello(None));
     next(&mut reading);
-    ask(&mut writing, &spawn_frame(80, 24, None));
+    ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
     let session = next(&mut reading)["session"].as_str().expect("a session").to_owned();
 
     once_the_shell_is_listening(&mut reading);
@@ -1537,7 +1542,7 @@ fn the_last_client_leaving_ends_its_sessions_while_another_connection_holds_the_
     let (mut reading, mut writing) = connect(&broker);
     ask(&mut writing, &hello(None));
     next(&mut reading);
-    ask(&mut writing, &spawn_frame(80, 24, None));
+    ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
     let (spawned, _) = until(&mut reading, "spawned");
     let pid = spawned["pid"].as_u64().expect("a pid") as i32;
 
@@ -1561,9 +1566,9 @@ fn two_sessions_are_told_apart() {
     ask(&mut writing, &hello(None));
     next(&mut reading);
 
-    ask(&mut writing, &spawn_frame(80, 24, None));
+    ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
     let (first, _) = until(&mut reading, "spawned");
-    ask(&mut writing, &spawn_frame(80, 24, None));
+    ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
     let (second, _) = until(&mut reading, "spawned");
 
     assert_ne!(
@@ -1590,7 +1595,7 @@ fn a_paused_session_stops_being_read_and_a_resume_delivers_what_it_missed() {
     let (mut reading, mut writing) = connect(&broker);
     ask(&mut writing, &hello(None));
     next(&mut reading);
-    ask(&mut writing, &spawn_frame(80, 24, None));
+    ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
     let session = next(&mut reading)["session"].as_str().expect("a session").to_owned();
     once_the_shell_is_listening(&mut reading);
 
@@ -1640,7 +1645,7 @@ fn a_pause_does_not_outlive_the_client_that_asked_for_it() {
     let (mut reading, mut writing) = connect(&broker);
     ask(&mut writing, &hello(None));
     next(&mut reading);
-    ask(&mut writing, &spawn_frame(80, 24, None));
+    ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
     let session = next(&mut reading)["session"].as_str().expect("a session").to_owned();
     once_the_shell_is_listening(&mut reading);
     ask(&mut writing, &format!(r#"{{"kind":"pause","session":"{session}"}}"#));
@@ -1670,7 +1675,7 @@ fn a_session_killed_by_a_signal_names_it_and_reports_no_code() {
     let (mut reading, mut writing) = connect(&broker);
     ask(&mut writing, &hello(None));
     next(&mut reading);
-    ask(&mut writing, &spawn_frame(80, 24, None));
+    ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
     let session = next(&mut reading)["session"].as_str().expect("a session").to_owned();
     once_the_shell_is_listening(&mut reading);
 
@@ -1693,7 +1698,7 @@ fn a_session_that_exits_of_its_own_accord_reports_a_code_and_no_signal() {
     let (mut reading, mut writing) = connect(&broker);
     ask(&mut writing, &hello(None));
     next(&mut reading);
-    ask(&mut writing, &spawn_frame(80, 24, None));
+    ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
     let session = next(&mut reading)["session"].as_str().expect("a session").to_owned();
     once_the_shell_is_listening(&mut reading);
 
@@ -1720,7 +1725,7 @@ fn a_signal_reaches_a_process_inside_the_session_s_tree_and_nothing_outside_it()
     let (mut reading, mut writing) = connect(&broker);
     ask(&mut writing, &hello(None));
     next(&mut reading);
-    ask(&mut writing, &spawn_frame(80, 24, None));
+    ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
     let session = next(&mut reading)["session"].as_str().expect("a session").to_owned();
     once_the_shell_is_listening(&mut reading);
     let notes = tempfile::tempdir().expect("a directory for the grandchild's pid");
@@ -1788,7 +1793,7 @@ fn a_signal_to_the_group_reaches_what_the_shell_started() {
     let (mut reading, mut writing) = connect(&broker);
     ask(&mut writing, &hello(None));
     next(&mut reading);
-    ask(&mut writing, &spawn_frame(80, 24, None));
+    ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
     let session = next(&mut reading)["session"].as_str().expect("a session").to_owned();
     once_the_shell_is_listening(&mut reading);
     let notes = tempfile::tempdir().expect("a directory for the grandchild's pid");
@@ -1836,7 +1841,7 @@ fn a_client_that_is_not_the_attached_one_leaving_takes_nothing_with_it() {
     ask(&mut opening, &hello(None));
     let mut first = first;
     next(&mut first);
-    ask(&mut opening, &spawn_frame(80, 24, None));
+    ask(&mut opening, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
     let session = next(&mut first)["session"].as_str().expect("a session").to_owned();
 
     // Last greeting wins the feed, so this one is now the attached client
@@ -1873,7 +1878,7 @@ fn a_session_says_which_pids_are_inside_its_own_tree() {
     let (mut reading, mut writing) = connect(&broker);
     ask(&mut writing, &hello(None));
     next(&mut reading);
-    ask(&mut writing, &spawn_frame(80, 24, None));
+    ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
     let spawned = next(&mut reading);
     let session = spawned["session"].as_str().expect("a session").to_owned();
     let leader = spawned["pid"].as_u64().expect("a pid");
@@ -1917,7 +1922,7 @@ fn two_questions_about_one_session_are_each_answered_about_their_own_pid() {
     let (mut reading, mut writing) = connect(&broker);
     ask(&mut writing, &hello(None));
     next(&mut reading);
-    ask(&mut writing, &spawn_frame(80, 24, None));
+    ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
     let spawned = next(&mut reading);
     let session = spawned["session"].as_str().expect("a session").to_owned();
     let leader = spawned["pid"].as_u64().expect("a pid");

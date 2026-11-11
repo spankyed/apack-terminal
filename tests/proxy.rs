@@ -3,7 +3,6 @@
 //! Driven as `ssh` or `docker exec` would carry it — a child whose pipes are the connection — against the
 //! real binary: that a broker is started when there is none, that the pipe is the broker's protocol byte
 //! for byte, and that a second proxy joins the first's broker rather than starting another.
-#![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -13,7 +12,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
-use apack_terminal::listening::{HELD_EXIT, START_GRACE};
+use apack_terminal::listening::{HELD_EXIT, START_GRACE, START_GRACE_ENV, start_grace};
 use apack_terminal::protocol::{Event, PROTOCOL_VERSION, Request, Role};
 
 /// How long a wait in this file goes on with nothing arriving. **Shorter than the runner's deadline for a
@@ -216,7 +215,18 @@ impl Drop for Broker {
 }
 
 fn broker(socket: &Path) -> Broker {
-    let mut process = Command::new(env!("CARGO_BIN_EXE_apack-terminal"))
+    broker_given(socket, None)
+}
+
+/// A broker told how long to wait for its first connection, or left to wait as long as it does in use.
+fn broker_given(socket: &Path, grace: Option<Duration>) -> Broker {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_apack-terminal"));
+    match grace {
+        Some(grace) => command.env(START_GRACE_ENV, grace.as_millis().to_string()),
+        // Whatever ran the suite may have set one
+        None => command.env_remove(START_GRACE_ENV),
+    };
+    let mut process = command
         .arg(socket)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -400,18 +410,25 @@ fn a_proxy_whose_input_has_ended_still_carries_the_answer_to_what_it_was_last_se
 /// allows for that first connection has passed.
 #[test]
 fn a_broker_nothing_ever_connects_to_exits() {
+    // Long enough that leaving at once and leaving when it is over cannot be mistaken for each other
+    let grace = Duration::from_millis(500);
     let directory = tempfile::tempdir().expect("a directory for the socket");
     let socket = directory.path().join("broker.sock");
     let started = Instant::now();
-    let mut alone = broker(&socket);
+    let mut alone = broker_given(&socket, Some(grace));
     assert!(alone.said.starts_with("listening "), "{}", alone.said);
     let (code, _) = alone.ended();
     assert_eq!(code, Some(0));
-    assert!(
-        started.elapsed() >= START_GRACE,
-        "it left after {:?}, before anything could have connected",
-        started.elapsed()
-    );
+    assert!(started.elapsed() >= grace, "it left after {:?}, before anything could have connected", started.elapsed());
+}
+
+/// A broker waits as long as it does in use unless it is told a number of milliseconds.
+#[test]
+fn the_grace_is_the_one_in_use_unless_a_number_of_milliseconds_is_given() {
+    assert_eq!(start_grace(None), START_GRACE);
+    assert_eq!(start_grace(Some("250")), Duration::from_millis(250));
+    assert_eq!(start_grace(Some("soon")), START_GRACE);
+    assert_eq!(start_grace(Some("")), START_GRACE);
 }
 
 /// A broker whose socket has been taken from under it cannot be connected to by anything, itself
@@ -421,7 +438,8 @@ fn a_broker_nothing_ever_connects_to_exits() {
 fn a_broker_nothing_can_reach_exits() {
     let directory = tempfile::tempdir().expect("a directory for the socket");
     let socket = directory.path().join("broker.sock");
-    let mut alone = broker(&socket);
+    // Its socket is gone well inside this, so what it finds when the grace is over is nothing to reach
+    let mut alone = broker_given(&socket, Some(Duration::from_secs(2)));
     assert!(alone.said.starts_with("listening "), "{}", alone.said);
     std::fs::remove_file(&socket).expect("the socket's file is removed");
     let (code, _) = alone.ended();
