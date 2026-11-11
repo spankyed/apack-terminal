@@ -190,16 +190,16 @@ session ending settles every wait on it, because nothing is coming.
   What bounds it is the caller: a thread per outstanding wait, each for no longer than the timeout it
   was asked with, holding nothing but the session's id.
 
-- **Windows is written for and was not built here.** Everything Windows-only in this tree — the named
-  pipe transport, the job object that owns a session's tree (`tree.rs`), ConPTY's start-up exchange, the
-  branches marked `cfg(windows)` or `cfg(not(unix))` in `session.rs`, `listening.rs`, `recording.rs`, `proxy.rs` and `main.rs` — was
-  neither compiled nor run while views, recordings, the socket's lock and the bounded waits were written:
-  that work was built and tested on macOS alone, and the suites that drive the real binary (`keeping`,
-  `view_broker`, `proxy`) use Unix sockets and `/bin/sh` and do not run on Windows at all. What is known
-  to differ there is said where it applies: a view past its limit is not hung up on (`views.md`), a
-  session's exit is not waited on for its last output, `signal` answers `UNSUPPORTED`, and the socket's
-  directory and peer are not checked as they are on POSIX. A Windows build of this tree is a first
-  build, and should be treated as one.
+- **Windows builds and passes what runs there, which is not everything.** CI's Windows job builds the
+  terminal core from source — nobody publishes one for Windows, so the job installs the Zig its commit
+  wants and builds it for speed, as the library every other platform links was — and runs the suite:
+  276 cases. What does not run there is the suites that drive the real binary over a socket (`keeping`,
+  `view_broker`, `proxy`), which use Unix sockets and `/bin/sh`; so a view's connection, the lock that
+  makes a broker the only one on its pipe, the proxy and a kept session are compiled on Windows and
+  exercised nowhere on it. What is known to differ there is said where it applies: a view past its
+  limit is not hung up on (`views.md`), a session's exit is not waited on for its last output,
+  `signal` answers `UNSUPPORTED`, and the pipe's directory and peer are not checked as a socket's are
+  on POSIX.
 
 ## What the broker will not do
 
