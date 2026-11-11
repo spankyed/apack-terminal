@@ -37,7 +37,12 @@ pub fn fetch(root: &Path) -> Result<(), String> {
     } else {
         let archive = format!("ghostty-vt-{short}-{triple}.tar.gz");
         let url = format!("{RELEASES}/ghostty-{short}/{archive}");
-        let staged = tempfile::tempdir().map_err(|error| format!("no temporary directory: {error}"))?;
+        // **Beside where it will be placed, not in the system's temporary directory**: the unpacked tree
+        // is put in place by a rename, which cannot cross filesystems, and a build directory on a volume
+        // of its own is the ordinary case in a container
+        let beside = into.parent().unwrap_or(root);
+        std::fs::create_dir_all(beside).map_err(|error| format!("{}: {error}", beside.display()))?;
+        let staged = tempfile::tempdir_in(beside).map_err(|error| format!("no temporary directory: {error}"))?;
         let downloaded = staged.path().join(&archive);
 
         println!("fetching {url}");
@@ -51,9 +56,6 @@ pub fn fetch(root: &Path) -> Result<(), String> {
         untar(&downloaded, &unpacked)?;
         if !unpacked.join("lib").join("libghostty-vt.a").exists() {
             return Err(format!("{archive} holds no lib/libghostty-vt.a; the archive layout has changed"));
-        }
-        if let Some(parent) = into.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
         }
         std::fs::remove_dir_all(&into).ok();
         std::fs::rename(&unpacked, &into).map_err(|error| format!("could not place {}: {error}", into.display()))?;

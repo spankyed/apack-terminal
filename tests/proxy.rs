@@ -5,11 +5,15 @@
 //! for byte, and that a second proxy joins the first's broker rather than starting another.
 #![cfg(unix)]
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use apack_terminal::listening::{HELD_EXIT, START_GRACE};
 use apack_terminal::protocol::{Event, PROTOCOL_VERSION, Request, Role};
 
 const PATIENCE: Duration = Duration::from_secs(20);
@@ -193,16 +197,306 @@ fn only_the_word_proxy_asks_for_one() {
     assert!(!socket.exists(), "a broker was started for an invocation that asked for none");
 }
 
-/// A proxy that died while starting a broker leaves its claim behind, and nothing listening. The next
-/// proxy waits for the broker that claim promises, and when none comes takes the claim over and starts
-/// one — rather than waiting on a file nobody is going to remove.
+/// A broker started directly, as the app starts its own, with what it said first on its stdout: the line
+/// that says it is listening, or the one that says why it is not.
+struct Broker {
+    process: Child,
+    said: String,
+}
+
+impl Drop for Broker {
+    fn drop(&mut self) {
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+    }
+}
+
+fn broker(socket: &Path) -> Broker {
+    let mut process = Command::new(env!("CARGO_BIN_EXE_apack-terminal"))
+        .arg(socket)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the broker starts");
+    let mut said = String::new();
+    BufReader::new(process.stdout.take().expect("piped stdout"))
+        .read_line(&mut said)
+        .expect("the broker's stdout reads");
+    Broker { process, said }
+}
+
+impl Broker {
+    /// Waits for it to exit, answering its code and what it wrote to stderr.
+    fn ended(&mut self) -> (Option<i32>, String) {
+        let mut errors = String::new();
+        self.process
+            .stderr
+            .take()
+            .expect("piped stderr")
+            .read_to_string(&mut errors)
+            .expect("the broker's stderr reads");
+        (self.process.wait().expect("the broker is waited for").code(), errors)
+    }
+}
+
+/// Greets a broker over its socket as a client, answering the connection once the broker has answered.
+fn greeted(socket: &Path) -> UnixStream {
+    let mut stream = UnixStream::connect(socket).expect("the broker accepts");
+    let hello =
+        serde_json::to_string(&Request::Hello { protocol: PROTOCOL_VERSION, role: Role::Client }).expect("hello");
+    stream.write_all(format!("{hello}\n").as_bytes()).expect("the broker reads");
+    let mut answer = String::new();
+    BufReader::new(stream.try_clone().expect("a second handle")).read_line(&mut answer).expect("the broker answers");
+    assert!(matches!(serde_json::from_str::<Event>(&answer), Ok(Event::Hello { .. })), "{answer}");
+    stream
+}
+
+/// **One broker a socket.** A second broker asked to listen where one already is does not take the socket
+/// from it — which would leave the first running with nothing able to reach it — but exits, with a code
+/// of its own and the reason, and the first is still there.
 #[test]
-fn a_claim_left_by_a_proxy_that_died_is_taken_over() {
+fn a_second_broker_on_a_socket_leaves_the_first_alone_and_says_why_it_left() {
     let directory = tempfile::tempdir().expect("a directory for the socket");
     let socket = directory.path().join("broker.sock");
-    let claim = directory.path().join("broker.sock.starting");
-    std::fs::write(&claim, b"").expect("the claim is left");
-    let mut late = proxy(&socket);
-    late.greet(Role::Client);
-    assert!(!claim.exists(), "the claim outlived the broker it was for");
+    let first = broker(&socket);
+    assert!(first.said.starts_with("listening "), "{}", first.said);
+    let _held = greeted(&socket);
+
+    let mut second = broker(&socket);
+    assert_eq!(second.said.trim(), "failed another broker is already listening there");
+    let (code, errors) = second.ended();
+    assert_eq!(code, Some(HELD_EXIT));
+    assert!(errors.contains("another broker is already listening there"), "{errors}");
+
+    // And the first is still the one that answers there
+    let _again = greeted(&socket);
+}
+
+/// A broker that was killed leaves its socket file behind, and nothing holding the socket: the next
+/// broker replaces the file and listens.
+#[test]
+fn a_socket_file_a_dead_broker_left_is_replaced() {
+    let directory = tempfile::tempdir().expect("a directory for the socket");
+    let socket = directory.path().join("broker.sock");
+    let mut dead = broker(&socket);
+    assert!(dead.said.starts_with("listening "), "{}", dead.said);
+    dead.process.kill().expect("the broker is killed");
+    dead.process.wait().expect("the broker is waited for");
+    assert!(socket.exists(), "the socket file went with the broker, so this case shows nothing");
+
+    let next = broker(&socket);
+    assert!(next.said.starts_with("listening "), "{}", next.said);
+    let _connection = greeted(&socket);
+}
+
+/// What crosses the socket is a user's terminals, so the socket is theirs alone to open, and a directory
+/// made for it is theirs alone to look in.
+#[test]
+fn a_socket_and_a_directory_made_for_it_are_their_owners_alone() {
+    let directory = tempfile::tempdir().expect("a directory for the socket");
+    let made = directory.path().join("made").join("for-it");
+    let socket = made.join("broker.sock");
+    let listening = broker(&socket);
+    assert!(listening.said.starts_with("listening "), "{}", listening.said);
+    let mode = |path: &Path| std::fs::metadata(path).expect("it is there").permissions().mode() & 0o777;
+    assert_eq!(mode(&socket), 0o600);
+    assert_eq!(mode(&made), 0o700);
+    assert_eq!(mode(&directory.path().join("made")), 0o700);
+}
+
+/// A directory other users can write to is one where the socket can be swapped for theirs: a broker will
+/// not listen in it, and a proxy will not look for one there.
+#[test]
+fn a_directory_others_can_write_to_is_refused() {
+    let directory = tempfile::tempdir().expect("a directory for the socket");
+    let shared = directory.path().join("shared");
+    std::fs::create_dir(&shared).expect("the directory is made");
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).expect("the mode is set");
+    let socket = shared.join("broker.sock");
+
+    let mut refused = broker(&socket);
+    assert!(refused.said.contains("can be written to by other users"), "{}", refused.said);
+    let (code, _) = refused.ended();
+    assert_eq!(code, Some(1));
+    assert!(!socket.exists());
+
+    let through = Command::new(env!("CARGO_BIN_EXE_apack-terminal"))
+        .arg("proxy")
+        .arg(&socket)
+        .stdin(Stdio::null())
+        .output()
+        .expect("the proxy runs");
+    assert!(!through.status.success());
+    assert!(String::from_utf8_lossy(&through.stderr).contains("can be written to by other users"));
+}
+
+/// A broker a proxy starts that cannot listen says why, and the proxy passes it on: the person at the far
+/// end of an `ssh` reads the reason rather than that nothing was said.
+#[test]
+fn a_proxy_says_why_the_broker_it_started_could_not_listen() {
+    let directory = tempfile::tempdir().expect("a directory for the socket");
+    // A path that is already something no socket can replace
+    let socket = directory.path().join("taken");
+    std::fs::create_dir(&socket).expect("the directory is made");
+    std::fs::write(socket.join("kept"), b"").expect("a file is put in it");
+
+    let through = Command::new(env!("CARGO_BIN_EXE_apack-terminal"))
+        .arg("proxy")
+        .arg(&socket)
+        .stdin(Stdio::null())
+        .output()
+        .expect("the proxy runs");
+    assert!(!through.status.success());
+    let errors = String::from_utf8_lossy(&through.stderr);
+    assert!(errors.contains("could not listen: "), "{errors}");
+    assert!(socket.join("kept").exists(), "what was at the path was removed to make way");
+}
+
+/// **The far end finishing what it has to say is not the end of the answer.** A proxy whose input ends —
+/// the whole of a conversation piped into it — goes on carrying what the broker says until the broker
+/// has said it, so the last request is answered like the first.
+#[test]
+fn a_proxy_whose_input_has_ended_still_carries_the_answer_to_what_it_was_last_sent() {
+    let directory = tempfile::tempdir().expect("a directory for the socket");
+    let socket = directory.path().join("broker.sock");
+    let mut process = Command::new(env!("CARGO_BIN_EXE_apack-terminal"))
+        .arg("proxy")
+        .arg(&socket)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("the proxy starts");
+    let mut input = process.stdin.take().expect("piped stdin");
+    let mut said = String::new();
+    for request in [
+        Request::Hello { protocol: PROTOCOL_VERSION, role: Role::Client },
+        Request::Sessions,
+        Request::Facts { session: "s-404".to_owned() },
+    ] {
+        said.push_str(&serde_json::to_string(&request).expect("a request serializes"));
+        said.push('\n');
+    }
+    // Everything at once, and then nothing more ever
+    input.write_all(said.as_bytes()).expect("the proxy reads");
+    drop(input);
+
+    let mut answered = String::new();
+    process.stdout.take().expect("piped stdout").read_to_string(&mut answered).expect("the proxy's output reads");
+    let events: Vec<Event> = answered.lines().filter_map(|line| serde_json::from_str(line).ok()).collect();
+    assert!(
+        matches!(events.as_slice(), [Event::Hello { .. }, Event::Sessions { .. }, Event::Failed { .. }]),
+        "{answered}"
+    );
+    assert!(process.wait().expect("the proxy is waited for").success());
+}
+
+/// A broker is started to be connected to. One that nothing ever connects to — whatever started it died
+/// first — has no connection closing to tell it to go, and goes of its own accord once the time it
+/// allows for that first connection has passed.
+#[test]
+fn a_broker_nothing_ever_connects_to_exits() {
+    let directory = tempfile::tempdir().expect("a directory for the socket");
+    let socket = directory.path().join("broker.sock");
+    let started = Instant::now();
+    let mut alone = broker(&socket);
+    assert!(alone.said.starts_with("listening "), "{}", alone.said);
+    let (code, _) = alone.ended();
+    assert_eq!(code, Some(0));
+    assert!(
+        started.elapsed() >= START_GRACE,
+        "it left after {:?}, before anything could have connected",
+        started.elapsed()
+    );
+}
+
+/// A broker whose socket has been taken from under it cannot be connected to by anything, itself
+/// included: with nothing ever having connected, it goes when the time it allows for a first connection
+/// has passed, as one that could still be reached does.
+#[test]
+fn a_broker_nothing_can_reach_exits() {
+    let directory = tempfile::tempdir().expect("a directory for the socket");
+    let socket = directory.path().join("broker.sock");
+    let mut alone = broker(&socket);
+    assert!(alone.said.starts_with("listening "), "{}", alone.said);
+    std::fs::remove_file(&socket).expect("the socket's file is removed");
+    let (code, _) = alone.ended();
+    assert_eq!(code, Some(0));
+}
+
+/// A socket named with no directory is in the directory the broker was started in, and that directory
+/// is asked what any other is: one other users can write to is refused.
+#[test]
+fn a_socket_named_without_a_directory_is_checked_where_it_would_be_made() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let shared = directory.path().join("shared");
+    std::fs::create_dir(&shared).expect("the directory is made");
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).expect("the mode is set");
+    let started = |within: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_apack-terminal"))
+            .arg("bare.sock")
+            .current_dir(within)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the broker starts")
+    };
+    let said = |mut process: Child| {
+        let mut line = String::new();
+        BufReader::new(process.stdout.take().expect("piped stdout")).read_line(&mut line).expect("stdout reads");
+        let _ = process.kill();
+        let _ = process.wait();
+        line
+    };
+    assert!(said(started(&shared)).contains("can be written to by other users"));
+    assert!(!shared.join("bare.sock").exists());
+    // And in one that is its user's alone, it listens
+    assert!(said(started(directory.path())).starts_with("listening "));
+}
+
+/// **A proxy told no socket uses the one place a user is known to have**: under the runtime directory
+/// the system gives them, or failing that under their home, in a directory made for them alone. So
+/// `ssh host apack-terminal proxy` needs nothing set up on the host, and two proxies told nothing meet.
+#[test]
+fn a_proxy_told_no_socket_uses_the_users_own() {
+    let home = tempfile::tempdir().expect("a home directory");
+    let runtime = tempfile::tempdir().expect("a runtime directory");
+    let through = |runtime_directory: Option<&Path>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_apack-terminal"));
+        command.arg("proxy").env("HOME", home.path()).stdin(Stdio::piped()).stdout(Stdio::piped());
+        match runtime_directory {
+            Some(directory) => command.env("XDG_RUNTIME_DIR", directory),
+            None => command.env_remove("XDG_RUNTIME_DIR"),
+        };
+        let mut process = command.spawn().expect("the proxy starts");
+        let input = process.stdin.take().expect("piped stdin");
+        let events = read_events(process.stdout.take().expect("piped stdout"));
+        Proxy { process, input, events }
+    };
+    let mode = |path: &Path| std::fs::metadata(path).expect("it is there").permissions().mode() & 0o777;
+
+    let mut first = through(None);
+    first.greet(Role::Client);
+    let made = home.path().join(".apack-terminal");
+    assert!(made.join("broker.sock").exists());
+    assert_eq!(mode(&made), 0o700);
+    // A second told nothing reaches the first's broker
+    let session = first.shell();
+    let mut second = through(None);
+    second.greet(Role::Client);
+    second.say(&Request::Facts { session: session.clone() });
+    loop {
+        match second.event() {
+            Event::Facts { session: asked, .. } => break assert_eq!(asked, session),
+            Event::Failed { message, .. } => panic!("the second proxy reached another broker: {message}"),
+            _ => {}
+        }
+    }
+
+    // Where the system gives the user a runtime directory, that is the place
+    let mut third = through(Some(runtime.path()));
+    third.greet(Role::Client);
+    assert!(runtime.path().join("apack-terminal").join("broker.sock").exists());
+    assert_eq!(mode(&runtime.path().join("apack-terminal")), 0o700);
 }

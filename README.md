@@ -26,7 +26,7 @@ by the npm package, so a consumer imports the types without building Rust.
 → {"kind":"hello","protocol":1,"role":"client"}
 ← {"kind":"hello","protocol":1,"history":1000}
 → {"kind":"spawn","cols":80,"rows":24,"shell":null,"args":[],"env":[],"unset":[],"cwd":null}
-← {"kind":"spawned","session":"s-1","pid":4242}
+← {"kind":"spawned","session":"s-1","pid":4242,"recorded":false,"restored":false}
 → {"kind":"write","session":"s-1","text":"echo hi\n"}
 ← {"kind":"output","session":"s-1","text":"echo hi\r\nhi\r\n"}
 → {"kind":"facts","session":"s-1"}
@@ -37,9 +37,11 @@ by the npm package, so a consumer imports the types without building Rust.
 
 A window draws a session over a connection of its own, greeting as a `view`: it is sent the rows that
 changed and paints them, interpreting nothing ([views.md](docs/architecture/views.md)). And
-`apack-terminal proxy <socket>` is a process's stdin and stdout as a connection to the broker on that
-socket, started first if there is none — so `ssh host apack-terminal proxy /tmp/t.sock` is a connection
-to a broker on another machine.
+`apack-terminal proxy [<socket>]` is a process's stdin and stdout as a connection to the broker on that
+socket, started first if there is none — so `ssh host apack-terminal proxy` is a connection to a broker
+on another machine. With no socket named it is the user's own: `$XDG_RUNTIME_DIR/apack-terminal/broker.sock`
+where the system gives a runtime directory, and `~/.apack-terminal/broker.sock` otherwise. A socket goes
+in a directory that is its user's alone: one other users can write to, `/tmp` among them, is refused.
 
 ## Status
 
@@ -95,7 +97,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 cargo xtask generate                         # regenerate the protocol's TypeScript; commit it if it moved
 cargo xtask package                          # release build, staged into the npm package in node/
-cargo run -- /tmp/apack-terminal.sock        # run one, and talk to it
+cargo run -- ~/.apack-terminal/broker.sock   # run one, and talk to it
 ```
 
 `cargo xtask pre-push` is the one to run before a push: it is every check

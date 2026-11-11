@@ -17,7 +17,7 @@ pub mod input;
 pub mod reads;
 pub mod rows;
 
-use crate::commands::Commands;
+use crate::commands::{Commands, Moment};
 use crate::markers::{self, Marker, PAYLOAD_CAP, cwd_from_url};
 use crate::screen::Facts;
 use rows::Mark;
@@ -110,31 +110,69 @@ impl Terminal {
     /// the cursor where the shell left it, rather than wherever the rest of the read moved it to. Every
     /// byte is parsed exactly as `feed` parses it; what differs is only where the call returns.
     pub fn feed_to_osc_end(&mut self, bytes: &[u8]) -> usize {
+        self.feed_to(bytes, false).0
+    }
+
+    /// The same, stopping as well — when `or_ground` — at the first byte that leaves the parser between
+    /// sequences. Answers how many bytes were taken and whether that is where it stopped.
+    ///
+    /// **Ground is a state, so it can be reached having taken nothing**: asked of a parser that is already
+    /// between sequences, this answers `(0, true)`.
+    pub fn feed_to(&mut self, bytes: &[u8], or_ground: bool) -> (usize, bool) {
         if bytes.is_empty() {
-            return 0;
+            return (0, or_ground && self.at_ground());
         }
+        let boundaries = if or_ground {
+            sys::TerminalBoundary::OSC_END | sys::TerminalBoundary::GROUND
+        } else {
+            sys::TerminalBoundary::OSC_END
+        };
         let mut stop =
             sys::TerminalWriteStop { size: std::mem::size_of::<sys::TerminalWriteStop>(), ..Default::default() };
         // SAFETY: the handle is live for `&mut self`, the slice outlives the call, and `stop` is sized
         let result = unsafe {
-            sys::ghostty_terminal_vt_write_until(
-                self.handle,
-                bytes.as_ptr(),
-                bytes.len(),
-                sys::TerminalBoundary::OSC_END,
-                &raw mut stop,
-            )
+            sys::ghostty_terminal_vt_write_until(self.handle, bytes.as_ptr(), bytes.len(), boundaries, &raw mut stop)
         };
         match result {
-            sys::Result::SUCCESS => stop.consumed.clamp(1, bytes.len()),
-            // No OSC ended in these bytes, and all of them were parsed
-            sys::Result::NO_VALUE => bytes.len(),
+            sys::Result::SUCCESS => {
+                let ground = stop.reached & sys::TerminalBoundary::GROUND != 0;
+                // Only ground stops on no byte at all; an OSC ends on one
+                let least = usize::from(!ground);
+                (stop.consumed.clamp(least, bytes.len()), ground)
+            }
+            // No boundary was reached in these bytes, and all of them were parsed
+            sys::Result::NO_VALUE => (bytes.len(), false),
             // Refused outright, with nothing parsed: parsed the plain way, so a byte is never lost to it
             _ => {
                 self.feed(bytes);
-                bytes.len()
+                (bytes.len(), false)
             }
         }
+    }
+
+    /// Whether the parser is between sequences: not part way through an escape sequence, a control string
+    /// or a character of several bytes.
+    ///
+    /// **Asked of the core, which is the only thing that knows.** What a sequence is — where a string ends,
+    /// which bytes continue a character — is the parser's own state machine, and a second scanner beside it
+    /// would be a second opinion. The core answers by being asked to parse nothing up to ground: it stops
+    /// at once when it is already there, and has no boundary to report when it is not.
+    pub fn at_ground(&mut self) -> bool {
+        let mut stop =
+            sys::TerminalWriteStop { size: std::mem::size_of::<sys::TerminalWriteStop>(), ..Default::default() };
+        let nothing = [0u8; 1];
+        // SAFETY: the handle is live for `&mut self`; the pointer is valid and no byte of it is read, the
+        // length being zero; `stop` is sized
+        let result = unsafe {
+            sys::ghostty_terminal_vt_write_until(
+                self.handle,
+                nothing.as_ptr(),
+                0,
+                sys::TerminalBoundary::GROUND,
+                &raw mut stop,
+            )
+        };
+        result == sys::Result::SUCCESS
     }
 
     /// A `u16` the terminal answers for, by key.
@@ -352,9 +390,10 @@ impl Terminal {
     ///
     /// # Safety
     ///
-    /// `collector` must point at a live `Replies` for as long as this terminal can parse, which means it
-    /// must outlive the handle. `screen::Screen` owns both and declares the terminal first so it is freed
-    /// first.
+    /// `collector` must point at a live `Reported` for as long as this terminal can parse, which means it
+    /// must outlive the handle, and nothing may hold a reference to it across a call that parses: the
+    /// callbacks below each make one of their own. `screen::Screen` owns both, declares the terminal first
+    /// so it is freed first, and reaches the collector only through its pointer.
     pub(crate) unsafe fn route_reports(&self, collector: *mut Reported) -> Result<(), Failed> {
         // SAFETY: userdata is an untyped pointer the library only ever hands back to the callback below
         let result = unsafe { sys::ghostty_terminal_set(self.handle, sys::TerminalOption::USERDATA, collector.cast()) };
@@ -387,6 +426,11 @@ impl Terminal {
         // SAFETY: the signature matches `GhosttyTerminalSizeFn`
         let result = unsafe { sys::ghostty_terminal_set(self.handle, sys::TerminalOption::SIZE, size) };
         Failed::check("ghostty_terminal_set(SIZE)", result)?;
+
+        let hold = note_render_hold as *const std::ffi::c_void;
+        // SAFETY: the signature matches `GhosttyTerminalRenderHoldFn`
+        let result = unsafe { sys::ghostty_terminal_set(self.handle, sys::TerminalOption::RENDER_HOLD, hold) };
+        Failed::check("ghostty_terminal_set(RENDER_HOLD)", result)?;
 
         // **What a program asks of the world outside its screen**: a title, a bell, the clipboard, a
         // notification, how far along it is. The core reads each and reports it; none of them is drawn
@@ -692,7 +736,8 @@ impl std::error::Error for Failed {}
 
 /// Everything the library reports to its host, collected as it arrives.
 ///
-/// Boxed and owned by the screen that routed it, because its address is what the library is handed.
+/// Held at one address by the screen that routed it (`screen::Collector`), because that address is what
+/// the library is handed.
 #[derive(Default)]
 pub struct Reported {
     /// What the terminal wants said back to the program, kept rather than discarded.
@@ -706,12 +751,24 @@ pub struct Reported {
     effects: Vec<Effect>,
     /// Every command the shell has reported, with the rows that are its
     commands: Commands<Placed>,
+    /// The line the shell said it is about to run, until the command it belongs to starts.
+    line: Option<String>,
+    /// Each time the program began holding the screen (`true`) or let it go, in order, since last taken.
+    holds: Vec<bool>,
+    /// What time it is for whatever is being parsed, when that is not now: a recording being replayed
+    /// happened when it was recorded.
+    clock: Option<SystemTime>,
 }
 
-/// Where the cursor was at a moment in a command's life: a mark on its row, and its column.
+/// Where the cursor was at a moment in a command's life, as a mark the core moves with the cell it is on.
 pub struct Placed {
     pub mark: Mark,
-    pub column: u16,
+    /// Which screen the mark is on. A mark answers in the numbering of the screen that holds it, so one
+    /// made on the primary screen means nothing while an alternate-screen application is showing.
+    pub alternate: bool,
+    /// The mark is on the last cell the command wrote, rather than at the start of a row it wrote
+    /// nothing on. Only an end is ever marked this way.
+    pub closes: bool,
 }
 
 /// Something a program did that is not on its screen.
@@ -785,16 +842,62 @@ impl Reported {
 
     /// Forgets what the shell said about itself and what is waiting to be told, keeping the commands and
     /// their rows: what a screen rebuilt from a recording holds is the past, and the shell that said those
-    /// things is not the one about to be read.
+    /// things is not the one about to be read. **A command it left running is ended**, without a status:
+    /// nothing is running it any more, and nothing will ever report that it stopped.
     pub fn forget_the_shell(&mut self) {
+        let now = self.now();
+        self.commands.ended(None, now);
         self.facts = Facts::default();
+        self.line = None;
         self.effects.clear();
         self.replies.clear();
     }
 
+    /// Forgets every command, for a screen about to be rebuilt from a recording: the replay reports them
+    /// again, and kept they would each be there twice.
+    pub fn forget_commands(&mut self) {
+        self.commands.clear();
+    }
+
+    /// Says what time it is for what is parsed from here on, or `None` for now. A recording replayed
+    /// happened when it was recorded, and its commands are stamped with that.
+    pub fn set_clock(&mut self, clock: Option<SystemTime>) {
+        self.clock = clock;
+    }
+
+    fn now(&self) -> SystemTime {
+        self.clock.unwrap_or_else(SystemTime::now)
+    }
+
     /// What has happened since this was last taken.
+    ///
+    /// **A program can repeat itself faster than anyone can be told**: a loop ringing the bell is thousands
+    /// of them in one read, and each would be an event. A bell is one however often it rang, and a title or
+    /// a progress report is the last one given — the ones before it were replaced before anybody could
+    /// have shown them. Everything else is told as it happened, in order.
     pub fn take_effects(&mut self) -> Vec<Effect> {
-        std::mem::take(&mut self.effects)
+        let mut effects = std::mem::take(&mut self.effects);
+        let last = |effects: &[Effect], is: fn(&Effect) -> bool| effects.iter().rposition(is);
+        let title = last(&effects, |effect| matches!(effect, Effect::Title(_)));
+        let progress = last(&effects, |effect| matches!(effect, Effect::Progress { .. }));
+        let bell = effects.iter().position(|effect| matches!(effect, Effect::Bell));
+        let mut index = 0;
+        effects.retain(|effect| {
+            let at = index;
+            index += 1;
+            match effect {
+                Effect::Title(_) => Some(at) == title,
+                Effect::Progress { .. } => Some(at) == progress,
+                Effect::Bell => Some(at) == bell,
+                _ => true,
+            }
+        });
+        effects
+    }
+
+    /// Each time the program began holding the screen (`true`) or let it go, in order, since last taken.
+    pub fn take_holds(&mut self) -> Vec<bool> {
+        std::mem::take(&mut self.holds)
     }
 
     /// The commands the shell has reported.
@@ -802,14 +905,28 @@ impl Reported {
         &self.commands
     }
 
-    /// Marks the cursor's row for each moment of a command reported since the last call. Called where the
-    /// parse stopped at the marker that reported it, which is what makes the row the right one.
+    /// Marks where the cursor is for each moment of a command reported since the last call. Called where
+    /// the parse stopped at the marker that reported it, which is what makes the place the right one.
+    ///
+    /// **A prompt and the start of output are marked by their row; an end by the last cell written.** The
+    /// cell under the cursor at an end is blank — the cursor is past what was printed — and a blank cell
+    /// has no place of its own when the screen is reflowed, where a written one is carried with its line.
+    /// An end at the start of a row wrote nothing on it and is marked there.
     pub fn place_marks(&mut self, terminal: &Terminal) {
-        if self.commands.moments_waiting() {
-            self.commands.place(|| {
-                Some(Placed { mark: Mark::at_cursor(terminal).ok()?, column: terminal.cursor_column().ok()? })
-            });
+        if !self.commands.moments_waiting() {
+            return;
         }
+        self.commands.place(|moment| {
+            let (column, row) = (terminal.cursor_column().ok()?, terminal.cursor_row().ok()?);
+            let (column, closes) = match moment {
+                // The cursor is on the last cell written, not past it: the row is full, and the cursor
+                // moves on only when something more is printed
+                Moment::End if terminal.cursor_pending_wrap().ok()? => (column, true),
+                Moment::End if column > 0 => (column - 1, true),
+                _ => (0, false),
+            };
+            Some(Placed { mark: Mark::at(terminal, column, row).ok()?, alternate: terminal.alt_screen().ok()?, closes })
+        });
     }
 
     /// Takes a marker the core does not read — the OSC 633 family — into the same facts its own callbacks
@@ -820,26 +937,45 @@ impl Reported {
             Marker::PromptEnd => {}
             Marker::CommandStart => self.started(None),
             Marker::CommandDone(status) => self.ended(status),
-            Marker::CommandLine(line) => self.facts.command = Some(line),
+            Marker::CommandLine(line) => self.named(line),
             Marker::Cwd(path) => self.moved(path),
         }
     }
 
-    /// A command is running. `command` is its line where the report carried one; a shell that named it
-    /// in an earlier report has it in the facts already.
-    fn started(&mut self, command: Option<String>) {
-        if let Some(command) = command {
-            self.facts.command = Some(command);
+    /// The shell said which line it is running. Before the command starts it is the line that command
+    /// will have; just after, it names the command that started without one.
+    fn named(&mut self, line: String) {
+        if self.facts.running && self.facts.command.is_none() {
+            self.facts.command = Some(line.clone());
+            self.commands.name_running(line);
+        } else {
+            // What the shell last said it is about to run, from now; and the line the command will have
+            // when it starts
+            self.facts.command = Some(line.clone());
+            self.line = Some(line);
         }
+    }
+
+    /// A command is running. `command` is its line where the report carried one; otherwise it is the line
+    /// the shell named since the last command, and none when it named none — **never the line of the
+    /// command before**, which is what a shell that reports no line has not said.
+    fn started(&mut self, command: Option<String>) {
+        let command = command.or_else(|| self.line.take());
+        self.line = None;
+        self.facts.command = command.clone();
         self.facts.running = true;
-        self.commands.output_started(self.facts.command.clone(), self.facts.cwd.clone(), SystemTime::now());
-        self.effects.push(Effect::CommandStarted { command: self.facts.command.clone() });
+        let now = self.now();
+        self.commands.output_started(command.clone(), self.facts.cwd.clone(), now);
+        self.effects.push(Effect::CommandStarted { command });
     }
 
     /// The shell is drawing a prompt, which means whatever ran has finished, whether or not it said so.
     fn prompted(&mut self) {
         self.ended(None);
-        self.commands.prompt_started(SystemTime::now());
+        // A line named and never run — the prompt was abandoned — is not the next command's
+        self.line = None;
+        let now = self.now();
+        self.commands.prompt_started(now);
     }
 
     /// Whatever was running has ended. Said once per command: a shell that reports an end and then draws
@@ -850,7 +986,8 @@ impl Reported {
         }
         self.facts.ended();
         self.facts.exit_status = exit_status;
-        self.commands.ended(exit_status, SystemTime::now());
+        let now = self.now();
+        self.commands.ended(exit_status, now);
         self.effects.push(Effect::CommandFinished { exit_status });
     }
 
@@ -900,7 +1037,15 @@ unsafe extern "C" fn note_semantic_prompt(
     // SAFETY: both pointers are the library's, valid for this call
     let (reported, event) = unsafe { (&mut *userdata.cast::<Reported>(), &*event) };
     match event.kind {
-        sys::SemanticPromptKind::GHOSTTY_SEMANTIC_PROMPT_PROMPT_START => reported.prompted(),
+        // **Only the main prompt begins a command.** A shell also marks the prompt it draws at the right
+        // edge and the one it draws for each further line of a command being typed; neither is a new
+        // command, and read as one a continuation line would end whatever was running and move the
+        // waiting command's prompt to the middle of what is being typed.
+        sys::SemanticPromptKind::GHOSTTY_SEMANTIC_PROMPT_PROMPT_START => {
+            if event.prompt_kind == sys::SemanticPromptPromptKind::GHOSTTY_SEMANTIC_PROMPT_PROMPT_PRIMARY {
+                reported.prompted();
+            }
+        }
         sys::SemanticPromptKind::GHOSTTY_SEMANTIC_PROMPT_OUTPUT_START => {
             // SAFETY: the library owns the bytes for this call, and this copies them
             reported.started(unsafe { text_of(&event.command) });
@@ -991,6 +1136,11 @@ unsafe extern "C" fn note_bell(_terminal: sys::Terminal, userdata: *mut std::ffi
 /// **Only text, and only reported.** The first representation with a text type is handed on; whether it
 /// reaches a clipboard is the app's decision, made where the person is. The program is told the write was
 /// taken, which is the only answer that does not teach it to retry.
+///
+/// **Only the clipboard itself.** A program may name the selection instead — what a middle click pastes on
+/// X11 — and that is a different place: told as a clipboard write, it would overwrite what the person
+/// copied with what a program selected. Nothing here has a selection to give it to, so it is taken and
+/// not told.
 unsafe extern "C" fn note_clipboard_write(
     _terminal: sys::Terminal,
     userdata: *mut std::ffi::c_void,
@@ -1001,7 +1151,7 @@ unsafe extern "C" fn note_clipboard_write(
     }
     // SAFETY: both pointers are the library's, valid for this call
     let (reported, request) = unsafe { (&mut *userdata.cast::<Reported>(), &*write) };
-    if !request.contents.is_null() {
+    if !request.contents.is_null() && request.location == sys::ClipboardLocation::STANDARD {
         // SAFETY: the library promises `contents_len` entries at `contents` for this call
         let contents = unsafe { std::slice::from_raw_parts(request.contents, request.contents_len) };
         let text = contents.iter().find_map(|content| {
@@ -1058,6 +1208,18 @@ unsafe extern "C" fn note_progress(
         _ => Progress::None,
     };
     reported.effects.push(Effect::Progress { state, percent: u8::try_from(report.progress).ok() });
+}
+
+/// The program began holding the screen (mode 2026), or let it go.
+///
+/// **Noted here and acted on where the parse returns** (`Screen::feed`): a frame is read out of the
+/// terminal, and the terminal is in the middle of a write for as long as this callback runs.
+unsafe extern "C" fn note_render_hold(_terminal: sys::Terminal, userdata: *mut std::ffi::c_void, held: bool) {
+    if userdata.is_null() {
+        return;
+    }
+    // SAFETY: `userdata` is the collector
+    unsafe { &mut *userdata.cast::<Reported>() }.holds.push(held);
 }
 
 /// A sequence the core has no behaviour for, which is where the shell's OSC 633 markers arrive.

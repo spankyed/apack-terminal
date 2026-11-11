@@ -15,8 +15,8 @@ use std::sync::mpsc::{Receiver, channel};
 
 use apack_terminal::screen::Screen;
 use apack_terminal::view::publish::ViewId;
-use apack_terminal::view::wire::{Block, Frame, ToView, body};
-use apack_terminal::vt::rows::{CellRead, RowRead, Space};
+use apack_terminal::view::wire::{Block, Frame, Style, ToView, body};
+use apack_terminal::vt::rows::{RowRead, Space};
 use proptest::prelude::*;
 
 /// What a view keeps: its rows by line, and where the screen is.
@@ -25,14 +25,34 @@ struct Model {
     epoch: Option<u32>,
     first_active: u64,
     screen_rows: u16,
-    lines: BTreeMap<u64, RowRead>,
+    lines: BTreeMap<u64, Line>,
     /// The sequence of the last frame applied, which is what an acknowledgement names
     drawn: Option<u64>,
     frames: usize,
 }
 
+/// A row as something that draws it holds one: each character where it is, with its own style and link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Line {
+    wrapped: bool,
+    prompt: bool,
+    cells: Vec<(u16, u8, String, Style, Option<String>)>,
+}
+
+/// A row read straight out of the terminal, as a view would hold it.
+fn line_of(row: &RowRead) -> Line {
+    Line {
+        wrapped: row.wrapped,
+        prompt: row.prompt,
+        cells: row
+            .cells()
+            .map(|cell| (cell.column, cell.width, cell.text.to_owned(), cell.style, cell.link.map(str::to_owned)))
+            .collect(),
+    }
+}
+
 /// The rows of a block with their styles and links looked up, which is what the terminal's own rows are.
-fn rows_of(block: &Block) -> Vec<(u64, RowRead)> {
+fn rows_of(block: &Block) -> Vec<(u64, Line)> {
     block
         .rows
         .iter()
@@ -40,15 +60,12 @@ fn rows_of(block: &Block) -> Vec<(u64, RowRead)> {
             let cells = row
                 .glyphs
                 .iter()
-                .map(|glyph| CellRead {
-                    column: glyph.column,
-                    width: glyph.width,
-                    text: glyph.text.clone(),
-                    style: block.styles[usize::from(glyph.style)],
-                    link: (glyph.link != 0).then(|| block.links[usize::from(glyph.link)].clone()),
+                .map(|glyph| {
+                    let link = row.link_of(glyph).map(str::to_owned);
+                    (glyph.column, glyph.width, glyph.text.clone(), row.style_of(glyph), link)
                 })
                 .collect();
-            (row.line, RowRead { wrapped: row.wrapped, prompt: row.prompt, cells })
+            (row.line, Line { wrapped: row.wrapped, prompt: row.prompt, cells })
         })
         .collect()
 }
@@ -84,7 +101,7 @@ impl Model {
             // The screen's first row is `first_active`, and is `scrollback` rows down the terminal
             let row = (line + scrollback).checked_sub(self.first_active);
             let truth = match row.and_then(|row| u32::try_from(row).ok()) {
-                Some(row) => screen.row(Space::Screen, row).expect("a row reads"),
+                Some(row) => screen.row(Space::Screen, row).expect("a row reads").as_ref().map(line_of),
                 None => None,
             };
             prop_assert_eq!(
@@ -242,19 +259,27 @@ proptest! {
                     // A view names lines in the epoch its frames are in, so only one that is up to date
                     // can ask; the answer is compared with the terminal where the screen starts *now*
                     let asked_from = viewers[0].model.first_active.saturating_sub(u64::from(*back));
-                    let (epoch, block) = screen.fetch(asked_from, u32::from(*count)).expect("a fetch reads");
-                    let (now_epoch, first_active) = screen.view_position().expect("a position reads");
-                    prop_assert_eq!(epoch, now_epoch);
+                    let (epoch, first_active) = screen.view_position().expect("a position reads");
+                    let fetched = screen.fetch(epoch, asked_from, u32::from(*count)).expect("a fetch reads");
+                    // A fetch this small is answered whole: it says so, and a line it left out is one the
+                    // terminal does not hold
+                    prop_assert_eq!((fetched.first, fetched.count), (asked_from, u32::from(*count)));
+                    let block = fetched.rows.block().expect("the rows read back");
                     let scrollback = u64::from(screen.scrollback_rows());
-                    let fetched: BTreeMap<u64, RowRead> = rows_of(&block).into_iter().collect();
+                    let rows: BTreeMap<u64, Line> = rows_of(&block).into_iter().collect();
                     for line in asked_from..asked_from + u64::from(*count) {
                         let truth = (line + scrollback)
                             .checked_sub(first_active)
                             .and_then(|row| u32::try_from(row).ok())
-                            .and_then(|row| screen.row(Space::Screen, row).expect("a row reads"));
-                        prop_assert_eq!(fetched.get(&line), truth.as_ref(), "line {} of a fetch", line);
+                            .and_then(|row| screen.row(Space::Screen, row).expect("a row reads"))
+                            .as_ref()
+                            .map(line_of);
+                        prop_assert_eq!(rows.get(&line), truth.as_ref(), "line {} of a fetch", line);
                     }
-                    prop_assert_eq!(fetched.len(), block.rows.len(), "a fetch answered a line twice");
+                    prop_assert_eq!(rows.len(), block.rows.len(), "a fetch answered a line twice");
+                    // And asked in a numbering that is over, it is refused rather than answered about
+                    // whichever lines have those numbers now
+                    prop_assert!(screen.fetch(epoch.wrapping_add(1), asked_from, u32::from(*count)).is_err());
                 }
             }
             for viewer in &mut viewers {

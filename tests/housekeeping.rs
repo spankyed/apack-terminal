@@ -6,7 +6,7 @@
 
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use apack_terminal::housekeeping::Housekeeping;
 use apack_terminal::screen::Screen;
@@ -125,4 +125,25 @@ fn a_session_just_written_to_waits_its_own_time_while_another_is_compressed() {
     }
     let left_alone_for = left_alone_for.expect("the session written to last was compressed");
     assert!(left_alone_for >= quiet_for, "compressed {left_alone_for:?} after it was written to");
+}
+
+/// **Quiet is counted from the write.** A session written to is looked at once it has been left alone
+/// for the quiet period and compressed if it did nothing for another, so its history is never compressed
+/// sooner than two quiet periods after the write that woke the housekeeper. Measured from before the
+/// write and waited for with patience: a machine that is busy makes the compression later, which is
+/// allowed, and nothing makes it sooner.
+#[test]
+fn a_session_is_not_compressed_until_it_has_been_left_alone() {
+    let quiet_for = Duration::from_millis(400);
+    let (compressed, said) = channel();
+    let housekeeping = Housekeeping::start_with(quiet_for, Some(compressed));
+    let screen = Arc::new(Mutex::new(Screen::new(80, 24)));
+    screen.lock().expect("the screen locks").feed(&lines(2_000));
+    let quiet = housekeeping.for_session("s-1", &screen);
+
+    let written = Instant::now();
+    quiet.wrote();
+    assert_eq!(said.recv_timeout(PATIENCE).as_deref(), Ok("s-1"));
+    let left_alone_for = written.elapsed();
+    assert!(left_alone_for >= quiet_for * 2, "compressed {left_alone_for:?} after it was written to");
 }

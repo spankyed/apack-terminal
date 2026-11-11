@@ -8,6 +8,8 @@
 //! **A virtual placement is not told.** One shown through Unicode placeholder cells has no position in the
 //! storage; it is wherever those cells are. A view draws the placeholder cells as the text they are.
 
+use std::ptr::NonNull;
+
 use ghostty_vt_rs_sys as sys;
 
 use super::{Failed, Terminal};
@@ -58,11 +60,27 @@ pub struct ImageRead {
 /// `None` for bytes that are not a PNG, and for one whose pixels would be more than a session's images may
 /// hold altogether: its header says how large it is before anything is allocated for it.
 pub fn rgba_of_png(encoded: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let mut rgba = Vec::new();
+    let (width, height) = decode_png_into(encoded, |length| {
+        rgba.resize(length, 0);
+        Some(rgba.as_mut_slice())
+    })?;
+    Some((width, height, rgba))
+}
+
+/// Decodes a PNG into a buffer `allocate` hands out for it, answering its width and height. The buffer is
+/// asked for once, at four bytes a pixel, after the header has said how many there are.
+///
+/// **Decoded where it will stay.** The pixels of an image are megabytes, and decoded into a buffer of
+/// this function's own they would be held twice for as long as the copy took. A PNG with no colour — grey
+/// and alpha, which is half the size — is decoded into the front of the buffer and widened from its last
+/// pixel back, so that needs no second buffer either.
+fn decode_png_into<'a>(encoded: &[u8], allocate: impl FnOnce(usize) -> Option<&'a mut [u8]>) -> Option<(u32, u32)> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(encoded));
     // A palette or a few bits a pixel widened to bytes, sixteen bits narrowed to eight, and an alpha
     // channel added where there is none: what is left is grey and alpha, or red green blue and alpha
     decoder.set_transformations(
-        png::Transformations::EXPAND | png::Transformations::STRIP_16 | png::Transformations::ALPHA,
+        png::Transformations::EXPAND.union(png::Transformations::STRIP_16).union(png::Transformations::ALPHA),
     );
     let mut reader = decoder.read_info().ok()?;
     let (width, height) = (reader.info().width, reader.info().height);
@@ -70,17 +88,27 @@ pub fn rgba_of_png(encoded: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     if pixels.checked_mul(4)? > IMAGE_STORAGE_BYTES {
         return None;
     }
-    let mut decoded = vec![0u8; reader.output_buffer_size()?];
-    let frame = reader.next_frame(&mut decoded).ok()?;
-    decoded.truncate(frame.buffer_size());
-    let rgba = match frame.color_type {
-        png::ColorType::Rgba => decoded,
-        png::ColorType::GrayscaleAlpha => {
-            decoded.as_chunks::<2>().0.iter().flat_map(|[grey, alpha]| [*grey, *grey, *grey, *alpha]).collect()
+    let pixels = usize::try_from(pixels).ok()?;
+    // What one frame decodes to: never more than four bytes a pixel, which is what was allocated
+    let decoded = reader.output_buffer_size()?;
+    if decoded > pixels * 4 {
+        return None;
+    }
+    let rgba = allocate(pixels * 4).filter(|buffer| buffer.len() == pixels * 4)?;
+    let frame = reader.next_frame(&mut rgba[..decoded]).ok()?;
+    match frame.color_type {
+        png::ColorType::Rgba if frame.buffer_size() == pixels * 4 => {}
+        png::ColorType::GrayscaleAlpha if frame.buffer_size() == pixels * 2 => {
+            // From the last pixel back: a pixel's four bytes land at or after its two, so nothing still
+            // to be read is written over
+            for pixel in (0..pixels).rev() {
+                let (grey, alpha) = (rgba[pixel * 2], rgba[pixel * 2 + 1]);
+                rgba[pixel * 4..pixel * 4 + 4].copy_from_slice(&[grey, grey, grey, alpha]);
+            }
         }
         _ => return None,
-    };
-    (rgba.len() as u64 == pixels * 4).then_some((width, height, rgba))
+    }
+    Some((width, height))
 }
 
 /// The core's callback for a PNG: decoded here, into memory the core hands out and then owns.
@@ -91,26 +119,42 @@ unsafe extern "C" fn decode_png(
     data_len: usize,
     out: *mut sys::SysImage,
 ) -> bool {
-    if data.is_null() {
+    if data.is_null() || out.is_null() {
         return false;
     }
     // SAFETY: the core passes `data_len` readable bytes at `data`, valid for this call
     let encoded = unsafe { std::slice::from_raw_parts(data, data_len) };
+    let mut buffer: (*mut u8, usize) = (std::ptr::null_mut(), 0);
     // A panic may not cross into the core, and a program chose these bytes
-    let Ok(Some((width, height, rgba))) = std::panic::catch_unwind(|| rgba_of_png(encoded)) else { return false };
-    // SAFETY: the allocator is the one the core passed for exactly this
-    let buffer = unsafe { sys::ghostty_alloc(allocator, rgba.len()) };
-    if buffer.is_null() {
+    let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        decode_png_into(encoded, |length| {
+            // SAFETY: the allocator is the one the core passed for exactly this
+            let allocated = unsafe { sys::ghostty_alloc(allocator, length) };
+            if allocated.is_null() {
+                return None;
+            }
+            buffer = (allocated, length);
+            // SAFETY: `length` bytes were just allocated at `allocated`, zeroed here before any is read,
+            // and nothing else holds them until this callback returns
+            unsafe {
+                std::ptr::write_bytes(allocated, 0, length);
+                Some(std::slice::from_raw_parts_mut(allocated, length))
+            }
+        })
+    }));
+    let Ok(Some((width, height))) = decoded else {
+        // Not a picture after all: what was allocated for it goes back to where it came from
+        // SAFETY: a buffer `ghostty_alloc` handed out, freed once with its own length; a null is taken
+        unsafe { sys::ghostty_free(allocator, buffer.0, buffer.1) };
         return false;
-    }
-    // SAFETY: `buffer` is `rgba.len()` bytes just allocated, `out` is the core's to be filled in, and the
-    // core frees the buffer with the length recorded here
+    };
+    // SAFETY: `out` is the core's to be filled in, and the core frees the buffer with the length
+    // recorded here, which is the length it was asked for
     unsafe {
-        std::ptr::copy_nonoverlapping(rgba.as_ptr(), buffer, rgba.len());
         (*out).width = width;
         (*out).height = height;
-        (*out).data = buffer;
-        (*out).data_len = rgba.len();
+        (*out).data = buffer.0;
+        (*out).data_len = buffer.1;
     }
     true
 }
@@ -252,6 +296,9 @@ impl Terminal {
                 &raw mut rows,
             )
         };
+        if sized != sys::Result::SUCCESS {
+            return None;
+        }
         let mut size = (0u32, 0u32);
         // SAFETY: as above, with two `uint32_t` out-pointers
         let drawn = unsafe {
@@ -263,6 +310,9 @@ impl Terminal {
                 &raw mut size.1,
             )
         };
+        if drawn != sys::Result::SUCCESS {
+            return None;
+        }
         let mut source = (0u32, 0u32, 0u32, 0u32);
         // SAFETY: as above, with four `uint32_t` out-pointers
         let cut = unsafe {
@@ -275,7 +325,7 @@ impl Terminal {
                 &raw mut source.3,
             )
         };
-        if sized != sys::Result::SUCCESS || drawn != sys::Result::SUCCESS || cut != sys::Result::SUCCESS {
+        if cut != sys::Result::SUCCESS {
             return None;
         }
         let mut z: i32 = 0;
@@ -329,11 +379,13 @@ impl Terminal {
         // SAFETY: PIXELS writes a `GhosttyString` pointing into the terminal, which nothing writes to
         // while this borrow of it is held
         let result = unsafe { sys::ghostty_kitty_graphics_image_get(image, Data::PIXELS, (&raw mut pixels).cast()) };
-        if result != sys::Result::SUCCESS || pixels.ptr.is_null() {
+        if result != sys::Result::SUCCESS {
             return None;
         }
-        // SAFETY: the library says `len` bytes are at `ptr`
-        let all = unsafe { std::slice::from_raw_parts(pixels.ptr, pixels.len) };
+        // An image whose pixels have not all arrived has none to point at
+        let pixels = NonNull::new(pixels.ptr.cast_mut()).map(|at| (at, pixels.len))?;
+        // SAFETY: the library says `len` bytes are at `ptr`, which is not null
+        let all = unsafe { std::slice::from_raw_parts(pixels.0.as_ptr().cast_const(), pixels.1) };
         let from = offset.min(all.len());
         let to = (from + IMAGE_CHUNK_BYTES).min(all.len());
         Some(ImageRead {

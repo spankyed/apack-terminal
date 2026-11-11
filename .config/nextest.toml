@@ -6,9 +6,10 @@
 # What CI installs, and the oldest that reads this file as written
 nextest-version = "0.9.148"
 
-# A reading, not a bound: the whole suite is 8.5 s and its slowest test 7.2 s on an Apple-silicon laptop
-# (55 tests, 2026-11-08). The deadline below is for a test that has stopped ending at all, so it is several
-# times the slowest rather than near it.
+# A reading, not a bound: the whole suite is 15 s and its slowest test 10 s on an Apple-silicon laptop
+# (354 tests, 2026-11-10) — that one waits out a ten-second grace and has a deadline of its own below; the
+# slowest of the rest is 7.7 s. The deadline here is for a test that has stopped ending at all, so it is
+# several times the slowest rather than near it.
 [profile.default]
 slow-timeout = { period = "10s", terminate-after = 2 }
 
@@ -18,10 +19,10 @@ slow-timeout = { period = "10s", terminate-after = 2 }
 filter = "test(=a_saturating_producer_reports_that_it_was_throttled_rather_than_losing_output)"
 slow-timeout = { period = "30s", terminate-after = 2 }
 
-# The one test that waits out a deadline rather than a round trip: a proxy gives a claim somebody else left
-# `START_WAIT` (`src/proxy.rs`, ten seconds) before taking it over, so that wait is the test
+# The two tests that wait out a deadline rather than a round trip: a broker nothing connects to gives
+# whatever started it `START_GRACE` (`src/listening.rs`, ten seconds) to arrive, so that wait is the test
 [[profile.default.overrides]]
-filter = "test(=a_claim_left_by_a_proxy_that_died_is_taken_over)"
+filter = "test(=a_broker_nothing_ever_connects_to_exits) | test(=a_broker_nothing_can_reach_exits)"
 slow-timeout = { period = "30s", terminate-after = 2 }
 
 # **ts-rs generates one `export_bindings_*` test per exported type, and every one of them writes the same

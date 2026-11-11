@@ -10,8 +10,8 @@
 //!   with one byte changed, never panic and never allocate from a count the payload could not hold.
 
 use apack_terminal::view::wire::{
-    Block, Color, CommandRow, Cursor, Frame, Glyph, Incoming, MAX_MESSAGE_BYTES, Malformed, Placement, Position, Row,
-    Span, Style, ToBroker, ToView, body, read_message,
+    Block, Color, ColorChanges, CommandRow, Cursor, Frame, FrameHead, Glyph, Incoming, MAX_MESSAGE_BYTES, Malformed,
+    Placement, Position, Row, Rows, Span, Style, ToBroker, ToView, TooLong, body, frame, read_message,
 };
 use proptest::prelude::*;
 
@@ -37,38 +37,33 @@ fn character() -> impl Strategy<Value = (u8, String)> {
     ]
 }
 
-/// A row whose glyphs are in order and do not overlap, with gaps, as a screen's are.
-fn row(styles: usize, links: usize) -> impl Strategy<Value = Row> {
-    let glyph = (character(), 0u16..3, 0..styles, 0..links);
-    (any::<u32>(), any::<bool>(), any::<bool>(), prop::collection::vec(glyph, 0..24)).prop_map(
-        |(line, wrapped, prompt, cells)| {
-            let mut column = 0u16;
-            let glyphs = cells
-                .into_iter()
-                .map(|((width, text), gap, style, link)| {
-                    column += gap;
-                    let glyph = Glyph { column, width, text, style: style as u16, link: link as u16 };
-                    column += u16::from(width);
-                    glyph
-                })
-                .collect();
-            Row { line: u64::from(line), wrapped, prompt, glyphs }
+/// A row whose glyphs are in order and do not overlap, with gaps, as a screen's are, each drawn in one
+/// of the row's own styles or the plain one and linked to one of its own links or to nothing.
+fn row() -> impl Strategy<Value = Row> {
+    (prop::collection::vec(style(), 0..4), prop::collection::vec("[a-z:/.]{1,12}", 0..3)).prop_flat_map(
+        |(styles, links): (Vec<Style>, Vec<String>)| {
+            let glyph = (character(), 0u16..3, 0..=styles.len(), 0..=links.len());
+            (any::<u32>(), any::<bool>(), any::<bool>(), prop::collection::vec(glyph, 0..24)).prop_map(
+                move |(line, wrapped, prompt, cells)| {
+                    let mut column = 0u16;
+                    let glyphs = cells
+                        .into_iter()
+                        .map(|((width, text), gap, style, link)| {
+                            column += gap;
+                            let glyph = Glyph { column, width, text, style: style as u16, link: link as u16 };
+                            column += u16::from(width);
+                            glyph
+                        })
+                        .collect();
+                    Row { line: u64::from(line), wrapped, prompt, styles: styles.clone(), links: links.clone(), glyphs }
+                },
+            )
         },
     )
 }
 
 fn block() -> impl Strategy<Value = Block> {
-    (prop::collection::vec(style(), 0..4), prop::collection::vec("[a-z:/.]{1,12}", 0..3)).prop_flat_map(
-        |(styles, links)| {
-            let styles: Vec<Style> = std::iter::once(Style::default()).chain(styles).collect();
-            let links: Vec<String> = std::iter::once(String::new()).chain(links).collect();
-            prop::collection::vec(row(styles.len(), links.len()), 0..6).prop_map(move |rows| Block {
-                styles: styles.clone(),
-                links: links.clone(),
-                rows,
-            })
-        },
-    )
+    prop::collection::vec(row(), 0..6).prop_map(|rows| Block { rows })
 }
 
 fn position() -> impl Strategy<Value = Position> {
@@ -92,6 +87,19 @@ fn command() -> impl Strategy<Value = CommandRow> {
         })
 }
 
+/// Colours a program changed: any of the three, and palette entries in order of index, each once.
+fn colors() -> impl Strategy<Value = ColorChanges> {
+    let rgb = || prop::option::of(any::<[u8; 3]>());
+    (rgb(), rgb(), rgb(), prop::collection::btree_map(any::<u8>(), any::<[u8; 3]>(), 0..20)).prop_map(
+        |(foreground, background, cursor, palette)| ColorChanges {
+            foreground,
+            background,
+            cursor,
+            palette: palette.into_iter().collect(),
+        },
+    )
+}
+
 fn to_view() -> impl Strategy<Value = ToView> {
     let cursor = prop::option::of(
         (any::<u16>(), any::<u16>(), 0u8..4, any::<bool>()).prop_map(|(column, row, shape, blinking)| Cursor {
@@ -105,9 +113,10 @@ fn to_view() -> impl Strategy<Value = ToView> {
         (any::<u32>(), any::<u64>(), any::<u32>(), any::<u64>()),
         (any::<u16>(), any::<u16>(), any::<u32>(), any::<u32>(), any::<u32>()),
         (cursor, any::<bool>(), any::<bool>(), prop::option::of(any::<u64>())),
+        (any::<bool>(), prop::option::of(colors())),
         block(),
     )
-        .prop_map(|(ids, grid, state, block)| {
+        .prop_map(|(ids, grid, state, shown, block)| {
             ToView::Frame(Frame {
                 channel: ids.0,
                 sequence: ids.1,
@@ -121,18 +130,24 @@ fn to_view() -> impl Strategy<Value = ToView> {
                 cursor: state.0,
                 alternate_screen: state.1,
                 mouse: state.2,
+                reverse_video: shown.0,
                 stale_from: state.3,
+                colors: shown.1,
                 block,
             })
         });
     prop_oneof![
         frame,
-        (any::<u32>(), any::<u32>(), any::<u32>(), block()).prop_map(|(channel, request, epoch, block)| ToView::Rows {
-            channel,
-            request,
-            epoch,
-            block
-        }),
+        (any::<u32>(), any::<u32>(), any::<u32>(), any::<u64>(), any::<u32>(), block()).prop_map(
+            |(channel, request, epoch, first, count, block)| ToView::Rows {
+                channel,
+                request,
+                epoch,
+                first,
+                count,
+                block
+            }
+        ),
         any::<u32>().prop_map(|channel| ToView::Ended { channel }),
         (any::<u32>(), any::<u32>(), 0u8..2).prop_map(|(channel, request, outcome)| ToView::Pasted {
             channel,
@@ -141,11 +156,8 @@ fn to_view() -> impl Strategy<Value = ToView> {
         }),
         (any::<u32>(), any::<u32>(), any::<u32>(), prop::option::of(span()))
             .prop_map(|(channel, request, epoch, span)| ToView::Span { channel, request, epoch, span }),
-        (any::<u32>(), any::<u32>(), ".{0,40}").prop_map(|(channel, request, text)| ToView::Text {
-            channel,
-            request,
-            text
-        }),
+        (any::<u32>(), any::<u32>(), any::<u32>(), ".{0,40}")
+            .prop_map(|(channel, request, epoch, text)| { ToView::Text { channel, request, epoch, text } }),
         (any::<u32>(), any::<u32>(), any::<u32>(), prop::collection::vec(span(), 0..5))
             .prop_map(|(channel, request, epoch, spans)| ToView::Spans { channel, request, epoch, spans }),
         (any::<u32>(), any::<u32>(), ".{0,40}").prop_map(|(channel, request, message)| ToView::Failed {
@@ -214,14 +226,15 @@ fn to_broker() -> impl Strategy<Value = ToBroker> {
         (any::<u32>(), any::<u32>(), any::<u32>(), any::<u64>(), any::<u32>()).prop_map(
             |(channel, request, epoch, first, count)| ToBroker::Fetch { channel, request, epoch, first, count }
         ),
-        (any::<u32>(), 0u8..3, any::<u16>(), "[A-Za-z0-9]{0,12}", ".{0,4}", any::<u32>()).prop_map(
-            |(channel, action, modifiers, code, text, unshifted)| ToBroker::Key {
+        (any::<u32>(), 0u8..3, any::<u16>(), "[A-Za-z0-9]{0,12}", ".{0,4}", any::<u32>(), any::<bool>()).prop_map(
+            |(channel, action, modifiers, code, text, unshifted, composed)| ToBroker::Key {
                 channel,
                 action,
                 modifiers,
                 code,
                 text,
-                unshifted
+                unshifted,
+                composed
             }
         ),
         (any::<u32>(), ".{0,40}").prop_map(|(channel, text)| ToBroker::Text { channel, text }),
@@ -263,7 +276,7 @@ proptest! {
 
     #[test]
     fn what_the_broker_sends_a_view_reads(message in to_view()) {
-        let encoded = message.encode();
+        let encoded = message.encode().expect("a message this small is one");
         prop_assert_eq!(ToView::decode(body(&encoded)), Ok(message));
     }
 
@@ -303,7 +316,7 @@ proptest! {
         at in any::<prop::sample::Index>(),
         with in any::<u8>(),
     ) {
-        let encoded = message.encode();
+        let encoded = message.encode().expect("a message this small is one");
         let whole = body(&encoded);
         let short = &whole[..cut.index(whole.len())];
         prop_assert!(ToView::decode(short).is_err(), "a message {} bytes short decoded", whole.len() - short.len());
@@ -319,10 +332,11 @@ proptest! {
 /// links in a payload of a few bytes.
 #[test]
 fn a_count_the_payload_cannot_hold_is_refused() {
-    let empty = ToView::Rows { channel: 0, request: 0, epoch: 0, block: Block::default() }.encode();
-    let mut forged = body(&empty).to_vec();
-    // channel, request, epoch, then the count of styles
-    forged.truncate(4);
+    let row = Row { line: 0, ..Row::default() };
+    let one = ToView::Rows { channel: 0, request: 0, epoch: 0, first: 0, count: 1, block: Block { rows: vec![row] } };
+    let mut forged = body(&one.encode().expect("a message")).to_vec();
+    // kind, channel, request, epoch, first, count, rows, line, flags, then the count of the row's styles
+    forged.truncate(9);
     forged.extend([0xFF, 0xFF, 0xFF, 0xFF, 0x0F]);
     assert_eq!(ToView::decode(&forged), Err(Malformed::Truncated));
 }
@@ -330,12 +344,13 @@ fn a_count_the_payload_cannot_hold_is_refused() {
 #[test]
 fn a_glyph_naming_a_style_the_block_lacks_is_refused() {
     let glyph = Glyph { column: 0, width: 1, text: "a".to_owned(), style: 0, link: 0 };
-    let block =
-        Block { rows: vec![Row { line: 0, wrapped: false, prompt: false, glyphs: vec![glyph] }], ..Block::default() };
-    let encoded = ToView::Rows { channel: 0, request: 0, epoch: 0, block }.encode();
+    let block = Block { rows: vec![Row { line: 0, glyphs: vec![glyph], ..Row::default() }] };
+    let encoded =
+        ToView::Rows { channel: 0, request: 0, epoch: 0, first: 0, count: 1, block }.encode().expect("a message");
     let mut forged = body(&encoded).to_vec();
-    // kind, channel, request, epoch, styles, links, rows, line, flags, runs, column, then the style's index
-    forged[11] = 5;
+    // kind, channel, request, epoch, first, count, rows, line, flags, styles, links, runs, column, then the
+    // style's index: the row has no style but the plain one, so the first is one it lacks
+    forged[13] = 1;
     assert_eq!(ToView::decode(&forged), Err(Malformed::Value("a style's index")));
 }
 
@@ -344,6 +359,35 @@ fn a_message_past_the_cap_is_not_read() {
     let length = u32::try_from(MAX_MESSAGE_BYTES + 1).expect("the cap fits a length");
     let mut stream: &[u8] = &length.to_le_bytes();
     assert!(matches!(read_message(&mut stream), Incoming::TooLong));
+}
+
+/// The cap is the longest message there is, and a message of exactly that length is one.
+#[test]
+fn a_message_of_exactly_the_cap_is_read() {
+    let length = u32::try_from(MAX_MESSAGE_BYTES).expect("the cap fits a length");
+    let mut stream = length.to_le_bytes().to_vec();
+    stream.resize(4 + MAX_MESSAGE_BYTES, 7);
+    match read_message(&mut stream.as_slice()) {
+        Incoming::Message(body) => assert_eq!(body.len(), MAX_MESSAGE_BYTES),
+        other => panic!("a message at the cap was {other:?}"),
+    }
+}
+
+/// Each way bytes can fail to be a message is said in words of its own.
+#[test]
+fn what_is_wrong_with_a_message_is_said() {
+    let said = [
+        Malformed::Truncated,
+        Malformed::UnknownKind(250),
+        Malformed::Text,
+        Malformed::Overflow,
+        Malformed::Value("a flag"),
+        Malformed::Trailing,
+    ]
+    .map(|wrong| wrong.to_string());
+    assert!(said.iter().all(|sentence| sentence.len() > 10), "{said:?}");
+    assert_eq!(said.iter().collect::<std::collections::BTreeSet<_>>().len(), said.len(), "{said:?}");
+    assert!(said[1].contains("250") && said[4].contains("a flag"), "{said:?}");
 }
 
 #[test]
@@ -369,4 +413,62 @@ fn a_number_with_more_than_sixty_four_bits_is_refused() {
     forged.extend([0x80; 8]);
     forged.push(0x02);
     assert_eq!(ToBroker::decode(&forged), Err(Malformed::Overflow));
+}
+
+/// **A message longer than a view reads is not made.** Whatever asked for it is told how long it came to,
+/// and nothing is written with a length a view would have to hang up on.
+#[test]
+fn an_answer_longer_than_a_message_is_refused_rather_than_written() {
+    let within = ToView::Text { channel: 1, request: 2, epoch: 3, text: "x".repeat(MAX_MESSAGE_BYTES - 64) };
+    assert!(within.encode().is_ok_and(|encoded| encoded.len() <= MAX_MESSAGE_BYTES + 4));
+    let past = ToView::Text { channel: 1, request: 2, epoch: 3, text: "x".repeat(MAX_MESSAGE_BYTES) };
+    assert_eq!(past.encode(), Err(TooLong(MAX_MESSAGE_BYTES + 8)));
+    // What a view sends is written as it is: the broker reads its length first, and refuses it there
+    let pasted = ToBroker::Paste { channel: 1, request: 2, allow_unsafe: false, text: "x".repeat(MAX_MESSAGE_BYTES) };
+    assert!(matches!(read_message(&mut pasted.encode().as_slice()), Incoming::TooLong));
+}
+
+/// **Rows are taken until a message is full, and full allows for everything else a frame says.** The
+/// most a frame can carry beside its rows — every number at its longest, a cursor, a line to forget
+/// from and all 256 palette entries changed with the three colours beside them — still fits with rows
+/// taken right up to where no more are.
+#[test]
+fn the_longest_head_there_is_fits_with_as_many_rows_as_are_taken() {
+    let mut rows = Rows::default();
+    // Filled to within a byte of what rows may be: large bodies, then ever smaller ones
+    for body in [1usize << 20, 1 << 10, 1] {
+        while rows.takes(body) {
+            rows.push(u64::MAX, &vec![0; body]);
+        }
+    }
+    let colors = ColorChanges {
+        foreground: Some([1, 2, 3]),
+        background: Some([4, 5, 6]),
+        cursor: Some([7, 8, 9]),
+        palette: (0..=u8::MAX).map(|index| (index, [index; 3])).collect(),
+    };
+    let head = FrameHead {
+        channel: u32::MAX,
+        sequence: u64::MAX,
+        epoch: u32::MAX,
+        first_active: u64::MAX,
+        columns: u16::MAX,
+        screen_rows: u16::MAX,
+        scrollback: u32::MAX,
+        commands: u32::MAX,
+        images: u32::MAX,
+        cursor: Some(Cursor { column: u16::MAX, row: u16::MAX, shape: 3, blinking: true }),
+        alternate_screen: true,
+        mouse: true,
+        reverse_video: true,
+        stale_from: Some(u64::MAX),
+        colors: Some(&colors),
+    };
+    let message = frame(&head, &rows).expect("a frame of the rows that were taken is one that can be sent");
+    // And nothing was left on the table: the next row there is room to ask about would not have fitted
+    assert!(
+        MAX_MESSAGE_BYTES - (message.len() - 4) < 16,
+        "{} bytes of a message went unused",
+        MAX_MESSAGE_BYTES - (message.len() - 4)
+    );
 }

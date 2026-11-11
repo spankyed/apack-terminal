@@ -38,7 +38,7 @@ fn events(chunks: &[&[u8]], ending: bool) -> Vec<String> {
 
     let mut arrived = Vec::new();
     while let Ok(out) = answers.recv_timeout(Duration::from_secs(2)) {
-        if let Event::Output { text: chunk, .. } = out.event {
+        if let Some(Event::Output { text: chunk, .. }) = out.event {
             arrived.push(chunk);
         }
     }
@@ -194,7 +194,7 @@ mod pacing {
 
     fn text(out: Outgoing) -> String {
         match out.event {
-            Event::Output { text, .. } => text,
+            Some(Event::Output { text, .. }) => text,
             other => panic!("expected output, got {other:?}"),
         }
     }

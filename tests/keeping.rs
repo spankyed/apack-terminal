@@ -123,6 +123,11 @@ impl Connection {
     }
 
     fn shell(&self, record: Option<&Path>, restore: bool) -> String {
+        self.spawned(record, restore).0
+    }
+
+    /// A shell, with whether the broker says it is recorded and whether it was restored.
+    fn spawned(&self, record: Option<&Path>, restore: bool) -> (String, bool, bool) {
         self.say(&Request::Spawn {
             cols: 60,
             rows: 8,
@@ -137,7 +142,16 @@ impl Connection {
             restore,
             images: false,
         });
-        self.answer(|event| if let Event::Spawned { session, .. } = event { Some(session) } else { None })
+        self.answer(|event| match event {
+            Event::Spawned { session, recorded, restored, .. } => Some((session, recorded, restored)),
+            _ => None,
+        })
+    }
+
+    /// Ends a session and waits for it to have ended.
+    fn kill(&self, session: &str) {
+        self.say(&Request::Kill { session: session.to_owned() });
+        self.answer(|event| matches!(event, Event::Exited { session: ended, .. } if ended == session).then_some(()));
     }
 
     fn sessions(&self) -> Vec<SessionSummary> {
@@ -148,6 +162,13 @@ impl Connection {
     /// Closes the connection, as its process ending would.
     fn hang_up(self) {
         let _ = self.stream.shutdown(Shutdown::Both);
+    }
+
+    /// Says nothing more will be sent, and waits for the broker to have let the connection go: it closes
+    /// its end last, after everything a connection ending leads to.
+    fn closed(self) {
+        let _ = self.stream.shutdown(Shutdown::Write);
+        while self.events.recv_timeout(PATIENCE).is_ok() {}
     }
 }
 
@@ -190,6 +211,16 @@ impl View {
 
     fn send(&self, message: &ToBroker) {
         (&self.stream).write_all(&message.encode()).expect("the broker reads");
+    }
+
+    /// Messages until the view is told its session is over.
+    fn until_ended(&mut self) {
+        loop {
+            let message = self.incoming.recv_timeout(PATIENCE).expect("the broker sends");
+            if matches!(message, ToView::Ended { .. }) {
+                return;
+            }
+        }
     }
 
     fn step(&mut self) {
@@ -243,6 +274,7 @@ impl View {
                 code: String::new(),
                 text: character.to_string(),
                 unshifted: u32::from(character),
+                composed: false,
             });
         }
         self.send(&ToBroker::Key {
@@ -252,11 +284,18 @@ impl View {
             code: "Enter".to_owned(),
             text: String::new(),
             unshifted: 0,
+            composed: false,
         });
     }
 
     fn hang_up(self) {
         let _ = self.stream.shutdown(Shutdown::Both);
+    }
+
+    /// Says nothing more will be sent, and waits for the broker to have let the connection go.
+    fn closed(self) {
+        let _ = self.stream.shutdown(Shutdown::Write);
+        while self.incoming.recv_timeout(PATIENCE).is_ok() {}
     }
 }
 
@@ -288,9 +327,11 @@ fn a_kept_session_outlives_the_app_and_is_found_by_the_next() {
     view.type_line("echo be$((1+1))fore");
     view.until_shows("be2fore");
 
-    view.hang_up();
-    client.hang_up();
-    hold.hang_up();
+    // Each waited for, so there is a moment when nothing at all is connected and the kept session is the
+    // only reason the broker is still there
+    view.closed();
+    client.closed();
+    hold.closed();
 
     // A new app: it holds the broker again and asks what is there
     let hold = Connection::greeting(&broker, Role::Lifetime);
@@ -413,6 +454,11 @@ fn a_recording_is_looked_back_through_as_a_session() {
         if let Event::Rewound { session, first, last } = event { Some((session, first, last)) } else { None }
     });
     assert!(first < between && between < last, "{first} {between} {last}");
+    // Opened again it is another session, with an id of its own and no live session's
+    client.say(&Request::Rewind { recording: recording.to_str().expect("a utf-8 path").to_owned(), cols: 60, rows: 8 });
+    let again = client.answer(|event| if let Event::Rewound { session, .. } = event { Some(session) } else { None });
+    assert!(again != rewound && again != live && rewound != live, "{again} {rewound} {live}");
+    client.say(&Request::Kill { session: again });
     let mut looking = View::attached(&broker, &rewound);
     looking.until_shows("la4ter");
 
@@ -434,4 +480,354 @@ fn a_recording_is_looked_back_through_as_a_session() {
     client.say(&Request::Kill { session: rewound });
     view.type_line("echo still-he$((1+1))re");
     view.until_shows("still-he2re");
+}
+
+/// **A spawn says what it got, not only that it started.** Whether a session is recorded, and whether it
+/// began with what a recording held, are things a caller asked for and may not have been given: nothing
+/// to record to, a file somebody else is writing, a file that is no recording.
+#[test]
+fn a_spawn_says_whether_it_is_recorded_and_whether_it_was_restored() {
+    let broker = Broker::start();
+    let recording = broker.recording("terminal-1");
+    let hold = Connection::greeting(&broker, Role::Lifetime);
+    let client = Connection::greeting(&broker, Role::Client);
+
+    // Asked to restore and given nowhere to restore from
+    let (unrecorded, recorded, restored) = client.spawned(None, true);
+    assert_eq!((recorded, restored), (false, false));
+
+    // A recording begun: recorded, and nothing was there to restore
+    let (first, recorded, restored) = client.spawned(Some(&recording), true);
+    assert_eq!((recorded, restored), (true, false));
+    let mut view = View::attached(&broker, &first);
+    view.until_shows("$ ");
+    view.type_line("echo from-the-fi$((1+1))rst");
+    view.until_shows("from-the-fi2rst");
+
+    // **One writer a file.** A second session asked to record there while the first still is starts,
+    // unrecorded — and with nothing restored, the recording being somebody else's to write
+    let (second, recorded, restored) = client.spawned(Some(&recording), true);
+    assert_eq!((recorded, restored), (false, false));
+    let listed = client.sessions();
+    let is_recorded = |session: &str| listed.iter().find(|one| one.session == session).map(|one| one.recorded);
+    assert_eq!(
+        (is_recorded(&first), is_recorded(&second), is_recorded(&unrecorded)),
+        (Some(true), Some(false), Some(false))
+    );
+    // The same file by another spelling is the same file: through `.`, through `..`, and through a link
+    // to the directory it is in
+    let directory = recording.parent().expect("a directory");
+    let linked = broker.directory.path().join("linked");
+    std::os::unix::fs::symlink(directory, &linked).expect("the link is made");
+    for respelled in [
+        directory.join(".").join("terminal-1"),
+        directory.join("..").join("recordings").join("terminal-1"),
+        linked.join("terminal-1"),
+    ] {
+        assert!(!client.spawned(Some(&respelled), false).1, "{} was taken for another file", respelled.display());
+    }
+
+    // The first ended, the file is free again, and what it recorded is all there to begin from
+    client.kill(&first);
+    let (third, recorded, restored) = client.spawned(Some(&recording), true);
+    assert_eq!((recorded, restored), (true, true));
+    let mut view = View::attached(&broker, &third);
+    view.until_shows("from-the-fi2rst");
+
+    // A file that is there and is no recording is neither recorded to nor emptied
+    let notes = broker.directory.path().join("notes.txt");
+    std::fs::write(&notes, b"somebody's notes").expect("the file is written");
+    let (_, recorded, restored) = client.spawned(Some(&notes), true);
+    assert_eq!((recorded, restored), (false, false));
+    assert_eq!(std::fs::read(&notes).expect("the file reads"), b"somebody's notes");
+    drop(hold);
+}
+
+/// A session that ends of its own accord, and one ended with its holder, each leave their recording whole
+/// and free: the session that replaces either is recorded there, and begins with what it held.
+#[test]
+fn a_recording_is_free_and_whole_however_its_session_ended() {
+    let broker = Broker::start();
+    let recording = broker.recording("terminal-1");
+    let hold = Connection::greeting(&broker, Role::Lifetime);
+    let client = Connection::greeting(&broker, Role::Client);
+
+    // The shell exits because it was told to, by the person typing at it
+    let (first, ..) = client.spawned(Some(&recording), false);
+    let mut view = View::attached(&broker, &first);
+    view.until_shows("$ ");
+    view.type_line("echo typed-ex$((1+1))it; exit");
+    client.answer(|event| matches!(event, Event::Exited { .. }).then_some(()));
+    let (second, recorded, restored) = client.spawned(Some(&recording), true);
+    assert_eq!((recorded, restored), (true, true));
+    let mut view = View::attached(&broker, &second);
+    view.until_shows("typed-ex2it");
+    view.until_shows("$ ");
+    view.type_line("echo before-the-ho$((1+1))lder-went");
+    view.until_shows("before-the-ho2lder-went");
+
+    // The app goes, and its sessions with it; what is still connected starts one in the same place
+    hold.hang_up();
+    client.answer(|event| matches!(event, Event::Exited { .. }).then_some(()));
+    let (third, recorded, restored) = client.spawned(Some(&recording), true);
+    assert_eq!((recorded, restored), (true, true));
+    let mut view = View::attached(&broker, &third);
+    view.until_shows("before-the-ho2lder-went");
+}
+
+/// **A recording being looked through is its opener's.** Nothing else knows its id, and it is no process
+/// that would end by itself; so it ends when the connection that opened it does, and a view of it is told.
+#[test]
+fn a_recording_being_looked_through_ends_with_the_connection_that_opened_it() {
+    let broker = Broker::start();
+    let recording = broker.recording("terminal-1");
+    let hold = Connection::greeting(&broker, Role::Lifetime);
+    let opener = Connection::greeting(&broker, Role::Client);
+    let live = opener.shell(Some(&recording), false);
+    let mut view = View::attached(&broker, &live);
+    view.until_shows("$ ");
+    view.type_line("echo reco$((1+1))rded");
+    view.until_shows("reco2rded");
+
+    opener.say(&Request::Rewind { recording: recording.to_str().expect("a utf-8 path").to_owned(), cols: 60, rows: 8 });
+    let rewound = opener.answer(|event| if let Event::Rewound { session, .. } = event { Some(session) } else { None });
+    let mut looking = View::attached(&broker, &rewound);
+    looking.until_shows("reco2rded");
+
+    // The opener goes. The app still holds the broker, so the live session stays — and the look back goes
+    opener.hang_up();
+    looking.until_ended();
+    View::attached(&broker, &rewound).until_ended();
+
+    let next = Connection::greeting(&broker, Role::Client);
+    assert_eq!(next.sessions().iter().map(|one| one.session.as_str()).collect::<Vec<_>>(), [live.as_str()]);
+    view.type_line("echo still-run$((1+1))ning");
+    view.until_shows("still-run2ning");
+    drop(hold);
+}
+
+/// Types characters at a session without entering them.
+fn type_without_entering(view: &View, text: &str) {
+    for character in text.chars() {
+        view.send(&ToBroker::Key {
+            channel: 1,
+            action: 0,
+            modifiers: 0,
+            code: String::new(),
+            text: character.to_string(),
+            unshifted: u32::from(character),
+            composed: false,
+        });
+    }
+}
+
+/// **Ending a session submits nothing to it.** A line typed at a shell and not entered is not entered by
+/// the terminal being closed, nor by the app going: here each line would make a file, and no file is
+/// made. Checked once the shell is known to be gone, after which nothing could make one.
+#[test]
+fn a_line_typed_and_not_entered_is_not_run_when_its_session_is_ended() {
+    let broker = Broker::start();
+    let hold = Connection::greeting(&broker, Role::Lifetime);
+    let client = Connection::greeting(&broker, Role::Client);
+    let made = |name: &str| broker.directory.path().join(name);
+
+    // Closed: the session is killed
+    let closed = client.shell(None, false);
+    let mut view = View::attached(&broker, &closed);
+    view.until_shows("$ ");
+    type_without_entering(&view, &format!("touch {}", made("on-kill").display()));
+    view.until_shows("on-kill");
+    client.kill(&closed);
+    assert!(!made("on-kill").exists(), "killing a session entered the line that was on its prompt");
+
+    // The same with a program that takes whatever line it is given: `cat` writing what it reads to a file
+    let reading = {
+        client.say(&Request::Spawn {
+            cols: 60,
+            rows: 8,
+            shell: Some("/bin/sh".to_owned()),
+            args: vec!["-c".to_owned(), format!("cat > {}", made("read-by-cat").display())],
+            env: Vec::new(),
+            unset: Vec::new(),
+            cwd: None,
+            colors: None,
+            output: false,
+            record: None,
+            restore: false,
+            images: false,
+        });
+        client.answer(|event| if let Event::Spawned { session, .. } = event { Some(session) } else { None })
+    };
+    let mut view = View::attached(&broker, &reading);
+    type_without_entering(&view, "half a line");
+    view.until_shows("half a line");
+    client.kill(&reading);
+    assert_eq!(std::fs::read(made("read-by-cat")).unwrap_or_default(), b"", "a line was submitted to the program");
+
+    // Quit: the app's hold on the broker goes, and its sessions with it
+    let quit = client.shell(None, false);
+    let mut view = View::attached(&broker, &quit);
+    view.until_shows("$ ");
+    type_without_entering(&view, &format!("touch {}", made("on-quit").display()));
+    view.until_shows("on-quit");
+    hold.hang_up();
+    client.answer(|event| matches!(event, Event::Exited { session, .. } if session == quit).then_some(()));
+    assert!(!made("on-quit").exists(), "the app going entered the line that was on a prompt");
+}
+
+/// **A view that stops making sense and stops reading is hung up on, not waited for.** It is owed more
+/// than its socket holds, so the thread writing to it is parked; it then sends something that is not the
+/// protocol and goes quiet, its connection still open. The broker lets go of it there and then — which
+/// shows as the broker exiting when its last real connection leaves, with the view's socket still held
+/// open at this end.
+#[test]
+fn a_view_that_sends_nonsense_and_stops_reading_does_not_keep_the_broker() {
+    let mut broker = Broker::start();
+    let client = Connection::greeting(&broker, Role::Client);
+    let session = client.shell(None, false);
+    {
+        let mut drawn = View::attached(&broker, &session);
+        drawn.until_shows("$ ");
+        drawn.hang_up();
+    }
+
+    // Greets as a view, attaches, and never reads a byte
+    let mut vandal = UnixStream::connect(&broker.socket).expect("the broker accepts");
+    let hello = serde_json::to_string(&Request::Hello { protocol: PROTOCOL_VERSION, role: Role::View }).expect("hello");
+    vandal.write_all(format!("{hello}\n").as_bytes()).expect("the broker reads");
+    vandal.write_all(&ToBroker::Attach { channel: 1, session: session.clone() }.encode()).expect("the broker reads");
+    // Megabytes of answers it will not read: far more than a socket holds, far less than it may leave
+    let ask = ToBroker::Commands { channel: 1, request: 1 }.encode();
+    let search = ToBroker::Search { channel: 1, request: 2, needle: "$".to_owned() }.encode();
+    for _ in 0..40_000 {
+        vandal.write_all(&ask).expect("the broker reads");
+        vandal.write_all(&search).expect("the broker reads");
+    }
+    // Then something that is no message, and nothing more
+    vandal.write_all(&[3, 0, 0, 0, 250, 1, 2]).expect("the broker reads");
+
+    client.hang_up();
+    assert!(broker.exits(), "the broker stayed for a view it could not write to and would not hear from");
+    drop(vandal);
+}
+
+/// **What a session printed last is in its recording, though the broker left the moment it ended.** A
+/// recording is written by a thread of its own, behind the session; a broker with nothing left exits,
+/// and it waits for that thread first — so the session that picks the recording up, under another
+/// broker, begins with everything the last one printed.
+#[test]
+fn a_recording_holds_all_its_session_printed_though_the_broker_left_as_it_ended() {
+    let recordings = tempfile::tempdir().expect("a directory for the recording");
+    let recording = recordings.path().join("kept").join("terminal-1");
+    {
+        let mut broker = Broker::start();
+        let client = Connection::greeting(&broker, Role::Client);
+        let kept = client.shell(Some(&recording), false);
+        client.say(&Request::Keep { session: kept.clone(), kept: true });
+        client.answer(|event| matches!(event, Event::Kept { .. }).then_some(()));
+        let mut view = View::attached(&broker, &kept);
+        view.until_shows("$ ");
+        // Once everyone has gone: a great deal of output, a last line, and the shell's own exit — which is
+        // the broker's last reason to stay
+        view.type_line(
+            "sleep 1; i=0; while [ $i -lt 20000 ]; do echo \"line $i of what was printed before the end\"; \
+             i=$((i+1)); done; echo the-la$((1+1))st-line; exit",
+        );
+        view.hang_up();
+        client.hang_up();
+        assert!(broker.exits(), "the broker stayed after its last session ended");
+    }
+
+    let broker = Broker::start();
+    let client = Connection::greeting(&broker, Role::Client);
+    let (session, recorded, restored) = client.spawned(Some(&recording), true);
+    assert_eq!((recorded, restored), (true, true));
+    let mut view = View::attached(&broker, &session);
+    view.until_shows("the-la2st-line");
+}
+
+/// **Ending a session ends it, whatever its program makes of being asked.** What a session is sent is a
+/// hangup, and a program may ignore one; such a session is still reported over, because what was asked
+/// for and not done is then done for certain.
+#[test]
+fn a_session_whose_program_ignores_a_hangup_is_ended_all_the_same() {
+    let broker = Broker::start();
+    let client = Connection::greeting(&broker, Role::Client);
+    client.say(&Request::Spawn {
+        cols: 60,
+        rows: 8,
+        shell: Some("/bin/sh".to_owned()),
+        args: vec!["-c".to_owned(), "trap '' HUP; echo rea$((1+1))dy; while :; do sleep 1; done".to_owned()],
+        env: Vec::new(),
+        unset: Vec::new(),
+        cwd: None,
+        colors: None,
+        output: false,
+        record: None,
+        restore: false,
+        images: false,
+    });
+    let session = client.answer(|event| if let Event::Spawned { session, .. } = event { Some(session) } else { None });
+    // Shown once the hangup is being ignored
+    View::attached(&broker, &session).until_shows("rea2dy");
+
+    client.say(&Request::Kill { session: session.clone() });
+    let (code, signal) = client.answer(|event| match event {
+        Event::Exited { session: ended, code, signal } if ended == session => Some((code, signal)),
+        _ => None,
+    });
+    assert_eq!((code, signal.as_deref()), (None, Some("SIGKILL")), "it was not the broker that ended it");
+}
+
+/// **Asking after a recording makes nothing.** A recording that is not there is answered as not there,
+/// and the directory it would have been in is not there afterwards either.
+#[test]
+fn looking_back_through_a_recording_that_does_not_exist_leaves_nothing_behind() {
+    let broker = Broker::start();
+    let client = Connection::greeting(&broker, Role::Client);
+    let absent = broker.recording("never-recorded");
+    client.say(&Request::Rewind { recording: absent.to_str().expect("a utf-8 path").to_owned(), cols: 60, rows: 8 });
+    loop {
+        match client.event() {
+            Event::Failed { .. } => break,
+            Event::Rewound { .. } => panic!("a recording that does not exist was opened"),
+            _ => {}
+        }
+    }
+    let directory = absent.parent().expect("a recording is in a directory");
+    assert!(!directory.exists(), "{} was made by asking after a recording in it", directory.display());
+}
+
+/// **A view that finished speaking and then takes nothing is not waited for.** It closed its side, which
+/// is what a view that is still listening does — and then read none of the megabytes it was owed, with
+/// its connection left open. The broker gives up on it when it has taken nothing for a while, rather
+/// than keeping a thread, and itself, for a view that will never read.
+#[test]
+fn a_view_that_stops_speaking_and_never_reads_does_not_keep_the_broker() {
+    let mut broker = Broker::start();
+    let client = Connection::greeting(&broker, Role::Client);
+    let session = client.shell(None, false);
+    {
+        let mut drawn = View::attached(&broker, &session);
+        drawn.until_shows("$ ");
+        drawn.hang_up();
+    }
+
+    let mut silent = UnixStream::connect(&broker.socket).expect("the broker accepts");
+    let hello = serde_json::to_string(&Request::Hello { protocol: PROTOCOL_VERSION, role: Role::View }).expect("hello");
+    silent.write_all(format!("{hello}\n").as_bytes()).expect("the broker reads");
+    silent.write_all(&ToBroker::Attach { channel: 1, session: session.clone() }.encode()).expect("the broker reads");
+    // Megabytes of answers it will not read: far more than a socket holds, far less than it may leave
+    let ask = ToBroker::Commands { channel: 1, request: 1 }.encode();
+    let search = ToBroker::Search { channel: 1, request: 2, needle: "$".to_owned() }.encode();
+    for _ in 0..40_000 {
+        silent.write_all(&ask).expect("the broker reads");
+        silent.write_all(&search).expect("the broker reads");
+    }
+    // Nothing more to say, said properly — and the connection kept open, unread
+    silent.shutdown(Shutdown::Write).expect("its side closes");
+
+    client.hang_up();
+    assert!(broker.exits(), "the broker stayed for a view that had stopped reading");
+    drop(silent);
 }

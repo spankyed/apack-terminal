@@ -60,8 +60,8 @@ exclude_re = [
     # process. Excluding the guard wholesale would have taken both with it. The lines are pinned, which
     # `cargo xtask check-exclusions` is what makes safe: a pattern left behind by an edit above matches
     # nothing and fails that check.
-    "session.rs:357:(12|26): replace < with (==|<=) in inside_tree",
-    "session.rs:357:16: replace \\|\\| with && in inside_tree",
+    "session.rs:466:(12|26): replace < with (==|<=) in inside_tree",
+    "session.rs:466:16: replace \\|\\| with && in inside_tree",
 
     # `sendable`'s ASCII arm gives 1 and so does the `_` fallback, so deleting it changes no answer. It is
     # there to say that ASCII is one byte, where `_` says "not a lead byte at all" — removing the arm to kill
@@ -116,10 +116,24 @@ exclude_re = [
     "proxy.rs:.*replace \\* with \\+ in pump",
 
     # **Flags that are distinct bits, joined.** `|` and `^` differ only where two operands share a bit, and
-    # these share none: a frame's flags are one bit each (`FRAME_CURSOR` … `FRAME_BLINKING`), and the
-    # modifiers that compose a character are shift and alt
-    "view/wire.rs:.*replace \\| with \\^ in ToView::encode",
+    # these share none: a frame's flags are one bit each (`FRAME_CURSOR` … `FRAME_BLINKING`), a row's are
+    # two, a command's say which of eight fields it has, the bit that says a number goes on is the one
+    # bit its seven others are not, and the modifiers that compose a character are shift and alt
+    "view/wire.rs:.*replace \\| with \\^ in (frame|write_row|number|Writer::command)",
     "vt/input.rs:.*replace \\| with \\^ in consumed",
+
+    # **Freeing what the core allocated, and the collector it fills.** As `Terminal`'s above: a mutant of
+    # one of these leaks, and a leak is not an answer any case here can read. Each has one owner by
+    # construction — a mark is a command's or a publication's, a render state a publication's, and the
+    # collector a screen's, none of them `Clone`
+    "vt/rows.rs:.*<impl Drop for (Mark|Rendering)>::drop",
+    "screen.rs:.*<impl Drop for Collector>::drop",
+
+    # **A deadline compared with the instant it is read against.** The housekeeper leaves alone whatever
+    # is not yet due; `>` and `>=` differ only for a session due at exactly the nanosecond the clock was
+    # read, and both a deadline and that reading are `Instant::now()` taken at different moments. A case
+    # that told them apart would have to make two readings of the clock equal
+    "housekeeping.rs:.*replace > with >= in keep",
 
     # **Two ways of saying one thing the core says once.** Each asks the core for something and reads both
     # its result and what it wrote, and the core never gives one answer without the other: a feature it

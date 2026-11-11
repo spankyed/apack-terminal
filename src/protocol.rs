@@ -406,7 +406,14 @@ pub enum Event {
     /// both places, so the two cannot drift.
     Hello { protocol: u32, history: u32 },
     /// A session exists and its process is running.
-    Spawned { session: SessionId, pid: u32 },
+    ///
+    /// **What was asked for and what was got are both said.** `recorded` is whether the session is being
+    /// recorded: `false` when no `record` was asked for, when the recording could not be opened — a file
+    /// that is there and is not a recording is left alone rather than emptied — and when another session
+    /// is already recording to that file. `restored` is whether its screen began as what the recording
+    /// held: `false` when `restore` was not asked for, was asked for without `record`, or found nothing
+    /// to restore. A session is started either way; a caller that needed the recording reads these.
+    Spawned { session: SessionId, pid: u32, recorded: bool, restored: bool },
     /// Bytes the process wrote, **as text**. A feed: unprompted, and nobody asked for it.
     ///
     /// **The broker forwards decoded text, not bytes, and that is a decision rather than a compromise.**

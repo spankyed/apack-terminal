@@ -14,11 +14,36 @@ fn effects_after(stream: &[u8]) -> Vec<Effect> {
 
 #[test]
 fn a_title_is_reported_each_time_the_program_sets_one() {
-    assert_eq!(
-        effects_after(b"\x1b]0;first\x07\x1b]2;second\x1b\\"),
-        vec![Effect::Title("first".to_owned()), Effect::Title("second".to_owned())]
-    );
+    let mut screen = Screen::new(80, 24);
+    screen.feed(b"\x1b]0;first\x07");
+    assert_eq!(screen.take_effects(), vec![Effect::Title("first".to_owned())]);
+    screen.feed(b"\x1b]2;second\x1b\\");
+    assert_eq!(screen.take_effects(), vec![Effect::Title("second".to_owned())]);
     assert_eq!(effects_after(b"\x1b]2;\x07"), vec![Effect::Title(String::new())], "a name taken back");
+}
+
+/// **What a program says faster than anyone can be told is told as where it ended up.** Inside one read
+/// a bell rung a thousand times is a bell, and a title or a progress report replaced before it could
+/// have been shown is the one that replaced it. What is not a state — a notification, a clipboard write,
+/// a command starting — is each told, where it happened among the rest.
+#[test]
+fn what_a_program_repeats_within_one_read_is_told_once() {
+    let mut stream = Vec::new();
+    stream.extend_from_slice(b"\x1b]0;first\x07");
+    stream.extend_from_slice(&[0x07; 1_000]);
+    stream.extend_from_slice(b"\x1b]9;4;1;10\x07\x1b]9;one\x07\x1b]2;second\x07");
+    stream.extend_from_slice(&[0x07; 1_000]);
+    stream.extend_from_slice(b"\x1b]9;4;1;90\x07\x1b]9;two\x07\x1b]2;third\x07");
+    assert_eq!(
+        effects_after(&stream),
+        vec![
+            Effect::Bell,
+            Effect::Notification { title: String::new(), body: "one".to_owned() },
+            Effect::Progress { state: Progress::Running, percent: Some(90) },
+            Effect::Notification { title: String::new(), body: "two".to_owned() },
+            Effect::Title("third".to_owned()),
+        ]
+    );
 }
 
 #[test]
@@ -32,6 +57,10 @@ fn a_bell_is_reported_and_one_that_ends_a_sequence_is_not() {
 fn a_clipboard_write_is_reported_as_the_text_it_carries() {
     assert_eq!(effects_after(b"\x1b]52;c;aGVsbG8gd29ybGQ=\x07"), vec![Effect::Clipboard("hello world".to_owned())]);
     assert_eq!(effects_after(b"\x1b]52;c;not base64!\x07"), vec![], "what does not decode is not a write");
+    // **Only the clipboard.** The selection — what a middle click pastes — is another place, and a write
+    // to it told as a clipboard write would put what a program selected over what the person copied
+    assert_eq!(effects_after(b"\x1b]52;p;aGVsbG8gd29ybGQ=\x07"), vec![], "the primary selection");
+    assert_eq!(effects_after(b"\x1b]52;s;aGVsbG8gd29ybGQ=\x07"), vec![], "the selection");
 }
 
 #[test]
@@ -48,8 +77,13 @@ fn a_notification_is_reported_with_its_title_where_it_has_one() {
 
 #[test]
 fn progress_is_reported_as_the_program_states_it() {
+    let stated: Vec<Vec<Effect>> =
+        [&b"\x1b]9;4;1;40\x07"[..], b"\x1b]9;4;3\x07", b"\x1b]9;4;2;90\x07", b"\x1b]9;4;0\x07"]
+            .into_iter()
+            .map(effects_after)
+            .collect();
     assert_eq!(
-        effects_after(b"\x1b]9;4;1;40\x07\x1b]9;4;3\x07\x1b]9;4;2;90\x07\x1b]9;4;0\x07"),
+        stated.concat(),
         vec![
             Effect::Progress { state: Progress::Running, percent: Some(40) },
             Effect::Progress { state: Progress::Indeterminate, percent: None },

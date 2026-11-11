@@ -20,12 +20,14 @@ cargo xtask check-exclusions                   # fails when a mutants exclusion 
 | `tests/view_wire.rs`, `tests/view_vectors.rs` | the view protocol's bytes: the round trip over generated messages, arbitrary bytes, and the vectors a view in another repository is held to |
 | `tests/view_model.rs` | the invariant a view rests on: a model that applies every frame it is sent holds exactly the terminal's screen and history, over generated streams |
 | `tests/view_frames.rs`, `tests/view_input.rs`, `tests/view_reads.rs` | what a frame carries and when one is sent; keys, pointer and paste as the core encodes them; words, lines, text and search |
+| `tests/view_sink.rs` | what waits to be written to one view connection, and where that ends |
+| `tests/writer.rs` | what is queued for a session's program: a pty that refused a write told apart from a session that ended |
 | `tests/view_broker.rs` | a view driven as a window drives one: a real socket, the real binary, a real shell |
 | `tests/effects.rs`, `tests/commands.rs`, `tests/command_rows.rs` | what a program does that is not on its screen; the ring of commands a shell marked, and the lines each is on |
 | `tests/recording.rs`, `tests/keeping.rs` | a recording replayed, bounded and picked up from; sessions kept past their holder, restored and rewound, against the real binary |
 | `tests/images.rs` | images a program places: where each is told to be, and its pixels in parts |
 | `tests/housekeeping.rs` | history compressed once a session has gone quiet |
-| `tests/proxy.rs` | a broker reached through a process's stdin and stdout, and proxies arriving together starting one |
+| `tests/proxy.rs` | a broker reached through a process's stdin and stdout, proxies arriving together starting one, and the one broker a socket has: its lock, its socket's mode, and when it leaves |
 | `tests/core_features.rs` | that the core this was built against has what the broker uses |
 | `tests/frames.rs` | the frame decoder as a decoder — arbitrary bytes, mutated frames, the round trip |
 | `tests/screen.rs` | what a snapshot answers: the viewport, the history asked for, the alternate screen |
@@ -126,8 +128,9 @@ returns rather than a wrong answer — and under `cargo test` one such case hold
 
 The deadlines are in [`.config/nextest.toml`](../../.config/nextest.toml). Each is several times the slowest
 reading rather than near it, because what it is for is a test that has stopped ending at all: the whole
-suite is 8.5 s and its slowest case 7.2 s on an Apple-silicon laptop (55 tests, 2026-11-08), against a
-default deadline of 20 s. **A reading, never a bound** — a slower machine reports, it does not fail.
+suite is 15 s on an Apple-silicon laptop (345 tests, 2026-11-10), and its slowest case 7.7 s against a
+default deadline of 20 s — but for the one that waits out a broker's ten-second grace, which has a
+deadline of its own. **A reading, never a bound** — a slower machine reports, it does not fail.
 
 ## Mutation testing
 

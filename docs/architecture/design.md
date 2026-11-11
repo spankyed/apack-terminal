@@ -54,7 +54,37 @@ after the app is gone.
 
 A broker nobody is connected to exits. The count is taken from the accept rather than from the handshake,
 which is what makes zero a safe moment: a caller that has connected and not yet greeted is already counted,
-so it cannot be hung up on by a broker deciding nobody wants it.
+so it cannot be hung up on by a broker deciding nobody wants it. A broker nothing *ever* connects to has no
+connection closing to tell it so, and exits ten seconds after it began listening — by connecting to
+itself and hanging up, so the decision is taken where every other is, or outright when its own socket
+cannot be reached, since then nothing else can reach it either.
+
+**Ending a session ends it.** A session that is killed, or goes with its holder, is sent a hangup, which
+is what a terminal closing is and what a shell tidies up on. A program may ignore one: two seconds later
+a process that is still there is killed with its process group, by the same guarded signal a caller
+could have sent (`session.rs`, `end_for_certain`), so a session that was ended is always reported
+`exited`. On Windows the job object ends the tree when the session's record goes, and nothing is waited
+for.
+
+**A broker leaves with its recordings written.** A recording's last entries are on a thread of its own
+when its session ends, and a thread ends with its process; every way a broker exits waits for the
+recorders that have stopped, for five seconds at most.
+
+## One broker a socket, and one session's work is no other's wait
+
+**A broker holds a lock beside its socket for its life** (`listening.rs`). One that cannot take it exits
+with a code of its own, 3, having touched nothing — so a second broker never takes the socket from a
+first, which would leave the first holding its sessions with nothing able to reach them — and only the
+lock's holder replaces a socket file, which is then known to be a dead broker's. The socket is made for
+its owner alone, in a directory only its owner can put files in; a directory other users can write to is
+refused.
+
+**The record of sessions is locked to look one up and for nothing else** (`session.rs`). Everything done
+*to* a session — a search of a long history, a recording replayed, a resize that reflows a hundred
+thousand lines — is done with that lock let go, so it holds up that session alone. And nothing that has
+something for a session's program waits for the program to take it: one thread per session writes to its
+pty, from a queue everything else adds to (`writer.rs`), so a program that has stopped reading stalls its
+own input and no request.
 
 ## Output is text, and the scrollback is one number
 
@@ -101,27 +131,75 @@ Opt-in per session (`Spawn.record`), because a recording holds everything the pr
 what it printed once and erased. It is a log of what arrived — the pty's bytes and each resize, stamped —
 with the screen written out whole every megabyte, so a replay starts from the last such keyframe before
 the moment it wants rather than from the beginning (`recording.rs`). A keyframe carries the screen and a
-thousand lines above it, waits for the primary screen, and is what lets a recording past its budget drop
-its oldest part.
+thousand lines above it, waits for the primary screen and for the parser to be between sequences — a
+replay may begin at any keyframe, and one taken part way through a sequence would be followed by the rest
+of it — and is what lets a recording past its budget drop its oldest part.
+
+The file is written by a thread of its own, so a slow disk holds up no session. What that leaves is this:
+an entry is in the operating system's hands moments after it happened and survives the broker dying,
+however it dies; nothing is synced, so losing power can lose a recording's last moments or tear its last
+entry, which a reader stops at. A recording that cannot be written stops, and the session carries on
+unrecorded (`sessions` says so). One session records to a file at a time, and a file that is there and is
+not a recording is never emptied to make one.
+
+**Nothing waits on a disk without a limit.** A session that replaces one just ended may find the last of
+that one's recording still on its way to the file. It is waited for before the new program is started,
+for five seconds at most (`RECORDER_PATIENCE`); past that the session starts unrecorded and `spawned`
+says `recorded: false`, and a `rewind` of such a file is refused with a message saying it is still being
+written. Asking after a recording makes nothing: a `rewind` of a path that is not there is refused, and
+no directory is left behind by the asking.
 
 `Spawn.restore` begins a session with everything its recording holds, out of whatever application the
 last one was left in, and carries the recording on in the same file. `Rewind` opens a recording as a
-session with no process, which a view attaches to like any other, and `Seek` shows it at a moment. Nothing
-a replay provokes is told again: no reply, clipboard write, bell or title.
+session with no process, which a view attaches to like any other, and `Seek` shows it at a moment; it is
+its opener's, and ends with the connection that asked for it. Nothing a replay provokes is told again: no
+reply, clipboard write, bell or title. The commands it holds are the recording's, with the times they ran
+— **those the shell marked since the keyframe the moment shown was replayed from**, which is at most a
+megabyte of output back, and not every command the recording covers: a keyframe is a screen, and says
+nothing of the commands that drew it.
 
 ## A broker somewhere else
 
-`apack-terminal proxy <socket>` is a process's stdin and stdout as a connection to the broker on that
-socket, started first if there is none (`proxy.rs`). Run under `ssh host` or `docker exec -i`, that is a
+`apack-terminal proxy [<socket>]` is a process's stdin and stdout as a connection to the broker on that
+socket, started first if there is none (`proxy.rs`). With no socket named it is the one place a user is
+known to have on a machine nobody has set up: `$XDG_RUNTIME_DIR/apack-terminal/broker.sock`, or
+`~/.apack-terminal/broker.sock` where there is no runtime directory. Run under `ssh host` or `docker exec -i`, that is a
 connection to a broker on another machine or in a container, in whichever role the caller greets with —
 so a remote terminal is the same protocol over a different pipe. Proxies arriving together start one
-broker between them.
+broker between them: each that finds none starts one, and all but the first to take the socket's lock
+exit, leaving their proxies to connect to the one that is there. A proxy carries nothing until the kernel
+has said the broker it reached runs as its own user, and when its input ends it goes on carrying what the
+broker says until the broker has said it.
 
 ## Nothing polls
 
 A `wait` registers a condition that is checked where the bytes land. The broker already knows when something
 arrived, so a caller waiting for a state costs a condition check per read rather than a request per tick. A
 session ending settles every wait on it, because nothing is coming.
+
+## Known limits
+
+- **One client that stops reading stalls every client's events.** Events for `client` connections leave on
+  one thread, to whichever client greeted last; a client that is connected and not reading leaves that
+  thread in a write until it reads or closes. What bounds it: output is under credit, so sessions stall
+  rather than the broker growing (sixty-four messages in flight at most); views have connections and
+  queues of their own and are not affected; and a client that has gone, rather than stalled, fails the
+  write and is detached at once.
+- **A `wait` costs a thread until its deadline.** Each one sleeps out its `timeout_ms` to answer `TIMEOUT`
+  if nothing else has, and stays that long even when the wait was met at once after being registered.
+  What bounds it is the caller: a thread per outstanding wait, each for no longer than the timeout it
+  was asked with, holding nothing but the session's id.
+
+- **Windows is written for and was not built here.** Everything Windows-only in this tree — the named
+  pipe transport, the job object that owns a session's tree (`tree.rs`), ConPTY's start-up exchange, the
+  branches marked `cfg(windows)` or `cfg(not(unix))` in `session.rs`, `listening.rs`, `recording.rs`, `proxy.rs` and `main.rs` — was
+  neither compiled nor run while views, recordings, the socket's lock and the bounded waits were written:
+  that work was built and tested on macOS alone, and the suites that drive the real binary (`keeping`,
+  `view_broker`, `proxy`) use Unix sockets and `/bin/sh` and do not run on Windows at all. What is known
+  to differ there is said where it applies: a view past its limit is not hung up on (`views.md`), a
+  session's exit is not waited on for its last output, `signal` answers `UNSUPPORTED`, and the socket's
+  directory and peer are not checked as they are on POSIX. A Windows build of this tree is a first
+  build, and should be treated as one.
 
 ## What the broker will not do
 

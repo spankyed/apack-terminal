@@ -263,3 +263,33 @@ fn what_is_not_a_whole_png_of_a_size_a_session_may_hold_is_no_picture() {
     assert_eq!(screen.images().expect("the images read").2.len(), 1);
     assert!(screen.image(7, 0).is_some());
 }
+
+/// A picture sent as three bytes a pixel — red, green and blue, with no alpha — is held as it was sent,
+/// and a view is told it is three bytes a pixel.
+#[test]
+fn a_picture_with_no_alpha_is_three_bytes_a_pixel() {
+    let (mut screen, _sent) = viewed(80, 24);
+    let rgb: Vec<u8> = (0..6u8 * 4 * 3).collect();
+    screen.feed(format!("\x1b_Ga=T,f=24,i=8,s=6,v=4,q=2;{}\x1b\\", base64(&rgb)).as_bytes());
+    let read = screen.image(8, 0).expect("the image is there");
+    assert_eq!((read.width, read.height, read.channels, read.total), (6, 4, 3, 72));
+    assert_eq!(read.bytes, rgb);
+}
+
+/// A view keeps an image's pixels until it is told they changed, and what tells it is the image's
+/// generation: sent again under the same number with other pixels, an image is a different generation.
+#[test]
+fn an_image_sent_again_is_another_generation() {
+    let (mut screen, _sent) = viewed(80, 24);
+    screen.feed(&shown(3, 4, 4, &picture(4, 4), ""));
+    let (_, _, placed) = screen.images().expect("the images read");
+    let first = (placed[0].1.generation, screen.image(3, 0).expect("the image is there").generation);
+    assert_eq!(first.0, first.1, "an image and where it is placed are of one generation");
+
+    let other: Vec<u8> = picture(4, 4).into_iter().rev().collect();
+    screen.feed(&shown(3, 4, 4, &other, ""));
+    let (_, _, placed) = screen.images().expect("the images read");
+    let second = (placed[0].1.generation, screen.image(3, 0).expect("the image is there").generation);
+    assert_eq!(second.0, second.1);
+    assert_ne!(second, first);
+}

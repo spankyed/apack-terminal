@@ -162,20 +162,37 @@ impl Flow {
 
 /// What the writer takes off the queue: an event, and the credit to return once it is written.
 pub struct Outgoing {
-    pub event: Event,
+    /// What to write, or nothing for a place in the queue somebody is waiting for the writer to reach
+    /// (`Outgoing::reached`)
+    pub event: Option<Event>,
     credit: Option<Arc<Credit>>,
+    /// Told when the writer has dealt with this
+    reached: Option<Sender<()>>,
 }
 
 impl Outgoing {
     /// An answer: no credit, so it is never held behind output
     pub fn answer(event: Event) -> Self {
-        Self { event, credit: None }
+        Self { event: Some(event), credit: None, reached: None }
+    }
+
+    /// Nothing to write: a place in the queue, and `reached` is told when the writer gets to it — which
+    /// is when everything queued before it has been written.
+    ///
+    /// **For a client that has said all it will and is waiting to hear the rest.** Its answers are in
+    /// this queue behind whatever was there first, and its connection must stay open until they have
+    /// gone down it.
+    pub fn reached(reached: Sender<()>) -> Self {
+        Self { event: None, credit: None, reached: Some(reached) }
     }
 
     /// Returns the credit this message spent, once it has actually been written
     pub fn written(self) {
         if let Some(credit) = self.credit {
             credit.give();
+        }
+        if let Some(reached) = self.reached {
+            let _ = reached.send(());
         }
     }
 }
@@ -260,8 +277,9 @@ pub fn coalesce_within(
         }
         outgoing
             .send(Outgoing {
-                event: Event::Output { session: session.clone(), text },
+                event: Some(Event::Output { session: session.clone(), text }),
                 credit: Some(Arc::clone(credit)),
+                reached: None,
             })
             .is_ok()
     };

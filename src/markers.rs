@@ -90,13 +90,15 @@ fn decode(text: &str) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            let pair = std::str::from_utf8(&bytes[index + 1..index + 3]).ok();
-            if let Some(byte) = pair.and_then(|pair| u8::from_str_radix(pair, 16).ok()) {
-                out.push(byte);
-                index += 3;
-                continue;
-            }
+        // **Exactly two hexadecimal digits**, asked of each: a number parser also takes a sign, and would
+        // read `%+1` as the byte 0x01 where the shell wrote a percent, a plus and a one
+        if bytes[index] == b'%'
+            && let Some(&[high, low]) = bytes.get(index + 1..index + 3)
+            && let (Some(high), Some(low)) = (char::from(high).to_digit(16), char::from(low).to_digit(16))
+        {
+            out.push((high * 16 + low) as u8);
+            index += 3;
+            continue;
         }
         out.push(bytes[index]);
         index += 1;

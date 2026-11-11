@@ -34,6 +34,10 @@ pub struct Key<'a> {
     pub text: &'a str,
     /// What it types with none, as a code point, or `0`
     pub unshifted: u32,
+    /// Alt went into producing `text` rather than modifying the key: the option key on a Mac, where it
+    /// types characters unless the person chose it as alt. Only the view knows — it is a fact about the
+    /// keyboard in front of the person, which need not be on the machine the broker runs on.
+    pub composed: bool,
 }
 
 /// The pointer, for a program that asked for it.
@@ -44,7 +48,7 @@ pub struct Pointer {
     /// `0` left, `1` middle, `2` right; anything else is no button
     pub button: u8,
     pub modifiers: u16,
-    /// Pixels from the grid's top-left corner
+    /// Pixels from the grid's top-left corner, which may be outside the grid: a drag that left the window
     pub x: f32,
     pub y: f32,
     pub cell_width: f32,
@@ -245,10 +249,15 @@ fn key_named(code: &str) -> sys::Key::Type {
 
 /// The modifiers that went into producing a key's text rather than modifying it.
 ///
-/// Shift is spent when it changed what was typed — `A` from `a`, `!` from `1` — and so is alt where it
-/// composes a character, as the option key does on a Mac. Reported as spent, the encoder sends the text;
-/// reported as held, it would send the unshifted key with the modifier, which is a different key.
-fn consumed(key: &Key<'_>, option_as_alt: bool) -> u16 {
+/// Shift is spent when it changed what was typed — `A` from `a`, `!` from `1`. **Alt is spent only where
+/// the view says it composed the character** (`Key::composed`): on Linux and Windows alt never types
+/// anything, so `Alt+Shift+A` is the key `A` with alt held and is sent as `ESC A`. Reported as spent, the
+/// encoder sends the text; reported as held, it sends the key with the modifier, which is a different key.
+///
+/// **What a view sends for a character typed through AltGr** — which a browser reports as control and alt
+/// held — is the character as `text` with those two modifiers left out: they were how it was typed, and
+/// with control reported nothing here could tell it from a control chord.
+fn consumed(key: &Key<'_>) -> u16 {
     let mut typed = key.text.chars();
     let (Some(first), None) = (typed.next(), typed.next()) else { return 0 };
     if key.unshifted == 0 || u32::from(first) == key.unshifted || first.is_control() {
@@ -258,9 +267,26 @@ fn consumed(key: &Key<'_>, option_as_alt: bool) -> u16 {
     if key.modifiers & sys::MODS_CTRL != 0 {
         return 0;
     }
-    let composing = if option_as_alt { sys::MODS_SHIFT } else { sys::MODS_SHIFT | sys::MODS_ALT };
+    let composing = if key.composed { sys::MODS_SHIFT | sys::MODS_ALT } else { sys::MODS_SHIFT };
     key.modifiers & composing
 }
+
+/// A key's text as the encoder may be given it: nothing for a control character.
+///
+/// The core asks for the character a key types and derives a control chord from the key and its
+/// modifiers; handed the control character itself — what a browser reports for `Ctrl+C`, or for Enter —
+/// it would send that and the chord's encoding both.
+fn typed(text: &str) -> &str {
+    // The control characters, and the private-use code points a Mac reports its function keys as
+    let names_a_key = |character: char| matches!(character, '\0'..='\u{1f}' | '\u{7f}' | '\u{f700}'..='\u{f8ff}');
+    if text.chars().any(names_a_key) { "" } else { text }
+}
+
+/// The buttons the core has a name for, as the bits a view's held buttons are kept in.
+const NAMED_BUTTONS: u8 = 3;
+
+/// The widest and tallest a cell is taken to be, in pixels. A view measures one in the tens.
+const MAX_CELL_PIXELS: f32 = 1024.0;
 
 /// The core's encoders, kept for a session: the mouse one remembers the last cell it reported.
 pub struct Encoders {
@@ -268,15 +294,11 @@ pub struct Encoders {
     key_event: sys::KeyEvent,
     mouse: sys::MouseEncoder,
     mouse_event: sys::MouseEvent,
-    /// Buttons held, as bits, which decides whether a move is a drag
-    held: u8,
     /// The mouse modes the encoder was last set from. Setting it again forgets the cell it last
     /// reported, so it is set only when one of these has changed
     mouse_modes: Option<[bool; MOUSE_MODES.len()]>,
     /// The grid in pixels the encoder was last given, for the same reason
     mouse_size: Option<[u32; 4]>,
-    /// The option key composes characters on a Mac unless the person chose it as alt
-    option_as_alt: bool,
 }
 
 /// Every mode that decides whether, and how, the pointer is reported: the four kinds of tracking and the
@@ -293,10 +315,8 @@ impl Encoders {
             key_event: std::ptr::null_mut(),
             mouse: std::ptr::null_mut(),
             mouse_event: std::ptr::null_mut(),
-            held: 0,
             mouse_modes: None,
             mouse_size: None,
-            option_as_alt: false,
         };
         // SAFETY: each is a valid out-pointer, and a null allocator asks for the library's own. A failure
         // part way leaves the rest null, which `Drop` passes to frees that take one
@@ -321,11 +341,6 @@ impl Encoders {
         Ok(encoders)
     }
 
-    /// Whether the option key is alt, which on a Mac it is not unless chosen: there it types characters.
-    pub fn set_option_as_alt(&mut self, as_alt: bool) {
-        self.option_as_alt = as_alt;
-    }
-
     /// What a key sends the program now, which for many keys in many modes is nothing.
     pub fn key(&mut self, terminal: &Terminal, key: &Key<'_>) -> Result<Vec<u8>, Failed> {
         let action = match key.action {
@@ -334,16 +349,19 @@ impl Encoders {
             _ => sys::KeyAction::PRESS,
         };
         // A release types nothing, whatever the keyboard said the key was
-        let text = if action == sys::KeyAction::RELEASE { "" } else { key.text };
-        // SAFETY: every handle is live; `text` outlives the encode below, which is the last use of the
-        // event's borrow of it
+        let text = if action == sys::KeyAction::RELEASE { "" } else { typed(key.text) };
+        // SAFETY: every handle is live; `text` outlives the encode below, after which the event's borrow
+        // of it is taken back
         unsafe {
             Failed::check(
                 "ghostty_key_encoder_set_from_terminal",
                 sys::ghostty_key_encoder_set_from_terminal(self.key, terminal.handle),
             )?;
-            // Set from the terminal, this is reset every time: it is not something a terminal knows
-            let option = if self.option_as_alt { sys::OptionAsAlt::TRUE } else { sys::OptionAsAlt::FALSE };
+            // Set from the terminal, this is reset every time: it is not something a terminal knows.
+            // **Alt is alt unless the view said it composed the character.** The core built for a Mac
+            // otherwise assumes the option key types characters and never sends alt at all — which is a
+            // rule about the machine the broker runs on, where the keyboard is the view's
+            let option = if key.composed { sys::OptionAsAlt::FALSE } else { sys::OptionAsAlt::TRUE };
             Failed::check(
                 "ghostty_key_encoder_set(MACOS_OPTION_AS_ALT)",
                 sys::ghostty_key_encoder_set(
@@ -363,7 +381,7 @@ impl Encoders {
             )?;
             Failed::check(
                 "ghostty_key_event_set_consumed_mods",
-                sys::ghostty_key_event_set_consumed_mods(self.key_event, consumed(key, self.option_as_alt)),
+                sys::ghostty_key_event_set_consumed_mods(self.key_event, consumed(key)),
             )?;
             Failed::check(
                 "ghostty_key_event_set_composing",
@@ -380,14 +398,41 @@ impl Encoders {
         }
         let (encoder, event) = (self.key, self.key_event);
         // SAFETY: the buffer is as long as the length passed
-        sized("ghostty_key_encoder_encode", |buffer, length, written| unsafe {
+        let encoded = sized("ghostty_key_encoder_encode", |buffer, length, written| unsafe {
             sys::ghostty_key_encoder_encode(encoder, event, buffer, length, written)
-        })
+        });
+        // **The event keeps a pointer to the text and not a copy**, and the text is the caller's: left
+        // set, the event would hold a pointer into a message that has been freed until the next key
+        // SAFETY: the handle is live, and an empty string is one whose pointer the core does not read
+        unsafe { sys::ghostty_key_event_set_utf8(self.key_event, sys::String::from("")) };
+        encoded
     }
 
     /// What the pointer sends the program now: nothing unless it asked, and nothing for a move within a
     /// cell it was already told about.
-    pub fn pointer(&mut self, terminal: &Terminal, pointer: &Pointer) -> Result<Vec<u8>, Failed> {
+    ///
+    /// `held` is the buttons the view sending this is holding down, as bits, which decides whether a move
+    /// is a drag. **It is the view's and not the session's**: a release that never arrives — the button
+    /// let go outside the window, the view closed mid-drag — would otherwise leave every other view of
+    /// the session dragging for ever.
+    pub fn pointer(&mut self, terminal: &Terminal, pointer: &Pointer, held: &mut u8) -> Result<Vec<u8>, Failed> {
+        // **Numbers a view sent, so any float at all.** One that is not a number, or is infinite, is no
+        // position; the core is given none of it
+        if ![pointer.x, pointer.y, pointer.cell_width, pointer.cell_height].iter().all(|value| value.is_finite()) {
+            return Ok(Vec::new());
+        }
+        let cell_width = pointer.cell_width.clamp(1.0, MAX_CELL_PIXELS);
+        let cell_height = pointer.cell_height.clamp(1.0, MAX_CELL_PIXELS);
+        let width = f32::from(terminal.cols()?) * cell_width;
+        let height = f32::from(terminal.rows()?) * cell_height;
+        // **Held to a cell's width outside the grid, and no further.** Outside is something the core has
+        // a rule for — a drag is reported at the nearest edge, and a pointer with nothing held is
+        // nobody's — so it is still told when the pointer has left; what it is not given is a distance
+        // a view made up, which it would turn into a cell number
+        let position = sys::MousePosition {
+            x: pointer.x.clamp(-cell_width, width + cell_width),
+            y: pointer.y.clamp(-cell_height, height + cell_height),
+        };
         let (action, button) = match pointer.action {
             0 => (sys::MouseAction::PRESS, button_named(pointer.button)),
             1 => (sys::MouseAction::RELEASE, button_named(pointer.button)),
@@ -396,23 +441,24 @@ impl Encoders {
             4 => (sys::MouseAction::PRESS, Some(sys::MouseButton::FIVE)),
             _ => (sys::MouseAction::MOTION, button_named(pointer.button)),
         };
-        if pointer.button < 8 {
+        // Only a button with a name is held: anything else is no button, and has no release to clear it
+        if pointer.button < NAMED_BUTTONS {
             match pointer.action {
-                0 => self.held |= 1 << pointer.button,
-                1 => self.held &= !(1 << pointer.button),
+                0 => *held |= 1 << pointer.button,
+                1 => *held &= !(1 << pointer.button),
                 _ => {}
             }
         }
         let size = sys::MouseEncoderSize {
             size: std::mem::size_of::<sys::MouseEncoderSize>(),
-            screen_width: (f32::from(terminal.cols()?) * pointer.cell_width) as u32,
-            screen_height: (f32::from(terminal.rows()?) * pointer.cell_height) as u32,
-            cell_width: (pointer.cell_width as u32).max(1),
-            cell_height: (pointer.cell_height as u32).max(1),
+            screen_width: width as u32,
+            screen_height: height as u32,
+            cell_width: cell_width as u32,
+            cell_height: cell_height as u32,
             ..Default::default()
         };
         // A press counts as held for the event that reports it, and a release no longer does
-        let pressed = self.held != 0;
+        let pressed = *held != 0;
         let mut modes = [false; MOUSE_MODES.len()];
         for (on, mode) in modes.iter_mut().zip(MOUSE_MODES) {
             *on = terminal.mode(mode)?;
@@ -475,10 +521,7 @@ impl Encoders {
             )?;
             Failed::check(
                 "ghostty_mouse_event_set_position",
-                sys::ghostty_mouse_event_set_position(
-                    self.mouse_event,
-                    sys::MousePosition { x: pointer.x, y: pointer.y },
-                ),
+                sys::ghostty_mouse_event_set_position(self.mouse_event, position),
             )?;
         }
         let (encoder, event) = (self.mouse, self.mouse_event);

@@ -9,6 +9,8 @@
 //! Every position here is a cell in **screen** coordinates: a column, and a row counted from the oldest
 //! line held.
 
+use std::ptr::NonNull;
+
 use ghostty_vt_rs_sys as sys;
 
 use super::{Failed, Terminal};
@@ -85,8 +87,14 @@ impl Terminal {
     /// The text from one cell to another, both included, as a program wrote it: rows that wrapped joined
     /// into their line, and the blanks after a line's last character dropped.
     pub fn text_between(&self, start: Cell, end: Cell) -> Result<String, Failed> {
+        Ok(self.text_within(start, end, usize::MAX)?.unwrap_or_default())
+    }
+
+    /// The same, or `Err` of how long the text is when that is more than `limit` bytes: a caller with a
+    /// bound on what it can carry is told the size rather than handed a copy it would have to drop.
+    pub fn text_within(&self, start: Cell, end: Cell, limit: usize) -> Result<Result<String, usize>, Failed> {
         let (Some(first), Some(last)) = (self.reference_at(start), self.reference_at(end)) else {
-            return Ok(String::new());
+            return Ok(Ok(String::new()));
         };
         let selection = sys::Selection { start: first, end: last, rectangle: false };
         let mut formatter: sys::Formatter = std::ptr::null_mut();
@@ -112,11 +120,13 @@ impl Terminal {
             }
             result
         };
-        let copied = if result == sys::Result::SUCCESS && !text.is_null() {
+        let copied = match NonNull::new(text).filter(|_| result == sys::Result::SUCCESS) {
+            None => Ok(String::new()),
+            Some(_) if length > limit => Err(length),
             // SAFETY: the library wrote `length` bytes at `text`
-            String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(text, length) }).into_owned()
-        } else {
-            String::new()
+            Some(text) => {
+                Ok(String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(text.as_ptr(), length) }).into_owned())
+            }
         };
         // SAFETY: each is freed once; a null buffer is one `ghostty_free` takes
         unsafe {
@@ -166,8 +176,12 @@ impl Terminal {
             let mut result = sys::Result::SUCCESS;
             for (option, value) in options {
                 // The whole of what is held needs no selection, and is then written with the state before it
-                if result == sys::Result::SUCCESS && !(option == sys::FormatterOption::SELECTION && from == 0) {
-                    result = sys::ghostty_formatter_set(formatter, option, value);
+                if option == sys::FormatterOption::SELECTION && from == 0 {
+                    continue;
+                }
+                result = sys::ghostty_formatter_set(formatter, option, value);
+                if result != sys::Result::SUCCESS {
+                    break;
                 }
             }
             if result == sys::Result::SUCCESS {
@@ -176,11 +190,10 @@ impl Terminal {
             }
             result
         };
-        let copied = if result == sys::Result::SUCCESS && !text.is_null() {
+        let copied = match NonNull::new(text).filter(|_| result == sys::Result::SUCCESS) {
             // SAFETY: the library wrote `length` bytes at `text`
-            unsafe { std::slice::from_raw_parts(text, length) }.to_vec()
-        } else {
-            Vec::new()
+            Some(text) => unsafe { std::slice::from_raw_parts(text.as_ptr(), length) }.to_vec(),
+            None => Vec::new(),
         };
         // SAFETY: each is freed once; a null buffer is one `ghostty_free` takes
         unsafe {
@@ -191,8 +204,13 @@ impl Terminal {
         Ok(copied)
     }
 
-    /// Every place `needle` appears, newest first, as the cells each match covers. Letters match in either
-    /// case, which is the core's rule.
+    /// Every place `needle` appears, newest first, as the cells each match covers — the newest
+    /// `SEARCH_MATCHES` of them. Letters match in either case, which is the core's rule.
+    ///
+    /// **The search stops when it has enough, rather than finding everything and keeping some.** The core
+    /// searches the screen and then the history a part at a time, newest first, so it is given parts until
+    /// it has the matches a view is answered with and no further: a single letter looked for in a hundred
+    /// thousand lines is the work of finding two thousand of it, not of finding every one.
     pub fn find(&self, needle: &str) -> Result<Vec<(Cell, Cell)>, Failed> {
         if needle.is_empty() {
             return Ok(Vec::new());
@@ -204,22 +222,33 @@ impl Terminal {
         })?;
         let text = sys::String::from(needle);
         let mut found: Vec<sys::Selection> = Vec::new();
-        // SAFETY: NEEDLE copies its `GhosttyString`; the buffer handed to MATCHES is `cap` entries long
+        // SAFETY: NEEDLE copies its `GhosttyString`; STATUS and TOTAL_MATCHES write the types their
+        // out-pointers are; the buffer handed to MATCHES is `cap` entries long
         let result = unsafe {
             let mut result =
                 sys::ghostty_search_set(search, sys::SearchOption::GHOSTTY_SEARCH_OPT_NEEDLE, (&raw const text).cast());
-            if result == sys::Result::SUCCESS {
-                result = sys::ghostty_search_run(search);
-            }
-            if result == sys::Result::SUCCESS {
-                let mut buffer = sys::SelectionBuffer { ptr: std::ptr::null_mut(), cap: 0, len: 0 };
-                result = sys::ghostty_search_get(search, sys::SearchData::MATCHES, (&raw mut buffer).cast());
-                if result == sys::Result::OUT_OF_SPACE {
-                    found.resize(buffer.len, sys::Selection::default());
-                    buffer = sys::SelectionBuffer { ptr: found.as_mut_ptr(), cap: found.len(), len: 0 };
-                    result = sys::ghostty_search_get(search, sys::SearchData::MATCHES, (&raw mut buffer).cast());
-                    found.truncate(buffer.len.min(found.len()));
+            let mut total: usize = 0;
+            while result == sys::Result::SUCCESS {
+                // One part of the terminal, searched to the end of what was taken
+                result = sys::ghostty_search_feed(search);
+                let mut status: sys::SearchStatus::Type = sys::SearchStatus::RUNNING;
+                while result == sys::Result::SUCCESS && status == sys::SearchStatus::RUNNING {
+                    result = sys::ghostty_search_tick(search, &raw mut status);
                 }
+                if result == sys::Result::SUCCESS {
+                    result = sys::ghostty_search_get(search, sys::SearchData::TOTAL_MATCHES, (&raw mut total).cast());
+                }
+                if status == sys::SearchStatus::COMPLETE || total >= SEARCH_MATCHES {
+                    break;
+                }
+            }
+            if result == sys::Result::SUCCESS && total > 0 {
+                // The core fills a buffer that holds every match so far or none of it, so it is given
+                // room for them all: at most what was wanted and one part's worth more
+                found.resize(total, sys::Selection::default());
+                let mut buffer = sys::SelectionBuffer { ptr: found.as_mut_ptr(), cap: found.len(), len: 0 };
+                result = sys::ghostty_search_get(search, sys::SearchData::MATCHES, (&raw mut buffer).cast());
+                found.truncate(if result == sys::Result::SUCCESS { buffer.len.min(found.len()) } else { 0 });
             }
             result
         };

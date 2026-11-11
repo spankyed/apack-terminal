@@ -45,7 +45,7 @@ export type ErrorCode = "HANDSHAKE" | "MALFORMED" | "NO_SUCH_SESSION" | "PTY" | 
 /**
  * What the broker tells the app, unprompted or in answer.
  */
-export type Event = { "kind": "hello", protocol: number, history: number, } | { "kind": "spawned", session: string, pid: number, } | { "kind": "output", session: string, text: string, } | { "kind": "exited", session: string, code: number | null, signal: string | null, } | { "kind": "throttled", session: string, waited_us: number, } | { "kind": "screen", session: string, lines: Array<string>, 
+export type Event = { "kind": "hello", protocol: number, history: number, } | { "kind": "spawned", session: string, pid: number, recorded: boolean, restored: boolean, } | { "kind": "output", session: string, text: string, } | { "kind": "exited", session: string, code: number | null, signal: string | null, } | { "kind": "throttled", session: string, waited_us: number, } | { "kind": "screen", session: string, lines: Array<string>, 
 /**
  * For each line, whether it runs on into the next. A line longer than the grid is wide is drawn
  * over several rows, and a caller reading them as text joins the ones this marks.

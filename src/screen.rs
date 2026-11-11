@@ -11,19 +11,19 @@
 //! about itself (`markers.rs`). The difference is provenance: a fact here was stated by the shell, and a
 //! status rule would be this file's guess about one.
 
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::mpsc::Sender;
+use std::ptr::NonNull;
+use std::time::{Duration, SystemTime};
 
+use crate::holds::HoldLimit;
 use crate::recording::{self, Entry, Recorder, Timed};
-
-use crate::view::publish::{Publication, ViewId};
-use crate::view::wire::{Block, Position, Span};
+use crate::view::publish::{Outlet, Publication, ViewId};
+use crate::view::wire::{MAX_MESSAGE_BYTES, Position, Rows, Span};
 use crate::vt::images::{ImageRead, PlacementRead};
 use crate::vt::input::{self, Encoders, Key, Pasted, Pointer};
 use crate::vt::reads;
 use crate::vt::rows::{RowRead, Space};
-use std::time::SystemTime;
-
 use crate::vt::{Effect, Failed, Placed, Reported, Terminal};
 
 /// Lines of scrollback a session keeps.
@@ -106,9 +106,9 @@ pub struct Facts {
     /// **A count rather than a flag, because a caller asks after the fact.** A command that starts and ends
     /// between two reads leaves `running` false at both, so nothing else here says one ran; this has moved.
     /// It moves once per command, whichever marker ended it, and not for a prompt drawn with nothing
-    /// running. **It says that commands ended, not how many**: the two marker families are read as two
-    /// passes over each chunk, so a shell emitting both has each command read twice, and it wraps. It is
-    /// compared for a difference and never for an order or an amount.
+    /// running. **It says that commands ended, not how many**: a shell emitting both marker families
+    /// reports each command's start and end twice, a report that finds nothing running counts nothing,
+    /// and the count wraps. It is compared for a difference and never for an order or an amount.
     pub finished: u32,
 }
 
@@ -144,31 +144,151 @@ pub struct Snapshot {
     pub alt_screen: bool,
 }
 
+/// What the library reports to its host, at an address that does not move: the address is what the
+/// library is handed, and what each of its callbacks is handed back.
+///
+/// **A pointer and never a `Box`.** The callbacks run inside a write to the terminal and each makes a
+/// reference to this from that pointer; a `Box` held beside it would be a second owner asserting it is the
+/// only way in while they do. Everything here goes through the one pointer, a borrow at a time, and none
+/// is alive across a call that parses.
+struct Collector(NonNull<Reported>);
+
+// The allocation is this value's alone, and it moves between threads only with the screen that owns it
+unsafe impl Send for Collector {}
+
+impl Collector {
+    fn new() -> Self {
+        Self(NonNull::from(Box::leak(Box::<Reported>::default())))
+    }
+
+    fn get(&self) -> &Reported {
+        // SAFETY: allocated in `new`, freed in `drop`, and no callback is running: they run only inside
+        // a call on the terminal, which this borrow's holder is not in
+        unsafe { self.0.as_ref() }
+    }
+
+    fn get_mut(&mut self) -> &mut Reported {
+        // SAFETY: as `get`, and `&mut self` makes this the only borrow
+        unsafe { self.0.as_mut() }
+    }
+}
+
+impl Drop for Collector {
+    fn drop(&mut self) {
+        // SAFETY: the pointer `new` leaked, freed once. `Screen` declares the terminal before this, so
+        // the terminal — and with it every callback that could be handed the pointer — is gone already
+        drop(unsafe { Box::from_raw(self.0.as_ptr()) });
+    }
+}
+
 /// One session's VT state.
 pub struct Screen {
     /// Declared first so it is dropped first: the collector below is reachable from the library while this
     /// handle lives, and freeing it behind a live terminal would leave a dangling callback.
     terminal: Terminal,
     /// What the library reports — the replies it makes for a program, and the facts its own callbacks read.
-    /// Boxed because its address is what the library was handed.
-    reported: Box<Reported>,
+    reported: Collector,
     cols: u16,
     rows: u16,
     /// One cell in pixels, as the window drawing this session measured it. Zero until one has.
     cell: (u16, u16),
     /// The core's input encoders, from the first input a view sends.
     encoders: Option<Encoders>,
-    /// What this session's views have been sent, from the first one that attaches. A session nothing
-    /// views keeps none, so being viewable costs a session that is not viewed nothing.
+    /// The buttons each view is holding down, as bits. A view not here holds none.
+    pointers: HashMap<ViewId, u8>,
+    /// What this session's views have been sent, for as long as it has a view. A session nothing views
+    /// keeps none, so being viewable costs a session that is not viewed nothing.
     publication: Option<Publication>,
+    /// Where the next publication's epochs start: past every epoch a view of this session was told.
+    epochs: u32,
+    /// The hold the program has on the screen (mode 2026), as its number, while there is one and it has
+    /// not run past its limit.
+    hold: Option<u64>,
+    /// How many holds there have been, which is what numbers them.
+    holds: u64,
+    /// What says when a hold must be over. A screen with none is drawn when its program lets go and not
+    /// before, which is what a screen nothing views needs.
+    hold_limit: Option<HoldLimit>,
+    /// The screen is being rebuilt from a recording: what the replay provokes is not acted on.
+    replaying: bool,
     /// Where what is fed here is also written, for a session that asked to be recorded (`recording`).
     recorder: Option<Recorder>,
+    /// A keyframe is due and is waiting for the parser to be between sequences (`keyframe_when_due`).
+    keyframe_waits: bool,
     /// What the program last named its terminal, for a caller that was not there to be told.
     title: Option<String>,
+    /// The session is over and its views have been told (`end_views`). The screen itself may be read a
+    /// little longer — its reader holds it until the pty closes — and nothing may attach to it.
+    ended: bool,
 }
 
 /// The epoch a session's lines are in, one cell in pixels, and each image with the line it is on.
 pub type ImagesAt = (u32, (u16, u16), Vec<(u64, PlacementRead)>);
+
+/// The most text one answer carries: what is left of a message once the rest of the answer is in it.
+pub const TEXT_BYTES: usize = MAX_MESSAGE_BYTES - 64;
+
+/// Why a view's question about lines was not answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unanswered {
+    /// The core refused a call.
+    Core(Failed),
+    /// Nothing is viewing the session, and it is a view's frames that number its lines.
+    Unviewed,
+    /// The session is over: its views were told so, and there is nothing to attach to.
+    Ended,
+    /// The lines were numbered again since the question was put: it names lines of an epoch that is over.
+    Renumbered { asked: u32, now: u32 },
+    /// The answer is longer than one message carries.
+    TooLong { bytes: usize },
+}
+
+impl From<Failed> for Unanswered {
+    fn from(failed: Failed) -> Self {
+        Self::Core(failed)
+    }
+}
+
+impl std::fmt::Display for Unanswered {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Core(failed) => write!(out, "{failed}"),
+            Self::Unviewed => write!(out, "no view is attached to this session, so its lines have no numbers"),
+            Self::Ended => write!(out, "the session has ended"),
+            Self::Renumbered { asked, now } => {
+                write!(
+                    out,
+                    "the lines were numbered again since this was asked: it is of epoch {asked}, and this is {now}"
+                )
+            }
+            Self::TooLong { bytes } => {
+                write!(out, "the text is {bytes} bytes, and one answer carries {TEXT_BYTES} at most")
+            }
+        }
+    }
+}
+
+/// The answer to a fetch: the lines it covers, and the rows among them the session holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fetched {
+    pub first: u64,
+    /// How many lines from `first` this answers for (`wire::ToView::Rows`)
+    pub count: u32,
+    pub rows: Rows,
+}
+
+/// Where a run of bytes should be cut so that the terminal is looked at right after a sequence that
+/// begins or ends a hold: one past the first `2026h` or `2026l` in it, or its whole length.
+///
+/// **Only where to look, never what was said.** The parser is fed every byte either way and reports a
+/// hold through its own callback; a cut in the wrong place costs nothing, and a hold spelled some other
+/// way is still learnt of, at the end of the read it was in.
+fn hold_piece(bytes: &[u8]) -> usize {
+    bytes
+        .windows(5)
+        .position(|window| window.starts_with(b"2026") && matches!(window[4], b'h' | b'l'))
+        .map_or(bytes.len(), |at| at + 5)
+}
 
 /// A command the shell reported, with the line each of its moments is on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,6 +348,10 @@ impl Screen {
     fn build(cols: u16, rows: u16, history: usize) -> Result<Self, Failed> {
         let cols = cols.max(1);
         let rows = rows.max(1);
+        // **Before the terminal, so it goes after it.** A terminal that has been handed the collector
+        // may reach it for as long as it lives, its own freeing included; were routing to fail part
+        // way, these two are let go of in the reverse of the order they were made
+        let reported = Collector::new();
         let mut terminal = Terminal::new(cols, rows)?;
         terminal.default_cursor_is_a_blinking_bar()?;
         // Never less than what a client reading the screen as text is promised (`SCROLLBACK_ASKED`)
@@ -237,9 +361,9 @@ impl Screen {
         terminal.set_mode(GRAPHEME_CLUSTERING, true)?;
         terminal.refuse_images()?;
 
-        let mut reported = Box::new(Reported::default());
-        // SAFETY: the box outlives the handle, which this struct's field order guarantees
-        unsafe { terminal.route_reports(&raw mut *reported) }?;
+        // SAFETY: the collector outlives the handle — here by the order the two were made in, and from
+        // then on by this struct's field order — and is reached only through this pointer
+        unsafe { terminal.route_reports(reported.0.as_ptr()) }?;
 
         Ok(Self {
             terminal,
@@ -248,9 +372,17 @@ impl Screen {
             rows,
             cell: (0, 0),
             encoders: None,
+            pointers: HashMap::new(),
             publication: None,
+            epochs: 0,
+            hold: None,
+            holds: 0,
+            hold_limit: None,
+            replaying: false,
             recorder: None,
+            keyframe_waits: false,
             title: None,
+            ended: false,
         })
     }
 
@@ -262,19 +394,77 @@ impl Screen {
     ///
     /// Everything the core reports — replies, the shell's markers, what the program asked of the world
     /// outside — is collected by callbacks that run inside this write, and taken afterwards.
+    ///
+    /// **The parse is stopped where something has to be looked at**, and nowhere else changes what is
+    /// parsed: after each sequence a shell's marker can be, so the cell a command's prompt, output or end
+    /// was at is marked while the cursor is still on it (`commands`); after a sequence that begins or
+    /// ends a hold, so the screen a program let go of is the one sent (`settle_holds`); and, when a
+    /// keyframe is waiting, at the first byte that leaves the parser between sequences.
     pub fn feed(&mut self, bytes: &[u8]) {
-        // Stopped after each sequence a shell's marker can be, so the row a command's prompt, output or
-        // end was at is marked while the cursor is still on it (`commands`)
-        let mut rest = bytes;
-        while !rest.is_empty() {
-            let taken = self.terminal.feed_to_osc_end(rest);
-            rest = &rest[taken..];
-            self.reported.place_marks(&self.terminal);
+        // How much of `bytes` has been parsed, and how much of it the recording has been given
+        let (mut fed, mut recorded) = (0, 0);
+        while fed < bytes.len() {
+            let piece = fed + hold_piece(&bytes[fed..]);
+            while fed < piece {
+                let (taken, ground) = self.terminal.feed_to(&bytes[fed..piece], self.keyframe_waits);
+                fed += taken;
+                self.reported.get_mut().place_marks(&self.terminal);
+                if ground {
+                    // What was parsed before the keyframe is recorded before it, and the rest after
+                    self.record(|recorder| recorder.output(&bytes[recorded..fed]));
+                    recorded = fed;
+                    self.keyframe_waits = false;
+                    self.keyframe_when_due();
+                }
+            }
+            self.settle_holds();
         }
         if let Some(publication) = &mut self.publication {
             publication.touch();
         }
-        self.record(|recorder| recorder.output(bytes));
+        self.record(|recorder| recorder.output(&bytes[recorded..]));
+        self.keyframe_when_due();
+    }
+
+    /// Acts on each hold the program began or ended since this was last called.
+    ///
+    /// **A hold beginning starts its own clock**, whatever came before it: a program that lets go and
+    /// takes hold again inside one read is holding a new frame, with the whole limit ahead of it.
+    /// **A hold ending is when the frame is whole**, so that is when it is sent — here, with the terminal
+    /// exactly as the program left it, rather than after whatever else the same read went on to draw.
+    fn settle_holds(&mut self) {
+        for began in self.reported.get_mut().take_holds() {
+            if self.replaying {
+                continue;
+            }
+            if began {
+                self.holds += 1;
+                self.hold = Some(self.holds);
+                if let Some(limit) = &self.hold_limit {
+                    limit.began(self.holds);
+                }
+            } else {
+                self.hold = None;
+                if let Some(publication) = &mut self.publication {
+                    publication.touch();
+                }
+                self.publish();
+            }
+        }
+    }
+
+    /// Says what ends a hold of this screen's that its program does not (`holds`).
+    pub fn limit_holds(&mut self, limit: HoldLimit) {
+        self.hold_limit = Some(limit);
+    }
+
+    /// The hold numbered `hold` has gone on as long as one may: if it is still the one in force, the
+    /// screen is drawn as it stands and the program's hold on it is over.
+    pub fn end_hold(&mut self, hold: u64) {
+        if self.hold == Some(hold) {
+            self.hold = None;
+            self.publish();
+        }
     }
 
     /// Records every byte fed and every resize from here on at `path`, starting with the screen as it is.
@@ -302,15 +492,33 @@ impl Screen {
         Ok(true)
     }
 
-    /// Stops recording. For a session that is being ended: whatever its program still prints on its way
-    /// out must not be written into a file the session replacing it has already picked up.
+    /// Stops recording, without waiting for the file: what was recorded is still on its way to it, and
+    /// whatever records there next waits for that (`recording::claim`). For a session that is being
+    /// ended: whatever its program still prints on its way out must not be written into a file the
+    /// session replacing it has already picked up.
     pub fn stop_recording(&mut self) {
         self.recorder = None;
+        self.keyframe_waits = false;
     }
 
-    /// Whether what is fed here is being recorded.
+    /// Waits until the recording's file holds everything recorded so far, for whoever is about to read it.
+    pub fn flush_recording(&mut self) {
+        if let Some(recorder) = &mut self.recorder {
+            recorder.flush();
+        }
+    }
+
+    /// Something to wait on until the recording's file holds everything recorded so far, or `None` when
+    /// nothing is being recorded. **For a caller that holds this screen locked**: it takes this, lets
+    /// the screen go, and waits then — the wait is for a disk, and the screen is what its reader needs.
+    pub fn recording_reached(&mut self) -> Option<std::sync::mpsc::Receiver<()>> {
+        self.recorder.as_mut().and_then(Recorder::reached)
+    }
+
+    /// Whether what is fed here is being recorded. A recording whose file could not be written has
+    /// stopped, and is not one.
     pub fn recorded(&self) -> bool {
-        self.recorder.is_some()
+        self.recorder.as_ref().is_some_and(|recorder| !recorder.failed())
     }
 
     /// The grid's height.
@@ -326,33 +534,51 @@ impl Screen {
     /// The same into a recorder of the caller's making.
     pub fn start_recording_with(&mut self, mut recorder: Recorder) -> std::io::Result<()> {
         let redraw = self.redraw().map_err(|failed| std::io::Error::other(failed.to_string()))?;
-        recorder.keyframe(self.cols, self.rows, redraw)?;
+        recorder.keyframe(self.cols, self.rows, &redraw)?;
         self.recorder = Some(recorder);
         Ok(())
     }
 
-    /// Writes to the recording, when there is one, and the keyframe that write made due.
+    /// Writes to the recording, when there is one.
+    ///
+    /// **A recording that cannot be written stops**, rather than failing the session it is of: the disk
+    /// filling must not be what ends a shell.
+    fn record(&mut self, write: impl FnOnce(&mut Recorder) -> std::io::Result<()>) {
+        if let Some(recorder) = &mut self.recorder
+            && write(recorder).is_err()
+        {
+            self.recorder = None;
+        }
+    }
+
+    /// Takes the keyframe the recording is due, if it is due one and one can be taken.
     ///
     /// **A keyframe waits for the primary screen**, because one taken while `vim` is showing would hold the
     /// editor and not the shell history under it — and a replay starting there would have lost it. The
     /// bytes are still recorded, so nothing is missing; the keyframe is only later. It stops waiting when
     /// the recording is past its budget, where a keyframe is the only way its oldest part can go.
     ///
-    /// **A recording that cannot be written stops**, rather than failing the session it is of: the disk
-    /// filling must not be what ends a shell.
-    fn record(&mut self, write: impl FnOnce(&mut Recorder) -> std::io::Result<bool>) {
-        let Some(mut recorder) = self.recorder.take() else { return };
-        let written = write(&mut recorder).and_then(|due| {
-            let primary = !self.terminal.alt_screen().unwrap_or(false);
-            if (due && primary) || recorder.keyframe_overdue() {
-                let redraw = self.redraw().map_err(|failed| std::io::Error::other(failed.to_string()))?;
-                recorder.keyframe(self.cols, self.rows, redraw)?;
-            }
-            Ok(())
-        });
-        if written.is_ok() {
-            self.recorder = Some(recorder);
+    /// **And it waits for the parser to be between sequences.** A keyframe is the screen as it stands,
+    /// and says nothing of a sequence the parser is part way through: a replay that began at one taken
+    /// there would redraw the screen and then be fed the rest of that sequence as if it were text. So a
+    /// keyframe that falls due mid-sequence is taken at the byte that ends the sequence (`feed`). A
+    /// sequence that never ends would put it off for ever and the recording would grow without bound, so
+    /// at twice its budget the keyframe is taken regardless.
+    fn keyframe_when_due(&mut self) {
+        let Some(recorder) = &self.recorder else { return };
+        let primary = !self.terminal.alt_screen().unwrap_or(false);
+        if !(recorder.keyframe_due() && (primary || recorder.over_budget())) {
+            return;
         }
+        if !recorder.far_over_budget() && !self.terminal.at_ground() {
+            self.keyframe_waits = true;
+            return;
+        }
+        let (cols, rows) = (self.cols, self.rows);
+        let redraw = self.redraw();
+        self.record(|recorder| {
+            recorder.keyframe(cols, rows, &redraw.map_err(|failed| std::io::Error::other(failed.to_string()))?)
+        });
     }
 
     /// The screen and the `KEYFRAME_HISTORY_LINES` above it, as the sequences that redraw them.
@@ -377,22 +603,7 @@ impl Screen {
     /// past.
     pub fn replay(&mut self, entries: &[Timed], until: u64) -> bool {
         let Some((start, end)) = recording::span(entries, until) else { return false };
-        // The recording is of another moment: writing the replay into it would record the past as now
-        let recorder = self.recorder.take();
-        // A full reset, and the history it leaves erased: the keyframe redraws both
-        self.feed(b"\x1bc\x1b[3J");
-        for timed in &entries[start..end] {
-            match &timed.entry {
-                Entry::Keyframe { cols, rows, redraw } => {
-                    self.resize(*cols, *rows, 0, 0);
-                    self.feed(redraw);
-                }
-                Entry::Output(bytes) => self.feed(bytes),
-                Entry::Resize { cols, rows } => self.resize(*cols, *rows, 0, 0),
-            }
-        }
-        self.reported.forget_the_shell();
-        self.recorder = recorder;
+        self.rebuild(&entries[start..end]);
         true
     }
 
@@ -401,15 +612,32 @@ impl Screen {
     ///
     /// **From the first keyframe rather than the last**, which is what a session picking up where one left
     /// off wants and a rewind does not: a keyframe carries a bounded history, and the bytes after the
-    /// first one rebuild all the history the recording covers. The later keyframes are passed over — each
-    /// says again what the bytes before it already drew.
+    /// first one rebuild all the history the recording covers.
     pub fn replay_all(&mut self, entries: &[Timed]) -> bool {
         let Some(first) = entries.iter().position(|timed| matches!(timed.entry, Entry::Keyframe { .. })) else {
             return false;
         };
+        self.rebuild(&entries[first..]);
+        true
+    }
+
+    /// Makes this screen what `entries` leave a terminal as, the first of them being a keyframe. A
+    /// keyframe after the first is passed over: it says again what the bytes before it already drew.
+    ///
+    /// **The commands are the recording's, with the recording's times.** The ones this screen held are
+    /// forgotten first — the replay reports them again, and kept they would each be listed twice — and
+    /// each entry is parsed as of when it was recorded, so a command is stamped with when it ran rather
+    /// than with when somebody looked back at it.
+    fn rebuild(&mut self, entries: &[Timed]) {
+        // The recording is of another moment: writing the replay into it would record the past as now
         let recorder = self.recorder.take();
+        self.replaying = true;
+        self.reported.get_mut().forget_commands();
+        // A full reset, and the history it leaves erased: the keyframe redraws both
         self.feed(b"\x1bc\x1b[3J");
-        for (index, timed) in entries[first..].iter().enumerate() {
+        for (index, timed) in entries.iter().enumerate() {
+            let at = SystemTime::UNIX_EPOCH + Duration::from_millis(timed.at);
+            self.reported.get_mut().set_clock(Some(at));
             match &timed.entry {
                 Entry::Keyframe { cols, rows, redraw } if index == 0 => {
                     self.resize(*cols, *rows, 0, 0);
@@ -420,9 +648,19 @@ impl Screen {
                 Entry::Resize { cols, rows } => self.resize(*cols, *rows, 0, 0),
             }
         }
-        self.reported.forget_the_shell();
+        self.forget_the_shell();
+        self.reported.get_mut().set_clock(None);
+        self.replaying = false;
+        // Whatever the recorded program was holding when the recording stops, nothing is holding now
+        self.hold = None;
         self.recorder = recorder;
-        true
+    }
+
+    /// Forgets what the shell said about itself (`Reported::forget_the_shell`), and gives the command it
+    /// left running the place it ended at: where the cursor is.
+    fn forget_the_shell(&mut self) {
+        self.reported.get_mut().forget_the_shell();
+        self.reported.get_mut().place_marks(&self.terminal);
     }
 
     /// Leaves a screen rebuilt from a recording ready for a new shell: out of whatever application was
@@ -439,10 +677,12 @@ impl Screen {
         if self.terminal.alt_screen().unwrap_or(false) {
             self.feed(b"\x1b[?1049l");
         }
-        // No mouse reporting, bracketed paste or focus reports; a soft reset for the rest (keypad, cursor
-        // keys, margins, attributes); the cursor shown, on a fresh line
-        self.feed(b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[!p\x1b[?25h\x1b[0m\r\n");
-        self.reported.forget_the_shell();
+        // No mouse reporting, bracketed paste, focus reports or hold on the screen; a soft reset for the
+        // rest (keypad, cursor keys, margins, attributes); the cursor shown, on a fresh line
+        self.feed(
+            b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[?2026l\x1b[!p\x1b[?25h\x1b[0m\r\n",
+        );
+        self.forget_the_shell();
     }
 
     /// Whether the program has asked to be told about the mouse.
@@ -452,7 +692,7 @@ impl Screen {
 
     /// What the program did that is not on its screen, since this was last taken.
     pub fn take_effects(&mut self) -> Vec<Effect> {
-        let effects = self.reported.take_effects();
+        let effects = self.reported.get_mut().take_effects();
         for effect in &effects {
             if let Effect::Title(title) = effect {
                 self.title = (!title.is_empty()).then(|| title.clone());
@@ -463,37 +703,48 @@ impl Screen {
 
     /// What the shell has said about itself.
     pub fn facts(&self) -> &Facts {
-        self.reported.facts()
+        self.reported.get().facts()
     }
 
     /// What the program asked for and must be told, taken rather than read: each reply is written once.
     pub fn take_replies(&mut self) -> Vec<String> {
-        self.reported.take_replies()
+        self.reported.get_mut().take_replies()
     }
 
     /// The grid changed, and perhaps the size of a cell with it.
     ///
     /// **A cell size of zero means the caller does not know one, and the last one known stands.** Only a
     /// window measures a cell, and not every resize comes from one.
+    ///
+    /// **A size the core refuses is not the size.** The grid recorded here is what a row is read against
+    /// and what a recording says the terminal was, so it moves only when the terminal did.
     pub fn resize(&mut self, cols: u16, rows: u16, cell_width: u16, cell_height: u16) {
-        self.cols = cols.max(1);
-        self.rows = rows.max(1);
-        if cell_width > 0 && cell_height > 0 {
-            self.cell = (cell_width, cell_height);
+        let (cols, rows) = (cols.max(1), rows.max(1));
+        let (cell_width, cell_height) =
+            if cell_width > 0 && cell_height > 0 { (cell_width, cell_height) } else { self.cell };
+        if self.terminal.resize(cols, rows, cell_width, cell_height).is_err() {
+            return;
         }
-        let (cell_width, cell_height) = self.cell;
-        let _ = self.terminal.resize(self.cols, self.rows, cell_width, cell_height);
+        (self.cols, self.rows, self.cell) = (cols, rows, (cell_width, cell_height));
         if let Some(publication) = &mut self.publication {
             publication.touch();
         }
-        let (cols, rows) = (self.cols, self.rows);
-        self.record(|recorder| recorder.resize(cols, rows).map(|()| false));
-        self.reported.set_size((cell_width > 0).then_some(crate::vt::Size {
+        // A resize ends a hold: the frame the program was drawing is of a grid that is gone
+        self.settle_holds();
+        self.record(|recorder| recorder.resize(cols, rows));
+        self.reported.get_mut().set_size((cell_width > 0).then_some(crate::vt::Size {
             cols: self.cols,
             rows: self.rows,
             cell_width,
             cell_height,
         }));
+        // **Its views are sent the new grid here**, like anything else that changed the screen: a
+        // program told its terminal was resized may print nothing in answer, and a view would otherwise
+        // go on drawing the old grid until it did. Not while a recording is replayed, which passes
+        // through every size the recording had on its way to the one it shows
+        if !self.replaying {
+            self.publish();
+        }
     }
 
     fn encoders(&mut self) -> Result<&mut Encoders, Failed> {
@@ -513,19 +764,25 @@ impl Screen {
         }
     }
 
-    /// Whether the option key is alt for this session's keys, which on a Mac it is not unless chosen.
-    pub fn set_option_as_alt(&mut self, as_alt: bool) -> Result<(), Failed> {
-        self.encoders()?.set_option_as_alt(as_alt);
-        Ok(())
+    /// What the pointer sends the program now, which is nothing unless it asked for the mouse. `view` is
+    /// the view it came from, which is whose buttons are down (`Encoders::pointer`).
+    pub fn pointer(&mut self, view: ViewId, pointer: &Pointer) -> Result<Vec<u8>, Failed> {
+        self.encoders()?;
+        let held = self.pointers.entry(view).or_default();
+        let encoded = match &mut self.encoders {
+            Some(encoders) => encoders.pointer(&self.terminal, pointer, held),
+            None => Ok(Vec::new()),
+        };
+        if *held == 0 {
+            self.pointers.remove(&view);
+        }
+        encoded
     }
 
-    /// What the pointer sends the program now, which is nothing unless it asked for the mouse.
-    pub fn pointer(&mut self, pointer: &Pointer) -> Result<Vec<u8>, Failed> {
-        self.encoders()?;
-        match &mut self.encoders {
-            Some(encoders) => encoders.pointer(&self.terminal, pointer),
-            None => Ok(Vec::new()),
-        }
+    /// A view holds no button down any more, whatever it last said: it lost focus, so the release went
+    /// somewhere else, or it has gone.
+    pub fn release_pointer(&mut self, view: ViewId) {
+        self.pointers.remove(&view);
     }
 
     /// Pasted text as the program should receive it, or a refusal when it could run a command.
@@ -538,15 +795,35 @@ impl Screen {
         input::focus(&self.terminal, gained)
     }
 
-    /// Starts sending a view this session's frames through `sink`, beginning with the whole screen.
-    pub fn attach_view(&mut self, id: ViewId, sink: Sender<Vec<u8>>) -> Result<(), Failed> {
-        if self.publication.is_none() {
-            self.publication = Some(Publication::new(&self.terminal)?);
+    /// Starts sending a view this session's frames through `outlet`, beginning with the whole screen.
+    ///
+    /// **Refused once the session is over.** Its views have been told it ended and nothing will tell a
+    /// later one: a view that attached then would be drawing a screen whose end it never hears of.
+    pub fn attach_view(&mut self, id: ViewId, outlet: impl Outlet + 'static) -> Result<(), Unanswered> {
+        if self.ended {
+            return Err(Unanswered::Ended);
         }
-        let commands = self.reported.commands().generation();
-        match &mut self.publication {
-            Some(publication) => publication.attach(&self.terminal, commands, id, sink),
+        if self.publication.is_none() {
+            self.publication = Some(Publication::new(&self.terminal, self.epochs)?);
+        }
+        let commands = self.reported.get().commands().generation();
+        let held = self.hold.is_some();
+        let attached = match &mut self.publication {
+            Some(publication) => publication.attach(&self.terminal, commands, held, id, Box::new(outlet)),
             None => Ok(()),
+        };
+        self.drop_unviewed();
+        Ok(attached?)
+    }
+
+    /// Lets go of what the views were told once the last of them has gone.
+    ///
+    /// **The next view's lines are numbered past these.** A publication counts its epochs from where it
+    /// was started, and a view that comes back holds rows from the epochs it was told; starting again at
+    /// the same number would tell it those rows are still good.
+    fn drop_unviewed(&mut self) {
+        if let Some(publication) = self.publication.take_if(|publication| publication.unviewed()) {
+            self.epochs = publication.epoch().wrapping_add(1);
         }
     }
 
@@ -554,6 +831,8 @@ impl Screen {
         if let Some(publication) = &mut self.publication {
             publication.detach(id);
         }
+        self.release_pointer(id);
+        self.drop_unviewed();
     }
 
     /// Every view a connection had, when the connection goes.
@@ -561,52 +840,60 @@ impl Screen {
         if let Some(publication) = &mut self.publication {
             publication.detach_connection(connection);
         }
+        self.pointers.retain(|view, _| view.connection != connection);
+        self.drop_unviewed();
     }
 
     /// A view drew the frame with this sequence.
     pub fn acknowledge(&mut self, id: ViewId, sequence: u64) -> Result<(), Failed> {
-        let commands = self.reported.commands().generation();
-        match &mut self.publication {
-            Some(publication) => publication.acknowledge(&self.terminal, commands, id, sequence),
+        let commands = self.reported.get().commands().generation();
+        let held = self.hold.is_some();
+        let acknowledged = match &mut self.publication {
+            Some(publication) => publication.acknowledge(&self.terminal, commands, held, id, sequence),
             None => Ok(()),
-        }
+        };
+        self.drop_unviewed();
+        acknowledged
     }
 
-    /// Sends each view that is waiting for one the frame it is owed. Called where bytes land and where a
-    /// view acknowledges, which between them are every moment a frame can become due.
+    /// Sends each view that is waiting for one the frame it is owed. Called where bytes land, where a
+    /// view acknowledges, where the grid changes and where a hold ends, which between them are every
+    /// moment a frame can become due.
     pub fn publish(&mut self) {
-        let commands = self.reported.commands().generation();
+        let commands = self.reported.get().commands().generation();
+        let held = self.hold.is_some();
         if let Some(publication) = &mut self.publication {
-            let _ = publication.pump(&self.terminal, commands);
+            let _ = publication.pump(&self.terminal, commands, held);
         }
+        self.drop_unviewed();
     }
 
-    /// Lines by number, for a view that does not hold them, with the epoch the numbers belong to.
-    pub fn fetch(&mut self, first: u64, count: u32) -> Result<(u32, Block), Failed> {
-        if self.publication.is_none() {
-            self.publication = Some(Publication::new(&self.terminal)?);
-        }
-        match &mut self.publication {
-            Some(publication) => {
-                let block = publication.fetch(&self.terminal, first, count)?;
-                Ok((publication.epoch(), block))
-            }
-            None => Ok((0, Block::default())),
-        }
+    /// What numbers this session's lines, brought up to the terminal: what its views are told.
+    ///
+    /// **Only while something views it.** A line's number is a view's way of keeping what it was sent,
+    /// and means nothing to anything else; a session nothing views keeps no numbering, so a question
+    /// about lines put to one is refused rather than answered in numbers made up for the occasion.
+    fn positioned(&mut self) -> Result<&mut Publication, Unanswered> {
+        let publication = self.publication.as_mut().ok_or(Unanswered::Unviewed)?;
+        publication.advance(&self.terminal)?;
+        Ok(publication)
     }
 
-    /// The publication brought up to the terminal, which is what turns a line number into a row of it.
-    fn positioned(&mut self) -> Result<&Publication, Failed> {
-        if self.publication.is_none() {
-            self.publication = Some(Publication::new(&self.terminal)?);
-        }
-        match &mut self.publication {
-            Some(publication) => {
-                publication.advance(&self.terminal)?;
-                Ok(publication)
-            }
-            None => Err(Failed { call: "ghostty_terminal_grid_ref_track", code: 0 }),
-        }
+    /// The same, for a question that names lines: refused when the lines have been numbered again since
+    /// `epoch`, which is the numbering the question was put in. Answered in the new numbering it would
+    /// be about whichever lines now have those numbers.
+    fn numbered(&mut self, epoch: u32) -> Result<&mut Publication, Unanswered> {
+        let publication = self.positioned()?;
+        let now = publication.epoch();
+        if epoch == now { Ok(publication) } else { Err(Unanswered::Renumbered { asked: epoch, now }) }
+    }
+
+    /// Lines by number, for a view that does not hold them. `epoch` is the numbering the view asked in.
+    pub fn fetch(&mut self, epoch: u32, first: u64, count: u32) -> Result<Fetched, Unanswered> {
+        self.numbered(epoch)?;
+        let Some(publication) = &mut self.publication else { return Err(Unanswered::Unviewed) };
+        let (count, rows) = publication.fetch(&self.terminal, first, count)?;
+        Ok(Fetched { first, count, rows })
     }
 
     fn span_of(publication: &Publication, cells: (reads::Cell, reads::Cell)) -> Span {
@@ -614,40 +901,38 @@ impl Screen {
         Span { start: position(cells.0), end: position(cells.1) }
     }
 
-    /// The word at a cell, with the epoch its line numbers are in. `None` where there is no word, or no
-    /// such line any more.
-    pub fn word_at(&mut self, at: Position) -> Result<(u32, Option<Span>), Failed> {
-        let publication = self.positioned()?;
-        let epoch = publication.epoch();
-        let Some(row) = publication.screen_row(at.line) else { return Ok((epoch, None)) };
+    /// The word at a cell. `None` where there is no word, or no such line any more.
+    pub fn word_at(&mut self, epoch: u32, at: Position) -> Result<Option<Span>, Unanswered> {
+        let Some(row) = self.numbered(epoch)?.screen_row(at.line) else { return Ok(None) };
         let found = self.terminal.word_at((at.column, row))?;
         let publication = self.positioned()?;
-        Ok((epoch, found.map(|cells| Self::span_of(publication, cells))))
+        Ok(found.map(|cells| Self::span_of(publication, cells)))
     }
 
     /// The whole line a cell is on, across the rows it wrapped onto.
-    pub fn line_at(&mut self, at: Position) -> Result<(u32, Option<Span>), Failed> {
-        let publication = self.positioned()?;
-        let epoch = publication.epoch();
-        let Some(row) = publication.screen_row(at.line) else { return Ok((epoch, None)) };
+    pub fn line_at(&mut self, epoch: u32, at: Position) -> Result<Option<Span>, Unanswered> {
+        let Some(row) = self.numbered(epoch)?.screen_row(at.line) else { return Ok(None) };
         let found = self.terminal.line_at((at.column, row))?;
         let publication = self.positioned()?;
-        Ok((epoch, found.map(|cells| Self::span_of(publication, cells))))
+        Ok(found.map(|cells| Self::span_of(publication, cells)))
     }
 
-    /// The text of a span as a program wrote it. Empty when either end is a line no longer held.
-    pub fn text_of(&mut self, span: Span) -> Result<String, Failed> {
-        let publication = self.positioned()?;
+    /// The text of a span as a program wrote it. Empty when either end is a line no longer held, and
+    /// refused when it is more than one answer carries.
+    pub fn text_of(&mut self, epoch: u32, span: Span) -> Result<String, Unanswered> {
+        let publication = self.numbered(epoch)?;
         let (Some(first), Some(last)) =
             (publication.screen_row(span.start.line), publication.screen_row(span.end.line))
         else {
             return Ok(String::new());
         };
-        self.terminal.text_between((span.start.column, first), (span.end.column, last))
+        self.terminal
+            .text_within((span.start.column, first), (span.end.column, last), TEXT_BYTES)?
+            .map_err(|bytes| Unanswered::TooLong { bytes })
     }
 
     /// Every place `needle` appears, newest first, with the epoch the line numbers are in.
-    pub fn find(&mut self, needle: &str) -> Result<(u32, Vec<Span>), Failed> {
+    pub fn find(&mut self, needle: &str) -> Result<(u32, Vec<Span>), Unanswered> {
         let found = self.terminal.find(needle)?;
         let publication = self.positioned()?;
         Ok((publication.epoch(), found.into_iter().map(|cells| Self::span_of(publication, cells)).collect()))
@@ -676,7 +961,7 @@ impl Screen {
 
     /// Every image in this session with the line it is on, the epoch those lines are in, and one cell
     /// in pixels as a window last measured it.
-    pub fn images(&mut self) -> Result<ImagesAt, Failed> {
+    pub fn images(&mut self) -> Result<ImagesAt, Unanswered> {
         let placements = self.terminal.placements()?;
         let cell = self.cell;
         let publication = self.positioned()?;
@@ -691,16 +976,34 @@ impl Screen {
 
     /// Moves whenever a command is reported, so something watching knows to ask for them again.
     pub fn command_generation(&self) -> u32 {
-        self.reported.commands().generation()
+        self.reported.get().commands().generation()
+    }
+
+    /// Where a mark is now — its column, and its row counted from the oldest line held — or `None` for
+    /// one whose row has left the history, or that is on the screen that is not showing.
+    ///
+    /// **A mark answers in the numbering of the screen it was made on.** The primary screen and an
+    /// alternate-screen application each count their rows from their own top, so a mark on the shell's
+    /// screen read while `vim` is showing would name a row of `vim`.
+    fn place_of(placed: &Placed, alternate: bool) -> Option<(u16, u32)> {
+        if placed.alternate == alternate { placed.mark.screen_cell() } else { None }
     }
 
     /// Every command the shell has reported, with the line each of its moments is on now, and the epoch
-    /// those numbers are in. A moment whose row has left the history has no line.
+    /// those numbers are in. A moment whose row has left the history has no line; nor has any moment
+    /// while nothing views the session, when no line has a number.
     pub fn commands(&mut self) -> Result<(u32, Vec<CommandAt>), Failed> {
-        self.positioned()?;
-        let Some(publication) = &self.publication else { return Ok((0, Vec::new())) };
+        let alternate = self.terminal.alt_screen()?;
+        let numbering = match &mut self.publication {
+            Some(publication) => {
+                publication.advance(&self.terminal)?;
+                Some(&*publication)
+            }
+            None => None,
+        };
         let line = |placed: &Option<Placed>| {
-            placed.as_ref().and_then(|placed| placed.mark.screen_row()).map(|row| publication.line_of(row))
+            let (_, row) = Self::place_of(placed.as_ref()?, alternate)?;
+            Some(numbering?.line_of(row))
         };
         let since_epoch = |time: Option<SystemTime>| {
             time.and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
@@ -708,6 +1011,7 @@ impl Screen {
         };
         let commands = self
             .reported
+            .get()
             .commands()
             .iter()
             .map(|command| CommandAt {
@@ -722,24 +1026,28 @@ impl Screen {
                 end: line(&command.end),
             })
             .collect();
-        Ok((publication.epoch(), commands))
+        Ok((numbering.map_or(0, Publication::epoch), commands))
     }
 
-    /// What a command printed, as text, or `None` for a command that is not kept or whose output has
-    /// left the history.
+    /// What a command printed, as text, or `None` for a command that is not kept, whose output has
+    /// left the history, or that ran on the screen that is not showing.
     ///
-    /// From the row its output began on to where it ended — or, while it runs, to the cursor. A command
-    /// that ended part way along a row printed that row too: a last line with no newline is still output.
+    /// From the row its output began on to the last cell it wrote — or, while it runs, to the cursor. A
+    /// command that ended part way along a row printed that row too: a last line with no newline is
+    /// still output. Both ends are marks the core carries with the text, so they are still its ends
+    /// after a resize has wrapped the lines somewhere else.
     pub fn command_output(&self, id: u64) -> Result<Option<String>, Failed> {
-        let Some(command) = self.reported.commands().get(id) else { return Ok(None) };
-        let Some(first) = command.output.as_ref().and_then(|placed| placed.mark.screen_row()) else { return Ok(None) };
+        let Some(command) = self.reported.get().commands().get(id) else { return Ok(None) };
+        let alternate = self.terminal.alt_screen()?;
+        let Some((_, first)) = command.output.as_ref().and_then(|placed| Self::place_of(placed, alternate)) else {
+            return Ok(None);
+        };
         let columns = self.terminal.cols()?;
         let last: Option<(u16, u32)> = match &command.end {
-            Some(end) => match end.mark.screen_row() {
-                Some(row) if end.column > 0 => Some((end.column - 1, row)),
-                Some(row) if row > first => Some((columns.saturating_sub(1), row - 1)),
-                // It ended where it began, having printed nothing
-                Some(_) => None,
+            Some(end) => match Self::place_of(end, alternate) {
+                Some(cell) if end.closes => Some(cell),
+                // It ended at the start of a row, having written nothing on it: the row above is its last
+                Some((_, row)) => row.checked_sub(1).map(|above| (columns.saturating_sub(1), above)),
                 None => return Ok(None),
             },
             // Still running, or its end was never marked: everything down to the cursor
@@ -750,30 +1058,26 @@ impl Screen {
         };
         match last {
             Some(last) if last.1 >= first => self.terminal.text_between((0, first), last).map(Some),
+            // It ended where it began, having printed nothing
             _ => Ok(Some(String::new())),
         }
     }
 
     /// The epoch line numbers are in and the line the screen's first row is, as of now.
-    pub fn view_position(&mut self) -> Result<(u32, u64), Failed> {
-        if self.publication.is_none() {
-            self.publication = Some(Publication::new(&self.terminal)?);
-        }
-        match &mut self.publication {
-            Some(publication) => {
-                publication.advance(&self.terminal)?;
-                Ok((publication.epoch(), publication.first_active()))
-            }
-            None => Ok((0, 0)),
-        }
+    pub fn view_position(&mut self) -> Result<(u32, u64), Unanswered> {
+        let publication = self.positioned()?;
+        Ok((publication.epoch(), publication.first_active()))
     }
 
     /// Tells every view the session is over, after the screen as it ended.
     pub fn end_views(&mut self) {
-        let commands = self.reported.commands().generation();
+        let commands = self.reported.get().commands().generation();
         if let Some(mut publication) = self.publication.take() {
             publication.end(&self.terminal, commands);
+            self.epochs = publication.epoch().wrapping_add(1);
         }
+        self.pointers.clear();
+        self.ended = true;
     }
 
     /// A row as the grid holds it, in the core's own coordinates.

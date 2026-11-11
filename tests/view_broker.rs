@@ -105,13 +105,18 @@ impl Client {
 
     /// The same, saying whether a program in it may place images.
     fn shell_taking(&self, images: bool) -> String {
+        self.running("/bin/sh", &[], images)
+    }
+
+    /// A session running `program`, whose bytes nobody reads.
+    fn running(&self, program: &str, arguments: &[&str], images: bool) -> String {
         say(
             &self.stream,
             &Request::Spawn {
                 cols: 60,
                 rows: 8,
-                shell: Some("/bin/sh".to_owned()),
-                args: Vec::new(),
+                shell: Some(program.to_owned()),
+                args: arguments.iter().map(|argument| (*argument).to_owned()).collect(),
                 // A prompt that is the same on every machine, and no line editor to redraw it
                 env: vec![("PS1".to_owned(), "$ ".to_owned()), ("ENV".to_owned(), String::new())],
                 unset: Vec::new(),
@@ -235,6 +240,7 @@ impl View {
             code: code.to_owned(),
             text: typed.to_owned(),
             unshifted,
+            composed: false,
         });
     }
 
@@ -542,4 +548,254 @@ fn a_placed_image_and_its_pixels_are_answered_to_the_view_that_asked() {
         _ => None,
     });
     assert_eq!(pixels, (1, 1, 4, 4, vec![255, 0, 0, 255]));
+}
+
+/// **Nothing that has something for a program waits for the program to take it.** A paste of megabytes
+/// into a program that echoes every line is the case where waiting would stop everything: the program
+/// reads only as fast as its echo is read, and whatever was waiting on it would be holding what the
+/// reader of that echo needs. So the paste is answered at once, the rest of the broker goes on
+/// answering, and all of it reaches the program.
+#[test]
+fn a_paste_of_megabytes_into_a_program_that_echoes_holds_nothing_up() {
+    let broker = start();
+    let client = Client::greeting(&broker);
+    let echoing = client.running("/bin/cat", &[], false);
+    let mut view = View::attached(&broker, &echoing);
+    view.step();
+
+    let mut text = "the quick brown fox jumps over the lazy dog\n".repeat(3 * (1 << 20) / 44);
+    text.push_str("that-is-all-of-it\n");
+    view.send(&ToBroker::Paste { channel: 1, request: 3, allow_unsafe: true, text });
+    let outcome = view.answer(|message| match message {
+        ToView::Pasted { request: 3, outcome, .. } => Some(*outcome),
+        _ => None,
+    });
+    assert_eq!(outcome, 0);
+
+    // While the program is still reading it: the broker lists its sessions, starts another, and that one
+    // is typed at and answers
+    say(&client.stream, &Request::Sessions);
+    loop {
+        if let Event::Sessions { sessions } = client.event() {
+            assert_eq!(sessions.len(), 1);
+            break;
+        }
+    }
+    let other = client.shell();
+    let mut beside = View::attached(&broker, &other);
+    beside.until_shows("$ ");
+    beside.type_line("echo mean$((1+1))while");
+    beside.until_shows("mean2while");
+
+    view.until_shows("that-is-all-of-it");
+}
+
+/// A program that never reads its input fills its pty with the first few kilobytes written to it. What
+/// is written after that waits in the broker — up to a bound, past which it is refused — and neither the
+/// waiting nor the refusal is anything another session, or this one's ending, has to wait for.
+#[test]
+fn a_program_that_never_reads_holds_up_neither_another_session_nor_its_own_ending() {
+    let broker = start();
+    let client = Client::greeting(&broker);
+    let deaf = client.running("/bin/sleep", &["600"], false);
+
+    // Twenty megabytes of lines, half a megabyte to a request: more than may wait for it. Lines,
+    // because a terminal takes a line that is never finished by throwing the end of it away, and one
+    // that is finished by keeping it for the program — which is what fills a pty
+    let chunk = "a line the program will never read\n".repeat((1 << 19) / 35);
+    let mut refused = None;
+    for _ in 0..40 {
+        say(&client.stream, &Request::Write { session: deaf.clone(), text: chunk.clone() });
+    }
+    // Each write was accepted or refused, and the broker read every one of them to get to this
+    say(&client.stream, &Request::Sessions);
+    loop {
+        match client.event() {
+            Event::Failed { session: Some(session), message, .. } if session == deaf => refused = Some(message),
+            Event::Sessions { sessions } => {
+                assert_eq!(sessions.len(), 1);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let refused = refused.expect("twenty megabytes were taken for a program that reads nothing");
+    assert!(refused.contains("takes no more"), "{refused}");
+
+    // Another session is started, typed at and answers
+    let other = client.shell();
+    let mut beside = View::attached(&broker, &other);
+    beside.until_shows("$ ");
+    beside.type_line("echo unhe$((1+1))ld");
+    beside.until_shows("unhe2ld");
+
+    // And the one that is not reading ends when it is told to
+    say(&client.stream, &Request::Kill { session: deaf.clone() });
+    loop {
+        if let Event::Exited { session, .. } = client.event()
+            && session == deaf
+        {
+            break;
+        }
+    }
+}
+
+/// **A resize is told to a view by the resize.** A program is told its terminal changed size and may
+/// print nothing in answer — `cat` never does — so the frame with the new grid cannot wait for output.
+#[test]
+fn a_resize_is_sent_to_a_view_though_the_program_prints_nothing() {
+    let broker = start();
+    let client = Client::greeting(&broker);
+    let silent = client.running("/bin/cat", &[], false);
+    let mut view = View::attached(&broker, &silent);
+    let first = match view.step() {
+        ToView::Frame(frame) => frame,
+        other => panic!("expected the first frame, was sent {other:?}"),
+    };
+    assert_eq!((first.columns, first.screen_rows), (60, 8));
+
+    say(&client.stream, &Request::Resize { session: silent, cols: 44, rows: 5, cell_width: 0, cell_height: 0 });
+    let resized = view.answer(|message| match message {
+        ToView::Frame(frame) if frame.columns != 60 => Some(frame.clone()),
+        _ => None,
+    });
+    assert_eq!((resized.columns, resized.screen_rows), (44, 5));
+    assert_ne!(resized.epoch, first.epoch);
+}
+
+/// **A view that asks and does not read is hung up on.** What it is owed waits in a queue of its own, and
+/// that queue has an end: a view asking for megabytes over and over while taking none of them is not
+/// reading, and the broker stops holding answers for it rather than holding ever more.
+#[test]
+fn a_view_that_asks_without_reading_is_hung_up_on() {
+    let broker = start();
+    let client = Client::greeting(&broker);
+    let session = client.shell();
+    {
+        // Something worth asking for: a screen wide and tall enough that its lines are a megabyte
+        let mut filling = View::attached(&broker, &session);
+        say(
+            &client.stream,
+            &Request::Resize { session: session.clone(), cols: 500, rows: 100, cell_width: 0, cell_height: 0 },
+        );
+        filling.until_shows("$ ");
+        filling.type_line("i=0; while [ $i -lt 200 ]; do printf '%0500d\\n' $i; i=$((i+1)); done; echo fil$((1+1))led");
+        filling.until_shows("fil2led");
+    }
+
+    // A connection that greets as a view, attaches, reads its first frame, and from then on only writes
+    let stream = connect(&broker);
+    say(&stream, &Request::Hello { protocol: PROTOCOL_VERSION, role: Role::View });
+    let send = |message: &ToBroker| (&*stream).write_all(&message.encode());
+    send(&ToBroker::Attach { channel: 1, session: session.clone() }).expect("the broker reads");
+    let first = {
+        let mut reader = BufReader::new(&*stream);
+        let mut hello = String::new();
+        reader.read_line(&mut hello).expect("the handshake is answered");
+        let Incoming::Message(body) = read_message(&mut reader) else { panic!("the first frame did not come") };
+        match ToView::decode(&body) {
+            Ok(ToView::Frame(frame)) => frame,
+            other => panic!("expected the first frame, was sent {other:?}"),
+        }
+    };
+    // Everything the session holds, as text: a hundred kilobytes an answer. Far more are asked for than
+    // may wait, and the broker — which reads every request — stops reading this connection's, and closes it
+    let all = Span {
+        start: Position { line: first.first_active - u64::from(first.scrollback), column: 0 },
+        end: Position { line: first.first_active + u64::from(first.screen_rows) - 1, column: 499 },
+    };
+    let ask = ToBroker::TextOf { channel: 1, request: 1, epoch: first.epoch, span: all };
+    let hung_up = (0..20_000).any(|_| send(&ask).is_err());
+    assert!(hung_up, "twenty thousand answers were kept for a view that read none of them");
+
+    // The session, and a view that does read, are none the worse
+    let mut reading = View::attached(&broker, &session);
+    reading.until_shows("fil2led");
+}
+
+/// **A connection says hello once.** Its role is what it is counted as and how it is spoken to; said
+/// again it is refused, and the connection is still the one it was.
+#[test]
+fn a_second_hello_is_refused_and_changes_nothing() {
+    let broker = start();
+    let client = Client::greeting(&broker);
+    assert!(matches!(client.event(), Event::Hello { .. }));
+    for role in [Role::Client, Role::View, Role::Lifetime] {
+        say(&client.stream, &Request::Hello { protocol: PROTOCOL_VERSION, role });
+        match client.event() {
+            Event::Failed { message, .. } => assert!(message.contains("already said hello"), "{message}"),
+            other => panic!("a second hello was answered {other:?}"),
+        }
+    }
+    // Still a client, spoken to in JSON, whose requests are carried out
+    let session = client.shell();
+    let mut view = View::attached(&broker, &session);
+    view.until_shows("$ ");
+
+    // And counted once: when it goes, nothing is left holding the broker's sessions, and they end
+    let Stream::UdSocket(socket) = &*client.stream;
+    socket.inner().shutdown(std::net::Shutdown::Both).expect("the connection closes");
+    while !view.ended {
+        view.step();
+    }
+    let mut late = View::greeting(&broker);
+    late.send(&ToBroker::Attach { channel: 1, session });
+    assert!(matches!(late.step(), ToView::Ended { channel: 1 }));
+}
+
+/// The epoch of the first frame a view is sent on attaching.
+fn first_epoch(view: &mut View) -> u32 {
+    view.answer(|message| if let ToView::Frame(frame) = message { Some(frame.epoch) } else { None })
+}
+
+/// **A view that detaches is a view that has gone**, and with the last of them goes what the views were
+/// told: the next to attach is in a numbering of its own, rather than one a view that left may still
+/// hold rows of. The same when it is the connection that goes.
+#[test]
+fn the_last_view_leaving_ends_the_numbering_it_was_told() {
+    let broker = start();
+    let client = Client::greeting(&broker);
+    let session = client.shell();
+
+    let mut view = View::attached(&broker, &session);
+    let attached = first_epoch(&mut view);
+    view.send(&ToBroker::Detach { channel: 1 });
+    view.send(&ToBroker::Attach { channel: 1, session: session.clone() });
+    let reattached = first_epoch(&mut view);
+    assert_ne!(reattached, attached, "detaching left the view attached");
+
+    // The connection closes, and the broker has let go of it by the time it closes its own end
+    let Stream::UdSocket(socket) = &*view.stream;
+    socket.inner().shutdown(std::net::Shutdown::Write).expect("the connection closes one way");
+    while view.incoming.recv_timeout(PATIENCE).is_ok() {}
+    let mut next = View::attached(&broker, &session);
+    assert_ne!(first_epoch(&mut next), reattached, "a connection that went left its view attached");
+}
+
+/// **A channel whose session is over is attached to nothing**, whether or not the view detaches: what it
+/// asks of that channel next is answered as for a channel that was never attached, and the session's pty
+/// and screen are nobody's to keep.
+#[test]
+fn a_channel_whose_session_ended_is_let_go_of_without_being_detached() {
+    let broker = start();
+    let client = Client::greeting(&broker);
+    let session = client.shell();
+    let mut view = View::attached(&broker, &session);
+    view.until_shows("$ ");
+    say(&client.stream, &Request::Kill { session });
+    while !view.ended {
+        view.step();
+    }
+
+    let asked = |view: &mut View, request: u32| {
+        view.send(&ToBroker::Paste { channel: 1, request, allow_unsafe: true, text: "x".to_owned() });
+        view.answer(|message| match message {
+            ToView::Failed { request: answered, message, .. } if *answered == request => Some(message.clone()),
+            _ => None,
+        })
+    };
+    // The first asks of a session that has ended; from then on the channel is simply not attached
+    let first = asked(&mut view, 1);
+    assert!(first.contains("no session") || first.contains("ended"), "{first}");
+    assert_eq!(asked(&mut view, 2), "this channel is not attached to a session");
 }

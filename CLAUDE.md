@@ -10,12 +10,17 @@ holds.
 
 | Path | What it is |
 |---|---|
-| `src/session.rs`, `src/output.rs`, `src/tree.rs` | the process layer: the pty, the lifetime, the bounded output channel, the owned process tree |
-| `src/screen.rs`, `src/markers.rs` | the terminal capability: the VT core, and the facts a shell reported |
-| `src/protocol.rs` | every message, and the one place their shape is defined |
-| `src/main.rs` | the process: a socket, a handshake, the request loop |
+| `src/session.rs`, `src/output.rs`, `src/tree.rs`, `src/writer.rs` | the process layer: the pty, the lifetime, the bounded output channel, the owned process tree, and the queue everything typed at a program goes through |
+| `src/screen.rs`, `src/markers.rs`, `src/commands.rs` | the terminal capability: the VT core, the facts a shell reported, and the commands it ran |
+| `src/vt/` | the core itself, behind the one module that calls it: the terminal, input encoding, row and text reads, images |
+| `src/view/` | what a view is sent: the binary wire (`wire.rs`), what changed since a view's last frame (`publish.rs`), and a connection's bounded queue (`sink.rs`) |
+| `src/holds.rs`, `src/housekeeping.rs` | what happens on a clock rather than on a byte: a synchronized-output hold reaching its limit, and a quiet session's history being compressed |
+| `src/recording.rs` | a session's recording: the file, its keyframes, and reading it back |
+| `src/protocol.rs`, `src/frames.rs` | every message a client sends and is sent, the one place their shape is defined, and how one is read off a connection |
+| `src/listening.rs`, `src/security.rs`, `src/proxy.rs` | who may reach a broker: the lock that makes it the only one on its socket, the socket's directory and permissions, the Windows pipe's descriptor, and `proxy`, which is a process's stdin and stdout as a connection |
+| `src/main.rs` | the process: a socket, a handshake, the request loop for a client and for a view |
 | `src/lib.rs` | so the parser can be tested as a parser |
-| `node/protocol.ts` | **generated** from `src/protocol.rs`; never edited by hand, and shipped by the package |
+| `node/protocol.ts`, `node/view-vectors.json` | **generated** from `src/protocol.rs` and `src/view/wire.rs`; never edited by hand, and shipped by the package |
 | `xtask/` | the repository's own tasks (`cargo xtask <task>`): the protocol's derivation, the mutation gate's own checks, and pre-push |
 | `node/` | the npm package a consumer installs: the protocol's types, where the binary is, and the binary `cargo xtask package` stages into it |
 

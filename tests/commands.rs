@@ -25,13 +25,13 @@ fn summary(commands: &Commands<u32>) -> Vec<Summary> {
 fn a_command_is_recorded_from_its_prompt_to_its_end_with_the_row_each_was_at() {
     let mut commands = Commands::<u32>::default();
     commands.prompt_started(at(1));
-    commands.place(|| Some(10));
+    commands.place(|_| Some(10));
     commands.output_started(Some("make".to_owned()), Some("/src".to_owned()), at(2));
-    commands.place(|| Some(11));
+    commands.place(|_| Some(11));
     assert_eq!(summary(&commands), vec![(1, Some("make".to_owned()), None, Some(10), Some(11), None, true)]);
 
     commands.ended(Some(2), at(5));
-    commands.place(|| Some(40));
+    commands.place(|_| Some(40));
     assert_eq!(summary(&commands), vec![(1, Some("make".to_owned()), Some(2), Some(10), Some(11), Some(40), false)]);
     let made = commands.get(1).expect("the command is kept");
     assert_eq!((made.cwd.as_deref(), made.started, made.finished), (Some("/src"), Some(at(2)), Some(at(5))));
@@ -46,7 +46,7 @@ fn the_prompt_after_an_end_is_the_next_command_waiting() {
     commands.output_started(None, None, at(2));
     commands.ended(Some(0), at(3));
     commands.prompt_started(at(3));
-    commands.place(|| Some(7));
+    commands.place(|_| Some(7));
     let all = summary(&commands);
     assert_eq!(all.len(), 2);
     assert_eq!((all[0].2, all[0].6), (Some(0), false), "the first ended once, with its status");
@@ -70,9 +70,9 @@ fn a_prompt_ends_a_command_whose_end_was_never_reported() {
 fn a_prompt_drawn_again_with_nothing_run_is_the_same_command_moved() {
     let mut commands = Commands::<u32>::default();
     commands.prompt_started(at(1));
-    commands.place(|| Some(3));
+    commands.place(|_| Some(3));
     commands.prompt_started(at(2));
-    commands.place(|| Some(4));
+    commands.place(|_| Some(4));
     assert_eq!(summary(&commands), vec![(1, None, None, Some(4), None, None, false)]);
 }
 
@@ -110,7 +110,7 @@ fn moments_are_given_rows_in_the_order_they_happened() {
     commands.ended(None, at(1));
     assert!(commands.moments_waiting());
     let mut rows = [Some(1), None, Some(3)].into_iter();
-    commands.place(|| rows.next().flatten());
+    commands.place(|_| rows.next().flatten());
     assert!(!commands.moments_waiting());
     assert_eq!(summary(&commands), vec![(1, None, None, Some(1), None, Some(3), false)]);
 }

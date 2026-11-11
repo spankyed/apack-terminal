@@ -10,8 +10,8 @@
 //! line of it is a change a view has to be taught.
 
 use apack_terminal::view::wire::{
-    Block, Color, CommandRow, Cursor, Frame, Glyph, NO_BUTTON, Placement, Position, Row, Span, Style, ToBroker, ToView,
-    body,
+    Block, Color, ColorChanges, CommandRow, Cursor, Frame, Glyph, NO_BUTTON, Placement, Position, Row, Span, Style,
+    ToBroker, ToView, body,
 };
 use serde_json::{Value, json};
 
@@ -42,18 +42,20 @@ fn span(span: Span) -> Value {
     json!({ "start": position(span.start), "end": position(span.end) })
 }
 
-fn block(block: &Block) -> (Value, Value, Value) {
-    let styles: Vec<Value> = block
-        .styles
-        .iter()
-        .map(|style| {
-            json!({ "fg": color(style.fg), "bg": color(style.bg), "underline": color(style.underline), "flags": style.flags })
-        })
-        .collect();
+/// A block's rows. Each carries its own styles and links, and a glyph's `style` and `link` count into
+/// them from one: `0` is the plain style, and no link.
+fn block(block: &Block) -> Value {
     let rows: Vec<Value> = block
         .rows
         .iter()
         .map(|row| {
+            let styles: Vec<Value> = row
+                .styles
+                .iter()
+                .map(|style| {
+                    json!({ "fg": color(style.fg), "bg": color(style.bg), "underline": color(style.underline), "flags": style.flags })
+                })
+                .collect();
             let glyphs: Vec<Value> = row
                 .glyphs
                 .iter()
@@ -61,16 +63,34 @@ fn block(block: &Block) -> (Value, Value, Value) {
                     json!({ "column": glyph.column, "width": glyph.width, "text": glyph.text, "style": glyph.style, "link": glyph.link })
                 })
                 .collect();
-            json!({ "line": row.line, "wrapped": row.wrapped, "prompt": row.prompt, "glyphs": glyphs })
+            json!({
+                "line": row.line, "wrapped": row.wrapped, "prompt": row.prompt, "styles": styles, "links": row.links,
+                "glyphs": glyphs,
+            })
         })
         .collect();
-    (json!(styles), json!(block.links), json!(rows))
+    json!(rows)
+}
+
+/// One colour as the number a view writes it as: `0xRRGGBB`.
+fn rgb(color: [u8; 3]) -> u32 {
+    (u32::from(color[0]) << 16) | (u32::from(color[1]) << 8) | u32::from(color[2])
+}
+
+/// The colours a program changed: each of the three or `null`, and the palette entries by index.
+fn colors(changed: &ColorChanges) -> Value {
+    let palette: Vec<Value> =
+        changed.palette.iter().map(|(index, color)| json!({ "index": index, "rgb": rgb(*color) })).collect();
+    json!({
+        "foreground": changed.foreground.map(rgb), "background": changed.background.map(rgb),
+        "cursor": changed.cursor.map(rgb), "palette": palette,
+    })
 }
 
 fn to_view(message: &ToView) -> Value {
     match message {
         ToView::Frame(frame) => {
-            let (styles, links, rows) = block(&frame.block);
+            let rows = block(&frame.block);
             let cursor = frame.cursor.map(|cursor| {
                 let shape = ["block", "bar", "underline", "hollow"][usize::from(cursor.shape)];
                 json!({ "column": cursor.column, "row": cursor.row, "shape": shape, "blinking": cursor.blinking })
@@ -80,12 +100,15 @@ fn to_view(message: &ToView) -> Value {
                 "firstActive": frame.first_active, "columns": frame.columns, "screenRows": frame.screen_rows,
                 "scrollback": frame.scrollback, "commands": frame.commands, "images": frame.images, "cursor": cursor,
                 "alternateScreen": frame.alternate_screen,
-                "mouse": frame.mouse, "staleFrom": frame.stale_from, "styles": styles, "links": links, "rows": rows,
+                "mouse": frame.mouse, "reverseVideo": frame.reverse_video, "staleFrom": frame.stale_from,
+                "colors": frame.colors.as_ref().map(colors), "rows": rows,
             })
         }
-        ToView::Rows { channel, request, epoch, block: rows_block } => {
-            let (styles, links, rows) = block(rows_block);
-            json!({ "kind": "rows", "channel": channel, "request": request, "epoch": epoch, "styles": styles, "links": links, "rows": rows })
+        ToView::Rows { channel, request, epoch, first, count, block: rows_block } => {
+            json!({
+                "kind": "rows", "channel": channel, "request": request, "epoch": epoch, "first": first, "count": count,
+                "rows": block(rows_block),
+            })
         }
         ToView::Ended { channel } => json!({ "kind": "ended", "channel": channel }),
         ToView::Pasted { channel, request, outcome } => {
@@ -94,8 +117,8 @@ fn to_view(message: &ToView) -> Value {
         ToView::Span { channel, request, epoch, span: found } => {
             json!({ "kind": "span", "channel": channel, "request": request, "epoch": epoch, "span": found.map(span) })
         }
-        ToView::Text { channel, request, text } => {
-            json!({ "kind": "text", "channel": channel, "request": request, "text": text })
+        ToView::Text { channel, request, epoch, text } => {
+            json!({ "kind": "text", "channel": channel, "request": request, "epoch": epoch, "text": text })
         }
         ToView::Spans { channel, request, epoch, spans } => {
             let spans: Vec<Value> = spans.iter().copied().map(span).collect();
@@ -154,9 +177,9 @@ fn to_broker(message: &ToBroker) -> Value {
         ToBroker::Fetch { channel, request, epoch, first, count } => {
             json!({ "kind": "fetch", "channel": channel, "request": request, "epoch": epoch, "first": first, "count": count })
         }
-        ToBroker::Key { channel, action, modifiers, code, text, unshifted } => json!({
+        ToBroker::Key { channel, action, modifiers, code, text, unshifted, composed } => json!({
             "kind": "key", "channel": channel, "action": named(&["press", "repeat", "release"], *action),
-            "modifiers": modifiers, "code": code, "text": text, "unshifted": unshifted,
+            "modifiers": modifiers, "code": code, "text": text, "unshifted": unshifted, "composed": composed,
         }),
         ToBroker::Text { channel, text } => json!({ "kind": "text", "channel": channel, "text": text }),
         ToBroker::Pointer { channel, action, button, modifiers, x, y, cell_width, cell_height } => json!({
@@ -203,23 +226,22 @@ fn sample_block() -> Block {
         link,
     };
     Block {
-        styles: vec![
-            Style::default(),
-            Style { fg: Color::Palette(1), bg: Color::Default, underline: Color::Default, flags: 1 },
-            Style {
-                fg: Color::Rgb(0x12, 0x34, 0x56),
-                bg: Color::Palette(250),
-                underline: Color::Rgb(255, 0, 128),
-                flags: 0x302,
-            },
-        ],
-        links: vec![String::new(), "https://example.com/a?b=c".to_owned()],
         rows: vec![
             // Plain text, a gap, then styled and linked runs side by side
             Row {
                 line: 0,
                 wrapped: false,
                 prompt: true,
+                styles: vec![
+                    Style { fg: Color::Palette(1), bg: Color::Default, underline: Color::Default, flags: 1 },
+                    Style {
+                        fg: Color::Rgb(0x12, 0x34, 0x56),
+                        bg: Color::Palette(250),
+                        underline: Color::Rgb(255, 0, 128),
+                        flags: 0x302,
+                    },
+                ],
+                links: vec!["https://example.com/a?b=c".to_owned()],
                 glyphs: vec![
                     glyph(0, 1, "$", 0, 0),
                     glyph(2, 1, "l", 1, 0),
@@ -233,6 +255,8 @@ fn sample_block() -> Block {
                 line: 1,
                 wrapped: true,
                 prompt: false,
+                styles: Vec::new(),
+                links: Vec::new(),
                 glyphs: vec![
                     glyph(0, 2, "\u{4e16}", 0, 0),
                     glyph(2, 1, "e\u{301}", 0, 0),
@@ -241,13 +265,33 @@ fn sample_block() -> Block {
                 ],
             },
             // An empty row, and one far enough up that its number takes more than a byte
-            Row { line: 2, wrapped: false, prompt: false, glyphs: Vec::new() },
-            Row { line: 123_456_789, wrapped: false, prompt: false, glyphs: vec![glyph(79, 1, "z", 0, 0)] },
+            Row { line: 2, ..Row::default() },
+            Row { line: 123_456_789, glyphs: vec![glyph(79, 1, "z", 0, 0)], ..Row::default() },
         ],
     }
 }
 
 fn vectors() -> Value {
+    let recolored = |reverse_video: bool, colors: ColorChanges| {
+        ToView::Frame(Frame {
+            channel: 3,
+            sequence: 42,
+            epoch: 2,
+            first_active: 1_000,
+            columns: 80,
+            screen_rows: 24,
+            scrollback: 1_000,
+            commands: 7,
+            images: 4,
+            cursor: None,
+            alternate_screen: false,
+            mouse: false,
+            reverse_video,
+            stale_from: None,
+            colors: Some(colors),
+            block: Block::default(),
+        })
+    };
     let frame = |cursor: Option<Cursor>, stale_from: Option<u64>, block: Block| {
         ToView::Frame(Frame {
             channel: 3,
@@ -262,7 +306,9 @@ fn vectors() -> Value {
             cursor,
             alternate_screen: stale_from.is_some(),
             mouse: cursor.is_none(),
+            reverse_video: false,
             stale_from,
+            colors: None,
             block,
         })
     };
@@ -278,19 +324,47 @@ fn vectors() -> Value {
             "a frame naming stale history, with a steady underline cursor",
             frame(Some(Cursor { column: 0, row: 0, shape: 2, blinking: false }), Some(990), Block::default()),
         ),
-        ("fetched rows", ToView::Rows { channel: 3, request: 7, epoch: 2, block: sample_block() }),
+        (
+            "a frame in reverse video whose program set its foreground, background, cursor and two palette entries",
+            recolored(
+                true,
+                ColorChanges {
+                    foreground: Some([0xEE, 0xE8, 0xD5]),
+                    background: Some([0x00, 0x2B, 0x36]),
+                    cursor: Some([0xDC, 0x32, 0x2F]),
+                    palette: vec![(1, [0xDC, 0x32, 0x2F]), (255, [0x01, 0x02, 0x03])],
+                },
+            ),
+        ),
+        (
+            "a frame whose program changed only its background",
+            recolored(false, ColorChanges { background: Some([0x10, 0x20, 0x30]), ..ColorChanges::default() }),
+        ),
+        ("a frame saying the program put every colour back", recolored(false, ColorChanges::default())),
+        (
+            "fetched rows: the four held among the hundred and fifty lines from 69,000 that the answer covers",
+            ToView::Rows { channel: 3, request: 7, epoch: 2, first: 69_000, count: 150, block: sample_block() },
+        ),
+        (
+            "fetched rows: none of the lines asked for is held",
+            ToView::Rows { channel: 3, request: 21, epoch: 2, first: 5, count: 200, block: Block::default() },
+        ),
         ("a session ending", ToView::Ended { channel: 3 }),
         ("a paste that went", ToView::Pasted { channel: 3, request: 8, outcome: 0 }),
         ("a paste refused", ToView::Pasted { channel: 3, request: 9, outcome: 1 }),
         ("a word", ToView::Span { channel: 3, request: 10, epoch: 2, span: Some(across) }),
         ("no word", ToView::Span { channel: 3, request: 11, epoch: 2, span: None }),
-        ("text", ToView::Text { channel: 3, request: 12, text: "one\ntwo \u{4e16}".to_owned() }),
+        ("text", ToView::Text { channel: 3, request: 12, epoch: 2, text: "one\ntwo \u{4e16}".to_owned() }),
         (
             "matches",
             ToView::Spans { channel: 3, request: 13, epoch: 2, spans: vec![across, Span { start: at, end: at }] },
         ),
         ("no matches", ToView::Spans { channel: 3, request: 14, epoch: 2, spans: Vec::new() }),
         ("a refusal", ToView::Failed { channel: 3, request: 15, message: "no session s-9".to_owned() }),
+        (
+            "an attach refused, which has no request of its own and is answered as request zero",
+            ToView::Failed { channel: 3, request: 0, message: "ghostty_render_state_new failed with -1".to_owned() },
+        ),
         (
             "commands: one finished with everything known, one that failed with a negative status, one waiting",
             ToView::Commands {
@@ -396,6 +470,7 @@ fn vectors() -> Value {
                 code: "KeyA".to_owned(),
                 text: "A".to_owned(),
                 unshifted: 97,
+                composed: false,
             },
         ),
         (
@@ -407,6 +482,7 @@ fn vectors() -> Value {
                 code: "ArrowUp".to_owned(),
                 text: String::new(),
                 unshifted: 0,
+                composed: false,
             },
         ),
         (
@@ -418,6 +494,19 @@ fn vectors() -> Value {
                 code: "KeyJ".to_owned(),
                 text: "j".to_owned(),
                 unshifted: 106,
+                composed: false,
+            },
+        ),
+        (
+            "a character the option key composed on a Mac",
+            ToBroker::Key {
+                channel: 3,
+                action: 0,
+                modifiers: 4,
+                code: "KeyA".to_owned(),
+                text: "\u{e5}".to_owned(),
+                unshifted: 97,
+                composed: true,
             },
         ),
         ("composed text", ToBroker::Text { channel: 3, text: "\u{65e5}\u{672c}\u{8a9e}".to_owned() }),
@@ -478,7 +567,7 @@ fn vectors() -> Value {
 
     let mut all: Vec<Value> = Vec::new();
     for (name, message) in &for_a_view {
-        let encoded = message.encode();
+        let encoded = message.encode().expect("a vector is a message");
         assert_eq!(ToView::decode(body(&encoded)).as_ref(), Ok(message), "{name} does not read back");
         all.push(json!({ "name": name, "to": "view", "hex": hex(&encoded), "message": to_view(message) }));
     }

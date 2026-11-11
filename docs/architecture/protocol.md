@@ -27,7 +27,8 @@ more than a compact one. Nothing in the traffic makes framing the bottleneck. A 
 ```
 
 The broker answers `hello` with its own version, or refuses with `HANDSHAKE`. Nothing can be asked before
-it.
+it, and it is said once: a second `hello` on a connection is refused with `HANDSHAKE` and changes nothing,
+the connection's role being what it is counted as and how it is spoken to from the first.
 
 **It is a contract across a pin boundary.** A consumer pins a commit of this repository, so a stale pin has
 to be a clear refusal rather than a message that means something else.
@@ -58,13 +59,24 @@ means for a session's lifetime.
 | `sessions` | every session the broker has |
 | `rewind` | a recording, opened as a session with no process |
 | `seek` | show a rewound session's recording as it was at a moment |
-| `kill` | end the session and its process tree; for a rewound session, close it |
+| `kill` | end the session and its process tree; for a rewound session, close it. The process is asked first (a hangup) and killed two seconds later if it is still there, so `exited` always follows |
 
 `output` says whether the session's bytes are sent as `output` at all. A caller that reads a program's
 bytes wants them; a terminal a person looks at is drawn by a view, which is sent rows
 ([views.md](views.md)), and its bytes would cross the socket to be thrown away and stall the program on
 their credit. `record` and `restore` are a file to record the session in and whether to begin with what it
 holds; `images` is whether its programs may send any ([design.md](design.md)).
+
+**A `write` is queued, not written.** What is bound for a program — a `write`, and everything a view
+types, pastes or points at — waits its turn for the program to read it, and the request is answered
+without waiting: a program that has stopped reading holds up its own input and nothing else. Up to 16 MiB
+may wait for one session; a `write` past that is refused with `PTY` rather than dropped or held.
+
+**A rewound session lists the commands since its keyframe.** `commands` on one answers those the shell
+marked between the keyframe the moment shown was replayed from and that moment, with the times they ran.
+
+**A rewound session is its opener's.** It ends when the connection that asked for it closes, as well as
+when it is killed: it is no process, nothing else knows its id, and a client that reconnects asks again.
 
 A connection that greets with `role: "view"` leaves this protocol after the handshake: what it speaks is
 [views.md](views.md).
@@ -90,7 +102,7 @@ is what a caller gets when it asks for both.
 | kind | says |
 |---|---|
 | `hello` | the broker's own protocol version |
-| `spawned` | a session exists and its process is running, with its pid |
+| `spawned` | a session exists and its process is running, with its pid. `recorded` says whether it is being recorded and `restored` whether its screen began as what the recording held — each `false` when it was not asked for, and when it was asked for and not got: a file that is not a recording is left alone, a file another session is recording to has one writer, and a file the session before is still writing the last of is waited for five seconds and no longer |
 | `output` | bytes the process wrote. A feed: unprompted, and nobody asked |
 | `exited` | the process ended: `code` when it exited, `signal` by name when one killed it, never both |
 | `throttled` | a flush waited for credit, with the microseconds it waited. Not a loss |
@@ -230,10 +242,10 @@ rather than matching a message that is free to be reworded.
 
 | code | means |
 |---|---|
-| `HANDSHAKE` | the first message was not `hello`, or its version is not ours |
+| `HANDSHAKE` | the first message was not `hello`, its version is not ours, or `hello` was said a second time |
 | `MALFORMED` | a frame did not parse as a request |
 | `NO_SUCH_SESSION` | no session has that id — it never existed, or it has already exited |
-| `PTY` | the pty or the process refused: spawn, resize or write failed at the OS |
+| `PTY` | the pty or the process refused: spawn or resize failed at the OS, or more is already waiting for the program to read than a session holds |
 | `OUTSIDE_SESSION` | a `signal` named a pid that is not in that session's tree |
 | `UNSUPPORTED` | this platform has no such operation — signals, on Windows |
 

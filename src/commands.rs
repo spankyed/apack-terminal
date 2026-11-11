@@ -102,6 +102,23 @@ impl<M> Commands<M> {
         self.generation = self.generation.wrapping_add(1);
     }
 
+    /// Forgets every command and counts them from one again, for a terminal about to be rebuilt from a
+    /// recording that will report them afresh.
+    pub fn clear(&mut self) {
+        self.kept.clear();
+        self.pending.clear();
+        self.next = 1;
+        self.changed();
+    }
+
+    /// Gives the running command the line the shell read, for a shell that says so after the command
+    /// has started rather than before. With none running there is nothing to name.
+    pub fn name_running(&mut self, line: String) {
+        let Some(current) = self.kept.back_mut().filter(|last| last.running()) else { return };
+        current.command = Some(line);
+        self.changed();
+    }
+
     fn begin(&mut self) -> &mut Command<M> {
         let id = self.next;
         self.next += 1;
@@ -156,11 +173,12 @@ impl<M> Commands<M> {
         !self.pending.is_empty()
     }
 
-    /// Gives every moment reported since the last call the row `mark` makes, in the order they happened.
+    /// Gives every moment reported since the last call the mark `mark` makes for it, in the order they
+    /// happened.
     ///
     /// Called where the terminal is exactly as it was when the shell wrote the marker, so each mark is
-    /// made at the cursor's row at that moment.
-    pub fn place(&mut self, mut mark: impl FnMut() -> Option<M>) {
+    /// made where the cursor was at that moment.
+    pub fn place(&mut self, mut mark: impl FnMut(Moment) -> Option<M>) {
         for (id, moment) in std::mem::take(&mut self.pending) {
             let Some(command) = self.kept.iter_mut().find(|command| command.id == id) else { continue };
             let slot = match moment {
@@ -168,7 +186,7 @@ impl<M> Commands<M> {
                 Moment::Output => &mut command.output,
                 Moment::End => &mut command.end,
             };
-            *slot = mark();
+            *slot = mark(moment);
         }
     }
 }

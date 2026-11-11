@@ -5,6 +5,7 @@
 //! rather than bytes.
 
 use apack_terminal::screen::Screen;
+use apack_terminal::view::publish::ViewId;
 use apack_terminal::vt::input::{Key, Pasted, Pointer};
 
 const SHIFT: u16 = 1;
@@ -12,8 +13,16 @@ const CONTROL: u16 = 2;
 const ALT: u16 = 4;
 
 fn key<'a>(code: &'a str, modifiers: u16, text: &'a str, unshifted: char) -> Key<'a> {
-    Key { action: 0, code, modifiers, text, unshifted: u32::from(unshifted) }
+    Key { action: 0, code, modifiers, text, unshifted: u32::from(unshifted), composed: false }
 }
+
+/// The same key where the view says alt went into what was typed, as the option key does on a Mac.
+fn composed<'a>(code: &'a str, modifiers: u16, text: &'a str, unshifted: char) -> Key<'a> {
+    Key { composed: true, ..key(code, modifiers, text, unshifted) }
+}
+
+/// The view a case's pointer events come from, where the case has only one.
+const VIEW: ViewId = ViewId { connection: 1, channel: 1 };
 
 fn sent(screen: &mut Screen, key: &Key<'_>) -> String {
     String::from_utf8(screen.key(key).expect("a key encodes")).expect("a key's bytes are text")
@@ -33,7 +42,11 @@ fn click(action: u8, button: u8, column: f32, row: f32) -> Pointer {
 }
 
 fn pointed(screen: &mut Screen, pointer: &Pointer) -> String {
-    String::from_utf8(screen.pointer(pointer).expect("a pointer event encodes")).expect("a report is text")
+    pointed_by(screen, VIEW, pointer)
+}
+
+fn pointed_by(screen: &mut Screen, view: ViewId, pointer: &Pointer) -> String {
+    String::from_utf8(screen.pointer(view, pointer).expect("a pointer event encodes")).expect("a report is text")
 }
 
 #[test]
@@ -56,16 +69,43 @@ fn control_and_alt_change_what_a_letter_sends() {
     assert_eq!(sent(&mut screen, &key("KeyD", CONTROL, "", 'd')), "\x04");
 }
 
-/// Alt before a letter is the escape prefix — where the key *is* alt. On a Mac it is the option key, which
-/// types a character of its own unless the person chose otherwise, and that choice is the session's.
+/// Alt before a letter is the escape prefix — where the key *is* alt, which is everywhere but a Mac whose
+/// option key is typing characters. Only the view knows which keyboard it is in front of, so it says:
+/// alt is alt unless the key is marked as having composed its character.
 #[test]
-fn alt_is_the_escape_prefix_once_the_option_key_is_chosen_as_alt() {
+fn alt_is_the_escape_prefix_unless_the_view_says_it_composed_the_character() {
     let mut screen = Screen::new(80, 24);
-    screen.set_option_as_alt(true).expect("the choice is taken");
     assert_eq!(sent(&mut screen, &key("KeyB", ALT, "b", 'b')), "\x1bb");
+    // **With shift as well, shift made the capital and alt is still held**: this is the key Linux and
+    // Windows report for Alt+Shift+A, and what a shell binds is the escape and the capital
+    assert_eq!(sent(&mut screen, &key("KeyA", ALT | SHIFT, "A", 'a')), "\x1bA");
     // Composing instead, the character the option key typed is what is sent
-    screen.set_option_as_alt(false).expect("the choice is taken");
-    assert_eq!(sent(&mut screen, &key("KeyB", ALT, "\u{222b}", 'b')), "\u{222b}");
+    assert_eq!(sent(&mut screen, &composed("KeyB", ALT, "\u{222b}", 'b')), "\u{222b}");
+    assert_eq!(sent(&mut screen, &composed("KeyA", ALT | SHIFT, "\u{c5}", 'a')), "\u{c5}");
+}
+
+/// A character typed through AltGr arrives as its text with control and alt left out, which is how a
+/// view says they were the way it was typed: it is sent as that character.
+#[test]
+fn a_character_typed_through_altgr_is_sent_as_the_character() {
+    let mut screen = Screen::new(80, 24);
+    assert_eq!(sent(&mut screen, &key("KeyQ", 0, "@", 'q')), "@");
+    assert_eq!(sent(&mut screen, &key("Digit7", 0, "{", '7')), "{");
+    screen.feed(b"\x1b[>1u");
+    assert_eq!(sent(&mut screen, &key("KeyQ", 0, "@", 'q')), "@");
+}
+
+/// A browser reports some keys by the control character they stand for. The core derives that from the
+/// key itself, and given the character as well it would be sent twice over; so it is given the key alone.
+#[test]
+fn a_key_reported_as_a_control_character_is_sent_once() {
+    let mut screen = Screen::new(80, 24);
+    assert_eq!(sent(&mut screen, &key("KeyC", CONTROL, "\x03", 'c')), "\x03");
+    assert_eq!(sent(&mut screen, &key("Enter", 0, "\r", '\0')), "\r");
+    assert_eq!(sent(&mut screen, &key("Backspace", 0, "\x7f", '\0')), "\x7f");
+    assert_eq!(sent(&mut screen, &key("Escape", 0, "\x1b", '\0')), "\x1b");
+    // The code point a Mac reports an arrow as names the key too, and is no character to send
+    assert_eq!(sent(&mut screen, &key("ArrowUp", 0, "\u{f700}", '\0')), "\x1b[A");
 }
 
 /// **The reason keys are encoded here.** The same arrow is two different sequences depending on a mode a
@@ -190,7 +230,26 @@ fn shift_is_spent_on_what_it_typed_and_held_beside_control() {
     assert_eq!(sent(&mut screen, &key("Digit1", SHIFT, "!", '1')), "!");
     assert_eq!(sent(&mut screen, &key("KeyA", SHIFT, "A", 'a')), "A");
     assert_eq!(sent(&mut screen, &key("KeyA", SHIFT | CONTROL, "A", 'a')), "\x1b[97;6u");
-    assert_eq!(sent(&mut screen, &key("KeyB", ALT, "\u{222b}", 'b')), "\u{222b}");
+    assert_eq!(sent(&mut screen, &composed("KeyB", ALT, "\u{222b}", 'b')), "\u{222b}");
+    // Alt that composed nothing is reported as alt, with the key it was held with
+    assert_eq!(sent(&mut screen, &key("KeyB", ALT, "b", 'b')), "\x1b[98;3u");
+    // And shift held beside a letter it did not change — caps lock made the capital small again — was
+    // not spent on it: the key is the letter with shift down
+    assert_eq!(sent(&mut screen, &key("KeyA", SHIFT, "a", 'a')), "\x1b[97;2u");
+}
+
+/// A key held down repeats, which a program that asked to be told of key events is told as a repeat and
+/// not as the key pressed again.
+#[test]
+fn a_held_key_is_reported_as_a_repeat_to_a_program_that_asked() {
+    let mut screen = Screen::new(80, 24);
+    let repeat = Key { action: 1, ..key("KeyA", 0, "a", 'a') };
+    assert_eq!(sent(&mut screen, &repeat), "a", "to a program that did not ask, a held key types again");
+    // Disambiguate, report event types, and every key as an escape code
+    screen.feed(b"\x1b[>11u");
+    assert_eq!(sent(&mut screen, &key("KeyA", 0, "a", 'a')), "\x1b[97u");
+    assert_eq!(sent(&mut screen, &repeat), "\x1b[97;1:2u");
+    assert_eq!(sent(&mut screen, &Key { action: 2, ..repeat }), "\x1b[97;1:3u");
 }
 
 /// **A drag that leaves the grid is still a drag.** The pointer goes on being reported, held to the
@@ -218,7 +277,65 @@ fn a_drag_past_the_edge_is_reported_at_the_edge_while_a_button_is_held() {
     assert_eq!(pointed(&mut screen, &click(1, 0, 1.0, 1.0)), "\x1b[<0;2;2m");
     assert_eq!(pointed(&mut screen, &outside(0, 950.0)), "");
 
-    // A button the core has no name for is not one that can be held
-    assert_eq!(pointed(&mut screen, &click(0, 8, 1.0, 1.0)), "");
-    assert_eq!(pointed(&mut screen, &outside(0, 900.0)), "");
+    // A button the core has no name for is not one that can be held: it has no release to let it go
+    for unnamed in [3, 5, 7, 8] {
+        assert_eq!(pointed(&mut screen, &click(0, unnamed, 1.0, 1.0)), "");
+        assert_eq!(pointed(&mut screen, &outside(0, 900.0)), "", "button {unnamed} is not held");
+    }
+}
+
+/// **Which buttons are down is a view's, not the session's.** One view's press does not make another
+/// view's move a drag, and a press whose release never comes — the view went, or lost focus with the
+/// button down, so the release was somebody else's — is let go with the view.
+#[test]
+fn a_button_one_view_holds_is_not_held_by_another_and_goes_with_the_view() {
+    let (first, second) = (ViewId { connection: 1, channel: 1 }, ViewId { connection: 2, channel: 1 });
+    let mut screen = Screen::new(80, 24);
+    screen.feed(b"\x1b[?1002h\x1b[?1006h");
+    // A move past the right edge, which is reported — at the edge — only to a view holding a button down
+    let dragged_out = || Pointer { x: 900.0, ..click(2, 0, 0.0, 1.0) };
+    let at_the_edge = "\x1b[<32;80;2M";
+
+    assert_eq!(pointed_by(&mut screen, first, &click(0, 0, 1.0, 1.0)), "\x1b[<0;2;2M");
+    assert_eq!(pointed_by(&mut screen, second, &dragged_out()), "", "the other view holds nothing");
+    assert_eq!(pointed_by(&mut screen, first, &dragged_out()), at_the_edge, "the one that pressed is dragging");
+
+    // The view that pressed detaches without ever releasing, and comes back: it holds nothing
+    screen.detach_view(first);
+    assert_eq!(pointed_by(&mut screen, first, &dragged_out()), "");
+
+    // Pressed again, and its connection goes
+    assert_eq!(pointed_by(&mut screen, first, &click(0, 0, 1.0, 1.0)), "\x1b[<0;2;2M");
+    assert_eq!(pointed_by(&mut screen, first, &dragged_out()), at_the_edge);
+    screen.detach_connection(1);
+    assert_eq!(pointed_by(&mut screen, first, &dragged_out()), "");
+
+    // Pressed again, and it loses focus with the button down
+    assert_eq!(pointed_by(&mut screen, first, &click(0, 0, 1.0, 1.0)), "\x1b[<0;2;2M");
+    assert_eq!(pointed_by(&mut screen, first, &dragged_out()), at_the_edge);
+    screen.release_pointer(first);
+    assert_eq!(pointed_by(&mut screen, first, &dragged_out()), "");
+}
+
+/// A position is four numbers a view sent, and a number need not be one: what is not a position is
+/// reported as nothing, and one far outside the grid is the grid's edge and not a cell number made of it.
+#[test]
+fn a_pointer_position_that_is_not_a_number_is_no_position_and_a_far_one_is_the_edge() {
+    let mut screen = Screen::new(80, 24);
+    screen.feed(b"\x1b[?1002h\x1b[?1006h");
+    assert_eq!(pointed(&mut screen, &click(0, 0, 1.0, 1.0)), "\x1b[<0;2;2M");
+    let held = click(2, 0, 4.0, 1.0);
+    for not_a_number in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        assert_eq!(pointed(&mut screen, &Pointer { x: not_a_number, ..held }), "");
+        assert_eq!(pointed(&mut screen, &Pointer { y: not_a_number, ..held }), "");
+        assert_eq!(pointed(&mut screen, &Pointer { cell_width: not_a_number, ..held }), "");
+        assert_eq!(pointed(&mut screen, &Pointer { cell_height: not_a_number, ..held }), "");
+    }
+    assert_eq!(pointed(&mut screen, &Pointer { x: 1e30, y: 1e30, ..held }), "\x1b[<32;80;24M");
+    assert_eq!(pointed(&mut screen, &Pointer { x: -1e30, y: -1e30, ..held }), "\x1b[<32;1;1M");
+    // A cell of no size, or of a size no view measures, is taken as the nearest a cell can be
+    assert_eq!(
+        pointed(&mut screen, &Pointer { x: 9.0, y: 0.0, cell_width: 0.0, cell_height: 1e30, ..held }),
+        "\x1b[<32;10;1M"
+    );
 }

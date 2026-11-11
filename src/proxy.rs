@@ -1,5 +1,6 @@
-//! `apack-terminal proxy <socket>`: this process's stdin and stdout, as a connection to the broker on
-//! that socket — started first, if there is none.
+//! `apack-terminal proxy [<socket>]`: this process's stdin and stdout, as a connection to the broker on
+//! that socket — started first, if there is none. With no socket named, the user's own
+//! (`listening::default_socket`).
 //!
 //! **This is what puts a broker anywhere a command can be run.** A broker listens on a socket, which only
 //! something on the same machine can reach. Run under `ssh host`, `docker exec -i` or anything else that
@@ -8,32 +9,54 @@
 //! speaks to a broker on another machine exactly as it speaks to its own, in whichever role it greets
 //! with, and nothing about a remote terminal is a second protocol.
 //!
-//! **One broker per socket, however many proxies arrive.** The first finds nothing listening and starts
-//! one; the rest connect to it. A broker started here is a process of its own — it has to outlive this
-//! one, whose life is one connection — and ends by the broker's own rule, when nothing is connected to it.
+//! **One broker per socket, however many proxies arrive, and that is the broker's doing.** A broker holds
+//! a lock on its socket for its life and one that cannot take it exits saying so (`listening`). So a proxy
+//! that finds nothing listening simply starts a broker: if another proxy's broker got there first, this
+//! one's exits at once, and the proxy connects to the one that is there. A broker started here is a
+//! process of its own — it has to outlive this one, whose life is one connection — and ends by the
+//! broker's own rules: when nothing is connected to it, or when nothing ever connects.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use interprocess::local_socket::{GenericFilePath, Stream, ToFsName, prelude::*};
 
-/// How long a broker another proxy is starting is waited for before this one gives up on it.
-const START_WAIT: Duration = Duration::from_secs(10);
+use crate::listening::{self, HELD_EXIT};
+
+/// How many times a proxy looks for a broker before giving up on there being one.
+///
+/// Each look that finds none starts a broker, so this is reached only when brokers keep starting and
+/// none ends up listening — which is something wrong with the machine, not a race to be waited out.
+const LOOKS: usize = 50;
+
+/// How long a proxy leaves a broker that beat its own to the socket to finish starting to listen.
+///
+/// **A pause, because there is nothing to wait on.** The broker that holds the socket was started by
+/// some other process and says it is listening on a pipe this one does not have; from here the only
+/// sign of it is that a connection is accepted. It took the lock a moment before it listens, so the
+/// pause is that moment several times over, and `LOOKS` of them is the bound.
+const BETWEEN_LOOKS: Duration = Duration::from_millis(20);
 
 fn connect(socket: &str) -> std::io::Result<Stream> {
     Stream::connect(socket.to_fs_name::<GenericFilePath>()?)
 }
 
-/// Where the claim to be the one starting a broker for `socket` is made.
-fn starting_file(socket: &str) -> PathBuf {
-    PathBuf::from(format!("{socket}.starting"))
+/// What became of a broker this proxy started.
+enum Started {
+    /// It is listening
+    Listening,
+    /// Another broker holds the socket, and this one has exited
+    Beaten,
 }
 
-/// Starts a broker on `socket` as a process of its own, answering once it has said it is listening.
-fn start_broker(socket: &str) -> std::io::Result<()> {
+/// Starts a broker on `socket` as a process of its own, answering once it has said what became of it.
+///
+/// **The broker says so on its stdout, in one line**: `listening <socket>`, or `failed <why>` before it
+/// exits. Its stderr goes nowhere: a broker outlives the proxy that started it, and a pipe to a process
+/// that has gone is one more thing a long-lived broker could be killed by writing to.
+fn start_broker(socket: &str) -> std::io::Result<Started> {
     let mut command = Command::new(std::env::current_exe()?);
     command.arg(socket).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
     // **A session of its own**, so the broker is not ended with whatever carried this proxy: an `ssh`
@@ -48,55 +71,37 @@ fn start_broker(socket: &str) -> std::io::Result<()> {
         };
     }
     let mut broker = command.spawn()?;
-    let mut ready = String::new();
-    let said = broker.stdout.take().ok_or_else(|| std::io::Error::other("the broker has no stdout to read"))?;
-    BufReader::new(said).read_line(&mut ready)?;
-    if ready.starts_with("listening ") {
-        return Ok(());
+    let mut said = String::new();
+    let stdout = broker.stdout.take().ok_or_else(|| std::io::Error::other("the broker has no stdout to read"))?;
+    BufReader::new(stdout).read_line(&mut said)?;
+    if said.starts_with("listening ") {
+        return Ok(Started::Listening);
     }
-    Err(std::io::Error::other(format!("the broker did not say it was listening: {ready:?}")))
+    // It said why it is not listening, or nothing at all, and either way it is on its way out
+    let status = broker.wait()?;
+    if status.code() == Some(HELD_EXIT) {
+        return Ok(Started::Beaten);
+    }
+    let why = said.trim().strip_prefix("failed ").unwrap_or(said.trim());
+    Err(std::io::Error::other(if why.is_empty() {
+        format!("the broker started for {socket} exited without listening ({status})")
+    } else {
+        format!("the broker started for {socket} could not listen: {why}")
+    }))
 }
 
 /// A connection to the broker on `socket`, starting one when nothing is listening there.
-///
-/// **Two proxies arriving together must not both start one**: the broker takes its socket whether or not
-/// another holds it, so the second would leave the first one's sessions unreachable. The one that creates
-/// the claim file starts the broker; any other waits for it to be listening.
-///
-/// **Holding the claim is not yet a reason to start one.** A proxy can find nothing listening, and take the
-/// claim only after another has started a broker and let it go — so the claim's holder asks once more, and
-/// a broker is started only by a holder that still finds none. A broker is listening before its starter
-/// releases the claim, which is what makes that second look decisive.
-/// The window that second look closes is a few microseconds wide and no test reaches it; what the suite
-/// holds is the claim itself, without which proxies arriving together fail every time.
 fn reach(socket: &str) -> std::io::Result<Stream> {
-    let claim = starting_file(socket);
-    let mut waiting_since = Instant::now();
-    let mut took_over = false;
-    loop {
+    for _ in 0..LOOKS {
         if let Ok(stream) = connect(socket) {
             return Ok(stream);
         }
-        if std::fs::OpenOptions::new().write(true).create_new(true).open(&claim).is_ok() {
-            let reached = connect(socket).or_else(|_| start_broker(socket).and_then(|()| connect(socket)));
-            let _ = std::fs::remove_file(&claim);
-            return reached;
+        match start_broker(socket)? {
+            Started::Listening => {}
+            Started::Beaten => std::thread::sleep(BETWEEN_LOOKS),
         }
-        // Another proxy is starting it. A claim outlives a proxy that died holding it, so one that has had
-        // its time is removed and contended for again — once, since a second that goes nowhere is not stale
-        if waiting_since.elapsed() > START_WAIT {
-            if took_over {
-                return Err(std::io::Error::other(format!(
-                    "nothing started listening on {socket}, and {} is held by something that is not starting it",
-                    claim.display()
-                )));
-            }
-            let _ = std::fs::remove_file(&claim);
-            took_over = true;
-            waiting_since = Instant::now();
-        }
-        std::thread::sleep(Duration::from_millis(20));
     }
+    Err(std::io::Error::other(format!("nothing started listening on {socket}")))
 }
 
 /// Copies everything from `from` to `to`, a read at a time, until either ends.
@@ -114,22 +119,43 @@ fn pump(mut from: impl Read, mut to: impl Write) {
     }
 }
 
-/// Runs as the proxy: until this process's stdin ends or the broker hangs up.
-pub fn run(socket: &str) -> std::io::Result<()> {
-    if let Some(directory) = Path::new(socket).parent().filter(|directory| !directory.as_os_str().is_empty()) {
-        std::fs::create_dir_all(directory)?;
+/// Says nothing more will be sent on `stream`, leaving what the broker still has to say to be read.
+/// `false` where a connection cannot be closed one way, which is a named pipe.
+fn finish_sending(stream: &Stream) -> bool {
+    match stream {
+        #[cfg(unix)]
+        Stream::UdSocket(socket) => socket.inner().shutdown(std::net::Shutdown::Write).is_ok(),
+        #[cfg(windows)]
+        Stream::NamedPipe(_) => false,
     }
+}
+
+/// Runs as the proxy: until the broker hangs up, which it does once this process's stdin has ended and
+/// the broker has said everything it had to say.
+pub fn run(socket: &str) -> std::io::Result<()> {
+    listening::private_directory(socket).map_err(|refused| std::io::Error::other(refused.to_string()))?;
     let stream = Arc::new(reach(socket)?);
-    // **Whichever side ends first ends the process**, which is what closes the other: the broker hanging
-    // up leaves nothing to read, and stdin ending is the far end having gone. A thread parked on the other
-    // read is no reason to stay
+    // Before a byte is carried either way: what is about to be handed over is somebody's terminals
+    if !listening::peer_is_this_user(&stream)? {
+        return Err(std::io::Error::other(format!(
+            "what is listening on {socket} is another user's, not a broker of this one's"
+        )));
+    }
+    // **Stdin ending is the far end having said all it will, not the end of the conversation.** The
+    // broker may still be answering what it was last asked, so the connection is closed in that one
+    // direction and read until the broker closes the other; ending the process here would cut off the
+    // answer to the request just carried. Where a connection has only one end to close, that is what
+    // this still does
     std::thread::spawn({
         let stream = Arc::clone(&stream);
         move || {
             pump(std::io::stdin().lock(), &*stream);
-            std::process::exit(0);
+            if !finish_sending(&stream) {
+                std::process::exit(0);
+            }
         }
     });
+    // The broker hanging up leaves nothing to read, and a thread still parked on stdin is no reason to stay
     pump(&*stream, std::io::stdout().lock());
     Ok(())
 }

@@ -134,4 +134,10 @@ fn a_percent_escape_is_decoded_and_one_with_no_pair_is_kept_as_itself() {
     assert_eq!(line("cd 50%").as_deref(), Some("cd 50%"));
     // An escape inside a command line arrives escaped, which is how the shell's script writes one
     assert_eq!(line("printf '%1b[31m'").as_deref(), Some("printf '\x1b[31m'"));
+    // **Two hexadecimal digits and nothing else.** A sign is not a digit, though a number parser takes
+    // one: `%+1` is a percent, a plus and a one, as the shell wrote them
+    assert_eq!(line("echo %+1 %-1 %+f").as_deref(), Some("echo %+1 %-1 %+f"));
+    assert_eq!(line("100%, %zz, %4").as_deref(), Some("100%, %zz, %4"));
+    // A pair that ends the line is a pair, and one in either case
+    assert_eq!(line("a%2f%2Fb%7e").as_deref(), Some("a//b~"));
 }
