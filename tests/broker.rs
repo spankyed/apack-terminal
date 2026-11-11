@@ -467,9 +467,21 @@ fn a_client_that_disconnects_leaves_no_shell_running() {
 /// asks without touching the process. Windows has no signal at all, and `OpenProcess` would be a dependency
 /// for one call, so the OS's own list is asked instead — `tasklist` is on every Windows Server image and its
 /// filter answers with the row or with "no tasks".
+///
+/// **A process that has ended and not been collected has ended.** Signal 0 still finds it: it is in the
+/// table until its parent waits for it, and when a shell waits for a job it put in the background is the
+/// shell's own business — `bash` does as the job ends, `dash` not until its next prompt. What a case asks
+/// is whether a signal reached a process, not whether the shell has tidied up after it, so the process's
+/// state is read and one that only awaits collection is not alive.
 #[cfg(unix)]
 fn alive(pid: i32) -> bool {
-    unsafe { libc::kill(pid, 0) == 0 }
+    // SAFETY: signal 0 delivers nothing; it asks whether there is such a process
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return false;
+    }
+    let state = std::process::Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]).output();
+    // A state that cannot be read is no evidence the process ended
+    state.map_or(true, |state| !String::from_utf8_lossy(&state.stdout).trim_start().starts_with('Z'))
 }
 
 #[cfg(windows)]
