@@ -2,10 +2,13 @@
 
 Draws a terminal from rows something else interpreted.
 
+A package of the [`apack-terminal`](..) repository, beside the broker whose rows it draws.
+
 A view here has no terminal core. It is handed rows of characters with their styles by a `TerminalSource`,
-which is whatever owns the terminal — in apack, the `apack-terminal` broker — and it owns the rest: painting,
-scrolling, selection, text input, links and what a screen reader hears. Input goes back to the source as key
-and pointer events, not bytes, because what a key sends depends on modes only the terminal's owner knows.
+which is whatever owns the terminal — in apack, the broker at this repository's root — and it owns the rest:
+painting, scrolling, selection, text input, links and what a screen reader hears. Input goes back to the
+source as key and pointer events, not bytes, because what a key sends depends on modes only the terminal's
+owner knows.
 
 `src/source.ts` is the contract.
 
@@ -18,11 +21,24 @@ const view = new TerminalView(views.open(sessionId), { font, theme })
 view.mount(element)
 ```
 
+From this directory, on Node 24.12 or later:
+
 ```sh
-npm install
+npm ci
+npm run typecheck
 npm test
-npm run build
+npm run build        # dist/, which is what a consumer bundles
 ```
+
+The repository's CI runs those four as its `view` job, and `cargo xtask pre-push` at the root runs them
+after the broker's suites.
+
+## Using it
+
+Not published. A consumer depends on this directory (apack: `file:…/vendor/apack-terminal/view`, through
+its link to a checkout of this repository) and bundles `dist/`, which is not tracked — so it is built
+wherever the checkout is linked or cloned. There is no WebAssembly and nothing to load at runtime: one ES
+module and its declarations.
 
 ## What is where
 
@@ -79,5 +95,7 @@ file where it lies, decodes every vector for a view and encodes every one for th
 protocol changes, the re-recorded file fails this suite until the codec reads it — in the same commit,
 since both halves are in it.
 
-Began as a clone of [coder/ghostty-web](https://github.com/coder/ghostty-web) (MIT), whose input handling it
-draws on.
+## License
+
+MIT ([LICENSE](LICENSE)). The input handling draws on
+[coder/ghostty-web](https://github.com/coder/ghostty-web), whose notice that file carries.

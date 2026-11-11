@@ -13,7 +13,8 @@ What each directory is for, so you know how far to trust what you're reading.
   Start here.
 - [protocol.md](architecture/protocol.md): every message, the handshake, the roles, and the closed error set.
 - [views.md](architecture/views.md): how a window draws a session from rows it is sent, and the binary
-  protocol a view speaks.
+  protocol a view speaks. The view itself is the package in [`view/`](../view), with
+  [a README of its own](../view/README.md).
 - [windows-pipe-access.md](architecture/windows-pipe-access.md): who may open the pipe there, and the
   descriptor read back off a live one.
 - [testing.md](architecture/testing.md): what proves it correct, and the command for each check.
