@@ -1122,7 +1122,6 @@ fn a_session_ending_settles_both_kinds_of_wait() {
 }
 
 /// What a keyed session's shell is given and nothing else is, in the cases below.
-#[cfg(unix)]
 const MARKS_KEY: &str = "00112233445566778899aabbccddeeff";
 
 /// A session spawned with `MARKS_KEY`, with a shell running, ready to be typed into.
@@ -1260,6 +1259,47 @@ fn a_keyed_session_that_ends_reports_the_command_it_left_running_as_over_and_unk
     let finished: Vec<&serde_json::Value> = before.iter().filter(|event| event["kind"] == "command_finished").collect();
     let [finished] = finished.as_slice() else { panic!("expected one command to be reported over: {before:?}") };
     assert_eq!(finished["outcome"], serde_json::json!({ "kind": "unknown", "why": "session_ended" }));
+}
+
+/// A program that writes the marks of one command, begun and ended with status 0, and exits at once.
+#[cfg(unix)]
+fn prints_a_whole_command_and_exits() -> (&'static str, Vec<String>) {
+    let marks = format!("{}{}", keyed_start(1, "true"), keyed_finish(1, "0", "/tmp"));
+    ("/bin/sh", vec!["-c".to_owned(), format!("printf '{marks}'")])
+}
+
+/// PowerShell, because `cmd.exe` cannot write an escape byte.
+#[cfg(windows)]
+fn prints_a_whole_command_and_exits() -> (&'static str, Vec<String>) {
+    let script = format!(
+        "$e = [char]27; $b = [char]7; [Console]::Out.Write($e + ']633;V;S;1;{MARKS_KEY};true' + $b + $e + \
+         ']633;V;F;1;{MARKS_KEY};0;C:/' + $b)"
+    );
+    ("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", &script].map(str::to_owned).to_vec())
+}
+
+/// **A command's end printed as its shell exits is the end it is given.** The exit and the last of the
+/// output are reported by two threads, and the one that says the session is over waits until the other
+/// has read everything: a finish read after it would find its command already closed as unknown, and a
+/// caller that ran one command and left would never be told how it came out. A ConPTY is where the wait
+/// decides it: its output does not end when its shell does, so nothing but the wait puts the finish first.
+#[test]
+fn a_finish_printed_as_the_shell_exits_is_how_its_command_is_reported_over() {
+    let broker = start();
+    let (mut reading, mut writing) = connect(&broker);
+    ask(&mut writing, &hello(None));
+    assert_eq!(next(&mut reading)["kind"], "hello");
+    let (shell, args) = prints_a_whole_command_and_exits();
+    let frame = serde_json::json!({
+        "kind": "spawn", "cols": 80, "rows": 24, "shell": shell, "args": args, "env": [], "unset": [],
+        "cwd": null, "marks_key": MARKS_KEY,
+    });
+    ask(&mut writing, &frame.to_string());
+
+    let (_, before) = until(&mut reading, "exited");
+    let finished: Vec<&serde_json::Value> = before.iter().filter(|event| event["kind"] == "command_finished").collect();
+    let [finished] = finished.as_slice() else { panic!("expected one command to be reported over: {before:?}") };
+    assert_eq!(finished["outcome"], serde_json::json!({ "kind": "exited", "code": 0 }));
 }
 
 /// A key that is not one is refused rather than spawned without: a session that came back unkeyed would

@@ -37,11 +37,12 @@ use crate::writer::{INPUT_BYTES, Input, Refused};
 ///
 /// **The exit and the last of the output are two events on two threads**, and a view told the session is
 /// over is sent the screen as it ended — so the ending has to come second. On a POSIX pty the reader sees
-/// the end of the stream as soon as the process is gone and this wait is over in microseconds. It is
-/// bounded for the case where it never does: a background job the shell left behind still holds the pty
-/// open, and a session whose shell has exited must not wait on it. Not on the clock for any other reason,
-/// and not waited at all on Windows, where the read of a closed console never returns.
-#[cfg(unix)]
+/// the end of the stream as soon as the process is gone and this wait is over in microseconds. A ConPTY
+/// reports no end while its console is open, so the console is closed once the shell has gone
+/// (`Process::pty`), which flushes what it holds and ends the stream the same way. It is bounded for the
+/// case where the end never comes: a background job the shell left behind still holds a POSIX pty open, a
+/// reader parked on a pause is reading nothing, and a session whose shell has exited must not wait on
+/// either. Not on the clock for any other reason.
 const EXIT_DRAIN: Duration = Duration::from_millis(250);
 
 /// How long a session that was ended is given to go before it is made to.
@@ -153,7 +154,12 @@ struct Process {
     /// What is written to the program, by the one thread that writes to its pty (`writer::Input`).
     input: Arc<Input>,
     /// The master side of its pty, which is what is resized and what knows the foreground process.
-    pty: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    ///
+    /// **`None` once its shell has exited**, which is when it is let go of: a ConPTY's output ends only
+    /// when its console is closed, and the last of what the shell printed is read before the session is
+    /// said to be over (`EXIT_DRAIN`). The reader holds its own handle on the output, so letting go of
+    /// this one loses nothing still to be read on either platform.
+    pty: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
     /// Waits outstanding on this session, shared with the reader thread that settles them. **Checked where
     /// the bytes land**: the broker already knows when something arrived, so a caller waiting for a state
     /// costs a condition check per read rather than a timer asking.
@@ -748,19 +754,22 @@ impl Handle {
                 let look = look.upgrade().ok_or_else(|| missing(&self.session))?;
                 look.lock().map_err(|_| poisoned("resizing a screen"))?.size = (cols, rows);
             }
-            Behind::Process(_) => self
-                .process()?
-                .pty
-                .lock()
-                .map_err(|_| poisoned("resizing a pty"))?
-                .resize(PtySize {
-                    rows,
-                    cols,
-                    // The pty carries the same fact for a program that asks the kernel rather than the terminal
-                    pixel_width: cols.saturating_mul(cell_width),
-                    pixel_height: rows.saturating_mul(cell_height),
-                })
-                .map_err(|error| Refusal::pty("resizing a pty", error))?,
+            Behind::Process(_) => {
+                let process = self.process()?;
+                let pty = process.pty.lock().map_err(|_| poisoned("resizing a pty"))?;
+                // A session whose shell has exited has no pty left to tell, and its screen is still
+                // one a view is drawing
+                if let Some(pty) = pty.as_ref() {
+                    pty.resize(PtySize {
+                        rows,
+                        cols,
+                        // The pty carries the same fact for a program that asks the kernel rather than the terminal
+                        pixel_width: cols.saturating_mul(cell_width),
+                        pixel_height: rows.saturating_mul(cell_height),
+                    })
+                    .map_err(|error| Refusal::pty("resizing a pty", error))?;
+                }
+            }
         }
         // The screen is resized too, or the authority would describe a viewport the process no longer has
         self.on_screen(|screen| screen.resize(cols, rows, cell_width, cell_height))
@@ -776,7 +785,7 @@ impl Handle {
     pub fn foreground(&self) -> Option<Foreground> {
         let process = self.process().ok()?;
         let pty = process.pty.lock().ok()?;
-        foreground_of(pty.as_ref())
+        foreground_of(pty.as_deref()?)
     }
 
     /// What the shell has reported about itself, and what vouches for it: both as of one moment.
@@ -1056,13 +1065,14 @@ impl Sessions {
         let waiters: Arc<Mutex<Vec<Waiter>>> = Arc::new(Mutex::new(Vec::new()));
         let process = Arc::new(Process {
             input: Input::start(writer),
-            pty: Arc::new(Mutex::new(pty.master)),
+            pty: Arc::new(Mutex::new(Some(pty.master))),
             waiters: Arc::clone(&waiters),
             flow: Arc::clone(&flow),
             pid,
         });
         let answering = Arc::clone(&process.input);
         let ending_input = Arc::clone(&process.input);
+        let ending_pty = Arc::clone(&process.pty);
         let (reaping, reaped) = channel::<()>();
 
         // **In the record before anything can report its end.** The thread that waits on the child tells
@@ -1220,10 +1230,12 @@ impl Sessions {
             // Only now: letting go of a pty's writer types into the pty, and until here there was a
             // program that could have read it
             ending_input.release();
-            #[cfg(unix)]
+            // **Let go of on a thread of its own**: closing a console waits, on the Windows releases that
+            // wait at all, for its output to be read to the end, and a reader parked on a pause reads
+            // nothing — so the exit waits for the reader below, by its own bound, and never for the close
+            let master = ending_pty.lock().ok().and_then(|mut held| held.take());
+            std::thread::spawn(move || drop(master));
             let _ = draining.recv_timeout(EXIT_DRAIN);
-            #[cfg(not(unix))]
-            drop(draining);
             // **A command the shell left running is over, and is told before the exit is**: a shell that
             // is told to exit begins a command and never ends it. After the last of the output, so a
             // finish the shell did print is the one that closes it

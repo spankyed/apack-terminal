@@ -250,9 +250,8 @@ session ending settles every wait on it, because nothing is coming.
   `view_broker`, `proxy`), which use Unix sockets and `/bin/sh`; so a view's connection, the lock that
   makes a broker the only one on its pipe, the proxy and a kept session are compiled on Windows and
   exercised nowhere on it. What is known to differ there is said where it applies: a view past its
-  limit is not hung up on (`views.md`), a session's exit is not waited on for its last output,
-  `signal` answers `UNSUPPORTED`, and the pipe's directory and peer are not checked as a socket's are
-  on POSIX.
+  limit is not hung up on (`views.md`), `signal` answers `UNSUPPORTED`, and the pipe's directory and
+  peer are not checked as a socket's are on POSIX.
 
 ## What the broker will not do
 
