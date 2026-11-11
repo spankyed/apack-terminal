@@ -16,13 +16,13 @@ export function installFrames(): void {
 /** How many frames are waiting to run */
 export const framesWaiting = (): number => queued.filter(Boolean).length
 
-/** Runs every frame asked for so far, answering how many ran */
-export function runFrames(): number {
+/** Runs every frame asked for so far, at `time` on the page's clock, answering how many ran */
+export function runFrames(time = 0): number {
   const running = queued
   queued = []
   let ran = 0
   for (const callback of running) {
-    if (callback) { callback(0); ran += 1 }
+    if (callback) { callback(time); ran += 1 }
   }
   return ran
 }

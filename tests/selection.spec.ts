@@ -6,6 +6,9 @@ import { FakeSource } from './_source.ts'
 
 const at = (line: number, column: number): Position => ({ line, column })
 
+/** Lets promises that are already settled run their continuations */
+const settled = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
+
 function selection(source = new FakeSource()) {
   let changes = 0
   const made = new Selection(source, () => 80, () => { changes += 1 })
@@ -63,6 +66,50 @@ describe('a selection by word or line', () => {
     expect(made.span, 'dragging did not take whole words').toEqual({ start: at(3, 10), end: at(3, 34) })
   })
 
+  it('keeps the word it started in when the far end moves before that word is known', async () => {
+    const answers: Array<() => void> = []
+    class Slow extends Words {
+      override wordAt(position: Position): Promise<Span | null> {
+        return new Promise((resolve) => { answers.push(() => { void super.wordAt(position).then(resolve) }) })
+      }
+    }
+    const { made } = selection(new Slow())
+    // A double click and a drag, faster than the terminal says where the first word ends
+    made.begin(at(3, 12), 'word')
+    made.extendTo(at(3, 33))
+    for (const answer of answers) answer()
+    await settled()
+
+    expect(made.span, 'the start stayed one cell of the word it is in').toEqual({ start: at(3, 10), end: at(3, 34) })
+  })
+
+  it('asks nothing more while the far end stays in the cell it is in', async () => {
+    let asked = 0
+    class Counting extends Words {
+      override wordAt(position: Position): Promise<Span | null> { asked += 1; return super.wordAt(position) }
+    }
+    const { made, changes } = selection(new Counting())
+    made.begin(at(3, 12), 'word')
+    made.extendTo(at(3, 33))
+    await settled()
+    const before = changes()
+    made.extendTo(at(3, 33))
+    made.extendTo(at(3, 33))
+
+    expect(asked).toBe(2)
+    expect(changes(), 'a move within one cell was drawn again').toBe(before)
+  })
+
+  it('stays the cell it is when the source cannot say what the word is', async () => {
+    class Failing extends FakeSource {
+      override async wordAt(): Promise<Span | null> { throw new Error('the session ended') }
+    }
+    const { made } = selection(new Failing())
+    made.begin(at(3, 12), 'word')
+    await settled()
+    expect(made.span).toEqual({ start: at(3, 12), end: at(3, 12) })
+  })
+
   it('ignores an answer that arrives after the selection has moved on', async () => {
     const { made } = selection(new Words())
     made.begin(at(3, 12), 'word')
@@ -86,6 +133,27 @@ describe('the selected text', () => {
 
     expect(await made.text()).toBe('the text')
     expect(source.asked).toEqual({ start: at(1, 0), end: at(2, 5) })
+  })
+
+  it('is asked only of lines the terminal still holds, when the selection was made before some were let go', async () => {
+    class Text extends FakeSource {
+      asked: Span[] = []
+      override async textOf(span: Span): Promise<string> { this.asked.push(span); return 'what is left' }
+    }
+    const source = new Text()
+    let held = { oldest: 0, end: 104 }
+    const made = new Selection(source, () => 80, () => {}, () => held)
+    made.select({ start: at(0, 3), end: at(103, 79) })
+
+    // History was trimmed to the last forty lines, and the screen is four lines shorter
+    held = { oldest: 60, end: 100 }
+    expect(await made.text()).toBe('what is left')
+    expect(source.asked).toEqual([{ start: at(60, 0), end: at(99, 79) }])
+
+    // And then all of what was selected is gone
+    held = { oldest: 200, end: 204 }
+    expect(await made.text()).toBe('')
+    expect(source.asked, 'the source was asked for lines it does not hold').toHaveLength(1)
   })
 
   it('is empty with nothing selected', async () => {

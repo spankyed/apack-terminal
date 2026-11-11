@@ -10,13 +10,13 @@
  */
 import type {
   Command,
+  Fetched,
   KeyInput,
   PasteOutcome,
   Picture,
   Placements,
   PointerInput,
   Position,
-  Rows,
   SourceListener,
   Span,
   TerminalSource,
@@ -37,13 +37,27 @@ export class Unanswered extends Error {}
 
 type Answer = Exclude<ToView, { kind: 'frame' | 'ended' }>
 
+/** What a session is given of the connection it is on */
+interface Connection {
+  send(message: ToBroker): void
+  /** A channel no session has used, on which this one now hears what the broker says */
+  channel(session: SessionSource): number
+  /** The session is finished with a channel: nothing more is expected on it */
+  release(channel: number): void
+  /** The session has ended */
+  forget(session: SessionSource): void
+}
+
 /** One connection to a broker, and the sessions drawn over it */
 export class BrokerViews {
   private readonly messages = new Messages()
-  private readonly sessions = new Map<number, SessionSource>()
+  /** Every session opened that has not ended, and the one each channel in use belongs to */
+  private readonly sessions = new Set<SessionSource>()
+  private readonly channels = new Map<number, SessionSource>()
   private nextChannel = 1
   private closed = false
   private readonly stop: Array<() => void>
+  private readonly closing = new Set<() => void>()
 
   constructor(private readonly stream: ByteStream) {
     this.stop = [stream.onData((chunk) => this.receive(chunk)), stream.onClose(() => this.close())]
@@ -51,12 +65,30 @@ export class BrokerViews {
 
   /** A source for the session the broker calls `session`. Nothing is sent until a view attaches to it */
   open(session: string): TerminalSource {
-    const channel = this.nextChannel
-    this.nextChannel += 1
-    const source = new SessionSource(session, channel, (message) => this.send(message), () => this.sessions.delete(channel))
-    this.sessions.set(channel, source)
+    const source = new SessionSource(session, {
+      send: (message) => this.send(message),
+      channel: (owner) => {
+        const channel = this.nextChannel
+        this.nextChannel += 1
+        this.channels.set(channel, owner)
+        return channel
+      },
+      release: (channel) => { this.channels.delete(channel) },
+      forget: (ended) => { this.sessions.delete(ended) },
+    })
+    this.sessions.add(source)
     if (this.closed) source.end()
     return source
+  }
+
+  /**
+   * Hears that this has stopped, once, whatever stopped it: `close`, the stream ending, or bytes arriving
+   * that are not the protocol. An owner that keeps one of these per broker learns here to make another.
+   * The returned function stops listening.
+   */
+  onClose(listener: () => void): () => void {
+    this.closing.add(listener)
+    return () => { this.closing.delete(listener) }
   }
 
   /** Stops listening to the stream. Every session is told it has ended */
@@ -64,8 +96,11 @@ export class BrokerViews {
     if (this.closed) return
     this.closed = true
     for (const stop of this.stop) stop()
-    for (const session of [...this.sessions.values()]) session.end()
+    for (const session of [...this.sessions]) session.end()
     this.sessions.clear()
+    this.channels.clear()
+    for (const listener of [...this.closing]) listener()
+    this.closing.clear()
   }
 
   private send(message: ToBroker): void {
@@ -87,116 +122,196 @@ export class BrokerViews {
         // Not the protocol: where the next message starts can no longer be trusted either
         return this.close()
       }
-      this.sessions.get(message.channel)?.receive(message)
+      this.channels.get(message.channel)?.receive(message)
     }
   }
 }
 
-/** One session, as a view sees it */
+/**
+ * One session, as a view sees it.
+ *
+ * **A channel is used for one attachment and never again.** The broker goes on sending on a channel until
+ * it has read the detach, so a frame can be on its way when a view stops listening. Were the next
+ * attachment on the same channel, that frame — a change from a frame this view no longer holds — would
+ * arrive looking like the first of the new one. On a channel of its own it is addressed to nobody.
+ */
 class SessionSource implements TerminalSource {
   private listener: SourceListener | null = null
   private ended = false
+  /** The channel of the attachment there is now, or `null` with none */
+  private channel: number | null = null
   /** The epoch of the last frame, which is the one every line number a view holds belongs to */
   private epoch = 0
   private nextRequest = 1
-  private readonly waiting = new Map<number, { resolve: (answer: Answer) => void; reject: (error: Error) => void }>()
+  private readonly waiting = new Map<number, { channel: number; resolve: (answer: Answer) => void; reject: (error: Error) => void }>()
 
-  constructor(
-    private readonly session: string,
-    private readonly channel: number,
-    private readonly send: (message: ToBroker) => void,
-    private readonly forget: () => void,
-  ) {}
+  constructor(private readonly session: string, private readonly connection: Connection) {}
 
   attach(listener: SourceListener): () => void {
+    this.detach()
     this.listener = listener
     if (this.ended) {
       listener.ended()
       return () => {}
     }
-    this.send({ kind: 'attach', channel: this.channel, session: this.session })
+    this.channel = this.connection.channel(this)
+    this.connection.send({ kind: 'attach', channel: this.channel, session: this.session })
     return () => {
-      if (this.listener !== listener) return
-      this.listener = null
-      if (!this.ended) this.send({ kind: 'detach', channel: this.channel })
+      if (this.listener === listener) this.detach()
     }
+  }
+
+  /** Stops the frames of the attachment there is, and lets its channel go once nothing is owed on it */
+  private detach(): void {
+    const channel = this.channel
+    this.listener = null
+    this.channel = null
+    if (channel === null) return
+    this.connection.send({ kind: 'detach', channel })
+    this.settle(channel)
+  }
+
+  /** Lets go of a channel no view is attached on once every question asked on it has its answer */
+  private settle(channel: number): void {
+    if (channel === this.channel) return
+    for (const waiting of this.waiting.values()) if (waiting.channel === channel) return
+    this.connection.release(channel)
   }
 
   receive(message: ToView): void {
     switch (message.kind) {
       case 'frame':
+        // One for an attachment that is over describes a change from a frame nobody holds
+        if (message.channel !== this.channel) break
         this.epoch = message.frame.epoch
         this.listener?.frame(message.frame)
         break
       case 'ended':
-        this.end()
+        if (message.channel === this.channel) this.end()
         break
       default: {
+        // Requests are numbered from one, so a failure of request zero answers the one thing a view sends
+        // that has no number: the attach
+        if (message.kind === 'failed' && message.request === 0) {
+          if (message.channel === this.channel) this.refused(message.message)
+          break
+        }
         const waiting = this.waiting.get(message.request)
+        if (!waiting) break
         this.waiting.delete(message.request)
-        if (message.kind === 'failed') waiting?.reject(new Unanswered(message.message))
-        else waiting?.resolve(message)
+        this.settle(waiting.channel)
+        if (message.kind === 'failed') waiting.reject(new Unanswered(message.message))
+        else waiting.resolve(message)
       }
     }
+  }
+
+  /**
+   * The broker could not show the session to this attachment, and said why. The attachment is over — its
+   * view is told so, with the reason, and what it was asking has no answer — and the session is not: it
+   * is still there, and attaching again asks again. The broker is told the channel is finished with, since
+   * one that failed part-way through — it could not build a frame — is still holding it.
+   */
+  private refused(reason: string): void {
+    const channel = this.channel
+    if (channel === null) return
+    this.channel = null
+    for (const [request, waiting] of this.waiting) {
+      if (waiting.channel !== channel) continue
+      this.waiting.delete(request)
+      waiting.reject(new Unanswered(reason))
+    }
+    this.connection.send({ kind: 'detach', channel })
+    this.connection.release(channel)
+    this.listener?.ended(reason)
   }
 
   /** The session is over, or the connection to it is: whoever is waiting is told, once */
   end(): void {
     if (this.ended) return
     this.ended = true
-    for (const waiting of this.waiting.values()) waiting.reject(new Unanswered('the session ended'))
+    const waiting = [...this.waiting.values()]
     this.waiting.clear()
-    this.forget()
+    for (const channel of new Set([this.channel, ...waiting.map((one) => one.channel)])) {
+      if (channel !== null) this.connection.release(channel)
+    }
+    this.channel = null
+    this.connection.forget(this)
+    for (const one of waiting) one.reject(new Unanswered('the session ended'))
     this.listener?.ended()
   }
 
-  /** Sends a request and waits for the message that answers it, which is the one carrying its number */
-  private ask<K extends Answer['kind']>(kind: K, build: (request: number) => ToBroker): Promise<Extract<Answer, { kind: K }>> {
+  /**
+   * What a view says that is not a question: sent on the channel it is attached on, and dropped where
+   * there is none — before a view attaches, after it detaches, and once the session has ended.
+   */
+  private tell(build: (channel: number) => ToBroker): void {
+    if (this.channel !== null) this.connection.send(build(this.channel))
+  }
+
+  /**
+   * Sends a request and waits for the message that answers it, which is the one carrying its number. With
+   * no view attached there is no channel to ask on, so there is no answer.
+   */
+  private ask<K extends Answer['kind']>(kind: K, build: (channel: number, request: number) => ToBroker): Promise<Extract<Answer, { kind: K }>> {
     if (this.ended) return Promise.reject(new Unanswered('the session ended'))
+    const channel = this.channel
+    if (channel === null) return Promise.reject(new Unanswered('no view is attached to the session'))
     const request = this.nextRequest
     this.nextRequest += 1
     return new Promise((resolve, reject) => {
       this.waiting.set(request, {
+        channel,
         resolve: (answer) => {
           if (answer.kind === kind) resolve(answer as Extract<Answer, { kind: K }>)
           else reject(new Unanswered(`asked for ${kind} and was answered ${answer.kind}`))
         },
         reject,
       })
-      this.send(build(request))
+      try {
+        this.connection.send(build(channel, request))
+      } catch (error) {
+        // What could not be written was not asked, so nothing will answer it
+        this.waiting.delete(request)
+        throw error
+      }
     })
   }
 
   acknowledge(sequence: number): void {
-    this.send({ kind: 'acknowledge', channel: this.channel, sequence })
+    this.tell((channel) => ({ kind: 'acknowledge', channel, sequence }))
   }
 
-  async fetch(first: number, count: number): Promise<Rows & { readonly epoch: number }> {
-    const { channel, epoch } = this
-    const answer = await this.ask('rows', (request) => ({ kind: 'fetch', channel, request, epoch, first, count }))
-    return { ...answer.rows, epoch: answer.epoch }
+  /**
+   * Asked in the epoch of the last frame, which is the one the view's line numbers are in. The broker
+   * refuses a question about an epoch that is over, and that refusal is the rejection a view takes as no
+   * answer.
+   */
+  async fetch(first: number, count: number): Promise<Fetched> {
+    const { epoch } = this
+    const answer = await this.ask('rows', (channel, request) => ({ kind: 'fetch', channel, request, epoch, first, count }))
+    return { rows: answer.rows.rows, epoch: answer.epoch, first: answer.first, count: answer.count }
   }
 
   key(input: KeyInput): void {
-    this.send({ kind: 'key', channel: this.channel, ...input })
+    this.tell((channel) => ({ kind: 'key', channel, ...input }))
   }
 
   text(text: string): void {
-    if (text !== '') this.send({ kind: 'text', channel: this.channel, text })
+    if (text !== '') this.tell((channel) => ({ kind: 'text', channel, text }))
   }
 
   pointer(input: PointerInput): void {
-    this.send({ kind: 'pointer', channel: this.channel, ...input })
+    this.tell((channel) => ({ kind: 'pointer', channel, ...input }))
   }
 
   async paste(text: string, options?: { readonly allowUnsafe?: boolean }): Promise<PasteOutcome> {
-    const { channel } = this
     const allowUnsafe = options?.allowUnsafe ?? false
-    return (await this.ask('pasted', (request) => ({ kind: 'paste', channel, request, allowUnsafe, text }))).outcome
+    return (await this.ask('pasted', (channel, request) => ({ kind: 'paste', channel, request, allowUnsafe, text }))).outcome
   }
 
   focus(gained: boolean): void {
-    this.send({ kind: 'focus', channel: this.channel, gained })
+    this.tell((channel) => ({ kind: 'focus', channel, gained }))
   }
 
   wordAt(position: Position): Promise<Span | null> {
@@ -212,19 +327,24 @@ class SessionSource implements TerminalSource {
    * reflowed while the question was on its way — so it is no answer.
    */
   private async spanAt(kind: 'wordAt' | 'lineAt', at: Position): Promise<Span | null> {
-    const { channel, epoch } = this
-    const answer = await this.ask('span', (request) => ({ kind, channel, request, epoch, at }))
+    const { epoch } = this
+    const answer = await this.ask('span', (channel, request) => ({ kind, channel, request, epoch, at }))
     return answer.epoch === this.epoch ? answer.span : null
   }
 
+  /**
+   * Text read in another epoch than the view is in is text from other lines than the ones it selected —
+   * the screen was reflowed while the answer was on its way — so it is no answer.
+   */
   async textOf(span: Span): Promise<string> {
-    const { channel, epoch } = this
-    return (await this.ask('text', (request) => ({ kind: 'textOf', channel, request, epoch, span }))).text
+    const { epoch } = this
+    const answer = await this.ask('text', (channel, request) => ({ kind: 'textOf', channel, request, epoch, span }))
+    if (answer.epoch !== this.epoch) throw new Unanswered('the lines were numbered again while their text was on its way')
+    return answer.text
   }
 
   async search(needle: string): Promise<readonly Span[]> {
-    const { channel } = this
-    const answer = await this.ask('spans', (request) => ({ kind: 'search', channel, request, needle }))
+    const answer = await this.ask('spans', (channel, request) => ({ kind: 'search', channel, request, needle }))
     return answer.epoch === this.epoch ? answer.spans : []
   }
 
@@ -233,16 +353,14 @@ class SessionSource implements TerminalSource {
    * before a reflow keeps its commands and loses their lines.
    */
   async commands(): Promise<readonly Command[]> {
-    const { channel } = this
-    const answer = await this.ask('commands', (request) => ({ kind: 'commands', channel, request }))
+    const answer = await this.ask('commands', (channel, request) => ({ kind: 'commands', channel, request }))
     if (answer.epoch === this.epoch) return answer.commands
     return answer.commands.map((command) => ({ ...command, prompt: null, output: null, end: null }))
   }
 
   /** An answer from before a reflow names lines that are no longer where the images are: it is none */
   async images(): Promise<Placements> {
-    const { channel } = this
-    const answer = await this.ask('images', (request) => ({ kind: 'images', channel, request }))
+    const answer = await this.ask('images', (channel, request) => ({ kind: 'images', channel, request }))
     const { cellWidth, cellHeight } = answer
     return { cellWidth, cellHeight, placements: answer.epoch === this.epoch ? answer.placements : [] }
   }
@@ -253,7 +371,6 @@ class SessionSource implements TerminalSource {
    * and it is read again from its start.
    */
   async image(id: number): Promise<Picture | null> {
-    const { channel } = this
     let whole: Uint8Array | null = null
     let generation = -1
     let read = 0
@@ -261,7 +378,7 @@ class SessionSource implements TerminalSource {
       const offset = read
       let part
       try {
-        part = await this.ask('image', (request) => ({ kind: 'image', channel, request, image: id, offset }))
+        part = await this.ask('image', (channel, request) => ({ kind: 'image', channel, request, image: id, offset }))
       } catch (error) {
         if (error instanceof Unanswered) return null
         throw error

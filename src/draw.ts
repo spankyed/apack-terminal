@@ -1,4 +1,4 @@
-import { StyleFlag, paletteIndex, underlineOf, type Color, type Row, type Style, type Underline } from './source.ts'
+import { PLAIN, StyleFlag, paletteIndex, underlineOf, type Color, type Row, type SessionColors, type Underline } from './source.ts'
 
 /**
  * The colours a view supplies: the defaults a program did not override, the palette its numbered colours
@@ -18,6 +18,33 @@ export interface Theme {
   /** Behind every place a search found its text, and behind the one the person is on. Left out, a view's own */
   readonly matchBackground?: number
   readonly currentMatchBackground?: number
+}
+
+/**
+ * A theme as a session is drawn in it: the host's, with the colours the program set for itself in place
+ * of the theme's own, and with the two defaults changed places while the program has the screen in
+ * reverse video.
+ *
+ * **Only the defaults change places.** A character with a colour of its own keeps it, as it does in every
+ * terminal: reverse video is about the screen a program did not colour.
+ */
+export function sessionTheme(theme: Theme, colors: SessionColors | null, reverseVideo: boolean): Theme {
+  if (!reverseVideo && (!colors || (colors.foreground === null && colors.background === null && colors.cursor === null && colors.palette.length === 0))) return theme
+  let palette = theme.palette
+  if (colors && colors.palette.length > 0) {
+    const changed = [...theme.palette]
+    for (const entry of colors.palette) changed[entry.index] = entry.rgb
+    palette = changed
+  }
+  const foreground = colors?.foreground ?? theme.foreground
+  const background = colors?.background ?? theme.background
+  return {
+    ...theme,
+    palette,
+    foreground: reverseVideo ? background : foreground,
+    background: reverseVideo ? foreground : background,
+    cursor: colors?.cursor ?? theme.cursor,
+  }
 }
 
 export type LineKind = Exclude<Underline, 'none'> | 'strikethrough' | 'overline'
@@ -64,8 +91,13 @@ function colorIn(theme: Theme, color: Color): number | null {
  * The rules a terminal's styles follow, in the order they apply: inverse swaps the two colours, defaults
  * included; a selection then replaces the background and, if the theme says so, the text; invisible text
  * keeps its background and draws no character; faint text is drawn at half strength.
+ *
+ * **A selection is one rectangle over the cells it covers, whatever is in them.** A row lists the characters
+ * a program wrote and not the blank cells between or after them, so a background made from characters
+ * would have a hole wherever nothing was written. The rectangle is the selection's own; the characters
+ * under it give up their backgrounds and take its text colour.
  */
-export function drawRow(row: Row, styles: readonly Style[], theme: Theme, selected?: SelectedCells): RowDrawing {
+export function drawRow(row: Row, theme: Theme, selected?: SelectedCells): RowDrawing {
   const backgrounds: Array<{ column: number; cells: number; color: number }> = []
   const glyphs: Array<RowDrawing['glyphs'][number]> = []
   const lines: Array<{ kind: LineKind; column: number; cells: number; color: number }> = []
@@ -77,11 +109,16 @@ export function drawRow(row: Row, styles: readonly Style[], theme: Theme, select
     else runs.push(next)
   }
 
+  // The cells the selection's rectangle covers: what was asked for, widened to the whole of any character
+  // it only partly reaches
+  let selectedFrom = selected?.from ?? 0
+  let selectedTo = selected?.to ?? 0
+
   for (let index = 0; index < row.text.length; index += 1) {
     const text = row.text[index]!
     const column = row.column[index]!
     const cells = row.width[index]!
-    const style = styles[row.style[index]!] ?? styles[0]!
+    const style = row.styles[row.style[index]!] ?? PLAIN
     const flags = style.flags
 
     let fg = colorIn(theme, style.fg) ?? theme.foreground
@@ -89,11 +126,10 @@ export function drawRow(row: Row, styles: readonly Style[], theme: Theme, select
     if (flags & StyleFlag.inverse) [fg, bg] = [bg ?? theme.background, fg]
     const isSelected = selected !== undefined && column < selected.to && column + cells > selected.from
     if (isSelected) {
-      bg = theme.selectionBackground
       fg = theme.selectionForeground ?? fg
-    }
-
-    if (bg !== null && bg !== theme.background) {
+      selectedFrom = Math.min(selectedFrom, column)
+      selectedTo = Math.max(selectedTo, column + cells)
+    } else if (bg !== null && bg !== theme.background) {
       extend(backgrounds, { column, cells, color: bg }, (last) => last.color === bg)
     }
 
@@ -124,15 +160,10 @@ export function drawRow(row: Row, styles: readonly Style[], theme: Theme, select
     }
   }
 
-  // A selection reaches past the last character of a line: the blank cells it covers are selected too
-  if (selected !== undefined) {
-    const last = row.text.length - 1
-    const end = last < 0 ? 0 : row.column[last]! + row.width[last]!
-    const from = Math.max(selected.from, end)
-    if (selected.to > from) {
-      extend(backgrounds, { column: from, cells: selected.to - from, color: theme.selectionBackground },
-        (run) => run.color === theme.selectionBackground)
-    }
+  if (selectedTo > selectedFrom) {
+    // Among the others in the order of its cells, which is the order they are all in
+    const after = backgrounds.findIndex((run) => run.column >= selectedTo)
+    backgrounds.splice(after === -1 ? backgrounds.length : after, 0, { column: selectedFrom, cells: selectedTo - selectedFrom, color: theme.selectionBackground })
   }
 
   return { backgrounds, glyphs, lines }

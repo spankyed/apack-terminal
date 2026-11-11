@@ -33,16 +33,17 @@ class Out {
     this.bytes.push((color >> 16) & 0xff, (color >> 8) & 0xff, color & 0xff)
   }
   rows(block: Rows): void {
-    this.number(block.styles.length - 1)
-    for (const style of block.styles.slice(1)) {
-      this.color(style.fg); this.color(style.bg); this.color(style.underlineColor); this.number(style.flags)
-    }
-    this.number(block.links.length - 1)
-    for (const link of block.links.slice(1)) this.text(link)
     this.number(block.rows.length)
     for (const row of block.rows) {
       this.number(row.line)
       this.byte((row.wrapped ? 1 : 0) | (row.prompt ? 2 : 0))
+      // The row's own tables, less the plain style and the empty link every row has in front
+      this.number(row.styles.length - 1)
+      for (const style of row.styles.slice(1)) {
+        this.color(style.fg); this.color(style.bg); this.color(style.underlineColor); this.number(style.flags)
+      }
+      this.number(row.links.length - 1)
+      for (const link of row.links.slice(1)) this.text(link)
       // Characters side by side that share a style and a link, and are all plain or all not
       const runs: Array<{ start: number; end: number; simple: boolean }> = []
       row.text.forEach((text, index) => {
@@ -83,20 +84,28 @@ export function encodeToView(message: ToView): Uint8Array {
       const { frame } = message
       for (const value of [frame.sequence, frame.epoch, frame.firstActive, frame.columns, frame.screenRows, frame.scrollback, frame.commands, frame.images]) out.number(value)
       out.byte((frame.cursor ? 1 : 0) | (frame.modes.alternateScreen ? 2 : 0) | (frame.modes.mouse ? 4 : 0)
-        | (frame.staleFrom === undefined ? 0 : 8) | (frame.cursor?.blinking ? 16 : 0))
+        | (frame.staleFrom === undefined ? 0 : 8) | (frame.cursor?.blinking ? 16 : 0) | (frame.reverseVideo ? 32 : 0) | (frame.colors ? 64 : 0))
       if (frame.cursor) { out.number(frame.cursor.column); out.number(frame.cursor.row); out.byte(CURSOR_SHAPES.indexOf(frame.cursor.shape)) }
       if (frame.staleFrom !== undefined) out.number(frame.staleFrom)
+      if (frame.colors) {
+        const set = [frame.colors.foreground, frame.colors.background, frame.colors.cursor]
+        out.byte(set.reduce<number>((bits, color, bit) => bits | (color === null ? 0 : 1 << bit), 0))
+        const rgb = (color: number) => { out.byte((color >> 16) & 0xff); out.byte((color >> 8) & 0xff); out.byte(color & 0xff) }
+        for (const color of set) if (color !== null) rgb(color)
+        out.number(frame.colors.palette.length)
+        for (const entry of frame.colors.palette) { out.byte(entry.index); rgb(entry.rgb) }
+      }
       out.rows(frame)
       break
     }
-    case 'rows': out.number(message.request); out.number(message.epoch); out.rows(message.rows); break
+    case 'rows': for (const value of [message.request, message.epoch, message.first, message.count]) out.number(value); out.rows(message.rows); break
     case 'ended': break
     case 'pasted': out.number(message.request); out.byte(message.outcome === 'pasted' ? 0 : 1); break
     case 'span':
       out.number(message.request); out.number(message.epoch); out.flag(message.span !== null)
       if (message.span) { out.position(message.span.start); out.position(message.span.end) }
       break
-    case 'text': out.number(message.request); out.text(message.text); break
+    case 'text': out.number(message.request); out.number(message.epoch); out.text(message.text); break
     case 'spans':
       out.number(message.request); out.number(message.epoch); out.number(message.spans.length)
       for (const span of message.spans) { out.position(span.start); out.position(span.end) }
@@ -165,7 +174,7 @@ export function decodeToBroker(body: Uint8Array): ToBroker {
     case 2: return { kind: 'detach', channel }
     case 3: return { kind: 'acknowledge', channel, sequence: number() }
     case 4: return { kind: 'fetch', channel, request: number(), epoch: number(), first: number(), count: number() }
-    case 5: return { kind: 'key', channel, action: KEY_ACTIONS[byte()]!, modifiers: number(), code: text(), text: text(), unshifted: number() }
+    case 5: return { kind: 'key', channel, action: KEY_ACTIONS[byte()]!, modifiers: number(), code: text(), text: text(), unshifted: number(), composed: byte() === 1 }
     case 6: return { kind: 'text', channel, text: text() }
     case 7: {
       const action = POINTER_ACTIONS[byte()]!

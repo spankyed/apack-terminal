@@ -79,9 +79,27 @@ describe('a screen with no history', () => {
 
     // A full-screen program takes over, which has no scrollback
     store.apply(frame({ sequence: 2, firstActive: 100, scrollback: 0, modes: { alternateScreen: true, mouse: false } }))
+    viewport.settle()
 
     expect(viewport.following).toBe(true)
     expect(viewport.top).toBe(100)
+  })
+
+  it('goes on being followed when history starts again, after the history a view was reading was erased', () => {
+    const { store, viewport } = scrolledTo(100)
+    viewport.scrollBy(-10)
+
+    // The history is cleared while the view is scrolled back in it
+    store.apply(frame({ sequence: 2, firstActive: 100, scrollback: 0 }))
+    viewport.settle()
+    expect(viewport.following).toBe(true)
+
+    // And then one line scrolls off the screen
+    store.apply(frame({ sequence: 3, firstActive: 101, scrollback: 1 }))
+    viewport.settle()
+
+    expect(viewport.following, 'a view with nothing to hold stopped following at the first new line').toBe(true)
+    expect(viewport.top).toBe(101)
   })
 })
 

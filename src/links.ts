@@ -24,55 +24,100 @@ export interface Detector {
   find(text: string): ReadonlyArray<{ readonly start: number; readonly end: number; readonly target?: string }>
 }
 
+/** What closes a bracket, and what opens it */
+const OPENS: Record<string, string> = { ')': '(', ']': '[', '}': '{' }
+
 /**
- * URLs with a scheme a person would recognise. What may follow one in prose — a full stop, a closing
- * bracket — is not part of it.
+ * URLs with a scheme a person would recognise. What may follow one in prose — a full stop, a bracket that
+ * closes one opened before it — is not part of it; a bracket that closes one the URL itself opened is.
  */
 export const urls: Detector = {
   kind: 'url',
   find(text) {
     const found: Array<{ start: number; end: number }> = []
     for (const match of text.matchAll(/\b(?:https?|ftp|file):\/\/[^\s<>"'`]+/g)) {
-      const url = match[0].replace(/[.,;:!?)\]}>]+$/, '')
+      let url = match[0]
+      for (;;) {
+        const last = url.at(-1)!
+        const opens = OPENS[last]
+        const trailing = opens === undefined ? '.,;:!?'.includes(last) : count(url, last) > count(url, opens)
+        if (!trailing) break
+        url = url.slice(0, -1)
+      }
       found.push({ start: match.index, end: match.index + url.length })
     }
     return found
   },
 }
 
-/** The link at a cell of a row, if there is one */
-export function linkAt(row: Row, links: readonly string[], column: number, detectors: readonly Detector[]): Link | null {
+function count(text: string, character: string): number {
+  let found = 0
+  for (const one of text) if (one === character) found += 1
+  return found
+}
+
+/** How many rows of a wrapped line are read on each side of the one asked about */
+const JOINED_ROWS = 16
+
+/**
+ * The link at a cell of a row, if there is one.
+ *
+ * `rowAt` gives the rows above and below, by line. Text a program wrote as one line and the terminal
+ * wrapped is read as that one line, so a URL cut by the edge is found whole from any row of it; `from` and
+ * `to` are still the cells of it on the row asked about. Left out, a row is read on its own.
+ */
+export function linkAt(row: Row, column: number, detectors: readonly Detector[], rowAt?: (line: number) => Row | undefined): Link | null {
   const at = glyphAt(row, column)
   if (at === -1) return null
 
   // What a program declared wins: it said what this text opens
   const declared = row.link[at]!
-  if (declared !== 0) {
+  const target = row.links[declared]
+  if (declared !== 0 && target !== undefined) {
     let first = at
     let last = at
     while (first > 0 && row.link[first - 1] === declared) first -= 1
     while (last + 1 < row.text.length && row.link[last + 1] === declared) last += 1
-    return { target: links[declared] ?? '', kind: 'declared', from: row.column[first]!, to: row.column[last]! + row.width[last]! }
+    return { target, kind: 'declared', from: row.column[first]!, to: row.column[last]! + row.width[last]! }
   }
 
-  // Otherwise, text that looks like one. The row is read as a string, with each offset mapped back to
-  // the character it came from: a character can be several code units and can cover two cells
+  // Otherwise, text that looks like one. The rows the line wrapped onto, as far as they are held
+  const joined: Row[] = [row]
+  if (rowAt) {
+    for (let line = row.line - 1; joined.length <= JOINED_ROWS; line -= 1) {
+      const above = rowAt(line)
+      if (!above?.wrapped) break
+      joined.unshift(above)
+    }
+    const before = joined.length - 1
+    for (let below = row; below.wrapped && joined.length <= before + JOINED_ROWS; ) {
+      const next = rowAt(below.line + 1)
+      if (!next) break
+      joined.push(next)
+      below = next
+    }
+  }
+
+  // The line is read as a string, with each offset mapped back to the character it came from: a character
+  // can be several code units and can cover two cells. `starts` is of the row asked about only
   let text = ''
   const starts: number[] = []
-  for (let index = 0; index < row.text.length; index += 1) {
-    const gap = index > 0 ? row.column[index]! - (row.column[index - 1]! + row.width[index - 1]!) : row.column[index]!
-    text += ' '.repeat(Math.max(0, gap))
-    starts.push(text.length)
-    text += row.text[index]!
+  for (const part of joined) {
+    for (let index = 0; index < part.text.length; index += 1) {
+      const gap = index > 0 ? part.column[index]! - (part.column[index - 1]! + part.width[index - 1]!) : part.column[index]!
+      text += ' '.repeat(Math.max(0, gap))
+      if (part === row) starts.push(text.length)
+      text += part.text[index]!
+    }
   }
   const offset = starts[at]!
   for (const detector of detectors) {
     for (const match of detector.find(text)) {
       if (offset < match.start || offset >= match.end) continue
       const first = starts.findIndex((start) => start >= match.start)
+      if (first === -1) continue
       let last = first
       while (last + 1 < starts.length && starts[last + 1]! < match.end) last += 1
-      if (first === -1) continue
       return {
         target: match.target ?? text.slice(match.start, match.end),
         kind: detector.kind,

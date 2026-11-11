@@ -7,8 +7,8 @@
 import { describe, expect, it } from 'vitest'
 import recorded from './vectors/view-vectors.json'
 import { decodeToBroker, encodeToView } from './_broker.ts'
-import { Malformed, Messages, decodeToView, encodeToBroker, type ToBroker, type ToView } from '../src/broker/wire.ts'
-import { paletteIndex, type Color, type Rows } from '../src/source.ts'
+import { MAX_MESSAGE_BYTES, Malformed, Messages, decodeToView, encodeToBroker, type ToBroker, type ToView } from '../src/broker/wire.ts'
+import { TooLarge, paletteIndex, type Color, type Rows } from '../src/source.ts'
 
 interface Vector {
   readonly name: string
@@ -32,12 +32,13 @@ function color(value: Color): unknown {
 /** Rows as the vectors write them: a list of characters rather than arrays side by side */
 function rows(block: Rows): Record<string, unknown> {
   return {
-    styles: block.styles.map((style) => ({ fg: color(style.fg), bg: color(style.bg), underline: color(style.underlineColor), flags: style.flags })),
-    links: block.links,
     rows: block.rows.map((row) => ({
       line: row.line,
       wrapped: row.wrapped,
       prompt: row.prompt,
+      // Without the plain style and the empty link a view puts in front, which the bytes do not carry
+      styles: row.styles.slice(1).map((style) => ({ fg: color(style.fg), bg: color(style.bg), underline: color(style.underlineColor), flags: style.flags })),
+      links: row.links.slice(1),
       glyphs: row.text.map((text, index) => ({
         column: row.column[index], width: row.width[index], text, style: row.style[index], link: row.link[index],
       })),
@@ -54,11 +55,11 @@ function written(message: ToView): Record<string, unknown> {
         kind: 'frame', channel: message.channel, sequence: frame.sequence, epoch: frame.epoch,
         firstActive: frame.firstActive, columns: frame.columns, screenRows: frame.screenRows,
         scrollback: frame.scrollback, commands: frame.commands, images: frame.images, cursor: frame.cursor, alternateScreen: frame.modes.alternateScreen,
-        mouse: frame.modes.mouse, staleFrom: frame.staleFrom ?? null, ...rows(frame),
+        mouse: frame.modes.mouse, staleFrom: frame.staleFrom ?? null, reverseVideo: frame.reverseVideo, colors: frame.colors ?? null, ...rows(frame),
       }
     }
     case 'rows':
-      return { kind: 'rows', channel: message.channel, request: message.request, epoch: message.epoch, ...rows(message.rows) }
+      return { kind: 'rows', channel: message.channel, request: message.request, epoch: message.epoch, first: message.first, count: message.count, ...rows(message.rows) }
     case 'image':
       return { ...message, bytes: Array.from(message.bytes) }
     default:
@@ -126,6 +127,26 @@ describe('messages in a stream', () => {
     expect(messages.push(new Uint8Array(0))).toEqual([])
   })
 
+  it('are whole however many pieces one arrived in, the length included', () => {
+    const body = Uint8Array.from({ length: 5000 }, (_, index) => index % 251)
+    const sent = new Uint8Array(4 + body.length + 4 + 3)
+    new DataView(sent.buffer).setUint32(0, body.length, true)
+    sent.set(body, 4)
+    new DataView(sent.buffer).setUint32(4 + body.length, 3, true)
+    sent.set([7, 8, 9], 8 + body.length)
+
+    for (const size of [1, 3, 7, 4096]) {
+      const messages = new Messages()
+      const found: Uint8Array[] = []
+      for (let at = 0; at < sent.length; at += size) found.push(...messages.push(sent.subarray(at, at + size)))
+      expect(found.map((one) => [...one]), `in pieces of ${size}`).toEqual([[...body], [7, 8, 9]])
+    }
+  })
+
+  it('include one with nothing in it', () => {
+    expect(new Messages().push(Uint8Array.of(0, 0, 0, 0, 1, 0, 0, 0, 9)).map((one) => [...one])).toEqual([[], [9]])
+  })
+
   it('refuses a message longer than a message may be', () => {
     const length = new Uint8Array(4)
     new DataView(length.buffer).setUint32(0, (8 << 20) + 1, true)
@@ -170,7 +191,22 @@ describe('bytes that are not a message', () => {
   })
 })
 
+describe('a string', () => {
+  it('keeps a byte order mark a program wrote at its start', () => {
+    const [body] = new Messages().push(encodeToView({ kind: 'text', channel: 1, request: 1, epoch: 1, text: '\ufeffsigned' }))
+    expect(decodeToView(body!)).toMatchObject({ text: '\ufeffsigned' })
+  })
+})
+
 describe('what a view cannot say', () => {
+  it('is refused where it is written when it is longer than a message may be, which the broker would end the stream over', () => {
+    const paste = (text: string): ToBroker => ({ kind: 'paste', channel: 1, request: 1, allowUnsafe: false, text })
+    expect(() => encodeToBroker(paste('x'.repeat(MAX_MESSAGE_BYTES + 1)))).toThrow(TooLarge)
+    // Under the bound as characters and over it as bytes
+    expect(() => encodeToBroker(paste('日'.repeat(MAX_MESSAGE_BYTES / 3)))).toThrow(TooLarge)
+    expect(encodeToBroker(paste('x'.repeat(1000))).length).toBeLessThan(1100)
+  })
+
   it('is refused where it is written', () => {
     expect(() => encodeToBroker({ kind: 'acknowledge', channel: 1, sequence: -1 })).toThrow(RangeError)
     expect(() => encodeToBroker({ kind: 'acknowledge', channel: 1, sequence: 2 ** 60 })).toThrow(RangeError)

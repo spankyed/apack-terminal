@@ -4,13 +4,16 @@ import { beforeEach, describe, expect, it } from 'vitest'
 import { BrokerViews } from '../src/index.ts'
 import { rgbaOf } from '../src/broker/source.ts'
 import { CanvasPainter } from '../src/canvas-painter.ts'
-import { drawRow } from '../src/draw.ts'
-import { PLAIN, type Picture, type Placement } from '../src/source.ts'
+import { drawRow, type SelectedCells, type Theme } from '../src/draw.ts'
+import { PLAIN, type Picture, type Placement, type Row, type Style } from '../src/source.ts'
 import { FakeBroker } from './_broker.ts'
 import { recordingContext } from './_canvas.ts'
-import { installFrames } from './_frames.ts'
+import { installFrames, runFrames } from './_frames.ts'
 import { frame, row } from './_support.ts'
 import { mountedView, settled, theme } from './_view.ts'
+
+/** A row drawn with `styles` as its own: the plain one, then whatever its characters name */
+const drawStyled = (row: Row, styles: Style[], theme: Theme, selected?: SelectedCells) => drawRow({ ...row, styles }, theme, selected)
 
 beforeEach(installFrames)
 
@@ -111,6 +114,151 @@ describe('the images of a session', () => {
   })
 })
 
+describe('the pictures a view holds', () => {
+  /** A view whose pictures say when they are closed, as a bitmap must be for its pixels to be given back */
+  function holding() {
+    const made: Array<{ of: Picture; closed: boolean; close(): void }> = []
+    const setup = mountedView({
+      picture: async (read) => {
+        const picture = { of: read, closed: false, close() { this.closed = true } }
+        made.push(picture)
+        return picture as unknown as CanvasImageSource
+      },
+    })
+    const place = async (sequence: number, placements: Placement[]) => {
+      setup.source.placed = { cellWidth: 10, cellHeight: 20, placements }
+      setup.source.send(frame({ sequence, images: sequence }))
+      await settled()
+      await settled()
+    }
+    return { ...setup, made, place }
+  }
+
+  it('are closed when nothing places their image any more, and when the view is disposed', async () => {
+    const view = holding()
+    view.source.pictures.set(1, pixels(4, 4))
+    view.source.pictures.set(2, pixels(4, 4))
+    await view.place(1, [placement({ image: 1 }), placement({ image: 2, column: 6 })])
+    expect(view.made.map((picture) => picture.closed)).toEqual([false, false])
+
+    await view.place(2, [placement({ image: 2, column: 6 })])
+    expect(view.made.map((picture) => picture.closed), 'the picture of an image that was deleted was left open').toEqual([true, false])
+    expect(view.painted().images).toHaveLength(1)
+
+    view.view.dispose()
+    expect(view.made.map((picture) => picture.closed)).toEqual([true, true])
+  })
+
+  it('are closed when the program replaces their image, once the new picture is there to draw instead', async () => {
+    const view = holding()
+    view.source.pictures.set(1, pixels(4, 4))
+    await view.place(1, [placement({ image: 1 })])
+
+    view.source.pictures.set(1, { ...pixels(8, 8), generation: 2 })
+    view.source.placed = { cellWidth: 10, cellHeight: 20, placements: [placement({ image: 1, generation: 2 })] }
+    view.source.send(frame({ sequence: 2, images: 2 }))
+    await Promise.resolve()
+    expect(view.painted().images?.[0]?.picture, 'nothing was drawn while the new pixels were on their way').toBe(view.made[0])
+    await settled()
+    await settled()
+
+    expect(view.made.map((picture) => [picture.of.width, picture.closed])).toEqual([[4, true], [8, false]])
+    expect(view.painted().images?.[0]?.picture).toBe(view.made[1])
+  })
+
+  it('are closed, and never drawn, when their image was deleted while they were being made', async () => {
+    const made: Array<{ closed: boolean; close(): void }> = []
+    let finish = () => {}
+    const view = mountedView({
+      picture: () => new Promise((resolve) => {
+        finish = () => {
+          const picture = { closed: false, close() { this.closed = true } }
+          made.push(picture)
+          resolve(picture as unknown as CanvasImageSource)
+        }
+      }),
+    })
+    view.source.pictures.set(1, pixels(4, 4))
+    view.source.placed = { cellWidth: 10, cellHeight: 20, placements: [placement({ image: 1 })] }
+    view.source.send(frame({ images: 1 }))
+    await settled()
+
+    // Deleted while its pixels are being turned into a picture
+    view.source.placed = { cellWidth: 10, cellHeight: 20, placements: [] }
+    view.source.send(frame({ sequence: 2, images: 2 }))
+    await settled()
+    finish()
+    await settled()
+
+    expect(made.map((picture) => picture.closed), 'a picture nothing holds was left open').toEqual([true])
+    expect(view.painted().images).toEqual([])
+  })
+
+  it('are asked for again when the placements are told again, after an answer that was no picture — and not on every paint until then', async () => {
+    const view = holding()
+    // The image is placed, and the source has no pixels for it yet
+    await view.place(1, [placement({ image: 7 })])
+    for (let paint = 0; paint < 3; paint += 1) {
+      view.view.redraw()
+      runFrames()
+      await settled()
+    }
+    expect(view.source.picturesAsked, 'asked again on every paint').toEqual([7])
+
+    view.source.pictures.set(7, pixels(4, 4))
+    await view.place(2, [placement({ image: 7 })])
+    expect(view.source.picturesAsked).toEqual([7, 7])
+    expect(view.painted().images).toHaveLength(1)
+  })
+
+  it('are asked for again when the view is mounted again, after an answer that never came for want of an attachment', async () => {
+    const view = holding()
+    let answer: (read: Picture | null) => void = () => {}
+    view.source.image = (id: number) => {
+      view.source.picturesAsked.push(id)
+      return new Promise((resolve) => { answer = resolve })
+    }
+    view.source.placed = { cellWidth: 10, cellHeight: 20, placements: [placement({ image: 1 })] }
+    view.source.send(frame({ images: 1 }))
+    await settled()
+    expect(view.source.picturesAsked).toEqual([1])
+
+    // Taken off the page while the pixels were on their way: a source with no attachment has no answer
+    view.view.unmount()
+    answer(null)
+    await settled()
+
+    // Back on it in the same numbering, with the same images where they were: nothing says to ask where they are
+    view.view.mount(view.host)
+    view.source.send(frame({ sequence: 2, images: 1, staleFrom: 0 }))
+    await settled()
+    expect(view.source.picturesAsked, 'the image was given up on').toEqual([1, 1])
+    expect(view.source.imagesAsked).toBe(1)
+    answer(pixels(4, 4))
+    await settled()
+    await settled()
+    expect(view.painted().images).toHaveLength(1)
+  })
+
+  it('are asked for when their image is in view or a screenful from it, and not before', async () => {
+    const view = holding()
+    view.source.pictures.set(1, pixels(4, 4))
+    view.source.placed = { cellWidth: 10, cellHeight: 20, placements: [placement({ image: 1, line: 40, rows: 3 })] }
+    view.source.send(frame({ firstActive: 100, scrollback: 100, images: 1 }))
+    await settled()
+    runFrames()
+    expect(view.source.picturesAsked, 'pixels were fetched for an image sixty lines up the history').toEqual([])
+
+    view.view.scrollTo(45)
+    runFrames()
+    await settled()
+    await settled()
+    expect(view.source.picturesAsked).toEqual([1])
+    view.view.scrollTo(41)
+    expect(view.painted().images).toHaveLength(1)
+  })
+})
+
 describe('an image on the canvas', () => {
   it('is drawn over the backgrounds and under the characters, or over both', () => {
     const { canvas, drawn } = recordingContext()
@@ -120,7 +268,7 @@ describe('an image on the canvas', () => {
     const source = { x: 1, y: 2, width: 3, height: 4 }
     painter.paint({
       theme,
-      rows: [drawRow(row(0, 'ab'), [PLAIN], theme)],
+      rows: [drawStyled(row(0, 'ab'), [PLAIN], theme)],
       offset: 0.5,
       images: [
         { picture, x: 10, y: 20, width: 30, height: 40, source, above: false },

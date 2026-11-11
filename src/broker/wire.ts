@@ -28,8 +28,10 @@ import {
   type Position,
   type Row,
   type Rows,
+  type SessionColors,
   type Span,
   type Style,
+  TooLarge,
 } from '../source.ts'
 
 /** The largest message either side may send, as the broker has it */
@@ -56,11 +58,11 @@ export type ToBroker =
 /** What a view is sent */
 export type ToView =
   | { readonly kind: 'frame'; readonly channel: number; readonly frame: Frame }
-  | { readonly kind: 'rows'; readonly channel: number; readonly request: number; readonly epoch: number; readonly rows: Rows }
+  | { readonly kind: 'rows'; readonly channel: number; readonly request: number; readonly epoch: number; readonly first: number; readonly count: number; readonly rows: Rows }
   | { readonly kind: 'ended'; readonly channel: number }
   | { readonly kind: 'pasted'; readonly channel: number; readonly request: number; readonly outcome: PasteOutcome }
   | { readonly kind: 'span'; readonly channel: number; readonly request: number; readonly epoch: number; readonly span: Span | null }
-  | { readonly kind: 'text'; readonly channel: number; readonly request: number; readonly text: string }
+  | { readonly kind: 'text'; readonly channel: number; readonly request: number; readonly epoch: number; readonly text: string }
   | { readonly kind: 'spans'; readonly channel: number; readonly request: number; readonly epoch: number; readonly spans: readonly Span[] }
   | { readonly kind: 'failed'; readonly channel: number; readonly request: number; readonly message: string }
   | { readonly kind: 'commands'; readonly channel: number; readonly request: number; readonly epoch: number; readonly commands: readonly Command[] }
@@ -92,12 +94,19 @@ const FRAME_ALTERNATE = 2
 const FRAME_MOUSE = 4
 const FRAME_STALE = 8
 const FRAME_BLINKING = 16
+const FRAME_REVERSE = 32
+const FRAME_COLORS = 64
+
+const COLOR_FOREGROUND = 1
+const COLOR_BACKGROUND = 2
+const COLOR_CURSOR = 4
 
 /** The button byte for a move with nothing held, or a wheel */
 const NO_BUTTON = 255
 
 const utf8 = new TextEncoder()
-const text = new TextDecoder('utf-8', { fatal: true })
+// A string is whatever the program wrote, a leading U+FEFF included: the decoder is not to drop one
+const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
 
 class Writer {
   private bytes = new Uint8Array(64)
@@ -142,6 +151,8 @@ class Writer {
   }
 
   text(value: string): void {
+    // UTF-8 is never shorter than the string's own length, so one this long is refused before it is encoded
+    if (value.length > MAX_MESSAGE_BYTES) throw new TooLarge('a message was longer than a message may be')
     const encoded = utf8.encode(value)
     this.number(encoded.length)
     this.room(encoded.length)
@@ -154,13 +165,15 @@ class Writer {
     this.number(at.column)
   }
 
+  /** The message with its length in front, or `TooLarge`: the broker ends a stream that sends one */
   finish(): Uint8Array {
+    if (this.length - 4 > MAX_MESSAGE_BYTES) throw new TooLarge('a message was longer than a message may be')
     new DataView(this.bytes.buffer).setUint32(0, this.length - 4, true)
     return this.bytes.subarray(0, this.length)
   }
 }
 
-/** A message for the broker, with its length in front */
+/** A message for the broker, with its length in front. Throws `TooLarge` for one past `MAX_MESSAGE_BYTES` */
 export function encodeToBroker(message: ToBroker): Uint8Array {
   const out = new Writer(KIND[message.kind])
   out.number(message.channel)
@@ -185,6 +198,7 @@ export function encodeToBroker(message: ToBroker): Uint8Array {
       out.text(message.code)
       out.text(message.text)
       out.number(message.unshifted)
+      out.flag(message.composed)
       break
     case 'text':
       out.text(message.text)
@@ -333,26 +347,47 @@ class Reader {
     }
   }
 
-  rows(): Rows {
-    const styles: Style[] = [PLAIN]
-    for (let more = this.count(); more > 0; more -= 1) {
-      styles.push({ fg: this.color(), bg: this.color(), underlineColor: this.color(), flags: this.number() })
+  /**
+   * The colours a program changed: a byte saying which of foreground, background and cursor it set, those
+   * as three bytes each, then the numbered colours it redefined, each as its number and three bytes.
+   */
+  colors(): SessionColors {
+    const set = this.byte()
+    if (set >= 8) throw new Malformed('which colours are set is outside what the format defines')
+    const rgb = (): number => {
+      const [red, green, blue] = this.take(3)
+      return (red! << 16) | (green! << 8) | blue!
     }
-    const links: string[] = ['']
-    for (let more = this.count(); more > 0; more -= 1) links.push(this.text())
+    const foreground = set & COLOR_FOREGROUND ? rgb() : null
+    const background = set & COLOR_BACKGROUND ? rgb() : null
+    const cursor = set & COLOR_CURSOR ? rgb() : null
+    const palette: Array<{ index: number; rgb: number }> = []
+    for (let more = this.count(); more > 0; more -= 1) palette.push({ index: this.byte(), rgb: rgb() })
+    return { foreground, background, cursor, palette }
+  }
+
+  rows(): Rows {
     const rows: Row[] = []
-    for (let more = this.count(); more > 0; more -= 1) rows.push(this.row(styles.length, links.length))
-    return { styles, links, rows }
+    for (let more = this.count(); more > 0; more -= 1) rows.push(this.row())
+    return { rows }
   }
 
   /**
    * A row, which arrives as runs: characters side by side that share a style and a link. A run of plain
    * characters is one string, each code point a cell; any other says each character's width.
    */
-  private row(styles: number, links: number): Row {
+  private row(): Row {
     const line = this.number()
     const flags = this.byte()
     if (flags > 3) throw new Malformed("a row's flags are outside what the format defines")
+    // The row's own tables, which its characters count from one: the plain style and no link are put in
+    // front, so an index is where the thing is
+    const styles: Style[] = [PLAIN]
+    for (let more = this.count(); more > 0; more -= 1) {
+      styles.push({ fg: this.color(), bg: this.color(), underlineColor: this.color(), flags: this.number() })
+    }
+    const links: string[] = ['']
+    for (let more = this.count(); more > 0; more -= 1) links.push(this.text())
     const characters: string[] = []
     const columns: number[] = []
     const widths: number[] = []
@@ -362,8 +397,8 @@ class Reader {
       let column = this.number()
       const runStyle = this.number()
       const runLink = this.number()
-      if (runStyle >= styles) throw new Malformed("a style's index is outside its block")
-      if (runLink >= links) throw new Malformed("a link's index is outside its block")
+      if (runStyle >= styles.length) throw new Malformed("a style's index is outside its row's")
+      if (runLink >= links.length) throw new Malformed("a link's index is outside its row's")
       const push = (character: string, width: number) => {
         characters.push(character)
         columns.push(column)
@@ -396,6 +431,8 @@ class Reader {
       width: Uint8Array.from(widths),
       style: Uint16Array.from(style),
       link: Uint16Array.from(link),
+      styles,
+      links,
     }
   }
 
@@ -421,7 +458,7 @@ export function decodeToView(body: Uint8Array): ToView {
       const commands = read.number()
       const images = read.number()
       const flags = read.byte()
-      if (flags >= 32) throw new Malformed("a frame's flags are outside what the format defines")
+      if (flags >= 128) throw new Malformed("a frame's flags are outside what the format defines")
       let cursor: Cursor | null = null
       if (flags & FRAME_CURSOR) {
         const column = read.number()
@@ -431,9 +468,12 @@ export function decodeToView(body: Uint8Array): ToView {
         cursor = { column, row, shape, blinking: (flags & FRAME_BLINKING) !== 0 }
       }
       const staleFrom = flags & FRAME_STALE ? read.number() : undefined
+      const colors = flags & FRAME_COLORS ? read.colors() : undefined
       const frame: Frame = {
         sequence, epoch, firstActive, columns, screenRows, scrollback, commands, images, cursor,
         modes: { alternateScreen: (flags & FRAME_ALTERNATE) !== 0, mouse: (flags & FRAME_MOUSE) !== 0 },
+        reverseVideo: (flags & FRAME_REVERSE) !== 0,
+        ...(colors === undefined ? {} : { colors }),
         ...(staleFrom === undefined ? {} : { staleFrom }),
         ...read.rows(),
       }
@@ -442,7 +482,9 @@ export function decodeToView(body: Uint8Array): ToView {
     case ROWS: {
       const request = read.number()
       const epoch = read.number()
-      return read.finish({ kind: 'rows', channel, request, epoch, rows: read.rows() })
+      const first = read.number()
+      const count = read.number()
+      return read.finish({ kind: 'rows', channel, request, epoch, first, count, rows: read.rows() })
     }
     case ENDED:
       return read.finish({ kind: 'ended', channel })
@@ -459,7 +501,8 @@ export function decodeToView(body: Uint8Array): ToView {
     }
     case TEXT: {
       const request = read.number()
-      return read.finish({ kind: 'text', channel, request, text: read.text() })
+      const epoch = read.number()
+      return read.finish({ kind: 'text', channel, request, epoch, text: read.text() })
     }
     case SPANS: {
       const request = read.number()
@@ -523,28 +566,49 @@ export function decodeToView(body: Uint8Array): ToView {
  *
  * A socket delivers what it has: half a length, three messages and the start of a fourth. Each piece is
  * pushed as it comes and every message that is now whole is handed back as its kind and payload.
+ *
+ * **A message is copied at most once.** One that arrives whole in a piece is handed back as a part of that
+ * piece. One cut across pieces is given its full size as soon as its length is known and filled as the
+ * pieces come, so what a message costs does not grow with how many pieces it came in.
  */
 export class Messages {
-  private held = new Uint8Array(0)
+  /** The four bytes of a length, and how many of them have arrived */
+  private readonly head = new Uint8Array(4)
+  private headFilled = 0
+  /** A message whose length is known and whose bytes are still arriving, and how many of them have */
+  private body: Uint8Array | null = null
+  private bodyFilled = 0
 
   push(chunk: Uint8Array): Uint8Array[] {
-    let bytes = chunk
-    if (this.held.length > 0) {
-      bytes = new Uint8Array(this.held.length + chunk.length)
-      bytes.set(this.held)
-      bytes.set(chunk, this.held.length)
-    }
     const whole: Uint8Array[] = []
     let at = 0
-    while (bytes.length - at >= 4) {
-      const length = new DataView(bytes.buffer, bytes.byteOffset + at, 4).getUint32(0, true)
+    while (at < chunk.length) {
+      if (this.body) {
+        const taken = Math.min(this.body.length - this.bodyFilled, chunk.length - at)
+        this.body.set(chunk.subarray(at, at + taken), this.bodyFilled)
+        this.bodyFilled += taken
+        at += taken
+        if (this.bodyFilled < this.body.length) break
+        whole.push(this.body)
+        this.body = null
+        continue
+      }
+      const taken = Math.min(4 - this.headFilled, chunk.length - at)
+      this.head.set(chunk.subarray(at, at + taken), this.headFilled)
+      this.headFilled += taken
+      at += taken
+      if (this.headFilled < 4) break
+      this.headFilled = 0
+      const length = new DataView(this.head.buffer).getUint32(0, true)
       if (length > MAX_MESSAGE_BYTES) throw new Malformed('a message was longer than a message may be')
-      if (bytes.length - at - 4 < length) break
-      whole.push(bytes.subarray(at + 4, at + 4 + length))
-      at += 4 + length
+      if (chunk.length - at >= length) {
+        whole.push(chunk.subarray(at, at + length))
+        at += length
+      } else {
+        this.body = new Uint8Array(length)
+        this.bodyFilled = 0
+      }
     }
-    // What is left is copied, so the next push does not keep this chunk's whole buffer alive for a tail
-    this.held = bytes.slice(at)
     return whole
   }
 }

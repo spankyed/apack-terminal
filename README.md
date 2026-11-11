@@ -52,6 +52,24 @@ npm run build
 - **Says what is on screen as text**, in an element a screen reader and a test read
   (`[data-terminal-text]`), and which frame it last painted (`data-terminal-drawn`).
 
+## What a host says to it
+
+- **`setTheme(theme)` and `setFont(font)`** change what a view is drawn in after it was made. Every row it
+  holds is drawn again and none is asked for; a font is measured, and `onFit` says what fits now.
+- **`followOnInput`** (on unless turned off): typing, composed text and a paste bring a view that is
+  scrolled back down to the screen, where what was typed appears.
+- **`onPasteRefused`** hears of a paste too large for the source to carry, of which none was sent. `paste()`
+  called by the host rejects with the same `TooLarge` instead.
+- **`optionIsAlt`** (off unless turned on): a Mac's option key is alt, as a person who set their terminal
+  that way expects, rather than the key that composes characters. A key held with it is then sent as what
+  the key types without it. Left off, a character option typed is sent as that character, marked as
+  `composed`.
+- **`BrokerViews.onClose(listener)`** hears, once, that a connection has stopped — it was closed, its stream
+  ended, or what arrived was not the protocol — which is when an owner that keeps one per broker makes
+  another.
+- **`onEnded(reason)`** hears that no more frames will come: with no reason the session is over, and with
+  one it is there and the broker could not show it.
+
 ## The protocol's two halves
 
 `src/broker/wire.ts` is the view's half of `apack-terminal`'s view protocol; the other half is in Rust, in

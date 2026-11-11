@@ -24,6 +24,11 @@ export interface InputOptions {
   /** A Mac's command key belongs to the app, and its option key composes characters */
   readonly mac: boolean
   /**
+   * The option key is alt, as a person who set their terminal that way expects: it composes nothing, and a
+   * key held with it is sent as the character the key types without it. Only a Mac has the choice.
+   */
+  readonly optionIsAlt?: boolean
+  /**
    * A key the host wants for itself — a shortcut. Answering `true` keeps it from the program. Asked before
    * anything else, for every key.
    */
@@ -33,6 +38,38 @@ export interface InputOptions {
   /** The person asked to copy: a shortcut, or the page's own copy command */
   readonly copy: () => void
   readonly focused: (focused: boolean) => void
+  /** The person typed something the program was sent: a key that is more than a modifier, or text */
+  readonly typed?: () => void
+}
+
+/** The keys that only change what another key means */
+const MODIFIER_KEYS = new Set(['Shift', 'Control', 'Alt', 'AltGraph', 'Meta', 'CapsLock', 'NumLock', 'ScrollLock', 'Fn', 'Hyper', 'Super'])
+
+/** How the field that shows a composition is drawn, so what is being composed looks like what it will become */
+export interface FieldAppearance {
+  /** A CSS font shorthand */
+  readonly font: string
+  readonly color: string
+  readonly background: string
+}
+
+/** Whether a string is a control character, which no key types */
+function isControl(character: string): boolean {
+  const point = character.codePointAt(0) ?? 0
+  return point < 0x20 || (point >= 0x7f && point < 0xa0)
+}
+
+/**
+ * What a key types with at most shift held, from what it types with nothing held: itself, or for a letter
+ * its capital. Empty where that cannot be known — a key with nothing known of it, or the shifted character
+ * of a key that is not a letter, which is the layout's to say — and the owner encodes from the key itself.
+ */
+function withShift(unshifted: number, shift: boolean): string {
+  if (unshifted === 0) return ''
+  const plain = String.fromCodePoint(unshifted)
+  if (!shift) return plain
+  const capital = plain.toUpperCase()
+  return capital !== plain && [...capital].length === 1 ? capital : ''
 }
 
 function modifiersOf(event: KeyboardEvent | MouseEvent): number {
@@ -51,6 +88,8 @@ export class Input {
   readonly field: HTMLTextAreaElement
   private layout: LayoutMap | null = null
   private composing = false
+  /** The keys the source was told went down and has not been told came up */
+  private readonly down = new Set<string>()
 
   constructor(private readonly source: TerminalSource, private readonly options: InputOptions) {
     const field = document.createElement('textarea')
@@ -80,11 +119,22 @@ export class Input {
     void keyboard?.getLayoutMap?.().then((layout) => { this.layout = layout }, () => {})
   }
 
-  /** Puts the field where the cursor is, so an input method's window opens beside what is being typed */
+  /**
+   * Puts the field where the cursor is, so an input method's window opens beside what is being typed.
+   * In pixels from the corner of the element the field is in, and one row high.
+   */
   moveTo(x: number, y: number, height: number): void {
     this.field.style.left = `${x}px`
     this.field.style.top = `${y}px`
     this.field.style.height = `${height}px`
+    this.field.style.lineHeight = `${height}px`
+  }
+
+  /** What a composition is drawn in: the terminal's own font and colours, over the cells it will replace */
+  appearance(appearance: FieldAppearance): void {
+    this.field.style.font = appearance.font
+    this.field.style.color = appearance.color
+    this.field.style.background = appearance.background
   }
 
   dispose(): void {
@@ -99,12 +149,40 @@ export class Input {
 
   /** The key as the source is told it, or `null` for one that is the input method's or the app's */
   private read(event: KeyboardEvent, action: KeyInput['action']): KeyInput | null {
-    // A key the input method is in the middle of, or one that only starts an accent
-    if (this.composing || event.isComposing || event.key === 'Dead' || event.key === 'Process' || event.keyCode === 229) return null
     // The command key is the app's on a Mac: a program never hears it
     if (this.options.mac && event.metaKey) return null
-    const typed = [...event.key].length === 1 && !event.ctrlKey && !event.metaKey ? event.key : ''
-    return { action, code: event.code, modifiers: modifiersOf(event), text: action === 'release' ? '' : typed, unshifted: this.unshifted(event.code) }
+    const unshifted = this.unshifted(event.code)
+    // An option key that is alt composes nothing, the accents it would otherwise start included: option
+    // and E is alt and `e`, not the beginning of an `é`
+    const optionAsAlt = this.options.mac && this.options.optionIsAlt === true && event.altKey && !event.ctrlKey
+    if (optionAsAlt && !this.composing && !event.isComposing) {
+      const release = action === 'release'
+      return { action, code: event.code, modifiers: modifiersOf(event), text: release ? '' : withShift(unshifted, event.shiftKey), unshifted, composed: false }
+    }
+    // A key the input method is in the middle of, or one that only starts an accent
+    if (this.composing || event.isComposing || event.key === 'Dead' || event.key === 'Process' || event.keyCode === 229) return null
+    // One character, and one that is typed: a control character is a key's doing, never its text
+    const character = [...event.key].length === 1 && !isControl(event.key)
+    let modifiers = modifiersOf(event)
+    let text = ''
+    let composed = false
+    if (character && event.getModifierState?.('AltGraph') === true) {
+      // The key that reaches a keyboard's third level — `@`, `{`, `\` on most European layouts — is reported
+      // by Windows as control and alt together. Those two are how the character was typed, not held with it
+      modifiers &= ~(Modifier.control | Modifier.alt)
+      text = event.key
+    } else if (this.options.mac && event.altKey && !event.ctrlKey) {
+      // A Mac's option key is its third level, and the system has already typed the character by the time
+      // a page hears the key. Alt stays among the modifiers: `composed` is what says it typed the character
+      if (character) {
+        text = event.key
+        composed = event.key !== withShift(unshifted, false) && event.key !== withShift(unshifted, true)
+      }
+    } else if (character && !event.ctrlKey && !event.metaKey) {
+      text = event.key
+    }
+    const release = action === 'release'
+    return { action, code: event.code, modifiers, text: release ? '' : text, unshifted, composed: !release && composed }
   }
 
   private readonly keyDown = (event: KeyboardEvent) => {
@@ -129,10 +207,14 @@ export class Input {
     if (!key) return
     // Sent as a key, so it must not also arrive as text typed into the field
     event.preventDefault()
+    this.down.add(event.code)
     this.source.key(key)
+    if (!MODIFIER_KEYS.has(event.key)) this.options.typed?.()
   }
 
+  /** A release is sent for a key whose press was: one the host kept, or the app's, never went down for the program */
   private readonly keyUp = (event: KeyboardEvent) => {
+    if (!this.down.delete(event.code)) return
     const key = this.read(event, 'release')
     if (key) this.source.key(key)
   }
@@ -150,6 +232,7 @@ export class Input {
     this.field.style.width = '1px'
     this.field.value = ''
     this.source.text(event.data)
+    if (event.data !== '') this.options.typed?.()
   }
 
   /** Text put in the field by something other than a key or a composition: a picker, dictation */
@@ -158,6 +241,7 @@ export class Input {
     const text = this.field.value
     this.field.value = ''
     this.source.text(text)
+    if (text !== '') this.options.typed?.()
   }
 
   private readonly pasted = (event: ClipboardEvent) => {
@@ -172,5 +256,9 @@ export class Input {
   }
 
   private readonly focus = () => this.options.focused(true)
-  private readonly blur = () => this.options.focused(false)
+  private readonly blur = () => {
+    // Keys let go while something else has the keyboard are never heard of again
+    this.down.clear()
+    this.options.focused(false)
+  }
 }

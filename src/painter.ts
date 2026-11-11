@@ -55,15 +55,26 @@ export interface Scene {
 }
 
 /**
- * What draws a scene. Two of these exist — one on the GPU, one on a 2D canvas for where there is none —
- * and a view does not know which it holds.
+ * What draws a scene. This package has one, `CanvasPainter`, which draws on a 2D canvas; a host that
+ * draws another way — on the GPU, say — gives a view its own, and a view does not know which it holds.
  */
 export interface Painter {
   readonly canvas: HTMLCanvasElement
+  /** One cell as last measured: by `resize` for the display it names, and by `setFont` */
   readonly metrics: Metrics
-  /** The view is `columns` by `rows` cells, on a display with `pixelRatio` device pixels to a CSS pixel */
-  /** `gutter` is a strip of that many pixels left of the first column, which rows are not drawn in */
+  /**
+   * The view is `columns` by `rows` cells, on a display with `pixelRatio` device pixels to a CSS pixel.
+   * `gutter` is a strip of that many pixels left of the first column, which rows are not drawn in.
+   */
   resize(columns: number, rows: number, pixelRatio: number, gutter?: number): void
+  /** Draws in another typeface from here on, with cells measured for it */
+  setFont(font: Font): void
+  /**
+   * Gives the painter a way to say that what it drew is gone through no doing of the view's — a context
+   * the browser took away and gave back blank — so the view paints again. A painter that cannot lose what
+   * it drew has no need of one.
+   */
+  whenCleared?(repaint: () => void): void
   paint(scene: Scene): void
   dispose(): void
 }

@@ -1,4 +1,4 @@
-import { PLAIN, type Command, type Frame, type Picture, type Placements, type KeyInput, type PasteOutcome, type PointerInput, type Position, type Row, type Rows, type SourceListener, type Span, type TerminalSource } from '../src/source.ts'
+import type { Command, Fetched, Frame, Picture, Placements, KeyInput, PasteOutcome, PointerInput, Position, Row, SourceListener, Span, TerminalSource } from '../src/source.ts'
 
 /** A source a case drives by hand: it sends what the case tells it to and records what the view asked of it */
 export class FakeSource implements TerminalSource {
@@ -29,14 +29,15 @@ export class FakeSource implements TerminalSource {
 
   acknowledge(sequence: number): void { this.acknowledged.push(sequence) }
 
-  async fetch(first: number, count: number): Promise<Rows & { epoch: number }> {
+  /** Answers for every line asked about: one it has no history for is one it does not hold */
+  async fetch(first: number, count: number): Promise<Fetched> {
     this.fetched.push([first, count])
     const rows: Row[] = []
     for (let line = first; line < first + count; line += 1) {
       const row = this.history.get(line)
       if (row) rows.push(row)
     }
-    return { epoch: this.epoch, styles: [PLAIN], links: [''], rows }
+    return { epoch: this.epoch, first, count, rows }
   }
 
   key(input: KeyInput): void { this.keys.push(input) }

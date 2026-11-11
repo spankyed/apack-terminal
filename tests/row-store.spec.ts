@@ -1,7 +1,7 @@
 // What a view keeps of what it has been sent, and what it knows to ask for.
 import { describe, expect, it } from 'vitest'
-import { KEPT_LINES, RowStore } from '../src/row-store.ts'
-import { PLAIN, StyleFlag, type Style } from '../src/source.ts'
+import { KEPT_LINES, KEPT_SLACK, RowStore } from '../src/row-store.ts'
+import { PLAIN, StyleFlag, type Fetched, type Style } from '../src/source.ts'
 import { frame, row } from './_support.ts'
 
 const bold: Style = { ...PLAIN, flags: StyleFlag.bold }
@@ -58,17 +58,28 @@ describe('a frame', () => {
   })
 })
 
-describe('the styles and links of kept rows', () => {
-  it('are moved onto the store, so two messages numbering them differently agree', () => {
+describe('the styles and links of a kept row', () => {
+  it('are its own, so rows that number theirs differently each keep what they were sent with', () => {
     const store = new RowStore()
-    store.apply(frame({ styles: [PLAIN, bold], rows: [row(0, 'b', { style: 1 })] }))
-    store.apply(frame({ sequence: 2, styles: [PLAIN, red, bold], rows: [row(1, 'r', { style: 1 }), row(2, 'b', { style: 2 })] }))
+    const linked = { ...row(2, 'b', { style: 2, styles: [red, bold], links: ['https://example.com'] }), link: Uint16Array.from([1]) }
+    store.apply(frame({ rows: [row(0, 'b', { style: 1, styles: [bold] }), row(1, 'r', { style: 1, styles: [red] }), linked] }))
 
-    const styleOf = (line: number) => store.styles[store.row(line)!.style[0]!]
+    const styleOf = (line: number) => { const kept = store.row(line)!; return kept.styles[kept.style[0]!] }
     expect(styleOf(0)).toEqual(bold)
     expect(styleOf(1)).toEqual(red)
-    expect(styleOf(2), 'the same style arrived under another number and was kept twice').toBe(styleOf(0))
-    expect(store.styles[0], 'index zero is the plain style whatever was sent').toEqual(PLAIN)
+    expect(styleOf(2)).toEqual(bold)
+    expect(store.row(2)!.links[store.row(2)!.link[0]!]).toBe('https://example.com')
+    expect(store.row(0)!.styles[0], 'index zero is the plain style on every row').toEqual(PLAIN)
+  })
+
+  it('are let go with the row, so a store holds no more of them than its rows do', () => {
+    const store = new RowStore()
+    const coloured = (sequence: number) => row(0, 'x', { style: 1, styles: [{ ...PLAIN, fg: sequence }] })
+    // One line rewritten ten thousand times, a new colour each time
+    for (let sequence = 1; sequence <= 10_000; sequence += 1) store.apply(frame({ sequence, rows: [coloured(sequence)] }))
+
+    expect(store.size).toBe(1)
+    expect(store.row(0)!.styles).toEqual([PLAIN, { ...PLAIN, fg: 10_000 }])
   })
 })
 
@@ -94,17 +105,53 @@ describe('rows that were asked for', () => {
     const store = new RowStore()
     store.apply(frame({ firstActive: 10, scrollback: 10 }))
 
-    const kept = store.absorb({ epoch: 1, styles: [PLAIN], links: [''], rows: [row(2, 'old')] })
+    const kept = store.absorb({ epoch: 1, first: 2, count: 1, rows: [row(2, 'old')] })
 
     expect(kept).toEqual([2])
     expect(store.row(2)?.text.join('')).toBe('old')
+  })
+
+  it('say which lines they answer for: one of those with no row is not held by the owner, and is not asked for again', () => {
+    const store = new RowStore()
+    store.apply(frame({ firstActive: 100, scrollback: 100 }))
+    expect(store.missing(0, 100)).toEqual([[0, 100]])
+
+    // Sixty lines were asked about; the answer got as far as forty of them, and has rows for two
+    const told = store.absorb({ epoch: 1, first: 20, count: 40, rows: [row(30, 'held'), row(31, 'held too')] })
+
+    expect(told, 'every line the answer said something about').toHaveLength(40)
+    expect(store.missing(0, 100), 'what it covered is settled; what it did not reach is still to ask for').toEqual([[0, 20], [60, 40]])
+  })
+
+  it('that the owner did not hold are asked for again once the owner says its history changed', () => {
+    const none = (store: RowStore) => store.absorb({ epoch: 1, first: 0, count: 10, rows: [] })
+
+    const stale = new RowStore()
+    stale.apply(frame({ firstActive: 10, scrollback: 10 }))
+    none(stale)
+    expect(stale.missing(0, 10)).toEqual([])
+    stale.apply(frame({ sequence: 2, firstActive: 10, scrollback: 10, staleFrom: 4 }))
+    expect(stale.missing(0, 10), 'history that changed without being resent').toEqual([[0, 10]])
+
+    const trimmed = new RowStore()
+    trimmed.apply(frame({ firstActive: 10, scrollback: 10 }))
+    none(trimmed)
+    trimmed.apply(frame({ sequence: 2, firstActive: 12, scrollback: 6 }))
+    expect(trimmed.missing(0, 12), 'where history starts moved').toEqual([[6, 6]])
+
+    const written = new RowStore()
+    written.apply(frame({ firstActive: 10, scrollback: 10 }))
+    none(written)
+    written.apply(frame({ sequence: 2, firstActive: 10, scrollback: 10, rows: [row(3, 'resent')] }))
+    expect(written.row(3)?.text.join(''), 'a frame brought a line the owner had said it did not hold').toBe('resent')
+    expect(written.missing(0, 10)).toEqual([])
   })
 
   it('are dropped when they answer for another epoch', () => {
     const store = new RowStore()
     store.apply(frame({ epoch: 2, firstActive: 10, scrollback: 10 }))
 
-    expect(store.absorb({ epoch: 1, styles: [PLAIN], links: [''], rows: [row(2, 'stale')] })).toEqual([])
+    expect(store.absorb({ epoch: 1, first: 2, count: 1, rows: [row(2, 'stale')] })).toEqual([])
     expect(store.row(2)).toBeUndefined()
   })
 
@@ -112,21 +159,62 @@ describe('rows that were asked for', () => {
     const store = new RowStore()
     store.apply(frame({ firstActive: 10, scrollback: 10, rows: [row(10, 'live')] }))
 
-    store.absorb({ epoch: 1, styles: [PLAIN], links: [''], rows: [row(10, 'fetched')] })
+    store.absorb({ epoch: 1, first: 10, count: 1, rows: [row(10, 'fetched')] })
 
     expect(store.row(10)?.text.join('')).toBe('live')
   })
 })
 
 describe('how much is kept', () => {
-  it('is bounded, and what goes is the oldest', () => {
-    const store = new RowStore()
-    const lines = KEPT_LINES + 10
-    store.apply(frame({ firstActive: lines, scrollback: lines }))
-    store.absorb({ epoch: 1, styles: [PLAIN], links: [''], rows: Array.from({ length: lines }, (_, line) => row(line, 'x')) })
+  const lines = KEPT_LINES + KEPT_SLACK + 10
+  const fetched = (first: number, count: number): Fetched =>
+    ({ epoch: 1, first, count, rows: Array.from({ length: count }, (_, index) => row(first + index, 'x')) })
 
-    expect(store.size).toBe(KEPT_LINES)
-    expect(store.row(0), 'the oldest line was kept past the bound').toBeUndefined()
+  it('is bounded, and what goes is furthest from the screen for a view that is showing it', () => {
+    const store = new RowStore()
+    store.apply(frame({ firstActive: lines, scrollback: lines }))
+    store.absorb(fetched(0, lines))
+
+    expect(store.size).toBeLessThanOrEqual(KEPT_LINES)
+    expect(store.size, 'far more went than had to').toBeGreaterThan(KEPT_LINES - 2)
+    expect(store.row(0), 'the line furthest from the screen was kept past the bound').toBeUndefined()
     expect(store.row(lines - 1)).toBeDefined()
+  })
+
+  it('is what is nearest the viewer, so lines fetched for someone reading far back are not let go as they arrive', () => {
+    const store = new RowStore()
+    store.apply(frame({ firstActive: lines * 2, scrollback: lines * 2 }))
+    // Everything near the screen is held, right up to where lines start being let go
+    store.absorb(fetched(lines * 2 - KEPT_LINES - KEPT_SLACK, KEPT_LINES + KEPT_SLACK))
+
+    // And the viewer is at the oldest line there is, where a page arrives
+    const kept = store.absorb(fetched(0, 256), 0)
+
+    expect(kept).toHaveLength(256)
+    expect(store.row(0), 'the lines just fetched were the ones let go').toBeDefined()
+    expect(store.row(255)).toBeDefined()
+    expect(store.missing(0, 256), 'what was fetched has to be asked for again').toEqual([])
+    expect(store.row(lines * 2 - 1), 'the line furthest from the viewer was kept').toBeUndefined()
+    expect(store.size).toBeLessThanOrEqual(KEPT_LINES)
+  })
+
+  it('is never short of the screen, which no fetch brings back, however far from it the viewer is', () => {
+    const store = new RowStore()
+    const screen = [0, 1, 2, 3].map((index) => row(lines * 2 + index, 'live'))
+    store.apply(frame({ firstActive: lines * 2, scrollback: lines * 2, rows: screen }))
+    // The viewer is at the oldest line, and more than may be kept arrives around it
+    store.absorb(fetched(0, lines), 0)
+
+    expect(store.size).toBeLessThanOrEqual(KEPT_LINES + 1)
+    expect(screen.map((live) => store.row(live.line)?.text.join('')), 'a line of the screen was let go').toEqual(['live', 'live', 'live', 'live'])
+    expect(store.row(0)).toBeDefined()
+  })
+
+  it('is not gone through again for every line that arrives past the bound', () => {
+    const store = new RowStore()
+    store.apply(frame({ firstActive: lines, scrollback: lines }))
+    store.absorb(fetched(0, KEPT_LINES + 10))
+
+    expect(store.size, 'a few lines over the bound cost a pass over all of them').toBe(KEPT_LINES + 10)
   })
 })

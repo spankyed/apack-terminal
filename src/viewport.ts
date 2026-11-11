@@ -16,9 +16,23 @@ export class Viewport {
 
   constructor(private readonly store: RowStore) {}
 
-  /** Whether the view shows the screen and moves with it */
+  /**
+   * Whether the view shows the screen and moves with it.
+   *
+   * **One fact, and only a scroll or the history going makes it false or true.** It is not worked out from
+   * how much history there is: a view whose history was erased under it is following from then on, and
+   * stays following when the next line scrolls into a history that is no longer empty.
+   */
   get following(): boolean {
-    return this.followingOutput || this.store.scrollback === 0
+    return this.followingOutput
+  }
+
+  /**
+   * The store took a frame. With no history left, or none at or above the line held, there is nothing to
+   * hold: the view is following.
+   */
+  settle(): void {
+    if (this.store.scrollback === 0 || this.held >= this.store.firstActive) this.followingOutput = true
   }
 
   /** The line at the top of the view, fractional while a scroll is part-way between two */

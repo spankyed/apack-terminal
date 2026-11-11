@@ -76,6 +76,10 @@ export const PLAIN: Style = { fg: null, bg: null, underlineColor: null, flags: 0
  * unit — a letter with its accent, an emoji with its skin tone — so `text[i]` may be several code points,
  * `column[i]` is the cell it starts in and `width[i]` is how many cells it covers. Cells past the last
  * character are blank and carry no style.
+ *
+ * **A row says everything about itself.** The styles and links its characters name are its own, so a row
+ * is drawn from nothing but itself and the theme, means the same in whichever message brought it, and
+ * takes its tables with it when it is let go.
  */
 export interface Row {
   readonly line: number
@@ -86,10 +90,14 @@ export interface Row {
   readonly text: readonly string[]
   readonly column: Uint16Array
   readonly width: Uint8Array
-  /** For each character, an index into the styles its message came with; `0` is always `PLAIN` */
+  /** For each character, an index into `styles`; one that names nothing is drawn plain */
   readonly style: Uint16Array
-  /** For each character, an index into the links its message came with; `0` is no link */
+  /** For each character, an index into `links`; `0` is no link */
   readonly link: Uint16Array
+  /** The styles on this row. `styles[0]` is always `PLAIN`, so a character's `0` means "unstyled" */
+  readonly styles: readonly Style[]
+  /** The links on this row. `links[0]` is the empty string, so a character's `0` means none */
+  readonly links: readonly string[]
 }
 
 export const CURSOR_SHAPES = ['block', 'bar', 'underline', 'hollow'] as const
@@ -111,12 +119,23 @@ export interface Modes {
   readonly mouse: boolean
 }
 
-/** Rows and the tables their `style` and `link` indices point into */
+/** Rows, as a message brings them */
 export interface Rows {
-  readonly styles: readonly Style[]
-  /** `links[0]` is unused, so that a `link` of `0` means none */
-  readonly links: readonly string[]
   readonly rows: readonly Row[]
+}
+
+/**
+ * The answer to a fetch: the rows the owner holds among the `count` lines from `first`, in the epoch they
+ * are numbered in.
+ *
+ * **It says which lines it answers for**, which may be fewer than were asked about: an answer holds what
+ * one message can. A line among them with no row is one the owner does not hold. A line past them was not
+ * answered, and is there to be asked for again.
+ */
+export interface Fetched extends Rows {
+  readonly epoch: number
+  readonly first: number
+  readonly count: number
 }
 
 /**
@@ -125,6 +144,10 @@ export interface Rows {
  * **A frame is not a unit of output.** The owner sends one when the screen has changed and the last has
  * been acknowledged, so a program that writes faster than a view draws produces fewer frames, not a
  * backlog: each carries everything that changed since, however much that was.
+ *
+ * **Nor is it the whole of a change.** A screen longer than one message can hold comes in as many frames as
+ * it takes, the next after the last was acknowledged. A line of the screen no frame has brought yet is
+ * blank until one does.
  */
 export interface Frame extends Rows {
   readonly sequence: number
@@ -147,6 +170,29 @@ export interface Frame extends Rows {
    * view that kept any of them must let them go. Absent when none did.
    */
   readonly staleFrom?: number
+  /** The program has the whole screen in reverse video: the default foreground and background change places */
+  readonly reverseVideo: boolean
+  /**
+   * The colours the program changed, when this frame says what they are: an attachment's first frame
+   * does, and so does any frame since whose colours differ from the frame before. Absent, they are what
+   * they were.
+   */
+  readonly colors?: SessionColors
+}
+
+/**
+ * The colours a program set for itself, over the ones the session was given — which are the theme's.
+ *
+ * **All of them, every time.** What this names replaces what a view held of the same: a colour that is
+ * `null`, and a palette entry that is not listed, is the theme's again.
+ */
+export interface SessionColors {
+  /** `0xRRGGBB`, or `null` where the program left the theme's */
+  readonly foreground: number | null
+  readonly background: number | null
+  readonly cursor: number | null
+  /** The numbered colours the program redefined, each by its number */
+  readonly palette: ReadonlyArray<{ readonly index: number; readonly rgb: number }>
 }
 
 /**
@@ -245,6 +291,12 @@ export interface KeyInput {
   readonly text: string
   /** What the key types with no modifier, as a code point, or `0` */
   readonly unshifted: number
+  /**
+   * Alt went into typing `text` rather than being held with the key: the option key on a Mac, which is how
+   * that keyboard reaches its third level. An owner sends such a key as its text, and any other key with
+   * alt as alt.
+   */
+  readonly composed: boolean
 }
 
 export const POINTER_ACTIONS = ['press', 'release', 'move', 'wheelUp', 'wheelDown'] as const
@@ -269,11 +321,17 @@ export type PasteOutcome =
   /** The text could run a command — it holds a line ending where the program takes them as typed — and was not sent */
   | 'unsafe'
 
+/** Input too large for the source to carry: a paste past what one message may hold. Nothing was sent */
+export class TooLarge extends Error {}
+
 /** What a view hears from its source */
 export interface SourceListener {
   frame(frame: Frame): void
-  /** The session is over; no more frames will come */
-  ended(): void
+  /**
+   * No more frames will come: the session is over, or — with `reason`, which is the owner's own words for
+   * it — the session is there and could not be shown.
+   */
+  ended(reason?: string): void
 }
 
 /**
@@ -283,17 +341,26 @@ export interface SourceListener {
  * reflow names lines that no longer exist, so it carries the epoch it describes.
  */
 export interface TerminalSource {
-  /** Starts the frames. The returned function stops them */
+  /**
+   * Starts the frames. The returned function stops them.
+   *
+   * **An attachment's first frames say what of an attachment before can be trusted.** They describe the
+   * whole screen, and name as stale (`staleFrom`) the history that may have changed while nobody was
+   * listening, so a view lets go of nothing by hand. The epoch is the same where the lines still have the
+   * numbers they had — the owner kept them, for another view or for this one — and another where they do
+   * not, and then a view forgets its rows as it does for any epoch that moves.
+   */
   attach(listener: SourceListener): () => void
   /** The frame with this sequence has been drawn, so the next may be sent */
   acknowledge(sequence: number): void
-  /** Lines the view does not hold. Lines no longer held by the owner are simply absent from the answer */
-  fetch(first: number, count: number): Promise<Rows & { readonly epoch: number }>
+  /** Lines the view does not hold. No answer, as a rejection, when the lines have been numbered again since */
+  fetch(first: number, count: number): Promise<Fetched>
 
   key(input: KeyInput): void
   /** Text that did not come from a key: what an input method composed */
   text(text: string): void
   pointer(input: PointerInput): void
+  /** Rejects with `TooLarge` for text the source cannot carry, having sent none of it */
   paste(text: string, options?: { readonly allowUnsafe?: boolean }): Promise<PasteOutcome>
   focus(gained: boolean): void
 
@@ -301,9 +368,12 @@ export interface TerminalSource {
   wordAt(position: Position): Promise<Span | null>
   /** The whole line a cell is on, across the rows it wrapped onto */
   lineAt(position: Position): Promise<Span | null>
-  /** The text of a span as a program wrote it: wrapped rows joined, trailing blanks dropped */
+  /**
+   * The text of a span as a program wrote it: wrapped rows joined, trailing blanks dropped. No answer, as a
+   * rejection, for a span numbered in an epoch that is over, and for text longer than an owner will carry
+   */
   textOf(span: Span): Promise<string>
-  /** Every place `needle` appears, newest first */
+  /** Every place `needle` appears, newest first — as many of the newest as the owner looks for */
   search(needle: string): Promise<readonly Span[]>
   /** The commands the shell has reported, oldest first. Empty for a shell that marks none */
   commands(): Promise<readonly Command[]>
