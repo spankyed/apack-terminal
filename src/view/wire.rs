@@ -15,6 +15,8 @@
 
 use std::io::Read;
 
+use crate::protocol::{CommandOutcome, Unreported};
+
 /// The largest message either side may send.
 ///
 /// A ceiling on what is read before it is understood, as `frames::MAX_FRAME_BYTES` is for a client.
@@ -426,7 +428,8 @@ pub struct CommandRow {
     /// Milliseconds since the Unix epoch
     pub started_ms: Option<u64>,
     pub finished_ms: Option<u64>,
-    pub exit_status: Option<i32>,
+    /// How it ended, or that it has not, with who said so: what a client is told (`CommandOutcome`)
+    pub outcome: CommandOutcome,
     pub prompt: Option<u64>,
     pub output: Option<u64>,
     pub end: Option<u64>,
@@ -813,7 +816,8 @@ impl Writer {
         self.number(at.column);
     }
 
-    /// A command, as a byte saying which of its fields it has and then those fields in order.
+    /// A command, as a byte saying which of its optional fields it has, then those fields in order
+    /// with how it ended between its times and its lines.
     fn command(&mut self, command: &CommandRow) {
         self.number(command.id);
         let has = [
@@ -821,7 +825,6 @@ impl Writer {
             command.cwd.is_some(),
             command.started_ms.is_some(),
             command.finished_ms.is_some(),
-            command.exit_status.is_some(),
             command.prompt.is_some(),
             command.output.is_some(),
             command.end.is_some(),
@@ -836,13 +839,41 @@ impl Writer {
         for time in [command.started_ms, command.finished_ms].into_iter().flatten() {
             self.number(time);
         }
-        if let Some(status) = command.exit_status {
-            // Zigzag, so a small negative status is as short as a small positive one
-            self.number(((status << 1) ^ (status >> 31)) as u32);
-        }
+        self.outcome(command.outcome);
         for line in [command.prompt, command.output, command.end].into_iter().flatten() {
             self.number(line);
         }
+    }
+
+    /// How a command ended: a byte saying which kind, then what that kind carries. **A kind of its
+    /// own for each, with no field two of them share**, so a status that was claimed cannot be read
+    /// back as one that was vouched for by a reader that mistook a flag.
+    fn outcome(&mut self, outcome: CommandOutcome) {
+        match outcome {
+            CommandOutcome::Running => self.byte(outcome::RUNNING),
+            CommandOutcome::Exited { code } => {
+                self.byte(outcome::EXITED);
+                self.status(code);
+            }
+            CommandOutcome::Unknown { why } => {
+                self.byte(outcome::UNKNOWN);
+                self.byte(match why {
+                    Unreported::NoStatus => outcome::NO_STATUS,
+                    Unreported::Superseded => outcome::SUPERSEDED,
+                    Unreported::SessionEnded => outcome::SESSION_ENDED,
+                });
+            }
+            CommandOutcome::Claimed { code: None } => self.byte(outcome::CLAIMED),
+            CommandOutcome::Claimed { code: Some(code) } => {
+                self.byte(outcome::CLAIMED_STATUS);
+                self.status(code);
+            }
+        }
+    }
+
+    /// An exit status, zigzag, so a small negative one is as short as a small positive one.
+    fn status(&mut self, status: i32) {
+        self.number(((status << 1) ^ (status >> 31)) as u32);
     }
 
     fn span(&mut self, span: Span) {
@@ -949,20 +980,43 @@ impl<'a> Reader<'a> {
         if has & 8 != 0 {
             command.finished_ms = Some(self.number()?);
         }
+        command.outcome = self.outcome()?;
         if has & 16 != 0 {
-            let zigzag = self.u32()?;
-            command.exit_status = Some(((zigzag >> 1) as i32) ^ -((zigzag & 1) as i32));
-        }
-        if has & 32 != 0 {
             command.prompt = Some(self.number()?);
         }
-        if has & 64 != 0 {
+        if has & 32 != 0 {
             command.output = Some(self.number()?);
         }
-        if has & 128 != 0 {
+        if has & 64 != 0 {
             command.end = Some(self.number()?);
         }
+        if has & 128 != 0 {
+            return Err(Malformed::Value("a command's fields"));
+        }
         Ok(command)
+    }
+
+    fn outcome(&mut self) -> Result<CommandOutcome, Malformed> {
+        Ok(match self.byte()? {
+            outcome::RUNNING => CommandOutcome::Running,
+            outcome::EXITED => CommandOutcome::Exited { code: self.status()? },
+            outcome::UNKNOWN => CommandOutcome::Unknown {
+                why: match self.byte()? {
+                    outcome::NO_STATUS => Unreported::NoStatus,
+                    outcome::SUPERSEDED => Unreported::Superseded,
+                    outcome::SESSION_ENDED => Unreported::SessionEnded,
+                    _ => return Err(Malformed::Value("why a command's end is unknown")),
+                },
+            },
+            outcome::CLAIMED => CommandOutcome::Claimed { code: None },
+            outcome::CLAIMED_STATUS => CommandOutcome::Claimed { code: Some(self.status()?) },
+            _ => return Err(Malformed::Value("how a command ended")),
+        })
+    }
+
+    fn status(&mut self) -> Result<i32, Malformed> {
+        let zigzag = self.u32()?;
+        Ok(((zigzag >> 1) as i32) ^ -((zigzag & 1) as i32))
     }
 
     fn color(&mut self) -> Result<Color, Malformed> {
@@ -1034,6 +1088,19 @@ impl<'a> Reader<'a> {
     fn finish<T>(self, value: T) -> Result<T, Malformed> {
         if self.bytes.is_empty() { Ok(value) } else { Err(Malformed::Trailing) }
     }
+}
+
+/// How a command ended, as the byte that says which kind, and why one's end is unknown.
+mod outcome {
+    pub const RUNNING: u8 = 0;
+    pub const EXITED: u8 = 1;
+    pub const UNKNOWN: u8 = 2;
+    pub const CLAIMED: u8 = 3;
+    pub const CLAIMED_STATUS: u8 = 4;
+
+    pub const NO_STATUS: u8 = 0;
+    pub const SUPERSEDED: u8 = 1;
+    pub const SESSION_ENDED: u8 = 2;
 }
 
 mod kind {

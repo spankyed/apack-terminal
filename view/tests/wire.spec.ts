@@ -186,6 +186,15 @@ describe('bytes that are not a message', () => {
     expect(() => decodeToView(Uint8Array.of(200, 0))).toThrow('no message has kind 200')
   })
 
+  it('refuses a command that ended no way the format defines, rather than reading the nearest', () => {
+    // A `commands` answer of one command: kind, channel, request, epoch, how many, id, which fields, how it ended
+    const listed = (...ended: number[]) => Uint8Array.of(73, 0, 0, 0, 1, 1, 0, ...ended)
+    expect(decodeToView(listed(0))).toMatchObject({ commands: [{ id: 1, outcome: { kind: 'running' } }] })
+    expect(() => decodeToView(listed(5))).toThrow('how a command ended is outside what the format defines')
+    expect(() => decodeToView(listed(2, 3))).toThrow("why a command's end is unknown is outside what the format defines")
+    expect(() => decodeToView(Uint8Array.of(73, 0, 0, 0, 1, 1, 0x80, 0))).toThrow("a command's fields are outside what the format defines")
+  })
+
   it('refuses a count the payload cannot hold before making anything for it', () => {
     // A `rows` answer claiming two hundred million styles in four bytes
     expect(() => decodeToView(Uint8Array.of(66, 0, 0, 0, 0xff, 0xff, 0xff, 0x5f))).toThrow(Malformed)

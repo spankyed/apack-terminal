@@ -9,6 +9,7 @@
 //! Re-record with `APACK_UPDATE_VECTORS=1 cargo nextest run --test view_vectors`, and read the diff: every
 //! line of it is a change a view has to be taught.
 
+use apack_terminal::protocol::{CommandOutcome, Unreported};
 use apack_terminal::view::wire::{
     Block, Color, ColorChanges, CommandRow, Cursor, Frame, Glyph, NO_BUTTON, Placement, Position, Row, Span, Style,
     ToBroker, ToView, body,
@@ -133,7 +134,7 @@ fn to_view(message: &ToView) -> Value {
                 .map(|one| {
                     json!({
                         "id": one.id, "command": one.command, "cwd": one.cwd, "startedMs": one.started_ms,
-                        "finishedMs": one.finished_ms, "exitStatus": one.exit_status, "prompt": one.prompt,
+                        "finishedMs": one.finished_ms, "outcome": one.outcome, "prompt": one.prompt,
                         "output": one.output, "end": one.end,
                     })
                 })
@@ -366,7 +367,7 @@ fn vectors() -> Value {
             ToView::Failed { channel: 3, request: 0, message: "ghostty_render_state_new failed with -1".to_owned() },
         ),
         (
-            "commands: one finished with everything known, one that failed with a negative status, one waiting",
+            "commands: one that exited with everything known, one claimed to have failed with a negative status, one claimed to have ended with none, one whose end was never reported, one waiting",
             ToView::Commands {
                 channel: 3,
                 request: 17,
@@ -378,7 +379,7 @@ fn vectors() -> Value {
                         cwd: Some("/src/app".to_owned()),
                         started_ms: Some(1_794_000_000_000),
                         finished_ms: Some(1_794_000_012_345),
-                        exit_status: Some(0),
+                        outcome: CommandOutcome::Exited { code: 0 },
                         prompt: Some(40),
                         output: Some(41),
                         end: Some(90),
@@ -389,10 +390,24 @@ fn vectors() -> Value {
                         cwd: None,
                         started_ms: Some(1_794_000_020_000),
                         finished_ms: Some(1_794_000_020_500),
-                        exit_status: Some(-1),
+                        outcome: CommandOutcome::Claimed { code: Some(-1) },
                         prompt: None,
                         output: None,
                         end: Some(95),
+                    },
+                    CommandRow {
+                        id: 3,
+                        finished_ms: Some(1_794_000_021_000),
+                        outcome: CommandOutcome::Claimed { code: None },
+                        ..CommandRow::default()
+                    },
+                    CommandRow {
+                        id: 4,
+                        command: Some("sleep 100".to_owned()),
+                        started_ms: Some(1_794_000_022_000),
+                        finished_ms: Some(1_794_000_023_000),
+                        outcome: CommandOutcome::Unknown { why: Unreported::Superseded },
+                        ..CommandRow::default()
                     },
                     CommandRow { id: 300, prompt: Some(95), ..CommandRow::default() },
                 ],

@@ -4,6 +4,7 @@
 
 use std::path::Path;
 
+use apack_terminal::commands::Outcome;
 use apack_terminal::recording::{self, Entry, Index, Recorder, Timed};
 use apack_terminal::screen::Screen;
 use apack_terminal::vt::rows::{RowRead, Space};
@@ -708,10 +709,13 @@ fn a_replay_holds_the_recordings_commands_once_with_the_times_they_ran() {
         assert!(screen.replay(&entries, u64::MAX));
     }
     let (_, commands) = screen.commands().expect("the commands read");
-    let times: Vec<_> = commands.iter().map(|one| (one.id, one.started_ms, one.finished_ms, one.exit_status)).collect();
+    let times: Vec<_> = commands.iter().map(|one| (one.id, one.started_ms, one.finished_ms, one.outcome)).collect();
     assert_eq!(
         times,
-        vec![(1, Some(2_000), Some(3_000), Some(0)), (2, Some(4_000), Some(4_000), None)],
+        vec![
+            (1, Some(2_000), Some(3_000), Outcome::Claimed(Some(0))),
+            (2, Some(4_000), Some(4_000), Outcome::Claimed(None))
+        ],
         "two commands, however many times the recording is replayed"
     );
     assert!(!screen.facts().running);

@@ -976,7 +976,8 @@ fn types(writing: &mut impl Write, session: &str, data: &str) {
 ///
 /// No window, no attachment, no view — the facts come from the broker's own parse of the markers, which is
 /// the whole gain of the VT core living here. Every field is a claim the shell made, and the case asserts
-/// they are reported as made: a status of 3 is 3, not "it failed".
+/// they are reported as made, and as claims: a status of 3 is a claim of 3, not "it failed" and not an
+/// exit.
 #[cfg(unix)]
 #[test]
 fn a_session_nobody_is_drawing_answers_what_its_shell_reported() {
@@ -994,7 +995,12 @@ fn a_session_nobody_is_drawing_answers_what_its_shell_reported() {
     let (facts, _) = until(&mut reading, "facts");
     assert_eq!(facts["cwd"], "/tmp", "the directory the shell reported");
     assert_eq!(facts["command"], "ls -la", "the command line it reported");
-    assert_eq!(facts["exit_status"], 3, "the status it reported, as reported");
+    assert_eq!(
+        facts["outcome"],
+        serde_json::json!({ "kind": "claimed", "code": 3 }),
+        "the status it reported, as the claim it is"
+    );
+    assert_eq!(facts["vouched"], false, "nothing vouches for a session spawned without a key");
     assert_eq!(facts["running"], false, "the command finished");
     assert_eq!(facts["finished"], 1, "and it is counted, for a caller that asks after it ended");
 }
@@ -1113,6 +1119,169 @@ fn a_session_ending_settles_both_kinds_of_wait() {
         vec!["EXITED".to_string(), "MET".to_string()],
         "the exit wait is met and the idle wait is told the session ended"
     );
+}
+
+/// What a keyed session's shell is given and nothing else is, in the cases below.
+#[cfg(unix)]
+const MARKS_KEY: &str = "00112233445566778899aabbccddeeff";
+
+/// A session spawned with `MARKS_KEY`, with a shell running, ready to be typed into.
+///
+/// **No hook is arranged, and the case writes the marks a hook would**: what is under test is what the
+/// broker believes, and a mark is believed for the key it carries, whoever printed it.
+#[cfg(unix)]
+fn a_keyed_session(broker: &Broker) -> (Events, Wire, String) {
+    let (mut reading, mut writing) = connect(broker);
+    ask(&mut writing, &hello(None));
+    assert_eq!(next(&mut reading)["kind"], "hello");
+    let frame = serde_json::json!({
+        "kind": "spawn", "cols": 80, "rows": 24, "shell": DEFAULT_SHELL, "args": [], "env": [], "unset": [],
+        "cwd": null, "marks_key": MARKS_KEY,
+    });
+    ask(&mut writing, &frame.to_string());
+    let session = next(&mut reading)["session"].as_str().expect("a session id").to_owned();
+    once_the_shell_is_listening(&mut reading);
+    (reading, writing, session)
+}
+
+/// A command beginning and ending, as `printf` is asked to write the marks a keyed hook prints.
+#[cfg(unix)]
+fn keyed_start(number: u32, line: &str) -> String {
+    format!("\\033]633;V;S;{number};{MARKS_KEY};{line}\\007")
+}
+
+#[cfg(unix)]
+fn keyed_finish(number: u32, status: &str, cwd: &str) -> String {
+    format!("\\033]633;V;F;{number};{MARKS_KEY};{status};{cwd}\\007")
+}
+
+/// Markers written to be believed by something that was not given the key: an end in each family
+/// anything can print, a prompt, and a keyed finish for the right command with a key of its own.
+#[cfg(unix)]
+const FORGED_FINISH: &str = "\\033]133;D;0\\007\\033]633;D;0\\007\\033]133;A\\007\\033]633;A\\007\
+    \\033]633;V;F;1;ffffffffffffffffffffffffffffffff;0;/tmp\\007";
+
+#[cfg(unix)]
+fn facts_of(reading: &mut Events, writing: &mut Wire, session: &str) -> serde_json::Value {
+    ask(writing, &format!(r#"{{"kind":"facts","session":"{session}"}}"#));
+    until(reading, "facts").0
+}
+
+#[cfg(unix)]
+fn commands_of(reading: &mut Events, writing: &mut Wire, session: &str) -> Vec<serde_json::Value> {
+    ask(writing, &format!(r#"{{"kind":"commands","session":"{session}"}}"#));
+    until(reading, "commands").0["commands"].as_array().expect("commands").clone()
+}
+
+/// **What a keyed session says of its commands cannot be printed into it.** A command is running on the
+/// word of a mark that carried the key, and a program that prints the end of it — in every spelling
+/// there is, with every part right but the key — has ended nothing: the session is still busy, the
+/// command has no outcome, and the one keyed mark it would not take is counted.
+#[cfg(unix)]
+#[test]
+fn a_shell_that_prints_a_forged_finish_is_still_running_its_command() {
+    let broker = start();
+    let (mut reading, mut writing, session) = a_keyed_session(&broker);
+
+    types(&mut writing, &session, &prints(&keyed_start(1, "make")));
+    once_the_sentinel_is_printed(&mut reading);
+    types(&mut writing, &session, &prints(FORGED_FINISH));
+    once_the_sentinel_is_printed(&mut reading);
+
+    let facts = facts_of(&mut reading, &mut writing, &session);
+    assert_eq!(facts["running"], true, "a forged finish ended the command: {facts}");
+    assert_eq!(facts["command"], "make");
+    assert_eq!(facts["outcome"], serde_json::Value::Null, "nothing has ended: {facts}");
+    assert_eq!(facts["finished"], 0);
+    assert_eq!(facts["vouched"], true);
+    assert_eq!(facts["refused"], 1, "the keyed mark with another key is the one that is counted: {facts}");
+    let commands = commands_of(&mut reading, &mut writing, &session);
+    let [command] = commands.as_slice() else { panic!("expected one command, was told {commands:?}") };
+    assert_eq!((&command["command"], &command["outcome"]["kind"]), (&"make".into(), &"running".into()));
+
+    // And the finish that does carry the key is the one that ends it, as an exit
+    types(&mut writing, &session, &prints(&keyed_finish(1, "3", "/tmp")));
+    once_the_sentinel_is_printed(&mut reading);
+    let facts = facts_of(&mut reading, &mut writing, &session);
+    assert_eq!(facts["running"], false);
+    assert_eq!(facts["outcome"], serde_json::json!({ "kind": "exited", "code": 3 }));
+    let commands = commands_of(&mut reading, &mut writing, &session);
+    assert_eq!(commands[0]["outcome"], serde_json::json!({ "kind": "exited", "code": 3 }));
+    assert_eq!(commands[0]["cwd"], "/tmp");
+}
+
+/// **A wait for idle in a keyed session is the keyed marks' idle.** A prompt mark is what ends a command
+/// for a session without a key, and anything can print one; here it ends nothing, and the wait is met by
+/// the finish that carries the key.
+#[cfg(unix)]
+#[test]
+fn a_wait_for_idle_in_a_keyed_session_is_met_by_a_keyed_finish_and_by_no_forged_one() {
+    let broker = start();
+    let (mut reading, mut writing, session) = a_keyed_session(&broker);
+
+    types(&mut writing, &session, &prints(&keyed_start(1, "sleep 100")));
+    once_the_sentinel_is_printed(&mut reading);
+    ask(
+        &mut writing,
+        &format!(r#"{{"kind":"wait","session":"{session}","until":{{"kind":"idle"}},"timeout_ms":30000}}"#),
+    );
+
+    // Everything up to the sentinel is every event the forgery caused, since the screen is fed before
+    // the bytes leave: none of them may be the wait's answer
+    types(&mut writing, &session, &prints(FORGED_FINISH));
+    let mut output = String::new();
+    while !output.contains("READY") {
+        let event = next(&mut reading);
+        assert_ne!(event["kind"], "waited", "a forged finish made the session idle: {event}");
+        if event["kind"] == "output" {
+            output.push_str(event["text"].as_str().unwrap_or_default());
+        }
+    }
+
+    types(&mut writing, &session, &prints(&keyed_finish(1, "0", "/tmp")));
+    let (waited, _) = until(&mut reading, "waited");
+    assert_eq!(waited["outcome"], "MET", "the keyed finish is what makes it idle");
+}
+
+/// **A keyed session that ends says how the command its shell left running stands**, before it says it
+/// has ended: a shell told to exit begins a command and never reports its end, and a caller that was
+/// told a command started is owed how it came out.
+#[cfg(unix)]
+#[test]
+fn a_keyed_session_that_ends_reports_the_command_it_left_running_as_over_and_unknown() {
+    let broker = start();
+    let (mut reading, mut writing, session) = a_keyed_session(&broker);
+
+    types(&mut writing, &session, &prints(&keyed_start(1, "exit")));
+    once_the_sentinel_is_printed(&mut reading);
+    types(&mut writing, &session, &format!("exit{SUBMIT}"));
+
+    let (_, before) = until(&mut reading, "exited");
+    let finished: Vec<&serde_json::Value> = before.iter().filter(|event| event["kind"] == "command_finished").collect();
+    let [finished] = finished.as_slice() else { panic!("expected one command to be reported over: {before:?}") };
+    assert_eq!(finished["outcome"], serde_json::json!({ "kind": "unknown", "why": "session_ended" }));
+}
+
+/// A key that is not one is refused rather than spawned without: a session that came back unkeyed would
+/// report as vouched for what nothing vouches for.
+#[test]
+fn a_spawn_with_a_marks_key_that_is_not_one_is_refused_and_starts_nothing() {
+    let broker = start();
+    let (mut reading, mut writing) = connect(&broker);
+    ask(&mut writing, &hello(None));
+    next(&mut reading);
+
+    for not_a_key in ["", "secret", "00112233445566778899AABBCCDDEEFF", "00112233445566778899aabbccddeeff0"] {
+        let frame = serde_json::json!({
+            "kind": "spawn", "cols": 80, "rows": 24, "shell": DEFAULT_SHELL, "args": [], "env": [], "unset": [],
+            "cwd": null, "marks_key": not_a_key,
+        });
+        ask(&mut writing, &frame.to_string());
+        let failed = next(&mut reading);
+        assert_eq!((&failed["kind"], &failed["code"]), (&"failed".into(), &"MALFORMED".into()), "{not_a_key:?}");
+    }
+    ask(&mut writing, r#"{"kind":"sessions"}"#);
+    assert_eq!(until(&mut reading, "sessions").0["sessions"], serde_json::json!([]));
 }
 
 /// Greets as a given role, answering the connection and its id.

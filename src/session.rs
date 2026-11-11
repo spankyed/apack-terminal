@@ -16,12 +16,15 @@ use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_s
 
 use crate::holds::Holds;
 use crate::housekeeping::Housekeeping;
+use crate::markers::MarksKey;
 use crate::output::{Credit, Flow, Outgoing, READ_AHEAD, coalesce};
 use crate::protocol::{
     ErrorCode, Event, Foreground, ProgressState, Scope, SessionId, SessionSummary, Signal, Until, WaitOutcome,
 };
 use crate::recording;
-use crate::screen::{Colors, CommandAt, Facts, Fetched, HISTORY_LINES, ImagesAt, Match, Screen, Snapshot, Unanswered};
+use crate::screen::{
+    Colors, CommandAt, Facts, Fetched, HISTORY_LINES, ImagesAt, Match, Screen, Snapshot, Unanswered, Vouching,
+};
 use crate::tree::Tree;
 use crate::view::publish::{Outlet, ViewId};
 use crate::view::wire::{Position, Span};
@@ -606,6 +609,8 @@ pub struct Spawning {
     pub restore: bool,
     /// Whether its programs may send images (`Request::Spawn`)
     pub images: bool,
+    /// What vouches for its shell's marks, if anything does (`Request::Spawn`)
+    pub marks_key: Option<String>,
 }
 
 /// A failure a request turns into a `Failed` event rather than a panic.
@@ -774,9 +779,9 @@ impl Handle {
         foreground_of(pty.as_ref())
     }
 
-    /// What the shell has reported about itself.
-    pub fn facts(&self) -> Result<Facts, Refusal> {
-        self.on_screen(|screen| screen.facts().clone())
+    /// What the shell has reported about itself, and what vouches for it: both as of one moment.
+    pub fn facts(&self) -> Result<(Facts, Vouching), Refusal> {
+        self.on_screen(|screen| (screen.facts().clone(), screen.vouching()))
     }
 
     /// Where `text` appears in the screen and the `history` lines above it.
@@ -953,7 +958,17 @@ impl Sessions {
 
     /// Starts a shell in a new pty and begins reading it. The id is the broker's to mint.
     pub fn spawn(&self, asked: Spawning) -> Outcome {
-        let Spawning { cols, rows, shell, args, env, unset, cwd, colors, output, record, restore, images } = asked;
+        let Spawning { cols, rows, shell, args, env, unset, cwd, colors, output, record, restore, images, marks_key } =
+            asked;
+        // **Before anything is started.** A key that is not one is a request this cannot carry out as
+        // asked, and a session spawned without it would report as vouched what nothing vouches for
+        let marks_key = match marks_key {
+            Some(key) => Some(MarksKey::new(&key).ok_or_else(|| Refusal {
+                code: ErrorCode::Malformed,
+                message: format!("a marks key is {} lowercase hexadecimal characters", MarksKey::LENGTH),
+            })?),
+            None => None,
+        };
         let (cols, rows) = grid(cols, rows);
         let pty = native_pty_system()
             .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
@@ -1007,7 +1022,10 @@ impl Sessions {
 
         // **Built before the session is anybody's to ask after**, with no lock held: a screen restored
         // from a recording replays all of it, which for a long one is the work of everything it printed.
-        let mut screen = Screen::new(cols, rows);
+        let mut screen = match marks_key {
+            Some(key) => Screen::keyed(cols, rows, key),
+            None => Screen::new(cols, rows),
+        };
         if let Some(colors) = &colors {
             screen.set_colors(colors);
         }
@@ -1095,6 +1113,7 @@ impl Sessions {
         let quiet = self.housekeeping.for_session(&session, &screen);
         let waiting = Arc::clone(&waiters);
         let ending = Arc::clone(&waiters);
+        let ended = Arc::clone(&screen);
         let waited = session.clone();
         let exiting = self.events.clone();
 
@@ -1205,6 +1224,19 @@ impl Sessions {
             let _ = draining.recv_timeout(EXIT_DRAIN);
             #[cfg(not(unix))]
             drop(draining);
+            // **A command the shell left running is over, and is told before the exit is**: a shell that
+            // is told to exit begins a command and never ends it. After the last of the output, so a
+            // finish the shell did print is the one that closes it
+            let left = ended.lock().map_or_else(
+                |_| Vec::new(),
+                |mut screen| {
+                    screen.session_ended();
+                    screen.take_effects()
+                },
+            );
+            for effect in left {
+                let _ = exiting.send(Outgoing::answer(event_of(&waited, effect)));
+            }
             // **A session ending settles every wait on it**, because nothing is coming: an `Exit` wait has
             // reached what it asked for and every other has not and never will. Without this a caller
             // waiting for a prompt from a shell the user just exited waits out its whole deadline.
@@ -1323,6 +1355,8 @@ impl Sessions {
         live.process.flow.close();
         live.process.input.close();
         if let Ok(mut screen) = live.screen.lock() {
+            // Before its views are sent the screen as it ended, which says how its commands stand
+            screen.session_ended();
             screen.end_views();
             // Its reader goes on until the pty closes, and the session that replaces this one may pick its
             // recording up before then
@@ -1564,7 +1598,7 @@ fn event_of(session: &str, effect: Effect) -> Event {
             percent,
         },
         Effect::CommandStarted { command } => Event::CommandStarted { session, command },
-        Effect::CommandFinished { exit_status } => Event::CommandFinished { session, exit_status },
+        Effect::CommandFinished { outcome } => Event::CommandFinished { session, outcome: outcome.into() },
         Effect::CwdChanged(cwd) => Event::CwdChanged { session, cwd },
     }
 }

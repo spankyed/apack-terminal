@@ -13,7 +13,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
-use apack_terminal::protocol::{Event, PROTOCOL_VERSION, Request, Role, SessionSummary};
+use apack_terminal::protocol::{CommandOutcome, Event, PROTOCOL_VERSION, Request, Role, SessionSummary, Unreported};
 use apack_terminal::view::wire::{Frame, Incoming, Row, ToBroker, ToView, read_message};
 
 /// How long a wait in this file goes on with nothing arriving. **Shorter than the runner's deadline for a
@@ -134,6 +134,11 @@ impl Connection {
 
     /// A shell, with whether the broker says it is recorded and whether it was restored.
     fn spawned(&self, record: Option<&Path>, restore: bool) -> (String, bool, bool) {
+        self.spawned_with(record, restore, None)
+    }
+
+    /// The same, in a session whose marks `marks_key` vouches for when there is one.
+    fn spawned_with(&self, record: Option<&Path>, restore: bool, marks_key: Option<&str>) -> (String, bool, bool) {
         self.say(&Request::Spawn {
             cols: 60,
             rows: 8,
@@ -147,11 +152,21 @@ impl Connection {
             record: record.map(|path| path.to_str().expect("a utf-8 path").to_owned()),
             restore,
             images: false,
+            marks_key: marks_key.map(str::to_owned),
         });
         self.answer(|event| match event {
             Event::Spawned { session, recorded, restored, .. } => Some((session, recorded, restored)),
             _ => None,
         })
+    }
+
+    /// The commands a session's shell has reported, each as its line, where the shell was, and how it
+    /// ended.
+    fn commands(&self, session: &str) -> Vec<(Option<String>, Option<String>, CommandOutcome)> {
+        self.say(&Request::Commands { session: session.to_owned() });
+        let commands =
+            self.answer(|event| if let Event::Commands { commands, .. } = event { Some(commands) } else { None });
+        commands.into_iter().map(|one| (one.command, one.cwd, one.outcome)).collect()
     }
 
     /// Ends a session and waits for it to have ended.
@@ -581,6 +596,57 @@ fn a_recording_is_free_and_whole_however_its_session_ended() {
     view.until_shows("before-the-ho2lder-went");
 }
 
+/// **A restored session lists the commands of the one before it as they ended.** The recording holds
+/// the stream as it was printed — the marks the session believed and the ones it refused alike — and the
+/// key that stream was vouched with, so the commands rebuilt from it are the ones that were: a finish
+/// printed by something without the key ends nothing the second time either, and the command the last
+/// shell left running is over without having said how. The session that restores it has a key of its own.
+#[test]
+fn a_restored_keyed_session_lists_the_commands_of_the_one_before_it_as_they_ended() {
+    const FIRST: &str = "00112233445566778899aabbccddeeff";
+    const SECOND: &str = "ffeeddccbbaa99887766554433221100";
+    let start = |key: &str, number: u32, line: &str| format!("\\033]633;V;S;{number};{key};{line}\\007");
+    let finish = |key: &str, number: u32, status: u32| format!("\\033]633;V;F;{number};{key};{status};/src\\007");
+
+    let broker = Broker::start();
+    let recording = broker.recording("terminal-1");
+    let client = Connection::greeting(&broker, Role::Client);
+    let (first, ..) = client.spawned_with(Some(&recording), false, Some(FIRST));
+    let mut view = View::attached(&broker, &first);
+    view.until_shows("$ ");
+    // What a hook holding the key writes around two commands, and between them what a program without
+    // it writes to be believed: an end in each family anything can print, and a keyed one of its own
+    let forged = format!("\\033]133;D;0\\007\\033]633;D;0\\007\\033]133;A\\007{}", finish(SECOND, 1, 0));
+    view.type_line(&format!(
+        "printf '{}built\\n{forged}{}{}'; echo mar$((1+1))ked",
+        start(FIRST, 1, "make"),
+        finish(FIRST, 1, 3),
+        start(FIRST, 2, "sleep 100"),
+    ));
+    view.until_shows("mar2ked");
+    let exited_3 = (Some("make".to_owned()), Some("/src".to_owned()), CommandOutcome::Exited { code: 3 });
+    assert_eq!(
+        client.commands(&first),
+        vec![exited_3.clone(), (Some("sleep 100".to_owned()), None, CommandOutcome::Running)]
+    );
+    client.kill(&first);
+
+    let (second, recorded, restored) = client.spawned_with(Some(&recording), true, Some(SECOND));
+    assert_eq!((recorded, restored), (true, true));
+    let left_running = (Some("sleep 100".to_owned()), None, CommandOutcome::Unknown { why: Unreported::SessionEnded });
+    assert_eq!(client.commands(&second), vec![exited_3.clone(), left_running.clone()]);
+
+    // Its own shell's marks are heard with its own key, numbered from one
+    let mut view = View::attached(&broker, &second);
+    view.until_shows("$ ");
+    view.type_line(&format!("printf '{}{}'; echo mar$((2+1))ked", start(SECOND, 1, "ls"), start(FIRST, 3, "forged")));
+    view.until_shows("mar3ked");
+    assert_eq!(
+        client.commands(&second),
+        vec![exited_3, left_running, (Some("ls".to_owned()), None, CommandOutcome::Running)]
+    );
+}
+
 /// **A recording being looked through is its opener's.** Nothing else knows its id, and it is no process
 /// that would end by itself; so it ends when the connection that opened it does, and a view of it is told.
 #[test]
@@ -661,6 +727,7 @@ fn a_line_typed_and_not_entered_is_not_run_when_its_session_is_ended() {
             record: None,
             restore: false,
             images: false,
+            marks_key: None,
         });
         client.answer(|event| if let Event::Spawned { session, .. } = event { Some(session) } else { None })
     };
@@ -772,6 +839,7 @@ fn a_session_whose_program_ignores_a_hangup_is_ended_all_the_same() {
         record: None,
         restore: false,
         images: false,
+        marks_key: None,
     });
     let session = client.answer(|event| if let Event::Spawned { session, .. } = event { Some(session) } else { None });
     // Shown once the hangup is being ignored
@@ -813,6 +881,7 @@ fn a_job_in_a_group_of_its_own_ends_with_a_shell_that_had_to_be_killed() {
         record: None,
         restore: false,
         images: false,
+        marks_key: None,
     });
     let session = client.answer(|event| if let Event::Spawned { session, .. } = event { Some(session) } else { None });
     View::attached(&broker, &session).until_shows("rea2dy");

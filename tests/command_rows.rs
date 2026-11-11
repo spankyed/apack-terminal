@@ -6,6 +6,7 @@
 
 use std::sync::mpsc::{Receiver, channel};
 
+use apack_terminal::commands::Outcome;
 use apack_terminal::screen::Screen;
 use apack_terminal::view::publish::ViewId;
 
@@ -25,12 +26,16 @@ fn ran(command: &str, output: &str, status: i32) -> String {
     format!("\x1b]133;A{BEL}$ \x1b]133;B{BEL}{command}\r\n\x1b]133;C{BEL}{output}\x1b]133;D;{status}{BEL}")
 }
 
-/// A command as `(command, exit status, prompt line, output line, end line)`.
+/// A command as `(command, the status it was claimed to end with, prompt line, output line, end line)`.
 type Lines = (Option<String>, Option<i32>, Option<u64>, Option<u64>, Option<u64>);
 
 fn lines(screen: &mut Screen) -> Vec<Lines> {
     let (_, commands) = screen.commands().expect("the commands read");
-    commands.into_iter().map(|one| (one.command, one.exit_status, one.prompt, one.output, one.end)).collect()
+    let claimed = |outcome: Outcome| match outcome {
+        Outcome::Claimed(status) => status,
+        _ => None,
+    };
+    commands.into_iter().map(|one| (one.command, claimed(one.outcome), one.prompt, one.output, one.end)).collect()
 }
 
 /// **The whole session in one read.** Three commands and their prompts arrive as a single chunk, so the

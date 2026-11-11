@@ -1,7 +1,7 @@
 // Sessions on a broker, as a view sees them: frames routed to the view that attached, questions matched to
 // their answers, and everyone told when a session or the connection ends.
 import { describe, expect, it } from 'vitest'
-import { BrokerViews, MAX_MESSAGE_BYTES, TooLarge, Unanswered, type Frame } from '../src/index.ts'
+import { BrokerViews, MAX_MESSAGE_BYTES, TooLarge, Unanswered, type Command, type Frame } from '../src/index.ts'
 import { FakeBroker } from './_broker.ts'
 import { frame, row } from './_support.ts'
 
@@ -333,7 +333,7 @@ describe('an ending', () => {
 })
 
 describe('the commands of a session', () => {
-  const ran = { id: 4, command: 'make', cwd: '/src', startedMs: 10, finishedMs: 20, exitStatus: -2, prompt: 7, output: 8, end: 12 }
+  const ran: Command = { id: 4, command: 'make', cwd: '/src', startedMs: 10, finishedMs: 20, outcome: { kind: 'exited', code: -2 }, prompt: 7, output: 8, end: 12 }
 
   it('are answered with the lines each is on', async () => {
     const { broker, source } = attached()

@@ -4,6 +4,7 @@
 //! whole. So these drive a `Screen`: what is being claimed is that a session ends up knowing what the shell
 //! said, not that some scanner found a marker.
 
+use apack_terminal::commands::Outcome;
 use apack_terminal::markers::PAYLOAD_CAP;
 use apack_terminal::screen::{Facts, Screen};
 use apack_terminal::vt::Effect;
@@ -31,23 +32,23 @@ fn reads_the_markers_a_prompt_and_a_command_emit() {
         effects_after(&stream),
         vec![
             Effect::CommandStarted { command: Some("ls -la".to_owned()) },
-            Effect::CommandFinished { exit_status: Some(0) },
+            Effect::CommandFinished { outcome: Outcome::Claimed(Some(0)) },
         ]
     );
     let facts = facts_after(&stream);
     assert_eq!(
-        (facts.command.as_deref(), facts.running, facts.exit_status, facts.finished),
-        (Some("ls -la"), false, Some(0), 1)
+        (facts.command.as_deref(), facts.running, facts.outcome, facts.finished),
+        (Some("ls -la"), false, Some(Outcome::Claimed(Some(0))), 1)
     );
 }
 
 /// A shell that reports no status is reporting that it has none, which is not the same as zero.
 #[test]
 fn tells_a_missing_status_from_a_zero_one() {
-    let ended = |finish: &str| facts_after(&format!("\x1b]633;C{BEL}\x1b]633;{finish}{BEL}")).exit_status;
-    assert_eq!(ended("D"), None);
-    assert_eq!(ended("D;0"), Some(0));
-    assert_eq!(ended("D;130"), Some(130));
+    let ended = |finish: &str| facts_after(&format!("\x1b]633;C{BEL}\x1b]633;{finish}{BEL}")).outcome;
+    assert_eq!(ended("D"), Some(Outcome::Claimed(None)));
+    assert_eq!(ended("D;0"), Some(Outcome::Claimed(Some(0))));
+    assert_eq!(ended("D;130"), Some(Outcome::Claimed(Some(130))));
 }
 
 #[test]
@@ -84,8 +85,8 @@ fn reads_the_same_markers_however_the_stream_is_chunked() {
     let stream = format!("\x1b]633;E;make test{BEL}\x1b]633;C{BEL}ok\r\n\x1b]633;D;2{BEL}\x1b]633;P;Cwd=/srv{BEL}");
     let whole = facts_after(&stream);
     assert_eq!(
-        (whole.command.as_deref(), whole.exit_status, whole.cwd.as_deref()),
-        (Some("make test"), Some(2), Some("/srv"))
+        (whole.command.as_deref(), whole.outcome, whole.cwd.as_deref()),
+        (Some("make test"), Some(Outcome::Claimed(Some(2))), Some("/srv"))
     );
 
     let bytes = stream.as_bytes();

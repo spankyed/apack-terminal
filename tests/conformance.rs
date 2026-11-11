@@ -9,6 +9,7 @@
 //!
 //! What is left is what was never a comparison: the values this broker depends on, each of which a case
 //! would have to be written to notice if the core stopped answering it.
+use apack_terminal::commands::Outcome;
 use apack_terminal::screen::{Screen, TERMINFO_NAME};
 
 /// **The union of the two shell-integration families, which is the whole of D5's claim.**
@@ -28,7 +29,11 @@ fn a_shell_is_understood_whichever_integration_it_speaks() {
         assert!(screen.facts().running, "OSC {family}'s command start was not read");
         screen.feed(finish);
         assert!(!screen.facts().running, "OSC {family}'s command end was not read");
-        assert_eq!(screen.facts().exit_status, Some(3), "OSC {family} reported a status and it was lost");
+        assert_eq!(
+            screen.facts().outcome,
+            Some(Outcome::Claimed(Some(3))),
+            "OSC {family} reported a status and it was lost"
+        );
     }
 }
 
@@ -62,7 +67,11 @@ fn a_command_that_ended_without_saying_how_reports_no_status() {
     for family in ["633", "133"] {
         let mut screen = Screen::new(20, 4);
         screen.feed(format!("\x1b]{family};C\x07\x1b]{family};D\x07").replace("\\x1b", "\x1b").as_bytes());
-        assert_eq!(screen.facts().exit_status, None, "OSC {family}: no status is not a zero status");
+        assert_eq!(
+            screen.facts().outcome,
+            Some(Outcome::Claimed(None)),
+            "OSC {family}: no status is not a zero status"
+        );
     }
 }
 

@@ -9,6 +9,7 @@
 //! - **No bytes get anything but a message or a refusal.** Arbitrary bodies, and valid ones cut short or
 //!   with one byte changed, never panic and never allocate from a count the payload could not hold.
 
+use apack_terminal::protocol::{CommandOutcome, Unreported};
 use apack_terminal::view::wire::{
     Block, Color, ColorChanges, CommandRow, Cursor, Frame, FrameHead, Glyph, Incoming, MAX_MESSAGE_BYTES, Malformed,
     Placement, Position, Row, Rows, Span, Style, ToBroker, ToView, TooLong, body, frame, read_message, write_row,
@@ -74,16 +75,35 @@ fn span() -> impl Strategy<Value = Span> {
     (position(), position()).prop_map(|(start, end)| Span { start, end })
 }
 
-/// A command with any of its fields present or absent, and a status of either sign.
+/// How a command ended: each kind there is, with a status of either sign where one is carried.
+fn outcome() -> impl Strategy<Value = CommandOutcome> {
+    prop_oneof![
+        Just(CommandOutcome::Running),
+        any::<i32>().prop_map(|code| CommandOutcome::Exited { code }),
+        prop_oneof![Just(Unreported::NoStatus), Just(Unreported::Superseded), Just(Unreported::SessionEnded)]
+            .prop_map(|why| CommandOutcome::Unknown { why }),
+        prop::option::of(any::<i32>()).prop_map(|code| CommandOutcome::Claimed { code }),
+    ]
+}
+
+/// A command with any of its fields present or absent, ended any way one can.
 fn command() -> impl Strategy<Value = CommandRow> {
     (
         any::<u64>(),
         (prop::option::of(".{0,12}"), prop::option::of("[a-z/]{0,12}")),
-        (prop::option::of(any::<u64>()), prop::option::of(any::<u64>()), prop::option::of(any::<i32>())),
+        (prop::option::of(any::<u64>()), prop::option::of(any::<u64>()), outcome()),
         (prop::option::of(any::<u64>()), prop::option::of(any::<u64>()), prop::option::of(any::<u64>())),
     )
-        .prop_map(|(id, (command, cwd), (started_ms, finished_ms, exit_status), (prompt, output, end))| {
-            CommandRow { id, command, cwd, started_ms, finished_ms, exit_status, prompt, output, end }
+        .prop_map(|(id, (command, cwd), (started_ms, finished_ms, outcome), (prompt, output, end))| CommandRow {
+            id,
+            command,
+            cwd,
+            started_ms,
+            finished_ms,
+            outcome,
+            prompt,
+            output,
+            end,
         })
 }
 
@@ -352,6 +372,32 @@ fn a_glyph_naming_a_style_the_block_lacks_is_refused() {
     // style's index: the row has no style but the plain one, so the first is one it lacks
     forged[13] = 1;
     assert_eq!(ToView::decode(&forged), Err(Malformed::Value("a style's index")));
+}
+
+/// How a command ended is a kind of its own for each way there is, and a byte that is none of them is
+/// refused rather than read as the nearest: a status that was only claimed is never one wrong byte from
+/// reading as an exit.
+#[test]
+fn a_command_that_ended_no_way_the_format_defines_is_refused() {
+    let commands = |outcome| {
+        let command = CommandRow { id: 1, outcome, ..CommandRow::default() };
+        let listed = ToView::Commands { channel: 0, request: 0, epoch: 0, commands: vec![command] };
+        body(&listed.encode().expect("a message")).to_vec()
+    };
+    // kind, channel, request, epoch, how many, id, which fields, then how it ended
+    let mut forged = commands(CommandOutcome::Running);
+    forged[7] = 5;
+    assert_eq!(ToView::decode(&forged), Err(Malformed::Value("how a command ended")));
+
+    // And then why its end is unknown
+    let mut forged = commands(CommandOutcome::Unknown { why: Unreported::NoStatus });
+    forged[8] = 3;
+    assert_eq!(ToView::decode(&forged), Err(Malformed::Value("why a command's end is unknown")));
+
+    // A field the format does not have is not skipped over
+    let mut forged = commands(CommandOutcome::Running);
+    forged[6] = 0x80;
+    assert_eq!(ToView::decode(&forged), Err(Malformed::Value("a command's fields")));
 }
 
 #[test]

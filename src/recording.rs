@@ -1,7 +1,8 @@
 //! A session's recording: what its program wrote, as a file a later session or a rewind reads.
 //!
 //! **A log of what arrived, with the screen written out whole every so often.** Each entry is one thing
-//! that happened to the terminal — bytes from the pty, a resize — stamped with when. Replaying them all
+//! that happened to the terminal — bytes from the pty, a resize, a change of what vouches for the shell's
+//! marks — stamped with when. Replaying them all
 //! from an empty terminal reproduces the session exactly, and costs everything it ever printed; so every
 //! `KEYFRAME_EVERY` bytes the terminal is written out as the sequences that redraw it (a *keyframe*), and a
 //! replay starts from the last one before the moment it wants. That bounds a replay's work by the distance
@@ -13,6 +14,12 @@
 //!
 //! **What is recorded is everything the program printed**, including what it printed and then erased. It
 //! is opt-in per session for that reason, and the file is readable by its owner alone.
+//!
+//! **And the key its shell's marks were vouched with** (`Entry::Marks`), for a session that had one. The
+//! stream holds the marks as they were printed, and a replay rebuilds the session's commands from them:
+//! read with the key and the numbering they were written under, what was refused then is refused again
+//! and what was recorded is recorded as it was. The key is in every mark the stream holds already, so
+//! the file keeps no secret the stream did not.
 //!
 //! **The file is written by a thread of its own** (`Recorder`), so a disk that is slow holds up no
 //! session: what the terminal's reader does is hand an entry over, and it waits for that thread at no
@@ -42,6 +49,8 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::markers::MarksKey;
+
 /// How many bytes a program writes between two keyframes: what a replay feeds at most, after the keyframe.
 pub const KEYFRAME_EVERY: u64 = 1 << 20;
 
@@ -58,6 +67,7 @@ pub const BACKLOG: usize = 16 << 20;
 const KEYFRAME: u8 = 1;
 const OUTPUT: u8 = 2;
 const RESIZE: u8 = 3;
+const MARKS: u8 = 4;
 
 /// Kind, time and payload length.
 const HEADER: usize = 1 + 8 + 4;
@@ -76,6 +86,13 @@ pub enum Entry {
     Resize {
         cols: u16,
         rows: u16,
+    },
+    /// What vouches for the shell's marks in the output that follows: the key they must carry and the
+    /// number of the last start accepted under it, or no key, where every marker was believed. Absent
+    /// from a recording's beginning, no key vouches.
+    Marks {
+        key: Option<MarksKey>,
+        last: u64,
     },
 }
 
@@ -104,6 +121,17 @@ fn encode(kind: u8, at: u64, payload: &[&[u8]]) -> Vec<u8> {
     bytes
 }
 
+/// What a marks entry's payload says: the last number, then the key or nothing. `None` for a payload
+/// that is neither.
+fn marks(payload: &[u8]) -> Option<Entry> {
+    let last = u64::from_le_bytes(payload.get(0..8)?.try_into().ok()?);
+    let key = match &payload[8..] {
+        [] => None,
+        key => Some(MarksKey::new(std::str::from_utf8(key).ok()?)?),
+    };
+    Some(Entry::Marks { key, last })
+}
+
 fn size(payload: &[u8]) -> Option<(u16, u16)> {
     let cols = u16::from_le_bytes(payload.get(0..2)?.try_into().ok()?);
     let rows = u16::from_le_bytes(payload.get(2..4)?.try_into().ok()?);
@@ -116,6 +144,7 @@ fn length(entry: &Entry) -> u64 {
         Entry::Keyframe { redraw, .. } => 4 + redraw.len(),
         Entry::Output(bytes) => bytes.len(),
         Entry::Resize { .. } => 4,
+        Entry::Marks { key, .. } => 8 + key.as_ref().map_or(0, |key| key.as_str().len()),
     };
     (HEADER + payload) as u64
 }
@@ -143,6 +172,10 @@ pub fn decode(bytes: &[u8]) -> Vec<Timed> {
                 Some((cols, rows)) => Entry::Resize { cols, rows },
                 None => break,
             },
+            MARKS => match marks(payload) {
+                Some(entry) => entry,
+                None => break,
+            },
             _ => break,
         };
         entries.push(Timed { at, entry });
@@ -158,6 +191,18 @@ pub fn read(path: &Path) -> Vec<Timed> {
         Ok(_) => decode(&bytes),
         Err(_) => Vec::new(),
     }
+}
+
+/// Whether the last stretch of a recording's stream was vouched with a key.
+pub fn ends_vouched(entries: &[Timed]) -> bool {
+    entries
+        .iter()
+        .rev()
+        .find_map(|timed| match &timed.entry {
+            Entry::Marks { key, .. } => Some(key.is_some()),
+            _ => None,
+        })
+        .unwrap_or(false)
 }
 
 /// Where a replay to `until` starts and ends: the last keyframe at or before it, and one past the last
@@ -202,6 +247,7 @@ impl Index {
             let length = u64::from(u32::from_le_bytes(header[9..13].try_into().unwrap_or_default()));
             let whole = match header[0] {
                 KEYFRAME | RESIZE => length >= 4,
+                MARKS => length == 8 || length == (8 + MarksKey::LENGTH) as u64,
                 OUTPUT => true,
                 _ => false,
             };
@@ -626,7 +672,7 @@ impl Recorder {
                     recorder.since_keyframe = 0;
                 }
                 Entry::Output(output) => recorder.since_keyframe += output.len() as u64,
-                Entry::Resize { .. } => {}
+                Entry::Resize { .. } | Entry::Marks { .. } => {}
             }
             offset += length(&timed.entry);
             // What is recorded from here on happened after everything already there
@@ -676,6 +722,11 @@ impl Recorder {
 
     pub fn resize(&mut self, cols: u16, rows: u16) -> std::io::Result<()> {
         self.append(RESIZE, &[&cols.to_le_bytes(), &rows.to_le_bytes()])
+    }
+
+    /// Records what vouches for the shell's marks in the output recorded after this (`Entry::Marks`).
+    pub fn marks(&mut self, key: Option<&MarksKey>, last: u64) -> std::io::Result<()> {
+        self.append(MARKS, &[&last.to_le_bytes(), key.map_or("", MarksKey::as_str).as_bytes()])
     }
 
     /// Whether enough has been written since the last keyframe for another, or none has been written yet.

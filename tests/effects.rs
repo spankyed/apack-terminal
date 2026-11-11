@@ -3,6 +3,7 @@
 //! Each of these is read by the core and handed on. None is drawn, and none is acted on here: a title is
 //! for whatever labels the session, a clipboard write is for whoever decides the person meant it.
 
+use apack_terminal::commands::Outcome;
 use apack_terminal::screen::Screen;
 use apack_terminal::vt::{Effect, Progress};
 
@@ -100,13 +101,13 @@ fn a_command_starting_and_ending_are_pushed_once_each() {
     let stream = b"\x1b]133;A\x07$ \x1b]133;B\x07true\r\n\x1b]133;C\x07\x1b]133;D;1\x07\x1b]133;A\x07$ ";
     assert_eq!(
         effects_after(stream),
-        vec![Effect::CommandStarted { command: None }, Effect::CommandFinished { exit_status: Some(1) }],
+        vec![Effect::CommandStarted { command: None }, Effect::CommandFinished { outcome: Outcome::Claimed(Some(1)) }],
         "the prompt after a reported end is the same command"
     );
     // A prompt with no end reported still ends what was running, with no status rather than a zero
     assert_eq!(
         effects_after(b"\x1b]133;C\x07\x1b]133;A\x07"),
-        vec![Effect::CommandStarted { command: None }, Effect::CommandFinished { exit_status: None }]
+        vec![Effect::CommandStarted { command: None }, Effect::CommandFinished { outcome: Outcome::Claimed(None) }]
     );
 }
 

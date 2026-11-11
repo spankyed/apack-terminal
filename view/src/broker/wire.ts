@@ -18,6 +18,7 @@ import {
   paletteColor,
   type Color,
   type Command,
+  type CommandOutcome,
   type Cursor,
   type Frame,
   type KeyInput,
@@ -36,6 +37,9 @@ import {
 
 /** The largest message either side may send, as the broker has it */
 export const MAX_MESSAGE_BYTES = 8 << 20
+
+/** Why a command's end is unknown, in the order the broker numbers them */
+const UNREPORTED = ['no_status', 'superseded', 'session_ended'] as const
 
 /** What a view sends. `channel` is the number the view gave the session when it attached */
 export type ToBroker =
@@ -312,24 +316,48 @@ class Reader {
     return { start: this.position(), end: this.position() }
   }
 
-  /** A command: a byte saying which of its fields it has, then those fields in order */
+  /**
+   * A command: a byte saying which of its optional fields it has, then those fields in order, with how
+   * it ended between its times and its lines
+   */
   command(): Command {
     const id = this.number()
     const has = this.byte()
+    if (has >= 128) throw new Malformed("a command's fields are outside what the format defines")
     const text = (bit: number) => (has & bit ? this.text() : null)
     const number = (bit: number) => (has & bit ? this.number() : null)
     const command = text(1)
     const cwd = text(2)
     const startedMs = number(4)
     const finishedMs = number(8)
-    let exitStatus: number | null = null
-    if (has & 16) {
-      // Zigzag, as the broker writes it: the low bit is the sign
-      const zigzag = this.number()
-      if (zigzag > 0xffffffff) throw new Malformed('an integer did not fit its field')
-      exitStatus = zigzag % 2 === 0 ? zigzag / 2 : -(zigzag + 1) / 2
+    const outcome = this.outcome()
+    return { id, command, cwd, startedMs, finishedMs, outcome, prompt: number(16), output: number(32), end: number(64) }
+  }
+
+  /**
+   * How a command ended: a byte saying which kind, then what that kind carries. A byte that is no kind
+   * is refused rather than read as the nearest, so a status that was claimed is never taken for an exit.
+   */
+  outcome(): CommandOutcome {
+    switch (this.byte()) {
+      case 0: return { kind: 'running' }
+      case 1: return { kind: 'exited', code: this.status() }
+      case 2: {
+        const why = UNREPORTED[this.byte()]
+        if (!why) throw new Malformed("why a command's end is unknown is outside what the format defines")
+        return { kind: 'unknown', why }
+      }
+      case 3: return { kind: 'claimed', code: null }
+      case 4: return { kind: 'claimed', code: this.status() }
+      default: throw new Malformed('how a command ended is outside what the format defines')
     }
-    return { id, command, cwd, startedMs, finishedMs, exitStatus, prompt: number(32), output: number(64), end: number(128) }
+  }
+
+  /** An exit status. Zigzag, as the broker writes it: the low bit is the sign */
+  status(): number {
+    const zigzag = this.number()
+    if (zigzag > 0xffffffff) throw new Malformed('an integer did not fit its field')
+    return zigzag % 2 === 0 ? zigzag / 2 : -(zigzag + 1) / 2
   }
 
   color(): Color {

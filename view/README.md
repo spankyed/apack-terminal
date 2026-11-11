@@ -61,7 +61,10 @@ module and its declarations.
 - **Asks the source what only it knows**: the word or line at a cell, the text of a selection, where a
   string appears (`find`, `findNext`), the commands a shell marked (`commands`, `scrollToCommand`,
   `selectOutput`) and where images are.
-- **Marks commands** in a gutter where the host gives it one, coloured by how each ended.
+- **Marks commands** in a gutter where the host gives it one, coloured by how each ended — and by who
+  said so. Green is an exit status of zero that a mark carrying the session's key reported, and nothing
+  else is green: a command whose end nothing believable reported is grey, and a status that was only
+  claimed, which is all a session without a key has, is yellow where it is zero and red where it is not.
 - **Draws images** a program placed: their pixels are fetched once per generation and drawn under or over
   the text as the program asked, scaled from the cell the terminal measured them in to the cell drawn.
 - **Confirms a paste** the source says could run a command, through the host's `confirmPaste`.

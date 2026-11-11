@@ -10,11 +10,17 @@
 //! and the terminal stops its parse at each one (`Screen::feed`), so the cursor is exactly where it was
 //! when the marker was written — not wherever the rest of that read left it.
 //!
+//! **How a command ended is one value, and it says who said so** (`Outcome`). A status a keyed mark
+//! carried is an exit code; a status anything could have printed is a claim of one, and no reader of a
+//! record is handed the second where it asked for the first.
+//!
 //! This holds the bookkeeping and nothing of the terminal: `M` is whatever marks a row, which is the
 //! core's own tracked reference in a session and a plain number in this module's cases.
 
 use std::collections::VecDeque;
 use std::time::SystemTime;
+
+use crate::markers::{ExitCode, Said, Vouched};
 
 /// How many commands a session remembers. The oldest goes when a new one arrives past this.
 pub const COMMANDS_KEPT: usize = 256;
@@ -30,19 +36,43 @@ pub enum Moment {
     End,
 }
 
+/// How a command ended, or that it has not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// It has not ended.
+    Running,
+    /// It exited with this status, said by a mark that carried the session's key.
+    Exited(ExitCode),
+    /// It is over, and nothing that could be believed said how.
+    Unknown(Unknown),
+    /// Something printed that it ended, with this status where it gave one. What a session spawned
+    /// without a key has for every command that ended: a claim, which is not a status.
+    Claimed(Option<i32>),
+}
+
+/// Why a keyed session's command is over without an exit status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unknown {
+    /// The shell reported its end and had no status to give.
+    NoStatus,
+    /// A later command began while it was still running: its end was never reported.
+    Superseded,
+    /// The session ended while it was running.
+    SessionEnded,
+}
+
 /// One command, as far as the shell has reported it.
 pub struct Command<M> {
     /// Counts from one, and is never reused in a session
     pub id: u64,
     /// The line the shell read, where it said
     pub command: Option<String>,
-    /// Where the shell was when it began
+    /// Where the shell was: when the command began, as a session without a key hears it, and when it
+    /// ended, which is what a keyed finish carries
     pub cwd: Option<String>,
     pub started: Option<SystemTime>,
     pub finished: Option<SystemTime>,
-    /// Absent while it runs, and when the shell reported none: a shell that says nothing about how a
-    /// command ended is not saying it succeeded
-    pub exit_status: Option<i32>,
+    pub outcome: Outcome,
     pub prompt: Option<M>,
     pub output: Option<M>,
     pub end: Option<M>,
@@ -56,7 +86,7 @@ impl<M> Command<M> {
             cwd: None,
             started: None,
             finished: None,
-            exit_status: None,
+            outcome: Outcome::Running,
             prompt: None,
             output: None,
             end: None,
@@ -66,6 +96,81 @@ impl<M> Command<M> {
     /// The command began and has not ended.
     pub fn running(&self) -> bool {
         self.started.is_some() && self.finished.is_none()
+    }
+}
+
+/// What a keyed session's marks have established: nothing is running, or the command of this number is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Keyed {
+    Idle,
+    Running(u64),
+}
+
+/// What a keyed mark that was accepted did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Step {
+    /// A command began, with its line. `superseded` says one was still running, which is over without
+    /// its end ever having been reported.
+    Started { line: String, superseded: bool },
+    /// The running command ended this way, with the shell where it said.
+    Finished { outcome: Outcome, cwd: Option<String> },
+}
+
+/// A keyed session's commands as its marks number them: which is running, and the last that began.
+///
+/// **Only a `Vouched` moves it**, and a `Vouched` exists only for a mark that carried the session's key
+/// (`markers::read`). **Numbers only go up.** The key is in the terminal's own output — every mark
+/// carries it — so a log of the session shown again, or its recording printed, is a stream of marks with
+/// the right key; what makes them the past is that their numbers are not past the last one accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Machine {
+    state: Keyed,
+    /// The number of the last start accepted. Zero before any, which no shell numbers a command.
+    last: u64,
+}
+
+impl Default for Machine {
+    fn default() -> Self {
+        Self::after(0)
+    }
+}
+
+impl Machine {
+    /// A machine with nothing running, whose last accepted start was `last`.
+    pub fn after(last: u64) -> Self {
+        Self { state: Keyed::Idle, last }
+    }
+
+    /// The number of the last start accepted.
+    pub fn last(&self) -> u64 {
+        self.last
+    }
+
+    /// Takes one keyed mark, answering what it did, or nothing for a mark that is refused.
+    ///
+    /// A start is accepted when its number is past the last accepted, whatever is running: a command
+    /// still running then is over, its end unreported. A finish is accepted for the command that is
+    /// running and for no other. Everything else is refused and leaves this as it was.
+    pub fn take(&mut self, mark: Vouched) -> Option<Step> {
+        let number = mark.number();
+        match (self.state, mark.into_said()) {
+            (state, Said::Start { line }) if number > self.last => {
+                self.last = number;
+                self.state = Keyed::Running(number);
+                Some(Step::Started { line, superseded: state != Keyed::Idle })
+            }
+            (Keyed::Running(running), Said::Finish { status, cwd }) if running == number => {
+                self.state = Keyed::Idle;
+                let outcome = status.map_or(Outcome::Unknown(Unknown::NoStatus), Outcome::Exited);
+                Some(Step::Finished { outcome, cwd })
+            }
+            (Keyed::Idle | Keyed::Running(_), Said::Start { .. } | Said::Finish { .. }) => None,
+        }
+    }
+
+    /// The session is over. Answers whether a command was running, which now is not.
+    pub fn end(&mut self) -> bool {
+        std::mem::replace(&mut self.state, Keyed::Idle) != Keyed::Idle
     }
 }
 
@@ -135,7 +240,7 @@ impl<M> Commands<M> {
     /// run since — an empty line entered, a redraw — is the same command still waiting to be typed, and
     /// moves to where the prompt now is.
     pub fn prompt_started(&mut self, now: SystemTime) {
-        self.ended(None, now);
+        self.ended(Outcome::Claimed(None), None, now);
         let waiting = self.kept.back().is_some_and(|last| last.started.is_none());
         let id = if waiting { self.kept.back().map_or(0, |last| last.id) } else { self.begin().id };
         self.pending.push((id, Moment::Prompt));
@@ -158,11 +263,31 @@ impl<M> Commands<M> {
         self.changed();
     }
 
-    /// The command that was running ended. With none running there is nothing to end.
-    pub fn ended(&mut self, exit_status: Option<i32>, now: SystemTime) {
+    /// A command began with this line, as a keyed start says: a record of its own, whatever came before.
+    ///
+    /// A record still waiting at a prompt was never a command — a session without a key left it, as one
+    /// replayed from a recording does — and goes rather than being taken for this one's.
+    pub fn began(&mut self, line: String, now: SystemTime) {
+        if self.kept.back().is_some_and(|last| last.started.is_none()) {
+            self.kept.pop_back();
+        }
+        let current = self.begin();
+        current.command = Some(line);
+        current.started = Some(now);
+        let id = current.id;
+        self.pending.push((id, Moment::Output));
+        self.changed();
+    }
+
+    /// The command that was running ended this way, and where the shell was if whatever ended it said.
+    /// With none running there is nothing to end.
+    pub fn ended(&mut self, outcome: Outcome, cwd: Option<String>, now: SystemTime) {
         let Some(current) = self.kept.back_mut().filter(|last| last.running()) else { return };
         current.finished = Some(now);
-        current.exit_status = exit_status;
+        current.outcome = outcome;
+        if cwd.is_some() {
+            current.cwd = cwd;
+        }
         let id = current.id;
         self.pending.push((id, Moment::End));
         self.changed();

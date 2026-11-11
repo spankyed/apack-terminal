@@ -706,7 +706,7 @@ fn carry_out_view(
                         cwd: one.cwd,
                         started_ms: one.started_ms,
                         finished_ms: one.finished_ms,
-                        exit_status: one.exit_status,
+                        outcome: one.outcome.into(),
                         prompt: one.prompt,
                         output: one.output,
                         end: one.end,
@@ -811,16 +811,44 @@ fn nothing_left(broker: &Broker) -> bool {
 fn carry_out(live: &Sessions, connection: u64, request: Request) {
     let outcome = match request {
         Request::Hello { .. } => return,
-        Request::Spawn { cols, rows, shell, args, env, unset, cwd, colors, output, record, restore, images } => {
+        Request::Spawn {
+            cols,
+            rows,
+            shell,
+            args,
+            env,
+            unset,
+            cwd,
+            colors,
+            output,
+            record,
+            restore,
+            images,
+            marks_key,
+        } => {
             let colors = colors.map(|colors| Colors {
                 foreground: colors.foreground,
                 background: colors.background,
                 cursor: colors.cursor,
                 ansi: colors.ansi,
             });
-            live.spawn(Spawning { cols, rows, shell, args, env, unset, cwd, colors, output, record, restore, images })
-                // What it started is said by the spawn itself, ahead of anything the session can say
-                .map_err(|refusal| (None, refusal))
+            live.spawn(Spawning {
+                cols,
+                rows,
+                shell,
+                args,
+                env,
+                unset,
+                cwd,
+                colors,
+                output,
+                record,
+                restore,
+                images,
+                marks_key,
+            })
+            // What it started is said by the spawn itself, ahead of anything the session can say
+            .map_err(|refusal| (None, refusal))
         }
         Request::Write { session, text } => {
             live.handle(&session).and_then(|handle| handle.write(&text)).map_err(|refusal| (Some(session), refusal))
@@ -861,14 +889,16 @@ fn carry_out(live: &Sessions, connection: u64, request: Request) {
             // What the shell said and what the pty measures, one after the other: nothing holds the
             // process still between them, and nothing could
             match live.handle(&session).and_then(|handle| Ok((handle.facts()?, handle.foreground()))) {
-                Ok((facts, foreground)) => {
+                Ok(((facts, vouching), foreground)) => {
                     live.answer(Event::Facts {
                         session,
                         cwd: facts.cwd,
                         command: facts.command,
                         running: facts.running,
-                        exit_status: facts.exit_status,
+                        outcome: facts.outcome.map(Into::into),
                         finished: facts.finished,
+                        vouched: vouching.keyed,
+                        refused: vouching.refused,
                         foreground,
                     });
                     Ok(())
@@ -903,7 +933,7 @@ fn carry_out(live: &Sessions, connection: u64, request: Request) {
                             cwd: one.cwd,
                             started_ms: one.started_ms,
                             finished_ms: one.finished_ms,
-                            exit_status: one.exit_status,
+                            outcome: one.outcome.into(),
                         })
                         .collect(),
                 });

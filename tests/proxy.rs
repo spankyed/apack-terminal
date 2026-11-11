@@ -92,6 +92,7 @@ impl Proxy {
             record: None,
             restore: false,
             images: false,
+            marks_key: None,
         });
         loop {
             if let Event::Spawned { session, .. } = self.event() {
