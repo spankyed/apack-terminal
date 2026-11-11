@@ -90,6 +90,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup show active-toolchain
+      # **Windows builds the terminal core, because nobody publishes one for it.** The core's crate links a
+      # prebuilt library where one exists for the target — Apple and Linux — and otherwise builds Ghostty at
+      # its pinned commit with Zig, whose version has to be the one that commit wants. Without Zig on the
+      # path that build fails before a line of this repository is compiled
+      - if: runner.os == 'Windows'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
