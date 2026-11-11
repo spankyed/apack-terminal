@@ -1717,6 +1717,9 @@ fn a_pause_does_not_outlive_the_client_that_asked_for_it() {
 /// the client that asked for it has gone. The pause was that client's way of not being sent more than it
 /// could take, and it is no longer being sent anything; the client that is has asked for nothing and has
 /// no way to learn that a session it holds is not being read.
+///
+/// **POSIX only**: what fills more than one read is typed in `sh`'s syntax, as the case above is.
+#[cfg(unix)]
 #[test]
 fn a_pause_is_lifted_when_another_client_becomes_the_one_being_sent_the_output() {
     let broker = start();
