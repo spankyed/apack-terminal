@@ -6,9 +6,8 @@ changed, with their styles — and paints it. So there is one copy of a screen, 
 about is the cursor that is drawn, and a question a program asks its terminal is answered once however
 many windows are showing it.
 
-The view's half is [`apack-terminal-view`](https://github.com/spankyed/apack-terminal-view), in
-TypeScript. This is the broker's half: `src/view/wire.rs` is the bytes, `src/view/publish.rs` is what is
-sent and when.
+The view's half is the `apack-terminal-view` package in [`view/`](../../view), in TypeScript. This is
+the broker's half: `src/view/wire.rs` is the bytes, `src/view/publish.rs` is what is sent and when.
 
 ## A connection of its own
 
@@ -179,5 +178,6 @@ no place of its own and is not told. Animations are not advanced.
 `node/view-vectors.json` holds every kind of message as the bytes this encoder writes and the value they
 mean. `tests/view_vectors.rs` fails when the file is not what the encoder writes now; the view's suite
 decodes every vector for a view and encodes every one for the broker. Re-record with
-`APACK_UPDATE_VECTORS=1 cargo nextest run --test view_vectors`, read the diff, and take the file to the
-view: every line of it is a change a view has to be taught.
+`APACK_UPDATE_VECTORS=1 cargo nextest run --test view_vectors` and read the diff: every line of it is a
+change the view's codec (`view/src/broker/wire.ts`) has to be taught, in the same commit. The view's suite
+reads the file where it lies, so there is no copy of it to carry anywhere.

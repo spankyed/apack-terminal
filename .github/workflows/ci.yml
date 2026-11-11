@@ -121,10 +121,32 @@ jobs:
         run: test -x "node/apack-terminal" || test -f "node/apack-terminal.exe"
         shell: bash
 
+  # The view (`view/`): its types, its suite and the build a consumer bundles. One platform, since it is
+  # TypeScript drawing on a canvas and nothing in it asks the operating system anything. Its suite reads
+  # `node/view-vectors.json` where the broker's suite writes it, so a change to the wire that taught only
+  # one half fails here or in `platforms`, in the same run
+  view:
+    name: view (Linux x64)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: view
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
   # The one check a merge waits on: every job above passed or was skipped (a documentation-only change)
   ci-pass:
     if: always()
-    needs: [changes, checks, platforms]
+    needs: [changes, checks, platforms, view]
     runs-on: ubuntu-24.04
     steps:
       - env:

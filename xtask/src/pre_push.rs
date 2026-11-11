@@ -48,6 +48,12 @@ const FIRST: &[Step] = &[
 const THEN: &[Step] = &[
     step("tests", &["cargo", "nextest", "run", "--workspace"]),
     step("doc tests", &["cargo", "test", "--workspace", "--doc"]),
+    // The view (`view/`), which is npm's rather than cargo's: its suite reads the vectors the tests above
+    // hold to the encoder, so it runs after them. Installed from its lockfile, as CI installs it
+    step("view: locked dependencies", &["npm", "--prefix", "view", "ci", "--no-audit", "--no-fund"]),
+    step("view: types", &["npm", "--prefix", "view", "run", "typecheck"]),
+    step("view: tests", &["npm", "--prefix", "view", "test"]),
+    step("view: build", &["npm", "--prefix", "view", "run", "build"]),
 ];
 
 /// A repository check this task runs in-process, by the name it prints
