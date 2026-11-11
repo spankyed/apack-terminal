@@ -97,6 +97,11 @@ fn decode_png_into<'a>(encoded: &[u8], allocate: impl FnOnce(usize) -> Option<&'
     let rgba = allocate(pixels * 4).filter(|buffer| buffer.len() == pixels * 4)?;
     let frame = reader.next_frame(&mut rgba[..decoded]).ok()?;
     match frame.color_type {
+        // **Each arm asks again what the decoder has already refused.** A frame smaller than the picture is
+        // an animation's, and the decoder rejects one whose first frame is not the whole of it — so
+        // neither guard is false for any file it accepts. They are here because what is decoded is
+        // whatever a program wrote, and the buffer below is read as a whole picture: a decoder that came
+        // to accept a partial frame would otherwise leave the rest of it holding whatever was there
         png::ColorType::Rgba if frame.buffer_size() == pixels * 4 => {}
         png::ColorType::GrayscaleAlpha if frame.buffer_size() == pixels * 2 => {
             // From the last pixel back: a pixel's four bytes land at or after its two, so nothing still
@@ -263,14 +268,6 @@ impl Terminal {
             let result = unsafe { sys::ghostty_kitty_graphics_placement_get(iterator, data, (&raw mut value).cast()) };
             (result == sys::Result::SUCCESS).then_some(value)
         };
-        let mut virtual_placement = false;
-        // SAFETY: IS_VIRTUAL writes a `bool`
-        let result = unsafe {
-            sys::ghostty_kitty_graphics_placement_get(iterator, Data::IS_VIRTUAL, (&raw mut virtual_placement).cast())
-        };
-        if result != sys::Result::SUCCESS || virtual_placement {
-            return None;
-        }
         let id = read_u32(Data::IMAGE_ID)?;
         // SAFETY: the storage is this terminal's; a null image is one that is gone
         let image = unsafe { sys::ghostty_kitty_graphics_image(graphics, id) };
@@ -281,6 +278,7 @@ impl Terminal {
         // SAFETY: the iterator is on a placement, the image is its own, and `rectangle` is a valid out-pointer
         let placed =
             unsafe { sys::ghostty_kitty_graphics_placement_rect(iterator, image, self.handle, &raw mut rectangle) };
+        // The core has no rectangle for a virtual placement, which is how one is left out
         if placed != sys::Result::SUCCESS {
             return None;
         }

@@ -299,7 +299,7 @@ pub struct Recorder {
 /// reading from under it. Written beside and renamed over, the old file is whoever has it open's until
 /// they close it.
 fn create(path: &Path) -> std::io::Result<File> {
-    if let Some(directory) = path.parent().filter(|directory| !directory.as_os_str().is_empty()) {
+    if let Some(directory) = path.parent() {
         std::fs::create_dir_all(directory)?;
     }
     let beside = beside(path);

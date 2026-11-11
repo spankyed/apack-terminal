@@ -22,7 +22,7 @@
 use std::sync::mpsc::Sender;
 
 use super::wire::{self, ColorChanges, Cursor, FrameHead, Rows, ToView};
-use crate::vt::rows::{Changed, Mark, Rendering, RowRead, Space};
+use crate::vt::rows::{Mark, Rendering, RowRead, Space};
 use crate::vt::{Failed, Terminal};
 
 /// DEC private mode 5: the screen is drawn with its default foreground and background swapped.
@@ -243,7 +243,8 @@ impl Publication {
     /// with, and the next read starts from nothing.
     fn capture(&mut self, terminal: &Terminal, commands: u32) -> Result<(), Failed> {
         self.advance(terminal)?;
-        let looked = self.rendering.look(terminal, &mut self.changed)?;
+        // A flag for each row the core answers for by itself, and none when it says everything changed
+        self.rendering.look(terminal, &mut self.changed)?;
 
         let next = self.sequence + 1;
         let rows = usize::from(self.rows);
@@ -252,15 +253,17 @@ impl Publication {
         // view has to hear of: it is holding lines that are gone. A screen that scrolled needs no saying
         // so here: its last rows are on lines nothing was held for, and are new whatever they hold
         let mut changed = self.scrollback != self.captured_scrollback;
-        let in_place = looked == Changed::Rows && shift == 0 && self.active.len() == rows && self.changed.len() == rows;
         let mut before: Vec<Option<Held>> = std::mem::take(&mut self.active).into_iter().map(Some).collect();
         let mut active = Vec::with_capacity(rows);
         for index in 0..rows {
             let was = shift.checked_add(index).and_then(|was| before.get_mut(was)).and_then(Option::take);
             let was = match was {
+                // The core's flag is of the row at this place on the screen, and what is held is the row
+                // that was on this line: the same row only while nothing has scrolled. `shift` is this
+                // file's own count of what did, kept beside the core's word: it flags no row once any has
                 Some(held)
-                    if in_place
-                        && !self.changed[index]
+                    if shift == 0
+                        && self.changed.get(index) == Some(&false)
                         && terminal.row_flags(Space::Active, index as u32)? == held.body.first().copied() =>
                 {
                     active.push(held);
@@ -546,16 +549,13 @@ impl Publication {
         self.stale = true;
         let captured = self.capture(terminal, commands).is_ok();
         for index in 0..self.viewers.len() {
-            // As many frames as the screen takes, which is one unless it is longer than a message
-            let mut frames = 0;
+            // As many frames as the screen takes, which is one unless it is longer than a message. A frame
+            // cut short still carries a row (`Rows::takes`), so each leaves fewer to send and one is the last
             while captured
-                && frames <= usize::from(self.rows) * 2
                 && !self.viewers[index].gone
                 && self.behind(&self.viewers[index])
                 && self.send_frame(terminal, index).is_ok()
-            {
-                frames += 1;
-            }
+            {}
             let viewer = &self.viewers[index];
             if let Ok(ended) = (ToView::Ended { channel: viewer.id.channel }).encode() {
                 viewer.outlet.deliver(ended);

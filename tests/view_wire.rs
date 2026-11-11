@@ -11,7 +11,7 @@
 
 use apack_terminal::view::wire::{
     Block, Color, ColorChanges, CommandRow, Cursor, Frame, FrameHead, Glyph, Incoming, MAX_MESSAGE_BYTES, Malformed,
-    Placement, Position, Row, Rows, Span, Style, ToBroker, ToView, TooLong, body, frame, read_message,
+    Placement, Position, Row, Rows, Span, Style, ToBroker, ToView, TooLong, body, frame, read_message, write_row,
 };
 use proptest::prelude::*;
 
@@ -415,14 +415,28 @@ fn a_number_with_more_than_sixty_four_bits_is_refused() {
     assert_eq!(ToBroker::decode(&forged), Err(Malformed::Overflow));
 }
 
-/// **A message longer than a view reads is not made.** Whatever asked for it is told how long it came to,
-/// and nothing is written with a length a view would have to hang up on.
+/// **A message longer than a view reads is not made, and one exactly as long as a view reads is.**
+/// Whatever asked for the longer one is told how long it came to and how long a message may be, and
+/// nothing is written with a length a view would have to hang up on.
 #[test]
 fn an_answer_longer_than_a_message_is_refused_rather_than_written() {
-    let within = ToView::Text { channel: 1, request: 2, epoch: 3, text: "x".repeat(MAX_MESSAGE_BYTES - 64) };
-    assert!(within.encode().is_ok_and(|encoded| encoded.len() <= MAX_MESSAGE_BYTES + 4));
-    let past = ToView::Text { channel: 1, request: 2, epoch: 3, text: "x".repeat(MAX_MESSAGE_BYTES) };
-    assert_eq!(past.encode(), Err(TooLong(MAX_MESSAGE_BYTES + 8)));
+    // A text's kind, channel, request, epoch and its own length are eight bytes of its message
+    let at_the_cap = ToView::Text { channel: 1, request: 2, epoch: 3, text: "x".repeat(MAX_MESSAGE_BYTES - 8) };
+    let written = at_the_cap.encode().expect("a message of exactly the length a view reads is one");
+    match read_message(&mut written.as_slice()) {
+        Incoming::Message(read) => assert_eq!(read.len(), MAX_MESSAGE_BYTES),
+        other => panic!("a message at the cap was {other:?}"),
+    }
+
+    let past = ToView::Text { channel: 1, request: 2, epoch: 3, text: "x".repeat(MAX_MESSAGE_BYTES - 7) };
+    let refused = past.encode().expect_err("a message a byte past the cap was written");
+    assert_eq!(refused, TooLong(MAX_MESSAGE_BYTES + 1));
+    let said = refused.to_string();
+    assert!(
+        said.contains(&(MAX_MESSAGE_BYTES + 1).to_string()) && said.contains(&MAX_MESSAGE_BYTES.to_string()),
+        "{said}"
+    );
+
     // What a view sends is written as it is: the broker reads its length first, and refuses it there
     let pasted = ToBroker::Paste { channel: 1, request: 2, allow_unsafe: false, text: "x".repeat(MAX_MESSAGE_BYTES) };
     assert!(matches!(read_message(&mut pasted.encode().as_slice()), Incoming::TooLong));
@@ -431,16 +445,31 @@ fn an_answer_longer_than_a_message_is_refused_rather_than_written() {
 /// **Rows are taken until a message is full, and full allows for everything else a frame says.** The
 /// most a frame can carry beside its rows — every number at its longest, a cursor, a line to forget
 /// from and all 256 palette entries changed with the three colours beside them — still fits with rows
-/// taken right up to where no more are.
+/// taken to the last byte that is, and what is then left of the message is nothing a row could have used.
 #[test]
-fn the_longest_head_there_is_fits_with_as_many_rows_as_are_taken() {
+fn the_longest_head_there_is_fits_with_rows_taken_to_the_last_byte() {
     let mut rows = Rows::default();
-    // Filled to within a byte of what rows may be: large bodies, then ever smaller ones
-    for body in [1usize << 20, 1 << 10, 1] {
-        while rows.takes(body) {
-            rows.push(u64::MAX, &vec![0; body]);
+    // Rows with nothing on them, enough that their count is written in three bytes: no message holds
+    // the rows it would take to make a count longer than that
+    let mut empty = Vec::new();
+    write_row(&mut empty, false, false, &Row::default());
+    for _ in 0..1 << 14 {
+        assert!(rows.takes(empty.len()));
+        rows.push(u64::MAX, &empty);
+    }
+    // And one more, as long as a row may be and still be taken: a byte longer is refused
+    let (mut taken, mut refused) = (0, MAX_MESSAGE_BYTES);
+    assert!(rows.takes(taken) && !rows.takes(refused));
+    while refused - taken > 1 {
+        let between = taken + (refused - taken) / 2;
+        if rows.takes(between) {
+            taken = between;
+        } else {
+            refused = between;
         }
     }
+    rows.push(u64::MAX, &vec![0; taken]);
+
     let colors = ColorChanges {
         foreground: Some([1, 2, 3]),
         background: Some([4, 5, 6]),
@@ -465,10 +494,12 @@ fn the_longest_head_there_is_fits_with_as_many_rows_as_are_taken() {
         colors: Some(&colors),
     };
     let message = frame(&head, &rows).expect("a frame of the rows that were taken is one that can be sent");
-    // And nothing was left on the table: the next row there is room to ask about would not have fitted
-    assert!(
-        MAX_MESSAGE_BYTES - (message.len() - 4) < 16,
-        "{} bytes of a message went unused",
-        MAX_MESSAGE_BYTES - (message.len() - 4)
-    );
+    // **Nothing was left on the table.** A count of rows may be five bytes and this one is three, so two
+    // bytes at most went unused: the row a byte longer was refused because it would not have fitted
+    // beside a count at its longest, and for no other reason
+    let unused = MAX_MESSAGE_BYTES - body(&message).len();
+    assert!(unused <= 2, "{unused} bytes of a message went unused under the longest row that was taken");
+    // A fetch says less beside its rows than a frame does, so what a frame can carry it can
+    let fetched = apack_terminal::view::wire::rows(u32::MAX, u32::MAX, u32::MAX, u64::MAX, u32::MAX, &rows);
+    assert!(fetched.is_ok_and(|answer| body(&answer).len() < body(&message).len()));
 }

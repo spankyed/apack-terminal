@@ -192,6 +192,43 @@ fn a_recording_cut_off_mid_entry_reads_up_to_it() {
     }
 }
 
+/// **Looked back through, a recording ends where its last whole entry does.** Where the keyframes are is
+/// read without reading the entries, so what counts as the recording's end is decided a second time
+/// there: an entry its writer did not finish, and one that is all there and is not an entry this reads,
+/// are each where it stops — with the moment before it still readable.
+#[test]
+fn a_recording_looked_through_ends_at_its_last_whole_entry() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let path = directory.path().join("one.recording");
+    let mut live = Screen::new(30, 6);
+    live.start_recording(&path).expect("the recording starts");
+    live.feed(b"first\r\n");
+    live.feed(b"second\r\n");
+    live.flush_recording();
+    let whole = std::fs::read(&path).expect("the recording reads");
+    let entries = recording::decode(&whole);
+    assert_eq!(entries.len(), 3);
+
+    let torn = directory.path().join("torn.recording");
+    for cut in 1..(b"second\r\n".len() + 13) {
+        std::fs::write(&torn, &whole[..whole.len() - cut]).expect("the recording is written");
+        let mut index = Index::open(&torn).expect("a recording with a keyframe");
+        assert_eq!(index.last(), entries[1].at, "cut {cut} bytes from the end");
+        assert_eq!(index.moment(u64::MAX).expect("the moment reads"), entries[..2], "cut {cut} bytes from the end");
+    }
+
+    // Something of a kind no recording holds, stamped far ahead of everything before it and with nothing
+    // in it: all of it is there, and it is not the recording's last moment
+    let mut followed = whole.clone();
+    followed.push(9);
+    followed.extend_from_slice(&u64::MAX.to_le_bytes());
+    followed.extend_from_slice(&0u32.to_le_bytes());
+    std::fs::write(&torn, &followed).expect("the recording is written");
+    let mut index = Index::open(&torn).expect("a recording with a keyframe");
+    assert_eq!(index.last(), entries[2].at);
+    assert_eq!(index.moment(u64::MAX).expect("the moment reads"), entries);
+}
+
 /// What a recorded program asked of the terminal and of the world is not asked again by a replay, and a
 /// screen made ready for a new shell is out of whatever the last one's programs left it in.
 #[test]
@@ -368,6 +405,85 @@ fn an_application_that_keeps_the_screen_does_not_grow_the_recording_without_boun
     assert!(largest < budget * 2, "the recording reached {largest} bytes on a budget of {budget}");
 }
 
+/// **A keyframe waits for the parser to be between sequences, until the recording is past twice its
+/// budget.** A program that begins a sequence and never ends it would otherwise put the keyframe off for
+/// ever, and with it the only thing that lets a recording's oldest part go. At exactly twice the budget
+/// the keyframe is still waited for; past that it is taken where the parser stands, and what came before
+/// it goes.
+#[test]
+fn a_keyframe_a_sequence_never_ends_for_is_taken_once_the_recording_is_past_twice_its_budget() {
+    let directory = tempfile::tempdir().expect("a directory");
+    // The screen as each recording below begins with it, and how long its keyframe is in the file
+    let begun = || {
+        let mut screen = Screen::new(40, 10);
+        screen.feed(&busy(30));
+        screen
+    };
+    let measured = directory.path().join("measured.recording");
+    let mut screen = begun();
+    screen.start_recording(&measured).expect("the recording starts");
+    let keyframe = length(&mut screen, &measured);
+
+    // A budget of one keyframe, and a keyframe due as soon as anything has been written
+    let path = directory.path().join("one.recording");
+    let mut live = begun();
+    live.start_recording_with(Recorder::start_with(&path, keyframe, 1).expect("the recording starts"))
+        .expect("the first keyframe is written");
+    assert_eq!(length(&mut live, &path), keyframe);
+    // A title begun and never ended, then as much of it as brings the file to twice the budget exactly:
+    // an entry is thirteen bytes and what was written
+    live.feed(b"\x1b]0;");
+    live.feed(&vec![b't'; (keyframe - (13 + 4) - 13) as usize]);
+    assert_eq!(length(&mut live, &path), keyframe * 2);
+    let entries = recorded(&mut live, &path);
+    assert!(
+        matches!(
+            entries.as_slice(),
+            [
+                Timed { entry: Entry::Keyframe { .. }, .. },
+                Timed { entry: Entry::Output(_), .. },
+                Timed { entry: Entry::Output(_), .. }
+            ]
+        ),
+        "at twice its budget, and not past it, the recording took a keyframe in the middle of a sequence"
+    );
+
+    live.feed(b"t");
+    let entries = recorded(&mut live, &path);
+    assert!(
+        matches!(entries.as_slice(), [Timed { entry: Entry::Keyframe { .. }, .. }]),
+        "{} entries: past twice its budget the recording went on waiting for a sequence to end",
+        entries.len()
+    );
+}
+
+/// **A recording that can no longer be written has stopped, and says so before anything more is fed.**
+/// Its file is written by a thread of its own, so the session learns of a failure from the recorder
+/// rather than from a write: here the file is taken from under the recording, the next keyframe finds
+/// nothing to drop the oldest part of, and the session — which carries on — is no longer a recorded one.
+#[test]
+fn a_recording_whose_file_has_gone_has_stopped_and_the_session_carries_on() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let path = directory.path().join("one.recording");
+    let mut live = Screen::new(40, 10);
+    live.feed(&busy(30));
+    // A budget the first keyframe is already past, so the next one drops everything before itself
+    live.start_recording_with(Recorder::start_with(&path, 100, 4_000).expect("the recording starts"))
+        .expect("the first keyframe is written");
+    live.flush_recording();
+    assert!(live.recorded());
+    std::fs::remove_file(&path).expect("the recording is removed");
+
+    // One read, long enough to bring the keyframe due
+    live.feed("0123456789".repeat(400).as_bytes());
+    live.flush_recording();
+    assert!(!live.recorded(), "a recording that could not be rewritten is still called one");
+
+    live.feed(b"\r\nstill here");
+    assert!(live.snapshot(0).lines.iter().any(|line| line == "still here"));
+    assert!(!live.recorded());
+}
+
 /// A recording carried on knows how much was written since its last keyframe, so the next one comes when
 /// it would have and not a whole distance later.
 #[test]
@@ -384,6 +500,50 @@ fn a_recording_carried_on_counts_what_was_written_since_its_last_keyframe() {
     assert!(!resumed.keyframe_due(), "a byte short of the distance between keyframes");
     resumed.output(b"o").expect("output is written");
     assert!(resumed.keyframe_due(), "and the byte that reaches it");
+}
+
+/// **A recording carried on is held to the budget every recording has, from where its keyframes are.**
+/// Thirty megabytes with a keyframe every twelve are picked up and written on: at exactly `BUDGET` all of
+/// it is still there, and the keyframe that puts it past drops the older half — up to the keyframe the
+/// recorder before this one wrote at twenty-four megabytes, which is the first in the newer half.
+#[test]
+fn a_recording_carried_on_past_its_budget_keeps_from_the_first_keyframe_in_its_newer_half() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let path = directory.path().join("one.recording");
+    let megabyte = vec![b'o'; 1 << 20];
+    {
+        let mut recorder = Recorder::start_with(&path, u64::MAX, u64::MAX).expect("the recording starts");
+        for (mark, megabytes) in [(b'a', 12), (b'b', 12), (b'c', 5)] {
+            // Each keyframe is 13 + 4 + 83 = 100 bytes
+            recorder.keyframe(20, 4, &[mark; 83]).expect("a keyframe is written");
+            for _ in 0..megabytes {
+                recorder.output(&megabyte).expect("output is written");
+            }
+            // Waited for a stretch at a time: what a recorder holds for a disk that is behind is bounded
+            recorder.flush();
+        }
+    }
+    let (mut resumed, entries) = Recorder::resume(&path).expect("the recording is carried on");
+    assert_eq!(entries.len(), 3 + 29);
+    drop(entries);
+    let size = |path: &Path| std::fs::metadata(path).expect("the recording is there").len();
+
+    // Output that leaves room for one keyframe and no more: thirteen bytes for the entry it is in
+    let room = recording::BUDGET - size(&path) - 100;
+    resumed.output(&vec![b'o'; (room - 13) as usize]).expect("output is written");
+    resumed.keyframe(20, 4, &[b'd'; 83]).expect("a keyframe is written");
+    resumed.flush();
+    assert_eq!(size(&path), recording::BUDGET, "a recording at its budget dropped something");
+
+    resumed.output(b"o").expect("output is written");
+    resumed.keyframe(20, 4, &[b'e'; 83]).expect("a keyframe is written");
+    drop(resumed);
+    recording::settled(&path);
+    let marks: Vec<u8> = recording::read(&path)
+        .iter()
+        .filter_map(|timed| if let Entry::Keyframe { redraw, .. } = &timed.entry { Some(redraw[0]) } else { None })
+        .collect();
+    assert_eq!(marks, b"cde");
 }
 
 /// **A file that is there and is not a recording is neither picked up nor emptied.** Carrying a recording
@@ -410,6 +570,27 @@ fn a_file_that_is_not_a_recording_is_refused_and_left_as_it_was() {
     screen.stop_recording();
     recording::settled(&empty);
     assert!(matches!(recording::read(&empty).as_slice(), [Timed { entry: Entry::Keyframe { .. }, .. }]));
+}
+
+/// **A recording that is there and cannot be read is not taken for one that is not there.** Only a path
+/// with nothing at it is a recording not yet begun; any other failure to read it is refused, with nothing
+/// written at the path or beside it. Here what is at the path is a directory.
+#[test]
+fn a_path_that_cannot_be_read_is_refused_and_nothing_is_written_at_it_or_beside_it() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let unreadable = directory.path().join("one.recording");
+    std::fs::create_dir(&unreadable).expect("the directory is made");
+    std::fs::write(unreadable.join("inside"), b"kept").expect("the file is written");
+
+    let mut screen = Screen::new(20, 4);
+    assert!(screen.resume_recording(&unreadable).is_err());
+    assert!(!screen.recorded());
+    let beside: Vec<_> = std::fs::read_dir(directory.path())
+        .expect("the directory reads")
+        .map(|entry| entry.expect("an entry reads").file_name())
+        .collect();
+    assert_eq!(beside, ["one.recording"]);
+    assert_eq!(std::fs::read(unreadable.join("inside")).expect("the file reads"), b"kept");
 }
 
 /// A recording is its owner's alone to read whether its file was made for it or was already there.

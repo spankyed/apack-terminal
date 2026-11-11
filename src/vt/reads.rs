@@ -242,7 +242,7 @@ impl Terminal {
                     break;
                 }
             }
-            if result == sys::Result::SUCCESS && total > 0 {
+            if result == sys::Result::SUCCESS {
                 // The core fills a buffer that holds every match so far or none of it, so it is given
                 // room for them all: at most what was wanted and one part's worth more
                 found.resize(total, sys::Selection::default());
