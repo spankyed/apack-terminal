@@ -744,8 +744,16 @@ fn a_second_hello_is_refused_and_changes_nothing() {
 }
 
 /// The epoch of the first frame a view is sent on attaching.
+///
+/// **The first of an attachment, which is the one that carries the colours** (`Frame::colors`), and not
+/// the next frame to arrive: a view that attaches again may still be sent a frame of the attachment it
+/// left, written before the broker read that it had gone. Nothing here changes a colour, so the frame
+/// that has them is the one a new attachment begins with.
 fn first_epoch(view: &mut View) -> u32 {
-    view.answer(|message| if let ToView::Frame(frame) = message { Some(frame.epoch) } else { None })
+    view.answer(|message| match message {
+        ToView::Frame(frame) if frame.colors.is_some() => Some(frame.epoch),
+        _ => None,
+    })
 }
 
 /// **A view that detaches is a view that has gone**, and with the last of them goes what the views were
