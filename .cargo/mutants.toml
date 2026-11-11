@@ -209,6 +209,17 @@ exclude_re = [
     "view/publish.rs:265:30: replace == with != in Publication::capture",
     "view/publish.rs:.*replace match guard shift == 0 .* with false in Publication::capture",
 
+    # **What a capture asks of a row it is about to keep unread** (the entry above): whether the row still
+    # runs on, and still is or is not the prompt's, since those change with nothing written on it
+    # (`a_row_whose_flags_changed_with_nothing_written_on_it_is_sent_again`). The first answers that there
+    # is no such row, for every row, which is the rows all read again and the same frames sent. The
+    # second answers that every row runs on and none is a prompt's: every row held as anything else is
+    # read again, and one held as exactly that is kept on the core's word alone — and of the ways such a
+    # row's flags change, the one a stream can cause, the shell marking its prompt there, the core does
+    # flag. Not proven for every way; found for none
+    "vt/rows.rs:210:.*replace != with == in Terminal::row_flags",
+    "vt/rows.rs:.*replace Terminal::row_flags -> Result<Option<u8>, Failed> with Ok\\(Some\\(1\\)\\)",
+
     # **Refusals nothing sent to a broker produces.** An attach is refused for a reason other than there
     # being no such session only when the core fails a call or a lock is poisoned, and the list of a
     # session's images is too long to send only past fifty thousand placements — which costs the core
@@ -232,6 +243,13 @@ exclude_re = [
     # screen free under all three
     "holds.rs:135:22: replace > with (==|>=) in keep",
     "holds.rs:.*replace \\+ with - in keep",
+
+    # **Who is on the other end of a pipe or a socket, which takes a second user to ask.** A broker told
+    # its pipe's name is taken is compiled only on Windows, where the suites that start two brokers do not
+    # run; and a peer that is not this user is a connection from another account, which no job here has.
+    # Both are refusals of somebody else, and are made by hand where there is a somebody else
+    "listening.rs:.*replace match guard matches!\\(error.kind\\(\\).* in listen$",
+    "listening.rs:.*replace peer_is_this_user -> io::Result<bool> with Ok\\(true\\)",
 
     # **What the decoder has already refused.** A frame smaller than its picture is an animation's, and
     # the decoder rejects one whose first frame is not the whole picture, so neither guard is false for a

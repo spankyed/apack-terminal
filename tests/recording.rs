@@ -877,6 +877,40 @@ fn a_recording_begun_where_one_is_being_looked_through_leaves_that_one_readable(
     );
 }
 
+/// **A recording holds as much as may wait for a disk that is behind, and stops a byte past it.** What
+/// waits to be written is counted as it is handed over, so one entry is the whole of the question,
+/// whatever the disk is doing at the time: an entry that is exactly as much as may wait is recorded, and
+/// one a byte longer is refused and is the end of the recording.
+#[test]
+fn an_entry_of_all_that_may_wait_is_recorded_and_a_byte_more_stops_the_recording() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let recording_of = |name: &str| directory.path().join(name);
+    let length_of = |path: &Path| {
+        recording::settled(path);
+        usize::try_from(std::fs::metadata(path).expect("the recording is there").len()).expect("a length")
+    };
+
+    // What an entry is beside the bytes it carries, read off a recording of one byte
+    let small = recording_of("small.recording");
+    let mut recorder = Recorder::start_with(&small, u64::MAX, u64::MAX).expect("the recording starts");
+    recorder.output(b"o").expect("output is taken");
+    drop(recorder);
+    let beside = length_of(&small) - 1;
+
+    let whole = recording_of("whole.recording");
+    let mut recorder = Recorder::start_with(&whole, u64::MAX, u64::MAX).expect("the recording starts");
+    recorder.output(&vec![b'o'; recording::BACKLOG - beside]).expect("an entry of all that may wait is taken");
+    assert!(!recorder.failed(), "a recording stopped at exactly what may wait for the disk");
+    drop(recorder);
+    assert_eq!(length_of(&whole), recording::BACKLOG);
+
+    let over = recording_of("over.recording");
+    let mut recorder = Recorder::start_with(&over, u64::MAX, u64::MAX).expect("the recording starts");
+    let refused = recorder.output(&vec![b'o'; recording::BACKLOG - beside + 1]);
+    assert!(refused.is_err(), "an entry a byte past what may wait for the disk was taken");
+    assert!(recorder.failed(), "and the recording carried on after it");
+}
+
 /// **A process about to exit waits for what its recorders were handed.** A recorder that is stopped
 /// leaves the last of its recording to its own thread, which ends with the process; `settle_all` is what
 /// a broker calls on its way out, and after it every recording that was stopped holds all it was given
