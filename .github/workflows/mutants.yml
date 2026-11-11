@@ -127,6 +127,11 @@ jobs:
           fi
       - if: steps.scope.outputs.code == 'true'
         run: rustup show active-toolchain
+      # The terminal core is built here, there being none published for Windows (`ci.yml`)
+      - if: steps.scope.outputs.code == 'true'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
       - if: steps.scope.outputs.code == 'true'
         uses: Swatinem/rust-cache@v2
       - if: steps.scope.outputs.code == 'true'
