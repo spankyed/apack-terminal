@@ -779,6 +779,57 @@ fn a_session_whose_program_ignores_a_hangup_is_ended_all_the_same() {
     assert_eq!((code, signal.as_deref()), (None, Some("SIGKILL")), "it was not the broker that ended it");
 }
 
+/// **And what its shell had running goes with it.** A shell that is killed passes no hangup on to its
+/// jobs, and the kernel hangs up only the foreground group, so a job in a group of its own would be left
+/// running under nothing. It is hung up before its shell is killed.
+#[test]
+fn a_job_in_a_group_of_its_own_ends_with_a_shell_that_had_to_be_killed() {
+    let broker = Broker::start();
+    let client = Connection::greeting(&broker, Role::Client);
+    let notes = tempfile::tempdir().expect("a directory for the job's pid");
+    let pid_file = notes.path().join("job.pid");
+    // A shell that takes a hangup and carries on, so it has to be killed; and under it a job that made
+    // itself a process group, as a shell with job control makes of one put in the background
+    let script = format!(
+        "trap : HUP; perl -e 'setpgrp(0, 0); sleep 300' & echo $! > {}; echo rea$((1+1))dy; while :; do sleep 1; done",
+        pid_file.display()
+    );
+    client.say(&Request::Spawn {
+        cols: 60,
+        rows: 8,
+        shell: Some("/bin/sh".to_owned()),
+        args: vec!["-c".to_owned(), script],
+        env: Vec::new(),
+        unset: Vec::new(),
+        cwd: None,
+        colors: None,
+        output: false,
+        record: None,
+        restore: false,
+        images: false,
+    });
+    let session = client.answer(|event| if let Event::Spawned { session, .. } = event { Some(session) } else { None });
+    View::attached(&broker, &session).until_shows("rea2dy");
+    let job = std::fs::read_to_string(&pid_file).expect("the job's pid").trim().to_owned();
+    let running =
+        || std::process::Command::new("kill").args(["-0", &job]).output().is_ok_and(|said| said.status.success());
+    assert!(running(), "the job {job} is running");
+
+    client.say(&Request::Kill { session: session.clone() });
+    client.answer(|event| match event {
+        Event::Exited { session: ended, .. } if ended == session => Some(()),
+        _ => None,
+    });
+
+    // A process being torn down reports nothing but its absence, so this is a count of looks and no wait
+    // on anything it does
+    let gone = (0..200).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        !running()
+    });
+    assert!(gone, "the job {job} outlived the shell it was started in");
+}
+
 /// **Asking after a recording makes nothing.** A recording that is not there is answered as not there,
 /// and the directory it would have been in is not there afterwards either.
 #[test]

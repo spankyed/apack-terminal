@@ -72,7 +72,8 @@ impl Proxy {
 
     fn greet(&mut self, role: Role) {
         self.say(&Request::Hello { protocol: PROTOCOL_VERSION, role });
-        assert!(matches!(self.event(), Event::Hello { .. }));
+        let answered = self.event();
+        assert!(matches!(answered, Event::Hello { .. }), "a greeting was answered {answered:?}");
     }
 
     fn shell(&mut self) -> String {

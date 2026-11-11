@@ -365,8 +365,16 @@ impl Terminal {
                 sys::ghostty_cell_get(cell, sys::CellData::HAS_HYPERLINK, (&raw mut linked).cast()),
             )?;
         }
-        // The cells a wide character leaves beside itself hold nothing of their own
-        if wide == sys::CellWide::SPACER_TAIL || wide == sys::CellWide::SPACER_HEAD {
+        // The second cell of a wide character is that character's, and holds nothing of its own.
+        //
+        // **The cell a wide character did not fit in is not one of those.** It is the last cell of the
+        // row before, left empty when the character went to the next one, and it is drawn as any empty
+        // cell is: with whatever colours it was left holding. The core marks it only for as long as that
+        // character is there, and turns it back into an ordinary cell when the character is written
+        // over — a change to this row made by a write to the next, which no row is reported as changed
+        // for. So it is read as the empty cell it is drawn as, and what a view was sent does not depend
+        // on which of the two it was at the time
+        if wide == sys::CellWide::SPACER_TAIL {
             return Ok(());
         }
 

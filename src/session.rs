@@ -88,9 +88,60 @@ fn end_for_certain(pid: u32, reaped: Receiver<()>) {
         // A pattern rather than a comparison, so there is no operator here to turn round: the one way
         // to the signal is the grace running out with the process unreaped
         if let Err(RecvTimeoutError::Timeout) = reaped.recv_timeout(KILL_GRACE) {
+            // Whatever it started while it was ignoring its own hangup
+            hang_up_the_rest(&[pid]);
             let _ = deliver(pid, Signal::Sigkill, Scope::Group);
         }
     });
+}
+
+/// Hangs up whatever else is in the sessions these shells lead, before the shells themselves are.
+///
+/// **Nothing but the shell can be relied on to tell a shell's jobs that their terminal has gone, and the
+/// shell cannot be relied on.** The kernel hangs up only the foreground group when a session's leader
+/// goes, so a job the shell put in the background — a group of its own under job control — hears of it
+/// only if the shell passes its own hangup on. One that is killed passes on nothing, and one that ends on
+/// the hangup may not either: measured here with the login shell under load, where it was gone two
+/// milliseconds after the signal and its `sleep 300 &` was left running under nothing
+/// (`killing_a_session_takes_the_whole_tree_with_it` is that case). So the broker tells them itself.
+///
+/// **While the leader is alive, which is why it is done first.** What is in a session's tree is read from
+/// each process's parent (`inside_tree`), and a job whose shell has gone has no parent to be read from.
+/// Ending a session calls this before its shell is signalled, and the grace running out calls it before
+/// the shell is killed.
+///
+/// **A hangup, as the shell would have sent, and through `deliver`.** A job that was told to outlive its
+/// terminal (`nohup`) ignores it and does, which is what it asked for; and each one is signalled by the
+/// one function here that signals anything, which sends only to a process still inside that session's
+/// tree. One listing of the machine's processes however many sessions are ending.
+fn hang_up_the_rest(leaders: &[u32]) {
+    #[cfg(not(unix))]
+    {
+        let _ = leaders;
+    }
+    #[cfg(unix)]
+    {
+        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+
+        if leaders.is_empty() {
+            return;
+        }
+        let Ok(mut system) = System::new() else {
+            return;
+        };
+        system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+        let others: Vec<(u32, u32)> = system
+            .processes()
+            .iter()
+            .filter_map(|(pid, process)| {
+                let session = process.session_id()?.as_u32();
+                (leaders.contains(&session) && pid.as_u32() != session).then_some((session, pid.as_u32()))
+            })
+            .collect();
+        for (leader, pid) in others {
+            let _ = deliver(leader, Signal::Sighup, Scope::Pid { pid });
+        }
+    }
 }
 
 /// What reaches a session's process. The record of the session owns it, and a `Handle` reaches it for
@@ -557,17 +608,6 @@ pub struct Spawning {
     pub images: bool,
 }
 
-/// What a spawn made: `Event::Spawned`'s own fields.
-pub struct Spawned {
-    pub session: SessionId,
-    pub pid: u32,
-    /// Whether the session is being recorded, which it is not when it was not asked to be, when its
-    /// recording could not be opened, and when another session is recording to the same file.
-    pub recorded: bool,
-    /// Whether its screen began as what the recording held.
-    pub restored: bool,
-}
-
 /// A failure a request turns into a `Failed` event rather than a panic.
 #[derive(Debug)]
 pub struct Refusal {
@@ -912,7 +952,7 @@ impl Sessions {
     }
 
     /// Starts a shell in a new pty and begins reading it. The id is the broker's to mint.
-    pub fn spawn(&self, asked: Spawning) -> Result<Spawned, Refusal> {
+    pub fn spawn(&self, asked: Spawning) -> Outcome {
         let Spawning { cols, rows, shell, args, env, unset, cwd, colors, output, record, restore, images } = asked;
         let (cols, rows) = grid(cols, rows);
         let pty = native_pty_system()
@@ -1028,6 +1068,12 @@ impl Sessions {
                 },
             );
         }
+
+        // **Said here, before any thread of the session's exists.** Each of them reports to the same
+        // queue this goes into — a title its program sets, its output, its exit — and a client told of
+        // any of those first would be reading about a session it has not been given
+        let _ =
+            self.events.send(Outgoing::answer(Event::Spawned { session: session.clone(), pid, recorded, restored }));
 
         // **The reader does not decide what a message is.** It hands what one `read` returned to the
         // coalescer, which flushes on a window or a cap — so N bytes of output is not N messages.
@@ -1177,7 +1223,7 @@ impl Sessions {
             let _ = events.send(Outgoing::answer(Event::Exited { session: reading, code, signal }));
         });
 
-        Ok(Spawned { session, pid, recorded, restored })
+        Ok(())
     }
 
     /// Stops reading this session's pty, so its process feels the reader stop (`output::Flow`).
@@ -1304,6 +1350,8 @@ impl Sessions {
             return Ok(());
         }
         let mut live = live.ok_or_else(|| missing(session))?;
+        // Its jobs first, while the shell that could say whose they are is still there
+        hang_up_the_rest(&[live.process.pid]);
         // **Killed first, and only then tidied up after.** Between the two its program can still read,
         // and nothing that ending a session does may reach a program that is being ended
         let killed = live.killer.kill().map_err(|error| Refusal::pty("killing a session", error));
@@ -1345,6 +1393,8 @@ impl Sessions {
             let rewound: Vec<Rewound> = record.rewound.drain().map(|(_, rewound)| rewound).collect();
             (ending, rewound)
         };
+        let leaders: Vec<u32> = ending.iter().map(|(_, live)| live.process.pid).collect();
+        hang_up_the_rest(&leaders);
         for (session, mut live) in ending {
             let _ = live.killer.kill();
             self.end(&session, &live);

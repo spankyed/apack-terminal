@@ -40,6 +40,12 @@ profile = "mutants"
 exclude_re = [
     "session.rs:.*in SignalTarget::at",
 
+    # **What is hung up when a shell has to be killed is not mutated from the inside.** `hang_up_the_rest`
+    # chooses which processes are sent a hangup; a mutant of the choice sends one to processes that were
+    # not chosen, on the machine running the suite. Replacing the function whole sends nothing, and is
+    # tested: `a_job_in_a_group_of_its_own_ends_with_a_shell_that_had_to_be_killed` fails without it.
+    "session.rs:.*in hang_up_the_rest",
+
     # **Starting a process is not mutated from the inside either.** `start_broker` runs this binary as a
     # broker in a session of its own, which is what lets it outlive the proxy that started it — and is also
     # what would let a mutant of how it is started outlive the run that made it, on a developer's machine,

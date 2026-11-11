@@ -302,3 +302,25 @@ proptest! {
         }
     }
 }
+
+/// **The cell a wide character did not fit in is the same row to a view whatever becomes of the
+/// character.** A character two cells wide with one cell left on its row goes to the next, and the cell
+/// it left is empty: drawn, when it has a colour, as any empty cell is. Writing over the character
+/// changes nothing about how that cell is drawn and is a write to the other row, so a view that was sent
+/// the row before is holding the row as it is after — which it is only if both read alike.
+#[test]
+fn the_cell_a_wide_character_did_not_fit_in_reads_alike_before_and_after_the_character_is_written_over() {
+    let mut screen = Screen::with_history(4, 3, 100);
+    // Three cells, a background, and then a character that needs two
+    screen.feed("aaa\x1b[41m\u{4e16}\x1b[0m".as_bytes());
+    let before = line_of(&screen.row(Space::Screen, 0).expect("a row reads").expect("the first row"));
+    assert_eq!(
+        before.cells.last().map(|(column, width, text, ..)| (*column, *width, text.as_str())),
+        Some((3, 1, " ")),
+        "the cell left empty is one the row holds, with the background it was left: {before:?}",
+    );
+
+    screen.feed(b"\x1b[2;1Hxy");
+    let after = line_of(&screen.row(Space::Screen, 0).expect("a row reads").expect("the first row"));
+    assert_eq!(before, after);
+}

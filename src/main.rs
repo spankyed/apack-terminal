@@ -162,7 +162,7 @@ struct Broker {
     sessions: Arc<Sessions>,
     /// The client receiving the feed. A `lifetime` connection never installs itself here — it asks for
     /// nothing and is sent nothing, which is what makes holding one cost no output.
-    feed: Arc<Mutex<Option<Arc<Stream>>>>,
+    feed: Arc<Mutex<Option<Arc<Wire>>>>,
     /// Whether a `lifetime` connection is open.
     owned: Arc<AtomicBool>,
     /// How many `client` connections are open.
@@ -197,12 +197,12 @@ fn write_out(outgoing: Receiver<Outgoing>, broker: Broker) {
         }
         let frame = message.event.as_ref().and_then(|event| serde_json::to_string(event).ok());
         let attached = broker.feed.lock().ok().and_then(|feed| feed.clone());
-        if let (Some(frame), Some(stream)) = (frame, attached.as_ref())
-            && (&**stream).write_all(frame.as_bytes()).and_then(|()| (&**stream).write_all(b"\n")).is_err()
+        if let (Some(frame), Some(wire)) = (frame, attached.as_ref())
+            && wire.write_line(&frame).is_err()
         {
             // That client is gone; the next one to greet installs itself. Nothing is ended here, because
             // whether a client leaving ends the sessions is `Role`'s question and is answered in `serve`
-            detach(&broker, stream);
+            detach(&broker, wire);
         }
         // **The credit returns whether or not anyone was listening.** It is what bounds the channel, so a
         // frame dropped for want of a client must not hold a slot — otherwise a restart of the service that
@@ -211,7 +211,7 @@ fn write_out(outgoing: Receiver<Outgoing>, broker: Broker) {
     }
 }
 
-/// Takes `stream` out of the feed, if it is still the one attached, **and lets every session be read
+/// Takes `wire` out of the feed, if it is still the one attached, **and lets every session be read
 /// again**.
 ///
 /// A pause belongs to the client that asked for one (`Request::Pause`). The next client to attach never
@@ -221,9 +221,9 @@ fn write_out(outgoing: Receiver<Outgoing>, broker: Broker) {
 /// **The feed's lock is let go before the sessions are touched.** Nothing else is ever locked while the
 /// record of sessions is (`Sessions`), and resuming inside the feed's guard would be the first place a
 /// lock was held across a call into it.
-fn detach(broker: &Broker, stream: &Arc<Stream>) {
+fn detach(broker: &Broker, wire: &Arc<Wire>) {
     let was_attached = match broker.feed.lock() {
-        Ok(mut feed) if feed.as_ref().is_some_and(|attached| Arc::ptr_eq(attached, stream)) => {
+        Ok(mut feed) if feed.as_ref().is_some_and(|attached| Arc::ptr_eq(attached, wire)) => {
             *feed = None;
             true
         }
@@ -239,9 +239,34 @@ fn detach(broker: &Broker, stream: &Arc<Stream>) {
 /// **A handshake is between the broker and one caller**, so its answer — and a refusal of a frame that
 /// never named a session — goes to whoever asked. Sending those through the shared channel would deliver a
 /// refusal of the lifetime connection's malformed frame to whichever client happened to be attached.
-fn say(stream: &Arc<Stream>, event: &Event) {
+fn say(wire: &Wire, event: &Event) {
     if let Ok(frame) = serde_json::to_string(event) {
-        let _ = (&**stream).write_all(frame.as_bytes()).and_then(|()| (&**stream).write_all(b"\n"));
+        let _ = wire.write_line(&frame);
+    }
+}
+
+/// A connection, and what makes each line written to it whole.
+///
+/// **Two threads write to a client.** The broker's one writer sends it what its sessions report
+/// (`write_out`), and the thread reading the connection answers it directly (`say`). A client reads a
+/// line at a time, and two events on one line are two it can read neither of — its greeting's answer
+/// among them. So each is written under `line`, in one write, and neither's lands inside the other's.
+///
+/// **A lock of the connection's own, held for that write and nothing else.** A client that has stopped
+/// reading holds up what is said to it, and nothing that is said to anyone else: the next client to
+/// greet is answered on a connection nobody else is writing to.
+struct Wire {
+    stream: Arc<Stream>,
+    line: Mutex<()>,
+}
+
+impl Wire {
+    fn write_line(&self, frame: &str) -> std::io::Result<()> {
+        let mut line = String::with_capacity(frame.len() + 1);
+        line.push_str(frame);
+        line.push('\n');
+        let _whole = self.line.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        (&*self.stream).write_all(line.as_bytes())
     }
 }
 
@@ -253,9 +278,9 @@ fn serve(stream: Stream, connection: u64, broker: Broker) {
     // **One stream in an `Arc`, not two halves.** `&Stream` implements `Read` and `Write`, which is what the
     // crate's deprecated `split` says to do instead — and dropping a half there does not shut it down, so
     // the halves were a shape that reads like a socket's and is not one.
-    let stream = Arc::new(stream);
-    let mut leaving = Leaving { stream: Arc::clone(&stream), connection, broker: broker.clone(), role: None };
-    converse(&stream, connection, &broker, &mut leaving.role);
+    let wire = Arc::new(Wire { stream: Arc::new(stream), line: Mutex::new(()) });
+    let mut leaving = Leaving { wire: Arc::clone(&wire), connection, broker: broker.clone(), role: None };
+    converse(&wire, connection, &broker, &mut leaving.role);
 }
 
 /// What a connection ending leads to, as a value whose going is the ending.
@@ -264,7 +289,7 @@ fn serve(stream: Stream, connection: u64, broker: Broker) {
 /// uncounted is a broker that never exits, and a client that left without its sessions being ended is
 /// shells left running; neither may hang on the thread having reached its last line.
 struct Leaving {
-    stream: Arc<Stream>,
+    wire: Arc<Wire>,
     connection: u64,
     broker: Broker,
     role: Option<Role>,
@@ -289,7 +314,7 @@ impl Drop for Leaving {
                 // reads — a proxy whose input ended does exactly that. So the writer is waited for to reach
                 // this point in its queue; only then is the connection taken out of the feed and closed
                 self.broker.sessions.settled();
-                detach(&self.broker, &self.stream);
+                detach(&self.broker, &self.wire);
                 // The recordings it opened to look back through were its alone to name
                 self.broker.sessions.end_rewound_by(self.connection);
                 let left = self.broker.clients.fetch_sub(1, Ordering::SeqCst) - 1;
@@ -316,8 +341,8 @@ impl Drop for Leaving {
 
 /// Reads a connection's requests and carries them out, until it has no more. `role` is what the
 /// connection greeted as, once it has.
-fn converse(stream: &Arc<Stream>, connection: u64, broker: &Broker, role: &mut Option<Role>) {
-    let mut reader = BufReader::new(&**stream);
+fn converse(wire: &Arc<Wire>, connection: u64, broker: &Broker, role: &mut Option<Role>) {
+    let mut reader = BufReader::new(&*wire.stream);
     let mut line = String::new();
 
     loop {
@@ -329,11 +354,11 @@ fn converse(stream: &Arc<Stream>, connection: u64, broker: &Broker, role: &mut O
             Frame::Request(request) => request,
             Frame::Blank => continue,
             Frame::Malformed(message) => {
-                say(stream, &Event::Failed { session: None, code: ErrorCode::Malformed, message });
+                say(wire, &Event::Failed { session: None, code: ErrorCode::Malformed, message });
                 continue;
             }
             Frame::TooLong(message) => {
-                say(stream, &Event::Failed { session: None, code: ErrorCode::Malformed, message });
+                say(wire, &Event::Failed { session: None, code: ErrorCode::Malformed, message });
                 break;
             }
             Frame::Ended => break,
@@ -347,7 +372,7 @@ fn converse(stream: &Arc<Stream>, connection: u64, broker: &Broker, role: &mut O
             // to the same socket
             (Request::Hello { .. }, Some(_)) => {
                 say(
-                    stream,
+                    wire,
                     &Event::Failed {
                         session: None,
                         code: ErrorCode::Handshake,
@@ -360,7 +385,7 @@ fn converse(stream: &Arc<Stream>, connection: u64, broker: &Broker, role: &mut O
             (Request::Hello { protocol, role: asked }, None) => {
                 if *protocol != PROTOCOL_VERSION {
                     say(
-                        stream,
+                        wire,
                         &Event::Failed {
                             session: None,
                             code: ErrorCode::Handshake,
@@ -375,27 +400,35 @@ fn converse(stream: &Arc<Stream>, connection: u64, broker: &Broker, role: &mut O
                 match asked {
                     Role::Client => {
                         broker.clients.fetch_add(1, Ordering::SeqCst);
-                        // Last greeting wins the feed: one app, one broker per data dir, and a client that
-                        // reconnects after its service restarted is the one that should be receiving
-                        if let Ok(mut feed) = broker.feed.lock() {
-                            *feed = Some(Arc::clone(stream));
-                        }
                     }
                     Role::Lifetime => broker.owned.store(true, Ordering::SeqCst),
                     Role::View => {}
                 }
-                say(stream, &Event::Hello { protocol: PROTOCOL_VERSION, history: HISTORY_LINES as u32 });
-                if *asked == Role::View {
-                    // From here the connection speaks `view::wire`, on the reader that already holds
-                    // whatever arrived behind the handshake
-                    serve_view(&mut reader, stream, connection, broker);
-                    break;
+                say(wire, &Event::Hello { protocol: PROTOCOL_VERSION, history: HISTORY_LINES as u32 });
+                match asked {
+                    // Last greeting wins the feed: one app, one broker per data dir, and a client that
+                    // reconnects after its service restarted is the one that should be receiving.
+                    // **Once its greeting is answered, and not before**: from here the broker's writer
+                    // sends it whatever a session reports next, and the first thing a client hears is
+                    // the handshake that says what those reports mean
+                    Role::Client => {
+                        if let Ok(mut feed) = broker.feed.lock() {
+                            *feed = Some(Arc::clone(wire));
+                        }
+                    }
+                    Role::View => {
+                        // From here the connection speaks `view::wire`, on the reader that already holds
+                        // whatever arrived behind the handshake
+                        serve_view(&mut reader, &wire.stream, connection, broker);
+                        break;
+                    }
+                    Role::Lifetime => {}
                 }
                 continue;
             }
             (_, None) => {
                 say(
-                    stream,
+                    wire,
                     &Event::Failed {
                         session: None,
                         code: ErrorCode::Handshake,
@@ -790,31 +823,9 @@ fn carry_out(live: &Sessions, connection: u64, request: Request) {
                 cursor: colors.cursor,
                 ansi: colors.ansi,
             });
-            match live.spawn(Spawning {
-                cols,
-                rows,
-                shell,
-                args,
-                env,
-                unset,
-                cwd,
-                colors,
-                output,
-                record,
-                restore,
-                images,
-            }) {
-                Ok(spawned) => {
-                    live.answer(Event::Spawned {
-                        session: spawned.session,
-                        pid: spawned.pid,
-                        recorded: spawned.recorded,
-                        restored: spawned.restored,
-                    });
-                    Ok(())
-                }
-                Err(refusal) => Err((None, refusal)),
-            }
+            live.spawn(Spawning { cols, rows, shell, args, env, unset, cwd, colors, output, record, restore, images })
+                // What it started is said by the spawn itself, ahead of anything the session can say
+                .map_err(|refusal| (None, refusal))
         }
         Request::Write { session, text } => {
             live.handle(&session).and_then(|handle| handle.write(&text)).map_err(|refusal| (Some(session), refusal))
