@@ -235,6 +235,13 @@ exclude_re = [
     # session and finds none, and the next session to record there writes its own name over it
     "session.rs:.*replace == with != in Sessions::end$",
 
+    # **A hold's number, which no deadline ever gets wrong.** Each hold is numbered so that a deadline
+    # ends the hold it was set for and not a later one. The number a deadline asks about is read from a
+    # clock the screen sets as a hold begins, with the screen locked, and is asked of the screen with it
+    # locked again: by then the screen holds that hold or none. With every hold numbered alike the same
+    # holds end at the same moments; the number is what says so on the page
+    "screen.rs:.*replace \\+= with \\*= in Screen::settle_holds",
+
     # **When a busy screen's lock is tried again, never which hold ends.** A deadline not yet due is kept
     # by the clock's own check a few lines on, so the first two change only a retry: tried when the next
     # deadline arrives rather than twenty milliseconds on. The third tries it on every turn — a thread
