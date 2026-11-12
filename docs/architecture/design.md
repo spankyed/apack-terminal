@@ -232,12 +232,14 @@ session ending settles every wait on it, because nothing is coming.
 
 ## Known limits
 
-- **One client that stops reading stalls every client's events.** Events for `client` connections leave on
-  one thread, to whichever client greeted last; a client that is connected and not reading leaves that
-  thread in a write until it reads or closes. What bounds it: output is under credit, so sessions stall
-  rather than the broker growing (sixty-four messages in flight at most); views have connections and
-  queues of their own and are not affected; and a client that has gone, rather than stalled, fails the
-  write and is detached at once.
+- **A client that stops reading is let go once 64 MiB is waiting for it.** Each client has a queue and a
+  writer of its own (`feed.rs`), so one that is connected and not reading holds up nothing but what it
+  is told: a session that ends is still forgotten and its views told. Output is under credit, so a
+  program that prints stalls rather than the queue growing (sixty-four messages in flight at most).
+  Everything else a client is told (a title, a bell, a command ending, the answer to a request) spends
+  none, because an answer made to wait for room is a deadlock, so it is counted instead: past the bound
+  the queue is dropped and the connection closed, and the client is where one whose broker went away
+  is. On Windows the queue ends and the connection does not, as for a view (`views.md`).
 - **A `wait` costs a thread until its deadline.** Each one sleeps out its `timeout_ms` to answer `TIMEOUT`
   if nothing else has, and stays that long even when the wait was met at once after being registered.
   What bounds it is the caller: a thread per outstanding wait, each for no longer than the timeout it

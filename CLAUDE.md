@@ -13,6 +13,7 @@ holds.
 | `src/session.rs`, `src/output.rs`, `src/tree.rs`, `src/writer.rs` | the process layer: the pty, the lifetime, the bounded output channel, the owned process tree, and the queue everything typed at a program goes through |
 | `src/screen.rs`, `src/markers.rs`, `src/commands.rs` | the terminal capability: the VT core, the facts a shell reported, and the commands it ran |
 | `src/vt/` | the core itself, behind the one module that calls it: the terminal, input encoding, row and text reads, images |
+| `src/feed.rs` | what is waiting to be written to the client a broker reports to: one bounded queue a client, and what becomes of what it will not write |
 | `src/view/` | what a view is sent: the binary wire (`wire.rs`), what changed since a view's last frame (`publish.rs`), and a connection's bounded queue (`sink.rs`) |
 | `src/holds.rs`, `src/housekeeping.rs` | what happens on a clock rather than on a byte: a synchronized-output hold reaching its limit, and a quiet session's history being compressed |
 | `src/recording.rs` | a session's recording: the file, its keyframes, and reading it back |
