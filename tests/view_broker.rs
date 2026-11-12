@@ -998,14 +998,16 @@ fn a_view_that_sends_what_is_not_the_protocol_is_hung_up_on_though_it_has_not_re
 
     let view = Unread::attached(&broker, &session);
     view.ask_for_all_of_it(1);
+    // Set before the bad frame below: the broker hangs up on that frame at once, and setting a timeout on a
+    // connection it has already closed is refused on macOS (EINVAL), where Linux accepts it
+    let Stream::UdSocket(socket) = &*view.stream;
+    socket.inner().set_write_timeout(Some(PATIENCE)).expect("a write may be given up on");
     // Not the protocol: a length, a kind no message has, and then anything
     (&*view.stream).write_all(&[3, 0, 0, 0, 250, 1, 2]).expect("the broker reads");
 
     // Reading none of it, the view goes on writing: what tells it the broker hung up is a write being
     // refused. A write that is merely not taken — the broker no longer reading, the connection still
     // open — waits, and is given up on
-    let Stream::UdSocket(socket) = &*view.stream;
-    socket.inner().set_write_timeout(Some(PATIENCE)).expect("a write may be given up on");
     let refused = loop {
         if let Err(refused) = (&*view.stream).write_all(&[0]) {
             break refused;
