@@ -248,6 +248,11 @@ exclude_re = [
     "listening.rs:.*replace match guard matches!\\(error.kind\\(\\).* in listen$",
     "listening.rs:.*replace peer_is_this_user -> io::Result<bool> with Ok\\(true\\)",
 
+    # **A deadline exactly due, which is due either way.** With `>=` a deadline at the instant it is checked
+    # is kept, and waited for with a zero timeout, so it is given up on on the next turn: the same answer,
+    # one turn later and at the same instant. Nothing outside the thread can see the difference
+    "deadlines.rs:.*replace > with >= in keep",
+
     # **A second way to hang up that only macOS needs.** There a socket whose far end has stopped sending
     # refuses to be shut both ways and takes being shut for writing; on Linux both succeed, so requiring
     # both is the same answer. The case that tells them apart
