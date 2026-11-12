@@ -9,12 +9,16 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+#[cfg(unix)]
+use std::sync::mpsc::RecvTimeoutError;
+use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 
 use interprocess::local_socket::{GenericFilePath, Stream, ToFsName, prelude::*};
 
-use apack_terminal::protocol::{CommandOutcome, Event, PROTOCOL_VERSION, Request, Role};
+#[cfg(unix)]
+use apack_terminal::protocol::CommandOutcome;
+use apack_terminal::protocol::{Event, PROTOCOL_VERSION, Request, Role};
 use apack_terminal::view::wire::{Frame, Incoming, Position, Row, Span, ToBroker, ToView, read_message};
 
 /// How long a case waits for something a working broker does at once: generous, so a busy machine does
