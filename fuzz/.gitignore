@@ -1,0 +1,4 @@
+# cargo-fuzz output: the build, the corpus the runs grew, and any crash it found
+target/
+corpus/
+artifacts/

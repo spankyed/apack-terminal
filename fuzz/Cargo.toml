@@ -1,0 +1,53 @@
+[package]
+name = "apack-terminal-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.apack-terminal]
+path = ".."
+
+# Its own workspace, so cargo-fuzz's toolchain and flags stay here and the broker's build does not see them
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "frames"
+path = "fuzz_targets/frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "view_wire"
+path = "fuzz_targets/view_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "markers"
+path = "fuzz_targets/markers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "png"
+path = "fuzz_targets/png.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "recording"
+path = "fuzz_targets/recording.rs"
+test = false
+doc = false
+bench = false

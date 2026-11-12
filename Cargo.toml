@@ -2,6 +2,7 @@
 # are a member rather than a script so they are compiled and type-checked with everything else.
 [workspace]
 members = ["xtask"]
+exclude = ["fuzz"]
 resolver = "3"
 
 [package]
