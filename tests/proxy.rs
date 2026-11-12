@@ -12,7 +12,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
-use apack_terminal::listening::{HELD_EXIT, START_GRACE, START_GRACE_ENV, start_grace};
+use apack_terminal::listening::{HELD_EXIT, Refused, START_GRACE, START_GRACE_ENV, hold, start_grace};
 use apack_terminal::protocol::{Event, PROTOCOL_VERSION, Request, Role};
 
 /// How long a wait in this file goes on with nothing arriving. **Shorter than the runner's deadline for a
@@ -118,6 +118,7 @@ fn a_proxy_starts_a_broker_where_there_is_none_and_is_a_connection_to_it() {
     let directory = tempfile::tempdir().expect("a directory for the socket");
     // In a directory that does not exist yet, as a path on a machine nobody has set up would be
     let socket = directory.path().join("made-on-demand").join("broker.sock");
+    let _ending = crate::reaper::ending_with_the_case(&socket, env!("CARGO_BIN_EXE_apack-terminal"));
     let mut first = proxy(&socket);
     first.greet(Role::Client);
     let session = first.shell();
@@ -131,6 +132,7 @@ fn a_proxy_starts_a_broker_where_there_is_none_and_is_a_connection_to_it() {
 fn a_second_proxy_joins_the_broker_the_first_started() {
     let directory = tempfile::tempdir().expect("a directory for the socket");
     let socket = directory.path().join("broker.sock");
+    let _ending = crate::reaper::ending_with_the_case(&socket, env!("CARGO_BIN_EXE_apack-terminal"));
     let mut first = proxy(&socket);
     first.greet(Role::Lifetime);
 
@@ -162,6 +164,7 @@ fn a_second_proxy_joins_the_broker_the_first_started() {
 fn proxies_arriving_together_start_one_broker() {
     let directory = tempfile::tempdir().expect("a directory for the socket");
     let socket = directory.path().join("broker.sock");
+    let _ending = crate::reaper::ending_with_the_case(&socket, env!("CARGO_BIN_EXE_apack-terminal"));
     let mut arrived: Vec<Proxy> = (0..6).map(|_| proxy(&socket)).collect();
     let mut rest = arrived.split_off(1);
     let first = &mut arrived[0];
@@ -181,6 +184,33 @@ fn proxies_arriving_together_start_one_broker() {
             }
         }
     }
+}
+
+/// **A broker a proxy started does not outlive the case that had it started**, even one that is meant
+/// to go on: a session asked to be kept holds its broker open after every connection has closed, which
+/// is the one broker here that does not go by itself, and stands for one that cannot.
+#[test]
+fn a_broker_a_proxy_started_is_ended_with_the_case_that_had_it_started() {
+    let directory = tempfile::tempdir().expect("a directory for the socket");
+    let socket = directory.path().join("broker.sock");
+    let ending = crate::reaper::ending_with_the_case(&socket, env!("CARGO_BIN_EXE_apack-terminal"));
+    {
+        let mut through = proxy(&socket);
+        through.greet(Role::Client);
+        let session = through.shell();
+        through.say(&Request::Keep { session, kept: true });
+        loop {
+            if let Event::Kept { kept: true, .. } = through.event() {
+                break;
+            }
+        }
+    }
+    // Its one connection has closed and it is still there, holding what a broker holds
+    let name = socket.to_str().expect("a utf-8 path");
+    assert!(matches!(hold(name), Err(Refused::Held)), "the broker went with its last connection");
+
+    drop(ending);
+    assert!(hold(name).is_ok(), "the broker is still holding its socket");
 }
 
 /// `proxy` is a word, not a position: two arguments of which the first is anything else are not a request
@@ -379,6 +409,7 @@ fn a_proxy_says_why_the_broker_it_started_could_not_listen() {
 fn a_proxy_whose_input_has_ended_still_carries_the_answer_to_what_it_was_last_sent() {
     let directory = tempfile::tempdir().expect("a directory for the socket");
     let socket = directory.path().join("broker.sock");
+    let _ending = crate::reaper::ending_with_the_case(&socket, env!("CARGO_BIN_EXE_apack-terminal"));
     let mut process = Command::new(env!("CARGO_BIN_EXE_apack-terminal"))
         .arg("proxy")
         .arg(&socket)
@@ -489,6 +520,12 @@ fn a_socket_named_without_a_directory_is_checked_where_it_would_be_made() {
 fn a_proxy_told_no_socket_uses_the_users_own() {
     let home = tempfile::tempdir().expect("a home directory");
     let runtime = tempfile::tempdir().expect("a runtime directory");
+    let ending =
+        |socket: std::path::PathBuf| crate::reaper::ending_with_the_case(&socket, env!("CARGO_BIN_EXE_apack-terminal"));
+    let _endings = [
+        ending(home.path().join(".apack-terminal").join("broker.sock")),
+        ending(runtime.path().join("apack-terminal").join("broker.sock")),
+    ];
     let through = |runtime_directory: Option<&Path>| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_apack-terminal"));
         command.arg("proxy").env("HOME", home.path()).stdin(Stdio::piped()).stdout(Stdio::piped());
