@@ -243,12 +243,16 @@ session ending settles every wait on it, because nothing is coming.
 - **Windows builds and passes what runs there, which is not everything.** CI's Windows job builds the
   terminal core from source — nobody publishes one for Windows, so the job installs the Zig its commit
   wants and builds it for speed, as the library every other platform links was — and runs the suite.
-  What does not run there is the suites that drive the real binary over a socket (`keeping`,
-  `view_broker`, `proxy`), which use Unix sockets and `/bin/sh`; so a view's connection, the lock that
-  makes a broker the only one on its pipe, the proxy and a kept session are compiled on Windows and
-  exercised nowhere on it. What is known to differ there is said where it applies: a view past its
-  limit is not hung up on (`views.md`), `signal` answers `UNSUPPORTED`, and the pipe's directory and
-  peer are not checked as a socket's are on POSIX.
+  The suites that drive the real binary run there over a named pipe and `cmd.exe`: a view attaching,
+  drawing, typing and being told its session ended; a proxy starting a broker, a second joining it and
+  several arriving at once; and a second broker refused the pipe the first holds. What is typed in
+  `sh`'s syntax, and what closes one direction of a connection, is POSIX only and says so case by
+  case. **Kept sessions and recordings (`keeping`) run nowhere on Windows**: each of its cases ends by
+  hanging up a connection its own reader thread is reading, which a named pipe does not allow. What is
+  known to differ there is said where it applies: a view or a client past its limit is not hung up on
+  (`views.md`), a proxy whose input ends leaves without carrying what the broker had still to say,
+  `signal` answers `UNSUPPORTED`, and the pipe's directory and peer are not checked as a socket's are
+  on POSIX.
 
 ## What the broker will not do
 

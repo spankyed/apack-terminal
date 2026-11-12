@@ -43,14 +43,43 @@ fn start() -> Broker {
     start_with_env(|_| {})
 }
 
+/// Where a broker listens: a path on POSIX, and a named pipe on Windows, where a path is refused
+/// (`tests/broker.rs`, `socket_in`).
+#[cfg(unix)]
+fn socket_in(directory: &std::path::Path) -> std::path::PathBuf {
+    directory.join("broker.sock")
+}
+
+#[cfg(windows)]
+fn socket_in(_directory: &std::path::Path) -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let nth = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::path::PathBuf::from(format!(r"\\.\pipe\apack-terminal-view-test-{}-{nth}", std::process::id()))
+}
+
+/// The shell a case's session runs: the one each platform is sure to have. Each is given a prompt of
+/// `$ `, so a case waits for the same thing on both.
+#[cfg(unix)]
+const SHELL: &str = "/bin/sh";
+#[cfg(windows)]
+const SHELL: &str = "cmd.exe";
+
+/// A line that prints `before` and `after` as one word, typed so that the word is nowhere in the line
+/// itself: what a case waits for is then the command's output and not the echo of what was typed. An
+/// empty pair of quotes is nothing to `sh`, and a caret is cmd's escape and is dropped.
+fn echoing(before: &str, after: &str) -> String {
+    if cfg!(windows) { format!("echo {before}^{after}") } else { format!("echo {before}''{after}") }
+}
+
 /// The same, with the broker's own environment arranged first: a bound a case is about, set where a
 /// case can reach it.
 fn start_with_env(arrange: impl FnOnce(&mut Command)) -> Broker {
     let directory = tempfile::tempdir().expect("a directory for the socket");
-    let socket = directory.path().join("broker.sock");
+    let socket = socket_in(directory.path());
     let mut command = Command::new(env!("CARGO_BIN_EXE_apack-terminal"));
     command.arg(&socket).stdout(Stdio::piped());
     // A session of its own, so a signal from the broker cannot leave this test (`tests/broker.rs`)
+    #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         // SAFETY: runs in the child between fork and exec, and `setsid` touches nothing this process owns
@@ -117,7 +146,7 @@ impl Client {
 
     /// The same, saying whether a program in it may place images.
     fn shell_taking(&self, images: bool) -> String {
-        self.running("/bin/sh", &[], images)
+        self.running(SHELL, &[], images)
     }
 
     /// A session running `program`, whose bytes nobody reads.
@@ -130,7 +159,12 @@ impl Client {
                 shell: Some(program.to_owned()),
                 args: arguments.iter().map(|argument| (*argument).to_owned()).collect(),
                 // A prompt that is the same on every machine, and no line editor to redraw it
-                env: vec![("PS1".to_owned(), "$ ".to_owned()), ("ENV".to_owned(), String::new())],
+                env: vec![
+                    ("PS1".to_owned(), "$ ".to_owned()),
+                    ("ENV".to_owned(), String::new()),
+                    // cmd's own spelling of the same prompt
+                    ("PROMPT".to_owned(), "$$$S".to_owned()),
+                ],
                 unset: Vec::new(),
                 cwd: None,
                 colors: None,
@@ -285,7 +319,7 @@ fn a_view_draws_a_shell_and_its_keys_reach_it() {
     let mut view = View::attached(&broker, &session);
 
     view.until_shows("$ ");
-    view.type_line("echo vi$((40+2))ew");
+    view.type_line(&echoing("vi", "42ew"));
     view.until_shows("vi42ew");
 
     // And none of it crossed the app's own connection as bytes: this session was spawned to be viewed
@@ -293,6 +327,7 @@ fn a_view_draws_a_shell_and_its_keys_reach_it() {
     assert!(leaked.is_empty(), "the client was sent {leaked:?}");
 }
 
+#[cfg(unix)]
 #[test]
 fn history_is_fetched_by_line_and_text_is_read_and_searched() {
     let broker = start();
@@ -335,6 +370,7 @@ fn history_is_fetched_by_line_and_text_is_read_and_searched() {
     assert_eq!(read, "line-7\nline-8");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_paste_that_could_run_a_command_is_refused_until_the_person_allows_it() {
     let broker = start();
@@ -368,7 +404,9 @@ fn a_view_is_told_when_its_session_ends_and_sent_the_screen_as_it_ended() {
     let mut view = View::attached(&broker, &session);
     view.until_shows("$ ");
 
-    view.type_line("echo last-wo$((1+1))rds; exit");
+    view.type_line(&echoing("last-wo", "2rds"));
+    view.until_shows("last-wo2rds");
+    view.type_line("exit");
     while !view.ended {
         view.step();
     }
@@ -389,7 +427,7 @@ fn a_view_that_stops_acknowledging_does_not_hold_up_another() {
     let mut live = View::attached(&broker, &session);
     live.until_shows("$ ");
 
-    live.type_line("echo sec$((1+1))ond");
+    live.type_line(&echoing("sec", "2ond"));
     live.until_shows("sec2ond");
 
     // The stuck view was sent its first frame and, never having acknowledged it, nothing since. The
@@ -417,12 +455,13 @@ fn a_view_leaving_or_sending_nonsense_leaves_the_session_running() {
 
     let mut second = View::attached(&broker, &session);
     second.until_shows("$ ");
-    second.type_line("echo sti$((1+1))ll");
+    second.type_line(&echoing("sti", "2ll"));
     second.until_shows("sti2ll");
 }
 
 /// What a program asks of the world outside its screen reaches the app's own connection, as it happens —
 /// from a session whose bytes are not sent at all.
+#[cfg(unix)]
 #[test]
 fn a_programs_title_clipboard_and_commands_are_told_to_the_client() {
     let broker = start();
@@ -448,6 +487,7 @@ fn a_programs_title_clipboard_and_commands_are_told_to_the_client() {
 /// A shell that marks its commands is remembered: a view is told when there is something new to ask for and
 /// is answered with each command and the lines that are its, and the app's own connection can read what
 /// one printed.
+#[cfg(unix)]
 #[test]
 fn the_commands_a_shell_marks_are_listed_with_their_lines_and_their_output_is_read() {
     let broker = start();
@@ -500,6 +540,7 @@ fn the_commands_a_shell_marks_are_listed_with_their_lines_and_their_output_is_re
 
 /// The line under a cell, asked for over the connection: all of what wrapped, from its first row to its
 /// last.
+#[cfg(unix)]
 #[test]
 fn the_line_at_a_cell_is_answered_to_the_view_that_asked() {
     let broker = start();
@@ -531,6 +572,7 @@ fn the_line_at_a_cell_is_answered_to_the_view_that_asked() {
 
 /// An image a program places is told to a view that asks where the images are, and its pixels to one that
 /// asks for them — in a session that was started taking images, with cells whose size is known.
+#[cfg(unix)]
 #[test]
 fn a_placed_image_and_its_pixels_are_answered_to_the_view_that_asked() {
     let broker = start();
@@ -569,6 +611,7 @@ fn a_placed_image_and_its_pixels_are_answered_to_the_view_that_asked() {
 /// **A session with more images than are listed is told so, not sent a list too long to read.** As many
 /// as the bound are listed whole; one more, and the view is told how many there are and how many it
 /// could have been told of.
+#[cfg(unix)]
 #[test]
 fn a_session_holding_more_images_than_are_listed_says_so_and_one_holding_as_many_lists_them() {
     let broker = start_with_env(|command| {
@@ -610,6 +653,7 @@ fn a_session_holding_more_images_than_are_listed_says_so_and_one_holding_as_many
 /// **A view that loses focus holds no button down any more.** The button is let go somewhere else, so
 /// the release this view would have reported never comes: a move it reports after that is not a drag,
 /// where one it reported with the button down was.
+#[cfg(unix)]
 #[test]
 fn a_view_that_loses_focus_with_a_button_down_is_no_longer_dragging() {
     let broker = start();
@@ -652,6 +696,7 @@ fn a_view_that_loses_focus_with_a_button_down_is_no_longer_dragging() {
 /// reads only as fast as its echo is read, and whatever was waiting on it would be holding what the
 /// reader of that echo needs. So the paste is answered at once, the rest of the broker goes on
 /// answering, and all of it reaches the program.
+#[cfg(unix)]
 #[test]
 fn a_paste_of_megabytes_into_a_program_that_echoes_holds_nothing_up() {
     let broker = start();
@@ -690,6 +735,7 @@ fn a_paste_of_megabytes_into_a_program_that_echoes_holds_nothing_up() {
 /// A program that never reads its input fills its pty with the first few kilobytes written to it. What
 /// is written after that waits in the broker — up to a bound, past which it is refused — and neither the
 /// waiting nor the refusal is anything another session, or this one's ending, has to wait for.
+#[cfg(unix)]
 #[test]
 fn a_program_that_never_reads_holds_up_neither_another_session_nor_its_own_ending() {
     let broker = start();
@@ -739,6 +785,7 @@ fn a_program_that_never_reads_holds_up_neither_another_session_nor_its_own_endin
 
 /// **A resize is told to a view by the resize.** A program is told its terminal changed size and may
 /// print nothing in answer — `cat` never does — so the frame with the new grid cannot wait for output.
+#[cfg(unix)]
 #[test]
 fn a_resize_is_sent_to_a_view_though_the_program_prints_nothing() {
     let broker = start();
@@ -763,6 +810,7 @@ fn a_resize_is_sent_to_a_view_though_the_program_prints_nothing() {
 /// **A view that asks and does not read is hung up on.** What it is owed waits in a queue of its own, and
 /// that queue has an end: a view asking for megabytes over and over while taking none of them is not
 /// reading, and the broker stops holding answers for it rather than holding ever more.
+#[cfg(unix)]
 #[test]
 fn a_view_that_asks_without_reading_is_hung_up_on() {
     let broker = start();
@@ -877,6 +925,7 @@ fn a_session_holding_a_megabyte(broker: &Broker, client: &Client) -> (String, Vi
 /// thing it does for a connection: by then whatever that connection's going leads to has happened.
 /// `incoming` is what the connection's reader hands on, which ends when the reader is told there is
 /// no more.
+#[cfg(unix)]
 fn gone<T>(stream: &Stream, incoming: &Receiver<T>) {
     let Stream::UdSocket(socket) = stream;
     socket.inner().shutdown(std::net::Shutdown::Write).expect("the connection closes one way");
@@ -894,6 +943,7 @@ fn gone<T>(stream: &Stream, incoming: &Receiver<T>) {
 /// app's connection, its session, the view beside this one. A broker nothing is connected to leaves,
 /// and this one has a view it owes most of a megabyte: the answer is written before that connection is
 /// closed, and the broker goes after it rather than from under it.
+#[cfg(unix)]
 #[test]
 fn a_view_that_finished_speaking_is_sent_its_answer_though_it_is_all_the_broker_has_left() {
     let broker = start();
@@ -935,6 +985,7 @@ fn a_view_that_finished_speaking_is_sent_its_answer_though_it_is_all_the_broker_
 /// to it may be waiting on a view that will never read, and only the connection closing lets it go: a
 /// view left connected there is one the broker holds an answer and a thread for, for as long as the
 /// view likes.
+#[cfg(unix)]
 #[test]
 fn a_view_that_sends_what_is_not_the_protocol_is_hung_up_on_though_it_has_not_read_what_it_is_owed() {
     let broker = start();
@@ -968,6 +1019,7 @@ fn a_view_that_sends_what_is_not_the_protocol_is_hung_up_on_though_it_has_not_re
 
 /// **A connection says hello once.** Its role is what it is counted as and how it is spoken to; said
 /// again it is refused, and the connection is still the one it was.
+#[cfg(unix)]
 #[test]
 fn a_second_hello_is_refused_and_changes_nothing() {
     let broker = start();
@@ -1012,6 +1064,7 @@ fn first_epoch(view: &mut View) -> u32 {
 /// **A view that detaches is a view that has gone**, and with the last of them goes what the views were
 /// told: the next to attach is in a numbering of its own, rather than one a view that left may still
 /// hold rows of. The same when it is the connection that goes.
+#[cfg(unix)]
 #[test]
 fn the_last_view_leaving_ends_the_numbering_it_was_told() {
     let broker = start();
@@ -1135,9 +1188,13 @@ fn a_session_that_ends_is_over_for_its_view_while_the_client_reads_nothing() {
         &Request::Spawn {
             cols: 60,
             rows: 8,
-            shell: Some("/bin/sh".to_owned()),
+            shell: Some(SHELL.to_owned()),
             args: Vec::new(),
-            env: vec![("PS1".to_owned(), "$ ".to_owned()), ("ENV".to_owned(), String::new())],
+            env: vec![
+                ("PS1".to_owned(), "$ ".to_owned()),
+                ("ENV".to_owned(), String::new()),
+                ("PROMPT".to_owned(), "$$$S".to_owned()),
+            ],
             unset: Vec::new(),
             cwd: None,
             colors: None,
@@ -1165,7 +1222,7 @@ fn a_session_that_ends_is_over_for_its_view_while_the_client_reads_nothing() {
         say(&stream, &Request::Sessions);
     }
     // Behind all of that, the shell is told to go
-    say(&stream, &Request::Write { session, text: "exit\n".to_owned() });
+    say(&stream, &Request::Write { session, text: if cfg!(windows) { "exit\r\n" } else { "exit\n" }.to_owned() });
     while !view.ended {
         view.step();
     }

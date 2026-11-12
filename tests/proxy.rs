@@ -5,12 +5,16 @@
 //! for byte, and that a second proxy joins the first's broker rather than starting another.
 
 use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
+
+use interprocess::local_socket::{GenericFilePath, Stream, ToFsName, prelude::*};
 
 use apack_terminal::listening::{HELD_EXIT, Refused, START_GRACE, START_GRACE_ENV, hold, start_grace};
 use apack_terminal::protocol::{Event, PROTOCOL_VERSION, Request, Role};
@@ -48,6 +52,34 @@ fn read_events(output: ChildStdout) -> Receiver<Event> {
     events
 }
 
+/// Where a broker listens: `name` in `directory` on POSIX, and on Windows a named pipe, where a path
+/// is refused. The pipe's name carries this process and a count, there being one namespace for the
+/// whole machine (`tests/broker.rs`, `socket_in`).
+#[cfg(unix)]
+fn socket_in(directory: &Path, name: &str) -> std::path::PathBuf {
+    directory.join(name)
+}
+
+#[cfg(windows)]
+fn socket_in(_directory: &Path, _name: &str) -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let nth = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::path::PathBuf::from(format!(r"\\.\pipe\apack-terminal-proxy-test-{}-{nth}", std::process::id()))
+}
+
+/// The shell each platform is sure to have, and how a line typed at it is ended.
+#[cfg(unix)]
+const SHELL: (&str, &str) = ("/bin/sh", "\n");
+#[cfg(windows)]
+const SHELL: (&str, &str) = ("cmd.exe", "\r\n");
+
+/// A line that prints `before` and `after` as one word that is nowhere in the line itself, so that
+/// what a case waits for is the command's output and not the echo of what was typed.
+fn echoing(before: &str, after: &str) -> String {
+    let (_, submit) = SHELL;
+    if cfg!(windows) { format!("echo {before}^{after}{submit}") } else { format!("echo {before}''{after}{submit}") }
+}
+
 fn proxy(socket: &std::path::Path) -> Proxy {
     let mut process = Command::new(env!("CARGO_BIN_EXE_apack-terminal"))
         .arg("proxy")
@@ -82,7 +114,7 @@ impl Proxy {
         self.say(&Request::Spawn {
             cols: 80,
             rows: 24,
-            shell: Some("/bin/sh".to_owned()),
+            shell: Some(SHELL.0.to_owned()),
             args: Vec::new(),
             env: vec![("PS1".to_owned(), "$ ".to_owned())],
             unset: Vec::new(),
@@ -117,12 +149,12 @@ impl Proxy {
 fn a_proxy_starts_a_broker_where_there_is_none_and_is_a_connection_to_it() {
     let directory = tempfile::tempdir().expect("a directory for the socket");
     // In a directory that does not exist yet, as a path on a machine nobody has set up would be
-    let socket = directory.path().join("made-on-demand").join("broker.sock");
+    let socket = socket_in(&directory.path().join("made-on-demand"), "broker.sock");
     let _ending = crate::reaper::ending_with_the_case(&socket, env!("CARGO_BIN_EXE_apack-terminal"));
     let mut first = proxy(&socket);
     first.greet(Role::Client);
     let session = first.shell();
-    first.say(&Request::Write { session: session.clone(), text: "echo thr$((1+1))ough\n".to_owned() });
+    first.say(&Request::Write { session: session.clone(), text: echoing("thr", "2ough") });
     assert!(first.output_with("thr2ough").contains("thr2ough"));
 }
 
@@ -131,7 +163,7 @@ fn a_proxy_starts_a_broker_where_there_is_none_and_is_a_connection_to_it() {
 #[test]
 fn a_second_proxy_joins_the_broker_the_first_started() {
     let directory = tempfile::tempdir().expect("a directory for the socket");
-    let socket = directory.path().join("broker.sock");
+    let socket = socket_in(directory.path(), "broker.sock");
     let _ending = crate::reaper::ending_with_the_case(&socket, env!("CARGO_BIN_EXE_apack-terminal"));
     let mut first = proxy(&socket);
     first.greet(Role::Lifetime);
@@ -163,7 +195,7 @@ fn a_second_proxy_joins_the_broker_the_first_started() {
 #[test]
 fn proxies_arriving_together_start_one_broker() {
     let directory = tempfile::tempdir().expect("a directory for the socket");
-    let socket = directory.path().join("broker.sock");
+    let socket = socket_in(directory.path(), "broker.sock");
     let _ending = crate::reaper::ending_with_the_case(&socket, env!("CARGO_BIN_EXE_apack-terminal"));
     let mut arrived: Vec<Proxy> = (0..6).map(|_| proxy(&socket)).collect();
     let mut rest = arrived.split_off(1);
@@ -189,6 +221,7 @@ fn proxies_arriving_together_start_one_broker() {
 /// **A broker a proxy started does not outlive the case that had it started**, even one that is meant
 /// to go on: a session asked to be kept holds its broker open after every connection has closed, which
 /// is the one broker here that does not go by itself, and stands for one that cannot.
+#[cfg(unix)]
 #[test]
 fn a_broker_a_proxy_started_is_ended_with_the_case_that_had_it_started() {
     let directory = tempfile::tempdir().expect("a directory for the socket");
@@ -215,6 +248,7 @@ fn a_broker_a_proxy_started_is_ended_with_the_case_that_had_it_started() {
 
 /// `proxy` is a word, not a position: two arguments of which the first is anything else are not a request
 /// to be one, and are refused as any other mistyped invocation is.
+#[cfg(unix)]
 #[test]
 fn only_the_word_proxy_asks_for_one() {
     let directory = tempfile::tempdir().expect("a directory for the socket");
@@ -290,13 +324,19 @@ impl Broker {
 }
 
 /// Greets a broker over its socket as a client, answering the connection once the broker has answered.
-fn greeted(socket: &Path) -> UnixStream {
-    let mut stream = UnixStream::connect(socket).expect("the broker accepts");
+fn greeted(socket: &Path) -> Stream {
+    let name = socket.to_str().expect("a utf-8 path").to_fs_name::<GenericFilePath>().expect("a socket name");
+    let stream = Stream::connect(name).expect("the broker accepts");
     let hello =
         serde_json::to_string(&Request::Hello { protocol: PROTOCOL_VERSION, role: Role::Client }).expect("hello");
-    stream.write_all(format!("{hello}\n").as_bytes()).expect("the broker reads");
-    let mut answer = String::new();
-    BufReader::new(stream.try_clone().expect("a second handle")).read_line(&mut answer).expect("the broker answers");
+    (&stream).write_all(format!("{hello}\n").as_bytes()).expect("the broker reads");
+    // A byte at a time, so that nothing past the answer is taken off the connection
+    let mut answer = Vec::new();
+    let mut byte = [0u8];
+    while (&stream).read(&mut byte).expect("the broker answers") == 1 && byte[0] != b'\n' {
+        answer.push(byte[0]);
+    }
+    let answer = String::from_utf8_lossy(&answer);
     assert!(matches!(serde_json::from_str::<Event>(&answer), Ok(Event::Hello { .. })), "{answer}");
     stream
 }
@@ -307,7 +347,7 @@ fn greeted(socket: &Path) -> UnixStream {
 #[test]
 fn a_second_broker_on_a_socket_leaves_the_first_alone_and_says_why_it_left() {
     let directory = tempfile::tempdir().expect("a directory for the socket");
-    let socket = directory.path().join("broker.sock");
+    let socket = socket_in(directory.path(), "broker.sock");
     let first = broker(&socket);
     assert!(first.said.starts_with("listening "), "{}", first.said);
     let _held = greeted(&socket);
@@ -324,6 +364,7 @@ fn a_second_broker_on_a_socket_leaves_the_first_alone_and_says_why_it_left() {
 
 /// A broker that was killed leaves its socket file behind, and nothing holding the socket: the next
 /// broker replaces the file and listens.
+#[cfg(unix)]
 #[test]
 fn a_socket_file_a_dead_broker_left_is_replaced() {
     let directory = tempfile::tempdir().expect("a directory for the socket");
@@ -341,6 +382,7 @@ fn a_socket_file_a_dead_broker_left_is_replaced() {
 
 /// What crosses the socket is a user's terminals, so the socket is theirs alone to open, and a directory
 /// made for it is theirs alone to look in.
+#[cfg(unix)]
 #[test]
 fn a_socket_and_a_directory_made_for_it_are_their_owners_alone() {
     let directory = tempfile::tempdir().expect("a directory for the socket");
@@ -356,6 +398,7 @@ fn a_socket_and_a_directory_made_for_it_are_their_owners_alone() {
 
 /// A directory other users can write to is one where the socket can be swapped for theirs: a broker will
 /// not listen in it, and a proxy will not look for one there.
+#[cfg(unix)]
 #[test]
 fn a_directory_others_can_write_to_is_refused() {
     let directory = tempfile::tempdir().expect("a directory for the socket");
@@ -382,6 +425,7 @@ fn a_directory_others_can_write_to_is_refused() {
 
 /// A broker a proxy starts that cannot listen says why, and the proxy passes it on: the person at the far
 /// end of an `ssh` reads the reason rather than that nothing was said.
+#[cfg(unix)]
 #[test]
 fn a_proxy_says_why_the_broker_it_started_could_not_listen() {
     let directory = tempfile::tempdir().expect("a directory for the socket");
@@ -405,10 +449,14 @@ fn a_proxy_says_why_the_broker_it_started_could_not_listen() {
 /// **The far end finishing what it has to say is not the end of the answer.** A proxy whose input ends —
 /// the whole of a conversation piped into it — goes on carrying what the broker says until the broker
 /// has said it, so the last request is answered like the first.
+///
+/// **POSIX only.** A named pipe has one end to close, so a proxy on Windows whose input ends leaves at
+/// once (`proxy::finish_sending`), and what the broker had still to say is not carried.
+#[cfg(unix)]
 #[test]
 fn a_proxy_whose_input_has_ended_still_carries_the_answer_to_what_it_was_last_sent() {
     let directory = tempfile::tempdir().expect("a directory for the socket");
-    let socket = directory.path().join("broker.sock");
+    let socket = socket_in(directory.path(), "broker.sock");
     let _ending = crate::reaper::ending_with_the_case(&socket, env!("CARGO_BIN_EXE_apack-terminal"));
     let mut process = Command::new(env!("CARGO_BIN_EXE_apack-terminal"))
         .arg("proxy")
@@ -449,7 +497,7 @@ fn a_broker_nothing_ever_connects_to_exits() {
     // Long enough that leaving at once and leaving when it is over cannot be mistaken for each other
     let grace = Duration::from_millis(500);
     let directory = tempfile::tempdir().expect("a directory for the socket");
-    let socket = directory.path().join("broker.sock");
+    let socket = socket_in(directory.path(), "broker.sock");
     let started = Instant::now();
     let mut alone = broker_given(&socket, Some(grace));
     assert!(alone.said.starts_with("listening "), "{}", alone.said);
@@ -470,6 +518,7 @@ fn the_grace_is_the_one_in_use_unless_a_number_of_milliseconds_is_given() {
 /// A broker whose socket has been taken from under it cannot be connected to by anything, itself
 /// included: with nothing ever having connected, it goes when the time it allows for a first connection
 /// has passed, as one that could still be reached does.
+#[cfg(unix)]
 #[test]
 fn a_broker_nothing_can_reach_exits() {
     let directory = tempfile::tempdir().expect("a directory for the socket");
@@ -484,6 +533,7 @@ fn a_broker_nothing_can_reach_exits() {
 
 /// A socket named with no directory is in the directory the broker was started in, and that directory
 /// is asked what any other is: one other users can write to is refused.
+#[cfg(unix)]
 #[test]
 fn a_socket_named_without_a_directory_is_checked_where_it_would_be_made() {
     let directory = tempfile::tempdir().expect("a directory");
@@ -516,6 +566,7 @@ fn a_socket_named_without_a_directory_is_checked_where_it_would_be_made() {
 /// **A proxy told no socket uses the one place a user is known to have**: under the runtime directory
 /// the system gives them, or failing that under their home, in a directory made for them alone. So
 /// `ssh host apack-terminal proxy` needs nothing set up on the host, and two proxies told nothing meet.
+#[cfg(unix)]
 #[test]
 fn a_proxy_told_no_socket_uses_the_users_own() {
     let home = tempfile::tempdir().expect("a home directory");
@@ -569,6 +620,7 @@ fn a_proxy_told_no_socket_uses_the_users_own() {
 /// finished speaking closes the side it sends on and may go on being owed answers; one that then stops
 /// reading has whatever writes to it parked, and hanging up is what lets that go. The far end's half
 /// being closed already is the state a hang-up most often finds a connection in.
+#[cfg(unix)]
 #[test]
 fn a_connection_whose_far_end_has_stopped_sending_is_hung_up_on_and_a_write_to_it_ends() {
     use apack_terminal::listening::hang_up;

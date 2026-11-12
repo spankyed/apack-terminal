@@ -115,6 +115,12 @@ pub fn ending_with_the_case(socket: &std::path::Path, program: &str) -> Ending {
     Ending { watcher: Some((watcher, held)) }
 }
 
+#[cfg(not(unix))]
+pub fn ending_with_the_case(_socket: &std::path::Path, _program: &str) -> Ending {
+    // There is no file beside a pipe to ask after, and a broker a case leaves is ended by its own rules
+    Ending {}
+}
+
 impl Drop for Ending {
     fn drop(&mut self) {
         // Let go of, which is what the watcher is waiting for, and waited for: when this returns the
