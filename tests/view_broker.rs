@@ -1278,3 +1278,22 @@ fn a_cursor_key_sent_to_a_full_screen_program_that_asked_for_no_mouse_reaches_it
     // ESC [ B
     view.until_shows("1b5b42");
 }
+
+/// Phase 1, OSC 52 reads are refused: a program that asks what is on the clipboard is answered nothing, so the first
+/// byte it reads is the one typed after the question, and nothing is reported to the client as a write.
+#[cfg(unix)]
+#[test]
+fn a_program_that_asks_what_the_clipboard_holds_is_answered_nothing() {
+    let broker = start();
+    let client = Client::greeting(&broker);
+    let script = "stty raw -echo; printf '\\033]52;c;?\\007'; printf 'ready\\n'; head -c 1 | od -An -tx1 | tr -d ' \\n'";
+    let session = client.running("sh", &["-c", script], false);
+    let mut view = View::attached(&broker, &session);
+    view.until_shows("ready");
+    view.key("", "x");
+    // The byte typed, in hex: a reply to the question would have arrived first, and been printed instead
+    view.until_shows("78");
+
+    let told: Vec<Event> = client.events.try_iter().filter(|event| matches!(event, Event::Clipboard { .. })).collect();
+    assert!(told.is_empty(), "a read was reported as a write: {told:?}");
+}
