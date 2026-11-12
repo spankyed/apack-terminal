@@ -1231,3 +1231,50 @@ fn a_session_that_ends_is_over_for_its_view_while_the_client_reads_nothing() {
         view.step();
     }
 }
+
+/// Phase 0, kitty keyboard protocol: a program that asks for it is sent the escape key as the protocol encodes it,
+/// and one that does not is sent the byte it always was. Both are answered by the real pty.
+#[cfg(unix)]
+#[test]
+fn a_program_that_asks_for_the_kitty_keyboard_protocol_is_sent_keys_as_it_encodes_them() {
+    let broker = start();
+    let client = Client::greeting(&broker);
+    // `ready` is printed after the protocol is asked for, so the key is typed under it; the program reads the
+    // bytes of one escape key and prints them in hex
+    let asking = "stty raw -echo; printf '\\033[>1u'; printf 'ready\\n'; head -c 5 | od -An -tx1 | tr -d ' \\n'; printf '\\033[<u'";
+    let session = client.running("sh", &["-c", asking], false);
+    let mut view = View::attached(&broker, &session);
+    view.until_shows("ready");
+    view.key("Escape", "");
+    // ESC [ 2 7 u
+    view.until_shows("1b5b323775");
+
+    // A broker of its own: a session's exit is told to every client, so the first program's would come before
+    // the second's spawn answer on a shared one
+    let broker = start();
+    let client = Client::greeting(&broker);
+    let plain = "stty raw -echo; printf 'ready\\n'; head -c 1 | od -An -tx1 | tr -d ' \\n'";
+    let session = client.running("sh", &["-c", plain], false);
+    let mut view = View::attached(&broker, &session);
+    view.until_shows("ready");
+    view.key("Escape", "");
+    // A lone ESC byte, which is what every terminal sent before the protocol
+    view.until_shows("1b");
+}
+
+/// Phase 0, wheel into a full-screen program: a program on the alternate screen that asked for no mouse is sent the
+/// cursor-down key the view sends for a wheel notch, and reads it as ESC [ B. The view's decision to send it
+/// is in its own tests; this is the part that reaches the program.
+#[cfg(unix)]
+#[test]
+fn a_cursor_key_sent_to_a_full_screen_program_that_asked_for_no_mouse_reaches_it() {
+    let broker = start();
+    let client = Client::greeting(&broker);
+    let script = "stty raw -echo; printf '\\033[?1049h'; printf 'ready\\n'; head -c 3 | od -An -tx1 | tr -d ' \\n'";
+    let session = client.running("sh", &["-c", script], false);
+    let mut view = View::attached(&broker, &session);
+    view.until_shows("ready");
+    view.key("ArrowDown", "");
+    // ESC [ B
+    view.until_shows("1b5b42");
+}
