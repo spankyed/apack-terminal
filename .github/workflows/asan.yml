@@ -1,0 +1,24 @@
+name: asan
+
+# The broker's suite under AddressSanitizer on a native x86_64 Linux runner. The Mac's Linux container runs
+# arm64 natively and x86_64 under emulation, where the sanitizer reports addresses the emulator, not the
+# broker, produced. Dispatch only: run it on a branch that has this file, to answer the x86_64 question.
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  asan:
+    name: AddressSanitizer (Linux x64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: the suite under AddressSanitizer
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+        run: cargo +nightly test --target x86_64-unknown-linux-gnu --test suite --no-fail-fast
