@@ -72,6 +72,47 @@ const MARKS: u8 = 4;
 /// Kind, time and payload length.
 const HEADER: usize = 1 + 8 + 4;
 
+/// The format a recording file is written in. A file records its format in its first bytes, so a reader can
+/// refuse a file it does not understand rather than decode it wrongly.
+pub const FORMAT: u16 = 1;
+
+/// The file's first bytes: the magic string, then the format as two little-endian bytes. No entry begins
+/// with `A` (its kind is one of `KEYFRAME` to `MARKS`), so a file that begins with this is not mistaken for
+/// a run of entries, and a file that does not is refused rather than read.
+const FILE_HEADER: [u8; 8] = {
+    let format = FORMAT.to_le_bytes();
+    [b'A', b'P', b'K', b'R', b'E', b'C', format[0], format[1]]
+};
+
+/// Why a recording's first bytes are not a recording this build reads, or `None` when they are, or when
+/// there are none yet. Given the start of a file, which is all that is needed to answer.
+pub fn refusal(head: &[u8]) -> Option<String> {
+    if head.is_empty() || head.starts_with(&FILE_HEADER) {
+        return None;
+    }
+    if head.starts_with(b"APKREC") {
+        let version = head.get(6..8).map_or(0, |bytes| u16::from_le_bytes([bytes[0], bytes[1]]));
+        return Some(format!("it is format {version}, and this broker reads format {FORMAT}"));
+    }
+    Some(format!("it does not begin with a recording's header, and only format {FORMAT} recordings are read"))
+}
+
+/// Whether the file at `path` is a recording this build reads: `Ok` for one that is, and for one that is
+/// not there or is empty, which have nothing to refuse. The reason for a refusal is said for a person.
+pub fn check(path: &Path) -> Result<(), String> {
+    let Ok(mut file) = File::open(path) else { return Ok(()) };
+    let mut head = [0u8; FILE_HEADER.len()];
+    let mut read = 0;
+    while read < head.len() {
+        match file.read(&mut head[read..]) {
+            Ok(0) => break,
+            Ok(more) => read += more,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    refusal(&head[..read]).map_or(Ok(()), Err)
+}
+
 /// One thing that happened to a recorded terminal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Entry {
@@ -156,7 +197,8 @@ fn length(entry: &Entry) -> u64 {
 /// came before it is what was recorded.
 pub fn decode(bytes: &[u8]) -> Vec<Timed> {
     let mut entries = Vec::new();
-    let mut rest = bytes;
+    // A whole file begins with its header, which is not an entry; a stretch of one never does
+    let mut rest = bytes.strip_prefix(&FILE_HEADER).unwrap_or(bytes);
     while rest.len() >= HEADER {
         let kind = rest[0];
         let at = u64::from_le_bytes(rest[1..9].try_into().unwrap_or_default());
@@ -188,8 +230,8 @@ pub fn decode(bytes: &[u8]) -> Vec<Timed> {
 pub fn read(path: &Path) -> Vec<Timed> {
     let mut bytes = Vec::new();
     match File::open(path).and_then(|mut file| file.read_to_end(&mut bytes)) {
-        Ok(_) => decode(&bytes),
-        Err(_) => Vec::new(),
+        Ok(_) if refusal(&bytes).is_none() => decode(&bytes),
+        _ => Vec::new(),
     }
 }
 
@@ -237,8 +279,12 @@ impl Index {
     pub fn open(path: &Path) -> Option<Self> {
         let file = File::open(path).ok()?;
         let mut reader = BufReader::new(file);
+        let mut prefix = [0u8; FILE_HEADER.len()];
+        if reader.read_exact(&mut prefix).is_err() || prefix != FILE_HEADER {
+            return None;
+        }
         let mut keyframes = Vec::new();
-        let (mut at, mut offset) = (0u64, 0u64);
+        let (mut at, mut offset) = (0u64, FILE_HEADER.len() as u64);
         let mut header = [0u8; HEADER];
         // An entry's header, and then past its payload without reading it. A header that is not all
         // there, or a payload the file ends inside, is a recording's torn end
@@ -356,8 +402,9 @@ fn create(path: &Path) -> std::io::Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let file = options.open(&beside)?;
+    let mut file = options.open(&beside)?;
     private(&file)?;
+    file.write_all(&FILE_HEADER)?;
     std::fs::rename(&beside, path)?;
     Ok(file)
 }
@@ -621,7 +668,7 @@ impl Recorder {
             jobs: Some(jobs),
             writing,
             shared,
-            written: 0,
+            written: FILE_HEADER.len() as u64,
             since_keyframe: 0,
             keyframes: Vec::new(),
             budget,
@@ -648,8 +695,14 @@ impl Recorder {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(error) => return Err(error),
         };
-        if bytes.is_empty() {
+        if bytes.is_empty() || bytes == FILE_HEADER {
             return Ok((Self::over(claim, create(path)?, BUDGET, KEYFRAME_EVERY), Vec::new()));
+        }
+        if let Some(why) = refusal(&bytes) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{} is not a recording this broker reads, and is left as it is: {why}", path.display()),
+            ));
         }
         let entries = decode(&bytes);
         if entries.is_empty() {
@@ -660,11 +713,11 @@ impl Recorder {
         }
         let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
         private(&file)?;
-        let written: u64 = entries.iter().map(|timed| length(&timed.entry)).sum();
+        let written: u64 = FILE_HEADER.len() as u64 + entries.iter().map(|timed| length(&timed.entry)).sum::<u64>();
         file.set_len(written)?;
         file.seek(SeekFrom::End(0))?;
         let mut recorder = Self::over(claim, file, BUDGET, KEYFRAME_EVERY);
-        let mut offset = 0;
+        let mut offset = FILE_HEADER.len() as u64;
         for timed in &entries {
             match &timed.entry {
                 Entry::Keyframe { .. } => {
@@ -771,8 +824,11 @@ impl Recorder {
             return Ok(());
         }
         self.ask(Job::DropBefore(from))?;
-        self.written -= from;
-        self.keyframes = self.keyframes.iter().filter(|offset| **offset >= from).map(|offset| offset - from).collect();
+        // What is kept follows the header in the new file, so every position moves back to that
+        let kept = FILE_HEADER.len() as u64;
+        self.written = self.written - from + kept;
+        self.keyframes =
+            self.keyframes.iter().filter(|offset| **offset >= from).map(|offset| offset - from + kept).collect();
         Ok(())
     }
 

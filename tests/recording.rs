@@ -354,7 +354,8 @@ fn a_recording_past_its_budget_keeps_from_the_first_keyframe_in_its_newer_half()
         .filter_map(|timed| if let Entry::Keyframe { redraw, .. } = &timed.entry { Some(redraw[0]) } else { None })
         .collect();
     assert_eq!(marks, b"de");
-    assert_eq!(std::fs::metadata(&path).expect("the recording is there").len(), 400);
+    // The file's eight-byte header, then the two keyframe stretches that were kept
+    assert_eq!(std::fs::metadata(&path).expect("the recording is there").len(), 8 + 400);
 }
 
 /// A keyframe is put off while an application has the screen. Past its budget a recording stops putting
@@ -894,19 +895,23 @@ fn an_entry_of_all_that_may_wait_is_recorded_and_a_byte_more_stops_the_recording
         usize::try_from(std::fs::metadata(path).expect("the recording is there").len()).expect("a length")
     };
 
-    // What an entry is beside the bytes it carries, read off a recording of one byte
+    // The file's header, which is there before any entry, then what an entry is beside the bytes it
+    // carries, read off a recording of one byte
+    let empty = recording_of("empty.recording");
+    drop(Recorder::start_with(&empty, u64::MAX, u64::MAX).expect("the recording starts"));
+    let header = length_of(&empty);
     let small = recording_of("small.recording");
     let mut recorder = Recorder::start_with(&small, u64::MAX, u64::MAX).expect("the recording starts");
     recorder.output(b"o").expect("output is taken");
     drop(recorder);
-    let beside = length_of(&small) - 1;
+    let beside = length_of(&small) - header - 1;
 
     let whole = recording_of("whole.recording");
     let mut recorder = Recorder::start_with(&whole, u64::MAX, u64::MAX).expect("the recording starts");
     recorder.output(&vec![b'o'; recording::BACKLOG - beside]).expect("an entry of all that may wait is taken");
     assert!(!recorder.failed(), "a recording stopped at exactly what may wait for the disk");
     drop(recorder);
-    assert_eq!(length_of(&whole), recording::BACKLOG);
+    assert_eq!(length_of(&whole), header + recording::BACKLOG);
 
     let over = recording_of("over.recording");
     let mut recorder = Recorder::start_with(&over, u64::MAX, u64::MAX).expect("the recording starts");
@@ -1000,4 +1005,76 @@ fn a_recording_whose_session_ended_is_no_longer_named() {
     sessions.spawn(spawn("third.rec", "sleep 600")).expect("the third session starts");
     assert_eq!(sessions.recorders(), 1, "the sessions that ended are still named");
     let _ = sessions.kill("s-3");
+}
+
+/// The format-1 golden file. It was written by a script from the documented layout (the header, then `kind u8`,
+/// `at u64 LE`, `length u32 LE` and the payload), not by this crate's encoder, so an encoder and a reader that
+/// agree on a wrong layout cannot both pass it.
+fn golden() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/recording-format-1.apkrec")
+}
+
+#[test]
+fn a_format_one_recording_reads_as_its_golden_entries() {
+    let path = golden();
+    let bytes = std::fs::read(&path).expect("the golden recording is there");
+    assert!(recording::refusal(&bytes).is_none(), "the golden file is a format 1 recording");
+    let key = apack_terminal::markers::MarksKey::new("00112233445566778899aabbccddeeff").expect("a key");
+    assert_eq!(
+        recording::read(&path),
+        vec![
+            Timed { at: 1000, entry: Entry::Keyframe { cols: 20, rows: 5, redraw: b"\x1b[H\x1b[2J$ ".to_vec() } },
+            Timed { at: 1100, entry: Entry::Output(b"hello\r\n".to_vec()) },
+            Timed { at: 1200, entry: Entry::Resize { cols: 30, rows: 6 } },
+            Timed { at: 1300, entry: Entry::Output(b"world\r\n".to_vec()) },
+            Timed { at: 1400, entry: Entry::Marks { key: None, last: 7 } },
+            Timed { at: 1500, entry: Entry::Marks { key: Some(key), last: 8 } },
+        ]
+    );
+}
+
+#[test]
+fn a_recording_without_the_header_is_refused_and_not_read() {
+    let golden = std::fs::read(golden()).expect("the golden recording is there");
+    // The same entries, as a file written before the header existed
+    let legacy = &golden[8..];
+    let directory = tempfile::tempdir().expect("a directory");
+    let path = directory.path().join("legacy.rec");
+    std::fs::write(&path, legacy).expect("the legacy recording is written");
+
+    assert!(recording::refusal(legacy).is_some());
+    assert!(recording::check(&path).is_err(), "the rewind path refuses it");
+    assert!(recording::read(&path).is_empty(), "nothing is read from it");
+    assert!(Index::open(&path).is_none(), "and no keyframe is found in it to look back through");
+    // The same entries behind a wrong magic: their layout is right, so an index that skipped the magic check
+    // would find the keyframes that are there
+    let mut wrong_magic = golden.clone();
+    wrong_magic[..6].copy_from_slice(b"NOTREC");
+    let wrong = directory.path().join("wrong-magic.rec");
+    std::fs::write(&wrong, &wrong_magic).expect("the recording is written");
+    assert!(Index::open(&wrong).is_none(), "a file that does not begin with the header is not indexed");
+    let refused = match recorder_resume(&path) {
+        Ok(_) => panic!("a recorder resumes nothing it cannot read"),
+        Err(error) => error,
+    };
+    assert_eq!(refused.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(std::fs::read(&path).expect("the file is still there"), legacy, "and it is left as it was");
+}
+
+#[test]
+fn a_recording_of_another_format_is_refused_and_says_which() {
+    let mut bytes = std::fs::read(golden()).expect("the golden recording is there");
+    bytes[6..8].copy_from_slice(&2u16.to_le_bytes());
+    let directory = tempfile::tempdir().expect("a directory");
+    let path = directory.path().join("format-two.rec");
+    std::fs::write(&path, &bytes).expect("the recording is written");
+
+    let why = recording::refusal(&bytes).expect("a format 2 recording is refused");
+    assert!(why.contains("format 2"), "the reason names the format it found: {why}");
+    assert!(recording::read(&path).is_empty());
+}
+
+/// `Recorder::resume` for a file that exists, with the error a refusal gives as an `io::Error`.
+fn recorder_resume(path: &Path) -> std::io::Result<()> {
+    Recorder::resume(path).map(|_| ())
 }

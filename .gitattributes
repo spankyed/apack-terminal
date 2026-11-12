@@ -2,3 +2,5 @@
 # whatever a checkout's platform would make of them
 node/view-vectors.json text eol=lf
 node/protocol.ts text eol=lf
+# A golden recording is compared byte for byte, and its payload has line endings in it
+tests/fixtures/*.apkrec binary

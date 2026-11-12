@@ -173,6 +173,11 @@ exclude_re = [
     # next reader of it
     "recording.rs:.*replace - with / in Recorder::drop_oldest",
 
+    # **The header read stops at the same byte with `<=`.** The loop reads into `head[read..]`, and once
+    # `read` is the whole header that slice is empty, so the extra pass returns `Ok(0)` and breaks: the same
+    # answer one pass later, with nothing read. No input can tell the two apart
+    "recording.rs:.*replace < with <= in check",
+
     # **Two bits that are never the same bit**, so `|` and `^` build one value: the two boundaries a parse
     # may stop at, and the two flags a socket's lock is taken with (the `tree.rs` entry above, again)
     "vt/mod.rs:.*replace \\| with \\^ in Terminal::feed_to",
