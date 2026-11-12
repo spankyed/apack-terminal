@@ -24,6 +24,7 @@ use std::time::Duration;
 use interprocess::local_socket::{GenericFilePath, Stream, ToFsName, prelude::*};
 
 use crate::listening::{self, HELD_EXIT};
+use crate::protocol::Request;
 
 /// How many times a proxy looks for a broker before giving up on there being one.
 ///
@@ -119,17 +120,6 @@ fn pump(mut from: impl Read, mut to: impl Write) {
     }
 }
 
-/// Says nothing more will be sent on `stream`, leaving what the broker still has to say to be read.
-/// `false` where a connection cannot be closed one way, which is a named pipe.
-fn finish_sending(stream: &Stream) -> bool {
-    match stream {
-        #[cfg(unix)]
-        Stream::UdSocket(socket) => socket.inner().shutdown(std::net::Shutdown::Write).is_ok(),
-        #[cfg(windows)]
-        Stream::NamedPipe(_) => false,
-    }
-}
-
 /// Runs as the proxy: until the broker hangs up, which it does once this process's stdin has ended and
 /// the broker has said everything it had to say.
 pub fn run(socket: &str) -> std::io::Result<()> {
@@ -142,17 +132,16 @@ pub fn run(socket: &str) -> std::io::Result<()> {
         )));
     }
     // **Stdin ending is the far end having said all it will, not the end of the conversation.** The
-    // broker may still be answering what it was last asked, so the connection is closed in that one
-    // direction and read until the broker closes the other; ending the process here would cut off the
-    // answer to the request just carried. Where a connection has only one end to close, that is what
-    // this still does
+    // broker may still be answering what it was last asked, so the caller says so with `Done` and goes on
+    // reading until the broker lets the connection go; ending the process here would cut off the answer
+    // to the request just carried. A named pipe cannot be closed one way, so this is the same on every
+    // platform, rather than a half-close where there is one and an exit where there is not
     std::thread::spawn({
         let stream = Arc::clone(&stream);
         move || {
             pump(std::io::stdin().lock(), &*stream);
-            if !finish_sending(&stream) {
-                std::process::exit(0);
-            }
+            let done = serde_json::to_string(&Request::Done).expect("a request serializes");
+            let _ = (&*stream).write_all(format!("{done}\n").as_bytes());
         }
     });
     // The broker hanging up leaves nothing to read, and a thread still parked on stdin is no reason to stay

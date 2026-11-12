@@ -450,9 +450,8 @@ fn a_proxy_says_why_the_broker_it_started_could_not_listen() {
 /// the whole of a conversation piped into it — goes on carrying what the broker says until the broker
 /// has said it, so the last request is answered like the first.
 ///
-/// **POSIX only.** A named pipe has one end to close, so a proxy on Windows whose input ends leaves at
-/// once (`proxy::finish_sending`), and what the broker had still to say is not carried.
-#[cfg(unix)]
+/// On every platform: the caller says `done` when its input ends, and the broker answers what it owes
+/// before it lets go.
 #[test]
 fn a_proxy_whose_input_has_ended_still_carries_the_answer_to_what_it_was_last_sent() {
     let directory = tempfile::tempdir().expect("a directory for the socket");

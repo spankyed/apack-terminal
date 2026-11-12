@@ -947,3 +947,44 @@ fn every_stopped_recording_is_whole_once_they_have_all_been_waited_for() {
         assert_eq!(output, chunk.len() * chunks, "{} does not hold what it was handed", path.display());
     }
 }
+
+/// **A broker names only the recordings whose sessions are still running.** A session that ended has
+/// nothing left to write, and a rewind of its file does not wait for it, so the list it was kept in is
+/// bounded by what is running and not by everything recorded since the broker started.
+#[cfg(unix)]
+#[test]
+fn a_recording_whose_session_ended_is_no_longer_named() {
+    use apack_terminal::output::Credit;
+    use apack_terminal::session::{Sessions, Spawning};
+
+    let directory = tempfile::tempdir().expect("a directory for recordings");
+    let (events, _told) = std::sync::mpsc::channel();
+    let sessions = Sessions::new(events, Credit::new(64));
+    let spawn = |file: &str| Spawning {
+        cols: 40,
+        rows: 10,
+        shell: Some("/bin/sh".to_owned()),
+        args: vec!["-c".to_owned(), "sleep 600".to_owned()],
+        env: Vec::new(),
+        unset: Vec::new(),
+        cwd: None,
+        colors: None,
+        output: false,
+        record: Some(directory.path().join(file).to_str().expect("a utf-8 path").to_owned()),
+        restore: false,
+        images: false,
+        marks_key: None,
+    };
+    let mut ids = Vec::new();
+    for file in ["first.rec", "second.rec", "third.rec"] {
+        sessions.spawn(spawn(file)).expect("the session starts");
+        ids.push(format!("s-{}", ids.len() + 1));
+    }
+    assert_eq!(sessions.recorders(), 3);
+
+    sessions.kill(&ids[0]).expect("the first session is ended");
+    sessions.kill(&ids[1]).expect("the second session is ended");
+    // Spawning the next one is what looks at the list, so the two ended ones are gone from it
+    sessions.spawn(spawn("fourth.rec")).expect("the next session starts");
+    assert_eq!(sessions.recorders(), 2, "the ended sessions are still named");
+}

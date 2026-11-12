@@ -1086,6 +1086,11 @@ impl Sessions {
         // before its session was recorded would be forgotten first and recorded after, for ever.
         {
             let mut record = self.record();
+            let held = &mut *record;
+            // Only sessions still running are named: the list of recordings keeps what a rewind must wait
+            // for, and a session that has ended has nothing left to write. Without this, every file a
+            // broker ever recorded to stayed in it for the life of the broker
+            held.recording.retain(|_, recorder| held.live.contains_key(recorder));
             if let Some(path) = &recording {
                 record.recording.insert(path.clone(), session.clone());
             }
@@ -1502,6 +1507,13 @@ impl Sessions {
         // `s-<n>`, in the order they were started
         all.sort_by_key(|summary| summary.session.trim_start_matches("s-").parse::<u64>().unwrap_or(u64::MAX));
         all
+    }
+
+    /// How many recordings have a session named against them, which is how many files are held open for
+    /// writing or waited on by a rewind. Bounded by the sessions that are running, not by every recording
+    /// the broker has ever made.
+    pub fn recorders(&self) -> usize {
+        self.record().recording.len()
     }
 
     /// Opens a recording as a session showing its end, answering the id and the moments it runs between.

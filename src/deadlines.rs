@@ -6,8 +6,10 @@
 //! is as many threads as there are callers waiting — an agent that waits on every command holds one
 //! for the whole of each, met or not. Here a wait costs an entry in a list.
 //!
-//! A wait that was met is dropped from the list the next time the thread looks, and says nothing.
+//! A wait that was met is dropped from the list the next time the thread looks at it, and says nothing.
 
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
@@ -45,36 +47,51 @@ impl Deadlines {
 }
 
 fn keep(set: &Receiver<Deadline>, events: &Sender<Outgoing>) {
-    let mut waiting: Vec<Deadline> = Vec::new();
+    // Ordered by when each falls due, earliest first; `seq` breaks a tie so that two due at the same
+    // instant are both given up on. The deadlines themselves are kept beside it, by `seq`
+    let mut waiting: BinaryHeap<Reverse<(Instant, u64)>> = BinaryHeap::new();
+    let mut pending: HashMap<u64, Deadline> = HashMap::new();
+    let mut seq = 0_u64;
     loop {
-        let arrived = match waiting.iter().map(|deadline| deadline.at).min() {
+        // Everything due is dealt with before anything is waited for again
+        let now = Instant::now();
+        while let Some(Reverse((at, next))) = waiting.peek().copied() {
+            let Some(deadline) = pending.remove(&next) else {
+                waiting.pop();
+                continue;
+            };
+            // Met since it was set: there is nothing to say of it, and nothing to wait for either
+            if deadline.settled.load(Ordering::SeqCst) {
+                waiting.pop();
+                continue;
+            }
+            if at > now {
+                pending.insert(next, deadline);
+                break;
+            }
+            waiting.pop();
+            // Whichever end settles a wait first is the one that answers it
+            if !deadline.settled.swap(true, Ordering::SeqCst) {
+                let timed_out = Event::Waited { session: deadline.session, outcome: WaitOutcome::Timeout };
+                let _ = events.send(Outgoing::answer(timed_out));
+            }
+        }
+        let arrived = match waiting.peek() {
             // Nothing is waited for: asleep until something is
             None => match set.recv() {
                 Ok(deadline) => Some(deadline),
                 Err(_) => return,
             },
-            Some(next) => match set.recv_timeout(next.saturating_duration_since(Instant::now())) {
+            Some(Reverse((at, _))) => match set.recv_timeout(at.saturating_duration_since(Instant::now())) {
                 Ok(deadline) => Some(deadline),
                 Err(RecvTimeoutError::Timeout) => None,
                 Err(RecvTimeoutError::Disconnected) => return,
             },
         };
-        waiting.extend(arrived);
-        let now = Instant::now();
-        waiting.retain(|deadline| {
-            // Met since it was last looked at: there is nothing to say of it
-            if deadline.settled.load(Ordering::SeqCst) {
-                return false;
-            }
-            if !deadline.at.saturating_duration_since(now).is_zero() {
-                return true;
-            }
-            // Whichever end settles a wait first is the one that answers it
-            if !deadline.settled.swap(true, Ordering::SeqCst) {
-                let timed_out = Event::Waited { session: deadline.session.clone(), outcome: WaitOutcome::Timeout };
-                let _ = events.send(Outgoing::answer(timed_out));
-            }
-            false
-        });
+        if let Some(deadline) = arrived {
+            seq += 1;
+            waiting.push(Reverse((deadline.at, seq)));
+            pending.insert(seq, deadline);
+        }
     }
 }
