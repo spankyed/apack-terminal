@@ -5,19 +5,24 @@
 
 use std::time::{Duration, SystemTime};
 
-use apack_terminal::commands::{COMMANDS_KEPT, Commands};
+use apack_terminal::commands::{COMMANDS_KEPT, Commands, Outcome};
 
 fn at(seconds: u64) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)
 }
 
-/// Each command as `(id, command, exit status, prompt row, output row, end row, running)`.
-type Summary = (u64, Option<String>, Option<i32>, Option<u32>, Option<u32>, Option<u32>, bool);
+/// Each command as `(id, command, how it ended, prompt row, output row, end row, running)`.
+type Summary = (u64, Option<String>, Outcome, Option<u32>, Option<u32>, Option<u32>, bool);
+
+/// An end as a marker anything can write reports one, with the status it gave.
+fn claimed(status: i32) -> Outcome {
+    Outcome::Claimed(Some(status))
+}
 
 fn summary(commands: &Commands<u32>) -> Vec<Summary> {
     commands
         .iter()
-        .map(|one| (one.id, one.command.clone(), one.exit_status, one.prompt, one.output, one.end, one.running()))
+        .map(|one| (one.id, one.command.clone(), one.outcome, one.prompt, one.output, one.end, one.running()))
         .collect()
 }
 
@@ -28,11 +33,14 @@ fn a_command_is_recorded_from_its_prompt_to_its_end_with_the_row_each_was_at() {
     commands.place(|_| Some(10));
     commands.output_started(Some("make".to_owned()), Some("/src".to_owned()), at(2));
     commands.place(|_| Some(11));
-    assert_eq!(summary(&commands), vec![(1, Some("make".to_owned()), None, Some(10), Some(11), None, true)]);
+    assert_eq!(
+        summary(&commands),
+        vec![(1, Some("make".to_owned()), Outcome::Running, Some(10), Some(11), None, true)]
+    );
 
-    commands.ended(Some(2), at(5));
+    commands.ended(claimed(2), None, at(5));
     commands.place(|_| Some(40));
-    assert_eq!(summary(&commands), vec![(1, Some("make".to_owned()), Some(2), Some(10), Some(11), Some(40), false)]);
+    assert_eq!(summary(&commands), vec![(1, Some("make".to_owned()), claimed(2), Some(10), Some(11), Some(40), false)]);
     let made = commands.get(1).expect("the command is kept");
     assert_eq!((made.cwd.as_deref(), made.started, made.finished), (Some("/src"), Some(at(2)), Some(at(5))));
 }
@@ -44,12 +52,12 @@ fn the_prompt_after_an_end_is_the_next_command_waiting() {
     let mut commands = Commands::<u32>::default();
     commands.prompt_started(at(1));
     commands.output_started(None, None, at(2));
-    commands.ended(Some(0), at(3));
+    commands.ended(claimed(0), None, at(3));
     commands.prompt_started(at(3));
     commands.place(|_| Some(7));
     let all = summary(&commands);
     assert_eq!(all.len(), 2);
-    assert_eq!((all[0].2, all[0].6), (Some(0), false), "the first ended once, with its status");
+    assert_eq!((all[0].2, all[0].6), (claimed(0), false), "the first ended once, with its status");
     assert_eq!((all[1].0, all[1].3, all[1].6), (2, Some(7), false), "the second is waiting at its prompt");
 }
 
@@ -60,7 +68,7 @@ fn a_prompt_ends_a_command_whose_end_was_never_reported() {
     commands.output_started(Some("sleep 1".to_owned()), None, at(1));
     commands.prompt_started(at(2));
     let all = summary(&commands);
-    assert_eq!((all[0].2, all[0].6), (None, false));
+    assert_eq!((all[0].2, all[0].6), (Outcome::Claimed(None), false));
     assert_eq!(commands.get(1).and_then(|one| one.finished), Some(at(2)));
 }
 
@@ -73,13 +81,13 @@ fn a_prompt_drawn_again_with_nothing_run_is_the_same_command_moved() {
     commands.place(|_| Some(3));
     commands.prompt_started(at(2));
     commands.place(|_| Some(4));
-    assert_eq!(summary(&commands), vec![(1, None, None, Some(4), None, None, false)]);
+    assert_eq!(summary(&commands), vec![(1, None, Outcome::Running, Some(4), None, None, false)]);
 }
 
 #[test]
 fn an_end_with_nothing_running_is_not_a_command() {
     let mut commands = Commands::<u32>::default();
-    commands.ended(Some(1), at(1));
+    commands.ended(claimed(1), None, at(1));
     assert_eq!(summary(&commands), vec![]);
     assert_eq!(commands.generation(), 0, "nothing happened, so nothing watching is told to look");
 }
@@ -93,9 +101,9 @@ fn the_generation_moves_with_every_change() {
     seen.push(commands.generation());
     commands.output_started(None, None, at(1));
     seen.push(commands.generation());
-    commands.ended(None, at(1));
+    commands.ended(Outcome::Claimed(None), None, at(1));
     seen.push(commands.generation());
-    commands.ended(None, at(1));
+    commands.ended(Outcome::Claimed(None), None, at(1));
     seen.push(commands.generation());
     assert_eq!(seen, vec![0, 1, 2, 3, 3]);
 }
@@ -107,12 +115,12 @@ fn moments_are_given_rows_in_the_order_they_happened() {
     let mut commands = Commands::<u32>::default();
     commands.prompt_started(at(1));
     commands.output_started(None, None, at(1));
-    commands.ended(None, at(1));
+    commands.ended(Outcome::Claimed(None), None, at(1));
     assert!(commands.moments_waiting());
     let mut rows = [Some(1), None, Some(3)].into_iter();
     commands.place(|_| rows.next().flatten());
     assert!(!commands.moments_waiting());
-    assert_eq!(summary(&commands), vec![(1, None, None, Some(1), None, Some(3), false)]);
+    assert_eq!(summary(&commands), vec![(1, None, Outcome::Claimed(None), Some(1), None, Some(3), false)]);
 }
 
 #[test]
@@ -120,7 +128,7 @@ fn only_the_newest_commands_are_kept_and_an_id_is_never_reused() {
     let mut commands = Commands::<u32>::default();
     for _ in 0..COMMANDS_KEPT + 5 {
         commands.output_started(None, None, at(1));
-        commands.ended(Some(0), at(1));
+        commands.ended(claimed(0), None, at(1));
     }
     let ids: Vec<u64> = commands.iter().map(|one| one.id).collect();
     assert_eq!(ids.len(), COMMANDS_KEPT);

@@ -607,7 +607,7 @@
     "to": "view"
   },
   {
-    "hex": "3f000000490311020301ff0a636172676f2074657374082f7372632f61707080a8ee959b34b988ef959b340028295a029ca0c4ef959b3494c8ef959b34015fac02205f",
+    "hex": "650000004903110205017f0a636172676f2074657374082f7372632f61707080a8ee959b34b988ef959b34010028295a024ca0c4ef959b3494c8ef959b3404015f030888ccef959b3403040d09736c65657020313030f0d3ef959b34d8dbef959b340201ac0210005f",
     "message": {
       "channel": 3,
       "commands": [
@@ -615,9 +615,12 @@
           "command": "cargo test",
           "cwd": "/src/app",
           "end": 90,
-          "exitStatus": 0,
           "finishedMs": 1794000012345,
           "id": 1,
+          "outcome": {
+            "code": 0,
+            "kind": "exited"
+          },
           "output": 41,
           "prompt": 40,
           "startedMs": 1794000000000
@@ -626,9 +629,12 @@
           "command": null,
           "cwd": null,
           "end": 95,
-          "exitStatus": -1,
           "finishedMs": 1794000020500,
           "id": 2,
+          "outcome": {
+            "code": -1,
+            "kind": "claimed"
+          },
           "output": null,
           "prompt": null,
           "startedMs": 1794000020000
@@ -637,9 +643,39 @@
           "command": null,
           "cwd": null,
           "end": null,
-          "exitStatus": null,
+          "finishedMs": 1794000021000,
+          "id": 3,
+          "outcome": {
+            "code": null,
+            "kind": "claimed"
+          },
+          "output": null,
+          "prompt": null,
+          "startedMs": null
+        },
+        {
+          "command": "sleep 100",
+          "cwd": null,
+          "end": null,
+          "finishedMs": 1794000023000,
+          "id": 4,
+          "outcome": {
+            "kind": "unknown",
+            "why": "superseded"
+          },
+          "output": null,
+          "prompt": null,
+          "startedMs": 1794000022000
+        },
+        {
+          "command": null,
+          "cwd": null,
+          "end": null,
           "finishedMs": null,
           "id": 300,
+          "outcome": {
+            "kind": "running"
+          },
           "output": null,
           "prompt": 95,
           "startedMs": null
@@ -649,7 +685,7 @@
       "kind": "commands",
       "request": 17
     },
-    "name": "commands: one finished with everything known, one that failed with a negative status, one waiting",
+    "name": "commands: one that exited with everything known, one claimed to have failed with a negative status, one claimed to have ended with none, one whose end was never reported, one waiting",
     "to": "view"
   },
   {

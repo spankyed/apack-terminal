@@ -42,7 +42,7 @@ means for a session's lifetime.
 | kind | asks for |
 |---|---|
 | `hello` | the handshake, with a protocol version and a role |
-| `spawn` | a shell in a new pty: `cols`, `rows`, `shell`, `args`, `env`, `unset`, `cwd`, and optionally `colors`, `output`, `record`, `restore`, `images` |
+| `spawn` | a shell in a new pty: `cols`, `rows`, `shell`, `args`, `env`, `unset`, `cwd`, and optionally `colors`, `output`, `record`, `restore`, `images`, `marks_key` |
 | `write` | bytes the user typed |
 | `resize` | the viewport changed; one size per session, because a pty has one |
 | `pause` | stop reading this session's pty, so its process feels the reader stop |
@@ -50,7 +50,7 @@ means for a session's lifetime.
 | `signal` | a signal to the session's process, its process group, or one process inside its tree |
 | `owns` | whether a pid is inside this session's process tree |
 | `screen` | the screen as the broker has it, with up to `history` lines above the viewport |
-| `facts` | what the shell reported about itself: directory, command line, whether one is running, last status, how many have finished |
+| `facts` | what the shell reported about itself: directory, command line, whether one is running, how the last one ended, how many have finished — and whether the session's marks are vouched for, and how many were refused |
 | `search` | where text appears in the screen and the history above it |
 | `wait` | until idle, until text appears, or until the process ends, with a deadline |
 | `commands` | the commands the session's shell has marked, oldest first |
@@ -66,6 +66,16 @@ bytes wants them; a terminal a person looks at is drawn by a view, which is sent
 ([views.md](views.md)), and its bytes would cross the socket to be thrown away and stall the program on
 their credit. `record` and `restore` are a file to record the session in and whether to begin with what it
 holds; `images` is whether its programs may send any ([design.md](design.md)).
+
+`marks_key` is what vouches for the shell's marks: 32 lowercase hexadecimal characters the caller also
+gives the shell — the broker does not; it spawns what it is handed — and nothing else. A session spawned
+with one records a command, and says one is running, only on the word of a mark carrying it; one spawned
+without believes every marker and reports how a command ended as a claim. Which it is holds for the
+session's whole life. A key that is not one is refused with `MALFORMED` rather than spawned without
+([design.md](design.md#a-sessions-marks-can-be-vouched-for)).
+
+**A `wait` for idle in a keyed session is met by a keyed finish and by nothing else.** A prompt mark is
+what ends a command for a session without a key, and anything can print one.
 
 **A `write` is queued, not written.** What is bound for a program — a `write`, and everything a view
 types, pastes or points at — waits its turn for the program to read it, and the request is answered
@@ -108,17 +118,36 @@ is what a caller gets when it asks for both.
 | `throttled` | a flush waited for credit, with the microseconds it waited. Not a loss |
 | `screen` | the lines a `screen` asked for, the cursor, and whether an alternate-screen app is showing |
 | `owns` | whether that pid is inside the session's tree; the pid is the correlation |
-| `facts` | the shell's claims about itself. `finished` moves each time a command it reported starting has ended, so a caller that asks after a quick command has ended still learns one ran. It is compared for a difference only: it wraps, and a shell emitting both marker families moves it twice per command |
+| `facts` | what the shell said about itself. `outcome` is how the last command to end ended, absent when none has. `finished` moves each time a command it reported starting has ended, so a caller that asks after a quick command has ended still learns one ran. It is compared for a difference only: it wraps, and a shell emitting both marker families moves it twice per command. `vouched` says whether the session was spawned with a key, which is whether `command`, `running`, `outcome` and `finished` come from keyed marks alone; `cwd` is a claim either way. `refused` counts the marks spelled as keyed ones that were not accepted |
 | `search` | where the text was found, with the whole line for context |
 | `waited` | how a wait ended: `MET`, `TIMEOUT` or `EXITED`. Once per wait, however it ended |
 | `title`, `bell`, `clipboard`, `notification`, `progress` | what the program did that is not on its screen. Reported, never acted on |
-| `command_started`, `command_finished`, `cwd_changed` | what the shell marked, as it happened |
+| `command_started`, `command_finished`, `cwd_changed` | what the shell marked, as it happened. `command_finished` carries how it ended (`outcome`), and a keyed session that ends with a command running sends one for it before `exited` |
 | `commands`, `command_output` | the answers to the requests of those names |
 | `kept` | whether the session outlives the broker's holder, answering `keep` |
 | `sessions` | every session there is: its size, whether it is kept and recorded, its title and its shell's claims |
 | `rewound` | a recording opened as a session, with the moments it runs between |
 | `sought` | the moment a rewound session now shows |
 | `failed` | a request could not be carried out |
+
+## How a command ended is one value, and it says who said so
+
+Wherever a command's end is told — a record in `commands`, `command_finished`, `facts` — it is an
+`outcome`, tagged by `kind`:
+
+| outcome | means |
+|---|---|
+| `{"kind":"running"}` | it has not ended. A record still waiting at its prompt has not begun either, which its `started_ms` says |
+| `{"kind":"exited","code":N}` | it exited with this status, as a mark carrying the session's key reported |
+| `{"kind":"unknown","why":…}` | it is over, in a keyed session, and no keyed mark said how: `no_status` (the shell reported the end and had no status), `superseded` (a later command began while it ran), `session_ended` |
+| `{"kind":"claimed","code":N\|null}` | something printed that it ended, with this status where it gave one. Every command that ended in a session spawned without a key, and none in one spawned with |
+
+**`exited` is the only one that is an exit status.** A reader that wants to know a command succeeded asks
+for `exited` with a code of zero, and nothing a program printed can be handed to it as that. There is no
+bare status field anywhere to read instead.
+
+A record's `cwd` is where the shell was: when the command began, in a session without a key, and when it
+ended, in one with — which is what a keyed finish carries.
 
 Lines in a `screen` are **text, not cells**: a wide character appears once rather than beside the spacer cell
 it occupies, and the padding a row carries to its full width is not there. What it answers is what was
@@ -243,7 +272,7 @@ rather than matching a message that is free to be reworded.
 | code | means |
 |---|---|
 | `HANDSHAKE` | the first message was not `hello`, its version is not ours, or `hello` was said a second time |
-| `MALFORMED` | a frame did not parse as a request |
+| `MALFORMED` | a frame did not parse as a request, or a field of one holds what it cannot: a `marks_key` that is not 32 lowercase hexadecimal characters |
 | `NO_SUCH_SESSION` | no session has that id — it never existed, or it has already exited |
 | `PTY` | the pty or the process refused: spawn or resize failed at the OS, or more is already waiting for the program to read than a session holds |
 | `OUTSIDE_SESSION` | a `signal` named a pid that is not in that session's tree |

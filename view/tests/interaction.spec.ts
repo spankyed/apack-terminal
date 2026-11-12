@@ -666,15 +666,15 @@ describe('where a session\'s images are', () => {
 
 describe('the commands a shell ran', () => {
   const command = (id: number, prompt: number, parts: Partial<Command> = {}): Command => ({
-    id, command: `cmd ${id}`, cwd: '/src', startedMs: 1000, finishedMs: 2000, exitStatus: 0, prompt, output: prompt + 1, end: prompt + 3, ...parts,
+    id, command: `cmd ${id}`, cwd: '/src', startedMs: 1000, finishedMs: 2000, outcome: { kind: 'exited', code: 0 }, prompt, output: prompt + 1, end: prompt + 3, ...parts,
   })
   /** A view over a screen at lines 100 to 103 with a hundred lines of history, and three commands in it */
   async function withCommands(options: Parameters<typeof mountedView>[0] = {}) {
     const view = mountedView({ gutter: 6, ...options })
     view.source.commandList = [
       command(1, 20),
-      command(2, 60, { exitStatus: 2 }),
-      command(3, 101, { finishedMs: null, exitStatus: null, end: null }),
+      command(2, 60, { outcome: { kind: 'exited', code: 2 } }),
+      command(3, 101, { finishedMs: null, outcome: { kind: 'running' }, end: null }),
     ]
     showing(view, { firstActive: 100, scrollback: 100, commands: 1 })
     await settled()
@@ -748,6 +748,28 @@ describe('the commands a shell ran', () => {
     expect(view.painted().marks, 'a command that failed').toEqual([{ row: 2, color: theme.palette[1] }])
     view.view.scrollTo(20)
     expect(view.painted().marks, 'a command that succeeded').toEqual([{ row: 0, color: theme.palette[2] }])
+  })
+
+  it('are marked as having succeeded only where a status of zero was vouched for', async () => {
+    const view = mountedView({ gutter: 6 })
+    const ended: Array<[Command['outcome'], number | undefined, string]> = [
+      [{ kind: 'exited', code: 0 }, theme.palette[2], 'an exit of zero'],
+      [{ kind: 'claimed', code: 0 }, theme.palette[3], 'a claim of zero'],
+      [{ kind: 'claimed', code: 2 }, theme.palette[1], 'a claim of a failure'],
+      [{ kind: 'claimed', code: null }, theme.palette[8], 'a claim of an end with no status'],
+      [{ kind: 'unknown', why: 'no_status' }, theme.palette[8], 'an end with no status'],
+      [{ kind: 'unknown', why: 'superseded' }, theme.palette[8], 'an end nothing reported'],
+      [{ kind: 'unknown', why: 'session_ended' }, theme.palette[8], 'a session that ended'],
+    ]
+    view.source.commandList = ended.map(([outcome], index) => command(index + 1, 100 + index, { outcome }))
+    showing(view, { firstActive: 100, scrollback: 100, commands: 1, screenRows: ended.length })
+    await settled()
+
+    const marks = view.painted().marks ?? []
+    expect(marks.map((mark) => mark.row)).toEqual(ended.map((_, index) => index))
+    for (const [index, [, color, what]] of ended.entries()) expect(marks[index]?.color, what).toBe(color)
+    const succeeded = marks.filter((mark) => mark.color === theme.palette[2])
+    expect(succeeded.map((mark) => mark.row), 'only the vouched exit of zero is drawn as success').toEqual([0])
   })
 
   it('are not marked where the view was given no gutter to mark them in', async () => {

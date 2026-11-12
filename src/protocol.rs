@@ -17,6 +17,8 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+use crate::commands::{Outcome, Unknown};
+
 /// Bumped when a message's meaning changes. The app refuses a broker that does not answer with its own.
 ///
 /// **Still 1, and a change to what a message means is not by itself a reason to move it.** The consumer
@@ -103,6 +105,18 @@ pub enum Request {
         /// views draw them; absent, a program is told no and prints what it would have otherwise.
         #[serde(default)]
         images: bool,
+        /// **What vouches for the shell's marks**: 32 lowercase hexadecimal characters the caller also
+        /// gave the shell, and nothing else (`markers::MarksKey`). A session spawned with one records a
+        /// command, and says one is running, only on the word of a mark carrying it — so a file shown
+        /// with `cat`, a log line or a web response that spells a marker changes nothing. Absent, every
+        /// marker is believed, and how a command ended is reported as a claim (`CommandOutcome`). Which
+        /// it is holds for the session's whole life.
+        ///
+        /// **Proof against what is printed, not against what runs.** A program running as the user in
+        /// that shell can read the key and write any mark it likes; nothing here is a boundary against
+        /// one. A key that is not one is refused (`ErrorCode::Malformed`) rather than spawned without.
+        #[serde(default)]
+        marks_key: Option<String>,
     },
     /// Bytes the user typed.
     /// `text`, not `data`: what crosses here is decoded text, which is the contract and not an accident.
@@ -184,11 +198,12 @@ pub enum Request {
     /// less, and an alternate-screen app has no scrollback to answer with at all.
     Screen { session: SessionId, history: u32 },
     /// **What the shell has reported about itself** — the working directory, the command line it last said
-    /// it was running, whether one is running, the status the last one ended with, and how many have ended.
+    /// it was running, whether one is running, how the last one ended, and how many have ended.
     ///
-    /// This is the read shell integration exists for, and it answers for a session nobody is drawing. Every
-    /// field is a claim the program in the pty made, so what a caller may do with a reported path is the
-    /// app's decision; the broker reports what was said.
+    /// This is the read shell integration exists for, and it answers for a session nobody is drawing. In
+    /// a session spawned without a key every field is a claim the program in the pty made, so what a
+    /// caller may do with one is the app's decision; the broker reports what was said. The answer says
+    /// which kind of session it is.
     Facts { session: SessionId },
     /// Where `text` appears in the screen and the `history` lines above it, oldest first.
     ///
@@ -334,6 +349,10 @@ pub enum Until {
     /// without the markers nothing ever reports a command starting, so a session that emits none is idle
     /// from the start and this answers at once. That is the honest answer for a session whose shell says
     /// nothing, rather than a guess read off the screen.
+    ///
+    /// **In a session spawned with a key, only a keyed mark moves it**: a command is running from a
+    /// start that carried the key until the finish with its number, and a prompt mark — which anything
+    /// can print — ends nothing.
     Idle,
     /// `text` appears in the screen or its history. The fallback for a program that reports nothing, and the
     /// one a caller reaches for when waiting for something a shell has no marker for.
@@ -488,21 +507,33 @@ pub enum Event {
     Owns { session: SessionId, pid: u32, owned: bool },
     /// What the shell reported about itself and what is running in the pty, answering `Facts`.
     ///
-    /// **`cwd`, `command`, `running`, `exit_status` and `finished` are claims; `foreground` is a
-    /// measurement**, and the
-    /// two are not interchangeable — a shell with no integration installed claims nothing at all, and a
-    /// program in the pty may claim whatever it likes. They travel in one event because a caller asking
-    /// what a session is doing wants both and should not pay two round trips to find out.
+    /// **`cwd`, `command`, `running`, `outcome` and `finished` are what was said; `foreground` is a
+    /// measurement**, and the two are not interchangeable — a shell with no integration installed says
+    /// nothing at all. They travel in one event because a caller asking what a session is doing wants
+    /// both and should not pay two round trips to find out.
+    ///
+    /// **`vouched` says who could have said it.** In a session spawned with a key, `command`, `running`,
+    /// `outcome` and `finished` come from marks carrying the key and from nothing else. In one spawned
+    /// without, a program in the pty may claim whatever it likes, and all of it is a claim. `cwd` is a
+    /// claim in both.
     Facts {
         session: SessionId,
         cwd: Option<String>,
         command: Option<String>,
         running: bool,
-        exit_status: Option<i32>,
+        /// How the last command to end ended. Absent when none has; never `running`.
+        outcome: Option<CommandOutcome>,
         /// Moves each time the shell reports a command it started has ended. A caller that asks after a
         /// command has already ended learns one ran by this differing from what it last read; it is not
         /// an exact number of commands and it wraps, so it is compared for a difference only.
         finished: u32,
+        /// Whether the session was spawned with a key (`Request::Spawn`'s `marks_key`).
+        vouched: bool,
+        /// **How many marks spelled as keyed ones were refused**: the wrong key, a number not past the
+        /// last one accepted, an end for a command that is not the one running, or any at all in a
+        /// session with no key. A hook out of step with its session and a stream forging marks both move
+        /// it, where a shell that marks nothing moves nothing. It stops at the largest number it holds.
+        refused: u32,
         foreground: Option<Foreground>,
     },
     /// Where a search found its text, answering `Search`.
@@ -550,8 +581,8 @@ pub enum Event {
     /// Pushed, as the two below are, because each is a moment: a caller asking `Facts` on a timer learns
     /// that a command ran and not when, and one that asks between two commands misses the first.
     CommandStarted { session: SessionId, command: Option<String> },
-    /// What was running ended. `exit_status` is absent when the shell reported none, which is not zero.
-    CommandFinished { session: SessionId, exit_status: Option<i32> },
+    /// What was running ended, and how as far as anything said. Never `running`.
+    CommandFinished { session: SessionId, outcome: CommandOutcome },
     /// The shell's working directory changed, as the shell reported it.
     CwdChanged { session: SessionId, cwd: String },
     /// A request could not be carried out. `session` is absent when the request named none.
@@ -578,7 +609,63 @@ pub struct SessionSummary {
     pub running: bool,
 }
 
-/// One command a session's shell reported. Every field but the id is a claim the shell made.
+/// How a command ended, or that it has not: one value, which says who said so.
+///
+/// **A status only a keyed mark can give is the only one called an exit.** `exited` is made from a
+/// finish that carried the session's key, and from nothing else; what a session without a key heard is
+/// `claimed`, whatever number came with it. A reader that wants to know a command succeeded asks for
+/// `exited` with a code of zero, and nothing a program printed can be handed to it as that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export, export_to = "protocol.ts")]
+pub enum CommandOutcome {
+    /// It has not ended. A command still waiting at its prompt has not begun either, which its
+    /// `started_ms` says.
+    #[default]
+    Running,
+    /// It exited with this status, as a mark carrying the session's key reported.
+    Exited { code: i32 },
+    /// It is over, in a session spawned with a key, and no keyed mark said how.
+    Unknown { why: Unreported },
+    /// Something printed that it ended, with this status where it gave one. Every command that ended
+    /// in a session spawned without a key, and none in one spawned with.
+    Claimed { code: Option<i32> },
+}
+
+/// Why a command in a session spawned with a key is over with no exit status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "protocol.ts")]
+pub enum Unreported {
+    /// The shell reported its end and had no status to give.
+    NoStatus,
+    /// A later command began while it was still running: its end was never reported.
+    Superseded,
+    /// The session ended while it was running.
+    SessionEnded,
+}
+
+impl From<Outcome> for CommandOutcome {
+    /// How a command ended as a client is told it. **One way only**: nothing a client sends is ever
+    /// read back as how a command ended.
+    fn from(outcome: Outcome) -> Self {
+        match outcome {
+            Outcome::Running => Self::Running,
+            Outcome::Exited(code) => Self::Exited { code: code.get() },
+            Outcome::Unknown(why) => Self::Unknown {
+                why: match why {
+                    Unknown::NoStatus => Unreported::NoStatus,
+                    Unknown::Superseded => Unreported::Superseded,
+                    Unknown::SessionEnded => Unreported::SessionEnded,
+                },
+            },
+            Outcome::Claimed(code) => Self::Claimed { code },
+        }
+    }
+}
+
+/// One command a session's shell reported. What vouches for its fields is the session's: in one
+/// spawned without a key every field but the id is a claim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "protocol.ts")]
 pub struct CommandRecord {
@@ -586,15 +673,15 @@ pub struct CommandRecord {
     pub id: u32,
     /// The line the shell read, where it said
     pub command: Option<String>,
-    /// Where the shell was when the command began
+    /// Where the shell was: when the command began, in a session spawned without a key, and when it
+    /// ended, in one spawned with — which is what a keyed finish carries. Absent where neither said
     pub cwd: Option<String>,
     /// When it began and ended, in milliseconds since the Unix epoch. `finished_ms` is absent while it runs
     #[ts(type = "number | null")]
     pub started_ms: Option<u64>,
     #[ts(type = "number | null")]
     pub finished_ms: Option<u64>,
-    /// Absent while it runs, and when the shell reported none — which is not zero
-    pub exit_status: Option<i32>,
+    pub outcome: CommandOutcome,
 }
 
 /// What a program says about how far along it is.
@@ -621,7 +708,8 @@ pub enum ProgressState {
 pub enum ErrorCode {
     /// The connection's first message was not `Hello`, or its version is not ours.
     Handshake,
-    /// A frame did not parse as a `Request`.
+    /// A frame did not parse as a `Request`, or a field of one holds what that field cannot: a marks
+    /// key that is not 32 lowercase hexadecimal characters.
     Malformed,
     /// No session has that id — it never existed, or it has already exited.
     NoSuchSession,

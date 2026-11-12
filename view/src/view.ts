@@ -637,16 +637,11 @@ export class TerminalView {
   /** A mark for each command whose prompt is in view, coloured by how the command ended */
   private marksIn(first: number, count: number): NonNullable<Scene['marks']> {
     if (this.gutter === 0) return []
-    const { palette } = this.theme
     const prompts = this.commandPrompts
     const marks: Array<{ row: number; color: number }> = []
     for (let index = firstAfter(prompts, first - 1); index < prompts.length && prompts[index]!.line < first + count; index += 1) {
       const { line, command } = prompts[index]!
-      // Still to run, running, succeeded, failed — and ended with the shell not saying how
-      const color = command.startedMs === null ? palette[8]
-        : command.finishedMs === null ? palette[4]
-          : command.exitStatus === null ? palette[8] : command.exitStatus === 0 ? palette[2] : palette[1]
-      marks.push({ row: line - first, color: color ?? this.theme.foreground })
+      marks.push({ row: line - first, color: this.theme.palette[markColor(command)] ?? this.theme.foreground })
     }
     return marks
   }
@@ -1503,6 +1498,26 @@ const sameSpan = (one: Span, other: Span): boolean =>
 /** `0xRRGGBB` as the page writes a colour */
 function hex(color: number): string {
   return `#${color.toString(16).padStart(6, '0')}`
+}
+
+/**
+ * Which of the theme's sixteen colours marks a command: grey (8) for one still to run, blue (4) for one
+ * running, green (2) for one that exited with zero and red (1) for one that exited with anything else.
+ *
+ * **Green is an exit status of zero that a mark carrying the session's key reported, and nothing else
+ * is green.** A command whose end nothing believable reported is grey. A status that was only claimed —
+ * all a session with no key has — is red where it is a failure, grey where there was none, and yellow
+ * (3) where it is zero: a claim of success is drawn as a claim, which is not success.
+ */
+function markColor(command: Command): number {
+  if (command.startedMs === null) return 8
+  const { outcome } = command
+  switch (outcome.kind) {
+    case 'running': return 4
+    case 'exited': return outcome.code === 0 ? 2 : 1
+    case 'unknown': return 8
+    case 'claimed': return outcome.code === null ? 8 : outcome.code === 0 ? 3 : 1
+  }
 }
 
 /** The index of the first of `items`, which are in the order of their lines, that is on a line after `line` */

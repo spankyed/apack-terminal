@@ -94,6 +94,11 @@ npm --prefix view test                       # the view's suite (also: run typec
 - **A claim is not a fact.** Everything a marker carries is written by whatever is running in the pty,
   which may be a hostile program rather than a shell. Report what was *said*, cap what you accumulate, and
   leave what a claimed path is good for to the caller.
+- **Only a mark that carries the session's key is more than a claim, and only against content.** A keyed
+  session's commands come from `markers::Vouched` and from nothing else; a status that did not come from
+  one is never given the type of an exit (`commands::Outcome`). A mark that fails to be vouched for is
+  refused and counted, never read as a claim instead. None of it is a boundary against a program running
+  as the user, which can read the key ([design.md](docs/architecture/design.md#a-sessions-marks-can-be-vouched-for)).
 - **Feed the authority before the bytes leave.** The renderer's copy is a replica, and the only acceptable
   disagreement is one where the authority is ahead.
 - **Nothing polls.** The broker knows when bytes arrived, so a condition is checked where they land. A

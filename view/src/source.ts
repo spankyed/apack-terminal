@@ -196,7 +196,24 @@ export interface SessionColors {
 }
 
 /**
- * A command the shell ran, as far as the shell reported it. Every field but `id` is the shell's claim.
+ * How a command ended, or that it has not: one value, which says who said so.
+ *
+ * **`exited` is the only one that is an exit status.** It is what a mark carrying the session's key
+ * reported, and nothing a program printed can be read as one. `claimed` is what a session with no key
+ * heard — every marker believed, so a status that anything could have printed — and `unknown` is a
+ * command in a session with a key that is over with nothing believable having said how. Code that wants
+ * to know a command succeeded asks for `exited` with a code of zero.
+ */
+export type CommandOutcome =
+  /** It has not ended. One still waiting at its prompt has not begun either: its `startedMs` is `null` */
+  | { readonly kind: 'running' }
+  | { readonly kind: 'exited'; readonly code: number }
+  | { readonly kind: 'unknown'; readonly why: 'no_status' | 'superseded' | 'session_ended' }
+  | { readonly kind: 'claimed'; readonly code: number | null }
+
+/**
+ * A command the shell ran, as far as the shell reported it. What vouches for its fields is the
+ * session's: in one with no key, every field but `id` is a claim.
  *
  * `prompt`, `output` and `end` are the lines the command's prompt, its output and its end are on, in the
  * epoch the answer came in. One is `null` where the shell never marked that moment, or where the row has
@@ -210,8 +227,7 @@ export interface Command {
   /** Milliseconds since the Unix epoch. `finishedMs` is `null` while it runs */
   readonly startedMs: number | null
   readonly finishedMs: number | null
-  /** `null` while it runs, and when the shell reported none — which is not zero */
-  readonly exitStatus: number | null
+  readonly outcome: CommandOutcome
   readonly prompt: number | null
   readonly output: number | null
   readonly end: number | null

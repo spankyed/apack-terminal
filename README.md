@@ -24,6 +24,10 @@ and the view paints, so they are the two halves of one protocol and change in on
   drawing still answers a bounded read, a search and a wait.
 - **Shell facts, not guesses.** OSC 633 markers give the working directory, command boundaries and exit
   status; what a shell did not say is reported as unknown rather than inferred.
+- **Marks that can be vouched for.** A session spawned with a key takes its commands only from marks that
+  carry it, so nothing printed into the terminal — a file, a log, a web response — can report a command
+  as ended or as having succeeded. A status a keyed mark did not give is told as a claim, never as an
+  exit.
 - **Bounded output with real backpressure.** Reads are coalesced, the channel is credit-bounded, and an
   overload is reported with the microseconds it waited rather than being silent.
 
@@ -42,7 +46,7 @@ greeting.
 → {"kind":"write","session":"s-1","text":"echo hi\n"}
 ← {"kind":"output","session":"s-1","text":"echo hi\r\nhi\r\n"}
 → {"kind":"facts","session":"s-1"}
-← {"kind":"facts","session":"s-1","cwd":"/home/me","command":"echo hi","running":false,"exit_status":0,"finished":1}
+← {"kind":"facts","session":"s-1","cwd":"/home/me","command":"echo hi","running":false,"outcome":{"kind":"claimed","code":0},"finished":1,"vouched":false,"refused":0}
 ```
 
 [protocol.md](docs/architecture/protocol.md) has every message, the roles, and the closed error set.

@@ -17,8 +17,8 @@ pub mod input;
 pub mod reads;
 pub mod rows;
 
-use crate::commands::{Commands, Moment};
-use crate::markers::{self, Marker, PAYLOAD_CAP, cwd_from_url};
+use crate::commands::{Commands, Machine, Moment, Outcome, Step, Unknown};
+use crate::markers::{self, Marker, MarksKey, PAYLOAD_CAP, Read, Vouched, cwd_from_url};
 use crate::screen::Facts;
 use rows::Mark;
 
@@ -403,10 +403,9 @@ impl Terminal {
         let result = unsafe { sys::ghostty_terminal_set(self.handle, sys::TerminalOption::WRITE_PTY, callback) };
         Failed::check("ghostty_terminal_set(WRITE_PTY)", result)?;
 
-        // **The shell's own account of itself**, which is what `markers.rs` scans the byte stream for
-        // today. The core reports each step of a command as an event and decodes the command line for us;
-        // what it does not do is interpret, so the mapping below is the broker's contract rather than the
-        // core's reading of it.
+        // **The shell's own account of itself, in the standard family** (OSC 133). The core reports each
+        // step of a command as an event and decodes the command line for us; what it does not do is
+        // interpret, so the mapping below is the broker's contract rather than the core's reading of it.
         let semantic = note_semantic_prompt as *const std::ffi::c_void;
         // SAFETY: the signature matches `GhosttyTerminalSemanticPromptFn`
         let result = unsafe { sys::ghostty_terminal_set(self.handle, sys::TerminalOption::SEMANTIC_PROMPT, semantic) };
@@ -753,6 +752,22 @@ pub struct Reported {
     /// What time it is for whatever is being parsed, when that is not now: a recording being replayed
     /// happened when it was recorded.
     clock: Option<SystemTime>,
+    /// Whose marks the commands above are taken from.
+    marks: Marks,
+}
+
+/// Whose marks a session's commands are taken from, and how many keyed marks it has turned away.
+///
+/// **One or the other for a session's whole life.** With a key, a command is recorded and one is said to
+/// be running only on the word of a mark that carries it, and the families anything can write are heard
+/// for nothing but the directory. Without one, every marker is believed, as a claim.
+#[derive(Default)]
+pub struct Marks {
+    /// The session's key and what its marks have established, for a session spawned with one.
+    keyed: Option<(MarksKey, Machine)>,
+    /// How many marks spelled as keyed ones were refused: the wrong key, a number not past the last, an
+    /// end for a command that is not the one running, or any at all in a session with no key.
+    refused: u32,
 }
 
 /// Where the cursor was at a moment in a command's life, as a mark the core moves with the cell it is on.
@@ -790,9 +805,9 @@ pub enum Effect {
     CommandStarted {
         command: Option<String>,
     },
-    /// What was running ended, and how if the shell said
+    /// What was running ended, and how as far as anything said
     CommandFinished {
-        exit_status: Option<i32>,
+        outcome: Outcome,
     },
     CwdChanged(String),
 }
@@ -835,13 +850,77 @@ impl Reported {
         self.size = size;
     }
 
+    /// Takes this session's commands from marks carrying `key` and from nothing else. Said once, before
+    /// anything is parsed: which it is does not change in a session's life.
+    pub fn vouch_with(&mut self, key: MarksKey) {
+        self.marks.keyed = Some((key, Machine::default()));
+    }
+
+    /// The key this session's marks are checked against and the number of the last start accepted, for
+    /// a session spawned with a key.
+    pub fn vouched_by(&self) -> Option<(&MarksKey, u64)> {
+        self.marks.keyed.as_ref().map(|(key, machine)| (key, machine.last()))
+    }
+
+    /// How many marks spelled as keyed ones were refused.
+    pub fn refused(&self) -> u32 {
+        self.marks.refused
+    }
+
+    /// Sets this session's own marks aside while a recording is replayed, answering them to be put back
+    /// (`end_replay`). **A replay is of another shell's stream**: it is read with the key that stream was
+    /// recorded under (`replay_vouched_with`), and nothing in it moves what the session's own shell has
+    /// been heard to say — its key, its last number, or how many of its marks were refused.
+    pub fn begin_replay(&mut self) -> Marks {
+        std::mem::take(&mut self.marks)
+    }
+
+    pub fn end_replay(&mut self, live: Marks) {
+        self.marks = live;
+    }
+
+    /// The recorded stream that follows was vouched with `key`, by a shell whose last accepted start was
+    /// `last`; with no key it is one whose every marker was believed.
+    ///
+    /// **Said again after every keyframe**, so a replay that begins part way through a session reads its
+    /// marks as that session did; said again with nothing changed, it changes nothing. A different key
+    /// or number is a different shell: what the one before left running is over.
+    pub fn replay_vouched_with(&mut self, key: Option<MarksKey>, last: u64) {
+        let same = match (&self.marks.keyed, &key) {
+            (Some((held, machine)), Some(key)) => held == key && machine.last() == last,
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            return;
+        }
+        self.forget_the_shell();
+        self.marks.keyed = key.map(|key| (key, Machine::after(last)));
+    }
+
+    /// The session is over. In one spawned with a key, a command still running is recorded as over
+    /// with nothing having said how; in one without, nothing was promised about a command's end and
+    /// nothing is said.
+    pub fn session_ended(&mut self) {
+        if self.marks.keyed.as_mut().is_some_and(|(_, machine)| machine.end()) {
+            self.finished(Outcome::Unknown(Unknown::SessionEnded), None);
+        }
+    }
+
     /// Forgets what the shell said about itself and what is waiting to be told, keeping the commands and
     /// their rows: what a screen rebuilt from a recording holds is the past, and the shell that said those
     /// things is not the one about to be read. **A command it left running is ended**, without a status:
     /// nothing is running it any more, and nothing will ever report that it stopped.
     pub fn forget_the_shell(&mut self) {
         let now = self.now();
-        self.commands.ended(None, now);
+        let left = match &mut self.marks.keyed {
+            Some((_, machine)) => {
+                machine.end();
+                Outcome::Unknown(Unknown::SessionEnded)
+            }
+            None => Outcome::Claimed(None),
+        };
+        self.commands.ended(left, None, now);
         self.facts = Facts::default();
         self.line = None;
         self.effects.clear();
@@ -924,17 +1003,52 @@ impl Reported {
         });
     }
 
+    /// Whether this session's commands are taken from keyed marks alone.
+    fn keyed(&self) -> bool {
+        self.marks.keyed.is_some()
+    }
+
     /// Takes a marker the core does not read — the OSC 633 family — into the same facts its own callbacks
     /// fill, so a caller has one account of the shell rather than two to merge.
+    ///
+    /// **A keyed session hears these for the directory and nothing else.** Its hooks still print the
+    /// prompt marks, which is what the core flags prompt rows from; a command it records, and whether
+    /// one is running, come from keyed marks alone (`vouched`).
     fn apply(&mut self, marker: Marker) {
         match marker {
+            Marker::Cwd(path) => self.moved(path),
+            _ if self.keyed() => {}
             Marker::PromptStart => self.prompted(),
-            Marker::PromptEnd => {}
             Marker::CommandStart => self.started(None),
             Marker::CommandDone(status) => self.ended(status),
             Marker::CommandLine(line) => self.named(line),
-            Marker::Cwd(path) => self.moved(path),
         }
+    }
+
+    /// Takes a mark that carried this session's key (`markers::read`): the only thing a keyed session's
+    /// commands are recorded from. One the session's numbering does not accept is counted and changes
+    /// nothing.
+    fn vouched(&mut self, mark: Vouched) {
+        match self.marks.keyed.as_mut().and_then(|(_, machine)| machine.take(mark)) {
+            None => self.refuse(),
+            Some(Step::Started { line, superseded }) => {
+                if superseded {
+                    self.finished(Outcome::Unknown(Unknown::Superseded), None);
+                }
+                self.facts.command = Some(line.clone());
+                self.facts.running = true;
+                let now = self.now();
+                self.commands.began(line.clone(), now);
+                self.effects.push(Effect::CommandStarted { command: Some(line) });
+            }
+            Some(Step::Finished { outcome, cwd }) => self.finished(outcome, cwd),
+        }
+    }
+
+    /// Counts a mark spelled as a keyed one that was not accepted, so a hook that is out of step and a
+    /// stream that is forging both show, rather than looking like a shell that marks nothing.
+    fn refuse(&mut self) {
+        self.marks.refused = self.marks.refused.saturating_add(1);
     }
 
     /// The shell said which line it is running. Before the command starts it is the line that command
@@ -973,17 +1087,23 @@ impl Reported {
         self.commands.prompt_started(now);
     }
 
-    /// Whatever was running has ended. Said once per command: a shell that reports an end and then draws
-    /// its prompt has ended one command, not two.
+    /// Whatever was running has ended, as a marker anything can write says. Said once per command: a
+    /// shell that reports an end and then draws its prompt has ended one command, not two. **The status
+    /// is a claim of one**, which is the only kind such a marker makes.
     fn ended(&mut self, exit_status: Option<i32>) {
         if !self.facts.running {
             return;
         }
+        self.finished(Outcome::Claimed(exit_status), None);
+    }
+
+    /// What was running is over: counted, recorded with how it ended, and told.
+    fn finished(&mut self, outcome: Outcome, cwd: Option<String>) {
         self.facts.ended();
-        self.facts.exit_status = exit_status;
+        self.facts.outcome = Some(outcome);
         let now = self.now();
-        self.commands.ended(exit_status, now);
-        self.effects.push(Effect::CommandFinished { exit_status });
+        self.commands.ended(outcome, cwd, now);
+        self.effects.push(Effect::CommandFinished { outcome });
     }
 
     fn moved(&mut self, cwd: String) {
@@ -1014,13 +1134,16 @@ unsafe extern "C" fn collect_reply(
     reported.replies.push(String::from_utf8_lossy(bytes).into_owned());
 }
 
-/// One step of a command, as the shell reported it.
+/// One step of a command, as the standard marks report it (OSC 133).
 ///
 /// **The mapping is the broker's, not the core's.** A prompt being drawn means whatever ran has finished
-/// whether or not the shell said so, and an exit status is absent rather than zero when the shell reported
+/// whether or not the shell said so, and a status is absent rather than zero when the shell reported
 /// none — a shell that says nothing about how a command ended is not saying it succeeded. Both of those
 /// are `screen::Facts`' contract and `markers.rs` already holds them; this reads the core's event into the
 /// same shape instead of inventing a second one.
+///
+/// **A claim, like the family the core does not read**: anything in the pty can print these, so a
+/// session with a key takes nothing from them, and one without reports what they said as claimed.
 unsafe extern "C" fn note_semantic_prompt(
     _terminal: sys::Terminal,
     userdata: *mut std::ffi::c_void,
@@ -1031,6 +1154,10 @@ unsafe extern "C" fn note_semantic_prompt(
     }
     // SAFETY: both pointers are the library's, valid for this call
     let (reported, event) = unsafe { (&mut *userdata.cast::<Reported>(), &*event) };
+    // The standard marks are anything's to print: a session with a key records nothing from them
+    if reported.keyed() {
+        return;
+    }
     match event.kind {
         // **Only the main prompt begins a command.** A shell also marks the prompt it draws at the right
         // edge and the one it draws for each further line of a command being typed; neither is a new
@@ -1219,7 +1346,8 @@ unsafe extern "C" fn note_render_hold(_terminal: sys::Terminal, userdata: *mut s
 
 /// A sequence the core has no behaviour for, which is where the shell's OSC 633 markers arrive.
 ///
-/// One cut short by the limit is not read: half a path is not a claim about a directory.
+/// One cut short by the limit is handed on as cut (`markers::read`): half a path is not a claim about a
+/// directory, and a keyed mark is vouched for by what comes first in it.
 unsafe extern "C" fn note_unknown_sequence(
     _terminal: sys::Terminal,
     userdata: *mut std::ffi::c_void,
@@ -1235,13 +1363,17 @@ unsafe extern "C" fn note_unknown_sequence(
     }
     // SAFETY: the tag says `osc` is the member that was written
     let osc = unsafe { &sequence.value.osc };
-    if osc.truncated || osc.content.ptr.is_null() {
+    if osc.content.ptr.is_null() {
         return;
     }
     // SAFETY: the library promises `len` bytes at `ptr` for this call
     let content = unsafe { std::slice::from_raw_parts(osc.content.ptr, osc.content.len) };
-    if let Some(marker) = markers::read(content) {
-        reported.apply(marker);
+    let key = reported.marks.keyed.as_ref().map(|(key, _)| key);
+    match markers::read(content, osc.truncated, key) {
+        Some(Read::Claim(marker)) => reported.apply(marker),
+        Some(Read::Vouched(mark)) => reported.vouched(mark),
+        Some(Read::Refused) => reported.refuse(),
+        None => {}
     }
 }
 

@@ -121,10 +121,52 @@ come the facts a `facts` request answers, the events that say a command started 
 record of each command with the lines it is on (`commands.rs`), which is what lets a window jump between
 commands and read one's output.
 
-Everything a marker carries is a **claim**. It is written by whatever is running in the pty, which may be a
-hostile program rather than a shell, so a payload is length-capped while it is collected and what is reported
-is what was *said* — a path some program named, not a directory anything checked. Deciding what a claimed
-path is good for belongs to the app.
+Everything a marker carries is a **claim**. It is written by whatever is running in the pty — a file shown
+with `cat`, a log line, a program that is not the shell — so a payload is length-capped while it is
+collected and what is reported is what was *said*: a path some program named, not a directory anything
+checked. Deciding what a claimed path is good for belongs to the app.
+
+## A session's marks can be vouched for
+
+A claim is enough for a person looking at a terminal. It is not enough for anything that acts on a
+record — a flow that goes on when "the build passed" — because a forged marker then makes it act on a
+failure as a success. So a session can be spawned with a **key** (`Spawn.marks_key`), which its caller
+also gives its shell and nothing else, and the mode holds for the session's whole life:
+
+- **Keyed.** A command is recorded, and one is said to be running, only on the word of a mark that
+  carries the key: `633;V;S;<number>;<key>;<line>` when one begins and
+  `633;V;F;<number>;<key>;<status>;<cwd>` when it ends. The standard marks are still read by the core,
+  which flags prompt rows from them, and the directory they carry is still reported; no record and no
+  idle is taken from them. A `wait` for idle is that machine's idle.
+- **Claimed.** A session spawned without a key believes every marker, and says so: how a command ended
+  is `claimed`, never `exited`.
+
+**The number and the key come before anything a command line or a path could hold**, and the last field
+is taken whole, so nothing in a line moves where the key is looked for. A keyed mark is read into a type
+of its own (`markers::Vouched`), and only a value of that type moves the record machine
+(`commands::Machine`); a mark with the wrong key, a number that is not one or a field missing is refused
+and counted, never read as a claim instead.
+
+**Numbers only go up.** The key is in the terminal's own output — every mark carries it — so a log of the
+session shown again, or its recording printed, is a stream of marks with the right key. What makes them
+the past is the number: a start is accepted only past the last one accepted, and a finish only for the
+command that is running. A start past a running command ends that one as `superseded`; a session that
+ends with one running ends it as `session_ended`, and says so before it says it has exited.
+
+**How a command ended is one value** (`CommandOutcome`): `running`, `exited` with a code, `unknown` with
+why, or `claimed` with whatever status was printed. An exit code can be made only from a keyed finish
+(`markers::ExitCode` has no other constructor), so nothing a session without a key heard has the type of
+a status. **Refusals are counted and told** in `facts`, so a hook that is out of step with its session
+and a stream that is forging both show, where a shell that marks nothing shows nothing.
+
+**A keyed mark longer than the core keeps is still read**, cut short: a start keeps as much of its line
+as arrived and a finish its status without its directory. What vouches for it comes first, and a command
+with a very long line is running all the same — dropped, the session would say nothing is.
+
+**What this is proof against is content, not code.** A file, a log or a web response printed into the
+terminal by something that was never given the key cannot move a keyed session's records. A program
+running as the user in that shell can read the key and write any mark it likes; nothing here is a
+boundary against one, and nothing should be described as if it were.
 
 ## A session can be recorded, and picked up from its recording
 
@@ -158,6 +200,16 @@ reply, clipboard write, bell or title. The commands it holds are the recording's
 — **those the shell marked since the keyframe the moment shown was replayed from**, which is at most a
 megabyte of output back, and not every command the recording covers: a keyframe is a screen, and says
 nothing of the commands that drew it.
+
+**A recording says which key its stream was vouched with**, where it was. The stream holds the marks as
+they were printed, the refused ones beside the believed, and a replay rebuilds the commands from them —
+so after every keyframe of a keyed session, and where a session picks a recording up, an entry names the
+key and the number of the last start accepted under it (`Entry::Marks`). A replay reads each stretch with
+that key and that numbering: what the session refused is refused again, from whichever keyframe the
+replay begins, and a command ends as it ended. The replay's key and numbering are its own; the session
+doing the replaying keeps its key, its last number and its count of refusals. A recording of a session
+without a key holds no such entry and is what it always was. The key is in every mark the stream holds
+already, so the file keeps no secret the stream did not.
 
 ## A broker somewhere else
 
@@ -198,9 +250,8 @@ session ending settles every wait on it, because nothing is coming.
   `view_broker`, `proxy`), which use Unix sockets and `/bin/sh`; so a view's connection, the lock that
   makes a broker the only one on its pipe, the proxy and a kept session are compiled on Windows and
   exercised nowhere on it. What is known to differ there is said where it applies: a view past its
-  limit is not hung up on (`views.md`), a session's exit is not waited on for its last output,
-  `signal` answers `UNSUPPORTED`, and the pipe's directory and peer are not checked as a socket's are
-  on POSIX.
+  limit is not hung up on (`views.md`), `signal` answers `UNSUPPORTED`, and the pipe's directory and
+  peer are not checked as a socket's are on POSIX.
 
 ## What the broker will not do
 

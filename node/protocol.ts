@@ -11,7 +11,18 @@ export type Colors = { foreground: [number, number, number], background: [number
 ansi: Array<[number, number, number]>, };
 
 /**
- * One command a session's shell reported. Every field but the id is a claim the shell made.
+ * How a command ended, or that it has not: one value, which says who said so.
+ *
+ * **A status only a keyed mark can give is the only one called an exit.** `exited` is made from a
+ * finish that carried the session's key, and from nothing else; what a session without a key heard is
+ * `claimed`, whatever number came with it. A reader that wants to know a command succeeded asks for
+ * `exited` with a code of zero, and nothing a program printed can be handed to it as that.
+ */
+export type CommandOutcome = { "kind": "running" } | { "kind": "exited", code: number, } | { "kind": "unknown", why: Unreported, } | { "kind": "claimed", code: number | null, };
+
+/**
+ * One command a session's shell reported. What vouches for its fields is the session's: in one
+ * spawned without a key every field but the id is a claim.
  */
 export type CommandRecord = { 
 /**
@@ -23,17 +34,14 @@ id: number,
  */
 command: string | null, 
 /**
- * Where the shell was when the command began
+ * Where the shell was: when the command began, in a session spawned without a key, and when it
+ * ended, in one spawned with — which is what a keyed finish carries. Absent where neither said
  */
 cwd: string | null, 
 /**
  * When it began and ended, in milliseconds since the Unix epoch. `finished_ms` is absent while it runs
  */
-started_ms: number | null, finished_ms: number | null, 
-/**
- * Absent while it runs, and when the shell reported none — which is not zero
- */
-exit_status: number | null, };
+started_ms: number | null, finished_ms: number | null, outcome: CommandOutcome, };
 
 /**
  * **A closed set, generated into the TypeScript as a string union** — elmdb's `ErrorCode` arrangement, and
@@ -54,13 +62,28 @@ wrapped: Array<boolean>,
 /**
  * Within the viewport, so `0` is its first line however much history came with it.
  */
-cursor_row: number, cursor_column: number, alt_screen: boolean, } | { "kind": "owns", session: string, pid: number, owned: boolean, } | { "kind": "facts", session: string, cwd: string | null, command: string | null, running: boolean, exit_status: number | null, 
+cursor_row: number, cursor_column: number, alt_screen: boolean, } | { "kind": "owns", session: string, pid: number, owned: boolean, } | { "kind": "facts", session: string, cwd: string | null, command: string | null, running: boolean, 
+/**
+ * How the last command to end ended. Absent when none has; never `running`.
+ */
+outcome: CommandOutcome | null, 
 /**
  * Moves each time the shell reports a command it started has ended. A caller that asks after a
  * command has already ended learns one ran by this differing from what it last read; it is not
  * an exact number of commands and it wraps, so it is compared for a difference only.
  */
-finished: number, foreground: Foreground | null, } | { "kind": "search", session: string, matches: Array<SearchMatch>, } | { "kind": "waited", session: string, outcome: WaitOutcome, } | { "kind": "commands", session: string, commands: Array<CommandRecord>, } | { "kind": "kept", session: string, kept: boolean, } | { "kind": "sessions", sessions: Array<SessionSummary>, } | { "kind": "rewound", session: string, first: number, last: number, } | { "kind": "sought", session: string, at: number, } | { "kind": "command_output", session: string, command: number, text: string | null, } | { "kind": "title", session: string, title: string, } | { "kind": "bell", session: string, } | { "kind": "clipboard", session: string, text: string, } | { "kind": "notification", session: string, title: string, body: string, } | { "kind": "progress", session: string, state: ProgressState, percent: number | null, } | { "kind": "command_started", session: string, command: string | null, } | { "kind": "command_finished", session: string, exit_status: number | null, } | { "kind": "cwd_changed", session: string, cwd: string, } | { "kind": "failed", session: string | null, code: ErrorCode, message: string, };
+finished: number, 
+/**
+ * Whether the session was spawned with a key (`Request::Spawn`'s `marks_key`).
+ */
+vouched: boolean, 
+/**
+ * **How many marks spelled as keyed ones were refused**: the wrong key, a number not past the
+ * last one accepted, an end for a command that is not the one running, or any at all in a
+ * session with no key. A hook out of step with its session and a stream forging marks both move
+ * it, where a shell that marks nothing moves nothing. It stops at the largest number it holds.
+ */
+refused: number, foreground: Foreground | null, } | { "kind": "search", session: string, matches: Array<SearchMatch>, } | { "kind": "waited", session: string, outcome: WaitOutcome, } | { "kind": "commands", session: string, commands: Array<CommandRecord>, } | { "kind": "kept", session: string, kept: boolean, } | { "kind": "sessions", sessions: Array<SessionSummary>, } | { "kind": "rewound", session: string, first: number, last: number, } | { "kind": "sought", session: string, at: number, } | { "kind": "command_output", session: string, command: number, text: string | null, } | { "kind": "title", session: string, title: string, } | { "kind": "bell", session: string, } | { "kind": "clipboard", session: string, text: string, } | { "kind": "notification", session: string, title: string, body: string, } | { "kind": "progress", session: string, state: ProgressState, percent: number | null, } | { "kind": "command_started", session: string, command: string | null, } | { "kind": "command_finished", session: string, outcome: CommandOutcome, } | { "kind": "cwd_changed", session: string, cwd: string, } | { "kind": "failed", session: string | null, code: ErrorCode, message: string, };
 
 /**
  * What the kernel says is reading the pty, as against what the shell claims about itself.
@@ -142,7 +165,20 @@ restore: boolean,
  * asks the terminal whether it can before it sends one, so this is yes only for a session whose
  * views draw them; absent, a program is told no and prints what it would have otherwise.
  */
-images: boolean, } | { "kind": "write", session: string, text: string, } | { "kind": "resize", session: string, cols: number, rows: number, cell_width: number, cell_height: number, } | { "kind": "pause", session: string, } | { "kind": "resume", session: string, } | { "kind": "signal", session: string, signal: Signal, scope: Scope, } | { "kind": "owns", session: string, pid: number, } | { "kind": "screen", session: string, history: number, } | { "kind": "facts", session: string, } | { "kind": "search", session: string, text: string, history: number, } | { "kind": "wait", session: string, until: Until, timeout_ms: number, } | { "kind": "commands", session: string, } | { "kind": "command_output", session: string, command: number, } | { "kind": "keep", session: string, kept: boolean, } | { "kind": "sessions" } | { "kind": "rewind", recording: string, cols: number, rows: number, } | { "kind": "seek", session: string, at: number, } | { "kind": "kill", session: string, };
+images: boolean, 
+/**
+ * **What vouches for the shell's marks**: 32 lowercase hexadecimal characters the caller also
+ * gave the shell, and nothing else (`markers::MarksKey`). A session spawned with one records a
+ * command, and says one is running, only on the word of a mark carrying it — so a file shown
+ * with `cat`, a log line or a web response that spells a marker changes nothing. Absent, every
+ * marker is believed, and how a command ended is reported as a claim (`CommandOutcome`). Which
+ * it is holds for the session's whole life.
+ *
+ * **Proof against what is printed, not against what runs.** A program running as the user in
+ * that shell can read the key and write any mark it likes; nothing here is a boundary against
+ * one. A key that is not one is refused (`ErrorCode::Malformed`) rather than spawned without.
+ */
+marks_key: string | null, } | { "kind": "write", session: string, text: string, } | { "kind": "resize", session: string, cols: number, rows: number, cell_width: number, cell_height: number, } | { "kind": "pause", session: string, } | { "kind": "resume", session: string, } | { "kind": "signal", session: string, signal: Signal, scope: Scope, } | { "kind": "owns", session: string, pid: number, } | { "kind": "screen", session: string, history: number, } | { "kind": "facts", session: string, } | { "kind": "search", session: string, text: string, history: number, } | { "kind": "wait", session: string, until: Until, timeout_ms: number, } | { "kind": "commands", session: string, } | { "kind": "command_output", session: string, command: number, } | { "kind": "keep", session: string, kept: boolean, } | { "kind": "sessions" } | { "kind": "rewind", recording: string, cols: number, rows: number, } | { "kind": "seek", session: string, at: number, } | { "kind": "kill", session: string, };
 
 /**
  * What a connection is for.
@@ -216,6 +252,11 @@ cwd: string | null, command: string | null, running: boolean, };
  * a program down is written with: hang up, interrupt, quit, terminate, and the one that cannot be caught.
  */
 export type Signal = "SIGHUP" | "SIGINT" | "SIGQUIT" | "SIGTERM" | "SIGKILL";
+
+/**
+ * Why a command in a session spawned with a key is over with no exit status.
+ */
+export type Unreported = "no_status" | "superseded" | "session_ended";
 
 /**
  * What a `Wait` is waiting for.

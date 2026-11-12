@@ -115,12 +115,22 @@ export function encodeToView(message: ToView): Uint8Array {
       out.number(message.request); out.number(message.epoch); out.number(message.commands.length)
       for (const command of message.commands) {
         out.number(command.id)
-        const fields = [command.command, command.cwd, command.startedMs, command.finishedMs, command.exitStatus, command.prompt, command.output, command.end]
+        const fields = [command.command, command.cwd, command.startedMs, command.finishedMs, command.prompt, command.output, command.end]
         out.byte(fields.reduce<number>((flags, field, bit) => flags | (field === null ? 0 : 1 << bit), 0))
         if (command.command !== null) out.text(command.command)
         if (command.cwd !== null) out.text(command.cwd)
         for (const time of [command.startedMs, command.finishedMs]) if (time !== null) out.number(time)
-        if (command.exitStatus !== null) out.number(command.exitStatus >= 0 ? command.exitStatus * 2 : -command.exitStatus * 2 - 1)
+        const status = (code: number) => out.number(code >= 0 ? code * 2 : -code * 2 - 1)
+        const { outcome } = command
+        switch (outcome.kind) {
+          case 'running': out.byte(0); break
+          case 'exited': out.byte(1); status(outcome.code); break
+          case 'unknown': out.byte(2); out.byte(['no_status', 'superseded', 'session_ended'].indexOf(outcome.why)); break
+          case 'claimed':
+            if (outcome.code === null) out.byte(3)
+            else { out.byte(4); status(outcome.code) }
+            break
+        }
         for (const line of [command.prompt, command.output, command.end]) if (line !== null) out.number(line)
       }
       break

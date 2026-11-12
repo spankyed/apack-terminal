@@ -83,10 +83,16 @@ fn requests() -> impl Strategy<Value = Request> {
                 proptest::option::of(any::<[u8; 3]>()),
                 proptest::collection::vec(any::<[u8; 3]>(), 0..17),
             )),
-            (any::<bool>(), proptest::option::of("[^\u{0}]{0,20}"), any::<bool>(), any::<bool>()),
+            (
+                any::<bool>(),
+                proptest::option::of("[^\u{0}]{0,20}"),
+                any::<bool>(),
+                any::<bool>(),
+                proptest::option::of("[0-9a-f]{32}"),
+            ),
         )
             .prop_map(
-                |(cols, rows, shell, args, env, unset, cwd, colors, (output, record, restore, images))| {
+                |(cols, rows, shell, args, env, unset, cwd, colors, (output, record, restore, images, marks_key))| {
                     Request::Spawn {
                         cols,
                         rows,
@@ -105,6 +111,7 @@ fn requests() -> impl Strategy<Value = Request> {
                         record,
                         restore,
                         images,
+                        marks_key,
                     }
                 }
             ),

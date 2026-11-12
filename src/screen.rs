@@ -16,7 +16,9 @@ use std::path::Path;
 use std::ptr::NonNull;
 use std::time::{Duration, SystemTime};
 
+use crate::commands::Outcome;
 use crate::holds::HoldLimit;
+use crate::markers::MarksKey;
 use crate::recording::{self, Entry, Recorder, Timed};
 use crate::view::publish::{Outlet, Publication, ViewId};
 use crate::view::wire::{MAX_MESSAGE_BYTES, Position, Rows, Span};
@@ -85,9 +87,12 @@ pub const SEARCH_MATCHES: usize = 100;
 
 /// What a shell has reported about itself, accumulated from the markers it emitted.
 ///
-/// **Every field is a claim the shell made, not a measurement of the machine**, which is why there is no
-/// `pid` or `user` here: those the broker knows for itself. A program in the pty can emit any of these
-/// sequences, so what this carries is what was *said* — the app decides what a claimed path is good for.
+/// **Every field is something that was said, not a measurement of the machine**, which is why there is
+/// no `pid` or `user` here: those the broker knows for itself. Who could have said it depends on the
+/// session (`Vouching`). In one spawned without a key a program in the pty can emit any of these
+/// sequences, so all of it is a claim. In one spawned with a key, `command`, `running`, `outcome` and
+/// `finished` come from marks carrying the key and from nothing else; `cwd` is a claim in both, being
+/// what a tab is titled with before any command has run.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Facts {
     /// The working directory the shell last reported.
@@ -97,10 +102,9 @@ pub struct Facts {
     /// Between a command starting and finishing, so a caller can tell a busy session from one at a prompt
     /// **without reading the screen**, which is the whole point of the markers.
     pub running: bool,
-    /// The status the last finished command reported. `None` when none has finished, or when the shell
-    /// reported a finish without one — a shell that says nothing about how a command ended is not saying
-    /// it succeeded.
-    pub exit_status: Option<i32>,
+    /// How the last command to end ended, as far as anything said. `None` when none has ended; never
+    /// `Running`.
+    pub outcome: Option<Outcome>,
     /// How many commands the shell has reported starting and then ending.
     ///
     /// **A count rather than a flag, because a caller asks after the fact.** A command that starts and ends
@@ -110,6 +114,17 @@ pub struct Facts {
     /// reports each command's start and end twice, a report that finds nothing running counts nothing,
     /// and the count wraps. It is compared for a difference and never for an order or an amount.
     pub finished: u32,
+}
+
+/// Where a session's account of its commands comes from, which is the broker's own to say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Vouching {
+    /// The session was spawned with a key: its commands, and whether one is running, are taken from
+    /// marks carrying it and from nothing else.
+    pub keyed: bool,
+    /// How many marks spelled as keyed ones were refused. A hook out of step with its session and a
+    /// stream forging marks both show here, where a shell that marks nothing shows nothing.
+    pub refused: u32,
 }
 
 /// Where a search found what it was asked for.
@@ -299,7 +314,7 @@ pub struct CommandAt {
     /// Milliseconds since the Unix epoch
     pub started_ms: Option<u64>,
     pub finished_ms: Option<u64>,
-    pub exit_status: Option<i32>,
+    pub outcome: Outcome,
     /// The line its prompt began on
     pub prompt: Option<u64>,
     /// The line its output began on
@@ -324,6 +339,15 @@ pub struct Colors {
 impl Screen {
     pub fn new(cols: u16, rows: u16) -> Self {
         Self::with_history(cols, rows, VIEW_HISTORY_LINES)
+    }
+
+    /// A screen whose commands are taken from marks carrying `key` and from nothing else (`markers`).
+    /// **Which it is is said here and nowhere later**: a session is keyed for its whole life or not at
+    /// all.
+    pub fn keyed(cols: u16, rows: u16, key: MarksKey) -> Self {
+        let mut screen = Self::new(cols, rows);
+        screen.reported.get_mut().vouch_with(key);
+        screen
     }
 
     /// A screen that keeps `lines` of history rather than what a session keeps. For a case about what
@@ -486,10 +510,29 @@ impl Screen {
             return Ok(false);
         }
         self.recorder = Some(recorder);
+        // What follows is another shell's stream: said when either it or the one before it is keyed, so
+        // a later replay reads each with the key it was written under
+        if self.reported.get().vouched_by().is_some() || recording::ends_vouched(&entries) {
+            self.record_marks();
+        }
         // Recorded like anything else fed: a later replay passes through this moment too
         self.settle_restored();
         self.resize(cols, rows, 0, 0);
         Ok(true)
+    }
+
+    /// Writes into the recording which key vouches for the stream that follows, and the number of the
+    /// last start accepted under it — or that none does.
+    ///
+    /// **After every keyframe of a keyed session**, because a replay may begin at any of them: read
+    /// from there with no key, a keyed session's commands would not be rebuilt at all, and read with the
+    /// key but no number, marks from before the keyframe shown again after it would be taken for new.
+    fn record_marks(&mut self) {
+        let vouched = self.reported.get().vouched_by().map(|(key, last)| (key.clone(), last));
+        self.record(|recorder| match &vouched {
+            Some((key, last)) => recorder.marks(Some(key), *last),
+            None => recorder.marks(None, 0),
+        });
     }
 
     /// Stops recording, without waiting for the file: what was recorded is still on its way to it, and
@@ -536,6 +579,9 @@ impl Screen {
         let redraw = self.redraw().map_err(|failed| std::io::Error::other(failed.to_string()))?;
         recorder.keyframe(self.cols, self.rows, &redraw)?;
         self.recorder = Some(recorder);
+        if self.reported.get().vouched_by().is_some() {
+            self.record_marks();
+        }
         Ok(())
     }
 
@@ -579,6 +625,9 @@ impl Screen {
         self.record(|recorder| {
             recorder.keyframe(cols, rows, &redraw.map_err(|failed| std::io::Error::other(failed.to_string()))?)
         });
+        if self.reported.get().vouched_by().is_some() {
+            self.record_marks();
+        }
     }
 
     /// The screen and the `KEYFRAME_HISTORY_LINES` above it, as the sequences that redraw them.
@@ -628,10 +677,16 @@ impl Screen {
     /// forgotten first — the replay reports them again, and kept they would each be listed twice — and
     /// each entry is parsed as of when it was recorded, so a command is stamped with when it ran rather
     /// than with when somebody looked back at it.
+    ///
+    /// **And they are the commands that were.** A recording says which key each stretch of its stream
+    /// was vouched with (`Entry::Marks`), and the replay reads each stretch with that key and that
+    /// numbering: a mark the session refused is refused again, and a command it recorded ends as it
+    /// ended. This screen's own key and numbering are set aside for the replay and put back after it.
     fn rebuild(&mut self, entries: &[Timed]) {
         // The recording is of another moment: writing the replay into it would record the past as now
         let recorder = self.recorder.take();
         self.replaying = true;
+        let live = self.reported.get_mut().begin_replay();
         self.reported.get_mut().forget_commands();
         // A full reset, and the history it leaves erased: the keyframe redraws both
         self.feed(b"\x1bc\x1b[3J");
@@ -646,9 +701,15 @@ impl Screen {
                 Entry::Keyframe { .. } => {}
                 Entry::Output(bytes) => self.feed(bytes),
                 Entry::Resize { cols, rows } => self.resize(*cols, *rows, 0, 0),
+                Entry::Marks { key, last } => {
+                    self.reported.get_mut().replay_vouched_with(key.clone(), *last);
+                    // A command the shell before this one left running ended here, where the cursor is
+                    self.reported.get_mut().place_marks(&self.terminal);
+                }
             }
         }
         self.forget_the_shell();
+        self.reported.get_mut().end_replay(live);
         self.reported.get_mut().set_clock(None);
         self.replaying = false;
         // Whatever the recorded program was holding when the recording stops, nothing is holding now
@@ -704,6 +765,20 @@ impl Screen {
     /// What the shell has said about itself.
     pub fn facts(&self) -> &Facts {
         self.reported.get().facts()
+    }
+
+    /// Whether this session's commands are taken from keyed marks alone, and how many such marks it
+    /// has refused.
+    pub fn vouching(&self) -> Vouching {
+        let reported = self.reported.get();
+        Vouching { keyed: reported.vouched_by().is_some(), refused: reported.refused() }
+    }
+
+    /// The session's process is gone: a command a keyed session's shell left running is over, where
+    /// the cursor is, with nothing having said how.
+    pub fn session_ended(&mut self) {
+        self.reported.get_mut().session_ended();
+        self.reported.get_mut().place_marks(&self.terminal);
     }
 
     /// What the program asked for and must be told, taken rather than read: each reply is written once.
@@ -1020,7 +1095,7 @@ impl Screen {
                 cwd: command.cwd.clone(),
                 started_ms: since_epoch(command.started),
                 finished_ms: since_epoch(command.finished),
-                exit_status: command.exit_status,
+                outcome: command.outcome,
                 prompt: line(&command.prompt),
                 output: line(&command.output),
                 end: line(&command.end),

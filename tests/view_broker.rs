@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use interprocess::local_socket::{GenericFilePath, Stream, ToFsName, prelude::*};
 
-use apack_terminal::protocol::{Event, PROTOCOL_VERSION, Request, Role};
+use apack_terminal::protocol::{CommandOutcome, Event, PROTOCOL_VERSION, Request, Role};
 use apack_terminal::view::wire::{Frame, Incoming, Position, Row, Span, ToBroker, ToView, read_message};
 
 /// How long a case waits for something a working broker does at once: generous, so a busy machine does
@@ -131,6 +131,7 @@ impl Client {
                 record: None,
                 restore: false,
                 images,
+                marks_key: None,
             },
         );
         loop {
@@ -429,12 +430,12 @@ fn a_programs_title_clipboard_and_commands_are_told_to_the_client() {
             Event::Title { title, .. } => told.push(format!("title {title}")),
             Event::Clipboard { text, .. } => told.push(format!("clipboard {text}")),
             Event::CommandStarted { command, .. } => told.push(format!("started {command:?}")),
-            Event::CommandFinished { exit_status, .. } => told.push(format!("finished {exit_status:?}")),
+            Event::CommandFinished { outcome, .. } => told.push(format!("finished {outcome:?}")),
             Event::Output { .. } => panic!("this session's bytes are not sent"),
             _ => {}
         }
     }
-    assert_eq!(told, ["title a title", "clipboard hi", "started Some(\"make\")", "finished Some(2)"]);
+    assert_eq!(told, ["title a title", "clipboard hi", "started Some(\"make\")", "finished Claimed { code: Some(2) }"]);
 }
 
 /// A shell that marks its commands is remembered: a view is told when there is something new to ask for and
@@ -461,7 +462,7 @@ fn the_commands_a_shell_marks_are_listed_with_their_lines_and_their_output_is_re
         _ => None,
     });
     let [command] = commands.as_slice() else { panic!("expected one command, was told {commands:?}") };
-    assert_eq!(command.exit_status, Some(3));
+    assert_eq!(command.outcome, CommandOutcome::Claimed { code: Some(3) });
     let (output, end) = (command.output.expect("its output has a line"), command.end.expect("its end has a line"));
     assert_eq!(end - output, 2, "two lines of output between where it began and where it ended");
 
@@ -477,7 +478,7 @@ fn the_commands_a_shell_marks_are_listed_with_their_lines_and_their_output_is_re
     let id = loop {
         if let Event::Commands { commands, .. } = client.event() {
             let [record] = commands.as_slice() else { panic!("expected one command, was told {commands:?}") };
-            assert_eq!(record.exit_status, Some(3));
+            assert_eq!(record.outcome, CommandOutcome::Claimed { code: Some(3) });
             break record.id;
         }
     };

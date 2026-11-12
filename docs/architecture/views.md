@@ -49,7 +49,7 @@ and a text too long to carry is refused.
 | 6 `text` | text that did not come from a key | 70 `text` | the text of a range |
 | 7 `pointer` | a pointer event, in pixels from the grid's corner, with the size of a cell | 71 `spans` | every match of a search |
 | 8 `paste` | pasted text | 72 `failed` | a request could not be answered |
-| 9 `focus` | the view gained or lost focus | 73 `commands` | the commands the shell marked, with their lines |
+| 9 `focus` | the view gained or lost focus | 73 `commands` | the commands the shell marked, with their lines and how each ended |
 | 10 `wordAt`, 11 `lineAt` | the word or line at a cell | 74 `images` | where every image is |
 | 12 `textOf` | the text between two cells | 75 `image` | part of an image's pixels |
 | 13 `search` | where a string appears | | |
@@ -164,6 +164,13 @@ A shell that marks its commands (OSC 133, OSC 633) has each kept with the line i
 its end are on; a frame's `commands` counter moves when one is added, and a view asks for the list. The
 last 256 are kept. A command's lines are told while the screen it ran on is the one showing: the shell's
 commands have none while an alternate-screen application is up.
+
+**Each is told with how it ended, as one value that says who said so** — the same four kinds a client is
+told ([protocol.md](protocol.md)): `running`, `exited` with a status a keyed mark reported, `unknown` with
+why, and `claimed` with whatever status a session without a key heard. On the wire each kind is a byte of
+its own and no two share a field, so a status that was claimed is never one flag away from reading as an
+exit; a byte that is no kind is refused. The view draws only `exited` with zero as success: `unknown` is
+grey, and `claimed` is yellow for zero and red otherwise (`view/src/view.ts`, `markColor`).
 
 A session asked to take images (`Spawn.images`) accepts the Kitty graphics protocol, as bytes in the
 stream only: raw pixels, or a PNG, which the broker decodes for the core (`rgba_of_png`) since the core

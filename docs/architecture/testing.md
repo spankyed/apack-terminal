@@ -17,6 +17,7 @@ cargo xtask check-exclusions                   # fails when a mutants exclusion 
 | `tests/broker.rs` | the broker driven as a consumer drives it: a real socket, the real binary |
 | `tests/parser.rs` | the VT core as a parser — grid snapshots, and the byte-boundary property |
 | `tests/markers.rs` | what a shell's markers say, read through the screen, including every chunk boundary |
+| `tests/vouched.rs` | a session spawned with a key: that its commands are what its keyed marks say and nothing else — over generated streams, that nothing without the key changes them, that its own stream shown again changes nothing, and that a replay from any keyframe rebuilds the commands that were |
 | `tests/view_wire.rs`, `tests/view_vectors.rs` | the view protocol's bytes: the round trip over generated messages, arbitrary bytes, and the vectors the view's suite (`view/`) is held to |
 | `tests/view_model.rs` | the invariant a view rests on: a model that applies every frame it is sent holds exactly the terminal's screen and history, over generated streams |
 | `tests/view_frames.rs`, `tests/view_input.rs`, `tests/view_reads.rs` | what a frame carries and when one is sent; keys, pointer and paste as the core encodes them; words, lines, text and search |

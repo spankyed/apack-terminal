@@ -44,5 +44,6 @@ mod view_reads;
 mod view_sink;
 mod view_vectors;
 mod view_wire;
+mod vouched;
 mod vt;
 mod writer;
