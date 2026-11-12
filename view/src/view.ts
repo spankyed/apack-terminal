@@ -546,6 +546,7 @@ export class TerminalView {
       if (sorted[index]!.first <= sorted[index - 1]!.last) throw new RangeError('folds overlap')
     }
     this.folds = sorted
+    this.viewport.setFolds(sorted)
     this.foldRows.clear()
     this.drawings.clear()
     this.schedule()
@@ -553,7 +554,7 @@ export class TerminalView {
 
   /** The fold a line is hidden in: a header is not, and neither is a line outside every fold */
   private hiddenIn(line: number): Fold | undefined {
-    return this.folds.find((fold) => line > fold.first && line <= fold.last)
+    return this.viewport.hiddenIn(line)
   }
 
   /**
@@ -983,8 +984,15 @@ export class TerminalView {
     this.schedule()
   }
 
-  scrollBy(lines: number): void {
-    this.viewport.scrollBy(lines)
+  /** Moves by drawn rows, negative for back: a fold's hidden lines are not counted */
+  scrollBy(rows: number): void {
+    this.viewport.scrollBy(rows)
+    this.scrolled()
+  }
+
+  /** Shows from a row of the history counted from its oldest line, as the scrollbar counts them */
+  private scrollToPosition(position: number): void {
+    this.viewport.scrollToPosition(position)
     this.scrolled()
   }
 
@@ -1477,11 +1485,11 @@ export class TerminalView {
     event.preventDefault()
     event.stopPropagation()
     this.thumbRelease?.()
-    const start = { y: event.clientY, top: this.viewport.top }
+    const start = { y: event.clientY, position: this.viewport.extent.position }
     const move = (moved: PointerEvent) => {
       const { total, shown } = this.viewport.extent
       const travel = this.thumbAt()?.travel ?? 0
-      if (travel > 0) this.scrollTo(start.top + ((moved.clientY - start.y) / travel) * (total - shown))
+      if (travel > 0) this.scrollToPosition(start.position + ((moved.clientY - start.y) / travel) * (total - shown))
     }
     const up = () => {
       window.removeEventListener('pointermove', move)

@@ -1,5 +1,11 @@
 import type { RowStore } from './row-store.ts'
 
+/** A run of lines folded to one header row: `first` is the header, and the lines after it up to `last` are hidden */
+export interface FoldRange {
+  readonly first: number
+  readonly last: number
+}
+
 /**
  * Which lines a view is showing.
  *
@@ -13,8 +19,20 @@ export class Viewport {
   /** The line at the top while scrolled back, which may be between two lines mid-scroll. Unused while following */
   private held = 0
   private followingOutput = true
+  /** The folded runs, sorted and not overlapping. Their hidden lines take no row, so scrolling counts rows past them */
+  private folds: readonly FoldRange[] = []
 
   constructor(private readonly store: RowStore) {}
+
+  /** Sets the folded runs the view draws; a fold's hidden lines are passed over by every scroll */
+  setFolds(folds: readonly FoldRange[]): void {
+    this.folds = folds
+  }
+
+  /** The fold a line is hidden in: a header is not, and neither is a line outside every fold */
+  hiddenIn(line: number): FoldRange | undefined {
+    return this.folds.find((fold) => line > fold.first && line <= fold.last)
+  }
 
   /**
    * Whether the view shows the screen and moves with it.
@@ -54,18 +72,30 @@ export class Viewport {
     return top - Math.floor(top)
   }
 
-  /** What a scrollbar draws: how much there is, where the view is in it, and how much it shows */
+  /**
+   * What a scrollbar draws, in rows: how many there are, where the view is among them, and how many it shows. A fold is one
+   * row, so the thumb moves a notch's worth for each row that is drawn, not each line.
+   */
   get extent(): { total: number; position: number; shown: number } {
+    const { oldest, firstActive, screenRows } = this.store
     return {
-      total: this.store.scrollback + this.store.screenRows,
-      position: this.top - this.store.oldest,
-      shown: this.store.screenRows,
+      total: this.rowsBetween(oldest, firstActive) + screenRows,
+      position: this.rowsBetween(oldest, this.top),
+      shown: screenRows,
     }
   }
 
-  /** Moves by `lines`, negative for back. Reaching the screen is following it again */
-  scrollBy(lines: number): void {
-    this.scrollTo(this.top + lines)
+  /**
+   * Moves by `rows`, negative for back. A row is a drawn one: a fold's hidden lines are passed over without counting, so
+   * every step changes what is on screen. Reaching the screen is following it again.
+   */
+  scrollBy(rows: number): void {
+    this.scrollTo(this.stepRows(this.top, rows))
+  }
+
+  /** Shows from the row `position` counted from the oldest line, as the scrollbar measures it */
+  scrollToPosition(position: number): void {
+    this.scrollTo(this.stepRows(this.store.oldest, position))
   }
 
   /** Shows from `line`. At or past the screen, the view follows the output again */
@@ -77,6 +107,46 @@ export class Viewport {
     }
     this.followingOutput = false
     this.held = clamped
+  }
+
+  /**
+   * The line `rows` drawn rows from `line`. A line that is hidden starts from its fold's header, and a fraction stays a
+   * fraction of the row it lands in: a whole row steps over a fold as one row, and a part-row never lands on a hidden line.
+   */
+  stepRows(line: number, rows: number): number {
+    const whole = Math.floor(line)
+    const hidden = this.hiddenIn(whole)
+    let row = hidden ? hidden.first : whole
+    const part = hidden ? 0 : line - whole
+    const steps = Math.trunc(rows)
+    for (let step = 0; step < Math.abs(steps); step += 1) row = steps > 0 ? this.nextRow(row) : this.previousRow(row)
+    const rest = part + (rows - steps)
+    if (rest >= 1) return this.nextRow(row) + rest - 1
+    if (rest < 0) return this.previousRow(row) + rest + 1
+    return row + rest
+  }
+
+  /** The drawn row below `line`, which is past the fold when `line` is a fold's header */
+  private nextRow(line: number): number {
+    const fold = this.folds.find((known) => known.first === line)
+    return fold ? fold.last + 1 : line + 1
+  }
+
+  /** The drawn row above `line`, which is a fold's header when the line above is folded away */
+  private previousRow(line: number): number {
+    const hidden = this.hiddenIn(line - 1)
+    return hidden ? hidden.first : line - 1
+  }
+
+  /** The number of drawn rows from line `from` up to `to`, a fold's hidden lines taking none; a fractional `to` counts its line */
+  private rowsBetween(from: number, to: number): number {
+    let rows = to - from
+    const through = Math.ceil(to) - 1
+    for (const fold of this.folds) {
+      const hidden = Math.min(fold.last, through) - Math.max(fold.first + 1, from) + 1
+      if (hidden > 0) rows -= hidden
+    }
+    return rows
   }
 
   /** Shows the screen and follows it */
