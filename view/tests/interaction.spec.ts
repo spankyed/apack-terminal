@@ -535,7 +535,8 @@ describe('a link', () => {
     view.point('pointermove', 8, 0)
     expect(view.painted().rows[0]!.lines).toEqual([{ kind: 'single', column: 4, cells: 19, color: theme.foreground }])
     expect(view.view.element.style.cursor).toBe('pointer')
-    expect(view.view.element.title).toBe('https://example.com')
+    // By default only a link a program declared previews where it opens; a URL found in the text does not
+    expect(view.view.element.title).toBe('')
 
     view.point('pointermove', 1, 0)
     expect(view.painted().rows[0]!.lines).toEqual([])
@@ -544,7 +545,7 @@ describe('a link', () => {
 
   it('is worked out once for each cell the pointer comes to, not for every move inside one', () => {
     let looked = 0
-    const view = mountedView({ detectors: [{ kind: 'counted', find: () => { looked += 1; return [] } }] })
+    const view = mountedView({ linkPreview: 'all', detectors: [{ kind: 'counted', find: () => { looked += 1; return [] } }] })
     view.source.send(frame({ rows: [row(0, 'nothing to open here')] }))
     runFrames()
     const moveTo = (clientX: number) => view.view.element.dispatchEvent(new MouseEvent('pointermove', { bubbles: true, clientX, clientY: 10 }))
@@ -585,6 +586,59 @@ describe('a link', () => {
     view.point('pointerdown', 8, 0, { metaKey: true })
     view.point('pointerup', 8, 0, { metaKey: true })
     expect(opened).toEqual(['https://example.com'])
+  })
+})
+
+describe('a link a program declared', () => {
+  const URI = 'https://x.example/a'
+  /** A row whose characters from `from` up to `to` declare `target`, as the broker sends one */
+  const declaredRow = (line: number, text: string, from: number, to: number, target: string, wrapped = false) => {
+    const base = row(line, text, { links: [target], wrapped })
+    return { ...base, link: Uint16Array.from(base.text, (_, index) => (index >= from && index < to ? 1 : 0)) }
+  }
+  /** `see the link` on row 0 wraps, and `continues here` on row 1 carries on the same link */
+  const wrapped = (options = {}) => {
+    const view = mountedView(options)
+    view.source.send(frame({ rows: [declaredRow(0, 'see the link', 4, 12, URI, true), declaredRow(1, 'continues here', 0, 9, URI)] }))
+    runFrames()
+    return view
+  }
+
+  it('is underlined on every row it wraps over while the pointer is over any of them, and on no other', () => {
+    const view = wrapped()
+    const under = (column: number, cells: number) => [{ kind: 'single', column, cells, color: theme.foreground }]
+
+    view.point('pointermove', 6, 0)
+    expect([view.painted().rows[0]!.lines, view.painted().rows[1]!.lines]).toEqual([under(4, 8), under(0, 9)])
+
+    view.point('pointermove', 3, 1)
+    expect([view.painted().rows[0]!.lines, view.painted().rows[1]!.lines]).toEqual([under(4, 8), under(0, 9)])
+
+    view.point('pointermove', 1, 0)
+    expect([view.painted().rows[0]!.lines, view.painted().rows[1]!.lines]).toEqual([[], []])
+  })
+
+  it('opens on a click with its URI and kind declared', () => {
+    const opened: unknown[] = []
+    const view = wrapped({ onLink: (link: unknown) => { opened.push(link) } })
+    view.point('pointerdown', 6, 0, { metaKey: true })
+    view.point('pointerup', 6, 0, { metaKey: true })
+    expect(opened).toEqual([{ target: URI, kind: 'declared', from: 4, to: 12 }])
+  })
+
+  it.each([
+    ['off', '', ''],
+    ['osc8', URI, ''],
+    ['all', URI, 'https://example.com'],
+  ] as const)('previews where it opens as the pointer\'s title with linkPreview %s', (preview, declaredTitle, urlTitle) => {
+    const view = mountedView({ linkPreview: preview })
+    view.source.send(frame({ rows: [declaredRow(0, 'see the link', 4, 12, URI), row(1, 'see https://example.com now')] }))
+    runFrames()
+
+    view.point('pointermove', 6, 0)
+    expect([view.view.element.style.cursor, view.view.element.title]).toEqual(['pointer', declaredTitle])
+    view.point('pointermove', 8, 1)
+    expect([view.view.element.style.cursor, view.view.element.title]).toEqual(['pointer', urlTitle])
   })
 })
 

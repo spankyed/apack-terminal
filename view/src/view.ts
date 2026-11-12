@@ -1,7 +1,7 @@
 import { CanvasPainter } from './canvas-painter.ts'
 import { blinks, drawRow, sessionTheme, type RowDrawing, type SelectedCells, type Theme } from './draw.ts'
 import { Input, modifiersOf } from './input.ts'
-import { linkAt, urls, type Detector, type Link } from './links.ts'
+import { linkAt, linkRuns, urls, type Detector, type Link, type LinkRun } from './links.ts'
 import { fontOf, type Font, type Painter, type Scene } from './painter.ts'
 import { RowStore } from './row-store.ts'
 import { Selection, type Granularity } from './selection.ts'
@@ -58,6 +58,13 @@ const THUMB_MIN = 20
  * `program` is whichever of those the program last set.
  */
 export type CursorBlink = 'on' | 'off' | 'program'
+
+/**
+ * What hovering a link shows of where it opens, as the pointer's title: `osc8` for a link a program declared
+ * with a hyperlink sequence, `all` for any link (text that looks like a URL, or what a detector found), and
+ * `off` for none. The pointer is a pointer over every link either way.
+ */
+export type LinkPreview = 'off' | 'osc8' | 'all'
 
 export interface ViewOptions {
   /** The typeface a view starts in; `setFont` changes it */
@@ -122,6 +129,8 @@ export interface ViewOptions {
   readonly optionIsAlt?: boolean
   /** The person opened a link: clicked it with the platform's modifier held */
   readonly onLink?: (link: Link, event: MouseEvent) => void
+  /** Which links show where they open when the pointer is over them (`LinkPreview`). Left out, `osc8` */
+  readonly linkPreview?: LinkPreview
   /** What else on a row can be opened, beyond URLs and what a program declared */
   readonly detectors?: readonly Detector[]
   /** Whether anything is selected changed, which a host draws its copy control from */
@@ -285,8 +294,8 @@ export class TerminalView {
   private thumbDrawn = { height: 0, top: 0, shown: false }
   /** Ends a drag of the thumb that is under way */
   private thumbRelease: (() => void) | null = null
-  /** The link the pointer is over, and the line it is on */
-  private hovered: { line: number; link: Link } | null = null
+  /** The link the pointer is over, the line it is on, and the cells it covers on each line it runs across */
+  private hovered: { line: number; link: Link; runs: LinkRun[] } | null = null
   /** The cell the pointer was over when that was last worked out, and the row that was on its line then */
   private hoverAt: { line: number; column: number; row: Row | undefined } | null = null
   private pressed: Pressed | null = null
@@ -1472,10 +1481,17 @@ export class TerminalView {
     const before = this.hovered
     const same = before !== null && link !== null && at !== null && before.line === at.line && before.link.from === link.from && before.link.to === link.to
     if (same || (!before && !link)) return
-    this.hovered = link && at ? { line: at.line, link } : null
+    const row = at ? this.store.row(at.line) : undefined
+    this.hovered = link && at && row ? { line: at.line, link, runs: linkRuns(link, row, at.column, (line) => this.store.row(line)) } : null
     this.element.style.cursor = link ? 'pointer' : 'text'
-    this.element.title = link ? link.target : ''
+    this.element.title = link && this.previews(link) ? link.target : ''
     this.schedule()
+  }
+
+  /** Whether hovering a link shows where it opens, by the `linkPreview` the host chose */
+  private previews(link: Link): boolean {
+    const preview = this.options.linkPreview ?? 'osc8'
+    return preview === 'all' || (preview === 'osc8' && link.kind === 'declared')
   }
 
   /**
@@ -1612,11 +1628,11 @@ export class TerminalView {
     const row = this.store.row(line)
     if (!row) return null
     const selected: SelectedCells | undefined = this.selection.on(line)
-    const hovered = this.hovered?.line === line ? this.hovered.link : null
+    const hovered = this.hovered?.runs.filter((run) => run.line === line) ?? []
     const matched = this.matches.length > 0 ? this.matchesOn(line) : []
     // Which half of a blink it is, for a row that has text to hide in one of them
     const blinkedOff = !this.textShown && blinksIn(row)
-    const key = `${selected ? `${selected.from}-${selected.to}` : ''}|${hovered ? `${hovered.from}-${hovered.to}` : ''}`
+    const key = `${selected ? `${selected.from}-${selected.to}` : ''}|${hovered.map((run) => `${run.from}-${run.to}`).join(',')}`
       + `|${matched.map((match) => `${match.from}-${match.to}${match.current ? '!' : ''}`).join(',')}|${blinkedOff ? 'off' : ''}`
     const kept = this.drawings.get(line)
     if (kept && kept.row === row && kept.selected === key) return kept.drawing
@@ -1633,10 +1649,10 @@ export class TerminalView {
       }
     }
     // A link under the pointer is underlined, whatever it looked like before
-    if (hovered) {
+    if (hovered.length > 0) {
       drawing = {
         ...drawing,
-        lines: [...drawing.lines, { kind: 'single', column: hovered.from, cells: hovered.to - hovered.from, color: this.theme.foreground }],
+        lines: [...drawing.lines, ...hovered.map((run) => ({ kind: 'single' as const, column: run.from, cells: run.to - run.from, color: this.theme.foreground }))],
       }
     }
     this.drawings.set(line, { row, selected: key, drawing })
