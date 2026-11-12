@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CanvasPainter } from '../src/canvas-painter.ts'
 import type { Theme } from '../src/draw.ts'
 import type { Painter, Scene } from '../src/painter.ts'
-import { PLAIN, paletteColor, type Fetched } from '../src/source.ts'
+import { PLAIN, StyleFlag, paletteColor, type Fetched } from '../src/source.ts'
 import { BLINK_MS, TerminalView } from '../src/view.ts'
 import { recordingContext } from './_canvas.ts'
 import { framesWaiting, installFrames, runFrames } from './_frames.ts'
@@ -731,5 +731,53 @@ describe('the cursor', () => {
     runFrames()
 
     expect(painter.scenes.at(-1)?.cursor).toBeUndefined()
+  })
+})
+
+describe('text that blinks', () => {
+  beforeEach(() => { vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] }) })
+  afterEach(() => { vi.useRealTimers() })
+
+  /** `ab`, of which the `a` blinks */
+  const blinkingRow = () => ({ ...row(0, 'ab'), style: Uint16Array.from([1, 0]), styles: [PLAIN, { ...PLAIN, flags: StyleFlag.blink }] })
+  const drawn = (view: ReturnType<typeof mountedView>) => view.painted().rows[0]?.glyphs.map((glyph) => glyph.text)
+
+  it('is drawn and hidden in turn, by a clock that what is printed does not start over', () => {
+    const view = mountedView()
+    view.source.send(frame({ rows: [blinkingRow()] }))
+    expect(drawn(view)).toEqual(['a', 'b'])
+    vi.advanceTimersByTime(BLINK_MS)
+    expect(drawn(view), 'did not blink').toEqual(['b'])
+
+    // Printed half way through the hidden half: a program that keeps printing must not keep it shown
+    vi.advanceTimersByTime(BLINK_MS / 2)
+    view.source.send(frame({ sequence: 2, rows: [blinkingRow()] }))
+    expect(drawn(view), 'output showed it again').toEqual(['b'])
+    vi.advanceTimersByTime(BLINK_MS / 2)
+    expect(drawn(view)).toEqual(['a', 'b'])
+  })
+
+  it('costs no clock where none is in view, and is shown once the last of it has gone', () => {
+    const view = mountedView()
+    view.source.send(frame({ rows: [row(0, 'ab')] }))
+    view.painted()
+    expect(vi.getTimerCount(), 'a clock for text that does not blink').toBe(0)
+
+    view.source.send(frame({ sequence: 2, rows: [blinkingRow()] }))
+    view.painted()
+    expect(vi.getTimerCount()).toBe(1)
+    vi.advanceTimersByTime(BLINK_MS)
+
+    view.source.send(frame({ sequence: 3, rows: [row(0, 'ab')] }))
+    expect(drawn(view)).toEqual(['a', 'b'])
+    expect(vi.getTimerCount(), 'the clock outlived the text').toBe(0)
+  })
+
+  it('stops with the frames when the view is taken off the page', () => {
+    const view = mountedView()
+    view.source.send(frame({ rows: [blinkingRow()] }))
+    view.painted()
+    view.view.unmount()
+    expect(vi.getTimerCount(), 'a view that is not on the page went on blinking').toBe(0)
   })
 })

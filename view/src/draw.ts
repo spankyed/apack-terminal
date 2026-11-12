@@ -72,6 +72,11 @@ export interface RowDrawing {
   readonly lines: ReadonlyArray<{ kind: LineKind; column: number; cells: number; color: number }>
 }
 
+/** Whether any of a row's text blinks, which is whether drawing it depends on which half of a blink it is */
+export function blinks(row: Row): boolean {
+  return row.style.some((style) => ((row.styles[style] ?? PLAIN).flags & StyleFlag.blink) !== 0)
+}
+
 /** The cells of one row that are selected: from `from` up to but not including `to` */
 export interface SelectedCells {
   readonly from: number
@@ -90,14 +95,15 @@ function colorIn(theme: Theme, color: Color): number | null {
  *
  * The rules a terminal's styles follow, in the order they apply: inverse swaps the two colours, defaults
  * included; a selection then replaces the background and, if the theme says so, the text; invisible text
- * keeps its background and draws no character; faint text is drawn at half strength.
+ * keeps its background and draws no character; faint text is drawn at half strength. Text that blinks is
+ * invisible text for the half of a blink it is off, which `blinkedOff` says this is.
  *
  * **A selection is one rectangle over the cells it covers, whatever is in them.** A row lists the characters
  * a program wrote and not the blank cells between or after them, so a background made from characters
  * would have a hole wherever nothing was written. The rectangle is the selection's own; the characters
  * under it give up their backgrounds and take its text colour.
  */
-export function drawRow(row: Row, theme: Theme, selected?: SelectedCells): RowDrawing {
+export function drawRow(row: Row, theme: Theme, selected?: SelectedCells, blinkedOff = false): RowDrawing {
   const backgrounds: Array<{ column: number; cells: number; color: number }> = []
   const glyphs: Array<RowDrawing['glyphs'][number]> = []
   const lines: Array<{ kind: LineKind; column: number; cells: number; color: number }> = []
@@ -133,7 +139,7 @@ export function drawRow(row: Row, theme: Theme, selected?: SelectedCells): RowDr
       extend(backgrounds, { column, cells, color: bg }, (last) => last.color === bg)
     }
 
-    const visible = !(flags & StyleFlag.invisible)
+    const visible = !(flags & StyleFlag.invisible) && !(blinkedOff && flags & StyleFlag.blink)
     if (visible && text !== ' ' && text !== '') {
       glyphs.push({
         text,
