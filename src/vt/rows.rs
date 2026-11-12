@@ -520,7 +520,7 @@ pub struct Mark {
     handle: sys::TrackedGridRef,
 }
 
-// As `Terminal`: allocated and freed by the library, and held by one session under its lock
+// SAFETY: as `Terminal`: allocated and freed by the library, and held by one session under its lock
 unsafe impl Send for Mark {}
 
 impl Mark {
@@ -591,7 +591,7 @@ pub struct Rendering {
     rows: sys::RenderStateRowIterator,
 }
 
-// As `Terminal`
+// SAFETY: as `Terminal`: the handles are the library's and held by one session under its lock
 unsafe impl Send for Rendering {}
 
 /// What a look at the terminal found changed.

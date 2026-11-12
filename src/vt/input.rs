@@ -305,7 +305,7 @@ pub struct Encoders {
 /// four formats a report can take.
 const MOUSE_MODES: [u16; 8] = [9, 1000, 1002, 1003, 1005, 1006, 1015, 1016];
 
-// As `Terminal`: allocated and freed by the library, and held by one session under its lock
+// SAFETY: as `Terminal`: allocated and freed by the library, and held by one session under its lock
 unsafe impl Send for Encoders {}
 
 impl Encoders {

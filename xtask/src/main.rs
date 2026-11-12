@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use xtask::{generate, leftovers, mutants, package, pre_push, vt_prebuilt};
+use xtask::{generate, leftovers, mutants, package, pre_push, safety, vt_prebuilt};
 
 fn main() -> ExitCode {
     let task = std::env::args().nth(1);
@@ -21,6 +21,7 @@ fn main() -> ExitCode {
         Some("generate") => generate::update(&root),
         Some("check-generated") => generate::check(&root),
         Some("check-exclusions") => mutants::check_exclusions(&root),
+        Some("check-safety") => safety::check(&root),
         Some("clear-mutants") => leftovers::clear(&root),
         Some("package") => package::package(&root),
         Some("vt-prebuilt") => vt_prebuilt::fetch(&root),
@@ -30,10 +31,11 @@ fn main() -> ExitCode {
             &[
                 ("generated protocol", &|| generate::check(&root)),
                 ("mutant exclusions", &|| mutants::check_exclusions(&root)),
+                ("unsafe justifications", &|| safety::check(&root)),
             ],
         ),
         _ => {
-            Err("usage: cargo xtask <generate | check-generated | check-exclusions | clear-mutants | package | vt-prebuilt | pre-push>"
+            Err("usage: cargo xtask <generate | check-generated | check-exclusions | check-safety | clear-mutants | package | vt-prebuilt | pre-push>"
                 .to_owned())
         }
     };

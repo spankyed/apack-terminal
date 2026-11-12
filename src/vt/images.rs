@@ -117,6 +117,8 @@ fn decode_png_into<'a>(encoded: &[u8], allocate: impl FnOnce(usize) -> Option<&'
 }
 
 /// The core's callback for a PNG: decoded here, into memory the core hands out and then owns.
+// SAFETY: the core calls this with `data` readable for `data_len` bytes, and `allocator` and `out` valid for
+// the call; the null checks in the body come before any use of them
 unsafe extern "C" fn decode_png(
     _userdata: *mut std::ffi::c_void,
     allocator: *const sys::Allocator,
