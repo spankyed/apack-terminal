@@ -7,6 +7,7 @@ import { RowStore } from './row-store.ts'
 import { Selection, type Granularity } from './selection.ts'
 import { Modifier, PLAIN, TooLarge, type Command, type Frame, type Picture, type Placements, type PointerInput, type Position, type Row, type SessionColors, type Span, type TerminalSource } from './source.ts'
 import { Viewport } from './viewport.ts'
+import { cellsOfCodePoint } from './width.ts'
 
 /**
  * A run of lines a host folds away. The first line stays on screen as a header, which stands for the lines after it up
@@ -594,13 +595,21 @@ export class TerminalView {
     const known = this.foldRows.get(key)
     if (known) return known
     const characters = [...text]
+    // Each character starts where the cells before it end, so a wide label lines up with what is after it
+    const widths = characters.map((character) => cellsOfCodePoint(character.codePointAt(0) ?? 0))
+    const starts: number[] = []
+    let next = 0
+    for (const cells of widths) {
+      starts.push(next)
+      next += cells
+    }
     const row: Row = {
       line: fold.first,
       wrapped: false,
       prompt: false,
       text: characters,
-      column: Uint16Array.from(characters, (_, index) => index),
-      width: Uint8Array.from(characters, () => 1),
+      column: Uint16Array.from(starts),
+      width: Uint8Array.from(widths),
       style: new Uint16Array(characters.length),
       link: new Uint16Array(characters.length),
       styles: [PLAIN],
@@ -1570,7 +1579,9 @@ export class TerminalView {
 
     const { cellWidth, cellHeight } = this.painter.metrics
     if (frame.cursor) {
-      const row = this.rowsBetween(first, frame.firstActive + frame.cursor.row)
+      // A cursor on a line a fold hides is drawn at the fold's header, so the input is placed where the header is
+      const cursorLine = frame.firstActive + frame.cursor.row
+      const row = this.rowsBetween(first, this.hiddenIn(cursorLine)?.first ?? cursorLine)
       this.input.moveTo(this.gutter + frame.cursor.column * cellWidth, Math.max(0, row - this.viewport.offset) * cellHeight, cellHeight)
     }
     // How far a page looking for output to be on screen can count on: this frame, and these lines

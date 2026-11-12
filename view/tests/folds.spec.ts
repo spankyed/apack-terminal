@@ -112,6 +112,26 @@ describe('a folded run of lines', () => {
     expect(drawnText(view)).toEqual(['L0', '▸ output', 'L4'])
   })
 
+  it('is headed by a label whose wide characters take two cells, so what follows lines up with them', () => {
+    const view = mountedView({}, new FakeSource())
+    sevenLines(view)
+    view.view.setFolds([{ first: 1, last: 3, label: '中x' }])
+    runFrames()
+    // The header is "▸ 中x": the wide character is on cells 2 and 3, so the x is on cell 4
+    const header = view.painted().rows[1]!
+    expect(header.glyphs.map((glyph) => [glyph.text, glyph.column])).toEqual([['▸', 0], ['中', 2], ['x', 4]])
+  })
+
+  it('places the input at the fold header when the cursor sits on a line the fold hides', () => {
+    const view = mountedView({}, new FakeSource())
+    // The cursor is on line 5, which a fold over lines 4 to 6 hides. The view is shown from line 0, so the header, line 4,
+    // is the fifth row; rows are twenty pixels high in the test painter. Placed on line 5 it would be a row lower still.
+    sevenLines(view, { row: 2, column: 0 })
+    view.view.setFolds([{ first: 4, last: 6 }])
+    runFrames()
+    expect(view.field.style.top).toBe('80px')
+  })
+
   it('takes folds that do not overlap, and refuses ones that do', () => {
     const view = mountedView({}, new FakeSource())
     expect(() => view.view.setFolds([{ first: 1, last: 3 }, { first: 3, last: 5 }])).toThrow(RangeError)
