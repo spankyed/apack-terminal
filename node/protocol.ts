@@ -116,7 +116,7 @@ export type ProgressState = "none" | "running" | "error" | "indeterminate" | "pa
 /**
  * What the app asks the broker to do.
  */
-export type Request = { "kind": "hello", protocol: number, role: Role, } | { "kind": "spawn", cols: number, rows: number, shell: string | null, 
+export type Request = { "kind": "done" } | { "kind": "hello", protocol: number, role: Role, } | { "kind": "spawn", cols: number, rows: number, shell: string | null, 
 /**
  * The shell's own launch arguments, in order. Empty starts it as the user would.
  */
