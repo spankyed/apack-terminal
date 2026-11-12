@@ -6,6 +6,7 @@
 //! snapshots and a byte-boundary property test, and neither is a thing you write through a pty and a socket.
 
 pub mod commands;
+pub mod deadlines;
 pub mod feed;
 pub mod frames;
 pub mod holds;

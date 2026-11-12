@@ -1,5 +1,5 @@
 import { CanvasPainter } from './canvas-painter.ts'
-import { drawRow, sessionTheme, type RowDrawing, type SelectedCells, type Theme } from './draw.ts'
+import { blinks, drawRow, sessionTheme, type RowDrawing, type SelectedCells, type Theme } from './draw.ts'
 import { Input, modifiersOf } from './input.ts'
 import { linkAt, urls, type Detector, type Link } from './links.ts'
 import { fontOf, type Font, type Painter, type Scene } from './painter.ts'
@@ -189,6 +189,9 @@ export class TerminalView {
   private height = 0
   private blink: ReturnType<typeof setInterval> | null = null
   private cursorShown = true
+  /** The clock blinking text goes by, while any is in view, and which half of a blink it is in */
+  private textBlink: ReturnType<typeof setInterval> | null = null
+  private textShown = true
   private focused = false
   private wasFollowing = true
   private disposed = false
@@ -911,6 +914,32 @@ export class TerminalView {
     this.scheduled = null
     this.stopDragScroll()
     this.blinkAgain()
+    this.blinkText(false)
+  }
+
+  /**
+   * Starts or stops the clock blinking text goes by. It runs only while text that blinks is in view and
+   * the view is taking frames, and whatever it stopped at, text is shown once it has: a view that is
+   * not blinking is one in which nothing is hidden.
+   *
+   * **A clock of its own, not the cursor's.** The cursor's starts over at every keystroke and every
+   * frame, so that a cursor that just moved is seen; text that started over that often would never
+   * reach the half it is hidden for under a program that keeps printing.
+   */
+  private blinkText(inView: boolean): void {
+    if (inView && this.listening) {
+      this.textBlink ??= setInterval(() => {
+        this.textShown = !this.textShown
+        this.schedule()
+      }, BLINK_MS)
+      return
+    }
+    if (this.textBlink) clearInterval(this.textBlink)
+    this.textBlink = null
+    if (!this.textShown) {
+      this.textShown = true
+      this.schedule()
+    }
   }
 
   private take(frame: Frame): void {
@@ -1333,6 +1362,12 @@ export class TerminalView {
       const [first, count] = this.viewport.visible
       const rows: Array<RowDrawing | null> = []
       for (let line = first; line < first + count; line += 1) rows.push(this.drawingOf(line))
+      let blinking = false
+      for (let line = first; line < first + count && !blinking; line += 1) {
+        const row = this.store.row(line)
+        blinking = row !== undefined && blinks(row)
+      }
+      this.blinkText(blinking)
       // What a scroll of a screenful either way would show stays drawn; the rest is not held on to
       for (const line of this.drawings.keys()) {
         if (line < first - count || line >= first + count * 2) this.drawings.delete(line)
@@ -1400,11 +1435,13 @@ export class TerminalView {
     const selected: SelectedCells | undefined = this.selection.on(line)
     const hovered = this.hovered?.line === line ? this.hovered.link : null
     const matched = this.matches.length > 0 ? this.matchesOn(line) : []
+    // Which half of a blink it is, for a row that has text to hide in one of them
+    const blinkedOff = !this.textShown && blinks(row)
     const key = `${selected ? `${selected.from}-${selected.to}` : ''}|${hovered ? `${hovered.from}-${hovered.to}` : ''}`
-      + `|${matched.map((match) => `${match.from}-${match.to}${match.current ? '!' : ''}`).join(',')}`
+      + `|${matched.map((match) => `${match.from}-${match.to}${match.current ? '!' : ''}`).join(',')}|${blinkedOff ? 'off' : ''}`
     const kept = this.drawings.get(line)
     if (kept && kept.row === row && kept.selected === key) return kept.drawing
-    let drawing = drawRow(row, this.theme, selected)
+    let drawing = drawRow(row, this.theme, selected, blinkedOff)
     // Behind what a search found, over whatever background the cells had: later rectangles cover earlier
     if (matched.length > 0) {
       const { matchBackground = 0x623315, currentMatchBackground = 0x9e6a03 } = this.theme

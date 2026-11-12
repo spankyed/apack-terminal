@@ -91,6 +91,20 @@ describe('text attributes', () => {
     expect(drawing.glyphs).toEqual([])
     expect(drawing.lines).toEqual([])
   })
+
+  it('text that blinks is drawn like any other, and for the half of a blink it is off keeps its background and draws nothing else', () => {
+    const blinking: Style = { ...PLAIN, bg: RED, flags: StyleFlag.blink | StyleFlag.strikethrough }
+    const both = { ...styled('ab', [1, 0]), styles: [PLAIN, blinking] }
+
+    const on = drawRow(both, theme)
+    expect(on.glyphs.map((glyph) => glyph.text)).toEqual(['a', 'b'])
+    expect(on.lines).toHaveLength(1)
+
+    const off = drawRow(both, theme, undefined, true)
+    expect(off.glyphs.map((glyph) => glyph.text), 'the text beside it does not blink').toEqual(['b'])
+    expect(off.lines).toEqual([])
+    expect(off.backgrounds).toEqual(on.backgrounds)
+  })
 })
 
 describe('lines through and under text', () => {

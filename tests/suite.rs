@@ -7,6 +7,8 @@
 //!
 //! A file that drives something only POSIX has is compiled only there, which is said here rather than
 //! in the file: an attribute on a whole file can only be written in the root of a program.
+//! A file that runs on both says so a case at a time: the ones that type `sh`'s syntax or close one
+//! direction of a connection are POSIX only.
 
 mod broker;
 #[cfg(unix)]
@@ -18,6 +20,7 @@ mod command_rows;
 mod commands;
 mod conformance;
 mod core_features;
+mod deadlines;
 mod effects;
 mod feed;
 mod frames;
@@ -28,7 +31,6 @@ mod images;
 mod keeping;
 mod markers;
 mod parser;
-#[cfg(unix)]
 mod proxy;
 mod reaper;
 mod recording;
@@ -36,7 +38,6 @@ mod screen;
 mod security;
 #[cfg(unix)]
 mod signals;
-#[cfg(unix)]
 mod view_broker;
 mod view_frames;
 mod view_input;
