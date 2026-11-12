@@ -8,7 +8,8 @@
 //!
 //! A wait that was met is dropped from the list the next time the thread looks at it, and says nothing.
 
-use std::collections::BinaryHeap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
@@ -45,54 +46,33 @@ impl Deadlines {
     }
 }
 
-/// A deadline in the order it falls due, which is the order the heap gives them back in. `seq` breaks a
-/// tie between two that fall due at the same instant, so each is given up on once and none is lost.
-struct Due {
-    at: Instant,
-    seq: u64,
-    deadline: Deadline,
-}
-
-impl PartialEq for Due {
-    fn eq(&self, other: &Self) -> bool {
-        self.at == other.at && self.seq == other.seq
-    }
-}
-
-impl Eq for Due {}
-
-impl PartialOrd for Due {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Due {
-    // Reversed, so the heap's largest is the one that falls due first
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other.at.cmp(&self.at).then(other.seq.cmp(&self.seq))
-    }
-}
-
 fn keep(set: &Receiver<Deadline>, events: &Sender<Outgoing>) {
-    let mut waiting: BinaryHeap<Due> = BinaryHeap::new();
+    // Ordered by when each falls due, earliest first; `seq` breaks a tie so that two due at the same
+    // instant are both given up on. The deadlines themselves are kept beside it, by `seq`
+    let mut waiting: BinaryHeap<Reverse<(Instant, u64)>> = BinaryHeap::new();
+    let mut pending: HashMap<u64, Deadline> = HashMap::new();
     let mut seq = 0_u64;
     loop {
         // Everything due is dealt with before anything is waited for again
         let now = Instant::now();
-        while let Some(next) = waiting.peek() {
+        while let Some(Reverse((at, next))) = waiting.peek().copied() {
+            let Some(deadline) = pending.remove(&next) else {
+                waiting.pop();
+                continue;
+            };
             // Met since it was set: there is nothing to say of it, and nothing to wait for either
-            if next.deadline.settled.load(Ordering::SeqCst) {
+            if deadline.settled.load(Ordering::SeqCst) {
                 waiting.pop();
                 continue;
             }
-            if next.at > now {
+            if at > now {
+                pending.insert(next, deadline);
                 break;
             }
-            let due = waiting.pop().expect("peeked");
+            waiting.pop();
             // Whichever end settles a wait first is the one that answers it
-            if !due.deadline.settled.swap(true, Ordering::SeqCst) {
-                let timed_out = Event::Waited { session: due.deadline.session, outcome: WaitOutcome::Timeout };
+            if !deadline.settled.swap(true, Ordering::SeqCst) {
+                let timed_out = Event::Waited { session: deadline.session, outcome: WaitOutcome::Timeout };
                 let _ = events.send(Outgoing::answer(timed_out));
             }
         }
@@ -102,7 +82,7 @@ fn keep(set: &Receiver<Deadline>, events: &Sender<Outgoing>) {
                 Ok(deadline) => Some(deadline),
                 Err(_) => return,
             },
-            Some(next) => match set.recv_timeout(next.at.saturating_duration_since(Instant::now())) {
+            Some(Reverse((at, _))) => match set.recv_timeout(at.saturating_duration_since(Instant::now())) {
                 Ok(deadline) => Some(deadline),
                 Err(RecvTimeoutError::Timeout) => None,
                 Err(RecvTimeoutError::Disconnected) => return,
@@ -110,7 +90,8 @@ fn keep(set: &Receiver<Deadline>, events: &Sender<Outgoing>) {
         };
         if let Some(deadline) = arrived {
             seq += 1;
-            waiting.push(Due { at: deadline.at, seq, deadline });
+            waiting.push(Reverse((deadline.at, seq)));
+            pending.insert(seq, deadline);
         }
     }
 }
