@@ -243,3 +243,24 @@ pub fn peer_is_this_user(stream: &Stream) -> io::Result<bool> {
         Ok(stream.peer_creds()?.euid() == Some(user))
     }
 }
+
+/// Closes a connection in both directions, whoever else still holds it, so a thread parked in a read or
+/// a write of it is let go. `false` where a connection cannot be closed from under its users, which is a
+/// named pipe: there the thread is left to the far end's closing.
+///
+/// **The half the far end has not already closed is closed by itself where both cannot be.** A caller
+/// that has said all it will has closed its sending side, and on macOS a socket in that state refuses to
+/// be shut down in both directions at all (`ENOTCONN`), leaving the direction this process writes in open
+/// and whatever is writing to it parked for as long as the far end likes. That direction is the one a
+/// hang-up is for.
+pub fn hang_up(stream: &Stream) -> bool {
+    match stream {
+        #[cfg(unix)]
+        Stream::UdSocket(socket) => {
+            let socket = socket.inner();
+            socket.shutdown(std::net::Shutdown::Both).is_ok() || socket.shutdown(std::net::Shutdown::Write).is_ok()
+        }
+        #[cfg(windows)]
+        Stream::NamedPipe(_) => false,
+    }
+}

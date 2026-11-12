@@ -21,11 +21,12 @@ cargo xtask check-exclusions                   # fails when a mutants exclusion 
 | `tests/view_model.rs` | the invariant a view rests on: a model that applies every frame it is sent holds exactly the terminal's screen and history, over generated streams |
 | `tests/view_frames.rs`, `tests/view_input.rs`, `tests/view_reads.rs` | what a frame carries and when one is sent; keys, pointer and paste as the core encodes them; words, lines, text and search |
 | `tests/view_sink.rs` | what waits to be written to one view connection, and where that ends |
-| `tests/writer.rs` | what is queued for a session's program: a pty that refused a write told apart from a session that ended |
+| `tests/writer.rs` | what is queued for a session's program: a pty that refused a write told apart from a session that ended, the most that may wait, and the pty's writer let go of only once the program is gone |
 | `tests/view_broker.rs` | a view driven as a window drives one: a real socket, the real binary, a real shell |
 | `tests/effects.rs`, `tests/commands.rs`, `tests/command_rows.rs` | what a program does that is not on its screen; the ring of commands a shell marked, and the lines each is on |
 | `tests/recording.rs`, `tests/keeping.rs` | a recording replayed, bounded and picked up from; sessions kept past their holder, restored and rewound, against the real binary |
 | `tests/images.rs` | images a program places: where each is told to be, and its pixels in parts |
+| `tests/holds.rs` | the deadlines kept for screens a program is holding still: one a screen, and none left once each has been drawn or its session has ended |
 | `tests/housekeeping.rs` | history compressed once a session has gone quiet |
 | `tests/proxy.rs` | a broker reached through a process's stdin and stdout, proxies arriving together starting one, and the one broker a socket has: its lock, its socket's mode, and when it leaves |
 | `tests/core_features.rs` | that the core this was built against has what the broker uses |

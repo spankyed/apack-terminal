@@ -102,19 +102,14 @@ impl Terminal {
         unsafe { sys::ghostty_terminal_vt_write(self.handle, bytes.as_ptr(), bytes.len()) };
     }
 
-    /// Parses `bytes` up to and including the byte that ends the next OSC string, answering how many were
-    /// taken. All of them, when no OSC ends in what was given.
+    /// Parses `bytes` up to and including the byte that ends the next OSC string, and — when `or_ground` —
+    /// no further than the first byte that leaves the parser between sequences. Answers how many bytes
+    /// were taken, which is all of them when neither was met, and whether ground is where it stopped.
     ///
     /// **This is how the terminal is caught at the moment a marker was written.** A shell reports a prompt
     /// or a command with an OSC sequence, and the callbacks for it have run by the time this returns — with
     /// the cursor where the shell left it, rather than wherever the rest of the read moved it to. Every
     /// byte is parsed exactly as `feed` parses it; what differs is only where the call returns.
-    pub fn feed_to_osc_end(&mut self, bytes: &[u8]) -> usize {
-        self.feed_to(bytes, false).0
-    }
-
-    /// The same, stopping as well — when `or_ground` — at the first byte that leaves the parser between
-    /// sequences. Answers how many bytes were taken and whether that is where it stopped.
     ///
     /// **Ground is a state, so it can be reached having taken nothing**: asked of a parser that is already
     /// between sequences, this answers `(0, true)`.

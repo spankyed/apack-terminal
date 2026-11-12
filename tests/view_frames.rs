@@ -10,11 +10,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use apack_terminal::holds::{HOLD_LIMIT, Holds};
-use apack_terminal::screen::{Screen, Unanswered};
-use apack_terminal::view::publish::{FETCH_LINES, ViewId};
+use apack_terminal::screen::{Screen, TEXT_BYTES, Unanswered};
+use apack_terminal::view::publish::{FETCH_LINES, Publication, ViewId};
 use apack_terminal::view::wire::{
     Color, ColorChanges, Frame, Glyph, MAX_MESSAGE_BYTES, Position, Row, Span, ToView, body, rows as rows_message,
 };
+use apack_terminal::vt::Terminal;
+use apack_terminal::vt::input::Pointer;
 use apack_terminal::vt::rows::ROW_LINK_BYTES;
 
 struct View {
@@ -67,6 +69,11 @@ fn lines(frame: &Frame) -> Vec<(u64, String)> {
 fn write(screen: &mut Screen, bytes: &str) {
     screen.feed(bytes.as_bytes());
     screen.publish();
+}
+
+/// The numbers a message says.
+fn numbers_in(said: &str) -> Vec<u64> {
+    said.split(|character: char| !character.is_ascii_digit()).filter_map(|digits| digits.parse().ok()).collect()
 }
 
 #[test]
@@ -156,6 +163,41 @@ fn a_few_lines_that_scrolled_off_come_as_they_ended_up() {
             (4, "five".to_owned())
         ]
     );
+}
+
+/// **A line that only moved is the row a view already has.** A screen that scrolls has every row somewhere
+/// new, and each is still the line it was: the frame carries the line that left as it ended up and the
+/// line that arrived, and none of the lines between.
+#[test]
+fn lines_that_only_moved_up_the_screen_are_not_sent_again() {
+    let mut screen = Screen::new(20, 4);
+    write(&mut screen, "one\r\ntwo\r\nthree\r\nfour");
+    let view = View::attached(&mut screen, 1, 1);
+    let first = view.frame();
+    screen.acknowledge(view.id, first.sequence).expect("an acknowledgement is taken");
+
+    write(&mut screen, "\r\nfive");
+    let second = view.frame();
+    assert_eq!(second.first_active, 1);
+    assert_eq!(lines(&second), vec![(0, "one".to_owned()), (4, "five".to_owned())]);
+}
+
+/// A program that draws a row again as it already stood has changed nothing, and a view is sent nothing:
+/// a row is the bytes it is sent as, and those are the ones the view has.
+#[test]
+fn a_row_written_over_with_what_it_already_held_is_no_change() {
+    let mut screen = Screen::new(20, 4);
+    write(&mut screen, "status: ok");
+    let view = View::attached(&mut screen, 1, 1);
+    let first = view.frame();
+    screen.acknowledge(view.id, first.sequence).expect("an acknowledgement is taken");
+
+    // Back to the start of the row and the same text over it, which leaves the cursor where it was too
+    write(&mut screen, "\rstatus: ok");
+    view.nothing();
+    // And one character of it different is the row again
+    write(&mut screen, "\rstatus: no");
+    assert_eq!(lines(&view.frame()), vec![(0, "status: no".to_owned())]);
 }
 
 /// A view showing the screen has no use for the thousand lines that passed between two of its frames, so
@@ -555,6 +597,45 @@ fn a_view_that_detaches_is_sent_nothing_more() {
     staying.nothing();
 }
 
+/// **The buttons a view holds down go when it does, and no other view's do.** A pointer that has left
+/// the grid is reported — at the edge — only for a view holding a button down, so that is what shows who
+/// is holding one: a view that lost focus or went holds none when its pointer next moves, and a view on
+/// another connection is still dragging after the first connection has gone.
+#[test]
+fn the_buttons_a_view_held_go_when_it_does_and_no_other_views_do() {
+    let mut screen = Screen::new(80, 24);
+    screen.feed(b"\x1b[?1002h\x1b[?1006h");
+    let (leaving, staying) = (ViewId { connection: 1, channel: 1 }, ViewId { connection: 2, channel: 1 });
+    // The left button over cells ten pixels by twenty: `0` presses and `2` moves
+    let told = |screen: &mut Screen, view: ViewId, action: u8, x: f32, row: u8| {
+        let y = f32::from(row) * 20.0 + 10.0;
+        let pointer = Pointer { action, button: 0, modifiers: 0, x, y, cell_width: 10.0, cell_height: 20.0 };
+        String::from_utf8(screen.pointer(view, &pointer).expect("a pointer event encodes")).expect("a report is text")
+    };
+    // In the second column, and past the last: eighty columns of ten pixels end at 800
+    let (inside, outside) = (15.0, 900.0);
+
+    // **Every move here is on a row whose last cell has not been reported**, since a move within the cell
+    // the program was last told of is reported to nobody, held or not
+    assert_eq!(told(&mut screen, leaving, 0, inside, 1), "\x1b[<0;2;2M");
+    assert_eq!(told(&mut screen, leaving, 2, outside, 1), "\x1b[<32;80;2M", "a drag, while it holds the button");
+    // It loses focus with the button down: the release goes somewhere else
+    screen.release_pointer(leaving);
+    assert_eq!(told(&mut screen, leaving, 2, outside, 2), "", "a view that lost focus holds nothing");
+
+    // It presses again and detaches without releasing, then comes back
+    assert_eq!(told(&mut screen, leaving, 0, inside, 3), "\x1b[<0;2;4M");
+    screen.detach_view(leaving);
+    assert_eq!(told(&mut screen, leaving, 2, outside, 3), "", "a view that went holds nothing");
+
+    // Both press, and the first one's connection goes
+    assert_eq!(told(&mut screen, leaving, 0, inside, 5), "\x1b[<0;2;6M");
+    assert_eq!(told(&mut screen, staying, 0, inside, 7), "\x1b[<0;2;8M");
+    screen.detach_connection(1);
+    assert_eq!(told(&mut screen, staying, 2, outside, 7), "\x1b[<32;80;8M", "the other connection's view still drags");
+    assert_eq!(told(&mut screen, leaving, 2, outside, 9), "", "a view whose connection went holds nothing");
+}
+
 /// The session ending is not paced: a view is sent the screen as it ended whether or not it had drawn its
 /// last frame, then told there is no more.
 #[test]
@@ -619,6 +700,28 @@ fn lines_are_fetched_by_number_and_a_line_no_longer_held_is_absent() {
     assert_eq!(block.rows.iter().map(|row| row.line).collect::<Vec<_>>(), vec![8, 9, 10]);
 }
 
+/// **A line has a place in the terminal only while the terminal holds it**: from the oldest line of the
+/// history to the last row of the screen. A line that has left the history has none, and nor has the line
+/// under the screen, which nothing has written yet.
+#[test]
+fn a_line_has_a_place_in_the_terminal_from_the_oldest_held_to_the_last_row_of_the_screen() {
+    let mut terminal = Terminal::new(20, 3).expect("a terminal");
+    terminal.feed(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+    let mut numbering = Publication::new(&terminal, 0).expect("a session's lines are numbered");
+    numbering.advance(&terminal).expect("the numbering is brought up to the terminal");
+    // Two lines of history over a screen of three, so lines 0 to 4
+    assert_eq!(numbering.first_active(), 2);
+    assert_eq!((numbering.screen_row(0), numbering.screen_row(4)), (Some(0), Some(4)));
+    assert_eq!(numbering.screen_row(5), None, "the line under the screen is not written yet");
+
+    // The history erased: the screen's lines keep their numbers, and are now the terminal's first rows
+    terminal.feed(b"\x1b[3J");
+    numbering.advance(&terminal).expect("the numbering is brought up to the terminal");
+    assert_eq!(numbering.screen_row(1), None, "a line that is gone");
+    assert_eq!((numbering.screen_row(2), numbering.screen_row(4)), (Some(0), Some(2)));
+    assert_eq!(numbering.screen_row(5), None, "and the line under the screen is still not written");
+}
+
 /// Line numbers belong to what a view is told, so a question about lines put to a session nothing views
 /// is refused: nothing is set up to answer it, and nothing is left behind by its having been asked.
 #[test]
@@ -661,6 +764,10 @@ fn a_question_asked_in_a_numbering_that_is_over_is_refused() {
     assert_eq!(screen.word_at(asked, at).err(), renumbered);
     assert_eq!(screen.line_at(asked, at).err(), renumbered);
     assert_eq!(screen.fetch(asked, 0, 3).err(), renumbered);
+    // The refusal is read by whoever asked, and says both numberings: the one to stop asking in, and
+    // the one to ask in
+    let said = screen.fetch(asked, 0, 3).expect_err("a refusal").to_string();
+    assert!(numbers_in(&said).contains(&u64::from(asked)) && numbers_in(&said).contains(&u64::from(now)), "{said:?}");
     // Asked again in the numbering in use, it is answered
     assert!(screen.word_at(now, at).is_ok());
 }
@@ -775,6 +882,28 @@ fn a_screen_longer_than_one_message_is_sent_in_as_many_frames_as_it_takes() {
     assert_eq!(seen, (0..200).collect::<Vec<u64>>(), "every row once, in order");
 }
 
+/// **A session that ends is sent whole however long its screen is**: every frame it takes, one after
+/// another with none of them waiting to be drawn, and the end said after the last.
+#[test]
+fn a_session_ending_with_a_screen_longer_than_one_message_is_sent_all_of_it_and_then_told() {
+    let mut screen = Screen::new(1_000, 200);
+    let view = View::attached(&mut screen, 1, 4);
+    let _unacknowledged = view.frame();
+    screen.feed(costly_rows(199, 1_000).as_bytes());
+    screen.end_views();
+
+    let messages = view.messages();
+    let (ended, frames) = messages.split_last().expect("the view is told something");
+    assert_eq!(ended, &ToView::Ended { channel: 4 });
+    assert!(frames.len() > 1, "the screen fitted one frame, so this case shows nothing");
+    let mut seen: Vec<u64> = Vec::new();
+    for message in frames {
+        let ToView::Frame(frame) = message else { panic!("expected a frame, found {message:?}") };
+        seen.extend(frame.block.rows.iter().map(|row| row.line));
+    }
+    assert_eq!(seen, (0..199).collect::<Vec<u64>>(), "every row that was written, once, in order");
+}
+
 /// A fetch stops where its answer is full and says how far it got, so the lines past that are asked for
 /// again rather than taken to be gone.
 #[test]
@@ -812,12 +941,33 @@ fn text_longer_than_one_answer_is_refused() {
     let first = first_active - u64::from(screen.scrollback_rows());
     let all = Span { start: Position { line: first, column: 0 }, end: Position { line: first_active, column: 0 } };
     match screen.text_of(epoch, all) {
-        Err(Unanswered::TooLong { bytes }) => assert!(bytes > MAX_MESSAGE_BYTES, "{bytes} bytes"),
+        Err(Unanswered::TooLong { bytes }) => {
+            assert!(bytes > MAX_MESSAGE_BYTES, "{bytes} bytes");
+            // Whoever asked is told how long it was and how long it may be
+            let said = Unanswered::TooLong { bytes }.to_string();
+            assert!(
+                numbers_in(&said).contains(&(bytes as u64)) && numbers_in(&said).contains(&(TEXT_BYTES as u64)),
+                "{said:?}"
+            );
+        }
         other => panic!("expected a refusal, found {:?}", other.map(|text| text.len())),
     }
-    // A part of it that fits is answered
-    let some = Span { start: all.start, end: Position { line: first + 100, column: 998 } };
-    assert_eq!(screen.text_of(epoch, some).map(|text| text.len()), Ok(101 * 1_000 - 1));
+    // A part of it that fits is answered: half a message of it, a thousand bytes a line
+    let half = MAX_MESSAGE_BYTES / 2_000;
+    let some = Span { start: all.start, end: Position { line: first + half as u64, column: 998 } };
+    assert_eq!(screen.text_of(epoch, some).map(|text| text.len()), Ok((half + 1) * 1_000 - 1));
+
+    // **As much as one answer carries, to the byte.** The longest text that is answered makes a message
+    // a view reads, with everything else the answer says at its longest, and one byte more is refused
+    let (lines, over) = (TEXT_BYTES / 1_000, TEXT_BYTES % 1_000);
+    assert!(over > 0 && first_active - first > lines as u64, "no span here is exactly that long");
+    let end = Position { line: first + lines as u64, column: over as u16 - 1 };
+    let most = screen.text_of(epoch, Span { start: all.start, end }).expect("the longest text is answered");
+    assert_eq!(most.len(), TEXT_BYTES);
+    let answer = ToView::Text { channel: u32::MAX, request: u32::MAX, epoch: u32::MAX, text: most };
+    assert!(answer.encode().is_ok(), "the longest text that is answered does not fit a message");
+    let past = Span { start: all.start, end: Position { column: end.column + 1, ..end } };
+    assert_eq!(screen.text_of(epoch, past).err(), Some(Unanswered::TooLong { bytes: TEXT_BYTES + 1 }));
 }
 
 /// A link is read whole however long it is, up to the length nothing real reaches.

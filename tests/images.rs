@@ -293,3 +293,75 @@ fn an_image_sent_again_is_another_generation() {
     assert_eq!(second.0, second.1);
     assert_ne!(second, first);
 }
+
+/// **A picture shown through placeholder cells is not told as placed.** It has no position of its own:
+/// it is wherever the program writes those cells, which a view draws as the text they are. So it is not
+/// among the placements a view is told of, and the same picture put where the cursor is, is.
+#[test]
+fn a_picture_shown_through_placeholder_cells_is_not_told_as_placed() {
+    let view = apack_terminal::view::publish::ViewId { connection: 1, channel: 1 };
+    let (mut screen, sent) = viewed(40, 10);
+    let attached = last_frame(&sent);
+    // Sent, and shown nowhere yet
+    screen.feed(format!("\x1b_Ga=t,f=32,i=7,s=4,v=4,q=2;{}\x1b\\", base64(&picture(4, 4))).as_bytes());
+    screen.acknowledge(view, attached.sequence).expect("an acknowledgement is taken");
+    let held = last_frame(&sent);
+
+    screen.feed(b"\x1b_Ga=p,U=1,i=7,p=1,c=2,r=1,q=2\x1b\\");
+    screen.acknowledge(view, held.sequence).expect("an acknowledgement is taken");
+    assert_ne!(last_frame(&sent).images, held.images, "showing it changed nothing a view is told of");
+    assert!(screen.images().expect("the images read").2.is_empty());
+    assert!(screen.image(7, 0).is_some(), "the picture itself is held");
+
+    screen.feed(b"\x1b_Ga=p,i=7,p=2,q=2\x1b\\");
+    let (_, _, placed) = screen.images().expect("the images read");
+    assert_eq!(placed.iter().map(|(_, placement)| placement.image).collect::<Vec<_>>(), [7]);
+}
+
+/// The checksum a PNG's chunk ends with.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+        }
+    }
+    !crc
+}
+
+/// A PNG made an animation of one frame, that frame being its picture and said to be `width` by `height`.
+fn animated(encoded: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let chunk = |kind: &[u8; 4], data: &[u8]| {
+        let mut chunk = (data.len() as u32).to_be_bytes().to_vec();
+        chunk.extend_from_slice(kind);
+        chunk.extend_from_slice(data);
+        chunk.extend_from_slice(&crc32(&chunk[4..]).to_be_bytes());
+        chunk
+    };
+    // One frame, played for ever; then that frame: the first, its size, at the top left, with no delay,
+    // nothing disposed of and nothing blended
+    let control = [0, 0, 0, 1, 0, 0, 0, 0];
+    let frame = [&0u32.to_be_bytes()[..], &width.to_be_bytes(), &height.to_be_bytes(), &[0; 14]].concat();
+    // Both go before the picture's pixels, whose chunk begins four bytes ahead of its name
+    let pixels = encoded.windows(4).position(|name| name == b"IDAT").expect("a PNG has pixels") - 4;
+    [&encoded[..pixels], &chunk(b"acTL", &control), &chunk(b"fcTL", &frame), &encoded[pixels..]].concat()
+}
+
+/// **A frame that is not the whole picture is no picture.** An animated PNG says how large each of its
+/// frames is, apart from how large the picture is, and the first is the one a terminal shows. One that
+/// covers part of the picture would be drawn as all of it, the rest whatever the buffer held.
+#[test]
+fn an_animated_png_whose_first_frame_is_part_of_the_picture_is_no_picture() {
+    use apack_terminal::vt::images::rgba_of_png;
+
+    let pixels = picture(4, 2);
+    let still = png_of(4, 2, png::ColorType::Rgba, png::BitDepth::Eight, &pixels);
+    assert_eq!(rgba_of_png(&animated(&still, 4, 2)), Some((4, 2, pixels)), "a frame of the whole picture is it");
+    assert_eq!(rgba_of_png(&animated(&still, 2, 2)), None);
+    assert_eq!(rgba_of_png(&animated(&still, 4, 1)), None);
+
+    let grey = png_of(4, 2, png::ColorType::GrayscaleAlpha, png::BitDepth::Eight, &[9; 16]);
+    assert!(rgba_of_png(&animated(&grey, 4, 2)).is_some());
+    assert_eq!(rgba_of_png(&animated(&grey, 2, 2)), None);
+}

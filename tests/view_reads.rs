@@ -108,6 +108,22 @@ fn a_search_finds_text_that_wrapped() {
     assert_eq!(found, vec![span((0, 7), (1, 2))]);
 }
 
+/// **A search goes on to the far end of the history.** The core is handed the history a part at a time,
+/// newest first, and a match is found whichever part it is in: one on the oldest of thousands of lines,
+/// with nothing like it in between, is answered after the one on the screen.
+#[test]
+fn a_search_finds_a_match_on_the_oldest_line_of_a_long_history() {
+    let mut screen = Screen::with_history(40, 4, 20_000);
+    screen.feed(b"the needle, first\r\n");
+    let between: String = (1..8_000).map(|line| format!("line {line}\r\n")).collect();
+    screen.feed(between.as_bytes());
+    screen.feed(b"and a needle, last");
+    let _view = viewed(&mut screen);
+
+    let (_, found) = screen.find("needle").expect("a search runs");
+    assert_eq!(found, vec![span((8_000, 6), (8_000, 11)), span((0, 4), (0, 9))]);
+}
+
 /// **A search that would match everywhere stops when it has what it answers with.** One letter looked for
 /// in tens of thousands of lines of it is answered with the newest matches there are room for — the ones
 /// nearest the screen, in order — and not by finding every one and keeping a few.

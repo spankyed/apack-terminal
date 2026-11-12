@@ -55,6 +55,25 @@ fn a_sink_holds_up_to_its_limit_and_is_closed_by_the_message_that_passes_it() {
     assert!(!sink.deliver(vec![0; 1]), "a closed sink took a message");
 }
 
+/// **How many messages the writer has taken is what says a view is reading.** It moves by one with each
+/// message handed out and stands still otherwise: a message queued has not been taken, and neither has
+/// the end.
+#[test]
+fn what_the_writer_has_taken_is_counted_a_message_at_a_time() {
+    let sink = Sink::new(|| {});
+    assert_eq!(sink.handed_out(), 0);
+    assert!(sink.deliver(vec![1]));
+    assert!(sink.deliver(vec![2]));
+    assert_eq!(sink.handed_out(), 0, "a message waiting was counted as taken");
+    assert_eq!(sink.next(), Some(vec![1]));
+    assert_eq!(sink.handed_out(), 1);
+    assert_eq!(sink.next(), Some(vec![2]));
+    assert_eq!(sink.handed_out(), 2);
+    sink.finish();
+    assert_eq!(sink.next(), None);
+    assert_eq!(sink.handed_out(), 2, "the end was counted as a message");
+}
+
 /// A sink closed because its writer could write no more is closed, and is not one whose view failed to
 /// read: the view went, and what it asked before going is still to be done.
 #[test]

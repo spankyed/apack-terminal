@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::time::Duration;
 
 use interprocess::local_socket::{GenericFilePath, Stream, ToFsName, prelude::*};
@@ -384,9 +384,12 @@ fn a_view_that_stops_acknowledging_does_not_hold_up_another() {
     live.type_line("echo sec$((1+1))ond");
     live.until_shows("sec2ond");
 
-    // The stuck view was sent its first frame and, never having acknowledged it, nothing since
-    let sent: Vec<ToView> = stuck.incoming.try_iter().collect();
-    assert_eq!(sent.len(), 1, "{sent:?}");
+    // The stuck view was sent its first frame and, never having acknowledged it, nothing since. The
+    // frame is waited for: it was sent before the live view's, and is read by a thread of its own
+    let first = stuck.incoming.recv_timeout(PATIENCE).expect("the stuck view's first frame");
+    assert!(matches!(first, ToView::Frame { .. }), "{first:?}");
+    let since: Vec<ToView> = stuck.incoming.try_iter().collect();
+    assert!(since.is_empty(), "{since:?}");
 }
 
 #[test]
@@ -555,6 +558,46 @@ fn a_placed_image_and_its_pixels_are_answered_to_the_view_that_asked() {
     assert_eq!(pixels, (1, 1, 4, 4, vec![255, 0, 0, 255]));
 }
 
+/// **A view that loses focus holds no button down any more.** The button is let go somewhere else, so
+/// the release this view would have reported never comes: a move it reports after that is not a drag,
+/// where one it reported with the button down was.
+#[test]
+fn a_view_that_loses_focus_with_a_button_down_is_no_longer_dragging() {
+    let broker = start();
+    let client = Client::greeting(&broker);
+    // A program that asks to be told of drags and then waits for a line that never ends: its terminal
+    // echoes what it is sent, an escape as `^[`, so a pointer report is on the screen as text
+    let session = client.running("/bin/sh", &["-c", "printf '\\033[?1002h\\033[?1006h'; exec cat"], false);
+    let mut view = View::attached(&broker, &session);
+    while !view.last.as_ref().is_some_and(|frame| frame.mouse) {
+        view.step();
+    }
+    // Cells ten pixels by twenty, on the second row
+    let pointer = |action: u8, x: f32| ToBroker::Pointer {
+        channel: 1,
+        action,
+        button: 0,
+        modifiers: 0,
+        x,
+        y: 30.0,
+        cell_width: 10.0,
+        cell_height: 20.0,
+    };
+
+    view.send(&pointer(0, 15.0));
+    view.until_shows("[<0;2;2M");
+    // Past the right edge with the button down, which is a drag and is reported at the edge
+    view.send(&pointer(2, 900.0));
+    view.until_shows("[<32;60;2M");
+
+    view.send(&ToBroker::Focus { channel: 1, gained: false });
+    // Past the left edge, which only a view holding a button down is reported at
+    view.send(&pointer(2, -30.0));
+    view.send(&ToBroker::Text { channel: 1, text: "after".to_owned() });
+    view.until_shows("after");
+    assert!(!view.screen().contains("[<32;1;2M"), "a drag was reported after the view lost focus:\n{}", view.screen());
+}
+
 /// **Nothing that has something for a program waits for the program to take it.** A paste of megabytes
 /// into a program that echoes every line is the case where waiting would stop everything: the program
 /// reads only as fast as its echo is read, and whatever was waiting on it would be holding what the
@@ -718,6 +761,162 @@ fn a_view_that_asks_without_reading_is_hung_up_on() {
     reading.until_shows("fil2led");
 }
 
+/// One end of a connection as something to read from, for a reader that is kept between reads.
+struct Reading(Arc<Stream>);
+
+impl Read for Reading {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        (&*self.0).read(buffer)
+    }
+}
+
+/// A view's connection that **takes what it is sent only when a case reads it**: greeted, attached on
+/// channel 1, and with its first frame read. `View` reads on a thread of its own, as a window does, so
+/// it cannot be a view that has stopped reading.
+struct Unread {
+    stream: Arc<Stream>,
+    reader: BufReader<Reading>,
+    first: Frame,
+}
+
+impl Unread {
+    fn attached(broker: &Broker, session: &str) -> Self {
+        let stream = connect(broker);
+        say(&stream, &Request::Hello { protocol: PROTOCOL_VERSION, role: Role::View });
+        (&*stream)
+            .write_all(&ToBroker::Attach { channel: 1, session: session.to_owned() }.encode())
+            .expect("the broker reads");
+        let mut reader = BufReader::new(Reading(Arc::clone(&stream)));
+        let mut hello = String::new();
+        reader.read_line(&mut hello).expect("the handshake is answered");
+        let Incoming::Message(body) = read_message(&mut reader) else { panic!("the first frame did not come") };
+        match ToView::decode(&body) {
+            Ok(ToView::Frame(first)) => Self { stream, reader, first },
+            other => panic!("expected the first frame, was sent {other:?}"),
+        }
+    }
+
+    /// Asks for everything the session holds, as text.
+    fn ask_for_all_of_it(&self, request: u32) {
+        let first = &self.first;
+        let all = Span {
+            start: Position { line: first.first_active - u64::from(first.scrollback), column: 0 },
+            end: Position { line: first.first_active + u64::from(first.screen_rows) - 1, column: first.columns - 1 },
+        };
+        let ask = ToBroker::TextOf { channel: 1, request, epoch: first.epoch, span: all };
+        (&*self.stream).write_all(&ask.encode()).expect("the broker reads");
+    }
+}
+
+/// A session holding most of a megabyte of text, with the view that typed it: far more than a
+/// connection carries unread, on any platform, so an answer made of it is one the broker is still
+/// writing for as long as the view it is for reads nothing.
+fn a_session_holding_a_megabyte(broker: &Broker, client: &Client) -> (String, View) {
+    let session = client.shell();
+    let mut filling = View::attached(broker, &session);
+    say(
+        &client.stream,
+        &Request::Resize { session: session.clone(), cols: 1000, rows: 100, cell_width: 0, cell_height: 0 },
+    );
+    filling.until_shows("$ ");
+    filling.type_line("i=0; while [ $i -lt 900 ]; do printf '%01000d\\n' $i; i=$((i+1)); done; echo fil$((1+1))led");
+    filling.until_shows("fil2led");
+    (session, filling)
+}
+
+/// Closes a connection's own side and waits until the broker has closed the other, which is the last
+/// thing it does for a connection: by then whatever that connection's going leads to has happened.
+/// `incoming` is what the connection's reader hands on, which ends when the reader is told there is
+/// no more.
+fn gone<T>(stream: &Stream, incoming: &Receiver<T>) {
+    let Stream::UdSocket(socket) = stream;
+    socket.inner().shutdown(std::net::Shutdown::Write).expect("the connection closes one way");
+    loop {
+        match incoming.recv_timeout(PATIENCE) {
+            Ok(_) => {}
+            Err(RecvTimeoutError::Disconnected) => return,
+            Err(RecvTimeoutError::Timeout) => panic!("the broker kept open a connection that had finished with it"),
+        }
+    }
+}
+
+/// **A view that has finished speaking is still listening, and still connected.** It asked, closed its
+/// side of the connection, and only then began to read — by which time everything else had gone: the
+/// app's connection, its session, the view beside this one. A broker nothing is connected to leaves,
+/// and this one has a view it owes most of a megabyte: the answer is written before that connection is
+/// closed, and the broker goes after it rather than from under it.
+#[test]
+fn a_view_that_finished_speaking_is_sent_its_answer_though_it_is_all_the_broker_has_left() {
+    let broker = start();
+    let client = Client::greeting(&broker);
+    let (session, mut beside) = a_session_holding_a_megabyte(&broker, &client);
+    beside.send(&ToBroker::Detach { channel: 1 });
+
+    let mut view = Unread::attached(&broker, &session);
+    view.ask_for_all_of_it(1);
+    let Stream::UdSocket(socket) = &*view.stream;
+    socket.inner().shutdown(std::net::Shutdown::Write).expect("the connection closes one way");
+
+    // **Nothing is read until the broker has seen that the view finished.** What says so is the
+    // numbering: a view that comes and goes beside this one is told the numbering this one was told
+    // for as long as this one is attached, and a new one once the broker has let go of it
+    loop {
+        beside.send(&ToBroker::Attach { channel: 1, session: session.clone() });
+        let told = first_epoch(&mut beside);
+        beside.send(&ToBroker::Detach { channel: 1 });
+        if told != view.first.epoch {
+            break;
+        }
+    }
+    // The app goes, and its session with it; then the view beside this one
+    gone(&client.stream, &client.events);
+    gone(&beside.stream, &beside.incoming);
+
+    let mut answer = None;
+    while let Incoming::Message(body) = read_message(&mut view.reader) {
+        if let Ok(ToView::Text { request: 1, text, .. }) = ToView::decode(&body) {
+            answer = Some(text);
+        }
+    }
+    let answer = answer.expect("the connection closed before the view was sent what it had asked for");
+    assert!(answer.contains("fil2led"), "the answer is {} bytes and stops short", answer.len());
+}
+
+/// **A view that stops making sense is hung up on at once, whatever it is owed.** The thread writing
+/// to it may be waiting on a view that will never read, and only the connection closing lets it go: a
+/// view left connected there is one the broker holds an answer and a thread for, for as long as the
+/// view likes.
+#[test]
+fn a_view_that_sends_what_is_not_the_protocol_is_hung_up_on_though_it_has_not_read_what_it_is_owed() {
+    let broker = start();
+    let client = Client::greeting(&broker);
+    let (session, _filling) = a_session_holding_a_megabyte(&broker, &client);
+
+    let view = Unread::attached(&broker, &session);
+    view.ask_for_all_of_it(1);
+    // Not the protocol: a length, a kind no message has, and then anything
+    (&*view.stream).write_all(&[3, 0, 0, 0, 250, 1, 2]).expect("the broker reads");
+
+    // Reading none of it, the view goes on writing: what tells it the broker hung up is a write being
+    // refused. A write that is merely not taken — the broker no longer reading, the connection still
+    // open — waits, and is given up on
+    let Stream::UdSocket(socket) = &*view.stream;
+    socket.inner().set_write_timeout(Some(PATIENCE)).expect("a write may be given up on");
+    let refused = loop {
+        if let Err(refused) = (&*view.stream).write_all(&[0]) {
+            break refused;
+        }
+    };
+    assert!(
+        !matches!(refused.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut),
+        "the connection was left open to a view that had stopped making sense: {refused}"
+    );
+
+    // The session, and a view that does read, are none the worse
+    let mut reading = View::attached(&broker, &session);
+    reading.until_shows("fil2led");
+}
+
 /// **A connection says hello once.** Its role is what it is counted as and how it is spoken to; said
 /// again it is refused, and the connection is still the one it was.
 #[test]
@@ -811,4 +1010,63 @@ fn a_channel_whose_session_ended_is_let_go_of_without_being_detached() {
     let first = asked(&mut view, 1);
     assert!(first.contains("no session") || first.contains("ended"), "{first}");
     assert_eq!(asked(&mut view, 2), "this channel is not attached to a session");
+}
+
+/// **And what a view sends that has no answer lets go of the channel too.** A key or text for a session
+/// that is over is told to nobody, so it is the broker that notices: the next thing asked on that
+/// channel is asked of a channel attached to nothing.
+#[test]
+fn text_for_a_session_that_ended_lets_go_of_its_channel_though_nothing_answers_it() {
+    let broker = start();
+    let client = Client::greeting(&broker);
+    let session = client.shell();
+    let mut view = View::attached(&broker, &session);
+    view.until_shows("$ ");
+    say(&client.stream, &Request::Kill { session });
+    while !view.ended {
+        view.step();
+    }
+
+    view.send(&ToBroker::Text { channel: 1, text: "x".to_owned() });
+    view.send(&ToBroker::Paste { channel: 1, request: 1, allow_unsafe: true, text: "x".to_owned() });
+    let refused = view.answer(|message| match message {
+        ToView::Failed { request: 1, message, .. } => Some(message.clone()),
+        _ => None,
+    });
+    assert_eq!(refused, "this channel is not attached to a session");
+}
+
+/// **A question that is refused is not a session that ended.** One put in a numbering that is over — the
+/// lines were numbered again by a resize while the question was on its way — is refused saying so, and
+/// the channel is still attached: the same view asks again in the numbering it has since been told.
+#[test]
+fn a_question_in_a_numbering_that_is_over_is_refused_and_its_channel_stays_attached() {
+    let broker = start();
+    let client = Client::greeting(&broker);
+    let session = client.shell();
+    let mut view = View::attached(&broker, &session);
+    view.until_shows("$ ");
+    let before = view.last.as_ref().expect("a frame arrived").epoch;
+
+    say(&client.stream, &Request::Resize { session, cols: 44, rows: 5, cell_width: 0, cell_height: 0 });
+    let now = view.answer(|message| match message {
+        ToView::Frame(frame) if frame.epoch != before => Some(frame.epoch),
+        _ => None,
+    });
+
+    let top = Position { line: 0, column: 0 };
+    view.send(&ToBroker::TextOf { channel: 1, request: 1, epoch: before, span: Span { start: top, end: top } });
+    let refused = view.answer(|message| match message {
+        ToView::Failed { request: 1, message, .. } => Some(message.clone()),
+        _ => None,
+    });
+    assert!(refused.contains("numbered again"), "{refused}");
+
+    view.send(&ToBroker::Search { channel: 1, request: 2, needle: "$".to_owned() });
+    let answered = view.answer(|message| match message {
+        ToView::Spans { request: 2, epoch, .. } => Some(Ok(*epoch)),
+        ToView::Failed { request: 2, message, .. } => Some(Err(message.clone())),
+        _ => None,
+    });
+    assert_eq!(answered, Ok(now), "a refusal took the channel's session from it");
 }

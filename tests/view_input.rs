@@ -339,3 +339,22 @@ fn a_pointer_position_that_is_not_a_number_is_no_position_and_a_far_one_is_the_e
         "\x1b[<32;10;1M"
     );
 }
+
+/// **How far outside is one cell, on every side.** A program that asked for the pointer in pixels is told
+/// the position as it stands rather than the cell it is in, so it is where what the core is given can be
+/// read: a drag carried any distance past an edge is a cell's width or height past it, and no further.
+#[test]
+fn a_drag_far_outside_is_told_in_pixels_as_one_cell_past_the_edge() {
+    let mut screen = Screen::new(80, 24);
+    screen.feed(b"\x1b[?1002h\x1b[?1016h");
+    assert_eq!(pointed(&mut screen, &click(0, 0, 1.0, 1.0)), "\x1b[<0;15;30M");
+    let held = click(2, 0, 4.0, 1.0);
+    assert_eq!(pointed(&mut screen, &held), "\x1b[<32;45;30M", "inside, where it is");
+    // Eighty columns of ten pixels and twenty-four rows of twenty: the grid ends at 800 by 480
+    assert_eq!(pointed(&mut screen, &Pointer { x: 1e30, y: 1e30, ..held }), "\x1b[<32;810;500M");
+    assert_eq!(pointed(&mut screen, &Pointer { x: -1e30, y: -1e30, ..held }), "\x1b[<32;-10;-20M");
+    // A cell's width past the right edge and its height past the bottom are each as far as it goes
+    assert_eq!(pointed(&mut screen, &Pointer { x: 810.0, y: 500.0, ..held }), "\x1b[<32;810;500M");
+    assert_eq!(pointed(&mut screen, &Pointer { x: 811.0, y: 501.0, ..held }), "\x1b[<32;810;500M");
+    assert_eq!(pointed(&mut screen, &Pointer { x: 809.0, y: 499.0, ..held }), "\x1b[<32;809;499M");
+}

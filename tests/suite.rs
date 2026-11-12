@@ -20,6 +20,7 @@ mod conformance;
 mod core_features;
 mod effects;
 mod frames;
+mod holds;
 mod housekeeping;
 mod images;
 #[cfg(unix)]

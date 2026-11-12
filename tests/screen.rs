@@ -4,6 +4,7 @@
 //! the replies the terminal owes the program in its pty, how much scrollback it keeps, and where a search
 //! finds its text. None of them needs a pty or a socket, which is why `screen` is a library module.
 
+use apack_terminal::recording::{self, Entry};
 use apack_terminal::screen::{Colors, HISTORY_LINES, SEARCH_MATCHES, Screen};
 
 /// **The terminal answers for itself, and the answer has to leave the screen.**
@@ -323,6 +324,34 @@ fn the_width_is_the_grids() {
     assert_eq!(screen.cols(), 80);
     screen.resize(132, 24, 0, 0);
     assert_eq!(screen.cols(), 132);
+}
+
+/// **A recording's file is written by a thread of its own, so a screen being recorded hands out something
+/// to wait on until the file holds what was fed.** Whoever is about to read the file takes it, lets the
+/// screen go, and waits; a screen that is not being recorded has nothing to wait for and says so.
+#[test]
+fn a_screen_being_recorded_gives_something_to_wait_on_until_its_file_holds_what_was_fed() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let path = directory.path().join("one.recording");
+    let mut screen = Screen::new(20, 4);
+    assert!(screen.recording_reached().is_none(), "nothing is being recorded yet");
+
+    screen.start_recording(&path).expect("the recording starts");
+    screen.feed(b"what was fed");
+    let reached = screen.recording_reached().expect("a recording has a file to wait for");
+    reached.recv().expect("the file holds everything recorded so far");
+    let written: Vec<u8> = recording::read(&path)
+        .into_iter()
+        .filter_map(|timed| match timed.entry {
+            Entry::Output(bytes) => Some(bytes),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(written, b"what was fed");
+
+    screen.stop_recording();
+    assert!(screen.recording_reached().is_none(), "and a recording that was stopped is not one");
 }
 
 /// **A wrapped line is read from its start however far above the rows asked for that is**, and with real

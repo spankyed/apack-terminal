@@ -1648,6 +1648,30 @@ fn a_paused_session_stops_being_read_and_a_resume_delivers_what_it_missed() {
     assert!(whole.contains("probe-2000"), "the middle of the output was lost over the pause");
 }
 
+/// Closes a client's own side of its connection, as one that has said all it will does. It can still be
+/// written to, and reads on until the broker closes the other side.
+#[cfg(unix)]
+fn finish_speaking(writing: &Wire) {
+    let Stream::UdSocket(socket) = &*writing.0;
+    socket.inner().shutdown(std::net::Shutdown::Write).expect("the connection closes one way");
+}
+
+/// Reads a connection until **the broker has closed its side of it**, which is the last thing it does
+/// for a client that left: by then whatever that client's leaving leads to has happened, so a case that
+/// goes on from here is not racing the broker to it.
+#[cfg(unix)]
+fn closed_by_the_broker(reading: &mut Events) {
+    loop {
+        match reading.line(QUIET) {
+            Ok(_) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("the broker kept open a connection whose client had finished with it")
+            }
+        }
+    }
+}
+
 /// A pause belongs to the client that asked for one: the next client never did, and has no way to find out.
 #[cfg(unix)]
 #[test]
@@ -1665,21 +1689,92 @@ fn a_pause_does_not_outlive_the_client_that_asked_for_it() {
     let session = next(&mut reading)["session"].as_str().expect("a session").to_owned();
     once_the_shell_is_listening(&mut reading);
     ask(&mut writing, &format!(r#"{{"kind":"pause","session":"{session}"}}"#));
-    disconnect(reading, writing);
+    finish_speaking(&writing);
+    closed_by_the_broker(&mut reading);
 
     let (mut again, mut writing_again) = connect(&broker);
     ask(&mut writing_again, &hello(None));
     next(&mut again);
+    // More than one `read` of output, as in the case above: a paused session still delivers the read it
+    // was in the middle of, so a line or two arriving says nothing about whether it is being read
     ask(
         &mut writing_again,
         &format!(
             r#"{{"kind":"write","session":"{session}","text":{}}}"#,
-            serde_json::to_string(&probe("inherited-probe")).expect("a JSON string")
+            serde_json::to_string(&format!("seq 1 4000 | sed 's/^/inherited-/'{SUBMIT}")).expect("a JSON string")
         ),
     );
 
-    let output = output_until(&mut again, Some(&session), |seen| seen.contains("inherited-probe"));
-    assert!(output.contains("inherited-probe"), "the new client inherited a pause it never asked for: {output:?}");
+    let output = output_until(&mut again, Some(&session), |seen| seen.contains("inherited-4000"));
+    assert!(
+        output.contains("inherited-4000"),
+        "the new client inherited a pause it never asked for: {} bytes arrived",
+        output.len()
+    );
+}
+
+/// **A pause is lifted when another client becomes the one a session's output goes to**, whether or not
+/// the client that asked for it has gone. The pause was that client's way of not being sent more than it
+/// could take, and it is no longer being sent anything; the client that is has asked for nothing and has
+/// no way to learn that a session it holds is not being read.
+///
+/// **POSIX only**: what fills more than one read is typed in `sh`'s syntax, as the case above is.
+#[cfg(unix)]
+#[test]
+fn a_pause_is_lifted_when_another_client_becomes_the_one_being_sent_the_output() {
+    let broker = start();
+    let (mut reading, mut writing) = connect(&broker);
+    ask(&mut writing, &hello(None));
+    next(&mut reading);
+    ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
+    let session = next(&mut reading)["session"].as_str().expect("a session").to_owned();
+    once_the_shell_is_listening(&mut reading);
+    ask(&mut writing, &format!(r#"{{"kind":"pause","session":"{session}"}}"#));
+    // Requests are carried out in the order a connection sent them, so an answer to the one after the
+    // pause says the pause has been taken
+    ask(&mut writing, &format!(r#"{{"kind":"screen","session":"{session}","history":0}}"#));
+    until(&mut reading, "screen");
+
+    // The first client is still connected, and stays so to the end of the case
+    let (mut again, mut writing_again) = connect(&broker);
+    ask(&mut writing_again, &hello(None));
+    next(&mut again);
+    // More than one `read` of output: a paused session still delivers the read it was in the middle
+    // of, so a line or two arriving says nothing about whether it is being read
+    ask(
+        &mut writing_again,
+        &format!(
+            r#"{{"kind":"write","session":"{session}","text":{}}}"#,
+            serde_json::to_string(&format!("seq 1 4000 | sed 's/^/taken-over-/'{SUBMIT}")).expect("a JSON string")
+        ),
+    );
+    let output = output_until(&mut again, Some(&session), |seen| seen.contains("taken-over-4000"));
+    assert!(
+        output.contains("taken-over-4000"),
+        "the client now being sent the output was left a pause it never asked for: {} bytes arrived",
+        output.len()
+    );
+    drop((reading, writing));
+}
+
+/// **A client that has said all it will is answered, and then let go of.** Its connection is closed from
+/// the broker's side too, though the broker itself goes on: a client that reads until there is no more —
+/// a proxy whose input ended does — is waiting for exactly that, and a broker an owner holds has no exit
+/// of its own to close the connection for it.
+#[cfg(unix)]
+#[test]
+fn a_client_that_has_said_all_it_will_is_answered_and_then_hung_up_on() {
+    let broker = start();
+    let (_owner_events, _owner) = greet(&broker, "lifetime");
+
+    let (mut reading, mut writing) = greet(&broker, "client");
+    ask(&mut writing, r#"{"kind":"sessions"}"#);
+    finish_speaking(&writing);
+    assert_eq!(next(&mut reading)["kind"], "sessions", "what it asked last is answered");
+    closed_by_the_broker(&mut reading);
+
+    // And the broker is still there for the next client
+    let (_again_events, _again) = greet(&broker, "client");
 }
 
 /// **An exit and a signal are different answers.** Reported as one they are the same `1`, so a window
