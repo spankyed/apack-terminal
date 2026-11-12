@@ -15,6 +15,11 @@
 //! watch for is a future change that bounds the queue itself: that is the edit this comment exists to stop,
 //! and `Outgoing::answer` returning credit would be its first step.
 //!
+//! **What an answer is bounded by is the client it is for, and not by waiting.** Whatever spends no credit
+//! can still pile up for a client that has stopped reading, and the one bound that holds nothing back is
+//! to count what is waiting for that client and let the client go (`feed`). Nothing is made to wait for
+//! room there, so it is not the bounded queue above.
+//!
 //! **The window and the cap are readings, not preferences.** apack's Phase G measured 64 KiB of terminal
 //! output arriving as 115 messages over 1,389 ms — about 12 ms between chunks, because the producer was a
 //! pipe writing small pieces. The window is one frame at 60 Hz, which is the next value up from that

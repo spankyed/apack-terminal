@@ -37,6 +37,13 @@ to be a clear refusal rather than a message that means something else.
 anything speaking the older handshake behaves exactly as before. [design.md](design.md) has what each role
 means for a session's lifetime.
 
+**A client is told what the sessions report for as long as it reads.** The last client to greet is the
+one reported to. What it has not yet read waits in a queue of its own, and a client that has left more
+than 64 MiB unread is hung up on. The sessions are as they were, and a client that connects again and
+greets is reported to from then on. Output never gets a client there, because one that stops reading
+stops the program instead ([design.md](design.md)); what can is everything else, titles and answers
+among it, left unread.
+
 ## Requests
 
 | kind | asks for |

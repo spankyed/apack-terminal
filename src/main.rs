@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use interprocess::local_socket::{GenericFilePath, Stream, ToFsName, prelude::*};
 
+use apack_terminal::feed::{FEED_BYTES_ENV, Feed, feed_bytes};
 use apack_terminal::frames::{Frame, read_frame};
 use apack_terminal::listening::{self, HELD_EXIT, Refused, START_GRACE_ENV, hang_up};
 use apack_terminal::output::{Outgoing, channel_with_credit};
@@ -90,13 +91,14 @@ fn main() -> std::io::Result<()> {
     let broker = Broker {
         sessions: Arc::new(Sessions::new(events, credit)),
         feed: Arc::new(Mutex::new(None)),
+        feed_bytes: feed_bytes(std::env::var(FEED_BYTES_ENV).ok().as_deref()),
         owned: Arc::new(AtomicBool::new(false)),
         clients: Arc::new(AtomicUsize::new(0)),
         connections: Arc::new(AtomicUsize::new(0)),
         accepted: Arc::new(AtomicU64::new(0)),
     };
-    // One writer for the broker's life: every event leaves on this thread, so nothing interleaves two
-    // frames, and a client arriving or leaving changes where they go rather than who writes them
+    // One thread takes everything off the queue for the broker's life, so what is reported is in one
+    // order, and a client arriving or leaving changes where it goes rather than who decides that
     std::thread::spawn({
         let broker = broker.clone();
         move || write_out(outgoing, broker)
@@ -162,7 +164,9 @@ struct Broker {
     sessions: Arc<Sessions>,
     /// The client receiving the feed. A `lifetime` connection never installs itself here — it asks for
     /// nothing and is sent nothing, which is what makes holding one cost no output.
-    feed: Arc<Mutex<Option<Arc<Wire>>>>,
+    feed: Arc<Mutex<Option<Arc<Client>>>>,
+    /// How much may be waiting for a client to read before it is let go (`feed::FEED_BYTES`)
+    feed_bytes: usize,
     /// Whether a `lifetime` connection is open.
     owned: Arc<AtomicBool>,
     /// How many `client` connections are open.
@@ -176,9 +180,15 @@ struct Broker {
     accepted: Arc<AtomicU64>,
 }
 
-/// Writes every event to whichever client is attached, for as long as the broker runs.
+/// Deals with everything the sessions report, for as long as the broker runs: what a report means for
+/// the broker is done here, and the report is handed to whichever client is attached.
+///
+/// **Handed on, never written here.** Each client has a queue and a writer of its own (`feed`), so this
+/// thread waits on no connection: a client that has stopped reading is behind on what it is told, and
+/// a session that ended is forgotten, its views are told and a broker with nothing left goes, all the
+/// same.
 fn write_out(outgoing: Receiver<Outgoing>, broker: Broker) {
-    for message in outgoing {
+    for mut message in outgoing {
         // **A shell that ended of its own accord is gone from here too.** Only `kill` used to remove a
         // session, so a user typing `exit` left its record behind: the map grew with every shell they
         // closed, and a later write answered `PTY` — the OS refusing a dead handle — where the true answer
@@ -195,20 +205,61 @@ fn write_out(outgoing: Receiver<Outgoing>, broker: Broker) {
         if exited && nothing_left(&broker) {
             leave();
         }
-        let frame = message.event.as_ref().and_then(|event| serde_json::to_string(event).ok());
+        let frame = message.event.take().and_then(|event| serde_json::to_string(&event).ok());
         let attached = broker.feed.lock().ok().and_then(|feed| feed.clone());
-        if let (Some(frame), Some(wire)) = (frame, attached.as_ref())
-            && wire.write_line(&frame).is_err()
-        {
-            // That client is gone; the next one to greet installs itself. Nothing is ended here, because
-            // whether a client leaving ends the sessions is `Role`'s question and is answered in `serve`
-            detach(&broker, wire);
+        match attached {
+            // Refused by a client that has been let go: the next one to greet installs itself. Nothing
+            // is ended here, because whether a client leaving ends the sessions is `Role`'s question
+            // and is answered in `serve`
+            Some(client) => {
+                if !client.feed.deliver(frame, message) {
+                    detach(&broker, &client.wire);
+                }
+            }
+            // **The credit returns whether or not anyone was listening.** It is what bounds the channel,
+            // so a frame dropped for want of a client must not hold a slot — otherwise a restart of the
+            // service that was attached would leave the broker permanently short of credit and its
+            // output would stall.
+            None => message.written(),
         }
-        // **The credit returns whether or not anyone was listening.** It is what bounds the channel, so a
-        // frame dropped for want of a client must not hold a slot — otherwise a restart of the service that
-        // was attached would leave the broker permanently short of credit and its output would stall.
-        message.written();
     }
+}
+
+/// A client the broker reports to: its connection, and what is waiting to be written to it.
+struct Client {
+    wire: Arc<Wire>,
+    feed: Arc<Feed>,
+}
+
+/// Makes `wire` a client the broker can report to, with a thread that writes what is queued for it.
+///
+/// **The writer returns what each message owes once it is written**, which is what makes credit a bound
+/// on output that has not reached the client rather than on output that has not reached this queue. It
+/// ends when the queue is closed or the client has gone, and takes the client out of the feed as it
+/// does: a client that cannot be written to is not one to queue anything more for.
+fn attachable(wire: &Arc<Wire>, broker: &Broker) -> Arc<Client> {
+    let feed = Feed::holding(broker.feed_bytes, {
+        let stream = Arc::clone(&wire.stream);
+        move || {
+            hang_up(&stream);
+        }
+    });
+    let client = Arc::new(Client { wire: Arc::clone(wire), feed });
+    std::thread::spawn({
+        let (client, broker) = (Arc::clone(&client), broker.clone());
+        move || {
+            while let Some((frame, message)) = client.feed.next() {
+                let gone = frame.is_some_and(|frame| client.wire.write_line(&frame).is_err());
+                message.written();
+                if gone {
+                    break;
+                }
+            }
+            client.feed.close();
+            detach(&broker, &client.wire);
+        }
+    });
+    client
 }
 
 /// Takes `wire` out of the feed, if it is still the one attached, **and lets every session be read
@@ -223,7 +274,7 @@ fn write_out(outgoing: Receiver<Outgoing>, broker: Broker) {
 /// lock was held across a call into it.
 fn detach(broker: &Broker, wire: &Arc<Wire>) {
     let was_attached = match broker.feed.lock() {
-        Ok(mut feed) if feed.as_ref().is_some_and(|attached| Arc::ptr_eq(attached, wire)) => {
+        Ok(mut feed) if feed.as_ref().is_some_and(|attached| Arc::ptr_eq(&attached.wire, wire)) => {
             *feed = None;
             true
         }
@@ -247,8 +298,8 @@ fn say(wire: &Wire, event: &Event) {
 
 /// A connection, and what makes each line written to it whole.
 ///
-/// **Two threads write to a client.** The broker's one writer sends it what its sessions report
-/// (`write_out`), and the thread reading the connection answers it directly (`say`). A client reads a
+/// **Two threads write to a client.** Its own writer sends it what the sessions report (`attachable`),
+/// and the thread reading the connection answers it directly (`say`). A client reads a
 /// line at a time, and two events on one line are two it can read neither of — its greeting's answer
 /// among them. So each is written under `line`, in one write, and neither's lands inside the other's.
 ///
@@ -279,8 +330,8 @@ fn serve(stream: Stream, connection: u64, broker: Broker) {
     // crate's deprecated `split` says to do instead — and dropping a half there does not shut it down, so
     // the halves were a shape that reads like a socket's and is not one.
     let wire = Arc::new(Wire { stream: Arc::new(stream), line: Mutex::new(()) });
-    let mut leaving = Leaving { wire: Arc::clone(&wire), connection, broker: broker.clone(), role: None };
-    converse(&wire, connection, &broker, &mut leaving.role);
+    let mut leaving = Leaving { wire: Arc::clone(&wire), connection, broker: broker.clone(), role: None, feed: None };
+    converse(&wire, connection, &broker, &mut leaving.role, &mut leaving.feed);
 }
 
 /// What a connection ending leads to, as a value whose going is the ending.
@@ -293,6 +344,8 @@ struct Leaving {
     connection: u64,
     broker: Broker,
     role: Option<Role>,
+    /// What was waiting to be written to it, for a connection that greeted as a client
+    feed: Option<Arc<Feed>>,
 }
 
 impl Drop for Leaving {
@@ -309,12 +362,20 @@ impl Drop for Leaving {
             // broker has always had, and it is what keeps a standalone run — the suite, tooling — from leaving
             // shells behind.
             Some(Role::Client) => {
-                // **What it asked last is answered before it is let go.** Its answers leave on the broker's
-                // one writer, behind whatever was queued first, and a client may stop sending while it still
-                // reads — a proxy whose input ended does exactly that. So the writer is waited for to reach
-                // this point in its queue; only then is the connection taken out of the feed and closed
+                // **What it asked last is answered before it is let go.** Its answers are written by the
+                // attached client's writer, behind whatever was queued first, and a client may stop sending
+                // while it still reads — a proxy whose input ended does exactly that. So that writer is
+                // waited for to reach this point in its queue; only then is the connection taken out of
+                // the feed and closed
                 self.broker.sessions.settled();
                 detach(&self.broker, &self.wire);
+                // Its writer has nothing more to write and ends. One held in a write by a client that
+                // stopped reading is let go by the connection closing, which is what this connection
+                // ending is
+                if let Some(feed) = &self.feed {
+                    feed.close();
+                }
+                hang_up(&self.wire.stream);
                 // The recordings it opened to look back through were its alone to name
                 self.broker.sessions.end_rewound_by(self.connection);
                 let left = self.broker.clients.fetch_sub(1, Ordering::SeqCst) - 1;
@@ -341,7 +402,7 @@ impl Drop for Leaving {
 
 /// Reads a connection's requests and carries them out, until it has no more. `role` is what the
 /// connection greeted as, once it has.
-fn converse(wire: &Arc<Wire>, connection: u64, broker: &Broker, role: &mut Option<Role>) {
+fn converse(wire: &Arc<Wire>, connection: u64, broker: &Broker, role: &mut Option<Role>, feed: &mut Option<Arc<Feed>>) {
     let mut reader = BufReader::new(&*wire.stream);
     let mut line = String::new();
 
@@ -408,12 +469,14 @@ fn converse(wire: &Arc<Wire>, connection: u64, broker: &Broker, role: &mut Optio
                 match asked {
                     // Last greeting wins the feed: one app, one broker per data dir, and a client that
                     // reconnects after its service restarted is the one that should be receiving.
-                    // **Once its greeting is answered, and not before**: from here the broker's writer
-                    // sends it whatever a session reports next, and the first thing a client hears is
-                    // the handshake that says what those reports mean
+                    // **Once its greeting is answered, and not before**: from here it is sent whatever a
+                    // session reports next, and the first thing a client hears is the handshake that
+                    // says what those reports mean
                     Role::Client => {
-                        if let Ok(mut feed) = broker.feed.lock() {
-                            *feed = Some(Arc::clone(wire));
+                        let client = attachable(wire, broker);
+                        *feed = Some(Arc::clone(&client.feed));
+                        if let Ok(mut attached) = broker.feed.lock() {
+                            *attached = Some(client);
                         }
                         // **A pause was the last reader's, and this is the reader now.** It asked for none
                         // and has no way to learn of one, and the client that did is no longer the one a

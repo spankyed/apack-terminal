@@ -2476,3 +2476,43 @@ fn a_refusal_and_a_session_talking_reach_a_client_as_lines_of_their_own() {
     }
     drop(asking.join().expect("the requests were written"));
 }
+
+/// **A client that asks and never reads what it is told is let go, and the broker goes on.** Its answers
+/// are owed to it and cannot be made to wait for room — a client waiting for an answer the broker is
+/// waiting to send is two processes stopped for good — so what is waiting for it is counted, and one
+/// that has left more than the bound unread is hung up on. Asking for the sessions costs the broker
+/// nothing but the answer, so what piles up here is answers and nothing else.
+#[cfg(unix)]
+#[test]
+fn a_client_that_asks_and_never_reads_is_hung_up_on_and_the_broker_goes_on() {
+    use apack_terminal::feed::FEED_BYTES_ENV;
+
+    // A bound a case can reach, where the one in use is tens of megabytes
+    let broker = start_with_env(|command| {
+        command.env(FEED_BYTES_ENV, "65536");
+    });
+    // An owner, so that the client's going is the end of nothing
+    let (mut owning, mut owner) = connect(&broker);
+    ask(&mut owner, &hello(Some("lifetime")));
+    assert_eq!(next(&mut owning)["kind"], "hello");
+
+    // Greeted by hand, so that nothing is reading from here on
+    let name =
+        broker.socket.to_str().expect("a utf-8 socket path").to_fs_name::<GenericFilePath>().expect("a socket name");
+    let mut deaf = Wire(std::sync::Arc::new(Stream::connect(name).expect("the broker accepts")));
+    ask(&mut deaf, &hello(None));
+    let mut greeting = String::new();
+    BufReader::new(deaf.clone()).read_line(&mut greeting).expect("the greeting is answered");
+    assert!(greeting.contains(r#""kind":"hello""#), "{greeting}");
+
+    // Far more requests than it takes: a broker that kept every answer would take them all
+    let hung_up_after = (0..2_000_000).find(|_| deaf.write_all(b"{\"kind\":\"sessions\"}\n").is_err());
+    assert!(hung_up_after.is_some(), "two million answers were kept for a client that read none of them");
+
+    // The next client is greeted and answered
+    let (mut reading, mut writing) = connect(&broker);
+    ask(&mut writing, &hello(None));
+    assert_eq!(next(&mut reading)["kind"], "hello");
+    ask(&mut writing, r#"{"kind":"sessions"}"#);
+    until(&mut reading, "sessions");
+}

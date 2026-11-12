@@ -1071,3 +1071,54 @@ fn a_question_in_a_numbering_that_is_over_is_refused_and_its_channel_stays_attac
     });
     assert_eq!(answered, Ok(now), "a refusal took the channel's session from it");
 }
+
+/// **A session that ends is over for the window drawing it, whether or not the client is reading.** The
+/// client is told of everything through one connection and may leave it unread — an app whose own work
+/// has it busy does — and what a window is shown is not the client's to hold up: its session ending is
+/// said to it by the broker, which has to have noticed.
+#[test]
+fn a_session_that_ends_is_over_for_its_view_while_the_client_reads_nothing() {
+    let broker = start();
+    // Greeted and answered by hand, so that from the spawn's answer on nothing reads this connection
+    let stream = connect(&broker);
+    say(&stream, &Request::Hello { protocol: PROTOCOL_VERSION, role: Role::Client });
+    say(
+        &stream,
+        &Request::Spawn {
+            cols: 60,
+            rows: 8,
+            shell: Some("/bin/sh".to_owned()),
+            args: Vec::new(),
+            env: vec![("PS1".to_owned(), "$ ".to_owned()), ("ENV".to_owned(), String::new())],
+            unset: Vec::new(),
+            cwd: None,
+            colors: None,
+            output: false,
+            record: None,
+            restore: false,
+            images: false,
+            marks_key: None,
+        },
+    );
+    let mut answers = BufReader::new(&*stream);
+    let session = loop {
+        let mut line = String::new();
+        answers.read_line(&mut line).expect("the broker answers");
+        if let Ok(Event::Spawned { session, .. }) = serde_json::from_str::<Event>(&line) {
+            break session;
+        }
+    };
+    let mut view = View::attached(&broker, &session);
+    view.until_shows("$ ");
+
+    // Several megabytes of answers, asked for and left: more than any socket holds for a reader that
+    // is not reading, so whatever writes them is waiting on this connection
+    for _ in 0..60_000 {
+        say(&stream, &Request::Sessions);
+    }
+    // Behind all of that, the shell is told to go
+    say(&stream, &Request::Write { session, text: "exit\n".to_owned() });
+    while !view.ended {
+        view.step();
+    }
+}

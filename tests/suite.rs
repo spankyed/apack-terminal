@@ -19,6 +19,7 @@ mod commands;
 mod conformance;
 mod core_features;
 mod effects;
+mod feed;
 mod frames;
 mod holds;
 mod housekeeping;
