@@ -1245,7 +1245,7 @@ fn facts_of(reading: &mut Events, writing: &mut Wire, session: &str) -> serde_js
     until(reading, "facts").0
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn commands_of(reading: &mut Events, writing: &mut Wire, session: &str) -> Vec<serde_json::Value> {
     ask(writing, &format!(r#"{{"kind":"commands","session":"{session}"}}"#));
     until(reading, "commands").0["commands"].as_array().expect("commands").clone()
@@ -2594,4 +2594,60 @@ fn a_client_that_asks_and_never_reads_is_hung_up_on_and_the_broker_goes_on() {
     assert_eq!(next(&mut reading)["kind"], "hello");
     ask(&mut writing, r#"{"kind":"sessions"}"#);
     until(&mut reading, "sessions");
+}
+
+/// The marks a PowerShell hook prints, for each command in the script below.
+#[cfg(windows)]
+const WINDOWS_COMMANDS_SCRIPT: &str = r#"
+$esc = [char]27
+$bel = [char]7
+$key = '00112233445566778899aabbccddeeff'
+for ($i = 1; $i -le 10000; $i++) {
+    [Console]::Write("$esc]633;V;S;$i;$key;cmd $i$bel")
+    Write-Output "cmd $i"
+    [Console]::Write("$esc]633;V;F;$i;$key;0;C:\$bel")
+}
+Write-Output 'DONE'
+"#;
+
+/// **W1: ConPTY keeps the order of command marks under load.** Ten thousand commands run in one PowerShell session
+/// through the broker's own marks path, each start and finish printed as a keyed mark. The broker keeps the last
+/// `COMMANDS_KEPT` commands, so what is checked is that window: its commands are the last of the ten thousand,
+/// in order, each finished with status zero. A reordered or dropped mark shows as a wrong, missing or misstated entry.
+#[cfg(windows)]
+#[test]
+fn ten_thousand_commands_from_a_powershell_session_come_back_in_order() {
+    let broker = start();
+    let directory = tempfile::tempdir().expect("a directory");
+    let script = directory.path().join("commands.ps1");
+    std::fs::write(&script, WINDOWS_COMMANDS_SCRIPT).expect("the script is written");
+
+    let (mut reading, mut writing) = connect(&broker);
+    ask(&mut writing, &hello(None));
+    assert_eq!(next(&mut reading)["kind"], "hello");
+    let frame = serde_json::json!({
+        "kind": "spawn", "cols": 120, "rows": 40, "shell": "powershell.exe",
+        "args": ["-NoProfile", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", script.display().to_string()],
+        "env": [], "unset": [], "cwd": null, "marks_key": MARKS_KEY,
+    });
+    ask(&mut writing, &frame.to_string());
+    let session = next(&mut reading)["session"].as_str().expect("a session id").to_owned();
+
+    // -NoExit keeps the shell at its prompt once the script is done: a shell that exits ends its session, and
+    // the broker then forgets what it ran
+    // ConPTY rewrites line breaks, so the line is found by its word: DONE is printed by nothing else
+    let printed = output_until(&mut reading, Some(&session), |text| text.contains("DONE"));
+    assert!(printed.contains("DONE"), "the script finished: {} bytes", printed.len());
+
+    let commands = commands_of(&mut reading, &mut writing, &session);
+    let kept = apack_terminal::commands::COMMANDS_KEPT;
+    assert_eq!(commands.len(), kept, "the commands the broker keeps");
+    for (position, command) in commands.iter().enumerate() {
+        let number = 10_000 - kept + 1 + position;
+        assert_eq!(
+            (&command["command"], &command["outcome"]),
+            (&serde_json::json!(format!("cmd {number}")), &serde_json::json!({ "kind": "exited", "code": 0 })),
+            "command {number} at position {position}"
+        );
+    }
 }
