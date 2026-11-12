@@ -1286,7 +1286,8 @@ fn a_cursor_key_sent_to_a_full_screen_program_that_asked_for_no_mouse_reaches_it
 fn a_program_that_asks_what_the_clipboard_holds_is_answered_nothing() {
     let broker = start();
     let client = Client::greeting(&broker);
-    let script = "stty raw -echo; printf '\\033]52;c;?\\007'; printf 'ready\\n'; head -c 1 | od -An -tx1 | tr -d ' \\n'";
+    let script =
+        "stty raw -echo; printf '\\033]52;c;?\\007'; printf 'ready\\n'; head -c 1 | od -An -tx1 | tr -d ' \\n'";
     let session = client.running("sh", &["-c", script], false);
     let mut view = View::attached(&broker, &session);
     view.until_shows("ready");
