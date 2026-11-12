@@ -245,8 +245,8 @@ session ending settles every wait on it, because nothing is coming.
 
 - **Windows builds and passes what runs there, which is not everything.** CI's Windows job builds the
   terminal core from source — nobody publishes one for Windows, so the job installs the Zig its commit
-  wants and builds it for speed, as the library every other platform links was — and runs the suite:
-  276 cases. What does not run there is the suites that drive the real binary over a socket (`keeping`,
+  wants and builds it for speed, as the library every other platform links was — and runs the suite.
+  What does not run there is the suites that drive the real binary over a socket (`keeping`,
   `view_broker`, `proxy`), which use Unix sockets and `/bin/sh`; so a view's connection, the lock that
   makes a broker the only one on its pipe, the proxy and a kept session are compiled on Windows and
   exercised nowhere on it. What is known to differ there is said where it applies: a view past its

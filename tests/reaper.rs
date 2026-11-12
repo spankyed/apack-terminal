@@ -61,6 +61,72 @@ pub fn watching(_broker: &std::process::Child, _program: &str) -> Reaper {
     Reaper {}
 }
 
+/// What ends the broker on a socket when the case that had one started is over, however it ended.
+///
+/// **For a broker the case did not start and has no pid for.** A proxy starts a broker where none is
+/// listening, in a session of its own, and says nothing of it but that it is there. Such a broker goes
+/// by its own rules once its connections have, and a mutant of those rules does not.
+pub struct Ending {
+    #[cfg(unix)]
+    watcher: Option<(Child, ChildStdin)>,
+}
+
+/// Starts watching for the end of the case on behalf of whatever broker comes to hold `socket`. Called
+/// before anything is started on it, and held to the end of the case: declared before the proxies, so
+/// that it is dropped after them.
+///
+/// **The broker is found by the lock it holds, when the case is over, and not before.** A broker keeps
+/// the file beside its socket open and locked for as long as it lives (`listening::hold`), so whatever
+/// has that file open is the broker on that socket: the system is asked who does, each answer is checked
+/// to be `program`, and that one process is killed. Asked only then, so there is no moment a broker
+/// exists and nothing knows of it, and no pid is carried from an earlier time to be somebody else's by
+/// now. Where the system has no `lsof` nothing is found and nothing is ended.
+///
+/// **The watcher stays until the broker has gone, and not for ever.** A kill is asked for and happens
+/// a moment later, and what follows a case — its directory removed, the next case's broker on a socket
+/// of the same name — is owed a broker that is no longer holding anything. A process its parent has not
+/// collected still answers to its pid, so the wait is counted: five seconds, then it is left.
+///
+/// **It acts at every ending, a clean one included.** A case that fails drops what it holds as one that
+/// passes does, and a broker that will not go by itself is as much left behind by either.
+#[cfg(unix)]
+pub fn ending_with_the_case(socket: &std::path::Path, program: &str) -> Ending {
+    use std::os::unix::process::CommandExt;
+
+    let mut lock = socket.as_os_str().to_owned();
+    lock.push(".lock");
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg(
+            r#"read _; for pid in $(lsof -t -- "$1" 2>/dev/null); do case "$(ps -o command= -p "$pid")" in "$2"*) kill -KILL "$pid"; n=0; while [ "$n" -lt 100 ] && kill -0 "$pid" 2>/dev/null; do n=$((n+1)); sleep 0.05; done ;; esac; done"#,
+        )
+        .arg("sh")
+        .arg(lock)
+        .arg(program)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // In a session of its own, for the reason `watching`'s is
+    // SAFETY: runs in the child between fork and exec, and `setsid` touches nothing this process owns
+    unsafe { command.pre_exec(|| if libc::setsid() == -1 { Err(std::io::Error::last_os_error()) } else { Ok(()) }) };
+    let mut watcher = command.spawn().expect("a watcher starts");
+    let held = watcher.stdin.take().expect("piped stdin");
+    Ending { watcher: Some((watcher, held)) }
+}
+
+impl Drop for Ending {
+    fn drop(&mut self) {
+        // Let go of, which is what the watcher is waiting for, and waited for: when this returns the
+        // broker has been ended, so a directory removed next is one nothing is still using
+        #[cfg(unix)]
+        if let Some((mut watcher, held)) = self.watcher.take() {
+            drop(held);
+            let _ = watcher.wait();
+        }
+    }
+}
+
 impl Reaper {
     /// Stops the watcher, **before** the broker is stopped: while its pipe is still held, so it has not
     /// acted and will not.
