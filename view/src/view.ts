@@ -5,8 +5,19 @@ import { linkAt, urls, type Detector, type Link } from './links.ts'
 import { fontOf, type Font, type Painter, type Scene } from './painter.ts'
 import { RowStore } from './row-store.ts'
 import { Selection, type Granularity } from './selection.ts'
-import { Modifier, TooLarge, type Command, type Frame, type Picture, type Placements, type PointerInput, type Position, type Row, type SessionColors, type Span, type TerminalSource } from './source.ts'
+import { Modifier, PLAIN, TooLarge, type Command, type Frame, type Picture, type Placements, type PointerInput, type Position, type Row, type SessionColors, type Span, type TerminalSource } from './source.ts'
 import { Viewport } from './viewport.ts'
+
+/**
+ * A run of lines a host folds away. The first line stays on screen as a header, which stands for the lines after it up
+ * to `last`: those are neither drawn nor pointed at, and what is copied from the fold is still all of its text.
+ */
+export interface Fold {
+  readonly first: number
+  readonly last: number
+  /** What the header says the fold holds, after the count of lines. Left out, the header says only the count */
+  readonly label?: string
+}
 
 /** How long the cursor is shown, and then hidden, while it blinks */
 export const BLINK_MS = 530
@@ -236,6 +247,8 @@ export class TerminalView {
   private readonly gutter: number
   /** The commands the shell has reported, and the frame's count that said to ask for them */
   private commandList: readonly Command[] = []
+  private folds: readonly Fold[] = []
+  private foldRows = new Map<string, Row>()
   private commandsSeen = -1
   /** Those of them that begin on a line, and those with a prompt on one: each in the order of its lines */
   private commandStarts: readonly CommandLine[] = []
@@ -522,6 +535,81 @@ export class TerminalView {
     return this.commandList
   }
 
+  /**
+   * Folds the lines a host names. Each fold is one header row in the lines it starts at, and its other lines are not drawn:
+   * a host draws its command blocks from this. Folds may not overlap.
+   */
+  setFolds(folds: readonly Fold[]): void {
+    const sorted = folds.filter((fold) => fold.last > fold.first).sort((one, other) => one.first - other.first)
+    for (let index = 1; index < sorted.length; index += 1) {
+      if (sorted[index]!.first <= sorted[index - 1]!.last) throw new RangeError('folds overlap')
+    }
+    this.folds = sorted
+    this.foldRows.clear()
+    this.drawings.clear()
+    this.schedule()
+  }
+
+  /** The fold a line is hidden in: a header is not, and neither is a line outside every fold */
+  private hiddenIn(line: number): Fold | undefined {
+    return this.folds.find((fold) => line > fold.first && line <= fold.last)
+  }
+
+  /**
+   * The rows the view draws, top down: the absolute line each is, a fold's header standing for the line it starts at. The
+   * window is as many rows as the screen, which is more lines than that where folds hide some.
+   */
+  private layout(): { first: number; lines: number[] } {
+    const [top, count] = this.viewport.visible
+    const hidden = this.hiddenIn(top)
+    const first = hidden ? hidden.first : top
+    const lines: number[] = []
+    let line = first
+    while (lines.length < count) {
+      const fold = this.hiddenIn(line)
+      if (fold) line = fold.last + 1
+      else {
+        lines.push(line)
+        line += 1
+      }
+    }
+    return { first, lines }
+  }
+
+  /** The number of rows from line `from` up to line `to`, folded lines taking none: negative when `to` is above `from` */
+  private rowsBetween(from: number, to: number): number {
+    if (to < from) return -this.rowsBetween(to, from)
+    let rows = to - from
+    for (const fold of this.folds) {
+      const hidden = Math.min(fold.last + 1, to) - Math.max(fold.first + 1, from)
+      if (hidden > 0) rows -= hidden
+    }
+    return rows
+  }
+
+  /** The header row of a fold, drawn as its label in the place of the line it starts at */
+  private foldRow(fold: Fold): Row {
+    const text = `▸ ${fold.label ?? `${fold.last - fold.first} lines folded`}`
+    const key = `${fold.first}:${fold.last}:${text}`
+    const known = this.foldRows.get(key)
+    if (known) return known
+    const characters = [...text]
+    const row: Row = {
+      line: fold.first,
+      wrapped: false,
+      prompt: false,
+      text: characters,
+      column: Uint16Array.from(characters, (_, index) => index),
+      width: Uint8Array.from(characters, () => 1),
+      style: new Uint16Array(characters.length),
+      link: new Uint16Array(characters.length),
+      styles: [PLAIN],
+      links: [''],
+    }
+    this.foldRows.set(key, row)
+    return row
+  }
+
   private setCommands(commands: readonly Command[]): void {
     this.commandList = commands
     this.options.onCommands?.(commands)
@@ -645,7 +733,7 @@ export class TerminalView {
   }
 
   /** The images with any part in view, lowest first, in the pixels this view draws a cell in */
-  private imagesIn(first: number, count: number): NonNullable<Scene['images']> {
+  private imagesIn(first: number, span: number): NonNullable<Scene['images']> {
     if (this.placed.placements.length === 0) return []
     const { cellWidth, cellHeight } = this.painter.metrics
     // What the terminal measured an image in, against what this view draws: the same, where it was not told
@@ -653,13 +741,14 @@ export class TerminalView {
     const scaleY = this.placed.cellHeight > 0 ? cellHeight / this.placed.cellHeight : 1
     const images: Array<NonNullable<Scene['images']>[number] & { z: number }> = []
     for (const placement of this.placed.placements) {
-      if (placement.line + placement.rows <= first || placement.line >= first + count) continue
+      if (placement.line + placement.rows <= first || placement.line >= first + span) continue
+      if (this.hiddenIn(placement.line)) continue
       const picture = this.pictures.get(placement.image)?.picture
       if (!picture) continue
       images.push({
         picture,
         x: placement.column * cellWidth + placement.offsetX * scaleX,
-        y: (placement.line - first) * cellHeight + placement.offsetY * scaleY,
+        y: this.rowsBetween(first, placement.line) * cellHeight + placement.offsetY * scaleY,
         width: placement.width * scaleX,
         height: placement.height * scaleY,
         source: { x: placement.sourceX, y: placement.sourceY, width: placement.sourceWidth, height: placement.sourceHeight },
@@ -671,13 +760,15 @@ export class TerminalView {
   }
 
   /** A mark for each command whose prompt is in view, coloured by how the command ended */
-  private marksIn(first: number, count: number): NonNullable<Scene['marks']> {
+  private marksIn(first: number, lines: number[]): NonNullable<Scene['marks']> {
     if (this.gutter === 0) return []
     const prompts = this.commandPrompts
+    const last = lines[lines.length - 1]!
     const marks: Array<{ row: number; color: number }> = []
-    for (let index = firstAfter(prompts, first - 1); index < prompts.length && prompts[index]!.line < first + count; index += 1) {
+    for (let index = firstAfter(prompts, first - 1); index < prompts.length && prompts[index]!.line <= last; index += 1) {
       const { line, command } = prompts[index]!
-      marks.push({ row: line - first, color: this.theme.palette[markColor(command)] ?? this.theme.foreground })
+      if (this.hiddenIn(line)) continue
+      marks.push({ row: this.rowsBetween(first, line), color: this.theme.palette[markColor(command)] ?? this.theme.foreground })
     }
     return marks
   }
@@ -1154,10 +1245,10 @@ export class TerminalView {
   private positionOf(point: Point): Position {
     const { cellWidth, cellHeight } = this.painter.metrics
     const { x, y } = this.pointIn(point)
-    const [first, count] = this.viewport.visible
+    const { lines } = this.layout()
     const row = Math.floor(y / cellHeight + this.viewport.offset)
     return {
-      line: first + Math.max(0, Math.min(row, count - 1)),
+      line: lines[Math.max(0, Math.min(row, lines.length - 1))]!,
       column: Math.max(0, Math.min(Math.floor(x / cellWidth), Math.max(0, this.columns - 1))),
     }
   }
@@ -1408,30 +1499,37 @@ export class TerminalView {
     const frame = this.frame
     if (!frame) return
     try {
-      const [first, count] = this.viewport.visible
+      const { first, lines } = this.layout()
+      // The absolute lines the window covers, folded ones included: what is asked of the source and what is held
+      const span = lines[lines.length - 1]! - first + 1
       // Decided before anything is drawn, so a blink that has just stopped draws its text shown, once
       let blinking = false
-      for (let line = first; line < first + count && !blinking; line += 1) {
+      for (const line of lines) {
         const row = this.store.row(line)
-        blinking = row !== undefined && blinksIn(row)
+        if (row !== undefined && blinksIn(row)) {
+          blinking = true
+          break
+        }
       }
       this.blinkText(blinking)
-      const rows: Array<RowDrawing | null> = []
-      for (let line = first; line < first + count; line += 1) rows.push(this.drawingOf(line))
+      const rows: Array<RowDrawing | null> = lines.map((line) => {
+        const fold = this.folds.find((known) => known.first === line)
+        return fold ? drawRow(this.foldRow(fold), this.theme) : this.drawingOf(line)
+      })
       // What a scroll of a screenful either way would show stays drawn; the rest is not held on to
       for (const line of this.drawings.keys()) {
-        if (line < first - count || line >= first + count * 2) this.drawings.delete(line)
+        if (line < first - span || line >= first + span * 2) this.drawings.delete(line)
       }
-      this.ask(first, count)
-      this.wantPictures(first, count)
+      this.ask(first, span)
+      this.wantPictures(first, span)
 
-      const cursor = this.cursorIn(frame, first, count)
+      const cursor = this.cursorIn(frame, lines)
       const scene: Scene = {
         theme: this.theme, rows, offset: this.viewport.offset, cursor,
-        marks: this.marksIn(first, count), images: this.imagesIn(first, count),
+        marks: this.marksIn(first, lines), images: this.imagesIn(first, span),
       }
       this.painter.paint(scene)
-      this.afterPaint(frame, first, count)
+      this.afterPaint(frame, first, lines)
     } finally {
       // Whatever became of the paint, the frame has been taken: one that is never acknowledged is the
       // last the source sends
@@ -1444,13 +1542,16 @@ export class TerminalView {
    * What follows a paint and is not paint: the text a page reader reads, the scrollbar, where an input
    * method's window goes, and the mark that says how far has been drawn.
    */
-  private afterPaint(frame: Frame, first: number, count: number): void {
+  private afterPaint(frame: Frame, first: number, lines: number[]): void {
+    const count = lines.length
     // One element a row, touched only when its row is a different one from what it last showed
     while (this.mirror.childElementCount < count) this.mirror.appendChild(document.createElement('div'))
     while (this.mirror.childElementCount > count) this.mirror.lastElementChild!.remove()
     this.mirrored.length = count
     for (let index = 0; index < count; index += 1) {
-      const row = this.store.row(first + index) ?? null
+      const line = lines[index]!
+      const fold = this.folds.find((known) => known.first === line)
+      const row = fold ? this.foldRow(fold) : (this.store.row(line) ?? null)
       if (this.mirrored[index] === row) continue
       this.mirrored[index] = row
       this.mirror.children[index]!.textContent = row ? textOf(row) : ''
@@ -1469,7 +1570,7 @@ export class TerminalView {
 
     const { cellWidth, cellHeight } = this.painter.metrics
     if (frame.cursor) {
-      const row = frame.firstActive + frame.cursor.row - first
+      const row = this.rowsBetween(first, frame.firstActive + frame.cursor.row)
       this.input.moveTo(this.gutter + frame.cursor.column * cellWidth, Math.max(0, row - this.viewport.offset) * cellHeight, cellHeight)
     }
     // How far a page looking for output to be on screen can count on: this frame, and these lines
@@ -1561,17 +1662,18 @@ export class TerminalView {
     })
   }
 
-  private cursorIn(frame: Frame, first: number, count: number): Scene['cursor'] {
+  private cursorIn(frame: Frame, lines: number[]): Scene['cursor'] {
     const cursor = frame.cursor
     if (!cursor || !this.cursorShown) return undefined
     const line = frame.firstActive + cursor.row
-    if (line < first || line >= first + count) return undefined
+    const index = lines.indexOf(line)
+    if (index === -1) return undefined
     const row = this.store.row(line)
     const at = row ? row.column.indexOf(cursor.column) : -1
     const style = row && at !== -1 ? row.styles[row.style[at]!] : undefined
     return {
       column: cursor.column,
-      row: line - first,
+      row: index,
       cells: row && at !== -1 ? row.width[at]! : 1,
       shape: this.focused ? cursor.shape : 'hollow',
       text: row && at !== -1 ? { text: row.text[at]!, bold: ((style?.flags ?? 0) & 1) !== 0, italic: ((style?.flags ?? 0) & 2) !== 0 } : undefined,
