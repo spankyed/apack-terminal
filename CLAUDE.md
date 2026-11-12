@@ -15,7 +15,7 @@ holds.
 | `src/vt/` | the core itself, behind the one module that calls it: the terminal, input encoding, row and text reads, images |
 | `src/feed.rs` | what is waiting to be written to the client a broker reports to: one bounded queue a client, and what becomes of what it will not write |
 | `src/view/` | what a view is sent: the binary wire (`wire.rs`), what changed since a view's last frame (`publish.rs`), and a connection's bounded queue (`sink.rs`) |
-| `src/holds.rs`, `src/housekeeping.rs` | what happens on a clock rather than on a byte: a synchronized-output hold reaching its limit, and a quiet session's history being compressed |
+| `src/holds.rs`, `src/housekeeping.rs`, `src/deadlines.rs` | what happens on a clock rather than on a byte: a synchronized-output hold reaching its limit, a quiet session's history being compressed, and a wait nothing met being given up on |
 | `src/recording.rs` | a session's recording: the file, its keyframes, and reading it back |
 | `src/protocol.rs`, `src/frames.rs` | every message a client sends and is sent, the one place their shape is defined, and how one is read off a connection |
 | `src/listening.rs`, `src/security.rs`, `src/proxy.rs` | who may reach a broker: the lock that makes it the only one on its socket, the socket's directory and permissions, the Windows pipe's descriptor, and `proxy`, which is a process's stdin and stdout as a connection |

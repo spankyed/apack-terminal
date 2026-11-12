@@ -41,6 +41,12 @@ use apack_terminal::vt::input::{Key, Pointer};
 /// A session with more is told it has too many to list, rather than sent a message too long to read.
 const IMAGES_LISTED: usize = 50_000;
 
+/// The variable a broker is told a number other than `IMAGES_LISTED` by.
+///
+/// A parameter for the reason `feed::FEED_BYTES_ENV` is one: the bound is the subject of a case, and
+/// fifty thousand images take the core longer to hold than the whole suite takes to run.
+const IMAGES_LISTED_ENV: &str = "APACK_TERMINAL_IMAGES_LISTED";
+
 /// Says why this broker is not going to listen, to whatever started it and to whoever reads its errors,
 /// and exits.
 ///
@@ -92,6 +98,10 @@ fn main() -> std::io::Result<()> {
         sessions: Arc::new(Sessions::new(events, credit)),
         feed: Arc::new(Mutex::new(None)),
         feed_bytes: feed_bytes(std::env::var(FEED_BYTES_ENV).ok().as_deref()),
+        images_listed: std::env::var(IMAGES_LISTED_ENV)
+            .ok()
+            .and_then(|asked| asked.parse().ok())
+            .unwrap_or(IMAGES_LISTED),
         owned: Arc::new(AtomicBool::new(false)),
         clients: Arc::new(AtomicUsize::new(0)),
         connections: Arc::new(AtomicUsize::new(0)),
@@ -167,6 +177,8 @@ struct Broker {
     feed: Arc<Mutex<Option<Arc<Client>>>>,
     /// How much may be waiting for a client to read before it is let go (`feed::FEED_BYTES`)
     feed_bytes: usize,
+    /// How many of a session's images are listed for a view at most (`IMAGES_LISTED`)
+    images_listed: usize,
     /// Whether a `lifetime` connection is open.
     owned: Arc<AtomicBool>,
     /// How many `client` connections are open.
@@ -780,15 +792,16 @@ fn carry_out_view(
             Err(refusal) => failed(channel, request, refusal),
         },
         ToBroker::Images { channel, request } => match session_of(channel).and_then(Handle::images) {
-            Ok((_, _, placed)) if placed.len() > IMAGES_LISTED => answer(
+            Ok((_, _, placed)) if placed.len() > broker.images_listed => answer(
                 channel,
                 request,
                 ToView::Failed {
                     channel,
                     request,
                     message: format!(
-                        "the session holds {} images, and {IMAGES_LISTED} at most are listed",
-                        placed.len()
+                        "the session holds {} images, and {} at most are listed",
+                        placed.len(),
+                        broker.images_listed
                     ),
                 },
             ),

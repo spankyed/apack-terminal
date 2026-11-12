@@ -220,20 +220,10 @@ exclude_re = [
     "vt/rows.rs:210:.*replace != with == in Terminal::row_flags",
     "vt/rows.rs:.*replace Terminal::row_flags -> Result<Option<u8>, Failed> with Ok\\(Some\\(1\\)\\)",
 
-    # **Refusals nothing sent to a broker produces.** An attach is refused for a reason other than there
-    # being no such session only when the core fails a call or a lock is poisoned, and the list of a
-    # session's images is too long to send only past fifty thousand placements — which costs the core
-    # seconds to hold, in a suite that takes ten. Both are there so the rare thing is said rather than
-    # mistaken for the common one
+    # **A refusal nothing sent to a broker produces.** An attach is refused for a reason other than there
+    # being no such session only when the core fails a call or a lock is poisoned. It is there so the
+    # rare thing is said rather than mistaken for the common one
     "main.rs:.*replace match guard refusal.code == ErrorCode::NoSuchSession with true in carry_out_view",
-    "main.rs:.*replace match guard placed.len\\(\\) > IMAGES_LISTED with false in carry_out_view",
-    "main.rs:.*replace > with (==|>=) in carry_out_view",
-
-    # **An entry left in a list nothing reads it from.** A session that ends takes its file out of the
-    # record of what is being recorded, unless a session that replaced it is already the one recording
-    # there. Left in, the entry names a session that is gone: looking a recording up goes through the
-    # session and finds none, and the next session to record there writes its own name over it
-    "session.rs:.*replace == with != in Sessions::end$",
 
     # **A hold's number, which no deadline ever gets wrong.** Each hold is numbered so that a deadline
     # ends the hold it was set for and not a later one. The number a deadline asks about is read from a

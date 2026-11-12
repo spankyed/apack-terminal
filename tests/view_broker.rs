@@ -40,6 +40,12 @@ impl Drop for Broker {
 }
 
 fn start() -> Broker {
+    start_with_env(|_| {})
+}
+
+/// The same, with the broker's own environment arranged first: a bound a case is about, set where a
+/// case can reach it.
+fn start_with_env(arrange: impl FnOnce(&mut Command)) -> Broker {
     let directory = tempfile::tempdir().expect("a directory for the socket");
     let socket = directory.path().join("broker.sock");
     let mut command = Command::new(env!("CARGO_BIN_EXE_apack-terminal"));
@@ -52,6 +58,7 @@ fn start() -> Broker {
             command.pre_exec(|| if libc::setsid() == -1 { Err(std::io::Error::last_os_error()) } else { Ok(()) })
         };
     }
+    arrange(&mut command);
     let mut process = command.spawn().expect("the broker starts");
     let mut ready = String::new();
     BufReader::new(process.stdout.as_mut().expect("piped stdout")).read_line(&mut ready).expect("a ready line");
@@ -557,6 +564,47 @@ fn a_placed_image_and_its_pixels_are_answered_to_the_view_that_asked() {
         _ => None,
     });
     assert_eq!(pixels, (1, 1, 4, 4, vec![255, 0, 0, 255]));
+}
+
+/// **A session with more images than are listed is told so, not sent a list too long to read.** As many
+/// as the bound are listed whole; one more, and the view is told how many there are and how many it
+/// could have been told of.
+#[test]
+fn a_session_holding_more_images_than_are_listed_says_so_and_one_holding_as_many_lists_them() {
+    let broker = start_with_env(|command| {
+        command.env("APACK_TERMINAL_IMAGES_LISTED", "2");
+    });
+    let client = Client::greeting(&broker);
+    let session = client.shell_taking(true);
+    say(
+        &client.stream,
+        &Request::Resize { session: session.clone(), cols: 60, rows: 8, cell_width: 10, cell_height: 20 },
+    );
+    let mut view = View::attached(&broker, &session);
+    view.until_shows("$ ");
+    let place = |image: u32| format!("printf '\\033_Ga=T,f=32,i={image},s=1,v=1,q=2;/wAA/w==\\033\\\\'");
+
+    view.type_line(&format!("{}; {}; echo tw$((1+1))o", place(7), place(8)));
+    view.until_shows("tw2o");
+    view.send(&ToBroker::Images { channel: 1, request: 9 });
+    let listed = view.answer(|message| match message {
+        ToView::Images { request: 9, placements, .. } => Some(placements.len()),
+        ToView::Failed { request: 9, message, .. } => panic!("as many as are listed were refused: {message}"),
+        _ => None,
+    });
+    assert_eq!(listed, 2);
+
+    view.type_line(&format!("{}; echo thr$((1+2))ee", place(9)));
+    view.until_shows("thr3ee");
+    view.send(&ToBroker::Images { channel: 1, request: 10 });
+    let refused = view.answer(|message| match message {
+        ToView::Failed { request: 10, message, .. } => Some(message.clone()),
+        ToView::Images { request: 10, placements, .. } => {
+            panic!("{} images were listed past the bound", placements.len())
+        }
+        _ => None,
+    });
+    assert!(refused.contains("holds 3 images") && refused.contains("2 at most"), "{refused}");
 }
 
 /// **A view that loses focus holds no button down any more.** The button is let go somewhere else, so

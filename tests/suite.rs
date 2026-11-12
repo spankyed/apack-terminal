@@ -18,6 +18,7 @@ mod command_rows;
 mod commands;
 mod conformance;
 mod core_features;
+mod deadlines;
 mod effects;
 mod feed;
 mod frames;

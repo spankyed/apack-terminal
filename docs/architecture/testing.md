@@ -23,6 +23,7 @@ cargo xtask clear-mutants                      # removes the working copies a mu
 | `tests/view_model.rs` | the invariant a view rests on: a model that applies every frame it is sent holds exactly the terminal's screen and history, over generated streams |
 | `tests/view_frames.rs`, `tests/view_input.rs`, `tests/view_reads.rs` | what a frame carries and when one is sent; keys, pointer and paste as the core encodes them; words, lines, text and search |
 | `tests/view_sink.rs` | what waits to be written to one view connection, and where that ends |
+| `tests/deadlines.rs` | when a wait nothing met is given up on: once, not before it asked to be, in the order they fall due, and never for one that was met |
 | `tests/feed.rs` | what waits to be written to a client: the order it leaves in, the most that may wait, and that what is dropped is still accounted for |
 | `tests/writer.rs` | what is queued for a session's program: a pty that refused a write told apart from a session that ended, the most that may wait, and the pty's writer let go of only once the program is gone |
 | `tests/view_broker.rs` | a view driven as a window drives one: a real socket, the real binary, a real shell |

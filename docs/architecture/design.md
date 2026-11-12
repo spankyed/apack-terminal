@@ -240,11 +240,6 @@ session ending settles every wait on it, because nothing is coming.
   none, because an answer made to wait for room is a deadlock, so it is counted instead: past the bound
   the queue is dropped and the connection closed, and the client is where one whose broker went away
   is. On Windows the queue ends and the connection does not, as for a view (`views.md`).
-- **A `wait` costs a thread until its deadline.** Each one sleeps out its `timeout_ms` to answer `TIMEOUT`
-  if nothing else has, and stays that long even when the wait was met at once after being registered.
-  What bounds it is the caller: a thread per outstanding wait, each for no longer than the timeout it
-  was asked with, holding nothing but the session's id.
-
 - **Windows builds and passes what runs there, which is not everything.** CI's Windows job builds the
   terminal core from source — nobody publishes one for Windows, so the job installs the Zig its commit
   wants and builds it for speed, as the library every other platform links was — and runs the suite.

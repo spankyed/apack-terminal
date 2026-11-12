@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
+use crate::deadlines::Deadlines;
 use crate::holds::Holds;
 use crate::housekeeping::Housekeeping;
 use crate::markers::MarksKey;
@@ -72,8 +73,6 @@ struct Session {
     screen: Arc<Mutex<Screen>>,
     /// Whether this session outlives whoever holds the broker (`Request::Keep`).
     kept: bool,
-    /// The file this session is recorded to, which is its alone until it ends (`Record::recording`).
-    recording: Option<PathBuf>,
     /// Closed by the thread that waits on the process, once it has been waited for: how an ending that
     /// was asked for learns it has happened (`end_for_certain`).
     reaped: Receiver<()>,
@@ -573,6 +572,8 @@ pub struct Sessions {
     events: Sender<Outgoing>,
     /// What output spends, which is the channel's bound
     credit: Arc<Credit>,
+    /// When each wait nothing has met is given up on
+    deadlines: Deadlines,
     /// Compresses the history of a session that has gone quiet
     housekeeping: Housekeeping,
     /// Ends a hold on a screen that its program does not
@@ -586,11 +587,15 @@ struct Record {
     live: HashMap<SessionId, Session>,
     /// Recordings opened as sessions (`Request::Rewind`), by the id each was given.
     rewound: HashMap<SessionId, Rewound>,
-    /// The file each recording under way is written to, and the session writing it.
+    /// The file each recording is written to, and the last session to write it.
     ///
     /// **One writer a file.** A recording is a log its writer knows the layout of — where each keyframe
     /// is, how long it has grown — and a second session appending to the same file would leave each
     /// rewriting the other's entries out from under it.
+    ///
+    /// **An entry outlives its session, and is none the worse for it.** What reads this asks the named
+    /// session what it has still to write (`rewind`), and a session that is gone has nothing: it reads
+    /// as a file nobody is writing. The next session to record there puts its own name in.
     recording: HashMap<PathBuf, SessionId>,
 }
 
@@ -920,6 +925,7 @@ impl Sessions {
     pub fn new(events: Sender<Outgoing>, credit: Arc<Credit>) -> Self {
         Self {
             record: Mutex::new(Record::default()),
+            deadlines: Deadlines::keeping(events.clone()),
             events,
             credit,
             housekeeping: Housekeeping::start(),
@@ -1091,7 +1097,6 @@ impl Sessions {
                     _tree: Tree::owning(pid),
                     screen: Arc::clone(&screen),
                     kept: false,
-                    recording,
                     reaped,
                 },
             );
@@ -1339,15 +1344,7 @@ impl Sessions {
             return Ok(());
         }
 
-        let events = self.events.clone();
-        let deadline = session.to_string();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(timeout_ms as u64));
-            if settled.swap(true, Ordering::SeqCst) {
-                return;
-            }
-            let _ = events.send(Outgoing::answer(Event::Waited { session: deadline, outcome: WaitOutcome::Timeout }));
-        });
+        self.deadlines.set(Duration::from_millis(timeout_ms as u64), session.to_string(), settled);
         Ok(())
     }
 
@@ -1361,7 +1358,7 @@ impl Sessions {
     ///
     /// **The pty's writer is not let go of**, only stopped (`Input::close`): the thread that waits on the
     /// process lets go of it once the process is gone.
-    fn end(&self, session: &str, live: &Session) {
+    fn end(&self, live: &Session) {
         // A reader parked on a pause has nobody left to lift it, and its thread would never reach the EOF
         // that ends it
         live.process.flow.close();
@@ -1373,13 +1370,6 @@ impl Sessions {
             // Its reader goes on until the pty closes, and the session that replaces this one may pick its
             // recording up before then
             screen.stop_recording();
-        }
-        if let Some(path) = &live.recording {
-            let mut record = self.record();
-            // Unless the session that replaced this one is already the one recording there
-            if record.recording.get(path).is_some_and(|recorder| recorder == session) {
-                record.recording.remove(path);
-            }
         }
     }
 
@@ -1401,7 +1391,7 @@ impl Sessions {
         // **Killed first, and only then tidied up after.** Between the two its program can still read,
         // and nothing that ending a session does may reach a program that is being ended
         let killed = live.killer.kill().map_err(|error| Refusal::pty("killing a session", error));
-        self.end(session, &live);
+        self.end(&live);
         // What was sent is a hangup, which a program may ignore
         end_for_certain(live.process.pid, live.reaped);
         killed
@@ -1412,7 +1402,7 @@ impl Sessions {
     pub fn forget(&self, session: &str) {
         let live = self.record().live.remove(session);
         if let Some(live) = live {
-            self.end(session, &live);
+            self.end(&live);
         }
     }
 
@@ -1431,19 +1421,16 @@ impl Sessions {
             let mut record = self.record();
             let unkept: Vec<SessionId> =
                 record.live.iter().filter(|(_, live)| !live.kept).map(|(session, _)| session.clone()).collect();
-            let ending: Vec<(SessionId, Session)> = unkept
-                .into_iter()
-                .filter_map(|session| record.live.remove(&session).map(|live| (session, live)))
-                .collect();
+            let ending: Vec<Session> = unkept.into_iter().filter_map(|session| record.live.remove(&session)).collect();
             // A recording being looked at is looked at by somebody, and they have gone
             let rewound: Vec<Rewound> = record.rewound.drain().map(|(_, rewound)| rewound).collect();
             (ending, rewound)
         };
-        let leaders: Vec<u32> = ending.iter().map(|(_, live)| live.process.pid).collect();
+        let leaders: Vec<u32> = ending.iter().map(|live| live.process.pid).collect();
         hang_up_the_rest(&leaders);
-        for (session, mut live) in ending {
+        for mut live in ending {
             let _ = live.killer.kill();
-            self.end(&session, &live);
+            self.end(&live);
             end_for_certain(live.process.pid, live.reaped);
         }
         for rewound in rewound {
