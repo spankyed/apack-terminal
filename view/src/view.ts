@@ -100,6 +100,12 @@ export interface ViewOptions {
   readonly onSelectionChange?: (selected: boolean) => void
   /** Text was copied. Left out, it is written to the clipboard the page has */
   readonly onCopy?: (text: string) => void
+  /**
+   * Copies a selection as the pointer is let go, as iTerm2 and Ghostty can, so the text is on the clipboard without a
+   * key. Off unless set, as macOS Terminal has it: a selection overwriting what was copied is a surprise to most people.
+   * `setCopyOnSelect` changes it while the view is up.
+   */
+  readonly copyOnSelect?: boolean
   /** Whether this is a Mac, where the command key is the app's. Left out, asked of the browser */
   readonly mac?: boolean
   /**
@@ -262,12 +268,15 @@ export class TerminalView {
   private dragScroll: { point: Point; frame: number; at: number | null } | null = null
   /** Fractions of a wheel notch not yet sent to a program that takes whole ones */
   private wheelOwed = 0
+  /** Whether a selection is copied as the pointer is let go: the option at construction, then `setCopyOnSelect` */
+  private copyOnSelect: boolean
   /** What is selected. It asks the source what a word or a line is and draws nothing itself */
   readonly selection: Selection
 
   constructor(private readonly source: TerminalSource, private readonly options: ViewOptions) {
     this.mac = options.mac ?? /Mac|iPhone|iPad/.test(navigator.platform)
     this.gutter = options.gutter ?? 0
+    this.copyOnSelect = options.copyOnSelect ?? false
     this.font = options.font
     this.theme = options.theme
     this.hostTheme = options.theme
@@ -335,6 +344,11 @@ export class TerminalView {
    *
    * The theme is taken as it is when given: a host that changes one it gave gives it again.
    */
+  /** Changes whether a selection is copied as the pointer is let go (`copyOnSelect`) */
+  setCopyOnSelect(on: boolean): void {
+    this.copyOnSelect = on
+  }
+
   setTheme(theme: Theme): void {
     // A copy, so that the same object given again with other colours in it is other colours
     this.hostTheme = { ...theme, palette: [...theme.palette] }
@@ -1225,6 +1239,8 @@ export class TerminalView {
   private readonly pointerUp = (event: PointerEvent) => {
     const pressed = this.released(event)
     if (!pressed || pressed.reporting) return
+    // A selection the person made — dragged out, or a word or line on a double or triple click — is copied where asked
+    if (pressed.button === 0 && this.copyOnSelect && this.selection.span) void this.copy()
     // A click that did not drag, with the platform's modifier held, opens what it is on
     const opening = this.mac ? event.metaKey : event.ctrlKey
     if (pressed.button === 0 && !pressed.moved && opening) {

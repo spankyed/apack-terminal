@@ -976,3 +976,67 @@ describe('finding text', () => {
     expect(view.view.found.total, 'an earlier search overwrote a later one').toBe(1)
   })
 })
+
+describe('copying a selection as the pointer is let go', () => {
+  class Text extends FakeSource {
+    override async textOf(): Promise<string> { return 'alpha beta' }
+  }
+
+  it('does not copy by default: the person asks for it with a copy', () => {
+    const copied: string[] = []
+    const view = mountedView({ onCopy: (text) => { copied.push(text) } }, new Text())
+    showing(view)
+    view.point('pointerdown', 0, 0)
+    view.point('pointermove', 5, 0)
+    view.point('pointerup', 5, 0)
+    expect(view.view.selection.span).not.toBeNull()
+    expect(copied).toEqual([])
+  })
+
+  it('copies a dragged selection when the option is set, as the pointer is let go', async () => {
+    const copied: string[] = []
+    const view = mountedView({ copyOnSelect: true, onCopy: (text) => { copied.push(text) } }, new Text())
+    showing(view)
+    view.point('pointerdown', 0, 0)
+    view.point('pointermove', 5, 0)
+    expect(copied, 'copied before the pointer was let go').toEqual([])
+    view.point('pointerup', 5, 0)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(copied).toEqual(['alpha beta'])
+  })
+
+  it('copies a word selected by a double click, which is a selection too', async () => {
+    const copied: string[] = []
+    const view = mountedView({ copyOnSelect: true, onCopy: (text) => { copied.push(text) } }, new Text())
+    showing(view)
+    // Two presses in one place, each soon after the last: a pointer event says that only through its time
+    view.point('pointerdown', 0, 0, { at: 1000 })
+    view.point('pointerup', 0, 0, { at: 1040 })
+    view.point('pointerdown', 0, 0, { at: 1200 })
+    view.point('pointerup', 0, 0, { at: 1240 })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(copied).toEqual(['alpha beta'])
+  })
+
+  it('is changed while the view is up by setCopyOnSelect', async () => {
+    const copied: string[] = []
+    const view = mountedView({ onCopy: (text) => { copied.push(text) } }, new Text())
+    showing(view)
+    view.view.setCopyOnSelect(true)
+    view.point('pointerdown', 0, 0)
+    view.point('pointermove', 5, 0)
+    view.point('pointerup', 5, 0)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(copied).toEqual(['alpha beta'])
+  })
+
+  it('does not copy a click that selects nothing', async () => {
+    const copied: string[] = []
+    const view = mountedView({ copyOnSelect: true, onCopy: (text) => { copied.push(text) } }, new Text())
+    showing(view)
+    view.point('pointerdown', 3, 0)
+    view.point('pointerup', 3, 0)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(copied).toEqual([])
+  })
+})
