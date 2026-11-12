@@ -77,6 +77,16 @@ describe('a character drawn with a minimum contrast', () => {
     expect(drawRow(row(0, 'a', { style: 1, styles: [darkRed] }), { ...theme, minimumContrast: 1 }).glyphs[0]!.color).toBe(PALETTE[1])
   })
 
+  it('is measured against the search match it is drawn over, where a search found it', () => {
+    const grey: Style = { ...PLAIN, fg: 0x7a7a7a, bg: null }
+    const black = { ...theme, background: BLACK, minimumContrast: 4.5 }
+    const current = 0x9e6a03
+    // On black alone the grey is far enough, so it is kept; on the current match it is not, and must be moved
+    expect(drawRow(row(0, 'a', { style: 1, styles: [grey] }), black).glyphs[0]!.color).toBe(0x7a7a7a)
+    const found = drawRow(row(0, 'a', { style: 1, styles: [grey] }), black, undefined, false, [{ from: 0, to: 1, color: current }])
+    expect(contrastRatio(found.glyphs[0]!.color, current)).toBeGreaterThanOrEqual(4.5)
+  })
+
   it('is measured against the selection where the character is selected', () => {
     const selected = { from: 0, to: 1 }
     const glyph = drawRow(row(0, 'a', { style: 1, styles: [darkRed] }), { ...theme, minimumContrast: 4.5, selectionBackground: 0xffffff }, selected).glyphs[0]!

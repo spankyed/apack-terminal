@@ -1592,18 +1592,9 @@ export class TerminalView {
       + `|${matched.map((match) => `${match.from}-${match.to}${match.current ? '!' : ''}`).join(',')}|${blinkedOff ? 'off' : ''}`
     const kept = this.drawings.get(line)
     if (kept && kept.row === row && kept.selected === key) return kept.drawing
-    let drawing = drawRow(row, this.theme, selected, blinkedOff)
-    // Behind what a search found, over whatever background the cells had: later rectangles cover earlier
-    if (matched.length > 0) {
-      const { matchBackground = 0x623315, currentMatchBackground = 0x9e6a03 } = this.theme
-      drawing = {
-        ...drawing,
-        backgrounds: [
-          ...drawing.backgrounds,
-          ...matched.map((match) => ({ column: match.from, cells: match.to - match.from, color: match.current ? currentMatchBackground : matchBackground })),
-        ],
-      }
-    }
+    const { matchBackground = 0x623315, currentMatchBackground = 0x9e6a03 } = this.theme
+    const found = matched.map((match) => ({ from: match.from, to: match.to, color: match.current ? currentMatchBackground : matchBackground }))
+    let drawing = drawRow(row, this.theme, selected, blinkedOff, found)
     // A link under the pointer is underlined, whatever it looked like before
     if (hovered) {
       drawing = {
