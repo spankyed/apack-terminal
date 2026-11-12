@@ -16,6 +16,12 @@ autotests = false
 name = "suite"
 path = "tests/suite.rs"
 
+# P1: the broker's numbers as a client drives it (`benches/broker.rs`). Reports, never fails
+[[bench]]
+name = "broker"
+path = "benches/broker.rs"
+harness = false
+
 [dependencies]
 interprocess = "2.4.7"
 portable-pty = "0.9.0"

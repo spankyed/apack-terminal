@@ -204,3 +204,23 @@ every `cfg(windows)` arm as unviable, and the Windows job is where those are act
 Windows, and the cheap checks — format, clippy, the generated protocol, the doc tests — on Linux alone.
 Three platforms is the point rather than thoroughness: a pty, a process tree and a shell's own reports are
 each the platform's answer, and the rule above holds for every one of them.
+
+## Native numbers: the baseline
+
+`cargo bench --bench broker` (`benches/broker.rs`) drives the release broker as a client and reports; it never fails.
+Recorded 2026-11-12 on the developer's Mac (Apple Silicon, macOS), load average about 8 during the run:
+
+| Measurement | Result |
+|---|---|
+| Output throughput, `seq 1 1000000` (7.9 MB) | 7.24 MB/s, 1.09 s |
+| Keystroke echo, back to back (300 round trips), median | 22.65 ms |
+| Keystroke echo, spaced 60 ms apart (300), median | 0.16 ms |
+| Broker resident memory, 1 / 10 / 50 idle sessions | 10.6 / 12.0 / 15.7 MB |
+
+The back-to-back echo is the 16 ms output window showing: a write's echo waits for the window to close. A quiet gap
+is what P2 changes; the spaced figure is the behaviour that already holds.
+
+The throughput figure is not the broker's alone. The benchmark's client parses each output event as JSON, and that
+parsing is on the same thread that times the run, so this number is the floor of what a client that reads the broker
+can see, not the broker's ceiling. It is close to the 7.7 MB/s the evaluation measured through Node, which says Node
+was not the only limit.
