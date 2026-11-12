@@ -1,4 +1,5 @@
 import { PLAIN, StyleFlag, paletteIndex, underlineOf, type Color, type Row, type SessionColors, type Underline } from './source.ts'
+import { ensureContrast } from './contrast.ts'
 
 /**
  * The colours a view supplies: the defaults a program did not override, the palette its numbered colours
@@ -18,6 +19,11 @@ export interface Theme {
   /** Behind every place a search found its text, and behind the one the person is on. Left out, a view's own */
   readonly matchBackground?: number
   readonly currentMatchBackground?: number
+  /**
+   * The least WCAG contrast ratio text is drawn at against what it sits on (`contrast.ts`). Left out, or 1, every colour
+   * is the program's own; 4.5 is the level WCAG asks for normal text. `setTheme` changes it while a view is up.
+   */
+  readonly minimumContrast?: number
 }
 
 /**
@@ -141,11 +147,13 @@ export function drawRow(row: Row, theme: Theme, selected?: SelectedCells, blinke
 
     const visible = !(flags & StyleFlag.invisible) && !(blinkedOff && flags & StyleFlag.blink)
     if (visible && text !== ' ' && text !== '') {
+      // What the character sits on is the selection's when it is selected, and the cell's own otherwise
+      const behind = isSelected ? theme.selectionBackground : (bg ?? theme.background)
       glyphs.push({
         text,
         column,
         cells,
-        color: fg,
+        color: theme.minimumContrast === undefined ? fg : ensureContrast(fg, behind, theme.minimumContrast),
         alpha: flags & StyleFlag.faint ? 0.5 : 1,
         bold: (flags & StyleFlag.bold) !== 0,
         italic: (flags & StyleFlag.italic) !== 0,

@@ -4,6 +4,12 @@ import type { Position, Span, TerminalSource } from './source.ts'
 /** What a click selects by, which is how many times it was clicked */
 export type Granularity = 'cell' | 'word' | 'line'
 
+/**
+ * The shape of a selection made by dragging over cells: `linear` is the text between two cells, as a program would have it;
+ * `block` is the rectangle between two cells, which is each line's own columns (Alt-drag, Option-drag on a Mac).
+ */
+export type Shape = 'linear' | 'block'
+
 const before = (a: Position, b: Position): boolean => a.line < b.line || (a.line === b.line && a.column < b.column)
 
 /**
@@ -24,6 +30,10 @@ export class Selection {
   private head: Span | null = null
   private headAt: Position | null = null
   private granularity: Granularity = 'cell'
+  /** Whether the selection is the text between its ends, or the rectangle between them. Only a cell selection is a block. */
+  private shape: Shape = 'linear'
+  /** Where a block selection began, in cells: the corner its rectangle is measured from with `headAt` */
+  private anchorAt: Position | null = null
   /**
    * Counts the asks about each end, so an answer to one that has been overtaken changes nothing. One each:
    * the far end moving does not make what the word under the start is any less the answer.
@@ -39,8 +49,24 @@ export class Selection {
     private readonly held?: () => { readonly oldest: number; readonly end: number },
   ) {}
 
-  /** The selection, start before end, or `null` when there is none */
+  /**
+   * The rectangle of a block selection, inclusive, or `null` when the selection is not one. Its corners are the cells the
+   * drag began and ended in, whichever way round.
+   */
+  get block(): { top: number; bottom: number; left: number; right: number } | null {
+    if (this.shape !== 'block' || !this.anchorAt || !this.headAt) return null
+    return {
+      top: Math.min(this.anchorAt.line, this.headAt.line),
+      bottom: Math.max(this.anchorAt.line, this.headAt.line),
+      left: Math.min(this.anchorAt.column, this.headAt.column),
+      right: Math.max(this.anchorAt.column, this.headAt.column),
+    }
+  }
+
+  /** The selection, start before end, or `null` when there is none. A block's is the span of its rectangle. */
   get span(): Span | null {
+    const rectangle = this.block
+    if (rectangle) return { start: { line: rectangle.top, column: rectangle.left }, end: { line: rectangle.bottom, column: rectangle.right } }
     if (!this.anchor || !this.head) return null
     const start = before(this.head.start, this.anchor.start) ? this.head.start : this.anchor.start
     const end = before(this.anchor.end, this.head.end) ? this.head.end : this.anchor.end
@@ -49,6 +75,8 @@ export class Selection {
 
   /** The cells of `line` that are selected, for drawing */
   on(line: number): SelectedCells | undefined {
+    const rectangle = this.block
+    if (rectangle) return line < rectangle.top || line > rectangle.bottom ? undefined : { from: rectangle.left, to: rectangle.right + 1 }
     const span = this.span
     if (!span || line < span.start.line || line > span.end.line) return undefined
     return {
@@ -58,9 +86,14 @@ export class Selection {
     }
   }
 
-  /** Starts a selection at `position`: a cell, or the word or line there */
-  begin(position: Position, granularity: Granularity): void {
+  /**
+   * Starts a selection at `position`: a cell, or the word or line there. A cell may start a block: a word or a line is
+   * always linear.
+   */
+  begin(position: Position, granularity: Granularity, shape: Shape = 'linear'): void {
     this.granularity = granularity
+    this.shape = granularity === 'cell' ? shape : 'linear'
+    this.anchorAt = position
     const cell = { start: position, end: position }
     this.anchor = cell
     this.head = cell
@@ -96,6 +129,8 @@ export class Selection {
     this.anchorAsked += 1
     this.headAsked += 1
     this.granularity = 'cell'
+    this.shape = 'linear'
+    this.anchorAt = null
     this.anchor = { start: span.start, end: span.start }
     this.head = { start: span.end, end: span.end }
     this.headAt = span.end
@@ -109,6 +144,8 @@ export class Selection {
     this.anchor = null
     this.head = null
     this.headAt = null
+    this.anchorAt = null
+    this.shape = 'linear'
     this.changed()
   }
 
@@ -118,6 +155,8 @@ export class Selection {
    * the text of those has none to give for any of it.
    */
   async text(): Promise<string> {
+    const rectangle = this.block
+    if (rectangle) return this.blockText(rectangle)
     const span = this.span
     if (!span) return ''
     const held = this.held?.()
@@ -125,6 +164,22 @@ export class Selection {
     const start = span.start.line < held.oldest ? { line: held.oldest, column: 0 } : span.start
     const end = span.end.line >= held.end ? { line: held.end - 1, column: Math.max(0, this.columns() - 1) } : span.end
     return before(end, start) ? '' : this.source.textOf({ start, end })
+  }
+
+  /**
+   * A block's text is each line's own columns, joined by newlines. Each line is asked for on its own, which is what a
+   * source has: a span of text that runs from one line's column to the next is a different text.
+   */
+  private async blockText(rectangle: { top: number; bottom: number; left: number; right: number }): Promise<string> {
+    const held = this.held?.()
+    const top = held ? Math.max(rectangle.top, held.oldest) : rectangle.top
+    const bottom = held ? Math.min(rectangle.bottom, held.end - 1) : rectangle.bottom
+    if (bottom < top) return ''
+    const lines: string[] = []
+    for (let line = top; line <= bottom; line += 1) {
+      lines.push(await this.source.textOf({ start: { line, column: rectangle.left }, end: { line, column: rectangle.right } }))
+    }
+    return lines.join('\n')
   }
 
   /** Line numbers are about to mean something else: a selection made in them is gone */
