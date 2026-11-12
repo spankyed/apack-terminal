@@ -180,7 +180,7 @@ mod flow {
 
 /// **When a session's bytes leave**, with a window long enough that "at once" and "held" cannot be confused.
 mod pacing {
-    use std::sync::mpsc::{RecvTimeoutError, channel};
+    use std::sync::mpsc::channel;
     use std::time::Duration;
 
     use apack_terminal::output::{Credit, OUTPUT_CREDIT, Outgoing, coalesce_within};
@@ -211,16 +211,34 @@ mod pacing {
         sending.send(b"echo".to_vec()).expect("the coalescer is listening");
         assert_eq!(text(answers.recv_timeout(SOON).expect("held for the window")), "echo");
 
-        // Inside the window now: these wait for it, and leave together when the stream ends
+        // Inside the window now: these are held until the output goes quiet, and leave together as one message
         sending.send(b"one ".to_vec()).expect("the coalescer is listening");
         sending.send(b"two".to_vec()).expect("the coalescer is listening");
-        assert!(
-            matches!(answers.recv_timeout(SHORT), Err(RecvTimeoutError::Timeout)),
-            "output inside the window was sent as it arrived, which is no batching at all"
+        assert_eq!(
+            text(answers.recv_timeout(SOON).expect("held for the quiet gap, not the window")),
+            "one two",
+            "one message, not two"
         );
+    }
+
+    /// **Bytes that arrive a moment apart are not held for the whole window either.** After the quiet gap the
+    /// coalescer sends what it has, so a second burst after a pause leaves promptly and is not batched with the
+    /// first.
+    #[test]
+    fn a_pause_sends_what_is_held_and_the_next_burst_is_not_batched_with_it() {
+        let (sending, incoming) = channel::<Vec<u8>>();
+        let (outgoing, answers) = channel();
+        let credit = Credit::new(OUTPUT_CREDIT);
+        std::thread::spawn(move || coalesce_within(WINDOW, "s-1".to_owned(), incoming, outgoing, credit));
+
+        sending.send(b"first".to_vec()).expect("the coalescer is listening");
+        assert_eq!(text(answers.recv_timeout(SOON).expect("the first flush")), "first");
+
+        std::thread::sleep(SHORT);
+        sending.send(b"second".to_vec()).expect("the coalescer is listening");
+        assert_eq!(text(answers.recv_timeout(SOON).expect("a pause ended the hold")), "second");
 
         drop(sending);
-        assert_eq!(text(answers.recv_timeout(SOON).expect("the last flush")), "one two", "one message, not two");
     }
 
     /// A buffer that reaches the cap does not wait for the window
