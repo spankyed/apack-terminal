@@ -1262,6 +1262,54 @@ fn a_program_that_asks_for_the_kitty_keyboard_protocol_is_sent_keys_as_it_encode
     view.until_shows("1b");
 }
 
+/// Phase 0, kitty keyboard protocol: flag 2 reports a key's release, as `CSI code ; 1 : 3 u` for Escape. The press is the
+/// flag 1 form. Flags 3 are asked for, since Escape is encoded with `CSI u` only under the disambiguation flag.
+#[cfg(unix)]
+#[test]
+fn a_key_release_is_reported_to_a_program_that_asked_for_event_types() {
+    let broker = start();
+    let client = Client::greeting(&broker);
+    let asking = "stty raw -echo; printf '\\033[>3u'; printf 'ready\\n'; head -c 14 | od -An -tx1 | tr -d ' \\n'; printf '\\033[<u'";
+    let session = client.running("sh", &["-c", asking], false);
+    let mut view = View::attached(&broker, &session);
+    view.until_shows("ready");
+    view.send(&ToBroker::Key { channel: 1, action: 0, modifiers: 0, code: "Escape".to_owned(), text: String::new(), unshifted: 0, composed: false });
+    view.send(&ToBroker::Key { channel: 1, action: 2, modifiers: 0, code: "Escape".to_owned(), text: String::new(), unshifted: 0, composed: false });
+    // ESC [ 2 7 u for the press, then ESC [ 2 7 ; 1 : 3 u for the release
+    view.until_shows("1b5b3237751b5b32373b313a3375");
+}
+
+/// Phase 0, kitty keyboard protocol: under flag 1 a control chord is a `CSI u` sequence with the unshifted code and the
+/// modifier as `1 + bits`, so Ctrl+c (ctrl is 4 in the protocol, so 5) is ESC [ 9 9 ; 5 u.
+#[cfg(unix)]
+#[test]
+fn a_control_chord_is_sent_to_a_program_that_asked_for_the_protocol_as_csi_u() {
+    let broker = start();
+    let client = Client::greeting(&broker);
+    let asking = "stty raw -echo; printf '\\033[>1u'; printf 'ready\\n'; head -c 7 | od -An -tx1 | tr -d ' \\n'; printf '\\033[<u'";
+    let session = client.running("sh", &["-c", asking], false);
+    let mut view = View::attached(&broker, &session);
+    view.until_shows("ready");
+    // Modifiers in the core's bits: control is 2
+    view.send(&ToBroker::Key { channel: 1, action: 0, modifiers: 2, code: "KeyC".to_owned(), text: String::new(), unshifted: 99, composed: false });
+    view.until_shows("1b5b39393b3575");
+}
+
+/// Phase 0, kitty keyboard protocol: under flag 1 an unmodified printable key is not encoded but typed, as its byte.
+#[cfg(unix)]
+#[test]
+fn an_unmodified_printable_key_under_the_disambiguation_flag_is_typed_as_text() {
+    let broker = start();
+    let client = Client::greeting(&broker);
+    let asking = "stty raw -echo; printf '\\033[>1u'; printf 'ready\\n'; head -c 1 | od -An -tx1 | tr -d ' \\n'; printf '\\033[<u'";
+    let session = client.running("sh", &["-c", asking], false);
+    let mut view = View::attached(&broker, &session);
+    view.until_shows("ready");
+    view.key("KeyA", "a");
+    // The letter is its own byte, not ESC [ 9 7 u
+    view.until_shows("61");
+}
+
 /// Phase 0, wheel into a full-screen program: a program on the alternate screen that asked for no mouse is sent the
 /// cursor-down key the view sends for a wheel notch, and reads it as ESC [ B. The view's decision to send it
 /// is in its own tests; this is the part that reaches the program.
