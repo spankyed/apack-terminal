@@ -89,6 +89,29 @@ describe('a folded run of lines', () => {
     expect(copied).toEqual(['the whole output'])
   })
 
+  it('survives scrolling: a view scrolled to a line folded away starts at the fold\'s header, and no hidden line is drawn', () => {
+    const view = mountedView({}, new FakeSource())
+    sevenLines(view)
+    view.view.setFolds([{ first: 1, last: 3, label: 'output' }])
+    runFrames()
+    view.view.viewport.scrollTo(2)
+    view.view.setFolds([{ first: 1, last: 3, label: 'output' }])
+    runFrames()
+    expect(drawnText(view)).toEqual(['▸ output', 'L4', 'L5', 'L6'])
+  })
+
+  it('survives a resize of the screen: the fold still hides its lines in the rows there are', () => {
+    const view = mountedView({}, new FakeSource())
+    sevenLines(view)
+    view.view.setFolds([{ first: 1, last: 3, label: 'output' }])
+    runFrames()
+    view.source.send(frame({ sequence: 2, screenRows: 3, columns: 20, firstActive: 3, scrollback: 3, rows: [row(0, 'L0'), row(1, 'L1'), row(2, 'L2'), row(3, 'L3'), row(4, 'L4'), row(5, 'L5'), row(6, 'L6')] }))
+    view.view.viewport.scrollTo(0)
+    view.view.setFolds([{ first: 1, last: 3, label: 'output' }])
+    runFrames()
+    expect(drawnText(view)).toEqual(['L0', '▸ output', 'L4'])
+  })
+
   it('takes folds that do not overlap, and refuses ones that do', () => {
     const view = mountedView({}, new FakeSource())
     expect(() => view.view.setFolds([{ first: 1, last: 3 }, { first: 3, last: 5 }])).toThrow(RangeError)
