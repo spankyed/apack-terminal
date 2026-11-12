@@ -252,12 +252,12 @@ fn lines_fetched_while_the_program_is_holding_the_screen_are_those_from_before_t
 
     write(&mut screen, "\x1b[?2026h\x1b[1;1Hnew text");
     let fetched = screen.fetch(epoch, 0, 1).expect("a fetch reads");
-    let rows = fetched.rows.block().expect("the rows read back").rows.iter().map(|row| text(row)).collect::<Vec<_>>();
+    let rows = fetched.rows.block().expect("the rows read back").rows.iter().map(text).collect::<Vec<_>>();
     assert_eq!(rows, vec!["old text".to_owned()], "a fetch during a hold shows the screen before it");
 
     write(&mut screen, "\x1b[?2026l");
     let fetched = screen.fetch(epoch, 0, 1).expect("a fetch reads");
-    let rows = fetched.rows.block().expect("the rows read back").rows.iter().map(|row| text(row)).collect::<Vec<_>>();
+    let rows = fetched.rows.block().expect("the rows read back").rows.iter().map(text).collect::<Vec<_>>();
     assert_eq!(rows, vec!["new text".to_owned()], "and what the program let go of once it has");
 }
 
