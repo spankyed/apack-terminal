@@ -12,6 +12,20 @@ import { Viewport } from './viewport.ts'
 export const BLINK_MS = 530
 
 /**
+ * Whether a row has blinking text, asked once per row it is. A row is replaced when it changes, so a row
+ * held is answered from memory and nothing rescans every cell of a screen on every frame.
+ */
+const blinkingRows = new WeakMap<Row, boolean>()
+function blinksIn(row: Row): boolean {
+  let answer = blinkingRows.get(row)
+  if (answer === undefined) {
+    answer = blinks(row)
+    blinkingRows.set(row, answer)
+  }
+  return answer
+}
+
+/**
  * How many lines of history are asked for at once, in pages that start on a multiple of it. A view scrolling
  * a line at a time crosses into a new page once in this many lines, and asks once.
  */
@@ -1360,14 +1374,15 @@ export class TerminalView {
     if (!frame) return
     try {
       const [first, count] = this.viewport.visible
-      const rows: Array<RowDrawing | null> = []
-      for (let line = first; line < first + count; line += 1) rows.push(this.drawingOf(line))
+      // Decided before anything is drawn, so a blink that has just stopped draws its text shown, once
       let blinking = false
       for (let line = first; line < first + count && !blinking; line += 1) {
         const row = this.store.row(line)
-        blinking = row !== undefined && blinks(row)
+        blinking = row !== undefined && blinksIn(row)
       }
       this.blinkText(blinking)
+      const rows: Array<RowDrawing | null> = []
+      for (let line = first; line < first + count; line += 1) rows.push(this.drawingOf(line))
       // What a scroll of a screenful either way would show stays drawn; the rest is not held on to
       for (const line of this.drawings.keys()) {
         if (line < first - count || line >= first + count * 2) this.drawings.delete(line)
@@ -1436,7 +1451,7 @@ export class TerminalView {
     const hovered = this.hovered?.line === line ? this.hovered.link : null
     const matched = this.matches.length > 0 ? this.matchesOn(line) : []
     // Which half of a blink it is, for a row that has text to hide in one of them
-    const blinkedOff = !this.textShown && blinks(row)
+    const blinkedOff = !this.textShown && blinksIn(row)
     const key = `${selected ? `${selected.from}-${selected.to}` : ''}|${hovered ? `${hovered.from}-${hovered.to}` : ''}`
       + `|${matched.map((match) => `${match.from}-${match.to}${match.current ? '!' : ''}`).join(',')}|${blinkedOff ? 'off' : ''}`
     const kept = this.drawings.get(line)
