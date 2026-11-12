@@ -140,7 +140,7 @@ describe('a question a view asks', () => {
     const { broker, source } = attached()
     broker.say({ kind: 'frame', channel: 1, frame: frame({ epoch: 6 }) })
     const word = source.wordAt({ line: 41, column: 3 })
-    const found = source.search('needle')
+    const found = source.search('needle', false)
     // The answers name lines of an epoch the view has since been told is over
     broker.say(
       { kind: 'frame', channel: 1, frame: frame({ epoch: 7 }) },

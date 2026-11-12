@@ -1,7 +1,8 @@
 // A view, used: what a click, a drag, a wheel and a pointer over a link each do — and who they are for,
 // which changes when a program asks for the mouse.
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Command, Placements, Span } from '../src/source.ts'
+import { MATCH_HIGHLIGHTS } from '../src/view.ts'
 import { framesWaiting, installFrames, runFrames } from './_frames.ts'
 import { FakeSource } from './_source.ts'
 import { frame, row } from './_support.ts'
@@ -16,6 +17,8 @@ function showing(setup: ReturnType<typeof mountedView>, parts: Parameters<typeof
 }
 
 /** The cells a painted row draws as selected */
+const MATCH_REFRESH_MS = 200
+
 const selectedOn = (setup: ReturnType<typeof mountedView>, index: number) =>
   setup.painted().rows[index]?.backgrounds.filter((run) => run.color === theme.selectionBackground).map((run) => [run.column, run.column + run.cells])
 
@@ -873,10 +876,16 @@ describe('the commands a shell ran', () => {
 })
 
 describe('finding text', () => {
+  afterEach(() => { vi.useRealTimers() })
   class Searchable extends FakeSource {
     asked: string[] = []
+    askedCase: boolean[] = []
     found: Span[] = []
-    override async search(needle: string): Promise<readonly Span[]> { this.asked.push(needle); return this.found }
+    override async search(needle: string, caseSensitive: boolean): Promise<readonly Span[]> {
+      this.asked.push(needle)
+      this.askedCase.push(caseSensitive)
+      return this.found
+    }
   }
   const span = (line: number, from: number, to: number, endLine = line): Span => ({ start: { line, column: from }, end: { line: endLine, column: to } })
   /** The cells a painted row draws behind a match, with the colour of each */
@@ -895,7 +904,7 @@ describe('finding text', () => {
     const { view, source } = searching([span(101, 0, 4), span(100, 6, 9), span(30, 2, 5)])
     expect(await view.view.find('beta')).toBe(3)
     expect(source.asked).toEqual(['beta'])
-    expect(view.view.found).toEqual({ current: 1, total: 3 })
+    expect(view.view.found).toEqual({ current: 1, total: 3, more: false })
   })
 
   it('draws every match on screen, and the one the person is on differently', async () => {
@@ -929,12 +938,13 @@ describe('finding text', () => {
   })
 
   it('that found nothing has a match to be on once output brings one', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
     const { view, source } = searching([])
     expect(await view.view.find('later')).toBe(0)
     source.found = [span(101, 0, 4), span(100, 6, 9)]
     view.source.send(frame({ sequence: 2, firstActive: 100, scrollback: 100, rows: [row(101, 'later')] }))
-    await settled()
-    expect(view.view.found).toEqual({ current: 1, total: 2 })
+    await vi.advanceTimersByTimeAsync(MATCH_REFRESH_MS)
+    expect(view.view.found).toEqual({ current: 1, total: 2, more: false })
     expect(matchedOn(view, 1)).toEqual([[0, 5, 'current']])
   })
 
@@ -959,14 +969,16 @@ describe('finding text', () => {
 
     await view.view.find('a')
     showing(view, { epoch: 2, sequence: 5, firstActive: 100, scrollback: 100 })
-    expect(view.view.found).toEqual({ current: 0, total: 0 })
+    expect(view.view.found).toEqual({ current: 0, total: 0, more: false })
   })
 
-  it('is searched for again when rows change, one search at a time, and the person stays on the match they were on', async () => {
+  it('is searched for again when rows change, at most once per 200 ms, one search at a time, and the person stays on the match they were on', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
     const source = new (class extends Searchable {
       waiting: Array<(found: Span[]) => void> = []
-      override search(needle: string): Promise<readonly Span[]> {
+      override search(needle: string, caseSensitive: boolean): Promise<readonly Span[]> {
         this.asked.push(needle)
+        this.askedCase.push(caseSensitive)
         return new Promise((resolve) => { this.waiting.push(resolve) })
       }
     })()
@@ -976,25 +988,69 @@ describe('finding text', () => {
     source.waiting[0]!([span(101, 0, 4), span(100, 6, 9)])
     await finding
     view.view.findNext()
-    expect(view.view.found).toEqual({ current: 2, total: 2 })
+    expect(view.view.found).toEqual({ current: 2, total: 2, more: false })
 
     // A frame that changed no row is not a reason to search
     view.source.send(frame({ sequence: 2, firstActive: 100, scrollback: 100, cursor: { column: 0, row: 0, shape: 'block', blinking: false } }))
+    await vi.advanceTimersByTimeAsync(MATCH_REFRESH_MS)
     expect(source.asked).toEqual(['a'])
 
-    // Three frames of new output while the first of their searches is on its way: one search, then one more
+    // Three frames of new output in one 200 ms: one search, due 200 ms after the first of them
     for (const sequence of [3, 4, 5]) view.source.send(frame({ sequence, firstActive: 100, scrollback: 100, rows: [row(102, `more a ${sequence}`)] }))
+    await vi.advanceTimersByTimeAsync(MATCH_REFRESH_MS - 1)
+    expect(source.asked, 'searched before the interval was up').toEqual(['a'])
+    await vi.advanceTimersByTimeAsync(1)
     expect(source.asked).toEqual(['a', 'a'])
+
+    // Output while that search is on its way is searched for once it answers, and no sooner than the interval
+    view.source.send(frame({ sequence: 6, firstActive: 100, scrollback: 100, rows: [row(103, 'even more a')] }))
     source.waiting[1]!([span(102, 5, 5), span(101, 0, 4), span(100, 6, 9)])
-    await settled()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(source.asked).toEqual(['a', 'a'])
+    await vi.advanceTimersByTimeAsync(MATCH_REFRESH_MS)
     expect(source.asked).toEqual(['a', 'a', 'a'])
-    source.waiting[2]!([span(102, 5, 5), span(101, 0, 4), span(100, 6, 9)])
-    await settled()
+    source.waiting[2]!([span(103, 10, 10), span(102, 5, 5), span(101, 0, 4), span(100, 6, 9)])
+    await vi.advanceTimersByTimeAsync(0)
+    await vi.advanceTimersByTimeAsync(MATCH_REFRESH_MS * 5)
     expect(source.asked, 'searched again with nothing changed since').toHaveLength(3)
 
-    expect(view.view.found, 'the match the person was on is still the one they are on').toEqual({ current: 3, total: 3 })
-    expect(matchedOn(view, 2)).toEqual([[5, 6, 'other']])
+    expect(view.view.found, 'the match the person was on is still the one they are on').toEqual({ current: 4, total: 4, more: false })
+    expect(matchedOn(view, 3)).toEqual([[10, 11, 'other']])
     expect(matchedOn(view, 0)).toEqual([[6, 10, 'current']])
+    vi.useRealTimers()
+  })
+
+  it('asks for a case-sensitive search only when the person asks, and says so to the source', async () => {
+    const { view, source } = searching([span(101, 0, 4)])
+    await view.view.find('Beta')
+    await view.view.find('Beta', { matchCase: true })
+    expect(source.asked).toEqual(['Beta', 'Beta'])
+    expect(source.askedCase).toEqual([false, true])
+  })
+
+  it('holds and paints at most a thousand matches, says there are more, and still steps through them all', async () => {
+    // Newest first, as a search answers: the last line written is the first match
+    const count = MATCH_HIGHLIGHTS + 500
+    const found = Array.from({ length: count }, (_, index) => {
+      const written = count - 1 - index
+      return span(100 + Math.floor(written / 75), written % 75, written % 75)
+    })
+    const source = new Searchable()
+    source.found = found
+    const view = mountedView({}, source)
+    view.source.send(frame({ firstActive: 100, scrollback: 100, columns: 80, screenRows: 20, rows: Array.from({ length: 20 }, (_, index) => row(100 + index, 'a'.repeat(40))) }))
+    runFrames()
+
+    expect(await view.view.find('a')).toBe(MATCH_HIGHLIGHTS)
+    expect(view.view.found).toEqual({ current: 1, total: MATCH_HIGHLIGHTS, more: true })
+    const painted = Array.from({ length: 20 }, (_, index) => index).flatMap((index) => matchedOn(view, index) ?? [])
+    expect(painted, 'a match past the first thousand was painted').toHaveLength(MATCH_HIGHLIGHTS)
+
+    // The newest first, then round from the oldest held match to the newest, as with any other count
+    view.view.findNext(-1)
+    expect(view.view.found.current).toBe(MATCH_HIGHLIGHTS)
+    view.view.findNext()
+    expect(view.view.found.current).toBe(1)
   })
 
   it('draws the matches on a line out of very many, and only those', async () => {

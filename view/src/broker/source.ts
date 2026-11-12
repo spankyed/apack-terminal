@@ -343,8 +343,8 @@ class SessionSource implements TerminalSource {
     return answer.text
   }
 
-  async search(needle: string): Promise<readonly Span[]> {
-    const answer = await this.ask('spans', (channel, request) => ({ kind: 'search', channel, request, needle }))
+  async search(needle: string, caseSensitive: boolean): Promise<readonly Span[]> {
+    const answer = await this.ask('spans', (channel, request) => ({ kind: 'search', channel, request, needle, caseSensitive }))
     return answer.epoch === this.epoch ? answer.spans : []
   }
 

@@ -41,6 +41,10 @@ function blinksIn(row: Row): boolean {
  * a line at a time crosses into a new page once in this many lines, and asks once.
  */
 export const PAGE_LINES = 256
+/** Matches a search highlights and steps through: the rest are counted as more, as "1000+" */
+export const MATCH_HIGHLIGHTS = 1000
+/** At most one refresh of the matches in this long: what changed while it waits is the next one's to find */
+const MATCH_REFRESH_MS = 200
 
 /** How fast a selection dragged past an edge scrolls: lines a second, for each row the pointer is past it */
 const DRAG_LINES_PER_SECOND = 15
@@ -265,6 +269,10 @@ export class TerminalView {
    */
   private needle = ''
   private matches: readonly Span[] = []
+  /** Whether the search found more than `MATCH_HIGHLIGHTS` matches, of which the first are held */
+  private moreMatches = false
+  private matchCase = false
+  private refreshTimer: ReturnType<typeof setTimeout> | undefined
   private currentMatch = -1
   private finding = 0
   /** A search made again because rows changed is on its way, and whether rows changed again since */
@@ -449,31 +457,50 @@ export class TerminalView {
    * and once more after it if rows changed while it was on its way — and the person stays on the match
    * they were on.
    */
-  async find(needle: string): Promise<number> {
+  async find(needle: string, options: { matchCase?: boolean } = {}): Promise<number> {
     const asked = (this.finding += 1)
     this.needle = needle
+    this.matchCase = options.matchCase ?? false
     const found = (await this.search(needle)) ?? []
     // A search that was overtaken by a later one has nothing to say
     if (asked !== this.finding) return this.matches.length
-    this.matches = found
-    this.currentMatch = found.length > 0 ? 0 : -1
+    this.setMatches(found)
+    this.currentMatch = this.matches.length > 0 ? 0 : -1
     this.drawings.clear()
     this.showMatch()
-    return found.length
+    return this.matches.length
+  }
+
+  /** Holds what a search found, up to `MATCH_HIGHLIGHTS` of it */
+  private setMatches(found: readonly Span[]): void {
+    this.matches = found.slice(0, MATCH_HIGHLIGHTS)
+    this.moreMatches = found.length > MATCH_HIGHLIGHTS
   }
 
   /** Where the source finds `needle`, or `null` when it could not say */
   private async search(needle: string): Promise<readonly Span[] | null> {
     if (needle === '') return []
     try {
-      return await this.source.search(needle)
+      return await this.source.search(needle, this.matchCase)
     } catch {
       return null
     }
   }
 
-  /** Rows changed under a search: what it found may no longer be where it was, or there at all */
+  /**
+   * Rows changed under a search: what it found may no longer be where it was, or there at all. At most one
+   * refresh per `MATCH_REFRESH_MS`, so a stream of output costs one search a window, and the last change is
+   * found once it is quiet.
+   */
   private refreshMatches(): void {
+    if (this.needle === '' || this.refreshTimer !== undefined) return
+    this.refreshTimer = setTimeout(() => {
+      this.refreshTimer = undefined
+      this.runRefresh()
+    }, MATCH_REFRESH_MS)
+  }
+
+  private runRefresh(): void {
     if (this.needle === '') return
     if (this.refreshing) {
       this.refreshAgain = true
@@ -492,8 +519,9 @@ export class TerminalView {
         // On the match they were on; failing that the nearest there is, which for a search that had found
         // nothing is the newest
         const current = found.length === 0 ? -1 : still !== -1 ? still : Math.max(0, Math.min(this.currentMatch, found.length - 1))
-        const same = current === this.currentMatch && found.length === this.matches.length && found.every((match, index) => sameSpan(match, this.matches[index]!))
-        this.matches = found
+        const held = found.slice(0, MATCH_HIGHLIGHTS)
+        const same = current === this.currentMatch && held.length === this.matches.length && held.every((match, index) => sameSpan(match, this.matches[index]!))
+        this.setMatches(found)
         this.currentMatch = current
         // A row's drawing is kept by what matches are on it, so only the rows whose matches moved are
         // drawn again — and with none moved, nothing is
@@ -504,8 +532,8 @@ export class TerminalView {
   }
 
   /** Which match the person is on, counting from one at the newest, and how many there are */
-  get found(): { current: number; total: number } {
-    return { current: this.currentMatch + 1, total: this.matches.length }
+  get found(): { current: number; total: number; more: boolean } {
+    return { current: this.currentMatch + 1, total: this.matches.length, more: this.moreMatches }
   }
 
   /** Goes to the next match: an older one for `1`, a newer one for `-1`, round to the other end past the last */
@@ -1022,6 +1050,7 @@ export class TerminalView {
   }
 
   dispose(): void {
+    if (this.refreshTimer !== undefined) clearTimeout(this.refreshTimer)
     if (this.disposed) return
     this.unmount()
     this.disposed = true
@@ -1130,7 +1159,7 @@ export class TerminalView {
       this.placed = { ...this.placed, placements: [] }
       this.imagesSeen = -1
       this.needle = ''
-      this.matches = []
+      this.setMatches([])
       this.currentMatch = -1
       this.finding += 1
     } else {
