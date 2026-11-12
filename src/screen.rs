@@ -19,6 +19,7 @@ use std::time::{Duration, SystemTime};
 use crate::commands::Outcome;
 use crate::holds::HoldLimit;
 use crate::markers::MarksKey;
+use crate::protocol::{CursorBlink, CursorStyle};
 use crate::recording::{self, Entry, Recorder, Timed};
 use crate::view::publish::{Outlet, Publication, ViewId};
 use crate::view::wire::{MAX_MESSAGE_BYTES, Position, Rows, Span};
@@ -377,7 +378,7 @@ impl Screen {
         // way, these two are let go of in the reverse of the order they were made
         let reported = Collector::new();
         let mut terminal = Terminal::new(cols, rows)?;
-        terminal.default_cursor_is_a_blinking_bar()?;
+        terminal.set_cursor_defaults(CursorStyle::Bar, CursorBlink::Program)?;
         // Never less than what a client reading the screen as text is promised (`SCROLLBACK_ASKED`)
         terminal.set_scrollback_lines(history.max(SCROLLBACK_ASKED))?;
         terminal.set_scrollback_bytes(HISTORY_BYTES)?;
@@ -868,6 +869,20 @@ impl Screen {
     /// Pasted text as the program should receive it, or a refusal when it could run a command.
     pub fn paste(&self, text: &str, allow_unsafe: bool) -> Result<Pasted, Failed> {
         input::paste(&self.terminal, text, allow_unsafe)
+    }
+
+    /// Sets the cursor a session starts with and returns to, and takes the cursor to it now; see
+    /// `Terminal::set_cursor_defaults`. The cursor a view is sent is the one that stands after it.
+    pub fn set_cursor_defaults(&mut self, style: CursorStyle, blink: CursorBlink) -> Result<(), Failed> {
+        self.terminal.set_cursor_defaults(style, blink)?;
+        if let Some(publication) = &mut self.publication {
+            publication.touch();
+        }
+        // Sent here, as a change to the screen is, and not while a recording is replayed
+        if !self.replaying {
+            self.publish();
+        }
+        Ok(())
     }
 
     /// What the program is told about its terminal gaining or losing focus.

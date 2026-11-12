@@ -44,6 +44,20 @@ cwd: string | null,
 started_ms: number | null, finished_ms: number | null, outcome: CommandOutcome, };
 
 /**
+ * Whether a session's cursor blinks when no program has chosen. `On` and `Off` are the app's answer and
+ * override the program's blink, in a view; `Program` leaves the blink to the program. In the core, DECSCUSR's
+ * blink and DEC mode 12 are one setting, so a program's choice of either is what `Program` means.
+ *
+ * A reset (`CSI 0 q`) returns to a blinking cursor for `On` and `Program`, and to a steady one for `Off`.
+ */
+export type CursorBlink = "on" | "off" | "program";
+
+/**
+ * The shape a session's cursor is drawn in when no program has chosen one.
+ */
+export type CursorStyle = "block" | "bar" | "underline";
+
+/**
  * **A closed set, generated into the TypeScript as a string union** — elmdb's `ErrorCode` arrangement, and
  * what #372's name-matching should become. A caller switches on a value the compiler knows, rather than
  * matching on a message that is free to be reworded.
@@ -178,7 +192,7 @@ images: boolean,
  * that shell can read the key and write any mark it likes; nothing here is a boundary against
  * one. A key that is not one is refused (`ErrorCode::Malformed`) rather than spawned without.
  */
-marks_key: string | null, } | { "kind": "write", session: string, text: string, } | { "kind": "resize", session: string, cols: number, rows: number, cell_width: number, cell_height: number, } | { "kind": "pause", session: string, } | { "kind": "resume", session: string, } | { "kind": "signal", session: string, signal: Signal, scope: Scope, } | { "kind": "owns", session: string, pid: number, } | { "kind": "screen", session: string, history: number, } | { "kind": "facts", session: string, } | { "kind": "search", session: string, text: string, history: number, } | { "kind": "wait", session: string, until: Until, timeout_ms: number, } | { "kind": "commands", session: string, } | { "kind": "command_output", session: string, command: number, } | { "kind": "keep", session: string, kept: boolean, } | { "kind": "sessions" } | { "kind": "rewind", recording: string, cols: number, rows: number, } | { "kind": "seek", session: string, at: number, } | { "kind": "kill", session: string, };
+marks_key: string | null, } | { "kind": "write", session: string, text: string, } | { "kind": "resize", session: string, cols: number, rows: number, cell_width: number, cell_height: number, } | { "kind": "set_cursor_defaults", session: string, style: CursorStyle, blink: CursorBlink, } | { "kind": "pause", session: string, } | { "kind": "resume", session: string, } | { "kind": "signal", session: string, signal: Signal, scope: Scope, } | { "kind": "owns", session: string, pid: number, } | { "kind": "screen", session: string, history: number, } | { "kind": "facts", session: string, } | { "kind": "search", session: string, text: string, history: number, } | { "kind": "wait", session: string, until: Until, timeout_ms: number, } | { "kind": "commands", session: string, } | { "kind": "command_output", session: string, command: number, } | { "kind": "keep", session: string, kept: boolean, } | { "kind": "sessions" } | { "kind": "rewind", recording: string, cols: number, rows: number, } | { "kind": "seek", session: string, at: number, } | { "kind": "kill", session: string, };
 
 /**
  * What a connection is for.

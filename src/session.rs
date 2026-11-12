@@ -20,7 +20,8 @@ use crate::housekeeping::Housekeeping;
 use crate::markers::MarksKey;
 use crate::output::{Credit, Flow, Outgoing, READ_AHEAD, coalesce};
 use crate::protocol::{
-    ErrorCode, Event, Foreground, ProgressState, Scope, SessionId, SessionSummary, Signal, Until, WaitOutcome,
+    CursorBlink, CursorStyle, ErrorCode, Event, Foreground, ProgressState, Scope, SessionId, SessionSummary, Signal,
+    Until, WaitOutcome,
 };
 use crate::recording;
 use crate::screen::{
@@ -778,6 +779,11 @@ impl Handle {
         }
         // The screen is resized too, or the authority would describe a viewport the process no longer has
         self.on_screen(|screen| screen.resize(cols, rows, cell_width, cell_height))
+    }
+
+    /// The cursor the session starts with and returns to; see `Screen::set_cursor_defaults`.
+    pub fn set_cursor_defaults(&self, style: CursorStyle, blink: CursorBlink) -> Outcome {
+        Ok(self.on_screen(|screen| screen.set_cursor_defaults(style, blink))??)
     }
 
     /// The screen as this session has it, with up to `history` lines above the viewport.

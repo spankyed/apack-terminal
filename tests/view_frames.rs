@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use apack_terminal::holds::{HOLD_LIMIT, Holds};
+use apack_terminal::protocol::{CursorBlink, CursorStyle};
 use apack_terminal::screen::{Screen, TEXT_BYTES, Unanswered};
 use apack_terminal::view::publish::{FETCH_LINES, Publication, ViewId};
 use apack_terminal::view::wire::{
@@ -488,6 +489,94 @@ fn a_frame_says_how_the_cursor_is_drawn_and_whether_the_program_took_the_mouse()
         last = view.frame();
         assert!(check(&last), "after {written:?}: {last:?}");
         assert!(last.block.rows.is_empty(), "no row changed, so none is sent");
+    }
+}
+
+/// What a frame says the cursor is drawn as: its shape, and whether it blinks.
+fn drawn_as(frame: &Frame) -> Option<(u8, bool)> {
+    frame.cursor.map(|cursor| (cursor.shape, cursor.blinking))
+}
+
+/// Applies `change` to the screen, and returns the frame a view is sent for it.
+fn after(screen: &mut Screen, view: &View, last: &Frame, change: impl FnOnce(&mut Screen)) -> Frame {
+    screen.acknowledge(view.id, last.sequence).expect("an acknowledgement is taken");
+    change(screen);
+    view.frame()
+}
+
+#[test]
+fn a_default_cursor_set_by_the_app_is_the_one_a_frame_shows() {
+    let mut screen = Screen::new(20, 4);
+    let view = View::attached(&mut screen, 1, 1);
+    let first = view.frame();
+    assert_eq!(drawn_as(&first), Some((1, true)), "the blinking bar a session starts with");
+
+    let block = after(&mut screen, &view, &first, |screen| {
+        screen.set_cursor_defaults(CursorStyle::Block, CursorBlink::Off).expect("the defaults are set")
+    });
+    assert_eq!(drawn_as(&block), Some((0, false)));
+
+    let underline = after(&mut screen, &view, &block, |screen| {
+        screen.set_cursor_defaults(CursorStyle::Underline, CursorBlink::On).expect("the defaults are set")
+    });
+    assert_eq!(drawn_as(&underline), Some((2, true)));
+}
+
+#[test]
+fn a_program_choice_wins_over_the_default_until_the_program_resets_it() {
+    let mut screen = Screen::new(20, 4);
+    let view = View::attached(&mut screen, 1, 1);
+    let first = view.frame();
+    let set = after(&mut screen, &view, &first, |screen| {
+        screen.set_cursor_defaults(CursorStyle::Block, CursorBlink::Off).expect("the defaults are set")
+    });
+
+    let chosen = after(&mut screen, &view, &set, |screen| write(screen, "\x1b[5 q"));
+    assert_eq!(drawn_as(&chosen), Some((1, true)), "DECSCUSR wins over the default");
+
+    let reset = after(&mut screen, &view, &chosen, |screen| write(screen, "\x1b[0 q"));
+    assert_eq!(drawn_as(&reset), Some((0, false)), "a reset returns to the default");
+}
+
+#[test]
+fn a_reset_returns_to_a_blinking_cursor_for_on_and_program_and_a_steady_one_for_off() {
+    for (blink, blinking) in [(CursorBlink::On, true), (CursorBlink::Program, true), (CursorBlink::Off, false)] {
+        let mut screen = Screen::new(20, 4);
+        let view = View::attached(&mut screen, 1, 1);
+        let first = view.frame();
+        let set = after(&mut screen, &view, &first, |screen| {
+            screen.set_cursor_defaults(CursorStyle::Block, blink).expect("the defaults are set")
+        });
+        let chosen = after(&mut screen, &view, &set, |screen| write(screen, "\x1b[6 q"));
+        let reset = after(&mut screen, &view, &chosen, |screen| write(screen, "\x1b[0 q"));
+        assert_eq!(drawn_as(&reset), Some((0, blinking)), "after a reset with {blink:?}");
+    }
+}
+
+#[test]
+fn a_default_set_part_way_through_a_program_sequence_still_takes_the_cursor() {
+    let mut screen = Screen::new(20, 4);
+    let view = View::attached(&mut screen, 1, 1);
+    let first = view.frame();
+    let set = after(&mut screen, &view, &first, |screen| {
+        write(screen, "\x1b[");
+        screen.set_cursor_defaults(CursorStyle::Block, CursorBlink::Off).expect("the defaults are set")
+    });
+    assert_eq!(drawn_as(&set), Some((0, false)));
+}
+
+/// DECSCUSR's blink and DEC mode 12 are one setting in the core: each sets what the other reads. The
+/// app's blink setting is a view's to apply over this, so it has to know this much to be right.
+#[test]
+fn decscusr_and_dec_mode_12_set_one_blink_between_them() {
+    let mut screen = Screen::new(20, 4);
+    let view = View::attached(&mut screen, 1, 1);
+    let mut last = view.frame();
+    for (written, expected) in
+        [("\x1b[2 q", (0, false)), ("\x1b[?12h", (0, true)), ("\x1b[5 q", (1, true)), ("\x1b[?12l", (1, false))]
+    {
+        last = after(&mut screen, &view, &last, |screen| write(screen, written));
+        assert_eq!(drawn_as(&last), Some(expected), "after {written:?}");
     }
 }
 

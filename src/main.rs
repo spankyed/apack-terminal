@@ -938,6 +938,10 @@ fn carry_out(live: &Sessions, connection: u64, request: Request) {
             .handle(&session)
             .and_then(|handle| handle.resize(cols, rows, cell_width, cell_height))
             .map_err(|refusal| (Some(session), refusal)),
+        Request::SetCursorDefaults { session, style, blink } => live
+            .handle(&session)
+            .and_then(|handle| handle.set_cursor_defaults(style, blink))
+            .map_err(|refusal| (Some(session), refusal)),
         Request::Pause { session } => live.pause(&session).map_err(|refusal| (Some(session), refusal)),
         Request::Resume { session } => live.resume(&session).map_err(|refusal| (Some(session), refusal)),
         Request::Signal { session, signal, scope } => {
