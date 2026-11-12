@@ -42,6 +42,13 @@ fn sent() -> bool {
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[ts(export, export_to = "protocol.ts")]
 pub enum Request {
+    /// The caller has said all it will, and will send nothing more; what the broker still owes it is
+    /// sent, and then the connection is let go. It is how a proxy whose input has ended says so on any
+    /// platform: a named pipe cannot be closed one way, so end-of-input cannot be the signal there.
+    ///
+    /// Answered with nothing, and not a refusal when it comes before a greeting: a caller that had
+    /// nothing to say still gets a connection that ends cleanly.
+    Done,
     /// The first message on a connection; the broker answers `Hello` or refuses.
     ///
     /// `role` says what this connection is for, and a caller that omits it is a `client` — so a raw caller,

@@ -436,6 +436,11 @@ fn converse(wire: &Arc<Wire>, connection: u64, broker: &Broker, role: &mut Optio
             }
             Frame::Ended => break,
         };
+        // **What the caller says last, and is then let go of.** Ends the conversation as a closed connection
+        // does, and so is answered with the same things owed to a caller that has finished
+        if matches!(request, Request::Done) {
+            break;
+        }
         // **The handshake is first or the connection is refused**, because the monorepo pins a commit of this
         // repository: a stale pin has to be a clear refusal rather than a message that means something else.
         match (&request, *role) {
@@ -886,7 +891,7 @@ fn nothing_left(broker: &Broker) -> bool {
 /// one request costs is that session's and no other's.
 fn carry_out(live: &Sessions, connection: u64, request: Request) {
     let outcome = match request {
-        Request::Hello { .. } => return,
+        Request::Hello { .. } | Request::Done => return,
         Request::Spawn {
             cols,
             rows,
