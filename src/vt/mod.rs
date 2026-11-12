@@ -71,7 +71,7 @@ pub struct Terminal {
     handle: sys::Terminal,
 }
 
-// The library allocates and frees this handle and nothing here shares it between threads: the broker gives
+// SAFETY: the library allocates and frees this handle and nothing here shares it between threads: the broker gives
 // each session its own, which is the arrangement `screen::Screen` already has under a mutex.
 unsafe impl Send for Terminal {}
 
@@ -1119,6 +1119,8 @@ impl Reported {
 ///
 /// A reply is a control sequence rather than text, and it is kept as a string: lossy, since a sequence
 /// is ASCII in practice and a replacement character is a visible difference rather than a silent one.
+// SAFETY: the core calls this during a parse of the terminal that `route_reports` gave `Reported` as its
+// userdata, which is live for the call; the pointers are those the core documents for this option
 unsafe extern "C" fn collect_reply(
     _terminal: sys::Terminal,
     userdata: *mut std::ffi::c_void,
@@ -1144,6 +1146,8 @@ unsafe extern "C" fn collect_reply(
 ///
 /// **A claim, like the family the core does not read**: anything in the pty can print these, so a
 /// session with a key takes nothing from them, and one without reports what they said as claimed.
+// SAFETY: the core calls this during a parse of the terminal that `route_reports` gave `Reported` as its
+// userdata, which is live for the call; the pointers are those the core documents for this option
 unsafe extern "C" fn note_semantic_prompt(
     _terminal: sys::Terminal,
     userdata: *mut std::ffi::c_void,
@@ -1184,6 +1188,8 @@ unsafe extern "C" fn note_semantic_prompt(
 /// **Unanswered until a window has measured a cell.** The reply carries pixels, and a reply of zero pixels
 /// is a wrong answer where silence is an honest one: a program that hears nothing falls back, and one told
 /// the window is zero pixels wide divides by it.
+// SAFETY: the core calls this during a parse of the terminal that `route_reports` gave `Reported` as its
+// userdata, which is live for the call; the pointers are those the core documents for this option
 unsafe extern "C" fn report_size(
     _terminal: sys::Terminal,
     userdata: *mut std::ffi::c_void,
@@ -1207,6 +1213,8 @@ unsafe extern "C" fn report_size(
 /// **The core stores the raw bytes and says so**: for OSC 7 that is a `file://` URI, which this decodes
 /// with the broker's own decoder. A cleared pwd arrives as a zero-length string and is left alone rather
 /// than recorded as an empty path.
+// SAFETY: the core calls this during a parse of the terminal that `route_reports` gave `Reported` as its
+// userdata, which is live for the call; the pointers are those the core documents for this option
 unsafe extern "C" fn note_pwd(terminal: sys::Terminal, userdata: *mut std::ffi::c_void) {
     if userdata.is_null() {
         return;
@@ -1227,6 +1235,8 @@ unsafe extern "C" fn note_pwd(terminal: sys::Terminal, userdata: *mut std::ffi::
 }
 
 /// The title a program gave its terminal, read back inside the callback as the option requires.
+// SAFETY: the core calls this during a parse of the terminal that `route_reports` gave `Reported` as its
+// userdata, which is live for the call; the pointers are those the core documents for this option
 unsafe extern "C" fn note_title(terminal: sys::Terminal, userdata: *mut std::ffi::c_void) {
     if userdata.is_null() {
         return;
@@ -1244,6 +1254,10 @@ unsafe extern "C" fn note_title(terminal: sys::Terminal, userdata: *mut std::ffi
     // A title set to nothing is a title all the same: the program took its name back
     reported.effects.push(Effect::Title(title.unwrap_or_default()));
 }
+
+// SAFETY: the core calls this during a parse of the terminal that `route_reports` gave `Reported` as its
+
+// userdata, which is live for the call; the pointers are those the core documents for this option
 
 unsafe extern "C" fn note_bell(_terminal: sys::Terminal, userdata: *mut std::ffi::c_void) {
     if userdata.is_null() {
@@ -1263,6 +1277,8 @@ unsafe extern "C" fn note_bell(_terminal: sys::Terminal, userdata: *mut std::ffi
 /// X11 — and that is a different place: told as a clipboard write, it would overwrite what the person
 /// copied with what a program selected. Nothing here has a selection to give it to, so it is taken and
 /// not told.
+// SAFETY: the core calls this during a parse of the terminal that `route_reports` gave `Reported` as its
+// userdata, which is live for the call; the pointers are those the core documents for this option
 unsafe extern "C" fn note_clipboard_write(
     _terminal: sys::Terminal,
     userdata: *mut std::ffi::c_void,
@@ -1279,6 +1295,7 @@ unsafe extern "C" fn note_clipboard_write(
         let text = contents.iter().find_map(|content| {
             // SAFETY: each string is the library's, valid for this call, and is copied
             let mime = unsafe { text_of(&content.mime) }?;
+            // SAFETY: the same guarantee as the mime string above, for the data
             mime.starts_with("text/").then(|| unsafe { text_of(&content.data) }.unwrap_or_default())
         });
         if let Some(text) = text {
@@ -1296,6 +1313,10 @@ unsafe extern "C" fn note_clipboard_write(
     }
 }
 
+// SAFETY: the core calls this during a parse of the terminal that `route_reports` gave `Reported` as its
+
+// userdata, which is live for the call; the pointers are those the core documents for this option
+
 unsafe extern "C" fn note_notification(
     _terminal: sys::Terminal,
     userdata: *mut std::ffi::c_void,
@@ -1311,6 +1332,10 @@ unsafe extern "C" fn note_notification(
     };
     reported.effects.push(Effect::Notification { title: title.unwrap_or_default(), body: body.unwrap_or_default() });
 }
+
+// SAFETY: the core calls this during a parse of the terminal that `route_reports` gave `Reported` as its
+
+// userdata, which is live for the call; the pointers are those the core documents for this option
 
 unsafe extern "C" fn note_progress(
     _terminal: sys::Terminal,
@@ -1336,6 +1361,8 @@ unsafe extern "C" fn note_progress(
 ///
 /// **Noted here and acted on where the parse returns** (`Screen::feed`): a frame is read out of the
 /// terminal, and the terminal is in the middle of a write for as long as this callback runs.
+// SAFETY: the core calls this during a parse of the terminal that `route_reports` gave `Reported` as its
+// userdata, which is live for the call; the pointers are those the core documents for this option
 unsafe extern "C" fn note_render_hold(_terminal: sys::Terminal, userdata: *mut std::ffi::c_void, held: bool) {
     if userdata.is_null() {
         return;
@@ -1348,6 +1375,8 @@ unsafe extern "C" fn note_render_hold(_terminal: sys::Terminal, userdata: *mut s
 ///
 /// One cut short by the limit is handed on as cut (`markers::read`): half a path is not a claim about a
 /// directory, and a keyed mark is vouched for by what comes first in it.
+// SAFETY: the core calls this during a parse of the terminal that `route_reports` gave `Reported` as its
+// userdata, which is live for the call; the pointers are those the core documents for this option
 unsafe extern "C" fn note_unknown_sequence(
     _terminal: sys::Terminal,
     userdata: *mut std::ffi::c_void,

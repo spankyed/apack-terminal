@@ -168,7 +168,7 @@ pub struct Snapshot {
 /// is alive across a call that parses.
 struct Collector(NonNull<Reported>);
 
-// The allocation is this value's alone, and it moves between threads only with the screen that owns it
+// SAFETY: the allocation is this value's alone, and it moves between threads only with the screen that owns it
 unsafe impl Send for Collector {}
 
 impl Collector {
