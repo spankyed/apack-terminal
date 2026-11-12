@@ -477,6 +477,11 @@ impl Screen {
         }
     }
 
+    /// Whether the program holds the screen (mode 2026) now.
+    pub fn holding(&self) -> bool {
+        self.hold.is_some()
+    }
+
     /// Says what ends a hold of this screen's that its program does not (`holds`).
     pub fn limit_holds(&mut self, limit: HoldLimit) {
         self.hold_limit = Some(limit);
@@ -967,7 +972,8 @@ impl Screen {
     pub fn fetch(&mut self, epoch: u32, first: u64, count: u32) -> Result<Fetched, Unanswered> {
         self.numbered(epoch)?;
         let Some(publication) = &mut self.publication else { return Err(Unanswered::Unviewed) };
-        let (count, rows) = publication.fetch(&self.terminal, first, count)?;
+        let held = self.hold.is_some();
+        let (count, rows) = publication.fetch(&self.terminal, first, count, held)?;
         Ok(Fetched { first, count, rows })
     }
 

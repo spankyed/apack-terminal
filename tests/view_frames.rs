@@ -237,6 +237,29 @@ fn a_program_holding_the_screen_is_not_shown_half_drawn() {
     assert_eq!(lines(&view.frame()), vec![(0, "half done".to_owned())]);
 }
 
+/// **A snapshot read during a hold is the screen from before it.** A view that asks for lines by number
+/// while a program is redrawing gets what the program last let go of, not the half-drawn rows it is
+/// writing: the same rule the frames follow.
+#[test]
+fn lines_fetched_while_the_program_is_holding_the_screen_are_those_from_before_the_hold() {
+    let mut screen = Screen::new(20, 3);
+    screen.feed(b"old text");
+    let view = View::attached(&mut screen, 1, 1);
+    let first = view.frame();
+    let epoch = first.epoch;
+    screen.acknowledge(view.id, first.sequence).expect("an acknowledgement is taken");
+
+    write(&mut screen, "\x1b[?2026h\x1b[1;1Hnew text");
+    let fetched = screen.fetch(epoch, 0, 1).expect("a fetch reads");
+    let rows = fetched.rows.block().expect("the rows read back").rows.iter().map(|row| text(row)).collect::<Vec<_>>();
+    assert_eq!(rows, vec!["old text".to_owned()], "a fetch during a hold shows the screen before it");
+
+    write(&mut screen, "\x1b[?2026l");
+    let fetched = screen.fetch(epoch, 0, 1).expect("a fetch reads");
+    let rows = fetched.rows.block().expect("the rows read back").rows.iter().map(|row| text(row)).collect::<Vec<_>>();
+    assert_eq!(rows, vec!["new text".to_owned()], "and what the program let go of once it has");
+}
+
 /// A program that asks and never lets go is drawn anyway, once it has had the time the limit allows.
 #[test]
 fn a_hold_nobody_ends_is_drawn_after_the_limit() {

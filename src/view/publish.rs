@@ -476,11 +476,27 @@ impl Publication {
     /// The lines a view asked for, as the terminal holds them now, and how many lines from `first` that
     /// answers for: all that were asked, up to `FETCH_LINES`, unless a message filled first. A line
     /// answered for and not among the rows is one the terminal does not hold.
-    pub fn fetch(&mut self, terminal: &Terminal, first: u64, count: u32) -> Result<(u32, Rows), Failed> {
+    ///
+    /// **While the program holds the screen, a line on the screen is the row last sent for it**, the same
+    /// rule the frames follow: what the program is part way through writing is not shown to a view until
+    /// it lets go. A line that was not on the screen when it was last sent is read as the terminal has it.
+    pub fn fetch(&mut self, terminal: &Terminal, first: u64, count: u32, held: bool) -> Result<(u32, Rows), Failed> {
         self.advance(terminal)?;
         let mut rows = Rows::default();
         let mut covered = 0;
         for line in first..first.saturating_add(u64::from(count.min(FETCH_LINES))) {
+            if held
+                && let Some(sent) = line
+                    .checked_sub(self.captured_first)
+                    .and_then(|index| self.active.get(usize::try_from(index).ok()?))
+            {
+                if !rows.takes(sent.body.len()) {
+                    break;
+                }
+                rows.push(line, &sent.body);
+                covered += 1;
+                continue;
+            }
             if let Some(row) = self.screen_row(line)
                 && terminal.read_row_into(Space::Screen, row, &mut self.read)?
             {
