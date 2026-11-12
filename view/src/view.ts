@@ -312,7 +312,7 @@ export class TerminalView {
         this.options.onSelectionChange?.(selected)
       }
       this.schedule()
-    }, () => ({ oldest: this.store.oldest, end: this.store.end }))
+    }, () => ({ oldest: this.store.oldest, end: this.store.end }), (line) => this.store.row(line) ?? null)
     this.input = new Input(source, {
       mac: this.mac,
       optionIsAlt: options.optionIsAlt,
