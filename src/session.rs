@@ -1548,6 +1548,10 @@ impl Sessions {
             code: ErrorCode::NoSuchSession,
             message: format!("{recording} holds no recording to look back through"),
         };
+        recording::check(&path).map_err(|why| Refusal {
+            code: ErrorCode::NoSuchSession,
+            message: format!("{recording} is not a recording this broker reads: {why}"),
+        })?;
         let mut index = recording::Index::open(&path).ok_or_else(nothing)?;
         let (first, last) = (index.first(), index.last());
         let entries = index.moment(last).map_err(|error| Refusal::pty("reading a recording", error))?;
