@@ -4,7 +4,7 @@ import { CanvasPainter } from '../src/canvas-painter.ts'
 import type { Theme } from '../src/draw.ts'
 import type { Painter, Scene } from '../src/painter.ts'
 import { PLAIN, StyleFlag, paletteColor, type Fetched } from '../src/source.ts'
-import { BLINK_MS, TerminalView } from '../src/view.ts'
+import { BLINK_MS, TerminalView, type CursorBlink } from '../src/view.ts'
 import { recordingContext } from './_canvas.ts'
 import { framesWaiting, installFrames, runFrames } from './_frames.ts'
 import { FakeSource } from './_source.ts'
@@ -721,6 +721,56 @@ describe('the cursor', () => {
       view.source.send({ ...withCursor(true), sequence: 2 })
       vi.advanceTimersByTime(BLINK_MS)
       expect(view.painted().cursor).toBeUndefined()
+    })
+  })
+
+  it('is drawn in the inactive style the view is given while the view does not have the keyboard', () => {
+    const { source, view, painter } = mountedView({ cursorInactive: 'underline' })
+    source.send(withCursor(false))
+    runFrames()
+    expect(painter.scenes.at(-1)?.cursor?.shape).toBe('underline')
+
+    view.setFocused(true)
+    runFrames()
+    expect(painter.scenes.at(-1)?.cursor?.shape, 'the program\'s shape once focused').toBe('bar')
+  })
+
+  describe('whose blink the view is given', () => {
+    beforeEach(() => { vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] }) })
+    afterEach(() => { vi.useRealTimers() })
+
+    function focused(cursorBlink: CursorBlink, blinking: boolean) {
+      const view = mountedView({ cursorBlink })
+      view.view.setFocused(true)
+      view.source.send(withCursor(blinking))
+      return view
+    }
+
+    it('blinks a cursor the program steadied when the view is given on', () => {
+      const view = focused('on', false)
+      expect(view.painted().cursor).toBeDefined()
+      vi.advanceTimersByTime(BLINK_MS)
+      expect(view.painted().cursor, 'did not blink').toBeUndefined()
+    })
+
+    it('never hides a cursor the program blinks when the view is given off', () => {
+      const view = focused('off', true)
+      vi.advanceTimersByTime(BLINK_MS * 3)
+      expect(view.painted().cursor, 'hidden').toBeDefined()
+      expect(vi.getTimerCount(), 'a clock for a cursor that does not blink').toBe(0)
+    })
+
+    it('blinks as the program asks when the view is given program', () => {
+      const view = focused('program', true)
+      vi.advanceTimersByTime(BLINK_MS)
+      expect(view.painted().cursor, 'did not blink for a program that asked').toBeUndefined()
+    })
+
+    it('does not blink as the program asks when the view is given program and the program steadied it', () => {
+      const view = focused('program', false)
+      vi.advanceTimersByTime(BLINK_MS * 3)
+      expect(view.painted().cursor, 'hidden for a program that steadied it').toBeDefined()
+      expect(vi.getTimerCount(), 'a clock for a cursor the program steadied').toBe(0)
     })
   })
 

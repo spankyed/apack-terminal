@@ -5,7 +5,7 @@ import { linkAt, urls, type Detector, type Link } from './links.ts'
 import { fontOf, type Font, type Painter, type Scene } from './painter.ts'
 import { RowStore } from './row-store.ts'
 import { Selection, type Granularity } from './selection.ts'
-import { Modifier, PLAIN, TooLarge, type Command, type Frame, type Picture, type Placements, type PointerInput, type Position, type Row, type SessionColors, type Span, type TerminalSource } from './source.ts'
+import { Modifier, PLAIN, TooLarge, type Command, type Frame, type Picture, type Placements, type PointerInput, type CursorShape, type Position, type Row, type SessionColors, type Span, type TerminalSource } from './source.ts'
 import { Viewport } from './viewport.ts'
 
 /**
@@ -52,6 +52,13 @@ const CLICK_AGAIN_PIXELS = 4
 /** The shortest the scrollbar's thumb is drawn, in pixels, however much history it stands for */
 const THUMB_MIN = 20
 
+/**
+ * Whether the cursor blinks while the view has the keyboard. `on` and `off` are the app's setting, and
+ * override what the program asks for: in the core, DECSCUSR's blink and DEC mode 12 are one setting, so
+ * `program` is whichever of those the program last set.
+ */
+export type CursorBlink = 'on' | 'off' | 'program'
+
 export interface ViewOptions {
   /** The typeface a view starts in; `setFont` changes it */
   readonly font: Font
@@ -97,6 +104,16 @@ export interface ViewOptions {
    * what was typed appears. Left out, they do.
    */
   readonly followOnInput?: boolean
+  /**
+   * The shape the cursor is drawn in while the view does not have the keyboard. Left out, a hollow block.
+   */
+  readonly cursorInactive?: CursorShape
+  /**
+   * Whether the cursor blinks while the view has the keyboard (`CursorBlink`). Left out, `program`: the
+   * blink the broker reports, as the program left it. A host that has an app setting passes it, with
+   * "unset" resolved to the value that setting means.
+   */
+  readonly cursorBlink?: CursorBlink
   /**
    * Whether a Mac's option key is alt rather than the key that composes characters: a key held with it is
    * then sent as what the key types without it. Left out, option composes, as it does everywhere else on
@@ -1158,6 +1175,17 @@ export class TerminalView {
     this.schedule()
   }
 
+  /** Whether the cursor blinks now: the view's setting where it has one, and the program's where it does not */
+  private cursorBlinks(): boolean {
+    const cursor = this.frame?.cursor
+    if (!cursor) return false
+    switch (this.options.cursorBlink ?? 'program') {
+      case 'on': return true
+      case 'off': return false
+      case 'program': return cursor.blinking
+    }
+  }
+
   /**
    * Shows the cursor and starts its blink over, which is what anything typed and anything printed does:
    * a cursor that has just moved is one a person is looking for. It blinks only while the view has the
@@ -1170,7 +1198,7 @@ export class TerminalView {
       this.cursorShown = true
       this.schedule()
     }
-    if (!this.focused || !this.listening || !this.frame?.cursor?.blinking) return
+    if (!this.focused || !this.listening || !this.cursorBlinks()) return
     this.blink = setInterval(() => {
       this.cursorShown = !this.cursorShown
       this.schedule()
@@ -1675,7 +1703,7 @@ export class TerminalView {
       column: cursor.column,
       row: index,
       cells: row && at !== -1 ? row.width[at]! : 1,
-      shape: this.focused ? cursor.shape : 'hollow',
+      shape: this.focused ? cursor.shape : (this.options.cursorInactive ?? 'hollow'),
       text: row && at !== -1 ? { text: row.text[at]!, bold: ((style?.flags ?? 0) & 1) !== 0, italic: ((style?.flags ?? 0) & 2) !== 0 } : undefined,
     }
   }
