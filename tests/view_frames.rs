@@ -623,6 +623,40 @@ fn a_row_carries_each_characters_style_and_link() {
     assert!(bar.glyphs.iter().all(|glyph| glyph.text == " " && styled(2, glyph).bg == Color::Palette(4)));
 }
 
+/// **A hyperlink covers the cells written inside its sequence and no others.** The cell after the close is
+/// unlinked. An id parameter does not change the URI reported: the core's only hyperlink accessor answers
+/// the URI, and no id, so grouping by id is not something a row can carry.
+#[test]
+fn a_hyperlink_covers_its_cells_until_it_is_closed_and_an_id_does_not_change_the_uri() {
+    let mut screen = Screen::new(30, 2);
+    screen.feed(b"\x1b]8;id=one;https://example.com\x1b\\in\x1b]8;;\x1b\\out");
+    let view = View::attached(&mut screen, 1, 1);
+    let frame = view.frame();
+    let row = &frame.block.rows[0];
+    let glyph_at = |column: u16| row.glyphs.iter().find(|glyph| glyph.column == column).expect("a glyph at that column");
+
+    assert_eq!(row.link_of(glyph_at(0)), Some("https://example.com"), "a cell inside the sequence, with an id on it");
+    assert_eq!(row.link_of(glyph_at(1)), Some("https://example.com"));
+    assert_eq!(row.link_of(glyph_at(2)), None, "the cell after the close");
+}
+
+/// **A hyperlink that wraps reports its URI on each row it covers**, the same string both times, so a view
+/// that groups cells by URI can see that they are one link across the wrap.
+#[test]
+fn a_hyperlink_that_wraps_reports_its_uri_on_each_row_it_covers() {
+    let mut screen = Screen::new(10, 3);
+    screen.feed(b"\x1b]8;;https://example.com/long\x1b\\abcdefghijkl\x1b]8;;\x1b\\");
+    let view = View::attached(&mut screen, 1, 1);
+    let frame = view.frame();
+    let rows = &frame.block.rows;
+    let last_of_first = rows[0].glyphs.iter().find(|glyph| glyph.column == 9).expect("the last cell of the first row");
+    let first_of_second = rows[1].glyphs.iter().find(|glyph| glyph.column == 0).expect("the first cell of the second row");
+
+    assert!(rows[0].wrapped, "the first row wraps onto the second");
+    assert_eq!(rows[0].link_of(last_of_first), Some("https://example.com/long"));
+    assert_eq!(rows[1].link_of(first_of_second), Some("https://example.com/long"));
+}
+
 /// A colour named exactly rather than by the palette is a cell of background all the same, and a wide
 /// character drawn in a colour is one character: the cell beside it that it also covers is not a second.
 #[test]
