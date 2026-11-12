@@ -951,20 +951,27 @@ fn every_stopped_recording_is_whole_once_they_have_all_been_waited_for() {
 /// **A broker names only the recordings whose sessions are still running.** A session that ended has
 /// nothing left to write, and a rewind of its file does not wait for it, so the list it was kept in is
 /// bounded by what is running and not by everything recorded since the broker started.
+///
+/// The sessions here end on their own, and are forgotten the way the broker's writer forgets a session
+/// once its end is told, rather than being killed: a kill of a process that has already gone is a refusal
+/// the case has no reason to meet.
 #[cfg(unix)]
 #[test]
 fn a_recording_whose_session_ended_is_no_longer_named() {
-    use apack_terminal::output::Credit;
+    use std::time::Duration;
+
+    use apack_terminal::output::{Credit, Outgoing};
+    use apack_terminal::protocol::Event;
     use apack_terminal::session::{Sessions, Spawning};
 
     let directory = tempfile::tempdir().expect("a directory for recordings");
-    let (events, _told) = std::sync::mpsc::channel();
+    let (events, told) = std::sync::mpsc::channel::<Outgoing>();
     let sessions = Sessions::new(events, Credit::new(64));
-    let spawn = |file: &str| Spawning {
+    let spawn = |file: &str, script: &str| Spawning {
         cols: 40,
         rows: 10,
         shell: Some("/bin/sh".to_owned()),
-        args: vec!["-c".to_owned(), "sleep 600".to_owned()],
+        args: vec!["-c".to_owned(), script.to_owned()],
         env: Vec::new(),
         unset: Vec::new(),
         cwd: None,
@@ -975,16 +982,22 @@ fn a_recording_whose_session_ended_is_no_longer_named() {
         images: false,
         marks_key: None,
     };
-    let mut ids = Vec::new();
-    for file in ["first.rec", "second.rec", "third.rec"] {
-        sessions.spawn(spawn(file)).expect("the session starts");
-        ids.push(format!("s-{}", ids.len() + 1));
-    }
-    assert_eq!(sessions.recorders(), 3);
 
-    sessions.kill(&ids[0]).expect("the first session is ended");
-    sessions.kill(&ids[1]).expect("the second session is ended");
-    // Spawning the next one is what looks at the list, so the two ended ones are gone from it
-    sessions.spawn(spawn("fourth.rec")).expect("the next session starts");
-    assert_eq!(sessions.recorders(), 2, "the ended sessions are still named");
+    // Two recordings whose programs end at once, and one that is still running when the list is looked at
+    sessions.spawn(spawn("first.rec", "exit 0")).expect("the first session starts");
+    sessions.spawn(spawn("second.rec", "exit 0")).expect("the second session starts");
+    let mut ended = Vec::new();
+    while ended.len() < 2 {
+        let message = told.recv_timeout(Duration::from_secs(10)).expect("both sessions are told they ended");
+        if let Some(Event::Exited { session, .. }) = message.event {
+            ended.push(session);
+        }
+    }
+    for session in &ended {
+        sessions.forget(session);
+    }
+
+    sessions.spawn(spawn("third.rec", "sleep 600")).expect("the third session starts");
+    assert_eq!(sessions.recorders(), 1, "the sessions that ended are still named");
+    let _ = sessions.kill("s-3");
 }
