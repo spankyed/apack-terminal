@@ -35,15 +35,42 @@ describe('the colour a character is drawn in', () => {
     expect(ensureContrast(0x123456, WHITE, 1)).toBe(0x123456)
   })
 
-  it('is moved until it reaches the minimum, and no further than it has to go', () => {
+  it('is moved to the nearest colour that reaches the minimum, not one further along', () => {
+    // The adjustment's path: from the foreground toward whichever of black or white gives more contrast, which is the
+    // target a reader would pick. Each step along it is a blend, so the scan below walks the path a thousandth at a time.
+    const along = (foreground: number, target: number, amount: number) => {
+      const mix = (shift: number) => Math.round(((foreground >> shift) & 0xff) * (1 - amount) + ((target >> shift) & 0xff) * amount)
+      return (mix(16) << 16) | (mix(8) << 8) | mix(0)
+    }
+    const nearest = (foreground: number, background: number, minimum: number) => {
+      const target = contrastRatio(WHITE, background) >= contrastRatio(BLACK, background) ? WHITE : BLACK
+      for (let step = 0; step <= 1000; step += 1) {
+        const colour = along(foreground, target, step / 1000)
+        if (contrastRatio(colour, background) >= minimum) return { colour, amount: step / 1000, target }
+      }
+      return null
+    }
     for (const minimum of [2, 3, 4.5, 7]) {
       for (const background of [BLACK, WHITE, 0x3366cc, 0x808080]) {
         for (const foreground of [0x000000, 0x111111, 0x777777, 0xdddddd, 0x3366cc]) {
+          const label = `${foreground.toString(16)} on ${background.toString(16)} at ${minimum}`
           const drawn = ensureContrast(foreground, background, minimum)
-          const best = Math.max(contrastRatio(BLACK, background), contrastRatio(WHITE, background))
-          // Where the minimum is reachable it is met; where it is not, the most contrast black or white can give is
-          if (best >= minimum) expect(contrastRatio(drawn, background), `${foreground.toString(16)} on ${background.toString(16)} at ${minimum}`).toBeGreaterThanOrEqual(minimum - 0.01)
-          else expect(contrastRatio(drawn, background)).toBeCloseTo(best, 2)
+          if (contrastRatio(foreground, background) >= minimum) {
+            expect(drawn, label).toBe(foreground)
+            continue
+          }
+          const reach = nearest(foreground, background, minimum)
+          if (reach === null) {
+            // Not reachable even at black or white: the most contrast the colour can have is drawn
+            const best = Math.max(contrastRatio(BLACK, background), contrastRatio(WHITE, background))
+            expect(contrastRatio(drawn, background), label).toBeCloseTo(best, 2)
+            continue
+          }
+          expect(contrastRatio(drawn, background), label).toBeGreaterThanOrEqual(minimum)
+          // Within a channel unit of the nearest colour on the path, so neither less nor further adjusted was chosen
+          for (const shift of [16, 8, 0]) expect(Math.abs(((drawn >> shift) & 0xff) - ((reach.colour >> shift) & 0xff)), label).toBeLessThanOrEqual(1)
+          // A little less adjusted than that fails the minimum
+          if (reach.amount >= 0.01) expect(contrastRatio(along(foreground, reach.target, reach.amount - 0.01), background), label).toBeLessThan(minimum)
         }
       }
     }
