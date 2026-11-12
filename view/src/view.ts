@@ -100,6 +100,8 @@ export interface ViewOptions {
   readonly onSelectionChange?: (selected: boolean) => void
   /** Text was copied. Left out, it is written to the clipboard the page has */
   readonly onCopy?: (text: string) => void
+  /** The commands the shell has reported, each time the view hears them: a host draws its command list from this */
+  readonly onCommands?: (commands: readonly Command[]) => void
   /**
    * Copies a selection as the pointer is let go, as iTerm2 and Ghostty can, so the text is on the clipboard without a
    * key. Off unless set, as macOS Terminal has it: a selection overwriting what was copied is a surprise to most people.
@@ -522,6 +524,7 @@ export class TerminalView {
 
   private setCommands(commands: readonly Command[]): void {
     this.commandList = commands
+    this.options.onCommands?.(commands)
     const starts: CommandLine[] = []
     const prompts: CommandLine[] = []
     for (const command of commands) {
@@ -687,6 +690,20 @@ export class TerminalView {
   /** Gives the view the keyboard */
   focus(): void {
     this.input.field.focus({ preventScroll: true })
+  }
+
+  /** Copies what one command printed, answering whether there was any to copy: a command whose output has left the history has none */
+  async copyCommand(command: Command): Promise<boolean> {
+    return this.selectOutput(command) ? this.copy() : false
+  }
+
+  /**
+   * Types `text` into the program as text a keyboard typed: what a program at a prompt would be sent by someone at the
+   * keyboard, with no paste and so no confirmation. A view scrolled back follows the screen down to it, as a key does.
+   */
+  typeText(text: string): void {
+    this.source.text(text)
+    this.typed()
   }
 
   /**
