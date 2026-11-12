@@ -750,13 +750,13 @@ describe('the commands a shell ran', () => {
     expect(view.painted().marks, 'a command that succeeded').toEqual([{ row: 0, color: theme.palette[2] }])
   })
 
-  it('are marked by the status each ended with, whoever reported it, and grey where there was none', async () => {
+  it('are marked by the status each ended with, a claim in the claim colour, and grey where there was none', async () => {
     const view = mountedView({ gutter: 6 })
     const ended: Array<[Command['outcome'], number | undefined, string]> = [
       [{ kind: 'exited', code: 0 }, theme.palette[2], 'an exit of zero'],
-      [{ kind: 'claimed', code: 0 }, theme.palette[2], 'a claim of zero'],
-      [{ kind: 'claimed', code: 2 }, theme.palette[1], 'a claim of a failure'],
-      [{ kind: 'claimed', code: null }, theme.palette[8], 'a claim of an end with no status'],
+      [{ kind: 'claimed', code: 0 }, theme.palette[3], 'a claim of zero'],
+      [{ kind: 'claimed', code: 2 }, theme.palette[3], 'a claim of a failure'],
+      [{ kind: 'claimed', code: null }, theme.palette[3], 'a claim of an end with no status'],
       [{ kind: 'unknown', why: 'no_status' }, theme.palette[8], 'an end with no status'],
       [{ kind: 'unknown', why: 'superseded' }, theme.palette[8], 'an end nothing reported'],
       [{ kind: 'unknown', why: 'session_ended' }, theme.palette[8], 'a session that ended'],

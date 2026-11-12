@@ -1681,15 +1681,13 @@ function hex(color: number): string {
 }
 
 /**
- * Which of the theme's sixteen colours marks a command: grey (8) for one still to run, blue (4) for one
- * running, green (2) for one that ended with zero and red (1) for one that ended with anything else.
+ * Which of the theme's sixteen colours marks a command: grey (8) for one still to run, blue (4) for one running, green (2)
+ * for one that exited with zero, red (1) for one that exited with anything else, and yellow (3) for one whose status is
+ * only claimed. A command whose end nothing reported is grey.
  *
- * **A status is drawn as the status it is, whoever reported it.** The mark is for a person, who is
- * looking at the output it stands beside and to whom everything on a screen is what a program printed:
- * a session with no key — a shell on a target, `cmd` — would otherwise draw every command that
- * succeeded as a warning. What tells a status that was vouched for from one that was only claimed is
- * the command's `outcome`, which is what a program reads. A command whose end nothing reported, or
- * that ended with no status, is grey.
+ * **A claim is drawn as a claim, whatever its code.** What separates a vouched status from a claimed one is the
+ * command's `outcome` kind, which is what a program reads; the code of a claim is not evidence of anything, so a claim
+ * of zero is yellow, the same as a claim of failure.
  */
 function markColor(command: Command): number {
   if (command.startedMs === null) return 8
@@ -1698,7 +1696,7 @@ function markColor(command: Command): number {
     case 'running': return 4
     case 'exited': return outcome.code === 0 ? 2 : 1
     case 'unknown': return 8
-    case 'claimed': return outcome.code === null ? 8 : outcome.code === 0 ? 2 : 1
+    case 'claimed': return 3
   }
 }
 
