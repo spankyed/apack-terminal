@@ -127,6 +127,8 @@ interface Pressed {
   readonly reporting: boolean
   readonly at: Position
   moved: boolean
+  /** Whether Alt (Option on a Mac) was held when the press began: a drag over cells then selects a rectangle */
+  readonly block: boolean
 }
 
 /** A point on the page, as a pointer event gives one */
@@ -1194,7 +1196,7 @@ export class TerminalView {
     const at = this.positionOf(event)
     // A program that asked for the mouse owns it, where the screen is showing; shift takes it back
     const reporting = this.frame?.modes.mouse === true && !event.shiftKey && this.viewport.following
-    this.pressed = { button: event.button, reporting, at, moved: false }
+    this.pressed = { button: event.button, reporting, at, moved: false, block: event.altKey }
     this.element.setPointerCapture?.(event.pointerId)
     if (reporting) {
       const input = this.pointerInput(event, 'press', event.button)
@@ -1225,7 +1227,7 @@ export class TerminalView {
       // The first move off the cell that was pressed is where a selection starts: a click selects nothing
       if (!pressed.moved && (at.line !== pressed.at.line || at.column !== pressed.at.column)) {
         pressed.moved = true
-        if (!this.selection.span) this.selection.begin(pressed.at, 'cell')
+        if (!this.selection.span) this.selection.begin(pressed.at, 'cell', pressed.block ? 'block' : 'linear')
       }
       if (pressed.moved) {
         this.selection.extendTo(at)
