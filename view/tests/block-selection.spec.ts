@@ -66,9 +66,7 @@ describe('a block selected with Alt', () => {
     const copied: string[] = []
     const view = mountedView({ onCopy: (text) => { copied.push(text) } }, source)
     // The wide character takes cells 2 and 3, so the characters after it start at 4
-    const wide = row(0, 'ab中cd')
-    wide.column = Uint16Array.from([0, 1, 2, 4, 5])
-    wide.width = Uint8Array.from([1, 1, 2, 1, 1])
+    const wide = { ...row(0, 'ab中cd'), column: Uint16Array.from([0, 1, 2, 4, 5]), width: Uint8Array.from([1, 1, 2, 1, 1]) }
     view.source.send(frame({ columns: 20, screenRows: 1, rows: [wide] }))
     runFrames()
     // The rectangle is cells 3 to 4: its left column is the wide character's second cell, which is highlighted with it
@@ -86,9 +84,7 @@ describe('a block selected with Alt', () => {
     const source = new Named()
     const copied: string[] = []
     const view = mountedView({ onCopy: (text) => { copied.push(text) } }, source)
-    const wide = row(0, 'ab中cd')
-    wide.column = Uint16Array.from([0, 1, 2, 4, 5])
-    wide.width = Uint8Array.from([1, 1, 2, 1, 1])
+    const wide = { ...row(0, 'ab中cd'), column: Uint16Array.from([0, 1, 2, 4, 5]), width: Uint8Array.from([1, 1, 2, 1, 1]) }
     view.source.send(frame({ columns: 20, screenRows: 1, rows: [wide] }))
     runFrames()
     // The rectangle ends on the wide character's first cell, so the character is in it and is copied to its last cell
