@@ -1034,8 +1034,9 @@
     "to": "broker"
   },
   {
-    "hex": "0a0000000d030d066572726f723a",
+    "hex": "0b0000000d030d066572726f723a00",
     "message": {
+      "caseSensitive": false,
       "channel": 3,
       "kind": "search",
       "needle": "error:",

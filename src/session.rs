@@ -880,8 +880,8 @@ impl Handle {
         Ok(self.on_screen(|screen| screen.text_of(epoch, span))??)
     }
 
-    pub fn find(&self, needle: &str) -> Result<(u32, Vec<Span>), Refusal> {
-        Ok(self.on_screen(|screen| screen.find(needle))??)
+    pub fn find(&self, needle: &str, case_sensitive: bool) -> Result<(u32, Vec<Span>), Refusal> {
+        Ok(self.on_screen(|screen| screen.find(needle, case_sensitive))??)
     }
 
     /// Every image in the session, with the epoch their lines are in and one cell in pixels.

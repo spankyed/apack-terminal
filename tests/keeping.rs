@@ -771,7 +771,7 @@ fn a_view_that_sends_nonsense_and_stops_reading_does_not_keep_the_broker() {
     vandal.write_all(&ToBroker::Attach { channel: 1, session: session.clone() }.encode()).expect("the broker reads");
     // Megabytes of answers it will not read: far more than a socket holds, far less than it may leave
     let ask = ToBroker::Commands { channel: 1, request: 1 }.encode();
-    let search = ToBroker::Search { channel: 1, request: 2, needle: "$".to_owned() }.encode();
+    let search = ToBroker::Search { channel: 1, request: 2, needle: "$".to_owned(), case_sensitive: false }.encode();
     for _ in 0..40_000 {
         vandal.write_all(&ask).expect("the broker reads");
         vandal.write_all(&search).expect("the broker reads");
@@ -945,7 +945,7 @@ fn a_view_that_stops_speaking_and_never_reads_does_not_keep_the_broker() {
     silent.write_all(&ToBroker::Attach { channel: 1, session: session.clone() }.encode()).expect("the broker reads");
     // Megabytes of answers it will not read: far more than a socket holds, far less than it may leave
     let ask = ToBroker::Commands { channel: 1, request: 1 }.encode();
-    let search = ToBroker::Search { channel: 1, request: 2, needle: "$".to_owned() }.encode();
+    let search = ToBroker::Search { channel: 1, request: 2, needle: "$".to_owned(), case_sensitive: false }.encode();
     for _ in 0..40_000 {
         silent.write_all(&ask).expect("the broker reads");
         silent.write_all(&search).expect("the broker reads");

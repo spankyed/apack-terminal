@@ -202,8 +202,8 @@ fn to_broker(message: &ToBroker) -> Value {
         ToBroker::TextOf { channel, request, epoch, span: asked } => {
             json!({ "kind": "textOf", "channel": channel, "request": request, "epoch": epoch, "span": span(*asked) })
         }
-        ToBroker::Search { channel, request, needle } => {
-            json!({ "kind": "search", "channel": channel, "request": request, "needle": needle })
+        ToBroker::Search { channel, request, needle, case_sensitive } => {
+            json!({ "kind": "search", "channel": channel, "request": request, "needle": needle, "caseSensitive": case_sensitive })
         }
         ToBroker::Commands { channel, request } => {
             json!({ "kind": "commands", "channel": channel, "request": request })
@@ -574,7 +574,7 @@ fn vectors() -> Value {
         ("asking for a word", ToBroker::WordAt { channel: 3, request: 10, epoch: 2, at }),
         ("asking for a line", ToBroker::LineAt { channel: 3, request: 16, epoch: 2, at }),
         ("asking for text", ToBroker::TextOf { channel: 3, request: 12, epoch: 2, span: across }),
-        ("searching", ToBroker::Search { channel: 3, request: 13, needle: "error:".to_owned() }),
+        ("searching", ToBroker::Search { channel: 3, request: 13, needle: "error:".to_owned(), case_sensitive: false }),
         ("asking for the commands", ToBroker::Commands { channel: 3, request: 17 }),
         ("asking where the images are", ToBroker::Images { channel: 3, request: 18 }),
         ("asking for an image's pixels", ToBroker::Image { channel: 3, request: 20, image: 7, offset: 8 }),

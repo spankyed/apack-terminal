@@ -1028,8 +1028,8 @@ impl Screen {
     }
 
     /// Every place `needle` appears, newest first, with the epoch the line numbers are in.
-    pub fn find(&mut self, needle: &str) -> Result<(u32, Vec<Span>), Unanswered> {
-        let found = self.terminal.find(needle)?;
+    pub fn find(&mut self, needle: &str, case_sensitive: bool) -> Result<(u32, Vec<Span>), Unanswered> {
+        let found = self.terminal.find(needle, case_sensitive)?;
         let publication = self.positioned()?;
         Ok((publication.epoch(), found.into_iter().map(|cells| Self::span_of(publication, cells)).collect()))
     }

@@ -770,8 +770,8 @@ fn carry_out_view(
                 Err(refusal) => failed(channel, request, refusal),
             }
         }
-        ToBroker::Search { channel, request, needle } => {
-            match session_of(channel).and_then(|handle| handle.find(&needle)) {
+        ToBroker::Search { channel, request, needle, case_sensitive } => {
+            match session_of(channel).and_then(|handle| handle.find(&needle, case_sensitive)) {
                 Ok((epoch, spans)) => answer(channel, request, ToView::Spans { channel, request, epoch, spans }),
                 Err(refusal) => failed(channel, request, refusal),
             }

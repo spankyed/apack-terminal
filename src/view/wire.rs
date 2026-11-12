@@ -534,6 +534,8 @@ pub enum ToBroker {
         channel: u32,
         request: u32,
         needle: String,
+        /// Whether the needle's letters must match in their own case; without it either case matches
+        case_sensitive: bool,
     },
     /// The commands the shell has reported in this session.
     Commands {
@@ -1221,10 +1223,11 @@ impl ToBroker {
                 out.number(*epoch);
                 out.span(*span);
             }),
-            Self::Search { channel, request, needle } => framed_as_it_is(kind::SEARCH, |out| {
+            Self::Search { channel, request, needle, case_sensitive } => framed_as_it_is(kind::SEARCH, |out| {
                 out.number(*channel);
                 out.number(*request);
                 out.text(needle);
+                out.flag(*case_sensitive);
             }),
             Self::Commands { channel, request } => framed_as_it_is(kind::COMMANDS, |out| {
                 out.number(*channel);
@@ -1293,7 +1296,12 @@ impl ToBroker {
             kind::TEXT_OF => {
                 Self::TextOf { channel: read.u32()?, request: read.u32()?, epoch: read.u32()?, span: read.span()? }
             }
-            kind::SEARCH => Self::Search { channel: read.u32()?, request: read.u32()?, needle: read.text()? },
+            kind::SEARCH => Self::Search {
+                channel: read.u32()?,
+                request: read.u32()?,
+                needle: read.text()?,
+                case_sensitive: read.flag()?,
+            },
             kind::COMMANDS => Self::Commands { channel: read.u32()?, request: read.u32()? },
             kind::IMAGES => Self::Images { channel: read.u32()?, request: read.u32()? },
             kind::IMAGE => {

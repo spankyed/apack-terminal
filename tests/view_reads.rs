@@ -89,13 +89,13 @@ fn a_search_answers_every_match_newest_first_in_either_case() {
     screen.feed(written.as_bytes());
     let (viewed_in, _view) = viewed(&mut screen);
 
-    let (epoch, found) = screen.find("needle").expect("a search runs");
+    let (epoch, found) = screen.find("needle", false).expect("a search runs");
     assert_eq!(epoch, viewed_in);
     assert_eq!(found.len(), 8);
     assert_eq!(found[0], span((7, 6), (7, 11)), "the newest first");
     assert_eq!(found[7], span((0, 6), (0, 11)), "and the oldest, from history, last");
-    assert!(screen.find("absent").expect("a search runs").1.is_empty());
-    assert!(screen.find("").expect("a search runs").1.is_empty());
+    assert!(screen.find("absent", false).expect("a search runs").1.is_empty());
+    assert!(screen.find("", false).expect("a search runs").1.is_empty());
 }
 
 /// A match can run across the end of a row, where the line wrapped.
@@ -104,8 +104,24 @@ fn a_search_finds_text_that_wrapped() {
     let mut screen = Screen::new(10, 4);
     screen.feed(b"0123456needle");
     let _view = viewed(&mut screen);
-    let (_, found) = screen.find("needle").expect("a search runs");
+    let (_, found) = screen.find("needle", false).expect("a search runs");
     assert_eq!(found, vec![span((0, 7), (1, 2))]);
+}
+
+/// **A case-sensitive search keeps the matches written in the needle's case.** The core matches letters in
+/// either case, so a search for `hello` finds both lines, and one that asks for the case finds only the line
+/// that was written in it.
+#[test]
+fn a_case_sensitive_search_keeps_only_the_matches_in_the_needles_case() {
+    let mut screen = Screen::new(40, 4);
+    screen.feed(b"Hello there\r\nhello again\r\n");
+    let _view = viewed(&mut screen);
+
+    let (_, either) = screen.find("hello", false).expect("a search runs");
+    assert_eq!(either, vec![span((1, 0), (1, 4)), span((0, 0), (0, 4))]);
+    let (_, exact) = screen.find("hello", true).expect("a search runs");
+    assert_eq!(exact, vec![span((1, 0), (1, 4))]);
+    assert!(screen.find("HELLO", true).expect("a search runs").1.is_empty());
 }
 
 /// **A search goes on to the far end of the history.** The core is handed the history a part at a time,
@@ -120,7 +136,7 @@ fn a_search_finds_a_match_on_the_oldest_line_of_a_long_history() {
     screen.feed(b"and a needle, last");
     let _view = viewed(&mut screen);
 
-    let (_, found) = screen.find("needle").expect("a search runs");
+    let (_, found) = screen.find("needle", false).expect("a search runs");
     assert_eq!(found, vec![span((8_000, 6), (8_000, 11)), span((0, 4), (0, 9))]);
 }
 
@@ -137,7 +153,7 @@ fn a_search_matching_everywhere_answers_the_newest_and_no_more() {
     let _view = viewed(&mut screen);
     let (_, first_active) = screen.view_position().expect("a position reads");
 
-    let (_, found) = screen.find("a").expect("a search runs");
+    let (_, found) = screen.find("a", false).expect("a search runs");
     assert_eq!(found.len(), SEARCH_MATCHES);
     // The newest is the last letter written, on the row above the cursor's, and they run back from there
     assert_eq!(found[0], span((first_active + 2, 38), (first_active + 2, 38)));
