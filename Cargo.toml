@@ -34,6 +34,12 @@ name = "blink"
 path = "benches/blink.rs"
 harness = false
 
+# The synchronized-output hold: its cost and the broker's limit on one (`benches/hold.rs`). Reports, never fails
+[[bench]]
+name = "hold"
+path = "benches/hold.rs"
+harness = false
+
 [dependencies]
 interprocess = "2.4.7"
 # Finding the escapes in a program's output (`vt::Terminal::watched`), which is every byte a session parses
