@@ -359,6 +359,7 @@ export class TerminalView {
       copy: () => { void this.copy() },
       focused: (focused) => this.setFocused(focused),
       typed: () => this.typed(),
+      compositionStarted: () => this.selection.clear(),
     })
     this.element.appendChild(this.input.field)
 
