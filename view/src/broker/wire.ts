@@ -54,7 +54,7 @@ export type ToBroker =
   | { readonly kind: 'focus'; readonly channel: number; readonly gained: boolean }
   | { readonly kind: 'wordAt' | 'lineAt'; readonly channel: number; readonly request: number; readonly epoch: number; readonly at: Position }
   | { readonly kind: 'textOf'; readonly channel: number; readonly request: number; readonly epoch: number; readonly span: Span }
-  | { readonly kind: 'search'; readonly channel: number; readonly request: number; readonly needle: string }
+  | { readonly kind: 'search'; readonly channel: number; readonly request: number; readonly needle: string; readonly caseSensitive: boolean }
   | { readonly kind: 'commands'; readonly channel: number; readonly request: number }
   | { readonly kind: 'images'; readonly channel: number; readonly request: number }
   | { readonly kind: 'image'; readonly channel: number; readonly request: number; readonly image: number; readonly offset: number }
@@ -239,6 +239,7 @@ export function encodeToBroker(message: ToBroker): Uint8Array {
     case 'search':
       out.number(message.request)
       out.text(message.needle)
+      out.flag(message.caseSensitive)
       break
     case 'commands':
     case 'images':

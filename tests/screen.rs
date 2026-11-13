@@ -173,6 +173,27 @@ fn a_program_asking_about_clustering_is_told_it_is_on() {
     assert_eq!(answered(&mut screen, b"\x1b[?2027$p"), "\u{1b}[?2027;1$y");
 }
 
+/// **Synchronized output is asked about like any mode.** A program that asks is told whether the screen is
+/// held: 2 when it is not, 1 when it is. The answer is written to the program by the core, and nothing
+/// else on the screen is changed by asking.
+#[test]
+fn a_program_asking_about_synchronized_output_is_told_whether_it_is_on() {
+    let mut screen = Screen::new(80, 24);
+    assert_eq!(answered(&mut screen, b"\x1b[?2026$p"), "\u{1b}[?2026;2$y");
+    assert_eq!(answered(&mut screen, b"\x1b[?2026h"), "", "turning it on is not answered");
+    assert_eq!(answered(&mut screen, b"\x1b[?2026$p"), "\u{1b}[?2026;1$y");
+    assert_eq!(answered(&mut screen, b"\x1b[?2026l"), "");
+    assert_eq!(answered(&mut screen, b"\x1b[?2026$p"), "\u{1b}[?2026;2$y");
+}
+
+/// A mode the core does not know is answered 0, which is the one answer a program is given for a mode
+/// the terminal does not support.
+#[test]
+fn a_program_asking_about_a_mode_not_supported_is_told_so() {
+    let mut screen = Screen::new(80, 24);
+    assert_eq!(answered(&mut screen, b"\x1b[?9999$p"), "\u{1b}[?9999;0$y");
+}
+
 /// **A reset does not turn it back off.** `reset` is something a user types, and a default set only for
 /// now would leave the terminal disagreeing with its window from then on.
 #[test]

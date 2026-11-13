@@ -19,6 +19,7 @@
 //! a resize, which reflows; a switch between the two screens; more scrolling than the history holds
 //! between two looks — starts a new `epoch`, and a view forgets its rows.
 
+use std::collections::BTreeMap;
 use std::sync::mpsc::Sender;
 
 use super::wire::{self, ColorChanges, Cursor, FrameHead, Rows, ToView};
@@ -122,6 +123,12 @@ pub struct Publication {
     /// `scrollback` when `active` was read
     captured_scrollback: u32,
     active: Vec<Held>,
+    /// The rows of the screen as the last frame published to any view carried them, by line, with the
+    /// screen's first line and height at that frame. What a view holds of the screen once it has applied
+    /// the frames sent; a fetch during a hold answers from it.
+    shown: BTreeMap<u64, Vec<u8>>,
+    shown_first: u64,
+    shown_rows: u16,
     cursor: Option<Cursor>,
     mouse: bool,
     /// The shell's command generation when the screen was last read
@@ -162,6 +169,9 @@ impl Publication {
             scrollback,
             captured_scrollback: scrollback,
             active: Vec::new(),
+            shown: BTreeMap::new(),
+            shown_first: 0,
+            shown_rows: 0,
             cursor: None,
             mouse: false,
             commands: 0,
@@ -211,6 +221,7 @@ impl Publication {
             self.first_active = u64::from(scrollback);
             self.captured_first = self.first_active;
             self.active.clear();
+            self.shown.clear();
             // A new epoch is a change in itself, which the next read finds: every row is new to it.
             // Whatever it was that noticed, that read is now owed
             self.stale = true;
@@ -366,6 +377,7 @@ impl Publication {
         let mut rows = Rows::default();
         let mut stale_from = None;
         let mut cut = None;
+        let mut carried: Vec<(u64, Vec<u8>)> = Vec::new();
 
         // **The lines that left the screen since.** A view holds them as they were when it was last sent
         // the screen, and a line is often written to once more before it scrolls — the one being typed
@@ -388,6 +400,7 @@ impl Publication {
                             break;
                         }
                         rows.push(line, &self.body);
+                        carried.push((line, self.body.clone()));
                     }
                 } else {
                     stale_from = Some(sent.first_active);
@@ -407,6 +420,7 @@ impl Publication {
                     break;
                 }
                 rows.push(line, &held.body);
+                carried.push((line, held.body.clone()));
             }
         }
 
@@ -443,6 +457,7 @@ impl Publication {
                 });
                 viewer.in_flight = true;
                 viewer.gone = !viewer.outlet.deliver(message);
+                self.show(carried);
             }
             // Past what a message carries though its rows were counted in: the view is told it cannot
             // be shown this session, and is not sent the same frame again at every change
@@ -476,11 +491,26 @@ impl Publication {
     /// The lines a view asked for, as the terminal holds them now, and how many lines from `first` that
     /// answers for: all that were asked, up to `FETCH_LINES`, unless a message filled first. A line
     /// answered for and not among the rows is one the terminal does not hold.
-    pub fn fetch(&mut self, terminal: &Terminal, first: u64, count: u32) -> Result<(u32, Rows), Failed> {
+    ///
+    /// **While the program holds the screen, a line on the screen is the row last sent for it**, the same
+    /// rule the frames follow: what the program is part way through writing is not shown to a view until
+    /// it lets go. A line that was not on the screen when it was last sent is read as the terminal has it.
+    pub fn fetch(&mut self, terminal: &Terminal, first: u64, count: u32, held: bool) -> Result<(u32, Rows), Failed> {
         self.advance(terminal)?;
         let mut rows = Rows::default();
         let mut covered = 0;
         for line in first..first.saturating_add(u64::from(count.min(FETCH_LINES))) {
+            if held && (self.shown_first..self.shown_first + u64::from(self.shown_rows)).contains(&line) {
+                // A line no frame has carried is one the view does not hold, and is answered absent
+                if let Some(body) = self.shown.get(&line) {
+                    if !rows.takes(body.len()) {
+                        break;
+                    }
+                    rows.push(line, body);
+                }
+                covered += 1;
+                continue;
+            }
             if let Some(row) = self.screen_row(line)
                 && terminal.read_row_into(Space::Screen, row, &mut self.read)?
             {
@@ -494,6 +524,20 @@ impl Publication {
             covered += 1;
         }
         Ok((covered, rows))
+    }
+
+    /// Records what a frame sent to a view carried of the screen: a line the frame did not carry is what it
+    /// was, which is what a view that applied the frame holds.
+    fn show(&mut self, carried: Vec<(u64, Vec<u8>)>) {
+        self.shown_first = self.first_active;
+        self.shown_rows = self.rows;
+        let on_screen = self.shown_first..self.shown_first + u64::from(self.shown_rows);
+        self.shown.retain(|line, _| on_screen.contains(line));
+        for (line, body) in carried {
+            if on_screen.contains(&line) {
+                self.shown.insert(line, body);
+            }
+        }
     }
 
     /// Starts sending a view this session's frames, beginning with the whole screen.

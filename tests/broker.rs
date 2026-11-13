@@ -841,6 +841,21 @@ fn a_screen_read_for_a_session_that_does_not_exist_is_refused_by_code() {
     assert_eq!(failed["code"], "NO_SUCH_SESSION");
 }
 
+/// A default cursor for a session the broker does not have is refused by code, as every request naming one is.
+#[test]
+fn setting_the_cursor_defaults_of_a_session_that_does_not_exist_is_refused_by_code() {
+    let broker = start();
+    let (mut reading, mut writing) = connect(&broker);
+    ask(&mut writing, &hello(None));
+    next(&mut reading);
+
+    ask(&mut writing, r#"{"kind":"set_cursor_defaults","session":"s-404","style":"block","blink":"off"}"#);
+    let failed = next(&mut reading);
+    assert_eq!(failed["kind"], "failed");
+    assert_eq!(failed["code"], "NO_SUCH_SESSION");
+    assert_eq!(failed["session"], "s-404");
+}
+
 /// Writing to and resizing a session whose shell has just exited is refused, not a crash — which is **X9**.
 ///
 /// ConPTY throws for about a second after a console's process ends, where a POSIX pty write to a closed

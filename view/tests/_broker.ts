@@ -196,7 +196,7 @@ export function decodeToBroker(body: Uint8Array): ToBroker {
     case 10: return { kind: 'wordAt', channel, request: number(), epoch: number(), at: position() }
     case 11: return { kind: 'lineAt', channel, request: number(), epoch: number(), at: position() }
     case 12: return { kind: 'textOf', channel, request: number(), epoch: number(), span: { start: position(), end: position() } }
-    case 13: return { kind: 'search', channel, request: number(), needle: text() }
+    case 13: return { kind: 'search', channel, request: number(), needle: text(), caseSensitive: byte() === 1 }
     case 14: return { kind: 'commands', channel, request: number() }
     case 15: return { kind: 'images', channel, request: number() }
     case 16: return { kind: 'image', channel, request: number(), image: number(), offset: number() }

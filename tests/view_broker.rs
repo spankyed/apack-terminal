@@ -344,7 +344,7 @@ fn history_is_fetched_by_line_and_text_is_read_and_searched() {
     view.until_shows("fin2ished");
 
     // The search finds what scrolled off long ago, newest first, and its numbers are lines to fetch
-    view.send(&ToBroker::Search { channel: 1, request: 5, needle: "line-7".to_owned() });
+    view.send(&ToBroker::Search { channel: 1, request: 5, needle: "line-7".to_owned(), case_sensitive: false });
     let spans = view.answer(|message| match message {
         ToView::Spans { request: 5, spans, .. } => Some(spans.clone()),
         _ => None,
@@ -556,7 +556,7 @@ fn the_line_at_a_cell_is_answered_to_the_view_that_asked() {
     view.type_line(&format!("echo st$((1+1))art-{}", "w".repeat(70)));
     view.until_shows("st2art-");
 
-    view.send(&ToBroker::Search { channel: 1, request: 5, needle: "st2art-".to_owned() });
+    view.send(&ToBroker::Search { channel: 1, request: 5, needle: "st2art-".to_owned(), case_sensitive: false });
     let found = view.answer(|message| match message {
         ToView::Spans { request: 5, spans, .. } => Some(spans.clone()),
         _ => None,
@@ -1170,7 +1170,7 @@ fn a_question_in_a_numbering_that_is_over_is_refused_and_its_channel_stays_attac
     });
     assert!(refused.contains("numbered again"), "{refused}");
 
-    view.send(&ToBroker::Search { channel: 1, request: 2, needle: "$".to_owned() });
+    view.send(&ToBroker::Search { channel: 1, request: 2, needle: "$".to_owned(), case_sensitive: false });
     let answered = view.answer(|message| match message {
         ToView::Spans { request: 2, epoch, .. } => Some(Ok(*epoch)),
         ToView::Failed { request: 2, message, .. } => Some(Err(message.clone())),

@@ -20,7 +20,8 @@ use crate::housekeeping::Housekeeping;
 use crate::markers::MarksKey;
 use crate::output::{Credit, Flow, Outgoing, READ_AHEAD, coalesce};
 use crate::protocol::{
-    ErrorCode, Event, Foreground, ProgressState, Scope, SessionId, SessionSummary, Signal, Until, WaitOutcome,
+    CursorBlink, CursorStyle, ErrorCode, Event, Foreground, ProgressState, Scope, SessionId, SessionSummary, Signal,
+    Until, WaitOutcome,
 };
 use crate::recording;
 use crate::screen::{
@@ -780,6 +781,11 @@ impl Handle {
         self.on_screen(|screen| screen.resize(cols, rows, cell_width, cell_height))
     }
 
+    /// The cursor the session starts with and returns to; see `Screen::set_cursor_defaults`.
+    pub fn set_cursor_defaults(&self, style: CursorStyle, blink: CursorBlink) -> Outcome {
+        Ok(self.on_screen(|screen| screen.set_cursor_defaults(style, blink))??)
+    }
+
     /// The screen as this session has it, with up to `history` lines above the viewport.
     pub fn snapshot(&self, history: u32) -> Result<Snapshot, Refusal> {
         self.on_screen(|screen| screen.snapshot(history))
@@ -874,8 +880,8 @@ impl Handle {
         Ok(self.on_screen(|screen| screen.text_of(epoch, span))??)
     }
 
-    pub fn find(&self, needle: &str) -> Result<(u32, Vec<Span>), Refusal> {
-        Ok(self.on_screen(|screen| screen.find(needle))??)
+    pub fn find(&self, needle: &str, case_sensitive: bool) -> Result<(u32, Vec<Span>), Refusal> {
+        Ok(self.on_screen(|screen| screen.find(needle, case_sensitive))??)
     }
 
     /// Every image in the session, with the epoch their lines are in and one cell in pixels.

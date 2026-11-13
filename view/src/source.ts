@@ -389,8 +389,11 @@ export interface TerminalSource {
    * rejection, for a span numbered in an epoch that is over, and for text longer than an owner will carry
    */
   textOf(span: Span): Promise<string>
-  /** Every place `needle` appears, newest first — as many of the newest as the owner looks for */
-  search(needle: string): Promise<readonly Span[]>
+  /**
+   * Every place `needle` appears, newest first — as many of the newest as the owner looks for. Letters match in
+   * either case unless `caseSensitive` says the needle's own case only
+   */
+  search(needle: string, caseSensitive: boolean): Promise<readonly Span[]>
   /** The commands the shell has reported, oldest first. Empty for a shell that marks none */
   commands(): Promise<readonly Command[]>
   /** Where every image is. Their lines are in the epoch of the frame that prompted the question */

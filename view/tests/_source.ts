@@ -51,7 +51,7 @@ export class FakeSource implements TerminalSource {
   async wordAt(_position: Position): Promise<Span | null> { return null }
   async lineAt(_position: Position): Promise<Span | null> { return null }
   async textOf(_span: Span): Promise<string> { return '' }
-  async search(_needle: string): Promise<readonly Span[]> { return [] }
+  async search(_needle: string, _caseSensitive: boolean): Promise<readonly Span[]> { return [] }
   /** What the source answers when asked for its commands, and how many times it was asked */
   commandList: Command[] = []
   commandsAsked = 0

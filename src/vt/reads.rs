@@ -205,13 +205,14 @@ impl Terminal {
     }
 
     /// Every place `needle` appears, newest first, as the cells each match covers — the newest
-    /// `SEARCH_MATCHES` of them. Letters match in either case, which is the core's rule.
+    /// `SEARCH_MATCHES` of them. Letters match in either case, which is the core's rule; `case_sensitive`
+    /// keeps only the matches whose text is the needle exactly, checked against the text of each match.
     ///
     /// **The search stops when it has enough, rather than finding everything and keeping some.** The core
     /// searches the screen and then the history a part at a time, newest first, so it is given parts until
     /// it has the matches a view is answered with and no further: a single letter looked for in a hundred
     /// thousand lines is the work of finding two thousand of it, not of finding every one.
-    pub fn find(&self, needle: &str) -> Result<Vec<(Cell, Cell)>, Failed> {
+    pub fn find(&self, needle: &str, case_sensitive: bool) -> Result<Vec<(Cell, Cell)>, Failed> {
         if needle.is_empty() {
             return Ok(Vec::new());
         }
@@ -252,7 +253,12 @@ impl Terminal {
             }
             result
         };
-        let matches = found.iter().take(SEARCH_MATCHES).filter_map(|selection| self.cells_of(selection)).collect();
+        let matches = found
+            .iter()
+            .filter_map(|selection| self.cells_of(selection))
+            .filter(|&(start, end)| !case_sensitive || self.text_between(start, end).is_ok_and(|text| text == needle))
+            .take(SEARCH_MATCHES)
+            .collect();
         // SAFETY: freed once, with the terminal still live
         unsafe { sys::ghostty_search_free(search) };
         Failed::check("ghostty_search", result)?;

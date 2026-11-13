@@ -279,10 +279,11 @@ fn to_broker() -> impl Strategy<Value = ToBroker> {
             .prop_map(|(channel, request, epoch, at)| ToBroker::LineAt { channel, request, epoch, at }),
         (any::<u32>(), any::<u32>(), any::<u32>(), span())
             .prop_map(|(channel, request, epoch, span)| ToBroker::TextOf { channel, request, epoch, span }),
-        (any::<u32>(), any::<u32>(), ".{0,20}").prop_map(|(channel, request, needle)| ToBroker::Search {
+        (any::<u32>(), any::<u32>(), ".{0,20}", any::<bool>()).prop_map(|(channel, request, needle, case_sensitive)| ToBroker::Search {
             channel,
             request,
-            needle
+            needle,
+            case_sensitive,
         }),
         (any::<u32>(), any::<u32>()).prop_map(|(channel, request)| ToBroker::Commands { channel, request }),
         (any::<u32>(), any::<u32>()).prop_map(|(channel, request)| ToBroker::Images { channel, request }),

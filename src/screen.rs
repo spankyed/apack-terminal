@@ -19,6 +19,7 @@ use std::time::{Duration, SystemTime};
 use crate::commands::Outcome;
 use crate::holds::HoldLimit;
 use crate::markers::MarksKey;
+use crate::protocol::{CursorBlink, CursorStyle};
 use crate::recording::{self, Entry, Recorder, Timed};
 use crate::view::publish::{Outlet, Publication, ViewId};
 use crate::view::wire::{MAX_MESSAGE_BYTES, Position, Rows, Span};
@@ -377,7 +378,7 @@ impl Screen {
         // way, these two are let go of in the reverse of the order they were made
         let reported = Collector::new();
         let mut terminal = Terminal::new(cols, rows)?;
-        terminal.default_cursor_is_a_blinking_bar()?;
+        terminal.set_cursor_defaults(CursorStyle::Bar, CursorBlink::Program)?;
         // Never less than what a client reading the screen as text is promised (`SCROLLBACK_ASKED`)
         terminal.set_scrollback_lines(history.max(SCROLLBACK_ASKED))?;
         terminal.set_scrollback_bytes(HISTORY_BYTES)?;
@@ -475,6 +476,11 @@ impl Screen {
                 self.publish();
             }
         }
+    }
+
+    /// Whether the program holds the screen (mode 2026) now.
+    pub fn holding(&self) -> bool {
+        self.hold.is_some()
     }
 
     /// Says what ends a hold of this screen's that its program does not (`holds`).
@@ -865,6 +871,20 @@ impl Screen {
         input::paste(&self.terminal, text, allow_unsafe)
     }
 
+    /// Sets the cursor a session starts with and returns to, and takes the cursor to it now; see
+    /// `Terminal::set_cursor_defaults`. The cursor a view is sent is the one that stands after it.
+    pub fn set_cursor_defaults(&mut self, style: CursorStyle, blink: CursorBlink) -> Result<(), Failed> {
+        self.terminal.set_cursor_defaults(style, blink)?;
+        if let Some(publication) = &mut self.publication {
+            publication.touch();
+        }
+        // Sent here, as a change to the screen is, and not while a recording is replayed
+        if !self.replaying {
+            self.publish();
+        }
+        Ok(())
+    }
+
     /// What the program is told about its terminal gaining or losing focus.
     pub fn focus(&self, gained: bool) -> Result<Vec<u8>, Failed> {
         input::focus(&self.terminal, gained)
@@ -967,7 +987,8 @@ impl Screen {
     pub fn fetch(&mut self, epoch: u32, first: u64, count: u32) -> Result<Fetched, Unanswered> {
         self.numbered(epoch)?;
         let Some(publication) = &mut self.publication else { return Err(Unanswered::Unviewed) };
-        let (count, rows) = publication.fetch(&self.terminal, first, count)?;
+        let held = self.hold.is_some();
+        let (count, rows) = publication.fetch(&self.terminal, first, count, held)?;
         Ok(Fetched { first, count, rows })
     }
 
@@ -1007,8 +1028,8 @@ impl Screen {
     }
 
     /// Every place `needle` appears, newest first, with the epoch the line numbers are in.
-    pub fn find(&mut self, needle: &str) -> Result<(u32, Vec<Span>), Unanswered> {
-        let found = self.terminal.find(needle)?;
+    pub fn find(&mut self, needle: &str, case_sensitive: bool) -> Result<(u32, Vec<Span>), Unanswered> {
+        let found = self.terminal.find(needle, case_sensitive)?;
         let publication = self.positioned()?;
         Ok((publication.epoch(), found.into_iter().map(|cells| Self::span_of(publication, cells)).collect()))
     }

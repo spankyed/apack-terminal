@@ -1,6 +1,6 @@
 // What on a row can be opened: what a program declared, and text that looks like something to open.
 import { describe, expect, it } from 'vitest'
-import { linkAt, urls, type Detector } from '../src/links.ts'
+import { linkAt, linkRuns, urls, type Detector } from '../src/links.ts'
 import type { Row } from '../src/source.ts'
 import { row } from './_support.ts'
 
@@ -71,5 +71,42 @@ describe('a link on a row', () => {
   it('stops at the edge of a row where the row it wrapped onto is not held', () => {
     const cut = row(5, 'docs: https://exampl', { wrapped: true })
     expect(linkAt(cut, 8, [urls], () => undefined)?.target).toBe('https://exampl')
+  })
+})
+
+describe('the cells a declared link covers across a wrap', () => {
+  /** A row whose characters from `from` up to `to` declare `target` */
+  const declaredRow = (line: number, text: string, from: number, to: number, target: string, wrapped = false): Row => {
+    const base = row(line, text, { links: [target], wrapped })
+    return { ...base, link: Uint16Array.from(base.text, (_, index) => (index >= from && index < to ? 1 : 0)) }
+  }
+  const rowsOf = (...rows: Row[]) => new Map(rows.map((one) => [one.line, one]))
+
+  it('is one run on each row it wraps over, joined by its URI, from any of them', () => {
+    const rows = rowsOf(declaredRow(0, 'see the link', 4, 12, 'https://x.example/a', true), declaredRow(1, 'continues here', 0, 9, 'https://x.example/a'))
+    const runs = (line: number, column: number) => linkRuns(linkAt(rows.get(line)!, column, [])!, rows.get(line)!, column, (other) => rows.get(other))
+    const both = [{ line: 0, from: 4, to: 12 }, { line: 1, from: 0, to: 9 }]
+
+    expect(runs(0, 6)).toEqual(both)
+    expect(runs(1, 3)).toEqual(both)
+  })
+
+  it('is not joined to a row below when the link stops before the edge of its row', () => {
+    const rows = rowsOf(declaredRow(0, 'see the link', 4, 8, 'https://x.example/a', true), declaredRow(1, 'continues here', 0, 9, 'https://x.example/a'))
+    expect(linkRuns(linkAt(rows.get(0)!, 5, [])!, rows.get(0)!, 5, (other) => rows.get(other))).toEqual([{ line: 0, from: 4, to: 8 }])
+  })
+
+  it('is not joined to a row the first row did not wrap onto, or to one with a different URI', () => {
+    const unwrapped = rowsOf(declaredRow(0, 'see the link', 4, 12, 'https://x.example/a'), declaredRow(1, 'continues here', 0, 9, 'https://x.example/a'))
+    expect(linkRuns(linkAt(unwrapped.get(0)!, 6, [])!, unwrapped.get(0)!, 6, (other) => unwrapped.get(other))).toEqual([{ line: 0, from: 4, to: 12 }])
+
+    const other = rowsOf(declaredRow(0, 'see the link', 4, 12, 'https://x.example/a', true), declaredRow(1, 'continues here', 0, 9, 'https://x.example/b'))
+    expect(linkRuns(linkAt(other.get(0)!, 6, [])!, other.get(0)!, 6, (line) => other.get(line))).toEqual([{ line: 0, from: 4, to: 12 }])
+  })
+
+  it('is one run for a link a detector found, which a wrap does not extend', () => {
+    const wrapped = rowsOf(row(0, 'docs: https://exampl', { wrapped: true }), row(1, 'e.com/path'))
+    const found = linkAt(wrapped.get(0)!, 8, [urls], (line) => wrapped.get(line))!
+    expect(linkRuns(found, wrapped.get(0)!, 8, (line) => wrapped.get(line))).toEqual([{ line: 0, from: 6, to: 20 }])
   })
 })

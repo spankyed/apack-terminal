@@ -19,6 +19,7 @@ pub mod rows;
 
 use crate::commands::{Commands, Machine, Moment, Outcome, Step, Unknown};
 use crate::markers::{self, Marker, MarksKey, PAYLOAD_CAP, Read, Vouched, cwd_from_url};
+use crate::protocol::{CursorBlink, CursorStyle};
 use crate::screen::Facts;
 use rows::Mark;
 
@@ -559,14 +560,19 @@ impl Terminal {
         Ok(())
     }
 
-    /// The cursor a program gets when it asks for the default one: a bar, blinking.
+    /// Sets the cursor a program gets when it asks for the default one (`CSI 0 q`), and takes the cursor to
+    /// it now. A session starts with a blinking bar, which is `set_cursor_defaults(Bar, Program)`.
     ///
-    /// **And the one it starts with**, which takes saying so: the option is what a reset to the default
-    /// means, not what the terminal is showing, so the reset is written once here, before any program has
-    /// written a byte.
-    pub fn default_cursor_is_a_blinking_bar(&mut self) -> Result<(), Failed> {
-        let style: sys::CursorStyle::Type = sys::CursorStyle::BAR;
-        let blink = true;
+    /// **The option is what a reset returns to, and only a reset reads it**, so the cursor is taken there by
+    /// feeding the reset as well. The reset goes through the parser like any output, so it lands wherever the
+    /// parser is: a program part way through an escape sequence when this is called is not protected from it.
+    pub fn set_cursor_defaults(&mut self, style: CursorStyle, blink: CursorBlink) -> Result<(), Failed> {
+        let style: sys::CursorStyle::Type = match style {
+            CursorStyle::Block => sys::CursorStyle::BLOCK,
+            CursorStyle::Bar => sys::CursorStyle::BAR,
+            CursorStyle::Underline => sys::CursorStyle::UNDERLINE,
+        };
+        let blink = blink != CursorBlink::Off;
         // SAFETY: DEFAULT_CURSOR_STYLE takes a `GhosttyCursorStyle*` and DEFAULT_CURSOR_BLINK a `bool*`
         unsafe {
             Failed::check(

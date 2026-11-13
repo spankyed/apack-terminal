@@ -143,6 +143,14 @@ pub enum Request {
         #[serde(default)]
         cell_height: u16,
     },
+    /// **The cursor a session starts with and returns to when a program resets it (`CSI 0 q`)**, set from
+    /// the app's settings. The cursor is taken to the new default at once, so a session shows it before any
+    /// program has chosen one; a program that chooses its own (DECSCUSR) keeps it until it resets again.
+    /// Refused for an unknown session, as any request is.
+    ///
+    /// **The broker reports blinking as the program left it.** `blink` sets what a reset returns to; a view
+    /// applies `On` and `Off` over what a program asks, which is the one place a program's blink is ignored.
+    SetCursorDefaults { session: SessionId, style: CursorStyle, blink: CursorBlink },
     /// **Stop reading this session's pty**, so the process feels the reader stop.
     ///
     /// This is flow control for a consumer whose own sink is slower than a shell can write — the app's
@@ -252,6 +260,30 @@ pub enum Request {
     },
     /// End the session and its process tree.
     Kill { session: SessionId },
+}
+
+/// The shape a session's cursor is drawn in when no program has chosen one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "protocol.ts")]
+pub enum CursorStyle {
+    Block,
+    Bar,
+    Underline,
+}
+
+/// Whether a session's cursor blinks when no program has chosen. `On` and `Off` are the app's answer and
+/// override the program's blink, in a view; `Program` leaves the blink to the program. In the core, DECSCUSR's
+/// blink and DEC mode 12 are one setting, so a program's choice of either is what `Program` means.
+///
+/// A reset (`CSI 0 q`) returns to a blinking cursor for `On` and `Program`, and to a steady one for `Off`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "protocol.ts")]
+pub enum CursorBlink {
+    On,
+    Off,
+    Program,
 }
 
 /// The colours a session is drawn in, each as red, green and blue.

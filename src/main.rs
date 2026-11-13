@@ -770,8 +770,8 @@ fn carry_out_view(
                 Err(refusal) => failed(channel, request, refusal),
             }
         }
-        ToBroker::Search { channel, request, needle } => {
-            match session_of(channel).and_then(|handle| handle.find(&needle)) {
+        ToBroker::Search { channel, request, needle, case_sensitive } => {
+            match session_of(channel).and_then(|handle| handle.find(&needle, case_sensitive)) {
                 Ok((epoch, spans)) => answer(channel, request, ToView::Spans { channel, request, epoch, spans }),
                 Err(refusal) => failed(channel, request, refusal),
             }
@@ -937,6 +937,10 @@ fn carry_out(live: &Sessions, connection: u64, request: Request) {
         Request::Resize { session, cols, rows, cell_width, cell_height } => live
             .handle(&session)
             .and_then(|handle| handle.resize(cols, rows, cell_width, cell_height))
+            .map_err(|refusal| (Some(session), refusal)),
+        Request::SetCursorDefaults { session, style, blink } => live
+            .handle(&session)
+            .and_then(|handle| handle.set_cursor_defaults(style, blink))
             .map_err(|refusal| (Some(session), refusal)),
         Request::Pause { session } => live.pause(&session).map_err(|refusal| (Some(session), refusal)),
         Request::Resume { session } => live.resume(&session).map_err(|refusal| (Some(session), refusal)),

@@ -261,6 +261,12 @@ proptest! {
                     let asked_from = viewers[0].model.first_active.saturating_sub(u64::from(*back));
                     let (epoch, first_active) = screen.view_position().expect("a position reads");
                     let fetched = screen.fetch(epoch, asked_from, u32::from(*count)).expect("a fetch reads");
+                    // **The invariant.** Outside a hold a fetch is the terminal as it stands. During one, a line on
+                    // the screen is what a view holds of it: the row the last frame sent to a view carried, which
+                    // is the frame the most advanced view has applied. A view in another epoch holds none of this
+                    // numbering. Lines off the screen are read from the terminal, as before.
+                    let held = screen.holding();
+                    let sent = viewers.iter().map(|viewer| &viewer.model).max_by_key(|model| model.drawn);
                     // A fetch this small is answered whole: it says so, and a line it left out is one the
                     // terminal does not hold
                     prop_assert_eq!((fetched.first, fetched.count), (asked_from, u32::from(*count)));
@@ -274,7 +280,16 @@ proptest! {
                             .and_then(|row| screen.row(Space::Screen, row).expect("a row reads"))
                             .as_ref()
                             .map(line_of);
-                        prop_assert_eq!(rows.get(&line), truth.as_ref(), "line {} of a fetch", line);
+                        let on_screen = sent.filter(|sent| {
+                            held && (sent.first_active..sent.first_active + u64::from(sent.screen_rows)).contains(&line)
+                        });
+                        let expected = match on_screen {
+                            // In another epoch the view holds none of this numbering
+                            Some(sent) if sent.epoch == Some(epoch) => sent.lines.get(&line).cloned(),
+                            Some(_) => None,
+                            None => truth,
+                        };
+                        prop_assert_eq!(rows.get(&line), expected.as_ref(), "line {} of a fetch (held {})", line, held);
                     }
                     prop_assert_eq!(rows.len(), block.rows.len(), "a fetch answered a line twice");
                     // And asked in a numbering that is over, it is refused rather than answered about
