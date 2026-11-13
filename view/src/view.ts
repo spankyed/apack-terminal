@@ -321,6 +321,10 @@ export class TerminalView {
   private wheelOwed = 0
   /** Whether a selection is copied as the pointer is let go: the option at construction, then `setCopyOnSelect` */
   private copyOnSelect: boolean
+  /** The cursor's shape without the keyboard, its blink and the link previews: the options at construction, then their setters */
+  private cursorInactive: CursorShape
+  private cursorBlink: CursorBlink
+  private linkPreview: LinkPreview
   /** What is selected. It asks the source what a word or a line is and draws nothing itself */
   readonly selection: Selection
 
@@ -328,6 +332,9 @@ export class TerminalView {
     this.mac = options.mac ?? /Mac|iPhone|iPad/.test(navigator.platform)
     this.gutter = options.gutter ?? 0
     this.copyOnSelect = options.copyOnSelect ?? false
+    this.cursorInactive = options.cursorInactive ?? 'hollow'
+    this.cursorBlink = options.cursorBlink ?? 'program'
+    this.linkPreview = options.linkPreview ?? 'osc8'
     this.font = options.font
     this.theme = options.theme
     this.hostTheme = options.theme
@@ -399,6 +406,31 @@ export class TerminalView {
   /** Changes whether a selection is copied as the pointer is let go (`copyOnSelect`) */
   setCopyOnSelect(on: boolean): void {
     this.copyOnSelect = on
+  }
+
+  /**
+   * Changes the shape the cursor is drawn in while the view does not have the keyboard (`cursorInactive`). The
+   * view is not remade: its scroll position and selection stay, and the next paint draws the new shape.
+   */
+  setCursorInactive(style: CursorShape): void {
+    this.cursorInactive = style
+    this.schedule()
+  }
+
+  /**
+   * Changes whether the cursor blinks (`cursorBlink`). The blink starts over in the new mode, as it does after
+   * anything is typed, and the view keeps its scroll position and selection.
+   */
+  setCursorBlink(mode: CursorBlink): void {
+    this.cursorBlink = mode
+    this.blinkAgain()
+    this.schedule()
+  }
+
+  /** Changes which links show where they open (`linkPreview`), and the link under the pointer shows it at once */
+  setLinkPreview(mode: LinkPreview): void {
+    this.linkPreview = mode
+    if (this.hovered) this.element.title = this.previews(this.hovered.link) ? this.hovered.link.target : ''
   }
 
   setTheme(theme: Theme): void {
@@ -1218,7 +1250,7 @@ export class TerminalView {
   private cursorBlinks(): boolean {
     const cursor = this.frame?.cursor
     if (!cursor) return false
-    switch (this.options.cursorBlink ?? 'program') {
+    switch (this.cursorBlink) {
       case 'on': return true
       case 'off': return false
       case 'program': return cursor.blinking
@@ -1520,8 +1552,7 @@ export class TerminalView {
 
   /** Whether hovering a link shows where it opens, by the `linkPreview` the host chose */
   private previews(link: Link): boolean {
-    const preview = this.options.linkPreview ?? 'osc8'
-    return preview === 'all' || (preview === 'osc8' && link.kind === 'declared')
+    return this.linkPreview === 'all' || (this.linkPreview === 'osc8' && link.kind === 'declared')
   }
 
   /**
@@ -1749,7 +1780,7 @@ export class TerminalView {
       column: cursor.column,
       row: index,
       cells: row && at !== -1 ? row.width[at]! : 1,
-      shape: this.focused ? cursor.shape : (this.options.cursorInactive ?? 'hollow'),
+      shape: this.focused ? cursor.shape : this.cursorInactive,
       text: row && at !== -1 ? { text: row.text[at]!, bold: ((style?.flags ?? 0) & 1) !== 0, italic: ((style?.flags ?? 0) & 2) !== 0 } : undefined,
     }
   }
