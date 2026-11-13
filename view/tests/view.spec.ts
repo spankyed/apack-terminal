@@ -784,6 +784,65 @@ describe('the cursor', () => {
   })
 })
 
+describe('cursor settings changed on a view that is up', () => {
+  beforeEach(() => { vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] }) })
+  afterEach(() => { vi.useRealTimers() })
+
+  /** A view at the foot of a screen of history, with text selected: the state a remake would lose */
+  function working(options: Parameters<typeof mountedView>[0], focused: boolean) {
+    const view = mountedView(options)
+    view.source.send(frame({ firstActive: 100, scrollback: 100, rows: [row(100, 'alpha beta'), row(101, 'gamma')], cursor: { column: 1, row: 1, shape: 'bar', blinking: true } }))
+    view.view.selection.select({ start: { line: 100, column: 0 }, end: { line: 100, column: 4 } })
+    view.view.setFocused(focused)
+    runFrames()
+    return view
+  }
+  const kept = (view: ReturnType<typeof working>) => ({ top: view.view.viewport.top, span: view.view.selection.span, element: view.view.element })
+
+  it('setCursorInactive: the next paint draws the new shape, and the view keeps its scroll and selection', () => {
+    const view = working({ cursorInactive: 'underline' }, false)
+    const before = kept(view)
+    expect(view.painted().cursor?.shape).toBe('underline')
+
+    view.view.setCursorInactive('bar')
+    expect(view.painted().cursor?.shape, 'the paint kept the old shape').toBe('bar')
+    expect(kept(view)).toEqual(before)
+
+    view.view.scrollTo(50)
+    const scrolled = kept(view)
+    view.view.setCursorInactive('block')
+    expect(kept(view), 'a scrolled-up view was moved').toEqual(scrolled)
+    expect(scrolled.top).toBe(50)
+  })
+
+  it('setCursorBlink: the next paint uses the new mode, and the view keeps its scroll and selection', () => {
+    const view = working({ cursorBlink: 'program' }, true)
+    const before = kept(view)
+    vi.advanceTimersByTime(BLINK_MS)
+    expect(view.painted().cursor, 'the program blinks the cursor').toBeUndefined()
+
+    view.view.setCursorBlink('off')
+    expect(view.painted().cursor, 'the cursor is hidden after a change to off').toBeDefined()
+    expect(vi.getTimerCount(), 'a clock for a cursor that does not blink').toBe(0)
+    expect(kept(view)).toEqual(before)
+
+    view.view.scrollTo(50)
+    const scrolled = kept(view)
+    view.view.setCursorBlink('on')
+    expect(vi.getTimerCount(), 'no clock after a change to on').toBe(1)
+    expect(kept(view), 'a scrolled-up view was moved').toEqual(scrolled)
+    expect(scrolled.top).toBe(50)
+  })
+
+  it('setCursorBlink: a cursor made to blink is hidden on its own schedule, not left shown until the program moves it', () => {
+    const view = working({ cursorBlink: 'off' }, true)
+    view.view.setCursorBlink('on')
+    expect(view.painted().cursor).toBeDefined()
+    vi.advanceTimersByTime(BLINK_MS)
+    expect(view.painted().cursor, 'did not blink after a change to on').toBeUndefined()
+  })
+})
+
 describe('text that blinks', () => {
   beforeEach(() => { vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] }) })
   afterEach(() => { vi.useRealTimers() })

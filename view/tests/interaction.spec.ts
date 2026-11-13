@@ -643,6 +643,29 @@ describe('a link a program declared', () => {
     view.point('pointermove', 8, 1)
     expect([view.view.element.style.cursor, view.view.element.title]).toEqual(['pointer', urlTitle])
   })
+
+  it('setLinkPreview: the link under the pointer shows its preview at once, and the view keeps its scroll and selection', () => {
+    const view = mountedView({ linkPreview: 'off' })
+    view.source.send(frame({ rows: [declaredRow(0, 'see the link', 4, 12, URI), row(1, 'see https://example.com now')] }))
+    view.view.selection.select({ start: { line: 1, column: 0 }, end: { line: 1, column: 2 } })
+    runFrames()
+    const element = view.view.element
+    const selected = view.view.selection.span
+    view.point('pointermove', 6, 0)
+    expect(element.title).toBe('')
+
+    view.view.setLinkPreview('osc8')
+    expect(element.title, 'the declared link did not show where it opens').toBe(URI)
+    view.view.setLinkPreview('all')
+    view.point('pointermove', 8, 1)
+    expect(element.title).toBe('https://example.com')
+    view.view.setLinkPreview('off')
+    expect(element.title).toBe('')
+
+    expect(view.view.element, 'the view was remade').toBe(element)
+    expect(view.view.selection.span).toEqual(selected)
+    expect(view.view.viewport.top).toBe(0)
+  })
 })
 
 describe('what a page can read of a view', () => {

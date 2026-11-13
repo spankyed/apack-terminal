@@ -124,6 +124,24 @@ fn a_case_sensitive_search_keeps_only_the_matches_in_the_needles_case() {
     assert!(screen.find("HELLO", true).expect("a search runs").1.is_empty());
 }
 
+/// **A case-sensitive search finds an exact match older than the newest `SEARCH_MATCHES` case-insensitive
+/// ones.** The oldest line is the only exact `needle`; every line after it is `Needle`, so the case-insensitive
+/// matches are more than the cap and the exact one is the oldest of them all. The history is long enough that
+/// the core is given it in several parts, so the stop a case-insensitive search makes after one part is reached.
+#[test]
+fn a_case_sensitive_search_finds_an_exact_match_older_than_the_case_insensitive_cap() {
+    let mut screen = Screen::with_history(40, 4, 50_000);
+    screen.feed(b"needle, exact\r\n");
+    let others: String = (0..40_000).map(|_| "Needle, other\r\n").collect();
+    screen.feed(others.as_bytes());
+    let _view = viewed(&mut screen);
+
+    let (_, exact) = screen.find("needle", true).expect("a search runs");
+    assert_eq!(exact, vec![span((0, 0), (0, 5))]);
+    let (_, either) = screen.find("needle", false).expect("a search runs");
+    assert_eq!(either.len(), SEARCH_MATCHES, "the case-insensitive search keeps its cap");
+}
+
 /// **A search goes on to the far end of the history.** The core is handed the history a part at a time,
 /// newest first, and a match is found whichever part it is in: one on the oldest of thousands of lines,
 /// with nothing like it in between, is answered after the one on the screen.
