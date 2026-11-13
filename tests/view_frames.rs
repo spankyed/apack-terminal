@@ -633,7 +633,8 @@ fn a_hyperlink_covers_its_cells_until_it_is_closed_and_an_id_does_not_change_the
     let view = View::attached(&mut screen, 1, 1);
     let frame = view.frame();
     let row = &frame.block.rows[0];
-    let glyph_at = |column: u16| row.glyphs.iter().find(|glyph| glyph.column == column).expect("a glyph at that column");
+    let glyph_at =
+        |column: u16| row.glyphs.iter().find(|glyph| glyph.column == column).expect("a glyph at that column");
 
     assert_eq!(row.link_of(glyph_at(0)), Some("https://example.com"), "a cell inside the sequence, with an id on it");
     assert_eq!(row.link_of(glyph_at(1)), Some("https://example.com"));
@@ -650,7 +651,8 @@ fn a_hyperlink_that_wraps_reports_its_uri_on_each_row_it_covers() {
     let frame = view.frame();
     let rows = &frame.block.rows;
     let last_of_first = rows[0].glyphs.iter().find(|glyph| glyph.column == 9).expect("the last cell of the first row");
-    let first_of_second = rows[1].glyphs.iter().find(|glyph| glyph.column == 0).expect("the first cell of the second row");
+    let first_of_second =
+        rows[1].glyphs.iter().find(|glyph| glyph.column == 0).expect("the first cell of the second row");
 
     assert!(rows[0].wrapped, "the first row wraps onto the second");
     assert_eq!(rows[0].link_of(last_of_first), Some("https://example.com/long"));
