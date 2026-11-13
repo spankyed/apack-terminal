@@ -5,7 +5,8 @@ import { TooLarge, type PasteOutcome } from '../src/source.ts'
 import { installFrames, runFrames } from './_frames.ts'
 import { FakeSource } from './_source.ts'
 import { frame, row } from './_support.ts'
-import { mountedView, settled } from './_view.ts'
+import { RecordingPainter, mountedView, settled, theme } from './_view.ts'
+import { TerminalView } from '../src/view.ts'
 
 beforeEach(() => installFrames())
 
@@ -145,6 +146,8 @@ describe('text that is not a key', () => {
     key('keydown', { code: 'KeyN', key: 'n' })
     field.value = 'に'
     field.dispatchEvent(new Event('input'))
+    // At the end the textarea holds what was committed, as the composition's own data says
+    field.value = '日本'
     field.dispatchEvent(new CompositionEvent('compositionend', { data: '日本' }))
     expect(source.keys).toEqual([])
     expect(source.texts).toEqual(['日本'])
@@ -192,6 +195,7 @@ describe('typing while scrolled back', () => {
 
     const composed = scrolledBack()
     composed.field.dispatchEvent(new CompositionEvent('compositionstart'))
+    composed.field.value = '日本'
     composed.field.dispatchEvent(new CompositionEvent('compositionend', { data: '日本' }))
     expect(composed.view.viewport.following, 'composed text').toBe(true)
   })
@@ -298,5 +302,154 @@ describe('focus', () => {
     field.dispatchEvent(new FocusEvent('focus'))
     field.dispatchEvent(new FocusEvent('blur'))
     expect(source.focus_).toEqual([true, false])
+  })
+})
+
+describe('composition', () => {
+  /** A composition: its start, what the field holds, and its end with what was committed */
+  function compose(view: ReturnType<typeof mountedView>, committed: string[]) {
+    view.field.dispatchEvent(new CompositionEvent('compositionstart'))
+    for (const value of committed) {
+      view.field.value = value
+      view.field.dispatchEvent(new CompositionEvent('compositionupdate', { data: value }))
+    }
+    view.field.dispatchEvent(new CompositionEvent('compositionend', { data: committed.at(-1) }))
+  }
+
+  it('reaches the program once, when it ends, however many updates came before', () => {
+    const view = mountedView()
+    view.field.dispatchEvent(new CompositionEvent('compositionstart'))
+    view.field.value = 'に'
+    view.field.dispatchEvent(new CompositionEvent('compositionupdate', { data: 'に' }))
+    view.field.value = 'にほ'
+    view.field.dispatchEvent(new CompositionEvent('compositionupdate', { data: 'にほ' }))
+    view.field.dispatchEvent(new Event('input'))
+    expect(view.source.texts, 'during composition').toEqual([])
+    view.field.value = '日本'
+    view.field.dispatchEvent(new CompositionEvent('compositionend', { data: '日本' }))
+    expect(view.source.texts).toEqual(['日本'])
+  })
+
+  it('a repeated string composed twice sends both occurrences', () => {
+    const view = mountedView()
+    compose(view, ['日本'])
+    compose(view, ['日本'])
+    expect(view.source.texts).toEqual(['日本', '日本'])
+  })
+
+  it('a repeated string is sent where the caret put it, not at its first occurrence', () => {
+    const view = mountedView()
+    // `b` then `a` in the field, the caret between them: composing `ab` there makes `baba`
+    view.field.value = 'ba'
+    view.field.setSelectionRange(1, 1)
+    compose(view, ['baba'])
+    expect(view.source.texts).toEqual(['ab'])
+  })
+
+  it('sends none of the text that was in the field before composition began', () => {
+    const before = mountedView()
+    before.field.value = 'pre'
+    before.field.setSelectionRange(3, 3)
+    compose(before, ['pre日本'])
+    expect(before.source.texts).toEqual(['日本'])
+
+    // Text after the caret at the start is kept by the composition, so it is not sent either
+    const after = mountedView()
+    after.field.value = 'ba'
+    after.field.setSelectionRange(0, 0)
+    compose(after, ['xba'])
+    expect(after.source.texts).toEqual(['x'])
+  })
+
+  it('Enter during composition sends the composed text, then Enter', () => {
+    const view = mountedView()
+    const log: string[] = []
+    const { text, key } = view.source
+    view.source.text = (sent: string) => { log.push(`text ${sent}`); text.call(view.source, sent) }
+    view.source.key = (input) => { log.push(`key ${input.code}`); key.call(view.source, input) }
+
+    view.field.dispatchEvent(new CompositionEvent('compositionstart'))
+    view.field.value = '日本'
+    const enter = view.key('keydown', { code: 'Enter', key: 'Enter', keyCode: 229, isComposing: true })
+    expect(log).toEqual(['text 日本', 'key Enter'])
+    expect(enter.defaultPrevented, 'the newline is not typed into the field').toBe(true)
+    // The composition goes on until the input method ends it, and what it adds then is what is sent
+    view.field.dispatchEvent(new CompositionEvent('compositionend', { data: '日本' }))
+    expect(log).toEqual(['text 日本', 'key Enter'])
+  })
+
+  it('a keydown of 229 is input-method processing: no key is sent, and composition is not ended', () => {
+    const view = mountedView()
+    view.field.dispatchEvent(new CompositionEvent('compositionstart'))
+    const processing = view.key('keydown', { code: 'KeyN', key: 'Process', keyCode: 229 })
+    expect(view.source.keys, 'a key during composition').toEqual([])
+    expect(processing.defaultPrevented).toBe(false)
+    view.field.value = '日本'
+    view.field.dispatchEvent(new Event('input'))
+    expect(view.source.texts, 'still composing, so the input is not sent yet').toEqual([])
+    view.field.dispatchEvent(new CompositionEvent('compositionend', { data: '日本' }))
+    expect(view.source.texts).toEqual(['日本'])
+  })
+
+  it('a keydown of 229 outside composition is not a key either', () => {
+    const view = mountedView({ mac: false })
+    view.key('keydown', { code: 'KeyN', key: 'Unidentified', keyCode: 229 })
+    expect(view.source.keys).toEqual([])
+  })
+
+  it('shift, control, alt and caps lock do not end composition', () => {
+    const view = mountedView()
+    view.field.dispatchEvent(new CompositionEvent('compositionstart'))
+    view.key('keydown', { code: 'ShiftLeft', key: 'Shift', keyCode: 16, shiftKey: true })
+    view.key('keydown', { code: 'ControlLeft', key: 'Control', keyCode: 17, ctrlKey: true })
+    view.key('keydown', { code: 'AltLeft', key: 'Alt', keyCode: 18, altKey: true })
+    view.key('keydown', { code: 'CapsLock', key: 'CapsLock', keyCode: 20 })
+    view.field.value = '日本'
+    view.field.dispatchEvent(new Event('input'))
+    expect(view.source.texts, 'still composing after the modifiers').toEqual([])
+    view.field.dispatchEvent(new CompositionEvent('compositionend', { data: '日本' }))
+    expect(view.source.texts).toEqual(['日本'])
+    expect(view.source.keys).toEqual([])
+  })
+
+  it('a keydown and the input it also reports send the text once', () => {
+    const view = mountedView({ mac: false })
+    view.key('keydown', { code: 'KeyA', key: 'a' })
+    view.field.value = 'a'
+    view.field.dispatchEvent(new Event('input'))
+    expect(view.source.keys.map((sent) => sent.text)).toEqual(['a'])
+    expect(view.source.texts).toEqual([])
+  })
+
+  it('selects nothing once composition starts, so the candidates are not drawn over a selection', () => {
+    const view = mountedView()
+    view.view.selection.select({ start: { line: 0, column: 0 }, end: { line: 0, column: 2 } })
+    expect(view.view.selection.span).not.toBeNull()
+    view.field.dispatchEvent(new CompositionEvent('compositionstart'))
+    expect(view.view.selection.span).toBeNull()
+  })
+
+  it('the field sits at the cursor\'s cell while composing, at least a pixel in each dimension', () => {
+    const view = mountedView({ gutter: 6 })
+    view.source.send(frame({ rows: [row(1, 'abc')], cursor: { column: 2, row: 1, shape: 'block', blinking: false } }))
+    runFrames()
+    view.field.dispatchEvent(new CompositionEvent('compositionstart'))
+    expect([view.field.style.left, view.field.style.top]).toEqual(['26px', '20px'])
+    expect(parseFloat(view.field.style.height)).toBeGreaterThanOrEqual(1)
+    expect(parseFloat(view.field.style.width)).toBeGreaterThanOrEqual(1)
+  })
+
+  it('a row of no height still gives the field a pixel, so an input method does not break', () => {
+    const painter = new RecordingPainter()
+    Object.assign(painter, { metrics: { cellWidth: 10, cellHeight: 0, baseline: 0 } })
+    const source = mountedView().source
+    const view = new TerminalView(source, { font: { family: 'monospace', size: 14 }, theme, painter: () => painter, mac: true })
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    view.mount(host)
+    source.send(frame({ rows: [row(1, 'abc')], cursor: { column: 0, row: 0, shape: 'block', blinking: false } }))
+    runFrames()
+    const field = view.element.querySelector('textarea')!
+    expect(parseFloat(field.style.height)).toBeGreaterThanOrEqual(1)
   })
 })

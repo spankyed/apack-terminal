@@ -40,6 +40,8 @@ export interface InputOptions {
   readonly focused: (focused: boolean) => void
   /** The person typed something the program was sent: a key that is more than a modifier, or text */
   readonly typed?: () => void
+  /** An input method began composing: what is selected is cleared, so the composition is not drawn over it */
+  readonly compositionStarted?: () => void
 }
 
 /** The keys that only change what another key means */
@@ -88,6 +90,13 @@ export class Input {
   readonly field: HTMLTextAreaElement
   private layout: LayoutMap | null = null
   private composing = false
+  /**
+   * Where the composition's text lies in the field: from `start` to the end less `suffix` characters. Text
+   * before `start` was in the field before composition and is never sent; so is the `suffix` after the caret.
+   */
+  private held = { start: 0, suffix: 0 }
+  /** The text the last key sent, which an input event for the same text would otherwise send a second time */
+  private keyText: string | null = null
   /** The keys the source was told went down and has not been told came up */
   private readonly down = new Set<string>()
 
@@ -126,8 +135,10 @@ export class Input {
   moveTo(x: number, y: number, height: number): void {
     this.field.style.left = `${x}px`
     this.field.style.top = `${y}px`
-    this.field.style.height = `${height}px`
-    this.field.style.lineHeight = `${height}px`
+    // Some input methods break at zero size, so the field is at least a pixel in each dimension
+    const size = Math.max(1, height)
+    this.field.style.height = `${size}px`
+    this.field.style.lineHeight = `${size}px`
   }
 
   /** What a composition is drawn in: the terminal's own font and colours, over the cells it will replace */
@@ -190,6 +201,16 @@ export class Input {
       event.preventDefault()
       return
     }
+    this.keyText = null
+    // Enter while an input method is composing sends what is composed, then Enter. The composition itself is
+    // not ended here: the field keeps its text, and the composition's end sends only what comes after this.
+    if (event.key === 'Enter' && (this.composing || event.isComposing)) {
+      this.sendComposed()
+      this.down.add(event.code)
+      this.source.key({ action: 'press', code: event.code, modifiers: modifiersOf(event), text: '', unshifted: 0, composed: false })
+      event.preventDefault()
+      return
+    }
     // Copy and paste where the command key is not there to ask with: control and shift together
     if (!this.options.mac && event.ctrlKey && event.shiftKey && !event.altKey) {
       if (event.code === 'KeyC') {
@@ -208,6 +229,7 @@ export class Input {
     // Sent as a key, so it must not also arrive as text typed into the field
     event.preventDefault()
     this.down.add(event.code)
+    this.keyText = key.text !== '' ? key.text : null
     this.source.key(key)
     if (!MODIFIER_KEYS.has(event.key)) this.options.typed?.()
   }
@@ -221,18 +243,40 @@ export class Input {
 
   private readonly compositionStart = () => {
     this.composing = true
+    // The caret is where the composition inserts, and what lies after it is text the composition keeps
+    const caret = this.field.selectionStart ?? this.field.value.length
+    this.held = { start: caret, suffix: this.field.value.length - caret }
+    this.options.compositionStarted?.()
     // What is being composed is shown where it will go, in the field itself
     this.field.style.opacity = '1'
     this.field.style.width = '20em'
   }
 
-  private readonly compositionEnd = (event: CompositionEvent) => {
+  private readonly compositionEnd = () => {
     this.composing = false
     this.field.style.opacity = '0'
     this.field.style.width = '1px'
-    this.field.value = ''
-    this.source.text(event.data)
-    if (event.data !== '') this.options.typed?.()
+    this.sendComposed(true)
+  }
+
+  /**
+   * Sends what the composition has put in the field since it began, by position: the text between the start
+   * and what follows the caret. The field is cleared only once composition has ended, since an input method
+   * loses its composition when the field's value is set under it.
+   */
+  private sendComposed(ended = false): void {
+    const { start, suffix } = this.held
+    const end = Math.max(start, this.field.value.length - suffix)
+    const text = this.field.value.slice(start, end)
+    if (ended) {
+      this.field.value = ''
+      this.held = { start: 0, suffix: 0 }
+    } else {
+      this.held = { start: end, suffix: suffix }
+    }
+    if (text === '') return
+    this.source.text(text)
+    this.options.typed?.()
   }
 
   /** Text put in the field by something other than a key or a composition: a picker, dictation */
@@ -240,8 +284,12 @@ export class Input {
     if (this.composing || (event as InputEvent).isComposing) return
     const text = this.field.value
     this.field.value = ''
-    this.source.text(text)
-    if (text !== '') this.options.typed?.()
+    // A key has already sent this text, and an input event for it is the same character arriving twice
+    const sent = text === this.keyText ? '' : text
+    this.keyText = null
+    if (sent === '') return
+    this.source.text(sent)
+    this.options.typed?.()
   }
 
   private readonly pasted = (event: ClipboardEvent) => {
