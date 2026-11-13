@@ -208,10 +208,14 @@ impl Terminal {
     /// `SEARCH_MATCHES` of them. Letters match in either case, which is the core's rule; `case_sensitive`
     /// keeps only the matches whose text is the needle exactly, checked against the text of each match.
     ///
-    /// **The search stops when it has enough, rather than finding everything and keeping some.** The core
-    /// searches the screen and then the history a part at a time, newest first, so it is given parts until
-    /// it has the matches a view is answered with and no further: a single letter looked for in a hundred
-    /// thousand lines is the work of finding two thousand of it, not of finding every one.
+    /// **A case-insensitive search stops when it has enough, rather than finding everything and keeping some.**
+    /// The core searches the screen and then the history a part at a time, newest first, so it is given parts
+    /// until it has the matches a view is answered with and no further: a single letter looked for in a
+    /// hundred thousand lines is the work of finding two thousand of it, not of finding every one.
+    ///
+    /// **A case-sensitive search goes to the end of the history.** Its matches are only the core's matches
+    /// that are exact, so stopping at the core's first two thousand would drop an exact match older than
+    /// those. The filter is lazy, so it reads text only until it has two thousand exact matches.
     pub fn find(&self, needle: &str, case_sensitive: bool) -> Result<Vec<(Cell, Cell)>, Failed> {
         if needle.is_empty() {
             return Ok(Vec::new());
@@ -239,7 +243,8 @@ impl Terminal {
                 if result == sys::Result::SUCCESS {
                     result = sys::ghostty_search_get(search, sys::SearchData::TOTAL_MATCHES, (&raw mut total).cast());
                 }
-                if status == sys::SearchStatus::COMPLETE || total >= SEARCH_MATCHES {
+                let enough = !case_sensitive && total >= SEARCH_MATCHES;
+                if status == sys::SearchStatus::COMPLETE || enough {
                     break;
                 }
             }
