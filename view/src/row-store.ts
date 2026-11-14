@@ -53,6 +53,12 @@ export class RowStore {
    * an answer asked for before the images last changed from one asked for since.
    */
   imagesChanged = 0
+  /**
+   * How many frames have named history stale, and from where the last did: what an asker notes when it
+   * asks, so an answer taken after a frame that named the lines it covers stale is not put back as it was.
+   */
+  staleFrames = 0
+  private staleLine = Infinity
 
   /** The oldest line the owner still holds */
   get oldest(): number {
@@ -101,6 +107,8 @@ export class RowStore {
     // History the owner changed and did not resend. Before the new rows, so one of them that is in that
     // range is kept
     if (frame.staleFrom !== undefined) {
+      this.staleFrames += 1
+      this.staleLine = frame.staleFrom
       for (let line = frame.staleFrom; line < frame.firstActive; line += 1) {
         if (this.rows.delete(line)) changed.add(line)
         this.doubted.delete(line)
@@ -130,16 +138,19 @@ export class RowStore {
    * the order which of them the answer's rows are older than. A row of placeholder cells brought by such
    * an answer is taken, and stays doubted: asked for once more, by a fetch made after the change.
    */
-  absorb(fetched: Fetched, near = this.firstActive, asked = this.imagesChanged): number[] {
+  absorb(fetched: Fetched, near = this.firstActive, asked = this.imagesChanged, askedStale = this.staleFrames): number[] {
     if (fetched.epoch !== this.epoch) return []
     const told: number[] = []
+    // Lines a frame has since named stale were changed after this was asked for: what the answer holds of
+    // them is the old text, and it is not put back
+    const stale = this.staleFrames !== askedStale ? this.staleLine : Infinity
     // The screen is only ever told by a frame: a fetched copy of a line a program can still write to may
     // be older than the frame that last described it
     const from = Math.max(fetched.first, this.oldest)
     const to = Math.min(fetched.first + fetched.count, this.firstActive)
     const brought = new Set<number>()
     for (const row of fetched.rows) {
-      if (row.line < from || row.line >= to) continue
+      if (row.line < from || row.line >= to || row.line >= stale) continue
       this.rows.set(row.line, row)
       this.absent.delete(row.line)
       if (row.images !== undefined && asked !== this.imagesChanged) this.doubted.add(row.line)
@@ -147,7 +158,7 @@ export class RowStore {
       brought.add(row.line)
       told.push(row.line)
     }
-    for (let line = from; line < to; line += 1) {
+    for (let line = from; line < Math.min(to, stale); line += 1) {
       if (brought.has(line) || this.absent.has(line)) continue
       // A row asked for again and not brought is one the owner no longer holds
       if (this.rows.has(line) && !this.doubted.delete(line)) continue
