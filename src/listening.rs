@@ -18,6 +18,9 @@ use std::time::Duration;
 
 use interprocess::local_socket::{GenericFilePath, Listener, ListenerOptions, Stream, ToFsName};
 
+#[cfg(windows)]
+mod pipe;
+
 /// What a broker exits with when another broker holds the socket it was asked to listen on.
 ///
 /// A number of its own, so whatever started it can tell "there is already one" — which is not a failure,
@@ -266,15 +269,6 @@ pub fn hang_up(stream: &Stream) -> bool {
             socket.shutdown(std::net::Shutdown::Both).is_ok() || socket.shutdown(std::net::Shutdown::Write).is_ok()
         }
         #[cfg(windows)]
-        Stream::NamedPipe(pipe) => {
-            use std::os::windows::io::{AsHandle as _, AsRawHandle as _};
-            use windows_sys::Win32::Foundation::HANDLE;
-            use windows_sys::Win32::System::IO::CancelIoEx;
-
-            let handle = pipe.as_handle().as_raw_handle() as HANDLE;
-            // SAFETY: `handle` is the pipe stream's own handle, which lives for the length of this borrow.
-            // A null overlapped pointer cancels every pending operation on the handle, from any thread.
-            unsafe { CancelIoEx(handle, std::ptr::null()) != 0 }
-        }
+        Stream::NamedPipe(pipe) => pipe::hang_up(pipe),
     }
 }
