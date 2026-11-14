@@ -511,15 +511,16 @@ fn a_name_longer_than_any_path_is_left_out() {
         asked.set(asked.get() + 1);
         true
     };
-    let command = |path: &[u8]| [b"Ga=T,t=f;", base64(path).as_bytes(), b"\x1b\\"].concat();
+    let command = |name: &str| [b"Ga=T,t=f;", name.as_bytes(), b"\x1b\\"].concat();
 
-    let longest = vec![b'a'; PATH_BYTES];
+    // As many characters as the longest path's name has, which is that path to the three bytes
+    let longest = "QUFB".repeat(PATH_BYTES.div_ceil(3));
     let (fed, _, _) = body(&[&command(&longest)], may_open);
-    assert_eq!(fed, [b"Ga=T,t=f;", base64(&longest).as_bytes()].concat(), "the longest path was not passed on");
+    assert_eq!(fed, command(&longest)[..9 + longest.len()], "the longest name was not passed on");
     assert_eq!(asked.get(), 1);
 
-    let longer = vec![b'a'; PATH_BYTES + 3];
-    let stream = command(&longer);
+    // And one character more
+    let stream = command(&format!("{longest}Q"));
     assert_eq!(body(&[&stream], may_open), (b"Ga=T,t=f;".to_vec(), vec![stream.len() - 2], false));
     assert_eq!(asked.get(), 1, "a name longer than any path was asked about");
 
