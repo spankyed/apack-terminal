@@ -684,6 +684,7 @@ fn the_line_at_a_cell_is_answered_to_the_view_that_asked() {
 /// An image named as a file and shown through placeholder cells reaches a view as part of the row that
 /// holds the cells, in a session started to read files; in one that was not, the same bytes show
 /// nothing. This is a program's whole path: the spawn's word, the file read, the cells, the frame.
+// POSIX only: ConPTY does not pass the graphics APC (`ESC _`) through to the broker, and this case sends its image in one.
 #[cfg(unix)]
 #[test]
 fn an_image_named_as_a_file_and_shown_through_cells_is_sent_with_its_row() {
