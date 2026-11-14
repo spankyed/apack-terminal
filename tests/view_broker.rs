@@ -550,22 +550,24 @@ fn a_view_leaving_or_sending_nonsense_leaves_the_session_running() {
 
 /// What a program asks of the world outside its screen reaches the app's own connection, as it happens —
 /// from a session whose bytes are not sent at all.
-// not ported: on Windows the broker answers none of the OSC sequences (observed); the cause is undiagnosed.
-#[cfg(unix)]
 #[test]
 fn a_programs_title_clipboard_and_commands_are_told_to_the_client() {
     let broker = start();
     let client = Client::greeting(&broker);
     let session = client.shell();
     let write = |text: &str| say(&client.stream, &Request::Write { session: session.clone(), text: text.to_owned() });
+    // Enter is the terminal's: a line feed is what POSIX shells take, and PowerShell's line editor takes a return
+    let enter = if cfg!(windows) { "\r" } else { "\n" };
     write(&format!(
-        "{}\n",
+        "{}{enter}",
         printed("\\033]0;a title\\007\\033]52;c;aGk=\\007\\033]633;E;make\\007\\033]633;C\\007\\033]633;D;2\\007")
     ));
 
     let mut told = Vec::new();
     while told.len() < 4 {
         match client.event() {
+            // A shell sets its own title (PowerShell does, at its start): only the program's title is this case's
+            Event::Title { title, .. } if title != "a title" => {}
             Event::Title { title, .. } => told.push(format!("title {title}")),
             Event::Clipboard { text, .. } => told.push(format!("clipboard {text}")),
             Event::CommandStarted { command, .. } => told.push(format!("started {command:?}")),
@@ -574,7 +576,21 @@ fn a_programs_title_clipboard_and_commands_are_told_to_the_client() {
             _ => {}
         }
     }
-    assert_eq!(told, ["title a title", "clipboard hi", "started Some(\"make\")", "finished Claimed { code: Some(2) }"]);
+    let expected = ["title a title", "clipboard hi", "started Some(\"make\")", "finished Claimed { code: Some(2) }"];
+    if cfg!(windows) {
+        // ConPTY does not keep a title and a clipboard write in the order the program wrote them, so those two are
+        // checked as told, and the command marks, which it does keep, in order
+        let marks: Vec<&String> =
+            told.iter().filter(|event| event.starts_with("started") || event.starts_with("finished")).collect();
+        assert_eq!(
+            marks,
+            [&expected[2].to_owned(), &expected[3].to_owned()],
+            "the command marks were not told in order"
+        );
+        assert!(told.contains(&expected[0].to_owned()) && told.contains(&expected[1].to_owned()), "told {told:?}");
+    } else {
+        assert_eq!(told, expected);
+    }
 }
 
 /// A shell that marks its commands is remembered: a view is told when there is something new to ask for and
@@ -668,6 +684,7 @@ fn the_line_at_a_cell_is_answered_to_the_view_that_asked() {
 /// An image named as a file and shown through placeholder cells reaches a view as part of the row that
 /// holds the cells, in a session started to read files; in one that was not, the same bytes show
 /// nothing. This is a program's whole path: the spawn's word, the file read, the cells, the frame.
+// POSIX only: ConPTY does not pass the graphics APC (`ESC _`) through to the broker, and this case sends its image in one.
 #[cfg(unix)]
 #[test]
 fn an_image_named_as_a_file_and_shown_through_cells_is_sent_with_its_row() {
@@ -731,8 +748,7 @@ fn an_image_named_as_a_file_and_shown_through_cells_is_sent_with_its_row() {
 }
 
 /// An image a program places is told to a view that asks where the images are, and its pixels to one that
-/// asks for them — in a session that was started taking images, with cells whose size is known.
-// not ported: on Windows the placed image is not listed (observed); the cause is undiagnosed.
+/// POSIX only: ConPTY does not pass the graphics APC (`ESC _`) through to the broker, so no image reaches it on Windows. The raw output of a program that writes one carries no `ESC _` (probe, 2026-11-14).
 #[cfg(unix)]
 #[test]
 fn a_placed_image_and_its_pixels_are_answered_to_the_view_that_asked() {
@@ -775,8 +791,7 @@ fn a_placed_image_and_its_pixels_are_answered_to_the_view_that_asked() {
 
 /// **A session with more images than are listed is told so, not sent a list too long to read.** As many
 /// as the bound are listed whole; one more, and the view is told how many there are and how many it
-/// could have been told of.
-// not ported: on Windows no image is listed (observed); the cause is undiagnosed.
+/// POSIX only: ConPTY does not pass the graphics APC (`ESC _`) through to the broker, so no image reaches it on Windows. The raw output of a program that writes one carries no `ESC _` (probe, 2026-11-14).
 #[cfg(unix)]
 #[test]
 fn a_session_holding_more_images_than_are_listed_says_so_and_one_holding_as_many_lists_them() {
@@ -818,8 +833,7 @@ fn a_session_holding_more_images_than_are_listed_says_so_and_one_holding_as_many
 
 /// **A view that loses focus holds no button down any more.** The button is let go somewhere else, so
 /// the release this view would have reported never comes: a move it reports after that is not a drag,
-/// where one it reported with the button down was.
-// not ported: on Windows the view never receives a frame with mouse reporting on (observed); the cause is undiagnosed.
+/// POSIX only: ConPTY consumes the mouse-mode request (`DECSET 1002`, `1006`) itself and does not send it on, so the broker is never told a program wants mouse reports. The raw output carries neither (probe, 2026-11-14).
 #[cfg(unix)]
 #[test]
 fn a_view_that_loses_focus_with_a_button_down_is_no_longer_dragging() {
@@ -984,8 +998,6 @@ fn a_resize_is_sent_to_a_view_though_the_program_prints_nothing() {
 /// **A view that asks and does not read is hung up on.** What it is owed waits in a queue of its own, and
 /// that queue has an end: a view asking for megabytes over and over while taking none of them is not
 /// reading, and the broker stops holding answers for it rather than holding ever more.
-// not ported: on Windows the broker does not hang up on the unread answers within 400,000 (observed); the cause is undiagnosed.
-#[cfg(unix)]
 #[test]
 fn a_view_that_asks_without_reading_is_hung_up_on() {
     let broker = start();
