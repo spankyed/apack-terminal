@@ -1217,6 +1217,9 @@ export class TerminalView {
     const after = moved ? this.viewport.acrossReset() : undefined
     // What is kept longest is what the viewer is at: the screen, or the line a scrolled view holds
     const near = moved || this.viewport.following ? frame.firstActive : this.viewport.top
+    // The images changed: history that shows part of one is asked for again. Before the frame is taken,
+    // so a row it brings is the row as it now is and is not asked for twice
+    if (this.imagesSeen !== -1 && frame.images !== this.imagesSeen) this.store.doubtPictured()
     const { reset, changed } = this.store.apply(frame, near)
     after?.()
     this.viewport.settle()
@@ -1256,8 +1259,6 @@ export class TerminalView {
       })
     }
     if (frame.images !== this.imagesSeen) {
-      // History that shows part of an image is asked for again: the screen's rows came with the frame
-      if (this.imagesSeen !== -1) this.store.doubtPictured()
       const seen = (this.imagesSeen = frame.images)
       const epoch = frame.epoch
       void this.source.images().then((placed) => {

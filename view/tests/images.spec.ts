@@ -141,6 +141,21 @@ describe('an image shown through placeholder cells', () => {
     expect(view.source.fetched.length, 'a history row that showed an image was not asked for again').toBeGreaterThan(fetched)
     expect(view.painted().images).toEqual([])
   })
+
+  it('is not asked after again where the frame that says the images changed brought the row', async () => {
+    const view = viewing()
+    view.source.pictures.set(7, pixels(40, 20))
+    view.source.history.set(99, showing(99, [piece({ image: 7 })]))
+    view.source.send(frame({ firstActive: 100, scrollback: 100, images: 1 }))
+    await quiet(view)
+    const covers = (line: number) => view.source.fetched.filter(([first, count]) => first <= line && line < first + count).length
+    const asked = covers(99)
+
+    // The line left the screen in this frame, which brings it as it ended up
+    view.source.send(frame({ sequence: 2, firstActive: 100, scrollback: 100, images: 2, rows: [showing(99, [piece({ image: 7, generation: 2 })])] }))
+    await quiet(view)
+    expect(covers(99), 'a row the frame brought was asked for again').toBe(asked)
+  })
 })
 
 describe('the images of a session', () => {
