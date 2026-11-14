@@ -22,8 +22,8 @@
 use std::collections::BTreeMap;
 use std::sync::mpsc::Sender;
 
-use super::wire::{self, ColorChanges, Cursor, FrameHead, Rows, ToView};
-use crate::vt::rows::{Mark, Rendering, RowRead, Space};
+use super::wire::{self, ANCHORED_LISTED, Anchored, AnchoredImages, ColorChanges, Cursor, FrameHead, Rows, ToView};
+use crate::vt::rows::{AnchoredRead, Mark, Rendering, RowRead, Space};
 use crate::vt::{Failed, Terminal};
 
 /// DEC private mode 5: the screen is drawn with its default foreground and background swapped.
@@ -150,6 +150,15 @@ pub struct Publication {
     colors: ColorChanges,
     /// The sequence at which those last changed
     colors_changed: u64,
+    /// The images on the screen that are placed relative to another, as of the last read: each with the
+    /// line its top-left cell is on, which may be above the oldest, and as many as a frame lists
+    /// (`wire::AnchoredImages`). By line rather than by row of the screen, so one that only scrolled with
+    /// its parent is the same one and is not told again
+    anchored: Vec<(i64, AnchoredRead)>,
+    /// How many more there were than are listed
+    anchored_omitted: u32,
+    /// The sequence at which those last changed
+    anchored_changed: u64,
     /// The terminal may no longer be what is held here: it was written to or resized since it was read
     stale: bool,
     viewers: Vec<Viewer>,
@@ -190,6 +199,9 @@ impl Publication {
             reverse: false,
             colors: ColorChanges::default(),
             colors_changed: 0,
+            anchored: Vec::new(),
+            anchored_omitted: 0,
+            anchored_changed: 0,
             stale: true,
             viewers: Vec::new(),
             read: RowRead::default(),
@@ -327,6 +339,16 @@ impl Publication {
         let mouse = terminal.mouse_tracking()?;
         let reverse = terminal.mode(REVERSE_VIDEO)?;
         let colors = terminal.color_changes()?;
+        // Where the core puts each on the screen as it was just looked at, which is the screen the rows
+        // above are of. The row is kept as the line it is, and no longer as a row
+        let mut anchored: Vec<(i64, AnchoredRead)> = self
+            .rendering
+            .anchored()?
+            .into_iter()
+            .map(|read| (self.first_active as i64 + i64::from(read.row), AnchoredRead { row: 0, ..read }))
+            .collect();
+        let anchored_omitted = u32::try_from(anchored.len().saturating_sub(ANCHORED_LISTED)).unwrap_or(u32::MAX);
+        anchored.truncate(ANCHORED_LISTED);
 
         // Everything is read: from here nothing can fail, and what is held moves as one
         if (cursor, mouse, reverse, commands, images, measured)
@@ -338,6 +360,11 @@ impl Publication {
             changed = true;
             self.colors = colors;
             self.colors_changed = next;
+        }
+        if (&anchored, anchored_omitted) != (&self.anchored, self.anchored_omitted) {
+            changed = true;
+            (self.anchored, self.anchored_omitted) = (anchored, anchored_omitted);
+            self.anchored_changed = next;
         }
         self.active = active;
         self.captured_first = self.first_active;
@@ -448,6 +475,35 @@ impl Publication {
             }
         }
 
+        // All of them whenever any changed since the frame this view last had, and in its first, as the
+        // colours are. Each row is counted from the screen's first line as this frame tells it
+        let anchored = sent.is_none_or(|sent| self.anchored_changed > sent.sequence).then(|| AnchoredImages {
+            cell: self.cell,
+            omitted: self.anchored_omitted,
+            list: self
+                .anchored
+                .iter()
+                .filter_map(|(line, read)| {
+                    Some(Anchored {
+                        image: read.image,
+                        generation: read.generation,
+                        z: read.z,
+                        row: i32::try_from(line - self.first_active as i64).ok()?,
+                        column: read.column,
+                        columns: read.columns,
+                        rows: read.rows,
+                        offset_x: read.offset.0,
+                        offset_y: read.offset.1,
+                        width: read.size.0,
+                        height: read.size.1,
+                        source_x: read.source.0,
+                        source_y: read.source.1,
+                        source_width: read.source.2,
+                        source_height: read.source.3,
+                    })
+                })
+                .collect(),
+        });
         let head = FrameHead {
             channel,
             sequence: self.sequence,
@@ -465,6 +521,7 @@ impl Publication {
             stale_from,
             // All of them whenever any changed since the frame this view last had, and in its first
             colors: sent.is_none_or(|sent| self.colors_changed > sent.sequence).then_some(&self.colors),
+            anchored: anchored.as_ref(),
         };
         let message = wire::frame(&head, &rows);
         // What the view has of the lines it was not sent: the older of what it had of any of them, so a

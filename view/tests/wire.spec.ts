@@ -58,7 +58,8 @@ function written(message: ToView): Record<string, unknown> {
         kind: 'frame', channel: message.channel, sequence: frame.sequence, epoch: frame.epoch,
         firstActive: frame.firstActive, columns: frame.columns, screenRows: frame.screenRows,
         scrollback: frame.scrollback, commands: frame.commands, images: frame.images, cursor: frame.cursor, alternateScreen: frame.modes.alternateScreen,
-        mouse: frame.modes.mouse, staleFrom: frame.staleFrom ?? null, reverseVideo: frame.reverseVideo, colors: frame.colors ?? null, ...rows(frame),
+        mouse: frame.modes.mouse, staleFrom: frame.staleFrom ?? null, reverseVideo: frame.reverseVideo, colors: frame.colors ?? null,
+        anchored: frame.anchored ?? null, ...rows(frame),
       }
     }
     case 'rows':
@@ -202,14 +203,23 @@ describe('bytes that are not a message', () => {
 
   it('refuses a frame that says how a cursor it lacks is drawn', () => {
     // Blinking and hidden are said of a cursor. The kind, eight fields of zero, the image counter, the
-    // flags, then no rows
-    for (const flags of [16, 128]) {
-      expect(() => decodeToView(Uint8Array.of(65, 0, 0, 0, 0, 0, 0, 0, 0, 0, flags, 0)), `flags ${flags}`)
+    // flags, then no rows. The flags are a number, so the ones past its first seven bits take a second byte
+    for (const flags of [[16], [0x80, 0x01]]) {
+      expect(() => decodeToView(Uint8Array.of(65, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...flags, 0)), `flags ${flags.join(' ')}`)
         .toThrow("a frame's flags are outside what the format defines")
     }
-    expect(decodeToView(Uint8Array.of(65, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 | 16 | 128, 3, 4, 0, 0))).toMatchObject({
+    expect(decodeToView(Uint8Array.of(65, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x80 | 1 | 16, 0x01, 3, 4, 0, 0))).toMatchObject({
       frame: { cursor: { column: 3, row: 4, shape: 'block', blinking: true, hidden: true } },
     })
+  })
+
+  it('refuses a frame flagged as something the format does not define', () => {
+    // The first bit past the ones a frame's flags have, and the last of them: said to tell the images
+    // placed relative to another, which is a cell of ten by twenty, none left out, and none listed
+    expect(() => decodeToView(Uint8Array.of(65, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0x04, 0)))
+      .toThrow("a frame's flags are outside what the format defines")
+    expect(decodeToView(Uint8Array.of(65, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0x02, 10, 20, 0, 0, 0)))
+      .toMatchObject({ frame: { anchored: { cellWidth: 10, cellHeight: 20, omitted: 0, list: [] } } })
   })
 
   it('refuses a command that ended no way the format defines, rather than reading the nearest', () => {

@@ -19,6 +19,8 @@ class Out {
       this.byte(low | 0x80)
     }
   }
+  /** A number that may be below zero: zigzag, the low bit the sign */
+  signed(value: number): void { this.number(value < 0 ? -value * 2 - 1 : value * 2) }
   text(value: string): void {
     const encoded = utf8.encode(value)
     this.number(encoded.length)
@@ -91,9 +93,9 @@ export function encodeToView(message: ToView): Uint8Array {
     case 'frame': {
       const { frame } = message
       for (const value of [frame.sequence, frame.epoch, frame.firstActive, frame.columns, frame.screenRows, frame.scrollback, frame.commands, frame.images]) out.number(value)
-      out.byte((frame.cursor ? 1 : 0) | (frame.modes.alternateScreen ? 2 : 0) | (frame.modes.mouse ? 4 : 0)
+      out.number((frame.cursor ? 1 : 0) | (frame.modes.alternateScreen ? 2 : 0) | (frame.modes.mouse ? 4 : 0)
         | (frame.staleFrom === undefined ? 0 : 8) | (frame.cursor?.blinking ? 16 : 0) | (frame.reverseVideo ? 32 : 0) | (frame.colors ? 64 : 0)
-        | (frame.cursor?.hidden ? 128 : 0))
+        | (frame.cursor?.hidden ? 128 : 0) | (frame.anchored ? 256 : 0))
       if (frame.cursor) { out.number(frame.cursor.column); out.number(frame.cursor.row); out.byte(CURSOR_SHAPES.indexOf(frame.cursor.shape)) }
       if (frame.staleFrom !== undefined) out.number(frame.staleFrom)
       if (frame.colors) {
@@ -103,6 +105,16 @@ export function encodeToView(message: ToView): Uint8Array {
         for (const color of set) if (color !== null) rgb(color)
         out.number(frame.colors.palette.length)
         for (const entry of frame.colors.palette) { out.byte(entry.index); rgb(entry.rgb) }
+      }
+      if (frame.anchored) {
+        const { cellWidth, cellHeight, omitted, list } = frame.anchored
+        for (const value of [cellWidth, cellHeight, omitted, list.length]) out.number(value)
+        for (const one of list) {
+          out.number(one.image); out.number(one.generation)
+          for (const signed of [one.z, one.row, one.column]) out.signed(signed)
+          for (const value of [one.columns, one.rows, one.offsetX, one.offsetY, one.width, one.height,
+            one.sourceX, one.sourceY, one.sourceWidth, one.sourceHeight]) out.number(value)
+        }
       }
       out.rows(frame)
       break

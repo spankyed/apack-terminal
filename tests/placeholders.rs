@@ -481,3 +481,33 @@ fn every_row_reads_as_the_core_says_it_shows() {
         pictured.get()
     );
 }
+
+/// The core's own answer for an image placed relative to another, which is what a frame carries
+/// (`view::publish`): beside a parent at a cell of its own, and beside one shown through cells, where it
+/// is measured from the top-left of those cells on the screen.
+#[test]
+fn the_core_places_an_image_anchored_to_another_on_the_screen() {
+    let mut terminal = terminal(40, 8, (10, 20));
+    let pixels = base64(&[0x80; 20 * 20 * 3]);
+    // A parent at row 2, column 5, and a child two columns right of it and one row down
+    terminal.feed(format!("\x1b[3;6H\x1b_Ga=T,f=24,i=6,p=3,s=20,v=20,c=2,r=1,C=1,q=2;{pixels}\x1b\\").as_bytes());
+    terminal.feed(format!("\x1b_Ga=t,f=24,i=7,s=20,v=20,q=2;{pixels}\x1b\\").as_bytes());
+    terminal.feed(b"\x1b_Ga=p,i=7,p=9,P=6,Q=3,H=2,V=1,c=2,r=1,z=4,q=2\x1b\\");
+    // A parent shown through cells at row 5, columns 10 and 11, and a child one column left of it
+    terminal.feed(&sent(8, 20, 20, 2, 1, Some(4)));
+    terminal.feed(b"\x1b_Ga=p,i=7,p=10,P=8,Q=4,H=-1,V=0,c=1,r=1,z=-3,q=2\x1b\\");
+    terminal
+        .feed(format!("\x1b[6;11H{}\x1b[58;5;4m{}{}\x1b[59m\x1b[39m", naming(8), cell(0, 0), cell(0, 1)).as_bytes());
+
+    let mut rendering = Rendering::new().expect("a render state");
+    rendering.look(&terminal, &mut Vec::new()).expect("a look");
+    let anchored: Vec<(u32, i32, i32, i32, u32, u32)> = rendering
+        .anchored()
+        .expect("the core's anchored images")
+        .iter()
+        .map(|one| (one.image, one.z, one.row, one.column, one.columns, one.rows))
+        .collect();
+    assert_eq!(anchored, [(7, -3, 5, 9, 1, 1), (7, 4, 3, 7, 2, 1)]);
+    // And neither is among what the storage can place
+    assert_eq!(terminal.placements().expect("placements").iter().map(|one| one.image).collect::<Vec<_>>(), [6]);
+}
