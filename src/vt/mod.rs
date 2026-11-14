@@ -12,6 +12,7 @@ use std::time::SystemTime;
 
 use ghostty_vt_rs_sys as sys;
 
+pub mod image_paths;
 pub mod images;
 pub mod input;
 pub mod placeholders;
@@ -116,14 +117,36 @@ impl Terminal {
     /// **Ground is a state, so it can be reached having taken nothing**: asked of a parser that is already
     /// between sequences, this answers `(0, true)`.
     pub fn feed_to(&mut self, bytes: &[u8], or_ground: bool) -> (usize, bool) {
+        let (taken, ground, _) = self.feed_until(bytes, or_ground, false);
+        (taken, ground)
+    }
+
+    /// As `feed_to`, and no further than the byte that begins an APC, SOS or PM string either. Answers
+    /// also whether that is where it stopped, which is with the string begun and none of it parsed.
+    ///
+    /// **Where a string begins is asked of the core, which is the only thing that knows.** It is not only
+    /// `ESC _`: the core takes `ESC X` and `ESC ^` the same way, and the single bytes `0x9f`, `0x98` and
+    /// `0x9e` wherever it is part way through a sequence — after an `ESC`, inside a CSI — though not
+    /// between sequences, where they are read as text. What follows the stop is the string's body, and
+    /// that is what `image_paths` reads before the core does.
+    pub fn feed_to_string(&mut self, bytes: &[u8], or_ground: bool) -> (usize, bool, bool) {
+        self.feed_until(bytes, or_ground, true)
+    }
+
+    /// Parses `bytes` up to the first boundary asked for: the byte that ends an OSC string always, ground
+    /// when `or_ground`, the byte that begins a string when `or_string`. Answers how many were taken, and
+    /// whether it stopped at ground and whether it stopped having begun a string.
+    fn feed_until(&mut self, bytes: &[u8], or_ground: bool, or_string: bool) -> (usize, bool, bool) {
         if bytes.is_empty() {
-            return (0, or_ground && self.at_ground());
+            return (0, or_ground && self.at_ground(), false);
         }
-        let boundaries = if or_ground {
-            sys::TerminalBoundary::OSC_END | sys::TerminalBoundary::GROUND
-        } else {
-            sys::TerminalBoundary::OSC_END
-        };
+        let mut boundaries = sys::TerminalBoundary::OSC_END;
+        if or_ground {
+            boundaries |= sys::TerminalBoundary::GROUND;
+        }
+        if or_string {
+            boundaries |= sys::TerminalBoundary::APC_START;
+        }
         let mut stop =
             sys::TerminalWriteStop { size: std::mem::size_of::<sys::TerminalWriteStop>(), ..Default::default() };
         // SAFETY: the handle is live for `&mut self`, the slice outlives the call, and `stop` is sized
@@ -133,16 +156,17 @@ impl Terminal {
         match result {
             sys::Result::SUCCESS => {
                 let ground = stop.reached & sys::TerminalBoundary::GROUND != 0;
-                // Only ground stops on no byte at all; an OSC ends on one
+                let string = stop.reached & sys::TerminalBoundary::APC_START != 0;
+                // Only ground stops on no byte at all; an OSC ends on one, and a string begins on one
                 let least = usize::from(!ground);
-                (stop.consumed.clamp(least, bytes.len()), ground)
+                (stop.consumed.clamp(least, bytes.len()), ground, string)
             }
             // No boundary was reached in these bytes, and all of them were parsed
-            sys::Result::NO_VALUE => (bytes.len(), false),
+            sys::Result::NO_VALUE => (bytes.len(), false, false),
             // Refused outright, with nothing parsed: parsed the plain way, so a byte is never lost to it
             _ => {
                 self.feed(bytes);
-                (bytes.len(), false)
+                (bytes.len(), false, false)
             }
         }
     }

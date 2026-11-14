@@ -23,6 +23,7 @@ use crate::protocol::{CursorBlink, CursorStyle};
 use crate::recording::{self, Entry, Recorder, Timed};
 use crate::view::publish::{Outlet, Publication, ViewId};
 use crate::view::wire::{MAX_MESSAGE_BYTES, Position, Rows, Span};
+use crate::vt::image_paths::{self, ImagePaths};
 use crate::vt::images::{ImageRead, PlacementRead};
 use crate::vt::input::{self, Encoders, Key, Pasted, Pointer};
 use crate::vt::reads;
@@ -230,6 +231,9 @@ pub struct Screen {
     /// Whether the session's programs may name a file or a shared memory object as an image's source
     /// (`allow_images`).
     image_files: bool,
+    /// What reads a file's name before the core is told of it, for a session whose images may be named
+    /// (`allow_images`). A session's without is `None`, and is fed exactly as if there were no such thing.
+    image_paths: Option<ImagePaths>,
     /// Where what is fed here is also written, for a session that asked to be recorded (`recording`).
     recorder: Option<Recorder>,
     /// A keyframe is due and is waiting for the parser to be between sequences (`keyframe_when_due`).
@@ -408,6 +412,7 @@ impl Screen {
             hold_limit: None,
             replaying: false,
             image_files: false,
+            image_paths: None,
             recorder: None,
             keyframe_waits: false,
             title: None,
@@ -429,13 +434,36 @@ impl Screen {
     /// was at is marked while the cursor is still on it (`commands`); after a sequence that begins or
     /// ends a hold, so the screen a program let go of is the one sent (`settle_holds`); and, when a
     /// keyframe is waiting, at the first byte that leaves the parser between sequences.
+    ///
+    /// **One thing is kept from the core, in a session whose images may be named as files**: the name,
+    /// until it has been asked about (`vt::image_paths`). There the parse also stops where an APC, SOS or
+    /// PM string begins, and the string's body is read before the core is fed it. The recording is of
+    /// what the program wrote either way.
     pub fn feed(&mut self, bytes: &[u8]) {
         // How much of `bytes` has been parsed, and how much of it the recording has been given
         let (mut fed, mut recorded) = (0, 0);
         while fed < bytes.len() {
             let piece = fed + hold_piece(&bytes[fed..]);
             while fed < piece {
-                let (taken, ground) = self.terminal.feed_to(&bytes[fed..piece], self.keyframe_waits);
+                let (taken, ground) = match &mut self.image_paths {
+                    None => self.terminal.feed_to(&bytes[fed..piece], self.keyframe_waits),
+                    // Never nothing: a body is read up to the byte that ends it, and then is not being read
+                    Some(paths) if paths.reading() => {
+                        let terminal = &mut self.terminal;
+                        fed += paths.read(&bytes[fed..piece], image_paths::regular_file, |passed| {
+                            terminal.feed(passed);
+                        });
+                        continue;
+                    }
+                    Some(paths) => {
+                        let (taken, ground, string) =
+                            self.terminal.feed_to_string(&bytes[fed..piece], self.keyframe_waits);
+                        if string {
+                            paths.begin();
+                        }
+                        (taken, ground)
+                    }
+                };
                 fed += taken;
                 self.reported.get_mut().place_marks(&self.terminal);
                 if ground {
@@ -699,7 +727,9 @@ impl Screen {
         // **A recording names the files it was shown; it does not hold them.** Read again now they would
         // be whatever is at those paths today, and a shared memory object would be unlinked a second
         // time under whoever has since made one of that name. So a replay takes images from its own
-        // bytes only, and one that was sent by name is absent from it
+        // bytes only, and one that was sent by name is absent from it. What reads names goes on reading
+        // them all the same (`feed`): fed around it, a replay that stops part way through a command
+        // would leave the core in a string that had not been told of
         if self.image_files {
             let _ = self.terminal.allow_images(false);
         }
@@ -1067,9 +1097,17 @@ impl Screen {
     /// asking whether it may is not told yes by a session nothing is drawing. `files` is whether one may
     /// also be named as a file or a shared memory object on this machine, which is the caller's to say:
     /// see `Terminal::allow_images`.
+    ///
+    /// **A file's name is asked about before the core opens it, on POSIX** (`vt::image_paths`), where
+    /// opening a FIFO waits for whatever writes to it. What stands in for one on Windows has not been
+    /// looked at, and a name there reaches the core as it came.
     pub fn allow_images(&mut self, files: bool) -> Result<(), Failed> {
         self.terminal.allow_images(files)?;
         self.image_files = files;
+        #[cfg(unix)]
+        {
+            self.image_paths = files.then(ImagePaths::default);
+        }
         Ok(())
     }
 
