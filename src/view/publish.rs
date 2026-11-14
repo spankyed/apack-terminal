@@ -135,6 +135,8 @@ pub struct Publication {
     commands: u32,
     /// The image storage's generation when the screen was last read, as much of it as a view compares
     images: u32,
+    /// One cell in pixels when the screen was last read, which is what a row's images are measured in
+    cell: (u16, u16),
     /// Whether the program had the screen in reverse video when it was last read
     reverse: bool,
     /// The colours the program has changed from the ones the session was given, as of the last read
@@ -176,6 +178,7 @@ impl Publication {
             mouse: false,
             commands: 0,
             images: 0,
+            cell: (0, 0),
             reverse: false,
             colors: ColorChanges::default(),
             colors_changed: 0,
@@ -249,6 +252,11 @@ impl Publication {
     /// touches the row's cells. So a row the core says is unchanged has those two flags read — and not
     /// its cells — and is read whole when they are not the ones it is held with.
     ///
+    /// **Nor is it about what a row shows of an image.** A row of placeholder cells is sent with the parts
+    /// of images those cells show (`wire::Piece`), and those change when the image does — sent again,
+    /// replaced, deleted — and when a cell's size in pixels does, with no cell of the row written. So a
+    /// read after either reads every row, and compares each as it does after a scroll.
+    ///
     /// **Nothing held moves until all of it is read.** A read the core refuses part way leaves no screen
     /// held rather than half of one, with no row stamped newer than the sequence a view is compared
     /// with, and the next read starts from nothing.
@@ -256,6 +264,11 @@ impl Publication {
         self.advance(terminal)?;
         // A flag for each row the core answers for by itself, and none when it says everything changed
         self.rendering.look(terminal, &mut self.changed)?;
+
+        // Compared and never ordered, so the low half is all of it a view needs
+        let images = terminal.images_generation() as u32;
+        let cell = terminal.cell_pixels();
+        let pictured = images != self.images || cell != self.cell;
 
         let next = self.sequence + 1;
         let rows = usize::from(self.rows);
@@ -274,6 +287,7 @@ impl Publication {
                 // file's own count of what did, kept beside the core's word: it flags no row once any has
                 Some(held)
                     if shift == 0
+                        && !pictured
                         && self.changed.get(index) == Some(&false)
                         && terminal.row_flags(Space::Active, index as u32)? == held.body.first().copied() =>
                 {
@@ -298,12 +312,11 @@ impl Publication {
             row: read.row,
             shape: read.shape,
             blinking: read.blinking,
+            hidden: read.hidden,
         });
         let mouse = terminal.mouse_tracking()?;
         let reverse = terminal.mode(REVERSE_VIDEO)?;
         let colors = terminal.color_changes()?;
-        // Compared and never ordered, so the low half is all of it a view needs
-        let images = terminal.images_generation() as u32;
 
         // Everything is read: from here nothing can fail, and what is held moves as one
         if (cursor, mouse, reverse, commands, images)
@@ -321,6 +334,7 @@ impl Publication {
         self.captured_scrollback = self.scrollback;
         (self.cursor, self.mouse, self.reverse, self.commands, self.images) =
             (cursor, mouse, reverse, commands, images);
+        self.cell = cell;
         if changed {
             self.sequence = next;
         }

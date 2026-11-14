@@ -5,8 +5,9 @@
 //! placement is told as the line it is on — which stays true as the screen scrolls — and a view draws the
 //! ones on the lines it is showing.
 //!
-//! **A virtual placement is not told.** One shown through Unicode placeholder cells has no position in the
-//! storage; it is wherever those cells are. A view draws the placeholder cells as the text they are.
+//! **A virtual placement is not told here.** One shown through Unicode placeholder cells has no position
+//! in the storage; it is wherever those cells are, so what it shows is read with the row that holds them
+//! (`rows`, `placeholders`) and a view is sent it as part of that row.
 
 use std::ptr::NonNull;
 
@@ -40,6 +41,17 @@ pub struct PlacementRead {
     pub size: (u32, u32),
     /// The part of the image drawn — left, top, width, height — in the image's own pixels
     pub source: (u32, u32, u32, u32),
+}
+
+/// What placeholder cells naming an image show: the image as it now is, and the cells its virtual
+/// placement covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shown {
+    pub generation: u64,
+    /// The image's width and height in its own pixels
+    pub picture: (u32, u32),
+    /// The columns and rows the placement was given, zero for one left to the picture's size
+    pub grid: (u32, u32),
 }
 
 /// Part of an image's pixels, with what a view needs to make sense of them.
@@ -189,10 +201,19 @@ pub(super) fn install_decoders() {
 impl Terminal {
     /// Lets programs send images, up to `IMAGE_STORAGE_BYTES` of them.
     ///
-    /// **As bytes in the stream only.** The protocol's other ways in — a file the terminal is asked to
-    /// read, a temporary file, shared memory — stay off, which is the core's default: each has the
-    /// terminal open something on this machine because a program's output named it.
-    pub fn allow_images(&self) -> Result<(), Failed> {
+    /// **As bytes in the stream, unless `files`.** The protocol has two other ways in that this takes —
+    /// a file the terminal is asked to read, and a shared memory object — and each has the terminal open
+    /// something on this machine because a program's output named it. That is a fair thing to ask of a
+    /// terminal by a program on this machine, which could have read the file itself, and not by whatever
+    /// else reaches a screen: a file shown with `cat`, a log, the far end of an `ssh`. Which of the two a
+    /// session's output is, only whoever started it knows, so it is theirs to say (`Request::Spawn`).
+    ///
+    /// **What the core then refuses is the core's to refuse**: a path that is not a regular file, one
+    /// under `/proc`, `/sys` or `/dev`, a file or object past what an image may be. A shared memory object
+    /// is unlinked once read, as the protocol says, and is the one thing here that is removed. The
+    /// protocol's third way in, a temporary file the terminal deletes, stays off: nothing a session is
+    /// started for sends one, and it is the one that removes a file.
+    pub fn allow_images(&self, files: bool) -> Result<(), Failed> {
         let limit: u64 = IMAGE_STORAGE_BYTES;
         // SAFETY: KITTY_IMAGE_STORAGE_LIMIT takes a `uint64_t*`
         let result = unsafe {
@@ -202,7 +223,111 @@ impl Terminal {
                 (&raw const limit).cast::<std::ffi::c_void>(),
             )
         };
-        Failed::check("ghostty_terminal_set(KITTY_IMAGE_STORAGE_LIMIT)", result)
+        Failed::check("ghostty_terminal_set(KITTY_IMAGE_STORAGE_LIMIT)", result)?;
+        for (option, call) in [
+            (sys::TerminalOption::KITTY_IMAGE_MEDIUM_FILE, "ghostty_terminal_set(KITTY_IMAGE_MEDIUM_FILE)"),
+            (sys::TerminalOption::KITTY_IMAGE_MEDIUM_SHARED_MEM, "ghostty_terminal_set(KITTY_IMAGE_MEDIUM_SHARED_MEM)"),
+        ] {
+            // SAFETY: both options take a `bool*`
+            let result = unsafe {
+                sys::ghostty_terminal_set(self.handle, option, (&raw const files).cast::<std::ffi::c_void>())
+            };
+            Failed::check(call, result)?;
+        }
+        Ok(())
+    }
+
+    /// One cell in pixels as a window last measured it, or zero where none has: the terminal's size in
+    /// pixels over its size in cells, which is how the core reckons a cell.
+    pub fn cell_pixels(&self) -> (u16, u16) {
+        let read = |data: sys::TerminalData::Type| {
+            let mut value: u32 = 0;
+            // SAFETY: WIDTH_PX and HEIGHT_PX each write a `uint32_t`
+            let result = unsafe { sys::ghostty_terminal_get(self.handle, data, (&raw mut value).cast()) };
+            if result == sys::Result::SUCCESS { value } else { 0 }
+        };
+        let per = |pixels: u32, cells: Result<u16, Failed>| {
+            pixels.checked_div(u32::from(cells.unwrap_or(0))).and_then(|cell| u16::try_from(cell).ok()).unwrap_or(0)
+        };
+        (per(read(sys::TerminalData::WIDTH_PX), self.cols()), per(read(sys::TerminalData::HEIGHT_PX), self.rows()))
+    }
+
+    /// What placeholder cells naming `image` and `placement` show, or `None` where they show nothing:
+    /// the image is not there or has not all arrived, or it has no such virtual placement. A `placement`
+    /// of zero is whichever virtual placement the image has.
+    ///
+    /// **Where an image has several and the cells name none, the lowest numbered is shown.** The core
+    /// prefers one the program numbered over one it numbered itself, and the storage does not say which
+    /// is which; a program that makes several numbers them and names one, and nothing checks the rest.
+    pub fn shown_by(&self, image: u32, placement: u32) -> Option<Shown> {
+        use sys::KittyGraphicsImageData as Image;
+        use sys::KittyGraphicsPlacementData as Data;
+        let graphics = self.graphics()?;
+        // SAFETY: the storage is this terminal's; a null image is one that is not there
+        let stored = unsafe { sys::ghostty_kitty_graphics_image(graphics, image) };
+        if stored.is_null() {
+            return None;
+        }
+        let of_image = |data: Image::Type| {
+            let mut value: u32 = 0;
+            // SAFETY: each key read through this writes a `uint32_t`
+            let result = unsafe { sys::ghostty_kitty_graphics_image_get(stored, data, (&raw mut value).cast()) };
+            (result == sys::Result::SUCCESS).then_some(value)
+        };
+        let picture = (of_image(Image::WIDTH)?, of_image(Image::HEIGHT)?);
+        let mut pixels = sys::String::default();
+        // SAFETY: PIXELS writes a `GhosttyString`; only whether there are any is read here
+        let arrived = unsafe { sys::ghostty_kitty_graphics_image_get(stored, Image::PIXELS, (&raw mut pixels).cast()) };
+        if arrived != sys::Result::SUCCESS || pixels.ptr.is_null() {
+            return None;
+        }
+
+        let mut iterator: sys::KittyGraphicsPlacementIterator = std::ptr::null_mut();
+        // SAFETY: `iterator` is a valid out-pointer; it is freed below
+        let made = unsafe { sys::ghostty_kitty_graphics_placement_iterator_new(std::ptr::null(), &raw mut iterator) };
+        if made != sys::Result::SUCCESS {
+            return None;
+        }
+        // SAFETY: PLACEMENT_ITERATOR fills the iterator it is handed a pointer to
+        let filled = unsafe {
+            sys::ghostty_kitty_graphics_get(
+                graphics,
+                sys::KittyGraphicsData::PLACEMENT_ITERATOR,
+                (&raw mut iterator).cast(),
+            )
+        };
+        let mut found: Option<(u32, (u32, u32))> = None;
+        if filled == sys::Result::SUCCESS {
+            let read_u32 = |data: Data::Type| {
+                let mut value: u32 = 0;
+                // SAFETY: each key read through this writes a `uint32_t`
+                let result =
+                    unsafe { sys::ghostty_kitty_graphics_placement_get(iterator, data, (&raw mut value).cast()) };
+                (result == sys::Result::SUCCESS).then_some(value)
+            };
+            // SAFETY: the iterator was filled from this terminal's storage and nothing has written since
+            while unsafe { sys::ghostty_kitty_graphics_placement_next(iterator) } {
+                let mut is_virtual = false;
+                // SAFETY: IS_VIRTUAL writes a `bool`
+                let read = unsafe {
+                    sys::ghostty_kitty_graphics_placement_get(iterator, Data::IS_VIRTUAL, (&raw mut is_virtual).cast())
+                };
+                if read != sys::Result::SUCCESS || !is_virtual || read_u32(Data::IMAGE_ID) != Some(image) {
+                    continue;
+                }
+                let Some(id) = read_u32(Data::PLACEMENT_ID) else { continue };
+                if placement != 0 && id != placement {
+                    continue;
+                }
+                if found.is_none_or(|(held, _)| id < held) {
+                    found = Some((id, (read_u32(Data::COLUMNS).unwrap_or(0), read_u32(Data::ROWS).unwrap_or(0))));
+                }
+            }
+        }
+        // SAFETY: freed once
+        unsafe { sys::ghostty_kitty_graphics_placement_iterator_free(iterator) };
+        let (_, grid) = found?;
+        Some(Shown { generation: image_generation(stored), picture, grid })
     }
 
     /// The active screen's image storage, borrowed until the terminal is next written to.

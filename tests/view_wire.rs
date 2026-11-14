@@ -12,7 +12,8 @@
 use apack_terminal::protocol::{CommandOutcome, Unreported};
 use apack_terminal::view::wire::{
     Block, Color, ColorChanges, CommandRow, Cursor, Frame, FrameHead, Glyph, Incoming, MAX_MESSAGE_BYTES, Malformed,
-    Placement, Position, Row, Rows, Span, Style, ToBroker, ToView, TooLong, body, frame, read_message, write_row,
+    Piece, Placement, Position, Row, Rows, Span, Style, ToBroker, ToView, TooLong, body, frame, read_message,
+    write_row,
 };
 use proptest::prelude::*;
 
@@ -44,8 +45,8 @@ fn row() -> impl Strategy<Value = Row> {
     (prop::collection::vec(style(), 0..4), prop::collection::vec("[a-z:/.]{1,12}", 0..3)).prop_flat_map(
         |(styles, links): (Vec<Style>, Vec<String>)| {
             let glyph = (character(), 0u16..3, 0..=styles.len(), 0..=links.len());
-            (any::<u32>(), any::<bool>(), any::<bool>(), prop::collection::vec(glyph, 0..24)).prop_map(
-                move |(line, wrapped, prompt, cells)| {
+            (any::<u32>(), any::<bool>(), any::<bool>(), prop::collection::vec(glyph, 0..24), pieces()).prop_map(
+                move |(line, wrapped, prompt, cells, (pieces, cell))| {
                     let mut column = 0u16;
                     let glyphs = cells
                         .into_iter()
@@ -56,11 +57,46 @@ fn row() -> impl Strategy<Value = Row> {
                             glyph
                         })
                         .collect();
-                    Row { line: u64::from(line), wrapped, prompt, styles: styles.clone(), links: links.clone(), glyphs }
+                    Row {
+                        line: u64::from(line),
+                        wrapped,
+                        prompt,
+                        styles: styles.clone(),
+                        links: links.clone(),
+                        glyphs,
+                        pieces,
+                        cell,
+                    }
                 },
             )
         },
     )
+}
+
+/// The parts of images a row shows and the cell they are measured in, which is said only of a row that
+/// shows any.
+fn pieces() -> impl Strategy<Value = (Vec<Piece>, (u16, u16))> {
+    let piece = (
+        (any::<u32>(), any::<u64>(), any::<u16>(), any::<u16>()),
+        (any::<u32>(), any::<u32>(), any::<u32>(), any::<u32>()),
+        (any::<u32>(), any::<u32>(), any::<u32>(), any::<u32>()),
+    )
+        .prop_map(|((image, generation, column, columns), drawn, source)| Piece {
+            image,
+            generation,
+            column,
+            columns,
+            offset_x: drawn.0,
+            offset_y: drawn.1,
+            width: drawn.2,
+            height: drawn.3,
+            source_x: source.0,
+            source_y: source.1,
+            source_width: source.2,
+            source_height: source.3,
+        });
+    (prop::collection::vec(piece, 0..4), any::<(u16, u16)>())
+        .prop_map(|(pieces, cell)| if pieces.is_empty() { (pieces, (0, 0)) } else { (pieces, cell) })
 }
 
 fn block() -> impl Strategy<Value = Block> {
@@ -122,12 +158,8 @@ fn colors() -> impl Strategy<Value = ColorChanges> {
 
 fn to_view() -> impl Strategy<Value = ToView> {
     let cursor = prop::option::of(
-        (any::<u16>(), any::<u16>(), 0u8..4, any::<bool>()).prop_map(|(column, row, shape, blinking)| Cursor {
-            column,
-            row,
-            shape,
-            blinking,
-        }),
+        (any::<u16>(), any::<u16>(), 0u8..4, any::<bool>(), any::<bool>())
+            .prop_map(|(column, row, shape, blinking, hidden)| Cursor { column, row, shape, blinking, hidden }),
     );
     let frame = (
         (any::<u32>(), any::<u64>(), any::<u32>(), any::<u64>()),
@@ -530,7 +562,7 @@ fn the_longest_head_there_is_fits_with_rows_taken_to_the_last_byte() {
         scrollback: u32::MAX,
         commands: u32::MAX,
         images: u32::MAX,
-        cursor: Some(Cursor { column: u16::MAX, row: u16::MAX, shape: 3, blinking: true }),
+        cursor: Some(Cursor { column: u16::MAX, row: u16::MAX, shape: 3, blinking: true, hidden: true }),
         alternate_screen: true,
         mouse: true,
         reverse_video: true,

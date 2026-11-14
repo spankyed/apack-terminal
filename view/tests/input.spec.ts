@@ -166,7 +166,7 @@ describe('text that is not a key', () => {
 describe('the field an input method composes in', () => {
   it('is where the cursor is drawn, clear of the gutter, in the terminal\'s font and colours', () => {
     const { source, field } = mountedView({ gutter: 6 })
-    source.send(frame({ rows: [row(1, 'abc')], cursor: { column: 2, row: 1, shape: 'block', blinking: false } }))
+    source.send(frame({ rows: [row(1, 'abc')], cursor: { column: 2, row: 1, shape: 'block', blinking: false, hidden: false } }))
     runFrames()
 
     // Cells are ten by twenty: two columns in, past six pixels of gutter, one row down
@@ -431,12 +431,29 @@ describe('composition', () => {
 
   it('the field sits at the cursor\'s cell while composing, at least a pixel in each dimension', () => {
     const view = mountedView({ gutter: 6 })
-    view.source.send(frame({ rows: [row(1, 'abc')], cursor: { column: 2, row: 1, shape: 'block', blinking: false } }))
+    view.source.send(frame({ rows: [row(1, 'abc')], cursor: { column: 2, row: 1, shape: 'block', blinking: false, hidden: false } }))
     runFrames()
     view.field.dispatchEvent(new CompositionEvent('compositionstart'))
     expect([view.field.style.left, view.field.style.top]).toEqual(['26px', '20px'])
     expect(parseFloat(view.field.style.height)).toBeGreaterThanOrEqual(1)
     expect(parseFloat(view.field.style.width)).toBeGreaterThanOrEqual(1)
+  })
+
+  it('the field follows a cursor the program has hidden, which is where a program that draws its own puts typing', () => {
+    const view = mountedView({ gutter: 6 })
+    view.source.send(frame({ rows: [row(1, 'abc')], cursor: { column: 2, row: 1, shape: 'block', blinking: false, hidden: true } }))
+    runFrames()
+    expect([view.field.style.left, view.field.style.top]).toEqual(['26px', '20px'])
+    expect(view.painted().cursor, 'a hidden cursor was drawn').toBeUndefined()
+
+    // Moved while hidden: the field goes with it, and still nothing is drawn
+    view.source.send(frame({ sequence: 2, cursor: { column: 5, row: 3, shape: 'block', blinking: true, hidden: true } }))
+    runFrames()
+    expect([view.field.style.left, view.field.style.top]).toEqual(['56px', '60px'])
+    expect(view.painted().cursor).toBeUndefined()
+
+    view.source.send(frame({ sequence: 3, cursor: { column: 5, row: 3, shape: 'block', blinking: false, hidden: false } }))
+    expect(view.painted().cursor, 'a cursor shown again was not drawn').toMatchObject({ column: 5 })
   })
 
   it('a row of no height still gives the field a pixel, so an input method does not break', () => {
@@ -447,7 +464,7 @@ describe('composition', () => {
     const host = document.createElement('div')
     document.body.appendChild(host)
     view.mount(host)
-    source.send(frame({ rows: [row(1, 'abc')], cursor: { column: 0, row: 0, shape: 'block', blinking: false } }))
+    source.send(frame({ rows: [row(1, 'abc')], cursor: { column: 0, row: 0, shape: 'block', blinking: false, hidden: false } }))
     runFrames()
     const field = view.element.querySelector('textarea')!
     expect(parseFloat(field.style.height)).toBeGreaterThanOrEqual(1)

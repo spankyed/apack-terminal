@@ -124,6 +124,7 @@ impl Proxy {
             record: None,
             restore: false,
             images: false,
+            image_files: false,
             marks_key: None,
         });
         loop {

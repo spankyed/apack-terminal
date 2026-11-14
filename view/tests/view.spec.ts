@@ -397,7 +397,7 @@ describe('the colours a program set for itself', () => {
   function coloured() {
     const view = mountedView()
     const rows = [row(0, 'p'), row(1, 'n', { style: 1, styles: [{ ...PLAIN, fg: paletteColor(1) }] }), row(2, 'x', { style: 1, styles: [{ ...PLAIN, fg: 0x123456, bg: 0x654321 }] })]
-    view.source.send(frame({ rows, colors: none, cursor: { column: 0, row: 3, shape: 'block', blinking: false } }))
+    view.source.send(frame({ rows, colors: none, cursor: { column: 0, row: 3, shape: 'block', blinking: false, hidden: false } }))
     const colours = () => {
       const scene = view.painted()
       return { background: scene.theme.background, cursor: scene.theme.cursor, glyphs: scene.rows.slice(0, 3).map((drawn) => drawn?.glyphs[0]?.color) }
@@ -666,7 +666,7 @@ describe('scrolling back', () => {
 
 describe('the cursor', () => {
   const withCursor = (blinking: boolean) =>
-    frame({ rows: [row(0, 'ab')], cursor: { column: 1, row: 0, shape: 'bar', blinking } })
+    frame({ rows: [row(0, 'ab')], cursor: { column: 1, row: 0, shape: 'bar', blinking, hidden: false } })
 
   it('is hollow while the view does not have the keyboard, and takes its shape when it does', () => {
     const { source, view, painter } = mounted()
@@ -776,7 +776,7 @@ describe('the cursor', () => {
 
   it('is not drawn while the view is scrolled away from it', () => {
     const { source, view, painter } = mounted()
-    source.send(frame({ firstActive: 100, scrollback: 100, cursor: { column: 0, row: 0, shape: 'block', blinking: false } }))
+    source.send(frame({ firstActive: 100, scrollback: 100, cursor: { column: 0, row: 0, shape: 'block', blinking: false, hidden: false } }))
     view.scrollTo(50)
     runFrames()
 
@@ -791,7 +791,7 @@ describe('cursor settings changed on a view that is up', () => {
   /** A view at the foot of a screen of history, with text selected: the state a remake would lose */
   function working(options: Parameters<typeof mountedView>[0], focused: boolean) {
     const view = mountedView(options)
-    view.source.send(frame({ firstActive: 100, scrollback: 100, rows: [row(100, 'alpha beta'), row(101, 'gamma')], cursor: { column: 1, row: 1, shape: 'bar', blinking: true } }))
+    view.source.send(frame({ firstActive: 100, scrollback: 100, rows: [row(100, 'alpha beta'), row(101, 'gamma')], cursor: { column: 1, row: 1, shape: 'bar', blinking: true, hidden: false } }))
     view.view.selection.select({ start: { line: 100, column: 0 }, end: { line: 100, column: 4 } })
     view.view.setFocused(focused)
     runFrames()

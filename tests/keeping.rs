@@ -152,6 +152,7 @@ impl Connection {
             record: record.map(|path| path.to_str().expect("a utf-8 path").to_owned()),
             restore,
             images: false,
+            image_files: false,
             marks_key: marks_key.map(str::to_owned),
         });
         self.answer(|event| match event {
@@ -727,6 +728,7 @@ fn a_line_typed_and_not_entered_is_not_run_when_its_session_is_ended() {
             record: None,
             restore: false,
             images: false,
+            image_files: false,
             marks_key: None,
         });
         client.answer(|event| if let Event::Spawned { session, .. } = event { Some(session) } else { None })
@@ -839,6 +841,7 @@ fn a_session_whose_program_ignores_a_hangup_is_ended_all_the_same() {
         record: None,
         restore: false,
         images: false,
+        image_files: false,
         marks_key: None,
     });
     let session = client.answer(|event| if let Event::Spawned { session, .. } = event { Some(session) } else { None });
@@ -881,6 +884,7 @@ fn a_job_in_a_group_of_its_own_ends_with_a_shell_that_had_to_be_killed() {
         record: None,
         restore: false,
         images: false,
+        image_files: false,
         marks_key: None,
     });
     let session = client.answer(|event| if let Event::Spawned { session, .. } = event { Some(session) } else { None });

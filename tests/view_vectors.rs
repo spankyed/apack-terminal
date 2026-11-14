@@ -11,8 +11,8 @@
 
 use apack_terminal::protocol::{CommandOutcome, Unreported};
 use apack_terminal::view::wire::{
-    Block, Color, ColorChanges, CommandRow, Cursor, Frame, Glyph, NO_BUTTON, Placement, Position, Row, Span, Style,
-    ToBroker, ToView, body,
+    Block, Color, ColorChanges, CommandRow, Cursor, Frame, Glyph, NO_BUTTON, Piece, Placement, Position, Row, Span,
+    Style, ToBroker, ToView, body,
 };
 use serde_json::{Value, json};
 
@@ -64,10 +64,28 @@ fn block(block: &Block) -> Value {
                     json!({ "column": glyph.column, "width": glyph.width, "text": glyph.text, "style": glyph.style, "link": glyph.link })
                 })
                 .collect();
-            json!({
+            let mut written = json!({
                 "line": row.line, "wrapped": row.wrapped, "prompt": row.prompt, "styles": styles, "links": row.links,
                 "glyphs": glyphs,
-            })
+            });
+            // Said only of a row that shows part of an image, which is how a view holds it
+            if !row.pieces.is_empty() {
+                let pieces: Vec<Value> = row
+                    .pieces
+                    .iter()
+                    .map(|one| {
+                        json!({
+                            "image": one.image, "generation": one.generation, "column": one.column,
+                            "columns": one.columns, "offsetX": one.offset_x, "offsetY": one.offset_y,
+                            "width": one.width, "height": one.height, "sourceX": one.source_x,
+                            "sourceY": one.source_y, "sourceWidth": one.source_width,
+                            "sourceHeight": one.source_height,
+                        })
+                    })
+                    .collect();
+                written["images"] = json!({ "cellWidth": row.cell.0, "cellHeight": row.cell.1, "pieces": pieces });
+            }
+            written
         })
         .collect();
     json!(rows)
@@ -94,7 +112,10 @@ fn to_view(message: &ToView) -> Value {
             let rows = block(&frame.block);
             let cursor = frame.cursor.map(|cursor| {
                 let shape = ["block", "bar", "underline", "hollow"][usize::from(cursor.shape)];
-                json!({ "column": cursor.column, "row": cursor.row, "shape": shape, "blinking": cursor.blinking })
+                json!({
+                    "column": cursor.column, "row": cursor.row, "shape": shape, "blinking": cursor.blinking,
+                    "hidden": cursor.hidden,
+                })
             });
             json!({
                 "kind": "frame", "channel": frame.channel, "sequence": frame.sequence, "epoch": frame.epoch,
@@ -250,6 +271,7 @@ fn sample_block() -> Block {
                     glyph(5, 1, "x", 2, 1),
                     glyph(6, 1, "y", 2, 1),
                 ],
+                ..Row::default()
             },
             // A wide character, one of several code points, and a letter of two bytes
             Row {
@@ -264,6 +286,46 @@ fn sample_block() -> Block {
                     glyph(3, 2, "\u{1F468}\u{200D}\u{1F469}", 0, 0),
                     glyph(5, 1, "\u{e9}", 0, 0),
                 ],
+                ..Row::default()
+            },
+            // Two images shown through placeholder cells: one from its first cell, one that starts part
+            // way into its cell and is cut from the middle of a larger picture. Their cells are blank
+            Row {
+                line: 3,
+                styles: vec![Style { fg: Color::Palette(7), ..Style::default() }],
+                glyphs: vec![glyph(0, 1, " ", 1, 0), glyph(1, 1, " ", 1, 0)],
+                pieces: vec![
+                    Piece {
+                        image: 7,
+                        generation: 9,
+                        column: 0,
+                        columns: 2,
+                        offset_x: 0,
+                        offset_y: 0,
+                        width: 20,
+                        height: 20,
+                        source_x: 0,
+                        source_y: 0,
+                        source_width: 40,
+                        source_height: 40,
+                    },
+                    Piece {
+                        image: 0x0102_0304,
+                        generation: 1 << 40,
+                        column: 40,
+                        columns: 300,
+                        offset_x: 3,
+                        offset_y: 5,
+                        width: 2_994,
+                        height: 15,
+                        source_x: 1_000,
+                        source_y: 2_000,
+                        source_width: 4_000,
+                        source_height: 20,
+                    },
+                ],
+                cell: (10, 20),
+                ..Row::default()
             },
             // An empty row, and one far enough up that its number takes more than a byte
             Row { line: 2, ..Row::default() },
@@ -318,12 +380,20 @@ fn vectors() -> Value {
     let for_a_view: Vec<(&str, ToView)> = vec![
         (
             "a frame with one of everything a row can hold",
-            frame(Some(Cursor { column: 4, row: 23, shape: 1, blinking: true }), None, sample_block()),
+            frame(Some(Cursor { column: 4, row: 23, shape: 1, blinking: true, hidden: false }), None, sample_block()),
         ),
         ("a frame with no cursor and nothing changed", frame(None, None, Block::default())),
         (
             "a frame naming stale history, with a steady underline cursor",
-            frame(Some(Cursor { column: 0, row: 0, shape: 2, blinking: false }), Some(990), Block::default()),
+            frame(
+                Some(Cursor { column: 0, row: 0, shape: 2, blinking: false, hidden: false }),
+                Some(990),
+                Block::default(),
+            ),
+        ),
+        (
+            "a frame whose program hid its cursor, which is still where typing goes",
+            frame(Some(Cursor { column: 26, row: 10, shape: 0, blinking: true, hidden: true }), None, Block::default()),
         ),
         (
             "a frame in reverse video whose program set its foreground, background, cursor and two palette entries",

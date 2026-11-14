@@ -218,3 +218,48 @@ describe('how much is kept', () => {
     expect(store.size, 'a few lines over the bound cost a pass over all of them').toBe(KEPT_LINES + 10)
   })
 })
+
+describe('history that shows part of an image', () => {
+  const pictured = (line: number, generation: number) => ({
+    ...row(line, '    '),
+    images: {
+      cellWidth: 10, cellHeight: 20,
+      pieces: [{ image: 7, generation, column: 0, columns: 4, offsetX: 0, offsetY: 0, width: 40, height: 20, sourceX: 0, sourceY: 0, sourceWidth: 40, sourceHeight: 20 }],
+    },
+  })
+
+  it('is asked for again once doubted, kept until it is brought, and taken as it then is', () => {
+    const store = new RowStore()
+    store.apply(frame({ firstActive: 10, scrollback: 10, rows: [pictured(10, 1)] }))
+    store.absorb({ epoch: 1, first: 0, count: 10, rows: [row(3, 'text'), pictured(4, 1), pictured(5, 1)] })
+    expect(store.missing(0, 10)).toEqual([])
+    expect([...store.pictured()]).toEqual([7])
+
+    store.doubtPictured()
+    expect(store.missing(0, 20), 'only the history that shows an image is asked for, and never the screen').toEqual([[4, 2]])
+    expect(store.row(4)?.images?.pieces[0]?.generation, 'a doubted row was let go before it was brought again').toBe(1)
+
+    // One of them brought as it now is; the other the owner answers for and no longer holds
+    const told = store.absorb({ epoch: 1, first: 4, count: 2, rows: [pictured(4, 2)] })
+    expect(told).toEqual([4, 5])
+    expect(store.row(4)?.images?.pieces[0]?.generation).toBe(2)
+    expect(store.row(5)).toBeUndefined()
+    expect(store.missing(0, 10)).toEqual([])
+  })
+
+  it('is doubted no longer once a frame brings it or names it stale', () => {
+    const store = new RowStore()
+    store.apply(frame({ firstActive: 10, scrollback: 10 }))
+    store.absorb({ epoch: 1, first: 0, count: 10, rows: [pictured(4, 1), pictured(8, 1)] })
+    store.doubtPictured()
+
+    store.apply(frame({ sequence: 2, firstActive: 10, scrollback: 10, staleFrom: 8, rows: [pictured(4, 2)] }))
+    expect(store.missing(4, 1), 'a row a frame brought is still asked for').toEqual([])
+    expect(store.row(4)?.images?.pieces[0]?.generation).toBe(2)
+    // Named stale, so let go: missing as any line not held is, and brought back as whatever it now is
+    expect(store.row(8)).toBeUndefined()
+    store.absorb({ epoch: 1, first: 8, count: 1, rows: [row(8, 'text')] })
+    expect(store.row(8)?.text.join('')).toBe('text')
+  })
+})
+

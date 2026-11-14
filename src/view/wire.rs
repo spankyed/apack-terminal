@@ -100,6 +100,39 @@ pub struct Row {
     /// The links on this row. A glyph's `link` of `n` is `links[n - 1]`
     pub links: Vec<String>,
     pub glyphs: Vec<Glyph>,
+    /// The parts of images this row shows through placeholder cells, left to right
+    pub pieces: Vec<Piece>,
+    /// One cell in pixels as the terminal was told one is, which is what `pieces` are measured in; zero
+    /// on a row that shows none
+    pub cell: (u16, u16),
+}
+
+/// Part of an image shown in a run of placeholder cells on one row (the Kitty graphics protocol's Unicode
+/// placeholders).
+///
+/// **It is the row's, because the cells are.** A program that shows an image this way prints characters
+/// where the image is to be, and the image is wherever those characters are: it moves when they are
+/// rewritten, scrolls with them and reflows with them. So what they show travels with the row that holds
+/// them, in the same message, and a view draws the picture and the text beside it from one frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Piece {
+    pub image: u32,
+    /// Moves when the image's pixels do, so a view knows the ones it holds are stale
+    pub generation: u64,
+    /// The first cell of the run, and how many cells it is
+    pub column: u16,
+    pub columns: u16,
+    /// How far into that first cell the picture starts, and how large it is drawn, in pixels of the
+    /// row's `cell`
+    pub offset_x: u32,
+    pub offset_y: u32,
+    pub width: u32,
+    pub height: u32,
+    /// The part of the image drawn, in the image's own pixels
+    pub source_x: u32,
+    pub source_y: u32,
+    pub source_width: u32,
+    pub source_height: u32,
 }
 
 impl Row {
@@ -137,6 +170,8 @@ pub trait Cells {
     fn links(&self) -> &[String];
     fn count(&self) -> usize;
     fn cell(&self, index: usize) -> Cell<'_>;
+    /// The parts of images the row shows, and one cell in the pixels they are measured in
+    fn pieces(&self) -> (&[Piece], (u16, u16));
 }
 
 impl Cells for Row {
@@ -156,10 +191,14 @@ impl Cells for Row {
         let glyph = &self.glyphs[index];
         Cell { column: glyph.column, width: glyph.width, text: &glyph.text, style: glyph.style, link: glyph.link }
     }
+
+    fn pieces(&self) -> (&[Piece], (u16, u16)) {
+        (&self.pieces, self.cell)
+    }
 }
 
 /// Appends a row to `out` as a message carries one, less the line number in front of it: its flags, its
-/// styles, its links, and its characters as runs.
+/// styles, its links, its characters as runs, and the parts of images it shows.
 ///
 /// **A run of plain characters is one string**, which is what most of a screen is: each code point one
 /// narrow cell, the next in the next. Anything else — a wide character, a character of several code
@@ -208,6 +247,27 @@ pub fn write_row(out: &mut Vec<u8>, wrapped: bool, prompt: bool, row: &impl Cell
             }
         }
         index = end;
+    }
+    // How many, and for a row that shows any: the cell they are measured in, then each
+    let (pieces, cell) = row.pieces();
+    number(out, pieces.len() as u64);
+    if !pieces.is_empty() {
+        number(out, cell.0);
+        number(out, cell.1);
+    }
+    for piece in pieces {
+        number(out, piece.image);
+        number(out, piece.generation);
+        number(out, piece.column);
+        number(out, piece.columns);
+        number(out, piece.offset_x);
+        number(out, piece.offset_y);
+        number(out, piece.width);
+        number(out, piece.height);
+        number(out, piece.source_x);
+        number(out, piece.source_y);
+        number(out, piece.source_width);
+        number(out, piece.source_height);
     }
 }
 
@@ -331,6 +391,7 @@ pub fn frame(head: &FrameHead<'_>, rows: &Rows) -> Result<Vec<u8>, TooLong> {
         out.number(head.commands);
         out.number(head.images);
         let blinking = head.cursor.is_some_and(|cursor| cursor.blinking);
+        let hidden = head.cursor.is_some_and(|cursor| cursor.hidden);
         out.byte(
             if head.cursor.is_some() { FRAME_CURSOR } else { 0 }
                 | if head.alternate_screen { FRAME_ALTERNATE } else { 0 }
@@ -338,7 +399,8 @@ pub fn frame(head: &FrameHead<'_>, rows: &Rows) -> Result<Vec<u8>, TooLong> {
                 | if head.stale_from.is_some() { FRAME_STALE } else { 0 }
                 | if blinking { FRAME_BLINKING } else { 0 }
                 | if head.reverse_video { FRAME_REVERSE } else { 0 }
-                | if head.colors.is_some() { FRAME_COLORS } else { 0 },
+                | if head.colors.is_some() { FRAME_COLORS } else { 0 }
+                | if hidden { FRAME_HIDDEN } else { 0 },
         );
         if let Some(cursor) = head.cursor {
             out.number(cursor.column);
@@ -382,6 +444,12 @@ pub fn rows(channel: u32, request: u32, epoch: u32, first: u64, count: u32, rows
     })
 }
 
+/// Where the cursor is, and how it is drawn when it is.
+///
+/// **Where it is and whether it is drawn are two facts.** A program that draws a cursor of its own hides
+/// the terminal's and still moves it to where typing goes, because that is where an input method composes:
+/// its window opens beside the cursor, drawn or not. So a frame says where the cursor is whenever it is on
+/// the screen, and `hidden` is the program's word on drawing it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cursor {
     pub column: u16,
@@ -389,6 +457,8 @@ pub struct Cursor {
     /// `0` block, `1` bar, `2` underline, `3` hollow
     pub shape: u8,
     pub blinking: bool,
+    /// The program has hidden it (mode 25): it is not drawn, and is still where this says
+    pub hidden: bool,
 }
 
 /// The screen as it now stands, as a change from what this view was last sent.
@@ -1084,7 +1154,26 @@ impl<'a> Reader<'a> {
                 _ => return Err(Malformed::Value("a run's kind")),
             }
         }
-        Ok(Row { line, wrapped: flags & 1 != 0, prompt: flags & 2 != 0, styles, links, glyphs })
+        let mut pieces = Vec::new();
+        let shown = self.count()?;
+        let cell = if shown > 0 { (self.u16()?, self.u16()?) } else { (0, 0) };
+        for _ in 0..shown {
+            pieces.push(Piece {
+                image: self.u32()?,
+                generation: self.number()?,
+                column: self.u16()?,
+                columns: self.u16()?,
+                offset_x: self.u32()?,
+                offset_y: self.u32()?,
+                width: self.u32()?,
+                height: self.u32()?,
+                source_x: self.u32()?,
+                source_y: self.u32()?,
+                source_width: self.u32()?,
+                source_height: self.u32()?,
+            });
+        }
+        Ok(Row { line, wrapped: flags & 1 != 0, prompt: flags & 2 != 0, styles, links, glyphs, pieces, cell })
     }
 
     fn finish<T>(self, value: T) -> Result<T, Malformed> {
@@ -1143,6 +1232,7 @@ const FRAME_STALE: u8 = 8;
 const FRAME_BLINKING: u8 = 16;
 const FRAME_REVERSE: u8 = 32;
 const FRAME_COLORS: u8 = 64;
+const FRAME_HIDDEN: u8 = 128;
 
 const COLOR_FOREGROUND: u8 = 1;
 const COLOR_BACKGROUND: u8 = 2;
@@ -1445,7 +1535,8 @@ impl ToView {
                 let commands = read.u32()?;
                 let images = read.u32()?;
                 let flags = read.byte()?;
-                if flags >= 128 {
+                // Blinking and hidden are said of a cursor, and of nothing when there is none
+                if flags & FRAME_CURSOR == 0 && flags & (FRAME_BLINKING | FRAME_HIDDEN) != 0 {
                     return Err(Malformed::Value("a frame's flags"));
                 }
                 let cursor = if flags & FRAME_CURSOR != 0 {
@@ -1454,6 +1545,7 @@ impl ToView {
                         row: read.u16()?,
                         shape: read.byte()?,
                         blinking: flags & FRAME_BLINKING != 0,
+                        hidden: flags & FRAME_HIDDEN != 0,
                     })
                 } else {
                     None

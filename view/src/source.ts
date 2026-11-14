@@ -98,17 +98,65 @@ export interface Row {
   readonly styles: readonly Style[]
   /** The links on this row. `links[0]` is the empty string, so a character's `0` means none */
   readonly links: readonly string[]
+  /** The parts of images this row shows through placeholder cells. Absent on a row that shows none */
+  readonly images?: RowImages
+}
+
+/**
+ * Part of an image shown in a run of placeholder cells on one row.
+ *
+ * **It is the row's, because the cells are.** A program that wants an image to move with its text prints
+ * placeholder characters where the image is to be, and the image is wherever those characters are. So what
+ * they show comes with the row that holds them, in the message that brings the row: the picture and the
+ * text beside it are drawn from one frame, and a row scrolled back to shows what it showed. The cells
+ * themselves arrive blank.
+ *
+ * `offsetX`, `offsetY`, `width` and `height` are in the pixels of a cell as the terminal was told one is
+ * (`RowImages.cellWidth`), which a view scales to the cell it draws. A piece is drawn under the text.
+ */
+export interface Piece {
+  readonly image: number
+  /** Moves when the image's pixels do, so the ones a view holds are known stale */
+  readonly generation: number
+  /** The first cell of the run, and how many cells it is */
+  readonly column: number
+  readonly columns: number
+  readonly offsetX: number
+  readonly offsetY: number
+  readonly width: number
+  readonly height: number
+  /** The part of the picture drawn, in its own pixels */
+  readonly sourceX: number
+  readonly sourceY: number
+  readonly sourceWidth: number
+  readonly sourceHeight: number
+}
+
+/** What a row shows of images, and one cell in the pixels that is measured in */
+export interface RowImages {
+  readonly cellWidth: number
+  readonly cellHeight: number
+  readonly pieces: readonly Piece[]
 }
 
 export const CURSOR_SHAPES = ['block', 'bar', 'underline', 'hollow'] as const
 export type CursorShape = (typeof CURSOR_SHAPES)[number]
 
+/**
+ * Where the cursor is, and how it is drawn when it is.
+ *
+ * **Where it is and whether it is drawn are two facts.** A program that draws a cursor of its own hides
+ * the terminal's and still moves it to where typing goes, because that is where an input method composes.
+ * So a view puts its input there whether or not it draws anything.
+ */
 export interface Cursor {
   /** The cell, within the screen: `row` counts from `firstActive` */
   readonly column: number
   readonly row: number
   readonly shape: CursorShape
   readonly blinking: boolean
+  /** The program has hidden it: nothing is drawn, and it is still where this says */
+  readonly hidden: boolean
 }
 
 /** What a view has to know about the program's modes, which is very little: the terminal's owner encodes input */
@@ -162,7 +210,7 @@ export interface Frame extends Rows {
   readonly commands: number
   /** Moves whenever an image is sent, placed, replaced or deleted: the cue to ask where they are again */
   readonly images: number
-  /** Absent while the program has hidden it */
+  /** Absent when it is not on the screen. One the program has hidden is here, and says so */
   readonly cursor: Cursor | null
   readonly modes: Modes
   /**

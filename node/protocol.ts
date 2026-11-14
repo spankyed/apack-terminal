@@ -181,6 +181,17 @@ restore: boolean,
  */
 images: boolean, 
 /**
+ * **Whether an image may be named instead of sent**: as a file on this machine, or a shared
+ * memory object, which the terminal then reads (the protocol's `t=f` and `t=s`). Only read where
+ * `images` is on. It is the caller's to say because only the caller knows what the session's
+ * output is: a program on this machine could have read the file itself, and asks the terminal
+ * to because megabytes need not then cross the pty; a file shown with `cat` or the far end of
+ * an `ssh` that spells the same request is asking this machine to open a path of its choosing.
+ * So yes is for a session started to run one program the caller trusts, and absent — a shell —
+ * such an image is refused and its program told so, which is how one learns to send the bytes.
+ */
+image_files: boolean, 
+/**
  * **What vouches for the shell's marks**: 32 lowercase hexadecimal characters the caller also
  * gave the shell, and nothing else (`markers::MarksKey`). A session spawned with one records a
  * command, and says one is running, only on the word of a mark carrying it — so a file shown

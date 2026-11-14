@@ -23,11 +23,13 @@ import {
   type Frame,
   type KeyInput,
   type PasteOutcome,
+  type Piece,
   type Placement,
   type Placements,
   type PointerInput,
   type Position,
   type Row,
+  type RowImages,
   type Rows,
   type SessionColors,
   type Span,
@@ -100,6 +102,7 @@ const FRAME_STALE = 8
 const FRAME_BLINKING = 16
 const FRAME_REVERSE = 32
 const FRAME_COLORS = 64
+const FRAME_HIDDEN = 128
 
 const COLOR_FOREGROUND = 1
 const COLOR_BACKGROUND = 2
@@ -451,6 +454,23 @@ class Reader {
       }
       if (column > 0xffff) throw new Malformed('an integer did not fit its field')
     }
+    // The parts of images the row shows: how many, and for a row that shows any, the cell they are
+    // measured in and then each
+    const shown = this.count()
+    let images: RowImages | undefined
+    if (shown > 0) {
+      const cellWidth = this.number()
+      const cellHeight = this.number()
+      const pieces: Piece[] = []
+      for (let more = shown; more > 0; more -= 1) {
+        pieces.push({
+          image: this.number(), generation: this.number(), column: this.number(), columns: this.number(),
+          offsetX: this.number(), offsetY: this.number(), width: this.number(), height: this.number(),
+          sourceX: this.number(), sourceY: this.number(), sourceWidth: this.number(), sourceHeight: this.number(),
+        })
+      }
+      images = { cellWidth, cellHeight, pieces }
+    }
     return {
       line,
       wrapped: (flags & 1) !== 0,
@@ -462,6 +482,7 @@ class Reader {
       link: Uint16Array.from(link),
       styles,
       links,
+      ...(images === undefined ? {} : { images }),
     }
   }
 
@@ -487,14 +508,17 @@ export function decodeToView(body: Uint8Array): ToView {
       const commands = read.number()
       const images = read.number()
       const flags = read.byte()
-      if (flags >= 128) throw new Malformed("a frame's flags are outside what the format defines")
+      // Blinking and hidden are said of a cursor, and of nothing when there is none
+      if (!(flags & FRAME_CURSOR) && flags & (FRAME_BLINKING | FRAME_HIDDEN)) {
+        throw new Malformed("a frame's flags are outside what the format defines")
+      }
       let cursor: Cursor | null = null
       if (flags & FRAME_CURSOR) {
         const column = read.number()
         const row = read.number()
         const shape = CURSOR_SHAPES[read.byte()]
         if (shape === undefined) throw new Malformed("a cursor's shape is outside what the format defines")
-        cursor = { column, row, shape, blinking: (flags & FRAME_BLINKING) !== 0 }
+        cursor = { column, row, shape, blinking: (flags & FRAME_BLINKING) !== 0, hidden: (flags & FRAME_HIDDEN) !== 0 }
       }
       const staleFrom = flags & FRAME_STALE ? read.number() : undefined
       const colors = flags & FRAME_COLORS ? read.colors() : undefined

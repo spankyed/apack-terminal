@@ -43,6 +43,8 @@ function rows(block: Rows): Record<string, unknown> {
       glyphs: row.text.map((text, index) => ({
         column: row.column[index], width: row.width[index], text, style: row.style[index], link: row.link[index],
       })),
+      // Said only of a row that shows part of an image
+      ...(row.images === undefined ? {} : { images: row.images }),
     })),
   }
 }

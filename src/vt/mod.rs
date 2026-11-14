@@ -14,6 +14,7 @@ use ghostty_vt_rs_sys as sys;
 
 pub mod images;
 pub mod input;
+pub mod placeholders;
 pub mod reads;
 pub mod rows;
 

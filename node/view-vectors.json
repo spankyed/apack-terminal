@@ -1,6 +1,6 @@
 [
   {
-    "hex": "9000000041032902e8075018e8070704110417010400020201010000010212345601fa02ff00808206011968747470733a2f2f6578616d706c652e636f6d2f613f623d630300000000012402010000026c7305020100027879010100000200000001030203e4b896010365cc81020bf09f91a8e2808df09f91a90500000002c3a90200000000959aef3a000000014f000000017a",
+    "hex": "cd00000041032902e8075018e8070704110417010500020201010000010212345601fa02ff00808206011968747470733a2f2f6578616d706c652e636f6d2f613f623d630300000000012402010000026c730502010002787900010100000200000001030203e4b896010365cc81020bf09f91a8e2808df09f91a90500000002c3a9000300010107000000000100010000022020020a140709000200001414000028288486880880808080802028ac020305b2170fe807d00fa01f14020000000000959aef3a000000014f000000017a00",
     "message": {
       "alternateScreen": false,
       "channel": 3,
@@ -10,6 +10,7 @@
       "cursor": {
         "blinking": true,
         "column": 4,
+        "hidden": false,
         "row": 23,
         "shape": "bar"
       },
@@ -125,6 +126,72 @@
           "wrapped": true
         },
         {
+          "glyphs": [
+            {
+              "column": 0,
+              "link": 0,
+              "style": 1,
+              "text": " ",
+              "width": 1
+            },
+            {
+              "column": 1,
+              "link": 0,
+              "style": 1,
+              "text": " ",
+              "width": 1
+            }
+          ],
+          "images": {
+            "cellHeight": 20,
+            "cellWidth": 10,
+            "pieces": [
+              {
+                "column": 0,
+                "columns": 2,
+                "generation": 9,
+                "height": 20,
+                "image": 7,
+                "offsetX": 0,
+                "offsetY": 0,
+                "sourceHeight": 40,
+                "sourceWidth": 40,
+                "sourceX": 0,
+                "sourceY": 0,
+                "width": 20
+              },
+              {
+                "column": 40,
+                "columns": 300,
+                "generation": 1099511627776,
+                "height": 15,
+                "image": 16909060,
+                "offsetX": 3,
+                "offsetY": 5,
+                "sourceHeight": 20,
+                "sourceWidth": 4000,
+                "sourceX": 1000,
+                "sourceY": 2000,
+                "width": 2994
+              }
+            ]
+          },
+          "line": 3,
+          "links": [],
+          "prompt": false,
+          "styles": [
+            {
+              "bg": null,
+              "fg": {
+                "palette": 7
+              },
+              "flags": 0,
+              "underline": null
+            }
+          ],
+          "wrapped": false
+        },
+        {
           "glyphs": [],
           "line": 2,
           "links": [],
@@ -192,6 +259,7 @@
       "cursor": {
         "blinking": false,
         "column": 0,
+        "hidden": false,
         "row": 0,
         "shape": "underline"
       },
@@ -208,6 +276,36 @@
       "staleFrom": 990
     },
     "name": "a frame naming stale history, with a steady underline cursor",
+    "to": "view"
+  },
+  {
+    "hex": "1100000041032902e8075018e8070704911a0a0000",
+    "message": {
+      "alternateScreen": false,
+      "channel": 3,
+      "colors": null,
+      "columns": 80,
+      "commands": 7,
+      "cursor": {
+        "blinking": true,
+        "column": 26,
+        "hidden": true,
+        "row": 10,
+        "shape": "block"
+      },
+      "epoch": 2,
+      "firstActive": 1000,
+      "images": 4,
+      "kind": "frame",
+      "mouse": false,
+      "reverseVideo": false,
+      "rows": [],
+      "screenRows": 24,
+      "scrollback": 1000,
+      "sequence": 41,
+      "staleFrom": null
+    },
+    "name": "a frame whose program hid its cursor, which is still where typing goes",
     "to": "view"
   },
   {
@@ -307,7 +405,7 @@
     "to": "view"
   },
   {
-    "hex": "8900000042030702889b0496010400020201010000010212345601fa02ff00808206011968747470733a2f2f6578616d706c652e636f6d2f613f623d630300000000012402010000026c7305020100027879010100000200000001030203e4b896010365cc81020bf09f91a8e2808df09f91a90500000002c3a90200000000959aef3a000000014f000000017a",
+    "hex": "c600000042030702889b0496010500020201010000010212345601fa02ff00808206011968747470733a2f2f6578616d706c652e636f6d2f613f623d630300000000012402010000026c730502010002787900010100000200000001030203e4b896010365cc81020bf09f91a8e2808df09f91a90500000002c3a9000300010107000000000100010000022020020a140709000200001414000028288486880880808080802028ac020305b2170fe807d00fa01f14020000000000959aef3a000000014f000000017a00",
     "message": {
       "channel": 3,
       "count": 150,
@@ -419,6 +517,72 @@
           "prompt": false,
           "styles": [],
           "wrapped": true
+        },
+        {
+          "glyphs": [
+            {
+              "column": 0,
+              "link": 0,
+              "style": 1,
+              "text": " ",
+              "width": 1
+            },
+            {
+              "column": 1,
+              "link": 0,
+              "style": 1,
+              "text": " ",
+              "width": 1
+            }
+          ],
+          "images": {
+            "cellHeight": 20,
+            "cellWidth": 10,
+            "pieces": [
+              {
+                "column": 0,
+                "columns": 2,
+                "generation": 9,
+                "height": 20,
+                "image": 7,
+                "offsetX": 0,
+                "offsetY": 0,
+                "sourceHeight": 40,
+                "sourceWidth": 40,
+                "sourceX": 0,
+                "sourceY": 0,
+                "width": 20
+              },
+              {
+                "column": 40,
+                "columns": 300,
+                "generation": 1099511627776,
+                "height": 15,
+                "image": 16909060,
+                "offsetX": 3,
+                "offsetY": 5,
+                "sourceHeight": 20,
+                "sourceWidth": 4000,
+                "sourceX": 1000,
+                "sourceY": 2000,
+                "width": 2994
+              }
+            ]
+          },
+          "line": 3,
+          "links": [],
+          "prompt": false,
+          "styles": [
+            {
+              "bg": null,
+              "fg": {
+                "palette": 7
+              },
+              "flags": 0,
+              "underline": null
+            }
+          ],
+          "wrapped": false
         },
         {
           "glyphs": [],

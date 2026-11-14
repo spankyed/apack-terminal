@@ -1014,7 +1014,7 @@ describe('finding text', () => {
     expect(view.view.found).toEqual({ current: 2, total: 2, more: false })
 
     // A frame that changed no row is not a reason to search
-    view.source.send(frame({ sequence: 2, firstActive: 100, scrollback: 100, cursor: { column: 0, row: 0, shape: 'block', blinking: false } }))
+    view.source.send(frame({ sequence: 2, firstActive: 100, scrollback: 100, cursor: { column: 0, row: 0, shape: 'block', blinking: false, hidden: false } }))
     await vi.advanceTimersByTimeAsync(MATCH_REFRESH_MS)
     expect(source.asked).toEqual(['a'])
 

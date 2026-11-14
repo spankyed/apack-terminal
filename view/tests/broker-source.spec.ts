@@ -73,7 +73,7 @@ describe('a session on a broker', () => {
     const { broker, frames } = attached()
     const sent = frame({
       sequence: 3, epoch: 4, firstActive: 100, scrollback: 100, staleFrom: 90,
-      cursor: { column: 2, row: 1, shape: 'bar', blinking: true },
+      cursor: { column: 2, row: 1, shape: 'bar', blinking: true, hidden: false },
       modes: { alternateScreen: true, mouse: true },
       rows: [row(100, 'hello', { wrapped: true }), row(101, '$ ', { prompt: true })],
     })
