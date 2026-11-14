@@ -1,0 +1,8 @@
+{"kind": "hello", "protocol": 1, "role": "client"}
+{"kind": "hello", "protocol": 1, "role": "view"}
+{"kind": "sessions"}
+{"kind": "commands", "session": "s-1"}
+{"kind": "keep", "session": "s-1", "kept": true}
+{"kind": "kill", "session": "s-1"}
+{"kind": "write", "session": "s-1", "text": "echo hi\n"}
+{"kind": "rewind", "recording": "/tmp/terminal-1", "cols": 60, "rows": 8}

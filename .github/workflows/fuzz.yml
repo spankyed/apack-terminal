@@ -56,8 +56,9 @@ jobs:
         working-directory: fuzz
         run: |
           mkdir -p corpus/${{ matrix.target }}
+          # The run grows corpus/; seeds/ is read as well and never written, so the seeds stay the tracked ones
           # Named explicitly: the prebuilt cargo-fuzz defaults to the musl target, which the sanitizer cannot use
-          cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} corpus/${{ matrix.target }} -- \
+          cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} corpus/${{ matrix.target }} seeds/${{ matrix.target }} -- \
             -max_total_time=${{ github.event.inputs.seconds || '1200' }}
 
       - name: Upload crash
