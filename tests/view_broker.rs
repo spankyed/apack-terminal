@@ -550,16 +550,16 @@ fn a_view_leaving_or_sending_nonsense_leaves_the_session_running() {
 
 /// What a program asks of the world outside its screen reaches the app's own connection, as it happens —
 /// from a session whose bytes are not sent at all.
-// not ported: on Windows the broker answers none of the OSC sequences (observed); the cause is undiagnosed.
-#[cfg(unix)]
 #[test]
 fn a_programs_title_clipboard_and_commands_are_told_to_the_client() {
     let broker = start();
     let client = Client::greeting(&broker);
     let session = client.shell();
     let write = |text: &str| say(&client.stream, &Request::Write { session: session.clone(), text: text.to_owned() });
+    // Enter is the terminal's: a line feed is what POSIX shells take, and PowerShell's line editor takes a return
+    let enter = if cfg!(windows) { "\r" } else { "\n" };
     write(&format!(
-        "{}\n",
+        "{}{enter}",
         printed("\\033]0;a title\\007\\033]52;c;aGk=\\007\\033]633;E;make\\007\\033]633;C\\007\\033]633;D;2\\007")
     ));
 
