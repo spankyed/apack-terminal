@@ -240,19 +240,26 @@ session ending settles every wait on it, because nothing is coming.
   none, because an answer made to wait for room is a deadlock, so it is counted instead: past the bound
   the queue is dropped and the connection closed, and the client is where one whose broker went away
   is. On Windows the queue ends and the connection does not, as for a view (`views.md`).
-- **Windows builds and passes what runs there, which is not everything.** CI's Windows job builds the
-  terminal core from source — nobody publishes one for Windows, so the job installs the Zig its commit
-  wants and builds it for speed, as the library every other platform links was — and runs the suite.
-  The suites that drive the real binary run there over a named pipe and `cmd.exe`: a view attaching,
-  drawing, typing and being told its session ended; a proxy starting a broker, a second joining it and
-  several arriving at once; and a second broker refused the pipe the first holds. What is typed in
-  `sh`'s syntax, and what closes one direction of a connection, is POSIX only and says so case by
-  case. **Kept sessions and recordings (`keeping`) run nowhere on Windows**: each of its cases ends by
-  hanging up a connection its own reader thread is reading, which a named pipe does not allow. What is
-  known to differ there is said where it applies: a view or a client past its limit is not hung up on
-  (`views.md`), a proxy whose input ends leaves without carrying what the broker had still to say,
-  `signal` answers `UNSUPPORTED`, and the pipe's directory and peer are not checked as a socket's are
-  on POSIX.
+- **Windows builds and runs most of the suite, which is not all of it.** CI's Windows job builds the
+  terminal core from source (nobody publishes one for Windows, so the job installs the Zig its commit wants
+  and builds it for speed, as the library every other platform links was) and runs the suite. The suites
+  that drive the real binary run there over a named pipe, with PowerShell as the shell (with the same `$ `
+  prompt every case waits for): a view attaching, drawing, typing and being told its session ended; a
+  proxy starting a broker, a second joining it and several arriving at once; a second broker refused the
+  pipe the first holds; and kept sessions and recordings (`keeping`), 12 of its 15 cases. A named pipe is
+  hung up by cancelling its pending I/O (`CancelIoEx`), since it cannot be shut down one way and a
+  disconnect waits behind a read parked on the same handle.
+  **Still POSIX only, each case says why:** what needs a POSIX tty mode (`stty`, `od`), a socket file or
+  its permission bits, a default socket path checked for mode bits, or one direction of a connection
+  closed. Five view cases run on POSIX and not yet on Windows, and fail there: two that place images (no
+  placement is listed), the title and clipboard sequences (no answer), the mouse-mode report (no frame
+  with mouse reporting on), and hanging up on a view that reads none of its answers. Their causes are not
+  diagnosed. Gated and named in `tests/view_broker.rs`.
+  What is known to differ on Windows: a view or a client past its limit is not hung up on (`views.md`); a
+  proxy whose input ends leaves without carrying what the broker had still to say; `signal` answers
+  `UNSUPPORTED`; and the pipe's directory and peer are not checked as a socket's are on POSIX.
+- **A session ends when the broker stops** (decision D4 in the v1 goal). Accepted for v1: there is no
+  handoff of a session to another broker.
 
 ## What the broker will not do
 
