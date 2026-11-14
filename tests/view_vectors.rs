@@ -11,8 +11,8 @@
 
 use apack_terminal::protocol::{CommandOutcome, Unreported};
 use apack_terminal::view::wire::{
-    Block, Color, ColorChanges, CommandRow, Cursor, Frame, Glyph, NO_BUTTON, Pictured, Piece, Placement, Position, Row,
-    Span, Style, ToBroker, ToView, body,
+    Anchored, AnchoredImages, Block, Color, ColorChanges, CommandRow, Cursor, Frame, Glyph, NO_BUTTON, Pictured, Piece,
+    Placement, Position, Row, Span, Style, ToBroker, ToView, body,
 };
 use serde_json::{Value, json};
 
@@ -107,6 +107,23 @@ fn colors(changed: &ColorChanges) -> Value {
     })
 }
 
+/// The images a frame says are placed relative to another, as a view holds them.
+fn anchored(told: &AnchoredImages) -> Value {
+    let list: Vec<Value> = told
+        .list
+        .iter()
+        .map(|one| {
+            json!({
+                "image": one.image, "generation": one.generation, "z": one.z, "row": one.row,
+                "column": one.column, "columns": one.columns, "rows": one.rows, "offsetX": one.offset_x,
+                "offsetY": one.offset_y, "width": one.width, "height": one.height, "sourceX": one.source_x,
+                "sourceY": one.source_y, "sourceWidth": one.source_width, "sourceHeight": one.source_height,
+            })
+        })
+        .collect();
+    json!({ "cellWidth": told.cell.0, "cellHeight": told.cell.1, "omitted": told.omitted, "list": list })
+}
+
 fn to_view(message: &ToView) -> Value {
     match message {
         ToView::Frame(frame) => {
@@ -124,7 +141,8 @@ fn to_view(message: &ToView) -> Value {
                 "scrollback": frame.scrollback, "commands": frame.commands, "images": frame.images, "cursor": cursor,
                 "alternateScreen": frame.alternate_screen,
                 "mouse": frame.mouse, "reverseVideo": frame.reverse_video, "staleFrom": frame.stale_from,
-                "colors": frame.colors.as_ref().map(colors), "rows": rows,
+                "colors": frame.colors.as_ref().map(colors), "anchored": frame.anchored.as_ref().map(anchored),
+                "rows": rows,
             })
         }
         ToView::Rows { channel, request, epoch, first, count, block: rows_block } => {
@@ -364,6 +382,28 @@ fn vectors() -> Value {
             reverse_video,
             stale_from: None,
             colors: Some(colors),
+            anchored: None,
+            block: Block::default(),
+        })
+    };
+    let anchoring = |anchored: AnchoredImages| {
+        ToView::Frame(Frame {
+            channel: 3,
+            sequence: 43,
+            epoch: 2,
+            first_active: 1_000,
+            columns: 80,
+            screen_rows: 24,
+            scrollback: 1_000,
+            commands: 7,
+            images: 4,
+            cursor: None,
+            alternate_screen: false,
+            mouse: false,
+            reverse_video: false,
+            stale_from: None,
+            colors: None,
+            anchored: Some(anchored),
             block: Block::default(),
         })
     };
@@ -384,6 +424,7 @@ fn vectors() -> Value {
             reverse_video: false,
             stale_from,
             colors: None,
+            anchored: None,
             block,
         })
     };
@@ -407,6 +448,51 @@ fn vectors() -> Value {
             "a frame whose program hid its cursor, which is still where typing goes",
             frame(Some(Cursor { column: 26, row: 10, shape: 0, blinking: true, hidden: true }), None, Block::default()),
         ),
+        (
+            "a frame with two images placed relative to another: one over the text, one under it that starts \
+             above and left of the screen, and three more than it lists",
+            anchoring(AnchoredImages {
+                cell: (10, 20),
+                omitted: 3,
+                list: vec![
+                    Anchored {
+                        image: 7,
+                        generation: 9,
+                        z: 4,
+                        row: 3,
+                        column: 7,
+                        columns: 2,
+                        rows: 1,
+                        offset_x: 0,
+                        offset_y: 0,
+                        width: 20,
+                        height: 20,
+                        source_x: 0,
+                        source_y: 0,
+                        source_width: 20,
+                        source_height: 20,
+                    },
+                    Anchored {
+                        image: 0x0102_0304,
+                        generation: 1 << 40,
+                        z: -3,
+                        row: -2,
+                        column: -1,
+                        columns: 300,
+                        rows: 4,
+                        offset_x: 3,
+                        offset_y: 5,
+                        width: 2_994,
+                        height: 75,
+                        source_x: 1_000,
+                        source_y: 2_000,
+                        source_width: 4_000,
+                        source_height: 100,
+                    },
+                ],
+            }),
+        ),
+        ("a frame saying no image is placed relative to another any more", anchoring(AnchoredImages::default())),
         (
             "a frame in reverse video whose program set its foreground, background, cursor and two palette entries",
             recolored(

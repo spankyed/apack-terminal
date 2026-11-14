@@ -3,6 +3,13 @@
 The broker is one process that owns ptys, so that no terminal session's lifetime is the lifetime of
 whatever asked for it. Everything else here follows from that sentence.
 
+## What v1 is
+
+The scope, platforms and crash behaviour are stated in the [README's status table](../../README.md#status);
+this document says how each is built and where each platform's limits are. v1 is macOS and Linux in full,
+and Windows with the POSIX-only cases gated and named (see Known limits). A session ends when the broker stops:
+there is no handoff to a second broker, and a kept session is the one case that outlives its app.
+
 ## The two layers
 
 **The process layer** — `session.rs`, `output.rs`, `tree.rs` — spawns a shell in a pty, moves bytes, owns a

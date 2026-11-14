@@ -5,7 +5,7 @@ import { BrokerViews } from '../src/index.ts'
 import { rgbaOf } from '../src/broker/source.ts'
 import { CanvasPainter } from '../src/canvas-painter.ts'
 import { drawRow, type SelectedCells, type Theme } from '../src/draw.ts'
-import { PLAIN, type Picture, type Piece, type Placement, type Row, type Style } from '../src/source.ts'
+import { PLAIN, type Anchored, type AnchoredImages, type Picture, type Piece, type Placement, type Row, type Style } from '../src/source.ts'
 import { FakeBroker } from './_broker.ts'
 import { recordingContext } from './_canvas.ts'
 import { installFrames, runFrames } from './_frames.ts'
@@ -220,6 +220,115 @@ describe('an image shown through placeholder cells', () => {
     await quiet(view)
     await quiet(view)
     expect(view.painted().images?.map((image) => image.width)).toEqual([20])
+  })
+})
+
+const anchored = (parts: Partial<Anchored>): Anchored => ({
+  image: 7, generation: 1, z: 0, row: 0, column: 0, columns: 2, rows: 1, offsetX: 0, offsetY: 0, width: 20, height: 20,
+  sourceX: 0, sourceY: 0, sourceWidth: 20, sourceHeight: 20, ...parts,
+})
+/** What a frame says of the images placed relative to another, measured in a cell of ten by twenty unless told */
+const anchoring = (list: Anchored[], cellWidth = 10, cellHeight = 20): AnchoredImages => ({ cellWidth, cellHeight, omitted: 0, list })
+
+describe('an image placed relative to another', () => {
+  it('is drawn where the frame says it is, in this view\'s cells, the ones under the text first', async () => {
+    const view = viewing()
+    const picture = pixels(20, 20)
+    view.source.pictures.set(7, picture)
+    // The terminal was told a cell is five by ten; this view draws one at ten by twenty
+    view.source.send(frame({
+      anchored: anchoring([
+        anchored({ z: 4, row: 1, column: 3, offsetX: 2, offsetY: 1, width: 10, height: 10 }),
+        // One that starts above and left of the screen and reaches into it
+        anchored({ z: -3, row: -1, column: -1, rows: 3, width: 10, height: 30 }),
+      ], 5, 10),
+    }))
+    await settled()
+    await settled()
+    expect(view.source.picturesAsked, 'one picture placed twice is one picture').toEqual([7])
+    expect(view.painted().images).toEqual([
+      { picture, x: -10, y: -20, width: 20, height: 60, source: { x: 0, y: 0, width: 20, height: 20 }, above: false, z: -3 },
+      { picture, x: 34, y: 22, width: 20, height: 20, source: { x: 0, y: 0, width: 20, height: 20 }, above: true, z: 4 },
+    ])
+  })
+
+  it('stays on its line when a frame that says nothing of it moves the screen', async () => {
+    const view = viewing()
+    view.source.pictures.set(7, pixels(20, 20))
+    view.source.send(frame({ firstActive: 5, scrollback: 5, anchored: anchoring([anchored({ row: 2 })]) }))
+    await settled()
+    await settled()
+    expect(view.painted().images?.map((image) => image.y)).toEqual([40])
+
+    // One line left the screen: a row is counted from the first line of the frame that told it
+    view.source.send(frame({ sequence: 2, firstActive: 6, scrollback: 6, rows: [row(9, 'more')] }))
+    expect(view.painted().images?.map((image) => image.y)).toEqual([20])
+  })
+
+  it('moves, and is gone, in the frame that says so', async () => {
+    const view = viewing()
+    view.source.pictures.set(7, pixels(20, 20))
+    view.source.send(frame({ anchored: anchoring([anchored({ row: 1 })]) }))
+    await settled()
+    await settled()
+    view.source.send(frame({ sequence: 2, anchored: anchoring([anchored({ row: 3, column: 5 })]) }))
+    expect(view.painted().images?.map((image) => [image.x, image.y])).toEqual([[50, 60]])
+    expect(view.source.picturesAsked, 'the same picture, wherever it is').toEqual([7])
+
+    view.source.send(frame({ sequence: 3, anchored: anchoring([]) }))
+    expect(view.painted().images).toEqual([])
+  })
+
+  it('keeps its picture while it is told, and lets it go once it is not', async () => {
+    const view = viewing()
+    view.source.pictures.set(7, pixels(20, 20))
+    view.source.send(frame({ images: 1, anchored: anchoring([anchored({})]) }))
+    await settled()
+    await settled()
+    // The images are told again, and none is placed by itself: the one placed relative to another is still shown
+    view.source.send(frame({ sequence: 2, images: 2 }))
+    await settled()
+    await settled()
+    expect(view.painted().images).toHaveLength(1)
+    expect(view.source.picturesAsked).toEqual([7])
+
+    // Gone, and then back: its picture was let go, so it is asked for again
+    view.source.send(frame({ sequence: 3, images: 3, anchored: anchoring([]) }))
+    await settled()
+    await settled()
+    view.source.send(frame({ sequence: 4, images: 4, anchored: anchoring([anchored({})]) }))
+    await settled()
+    await settled()
+    expect(view.source.picturesAsked).toEqual([7, 7])
+    expect(view.painted().images).toHaveLength(1)
+  })
+
+  it('has its pixels asked for again when a frame says they are another generation', async () => {
+    const view = viewing()
+    view.source.pictures.set(7, pixels(20, 20))
+    view.source.send(frame({ anchored: anchoring([anchored({})]) }))
+    await settled()
+    await settled()
+    view.source.pictures.set(7, { ...pixels(20, 20), generation: 2 })
+    view.source.send(frame({ sequence: 2, anchored: anchoring([anchored({ generation: 2 })]) }))
+    await settled()
+    await settled()
+    expect(view.source.picturesAsked).toEqual([7, 7])
+    expect(view.made.at(-1)?.generation).toBe(2)
+  })
+
+  it('loses its place when the screen is reflowed, unless the frame that says so tells it', async () => {
+    const view = viewing()
+    view.source.pictures.set(7, pixels(20, 20))
+    view.source.send(frame({ anchored: anchoring([anchored({ row: 1 })]) }))
+    await settled()
+    await settled()
+    expect(view.painted().images).toHaveLength(1)
+
+    view.source.send(frame({ sequence: 2, epoch: 2 }))
+    expect(view.painted().images).toEqual([])
+    view.source.send(frame({ sequence: 3, epoch: 3, anchored: anchoring([anchored({ row: 2 })]) }))
+    expect(view.painted().images?.map((image) => image.y)).toEqual([40])
   })
 })
 
