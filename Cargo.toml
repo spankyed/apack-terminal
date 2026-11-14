@@ -44,7 +44,7 @@ sysinfo = { version = "0.40.1", default-features = false, features = ["system"] 
 libc = "0.2.191"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Threading"] }
 # The SDDL string the pipe's security descriptor is built from, which `interprocess` takes as a `U16CStr`
 widestring = "1.0.2"
 

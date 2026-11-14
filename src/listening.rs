@@ -245,8 +245,13 @@ pub fn peer_is_this_user(stream: &Stream) -> io::Result<bool> {
 }
 
 /// Closes a connection in both directions, whoever else still holds it, so a thread parked in a read or
-/// a write of it is let go. `false` where a connection cannot be closed from under its users, which is a
-/// named pipe: there the thread is left to the far end's closing.
+/// a write of it is let go.
+///
+/// **A named pipe is hung up by cancelling its pending I/O** (`CancelIoEx` on the handle). A read or a write
+/// parked on a synchronous handle ends with `ERROR_OPERATION_ABORTED`, as a read parked on an overlapped one
+/// does. Disconnecting the pipe does not do this for a read parked on the server end: a synchronous call on
+/// that handle waits behind the pending read, so the disconnect would wait too. Closing the handle does not
+/// either. The pipe stays open after this, for the far end to close.
 ///
 /// **The half the far end has not already closed is closed by itself where both cannot be.** A caller
 /// that has said all it will has closed its sending side, and on macOS a socket in that state refuses to
@@ -261,6 +266,15 @@ pub fn hang_up(stream: &Stream) -> bool {
             socket.shutdown(std::net::Shutdown::Both).is_ok() || socket.shutdown(std::net::Shutdown::Write).is_ok()
         }
         #[cfg(windows)]
-        Stream::NamedPipe(_) => false,
+        Stream::NamedPipe(pipe) => {
+            use std::os::windows::io::{AsHandle as _, AsRawHandle as _};
+            use windows_sys::Win32::Foundation::HANDLE;
+            use windows_sys::Win32::System::IO::CancelIoEx;
+
+            let handle = pipe.as_handle().as_raw_handle() as HANDLE;
+            // SAFETY: `handle` is the pipe stream's own handle, which lives for the length of this borrow.
+            // A null overlapped pointer cancels every pending operation on the handle, from any thread.
+            unsafe { CancelIoEx(handle, std::ptr::null()) != 0 }
+        }
     }
 }
