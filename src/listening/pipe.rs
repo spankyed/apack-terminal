@@ -10,16 +10,23 @@ use std::os::windows::io::{AsHandle, AsRawHandle};
 
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::IO::CancelIoEx;
+use windows_sys::Win32::System::Pipes::DisconnectNamedPipe;
 
-/// Cancels a pipe's pending reads and writes, from any thread, and answers whether the cancel was made.
+/// Hangs up a pipe: cancels its pending reads and writes, then disconnects it, and answers whether the cancel was made.
 ///
-/// A named pipe cannot be shut down one way, and a synchronous call on the pipe's handle waits behind a read
-/// parked on it, so a disconnect or a close does not end that read. Cancelling its I/O does.
+/// Cancelling comes first because a disconnect is a synchronous call on the same handle, and it waits behind a
+/// read parked on it; once that read is cancelled nothing waits, and the disconnect ends the connection for the
+/// far end, as a socket's shutdown does on POSIX. The far end's next write or read then fails.
 pub fn hang_up(pipe: &impl AsHandle) -> bool {
     let handle = pipe.as_handle().as_raw_handle() as HANDLE;
     // SAFETY: `handle` is the pipe's own handle, which lives for the length of this borrow. A null overlapped
-    // pointer cancels every pending operation on the handle.
-    unsafe { CancelIoEx(handle, std::ptr::null()) != 0 }
+    // pointer cancels every pending operation on the handle, and the disconnect is made on that same handle once
+    // no operation is pending on it.
+    unsafe {
+        let cancelled = CancelIoEx(handle, std::ptr::null()) != 0;
+        DisconnectNamedPipe(handle);
+        cancelled
+    }
 }
 
 #[cfg(test)]
@@ -72,6 +79,13 @@ mod tests {
         let outcome = outcome_rx.recv_timeout(Duration::from_secs(10)).expect("the parked read ends once hung up");
         assert!(cancelled, "the hang-up reported that it cancelled nothing");
         assert_eq!(outcome, Err(Some(995)), "the read did not end as a cancelled one");
-        drop(client);
+        // The far end sees the connection end: its read returns, with end of file or an error, rather than waiting
+        let (far_tx, far_rx) = channel();
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 16];
+            let mut reader: &Stream = &client;
+            let _ = far_tx.send(reader.read(&mut buffer).is_ok());
+        });
+        far_rx.recv_timeout(Duration::from_secs(10)).expect("the far end's read ends once hung up");
     }
 }
