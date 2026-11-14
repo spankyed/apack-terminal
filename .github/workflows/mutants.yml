@@ -152,7 +152,13 @@ jobs:
           # A mixed file's Windows arms are answered by a dispatch (`-f files=src/session.rs`): nothing here
           # can tell a Windows mutant from a POSIX one inside one file, and a developer naming the file is
           # the claim being made deliberately rather than by a grep.
-          mapfile -t files < <(git diff --name-only --diff-filter=d "$base" -- $WINDOWS_ONLY)
+          # `base` is git arguments (`--merge-base HEAD^1` on a pull request), so it is split here as the Linux
+          # job's diff is. A failed diff fails this step: an empty list would pass a job that mutated nothing.
+          names="$(git diff --name-only --diff-filter=d $base -- $WINDOWS_ONLY)"
+          files=()
+          while IFS= read -r name; do
+            [ -n "$name" ] && files+=("$name")
+          done <<< "$names"
           if [ ${#files[@]} -gt 0 ]; then
             args=""
             for file in "${files[@]}"; do args="$args --file $file"; done
