@@ -99,7 +99,7 @@ impl Run {
 
     /// The image the run shows.
     pub fn image(&self) -> u32 {
-        self.image_low | (u32::from(self.image_high.unwrap_or(0)) << 24)
+        self.image_low + (u32::from(self.image_high.unwrap_or(0)) << 24)
     }
 
     /// The placement the run names, or zero for whichever virtual placement the image has.
@@ -127,7 +127,7 @@ pub struct Fit {
 /// picture narrower than its cells.
 pub fn fit(run: &Run, grid: (u32, u32), picture: (u32, u32), cell: (u32, u32)) -> Option<Fit> {
     let (cell_width, cell_height) = cell;
-    if cell_width == 0 || cell_height == 0 {
+    if cell_width.min(cell_height) == 0 {
         return None;
     }
     // A placement left to the picture's size takes as many cells as the picture needs
@@ -200,13 +200,11 @@ pub fn fit(run: &Run, grid: (u32, u32), picture: (u32, u32), cell: (u32, u32)) -
     } else {
         source_x -= padding_x;
     }
-    if source_width <= 0.0 || source_height <= 0.0 {
-        return None;
-    }
-
+    // A slice that lies wholly in a margin has nothing of the picture in it: its width or its height
+    // came out at nothing or less, which is a size of nothing once it is whole pixels
     let whole = |value: f64| value.round() as u32;
     let size = (whole(width), whole(height));
-    if size.0 == 0 || size.1 == 0 {
+    if size.0.min(size.1) == 0 {
         return None;
     }
     Some(Fit {
@@ -222,7 +220,7 @@ fn number_of(color: Color) -> u32 {
     match color {
         Color::Default => 0,
         Color::Palette(index) => u32::from(index),
-        Color::Rgb(red, green, blue) => (u32::from(red) << 16) | (u32::from(green) << 8) | u32::from(blue),
+        Color::Rgb(red, green, blue) => u32::from_be_bytes([0, red, green, blue]),
     }
 }
 

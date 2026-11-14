@@ -276,9 +276,10 @@ impl Terminal {
         };
         let picture = (of_image(Image::WIDTH)?, of_image(Image::HEIGHT)?);
         let mut pixels = sys::String::default();
-        // SAFETY: PIXELS writes a `GhosttyString`; only whether there are any is read here
+        // SAFETY: PIXELS writes a `GhosttyString`; only whether the core has any to give is read here,
+        // which it has once they have all arrived
         let arrived = unsafe { sys::ghostty_kitty_graphics_image_get(stored, Image::PIXELS, (&raw mut pixels).cast()) };
-        if arrived != sys::Result::SUCCESS || pixels.ptr.is_null() {
+        if arrived != sys::Result::SUCCESS {
             return None;
         }
 
@@ -296,7 +297,8 @@ impl Terminal {
                 (&raw mut iterator).cast(),
             )
         };
-        let mut found: Option<(u32, (u32, u32))> = None;
+        // Each of the image's virtual placements the cells could mean, by its number
+        let mut meant: Vec<(u32, (u32, u32))> = Vec::new();
         if filled == sys::Result::SUCCESS {
             let read_u32 = |data: Data::Type| {
                 let mut value: u32 = 0;
@@ -319,14 +321,12 @@ impl Terminal {
                 if placement != 0 && id != placement {
                     continue;
                 }
-                if found.is_none_or(|(held, _)| id < held) {
-                    found = Some((id, (read_u32(Data::COLUMNS).unwrap_or(0), read_u32(Data::ROWS).unwrap_or(0))));
-                }
+                meant.push((id, (read_u32(Data::COLUMNS).unwrap_or(0), read_u32(Data::ROWS).unwrap_or(0))));
             }
         }
         // SAFETY: freed once
         unsafe { sys::ghostty_kitty_graphics_placement_iterator_free(iterator) };
-        let (_, grid) = found?;
+        let (_, grid) = meant.into_iter().min_by_key(|(id, _)| *id)?;
         Some(Shown { generation: image_generation(stored), picture, grid })
     }
 

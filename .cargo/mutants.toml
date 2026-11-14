@@ -270,6 +270,16 @@ exclude_re = [
     # file it accepts (`an_animated_png_whose_first_frame_is_part_of_the_picture_is_no_picture` is what
     # fails if it stops). They stay because what is decoded is whatever a program wrote
     "vt/images.rs:.*replace match guard frame.buffer_size\\(\\) == pixels \\* (4|2) with true in decode_png_into",
+
+    # **Where two ways of fitting a picture meet, they agree.** `fit` chooses by comparison: whether the
+    # picture is wider than its cells or taller, and whether a run's slice begins in a margin, ends in
+    # one, or lies inside the picture. Each pair of branches gives the same answer at the value that
+    # divides them — a picture exactly the shape of its cells has no margin either way, and a slice that
+    # begins exactly where a margin ends loses nothing of itself to it — so a comparison that takes the
+    # boundary and one that leaves it are one function. Only the strictness is excluded: turning any of
+    # these round (`<` with `>`, `>` with `<`) or into an equality is a different fit, and
+    # `every_row_reads_as_the_core_says_it_shows` fails on each
+    "vt/placeholders.rs:.*replace (<|>) with (<=|>=) in fit",
 ]
 
 # **`src/tree.rs` is not excluded, and a whole-repository run on a Mac or on Linux will report its mutants

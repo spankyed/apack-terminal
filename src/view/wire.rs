@@ -1536,7 +1536,8 @@ impl ToView {
                 let images = read.u32()?;
                 let flags = read.byte()?;
                 // Blinking and hidden are said of a cursor, and of nothing when there is none
-                if flags & FRAME_CURSOR == 0 && flags & (FRAME_BLINKING | FRAME_HIDDEN) != 0 {
+                let said_of_a_cursor = flags & FRAME_BLINKING != 0 || flags & FRAME_HIDDEN != 0;
+                if flags & FRAME_CURSOR == 0 && said_of_a_cursor {
                     return Err(Malformed::Value("a frame's flags"));
                 }
                 let cursor = if flags & FRAME_CURSOR != 0 {
