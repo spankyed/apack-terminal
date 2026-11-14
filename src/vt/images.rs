@@ -5,9 +5,11 @@
 //! placement is told as the line it is on — which stays true as the screen scrolls — and a view draws the
 //! ones on the lines it is showing.
 //!
-//! **A virtual placement is not told.** One shown through Unicode placeholder cells has no position in the
-//! storage; it is wherever those cells are. A view draws the placeholder cells as the text they are.
+//! **A virtual placement is not told here.** One shown through Unicode placeholder cells has no position
+//! in the storage; it is wherever those cells are, so what it shows is read with the row that holds them
+//! (`rows`, `placeholders`) and a view is sent it as part of that row.
 
+use std::collections::HashMap;
 use std::ptr::NonNull;
 
 use ghostty_vt_rs_sys as sys;
@@ -41,6 +43,38 @@ pub struct PlacementRead {
     /// The part of the image drawn — left, top, width, height — in the image's own pixels
     pub source: (u32, u32, u32, u32),
 }
+
+/// What placeholder cells naming an image show: the image as it now is, and the cells its virtual
+/// placement covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shown {
+    pub generation: u64,
+    /// The image's width and height in its own pixels
+    pub picture: (u32, u32),
+    /// The columns and rows the placement was given, zero for one left to the picture's size
+    pub grid: (u32, u32),
+}
+
+/// The image storage's virtual placements as of one generation of it: what placeholder cells can name.
+///
+/// **Kept by the terminal between reads, and read again when the storage's generation moves**, which is
+/// whenever a program sends, replaces, places or deletes an image and at no other time. A generation is
+/// never one the core has used before, on this screen or the other, so what is held under one is what
+/// the storage holds while it stands. Zero is a storage nothing has been sent to, which holds none.
+#[derive(Debug, Default)]
+pub(super) struct Virtual {
+    generation: u64,
+    /// How many times the storage has been read out for this, which is once for each generation asked of
+    reads: u64,
+    named: Named,
+    lowest: Lowest,
+}
+
+/// The grid of each virtual placement, by its image and its own number.
+type Named = HashMap<(u32, u32), (u32, u32)>;
+
+/// The lowest numbered of each image's virtual placements, with its grid.
+type Lowest = HashMap<u32, (u32, (u32, u32))>;
 
 /// Part of an image's pixels, with what a view needs to make sense of them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,10 +223,19 @@ pub(super) fn install_decoders() {
 impl Terminal {
     /// Lets programs send images, up to `IMAGE_STORAGE_BYTES` of them.
     ///
-    /// **As bytes in the stream only.** The protocol's other ways in — a file the terminal is asked to
-    /// read, a temporary file, shared memory — stay off, which is the core's default: each has the
-    /// terminal open something on this machine because a program's output named it.
-    pub fn allow_images(&self) -> Result<(), Failed> {
+    /// **As bytes in the stream, unless `files`.** The protocol has two other ways in that this takes —
+    /// a file the terminal is asked to read, and a shared memory object — and each has the terminal open
+    /// something on this machine because a program's output named it. That is a fair thing to ask of a
+    /// terminal by a program on this machine, which could have read the file itself, and not by whatever
+    /// else reaches a screen: a file shown with `cat`, a log, the far end of an `ssh`. Which of the two a
+    /// session's output is, only whoever started it knows, so it is theirs to say (`Request::Spawn`).
+    ///
+    /// **What the core then refuses is the core's to refuse**: a path that is not a regular file, one
+    /// under `/proc`, `/sys` or `/dev`, a file or object past what an image may be. A shared memory object
+    /// is unlinked once read, as the protocol says, and is the one thing here that is removed. The
+    /// protocol's third way in, a temporary file the terminal deletes, stays off: nothing a session is
+    /// started for sends one, and it is the one that removes a file.
+    pub fn allow_images(&self, files: bool) -> Result<(), Failed> {
         let limit: u64 = IMAGE_STORAGE_BYTES;
         // SAFETY: KITTY_IMAGE_STORAGE_LIMIT takes a `uint64_t*`
         let result = unsafe {
@@ -202,7 +245,145 @@ impl Terminal {
                 (&raw const limit).cast::<std::ffi::c_void>(),
             )
         };
-        Failed::check("ghostty_terminal_set(KITTY_IMAGE_STORAGE_LIMIT)", result)
+        Failed::check("ghostty_terminal_set(KITTY_IMAGE_STORAGE_LIMIT)", result)?;
+        for (option, call) in [
+            (sys::TerminalOption::KITTY_IMAGE_MEDIUM_FILE, "ghostty_terminal_set(KITTY_IMAGE_MEDIUM_FILE)"),
+            (sys::TerminalOption::KITTY_IMAGE_MEDIUM_SHARED_MEM, "ghostty_terminal_set(KITTY_IMAGE_MEDIUM_SHARED_MEM)"),
+        ] {
+            // SAFETY: both options take a `bool*`
+            let result = unsafe {
+                sys::ghostty_terminal_set(self.handle, option, (&raw const files).cast::<std::ffi::c_void>())
+            };
+            Failed::check(call, result)?;
+        }
+        Ok(())
+    }
+
+    /// One cell in pixels as a window last measured it, or zero where none has: the terminal's size in
+    /// pixels over its size in cells, which is how the core reckons a cell.
+    pub fn cell_pixels(&self) -> (u16, u16) {
+        let read = |data: sys::TerminalData::Type| {
+            let mut value: u32 = 0;
+            // SAFETY: WIDTH_PX and HEIGHT_PX each write a `uint32_t`
+            let result = unsafe { sys::ghostty_terminal_get(self.handle, data, (&raw mut value).cast()) };
+            if result == sys::Result::SUCCESS { value } else { 0 }
+        };
+        let per = |pixels: u32, cells: Result<u16, Failed>| {
+            pixels.checked_div(u32::from(cells.unwrap_or(0))).and_then(|cell| u16::try_from(cell).ok()).unwrap_or(0)
+        };
+        (per(read(sys::TerminalData::WIDTH_PX), self.cols()), per(read(sys::TerminalData::HEIGHT_PX), self.rows()))
+    }
+
+    /// What placeholder cells naming `image` and `placement` show, or `None` where they show nothing:
+    /// the image is not there or has not all arrived, or it has no such virtual placement. A `placement`
+    /// of zero is whichever virtual placement the image has.
+    ///
+    /// **Where an image has several and the cells name none, the lowest numbered is shown.** The core
+    /// prefers one the program numbered over one it numbered itself, and the storage does not say which
+    /// is which; a program that makes several numbers them and names one, and nothing checks the rest.
+    pub fn shown_by(&self, image: u32, placement: u32) -> Option<Shown> {
+        use sys::KittyGraphicsImageData as Image;
+        let graphics = self.graphics()?;
+        // SAFETY: the storage is this terminal's; a null image is one that is not there
+        let stored = unsafe { sys::ghostty_kitty_graphics_image(graphics, image) };
+        if stored.is_null() {
+            return None;
+        }
+        let of_image = |data: Image::Type| {
+            let mut value: u32 = 0;
+            // SAFETY: each key read through this writes a `uint32_t`
+            let result = unsafe { sys::ghostty_kitty_graphics_image_get(stored, data, (&raw mut value).cast()) };
+            (result == sys::Result::SUCCESS).then_some(value)
+        };
+        let picture = (of_image(Image::WIDTH)?, of_image(Image::HEIGHT)?);
+        let mut pixels = sys::String::default();
+        // SAFETY: PIXELS writes a `GhosttyString`; only whether the core has any to give is read here,
+        // which it has once they have all arrived
+        let arrived = unsafe { sys::ghostty_kitty_graphics_image_get(stored, Image::PIXELS, (&raw mut pixels).cast()) };
+        if arrived != sys::Result::SUCCESS {
+            return None;
+        }
+
+        let grid = self.virtual_grid(graphics, image, placement)?;
+        Some(Shown { generation: image_generation(stored), picture, grid })
+    }
+
+    /// The grid of the virtual placement cells naming `image` and `placement` mean, from the storage's
+    /// virtual placements as they stand: read out once for each generation of the storage and kept
+    /// (`Virtual`), so a row of placeholder cells costs a lookup a run and not a walk of every placement
+    /// a program has made.
+    fn virtual_grid(&self, graphics: sys::KittyGraphics, image: u32, placement: u32) -> Option<(u32, u32)> {
+        let generation = self.images_generation();
+        let mut held = self.virtual_placements.borrow_mut();
+        if held.generation != generation {
+            let (named, lowest) = self.read_virtual(graphics)?;
+            *held = Virtual { generation, reads: held.reads + 1, named, lowest };
+        }
+        match placement {
+            0 => held.lowest.get(&image).map(|(_, grid)| *grid),
+            named => held.named.get(&(image, named)).copied(),
+        }
+    }
+
+    /// How many times the storage's virtual placements have been read out for a row of placeholder cells:
+    /// once for each generation of the storage one was read in, however many rows and runs that was.
+    ///
+    /// **What a row of placeholder cells costs is held to this**, since it is not something a row's
+    /// answer shows: read out at every run instead, every row reads the same and a screen of them takes
+    /// as long as a program cares to make it (`tests/placeholders.rs`).
+    pub fn virtual_reads(&self) -> u64 {
+        self.virtual_placements.borrow().reads
+    }
+
+    /// Every virtual placement in the storage, by what cells can name it with: the grid of each by its
+    /// image and its own number, and the lowest numbered of each image's.
+    fn read_virtual(&self, graphics: sys::KittyGraphics) -> Option<(Named, Lowest)> {
+        use sys::KittyGraphicsPlacementData as Data;
+        let mut iterator: sys::KittyGraphicsPlacementIterator = std::ptr::null_mut();
+        // SAFETY: `iterator` is a valid out-pointer; it is freed below
+        let made = unsafe { sys::ghostty_kitty_graphics_placement_iterator_new(std::ptr::null(), &raw mut iterator) };
+        if made != sys::Result::SUCCESS {
+            return None;
+        }
+        // SAFETY: PLACEMENT_ITERATOR fills the iterator it is handed a pointer to
+        let filled = unsafe {
+            sys::ghostty_kitty_graphics_get(
+                graphics,
+                sys::KittyGraphicsData::PLACEMENT_ITERATOR,
+                (&raw mut iterator).cast(),
+            )
+        };
+        let (mut named, mut lowest) = (Named::new(), Lowest::new());
+        if filled == sys::Result::SUCCESS {
+            let read_u32 = |data: Data::Type| {
+                let mut value: u32 = 0;
+                // SAFETY: each key read through this writes a `uint32_t`
+                let result =
+                    unsafe { sys::ghostty_kitty_graphics_placement_get(iterator, data, (&raw mut value).cast()) };
+                (result == sys::Result::SUCCESS).then_some(value)
+            };
+            // SAFETY: the iterator was filled from this terminal's storage and nothing has written since
+            while unsafe { sys::ghostty_kitty_graphics_placement_next(iterator) } {
+                let mut is_virtual = false;
+                // SAFETY: IS_VIRTUAL writes a `bool`
+                let known = unsafe {
+                    sys::ghostty_kitty_graphics_placement_get(iterator, Data::IS_VIRTUAL, (&raw mut is_virtual).cast())
+                };
+                if known != sys::Result::SUCCESS || !is_virtual {
+                    continue;
+                }
+                let (Some(image), Some(id)) = (read_u32(Data::IMAGE_ID), read_u32(Data::PLACEMENT_ID)) else {
+                    continue;
+                };
+                let grid = (read_u32(Data::COLUMNS).unwrap_or(0), read_u32(Data::ROWS).unwrap_or(0));
+                named.insert((image, id), grid);
+                // The lower numbered of the two, which a pair is ordered by before anything else
+                lowest.entry(image).and_modify(|held| *held = (*held).min((id, grid))).or_insert((id, grid));
+            }
+        }
+        // SAFETY: freed once
+        unsafe { sys::ghostty_kitty_graphics_placement_iterator_free(iterator) };
+        (filled == sys::Result::SUCCESS).then_some((named, lowest))
     }
 
     /// The active screen's image storage, borrowed until the terminal is next written to.

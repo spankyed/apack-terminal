@@ -12,8 +12,9 @@
 
 use ghostty_vt_rs_sys as sys;
 
+use super::placeholders::{PLACEHOLDER, Run, Said};
 use super::{CLUSTER_CODEPOINTS, Failed, Terminal};
-use crate::view::wire::{self, Color, ColorChanges, Style};
+use crate::view::wire::{self, Color, ColorChanges, Piece, Style};
 
 /// The most one row's links may come to, in bytes. Past it a cell is drawn unlinked.
 ///
@@ -71,6 +72,11 @@ pub struct RowRead {
     styles: Vec<Style>,
     /// Each distinct link on the row, in the order they first appear
     links: Vec<String>,
+    /// The runs of placeholder cells on the row, as the cells say them, left to right
+    runs: Vec<Run>,
+    /// What those runs show, for the ones that show anything, and the cell they are measured in
+    pieces: Vec<Piece>,
+    cell: (u16, u16),
 }
 
 impl RowRead {
@@ -101,6 +107,26 @@ impl RowRead {
         self.cells.clear();
         self.styles.clear();
         self.links.clear();
+        self.runs.clear();
+        self.pieces.clear();
+        self.cell = (0, 0);
+    }
+
+    /// The parts of images this row shows through placeholder cells, left to right.
+    pub fn pieces(&self) -> &[Piece] {
+        &self.pieces
+    }
+
+    /// Whether the row holds placeholder cells, which it may while they show nothing.
+    pub fn pictured(&self) -> bool {
+        !self.runs.is_empty()
+    }
+
+    /// Notes a placeholder cell at `column`: the next cell of the run before it, or the first of another.
+    fn placeholder(&mut self, column: u16, said: Said) {
+        if !self.runs.last_mut().is_some_and(|run| run.takes(column, said)) {
+            self.runs.push(Run::begin(column, said));
+        }
     }
 
     /// The index of `style` in this row's table, added if it is new. `0` is the plain style.
@@ -155,9 +181,14 @@ impl wire::Cells for RowRead {
             link: placed.link,
         }
     }
+
+    fn pictured(&self) -> Option<(&[Piece], (u16, u16))> {
+        self.pictured().then_some((self.pieces.as_slice(), self.cell))
+    }
 }
 
-/// Where the cursor is and how it is drawn, or nothing while the program has hidden it.
+/// Where the cursor is and how it is drawn. A cursor the program has hidden is still somewhere, which
+/// is where an input method composes (`wire::Cursor`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CursorRead {
     pub column: u16,
@@ -165,6 +196,8 @@ pub struct CursorRead {
     /// `0` block, `1` bar, `2` underline, `3` hollow
     pub shape: u8,
     pub blinking: bool,
+    /// The program has hidden it (mode 25)
+    pub hidden: bool,
 }
 
 fn color(color: sys::StyleColor) -> Color {
@@ -201,8 +234,8 @@ impl Terminal {
     }
 
     /// Whether the row at `row` in `space` runs on into the next and whether the shell drew its prompt
-    /// there, as the byte a row's body begins with (`wire::write_row`), or `None` where there is no such
-    /// row. What a row holds is not read.
+    /// there, as the two low bits of the byte a row's body begins with (`wire::row_flags`), or `None` where
+    /// there is no such row. What a row holds is not read.
     pub fn row_flags(&self, space: Space, row: u32) -> Result<Option<u8>, Failed> {
         let Some(reference) = self.reference_in(space, 0, row) else { return Ok(None) };
         let mut raw: sys::Row = 0;
@@ -326,7 +359,40 @@ impl Terminal {
             reference.x = column;
             self.read_cell(&reference, column, read)?;
         }
+        if !read.runs.is_empty() {
+            self.show_runs(read);
+        }
         Ok(true)
+    }
+
+    /// Works out what each run of placeholder cells on a row shows (`placeholders`), as the image storage
+    /// stands now. A run whose image is gone, has not all arrived, or has no virtual placement shows
+    /// nothing, and its cells are blank.
+    fn show_runs(&self, read: &mut RowRead) {
+        let cell = self.cell_pixels();
+        for run in &read.runs {
+            let Some(shown) = self.shown_by(run.image(), run.placement()) else { continue };
+            let Some(fit) =
+                super::placeholders::fit(run, shown.grid, shown.picture, (u32::from(cell.0), u32::from(cell.1)))
+            else {
+                continue;
+            };
+            read.pieces.push(Piece {
+                image: run.image(),
+                generation: shown.generation,
+                column: run.column,
+                columns: run.width,
+                offset_x: fit.offset.0,
+                offset_y: fit.offset.1,
+                width: fit.size.0,
+                height: fit.size.1,
+                source_x: fit.source.0,
+                source_y: fit.source.1,
+                source_width: fit.source.2,
+                source_height: fit.source.3,
+            });
+        }
+        read.cell = cell;
     }
 
     /// Adds the cell at `reference` to `read`, when it holds a character or is drawn as anything.
@@ -393,6 +459,34 @@ impl Terminal {
 
         let before = read.text.len();
         match content {
+            // **A placeholder cell is not a character to draw**: it stands for part of an image, which is
+            // read from it and from the characters that follow it in the cell (`placeholders`). What is
+            // left is a blank cell in the colours it was written in, which is what the core draws of one
+            // whether or not there is an image for it to show
+            sys::CellContentTag::CODEPOINT if codepoint == u32::from(PLACEHOLDER) => {
+                read.placeholder(column, Said::of(&style, []));
+            }
+            sys::CellContentTag::CODEPOINT_GRAPHEME if codepoint == u32::from(PLACEHOLDER) => {
+                let mut codepoints = [0u32; CLUSTER_CODEPOINTS];
+                let mut written: usize = 0;
+                // SAFETY: the buffer is `CLUSTER_CODEPOINTS` long, which is the length passed
+                let result = unsafe {
+                    sys::ghostty_grid_ref_graphemes(
+                        reference,
+                        codepoints.as_mut_ptr(),
+                        codepoints.len(),
+                        &raw mut written,
+                    )
+                };
+                // The first is the placeholder itself. A cell holding more characters than a read does
+                // is one no program writes for this, and is read as a placeholder that says nothing
+                let marks = if result == sys::Result::SUCCESS {
+                    &codepoints[1.min(written)..written.min(codepoints.len())]
+                } else {
+                    &[]
+                };
+                read.placeholder(column, Said::of(&style, marks.iter().filter_map(|mark| char::from_u32(*mark))));
+            }
             sys::CellContentTag::CODEPOINT => {
                 if let Some(character) = char::from_u32(codepoint).filter(|found| *found != '\0') {
                     read.text.push(character);
@@ -663,7 +757,7 @@ impl Rendering {
         Failed::check("ghostty_render_state_clean", unsafe { sys::ghostty_render_state_clean(self.handle) })
     }
 
-    /// The cursor as the terminal had it at the last `look`.
+    /// The cursor as the terminal had it at the last `look`, or `None` when it is not on the screen.
     ///
     /// How the cursor is drawn — its shape, whether it blinks — is not something the terminal answers
     /// directly; the render state resolves it from the program's request and the defaults.
@@ -674,7 +768,7 @@ impl Rendering {
         Failed::check("ghostty_render_state_get(CURSOR)", unsafe {
             sys::ghostty_render_state_get(self.handle, sys::RenderStateData::CURSOR, (&raw mut cursor).cast())
         })?;
-        if !cursor.visible || !cursor.viewport_has_value {
+        if !cursor.viewport_has_value {
             return Ok(None);
         }
         let shape = match cursor.visual_style {
@@ -683,7 +777,101 @@ impl Rendering {
             sys::CursorStyle::BLOCK_HOLLOW => 3,
             _ => 0,
         };
-        Ok(Some(CursorRead { column: cursor.viewport_x, row: cursor.viewport_y, shape, blinking: cursor.blinking }))
+        Ok(Some(CursorRead {
+            column: cursor.viewport_x,
+            row: cursor.viewport_y,
+            shape,
+            blinking: cursor.blinking,
+            hidden: !cursor.visible,
+        }))
+    }
+}
+
+/// Part of an image the core says a run of placeholder cells on the screen shows: `Rendering::shown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShownRead {
+    /// The row of the screen the run is on
+    pub row: u16,
+    pub piece: Piece,
+}
+
+impl Rendering {
+    /// What the core says the placeholder cells on the screen show, as of the last `look`, top to bottom
+    /// and left to right.
+    ///
+    /// **The core's answer to the question `Terminal::read_row_into` answers for itself**, and only for
+    /// the screen, which is why a row is not read from here (`placeholders`). It is what the suite holds
+    /// that reader to: the two have to say the same of every row both answer for.
+    pub fn shown(&self) -> Result<Vec<ShownRead>, Failed> {
+        use sys::RenderStateImageData as Data;
+        let mut iterator: sys::RenderStateImageIterator = std::ptr::null_mut();
+        // SAFETY: `iterator` is a valid out-pointer; it is freed below
+        Failed::check("ghostty_render_state_image_iterator_new", unsafe {
+            sys::ghostty_render_state_image_iterator_new(std::ptr::null(), &raw mut iterator)
+        })?;
+        // SAFETY: IMAGE_ITERATOR fills the iterator it is handed a pointer to
+        let filled = unsafe {
+            sys::ghostty_render_state_get(self.handle, sys::RenderStateData::IMAGE_ITERATOR, (&raw mut iterator).cast())
+        };
+        let mut shown = Vec::new();
+        if filled == sys::Result::SUCCESS {
+            let read_u32 = |data: Data::Type| {
+                let mut value: u32 = 0;
+                // SAFETY: each key read through this writes a `uint32_t`
+                let result = unsafe { sys::ghostty_render_state_image_get(iterator, data, (&raw mut value).cast()) };
+                (result == sys::Result::SUCCESS).then_some(value)
+            };
+            let read_i32 = |data: Data::Type| {
+                let mut value: i32 = 0;
+                // SAFETY: each key read through this writes an `int32_t`
+                let result = unsafe { sys::ghostty_render_state_image_get(iterator, data, (&raw mut value).cast()) };
+                (result == sys::Result::SUCCESS).then_some(value)
+            };
+            // SAFETY: the iterator was filled from this state and nothing has updated it since
+            while unsafe { sys::ghostty_render_state_image_iterator_next(iterator) } {
+                let mut kind: sys::RenderStateKittyPlacementKind::Type = sys::RenderStateKittyPlacementKind::FIXED;
+                // SAFETY: KITTY_KIND writes a `GhosttyRenderStateKittyPlacementKind`
+                let read =
+                    unsafe { sys::ghostty_render_state_image_get(iterator, Data::KITTY_KIND, (&raw mut kind).cast()) };
+                if read != sys::Result::SUCCESS || kind != sys::RenderStateKittyPlacementKind::VIRTUAL {
+                    continue;
+                }
+                let mut generation: u64 = 0;
+                // SAFETY: IMAGE_GENERATION writes a `uint64_t`
+                let _ = unsafe {
+                    sys::ghostty_render_state_image_get(iterator, Data::IMAGE_GENERATION, (&raw mut generation).cast())
+                };
+                let place = |value: Option<i32>| value.and_then(|at| u16::try_from(at).ok());
+                let (Some(row), Some(column)) =
+                    (place(read_i32(Data::VIEWPORT_ROW)), place(read_i32(Data::VIEWPORT_COL)))
+                else {
+                    continue;
+                };
+                let of = |data: Data::Type| read_u32(data).unwrap_or(0);
+                shown.push(ShownRead {
+                    row,
+                    piece: Piece {
+                        image: of(Data::IMAGE_ID),
+                        generation,
+                        column,
+                        columns: u16::try_from(of(Data::GRID_COLS)).unwrap_or(u16::MAX),
+                        offset_x: of(Data::CELL_OFFSET_X),
+                        offset_y: of(Data::CELL_OFFSET_Y),
+                        width: of(Data::PIXEL_WIDTH),
+                        height: of(Data::PIXEL_HEIGHT),
+                        source_x: of(Data::SOURCE_X),
+                        source_y: of(Data::SOURCE_Y),
+                        source_width: of(Data::SOURCE_WIDTH),
+                        source_height: of(Data::SOURCE_HEIGHT),
+                    },
+                });
+            }
+        }
+        // SAFETY: freed once
+        unsafe { sys::ghostty_render_state_image_iterator_free(iterator) };
+        Failed::check("ghostty_render_state_get(IMAGE_ITERATOR)", filled)?;
+        shown.sort_by_key(|one| (one.row, one.piece.column));
+        Ok(shown)
     }
 }
 

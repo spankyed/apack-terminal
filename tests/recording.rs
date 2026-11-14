@@ -108,6 +108,48 @@ fn a_replay_holds_what_the_live_screen_held() {
     assert_eq!(held(&after_leaving, 14), held(&live, 14));
 }
 
+/// **A replay reads no file a recording names.** A session that takes images by name recorded the name,
+/// not the pixels; replayed, the name would be read as whatever is there now. So what a replay shows of
+/// such an image is nothing, and the session takes one by name again once the replay is over.
+#[test]
+fn a_replay_reads_no_file_the_recording_names() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let picture = directory.path().join("picture.rgb");
+    std::fs::write(&picture, [0x40; 2 * 2 * 3]).expect("a file is written");
+    // The path in the base64 the protocol carries it in
+    let name = {
+        const DIGITS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let bytes = picture.to_str().expect("a path that is text").as_bytes();
+        let mut text = String::new();
+        for chunk in bytes.chunks(3) {
+            let bits =
+                chunk.iter().enumerate().fold(0u32, |bits, (at, byte)| bits | (u32::from(*byte) << (16 - 8 * at)));
+            for index in 0..4 {
+                text.push(if index <= chunk.len() {
+                    char::from(DIGITS[((bits >> (18 - 6 * index)) & 63) as usize])
+                } else {
+                    '='
+                });
+            }
+        }
+        text
+    };
+    let named = format!("\x1b_Ga=T,f=24,i=5,s=2,v=2,t=f,q=2;{name}\x1b\\").into_bytes();
+
+    let mut first = Screen::new(30, 6);
+    let path = directory.path().join("one.recording");
+    first.start_recording(&path).expect("the recording starts");
+    let keyframe = recorded(&mut first, &path).remove(0).entry;
+    let entries = vec![Timed { at: 100, entry: keyframe }, Timed { at: 200, entry: Entry::Output(named.clone()) }];
+
+    let mut screen = Screen::new(30, 6);
+    screen.allow_images(true).expect("images are allowed");
+    assert!(screen.replay(&entries, 200));
+    assert!(screen.image(5, 0).is_none(), "a replay read the file its recording names");
+    screen.feed(&named);
+    assert!(screen.image(5, 0).is_some(), "a session that takes files takes none once it has replayed");
+}
+
 /// A replay to a moment holds what had been written by then and nothing after.
 #[test]
 fn a_replay_stops_at_the_moment_it_is_asked_for() {
@@ -985,6 +1027,7 @@ fn a_recording_whose_session_ended_is_no_longer_named() {
         record: Some(directory.path().join(file).to_str().expect("a utf-8 path").to_owned()),
         restore: false,
         images: false,
+        image_files: false,
         marks_key: None,
     };
 

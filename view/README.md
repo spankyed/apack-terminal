@@ -66,7 +66,11 @@ module and its declarations.
   colour is the same whether the status was vouched for or only claimed; a command's `outcome` is what
   says which, for whatever reads it.
 - **Draws images** a program placed: their pixels are fetched once per generation and drawn under or over
-  the text as the program asked, scaled from the cell the terminal measured them in to the cell drawn.
+  the text as the program asked, scaled from the cell the terminal measured them in to the cell drawn. One
+  shown through placeholder cells comes with the rows that hold the cells, and is drawn under their text
+  wherever they are.
+- **Puts its input where the cursor is, drawn or not.** A program that draws its own cursor hides the
+  terminal's and still moves it to where typing goes; an input method composes there.
 - **Confirms a paste** the source says could run a command, through the host's `confirmPaste`.
 - **Says what is on screen as text**, in an element a screen reader and a test read
   (`[data-terminal-text]`), and which frame it last painted (`data-terminal-drawn`).

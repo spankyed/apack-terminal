@@ -50,7 +50,7 @@ fn picture(width: u32, height: u32) -> Vec<u8> {
 /// A screen that takes images, with a view attached so lines are numbered, and a cell of ten by twenty.
 fn viewed(cols: u16, rows: u16) -> (Screen, std::sync::mpsc::Receiver<Vec<u8>>) {
     let mut screen = Screen::new(cols, rows);
-    screen.allow_images().expect("images are allowed");
+    screen.allow_images(false).expect("images are allowed");
     screen.resize(cols, rows, 10, 20);
     let (sink, sent) = std::sync::mpsc::channel();
     screen
@@ -294,28 +294,221 @@ fn an_image_sent_again_is_another_generation() {
     assert_ne!(second, first);
 }
 
-/// **A picture shown through placeholder cells is not told as placed.** It has no position of its own:
-/// it is wherever the program writes those cells, which a view draws as the text they are. So it is not
-/// among the placements a view is told of, and the same picture put where the cursor is, is.
+/// The cells that show image `id`'s row `row`, as a program writes them: the colour that spells the
+/// image's number, then a placeholder for each column with its row and column after it.
+fn cells(id: u8, row: usize, columns: usize) -> String {
+    const MARKS: [char; 4] = ['\u{0305}', '\u{030D}', '\u{030E}', '\u{0310}'];
+    let cells: String = (0..columns).map(|column| format!("\u{10EEEE}{}{}", MARKS[row], MARKS[column])).collect();
+    format!("\x1b[38;5;{id}m{cells}\x1b[39m")
+}
+
+/// The row a frame carried for `line`, if it carried one.
+fn row_of(frame: &apack_terminal::view::wire::Frame, line: u64) -> Option<&apack_terminal::view::wire::Row> {
+    frame.block.rows.iter().find(|row| row.line == line)
+}
+
+/// **A picture shown through placeholder cells is part of the rows that hold them.** It has no position
+/// of its own: it is wherever the program writes those cells, so a view is sent what they show with the
+/// row, in the frame that brings the row, and it is not among the placements a view asks after. The same
+/// picture put where the cursor is, is.
 #[test]
-fn a_picture_shown_through_placeholder_cells_is_not_told_as_placed() {
+fn a_picture_shown_through_placeholder_cells_is_sent_with_the_rows_that_hold_them() {
     let view = apack_terminal::view::publish::ViewId { connection: 1, channel: 1 };
     let (mut screen, sent) = viewed(40, 10);
     let attached = last_frame(&sent);
-    // Sent, and shown nowhere yet
-    screen.feed(format!("\x1b_Ga=t,f=32,i=7,s=4,v=4,q=2;{}\x1b\\", base64(&picture(4, 4))).as_bytes());
+    // Forty pixels by forty in a grid of four cells by two, at a cell of ten by twenty
+    screen.feed(format!("\x1b_Ga=T,U=1,f=32,i=7,s=40,v=40,c=4,r=2,q=2;{}\x1b\\", base64(&picture(40, 40))).as_bytes());
+    screen.feed(format!("one\r\n{}\r\n{}\r\n", cells(7, 0, 4), cells(7, 1, 4)).as_bytes());
     screen.acknowledge(view, attached.sequence).expect("an acknowledgement is taken");
-    let held = last_frame(&sent);
+    let shown = last_frame(&sent);
 
-    screen.feed(b"\x1b_Ga=p,U=1,i=7,p=1,c=2,r=1,q=2\x1b\\");
-    screen.acknowledge(view, held.sequence).expect("an acknowledgement is taken");
-    assert_ne!(last_frame(&sent).images, held.images, "showing it changed nothing a view is told of");
-    assert!(screen.images().expect("the images read").2.is_empty());
-    assert!(screen.image(7, 0).is_some(), "the picture itself is held");
+    assert!(screen.images().expect("the images read").2.is_empty(), "it is told as placed as well");
+    for (index, line) in [shown.first_active + 1, shown.first_active + 2].into_iter().enumerate() {
+        let row = row_of(&shown, line).expect("the frame carries the row");
+        assert_eq!(row.pictured.as_ref().map(|pictured| pictured.cell), Some((10, 20)));
+        assert_eq!(row.pieces().len(), 1);
+        let piece = row.pieces()[0];
+        assert_eq!((piece.image, piece.column, piece.columns), (7, 0, 4));
+        assert_eq!((piece.width, piece.height), (40, 20));
+        assert_eq!(
+            (piece.source_x, piece.source_y, piece.source_width, piece.source_height),
+            (0, index as u32 * 20, 40, 20)
+        );
+        // What a view draws of the cells themselves is nothing
+        assert!(row.glyphs.iter().all(|glyph| glyph.text == " "), "a placeholder is drawn as a character");
+    }
+    assert!(row_of(&shown, shown.first_active).is_some_and(|row| row.pictured.is_none()));
 
     screen.feed(b"\x1b_Ga=p,i=7,p=2,q=2\x1b\\");
     let (_, _, placed) = screen.images().expect("the images read");
     assert_eq!(placed.iter().map(|(_, placement)| placement.image).collect::<Vec<_>>(), [7]);
+}
+
+/// A row is sent again when what it shows changes with no cell of it written: the image sent again,
+/// which is other pixels; a window measuring its cells anew, which is another size; and the image
+/// deleted, which is nothing to show.
+#[test]
+fn a_row_is_sent_again_when_the_picture_it_shows_changes() {
+    let view = apack_terminal::view::publish::ViewId { connection: 1, channel: 1 };
+    let (mut screen, sent) = viewed(40, 10);
+    let attached = last_frame(&sent);
+    let image = format!("\x1b_Ga=T,U=1,f=32,i=7,s=20,v=20,c=2,r=1,q=2;{}\x1b\\", base64(&picture(20, 20)));
+    screen.feed(image.as_bytes());
+    screen.feed(cells(7, 0, 2).as_bytes());
+    screen.acknowledge(view, attached.sequence).expect("an acknowledgement is taken");
+    let first = last_frame(&sent);
+    let line = first.first_active;
+    let piece = row_of(&first, line).expect("the row").pieces()[0];
+    assert_eq!((piece.width, piece.height), (20, 20));
+
+    // Sent again: the same cells, and other pixels
+    screen.feed(image.as_bytes());
+    screen.acknowledge(view, first.sequence).expect("an acknowledgement is taken");
+    let again = last_frame(&sent);
+    let resent = row_of(&again, line).expect("a row whose picture was sent again is not sent again").pieces()[0];
+    assert_ne!(resent.generation, piece.generation);
+
+    // A cell half as wide: the same grid, and half the size. A view is told the images changed, since
+    // where each is drawn did, though no image was touched
+    screen.resize(40, 10, 5, 20);
+    screen.acknowledge(view, again.sequence).expect("an acknowledgement is taken");
+    let measured = last_frame(&sent);
+    assert_ne!(measured.images, again.images, "a cell of another size is not a change a view is told of");
+    let row = row_of(&measured, line).expect("a row whose cells changed size is not sent again");
+    let pictured = row.pictured.as_ref().expect("a row of placeholder cells says what they show");
+    assert_eq!((pictured.cell, pictured.pieces[0].width, pictured.pieces[0].height), ((5, 20), 10, 10));
+
+    screen.feed(b"\x1b_Ga=d,d=I,i=7,q=2\x1b\\");
+    screen.acknowledge(view, measured.sequence).expect("an acknowledgement is taken");
+    let deleted = last_frame(&sent);
+    let emptied = row_of(&deleted, line).expect("a row whose picture was deleted is not sent again");
+    assert!(emptied.pieces().is_empty(), "a row still shows a picture that was deleted");
+    // And is still said to hold the cells, which is what a view asks after it by when the images change
+    assert!(emptied.pictured.is_some(), "a row whose cells show nothing is sent as a row with none");
+}
+
+/// **A row of placeholder cells says it holds them while they show nothing.** Cells written before their
+/// image has arrived show nothing yet, and a view that keeps the row has to know to ask after it when the
+/// images change: so the row is sent as one that holds such cells, and sent again with what they show
+/// once there is something.
+#[test]
+fn a_row_whose_cells_show_nothing_yet_says_it_holds_them() {
+    let view = apack_terminal::view::publish::ViewId { connection: 1, channel: 1 };
+    let (mut screen, sent) = viewed(40, 10);
+    let attached = last_frame(&sent);
+    screen.feed(format!("text\r\n{}", cells(7, 0, 2)).as_bytes());
+    screen.acknowledge(view, attached.sequence).expect("an acknowledgement is taken");
+    let before = last_frame(&sent);
+    let line = before.first_active + 1;
+    let waiting = row_of(&before, line).expect("the row");
+    assert!(waiting.pieces().is_empty());
+    assert_eq!(waiting.pictured.as_ref().map(|pictured| pictured.cell), Some((10, 20)));
+    assert!(
+        row_of(&before, before.first_active).is_some_and(|row| row.pictured.is_none()),
+        "a row of text says so too"
+    );
+
+    screen.feed(format!("\x1b_Ga=T,U=1,f=32,i=7,s=20,v=20,c=2,r=1,q=2;{}\x1b\\", base64(&picture(20, 20))).as_bytes());
+    screen.acknowledge(view, before.sequence).expect("an acknowledgement is taken");
+    let after = last_frame(&sent);
+    assert_eq!(row_of(&after, line).expect("the row is sent again once its image arrives").pieces().len(), 1);
+}
+
+/// A file of raw pixels, and the request that names it as image `id`'s source.
+fn named_file(directory: &std::path::Path, id: u32, action: &str) -> (std::path::PathBuf, Vec<u8>) {
+    let path = directory.join(format!("picture-{id}.rgba"));
+    std::fs::write(&path, picture(4, 4)).expect("a file is written");
+    let request = format!(
+        "\x1b_Ga={action},f=32,i={id},s=4,v=4,t=f;{}\x1b\\",
+        base64(path.to_str().expect("a path that is text").as_bytes())
+    );
+    (path, request.into_bytes())
+}
+
+/// **An image named as a file is read only where the session was started to take one that way.** A
+/// program that names a file is asking this machine to open a path its output chose, which is the
+/// caller's to allow (`Request::Spawn`); where it is not, the program is told no, which is how one finds
+/// out to send the bytes instead.
+#[test]
+fn an_image_named_as_a_file_is_read_only_where_the_session_takes_files() {
+    let directory = tempfile::tempdir().expect("a directory");
+
+    let mut refusing = Screen::new(40, 10);
+    refusing.allow_images(false).expect("images are allowed");
+    let (path, request) = named_file(directory.path(), 7, "T");
+    refusing.feed(&request);
+    assert!(refusing.image(7, 0).is_none(), "a session not started to read files read one");
+    assert!(
+        refusing.take_replies().concat().contains("\x1b_Gi=7;E"),
+        "a program whose file was refused is not told so",
+    );
+    assert!(path.exists());
+
+    let mut taking = Screen::new(40, 10);
+    taking.allow_images(true).expect("images are allowed");
+    taking.feed(&request);
+    let read = taking.image(7, 0).expect("a session started to read files did not read one");
+    assert_eq!((read.width, read.height, read.bytes), (4, 4, picture(4, 4)));
+    assert!(taking.take_replies().concat().contains("\x1b_Gi=7;OK"));
+    assert!(path.exists(), "a file a program named was removed");
+
+    // Asked whether it can, as a program does before it sends one this way
+    let (_, asked) = named_file(directory.path(), 8, "q");
+    taking.feed(&asked);
+    assert!(taking.take_replies().concat().contains("\x1b_Gi=8;OK"));
+    refusing.feed(&asked);
+    assert!(refusing.take_replies().concat().contains("\x1b_Gi=8;E"));
+}
+
+/// **A shared memory object is read once and unlinked**, as the protocol says: it is the program's way
+/// of handing pixels over without writing them down the pty, and the name is the terminal's to let go.
+#[cfg(unix)]
+#[test]
+fn an_image_named_as_shared_memory_is_read_and_unlinked() {
+    let pixels = picture(4, 4);
+    // Short enough for macOS, which holds a name to 31 bytes
+    let name = format!("/apack-test-{}", std::process::id());
+    let c_name = std::ffi::CString::new(name.clone()).expect("a name");
+    // SAFETY: the name is a valid C string; the descriptor is used for this object only and closed below
+    let made = unsafe {
+        let descriptor = libc::shm_open(c_name.as_ptr(), libc::O_CREAT | libc::O_EXCL | libc::O_RDWR, 0o600);
+        assert!(descriptor >= 0, "a shared memory object is made");
+        assert_eq!(libc::ftruncate(descriptor, pixels.len() as libc::off_t), 0);
+        let mapped = libc::mmap(std::ptr::null_mut(), pixels.len(), libc::PROT_WRITE, libc::MAP_SHARED, descriptor, 0);
+        assert_ne!(mapped, libc::MAP_FAILED);
+        std::ptr::copy_nonoverlapping(pixels.as_ptr(), mapped.cast::<u8>(), pixels.len());
+        libc::munmap(mapped, pixels.len());
+        libc::close(descriptor);
+        true
+    };
+    assert!(made);
+    let request = format!("\x1b_Ga=T,f=32,i=9,s=4,v=4,t=s;{}\x1b\\", base64(name.as_bytes()));
+
+    let mut refusing = Screen::new(40, 10);
+    refusing.allow_images(false).expect("images are allowed");
+    refusing.feed(request.as_bytes());
+    assert!(refusing.image(9, 0).is_none(), "a session not started to read shared memory read some");
+    // SAFETY: as above
+    let still = unsafe { libc::shm_open(c_name.as_ptr(), libc::O_RDONLY, 0) };
+    assert!(still >= 0, "a session that refused an object unlinked it");
+    // SAFETY: a descriptor this test opened
+    unsafe { libc::close(still) };
+
+    let mut taking = Screen::new(40, 10);
+    taking.allow_images(true).expect("images are allowed");
+    taking.feed(request.as_bytes());
+    let read = taking.image(9, 0).expect("a session started to read shared memory did not");
+    assert_eq!(read.bytes[..pixels.len()], pixels[..]);
+    // SAFETY: as above
+    let gone = unsafe { libc::shm_open(c_name.as_ptr(), libc::O_RDONLY, 0) };
+    if gone >= 0 {
+        // SAFETY: left behind by a failure of what this asserts, and removed so the next run can make it
+        unsafe {
+            libc::close(gone);
+            libc::shm_unlink(c_name.as_ptr());
+        }
+    }
+    assert!(gone < 0, "an object that was read is still there to be read again");
 }
 
 /// The checksum a PNG's chunk ends with.

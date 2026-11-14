@@ -155,6 +155,15 @@ impl Client {
 
     /// A session running `program`, whose bytes nobody reads.
     fn running(&self, program: &str, arguments: &[&str], images: bool) -> String {
+        self.started(program, arguments, images, false)
+    }
+
+    /// A shell whose programs may send images and may name one as a file on this machine.
+    fn shell_reading_files(&self) -> String {
+        self.started(SHELL, &[], true, true)
+    }
+
+    fn started(&self, program: &str, arguments: &[&str], images: bool, image_files: bool) -> String {
         say(
             &self.stream,
             &Request::Spawn {
@@ -176,6 +185,7 @@ impl Client {
                 record: None,
                 restore: false,
                 images,
+                image_files,
                 marks_key: None,
             },
         );
@@ -572,6 +582,71 @@ fn the_line_at_a_cell_is_answered_to_the_view_that_asked() {
         .expect("there is a line there");
     assert_eq!((line.start.line, line.start.column), (start.line, 0));
     assert_eq!((line.end.line, line.end.column), (start.line + 1, 16));
+}
+
+/// An image named as a file and shown through placeholder cells reaches a view as part of the row that
+/// holds the cells, in a session started to read files; in one that was not, the same bytes show
+/// nothing. This is a program's whole path: the spawn's word, the file read, the cells, the frame.
+#[cfg(unix)]
+#[test]
+fn an_image_named_as_a_file_and_shown_through_cells_is_sent_with_its_row() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let path = directory.path().join("dot.rgba");
+    std::fs::write(&path, [255u8, 0, 0, 255]).expect("a file is written");
+    let name = {
+        const DIGITS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut text = String::new();
+        for chunk in path.to_str().expect("a path that is text").as_bytes().chunks(3) {
+            let bits =
+                chunk.iter().enumerate().fold(0u32, |bits, (at, byte)| bits | (u32::from(*byte) << (16 - 8 * at)));
+            for index in 0..4 {
+                text.push(if index <= chunk.len() {
+                    char::from(DIGITS[((bits >> (18 - 6 * index)) & 63) as usize])
+                } else {
+                    '='
+                });
+            }
+        }
+        text
+    };
+    // The image by name with a placement of two cells by one, then the two cells that show it: the
+    // placeholder and its row and column marks, as the octal of their UTF-8
+    let cell = |column: &str| format!("\\364\\216\\273\\256\\314\\205{column}");
+    let shown = format!(
+        "printf '\\033_Ga=T,U=1,f=32,i=7,s=1,v=1,c=2,r=1,t=f,q=2;{name}\\033\\\\'; \
+         printf '\\033[38;5;7m{}{}\\033[39m'; echo sh$((1+1))own",
+        cell("\\314\\205"),
+        cell("\\314\\215"),
+    );
+
+    let broker = start();
+    let client = Client::greeting(&broker);
+    for (session, reads) in [(client.shell_reading_files(), true), (client.shell_taking(true), false)] {
+        say(
+            &client.stream,
+            &Request::Resize { session: session.clone(), cols: 60, rows: 8, cell_width: 10, cell_height: 20 },
+        );
+        let mut view = View::attached(&broker, &session);
+        view.until_shows("$ ");
+        view.type_line(&shown);
+        view.until_shows("sh2own");
+        let pieces: Vec<_> = view.rows.values().flat_map(|row| row.pieces().to_vec()).collect();
+        if reads {
+            assert_eq!(pieces.len(), 1, "a session started to read files shows no image named as one");
+            let piece = pieces[0];
+            assert_eq!((piece.image, piece.column, piece.columns), (7, 0, 2));
+            assert_eq!((piece.source_width, piece.source_height), (1, 1));
+            view.send(&ToBroker::Image { channel: 1, request: 10, image: 7, offset: 0 });
+            let pixels = view.answer(|message| match message {
+                ToView::Image { request: 10, bytes, .. } => Some(bytes.clone()),
+                _ => None,
+            });
+            assert_eq!(pixels, [255, 0, 0, 255]);
+        } else {
+            assert!(pieces.is_empty(), "a session not started to read files read one: {pieces:?}");
+        }
+    }
+    assert!(path.exists(), "a file a program named was removed");
 }
 
 /// An image a program places is told to a view that asks where the images are, and its pixels to one that
@@ -1208,6 +1283,7 @@ fn a_session_that_ends_is_over_for_its_view_while_the_client_reads_nothing() {
             record: None,
             restore: false,
             images: false,
+            image_files: false,
             marks_key: None,
         },
     );

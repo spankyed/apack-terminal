@@ -619,8 +619,10 @@ pub struct Spawning {
     /// Where to record it, if anywhere, and whether to begin with what is recorded there.
     pub record: Option<String>,
     pub restore: bool,
-    /// Whether its programs may send images (`Request::Spawn`)
+    /// Whether its programs may send images, and whether they may name one as a file or a shared memory
+    /// object on this machine (`Request::Spawn`)
     pub images: bool,
+    pub image_files: bool,
     /// What vouches for its shell's marks, if anything does (`Request::Spawn`)
     pub marks_key: Option<String>,
 }
@@ -979,8 +981,22 @@ impl Sessions {
 
     /// Starts a shell in a new pty and begins reading it. The id is the broker's to mint.
     pub fn spawn(&self, asked: Spawning) -> Outcome {
-        let Spawning { cols, rows, shell, args, env, unset, cwd, colors, output, record, restore, images, marks_key } =
-            asked;
+        let Spawning {
+            cols,
+            rows,
+            shell,
+            args,
+            env,
+            unset,
+            cwd,
+            colors,
+            output,
+            record,
+            restore,
+            images,
+            image_files,
+            marks_key,
+        } = asked;
         // **Before anything is started.** A key that is not one is a request this cannot carry out as
         // asked, and a session spawned without it would report as vouched what nothing vouches for
         let marks_key = match marks_key {
@@ -1051,7 +1067,7 @@ impl Sessions {
             screen.set_colors(colors);
         }
         if images {
-            let _ = screen.allow_images();
+            let _ = screen.allow_images(image_files);
         }
         // **Before the process is read**, so what it prints lands after what the last session left and
         // is recorded from its first byte. A recording that cannot be opened — or that another session is

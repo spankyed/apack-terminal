@@ -36,7 +36,7 @@ class Out {
     this.number(block.rows.length)
     for (const row of block.rows) {
       this.number(row.line)
-      this.byte((row.wrapped ? 1 : 0) | (row.prompt ? 2 : 0))
+      this.byte((row.wrapped ? 1 : 0) | (row.prompt ? 2 : 0) | (row.images ? 4 : 0))
       // The row's own tables, less the plain style and the empty link every row has in front
       this.number(row.styles.length - 1)
       for (const style of row.styles.slice(1)) {
@@ -64,6 +64,14 @@ class Out {
           texts.forEach((text, offset) => { this.byte(row.width[run.start + offset]!); this.text(text) })
         }
       }
+      // For a row that holds placeholder cells: the cell what they show is measured in, how many pieces, each
+      if (!row.images) continue
+      this.number(row.images.cellWidth); this.number(row.images.cellHeight)
+      this.number(row.images.pieces.length)
+      for (const piece of row.images.pieces) {
+        for (const value of [piece.image, piece.generation, piece.column, piece.columns, piece.offsetX, piece.offsetY,
+          piece.width, piece.height, piece.sourceX, piece.sourceY, piece.sourceWidth, piece.sourceHeight]) this.number(value)
+      }
     }
   }
   finish(): Uint8Array {
@@ -84,7 +92,8 @@ export function encodeToView(message: ToView): Uint8Array {
       const { frame } = message
       for (const value of [frame.sequence, frame.epoch, frame.firstActive, frame.columns, frame.screenRows, frame.scrollback, frame.commands, frame.images]) out.number(value)
       out.byte((frame.cursor ? 1 : 0) | (frame.modes.alternateScreen ? 2 : 0) | (frame.modes.mouse ? 4 : 0)
-        | (frame.staleFrom === undefined ? 0 : 8) | (frame.cursor?.blinking ? 16 : 0) | (frame.reverseVideo ? 32 : 0) | (frame.colors ? 64 : 0))
+        | (frame.staleFrom === undefined ? 0 : 8) | (frame.cursor?.blinking ? 16 : 0) | (frame.reverseVideo ? 32 : 0) | (frame.colors ? 64 : 0)
+        | (frame.cursor?.hidden ? 128 : 0))
       if (frame.cursor) { out.number(frame.cursor.column); out.number(frame.cursor.row); out.byte(CURSOR_SHAPES.indexOf(frame.cursor.shape)) }
       if (frame.staleFrom !== undefined) out.number(frame.staleFrom)
       if (frame.colors) {

@@ -290,7 +290,11 @@ export class TerminalView {
   /** Where the session's images are, as last told, and the generation of the frame that prompted asking */
   private placed: Placements = { cellWidth: 0, cellHeight: 0, placements: [] }
   private imagesSeen = -1
+  /** The last frame's count of the images, whether or not asking where they are was answered */
+  private imagesTold = -1
   private readonly pictures = new Map<number, HeldPicture>()
+  /** The generation of each image last asked for, which is the one an answer is held to */
+  private readonly wanted = new Map<number, number>()
   private readonly mac: boolean
   private readonly detectors: readonly Detector[]
   private readonly input: Input
@@ -755,19 +759,25 @@ export class TerminalView {
     return true
   }
 
-  /** Lets go of the pictures of images nothing places any more, which is known once placements are told */
+  /**
+   * Lets go of the pictures of images nothing shows any more: none places it, and no row held shows part
+   * of it. Known once placements are told, which is whenever the images change.
+   */
   private dropPictures(): void {
-    const placed = new Set(this.placed.placements.map((placement) => placement.image))
+    const shown = this.store.pictured()
+    for (const placement of this.placed.placements) shown.add(placement.image)
     for (const [image, held] of this.pictures) {
-      if (placed.has(image)) continue
+      if (shown.has(image)) continue
       release(held.picture)
       this.pictures.delete(image)
+      this.wanted.delete(image)
     }
   }
 
   /**
-   * Asks for the pixels of the images placed in view, or within a screenful of it, that this view does
-   * not hold at the generation placed. One far up the history costs nothing until it is scrolled to.
+   * Asks for the pixels of the images in view, or within a screenful of it, that this view does not hold
+   * at the generation shown: the ones placed there, and the ones the rows there show part of. One far up
+   * the history costs nothing until it is scrolled to.
    */
   private wantPictures(first: number, count: number): void {
     if (this.ended || !this.listening) return
@@ -775,17 +785,28 @@ export class TerminalView {
       if (placement.line + placement.rows <= first - count || placement.line >= first + count * 2) continue
       this.wantPicture(placement.image, placement.generation)
     }
+    // Once an image, at the newest generation any row there shows it at. A row brought before an image
+    // was sent again still names the generation before, until it is brought again: asked for by that,
+    // the pixels would be fetched for it and found to be the newer ones, at every paint
+    const shown = new Map<number, number>()
+    for (let line = first - count; line < first + count * 2; line += 1) {
+      for (const piece of this.store.row(line)?.images?.pieces ?? []) {
+        shown.set(piece.image, Math.max(shown.get(piece.image) ?? 0, piece.generation))
+      }
+    }
+    for (const [image, generation] of shown) this.wantPicture(image, generation)
   }
 
   /**
    * Asks for one image's pixels, once.
    *
-   * **An answer that is not what was placed is not asked for again until the placements are.** The image
-   * is gone, or could not be made into a picture, or was replaced after the placements were told — and
-   * asking again gets the same answer, on every paint, until something has changed. What changes is that
-   * the placements are told again, which is when it is asked for once more.
+   * **An answer that is not what was asked for is not asked for again until the placements are told.**
+   * The image is gone, or could not be made into a picture, or was replaced since — and asking again gets
+   * the same answer, on every paint, until something has changed. What changes is the images, and the
+   * placements are told again whenever they do, which is when it is asked for once more.
    */
   private wantPicture(image: number, generation: number): void {
+    this.wanted.set(image, generation)
     let held = this.pictures.get(image)
     if (!held) {
       held = { generation: -1, picture: null, asking: false, refused: null }
@@ -810,8 +831,7 @@ export class TerminalView {
       }
       // No answer for want of an attachment says nothing about the image: the next attachment asks
       if (!picture && (attachment !== this.attachment || !this.listening)) return
-      const wanted = this.placed.placements.find((placement) => placement.image === image)?.generation
-      if (!picture || got !== wanted) entry.refused = this.placed
+      if (!picture || got !== this.wanted.get(image)) entry.refused = this.placed
       this.schedule()
     }, () => {
       entry.asking = false
@@ -819,14 +839,18 @@ export class TerminalView {
     })
   }
 
-  /** The images with any part in view, lowest first, in the pixels this view draws a cell in */
-  private imagesIn(first: number, span: number): NonNullable<Scene['images']> {
-    if (this.placed.placements.length === 0) return []
+  /**
+   * The images with any part in view, lowest first, in the pixels this view draws a cell in: the ones
+   * placed there, and the parts of images the rows there show through placeholder cells.
+   */
+  private imagesIn(first: number, span: number, lines: number[]): NonNullable<Scene['images']> {
     const { cellWidth, cellHeight } = this.painter.metrics
     // What the terminal measured an image in, against what this view draws: the same, where it was not told
     const scaleX = this.placed.cellWidth > 0 ? cellWidth / this.placed.cellWidth : 1
     const scaleY = this.placed.cellHeight > 0 ? cellHeight / this.placed.cellHeight : 1
-    const images: Array<NonNullable<Scene['images']>[number] & { z: number }> = []
+    // A piece is under the text and over whatever else is: the core draws one at a z of minus one
+    const images: Array<NonNullable<Scene['images']>[number] & { z: number }> =
+      this.piecesIn(first, lines).map((piece) => ({ ...piece, z: -1 }))
     for (const placement of this.placed.placements) {
       if (placement.line + placement.rows <= first || placement.line >= first + span) continue
       if (this.hiddenIn(placement.line)) continue
@@ -844,6 +868,35 @@ export class TerminalView {
       })
     }
     return images.sort((one, other) => one.z - other.z)
+  }
+
+  /** The parts of images the rows in view show, each where its cells are, under the text */
+  private piecesIn(first: number, lines: number[]): NonNullable<Scene['images']> {
+    const { cellWidth, cellHeight } = this.painter.metrics
+    const shown: Array<NonNullable<Scene['images']>[number]> = []
+    for (const line of lines) {
+      const images = this.store.row(line)?.images
+      // A fold's line is drawn as the fold, not as the row that begins what it hides
+      if (images === undefined || this.folds.some((fold) => fold.first === line)) continue
+      // What the terminal measured a piece in, against what this view draws
+      const scaleX = images.cellWidth > 0 ? cellWidth / images.cellWidth : 1
+      const scaleY = images.cellHeight > 0 ? cellHeight / images.cellHeight : 1
+      const top = this.rowsBetween(first, line) * cellHeight
+      for (const piece of images.pieces) {
+        const picture = this.pictures.get(piece.image)?.picture
+        if (!picture) continue
+        shown.push({
+          picture,
+          x: piece.column * cellWidth + piece.offsetX * scaleX,
+          y: top + piece.offsetY * scaleY,
+          width: piece.width * scaleX,
+          height: piece.height * scaleY,
+          source: { x: piece.sourceX, y: piece.sourceY, width: piece.sourceWidth, height: piece.sourceHeight },
+          above: false,
+        })
+      }
+    }
+    return shown
   }
 
   /** A mark for each command whose prompt is in view, coloured by how the command ended */
@@ -1173,6 +1226,10 @@ export class TerminalView {
     const after = moved ? this.viewport.acrossReset() : undefined
     // What is kept longest is what the viewer is at: the screen, or the line a scrolled view holds
     const near = moved || this.viewport.following ? frame.firstActive : this.viewport.top
+    // The images changed: history that shows part of one is asked for again. Before the frame is taken,
+    // so a row it brings is the row as it now is and is not asked for twice
+    if (this.imagesTold !== -1 && frame.images !== this.imagesTold) this.store.doubtPictured()
+    this.imagesTold = frame.images
     const { reset, changed } = this.store.apply(frame, near)
     after?.()
     this.viewport.settle()
@@ -1249,7 +1306,7 @@ export class TerminalView {
   /** Whether the cursor blinks now: the view's setting where it has one, and the program's where it does not */
   private cursorBlinks(): boolean {
     const cursor = this.frame?.cursor
-    if (!cursor) return false
+    if (!cursor || cursor.hidden) return false
     switch (this.cursorBlink) {
       case 'on': return true
       case 'off': return false
@@ -1631,7 +1688,7 @@ export class TerminalView {
       const cursor = this.cursorIn(frame, lines)
       const scene: Scene = {
         theme: this.theme, rows, offset: this.viewport.offset, cursor,
-        marks: this.marksIn(first, lines), images: this.imagesIn(first, span),
+        marks: this.marksIn(first, lines), images: this.imagesIn(first, span, lines),
       }
       this.painter.paint(scene)
       this.afterPaint(frame, first, lines)
@@ -1674,6 +1731,7 @@ export class TerminalView {
     this.thumbDrawn = next
 
     const { cellWidth, cellHeight } = this.painter.metrics
+    // Where the cursor is, drawn or not: a program that hides it still puts it where typing goes
     if (frame.cursor) {
       const row = this.rowsBetween(first, frame.firstActive + frame.cursor.row)
       this.input.moveTo(this.gutter + frame.cursor.column * cellWidth, Math.max(0, row - this.viewport.offset) * cellHeight, cellHeight)
@@ -1752,12 +1810,13 @@ export class TerminalView {
     const to = last[0] + last[1]
     this.asking.add(page)
     const epoch = this.store.epoch
+    const asked = this.store.imagesChanged
     void this.source.fetch(from, to - from).then((fetched) => {
       // After a reflow the page is one of other lines, which this answer says nothing about — and the
       // page of that number being asked for may be the new one
       if (this.disposed || epoch !== this.store.epoch) return
       this.asking.delete(page)
-      const told = this.store.absorb(fetched, this.viewport.top)
+      const told = this.store.absorb(fetched, this.viewport.top, asked)
       for (const line of told) this.drawings.delete(line)
       if (told.length > 0) this.schedule()
     }, () => {
@@ -1769,7 +1828,7 @@ export class TerminalView {
 
   private cursorIn(frame: Frame, lines: number[]): Scene['cursor'] {
     const cursor = frame.cursor
-    if (!cursor || !this.cursorShown) return undefined
+    if (!cursor || cursor.hidden || !this.cursorShown) return undefined
     const line = frame.firstActive + cursor.row
     const index = lines.indexOf(line)
     if (index === -1) return undefined

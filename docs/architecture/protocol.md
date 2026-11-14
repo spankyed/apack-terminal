@@ -49,7 +49,7 @@ among it, left unread.
 | kind | asks for |
 |---|---|
 | `hello` | the handshake, with a protocol version and a role |
-| `spawn` | a shell in a new pty: `cols`, `rows`, `shell`, `args`, `env`, `unset`, `cwd`, and optionally `colors`, `output`, `record`, `restore`, `images`, `marks_key` |
+| `spawn` | a shell in a new pty: `cols`, `rows`, `shell`, `args`, `env`, `unset`, `cwd`, and optionally `colors`, `output`, `record`, `restore`, `images`, `image_files`, `marks_key` |
 | `write` | bytes the user typed |
 | `resize` | the viewport changed; one size per session, because a pty has one |
 | `pause` | stop reading this session's pty, so its process feels the reader stop |
@@ -73,6 +73,14 @@ bytes wants them; a terminal a person looks at is drawn by a view, which is sent
 ([views.md](views.md)), and its bytes would cross the socket to be thrown away and stall the program on
 their credit. `record` and `restore` are a file to record the session in and whether to begin with what it
 holds; `images` is whether its programs may send any ([design.md](design.md)).
+
+`image_files` is whether an image may be *named* rather than sent: as a file on this machine or a shared
+memory object, which the terminal then reads. It is read only where `images` is on, and it is the caller's
+to say because only the caller knows what a session's output is. A program on this machine could have read
+the file itself; a file shown with `cat`, a log, or the far end of an `ssh` that spells the same request
+is asking this machine to open a path of its choosing. So it is for a session started to run one program
+the caller trusts, and absent — a shell — such an image is refused and the program told so
+([design.md](design.md#known-limits)).
 
 `marks_key` is what vouches for the shell's marks: 32 lowercase hexadecimal characters the caller also
 gives the shell — the broker does not; it spawns what it is handed — and nothing else. A session spawned
