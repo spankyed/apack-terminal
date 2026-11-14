@@ -188,6 +188,18 @@ describe('bytes that are not a message', () => {
     expect(() => decodeToView(Uint8Array.of(200, 0))).toThrow('no message has kind 200')
   })
 
+  it('refuses a frame that says how a cursor it lacks is drawn', () => {
+    // Blinking and hidden are said of a cursor. The kind, eight fields of zero, the image counter, the
+    // flags, then no rows
+    for (const flags of [16, 128]) {
+      expect(() => decodeToView(Uint8Array.of(65, 0, 0, 0, 0, 0, 0, 0, 0, 0, flags, 0)), `flags ${flags}`)
+        .toThrow("a frame's flags are outside what the format defines")
+    }
+    expect(decodeToView(Uint8Array.of(65, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 | 16 | 128, 3, 4, 0, 0))).toMatchObject({
+      frame: { cursor: { column: 3, row: 4, shape: 'block', blinking: true, hidden: true } },
+    })
+  })
+
   it('refuses a command that ended no way the format defines, rather than reading the nearest', () => {
     // A `commands` answer of one command: kind, channel, request, epoch, how many, id, which fields, how it ended
     const listed = (...ended: number[]) => Uint8Array.of(73, 0, 0, 0, 1, 1, 0, ...ended)

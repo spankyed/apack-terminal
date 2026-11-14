@@ -404,6 +404,50 @@ fn a_glyph_naming_a_style_the_block_lacks_is_refused() {
     assert_eq!(ToView::decode(&forged), Err(Malformed::Value("a style's index")));
 }
 
+/// Blinking and hidden are said of a cursor. A frame that says either and has no cursor is not one this
+/// encoder writes, and is refused rather than read as a frame with a cursor nowhere.
+#[test]
+fn a_frame_that_says_how_a_cursor_it_lacks_is_drawn_is_refused() {
+    let frame = |cursor| {
+        let head = FrameHead {
+            channel: 0,
+            sequence: 0,
+            epoch: 0,
+            first_active: 0,
+            columns: 0,
+            screen_rows: 0,
+            scrollback: 0,
+            commands: 0,
+            images: 0,
+            cursor,
+            alternate_screen: false,
+            mouse: false,
+            reverse_video: false,
+            stale_from: None,
+            colors: None,
+        };
+        frame(&head, &Rows::default()).expect("a frame")
+    };
+    // kind, channel, sequence, epoch, first line, columns, rows, scrollback, commands, images, then the flags
+    let flags = 10;
+    for (bit, said) in [(16u8, "blinking"), (128, "hidden")] {
+        let mut forged = body(&frame(None)).to_vec();
+        assert_eq!(forged[flags], 0);
+        forged[flags] = bit;
+        assert_eq!(
+            ToView::decode(&forged),
+            Err(Malformed::Value("a frame's flags")),
+            "a cursor that is not there is {said}"
+        );
+    }
+    // And each is taken of a cursor that is there
+    let hidden = Cursor { column: 1, row: 2, shape: 0, blinking: true, hidden: true };
+    let ToView::Frame(read) = ToView::decode(body(&frame(Some(hidden)))).expect("a frame") else {
+        panic!("a frame decoded as something else")
+    };
+    assert_eq!(read.cursor, Some(hidden));
+}
+
 /// How a command ended is a kind of its own for each way there is, and a byte that is none of them is
 /// refused rather than read as the nearest: a status that was only claimed is never one wrong byte from
 /// reading as an exit.

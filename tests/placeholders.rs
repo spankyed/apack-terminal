@@ -222,14 +222,16 @@ fn a_row_shows_the_image_as_it_now_is() {
 /// the image does not have shows nothing.
 #[test]
 fn cells_that_name_a_placement_show_that_one() {
-    let mut terminal = terminal(40, 3, (10, 20));
-    terminal.feed(&sent(6, 80, 20, 4, 1, Some(11)));
-    // A second placement of the same image, twice as wide
-    terminal.feed(b"\x1b_Ga=p,U=1,i=6,p=12,c=8,r=1,q=2\x1b\\");
+    let mut terminal = terminal(40, 4, (10, 20));
+    // The wider placement first, so the one shown where none is named is not simply the first made
+    terminal.feed(&sent(6, 80, 20, 8, 1, Some(12)));
+    terminal.feed(b"\x1b_Ga=p,U=1,i=6,p=11,c=4,r=1,q=2\x1b\\");
     let named = |placement: u32| format!("\x1b[58;5;{placement}m");
     terminal.feed(format!("{}{}{}{}", naming(6), named(11), cell(0, 0), cell(0, 1)).as_bytes());
     terminal.feed(format!("\x1b[2;1H{}{}{}", named(12), cell(0, 0), cell(0, 1)).as_bytes());
     terminal.feed(format!("\x1b[3;1H{}{}{}", named(13), cell(0, 0), cell(0, 1)).as_bytes());
+    // And none named: whichever the image has, which with two is the lower numbered
+    terminal.feed(format!("\x1b[4;1H\x1b[59m{}{}", cell(0, 0), cell(0, 1)).as_bytes());
 
     let (found, said) = both(&terminal);
     assert_eq!(found, said, "a row is read to show something other than the core says it does");
@@ -237,6 +239,71 @@ fn cells_that_name_a_placement_show_that_one() {
     assert_eq!(found[0].iter().map(|piece| piece.source_width).collect::<Vec<_>>(), [40]);
     assert_eq!(found[1].iter().map(|piece| piece.source_width).collect::<Vec<_>>(), [20]);
     assert!(found[2].is_empty(), "cells naming a placement the image does not have show one");
+    assert_eq!(found[3].iter().map(|piece| piece.source_width).collect::<Vec<_>>(), [40]);
+}
+
+/// Cells show an image only through a placement made to be shown through cells: one put at a cell of
+/// its own is drawn there, and cells that name its image show nothing; and an image whose pixels have
+/// not all arrived shows nothing until they have.
+#[test]
+fn cells_show_only_an_image_that_is_there_to_be_shown_through_them() {
+    let mut terminal = terminal(40, 4, (10, 20));
+    // Placed where the cursor is, with no placement for cells
+    let placed = base64(&[0x80; 20 * 20 * 3]);
+    terminal.feed(format!("\x1b_Ga=T,f=24,i=8,s=20,v=20,c=2,r=1,q=2;{placed}\x1b\\").as_bytes());
+    terminal.feed(format!("\x1b[2;1H{}{}{}\x1b[39m", naming(8), cell(0, 0), cell(0, 1)).as_bytes());
+    // The first part of an image sent in two, and the cells that will show it
+    let (first, rest) = placed.split_at(placed.len() / 2 / 4 * 4);
+    terminal.feed(format!("\x1b_Ga=T,U=1,f=24,i=9,s=20,v=20,c=2,r=1,q=2,m=1;{first}\x1b\\").as_bytes());
+    terminal.feed(format!("\x1b[3;1H{}{}{}\x1b[39m", naming(9), cell(0, 0), cell(0, 1)).as_bytes());
+
+    let (found, said) = both(&terminal);
+    assert_eq!(found, said, "a row is read to show something other than the core says it does");
+    assert!(found[1].is_empty(), "cells show an image that was placed at a cell of its own");
+    assert!(found[2].is_empty(), "cells show an image whose pixels have not all arrived");
+
+    terminal.feed(format!("\x1b_Gm=0;{rest}\x1b\\").as_bytes());
+    let (found, said) = both(&terminal);
+    assert_eq!(found, said);
+    assert_eq!(found[2].len(), 1, "an image whose pixels have all arrived is not shown");
+}
+
+/// An image's number is spelled in three bytes of colour — a palette entry for one under 256, a colour
+/// given outright for the rest — and its fourth byte in a third mark after the row and column.
+#[test]
+fn an_images_number_is_its_colour_and_the_mark_after_its_column() {
+    let mut terminal = terminal(40, 4, (10, 20));
+    let (small, wide, widest) = (200, 0x0001_0203, 0x0500_0007);
+    for id in [small, wide, widest] {
+        terminal.feed(&sent(id, 20, 20, 2, 1, None));
+    }
+    let top = MARKS[5];
+    terminal.feed(format!("{}{}{}\x1b[39m", naming(small), cell(0, 0), cell(0, 1)).as_bytes());
+    terminal.feed(format!("\x1b[2;1H{}{}{}\x1b[39m", naming(wide), cell(0, 0), cell(0, 1)).as_bytes());
+    // The top byte on the first cell; the second leaves it out, and carries on with the first's
+    terminal.feed(format!("\x1b[3;1H{}{}{top}{}\x1b[39m", naming(widest), cell(0, 0), cell(0, 1)).as_bytes());
+    // The same three bytes of colour and no top byte is another image, which is not there
+    terminal.feed(format!("\x1b[4;1H{}{}{}\x1b[39m", naming(widest), cell(0, 0), cell(0, 1)).as_bytes());
+
+    let (found, said) = both(&terminal);
+    assert_eq!(found, said, "a row is read to show something other than the core says it does");
+    let shown: Vec<Vec<(u32, u16)>> =
+        found.iter().map(|row| row.iter().map(|piece| (piece.image, piece.columns)).collect()).collect();
+    assert_eq!(shown, [vec![(small, 2)], vec![(wide, 2)], vec![(widest, 2)], vec![]]);
+}
+
+/// A cell that says another top byte than the run before it shows another image, and begins a run.
+#[test]
+fn a_cell_with_another_top_byte_begins_a_run() {
+    let mut terminal = terminal(40, 2, (10, 20));
+    let (one, other) = (0x0100_0007, 0x0200_0007);
+    terminal.feed(&sent(one, 20, 20, 2, 1, None));
+    terminal.feed(&sent(other, 20, 20, 2, 1, None));
+    terminal.feed(format!("{}{}{}{}{}\x1b[39m", naming(one), cell(0, 0), MARKS[1], cell(0, 1), MARKS[2]).as_bytes());
+    let (found, said) = both(&terminal);
+    assert_eq!(found, said, "a row is read to show something other than the core says it does");
+    let shown: Vec<(u32, u16, u16)> = found[0].iter().map(|piece| (piece.image, piece.column, piece.columns)).collect();
+    assert_eq!(shown, [(one, 0, 1), (other, 1, 1)]);
 }
 
 /// Nothing is shown where no window has said how large a cell is: there is no size to draw at.
@@ -249,12 +316,24 @@ fn nothing_is_shown_where_a_cell_has_no_size() {
     let (found, said) = both(&terminal);
     assert_eq!(found, said);
     assert!(found[0].is_empty());
+
+    // Nor where it has a height and no width, or a width and no height
+    for cell in [(0, 20), (10, 0)] {
+        terminal.resize(20, 3, cell.0, cell.1).expect("a resize");
+        let (found, said) = both(&terminal);
+        assert_eq!(found, said);
+        assert!(found[0].is_empty(), "a cell of {cell:?} has a size to draw at");
+    }
+    terminal.resize(20, 3, 10, 20).expect("a resize");
+    assert_eq!(both(&terminal).0[0].len(), 1);
 }
 
 /// One screen a program might write: an image of some size shown in a grid of some size, at a cell of
 /// some size, with its cells written whole, in part, or out of step.
 #[derive(Debug, Clone)]
 struct Shown {
+    /// The image's number: one a palette entry spells, one a colour does, one with a top byte
+    image: u32,
     picture: (u32, u32),
     /// Zero is a grid left to the picture's size
     grid: (u32, u32),
@@ -280,8 +359,14 @@ fn shown() -> impl Strategy<Value = Shown> {
             .collect::<Vec<_>>()
     });
     let row = (0u16..8, prop_oneof![3 => in_step, 1 => prop::collection::vec(written, 1..8)]);
-    ((1u32..200, 1u32..200), (0u32..10, 0u32..10), (1u16..24, 1u16..40), prop::collection::vec(row, 1..6))
-        .prop_map(|(picture, grid, cell, rows)| Shown { picture, grid, cell, rows })
+    (
+        prop_oneof![Just(21u32), Just(0x00AB_CDEF), Just(0x0300_0102)],
+        (1u32..200, 1u32..200),
+        (0u32..10, 0u32..10),
+        (1u16..24, 1u16..40),
+        prop::collection::vec(row, 1..6),
+    )
+        .prop_map(|(image, picture, grid, cell, rows)| Shown { image, picture, grid, cell, rows })
 }
 
 /// Whatever a program writes, each row of the screen reads as the core says it shows: the same runs,
@@ -297,9 +382,9 @@ fn every_row_reads_as_the_core_says_it_shows() {
     runner
         .run(&shown(), |shown| {
             let mut terminal = terminal(40, 8, shown.cell);
-            terminal.feed(&sent(21, shown.picture.0, shown.picture.1, shown.grid.0, shown.grid.1, None));
+            terminal.feed(&sent(shown.image, shown.picture.0, shown.picture.1, shown.grid.0, shown.grid.1, None));
             for (index, (start, cells)) in shown.rows.iter().enumerate() {
-                terminal.feed(format!("\x1b[{};{}H{}", index + 1, start + 1, naming(21)).as_bytes());
+                terminal.feed(format!("\x1b[{};{}H{}", index + 1, start + 1, naming(shown.image)).as_bytes());
                 for written in cells {
                     let mut text = String::from(PLACEHOLDER);
                     // A column cannot be said without a row before it, which is the protocol's order
@@ -307,6 +392,10 @@ fn every_row_reads_as_the_core_says_it_shows() {
                         text.push(MARKS[row]);
                         if let Some(column) = written.column {
                             text.push(MARKS[column]);
+                            // And the image's top byte after both, where it has one
+                            if shown.image >> 24 != 0 {
+                                text.push(MARKS[(shown.image >> 24) as usize]);
+                            }
                         }
                     }
                     terminal.feed(text.as_bytes());
