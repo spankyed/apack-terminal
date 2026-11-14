@@ -11,6 +11,8 @@
  * and its UTF-8.
  */
 import {
+  type Anchored,
+  type AnchoredImages,
   CURSOR_SHAPES,
   KEY_ACTIONS,
   POINTER_ACTIONS,
@@ -103,6 +105,9 @@ const FRAME_BLINKING = 16
 const FRAME_REVERSE = 32
 const FRAME_COLORS = 64
 const FRAME_HIDDEN = 128
+const FRAME_ANCHORED = 256
+/** The first bit a frame's flags do not define */
+const FRAME_FLAGS = 512
 
 const COLOR_FOREGROUND = 1
 const COLOR_BACKGROUND = 2
@@ -357,7 +362,24 @@ class Reader {
     }
   }
 
-  /** An exit status. Zigzag, as the broker writes it: the low bit is the sign */
+  /** The images a frame says are placed relative to another: the cell they are measured in, and each */
+  anchored(): AnchoredImages {
+    const cellWidth = this.number()
+    const cellHeight = this.number()
+    const omitted = this.number()
+    const list: Anchored[] = []
+    for (let more = this.count(); more > 0; more -= 1) {
+      list.push({
+        image: this.number(), generation: this.number(), z: this.status(), row: this.status(), column: this.status(),
+        columns: this.number(), rows: this.number(),
+        offsetX: this.number(), offsetY: this.number(), width: this.number(), height: this.number(),
+        sourceX: this.number(), sourceY: this.number(), sourceWidth: this.number(), sourceHeight: this.number(),
+      })
+    }
+    return { cellWidth, cellHeight, omitted, list }
+  }
+
+  /** A number that may be below zero. Zigzag, as the broker writes it: the low bit is the sign */
   status(): number {
     const zigzag = this.number()
     if (zigzag > 0xffffffff) throw new Malformed('an integer did not fit its field')
@@ -506,9 +528,9 @@ export function decodeToView(body: Uint8Array): ToView {
       const scrollback = read.number()
       const commands = read.number()
       const images = read.number()
-      const flags = read.byte()
+      const flags = read.number()
       // Blinking and hidden are said of a cursor, and of nothing when there is none
-      if (!(flags & FRAME_CURSOR) && flags & (FRAME_BLINKING | FRAME_HIDDEN)) {
+      if (flags >= FRAME_FLAGS || (!(flags & FRAME_CURSOR) && flags & (FRAME_BLINKING | FRAME_HIDDEN))) {
         throw new Malformed("a frame's flags are outside what the format defines")
       }
       let cursor: Cursor | null = null
@@ -521,11 +543,13 @@ export function decodeToView(body: Uint8Array): ToView {
       }
       const staleFrom = flags & FRAME_STALE ? read.number() : undefined
       const colors = flags & FRAME_COLORS ? read.colors() : undefined
+      const anchored = flags & FRAME_ANCHORED ? read.anchored() : undefined
       const frame: Frame = {
         sequence, epoch, firstActive, columns, screenRows, scrollback, commands, images, cursor,
         modes: { alternateScreen: (flags & FRAME_ALTERNATE) !== 0, mouse: (flags & FRAME_MOUSE) !== 0 },
         reverseVideo: (flags & FRAME_REVERSE) !== 0,
         ...(colors === undefined ? {} : { colors }),
+        ...(anchored === undefined ? {} : { anchored }),
         ...(staleFrom === undefined ? {} : { staleFrom }),
         ...read.rows(),
       }

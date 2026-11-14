@@ -218,9 +218,26 @@ again when it arrives. Three things follow, and each is what keeps a view's rows
   arrive together are not taken in the order they were sent — so a row of placeholder cells such an
   answer brings is asked for once more (`absorb`).
 
-**Not drawn:** an image placed relative to one shown through cells (the protocol's `P` and `Q`). The core
-positions it from its parent's cells on the screen; nothing here does, and it is told neither as a
-placement nor as part of a row.
+**An image placed relative to another is told in the frame, for as long as it is on the screen.** The
+protocol's `P` and `Q` place an image so many cells from a parent, which is at a cell of its own or
+shown through placeholder cells, and the chain may be several long. Where that puts it is the core's to
+work out, and the core says so in one place: its render state, for the rows it draws, which are the
+screen's. Its image storage — which is what a view's placements are read from — says of such an image
+neither its parent nor its offset, so it is not among those placements.
+
+So a frame carries all of them (`wire::AnchoredImages`: each by its row from the frame's `first_active`
+and its column, either below zero for one that starts off the screen and reaches into it, with the size
+of a cell they were measured in), whenever one is somewhere else, new or gone since the frame that view
+last had, and in its first — as the colours are. They are held here by line, so a screen that only
+scrolled tells nothing again, and a view keeps them by line for the same reason. A program that rewrites
+the cells of a parent shown through cells moves its children in the frame that brings those rows.
+
+A frame lists at most `ANCHORED_LISTED` of them, in the order they are drawn in, and counts the rest
+(`omitted`).
+
+**Not drawn: one whose parent has scrolled into the history.** The core tells nothing of it there, and
+nothing here can place it without the parent and the offset the storage does not give. It is gone from
+the frame that follows, and a view lets it go.
 
 **An image may be named instead of sent, where the session was started for that** (`Spawn.image_files`):
 as a file on this machine, or a shared memory object, which the core then reads. Off, such an image is

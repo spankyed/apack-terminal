@@ -5,7 +5,7 @@ import { linkAt, linkRuns, urls, type Detector, type Link, type LinkRun } from '
 import { fontOf, type Font, type Painter, type Scene } from './painter.ts'
 import { RowStore } from './row-store.ts'
 import { Selection, type Granularity } from './selection.ts'
-import { Modifier, PLAIN, TooLarge, type Command, type Frame, type Picture, type Placements, type PointerInput, type CursorShape, type Position, type Row, type SessionColors, type Span, type TerminalSource } from './source.ts'
+import { Modifier, PLAIN, TooLarge, type Anchored, type Command, type Frame, type Picture, type Placements, type PointerInput, type CursorShape, type Position, type Row, type SessionColors, type Span, type TerminalSource } from './source.ts'
 import { Viewport } from './viewport.ts'
 
 /**
@@ -180,6 +180,13 @@ interface Point {
   readonly clientY: number
 }
 
+/** The images placed relative to another, each with the line it is on, and the cell they are measured in */
+interface AnchoredOnLines {
+  readonly cellWidth: number
+  readonly cellHeight: number
+  readonly list: ReadonlyArray<Anchored & { readonly line: number }>
+}
+
 /**
  * A picture a view holds for an image, or is asking for. `generation` is the one `picture` is of, and
  * `refused` the placements that were current when an answer was not the pixels they name.
@@ -290,6 +297,12 @@ export class TerminalView {
   /** Where the session's images are, as last told, and the generation of the frame that prompted asking */
   private placed: Placements = { cellWidth: 0, cellHeight: 0, placements: [] }
   private imagesSeen = -1
+  /**
+   * The images placed relative to another, as the last frame to tell them did, each on the line it is on:
+   * a frame counts a row from its own first line, and a view keeps what it is told across frames that
+   * only moved the screen
+   */
+  private anchored: AnchoredOnLines = { cellWidth: 0, cellHeight: 0, list: [] }
   /** The last frame's count of the images, whether or not asking where they are was answered */
   private imagesTold = -1
   private readonly pictures = new Map<number, HeldPicture>()
@@ -766,6 +779,7 @@ export class TerminalView {
   private dropPictures(): void {
     const shown = this.store.pictured()
     for (const placement of this.placed.placements) shown.add(placement.image)
+    for (const { image } of this.anchored.list) shown.add(image)
     for (const [image, held] of this.pictures) {
       if (shown.has(image)) continue
       release(held.picture)
@@ -776,12 +790,12 @@ export class TerminalView {
 
   /**
    * Asks for the pixels of the images in view, or within a screenful of it, that this view does not hold
-   * at the generation shown: the ones placed there, and the ones the rows there show part of. One far up
-   * the history costs nothing until it is scrolled to.
+   * at the generation shown: the ones placed there, by themselves or relative to another, and the ones
+   * the rows there show part of. One far up the history costs nothing until it is scrolled to.
    */
   private wantPictures(first: number, count: number): void {
     if (this.ended || !this.listening) return
-    for (const placement of this.placed.placements) {
+    for (const placement of [...this.placed.placements, ...this.anchored.list]) {
       if (placement.line + placement.rows <= first - count || placement.line >= first + count * 2) continue
       this.wantPicture(placement.image, placement.generation)
     }
@@ -841,31 +855,35 @@ export class TerminalView {
 
   /**
    * The images with any part in view, lowest first, in the pixels this view draws a cell in: the ones
-   * placed there, and the parts of images the rows there show through placeholder cells.
+   * placed there, by themselves or relative to another, and the parts of images the rows there show
+   * through placeholder cells.
    */
   private imagesIn(first: number, span: number, lines: number[]): NonNullable<Scene['images']> {
     const { cellWidth, cellHeight } = this.painter.metrics
     // What the terminal measured an image in, against what this view draws: the same, where it was not told
-    const scaleX = this.placed.cellWidth > 0 ? cellWidth / this.placed.cellWidth : 1
-    const scaleY = this.placed.cellHeight > 0 ? cellHeight / this.placed.cellHeight : 1
     // A piece is under the text and over whatever else is: the core draws one at a z of minus one
     const images: Array<NonNullable<Scene['images']>[number] & { z: number }> =
       this.piecesIn(first, lines).map((piece) => ({ ...piece, z: -1 }))
-    for (const placement of this.placed.placements) {
-      if (placement.line + placement.rows <= first || placement.line >= first + span) continue
-      if (this.hiddenIn(placement.line)) continue
-      const picture = this.pictures.get(placement.image)?.picture
-      if (!picture) continue
-      images.push({
-        picture,
-        x: placement.column * cellWidth + placement.offsetX * scaleX,
-        y: this.rowsBetween(first, placement.line) * cellHeight + placement.offsetY * scaleY,
-        width: placement.width * scaleX,
-        height: placement.height * scaleY,
-        source: { x: placement.sourceX, y: placement.sourceY, width: placement.sourceWidth, height: placement.sourceHeight },
-        above: placement.z >= 0,
-        z: placement.z,
-      })
+    // Each list in the cell it was measured in, which the two are told apart from each other
+    for (const told of [{ ...this.placed, list: this.placed.placements }, this.anchored]) {
+      const scaleX = told.cellWidth > 0 ? cellWidth / told.cellWidth : 1
+      const scaleY = told.cellHeight > 0 ? cellHeight / told.cellHeight : 1
+      for (const placement of told.list) {
+        if (placement.line + placement.rows <= first || placement.line >= first + span) continue
+        if (this.hiddenIn(placement.line)) continue
+        const picture = this.pictures.get(placement.image)?.picture
+        if (!picture) continue
+        images.push({
+          picture,
+          x: placement.column * cellWidth + placement.offsetX * scaleX,
+          y: this.rowsBetween(first, placement.line) * cellHeight + placement.offsetY * scaleY,
+          width: placement.width * scaleX,
+          height: placement.height * scaleY,
+          source: { x: placement.sourceX, y: placement.sourceY, width: placement.sourceWidth, height: placement.sourceHeight },
+          above: placement.z >= 0,
+          z: placement.z,
+        })
+      }
     }
     return images.sort((one, other) => one.z - other.z)
   }
@@ -1247,6 +1265,7 @@ export class TerminalView {
       this.commandsSeen = -1
       // And the lines its images were on. Their pixels are the same pictures wherever they are now
       this.placed = { ...this.placed, placements: [] }
+      this.anchored = { ...this.anchored, list: [] }
       this.imagesSeen = -1
       this.needle = ''
       this.setMatches([])
@@ -1267,6 +1286,12 @@ export class TerminalView {
         // Not heard, so not seen: the next frame asks again
         if (epoch === this.store.epoch && this.commandsSeen === seen) this.commandsSeen = -1
       })
+    }
+    // Told after a reset has let the old ones go, so a frame that begins a numbering and tells them keeps them
+    if (frame.anchored !== undefined) {
+      const { cellWidth, cellHeight, list } = frame.anchored
+      this.anchored = { cellWidth, cellHeight, list: list.map((one) => ({ ...one, line: frame.firstActive + one.row })) }
+      this.wantPictures(...this.viewport.visible)
     }
     if (frame.images !== this.imagesSeen) {
       const seen = (this.imagesSeen = frame.images)
