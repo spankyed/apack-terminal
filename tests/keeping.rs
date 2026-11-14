@@ -1164,3 +1164,45 @@ fn a_view_that_stops_speaking_and_never_reads_does_not_keep_the_broker() {
     assert!(broker.exits(), "the broker stayed for a view that had stopped reading");
     drop(silent);
 }
+
+/// **On Windows the same guarantee is the job the shell is in.** A child the shell starts is in that job, and
+/// ending the session ends every process in it (`tree.rs`), so the child is ended with the shell.
+#[cfg(windows)]
+#[test]
+fn a_job_in_a_group_of_its_own_ends_with_a_shell_that_had_to_be_killed() {
+    let broker = Broker::start();
+    let client = Connection::greeting(&broker, Role::Client);
+    let notes = tempfile::tempdir().expect("a directory for the job's pid");
+    let pid_file = notes.path().join("job.pid");
+    // A child the shell starts and leaves running, with its pid written where this case can read it
+    let script = format!(
+        "$p = Start-Process -FilePath powershell.exe -ArgumentList '-NoProfile','-Command','Start-Sleep 300' -PassThru; Set-Content -Path '{}' -Value $p.Id; Write-Output ('rea'+(1+1)+'dy')",
+        pid_file.display()
+    );
+    let session = client.spawn_program(
+        "powershell.exe",
+        vec!["-NoProfile".to_owned(), "-NoExit".to_owned(), "-Command".to_owned(), script],
+    );
+    View::attached(&broker, &session).until_shows("rea2dy");
+    let job = std::fs::read_to_string(&pid_file).expect("the job's pid").trim().to_owned();
+    let running = || {
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {job}"), "/NH"])
+            .output()
+            .is_ok_and(|said| String::from_utf8_lossy(&said.stdout).contains(&job))
+    };
+    assert!(running(), "the job {job} is running");
+
+    client.say(&Request::Kill { session: session.clone() });
+    client.answer(|event| match event {
+        Event::Exited { session: ended, .. } if ended == session => Some(()),
+        _ => None,
+    });
+
+    // A process being torn down is seen only by the count of looks: no wait on anything it does
+    let gone = (0..200).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        !running()
+    });
+    assert!(gone, "the job {job} outlived the shell it was started in");
+}
