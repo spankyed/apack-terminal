@@ -1401,18 +1401,6 @@ impl Sessions {
         hang_up_the_rest(&[live.process.pid]);
         // **Killed first, and only then tidied up after.** Between the two its program can still read,
         // and nothing that ending a session does may reach a program that is being ended
-        // **On Windows every error the killer returns is a kill that worked.** `portable-pty` 0.9.0 (the newest
-        // release) inverts `WinChildKiller::kill`: it returns the last OS error when `TerminateProcess` succeeds,
-        // which is 0 — "The operation completed successfully" — and `Ok` when it fails. wezterm fixed this on
-        // its main branch in `8afe0ad307` (`pty: windows: fix kill()`), which no crates.io release contains yet.
-        // Until one does, the Windows result is read the way the fixed code writes it. Remove this branch when
-        // the dependency is at a release with the fix.
-        #[cfg(windows)]
-        let killed: Outcome = {
-            let _ = live.killer.kill();
-            Ok(())
-        };
-        #[cfg(not(windows))]
         let killed = live.killer.kill().map_err(|error| Refusal::pty("killing a session", error));
         self.end(&live);
         // What was sent is a hangup, which a program may ignore
