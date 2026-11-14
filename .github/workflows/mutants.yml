@@ -77,8 +77,12 @@ jobs:
           fi
       - if: steps.scope.outputs.code == 'true'
         run: rustup show active-toolchain
+      # Saved from `master` only: a pull request's cache is readable by that pull request alone, and saving one
+      # evicts `master`'s from the repository's ten gigabytes (`ci.yml`, `checks`, says the same)
       - if: steps.scope.outputs.code == 'true'
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - if: steps.scope.outputs.code == 'true'
         uses: taiki-e/install-action@v2
         with:
@@ -175,8 +179,11 @@ jobs:
         uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0
+      # Saved from `master` only, as in the Linux job
       - if: steps.scope.outputs.code == 'true'
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - if: steps.scope.outputs.code == 'true'
         uses: taiki-e/install-action@v2
         with:

@@ -29,6 +29,10 @@ jobs:
     name: fuzz ${{ matrix.target }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    permissions:
+      contents: read
+      # To find and download the corpus an earlier run uploaded
+      actions: read
     strategy:
       fail-fast: false
       matrix:
@@ -44,22 +48,49 @@ jobs:
         with:
           tool: cargo-fuzz
 
-      # Corpus kept across nights, so a run starts from the inputs earlier runs found interesting
-      - name: Restore corpus
-        uses: actions/cache@v4
-        with:
-          path: fuzz/corpus/${{ matrix.target }}
-          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
-          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      # **The corpus is carried from run to run as an artifact, not in the Actions cache.** A run starts from the
+      # inputs earlier runs found interesting, which is what lets the deep targets reach further each night. The
+      # cache is shared with the Rust build caches and evicts by least recent use, so a corpus kept there is gone
+      # by the next night whenever the day's builds fill it; an artifact is stored apart and kept for its
+      # retention. The newest one the default branch's runs uploaded is the one taken, so a dispatch on a branch
+      # starts from the nightly corpus and never feeds its own back. None found is the first run: the seeds alone.
+      - name: Download corpus
+        working-directory: fuzz
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NAME: fuzz-corpus-${{ matrix.target }}
+          BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          mkdir -p corpus/${{ matrix.target }}
+          id="$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$NAME&per_page=100" --jq \
+            "[.artifacts[] | select(.expired | not) | select(.workflow_run.head_branch == \"$BRANCH\")]
+             | sort_by(.created_at) | last | .id // empty")"
+          if [ -z "$id" ]; then
+            echo "no earlier corpus for ${{ matrix.target }}: starting from the seeds"
+            exit 0
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > "$RUNNER_TEMP/corpus.zip"
+          unzip -q -o "$RUNNER_TEMP/corpus.zip" -d corpus/${{ matrix.target }}
+          echo "starting from $(find corpus/${{ matrix.target }} -type f | wc -l) inputs, artifact $id"
 
       - name: Fuzz
         working-directory: fuzz
         run: |
-          mkdir -p corpus/${{ matrix.target }}
           # The run grows corpus/; seeds/ is read as well and never written, so the seeds stay the tracked ones
           # Named explicitly: the prebuilt cargo-fuzz defaults to the musl target, which the sanitizer cannot use
           cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} corpus/${{ matrix.target }} seeds/${{ matrix.target }} -- \
             -max_total_time=${{ github.event.inputs.seconds || '1200' }}
+
+      # Also after a crash: the corpus holds the inputs that found new code, and the one that crashed is in
+      # artifacts/, not here. Fourteen days covers a run of missed nights; past that a run starts from the seeds
+      - name: Upload corpus
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus-${{ matrix.target }}
+          path: fuzz/corpus/${{ matrix.target }}
+          retention-days: 14
+          if-no-files-found: error
 
       - name: Upload crash
         if: failure()
