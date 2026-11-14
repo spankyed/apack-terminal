@@ -263,7 +263,6 @@ fn broker_holds(socket: &str) -> bool {
 
 /// `proxy` is a word, not a position: two arguments of which the first is anything else are not a request
 /// to be one, and are refused as any other mistyped invocation is.
-#[cfg(unix)]
 #[test]
 fn only_the_word_proxy_asks_for_one() {
     let directory = tempfile::tempdir().expect("a directory for the socket");
@@ -440,7 +439,6 @@ fn a_directory_others_can_write_to_is_refused() {
 
 /// A broker a proxy starts that cannot listen says why, and the proxy passes it on: the person at the far
 /// end of an `ssh` reads the reason rather than that nothing was said.
-#[cfg(unix)]
 #[test]
 fn a_proxy_says_why_the_broker_it_started_could_not_listen() {
     let directory = tempfile::tempdir().expect("a directory for the socket");
@@ -532,6 +530,7 @@ fn the_grace_is_the_one_in_use_unless_a_number_of_milliseconds_is_given() {
 /// A broker whose socket has been taken from under it cannot be connected to by anything, itself
 /// included: with nothing ever having connected, it goes when the time it allows for a first connection
 /// has passed, as one that could still be reached does.
+// POSIX only: it takes the broker's socket file away, and a named pipe has no file to take.
 #[cfg(unix)]
 #[test]
 fn a_broker_nothing_can_reach_exits() {
@@ -580,6 +579,7 @@ fn a_socket_named_without_a_directory_is_checked_where_it_would_be_made() {
 /// **A proxy told no socket uses the one place a user is known to have**: under the runtime directory
 /// the system gives them, or failing that under their home, in a directory made for them alone. So
 /// `ssh host apack-terminal proxy` needs nothing set up on the host, and two proxies told nothing meet.
+// POSIX only: the default socket and its directory are checked for Unix mode bits.
 #[cfg(unix)]
 #[test]
 fn a_proxy_told_no_socket_uses_the_users_own() {
