@@ -141,9 +141,9 @@ const ECHOING_PROGRAM: &str = "/bin/cat";
 #[cfg(unix)]
 const ECHOING_ARGS: &[&str] = &[];
 #[cfg(windows)]
-const ECHOING_PROGRAM: &str = "powershell.exe";
+const ECHOING_PROGRAM: &str = "cmd.exe";
 #[cfg(windows)]
-const ECHOING_ARGS: &[&str] = &["-NoProfile", "-Command", "while ($true) { [Console]::ReadLine() | Out-Null }"];
+const ECHOING_ARGS: &[&str] = &["/C", "findstr \"^\""];
 
 /// A line that prints `before` and `after` as one word, typed so that the word is nowhere in the line
 /// itself: what a case waits for is then the command's output and not the echo of what was typed. An
