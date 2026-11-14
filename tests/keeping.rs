@@ -779,14 +779,8 @@ fn make_directory_link(target: &Path, link: &Path) {
     }
     #[cfg(windows)]
     {
-        let made = Command::new("cmd")
-            .arg("/C")
-            .arg("mklink")
-            .arg("/J")
-            .arg(link)
-            .arg(target)
-            .status()
-            .expect("mklink runs");
+        let made =
+            Command::new("cmd").arg("/C").arg("mklink").arg("/J").arg(link).arg(target).status().expect("mklink runs");
         assert!(made.success(), "mklink /J failed");
     }
 }
@@ -844,7 +838,8 @@ fn a_restored_keyed_session_lists_the_commands_of_the_one_before_it_as_they_ende
     // What a hook holding the key writes around two commands, and between them what a program without
     // it writes to be believed: an end in each family anything can print, and a keyed one of its own
     let forged = format!("\\033]133;D;0\\007\\033]633;D;0\\007\\033]133;A\\007{}", finish(SECOND, 1, 0));
-    let body = format!("{}built\\n{forged}{}{}", start(FIRST, 1, "make"), finish(FIRST, 1, 3), start(FIRST, 2, "sleep 100"));
+    let body =
+        format!("{}built\\n{forged}{}{}", start(FIRST, 1, "make"), finish(FIRST, 1, 3), start(FIRST, 2, "sleep 100"));
     view.type_line(&format!("{}; {}", printed(&body), echo_sum("mar", 1, 1, "ked")));
     view.until_shows("mar2ked");
     let exited_3 = (Some("make".to_owned()), Some("/src".to_owned()), CommandOutcome::Exited { code: 3 });
@@ -1024,7 +1019,7 @@ fn a_recording_holds_all_its_session_printed_though_the_broker_left_as_it_ended(
         );
         #[cfg(windows)]
         let typed = format!(
-            "Start-Sleep 1; 0..19999 | ForEach-Object {{ Write-Output \"line $_ of what was printed before the end\" }}; {}; exit",
+            "Start-Sleep 1; for ($i = 0; $i -lt 20000; $i++) {{ [Console]::WriteLine(\"line $i of what was printed before the end\") }}; {}; exit",
             echo_sum("the-la", 1, 1, "st-line")
         );
         view.type_line(&typed);
@@ -1149,7 +1144,9 @@ fn a_view_that_stops_speaking_and_never_reads_does_not_keep_the_broker() {
     let silent = connect(&broker.socket);
     let hello = serde_json::to_string(&Request::Hello { protocol: PROTOCOL_VERSION, role: Role::View }).expect("hello");
     (&*silent.0).write_all(format!("{hello}\n").as_bytes()).expect("the broker reads");
-    (&*silent.0).write_all(&ToBroker::Attach { channel: 1, session: session.clone() }.encode()).expect("the broker reads");
+    (&*silent.0)
+        .write_all(&ToBroker::Attach { channel: 1, session: session.clone() }.encode())
+        .expect("the broker reads");
     // Megabytes of answers it will not read: far more than a socket holds, far less than it may leave
     let ask = ToBroker::Commands { channel: 1, request: 1 }.encode();
     let search = ToBroker::Search { channel: 1, request: 2, needle: "$".to_owned(), case_sensitive: false }.encode();

@@ -548,7 +548,10 @@ fn a_programs_title_clipboard_and_commands_are_told_to_the_client() {
     let client = Client::greeting(&broker);
     let session = client.shell();
     let write = |text: &str| say(&client.stream, &Request::Write { session: session.clone(), text: text.to_owned() });
-    write(&format!("{}\n", printed("\\033]0;a title\\007\\033]52;c;aGk=\\007\\033]633;E;make\\007\\033]633;C\\007\\033]633;D;2\\007")));
+    write(&format!(
+        "{}\n",
+        printed("\\033]0;a title\\007\\033]52;c;aGk=\\007\\033]633;E;make\\007\\033]633;C\\007\\033]633;D;2\\007")
+    ));
 
     let mut told = Vec::new();
     while told.len() < 4 {
@@ -578,7 +581,11 @@ fn the_commands_a_shell_marks_are_listed_with_their_lines_and_their_output_is_re
 
     // The marks a shell's integration writes around a command, written here by hand: its prompt, the
     // start of its output and its end with a status
-    view.type_line(&format!("{}; {}", printed("\\033]133;A\\007\\033]133;C\\007first\\nsecond\\n\\033]133;D;3\\007"), echo_sum("mar", 1, 1, "ked")));
+    view.type_line(&format!(
+        "{}; {}",
+        printed("\\033]133;A\\007\\033]133;C\\007first\\nsecond\\n\\033]133;D;3\\007"),
+        echo_sum("mar", 1, 1, "ked")
+    ));
     view.until_shows("mar2ked");
     assert_ne!(view.last.as_ref().expect("a frame arrived").commands, before, "a view was not told to ask again");
 
@@ -664,7 +671,11 @@ fn a_placed_image_and_its_pixels_are_answered_to_the_view_that_asked() {
     let mut view = View::attached(&broker, &session);
     view.until_shows("$ ");
     // One red pixel, sent whole and shown where the cursor is
-    view.type_line(&format!("{}; {}", printed("\\033_Ga=T,f=32,i=7,s=1,v=1,q=2;/wAA/w==\\033\\\\"), echo_sum("sh", 1, 1, "own")));
+    view.type_line(&format!(
+        "{}; {}",
+        printed("\\033_Ga=T,f=32,i=7,s=1,v=1,q=2;/wAA/w==\\033\\\\"),
+        echo_sum("sh", 1, 1, "own")
+    ));
     view.until_shows("sh2own");
 
     view.send(&ToBroker::Images { channel: 1, request: 9 });
