@@ -80,9 +80,10 @@ npm --prefix view ci && npm --prefix view test    # the view
 |---|---|
 | Rust | pinned by `rust-toolchain.toml` |
 | Node | 24.12 or later, for the view |
-| Platforms | macOS, Linux and Windows |
+| Platforms | macOS and Linux: the whole suite. Windows: most of it, with the POSIX-only cases gated and named in `tests/` (see [Known limits](docs/architecture/design.md#known-limits)) |
 | Transport | a Unix socket, or a named pipe on Windows |
-| Not in scope | agent status rules, command semantics beyond what a shell reports, storage |
+| Crash | a session ends when the broker stops; there is no handoff of a session to another broker |
+| Not in scope | agent status rules, command semantics beyond what a shell reports, storage, a recording or a path link on a remote target, `signal` on Windows, accessibility |
 
 Consumed by pinning a commit: apack keeps a gitignored `vendor/apack-terminal` symlink beside a committed
 `vendor/apack-terminal.rev`, and derives one Rust toolchain across every checkout linked that way. One pin
@@ -104,6 +105,12 @@ brokerBinary(); // the path, or undefined when this checkout has not staged one
 compiled `dist/`, which is not tracked, so whatever links or clones the checkout builds it
 (`npm run build` in `view/`): apack's linker does when `dist/` is missing or older than its sources, and
 its CI does after the clone.
+
+**v1 scope.** What v1 is: a broker that owns processes and screens, serves views over a protocol, records
+sessions and restores them from their recordings, keeps sessions the app asked to keep, and reports what a shell
+said of its commands, where the shell vouched for it. What v1 is not is said in the table above. Its decisions
+(scope, platforms, the crash behaviour, the echo flush) are recorded where they were taken, and each limit a
+platform has is stated beside the code it limits, in [Known limits](docs/architecture/design.md#known-limits).
 
 ## Docs
 
