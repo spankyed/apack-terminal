@@ -905,6 +905,7 @@ fn carry_out(live: &Sessions, connection: u64, request: Request) {
             record,
             restore,
             images,
+            image_files,
             marks_key,
         } => {
             let colors = colors.map(|colors| Colors {
@@ -926,6 +927,7 @@ fn carry_out(live: &Sessions, connection: u64, request: Request) {
                 record,
                 restore,
                 images,
+                image_files,
                 marks_key,
             })
             // What it started is said by the spawn itself, ahead of anything the session can say

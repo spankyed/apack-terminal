@@ -480,8 +480,27 @@ fn a_frame_says_how_the_cursor_is_drawn_and_whether_the_program_took_the_mouse()
             "\x1b[4 q",
             Box::new(|frame: &Frame| frame.cursor.is_some_and(|cursor| cursor.shape == 2 && !cursor.blinking)),
         ),
-        ("\x1b[?25l", Box::new(|frame: &Frame| frame.cursor.is_none())),
-        ("\x1b[?25h\x1b[?1000h", Box::new(|frame: &Frame| frame.cursor.is_some() && frame.mouse)),
+        // Hidden, and still where it is: an input method composes beside it whether or not it is drawn
+        (
+            "\x1b[?25l\x1b[3;8H",
+            Box::new(|frame: &Frame| {
+                frame.cursor.is_some_and(|cursor| cursor.hidden && (cursor.column, cursor.row) == (7, 2))
+            }),
+        ),
+        // And followed while it is: a program that draws its own cursor moves this one with it
+        (
+            "\x1b[2;3H",
+            Box::new(|frame: &Frame| {
+                frame.cursor.is_some_and(|cursor| cursor.hidden && (cursor.column, cursor.row) == (2, 1))
+            }),
+        ),
+        (
+            "\x1b[?25h\x1b[?1000h",
+            Box::new(|frame: &Frame| {
+                frame.mouse
+                    && frame.cursor.is_some_and(|cursor| !cursor.hidden && (cursor.column, cursor.row) == (2, 1))
+            }),
+        ),
         ("\x1b[?1000l", Box::new(|frame: &Frame| !frame.mouse)),
     ] {
         screen.acknowledge(view.id, last.sequence).expect("an acknowledgement is taken");

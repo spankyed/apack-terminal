@@ -30,6 +30,7 @@ mod images;
 mod keeping;
 mod markers;
 mod parser;
+mod placeholders;
 mod proxy;
 mod reaper;
 mod recording;

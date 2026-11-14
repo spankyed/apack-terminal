@@ -227,6 +227,9 @@ pub struct Screen {
     hold_limit: Option<HoldLimit>,
     /// The screen is being rebuilt from a recording: what the replay provokes is not acted on.
     replaying: bool,
+    /// Whether the session's programs may name a file or a shared memory object as an image's source
+    /// (`allow_images`).
+    image_files: bool,
     /// Where what is fed here is also written, for a session that asked to be recorded (`recording`).
     recorder: Option<Recorder>,
     /// A keyframe is due and is waiting for the parser to be between sequences (`keyframe_when_due`).
@@ -404,6 +407,7 @@ impl Screen {
             holds: 0,
             hold_limit: None,
             replaying: false,
+            image_files: false,
             recorder: None,
             keyframe_waits: false,
             title: None,
@@ -692,6 +696,13 @@ impl Screen {
         // The recording is of another moment: writing the replay into it would record the past as now
         let recorder = self.recorder.take();
         self.replaying = true;
+        // **A recording names the files it was shown; it does not hold them.** Read again now they would
+        // be whatever is at those paths today, and a shared memory object would be unlinked a second
+        // time under whoever has since made one of that name. So a replay takes images from its own
+        // bytes only, and one that was sent by name is absent from it
+        if self.image_files {
+            let _ = self.terminal.allow_images(false);
+        }
         let live = self.reported.get_mut().begin_replay();
         self.reported.get_mut().forget_commands();
         // A full reset, and the history it leaves erased: the keyframe redraws both
@@ -718,6 +729,9 @@ impl Screen {
         self.reported.get_mut().end_replay(live);
         self.reported.get_mut().set_clock(None);
         self.replaying = false;
+        if self.image_files {
+            let _ = self.terminal.allow_images(true);
+        }
         // Whatever the recorded program was holding when the recording stops, nothing is holding now
         self.hold = None;
         self.recorder = recorder;
@@ -1050,9 +1064,13 @@ impl Screen {
     }
 
     /// Lets programs in this session send images (`vt::images`). Off unless asked for, so a program
-    /// asking whether it may is not told yes by a session nothing is drawing.
-    pub fn allow_images(&mut self) -> Result<(), Failed> {
-        self.terminal.allow_images()
+    /// asking whether it may is not told yes by a session nothing is drawing. `files` is whether one may
+    /// also be named as a file or a shared memory object on this machine, which is the caller's to say:
+    /// see `Terminal::allow_images`.
+    pub fn allow_images(&mut self, files: bool) -> Result<(), Failed> {
+        self.terminal.allow_images(files)?;
+        self.image_files = files;
+        Ok(())
     }
 
     /// Every image in this session with the line it is on, the epoch those lines are in, and one cell

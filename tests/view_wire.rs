@@ -12,7 +12,8 @@
 use apack_terminal::protocol::{CommandOutcome, Unreported};
 use apack_terminal::view::wire::{
     Block, Color, ColorChanges, CommandRow, Cursor, Frame, FrameHead, Glyph, Incoming, MAX_MESSAGE_BYTES, Malformed,
-    Placement, Position, Row, Rows, Span, Style, ToBroker, ToView, TooLong, body, frame, read_message, write_row,
+    Pictured, Piece, Placement, Position, Row, Rows, Span, Style, ToBroker, ToView, TooLong, body, frame, read_message,
+    write_row,
 };
 use proptest::prelude::*;
 
@@ -44,8 +45,8 @@ fn row() -> impl Strategy<Value = Row> {
     (prop::collection::vec(style(), 0..4), prop::collection::vec("[a-z:/.]{1,12}", 0..3)).prop_flat_map(
         |(styles, links): (Vec<Style>, Vec<String>)| {
             let glyph = (character(), 0u16..3, 0..=styles.len(), 0..=links.len());
-            (any::<u32>(), any::<bool>(), any::<bool>(), prop::collection::vec(glyph, 0..24)).prop_map(
-                move |(line, wrapped, prompt, cells)| {
+            (any::<u32>(), any::<bool>(), any::<bool>(), prop::collection::vec(glyph, 0..24), pieces()).prop_map(
+                move |(line, wrapped, prompt, cells, pictured)| {
                     let mut column = 0u16;
                     let glyphs = cells
                         .into_iter()
@@ -56,10 +57,47 @@ fn row() -> impl Strategy<Value = Row> {
                             glyph
                         })
                         .collect();
-                    Row { line: u64::from(line), wrapped, prompt, styles: styles.clone(), links: links.clone(), glyphs }
+                    Row {
+                        line: u64::from(line),
+                        wrapped,
+                        prompt,
+                        styles: styles.clone(),
+                        links: links.clone(),
+                        glyphs,
+                        pictured,
+                    }
                 },
             )
         },
+    )
+}
+
+/// The parts of images a row shows and the cell they are measured in, which is said only of a row that
+/// shows any.
+fn pieces() -> impl Strategy<Value = Option<Pictured>> {
+    let piece = (
+        (any::<u32>(), any::<u64>(), any::<u16>(), any::<u16>()),
+        (any::<u32>(), any::<u32>(), any::<u32>(), any::<u32>()),
+        (any::<u32>(), any::<u32>(), any::<u32>(), any::<u32>()),
+    )
+        .prop_map(|((image, generation, column, columns), drawn, source)| Piece {
+            image,
+            generation,
+            column,
+            columns,
+            offset_x: drawn.0,
+            offset_y: drawn.1,
+            width: drawn.2,
+            height: drawn.3,
+            source_x: source.0,
+            source_y: source.1,
+            source_width: source.2,
+            source_height: source.3,
+        });
+    // A row with no placeholder cells says nothing; one with them says its cell, and what they show,
+    // which may be nothing
+    prop::option::of(
+        (any::<(u16, u16)>(), prop::collection::vec(piece, 0..4)).prop_map(|(cell, pieces)| Pictured { cell, pieces }),
     )
 }
 
@@ -122,12 +160,8 @@ fn colors() -> impl Strategy<Value = ColorChanges> {
 
 fn to_view() -> impl Strategy<Value = ToView> {
     let cursor = prop::option::of(
-        (any::<u16>(), any::<u16>(), 0u8..4, any::<bool>()).prop_map(|(column, row, shape, blinking)| Cursor {
-            column,
-            row,
-            shape,
-            blinking,
-        }),
+        (any::<u16>(), any::<u16>(), 0u8..4, any::<bool>(), any::<bool>())
+            .prop_map(|(column, row, shape, blinking, hidden)| Cursor { column, row, shape, blinking, hidden }),
     );
     let frame = (
         (any::<u32>(), any::<u64>(), any::<u32>(), any::<u64>()),
@@ -372,6 +406,69 @@ fn a_glyph_naming_a_style_the_block_lacks_is_refused() {
     assert_eq!(ToView::decode(&forged), Err(Malformed::Value("a style's index")));
 }
 
+/// A row's flags are three: that it runs on, that it holds a prompt, and that it holds placeholder cells,
+/// which is whether what they show follows. A bit past those is not one this encoder writes.
+#[test]
+fn a_row_flagged_as_nothing_the_format_defines_is_refused() {
+    let glyph = Glyph { column: 0, width: 1, text: "a".to_owned(), style: 0, link: 0 };
+    let block = Block { rows: vec![Row { line: 0, glyphs: vec![glyph], ..Row::default() }] };
+    let encoded =
+        ToView::Rows { channel: 0, request: 0, epoch: 0, first: 0, count: 1, block }.encode().expect("a message");
+    // kind, channel, request, epoch, first, count, rows, line, then the row's flags
+    let flags = 8;
+    let mut forged = body(&encoded).to_vec();
+    assert_eq!(forged[flags], 0);
+    forged[flags] = 8;
+    assert_eq!(ToView::decode(&forged), Err(Malformed::Value("a row's flags")));
+    // Said to hold placeholder cells and ending where what they show would begin
+    forged[flags] = 4;
+    assert_eq!(ToView::decode(&forged), Err(Malformed::Truncated));
+}
+
+/// Blinking and hidden are said of a cursor. A frame that says either and has no cursor is not one this
+/// encoder writes, and is refused rather than read as a frame with a cursor nowhere.
+#[test]
+fn a_frame_that_says_how_a_cursor_it_lacks_is_drawn_is_refused() {
+    let frame = |cursor| {
+        let head = FrameHead {
+            channel: 0,
+            sequence: 0,
+            epoch: 0,
+            first_active: 0,
+            columns: 0,
+            screen_rows: 0,
+            scrollback: 0,
+            commands: 0,
+            images: 0,
+            cursor,
+            alternate_screen: false,
+            mouse: false,
+            reverse_video: false,
+            stale_from: None,
+            colors: None,
+        };
+        frame(&head, &Rows::default()).expect("a frame")
+    };
+    // kind, channel, sequence, epoch, first line, columns, rows, scrollback, commands, images, then the flags
+    let flags = 10;
+    for (bit, said) in [(16u8, "blinking"), (128, "hidden")] {
+        let mut forged = body(&frame(None)).to_vec();
+        assert_eq!(forged[flags], 0);
+        forged[flags] = bit;
+        assert_eq!(
+            ToView::decode(&forged),
+            Err(Malformed::Value("a frame's flags")),
+            "a cursor that is not there is {said}"
+        );
+    }
+    // And each is taken of a cursor that is there
+    let hidden = Cursor { column: 1, row: 2, shape: 0, blinking: true, hidden: true };
+    let ToView::Frame(read) = ToView::decode(body(&frame(Some(hidden)))).expect("a frame") else {
+        panic!("a frame decoded as something else")
+    };
+    assert_eq!(read.cursor, Some(hidden));
+}
+
 /// How a command ended is a kind of its own for each way there is, and a byte that is none of them is
 /// refused rather than read as the nearest: a status that was only claimed is never one wrong byte from
 /// reading as an exit.
@@ -530,7 +627,7 @@ fn the_longest_head_there_is_fits_with_rows_taken_to_the_last_byte() {
         scrollback: u32::MAX,
         commands: u32::MAX,
         images: u32::MAX,
-        cursor: Some(Cursor { column: u16::MAX, row: u16::MAX, shape: 3, blinking: true }),
+        cursor: Some(Cursor { column: u16::MAX, row: u16::MAX, shape: 3, blinking: true, hidden: true }),
         alternate_screen: true,
         mouse: true,
         reverse_video: true,

@@ -325,6 +325,7 @@ impl Connection {
             record: record.map(|path| path.to_str().expect("a utf-8 path").to_owned()),
             restore,
             images: false,
+            image_files: false,
             marks_key: marks_key.map(str::to_owned),
         });
         self.answer(|event| match event {
@@ -348,6 +349,7 @@ impl Connection {
             record: None,
             restore: false,
             images: false,
+            image_files: false,
             marks_key: None,
         });
         self.answer(|event| if let Event::Spawned { session, .. } = event { Some(session) } else { None })

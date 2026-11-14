@@ -94,6 +94,12 @@ A frame carries the grid, the cursor, the modes a view needs (alternate screen, 
 video), counters that move when the commands or the images changed, and the rows that differ from what
 **that view** last acknowledged.
 
+**Where the cursor is and whether it is drawn are two facts.** A program that draws a cursor of its own
+hides the terminal's (mode 25) and still moves it to where typing goes, because that is where an input
+method composes: its window opens beside the cursor, drawn or not. So a frame says where the cursor is
+whenever it is on the screen, and `hidden` is the program's word on drawing it. A view draws nothing for
+a hidden cursor and puts its input field there all the same (`view/src/view.ts`, `afterPaint`).
+
 **And the colours a program changed.** A view draws in a theme of its own, which is where the colours a
 session is given come from; a program that sets its foreground, background or cursor colour (OSC 10, 11,
 12) or redefines palette entries (OSC 4) expects to be drawn in them. A frame carries what differs from
@@ -102,8 +108,9 @@ carries replaces what the view held: a colour absent from it is the theme's agai
 a frame like any other change, with no row in it.
 
 **A row says everything about itself**: its styles and its links are its own, and its glyphs index them
-from one, `0` being the plain style and no link. So a row is written out once when it changes, the same
-bytes go to every view owed it, and how long a message will be is known before it is built.
+from one, `0` being the plain style and no link; what its placeholder cells show comes with it, measured
+in a cell whose size it also says. So a row is written out once when it changes, the same bytes go to
+every view owed it, and how long a message will be is known before it is built.
 
 **A view is sent a frame when the screen has changed and it has acknowledged the last one.** One frame is
 in flight per view, so a view that stops drawing — hidden, busy, gone — costs nothing, and a program that
@@ -174,13 +181,53 @@ red otherwise, whichever of `exited` and `claimed` carried it, and `unknown` gre
 person looking at the output, and the kind is for whatever reads the command (`view/src/view.ts`,
 `markColor`).
 
-A session asked to take images (`Spawn.images`) accepts the Kitty graphics protocol, as bytes in the
-stream only: raw pixels, or a PNG, which the broker decodes for the core (`rgba_of_png`) since the core
-leaves that to whoever embeds it. A frame's `images` counter moves when one is sent, placed, replaced or
-deleted. A view asks
-where they are and is told each by the line it is on, which stays true as the screen scrolls; it asks for
-an image's pixels once per generation, in parts of 4 MiB. A placement shown through placeholder cells has
-no place of its own and is not told. Animations are not advanced.
+A session asked to take images (`Spawn.images`) accepts the Kitty graphics protocol: raw pixels, or a PNG,
+which the broker decodes for the core (`rgba_of_png`) since the core leaves that to whoever embeds it. A
+frame's `images` counter moves when one is sent, placed, replaced or deleted. A view asks where they are
+and is told each by the line it is on, which stays true as the screen scrolls; it asks for an image's
+pixels once per generation, in parts of 4 MiB. Animations are not advanced.
+
+**An image shown through placeholder cells is part of the rows that hold them.** A program that wants an
+image to move with its text makes a placement with no position and prints placeholder characters
+(`U+10EEEE`) where the image is to be; each cell says which image it shows and which cell of the image it
+is. The image is wherever those cells are, so it is not among the placements a view asks after: each row
+is sent with the parts of images its cells show (`wire::Piece`: a run of cells, where the picture starts
+in them, how large it is drawn and which part of it), and the cells themselves blank. That puts the
+picture and the text beside it in one frame — a program that redraws its screen moves both at once — and
+makes a row in the history show what it showed on the screen, since a view keeps the row.
+
+What a row shows is read where the row is read, from the row's cells and the image storage as it stands
+(`vt/placeholders.rs`). The core's render state answers the same question and only for the screen;
+`tests/placeholders.rs` holds the reader to it on every row both answer for. Which virtual placement a
+cell means is looked up in what the storage holds of them, read out once for each generation of the
+storage (`vt/images.rs`, `Virtual`), so a row costs a lookup a run however many placements a program has
+made.
+
+**A row says that it holds placeholder cells whether or not they show anything**, because what they show
+depends on more than the row's cells: an image not yet all there, or deleted, shows nothing, and shows
+again when it arrives. Three things follow, and each is what keeps a view's rows true:
+
+- The screen's rows are all read again when the image storage or the size of a cell changes, since
+  neither writes a cell (`publish.rs`, `capture`).
+- A frame's `images` counter moves for a change in the size of a cell as it does for a change in the
+  images. Where an image is drawn and how large depends on both, for one placed at a cell as for one
+  shown through cells.
+- A view asks again for every history row of placeholder cells it holds when that counter moves, keeping
+  each as it was until the answer comes (`view/src/row-store.ts`, `doubtPictured`). An answer it had
+  asked for before the counter moved may be of either side of the change — an answer and a frame that
+  arrive together are not taken in the order they were sent — so a row of placeholder cells such an
+  answer brings is asked for once more (`absorb`).
+
+**Not drawn:** an image placed relative to one shown through cells (the protocol's `P` and `Q`). The core
+positions it from its parent's cells on the screen; nothing here does, and it is told neither as a
+placement nor as part of a row.
+
+**An image may be named instead of sent, where the session was started for that** (`Spawn.image_files`):
+as a file on this machine, or a shared memory object, which the core then reads. Off, such an image is
+refused and its program told so, which is how one learns to send the bytes. A shared memory object is
+unlinked once read, as the protocol says; a file is left alone. A replay reads neither: a recording holds
+the name a program wrote and not the pixels, so an image sent by name is absent from a replay and from a
+session restored from one (`screen.rs`, `rebuild`).
 
 ## The two halves meet in a file
 
