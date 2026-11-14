@@ -100,11 +100,23 @@ pub struct Row {
     /// The links on this row. A glyph's `link` of `n` is `links[n - 1]`
     pub links: Vec<String>,
     pub glyphs: Vec<Glyph>,
-    /// The parts of images this row shows through placeholder cells, left to right
-    pub pieces: Vec<Piece>,
+    /// What the row's placeholder cells show, on a row that holds any
+    pub pictured: Option<Pictured>,
+}
+
+/// What a row's placeholder cells show.
+///
+/// **Said of every row that holds such cells, whether or not they show anything now.** What they show
+/// depends on the image they name as well as on the cells: an image not yet all there, or deleted, shows
+/// nothing, and shows again when it arrives. A view keeps rows, so it has to know which of them to ask
+/// after when the images change, and a row whose cells show nothing is one of them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Pictured {
     /// One cell in pixels as the terminal was told one is, which is what `pieces` are measured in; zero
-    /// on a row that shows none
+    /// where no window has said
     pub cell: (u16, u16),
+    /// The parts of images shown, left to right
+    pub pieces: Vec<Piece>,
 }
 
 /// Part of an image shown in a run of placeholder cells on one row (the Kitty graphics protocol's Unicode
@@ -136,6 +148,12 @@ pub struct Piece {
 }
 
 impl Row {
+    /// The parts of images this row shows, which is none on a row with no placeholder cells and on one
+    /// whose cells show nothing.
+    pub fn pieces(&self) -> &[Piece] {
+        self.pictured.as_ref().map_or(&[], |pictured| pictured.pieces.as_slice())
+    }
+
     /// How a glyph of this row is drawn.
     pub fn style_of(&self, glyph: &Glyph) -> Style {
         glyph.style.checked_sub(1).and_then(|at| self.styles.get(usize::from(at))).copied().unwrap_or_default()
@@ -170,8 +188,9 @@ pub trait Cells {
     fn links(&self) -> &[String];
     fn count(&self) -> usize;
     fn cell(&self, index: usize) -> Cell<'_>;
-    /// The parts of images the row shows, and one cell in the pixels they are measured in
-    fn pieces(&self) -> (&[Piece], (u16, u16));
+    /// For a row that holds placeholder cells: the parts of images they show, and one cell in the pixels
+    /// those are measured in
+    fn pictured(&self) -> Option<(&[Piece], (u16, u16))>;
 }
 
 impl Cells for Row {
@@ -192,8 +211,8 @@ impl Cells for Row {
         Cell { column: glyph.column, width: glyph.width, text: &glyph.text, style: glyph.style, link: glyph.link }
     }
 
-    fn pieces(&self) -> (&[Piece], (u16, u16)) {
-        (&self.pieces, self.cell)
+    fn pictured(&self) -> Option<(&[Piece], (u16, u16))> {
+        self.pictured.as_ref().map(|pictured| (pictured.pieces.as_slice(), pictured.cell))
     }
 }
 
@@ -204,7 +223,8 @@ impl Cells for Row {
 /// narrow cell, the next in the next. Anything else — a wide character, a character of several code
 /// points — goes in a run that says each one's width.
 pub fn write_row(out: &mut Vec<u8>, wrapped: bool, prompt: bool, row: &impl Cells) {
-    out.push(row_flags(wrapped, prompt));
+    let pictured = row.pictured();
+    out.push(row_head(wrapped, prompt, pictured.is_some()));
     number(out, row.styles().len() as u64);
     for style in row.styles() {
         color(out, style.fg);
@@ -248,13 +268,12 @@ pub fn write_row(out: &mut Vec<u8>, wrapped: bool, prompt: bool, row: &impl Cell
         }
         index = end;
     }
-    // How many, and for a row that shows any: the cell they are measured in, then each
-    let (pieces, cell) = row.pieces();
+    // For a row its flags say holds placeholder cells: the cell their pieces are measured in, how many
+    // pieces, then each
+    let Some((pieces, cell)) = pictured else { return };
+    number(out, cell.0);
+    number(out, cell.1);
     number(out, pieces.len() as u64);
-    if !pieces.is_empty() {
-        number(out, cell.0);
-        number(out, cell.1);
-    }
     for piece in pieces {
         number(out, piece.image);
         number(out, piece.generation);
@@ -290,10 +309,16 @@ fn run_end(row: &impl Cells, start: usize) -> usize {
     end
 }
 
-/// The byte a row's body begins with: whether it runs on into the next, and whether the shell drew its
-/// prompt there.
+/// What the grid flags a row as, in the two low bits of the byte its body begins with: whether it runs on
+/// into the next, and whether the shell drew its prompt there.
 pub fn row_flags(wrapped: bool, prompt: bool) -> u8 {
     u8::from(wrapped) | (u8::from(prompt) << 1)
+}
+
+/// The byte a row's body begins with: what the grid flags it as, and whether it holds placeholder cells,
+/// which is whether what they show follows its characters.
+fn row_head(wrapped: bool, prompt: bool, pictured: bool) -> u8 {
+    row_flags(wrapped, prompt) | (u8::from(pictured) << 2)
 }
 
 /// Whether a character is one code point in one cell, which is what a simple run is made of.
@@ -473,7 +498,8 @@ pub struct Frame {
     pub scrollback: u32,
     /// Moves whenever the shell reports a command, so a view knows to ask for them again
     pub commands: u32,
-    /// Moves whenever an image is sent, placed, replaced or deleted, so a view knows to ask for them again
+    /// Moves whenever an image is sent, placed, replaced or deleted, and whenever a cell's size in pixels
+    /// changes, since where an image is drawn depends on both: a view knows to ask for them again
     pub images: u32,
     pub cursor: Option<Cursor>,
     pub alternate_screen: bool,
@@ -1114,7 +1140,7 @@ impl<'a> Reader<'a> {
     fn row(&mut self) -> Result<Row, Malformed> {
         let line = self.number()?;
         let flags = self.byte()?;
-        if flags > 3 {
+        if flags > 7 {
             return Err(Malformed::Value("a row's flags"));
         }
         let mut styles = Vec::new();
@@ -1154,10 +1180,14 @@ impl<'a> Reader<'a> {
                 _ => return Err(Malformed::Value("a run's kind")),
             }
         }
+        let pictured = if flags & 4 != 0 { Some(self.pictured()?) } else { None };
+        Ok(Row { line, wrapped: flags & 1 != 0, prompt: flags & 2 != 0, styles, links, glyphs, pictured })
+    }
+
+    fn pictured(&mut self) -> Result<Pictured, Malformed> {
+        let cell = (self.u16()?, self.u16()?);
         let mut pieces = Vec::new();
-        let shown = self.count()?;
-        let cell = if shown > 0 { (self.u16()?, self.u16()?) } else { (0, 0) };
-        for _ in 0..shown {
+        for _ in 0..self.count()? {
             pieces.push(Piece {
                 image: self.u32()?,
                 generation: self.number()?,
@@ -1173,7 +1203,7 @@ impl<'a> Reader<'a> {
                 source_height: self.u32()?,
             });
         }
-        Ok(Row { line, wrapped: flags & 1 != 0, prompt: flags & 2 != 0, styles, links, glyphs, pieces, cell })
+        Ok(Pictured { cell, pieces })
     }
 
     fn finish<T>(self, value: T) -> Result<T, Malformed> {

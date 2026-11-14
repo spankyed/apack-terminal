@@ -630,7 +630,7 @@ fn an_image_named_as_a_file_and_shown_through_cells_is_sent_with_its_row() {
         view.until_shows("$ ");
         view.type_line(&shown);
         view.until_shows("sh2own");
-        let pieces: Vec<_> = view.rows.values().flat_map(|row| row.pieces.clone()).collect();
+        let pieces: Vec<_> = view.rows.values().flat_map(|row| row.pieces().to_vec()).collect();
         if reads {
             assert_eq!(pieces.len(), 1, "a session started to read files shows no image named as one");
             let piece = pieces[0];

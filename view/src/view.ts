@@ -290,6 +290,8 @@ export class TerminalView {
   /** Where the session's images are, as last told, and the generation of the frame that prompted asking */
   private placed: Placements = { cellWidth: 0, cellHeight: 0, placements: [] }
   private imagesSeen = -1
+  /** The last frame's count of the images, whether or not asking where they are was answered */
+  private imagesTold = -1
   private readonly pictures = new Map<number, HeldPicture>()
   /** The generation of each image last asked for, which is the one an answer is held to */
   private readonly wanted = new Map<number, number>()
@@ -783,9 +785,16 @@ export class TerminalView {
       if (placement.line + placement.rows <= first - count || placement.line >= first + count * 2) continue
       this.wantPicture(placement.image, placement.generation)
     }
+    // Once an image, at the newest generation any row there shows it at. A row brought before an image
+    // was sent again still names the generation before, until it is brought again: asked for by that,
+    // the pixels would be fetched for it and found to be the newer ones, at every paint
+    const shown = new Map<number, number>()
     for (let line = first - count; line < first + count * 2; line += 1) {
-      for (const piece of this.store.row(line)?.images?.pieces ?? []) this.wantPicture(piece.image, piece.generation)
+      for (const piece of this.store.row(line)?.images?.pieces ?? []) {
+        shown.set(piece.image, Math.max(shown.get(piece.image) ?? 0, piece.generation))
+      }
     }
+    for (const [image, generation] of shown) this.wantPicture(image, generation)
   }
 
   /**
@@ -1219,7 +1228,8 @@ export class TerminalView {
     const near = moved || this.viewport.following ? frame.firstActive : this.viewport.top
     // The images changed: history that shows part of one is asked for again. Before the frame is taken,
     // so a row it brings is the row as it now is and is not asked for twice
-    if (this.imagesSeen !== -1 && frame.images !== this.imagesSeen) this.store.doubtPictured()
+    if (this.imagesTold !== -1 && frame.images !== this.imagesTold) this.store.doubtPictured()
+    this.imagesTold = frame.images
     const { reset, changed } = this.store.apply(frame, near)
     after?.()
     this.viewport.settle()
@@ -1800,12 +1810,13 @@ export class TerminalView {
     const to = last[0] + last[1]
     this.asking.add(page)
     const epoch = this.store.epoch
+    const asked = this.store.imagesChanged
     void this.source.fetch(from, to - from).then((fetched) => {
       // After a reflow the page is one of other lines, which this answer says nothing about — and the
       // page of that number being asked for may be the new one
       if (this.disposed || epoch !== this.store.epoch) return
       this.asking.delete(page)
-      const told = this.store.absorb(fetched, this.viewport.top)
+      const told = this.store.absorb(fetched, this.viewport.top, asked)
       for (const line of told) this.drawings.delete(line)
       if (told.length > 0) this.schedule()
     }, () => {

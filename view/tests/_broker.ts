@@ -36,7 +36,7 @@ class Out {
     this.number(block.rows.length)
     for (const row of block.rows) {
       this.number(row.line)
-      this.byte((row.wrapped ? 1 : 0) | (row.prompt ? 2 : 0))
+      this.byte((row.wrapped ? 1 : 0) | (row.prompt ? 2 : 0) | (row.images ? 4 : 0))
       // The row's own tables, less the plain style and the empty link every row has in front
       this.number(row.styles.length - 1)
       for (const style of row.styles.slice(1)) {
@@ -64,11 +64,11 @@ class Out {
           texts.forEach((text, offset) => { this.byte(row.width[run.start + offset]!); this.text(text) })
         }
       }
-      // The parts of images the row shows: how many, and for a row that shows any, their cell and each
-      const pieces = row.images?.pieces ?? []
-      this.number(pieces.length)
-      if (row.images && pieces.length > 0) { this.number(row.images.cellWidth); this.number(row.images.cellHeight) }
-      for (const piece of pieces) {
+      // For a row that holds placeholder cells: the cell what they show is measured in, how many pieces, each
+      if (!row.images) continue
+      this.number(row.images.cellWidth); this.number(row.images.cellHeight)
+      this.number(row.images.pieces.length)
+      for (const piece of row.images.pieces) {
         for (const value of [piece.image, piece.generation, piece.column, piece.columns, piece.offsetX, piece.offsetY,
           piece.width, piece.height, piece.sourceX, piece.sourceY, piece.sourceWidth, piece.sourceHeight]) this.number(value)
       }

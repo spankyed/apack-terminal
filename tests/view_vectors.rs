@@ -11,8 +11,8 @@
 
 use apack_terminal::protocol::{CommandOutcome, Unreported};
 use apack_terminal::view::wire::{
-    Block, Color, ColorChanges, CommandRow, Cursor, Frame, Glyph, NO_BUTTON, Piece, Placement, Position, Row, Span,
-    Style, ToBroker, ToView, body,
+    Block, Color, ColorChanges, CommandRow, Cursor, Frame, Glyph, NO_BUTTON, Pictured, Piece, Placement, Position, Row,
+    Span, Style, ToBroker, ToView, body,
 };
 use serde_json::{Value, json};
 
@@ -68,9 +68,9 @@ fn block(block: &Block) -> Value {
                 "line": row.line, "wrapped": row.wrapped, "prompt": row.prompt, "styles": styles, "links": row.links,
                 "glyphs": glyphs,
             });
-            // Said only of a row that shows part of an image, which is how a view holds it
-            if !row.pieces.is_empty() {
-                let pieces: Vec<Value> = row
+            // Said only of a row that holds placeholder cells, which is how a view holds it
+            if let Some(pictured) = &row.pictured {
+                let pieces: Vec<Value> = pictured
                     .pieces
                     .iter()
                     .map(|one| {
@@ -83,7 +83,8 @@ fn block(block: &Block) -> Value {
                         })
                     })
                     .collect();
-                written["images"] = json!({ "cellWidth": row.cell.0, "cellHeight": row.cell.1, "pieces": pieces });
+                written["images"] =
+                    json!({ "cellWidth": pictured.cell.0, "cellHeight": pictured.cell.1, "pieces": pieces });
             }
             written
         })
@@ -294,37 +295,48 @@ fn sample_block() -> Block {
                 line: 3,
                 styles: vec![Style { fg: Color::Palette(7), ..Style::default() }],
                 glyphs: vec![glyph(0, 1, " ", 1, 0), glyph(1, 1, " ", 1, 0)],
-                pieces: vec![
-                    Piece {
-                        image: 7,
-                        generation: 9,
-                        column: 0,
-                        columns: 2,
-                        offset_x: 0,
-                        offset_y: 0,
-                        width: 20,
-                        height: 20,
-                        source_x: 0,
-                        source_y: 0,
-                        source_width: 40,
-                        source_height: 40,
-                    },
-                    Piece {
-                        image: 0x0102_0304,
-                        generation: 1 << 40,
-                        column: 40,
-                        columns: 300,
-                        offset_x: 3,
-                        offset_y: 5,
-                        width: 2_994,
-                        height: 15,
-                        source_x: 1_000,
-                        source_y: 2_000,
-                        source_width: 4_000,
-                        source_height: 20,
-                    },
-                ],
-                cell: (10, 20),
+                pictured: Some(Pictured {
+                    cell: (10, 20),
+                    pieces: vec![
+                        Piece {
+                            image: 7,
+                            generation: 9,
+                            column: 0,
+                            columns: 2,
+                            offset_x: 0,
+                            offset_y: 0,
+                            width: 20,
+                            height: 20,
+                            source_x: 0,
+                            source_y: 0,
+                            source_width: 40,
+                            source_height: 40,
+                        },
+                        Piece {
+                            image: 0x0102_0304,
+                            generation: 1 << 40,
+                            column: 40,
+                            columns: 300,
+                            offset_x: 3,
+                            offset_y: 5,
+                            width: 2_994,
+                            height: 15,
+                            source_x: 1_000,
+                            source_y: 2_000,
+                            source_width: 4_000,
+                            source_height: 20,
+                        },
+                    ],
+                }),
+                ..Row::default()
+            },
+            // Placeholder cells that show nothing: an image not yet all there, or one that is gone. Still
+            // said, since a view asks after such a row when the images change
+            Row {
+                line: 4,
+                styles: vec![Style { fg: Color::Palette(9), ..Style::default() }],
+                glyphs: vec![glyph(3, 1, " ", 1, 0)],
+                pictured: Some(Pictured { cell: (10, 20), pieces: Vec::new() }),
                 ..Row::default()
             },
             // An empty row, and one far enough up that its number takes more than a byte

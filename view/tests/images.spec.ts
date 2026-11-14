@@ -156,6 +156,71 @@ describe('an image shown through placeholder cells', () => {
     await quiet(view)
     expect(covers(99), 'a row the frame brought was asked for again').toBe(asked)
   })
+
+  it('is asked for once at its newest generation where two rows in view show it at two', async () => {
+    const view = viewing()
+    view.source.pictures.set(7, { ...pixels(40, 20), generation: 2 })
+    // A history row brought before the image was sent again, beside a screen row brought since
+    view.source.history.set(99, showing(99, [piece({ image: 7, generation: 1 })]))
+    view.source.send(frame({ firstActive: 100, scrollback: 100, images: 1, rows: [showing(100, [piece({ image: 7, generation: 2 })])] }))
+    view.view.scrollTo(98)
+    await quiet(view)
+    await quiet(view)
+    expect(view.source.picturesAsked, 'its pixels were fetched again at every paint').toEqual([7])
+    expect(view.painted().images).toHaveLength(2)
+  })
+
+  it('is asked after again when the answer that brought its row crossed the frame that changed the images', async () => {
+    const view = viewing()
+    view.source.pictures.set(7, pixels(40, 20))
+    view.source.history.set(98, showing(98, [piece({ image: 7, width: 40 })]))
+    view.source.send(frame({ firstActive: 100, scrollback: 100, images: 1 }))
+    view.view.scrollTo(98)
+    // The paint asks for the history; before its answer is taken, the image is replaced and the frame
+    // that says so arrives. The answer holds the row as it was
+    view.painted()
+    view.source.history.set(98, showing(98, [piece({ image: 7, generation: 2, width: 20 })]))
+    view.source.pictures.set(7, { ...pixels(20, 20), generation: 2 })
+    view.source.send(frame({ sequence: 2, firstActive: 100, scrollback: 100, images: 2 }))
+    await quiet(view)
+    await quiet(view)
+    expect(view.painted().images?.map((image) => image.width), 'the row stayed as the older answer had it').toEqual([20])
+  })
+
+  it('is drawn once its image arrives, in a history row whose cells showed nothing', async () => {
+    const view = viewing()
+    view.source.pictures.set(7, pixels(40, 20))
+    view.source.history.set(98, { ...row(98, '    '), images: { cellWidth: 10, cellHeight: 20, pieces: [] } })
+    view.source.send(frame({ firstActive: 100, scrollback: 100, images: 1 }))
+    view.view.scrollTo(98)
+    await quiet(view)
+    expect(view.painted().images).toEqual([])
+
+    view.source.history.set(98, showing(98, [piece({ image: 7 })]))
+    view.source.send(frame({ sequence: 2, firstActive: 100, scrollback: 100, images: 2 }))
+    await quiet(view)
+    await quiet(view)
+    expect(view.painted().images, 'a row whose cells showed nothing was not asked for again').toHaveLength(1)
+  })
+
+  it('is asked after when the images change though asking where they are had failed', async () => {
+    const view = viewing()
+    view.source.pictures.set(7, pixels(40, 20))
+    view.source.history.set(98, showing(98, [piece({ image: 7, width: 40 })]))
+    // Where the images are cannot be asked this once
+    const images = view.source.images.bind(view.source)
+    view.source.images = () => Promise.reject(new Error('not now'))
+    view.source.send(frame({ firstActive: 100, scrollback: 100, images: 1 }))
+    view.view.scrollTo(98)
+    await quiet(view)
+    view.source.images = images
+
+    view.source.history.set(98, showing(98, [piece({ image: 7, width: 20 })]))
+    view.source.send(frame({ sequence: 2, firstActive: 100, scrollback: 100, images: 2 }))
+    await quiet(view)
+    await quiet(view)
+    expect(view.painted().images?.map((image) => image.width)).toEqual([20])
+  })
 })
 
 describe('the images of a session', () => {

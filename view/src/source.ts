@@ -98,7 +98,10 @@ export interface Row {
   readonly styles: readonly Style[]
   /** The links on this row. `links[0]` is the empty string, so a character's `0` means none */
   readonly links: readonly string[]
-  /** The parts of images this row shows through placeholder cells. Absent on a row that shows none */
+  /**
+   * What this row's placeholder cells show, on a row that holds any — which it may while they show
+   * nothing, and then `pieces` is empty. Absent on a row with no such cells
+   */
   readonly images?: RowImages
 }
 
@@ -132,7 +135,14 @@ export interface Piece {
   readonly sourceHeight: number
 }
 
-/** What a row shows of images, and one cell in the pixels that is measured in */
+/**
+ * What a row's placeholder cells show, and one cell in the pixels that is measured in.
+ *
+ * **Said of every row that holds such cells, whether or not they show anything now.** What they show
+ * depends on the image they name as well as on the cells: one not yet all there, or deleted, shows nothing,
+ * and shows again when it arrives. A view keeps rows, so this is how it knows which to ask after when the
+ * images change.
+ */
 export interface RowImages {
   readonly cellWidth: number
   readonly cellHeight: number
@@ -208,7 +218,10 @@ export interface Frame extends Rows {
   readonly scrollback: number
   /** Moves whenever the shell reports a command, which is when `commands()` has something new to say */
   readonly commands: number
-  /** Moves whenever an image is sent, placed, replaced or deleted: the cue to ask where they are again */
+  /**
+   * Moves whenever an image is sent, placed, replaced or deleted, and whenever the size of a cell the
+   * terminal was told changes: the cue to ask where the images are again
+   */
   readonly images: number
   /** Absent when it is not on the screen. One the program has hidden is here, and says so */
   readonly cursor: Cursor | null

@@ -117,6 +117,11 @@ impl RowRead {
         &self.pieces
     }
 
+    /// Whether the row holds placeholder cells, which it may while they show nothing.
+    pub fn pictured(&self) -> bool {
+        !self.runs.is_empty()
+    }
+
     /// Notes a placeholder cell at `column`: the next cell of the run before it, or the first of another.
     fn placeholder(&mut self, column: u16, said: Said) {
         if !self.runs.last_mut().is_some_and(|run| run.takes(column, said)) {
@@ -177,8 +182,8 @@ impl wire::Cells for RowRead {
         }
     }
 
-    fn pieces(&self) -> (&[Piece], (u16, u16)) {
-        (&self.pieces, self.cell)
+    fn pictured(&self) -> Option<(&[Piece], (u16, u16))> {
+        self.pictured().then_some((self.pieces.as_slice(), self.cell))
     }
 }
 
@@ -229,8 +234,8 @@ impl Terminal {
     }
 
     /// Whether the row at `row` in `space` runs on into the next and whether the shell drew its prompt
-    /// there, as the byte a row's body begins with (`wire::write_row`), or `None` where there is no such
-    /// row. What a row holds is not read.
+    /// there, as the two low bits of the byte a row's body begins with (`wire::row_flags`), or `None` where
+    /// there is no such row. What a row holds is not read.
     pub fn row_flags(&self, space: Space, row: u32) -> Result<Option<u8>, Failed> {
         let Some(reference) = self.reference_in(space, 0, row) else { return Ok(None) };
         let mut raw: sys::Row = 0;
@@ -387,9 +392,7 @@ impl Terminal {
                 source_height: fit.source.3,
             });
         }
-        if !read.pieces.is_empty() {
-            read.cell = cell;
-        }
+        read.cell = cell;
     }
 
     /// Adds the cell at `reference` to `read`, when it holds a character or is drawn as anything.

@@ -247,6 +247,37 @@ describe('history that shows part of an image', () => {
     expect(store.missing(0, 10)).toEqual([])
   })
 
+  it('is asked for again though its cells showed nothing, since they may show something now', () => {
+    const store = new RowStore()
+    const blank = { ...row(4, '    '), images: { cellWidth: 10, cellHeight: 20, pieces: [] } }
+    store.apply(frame({ firstActive: 10, scrollback: 10 }))
+    store.absorb({ epoch: 1, first: 0, count: 10, rows: [row(3, 'text'), blank] })
+
+    store.doubtPictured()
+    expect(store.missing(0, 10), 'a row whose cells show nothing was taken for a row of text').toEqual([[4, 1]])
+    store.absorb({ epoch: 1, first: 4, count: 1, rows: [pictured(4, 1)] })
+    expect(store.row(4)?.images?.pieces).toHaveLength(1)
+    expect(store.missing(0, 10)).toEqual([])
+  })
+
+  it('stays doubted when the answer that brings it was asked for before the images changed', () => {
+    const store = new RowStore()
+    store.apply(frame({ firstActive: 10, scrollback: 10 }))
+    // Asked, then the images change, then the answer comes: whether its rows are from before the change
+    // or after it is not something their order says
+    const asked = store.imagesChanged
+    store.doubtPictured()
+    const told = store.absorb({ epoch: 1, first: 0, count: 10, rows: [row(3, 'text'), pictured(4, 1)] }, 10, asked)
+    expect(told).toContain(4)
+    expect(store.row(4)?.images?.pieces[0]?.generation, 'the row is drawn as it came meanwhile').toBe(1)
+    expect(store.missing(0, 10), 'only the row of placeholder cells is asked for again').toEqual([[4, 1]])
+
+    // Asked for since, the answer is of the images as they are
+    store.absorb({ epoch: 1, first: 4, count: 1, rows: [pictured(4, 2)] }, 10, store.imagesChanged)
+    expect(store.row(4)?.images?.pieces[0]?.generation).toBe(2)
+    expect(store.missing(0, 10)).toEqual([])
+  })
+
   it('is doubted no longer once a frame brings it or names it stale', () => {
     const store = new RowStore()
     store.apply(frame({ firstActive: 10, scrollback: 10 }))

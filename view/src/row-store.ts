@@ -48,6 +48,11 @@ export class RowStore {
    * A doubted row is still drawn: it is the best there is until the answer comes.
    */
   private readonly doubted = new Set<number>()
+  /**
+   * How many times `doubtPictured` has been called: what an asker notes when it asks, so `absorb` can tell
+   * an answer asked for before the images last changed from one asked for since.
+   */
+  imagesChanged = 0
 
   /** The oldest line the owner still holds */
   get oldest(): number {
@@ -118,8 +123,14 @@ export class RowStore {
    *
    * **What the answer covers and has no row for is not held by the owner**, and is remembered as that, so
    * it is not missing. What it does not cover it says nothing about.
+   *
+   * **An answer asked for before the images last changed may be of either side of the change.** `asked` is
+   * `imagesChanged` when the fetch was made. An answer and the frame that says the images changed can
+   * arrive together, and the frame is taken first whichever was sent first, so there is no telling from
+   * the order which of them the answer's rows are older than. A row of placeholder cells brought by such
+   * an answer is taken, and stays doubted: asked for once more, by a fetch made after the change.
    */
-  absorb(fetched: Fetched, near = this.firstActive): number[] {
+  absorb(fetched: Fetched, near = this.firstActive, asked = this.imagesChanged): number[] {
     if (fetched.epoch !== this.epoch) return []
     const told: number[] = []
     // The screen is only ever told by a frame: a fetched copy of a line a program can still write to may
@@ -131,7 +142,8 @@ export class RowStore {
       if (row.line < from || row.line >= to) continue
       this.rows.set(row.line, row)
       this.absent.delete(row.line)
-      this.doubted.delete(row.line)
+      if (row.images !== undefined && asked !== this.imagesChanged) this.doubted.add(row.line)
+      else this.doubted.delete(row.line)
       brought.add(row.line)
       told.push(row.line)
     }
@@ -172,12 +184,13 @@ export class RowStore {
   }
 
   /**
-   * The images changed: a history row that shows part of one may show something else now — another
-   * picture under the same number, or nothing — and the owner sends history again only when asked. So
-   * each such row is doubted: kept and drawn, and among what `missing` names until it is brought again.
-   * The screen's rows are not: a frame brings those.
+   * The images changed: a history row of placeholder cells may show something else now — another picture
+   * under the same number, nothing, or a picture where it showed none — and the owner sends history again
+   * only when asked. So each such row is doubted: kept and drawn, and among what `missing` names until it
+   * is brought again. The screen's rows are not: a frame brings those.
    */
   doubtPictured(): void {
+    this.imagesChanged += 1
     for (const [line, row] of this.rows) {
       if (line < this.firstActive && row.images !== undefined) this.doubted.add(line)
     }

@@ -108,9 +108,9 @@ carries replaces what the view held: a colour absent from it is the theme's agai
 a frame like any other change, with no row in it.
 
 **A row says everything about itself**: its styles and its links are its own, and its glyphs index them
-from one, `0` being the plain style and no link; the parts of images it shows come with it, measured in a
-cell whose size it also says. So a row is written out once when it changes, the same bytes go to every
-view owed it, and how long a message will be is known before it is built.
+from one, `0` being the plain style and no link; what its placeholder cells show comes with it, measured
+in a cell whose size it also says. So a row is written out once when it changes, the same bytes go to
+every view owed it, and how long a message will be is known before it is built.
 
 **A view is sent a frame when the screen has changed and it has acknowledged the last one.** One frame is
 in flight per view, so a view that stops drawing — hidden, busy, gone — costs nothing, and a program that
@@ -198,11 +198,29 @@ makes a row in the history show what it showed on the screen, since a view keeps
 
 What a row shows is read where the row is read, from the row's cells and the image storage as it stands
 (`vt/placeholders.rs`). The core's render state answers the same question and only for the screen;
-`tests/placeholders.rs` holds the reader to it on every row both answer for. Two things follow from a
-piece depending on more than its row's cells. The screen's rows are all read again when the image storage
-or the size of a cell changes, since neither writes a cell (`publish.rs`, `capture`). And a view asks
-again for the history rows it holds that show part of an image whenever a frame's `images` counter moves,
-keeping each as it was until the answer comes (`view/src/row-store.ts`, `doubtPictured`).
+`tests/placeholders.rs` holds the reader to it on every row both answer for. Which virtual placement a
+cell means is looked up in what the storage holds of them, read out once for each generation of the
+storage (`vt/images.rs`, `Virtual`), so a row costs a lookup a run however many placements a program has
+made.
+
+**A row says that it holds placeholder cells whether or not they show anything**, because what they show
+depends on more than the row's cells: an image not yet all there, or deleted, shows nothing, and shows
+again when it arrives. Three things follow, and each is what keeps a view's rows true:
+
+- The screen's rows are all read again when the image storage or the size of a cell changes, since
+  neither writes a cell (`publish.rs`, `capture`).
+- A frame's `images` counter moves for a change in the size of a cell as it does for a change in the
+  images. Where an image is drawn and how large depends on both, for one placed at a cell as for one
+  shown through cells.
+- A view asks again for every history row of placeholder cells it holds when that counter moves, keeping
+  each as it was until the answer comes (`view/src/row-store.ts`, `doubtPictured`). An answer it had
+  asked for before the counter moved may be of either side of the change — an answer and a frame that
+  arrive together are not taken in the order they were sent — so a row of placeholder cells such an
+  answer brings is asked for once more (`absorb`).
+
+**Not drawn:** an image placed relative to one shown through cells (the protocol's `P` and `Q`). The core
+positions it from its parent's cells on the screen; nothing here does, and it is told neither as a
+placement nor as part of a row.
 
 **An image may be named instead of sent, where the session was started for that** (`Spawn.image_files`):
 as a file on this machine, or a shared memory object, which the core then reads. Off, such an image is

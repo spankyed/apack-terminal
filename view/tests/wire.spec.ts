@@ -188,6 +188,18 @@ describe('bytes that are not a message', () => {
     expect(() => decodeToView(Uint8Array.of(200, 0))).toThrow('no message has kind 200')
   })
 
+  it('refuses a row flagged as nothing the format defines, and one that ends where what its cells show would begin', () => {
+    // A `rows` answer of one empty row: kind, channel, request, epoch, first, count, how many rows, the
+    // row's line, its flags, then no styles, links or runs
+    const answer = (flags: number) => Uint8Array.of(66, 0, 0, 0, 0, 1, 1, 0, flags, 0, 0, 0)
+    expect(decodeToView(answer(3))).toMatchObject({ rows: { rows: [{ wrapped: true, prompt: true }] } })
+    expect(() => decodeToView(answer(8))).toThrow("a row's flags are outside what the format defines")
+    expect(() => decodeToView(answer(4))).toThrow()
+    // And with them: a cell of ten by twenty, and no pieces
+    expect(decodeToView(Uint8Array.of(66, 0, 0, 0, 0, 1, 1, 0, 4, 0, 0, 0, 10, 20, 0)))
+      .toMatchObject({ rows: { rows: [{ images: { cellWidth: 10, cellHeight: 20, pieces: [] } }] } })
+  })
+
   it('refuses a frame that says how a cursor it lacks is drawn', () => {
     // Blinking and hidden are said of a cursor. The kind, eight fields of zero, the image counter, the
     // flags, then no rows

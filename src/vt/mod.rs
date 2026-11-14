@@ -71,6 +71,9 @@ pub fn features() -> Features {
 /// One terminal, freed with the value.
 pub struct Terminal {
     handle: sys::Terminal,
+    /// What placeholder cells can name, as of the image storage's generation when it was last asked
+    /// (`images::Virtual`)
+    virtual_placements: std::cell::RefCell<images::Virtual>,
 }
 
 // SAFETY: the library allocates and frees this handle and nothing here shares it between threads: the broker gives
@@ -88,7 +91,7 @@ impl Terminal {
         if handle.is_null() {
             return Err(Failed { call: "ghostty_terminal_new", code: sys::Result::SUCCESS });
         }
-        Ok(Self { handle })
+        Ok(Self { handle, virtual_placements: std::cell::RefCell::default() })
     }
 
     /// Parses `bytes`, exactly as the pty delivered them.

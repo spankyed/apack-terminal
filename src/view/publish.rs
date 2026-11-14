@@ -102,6 +102,9 @@ fn owed(viewer: &Viewer, held: bool) -> bool {
 struct Held {
     /// The row as a message carries it, less its line number
     body: Vec<u8>,
+    /// What the grid flags the row as, as `Terminal::row_flags` answers it: that it runs on, and that the
+    /// shell drew its prompt there
+    flags: u8,
     /// The sequence at which this row last differed from what was there before
     changed: u64,
 }
@@ -137,6 +140,10 @@ pub struct Publication {
     images: u32,
     /// One cell in pixels when the screen was last read, which is what a row's images are measured in
     cell: (u16, u16),
+    /// How many times that has changed. Where an image is drawn and how large depends on it as much as
+    /// on the image, so a view is told of a change in either as one: what a frame calls `images` is the
+    /// storage's generation and this, added
+    measured: u32,
     /// Whether the program had the screen in reverse video when it was last read
     reverse: bool,
     /// The colours the program has changed from the ones the session was given, as of the last read
@@ -179,6 +186,7 @@ impl Publication {
             commands: 0,
             images: 0,
             cell: (0, 0),
+            measured: 0,
             reverse: false,
             colors: ColorChanges::default(),
             colors_changed: 0,
@@ -268,7 +276,8 @@ impl Publication {
         // Compared and never ordered, so the low half is all of it a view needs
         let images = terminal.images_generation() as u32;
         let cell = terminal.cell_pixels();
-        let pictured = images != self.images || cell != self.cell;
+        let measured = if cell == self.cell { self.measured } else { self.measured.wrapping_add(1) };
+        let pictured = images != self.images || measured != self.measured;
 
         let next = self.sequence + 1;
         let rows = usize::from(self.rows);
@@ -289,7 +298,7 @@ impl Publication {
                     if shift == 0
                         && !pictured
                         && self.changed.get(index) == Some(&false)
-                        && terminal.row_flags(Space::Active, index as u32)? == held.body.first().copied() =>
+                        && terminal.row_flags(Space::Active, index as u32)? == Some(held.flags) =>
                 {
                     active.push(held);
                     continue;
@@ -303,7 +312,8 @@ impl Publication {
                 Some(held) if held.body == self.body => active.push(held),
                 _ => {
                     changed = true;
-                    active.push(Held { body: self.body.clone(), changed: next });
+                    let flags = wire::row_flags(self.read.wrapped, self.read.prompt);
+                    active.push(Held { body: self.body.clone(), flags, changed: next });
                 }
             }
         }
@@ -319,8 +329,8 @@ impl Publication {
         let colors = terminal.color_changes()?;
 
         // Everything is read: from here nothing can fail, and what is held moves as one
-        if (cursor, mouse, reverse, commands, images)
-            != (self.cursor, self.mouse, self.reverse, self.commands, self.images)
+        if (cursor, mouse, reverse, commands, images, measured)
+            != (self.cursor, self.mouse, self.reverse, self.commands, self.images, self.measured)
         {
             changed = true;
         }
@@ -334,7 +344,7 @@ impl Publication {
         self.captured_scrollback = self.scrollback;
         (self.cursor, self.mouse, self.reverse, self.commands, self.images) =
             (cursor, mouse, reverse, commands, images);
-        self.cell = cell;
+        (self.cell, self.measured) = (cell, measured);
         if changed {
             self.sequence = next;
         }
@@ -447,7 +457,7 @@ impl Publication {
             screen_rows: self.rows,
             scrollback: self.scrollback,
             commands: self.commands,
-            images: self.images,
+            images: self.images.wrapping_add(self.measured),
             cursor: self.cursor,
             alternate_screen: self.alternate,
             mouse: self.mouse,

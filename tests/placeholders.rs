@@ -306,6 +306,71 @@ fn a_cell_with_another_top_byte_begins_a_run() {
     assert_eq!(shown, [(one, 0, 1), (other, 1, 1)]);
 }
 
+/// What cells can name is the storage as it stands at each read: a placement made after a row was last
+/// read is one its cells show at the next, and the other screen's images are not this screen's.
+#[test]
+fn cells_show_what_the_storage_holds_at_each_read() {
+    let mut terminal = terminal(40, 4, (10, 20));
+    terminal.feed(&sent(6, 80, 20, 8, 1, Some(12)));
+    let named = |placement: u32| format!("\x1b[58;5;{placement}m");
+    terminal.feed(format!("{}{}{}{}\x1b[59m", naming(6), named(13), cell(0, 0), cell(0, 1)).as_bytes());
+    let (found, said) = both(&terminal);
+    assert_eq!(found, said);
+    assert!(found[0].is_empty(), "cells show a placement that has not been made");
+
+    // Made now, with no cell written: the same cells show it
+    terminal.feed(b"\x1b_Ga=p,U=1,i=6,p=13,c=4,r=1,q=2\x1b\\");
+    let (found, said) = both(&terminal);
+    assert_eq!(found, said);
+    assert_eq!(found[0].iter().map(|piece| piece.source_width).collect::<Vec<_>>(), [40]);
+
+    // The alternate screen has images of its own: the same cells there name nothing
+    terminal
+        .feed(format!("\x1b[?1049h\x1b[H{}{}{}{}\x1b[59m", naming(6), named(13), cell(0, 0), cell(0, 1)).as_bytes());
+    let (found, said) = both(&terminal);
+    assert_eq!(found, said);
+    assert!(found[0].is_empty(), "cells on one screen show an image sent to the other");
+    terminal.feed(b"\x1b[?1049l");
+    let (found, said) = both(&terminal);
+    assert_eq!(found, said);
+    assert_eq!(found[0].len(), 1, "the screen a program came back to lost what its cells show");
+}
+
+/// What cells can name is read out of the storage once for each change to the images, however many
+/// rows and runs are read meanwhile: a row of placeholder cells costs a lookup a run, and not a walk of
+/// every placement a program has made.
+#[test]
+fn what_cells_can_name_is_read_out_once_for_each_change_to_the_images() {
+    let mut terminal = terminal(40, 6, (10, 20));
+    terminal.feed(b"text\r\n");
+    let mut read = RowRead::default();
+    let mut read_screen = |terminal: &Terminal| {
+        let mut pieces = 0;
+        for row in 0..terminal.rows().expect("rows") {
+            assert!(terminal.read_row_into(Space::Active, u32::from(row), &mut read).expect("a row"));
+            pieces += read.pieces().len();
+        }
+        pieces
+    };
+    assert_eq!(read_screen(&terminal), 0);
+    assert_eq!(terminal.virtual_reads(), 0, "a screen with no placeholder cells read the storage");
+
+    terminal.feed(&sent(6, 40, 20, 4, 1, None));
+    // Every cell a run of its own: the same column named again, so none carries on from the last
+    for row in 2..5 {
+        terminal.feed(format!("\x1b[{row};1H{}{}", naming(6), cell(0, 0).repeat(8)).as_bytes());
+    }
+    assert_eq!(read_screen(&terminal), 24);
+    assert_eq!(read_screen(&terminal), 24);
+    assert_eq!(terminal.virtual_reads(), 1, "the storage was read again though nothing in it changed");
+
+    // Another placement is another generation of the storage, which is read once more
+    terminal.feed(b"\x1b_Ga=p,U=1,i=6,p=9,c=2,r=1,q=2\x1b\\");
+    assert_eq!(read_screen(&terminal), 24);
+    assert_eq!(read_screen(&terminal), 24);
+    assert_eq!(terminal.virtual_reads(), 2);
+}
+
 /// Nothing is shown where no window has said how large a cell is: there is no size to draw at.
 #[test]
 fn nothing_is_shown_where_a_cell_has_no_size() {

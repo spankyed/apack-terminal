@@ -411,7 +411,7 @@ class Reader {
   private row(): Row {
     const line = this.number()
     const flags = this.byte()
-    if (flags > 3) throw new Malformed("a row's flags are outside what the format defines")
+    if (flags > 7) throw new Malformed("a row's flags are outside what the format defines")
     // The row's own tables, which its characters count from one: the plain style and no link are put in
     // front, so an index is where the thing is
     const styles: Style[] = [PLAIN]
@@ -454,15 +454,14 @@ class Reader {
       }
       if (column > 0xffff) throw new Malformed('an integer did not fit its field')
     }
-    // The parts of images the row shows: how many, and for a row that shows any, the cell they are
-    // measured in and then each
-    const shown = this.count()
+    // For a row its flags say holds placeholder cells: the cell what they show is measured in, how many
+    // pieces that is, and each
     let images: RowImages | undefined
-    if (shown > 0) {
+    if (flags & 4) {
       const cellWidth = this.number()
       const cellHeight = this.number()
       const pieces: Piece[] = []
-      for (let more = shown; more > 0; more -= 1) {
+      for (let more = this.count(); more > 0; more -= 1) {
         pieces.push({
           image: this.number(), generation: this.number(), column: this.number(), columns: this.number(),
           offsetX: this.number(), offsetY: this.number(), width: this.number(), height: this.number(),

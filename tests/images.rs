@@ -325,9 +325,9 @@ fn a_picture_shown_through_placeholder_cells_is_sent_with_the_rows_that_hold_the
     assert!(screen.images().expect("the images read").2.is_empty(), "it is told as placed as well");
     for (index, line) in [shown.first_active + 1, shown.first_active + 2].into_iter().enumerate() {
         let row = row_of(&shown, line).expect("the frame carries the row");
-        assert_eq!(row.cell, (10, 20));
-        assert_eq!(row.pieces.len(), 1);
-        let piece = row.pieces[0];
+        assert_eq!(row.pictured.as_ref().map(|pictured| pictured.cell), Some((10, 20)));
+        assert_eq!(row.pieces().len(), 1);
+        let piece = row.pieces()[0];
         assert_eq!((piece.image, piece.column, piece.columns), (7, 0, 4));
         assert_eq!((piece.width, piece.height), (40, 20));
         assert_eq!(
@@ -337,7 +337,7 @@ fn a_picture_shown_through_placeholder_cells_is_sent_with_the_rows_that_hold_the
         // What a view draws of the cells themselves is nothing
         assert!(row.glyphs.iter().all(|glyph| glyph.text == " "), "a placeholder is drawn as a character");
     }
-    assert!(row_of(&shown, shown.first_active).is_some_and(|row| row.pieces.is_empty() && row.cell == (0, 0)));
+    assert!(row_of(&shown, shown.first_active).is_some_and(|row| row.pictured.is_none()));
 
     screen.feed(b"\x1b_Ga=p,i=7,p=2,q=2\x1b\\");
     let (_, _, placed) = screen.images().expect("the images read");
@@ -358,30 +358,60 @@ fn a_row_is_sent_again_when_the_picture_it_shows_changes() {
     screen.acknowledge(view, attached.sequence).expect("an acknowledgement is taken");
     let first = last_frame(&sent);
     let line = first.first_active;
-    let piece = row_of(&first, line).expect("the row").pieces[0];
+    let piece = row_of(&first, line).expect("the row").pieces()[0];
     assert_eq!((piece.width, piece.height), (20, 20));
 
     // Sent again: the same cells, and other pixels
     screen.feed(image.as_bytes());
     screen.acknowledge(view, first.sequence).expect("an acknowledgement is taken");
     let again = last_frame(&sent);
-    let resent = row_of(&again, line).expect("a row whose picture was sent again is not sent again").pieces[0];
+    let resent = row_of(&again, line).expect("a row whose picture was sent again is not sent again").pieces()[0];
     assert_ne!(resent.generation, piece.generation);
 
-    // A cell half as wide: the same grid, and half the size
+    // A cell half as wide: the same grid, and half the size. A view is told the images changed, since
+    // where each is drawn did, though no image was touched
     screen.resize(40, 10, 5, 20);
     screen.acknowledge(view, again.sequence).expect("an acknowledgement is taken");
     let measured = last_frame(&sent);
+    assert_ne!(measured.images, again.images, "a cell of another size is not a change a view is told of");
     let row = row_of(&measured, line).expect("a row whose cells changed size is not sent again");
-    assert_eq!((row.cell, row.pieces[0].width, row.pieces[0].height), ((5, 20), 10, 10));
+    let pictured = row.pictured.as_ref().expect("a row of placeholder cells says what they show");
+    assert_eq!((pictured.cell, pictured.pieces[0].width, pictured.pieces[0].height), ((5, 20), 10, 10));
 
     screen.feed(b"\x1b_Ga=d,d=I,i=7,q=2\x1b\\");
     screen.acknowledge(view, measured.sequence).expect("an acknowledgement is taken");
     let deleted = last_frame(&sent);
+    let emptied = row_of(&deleted, line).expect("a row whose picture was deleted is not sent again");
+    assert!(emptied.pieces().is_empty(), "a row still shows a picture that was deleted");
+    // And is still said to hold the cells, which is what a view asks after it by when the images change
+    assert!(emptied.pictured.is_some(), "a row whose cells show nothing is sent as a row with none");
+}
+
+/// **A row of placeholder cells says it holds them while they show nothing.** Cells written before their
+/// image has arrived show nothing yet, and a view that keeps the row has to know to ask after it when the
+/// images change: so the row is sent as one that holds such cells, and sent again with what they show
+/// once there is something.
+#[test]
+fn a_row_whose_cells_show_nothing_yet_says_it_holds_them() {
+    let view = apack_terminal::view::publish::ViewId { connection: 1, channel: 1 };
+    let (mut screen, sent) = viewed(40, 10);
+    let attached = last_frame(&sent);
+    screen.feed(format!("text\r\n{}", cells(7, 0, 2)).as_bytes());
+    screen.acknowledge(view, attached.sequence).expect("an acknowledgement is taken");
+    let before = last_frame(&sent);
+    let line = before.first_active + 1;
+    let waiting = row_of(&before, line).expect("the row");
+    assert!(waiting.pieces().is_empty());
+    assert_eq!(waiting.pictured.as_ref().map(|pictured| pictured.cell), Some((10, 20)));
     assert!(
-        row_of(&deleted, line).expect("a row whose picture was deleted is not sent again").pieces.is_empty(),
-        "a row still shows a picture that was deleted",
+        row_of(&before, before.first_active).is_some_and(|row| row.pictured.is_none()),
+        "a row of text says so too"
     );
+
+    screen.feed(format!("\x1b_Ga=T,U=1,f=32,i=7,s=20,v=20,c=2,r=1,q=2;{}\x1b\\", base64(&picture(20, 20))).as_bytes());
+    screen.acknowledge(view, before.sequence).expect("an acknowledgement is taken");
+    let after = last_frame(&sent);
+    assert_eq!(row_of(&after, line).expect("the row is sent again once its image arrives").pieces().len(), 1);
 }
 
 /// A file of raw pixels, and the request that names it as image `id`'s source.

@@ -128,10 +128,10 @@ exclude_re = [
     "proxy.rs:.*replace \\* with \\+ in pump",
 
     # **Flags that are distinct bits, joined.** `|` and `^` differ only where two operands share a bit, and
-    # these share none: a frame's flags are one bit each (`FRAME_CURSOR` … `FRAME_BLINKING`), a row's are
-    # two, a command's say which of eight fields it has, the bit that says a number goes on is the one
+    # these share none: a frame's flags are one bit each (`FRAME_CURSOR` … `FRAME_HIDDEN`), a row's are
+    # three, a command's say which of eight fields it has, the bit that says a number goes on is the one
     # bit its seven others are not, and the modifiers that compose a character are shift and alt
-    "view/wire.rs:.*replace \\| with \\^ in (frame|row_flags|number|Writer::command)",
+    "view/wire.rs:.*replace \\| with \\^ in (frame|row_flags|row_head|number|Writer::command)",
     "vt/input.rs:.*replace \\| with \\^ in consumed",
 
     # **Freeing what the core allocated, and the collector it fills.** As `Terminal`'s above: a mutant of
