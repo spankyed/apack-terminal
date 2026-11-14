@@ -1811,12 +1811,13 @@ export class TerminalView {
     this.asking.add(page)
     const epoch = this.store.epoch
     const asked = this.store.imagesChanged
+    const askedStale = this.store.staleFrames
     void this.source.fetch(from, to - from).then((fetched) => {
       // After a reflow the page is one of other lines, which this answer says nothing about — and the
       // page of that number being asked for may be the new one
       if (this.disposed || epoch !== this.store.epoch) return
       this.asking.delete(page)
-      const told = this.store.absorb(fetched, this.viewport.top, asked)
+      const told = this.store.absorb(fetched, this.viewport.top, asked, askedStale)
       for (const line of told) this.drawings.delete(line)
       if (told.length > 0) this.schedule()
     }, () => {

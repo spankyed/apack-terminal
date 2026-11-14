@@ -294,3 +294,17 @@ describe('history that shows part of an image', () => {
   })
 })
 
+describe('a fetch answered before a frame named history stale', () => {
+  it('does not put back the lines that frame named, though it was asked for before them', () => {
+    const store = new RowStore()
+    store.apply(frame({ firstActive: 10, scrollback: 10, rows: [] }))
+    const asked = store.imagesChanged
+    const askedStale = store.staleFrames
+    store.apply(frame({ sequence: 2, firstActive: 10, scrollback: 10, staleFrom: 6 }))
+    store.absorb({ epoch: 1, first: 0, count: 10, rows: [row(5, 'kept'), row(6, 'old'), row(7, 'old')] }, 10, asked, askedStale)
+    expect(store.row(5)?.text.join('')).toBe('kept')
+    expect(store.row(6), 'a line named stale was put back as it was').toBeUndefined()
+    expect(store.row(7)).toBeUndefined()
+  })
+})
+
