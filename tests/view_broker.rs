@@ -16,7 +16,6 @@ use std::time::Duration;
 
 use interprocess::local_socket::{GenericFilePath, Stream, ToFsName, prelude::*};
 
-#[cfg(unix)]
 use apack_terminal::protocol::CommandOutcome;
 use apack_terminal::protocol::{Event, PROTOCOL_VERSION, Request, Role};
 use apack_terminal::view::wire::{Frame, Incoming, Position, Row, Span, ToBroker, ToView, read_message};
@@ -66,13 +65,91 @@ fn socket_in(_directory: &std::path::Path) -> std::path::PathBuf {
 #[cfg(unix)]
 const SHELL: &str = "/bin/sh";
 #[cfg(windows)]
-const SHELL: &str = "cmd.exe";
+const SHELL: &str = "powershell.exe";
+
+/// The arguments that make the shell's prompt the `$ ` every case waits for.
+#[cfg(unix)]
+const SHELL_ARGS: &[&str] = &[];
+#[cfg(windows)]
+const SHELL_ARGS: &[&str] = &["-NoLogo", "-NoProfile", "-NoExit", "-Command", "function prompt { '$ ' }"];
+
+/// Prints `body` as the shell would print escape sequences: `\033` is ESC, `\007` is BEL, `\n` a newline and
+/// `\\` one backslash. printf on POSIX, a PowerShell `[Console]::Write` on Windows.
+fn printed(body: &str) -> String {
+    #[cfg(unix)]
+    {
+        format!("printf '{body}'")
+    }
+    #[cfg(windows)]
+    {
+        let body = body
+            .replace("\\033", "$([char]27)")
+            .replace("\\007", "$([char]7)")
+            .replace("\\n", "`n")
+            .replace("\\\\", "\\");
+        format!("[Console]::Write(\"{body}\")")
+    }
+}
+
+/// A line that prints `before`, then the sum of two numbers, then `after`: what a case waits for is the sum, so
+/// the line typed never contains it.
+fn echo_sum(before: &str, left: u32, right: u32, after: &str) -> String {
+    #[cfg(unix)]
+    {
+        format!("echo {before}$(({left}+{right})){after}")
+    }
+    #[cfg(windows)]
+    {
+        format!("Write-Output ('{before}'+({left}+{right})+'{after}')")
+    }
+}
+
+/// Prints `count` lines of `prefix` and their number, then runs `then`.
+fn numbered_lines(count: u32, prefix: &str, then: &str) -> String {
+    #[cfg(unix)]
+    {
+        format!("i=0; while [ $i -lt {count} ]; do echo {prefix}$i; i=$((i+1)); done; {then}")
+    }
+    #[cfg(windows)]
+    {
+        format!("0..{} | ForEach-Object {{ Write-Output \"{prefix}$_\" }}; {then}", count - 1)
+    }
+}
+
+/// Prints `count` lines, each a number padded to `width` digits, then runs `then`.
+fn padded_lines(count: u32, width: u32, then: &str) -> String {
+    #[cfg(unix)]
+    {
+        format!("i=0; while [ $i -lt {count} ]; do printf '%0{width}d\\n' $i; i=$((i+1)); done; {then}")
+    }
+    #[cfg(windows)]
+    {
+        format!("0..{} | ForEach-Object {{ Write-Output ('{{0:D{width}}}' -f $_) }}; {then}", count - 1)
+    }
+}
+
+/// How many answers a view that reads none are sent before it is hung up on: more on Windows, where a named
+/// pipe holds a larger buffer than a socket does.
+#[cfg(unix)]
+const HELD_ANSWERS: u32 = 20_000;
+#[cfg(windows)]
+const HELD_ANSWERS: u32 = 400_000;
+
+/// A program that echoes what it is sent and takes no more than its lines, as `cat` does on POSIX.
+#[cfg(unix)]
+const ECHOING_PROGRAM: &str = "/bin/cat";
+#[cfg(unix)]
+const ECHOING_ARGS: &[&str] = &[];
+#[cfg(windows)]
+const ECHOING_PROGRAM: &str = "cmd.exe";
+#[cfg(windows)]
+const ECHOING_ARGS: &[&str] = &["/C", "findstr \"^\""];
 
 /// A line that prints `before` and `after` as one word, typed so that the word is nowhere in the line
 /// itself: what a case waits for is then the command's output and not the echo of what was typed. An
 /// empty pair of quotes is nothing to `sh`, and a caret is cmd's escape and is dropped.
 fn echoing(before: &str, after: &str) -> String {
-    if cfg!(windows) { format!("echo {before}^{after}") } else { format!("echo {before}''{after}") }
+    if cfg!(windows) { format!("Write-Output ('{before}'+'{after}')") } else { format!("echo {before}''{after}") }
 }
 
 /// The same, with the broker's own environment arranged first: a bound a case is about, set where a
@@ -150,7 +227,7 @@ impl Client {
 
     /// The same, saying whether a program in it may place images.
     fn shell_taking(&self, images: bool) -> String {
-        self.running(SHELL, &[], images)
+        self.running(SHELL, SHELL_ARGS, images)
     }
 
     /// A session running `program`, whose bytes nobody reads.
@@ -341,7 +418,6 @@ fn a_view_draws_a_shell_and_its_keys_reach_it() {
     assert!(leaked.is_empty(), "the client was sent {leaked:?}");
 }
 
-#[cfg(unix)]
 #[test]
 fn history_is_fetched_by_line_and_text_is_read_and_searched() {
     let broker = start();
@@ -349,7 +425,7 @@ fn history_is_fetched_by_line_and_text_is_read_and_searched() {
     let session = client.shell();
     let mut view = View::attached(&broker, &session);
     view.until_shows("$ ");
-    view.type_line("i=0; while [ $i -lt 120 ]; do echo line-$i; i=$((i+1)); done; echo fin$((1+1))ished");
+    view.type_line(&numbered_lines(120, "line-", &echo_sum("fin", 1, 1, "ished")));
     // Arithmetic, so what is waited for is the output and not the echo of the command that asks for it
     view.until_shows("fin2ished");
 
@@ -384,7 +460,6 @@ fn history_is_fetched_by_line_and_text_is_read_and_searched() {
     assert_eq!(read, "line-7\nline-8");
 }
 
-#[cfg(unix)]
 #[test]
 fn a_paste_that_could_run_a_command_is_refused_until_the_person_allows_it() {
     let broker = start();
@@ -393,7 +468,7 @@ fn a_paste_that_could_run_a_command_is_refused_until_the_person_allows_it() {
     let mut view = View::attached(&broker, &session);
     view.until_shows("$ ");
 
-    let dangerous = "echo PA$((1+1))STE\n".to_owned();
+    let dangerous = format!("{}\n", echo_sum("PA", 1, 1, "STE"));
     view.send(&ToBroker::Paste { channel: 1, request: 3, allow_unsafe: false, text: dangerous.clone() });
     let outcome = view.answer(|message| match message {
         ToView::Pasted { request: 3, outcome, .. } => Some(*outcome),
@@ -475,6 +550,7 @@ fn a_view_leaving_or_sending_nonsense_leaves_the_session_running() {
 
 /// What a program asks of the world outside its screen reaches the app's own connection, as it happens —
 /// from a session whose bytes are not sent at all.
+// not ported: on Windows the broker answers none of the OSC sequences (observed); the cause is undiagnosed.
 #[cfg(unix)]
 #[test]
 fn a_programs_title_clipboard_and_commands_are_told_to_the_client() {
@@ -482,7 +558,10 @@ fn a_programs_title_clipboard_and_commands_are_told_to_the_client() {
     let client = Client::greeting(&broker);
     let session = client.shell();
     let write = |text: &str| say(&client.stream, &Request::Write { session: session.clone(), text: text.to_owned() });
-    write("printf '\\033]0;a title\\007\\033]52;c;aGk=\\007\\033]633;E;make\\007\\033]633;C\\007\\033]633;D;2\\007'\n");
+    write(&format!(
+        "{}\n",
+        printed("\\033]0;a title\\007\\033]52;c;aGk=\\007\\033]633;E;make\\007\\033]633;C\\007\\033]633;D;2\\007")
+    ));
 
     let mut told = Vec::new();
     while told.len() < 4 {
@@ -501,7 +580,6 @@ fn a_programs_title_clipboard_and_commands_are_told_to_the_client() {
 /// A shell that marks its commands is remembered: a view is told when there is something new to ask for and
 /// is answered with each command and the lines that are its, and the app's own connection can read what
 /// one printed.
-#[cfg(unix)]
 #[test]
 fn the_commands_a_shell_marks_are_listed_with_their_lines_and_their_output_is_read() {
     let broker = start();
@@ -513,7 +591,11 @@ fn the_commands_a_shell_marks_are_listed_with_their_lines_and_their_output_is_re
 
     // The marks a shell's integration writes around a command, written here by hand: its prompt, the
     // start of its output and its end with a status
-    view.type_line("printf '\\033]133;A\\007\\033]133;C\\007first\\nsecond\\n\\033]133;D;3\\007'; echo mar$((1+1))ked");
+    view.type_line(&format!(
+        "{}; {}",
+        printed("\\033]133;A\\007\\033]133;C\\007first\\nsecond\\n\\033]133;D;3\\007"),
+        echo_sum("mar", 1, 1, "ked")
+    ));
     view.until_shows("mar2ked");
     assert_ne!(view.last.as_ref().expect("a frame arrived").commands, before, "a view was not told to ask again");
 
@@ -554,7 +636,6 @@ fn the_commands_a_shell_marks_are_listed_with_their_lines_and_their_output_is_re
 
 /// The line under a cell, asked for over the connection: all of what wrapped, from its first row to its
 /// last.
-#[cfg(unix)]
 #[test]
 fn the_line_at_a_cell_is_answered_to_the_view_that_asked() {
     let broker = start();
@@ -563,7 +644,7 @@ fn the_line_at_a_cell_is_answered_to_the_view_that_asked() {
     let mut view = View::attached(&broker, &session);
     view.until_shows("$ ");
     // Sixty columns: seventy characters wrap onto a second row
-    view.type_line(&format!("echo st$((1+1))art-{}", "w".repeat(70)));
+    view.type_line(&echo_sum("st", 1, 1, &format!("art-{}", "w".repeat(70))));
     view.until_shows("st2art-");
 
     view.send(&ToBroker::Search { channel: 1, request: 5, needle: "st2art-".to_owned(), case_sensitive: false });
@@ -651,6 +732,7 @@ fn an_image_named_as_a_file_and_shown_through_cells_is_sent_with_its_row() {
 
 /// An image a program places is told to a view that asks where the images are, and its pixels to one that
 /// asks for them — in a session that was started taking images, with cells whose size is known.
+// not ported: on Windows the placed image is not listed (observed); the cause is undiagnosed.
 #[cfg(unix)]
 #[test]
 fn a_placed_image_and_its_pixels_are_answered_to_the_view_that_asked() {
@@ -664,7 +746,11 @@ fn a_placed_image_and_its_pixels_are_answered_to_the_view_that_asked() {
     let mut view = View::attached(&broker, &session);
     view.until_shows("$ ");
     // One red pixel, sent whole and shown where the cursor is
-    view.type_line("printf '\\033_Ga=T,f=32,i=7,s=1,v=1,q=2;/wAA/w==\\033\\\\'; echo sh$((1+1))own");
+    view.type_line(&format!(
+        "{}; {}",
+        printed("\\033_Ga=T,f=32,i=7,s=1,v=1,q=2;/wAA/w==\\033\\\\"),
+        echo_sum("sh", 1, 1, "own")
+    ));
     view.until_shows("sh2own");
 
     view.send(&ToBroker::Images { channel: 1, request: 9 });
@@ -690,6 +776,7 @@ fn a_placed_image_and_its_pixels_are_answered_to_the_view_that_asked() {
 /// **A session with more images than are listed is told so, not sent a list too long to read.** As many
 /// as the bound are listed whole; one more, and the view is told how many there are and how many it
 /// could have been told of.
+// not ported: on Windows no image is listed (observed); the cause is undiagnosed.
 #[cfg(unix)]
 #[test]
 fn a_session_holding_more_images_than_are_listed_says_so_and_one_holding_as_many_lists_them() {
@@ -704,9 +791,9 @@ fn a_session_holding_more_images_than_are_listed_says_so_and_one_holding_as_many
     );
     let mut view = View::attached(&broker, &session);
     view.until_shows("$ ");
-    let place = |image: u32| format!("printf '\\033_Ga=T,f=32,i={image},s=1,v=1,q=2;/wAA/w==\\033\\\\'");
+    let place = |image: u32| printed(&format!("\\033_Ga=T,f=32,i={image},s=1,v=1,q=2;/wAA/w==\\033\\\\"));
 
-    view.type_line(&format!("{}; {}; echo tw$((1+1))o", place(7), place(8)));
+    view.type_line(&format!("{}; {}; {}", place(7), place(8), echo_sum("tw", 1, 1, "o")));
     view.until_shows("tw2o");
     view.send(&ToBroker::Images { channel: 1, request: 9 });
     let listed = view.answer(|message| match message {
@@ -716,7 +803,7 @@ fn a_session_holding_more_images_than_are_listed_says_so_and_one_holding_as_many
     });
     assert_eq!(listed, 2);
 
-    view.type_line(&format!("{}; echo thr$((1+2))ee", place(9)));
+    view.type_line(&format!("{}; {}", place(9), echo_sum("thr", 1, 2, "ee")));
     view.until_shows("thr3ee");
     view.send(&ToBroker::Images { channel: 1, request: 10 });
     let refused = view.answer(|message| match message {
@@ -732,6 +819,7 @@ fn a_session_holding_more_images_than_are_listed_says_so_and_one_holding_as_many
 /// **A view that loses focus holds no button down any more.** The button is let go somewhere else, so
 /// the release this view would have reported never comes: a move it reports after that is not a drag,
 /// where one it reported with the button down was.
+// not ported: on Windows the view never receives a frame with mouse reporting on (observed); the cause is undiagnosed.
 #[cfg(unix)]
 #[test]
 fn a_view_that_loses_focus_with_a_button_down_is_no_longer_dragging() {
@@ -739,7 +827,14 @@ fn a_view_that_loses_focus_with_a_button_down_is_no_longer_dragging() {
     let client = Client::greeting(&broker);
     // A program that asks to be told of drags and then waits for a line that never ends: its terminal
     // echoes what it is sent, an escape as `^[`, so a pointer report is on the screen as text
+    #[cfg(unix)]
     let session = client.running("/bin/sh", &["-c", "printf '\\033[?1002h\\033[?1006h'; exec cat"], false);
+    #[cfg(windows)]
+    let session = client.running(
+        "powershell.exe",
+        &["-NoProfile", "-Command", "[Console]::Write([string][char]27 + '[?1002h' + [string][char]27 + '[?1006h'); while ($true) { [Console]::ReadLine() | Out-Null }"],
+        false,
+    );
     let mut view = View::attached(&broker, &session);
     while !view.last.as_ref().is_some_and(|frame| frame.mouse) {
         view.step();
@@ -775,12 +870,11 @@ fn a_view_that_loses_focus_with_a_button_down_is_no_longer_dragging() {
 /// reads only as fast as its echo is read, and whatever was waiting on it would be holding what the
 /// reader of that echo needs. So the paste is answered at once, the rest of the broker goes on
 /// answering, and all of it reaches the program.
-#[cfg(unix)]
 #[test]
 fn a_paste_of_megabytes_into_a_program_that_echoes_holds_nothing_up() {
     let broker = start();
     let client = Client::greeting(&broker);
-    let echoing = client.running("/bin/cat", &[], false);
+    let echoing = client.running(ECHOING_PROGRAM, ECHOING_ARGS, false);
     let mut view = View::attached(&broker, &echoing);
     view.step();
 
@@ -805,7 +899,7 @@ fn a_paste_of_megabytes_into_a_program_that_echoes_holds_nothing_up() {
     let other = client.shell();
     let mut beside = View::attached(&broker, &other);
     beside.until_shows("$ ");
-    beside.type_line("echo mean$((1+1))while");
+    beside.type_line(&echo_sum("mean", 1, 1, "while"));
     beside.until_shows("mean2while");
 
     view.until_shows("that-is-all-of-it");
@@ -814,12 +908,14 @@ fn a_paste_of_megabytes_into_a_program_that_echoes_holds_nothing_up() {
 /// A program that never reads its input fills its pty with the first few kilobytes written to it. What
 /// is written after that waits in the broker — up to a bound, past which it is refused — and neither the
 /// waiting nor the refusal is anything another session, or this one's ending, has to wait for.
-#[cfg(unix)]
 #[test]
 fn a_program_that_never_reads_holds_up_neither_another_session_nor_its_own_ending() {
     let broker = start();
     let client = Client::greeting(&broker);
+    #[cfg(unix)]
     let deaf = client.running("/bin/sleep", &["600"], false);
+    #[cfg(windows)]
+    let deaf = client.running("powershell.exe", &["-NoProfile", "-Command", "Start-Sleep 600"], false);
 
     // Twenty megabytes of lines, half a megabyte to a request: more than may wait for it. Lines,
     // because a terminal takes a line that is never finished by throwing the end of it away, and one
@@ -848,7 +944,7 @@ fn a_program_that_never_reads_holds_up_neither_another_session_nor_its_own_endin
     let other = client.shell();
     let mut beside = View::attached(&broker, &other);
     beside.until_shows("$ ");
-    beside.type_line("echo unhe$((1+1))ld");
+    beside.type_line(&echo_sum("unhe", 1, 1, "ld"));
     beside.until_shows("unhe2ld");
 
     // And the one that is not reading ends when it is told to
@@ -864,12 +960,11 @@ fn a_program_that_never_reads_holds_up_neither_another_session_nor_its_own_endin
 
 /// **A resize is told to a view by the resize.** A program is told its terminal changed size and may
 /// print nothing in answer — `cat` never does — so the frame with the new grid cannot wait for output.
-#[cfg(unix)]
 #[test]
 fn a_resize_is_sent_to_a_view_though_the_program_prints_nothing() {
     let broker = start();
     let client = Client::greeting(&broker);
-    let silent = client.running("/bin/cat", &[], false);
+    let silent = client.running(ECHOING_PROGRAM, ECHOING_ARGS, false);
     let mut view = View::attached(&broker, &silent);
     let first = match view.step() {
         ToView::Frame(frame) => frame,
@@ -889,6 +984,7 @@ fn a_resize_is_sent_to_a_view_though_the_program_prints_nothing() {
 /// **A view that asks and does not read is hung up on.** What it is owed waits in a queue of its own, and
 /// that queue has an end: a view asking for megabytes over and over while taking none of them is not
 /// reading, and the broker stops holding answers for it rather than holding ever more.
+// not ported: on Windows the broker does not hang up on the unread answers within 400,000 (observed); the cause is undiagnosed.
 #[cfg(unix)]
 #[test]
 fn a_view_that_asks_without_reading_is_hung_up_on() {
@@ -903,7 +999,7 @@ fn a_view_that_asks_without_reading_is_hung_up_on() {
             &Request::Resize { session: session.clone(), cols: 500, rows: 100, cell_width: 0, cell_height: 0 },
         );
         filling.until_shows("$ ");
-        filling.type_line("i=0; while [ $i -lt 200 ]; do printf '%0500d\\n' $i; i=$((i+1)); done; echo fil$((1+1))led");
+        filling.type_line(&padded_lines(200, 500, &echo_sum("fil", 1, 1, "led")));
         filling.until_shows("fil2led");
     }
 
@@ -929,7 +1025,7 @@ fn a_view_that_asks_without_reading_is_hung_up_on() {
         end: Position { line: first.first_active + u64::from(first.screen_rows) - 1, column: 499 },
     };
     let ask = ToBroker::TextOf { channel: 1, request: 1, epoch: first.epoch, span: all };
-    let hung_up = (0..20_000).any(|_| send(&ask).is_err());
+    let hung_up = (0..HELD_ANSWERS).any(|_| send(&ask).is_err());
     assert!(hung_up, "twenty thousand answers were kept for a view that read none of them");
 
     // The session, and a view that does read, are none the worse
@@ -995,7 +1091,7 @@ fn a_session_holding_a_megabyte(broker: &Broker, client: &Client) -> (String, Vi
         &Request::Resize { session: session.clone(), cols: 1000, rows: 100, cell_width: 0, cell_height: 0 },
     );
     filling.until_shows("$ ");
-    filling.type_line("i=0; while [ $i -lt 900 ]; do printf '%01000d\\n' $i; i=$((i+1)); done; echo fil$((1+1))led");
+    filling.type_line(&padded_lines(900, 1000, &echo_sum("fil", 1, 1, "led")));
     filling.until_shows("fil2led");
     (session, filling)
 }
@@ -1022,6 +1118,7 @@ fn gone<T>(stream: &Stream, incoming: &Receiver<T>) {
 /// app's connection, its session, the view beside this one. A broker nothing is connected to leaves,
 /// and this one has a view it owes most of a megabyte: the answer is written before that connection is
 /// closed, and the broker goes after it rather than from under it.
+// POSIX only: it closes one direction of a connection, which a named pipe cannot do.
 #[cfg(unix)]
 #[test]
 fn a_view_that_finished_speaking_is_sent_its_answer_though_it_is_all_the_broker_has_left() {
@@ -1064,6 +1161,7 @@ fn a_view_that_finished_speaking_is_sent_its_answer_though_it_is_all_the_broker_
 /// to it may be waiting on a view that will never read, and only the connection closing lets it go: a
 /// view left connected there is one the broker holds an answer and a thread for, for as long as the
 /// view likes.
+// POSIX only: it closes one direction of a connection, which a named pipe cannot do.
 #[cfg(unix)]
 #[test]
 fn a_view_that_sends_what_is_not_the_protocol_is_hung_up_on_though_it_has_not_read_what_it_is_owed() {
@@ -1100,6 +1198,7 @@ fn a_view_that_sends_what_is_not_the_protocol_is_hung_up_on_though_it_has_not_re
 
 /// **A connection says hello once.** Its role is what it is counted as and how it is spoken to; said
 /// again it is refused, and the connection is still the one it was.
+// POSIX only: it closes one direction of a connection, which a named pipe cannot do.
 #[cfg(unix)]
 #[test]
 fn a_second_hello_is_refused_and_changes_nothing() {
@@ -1145,6 +1244,7 @@ fn first_epoch(view: &mut View) -> u32 {
 /// **A view that detaches is a view that has gone**, and with the last of them goes what the views were
 /// told: the next to attach is in a numbering of its own, rather than one a view that left may still
 /// hold rows of. The same when it is the connection that goes.
+// POSIX only: it closes one direction of a connection, which a named pipe cannot do.
 #[cfg(unix)]
 #[test]
 fn the_last_view_leaving_ends_the_numbering_it_was_told() {
@@ -1270,7 +1370,7 @@ fn a_session_that_ends_is_over_for_its_view_while_the_client_reads_nothing() {
             cols: 60,
             rows: 8,
             shell: Some(SHELL.to_owned()),
-            args: Vec::new(),
+            args: SHELL_ARGS.iter().map(|argument| (*argument).to_owned()).collect(),
             env: vec![
                 ("PS1".to_owned(), "$ ".to_owned()),
                 ("ENV".to_owned(), String::new()),
@@ -1312,6 +1412,7 @@ fn a_session_that_ends_is_over_for_its_view_while_the_client_reads_nothing() {
 
 /// Phase 0, kitty keyboard protocol: a program that asks for it is sent the escape key as the protocol encodes it,
 /// and one that does not is sent the byte it always was. Both are answered by the real pty.
+// POSIX only: the program puts its terminal in raw mode with `stty` and reads its bytes with `od` and `head`.
 #[cfg(unix)]
 #[test]
 fn a_program_that_asks_for_the_kitty_keyboard_protocol_is_sent_keys_as_it_encodes_them() {
@@ -1343,6 +1444,7 @@ fn a_program_that_asks_for_the_kitty_keyboard_protocol_is_sent_keys_as_it_encode
 /// Phase 0, wheel into a full-screen program: a program on the alternate screen that asked for no mouse is sent the
 /// cursor-down key the view sends for a wheel notch, and reads it as ESC [ B. The view's decision to send it
 /// is in its own tests; this is the part that reaches the program.
+// POSIX only: the program puts its terminal in raw mode with `stty` and reads its bytes with `od` and `head`.
 #[cfg(unix)]
 #[test]
 fn a_cursor_key_sent_to_a_full_screen_program_that_asked_for_no_mouse_reaches_it() {
@@ -1359,6 +1461,7 @@ fn a_cursor_key_sent_to_a_full_screen_program_that_asked_for_no_mouse_reaches_it
 
 /// Phase 1, OSC 52 reads are refused: a program that asks what is on the clipboard is answered nothing, so the first
 /// byte it reads is the one typed after the question, and nothing is reported to the client as a write.
+// POSIX only: the program puts its terminal in raw mode with `stty` and reads its bytes with `od` and `head`.
 #[cfg(unix)]
 #[test]
 fn a_program_that_asks_what_the_clipboard_holds_is_answered_nothing() {

@@ -38,6 +38,10 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  # The files whose mutants only Windows can answer. Each is wholly `cfg(windows)`: the Linux run leaves it out
+  # of its diff, and the Windows run mutates it. A file with Windows arms among POSIX code is not listed: its
+  # Windows arms are answered by a dispatch (`-f files=`), as they were before.
+  WINDOWS_ONLY: src/tree.rs src/listening/pipe.rs
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -62,7 +66,10 @@ jobs:
           fetch-depth: 0
       - id: scope
         run: |
-          git diff $(bash .github/base.sh) -- '*.rs' > change.diff
+          # The Windows-only files are not this job's (`WINDOWS_ONLY`): it cannot compile them
+          excludes=()
+          for file in $WINDOWS_ONLY; do excludes+=(":!$file"); done
+          git diff $(bash .github/base.sh) -- '*.rs' "${excludes[@]}" > change.diff
           if [ -s change.diff ]; then
             echo "code=true" >> "$GITHUB_OUTPUT"
           else
@@ -145,8 +152,13 @@ jobs:
           # A mixed file's Windows arms are answered by a dispatch (`-f files=src/session.rs`): nothing here
           # can tell a Windows mutant from a POSIX one inside one file, and a developer naming the file is
           # the claim being made deliberately rather than by a grep.
-          windows_only="src/tree.rs"
-          mapfile -t files < <(git diff --name-only --diff-filter=d "$base" -- $windows_only)
+          # `base` is git arguments (`--merge-base HEAD^1` on a pull request), so it is split here as the Linux
+          # job's diff is. A failed diff fails this step: an empty list would pass a job that mutated nothing.
+          names="$(git diff --name-only --diff-filter=d $base -- $WINDOWS_ONLY)"
+          files=()
+          while IFS= read -r name; do
+            [ -n "$name" ] && files+=("$name")
+          done <<< "$names"
           if [ ${#files[@]} -gt 0 ]; then
             args=""
             for file in "${files[@]}"; do args="$args --file $file"; done

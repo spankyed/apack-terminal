@@ -69,6 +69,8 @@ pub fn watching(_broker: &std::process::Child, _program: &str) -> Reaper {
 pub struct Ending {
     #[cfg(unix)]
     watcher: Option<(Child, ChildStdin)>,
+    #[cfg(windows)]
+    job: Option<contained::CaseJob>,
 }
 
 /// Starts watching for the end of the case on behalf of whatever broker comes to hold `socket`. Called
@@ -115,10 +117,154 @@ pub fn ending_with_the_case(socket: &std::path::Path, program: &str) -> Ending {
     Ending { watcher: Some((watcher, held)) }
 }
 
-#[cfg(not(unix))]
+/// On Windows the case's processes are in a job of its own, which the case's `Ending` ends when it is
+/// dropped. A process started with `spawn_contained` while this is held is put in the job before it runs,
+/// and so is the broker it starts: a job's processes inherit into their children, and nothing here breaks
+/// away. A killed case ends its job when the test process ends, the handle closing with it.
+#[cfg(windows)]
 pub fn ending_with_the_case(_socket: &std::path::Path, _program: &str) -> Ending {
-    // There is no file beside a pipe to ask after, and a broker a case leaves is ended by its own rules
-    Ending {}
+    Ending { job: Some(contained::CaseJob::new()) }
+}
+
+/// Starts `command` as the case that holds an `Ending` would, so that it and what it starts are ended with
+/// that case. Without one on this thread it is started as it always is.
+#[cfg(unix)]
+pub fn spawn_contained(command: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+    command.spawn()
+}
+
+#[cfg(windows)]
+pub fn spawn_contained(command: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+    contained::spawn(command)
+}
+
+/// The Windows half of `spawn_contained`: a case's job, and a process started suspended so it is in the job
+/// before its first instruction runs.
+///
+/// **A process started and then assigned to a job can start a child first.** So it starts suspended, is
+/// assigned, and only then has its threads resumed; the child it starts is in the job from its beginning.
+/// `Ending`'s drop ends the job with `TerminateJobObject`, which ends every process in it at once.
+#[cfg(windows)]
+mod contained {
+    use std::cell::RefCell;
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::process::CommandExt;
+    use std::process::{Child, Command};
+    use std::ptr::null;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation, QueryInformationJobObject,
+        SetInformationJobObject, TerminateJobObject,
+    };
+    use windows_sys::Win32::System::Threading::{CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+
+    thread_local! {
+        /// The job of the case this thread is running, if one holds an `Ending`
+        static CURRENT: RefCell<Option<usize>> = const { RefCell::new(None) };
+    }
+
+    /// A job for one case, ended when the case's `Ending` is dropped.
+    pub struct CaseJob(HANDLE);
+
+    impl CaseJob {
+        pub fn new() -> Self {
+            // SAFETY: plain calls on handles this function creates and owns
+            unsafe {
+                let job = CreateJobObjectW(null(), null());
+                assert!(!job.is_null(), "a job for the case is made");
+                let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                let set = SetInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                );
+                assert!(set != 0, "the job ends with the case");
+                CURRENT.with(|current| *current.borrow_mut() = Some(job as usize));
+                CaseJob(job)
+            }
+        }
+    }
+
+    impl Drop for CaseJob {
+        fn drop(&mut self) {
+            CURRENT.with(|current| *current.borrow_mut() = None);
+            // SAFETY: the handle is this job's, and is closed once, here
+            unsafe {
+                TerminateJobObject(self.0, 1);
+            }
+            // Termination is asked for, and the processes end a moment later: the case's broker is let go only
+            // once the job holds none (the POSIX watcher is waited for in the same way), counted rather than timed
+            let waiting_since = std::time::Instant::now();
+            while active_processes(self.0) > 0 && waiting_since.elapsed() < std::time::Duration::from_secs(10) {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            // SAFETY: as above
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    /// The processes the job holds. A query that fails reports none, which ends the wait early rather than
+    /// holding the case for a job that cannot be read.
+    fn active_processes(job: HANDLE) -> u32 {
+        // SAFETY: a query into a local the size of its record
+        unsafe {
+            let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = std::mem::zeroed();
+            let mut returned = 0u32;
+            let ok = QueryInformationJobObject(
+                job,
+                JobObjectBasicAccountingInformation,
+                (&mut info as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                &mut returned,
+            );
+            if ok == 0 { 0 } else { info.ActiveProcesses }
+        }
+    }
+
+    pub fn spawn(command: &mut Command) -> std::io::Result<Child> {
+        let Some(job) = CURRENT.with(|current| *current.borrow()) else { return command.spawn() };
+        command.creation_flags(CREATE_SUSPENDED);
+        let child = command.spawn()?;
+        // SAFETY: the process handle is the child's, live while `child` is
+        let assigned = unsafe { AssignProcessToJobObject(job as HANDLE, child.as_raw_handle() as HANDLE) };
+        assert!(assigned != 0, "the process joins the case's job");
+        resume_threads(child.id());
+        Ok(child)
+    }
+
+    /// Resumes every thread of `pid`: a suspended process starts with one, and only the threads of this process
+    /// are named by its id.
+    fn resume_threads(pid: u32) {
+        // SAFETY: a snapshot this function takes and closes, and thread handles it opens and closes
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            assert!(snapshot != INVALID_HANDLE_VALUE, "the threads are listed");
+            let mut entry: THREADENTRY32 = std::mem::zeroed();
+            entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+            let mut more = Thread32First(snapshot, &mut entry) != 0;
+            while more {
+                if entry.th32OwnerProcessID == pid {
+                    let thread = OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID);
+                    if !thread.is_null() {
+                        ResumeThread(thread);
+                        CloseHandle(thread);
+                    }
+                }
+                more = Thread32Next(snapshot, &mut entry) != 0;
+            }
+            CloseHandle(snapshot);
+        }
+    }
 }
 
 impl Drop for Ending {
