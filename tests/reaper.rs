@@ -69,8 +69,9 @@ pub fn watching(_broker: &std::process::Child, _program: &str) -> Reaper {
 pub struct Ending {
     #[cfg(unix)]
     watcher: Option<(Child, ChildStdin)>,
+    /// Held for what dropping it does: the job, and every process in it, ends
     #[cfg(windows)]
-    job: Option<contained::CaseJob>,
+    _job: Option<contained::CaseJob>,
 }
 
 /// Starts watching for the end of the case on behalf of whatever broker comes to hold `socket`. Called
@@ -123,7 +124,7 @@ pub fn ending_with_the_case(socket: &std::path::Path, program: &str) -> Ending {
 /// away. A killed case ends its job when the test process ends, the handle closing with it.
 #[cfg(windows)]
 pub fn ending_with_the_case(_socket: &std::path::Path, _program: &str) -> Ending {
-    Ending { job: Some(contained::CaseJob::new()) }
+    Ending { _job: Some(contained::CaseJob::new()) }
 }
 
 /// Starts `command` as the case that holds an `Ending` would, so that it and what it starts are ended with

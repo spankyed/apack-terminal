@@ -236,6 +236,7 @@ impl Client {
     }
 
     /// A shell whose programs may send images and may name one as a file on this machine.
+    #[cfg(unix)]
     fn shell_reading_files(&self) -> String {
         self.started(SHELL, &[], true, true)
     }
@@ -1085,8 +1086,10 @@ fn a_view_that_asks_without_reading_is_hung_up_on() {
 }
 
 /// One end of a connection as something to read from, for a reader that is kept between reads.
+#[cfg(unix)]
 struct Reading(Arc<Stream>);
 
+#[cfg(unix)]
 impl Read for Reading {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         (&*self.0).read(buffer)
@@ -1096,12 +1099,14 @@ impl Read for Reading {
 /// A view's connection that **takes what it is sent only when a case reads it**: greeted, attached on
 /// channel 1, and with its first frame read. `View` reads on a thread of its own, as a window does, so
 /// it cannot be a view that has stopped reading.
+#[cfg(unix)]
 struct Unread {
     stream: Arc<Stream>,
     reader: BufReader<Reading>,
     first: Frame,
 }
 
+#[cfg(unix)]
 impl Unread {
     fn attached(broker: &Broker, session: &str) -> Self {
         let stream = connect(broker);
@@ -1134,6 +1139,7 @@ impl Unread {
 /// A session holding most of a megabyte of text, with the view that typed it: far more than a
 /// connection carries unread, on any platform, so an answer made of it is one the broker is still
 /// writing for as long as the view it is for reads nothing.
+#[cfg(unix)]
 fn a_session_holding_a_megabyte(broker: &Broker, client: &Client) -> (String, View) {
     let session = client.shell();
     let mut filling = View::attached(broker, &session);
@@ -1285,6 +1291,7 @@ fn a_second_hello_is_refused_and_changes_nothing() {
 /// the next frame to arrive: a view that attaches again may still be sent a frame of the attachment it
 /// left, written before the broker read that it had gone. Nothing here changes a colour, so the frame
 /// that has them is the one a new attachment begins with.
+#[cfg(unix)]
 fn first_epoch(view: &mut View) -> u32 {
     view.answer(|message| match message {
         ToView::Frame(frame) if frame.colors.is_some() => Some(frame.epoch),

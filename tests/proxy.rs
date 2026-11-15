@@ -16,7 +16,9 @@ use std::time::{Duration, Instant};
 
 use interprocess::local_socket::{GenericFilePath, Stream, ToFsName, prelude::*};
 
-use apack_terminal::listening::{HELD_EXIT, Refused, START_GRACE, START_GRACE_ENV, hold, start_grace};
+use apack_terminal::listening::{HELD_EXIT, START_GRACE, START_GRACE_ENV, start_grace};
+#[cfg(unix)]
+use apack_terminal::listening::{Refused, hold};
 use apack_terminal::protocol::{Event, PROTOCOL_VERSION, Request, Role};
 
 /// How long a wait in this file goes on with nothing arriving. **Shorter than the runner's deadline for a

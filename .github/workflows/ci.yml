@@ -118,6 +118,10 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.148
+      # **Windows is linted where it is built.** `checks` lints Linux, where `cfg(windows)` code and what only a
+      # POSIX case uses look different: a helper only POSIX cases call is unused here, and nothing else says so
+      - if: runner.os == 'Windows'
+        run: cargo clippy --workspace --all-targets -- -D warnings
       # Each test in its own process, killed at `.config/nextest.toml`'s deadline: a regression here loses a
       # signal, which is a read that never returns rather than a wrong answer
       - run: cargo nextest run --workspace --no-fail-fast
