@@ -93,9 +93,9 @@ pub fn on_special_filesystem(device: Device, special: &[Device]) -> bool {
 
 /// Whether a shared memory object's mode is one: on Linux a regular file, on macOS of no file type at
 /// all. A FIFO, a directory or a device is not.
-pub fn shared_memory_kind(mode: u32) -> bool {
-    let kind = mode & u32::from(libc::S_IFMT);
-    kind == 0 || kind == u32::from(libc::S_IFREG)
+pub fn shared_memory_kind(mode: libc::mode_t) -> bool {
+    let kind = mode & libc::S_IFMT;
+    kind == 0 || kind == libc::S_IFREG
 }
 
 /// Unlinks a shared memory object when dropped: the protocol has the terminal unlink what it was named
@@ -129,7 +129,7 @@ pub fn shared_memory(name: &[u8], range: impl FnOnce(u64) -> Option<Range<u64>>)
     if unsafe { libc::fstat(object.as_raw_fd(), &raw mut stat) } != 0 {
         return None;
     }
-    if !shared_memory_kind(u32::from(stat.st_mode)) {
+    if !shared_memory_kind(stat.st_mode) {
         return None;
     }
     let size = u64::try_from(stat.st_size).ok()?;

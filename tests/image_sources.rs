@@ -654,9 +654,9 @@ fn a_file_on_proc_is_not_read() {
 #[test]
 fn a_shared_memory_object_is_what_its_mode_says() {
     assert!(shared_memory_kind(0o600));
-    assert!(shared_memory_kind(u32::from(libc::S_IFREG) | 0o600));
+    assert!(shared_memory_kind(libc::S_IFREG | 0o600));
     for other in [libc::S_IFIFO, libc::S_IFDIR, libc::S_IFCHR, libc::S_IFBLK, libc::S_IFSOCK, libc::S_IFLNK] {
-        assert!(!shared_memory_kind(u32::from(other) | 0o600), "{other:o} is taken for shared memory");
+        assert!(!shared_memory_kind(other | 0o600), "{other:o} is taken for shared memory");
     }
 }
 
