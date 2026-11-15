@@ -18,6 +18,13 @@ const BINARY: &str = "apack-terminal.exe";
 #[cfg(not(windows))]
 const BINARY: &str = "apack-terminal";
 
+/// What goes beside the binary on Windows: the ConPTY it runs its sessions on, which `build.rs` puts beside every
+/// build and which is found only there (`windows/conpty/README.md`). `node/package.json` ships these too.
+#[cfg(windows)]
+const BESIDE: &[&str] = &["conpty.dll", "OpenConsole.exe"];
+#[cfg(not(windows))]
+const BESIDE: &[&str] = &[];
+
 /// Builds the broker for release and stages it in `node/`
 pub fn package(root: &Path) -> Result<(), String> {
     let status = Command::new(env!("CARGO"))
@@ -28,13 +35,19 @@ pub fn package(root: &Path) -> Result<(), String> {
     if !status.success() {
         return Err(format!("cargo build --release failed with {status}"));
     }
-    let built = root.join("target/release").join(BINARY);
+    for file in std::iter::once(BINARY).chain(BESIDE.iter().copied()) {
+        stage(&root.join("target/release").join(file), &root.join("node").join(file))?;
+    }
+    Ok(())
+}
+
+/// Copies `built` to `into`, by way of a file beside it
+fn stage(built: &Path, into: &Path) -> Result<(), String> {
     if !built.exists() {
-        // A build that reported success and wrote nothing under this name would stage the binary from the
+        // A build that reported success and wrote nothing under this name would stage the file from the
         // build before, which is the failure this names rather than hides
         return Err(format!("cargo build --release wrote no {}", built.display()));
     }
-    let into = root.join("node").join(BINARY);
 
     // **Staged by rename, never written over.** macOS caches a binary's code signature against the file it
     // executed, so overwriting an executable in place at a path that has already been run leaves the cache
@@ -49,11 +62,11 @@ pub fn package(root: &Path) -> Result<(), String> {
     // lives beside the destination because a rename across filesystems is not atomic and would fall back to
     // a copy, which is the thing being avoided.
     let staging = into.with_extension("staging");
-    std::fs::copy(&built, &staging).map_err(|e| format!("{} -> {}: {e}", built.display(), staging.display()))?;
-    std::fs::rename(&staging, &into).map_err(|e| {
+    std::fs::copy(built, &staging).map_err(|e| format!("{} -> {}: {e}", built.display(), staging.display()))?;
+    std::fs::rename(&staging, into).map_err(|e| {
         std::fs::remove_file(&staging).ok();
         format!("{} -> {}: {e}", staging.display(), into.display())
     })?;
-    println!("staged {} ({} bytes)", into.display(), std::fs::metadata(&into).map_err(|e| e.to_string())?.len());
+    println!("staged {} ({} bytes)", into.display(), std::fs::metadata(into).map_err(|e| e.to_string())?.len());
     Ok(())
 }

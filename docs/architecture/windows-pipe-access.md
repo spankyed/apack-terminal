@@ -53,9 +53,21 @@ ACEs and the same `…-513` group — so the group on the object was never ours 
 either: no ACE names it, and the pipe is inherited into by nothing. A descriptor should not say things the
 object will not hold.
 
-## What a second account would add
+## A second account
 
-Nothing that this does not already settle. The DACL is protected and names two accounts, so any third is
-denied by Windows' own semantics rather than by anything in this repository; an account created to be
-refused would be testing `AccessCheck`. What was worth measuring was whether our descriptor is the one on
-the object, and that is the reading above.
+**Refused in every direction.** On the development VM, 2026-11-15, a throwaway local account (not an
+administrator) tried the pipe of a broker the first account had started, through .NET's
+`NamedPipeClientStream`: for reading and writing, for reading alone and for writing alone, each was
+`Access to the path is denied`. That is the DACL above doing what Windows' semantics say it does, now seen.
+
+**What a second account does add is the name.** A pipe's name is one namespace for the whole machine, and any
+account may create a pipe under a name nobody holds yet — with a descriptor that lets this user in. A client
+connecting by name then reaches the other account's process, and the DACL on *our* pipe has nothing to say about
+it. So a proxy asks whose the pipe it reached is before it carries a byte (`listening::peer_is_this_user`, which on
+Windows reads the pipe's owner: `pipe::owned_by_this_user`), as it asks the kernel for the peer's uid on POSIX.
+An owner is the creator or a SID the creator holds, so an ordinary account cannot make a pipe that answers with
+ours. In the same run the second account created such a pipe, open to Everyone, and the first account's proxy was
+pointed at it: the proxy refused (`what is listening on \\.\pipe\apack-r8-squat-… is another user's, not a broker of
+this one's`) and the other account's pipe received 0 bytes. Reading that owner is tested in the suite against a
+pipe made as the broker's is (`src/listening/pipe.rs`); a pipe some other account owns is what needed the second
+account.

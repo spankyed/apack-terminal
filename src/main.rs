@@ -74,7 +74,14 @@ fn main() -> std::io::Result<()> {
         // at the place a broker is by default when no place is named
         [mode, rest @ ..] if mode == "proxy" && rest.len() <= 1 => {
             let Some(socket) = rest.first().cloned().or_else(listening::default_socket) else {
-                eprintln!("apack-terminal: no socket was named, and there is no home directory to keep one in");
+                eprintln!(
+                    "apack-terminal: no socket was named, and {}",
+                    if cfg!(windows) {
+                        "this user's SID could not be read to name one"
+                    } else {
+                        "there is no home directory to keep one in"
+                    }
+                );
                 std::process::exit(2);
             };
             return apack_terminal::proxy::run(&socket).inspect_err(|error| eprintln!("apack-terminal: {error}"));

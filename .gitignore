@@ -12,4 +12,7 @@
 # elmdb gitignores the `*.node` its own package ships.
 /node/apack-terminal
 /node/apack-terminal.exe
+# and on Windows the ConPTY staged beside it (`windows/conpty/`)
+/node/conpty.dll
+/node/OpenConsole.exe
 mutants.out/
