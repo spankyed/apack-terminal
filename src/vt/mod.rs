@@ -874,6 +874,21 @@ impl Reported {
         std::mem::take(&mut self.replies)
     }
 
+    /// How many replies are waiting to be taken.
+    pub fn reply_count(&self) -> usize {
+        self.replies.len()
+    }
+
+    /// The replies made since there were `count` waiting, taken.
+    pub fn take_replies_from(&mut self, count: usize) -> Vec<String> {
+        self.replies.split_off(count.min(self.replies.len()))
+    }
+
+    /// A reply made for the terminal rather than by it: the core's own, given when it was asked.
+    pub fn reply(&mut self, reply: String) {
+        self.replies.push(reply);
+    }
+
     pub fn facts(&self) -> &Facts {
         &self.facts
     }

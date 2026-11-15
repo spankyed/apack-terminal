@@ -67,7 +67,11 @@ const LONGEST_PATH: usize = 32_768;
 const FINAL_PATH: u32 = FILE_NAME_NORMALIZED;
 const _: () = assert!(VOLUME_NAME_DOS == 0);
 
-/// Never read: the core reads no shared memory object on Windows, so a command naming one is refused.
-pub fn shared_memory(_name: &[u8], _range: impl FnOnce(u64) -> Option<std::ops::Range<u64>>) -> Option<Vec<u8>> {
-    None
+/// Never read: the core reads no shared memory object on Windows (`UnsupportedMedium`), so a command
+/// naming one is refused — by the core itself, where it can be asked (`Load::asked`).
+pub fn shared_memory(
+    _name: &[u8],
+    _range: impl FnOnce(u64) -> Result<std::ops::Range<u64>, super::Refused>,
+) -> Result<Vec<u8>, super::Refused> {
+    Err(super::Refused::InvalidData)
 }

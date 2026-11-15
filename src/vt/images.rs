@@ -227,8 +227,9 @@ impl Terminal {
     /// shared memory object a program names. **A session never does**: the core opens a path before it
     /// asks what it is, so a FIFO stops it, and it reads inside the write that parses a session's output.
     /// A session that takes images by name has them read by `image_sources` instead, and its core is fed
-    /// the bytes (`Screen::allow_images`). `files` is here for what the suite holds that reading to: the
-    /// core doing it itself, over sources that answer. The protocol's third way in, a temporary file the
+    /// the bytes (`Screen::allow_images`); it allows `files` only while it feeds the core a command naming
+    /// a source with a NUL in it, which the core refuses before it opens anything. `files` is also what the
+    /// suite holds that reading to: the core doing it itself, over sources that answer. The protocol's third way in, a temporary file the
     /// terminal deletes, stays off either way.
     pub fn allow_images(&self, files: bool) -> Result<(), Failed> {
         let limit: u64 = IMAGE_STORAGE_BYTES;
@@ -389,12 +390,6 @@ impl Terminal {
             sys::ghostty_terminal_get(self.handle, sys::TerminalData::KITTY_GRAPHICS, (&raw mut graphics).cast())
         };
         (result == sys::Result::SUCCESS && !graphics.is_null()).then_some(graphics)
-    }
-
-    /// Whether the active screen holds an image of this id.
-    pub fn has_image(&self, id: u32) -> bool {
-        // SAFETY: the storage is this terminal's; a null image is one that is not there
-        self.graphics().is_some_and(|graphics| !unsafe { sys::ghostty_kitty_graphics_image(graphics, id) }.is_null())
     }
 
     /// Moves whenever a program sends, replaces, places or deletes an image; zero while there are none.

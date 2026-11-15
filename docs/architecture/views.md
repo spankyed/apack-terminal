@@ -248,17 +248,17 @@ session restored from one (`screen.rs`, `rebuild`).
 
 **A named image is read by the broker, never by the core** (`vt/image_sources/`). The core opens a path
 and then looks at what it opened, inside the write that parses the session's output, so a FIFO stopped a
-session being read. A session's core takes no file and no shared memory object; each command naming one is
-taken out of the stream instead — only it: control data that names no source, and every payload of sent
-bytes, is fed as it comes — and its source opened without waiting, asked about through the descriptor it
-was opened as, and read with the screen let go of — on a thread of its own, given up on once it has gone
-five seconds without reading anything, so a mount that has stopped answering holds the session up that
-long and no longer. What was read is fed to the core as the bytes it holds,
-in pieces where it is large, with the program's keys as the core read them, so the program is answered as
-the core would answer it. A FIFO, a directory, a device, a socket, a path that is not there, a file on a
-filesystem mounted at or beneath `/proc`, `/sys` or `/dev` (but for `/dev/shm`), a name longer than any path, and a name that is not base64 as the protocol has
-it are refused, and the program told what it is told of a file that could not be read. What is not looked
-at is in [design.md](design.md#known-limits).
+session being read. Each command naming a source is taken out of the stream instead. The core is asked
+whether it would get as far as reading it — fed the command naming a source with a NUL in it, which it
+refuses before opening anything, having done all it does first — and only if it would is the source
+read: opened without waiting, asked about through the descriptor it was opened as, and read with the
+screen let go of, on a thread of its own that is given up on once the system has gone five seconds
+without answering it. What was read is fed to the core as the bytes it holds, in pieces where it is large,
+with the program's keys as the core read them; what was not is refused with the core's own answer. So the
+program is told, and shown, what the core reading the source itself would tell and show it. A FIFO, a
+directory, a device, a socket, a path that is not there and a file on a filesystem mounted at or beneath
+`/proc`, `/sys` or `/dev` (but for `/dev/shm`) are refused without a wait. Where a session answers
+otherwise, and what is bounded rather than prevented, is in [design.md](design.md#known-limits).
 
 ## The two halves meet in a file
 

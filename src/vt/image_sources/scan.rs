@@ -9,22 +9,20 @@
 //! is read into keys and values (`Control`, `Keys`); and how a value is read as a number (`number`).
 //! `tests/image_sources.rs` holds all three to the core itself, over streams it makes up.
 //!
-//! **A command this does not understand is the core's, and the core opens nothing.** Every way this can
-//! give up — control data longer than it holds, a value it does not read as the core would — hands the
-//! command over as it came, and a session's core takes no file and no shared memory object
-//! (`Screen::allow_images`). So a disagreement with the core is an image not shown, never a path opened.
+//! **Nothing of a command is held but what the core keeps of it.** The core keeps a command's control data
+//! as its keys and their values and nothing else, so a command that names no source is fed to the core
+//! as those keys, in its own spelling, as soon as its control data ends; one the core would drop is let
+//! go of whole, the core given none of it; and of one that names its source the name is held, decoded,
+//! as the core's decoder would decode it (`Base64`). So what is held is a few hundred bytes and a path,
+//! whatever a program writes.
+//!
+//! **And the core opens nothing**: a session's core takes no file and no shared memory object
+//! (`Screen::allow_images`), so were this ever to pass a command naming one, the core would refuse it.
 
 use super::{Load, Source};
 
-/// The most control data held while it is read. A command with more is handed over as it came.
-pub const CONTROL_BYTES: usize = 4096;
-
-/// The longest path read. No system this runs on opens a longer one, so a name past this is refused
-/// without being looked at.
+/// The longest path read. No system this runs on opens a longer one, so a name past this is not read.
 pub const PATH_BYTES: usize = 4096;
-
-/// How much of a name is held: `PATH_BYTES` as base64.
-const NAME_BYTES: usize = PATH_BYTES.div_ceil(3) * 4;
 
 /// How much of a key or a value the core keeps. One more byte and it ignores the pair, and every pair
 /// after it.
@@ -224,6 +222,20 @@ impl Control {
         self.length = 0;
     }
 
+    /// The string has ended in the control data: whether the core completes the command, rather than
+    /// dropping it (`Parser.complete`). A value in hand is finished as a `,` would finish it, and a key in
+    /// hand is one the core refuses.
+    fn end(&mut self) -> bool {
+        match self.at {
+            Pair::Key | Pair::KeyIgnored => false,
+            Pair::Value => {
+                self.finish();
+                !self.refused
+            }
+            Pair::ValueIgnored => true,
+        }
+    }
+
     /// What the command asks to be read, at the `;` that ends its control data: `None` for one that
     /// names no source, or that the core would not run.
     fn names(&self) -> Option<Named> {
@@ -259,9 +271,9 @@ struct Named {
 }
 
 impl Named {
-    /// What is to be read for the command, the name it gave being `name` as base64.
-    fn load(self, name: Option<&[u8]>) -> Load {
-        let source = match name.and_then(decoded) {
+    /// What is to be read for the command, its name having been decoded as `name`.
+    fn load(self, name: Option<Vec<u8>>) -> Load {
+        let source = match name {
             Some(name) if self.shared => Source::SharedMemory(name),
             Some(path) => Source::File(path),
             None => Source::Unreadable,
@@ -270,28 +282,92 @@ impl Named {
     }
 }
 
-/// The bytes base64 `text` stands for, or `None` where a character of it is not base64's. Padding may be
-/// there or not.
-///
-/// **Stricter than the core**, whose decoder passes over characters this refuses: a name is the program's
-/// to spell, and one spelled so that two decoders read two paths is not read at all.
-fn decoded(text: &[u8]) -> Option<Vec<u8>> {
-    let text = text.strip_suffix(b"=").unwrap_or(text);
-    let text = text.strip_suffix(b"=").unwrap_or(text);
-    let mut bytes = Vec::new();
-    // The bits read and not yet written, and how many of them there are
-    let (mut bits, mut held) = (0u32, 0u32);
-    for character in text {
-        let value = ALPHABET.iter().position(|known| known == character)?;
-        bits = (bits << 6) + value as u32;
-        held += 6;
-        if held >= 8 {
-            held -= 8;
-            // The cast keeps the eight bits above the ones still held, and drops those written before
-            bytes.push((bits >> held) as u8);
+/// Whether a byte is one the core's decoder passes over in base64: ASCII white space, but for the
+/// vertical tab.
+fn white(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0c)
+}
+
+/// A name in base64, decoded a byte at a time as the core's decoder decodes it (simdutf's, in its loose
+/// mode). White space anywhere is passed over; `=` may only end it, and no more than twice; padded, it is
+/// whole groups of four, and unpadded it does not end on one character of a group; the bits a last
+/// character holds past the last whole byte are dropped. Anything else — a character outside the
+/// alphabet, `-` and `_` among them — and the core drops the command whole.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Base64 {
+    /// What has been decoded, up to `PATH_BYTES` of it
+    bytes: Vec<u8>,
+    /// More was decoded than any path is
+    long: bool,
+    /// The bits read and not yet written, and how many of them there are
+    bits: u32,
+    held: u32,
+    /// The characters read, padding among them and white space not
+    length: usize,
+    padding: usize,
+    /// Something the core's decoder refuses
+    refused: bool,
+}
+
+/// What a name decodes to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decoded {
+    /// The name as bytes
+    Name(Vec<u8>),
+    /// A name longer than any path, which nothing could open
+    TooLong,
+    /// Not base64 as the core's decoder reads it: the core drops the command
+    Refused,
+}
+
+impl Base64 {
+    /// Reads one more character of a name.
+    pub fn push(&mut self, character: u8) {
+        if white(character) {
+            return;
+        }
+        self.length += 1;
+        if character == b'=' {
+            self.padding += 1;
+            return;
+        }
+        match ALPHABET.iter().position(|known| *known == character) {
+            Some(value) if self.padding == 0 => {
+                bits_in(self, value as u32);
+            }
+            _ => self.refused = true,
         }
     }
-    Some(bytes)
+
+    /// What the characters read decode to.
+    pub fn finish(self) -> Decoded {
+        let whole = match self.padding {
+            0 => self.length % 4 != 1,
+            1 | 2 => self.length.is_multiple_of(4),
+            _ => false,
+        };
+        match (self.refused || !whole, self.long) {
+            (true, _) => Decoded::Refused,
+            (false, true) => Decoded::TooLong,
+            (false, false) => Decoded::Name(self.bytes),
+        }
+    }
+}
+
+/// Six more bits of a name, and the byte they complete if they complete one.
+fn bits_in(name: &mut Base64, value: u32) {
+    name.bits = (name.bits << 6) + value;
+    name.held += 6;
+    if name.held >= 8 {
+        name.held -= 8;
+        // The cast keeps the eight bits above the ones still held, and drops those written before
+        let byte = (name.bits >> name.held) as u8;
+        if name.bytes.len() < PATH_BYTES {
+            name.bytes.push(byte);
+        } else {
+            name.long = true;
+        }
+    }
 }
 
 /// `bytes` as base64, padded.
@@ -318,10 +394,10 @@ enum State {
     Begun,
     /// In a graphics command's control data
     Control(Control),
-    /// In the payload of a command that names its source: the name, which is held
-    Naming(Named),
-    /// In a name longer than any path, which is dropped as it comes
-    TooLong(Named),
+    /// In a command the core drops whole, all of which is passed over: the core is given none of it
+    Dropped,
+    /// In the payload of a command that names its source: its name
+    Naming(Named, Base64),
 }
 
 /// Reads the body of each string the core says has begun, and takes out of it each command that names
@@ -333,13 +409,11 @@ enum State {
 #[derive(Debug)]
 pub struct Scanner {
     state: State,
-    /// What of the body has been read and not yet fed: control data, or a name as base64
-    held: Vec<u8>,
 }
 
 impl Default for Scanner {
     fn default() -> Self {
-        Self { state: State::Away, held: Vec::new() }
+        Self { state: State::Away }
     }
 }
 
@@ -347,7 +421,6 @@ impl Scanner {
     /// The core has begun an APC, SOS or PM string: its body is `read`'s from the next byte.
     pub fn begin(&mut self) {
         self.state = State::Begun;
-        self.held.clear();
     }
 
     /// Whether the next byte is `read`'s.
@@ -355,86 +428,77 @@ impl Scanner {
         self.state != State::Away
     }
 
-    /// Reads a string's body from the front of `bytes`, feeding `core` what of it the core is to be fed
-    /// as it came. Answers how many bytes were read, which stops short of the byte that ends the string —
-    /// that one is the caller's to feed, as any byte outside a string is — and, where that byte runs a
-    /// command that named its source, what is to be read for it.
+    /// Reads a string's body from the front of `bytes`, feeding `core` what the core is to be fed of it.
+    /// Answers how many bytes were read, which stops short of the byte that ends the string — that one is
+    /// the caller's to feed, as any byte outside a string is — and, where that byte runs a command that
+    /// named its source, what is to be read for it.
     ///
-    /// **Held until it is decided, and only then.** A string that is not a graphics command is let go of
-    /// at its first byte. A command's control data is held up to its `;`, and fed as it came unless it
-    /// names a source; from there the rest is not read here at all. A name is held to the end of its
-    /// string and never fed: the command it was in is answered by the `Load` instead, which says what to
-    /// feed in its place once its source has been read.
+    /// **A command is decided at the end of its control data**: one that names no source is fed as the
+    /// core read it (`Keys::spelled`) and let go of, its payload the core's as it comes; one the core
+    /// would drop is passed over to its end; and one that names a source is answered by the `Load`, which
+    /// says what to feed in its place once its source has been read. A string that is not a graphics
+    /// command is let go of at its first byte of content.
     pub fn read(&mut self, bytes: &[u8], mut core: impl FnMut(&[u8])) -> (usize, Option<Load>) {
         let mut read = 0;
         while let Some(&byte) = bytes.get(read) {
             match (kind(byte), &mut self.state) {
                 (_, State::Away) => break,
-                (Byte::Runs | Byte::Drops, State::Begun | State::Control(_)) => {
-                    // The core runs or drops what it was given as it would have: it was given all of it
-                    core(&self.held);
-                    self.let_go();
+                // The core is given nothing of a string that ends here, and runs or drops nothing
+                (Byte::Drops, _) | (Byte::Runs, State::Begun | State::Dropped) => {
+                    self.state = State::Away;
                     break;
                 }
-                (Byte::Runs, State::Naming(named) | State::TooLong(named)) => {
-                    let named = *named;
-                    let name = matches!(self.state, State::Naming(_)).then_some(self.held.as_slice());
-                    let load = named.load(name);
-                    self.let_go();
-                    return (read, Some(load));
-                }
-                // Dropped: the core has been given none of the command, and the byte ending it drops nothing
-                (Byte::Drops, State::Naming(_) | State::TooLong(_)) => {
-                    self.let_go();
+                (Byte::Runs, State::Control(control)) => {
+                    // A command that ends with its control data: the core finishes it as it would
+                    let named = control.end().then(|| (control.names(), control.keys));
+                    self.state = State::Away;
+                    match named {
+                        Some((Some(named), _)) => return (read, Some(named.load(Some(Vec::new())))),
+                        // With no payload, which the core reads as one that is empty
+                        Some((None, keys)) => core(&[b"G".as_slice(), &keys.spelled(b""), b";"].concat()),
+                        None => {}
+                    }
                     break;
                 }
-                (Byte::PassedOver, State::Begun | State::Control(_)) => self.held.push(byte),
-                (Byte::PassedOver, _) => {}
-                (Byte::Content, State::Begun) if byte == b'G' => {
-                    self.held.push(byte);
-                    self.state = State::Control(Control::new());
+                (Byte::Runs, State::Naming(..)) => {
+                    let State::Naming(named, name) = std::mem::replace(&mut self.state, State::Away) else {
+                        unreachable!("matched as naming")
+                    };
+                    match name.finish() {
+                        Decoded::Name(name) => return (read, Some(named.load(Some(name)))),
+                        Decoded::TooLong => return (read, Some(named.load(None))),
+                        // Dropped by the core, which has been given none of it
+                        Decoded::Refused => break,
+                    }
                 }
+                (Byte::PassedOver, _) | (Byte::Content, State::Dropped) => {}
+                (Byte::Content, State::Begun) if byte == b'G' => self.state = State::Control(Control::new()),
+                // Not a graphics command: the core's, from this byte on
                 (Byte::Content, State::Begun) => {
-                    core(&self.held);
-                    self.let_go();
+                    self.state = State::Away;
                     break;
                 }
                 (Byte::Content, State::Control(control)) => {
                     let ended = control.take(byte);
-                    let named = if ended { control.names() } else { None };
-                    self.held.push(byte);
-                    match named {
-                        Some(named) => {
-                            self.held.clear();
-                            self.state = State::Naming(named);
-                        }
-                        // Not one this reads, or longer than it holds: the core's, as it came
-                        None if ended || self.held.len() > CONTROL_BYTES => {
-                            core(&self.held);
-                            self.let_go();
-                            read += 1;
-                            break;
-                        }
-                        None => {}
+                    if control.refused {
+                        self.state = State::Dropped;
+                    } else if ended {
+                        let (named, keys) = (control.names(), control.keys);
+                        self.state = match named {
+                            Some(named) => State::Naming(named, Base64::default()),
+                            None => {
+                                core(&[b"G".as_slice(), &keys.spelled(b""), b";"].concat());
+                                read += 1;
+                                self.state = State::Away;
+                                break;
+                            }
+                        };
                     }
                 }
-                (Byte::Content, State::Naming(named)) => {
-                    if self.held.len() < NAME_BYTES {
-                        self.held.push(byte);
-                    } else {
-                        self.state = State::TooLong(*named);
-                        self.held = Vec::new();
-                    }
-                }
-                (Byte::Content, State::TooLong(_)) => {}
+                (Byte::Content, State::Naming(_, name)) => name.push(byte),
             }
             read += 1;
         }
         (read, None)
-    }
-
-    fn let_go(&mut self) {
-        self.state = State::Away;
-        self.held = Vec::new();
     }
 }

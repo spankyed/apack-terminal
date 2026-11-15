@@ -23,7 +23,7 @@ use crate::protocol::{CursorBlink, CursorStyle};
 use crate::recording::{self, Entry, Recorder, Timed};
 use crate::view::publish::{Outlet, Publication, ViewId};
 use crate::view::wire::{MAX_MESSAGE_BYTES, Position, Rows, Span};
-use crate::vt::image_sources::{Load, Loaded, QUIET, Scanner, Worker};
+use crate::vt::image_sources::{Load, Loaded, QUIET, Quiet, Refused, Scanner, Worker, says_unreadable};
 use crate::vt::images::{ImageRead, PlacementRead};
 use crate::vt::input::{self, Encoders, Key, Pasted, Pointer};
 use crate::vt::reads;
@@ -232,9 +232,9 @@ pub struct Screen {
     /// here rather than by the core — for a session whose images may be named (`allow_images`). A
     /// session's without is `None`, and is fed exactly as if there were no such thing.
     image_sources: Option<Scanner>,
-    /// The command taken out whose source is being read, and the number it was handed out under
-    /// (`feed_until_image`). Its string is open in the core until it is answered.
-    outstanding: Option<(u64, Load)>,
+    /// The command taken out whose source is being read, the number it was handed out under, and how it
+    /// is refused if it is not read (`feed_until_image`). A string is open in the core until it is answered.
+    outstanding: Option<(u64, Load, Refusal)>,
     /// How many have been handed out, which is what numbers them.
     loads: u64,
     /// Where what is fed here is also written, for a session that asked to be recorded (`recording`).
@@ -246,6 +246,17 @@ pub struct Screen {
     /// The session is over and its views have been told (`end_views`). The screen itself may be read a
     /// little longer — its reader holds it until the pty closes — and nothing may attach to it.
     ended: bool,
+}
+
+/// How a command whose source is not read is refused.
+#[derive(Debug, Clone)]
+enum Refusal {
+    /// With the reply the core gave when it was asked (`Load::asked`): its refusal of the source, which it
+    /// reached and could not read
+    Said(String),
+    /// By the core itself (`Load::refusal`): a command it could not be asked about, having neither an id
+    /// nor a number, and to which it says nothing
+    ByCore,
 }
 
 /// A command that named an image's source, taken out of the stream until the source has been read
@@ -272,7 +283,7 @@ impl PendingImage {
         ReadImage { ticket: self.ticket, loaded }
     }
 
-    /// Refuses it without reading anything (`Load::refuse`).
+    /// Refuses it without reading anything.
     pub fn refuse(self) -> ReadImage {
         ReadImage { ticket: self.ticket, loaded: self.load.refuse() }
     }
@@ -520,8 +531,8 @@ impl Screen {
                         let terminal = &mut self.terminal;
                         let (taken, load) = scanner.read(&bytes[fed..piece], |passed| terminal.feed(passed));
                         fed += taken;
-                        if let Some(load) = load {
-                            pending = Some(self.hand_out(load));
+                        if let Some(image) = load.and_then(|load| self.hand_out(load)) {
+                            pending = Some(image);
                             break 'feeding;
                         }
                         continue;
@@ -555,32 +566,85 @@ impl Screen {
         (fed, pending)
     }
 
-    /// Numbers a command taken out of the stream and keeps it, for its answer to be known for its own.
-    /// A frame for an image that is not there is refused without a read, as the core refuses one.
-    fn hand_out(&mut self, load: Load) -> PendingImage {
-        let there = load.frame_of().is_none_or(|id| self.terminal.has_image(id));
-        let load = load.refuse_unless(there);
+    /// Decides whether a command taken out of the stream is to have its source read, and if so numbers it
+    /// and keeps it, for its answer to be known for its own.
+    ///
+    /// **Asked of the core, where it can be.** All the core does before it opens a source — whether the
+    /// image is there for a frame, whether an id and a number are both given, whether its format is one it
+    /// takes, what a program left part sent and what image of the same id is let go of — it does to the
+    /// command with a source it refuses to open (`Load::asked`), and its answer says whether it got that
+    /// far. Only then is the source read; otherwise its answer is the program's, as it would have been.
+    /// A command with neither an id nor a number is not answered at all, so what it would do is decided
+    /// here (`Load::read_unasked`), and one not to be read is refused by the core outright.
+    fn hand_out(&mut self, load: Load) -> Option<PendingImage> {
+        let refusal = if load.askable() {
+            let before = self.reported.get().reply_count();
+            self.by_core(&load.asked());
+            let said = self.reported.get_mut().take_replies_from(before);
+            match said.into_iter().next() {
+                Some(reply) if says_unreadable(&reply) => Refusal::Said(reply),
+                other => {
+                    self.tell(&load, other);
+                    return None;
+                }
+            }
+        } else if load.read_unasked() {
+            Refusal::ByCore
+        } else {
+            self.by_core(&load.refusal());
+            return None;
+        };
         self.loads += 1;
-        self.outstanding = Some((self.loads, load.clone()));
-        PendingImage { ticket: self.loads, load }
+        self.outstanding = Some((self.loads, load.clone(), refusal));
+        Some(PendingImage { ticket: self.loads, load })
     }
 
     /// Feeds the core what answers the command `feed_until_image` stopped at: the image, or its refusal.
     /// An answer to a command that is no longer the one waiting — settled already, because something
     /// else reached the core in the meantime — is let go of.
     pub fn finish_image(&mut self, read: ReadImage) {
-        if self.outstanding.as_ref().is_some_and(|(ticket, _)| *ticket == read.ticket) {
-            self.outstanding = None;
-            self.terminal.feed(&read.loaded.body());
+        if !self.outstanding.as_ref().is_some_and(|(ticket, ..)| *ticket == read.ticket) {
+            return;
+        }
+        let Some((_, load, refusal)) = self.outstanding.take() else { return };
+        match read.loaded.body() {
+            Some(body) => self.terminal.feed(&body),
+            None => self.refuse(&load, refusal, read.loaded.refused().unwrap_or(Refused::InvalidData)),
         }
     }
 
     /// Answers a command still waiting for its source with a refusal, before anything else reaches the
-    /// core: its string is open there, and whatever came next would be read as part of it.
+    /// core: a string is open there, and whatever came next would be read as part of it.
     fn settle_outstanding(&mut self) {
-        if let Some((_, load)) = self.outstanding.take() {
-            self.terminal.feed(&load.refuse().body());
+        if let Some((_, load, refusal)) = self.outstanding.take() {
+            self.refuse(&load, refusal, Refused::InvalidData);
         }
+    }
+
+    /// Refuses a command whose source was not read, as the core would have refused it.
+    fn refuse(&mut self, load: &Load, refusal: Refusal, why: Refused) {
+        match refusal {
+            Refusal::Said(reply) => self.tell(load, Some(why.reworded(&reply))),
+            Refusal::ByCore => self.by_core(&load.refusal()),
+        }
+    }
+
+    /// Tells the program what the core said of its command, if the core would have told it: a refusal is
+    /// kept from a program only by a `q` that keeps every failure from it.
+    fn tell(&mut self, load: &Load, reply: Option<String>) {
+        if let Some(reply) = reply
+            && load.quiet() != Quiet::Failures
+        {
+            self.reported.get_mut().reply(reply);
+        }
+    }
+
+    /// Feeds the core a command with its file and shared memory sources allowed, for the one it refuses
+    /// to open (`Load::asked`, `Load::refusal`), and turns them off again.
+    fn by_core(&mut self, command: &[u8]) {
+        let _ = self.terminal.allow_images(true);
+        self.terminal.feed(command);
+        let _ = self.terminal.allow_images(false);
     }
 
     /// Acts on each hold the program began or ended since this was last called.
@@ -1195,11 +1259,22 @@ impl Screen {
     ///
     /// **The core is never let read one itself.** A named image is taken out of the stream and read here
     /// (`vt::image_sources`), and the core fed its bytes; the core takes no file and no shared memory
-    /// object, so a command that is not taken out — one this does not read as the core would — is refused
-    /// by the core, and nothing is opened for it.
+    /// object, but for the moment it is fed a command naming one with a NUL in it, which it refuses before
+    /// it opens anything (`by_core`). A command that were not taken out would be refused by the core, and
+    /// nothing opened for it.
     pub fn allow_images(&mut self, files: bool) -> Result<(), Failed> {
         self.terminal.allow_images(false)?;
         self.image_sources = files.then(Scanner::default);
+        Ok(())
+    }
+
+    /// Lets the core read the images programs name by itself, which a session's never does: the core
+    /// opens what a program names inside the parse, and a FIFO stops it there (`allow_images`). **For the
+    /// reference the suite holds a session to**, over sources that answer: what the core alone tells a
+    /// program, and shows, is what a session must.
+    pub fn allow_images_read_by_core(&mut self) -> Result<(), Failed> {
+        self.terminal.allow_images(true)?;
+        self.image_sources = None;
         Ok(())
     }
 
