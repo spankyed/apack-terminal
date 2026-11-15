@@ -242,6 +242,12 @@ impl Terminal {
             )
         };
         Failed::check("ghostty_terminal_set(KITTY_IMAGE_STORAGE_LIMIT)", result)?;
+        self.read_named_images(files)
+    }
+
+    /// Whether the core reads a file or a shared memory object a program names, and nothing else: the
+    /// switch `allow_images` sets, on its own, for a terminal whose images are already allowed.
+    pub fn read_named_images(&self, files: bool) -> Result<(), Failed> {
         for (option, call) in [
             (sys::TerminalOption::KITTY_IMAGE_MEDIUM_FILE, "ghostty_terminal_set(KITTY_IMAGE_MEDIUM_FILE)"),
             (sys::TerminalOption::KITTY_IMAGE_MEDIUM_SHARED_MEM, "ghostty_terminal_set(KITTY_IMAGE_MEDIUM_SHARED_MEM)"),
