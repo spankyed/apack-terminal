@@ -239,6 +239,63 @@ export interface Frame extends Rows {
    * they were.
    */
   readonly colors?: SessionColors
+  /**
+   * The images on the screen that are placed relative to another, when this frame says where they are:
+   * an attachment's first frame does, and so does any frame since in which one is somewhere else, new
+   * or gone. Absent, they are on the lines they were on.
+   */
+  readonly anchored?: AnchoredImages
+}
+
+/**
+ * One image placed relative to another, where it is on the screen.
+ *
+ * **It comes with the frame, because it moves with what the frame brings.** Such an image has no cell of
+ * its own: it is so many cells from its parent, and where the parent is shown through placeholder cells
+ * that is wherever a program last wrote them. So where it is belongs to the screen as a frame tells it.
+ *
+ * `offsetX`, `offsetY`, `width` and `height` are in the pixels of a cell as the terminal was told one is
+ * (`AnchoredImages.cellWidth`), which a view scales to the cell it draws.
+ */
+export interface Anchored {
+  readonly image: number
+  /** Moves when the image's pixels do, so the ones a view holds are known stale */
+  readonly generation: number
+  /** Orders images that overlap; below zero is under the text */
+  readonly z: number
+  /**
+   * Its top-left cell: the row counted from the frame's `firstActive`, and the column. Either is below
+   * zero for one that starts above or to the left of the screen and reaches into it
+   */
+  readonly row: number
+  readonly column: number
+  /** How many cells it covers */
+  readonly columns: number
+  readonly rows: number
+  readonly offsetX: number
+  readonly offsetY: number
+  readonly width: number
+  readonly height: number
+  /** The part of the picture drawn, in its own pixels */
+  readonly sourceX: number
+  readonly sourceY: number
+  readonly sourceWidth: number
+  readonly sourceHeight: number
+}
+
+/**
+ * Every image on the screen that is placed relative to another, as far as a frame lists them, and one
+ * cell in the pixels they are measured in.
+ *
+ * **All of them, every time, and only the screen's.** What this lists replaces what a view held. One
+ * whose parent has scrolled into the history is not told, and is not drawn there.
+ */
+export interface AnchoredImages {
+  readonly cellWidth: number
+  readonly cellHeight: number
+  /** How many more there are than are listed */
+  readonly omitted: number
+  readonly list: readonly Anchored[]
 }
 
 /**

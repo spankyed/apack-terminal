@@ -18,6 +18,9 @@ use std::time::Duration;
 
 use interprocess::local_socket::{GenericFilePath, Listener, ListenerOptions, Stream, ToFsName};
 
+#[cfg(windows)]
+mod pipe;
+
 /// What a broker exits with when another broker holds the socket it was asked to listen on.
 ///
 /// A number of its own, so whatever started it can tell "there is already one" — which is not a failure,
@@ -245,8 +248,13 @@ pub fn peer_is_this_user(stream: &Stream) -> io::Result<bool> {
 }
 
 /// Closes a connection in both directions, whoever else still holds it, so a thread parked in a read or
-/// a write of it is let go. `false` where a connection cannot be closed from under its users, which is a
-/// named pipe: there the thread is left to the far end's closing.
+/// a write of it is let go.
+///
+/// **A named pipe is hung up by cancelling its pending I/O** (`CancelIoEx` on the handle). A read or a write
+/// parked on a synchronous handle ends with `ERROR_OPERATION_ABORTED`, as a read parked on an overlapped one
+/// does. Disconnecting the pipe does not do this for a read parked on the server end: a synchronous call on
+/// that handle waits behind the pending read, so the disconnect would wait too. Closing the handle does not
+/// either. The pipe stays open after this, for the far end to close.
 ///
 /// **The half the far end has not already closed is closed by itself where both cannot be.** A caller
 /// that has said all it will has closed its sending side, and on macOS a socket in that state refuses to
@@ -261,6 +269,6 @@ pub fn hang_up(stream: &Stream) -> bool {
             socket.shutdown(std::net::Shutdown::Both).is_ok() || socket.shutdown(std::net::Shutdown::Write).is_ok()
         }
         #[cfg(windows)]
-        Stream::NamedPipe(_) => false,
+        Stream::NamedPipe(pipe) => pipe::hang_up(pipe),
     }
 }

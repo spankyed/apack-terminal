@@ -7,7 +7,8 @@ name: mutants
 #
 # Windows-only code is mutated on Windows, and nowhere else: the files `.cargo/windows-only` lists compile on
 # no other platform, so a run elsewhere would report every one of their mutants as missed, and the Linux
-# job leaves them out. A change with none installs nothing there.
+# job leaves them out of its diff. A file with Windows arms among POSIX code is not listed: its Windows arms
+# are answered by a dispatch (`-f files=`). A change with none installs nothing there.
 #
 # **It runs on a push too, and that is not belt and braces.** This repository's work lands on `master`
 # directly, so a gate that fires only on a pull request had never fired at all — and `.cargo/mutants.toml`
@@ -61,7 +62,10 @@ jobs:
           fetch-depth: 0
       - id: scope
         run: |
-          git diff $(bash .github/base.sh) -- '*.rs' > change.diff
+          # The Windows-only files are not this job's (`.cargo/windows-only`): it cannot compile them
+          excludes=()
+          for file in $(grep -v -e '^#' -e '^ *$' .cargo/windows-only); do excludes+=(":!$file"); done
+          git diff $(bash .github/base.sh) -- '*.rs' "${excludes[@]}" > change.diff
           if [ -s change.diff ]; then
             echo "code=true" >> "$GITHUB_OUTPUT"
           else
@@ -69,8 +73,12 @@ jobs:
           fi
       - if: steps.scope.outputs.code == 'true'
         run: rustup show active-toolchain
+      # Saved from `master` only: a pull request's cache is readable by that pull request alone, and saving one
+      # evicts `master`'s from the repository's ten gigabytes (`ci.yml`, `checks`, says the same)
       - if: steps.scope.outputs.code == 'true'
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - if: steps.scope.outputs.code == 'true'
         uses: taiki-e/install-action@v2
         with:
@@ -78,16 +86,12 @@ jobs:
       # Exit 3 is a timeout, which is the suite's deadline catching a mutant rather than a survivor — the
       # credit-accounting mutants in `output.rs` hang the writer by design. It is also what a run with a
       # timeout *and* a survivor exits with, so the survivors are read from the list rather than the code.
-      # Two at a time: a runner has four cores, and the suite under one mutant uses more than one.
-      # **Without what only Windows compiles** (`.cargo/windows-only`): nothing here builds it, so a mutant
-      # of it changes nothing and the suite passes over it. The job below answers it
+      # Two at a time: a runner has four cores, and the suite under one mutant uses more than one
       - if: steps.scope.outputs.code == 'true'
         env:
           SHARD: ${{ matrix.shard }}
         run: |
-          excluded=()
-          while read -r file; do excluded+=(--exclude "$file"); done < <(grep -v -e '^#' -e '^ *$' .cargo/windows-only)
-          cargo mutants --in-diff change.diff --shard "$SHARD/8" --sharding round-robin --jobs 2 "${excluded[@]}" || [ $? = 3 ]
+          cargo mutants --in-diff change.diff --shard "$SHARD/8" --sharding round-robin --jobs 2 || [ $? = 3 ]
           if [ -s target/mutants.out/missed.txt ]; then cat target/mutants.out/missed.txt; exit 1; fi
       - uses: actions/upload-artifact@v4
         if: always() && steps.scope.outputs.code == 'true'
@@ -148,8 +152,13 @@ jobs:
           # A mixed file's Windows arms are answered by a dispatch (`-f files=src/session.rs`): nothing here
           # can tell a Windows mutant from a POSIX one inside one file, and a developer naming the file is
           # the claim being made deliberately rather than by a grep.
-          mapfile -t windows_only < <(grep -v -e '^#' -e '^ *$' .cargo/windows-only)
-          mapfile -t files < <(git diff --name-only --diff-filter=d "$base" -- "${windows_only[@]}")
+          # `base` is git arguments (`--merge-base HEAD^1` on a pull request), so it is split here as the Linux
+          # job's diff is. A failed diff fails this step: an empty list would pass a job that mutated nothing.
+          names="$(git diff --name-only --diff-filter=d $base -- $(grep -v -e '^#' -e '^ *$' .cargo/windows-only))"
+          files=()
+          while IFS= read -r name; do
+            [ -n "$name" ] && files+=("$name")
+          done <<< "$names"
           if [ ${#files[@]} -gt 0 ]; then
             args=""
             for file in "${files[@]}"; do args="$args --file $file"; done
@@ -166,8 +175,11 @@ jobs:
         uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0
+      # Saved from `master` only, as in the Linux job
       - if: steps.scope.outputs.code == 'true'
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - if: steps.scope.outputs.code == 'true'
         uses: taiki-e/install-action@v2
         with:

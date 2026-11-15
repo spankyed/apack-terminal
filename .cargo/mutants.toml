@@ -195,11 +195,11 @@ exclude_re = [
     # **The two bytes of a frame's head no frame can use.** The head is allowed a count of rows at its
     # longest, five bytes, and a message holds too few rows for the count ever to be more than three. A
     # head a byte or two short of that allowance still holds every head there can be, which is what these
-    # seven make it; the others on the line make it shorter than a real head, or leave room unused, and
+    # four make it; the others in the sum make it shorter than a real head, or leave room unused, and
     # are caught (`the_longest_head_there_is_fits_with_rows_taken_to_the_last_byte`). Pinned to the line
     # and column, since nothing else tells them from the ones that matter
-    "view/wire.rs:34:(47|60): replace \\+ with (-|\\*)$",
-    "view/wire.rs:34:(7|51|75): replace \\+ with \\*$",
+    "view/wire.rs:40:14: replace \\+ with (-|\\*)$",
+    "view/wire.rs:(38:5|42:10): replace \\+ with \\*$",
 
     # **A link the core flags and has no address for.** `read_link` is asked only of a cell the core says
     # is linked, and the core starts no link with an empty address (`OSC 8 ; ; ST` leaves a cell unlinked),
@@ -292,11 +292,11 @@ exclude_re = [
 ]
 
 # **What only Windows compiles is not excluded here, and is left out of every other run instead.**
-# `src/tree.rs` and `src/vt/image_sources/windows.rs` (`.cargo/windows-only`) compile nowhere else, so a
-# suite that does not build them cannot kill their mutants, and a run on a Mac or on Linux would report
-# every one as missed. `cargo xtask pre-push` and the Linux job of `.github/workflows/mutants.yml` pass
-# them as `--exclude`, and its second job, on `windows-latest`, mutates them, so a change to them is
-# answered where the claim is made. Excluding them here would turn that job into a no-op: a file named
+# The files `.cargo/windows-only` lists compile nowhere else, so a suite that does not build them cannot
+# kill their mutants, and a run on a Mac or on Linux would report every one as missed. `cargo xtask
+# pre-push` passes them as `--exclude`, the Linux job of `.github/workflows/mutants.yml` leaves them out of
+# its diff, and its second job, on `windows-latest`, mutates them, so a change to them is answered where
+# the claim is made. Excluding them here would turn that job into a no-op: a file named
 # on the command line is still left out by this file's `exclude_globs`.
 #
 # **A change is not the only way that job runs, and it had to stop being the only way.** `tree.rs` changes

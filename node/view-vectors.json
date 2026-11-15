@@ -3,6 +3,7 @@
     "hex": "dc00000041032902e8075018e8070704110417010600020201010000010212345601fa02ff00808206011968747470733a2f2f6578616d706c652e636f6d2f613f623d630300000000012402010000026c7305020100027879010100000200000001030203e4b896010365cc81020bf09f91a8e2808df09f91a90500000002c3a903040101070000000001000100000220200a14020709000200001414000028288486880880808080802028ac020305b2170fe807d00fa01f14040401010900000000010301000001200a14000200000000959aef3a000000014f000000017a",
     "message": {
       "alternateScreen": false,
+      "anchored": null,
       "channel": 3,
       "colors": null,
       "columns": 80,
@@ -258,6 +259,7 @@
     "hex": "0e00000041032902e8075018e80707040400",
     "message": {
       "alternateScreen": false,
+      "anchored": null,
       "channel": 3,
       "colors": null,
       "columns": 80,
@@ -282,6 +284,7 @@
     "hex": "1300000041032902e8075018e80707040b000002de0700",
     "message": {
       "alternateScreen": true,
+      "anchored": null,
       "channel": 3,
       "colors": null,
       "columns": 80,
@@ -309,9 +312,10 @@
     "to": "view"
   },
   {
-    "hex": "1100000041032902e8075018e8070704911a0a0000",
+    "hex": "1200000041032902e8075018e807070491011a0a0000",
     "message": {
       "alternateScreen": false,
+      "anchored": null,
       "channel": 3,
       "colors": null,
       "columns": 80,
@@ -339,9 +343,105 @@
     "to": "view"
   },
   {
+    "hex": "3e00000041032b02e8075018e807070480020a140302070908060e0201000014140000141484868808808080808020050301ac02040305b2174be807d00fa01f6400",
+    "message": {
+      "alternateScreen": false,
+      "anchored": {
+        "cellHeight": 20,
+        "cellWidth": 10,
+        "list": [
+          {
+            "column": 7,
+            "columns": 2,
+            "generation": 9,
+            "height": 20,
+            "image": 7,
+            "offsetX": 0,
+            "offsetY": 0,
+            "row": 3,
+            "rows": 1,
+            "sourceHeight": 20,
+            "sourceWidth": 20,
+            "sourceX": 0,
+            "sourceY": 0,
+            "width": 20,
+            "z": 4
+          },
+          {
+            "column": -1,
+            "columns": 300,
+            "generation": 1099511627776,
+            "height": 75,
+            "image": 16909060,
+            "offsetX": 3,
+            "offsetY": 5,
+            "row": -2,
+            "rows": 4,
+            "sourceHeight": 100,
+            "sourceWidth": 4000,
+            "sourceX": 1000,
+            "sourceY": 2000,
+            "width": 2994,
+            "z": -3
+          }
+        ],
+        "omitted": 3
+      },
+      "channel": 3,
+      "colors": null,
+      "columns": 80,
+      "commands": 7,
+      "cursor": null,
+      "epoch": 2,
+      "firstActive": 1000,
+      "images": 4,
+      "kind": "frame",
+      "mouse": false,
+      "reverseVideo": false,
+      "rows": [],
+      "screenRows": 24,
+      "scrollback": 1000,
+      "sequence": 43,
+      "staleFrom": null
+    },
+    "name": "a frame with two images placed relative to another: one over the text, one under it that starts above and left of the screen, and three more than it lists",
+    "to": "view"
+  },
+  {
+    "hex": "1300000041032b02e8075018e807070480020000000000",
+    "message": {
+      "alternateScreen": false,
+      "anchored": {
+        "cellHeight": 0,
+        "cellWidth": 0,
+        "list": [],
+        "omitted": 0
+      },
+      "channel": 3,
+      "colors": null,
+      "columns": 80,
+      "commands": 7,
+      "cursor": null,
+      "epoch": 2,
+      "firstActive": 1000,
+      "images": 4,
+      "kind": "frame",
+      "mouse": false,
+      "reverseVideo": false,
+      "rows": [],
+      "screenRows": 24,
+      "scrollback": 1000,
+      "sequence": 43,
+      "staleFrom": null
+    },
+    "name": "a frame saying no image is placed relative to another any more",
+    "to": "view"
+  },
+  {
     "hex": "2100000041032a02e8075018e80707046007eee8d5002b36dc322f0201dc322fff01020300",
     "message": {
       "alternateScreen": false,
+      "anchored": null,
       "channel": 3,
       "colors": {
         "background": 11062,
@@ -380,6 +480,7 @@
     "hex": "1300000041032a02e8075018e807070440021020300000",
     "message": {
       "alternateScreen": false,
+      "anchored": null,
       "channel": 3,
       "colors": {
         "background": 1056816,
@@ -409,6 +510,7 @@
     "hex": "1000000041032a02e8075018e807070440000000",
     "message": {
       "alternateScreen": false,
+      "anchored": null,
       "channel": 3,
       "colors": {
         "background": null,

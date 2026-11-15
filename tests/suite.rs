@@ -30,7 +30,6 @@ mod image_source_rules;
 #[cfg(unix)]
 mod image_sources;
 mod images;
-#[cfg(unix)]
 mod keeping;
 mod markers;
 mod parser;

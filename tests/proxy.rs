@@ -81,13 +81,10 @@ fn echoing(before: &str, after: &str) -> String {
 }
 
 fn proxy(socket: &std::path::Path) -> Proxy {
-    let mut process = Command::new(env!("CARGO_BIN_EXE_apack-terminal"))
-        .arg("proxy")
-        .arg(socket)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("the proxy starts");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_apack-terminal"));
+    command.arg("proxy").arg(socket).stdin(Stdio::piped()).stdout(Stdio::piped());
+    // In the case's job when it holds an `Ending`, so the broker this starts is ended with the case
+    let mut process = crate::reaper::spawn_contained(&mut command).expect("the proxy starts");
     let input = process.stdin.take().expect("piped stdin");
     let events = read_events(process.stdout.take().expect("piped stdout"));
     Proxy { process, input, events }
@@ -222,11 +219,10 @@ fn proxies_arriving_together_start_one_broker() {
 /// **A broker a proxy started does not outlive the case that had it started**, even one that is meant
 /// to go on: a session asked to be kept holds its broker open after every connection has closed, which
 /// is the one broker here that does not go by itself, and stands for one that cannot.
-#[cfg(unix)]
 #[test]
 fn a_broker_a_proxy_started_is_ended_with_the_case_that_had_it_started() {
     let directory = tempfile::tempdir().expect("a directory for the socket");
-    let socket = directory.path().join("broker.sock");
+    let socket = socket_in(directory.path(), "broker.sock");
     let ending = crate::reaper::ending_with_the_case(&socket, env!("CARGO_BIN_EXE_apack-terminal"));
     {
         let mut through = proxy(&socket);
@@ -241,15 +237,33 @@ fn a_broker_a_proxy_started_is_ended_with_the_case_that_had_it_started() {
     }
     // Its one connection has closed and it is still there, holding what a broker holds
     let name = socket.to_str().expect("a utf-8 path");
-    assert!(matches!(hold(name), Err(Refused::Held)), "the broker went with its last connection");
+    assert!(broker_holds(name), "the broker went with its last connection");
 
     drop(ending);
-    assert!(hold(name).is_ok(), "the broker is still holding its socket");
+    // A pipe is let go a moment after its process has ended, so on Windows the wait is for it to go, counted
+    let waiting_since = Instant::now();
+    while cfg!(windows) && broker_holds(name) && waiting_since.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!broker_holds(name), "the broker is still holding its socket");
+}
+
+/// Whether a broker holds `socket`: on POSIX the lock beside its socket, which only a live broker keeps, and on
+/// Windows a pipe that accepts a connection, the pipe being the hold there (`listening::hold` takes no part).
+#[cfg(unix)]
+fn broker_holds(socket: &str) -> bool {
+    matches!(hold(socket), Err(Refused::Held))
+}
+
+#[cfg(windows)]
+fn broker_holds(socket: &str) -> bool {
+    use interprocess::local_socket::{GenericFilePath, Stream, ToFsName, prelude::*};
+    let name = socket.to_fs_name::<GenericFilePath>().expect("a socket name");
+    Stream::connect(name).is_ok()
 }
 
 /// `proxy` is a word, not a position: two arguments of which the first is anything else are not a request
 /// to be one, and are refused as any other mistyped invocation is.
-#[cfg(unix)]
 #[test]
 fn only_the_word_proxy_asks_for_one() {
     let directory = tempfile::tempdir().expect("a directory for the socket");
@@ -426,7 +440,6 @@ fn a_directory_others_can_write_to_is_refused() {
 
 /// A broker a proxy starts that cannot listen says why, and the proxy passes it on: the person at the far
 /// end of an `ssh` reads the reason rather than that nothing was said.
-#[cfg(unix)]
 #[test]
 fn a_proxy_says_why_the_broker_it_started_could_not_listen() {
     let directory = tempfile::tempdir().expect("a directory for the socket");
@@ -518,6 +531,7 @@ fn the_grace_is_the_one_in_use_unless_a_number_of_milliseconds_is_given() {
 /// A broker whose socket has been taken from under it cannot be connected to by anything, itself
 /// included: with nothing ever having connected, it goes when the time it allows for a first connection
 /// has passed, as one that could still be reached does.
+// POSIX only: it takes the broker's socket file away, and a named pipe has no file to take.
 #[cfg(unix)]
 #[test]
 fn a_broker_nothing_can_reach_exits() {
@@ -566,6 +580,7 @@ fn a_socket_named_without_a_directory_is_checked_where_it_would_be_made() {
 /// **A proxy told no socket uses the one place a user is known to have**: under the runtime directory
 /// the system gives them, or failing that under their home, in a directory made for them alone. So
 /// `ssh host apack-terminal proxy` needs nothing set up on the host, and two proxies told nothing meet.
+// POSIX only: the default socket and its directory are checked for Unix mode bits.
 #[cfg(unix)]
 #[test]
 fn a_proxy_told_no_socket_uses_the_users_own() {

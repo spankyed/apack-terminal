@@ -26,14 +26,22 @@ use crate::protocol::{CommandOutcome, Unreported};
 pub const MAX_MESSAGE_BYTES: usize = 8 << 20;
 
 /// The most a frame can say beside its rows, which is more than a fetch can: every number at its
-/// longest, a cursor, a line to forget from, and every colour a program can change.
+/// longest, a cursor, a line to forget from, every colour a program can change, and as many images
+/// placed relative to another as a frame lists.
 ///
 /// Counted from what `frame` writes, in its order: the kind; channel, sequence, epoch, first line,
 /// columns, rows, scrollback, commands and images; the flags; the cursor; the stale line; the colours'
 /// own flags, the three that are not the palette, the palette's count and its 256 entries of an index
-/// and a colour; and the count of rows.
-pub const MAX_HEAD_BYTES: usize =
-    1 + (5 + 10 + 5 + 10 + 3 + 3 + 5 + 5 + 5) + 1 + (3 + 3 + 1) + 10 + (1 + 9 + 2 + 256 * 4) + 5;
+/// and a colour; the cell those images are measured in, how many were left out, their count and each
+/// of them, which is a generation and fourteen numbers of 32 bits; and the count of rows.
+pub const MAX_HEAD_BYTES: usize = 1
+    + (5 + 10 + 5 + 10 + 3 + 3 + 5 + 5 + 5)
+    + 2
+    + (3 + 3 + 1)
+    + 10
+    + (1 + 9 + 2 + 256 * 4)
+    + (3 + 3 + 5 + 2 + ANCHORED_LISTED * (10 + 14 * 5))
+    + 5;
 
 /// How much of a message its rows may be: what is left when the largest of everything else a frame or a
 /// fetch carries beside them is taken off.
@@ -401,6 +409,7 @@ pub struct FrameHead<'a> {
     pub reverse_video: bool,
     pub stale_from: Option<u64>,
     pub colors: Option<&'a ColorChanges>,
+    pub anchored: Option<&'a AnchoredImages>,
 }
 
 /// A frame as the message a view is sent, from its head and rows already written out.
@@ -417,7 +426,7 @@ pub fn frame(head: &FrameHead<'_>, rows: &Rows) -> Result<Vec<u8>, TooLong> {
         out.number(head.images);
         let blinking = head.cursor.is_some_and(|cursor| cursor.blinking);
         let hidden = head.cursor.is_some_and(|cursor| cursor.hidden);
-        out.byte(
+        out.number(
             if head.cursor.is_some() { FRAME_CURSOR } else { 0 }
                 | if head.alternate_screen { FRAME_ALTERNATE } else { 0 }
                 | if head.mouse { FRAME_MOUSE } else { 0 }
@@ -425,7 +434,8 @@ pub fn frame(head: &FrameHead<'_>, rows: &Rows) -> Result<Vec<u8>, TooLong> {
                 | if blinking { FRAME_BLINKING } else { 0 }
                 | if head.reverse_video { FRAME_REVERSE } else { 0 }
                 | if head.colors.is_some() { FRAME_COLORS } else { 0 }
-                | if hidden { FRAME_HIDDEN } else { 0 },
+                | if hidden { FRAME_HIDDEN } else { 0 }
+                | if head.anchored.is_some() { FRAME_ANCHORED } else { 0 },
         );
         if let Some(cursor) = head.cursor {
             out.number(cursor.column);
@@ -450,6 +460,30 @@ pub fn frame(head: &FrameHead<'_>, rows: &Rows) -> Result<Vec<u8>, TooLong> {
             for (index, rgb) in &colors.palette {
                 out.byte(*index);
                 out.bytes.extend_from_slice(rgb);
+            }
+        }
+        if let Some(told) = head.anchored {
+            out.number(told.cell.0);
+            out.number(told.cell.1);
+            out.number(told.omitted);
+            out.number(told.list.len() as u64);
+            for one in &told.list {
+                out.number(one.image);
+                out.number(one.generation);
+                // Signed, each of them: one can be under the text, and start above or left of the screen
+                out.status(one.z);
+                out.status(one.row);
+                out.status(one.column);
+                out.number(one.columns);
+                out.number(one.rows);
+                out.number(one.offset_x);
+                out.number(one.offset_y);
+                out.number(one.width);
+                out.number(one.height);
+                out.number(one.source_x);
+                out.number(one.source_y);
+                out.number(one.source_width);
+                out.number(one.source_height);
             }
         }
         rows.write(out);
@@ -511,8 +545,67 @@ pub struct Frame {
     /// of them changed** since this view's last frame, and in the first frame a view is sent: what is
     /// here replaces what the view held, and absent the view goes on with what it has.
     pub colors: Option<ColorChanges>,
+    /// The images on the screen that are placed relative to another, **all of them, when any of them
+    /// changed** since this view's last frame, and in the first frame a view is sent: what is here
+    /// replaces what the view held, and absent the view goes on with what it has.
+    pub anchored: Option<AnchoredImages>,
     pub block: Block,
 }
+
+/// An image a program placed relative to another (the Kitty graphics protocol's `P` and `Q`), where it
+/// is on the screen.
+///
+/// **It comes with the frame, because it moves with what the frame brings.** Such an image has no place
+/// of its own: it is its parent's place and an offset, and where the parent is shown through placeholder
+/// cells that place is the top-left of those cells on the screen. A program that rewrites the cells moves
+/// it without touching an image, so where it is belongs to the screen as a frame tells it, with the rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Anchored {
+    pub image: u32,
+    /// Moves when the image's pixels do, so a view knows the ones it holds are stale
+    pub generation: u64,
+    /// Orders images that overlap; below zero is under the text
+    pub z: i32,
+    /// Its top-left cell: the row counted from the frame's `first_active`, and the column. Either is
+    /// below zero for one that starts above or to the left of the screen and reaches into it
+    pub row: i32,
+    pub column: i32,
+    /// How many cells it covers
+    pub columns: u32,
+    pub rows: u32,
+    /// How far into its first cell it starts, and how large it is drawn, in pixels of `AnchoredImages::cell`
+    pub offset_x: u32,
+    pub offset_y: u32,
+    pub width: u32,
+    pub height: u32,
+    /// The part of the image drawn, in the image's own pixels
+    pub source_x: u32,
+    pub source_y: u32,
+    pub source_width: u32,
+    pub source_height: u32,
+}
+
+/// Every image on the screen that is placed relative to another, as far as a frame lists them.
+///
+/// **Only the screen's.** The core says where such an image is for the rows it draws, which are the
+/// screen's, and says neither its parent nor its offset, so there is nothing to place one from once its
+/// parent has scrolled into the history: there it is not drawn.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AnchoredImages {
+    /// One cell in pixels as the terminal was told one is, which is what each is measured in
+    pub cell: (u16, u16),
+    /// The first `ANCHORED_LISTED` of them, in the order they are drawn in
+    pub list: Vec<Anchored>,
+    /// How many more there are than are listed
+    pub omitted: u32,
+}
+
+/// The most images placed relative to another that a frame lists.
+///
+/// A program makes as many placements as it likes, and each is some forty bytes of every frame that
+/// tells them. A screen's worth of real ones is a handful; past this many the frame says how many it
+/// left out, which a view can tell a person rather than draw a part and call it the whole.
+pub const ANCHORED_LISTED: usize = 256;
 
 /// A command the shell reported, with the line each of its moments is on. A moment whose row has left
 /// the history has no line.
@@ -1255,14 +1348,17 @@ mod kind {
     pub const IMAGE_PIXELS: u8 = 75;
 }
 
-const FRAME_CURSOR: u8 = 1;
-const FRAME_ALTERNATE: u8 = 2;
-const FRAME_MOUSE: u8 = 4;
-const FRAME_STALE: u8 = 8;
-const FRAME_BLINKING: u8 = 16;
-const FRAME_REVERSE: u8 = 32;
-const FRAME_COLORS: u8 = 64;
-const FRAME_HIDDEN: u8 = 128;
+const FRAME_CURSOR: u16 = 1;
+const FRAME_ALTERNATE: u16 = 2;
+const FRAME_MOUSE: u16 = 4;
+const FRAME_STALE: u16 = 8;
+const FRAME_BLINKING: u16 = 16;
+const FRAME_REVERSE: u16 = 32;
+const FRAME_COLORS: u16 = 64;
+const FRAME_HIDDEN: u16 = 128;
+const FRAME_ANCHORED: u16 = 256;
+/// One past the last flag a frame has
+const FRAME_FLAGS: u16 = 512;
 
 const COLOR_FOREGROUND: u8 = 1;
 const COLOR_BACKGROUND: u8 = 2;
@@ -1454,6 +1550,7 @@ impl ToView {
                     reverse_video: sent.reverse_video,
                     stale_from: sent.stale_from,
                     colors: sent.colors.as_ref(),
+                    anchored: sent.anchored.as_ref(),
                 },
                 &Rows::of(&sent.block),
             ),
@@ -1564,7 +1661,10 @@ impl ToView {
                 let scrollback = read.u32()?;
                 let commands = read.u32()?;
                 let images = read.u32()?;
-                let flags = read.byte()?;
+                let flags = read.u16()?;
+                if flags >= FRAME_FLAGS {
+                    return Err(Malformed::Value("a frame's flags"));
+                }
                 // Blinking and hidden are said of a cursor, and of nothing when there is none
                 let said_of_a_cursor = flags & FRAME_BLINKING != 0 || flags & FRAME_HIDDEN != 0;
                 if flags & FRAME_CURSOR == 0 && said_of_a_cursor {
@@ -1605,6 +1705,33 @@ impl ToView {
                 } else {
                     None
                 };
+                let anchored = if flags & FRAME_ANCHORED != 0 {
+                    let cell = (read.u16()?, read.u16()?);
+                    let omitted = read.u32()?;
+                    let mut list = Vec::new();
+                    for _ in 0..read.count()? {
+                        list.push(Anchored {
+                            image: read.u32()?,
+                            generation: read.number()?,
+                            z: read.status()?,
+                            row: read.status()?,
+                            column: read.status()?,
+                            columns: read.u32()?,
+                            rows: read.u32()?,
+                            offset_x: read.u32()?,
+                            offset_y: read.u32()?,
+                            width: read.u32()?,
+                            height: read.u32()?,
+                            source_x: read.u32()?,
+                            source_y: read.u32()?,
+                            source_width: read.u32()?,
+                            source_height: read.u32()?,
+                        });
+                    }
+                    Some(AnchoredImages { cell, list, omitted })
+                } else {
+                    None
+                };
                 Self::Frame(Frame {
                     channel,
                     sequence,
@@ -1621,6 +1748,7 @@ impl ToView {
                     reverse_video: flags & FRAME_REVERSE != 0,
                     stale_from,
                     colors,
+                    anchored,
                     block: read.block()?,
                 })
             }

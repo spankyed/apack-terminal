@@ -795,6 +795,29 @@ pub struct ShownRead {
     pub piece: Piece,
 }
 
+/// An image a program placed relative to another (the protocol's `P` and `Q`), where the core puts it on
+/// the screen: `Rendering::anchored`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AnchoredRead {
+    /// Orders images that overlap; below zero is under the text
+    pub z: i32,
+    /// Its top-left cell, counted from the screen's first row and column. Either is below zero for one
+    /// that starts above or to the left of the screen and reaches into it
+    pub row: i32,
+    pub column: i32,
+    pub image: u32,
+    /// Moves when the image's pixels do
+    pub generation: u64,
+    /// How many cells it covers
+    pub columns: u32,
+    pub rows: u32,
+    /// How far into its first cell it starts, and how large it is drawn, in the pixels of a cell
+    pub offset: (u32, u32),
+    pub size: (u32, u32),
+    /// The part of the image drawn — left, top, width, height — in the image's own pixels
+    pub source: (u32, u32, u32, u32),
+}
+
 impl Rendering {
     /// What the core says the placeholder cells on the screen show, as of the last `look`, top to bottom
     /// and left to right.
@@ -803,6 +826,49 @@ impl Rendering {
     /// the screen, which is why a row is not read from here (`placeholders`). It is what the suite holds
     /// that reader to: the two have to say the same of every row both answer for.
     pub fn shown(&self) -> Result<Vec<ShownRead>, Failed> {
+        let mut shown: Vec<ShownRead> = self
+            .images_of(sys::RenderStateKittyPlacementKind::VIRTUAL)?
+            .into_iter()
+            .filter_map(|read| {
+                Some(ShownRead {
+                    row: u16::try_from(read.row).ok()?,
+                    piece: Piece {
+                        image: read.image,
+                        generation: read.generation,
+                        column: u16::try_from(read.column).ok()?,
+                        columns: u16::try_from(read.columns).unwrap_or(u16::MAX),
+                        offset_x: read.offset.0,
+                        offset_y: read.offset.1,
+                        width: read.size.0,
+                        height: read.size.1,
+                        source_x: read.source.0,
+                        source_y: read.source.1,
+                        source_width: read.source.2,
+                        source_height: read.source.3,
+                    },
+                })
+            })
+            .collect();
+        shown.sort_by_key(|one| (one.row, one.piece.column));
+        Ok(shown)
+    }
+
+    /// The images on the screen that a program placed relative to another, as of the last `look`, in the
+    /// order they are drawn in and then by where they are.
+    ///
+    /// **Read from the core and not worked out here.** Such an image has no place of its own: it is its
+    /// parent's place and an offset, through as many parents as it has, and where the first of them is
+    /// shown through placeholder cells that place is the top-left of those cells on the screen. The
+    /// storage says neither the parent nor the offset, so there is nothing to work it out from; the core
+    /// has, for the screen, and this is its answer.
+    pub fn anchored(&self) -> Result<Vec<AnchoredRead>, Failed> {
+        let mut anchored = self.images_of(sys::RenderStateKittyPlacementKind::RELATIVE)?;
+        anchored.sort();
+        Ok(anchored)
+    }
+
+    /// Every image of one kind in the core's list of what is drawn on the screen, as of the last `look`.
+    fn images_of(&self, wanted: sys::RenderStateKittyPlacementKind::Type) -> Result<Vec<AnchoredRead>, Failed> {
         use sys::RenderStateImageData as Data;
         let mut iterator: sys::RenderStateImageIterator = std::ptr::null_mut();
         // SAFETY: `iterator` is a valid out-pointer; it is freed below
@@ -813,7 +879,7 @@ impl Rendering {
         let filled = unsafe {
             sys::ghostty_render_state_get(self.handle, sys::RenderStateData::IMAGE_ITERATOR, (&raw mut iterator).cast())
         };
-        let mut shown = Vec::new();
+        let mut images = Vec::new();
         if filled == sys::Result::SUCCESS {
             let read_u32 = |data: Data::Type| {
                 let mut value: u32 = 0;
@@ -833,7 +899,7 @@ impl Rendering {
                 // SAFETY: KITTY_KIND writes a `GhosttyRenderStateKittyPlacementKind`
                 let read =
                     unsafe { sys::ghostty_render_state_image_get(iterator, Data::KITTY_KIND, (&raw mut kind).cast()) };
-                if read != sys::Result::SUCCESS || kind != sys::RenderStateKittyPlacementKind::VIRTUAL {
+                if read != sys::Result::SUCCESS || kind != wanted {
                     continue;
                 }
                 let mut generation: u64 = 0;
@@ -841,37 +907,28 @@ impl Rendering {
                 let _ = unsafe {
                     sys::ghostty_render_state_image_get(iterator, Data::IMAGE_GENERATION, (&raw mut generation).cast())
                 };
-                let place = |value: Option<i32>| value.and_then(|at| u16::try_from(at).ok());
-                let (Some(row), Some(column)) =
-                    (place(read_i32(Data::VIEWPORT_ROW)), place(read_i32(Data::VIEWPORT_COL)))
-                else {
+                let (Some(row), Some(column)) = (read_i32(Data::VIEWPORT_ROW), read_i32(Data::VIEWPORT_COL)) else {
                     continue;
                 };
                 let of = |data: Data::Type| read_u32(data).unwrap_or(0);
-                shown.push(ShownRead {
+                images.push(AnchoredRead {
+                    z: read_i32(Data::Z).unwrap_or(0),
                     row,
-                    piece: Piece {
-                        image: of(Data::IMAGE_ID),
-                        generation,
-                        column,
-                        columns: u16::try_from(of(Data::GRID_COLS)).unwrap_or(u16::MAX),
-                        offset_x: of(Data::CELL_OFFSET_X),
-                        offset_y: of(Data::CELL_OFFSET_Y),
-                        width: of(Data::PIXEL_WIDTH),
-                        height: of(Data::PIXEL_HEIGHT),
-                        source_x: of(Data::SOURCE_X),
-                        source_y: of(Data::SOURCE_Y),
-                        source_width: of(Data::SOURCE_WIDTH),
-                        source_height: of(Data::SOURCE_HEIGHT),
-                    },
+                    column,
+                    image: of(Data::IMAGE_ID),
+                    generation,
+                    columns: of(Data::GRID_COLS),
+                    rows: of(Data::GRID_ROWS),
+                    offset: (of(Data::CELL_OFFSET_X), of(Data::CELL_OFFSET_Y)),
+                    size: (of(Data::PIXEL_WIDTH), of(Data::PIXEL_HEIGHT)),
+                    source: (of(Data::SOURCE_X), of(Data::SOURCE_Y), of(Data::SOURCE_WIDTH), of(Data::SOURCE_HEIGHT)),
                 });
             }
         }
         // SAFETY: freed once
         unsafe { sys::ghostty_render_state_image_iterator_free(iterator) };
         Failed::check("ghostty_render_state_get(IMAGE_ITERATOR)", filled)?;
-        shown.sort_by_key(|one| (one.row, one.piece.column));
-        Ok(shown)
+        Ok(images)
     }
 }
 

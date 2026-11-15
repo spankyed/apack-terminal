@@ -68,7 +68,8 @@ module and its declarations.
 - **Draws images** a program placed: their pixels are fetched once per generation and drawn under or over
   the text as the program asked, scaled from the cell the terminal measured them in to the cell drawn. One
   shown through placeholder cells comes with the rows that hold the cells, and is drawn under their text
-  wherever they are.
+  wherever they are. One placed relative to another comes with the frame while it is on the screen, and
+  is not drawn once its parent has scrolled into the history.
 - **Puts its input where the cursor is, drawn or not.** A program that draws its own cursor hides the
   terminal's and still moves it to where typing goes; an input method composes there.
 - **Confirms a paste** the source says could run a command, through the host's `confirmPaste`.

@@ -2,7 +2,7 @@
 //! scrolls, the pixels a view is given, and that a session not asked to take images takes none.
 
 use apack_terminal::screen::Screen;
-use apack_terminal::view::wire::{ToView, body};
+use apack_terminal::view::wire::{ANCHORED_LISTED, ToView, body};
 use apack_terminal::vt::images::IMAGE_CHUNK_BYTES;
 
 const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -412,6 +412,155 @@ fn a_row_whose_cells_show_nothing_yet_says_it_holds_them() {
     screen.acknowledge(view, before.sequence).expect("an acknowledgement is taken");
     let after = last_frame(&sent);
     assert_eq!(row_of(&after, line).expect("the row is sent again once its image arrives").pieces().len(), 1);
+}
+
+/// What a view is sent after `bytes`, having drawn `last`.
+fn after(
+    screen: &mut Screen,
+    sent: &std::sync::mpsc::Receiver<Vec<u8>>,
+    last: &apack_terminal::view::wire::Frame,
+    bytes: &[u8],
+) -> apack_terminal::view::wire::Frame {
+    screen.feed(bytes);
+    screen
+        .acknowledge(apack_terminal::view::publish::ViewId { connection: 1, channel: 1 }, last.sequence)
+        .expect("an acknowledgement is taken");
+    last_frame(sent)
+}
+
+/// Image 6 at `row` and `column` (counted from one, as a program counts), two cells by one, and image 7
+/// sent and shown nowhere: a parent and something to place beside it.
+fn parent_and_picture(row: u16, column: u16) -> Vec<u8> {
+    let pixels = base64(&[0x80; 20 * 20 * 3]);
+    format!(
+        "\x1b[{row};{column}H\x1b_Ga=T,f=24,i=6,p=3,s=20,v=20,c=2,r=1,C=1,q=2;{pixels}\x1b\\\x1b_Ga=t,f=24,i=7,s=20,v=20,q=2;{pixels}\x1b\\"
+    )
+    .into_bytes()
+}
+
+/// Where a frame says each image placed relative to another is: its image, depth, row and column.
+fn beside(frame: &apack_terminal::view::wire::Frame) -> Option<Vec<(u32, i32, i32, i32)>> {
+    frame.anchored.as_ref().map(|told| told.list.iter().map(|one| (one.image, one.z, one.row, one.column)).collect())
+}
+
+/// **An image placed relative to another is told in the frame, where the core says it is on the screen.**
+/// It has no cell of its own: it is so many cells from its parent, and the storage a view's placements
+/// are read from cannot say where that is. So it is not among those placements, and a frame carries all
+/// of them, with the size of a cell they were measured at.
+#[test]
+fn an_image_placed_relative_to_another_is_told_in_the_frame_that_shows_it() {
+    let (mut screen, sent) = viewed(40, 10);
+    let first = last_frame(&sent);
+    assert_eq!(beside(&first), Some(vec![]), "a view's first frame says there are none");
+
+    let placed = after(&mut screen, &sent, &first, &parent_and_picture(3, 6));
+    assert_eq!(beside(&placed), None, "nothing is placed relative to another yet");
+
+    // Two columns right of its parent and one row down, over the text
+    let shown = after(&mut screen, &sent, &placed, b"\x1b_Ga=p,i=7,p=9,P=6,Q=3,H=2,V=1,c=2,r=1,z=4,q=2\x1b\\");
+    let told = shown.anchored.as_ref().expect("the frame tells it");
+    assert_eq!((told.cell, told.omitted), ((10, 20), 0));
+    let [one] = told.list.as_slice() else { panic!("one image is placed relative to another, not {told:?}") };
+    assert_eq!((one.image, one.z, one.row, one.column, one.columns, one.rows), (7, 4, 3, 7, 2, 1));
+    assert_eq!((one.offset_x, one.offset_y, one.width, one.height), (0, 0, 20, 20));
+    assert_eq!((one.source_x, one.source_y, one.source_width, one.source_height), (0, 0, 20, 20));
+    let (_, _, placements) = screen.images().expect("the images read");
+    assert_eq!(placements.iter().map(|(_, placement)| placement.image).collect::<Vec<_>>(), [6]);
+
+    // The image sent again is other pixels, which a view has to ask for
+    let pixels = base64(&[0x40; 20 * 20 * 3]);
+    let again =
+        after(&mut screen, &sent, &shown, format!("\x1b_Ga=t,f=24,i=7,s=20,v=20,q=2;{pixels}\x1b\\").as_bytes());
+    // Sending an image again removes what showed it, as the protocol has it
+    assert_eq!(beside(&again), Some(vec![]));
+    let back = after(&mut screen, &sent, &again, b"\x1b_Ga=p,i=7,p=9,P=6,Q=3,H=2,V=1,c=2,r=1,z=4,q=2\x1b\\");
+    let told = back.anchored.as_ref().expect("the frame tells it");
+    assert_eq!(beside(&back), Some(vec![(7, 4, 3, 7)]));
+    assert_ne!(told.list[0].generation, one.generation, "an image sent again is another generation");
+
+    // A view that attaches now is told in its first frame
+    let (sink, second) = std::sync::mpsc::channel();
+    screen
+        .attach_view(apack_terminal::view::publish::ViewId { connection: 2, channel: 1 }, sink)
+        .expect("a view attaches");
+    assert_eq!(beside(&last_frame(&second)), Some(vec![(7, 4, 3, 7)]));
+}
+
+/// **It stays on its line as the screen scrolls, and is not told again for that.** A view holds it by
+/// line, as it holds rows, so a frame that only moved the screen up says nothing of it. It is told again
+/// when it is somewhere else or gone.
+#[test]
+fn an_image_placed_relative_to_another_is_told_again_only_when_it_moved() {
+    let (mut screen, sent) = viewed(40, 10);
+    let first = last_frame(&sent);
+    let mut bytes = parent_and_picture(3, 6);
+    bytes.extend_from_slice(b"\x1b_Ga=p,i=7,p=9,P=6,Q=3,H=2,V=1,c=2,r=1,q=2\x1b\\");
+    let shown = after(&mut screen, &sent, &first, &bytes);
+    assert_eq!(beside(&shown), Some(vec![(7, 0, 3, 7)]));
+
+    // Two lines leave the screen: the image is two rows higher, on the line it was on
+    let scrolled = after(&mut screen, &sent, &shown, b"\x1b[10;1Hnine\r\nten\r\neleven");
+    assert_eq!(scrolled.first_active, shown.first_active + 2);
+    assert_eq!(beside(&scrolled), None, "an image that stayed on its line is told again");
+
+    // Another beside it: both are told, each by its row from the first line the screen now has
+    let joined = after(&mut screen, &sent, &scrolled, b"\x1b_Ga=p,i=7,p=11,P=6,Q=3,H=4,V=1,c=2,r=1,q=2\x1b\\");
+    assert_eq!(joined.first_active, scrolled.first_active);
+    assert_eq!(beside(&joined), Some(vec![(7, 0, 1, 7), (7, 0, 1, 9)]));
+
+    // Its parent gone, so are they
+    let gone = after(&mut screen, &sent, &joined, b"\x1b_Ga=d,d=I,i=6,q=2\x1b\\");
+    assert_eq!(beside(&gone), Some(vec![]));
+}
+
+/// **Beside an image shown through cells, it is wherever those cells are**, and moves in the frame that
+/// brings the rows they were written on: a program that redraws its screen moves both at once.
+#[test]
+fn an_image_placed_relative_to_one_shown_through_cells_moves_with_the_cells() {
+    let (mut screen, sent) = viewed(40, 10);
+    let first = last_frame(&sent);
+    let pixels = base64(&[0x80; 20 * 20 * 3]);
+    let mut bytes = format!(
+        "\x1b_Ga=T,U=1,f=24,i=8,s=20,v=20,c=2,r=1,q=2;{pixels}\x1b\\\x1b_Ga=t,f=24,i=7,s=20,v=20,q=2;{pixels}\x1b\\"
+    )
+    .into_bytes();
+    // One column left of its parent, under the text
+    bytes.extend_from_slice(b"\x1b_Ga=p,i=7,p=10,P=8,H=-1,c=1,r=1,z=-3,q=2\x1b\\");
+    bytes.extend_from_slice(format!("\x1b[6;11H{}", cells(8, 0, 2)).as_bytes());
+    let shown = after(&mut screen, &sent, &first, &bytes);
+    assert_eq!(beside(&shown), Some(vec![(7, -3, 5, 9)]));
+
+    let redrawn = format!("\x1b[6;1H\x1b[2K\x1b[8;21H{}", cells(8, 0, 2));
+    let moved = after(&mut screen, &sent, &shown, redrawn.as_bytes());
+    assert_eq!(beside(&moved), Some(vec![(7, -3, 7, 19)]));
+    assert!(
+        row_of(&moved, moved.first_active + 7).is_some_and(|row| row.pieces().len() == 1),
+        "the frame brings the row its parent is now on"
+    );
+
+    // And with no cells showing its parent it is nowhere
+    let erased = after(&mut screen, &sent, &moved, b"\x1b[8;1H\x1b[2K");
+    assert_eq!(beside(&erased), Some(vec![]));
+}
+
+/// A frame lists no more than `ANCHORED_LISTED` of them, the lowest first, and says how many it left out.
+#[test]
+fn a_frame_lists_so_many_images_placed_relative_to_another_and_counts_the_rest() {
+    let (mut screen, sent) = viewed(40, 10);
+    let first = last_frame(&sent);
+    let mut bytes = parent_and_picture(1, 1);
+    let places: Vec<(i32, i32)> = (0..7).flat_map(|row| (0..40).map(move |column| (row, column))).collect();
+    for (index, (row, column)) in places.iter().enumerate() {
+        bytes.extend_from_slice(
+            format!("\x1b_Ga=p,i=7,p={},P=6,Q=3,H={column},V={row},c=1,r=1,q=2\x1b\\", index + 1).as_bytes(),
+        );
+    }
+    let shown = after(&mut screen, &sent, &first, &bytes);
+    let told = shown.anchored.as_ref().expect("the frame tells them");
+    assert_eq!(told.list.len(), ANCHORED_LISTED);
+    assert_eq!(told.omitted as usize, places.len() - ANCHORED_LISTED);
+    let listed: Vec<(i32, i32)> = told.list.iter().map(|one| (one.row, one.column)).collect();
+    assert_eq!(listed, places[..ANCHORED_LISTED]);
 }
 
 /// A file of raw pixels, and the request that names it as image `id`'s source.

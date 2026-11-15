@@ -11,9 +11,9 @@
 
 use apack_terminal::protocol::{CommandOutcome, Unreported};
 use apack_terminal::view::wire::{
-    Block, Color, ColorChanges, CommandRow, Cursor, Frame, FrameHead, Glyph, Incoming, MAX_MESSAGE_BYTES, Malformed,
-    Pictured, Piece, Placement, Position, Row, Rows, Span, Style, ToBroker, ToView, TooLong, body, frame, read_message,
-    write_row,
+    ANCHORED_LISTED, Anchored, AnchoredImages, Block, Color, ColorChanges, CommandRow, Cursor, Frame, FrameHead, Glyph,
+    Incoming, MAX_MESSAGE_BYTES, Malformed, Pictured, Piece, Placement, Position, Row, Rows, Span, Style, ToBroker,
+    ToView, TooLong, body, frame, read_message, write_row,
 };
 use proptest::prelude::*;
 
@@ -158,6 +158,34 @@ fn colors() -> impl Strategy<Value = ColorChanges> {
     )
 }
 
+/// Images placed relative to another, as a frame lists them: anywhere, on any side of the screen.
+fn anchored_images() -> impl Strategy<Value = AnchoredImages> {
+    let one = (
+        (any::<u32>(), any::<u64>(), any::<i32>(), any::<i32>(), any::<i32>()),
+        (any::<u32>(), any::<u32>(), any::<u32>(), any::<u32>(), any::<u32>(), any::<u32>()),
+        (any::<u32>(), any::<u32>(), any::<u32>(), any::<u32>()),
+    )
+        .prop_map(|((image, generation, z, row, column), drawn, source)| Anchored {
+            image,
+            generation,
+            z,
+            row,
+            column,
+            columns: drawn.0,
+            rows: drawn.1,
+            offset_x: drawn.2,
+            offset_y: drawn.3,
+            width: drawn.4,
+            height: drawn.5,
+            source_x: source.0,
+            source_y: source.1,
+            source_width: source.2,
+            source_height: source.3,
+        });
+    (any::<(u16, u16)>(), prop::collection::vec(one, 0..4), any::<u32>())
+        .prop_map(|(cell, list, omitted)| AnchoredImages { cell, list, omitted })
+}
+
 fn to_view() -> impl Strategy<Value = ToView> {
     let cursor = prop::option::of(
         (any::<u16>(), any::<u16>(), 0u8..4, any::<bool>(), any::<bool>())
@@ -167,7 +195,7 @@ fn to_view() -> impl Strategy<Value = ToView> {
         (any::<u32>(), any::<u64>(), any::<u32>(), any::<u64>()),
         (any::<u16>(), any::<u16>(), any::<u32>(), any::<u32>(), any::<u32>()),
         (cursor, any::<bool>(), any::<bool>(), prop::option::of(any::<u64>())),
-        (any::<bool>(), prop::option::of(colors())),
+        (any::<bool>(), prop::option::of(colors()), prop::option::of(anchored_images())),
         block(),
     )
         .prop_map(|(ids, grid, state, shown, block)| {
@@ -187,6 +215,7 @@ fn to_view() -> impl Strategy<Value = ToView> {
                 reverse_video: shown.0,
                 stale_from: state.3,
                 colors: shown.1,
+                anchored: shown.2,
                 block,
             })
         });
@@ -446,21 +475,27 @@ fn a_frame_that_says_how_a_cursor_it_lacks_is_drawn_is_refused() {
             reverse_video: false,
             stale_from: None,
             colors: None,
+            anchored: None,
         };
         frame(&head, &Rows::default()).expect("a frame")
     };
     // kind, channel, sequence, epoch, first line, columns, rows, scrollback, commands, images, then the flags
     let flags = 10;
-    for (bit, said) in [(16u8, "blinking"), (128, "hidden")] {
+    // The flags are a number, so the ones past its first seven bits take a second byte
+    for (written, said) in [
+        (&[16u8][..], "a cursor that is not there is blinking"),
+        (&[0x80, 0x01], "a cursor that is not there is hidden"),
+        (&[0x80, 0x04], "a flag the format does not define is set"),
+    ] {
         let mut forged = body(&frame(None)).to_vec();
         assert_eq!(forged[flags], 0);
-        forged[flags] = bit;
-        assert_eq!(
-            ToView::decode(&forged),
-            Err(Malformed::Value("a frame's flags")),
-            "a cursor that is not there is {said}"
-        );
+        forged.splice(flags..=flags, written.iter().copied());
+        assert_eq!(ToView::decode(&forged), Err(Malformed::Value("a frame's flags")), "{said}");
     }
+    // Said to tell the images placed relative to another, and ending where they would begin
+    let mut forged = body(&frame(None)).to_vec();
+    forged.splice(flags..=flags, [0x80, 0x02]);
+    assert_eq!(ToView::decode(&forged), Err(Malformed::Truncated));
     // And each is taken of a cursor that is there
     let hidden = Cursor { column: 1, row: 2, shape: 0, blinking: true, hidden: true };
     let ToView::Frame(read) = ToView::decode(body(&frame(Some(hidden)))).expect("a frame") else {
@@ -585,8 +620,9 @@ fn an_answer_longer_than_a_message_is_refused_rather_than_written() {
 
 /// **Rows are taken until a message is full, and full allows for everything else a frame says.** The
 /// most a frame can carry beside its rows — every number at its longest, a cursor, a line to forget
-/// from and all 256 palette entries changed with the three colours beside them — still fits with rows
-/// taken to the last byte that is, and what is then left of the message is nothing a row could have used.
+/// from, all 256 palette entries changed with the three colours beside them, and as many images placed
+/// relative to another as a frame lists — still fits with rows taken to the last byte that is, and what
+/// is then left of the message is nothing a row could have used.
 #[test]
 fn the_longest_head_there_is_fits_with_rows_taken_to_the_last_byte() {
     let mut rows = Rows::default();
@@ -617,6 +653,26 @@ fn the_longest_head_there_is_fits_with_rows_taken_to_the_last_byte() {
         cursor: Some([7, 8, 9]),
         palette: (0..=u8::MAX).map(|index| (index, [index; 3])).collect(),
     };
+    // The numbers that may be below zero are longest at the lowest there is
+    let longest = Anchored {
+        image: u32::MAX,
+        generation: u64::MAX,
+        z: i32::MIN,
+        row: i32::MIN,
+        column: i32::MIN,
+        columns: u32::MAX,
+        rows: u32::MAX,
+        offset_x: u32::MAX,
+        offset_y: u32::MAX,
+        width: u32::MAX,
+        height: u32::MAX,
+        source_x: u32::MAX,
+        source_y: u32::MAX,
+        source_width: u32::MAX,
+        source_height: u32::MAX,
+    };
+    let anchored =
+        AnchoredImages { cell: (u16::MAX, u16::MAX), omitted: u32::MAX, list: vec![longest; ANCHORED_LISTED] };
     let head = FrameHead {
         channel: u32::MAX,
         sequence: u64::MAX,
@@ -633,6 +689,7 @@ fn the_longest_head_there_is_fits_with_rows_taken_to_the_last_byte() {
         reverse_video: true,
         stale_from: Some(u64::MAX),
         colors: Some(&colors),
+        anchored: Some(&anchored),
     };
     let message = frame(&head, &rows).expect("a frame of the rows that were taken is one that can be sent");
     // **Nothing was left on the table.** A count of rows may be five bytes and this one is three, so two
