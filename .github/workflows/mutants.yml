@@ -5,9 +5,10 @@ name: mutants
 # is minutes of mutants nobody edited and a survivor outside the change is not this change's to answer for.
 # `cargo xtask pre-push` runs the same thing before a push, so a survivor is normally found before CI sees it.
 #
-# Windows-only code is mutated on Windows, and nowhere else: `src/tree.rs`'s Job Objects and every
-# `cfg(windows)` arm compile on no other platform, so a Linux run reports every one of their mutants as
-# unviable. A change with none installs nothing there.
+# Windows-only code is mutated on Windows, and nowhere else: the files `.cargo/windows-only` lists compile on
+# no other platform, so a run elsewhere would report every one of their mutants as missed, and the Linux
+# job leaves them out of its diff. A file with Windows arms among POSIX code is not listed: its Windows arms
+# are answered by a dispatch (`-f files=`). A change with none installs nothing there.
 #
 # **It runs on a push too, and that is not belt and braces.** This repository's work lands on `master`
 # directly, so a gate that fires only on a pull request had never fired at all — and `.cargo/mutants.toml`
@@ -16,9 +17,8 @@ name: mutants
 # Windows half is the one no developer here can run, which is the point of having it.
 #
 # **A dispatch is for a file rather than a change**, which is how Windows-only code gets answered at all:
-# `src/tree.rs` is `#[cfg(windows)]` in its entirety and is excluded from no run, so until something mutates
-# it on Windows its mutants are missed everywhere. The Linux half sits a dispatch out, since a
-# whole-repository Linux run would report exactly those as missed.
+# a file `.cargo/windows-only` lists is mutated nowhere else, so until something mutates it on Windows its
+# mutants are answered by nobody. The Linux half sits a dispatch out.
 on:
   pull_request:
   push:
@@ -38,10 +38,6 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # The files whose mutants only Windows can answer. Each is wholly `cfg(windows)`: the Linux run leaves it out
-  # of its diff, and the Windows run mutates it. A file with Windows arms among POSIX code is not listed: its
-  # Windows arms are answered by a dispatch (`-f files=`), as they were before.
-  WINDOWS_ONLY: src/tree.rs src/listening/pipe.rs
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -66,9 +62,9 @@ jobs:
           fetch-depth: 0
       - id: scope
         run: |
-          # The Windows-only files are not this job's (`WINDOWS_ONLY`): it cannot compile them
+          # The Windows-only files are not this job's (`.cargo/windows-only`): it cannot compile them
           excludes=()
-          for file in $WINDOWS_ONLY; do excludes+=(":!$file"); done
+          for file in $(grep -v -e '^#' -e '^ *$' .cargo/windows-only); do excludes+=(":!$file"); done
           git diff $(bash .github/base.sh) -- '*.rs' "${excludes[@]}" > change.diff
           if [ -s change.diff ]; then
             echo "code=true" >> "$GITHUB_OUTPUT"
@@ -158,7 +154,7 @@ jobs:
           # the claim being made deliberately rather than by a grep.
           # `base` is git arguments (`--merge-base HEAD^1` on a pull request), so it is split here as the Linux
           # job's diff is. A failed diff fails this step: an empty list would pass a job that mutated nothing.
-          names="$(git diff --name-only --diff-filter=d $base -- $WINDOWS_ONLY)"
+          names="$(git diff --name-only --diff-filter=d $base -- $(grep -v -e '^#' -e '^ *$' .cargo/windows-only))"
           files=()
           while IFS= read -r name; do
             [ -n "$name" ] && files+=("$name")

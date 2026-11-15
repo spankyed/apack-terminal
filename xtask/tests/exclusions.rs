@@ -87,3 +87,20 @@ fn a_survivor_is_read_from_the_list_whatever_the_run_exited_with() {
     assert!(survivors("").is_empty(), "an empty list is a run nothing survived");
     assert!(survivors("\n  \n").is_empty(), "and blank lines are not mutants");
 }
+
+/// The list of Windows-only files is its lines that are neither blank nor comments, as written.
+#[test]
+fn the_windows_only_files_are_the_lines_that_name_one() {
+    let listed = "# a comment\n\nsrc/tree.rs\n  src/vt/image_sources/windows.rs  \n# src/gone.rs\n";
+    assert_eq!(xtask::mutants::windows_only(listed), ["src/tree.rs", "src/vt/image_sources/windows.rs"]);
+    assert!(xtask::mutants::windows_only("# nothing\n\n").is_empty());
+}
+
+/// **The list as committed names only files that are there**: a run told to leave out a file that has
+/// gone leaves out nothing.
+#[test]
+fn the_windows_only_files_listed_are_there() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("the repository");
+    let files = xtask::mutants::windows_only_files(root).expect("the list is whole");
+    assert!(files.iter().any(|file| file == "src/tree.rs"), "{files:?}");
+}

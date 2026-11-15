@@ -245,6 +245,20 @@ unlinked once read, as the protocol says; a file is left alone. A replay reads n
 the name a program wrote and not the pixels, so an image sent by name is absent from a replay and from a
 session restored from one (`screen.rs`, `rebuild`).
 
+**A named image is read by the broker, never by the core** (`vt/image_sources/`). The core opens a path
+and then looks at what it opened, inside the write that parses the session's output, so a FIFO stopped a
+session being read. Each command naming a source is taken out of the stream instead. The core is asked
+whether it would get as far as reading it — fed the command naming a source with a NUL in it, which it
+refuses before opening anything, having done all it does first — and only if it would is the source
+read: opened without waiting, asked about through the descriptor it was opened as, and read with the
+screen let go of, on a thread of its own that is given up on once the system has gone five seconds
+without answering it. What was read is fed to the core as the bytes it holds, in pieces where it is large,
+with the program's keys as the core read them; what was not is refused with the core's own answer. So the
+program is told, and shown, what the core reading the source itself would tell and show it. A FIFO, a
+directory, a device, a socket, a path that is not there and a file on a filesystem mounted at or beneath
+`/proc`, `/sys` or `/dev` (but for `/dev/shm`) are refused without a wait. Where a session answers
+otherwise, and what is bounded rather than prevented, is in [design.md](design.md#known-limits).
+
 ## The two halves meet in a file
 
 `node/view-vectors.json` holds every kind of message as the bytes this encoder writes and the value they

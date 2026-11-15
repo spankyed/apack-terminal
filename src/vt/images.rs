@@ -223,18 +223,14 @@ pub(super) fn install_decoders() {
 impl Terminal {
     /// Lets programs send images, up to `IMAGE_STORAGE_BYTES` of them.
     ///
-    /// **As bytes in the stream, unless `files`.** The protocol has two other ways in that this takes —
-    /// a file the terminal is asked to read, and a shared memory object — and each has the terminal open
-    /// something on this machine because a program's output named it. That is a fair thing to ask of a
-    /// terminal by a program on this machine, which could have read the file itself, and not by whatever
-    /// else reaches a screen: a file shown with `cat`, a log, the far end of an `ssh`. Which of the two a
-    /// session's output is, only whoever started it knows, so it is theirs to say (`Request::Spawn`).
-    ///
-    /// **What the core then refuses is the core's to refuse**: a path that is not a regular file, one
-    /// under `/proc`, `/sys` or `/dev`, a file or object past what an image may be. A shared memory object
-    /// is unlinked once read, as the protocol says, and is the one thing here that is removed. The
-    /// protocol's third way in, a temporary file the terminal deletes, stays off: nothing a session is
-    /// started for sends one, and it is the one that removes a file.
+    /// **As bytes in the stream, unless `files`**, which turns on the core's own reading of a file or a
+    /// shared memory object a program names. **A session never does**: the core opens a path before it
+    /// asks what it is, so a FIFO stops it, and it reads inside the write that parses a session's output.
+    /// A session that takes images by name has them read by `image_sources` instead, and its core is fed
+    /// the bytes (`Screen::allow_images`); it allows `files` only while it feeds the core a command naming
+    /// a source with a NUL in it, which the core refuses before it opens anything. `files` is also what the
+    /// suite holds that reading to: the core doing it itself, over sources that answer. The protocol's third way in, a temporary file the
+    /// terminal deletes, stays off either way.
     pub fn allow_images(&self, files: bool) -> Result<(), Failed> {
         let limit: u64 = IMAGE_STORAGE_BYTES;
         // SAFETY: KITTY_IMAGE_STORAGE_LIMIT takes a `uint64_t*`

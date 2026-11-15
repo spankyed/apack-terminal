@@ -90,7 +90,7 @@ their credit. `record` and `restore` are a file to record the session in and whe
 holds; `images` is whether its programs may send any ([design.md](design.md)).
 
 `image_files` is whether an image may be *named* rather than sent: as a file on this machine or a shared
-memory object, which the terminal then reads. It is read only where `images` is on, and it is the caller's
+memory object, which the broker then reads and hands to the terminal as its bytes. It is read only where `images` is on, and it is the caller's
 to say because only the caller knows what a session's output is. A program on this machine could have read
 the file itself; a file shown with `cat`, a log, or the far end of an `ssh` that spells the same request
 is asking this machine to open a path of its choosing. So it is for a session started to run one program
