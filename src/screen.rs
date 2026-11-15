@@ -241,6 +241,9 @@ pub struct Screen {
     recorder: Option<Recorder>,
     /// A keyframe is due and is waiting for the parser to be between sequences (`keyframe_when_due`).
     keyframe_waits: bool,
+    /// The cursor is to be taken to new defaults, and is waiting for the parser to be between sequences
+    /// (`set_cursor_defaults`).
+    cursor_waits: bool,
     /// What the program last named its terminal, for a caller that was not there to be told.
     title: Option<String>,
     /// The session is over and its views have been told (`end_views`). The screen itself may be read a
@@ -442,6 +445,8 @@ impl Screen {
         let reported = Collector::new();
         let mut terminal = Terminal::new(cols, rows)?;
         terminal.set_cursor_defaults(CursorStyle::Bar, CursorBlink::Program)?;
+        // A new terminal is between sequences
+        terminal.reset_cursor();
         // Never less than what a client reading the screen as text is promised (`SCROLLBACK_ASKED`)
         terminal.set_scrollback_lines(history.max(SCROLLBACK_ASKED))?;
         terminal.set_scrollback_bytes(HISTORY_BYTES)?;
@@ -472,6 +477,7 @@ impl Screen {
             loads: 0,
             recorder: None,
             keyframe_waits: false,
+            cursor_waits: false,
             title: None,
             ended: false,
         })
@@ -524,7 +530,7 @@ impl Screen {
             let piece = fed + hold_piece(&bytes[fed..]);
             while fed < piece {
                 let (taken, ground) = match &mut self.image_sources {
-                    None => self.terminal.feed_to(&bytes[fed..piece], self.keyframe_waits),
+                    None => self.terminal.feed_to(&bytes[fed..piece], self.keyframe_waits || self.cursor_waits),
                     // Never nothing: a body is read up to the byte that ends it, and then is not being read
                     // — unless it is a command naming its source, which is where the feed stops
                     Some(scanner) if scanner.reading() => {
@@ -539,7 +545,7 @@ impl Screen {
                     }
                     Some(scanner) => {
                         let (taken, ground, string) =
-                            self.terminal.feed_to_string(&bytes[fed..piece], self.keyframe_waits);
+                            self.terminal.feed_to_string(&bytes[fed..piece], self.keyframe_waits || self.cursor_waits);
                         if string {
                             scanner.begin();
                         }
@@ -548,6 +554,10 @@ impl Screen {
                 };
                 fed += taken;
                 self.reported.get_mut().place_marks(&self.terminal);
+                if ground && self.cursor_waits {
+                    self.cursor_waits = false;
+                    self.terminal.reset_cursor();
+                }
                 if ground {
                     // What was parsed before the keyframe is recorded before it, and the rest after
                     self.record(|recorder| recorder.output(&bytes[recorded..fed]));
@@ -642,9 +652,9 @@ impl Screen {
     /// Feeds the core a command with its file and shared memory sources allowed, for the one it refuses
     /// to open (`Load::asked`, `Load::refusal`), and turns them off again.
     fn by_core(&mut self, command: &[u8]) {
-        let _ = self.terminal.allow_images(true);
+        let _ = self.terminal.read_named_images(true);
         self.terminal.feed(command);
-        let _ = self.terminal.allow_images(false);
+        let _ = self.terminal.read_named_images(false);
     }
 
     /// Acts on each hold the program began or ended since this was last called.
@@ -1073,11 +1083,20 @@ impl Screen {
         input::paste(&self.terminal, text, allow_unsafe)
     }
 
-    /// Sets the cursor a session starts with and returns to, and takes the cursor to it now; see
+    /// Sets the cursor a session starts with and returns to, and takes the cursor to it; see
     /// `Terminal::set_cursor_defaults`. The cursor a view is sent is the one that stands after it.
+    ///
+    /// **Taken there where the parser is between sequences**: now, if it is, and otherwise at the byte that
+    /// ends the sequence the program is part way through (`feed_until_image`). Taking the cursor is a write
+    /// to the parser, and made in the middle of a program's sequence it would end that sequence early, the
+    /// rest of which would then be read as text; it would end a command whose image is being read too.
     pub fn set_cursor_defaults(&mut self, style: CursorStyle, blink: CursorBlink) -> Result<(), Failed> {
-        self.settle_outstanding();
         self.terminal.set_cursor_defaults(style, blink)?;
+        if self.outstanding.is_none() && self.terminal.at_ground() {
+            self.terminal.reset_cursor();
+        } else {
+            self.cursor_waits = true;
+        }
         if let Some(publication) = &mut self.publication {
             publication.touch();
         }

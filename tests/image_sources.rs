@@ -1012,12 +1012,8 @@ fn a_read_outstanding_when_something_else_reaches_the_core_is_refused() {
         let (taken, image) = screen.feed_until_image(&stream);
         let read = image.expect("the feed stopped").read();
         if interrupted {
-            screen
-                .set_cursor_defaults(
-                    apack_terminal::protocol::CursorStyle::Block,
-                    apack_terminal::protocol::CursorBlink::Program,
-                )
-                .expect("the cursor is set");
+            // Anything fed while the read is outstanding, though it is nothing
+            screen.feed(b"");
         }
         screen.finish_image(read);
         screen.feed(&stream[taken..]);
@@ -1155,12 +1151,6 @@ fn a_late_answer_is_not_taken_for_the_next_reads() {
     let mut screen = session(true);
     let (taken, image) = screen.feed_until_image(&stream);
     let late = image.expect("the feed stopped at the first").read();
-    screen
-        .set_cursor_defaults(
-            apack_terminal::protocol::CursorStyle::Block,
-            apack_terminal::protocol::CursorBlink::Program,
-        )
-        .expect("the cursor is set");
     let (more, image) = screen.feed_until_image(&stream[taken..]);
     let next = image.expect("the feed stopped at the second").read();
     screen.finish_image(late);
@@ -1309,4 +1299,24 @@ fn answers_again(worker: &Worker) -> bool {
         }
         answered
     })
+}
+
+/// **Setting the cursor's defaults while a read is outstanding waits for it**, rather than ending the
+/// command whose image is being read: the image is shown, and the cursor follows.
+#[test]
+fn a_cursor_set_while_a_read_is_outstanding_waits_for_it() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let stream = [&named_part(directory.path(), &PIXEL, "")[..], b"after"].concat();
+    let mut screen = session(true);
+    let (taken, image) = screen.feed_until_image(&stream);
+    let read = image.expect("the feed stopped").read();
+    screen
+        .set_cursor_defaults(apack_terminal::protocol::CursorStyle::Block, apack_terminal::protocol::CursorBlink::Off)
+        .expect("the cursor is set");
+    screen.finish_image(read);
+    screen.feed(&stream[taken..]);
+    let made = made(&mut screen);
+    assert_eq!(made.image.as_deref(), Some(&PIXEL[..]), "a read was ended by the cursor being set");
+    assert!(made.told.contains("i=7;OK"), "{:?}", made.told);
+    assert_eq!(made.screen.lines[0], "after");
 }

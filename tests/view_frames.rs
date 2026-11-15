@@ -572,16 +572,27 @@ fn a_reset_returns_to_a_blinking_cursor_for_on_and_program_and_a_steady_one_for_
     }
 }
 
+/// **A default set part way through a program's sequence takes the cursor, and leaves the sequence whole**:
+/// taking the cursor is a write to the parser, which waits for the sequence to end — made in the middle of
+/// it, the write would end it early and the rest would be printed. A program that had chosen a cursor of
+/// its own is the one the write is for, so each case begins by choosing one.
 #[test]
-fn a_default_set_part_way_through_a_program_sequence_still_takes_the_cursor() {
-    let mut screen = Screen::new(20, 4);
-    let view = View::attached(&mut screen, 1, 1);
-    let first = view.frame();
-    let set = after(&mut screen, &view, &first, |screen| {
-        write(screen, "\x1b[");
-        screen.set_cursor_defaults(CursorStyle::Block, CursorBlink::Off).expect("the defaults are set")
-    });
-    assert_eq!(drawn_as(&set), Some((0, false)));
+fn a_default_set_part_way_through_a_program_sequence_takes_the_cursor_once_it_ends() {
+    for (begun, rest) in [("\x1b[", "1mbold"), ("\x1b]0;a ti", "tle\x07bold"), ("\x1b_Gq=2", "\x1b\\bold")] {
+        let mut screen = Screen::new(20, 4);
+        screen.feed(b"\x1b[5 q");
+        let view = View::attached(&mut screen, 1, 1);
+        let first = view.frame();
+        screen.acknowledge(view.id, first.sequence).expect("an acknowledgement is taken");
+        write(&mut screen, begun);
+        screen.set_cursor_defaults(CursorStyle::Block, CursorBlink::Off).expect("the defaults are set");
+        // Nothing the program sees has changed while its sequence is unfinished
+        view.nothing();
+        write(&mut screen, rest);
+        let ended = view.frame();
+        assert_eq!(drawn_as(&ended), Some((0, false)), "{begun:?}: the cursor did not follow the sequence's end");
+        assert_eq!(screen.snapshot(0).lines[0], "bold", "{begun:?}: the sequence was cut short");
+    }
 }
 
 /// DECSCUSR's blink and DEC mode 12 are one setting in the core: each sets what the other reads. The
