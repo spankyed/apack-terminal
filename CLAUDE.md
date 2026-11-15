@@ -24,6 +24,7 @@ holds.
 | `node/protocol.ts`, `node/view-vectors.json` | **generated** from `src/protocol.rs` and `src/view/wire.rs`; never edited by hand, and shipped by the package |
 | `xtask/` | the repository's own tasks (`cargo xtask <task>`): the protocol's derivation, the mutation gate's own checks, and pre-push |
 | `node/` | the npm package a consumer installs: the protocol's types, where the binary is, and the binary `cargo xtask package` stages into it |
+| `windows/conpty/`, `build.rs` | Microsoft's ConPTY, which the broker runs its sessions on in Windows in place of the system's (its README says why and where it is from), and the build script that puts it beside every binary `cargo` builds |
 | `view/` | the `apack-terminal-view` npm package: what a window draws a session with, from the rows `src/view/` sends. TypeScript on npm, vite and vitest (`npm test`, `npm run typecheck`, `npm run build` there); its codec (`view/src/broker/wire.ts`) is the other half of `src/view/wire.rs`, and its suite reads `node/view-vectors.json` in place, so a change to the wire is one commit holding both halves |
 
 ## Checks

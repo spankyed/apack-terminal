@@ -1,4 +1,5 @@
-//! Hanging up a named pipe: wholly Windows code, in a file of its own.
+//! What a named pipe needs that a socket does not: hanging one up, asking whose one is, and the name a user's
+//! broker has when nobody names one. Wholly Windows code, in a file of its own.
 //!
 //! The Linux mutation run mutates every changed file and cannot compile this one, so each mutant here would
 //! be reported missed there. `.github/workflows/mutants.yml` names this file among the Windows-only ones: the
@@ -29,6 +30,65 @@ pub fn hang_up(pipe: &impl AsHandle) -> bool {
     }
 }
 
+/// Where a user's broker is when nobody says where: a pipe named for the user, by their SID.
+///
+/// **A pipe's name is one namespace for the whole machine**, so it is the SID that keeps two users' brokers apart,
+/// as each user's own directory does on POSIX — and unlike a directory, it keeps nobody else from taking the name
+/// first. What does that is asking whose a pipe is before carrying a byte to it (`owned_by_this_user`).
+pub fn default_name() -> Option<String> {
+    let sid = crate::security::current_user_sid().ok()?;
+    Some(format!(r"\\.\pipe\apack-terminal-{}", sid.to_string_lossy()))
+}
+
+/// Whether the pipe `pipe` is connected to belongs to the user this process runs as.
+///
+/// **Its owner, asked of the kernel.** A pipe's name can be taken by any account first, and a client that connects
+/// to it by name reaches whoever did. The owner a pipe is created with is its creator, or a SID the creator holds:
+/// naming another user takes a privilege an ordinary account does not have. So a pipe this user did not make
+/// answers with someone else's SID, and is refused before it is handed anything (`proxy.rs`). The broker's own
+/// pipe names its owner outright (`security::access_for`).
+pub fn owned_by_this_user(pipe: &impl AsHandle) -> std::io::Result<bool> {
+    owned_by(pipe, &crate::security::current_user_sid()?)
+}
+
+/// Whether `pipe` is owned by the account `sid` names, as SDDL spells a SID (`S-1-5-…`).
+fn owned_by(pipe: &impl AsHandle, sid: &widestring::U16CStr) -> std::io::Result<bool> {
+    use windows_sys::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, GetSecurityInfo, SE_KERNEL_OBJECT};
+    use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
+
+    let handle = pipe.as_handle().as_raw_handle() as HANDLE;
+    // SAFETY: `handle` is the pipe's own handle, which lives for the length of this borrow. `GetSecurityInfo` is
+    // asked for the owner alone, which points into the descriptor it allocates; that descriptor is freed on every
+    // path after the owner has been read, and the string `ConvertSidToStringSidW` allocates is freed once copied.
+    unsafe {
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let asked = GetSecurityInfo(
+            handle,
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        );
+        if asked != 0 {
+            return Err(std::io::Error::from_raw_os_error(asked as i32));
+        }
+        let mut text: windows_sys::core::PWSTR = std::ptr::null_mut();
+        let converted = ConvertSidToStringSidW(owner, &mut text);
+        LocalFree(descriptor as HLOCAL);
+        if converted == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let found = widestring::U16CStr::from_ptr_str(text) == sid;
+        LocalFree(text.cast::<core::ffi::c_void>() as HLOCAL);
+        Ok(found)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Read;
@@ -39,6 +99,8 @@ mod tests {
     use interprocess::local_socket::{GenericFilePath, ListenerOptions, Stream, ToFsName, prelude::*};
 
     use crate::listening::hang_up;
+
+    use super::{owned_by, owned_by_this_user};
 
     /// Hanging up a connection ends a read that is parked on it, and says that it did.
     ///
@@ -87,5 +149,30 @@ mod tests {
             let _ = far_tx.send(reader.read(&mut buffer).is_ok());
         });
         far_rx.recv_timeout(Duration::from_secs(10)).expect("the far end's read ends once hung up");
+    }
+
+    /// A pipe made as the broker makes its own is this user's, and is not another account's: asked from the
+    /// connecting end, which is where a proxy asks. The other account is `SYSTEM`, whose SID is the same on every
+    /// machine; a pipe an ordinary user cannot make is the case that needs another account, and was made by hand
+    /// (`docs/architecture/windows-pipe-access.md`).
+    #[test]
+    fn a_pipe_made_as_the_brokers_is_this_users_and_no_one_elses() {
+        use interprocess::os::windows::local_socket::ListenerOptionsExt;
+
+        let name = format!(r"\\.\pipe\apack-owner-test-{}", std::process::id());
+        let listener = ListenerOptions::new()
+            .name(name.clone().to_fs_name::<GenericFilePath>().expect("a pipe name"))
+            .security_descriptor(crate::security::owner_only().expect("the broker's descriptor"))
+            .create_sync()
+            .expect("the pipe is created");
+        let connecting = std::thread::spawn(move || {
+            Stream::connect(name.to_fs_name::<GenericFilePath>().expect("a pipe name")).expect("the pipe accepts")
+        });
+        let _server = listener.accept().expect("a connection is accepted");
+        let Stream::NamedPipe(client) = connecting.join().expect("the client connects");
+
+        assert!(owned_by_this_user(&client).expect("the owner is read"), "the broker's pipe is not its user's");
+        let system = widestring::U16CString::from_str("S-1-5-18").expect("no interior nul");
+        assert!(!owned_by(&client, &system).expect("the owner is read"), "the broker's pipe is SYSTEM's");
     }
 }
