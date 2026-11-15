@@ -254,31 +254,38 @@ session ending settles every wait on it, because nothing is coming.
   `signal` answers `UNSUPPORTED`, and the pipe's directory and peer are not checked as a socket's are
   on POSIX.
 
-- **A session that reads images by name reads what it is named, and on POSIX a file's name is asked
-  about first.** `Spawn.image_files` has the core open the file or shared memory object a program's
-  output names. The core refuses what is not a regular file and anything under `/proc`, `/sys` or `/dev`,
-  and reads no more than an image may be — but it opens the path before it looks at what it is, and
-  opening a FIFO waits for a writer, inside the write that parses the session's output. A program that
-  named one stopped its session being read until something opened the other end (observed on macOS: the
-  read had not returned after four seconds). The core takes no file it did not open itself, so the name
-  is kept from it instead (`vt/image_paths.rs`): until the command it is in has ended, when the path is
-  asked about without being opened and passed on only if it is a regular file. Any other is left out,
-  and the program is told what it is told of a file that could not be opened. Where such a command
-  begins is asked of the core, which begins one in more places than `ESC _ G`; what its body means is
-  repeated there, and `tests/image_paths.rs` holds the repeat to the core. What is not looked at:
-  - **A path changed between being asked about and being opened.** Whatever can do that runs as the
-    user on this machine, and needs no terminal to open a FIFO. This is against a name, not against a
-    program racing the check.
-  - **A shared memory object** (`t=s`), which is named to `shm_open` as it came. On macOS such an object
-    is not a file. On Linux it is one under `/dev/shm`, where a FIFO can be made, and `shm_open` waits
-    on it as `open` does (observed with glibc 2.41: still waiting after three seconds). So there a
-    session that takes names can still be stopped by one.
-  - **A regular file that is slow to open** — on a mount that has gone away — which is as slow to be
-    asked about.
-  - **Windows**, where nothing is asked: what stands in for a FIFO there has not been looked at.
+- **A session that reads images by name has the broker read them, and the core reads none.**
+  `Spawn.image_files` lets a program name an image's source — a file on this machine, or a shared memory
+  object — rather than send its bytes. The core would open what is named itself, inside the write that
+  parses the session's output and before it looks at what it opened, so a FIFO stopped the session being
+  read (observed on macOS: the read had not returned after four seconds), and so did one under `/dev/shm`
+  named as shared memory (glibc 2.41: still waiting after three seconds). So a session's core takes no
+  file and no shared memory object, and each command naming one is taken out of the stream instead
+  (`vt/image_sources/`): read by the broker, and fed to the core as a transmission of the bytes it holds,
+  with the program's other keys as the core read them, so the core answers the program as it would have.
+  - **Opened without waiting, and asked about through what was opened.** On POSIX a source is opened
+    with `O_NONBLOCK`, so a FIFO answers at once, and `fstat`ed on the same descriptor: only a regular
+    file is read (a shared memory object is a regular file on Linux and of no file type on macOS), and
+    not one on the filesystems mounted at `/proc`, `/sys` or `/dev`, told apart by device rather than by
+    path. On Windows the path is held to the core's rules before it is opened (no share, no device
+    namespace, no device name), and what was opened to them after, with its type a disk file's. Nothing
+    can be swapped in between the question and the read, because the question is asked of what was
+    opened.
+  - **Read with the screen let go of.** The pty's reader stops at such a command, reads its source with
+    nothing locked, and feeds the rest once it has (`Screen::feed_until_image`). A source that is slow to
+    read — a regular file on a mount that has stopped answering — holds up that session's own output, as a
+    program writing slowly does, and nothing else: views, snapshots and other clients of the screen go
+    on. Nothing cancels a read the system is in the middle of, so that session waits for it.
+  - **A command this does not read as the core would is the core's, and refused.** Where the core begins
+    such a command is asked of the core, which begins one in more places than `ESC _ G`; what its body
+    means is repeated, and `tests/image_sources.rs` holds the repeat to the core over every spelling it
+    can make. Every way the repeat gives up hands the command over as it came, to a core that opens
+    nothing — so a disagreement is an image not shown, never a path opened.
 
-  That is why the option stays the caller's, for a session running a program it trusts, and why a shell
-  is not started with it.
+  What is not looked at: a regular file on another filesystem mounted beneath `/proc` or `/sys`, which is
+  read like any other; and no shared memory object is read on Windows, where the core reads none either.
+  The option stays the caller's, for a session running a program it trusts — a file it names is read as
+  the user — and a shell is not started with it.
 
 ## What the broker will not do
 

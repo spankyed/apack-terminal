@@ -125,8 +125,11 @@ fn mutants_of_the_change(root: &Path, base: &str) -> Result<(), String> {
     }
     let started = Instant::now();
     println!("pre-push: mutants of the change");
+    // What only Windows compiles is not mutated here, where nothing builds it (`.cargo/windows-only`)
+    let windows_only = crate::mutants::windows_only_files(root)?;
     let status = Command::new("cargo")
         .args(["mutants", "--in-diff", CHANGE_DIFF])
+        .args(windows_only.iter().flat_map(|file| ["--exclude", file.as_str()]))
         .current_dir(root)
         .status()
         .map_err(|e| format!("pre-push: mutants of the change didn't start: {e}"))?;

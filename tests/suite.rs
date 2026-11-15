@@ -26,8 +26,9 @@ mod feed;
 mod frames;
 mod holds;
 mod housekeeping;
+mod image_source_rules;
 #[cfg(unix)]
-mod image_paths;
+mod image_sources;
 mod images;
 #[cfg(unix)]
 mod keeping;

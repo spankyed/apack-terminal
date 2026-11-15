@@ -25,7 +25,8 @@ use crate::protocol::{
 };
 use crate::recording;
 use crate::screen::{
-    Colors, CommandAt, Facts, Fetched, HISTORY_LINES, ImagesAt, Match, Screen, Snapshot, Unanswered, Vouching,
+    Colors, CommandAt, Facts, Fetched, HISTORY_LINES, ImagesAt, Match, PendingImage, Screen, Snapshot, Unanswered,
+    Vouching,
 };
 use crate::tree::Tree;
 use crate::view::publish::{Outlet, ViewId};
@@ -1183,23 +1184,37 @@ impl Sessions {
                 match reader.read(&mut buffer) {
                     Ok(0) | Err(_) => break,
                     Ok(read) => {
-                        // The authority first, then the renderer's copy. The waits are settled inside this
-                        // same lock, in one order everywhere — screen, then waiters — so the two threads
-                        // that take both cannot deadlock on each other
-                        let (replies, met, effects) = match parsing.lock() {
-                            Ok(mut screen) => {
-                                screen.feed(&buffer[..read]);
-                                let replies = screen.take_replies();
-                                let effects = screen.take_effects();
-                                let recent = rows_added(&buffer[..read], screen.cols());
-                                let met = settle_met(&waiting, &screen, recent);
-                                // Each view that has drawn its last frame is sent what changed, here
-                                // where the change landed
-                                screen.publish();
-                                (replies, met, effects)
+                        // **Fed as far as a command naming an image's source, which is read with the screen
+                        // let go of**: the read reaches a disk, and a slow one would otherwise hold up every
+                        // view, snapshot and client of this screen with it (`Screen::feed_until_image`). The
+                        // rest is fed once it has been, so nothing the program wrote after it is parsed before
+                        // it. This thread waits on the read either way, which is the session's own output
+                        // waiting, as it would on a program writing slowly
+                        let (mut fed, mut image) = (0, None);
+                        let (mut replies, mut met, mut effects) = (Vec::new(), 0, Vec::new());
+                        loop {
+                            let read_image = image.take().map(PendingImage::read);
+                            // The authority first, then the renderer's copy. The waits are settled inside this
+                            // same lock, in one order everywhere — screen, then waiters — so the two threads
+                            // that take both cannot deadlock on each other
+                            let Ok(mut screen) = parsing.lock() else { break };
+                            if let Some(read_image) = read_image {
+                                screen.finish_image(read_image);
                             }
-                            Err(_) => (Vec::new(), 0, Vec::new()),
-                        };
+                            let (taken, next) = screen.feed_until_image(&buffer[fed..read]);
+                            replies.extend(screen.take_replies());
+                            effects.extend(screen.take_effects());
+                            let recent = rows_added(&buffer[fed..fed + taken], screen.cols());
+                            met += settle_met(&waiting, &screen, recent);
+                            // Each view that has drawn its last frame is sent what changed, here
+                            // where the change landed
+                            screen.publish();
+                            fed += taken;
+                            image = next;
+                            if image.is_none() {
+                                break;
+                            }
+                        }
                         // Written to, so not quiet: its history is compressed once it has been (`housekeeping`)
                         quiet.wrote();
                         for effect in effects {

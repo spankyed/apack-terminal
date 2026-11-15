@@ -12,7 +12,7 @@ use std::time::SystemTime;
 
 use ghostty_vt_rs_sys as sys;
 
-pub mod image_paths;
+pub mod image_sources;
 pub mod images;
 pub mod input;
 pub mod placeholders;
@@ -131,7 +131,7 @@ impl Terminal {
     /// `ESC _`: the core takes `ESC X` and `ESC ^` the same way, and the single bytes `0x9f`, `0x98` and
     /// `0x9e` wherever it is part way through a sequence — after an `ESC`, inside a CSI — though not
     /// between sequences, where they are read as text. What follows the stop is the string's body, and
-    /// that is what `image_paths` reads before the core does.
+    /// that is what `image_sources` reads before the core does.
     pub fn feed_to_string(&mut self, bytes: &[u8], or_ground: bool) -> (usize, bool, bool) {
         self.feed_until(bytes, or_ground, true)
     }

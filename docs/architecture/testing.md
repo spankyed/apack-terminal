@@ -30,7 +30,8 @@ cargo xtask clear-mutants                      # removes the working copies a mu
 | `tests/effects.rs`, `tests/commands.rs`, `tests/command_rows.rs` | what a program does that is not on its screen; the ring of commands a shell marked, and the lines each is on |
 | `tests/recording.rs`, `tests/keeping.rs` | a recording replayed, bounded and picked up from; sessions kept past their holder, restored and rewound, against the real binary |
 | `tests/images.rs` | images a program places: where each is told to be, and its pixels in parts |
-| `tests/image_paths.rs` | a file named as an image's source: a FIFO does not stall the session, a regular file is read, and a session reads what the core alone would over every spelling of a command |
+| `tests/image_sources.rs` | an image named rather than sent: a FIFO does not stall the session, a regular file and a shared memory object are read for the range the core would read, a large one in pieces, a session reads what the core alone would over every spelling of a command, and what the session hands the core as it came is refused by it |
+| `tests/image_source_rules.rs` | the rules a Windows path is held to before and after it is opened, on every platform; and on Windows, what is opened by them |
 | `tests/holds.rs` | the deadlines kept for screens a program is holding still: one a screen, and none left once each has been drawn or its session has ended |
 | `tests/housekeeping.rs` | history compressed once a session has gone quiet |
 | `tests/proxy.rs` | a broker reached through a process's stdin and stdout, proxies arriving together starting one, and the one broker a socket has: its lock, its socket's mode, and when it leaves |

@@ -1,11 +1,12 @@
-//! A file a program names as an image's source is asked about before the core opens it
-//! (`vt::image_paths`): a FIFO named so does not stop the session being read, a regular file is read as
-//! it was, and nothing the core would run as such a command gets past unread.
+//! An image a program names rather than sends is read by the broker, and the core fed its bytes
+//! (`vt::image_sources`): a FIFO named so does not stop the session being read, a regular file and a
+//! shared memory object are read as the core would read them, and the core itself opens nothing.
 //!
 //! **The core is the reference, not a list of spellings.** What begins a string, what a string's body
-//! is, how control data is read and which values mean a file are the core's rules, repeated in
-//! `image_paths` — so the cases here that matter most feed the same stream to a session and to the core
-//! alone and demand the same picture, over every way of spelling a command this file can make up.
+//! is, how control data is read and which values name a source are the core's rules, repeated in
+//! `image_sources` — so the cases here that matter most feed the same stream to a session and to the
+//! core alone, reading files itself, and demand the same picture, over every way of spelling a command
+//! this file can make up.
 //!
 //! **A stall is a failure here, not a hang.** A session that opens a FIFO nothing writes to waits for
 //! ever, so every case that names one runs its feeds on a thread and gives up on it (`unstalled`).
@@ -17,8 +18,12 @@ use std::time::Duration;
 
 use apack_terminal::recording::{self, Entry, Timed};
 use apack_terminal::screen::Screen;
+use apack_terminal::screen::{PendingImage, Snapshot};
 use apack_terminal::vt::Terminal;
-use apack_terminal::vt::image_paths::{ImagePaths, PATH_BYTES, regular_file};
+use apack_terminal::vt::image_sources::posix::{
+    on_special_filesystem, open_file, shared_memory_kind, special_filesystems,
+};
+use apack_terminal::vt::image_sources::{CHUNK_BYTES, CONTROL_BYTES, Load, PATH_BYTES, Scanner, Source};
 use proptest::prelude::*;
 
 /// One pixel: red, green, blue and alpha.
@@ -387,21 +392,37 @@ fn a_session_reads_what_the_core_alone_would_read() {
 
 /// **Nothing the core would run as a command naming a file gets to it unread.**
 ///
-/// The name here has a space in it. The core's decoder passes over one, and reads the file; what reads
-/// names for a session does not, and leaves such a name out. So wherever the core alone reads the file
-/// and a session does not, the name was read on its way; and a session reading it anywhere would be a
-/// command the core ran that was never looked at — which, naming a FIFO, is the stall.
+/// **A name spelled so that two decoders could read two paths is not read at all.** The core's decoder
+/// passes over a space and reads the file anyway; a session reads a name in base64's own alphabet and no
+/// other — and the core itself is never let read one — so wherever the core alone reads the file, a
+/// session reads nothing.
 #[test]
-fn no_command_the_core_runs_reaches_it_with_its_name_unread() {
+fn a_name_the_core_alone_would_read_past_a_space_in_is_not_read() {
     let directory = tempfile::tempdir().expect("a directory");
     let name = named(&picture(&directory.path().join("picture")));
     let spaced = format!("{} {}", &name[..8], &name[8..]);
     let mut read_alone = 0;
     for stream in every_command(spaced.as_bytes()) {
         read_alone += usize::from(core_alone(&stream).is_some());
-        assert_eq!(taken(&[&stream]).image, None, "unread: {:?}", String::from_utf8_lossy(&stream));
+        assert_eq!(taken(&[&stream]).image, None, "read: {:?}", String::from_utf8_lossy(&stream));
     }
     assert!(read_alone > 20, "the core alone read {read_alone} of them, which is too few to have shown anything");
+}
+
+/// **A command this does not take out of the stream is the core's, and the core opens nothing.** Control
+/// data longer than is held is handed over as it came; the core alone, reading files itself, reads the
+/// file such a command names, and a session's core refuses it — the program is told no.
+#[test]
+fn a_command_handed_to_the_core_as_it_came_is_refused_by_it() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let name = named(&picture(&directory.path().join("picture")));
+    // Pairs the core keeps and ignores, so the command it reads is the one it would read without them
+    let padding = ",X=0".repeat(CONTROL_BYTES / 4 + 1);
+    let stream = command(b"\x1b_", format!("{SHOWN}{padding},t=f").as_bytes(), name.as_bytes(), ST);
+    assert_eq!(core_alone(&stream).as_deref(), Some(&PIXEL[..]), "the core alone did not read the file");
+    let made = taken(&[&stream]);
+    assert_eq!(made.image, None, "a session's core read a file itself");
+    assert!(made.told.contains("\x1b_Gi=7;E"), "the program was not told no: {:?}", made.told);
 }
 
 /// **The core begins a string where this file says it does, and nowhere it says it does not** — the
@@ -457,72 +478,69 @@ proptest! {
     }
 }
 
-/// Feeds `chunks` to what reads names as the body of a string the core has just begun, and answers what
-/// the core was fed, how much of each chunk was read, and whether more of the string is still to be read.
-fn body(chunks: &[&[u8]], may_open: impl Fn(&[u8]) -> bool) -> (Vec<u8>, Vec<usize>, bool) {
-    let mut paths = ImagePaths::default();
-    paths.begin();
-    let (mut fed, mut read) = (Vec::new(), Vec::new());
+/// Feeds `chunks` to the scanner as the body of a string the core has just begun, and answers what the
+/// core was fed, how much of each chunk was read, whether more of the string is still to be read, and
+/// the source of the command taken out, if one was.
+fn body(chunks: &[&[u8]]) -> (Vec<u8>, Vec<usize>, bool, Option<Source>) {
+    let mut scanner = Scanner::default();
+    scanner.begin();
+    let (mut fed, mut read, mut taken) = (Vec::new(), Vec::new(), None);
     for chunk in chunks {
-        read.push(paths.read(chunk, &may_open, |passed| fed.extend_from_slice(passed)));
+        let (count, load) = scanner.read(chunk, |passed| fed.extend_from_slice(passed));
+        read.push(count);
+        taken = taken.or(load.map(|load: Load| load.source().clone()));
     }
-    (fed, read, paths.reading())
+    (fed, read, scanner.reading(), taken)
 }
 
-/// **Nothing is held but a name.** A string that is not a graphics command is let go of at its first
-/// byte and a command that names no file where its payload begins, so megabytes of pixels are not read
-/// here on their way; a command that names one is fed its control data as it comes, and its name once.
+/// **Nothing is held but what is being decided.** A string that is not a graphics command is let go of
+/// at its first byte, and a command at the `;` after its control data unless it names its source — fed
+/// as it came, so megabytes of pixels are not read here on their way. A command that names one is fed
+/// nothing: it is taken out of the stream at the byte that ends it, with its source, and that byte left.
 #[test]
-fn only_a_name_is_held_and_only_until_its_string_ends() {
-    let asked = std::cell::RefCell::new(Vec::new());
-    let may_open = |path: &[u8]| {
-        asked.borrow_mut().push(path.to_vec());
-        true
-    };
+fn only_what_is_being_decided_is_held() {
+    assert_eq!(body(&[b"xa=T,t=f;L3RtcA=="]), (Vec::new(), vec![0], false, None), "not a graphics command");
+    assert_eq!(body(&[b"\xff\x9f"]), (Vec::new(), vec![2], true, None), "not yet anything");
+    assert_eq!(body(&[b"Ga=T,t=d;AQIDBA=="]), (b"Ga=T,t=d;".to_vec(), vec![9], false, None), "pixels");
+    assert_eq!(body(&[b"Ga=T,t=f", b"\x1b\\"]), (b"Ga=T,t=f".to_vec(), vec![8, 0], false, None), "no payload");
+    assert_eq!(body(&[b"Ga=p,t=f;L3RtcA==\x1b"]), (b"Ga=p,t=f;".to_vec(), vec![9], false, None), "not a transmission");
+    assert_eq!(body(&[b"Ga=T,t=f,o=y;L3RtcA=="]).3, None, "a compression the core refuses");
+    assert_eq!(body(&[b"Ga=T,t=_102;L3RtcA=="]).3, None, "a value the core refuses");
 
-    assert_eq!(body(&[b"xa=T,t=f;L3RtcA=="], may_open), (b"x".to_vec(), vec![1], false), "not a graphics command");
-    assert_eq!(body(&[b"\xff\x9f"], may_open), (b"\xff\x9f".to_vec(), vec![2], true), "not yet anything");
-    assert_eq!(body(&[b"Ga=T,t=d;AQIDBA=="], may_open), (b"Ga=T,t=d;".to_vec(), vec![9], false), "pixels");
-    assert_eq!(body(&[b"Ga=T,t=f", b"\x1b\\"], may_open), (b"Ga=T,t=f".to_vec(), vec![8, 0], false), "no payload");
-    assert!(asked.borrow().is_empty(), "something that is not a name was asked about");
-
-    // A name, in pieces: held through each of them, and fed as one when the string ends
+    // A name, in pieces: nothing fed, and the source given once the string ends, short of its end
     let pieces: [&[u8]; 4] = [b"Ga=T,t=f;", b"L3Rt", b"cA", b"\x1b\\"];
-    assert_eq!(body(&pieces[..1], may_open), (b"Ga=T,t=f;".to_vec(), vec![9], true));
-    assert_eq!(body(&pieces[..3], may_open), (b"Ga=T,t=f;".to_vec(), vec![9, 4, 2], true));
-    assert!(asked.borrow().is_empty(), "a name was asked about before all of it had come");
-    // Up to the byte that ends the string and not past it; padded, which is how every decoder reads it alike
-    assert_eq!(body(&pieces, may_open), (b"Ga=T,t=f;L3RtcA==".to_vec(), vec![9, 4, 2, 0], false));
-    assert_eq!(*asked.borrow(), [b"/tmp".to_vec()]);
+    assert_eq!(body(&pieces[..3]), (Vec::new(), vec![9, 4, 2], true, None));
+    let file = Some(Source::File(b"/tmp".to_vec()));
+    assert_eq!(body(&pieces), (Vec::new(), vec![9, 4, 2, 0], false, file.clone()));
+    assert_eq!(body(&[b"Ga=T,t=f;L3RtcA\x9c"]), (Vec::new(), vec![15], false, file.clone()), "the 8-bit ST");
+    let shared = Some(Source::SharedMemory(b"/tmp".to_vec()));
+    assert_eq!(body(&[b"Gt=115,a=q;L3RtcA==\x1b"]).3, shared, "shared memory, its medium as a number");
+    // One that is dropped rather than run takes nothing out, and one that is not base64 is unreadable
+    assert_eq!(body(&[b"Ga=T,t=f;L3RtcA==\x18"]), (Vec::new(), vec![17], false, None));
+    assert_eq!(body(&[b"Ga=T,t=f;L3Rt cA==\x1b"]).3, Some(Source::Unreadable));
 
-    // One that may not be opened is left out, and one that is not base64 is not asked about at all
-    assert_eq!(body(&pieces, |_| false), (b"Ga=T,t=f;".to_vec(), vec![9, 4, 2, 0], false));
-    asked.borrow_mut().clear();
-    assert_eq!(body(&[b"Ga=T,t=f;L3Rt cA==\x18"], may_open), (b"Ga=T,t=f;".to_vec(), vec![18], false));
-    assert!(asked.borrow().is_empty(), "a name that is not base64 was asked about");
+    // Control data past what is held is fed as it came
+    let long = [b"Ga=T".as_slice(), ",X=0".repeat(CONTROL_BYTES / 4).as_bytes(), b",t=f;L3RtcA=="].concat();
+    let (fed, read, reading, source) = body(&[&long]);
+    assert_eq!((source, reading), (None, false));
+    assert_eq!(fed, long[..read[0]], "what was held was not fed as it came");
+    assert!(read[0] > CONTROL_BYTES && read[0] < long.len());
 }
 
 /// **A name is held up to the longest path there is and no further**, so a string that never ends costs
-/// what one path does. Past that it is left out without being asked about: nothing could open it.
+/// what one path does. Past that it is unreadable, without being decoded.
 #[test]
-fn a_name_longer_than_any_path_is_left_out() {
-    let asked = std::cell::Cell::new(0);
-    let may_open = |_: &[u8]| {
-        asked.set(asked.get() + 1);
-        true
-    };
+fn a_name_longer_than_any_path_is_not_read() {
     let command = |name: &str| [b"Ga=T,t=f;", name.as_bytes(), b"\x1b\\"].concat();
 
     // As many characters as the longest path's name has, which is that path to the three bytes
     let longest = "QUFB".repeat(PATH_BYTES.div_ceil(3));
-    let (fed, _, _) = body(&[&command(&longest)], may_open);
-    assert_eq!(fed, command(&longest)[..9 + longest.len()], "the longest name was not passed on");
-    assert_eq!(asked.get(), 1);
+    let path = b"AAA".repeat(PATH_BYTES.div_ceil(3));
+    assert_eq!(body(&[&command(&longest)]).3, Some(Source::File(path)), "the longest name was not read");
 
     // And one character more
     let stream = command(&format!("{longest}Q"));
-    assert_eq!(body(&[&stream], may_open), (b"Ga=T,t=f;".to_vec(), vec![stream.len() - 2], false));
-    assert_eq!(asked.get(), 1, "a name longer than any path was asked about");
+    assert_eq!(body(&[&stream]), (Vec::new(), vec![stream.len() - 2], false, Some(Source::Unreadable)));
 
     // Through a session: told no, at whatever length, and what follows is read as it was
     let mut screen = session(true);
@@ -532,10 +550,10 @@ fn a_name_longer_than_any_path_is_left_out() {
     assert_eq!(made.screen.lines[0], "after");
 }
 
-/// **Only a regular file's name is passed on**: not a FIFO's, a directory's, a device's or a socket's,
-/// nor one of something that is not there — each as the system answers without opening it.
+/// **Only a regular file is opened to be read**, and what it is is asked of what was opened: not a FIFO,
+/// a directory, a device or a socket, nor something that is not there — and opening a FIFO does not wait.
 #[test]
-fn only_a_regular_file_is_passed_on() {
+fn only_a_regular_file_is_read() {
     let directory = tempfile::tempdir().expect("a directory");
     let file = picture(&directory.path().join("picture"));
     let socket = directory.path().join("socket");
@@ -548,15 +566,44 @@ fn only_a_regular_file_is_passed_on() {
         directory.path().join("missing"),
         PathBuf::new(),
     ];
-
-    assert!(regular_file(file.as_os_str().as_bytes()));
-    let stream = |path: &Path| [b"Ga=T,t=f;", named(path).as_bytes(), b"\x1b\\"].concat();
-    let (fed, _, _) = body(&[&stream(&file)], regular_file);
-    assert_eq!(fed, [b"Ga=T,t=f;", named(&file).as_bytes()].concat());
+    assert!(open_file(file.as_os_str().as_bytes()).is_some());
+    assert!(open_file(b"/tmp\0/x").is_none(), "a path with a NUL in it was opened");
     for other in others {
-        assert!(!regular_file(other.as_os_str().as_bytes()), "{} is taken for a regular file", other.display());
-        let (fed, _, _) = body(&[&stream(&other)], regular_file);
-        assert_eq!(fed, b"Ga=T,t=f;", "{} was passed on", other.display());
+        let path = other.as_os_str().as_bytes().to_vec();
+        assert!(unstalled(move || open_file(&path).is_none()), "{} was opened to be read", other.display());
+    }
+}
+
+/// **The filesystems the core refuses are told by their devices**: `/dev` is one wherever this runs, and
+/// what holds `/` never is, so a directory of it that nothing is mounted on refuses nothing.
+#[test]
+fn the_filesystems_refused_are_the_ones_mounted_where_the_core_refuses() {
+    use std::os::unix::fs::MetadataExt;
+    let device = |path: &str| std::fs::metadata(path).expect("a path that is there").dev();
+    let special = special_filesystems();
+    assert!(special.contains(&device("/dev")), "{special:?}");
+    assert!(!special.contains(&device("/")), "{special:?}");
+    assert!(on_special_filesystem(7, &[3, 7]));
+    assert!(!on_special_filesystem(7, &[3, 5]));
+    assert!(!on_special_filesystem(7, &[]));
+}
+
+/// A file on `/proc` is a regular file, and is refused for where it is.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_file_on_proc_is_not_read() {
+    assert!(std::fs::metadata("/proc/self/status").expect("procfs").is_file());
+    assert!(open_file(b"/proc/self/status").is_none());
+}
+
+/// **A shared memory object is of no file type on macOS and a regular file on Linux**; anything else
+/// that a name could lead to is not one.
+#[test]
+fn a_shared_memory_object_is_what_its_mode_says() {
+    assert!(shared_memory_kind(0o600));
+    assert!(shared_memory_kind(u32::from(libc::S_IFREG) | 0o600));
+    for other in [libc::S_IFIFO, libc::S_IFDIR, libc::S_IFCHR, libc::S_IFBLK, libc::S_IFSOCK, libc::S_IFLNK] {
+        assert!(!shared_memory_kind(u32::from(other) | 0o600), "{other:o} is taken for shared memory");
     }
 }
 
@@ -655,5 +702,240 @@ fn a_session_that_takes_no_names_answers_alike_whatever_is_named() {
             // Where images are taken at all, the program is told no; where they are not, it is told nothing
             assert_eq!(made.told.contains("\x1b_Gi=7;E"), images, "{spelled}: {:?}", made.told);
         }
+    }
+}
+
+/// A file of `bytes`, and the command that names part of it as image 7's source.
+fn named_part(directory: &Path, bytes: &[u8], control: &str) -> Vec<u8> {
+    let path = directory.join("bytes");
+    std::fs::write(&path, bytes).expect("a file is written");
+    command(b"\x1b_", format!("{SHOWN},t=f{control}").as_bytes(), named(&path).as_bytes(), ST)
+}
+
+/// **A file is read from its `O` offset, its `S` size of it exactly**, as the core reads one: a size past
+/// its end is refused, and an offset with no size reads to the end.
+#[test]
+fn a_file_is_read_from_its_offset_for_its_size() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let bytes = [9, 9, 1, 2, 3, 4, 9, 9];
+    for (control, read) in [
+        (",O=2,S=4", Some(&PIXEL[..])),
+        (",O=4,S=4", Some(&[3, 4, 9, 9][..])),
+        (",O=4", Some(&[3, 4, 9, 9][..])),
+        (",O=6,S=4", None),
+        (",S=9", None),
+    ] {
+        let stream = named_part(directory.path(), &bytes, control);
+        assert_eq!(core_alone(&stream).as_deref(), read, "{control}: the core alone");
+        assert_eq!(at_every_boundary(&stream).image.as_deref(), read, "{control}: a session");
+    }
+}
+
+/// A shared memory object holding `bytes`, made under `name`, and closed.
+fn made_shared(name: &str, bytes: &[u8]) -> CString {
+    let c_name = CString::new(name).expect("a name");
+    // SAFETY: the name is a valid C string; the descriptor is used for this object only and closed here
+    unsafe {
+        let descriptor = libc::shm_open(c_name.as_ptr(), libc::O_CREAT | libc::O_EXCL | libc::O_RDWR, 0o600);
+        assert!(descriptor >= 0, "a shared memory object is made");
+        assert_eq!(libc::ftruncate(descriptor, bytes.len() as libc::off_t), 0);
+        let mapped = libc::mmap(std::ptr::null_mut(), bytes.len(), libc::PROT_WRITE, libc::MAP_SHARED, descriptor, 0);
+        assert_ne!(mapped, libc::MAP_FAILED);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>(), bytes.len());
+        libc::munmap(mapped, bytes.len());
+        libc::close(descriptor);
+    }
+    c_name
+}
+
+/// Whether a shared memory object of this name is there, which is gone once it was read. Unlinked if it
+/// is, so the next run can make it.
+fn still_shared(c_name: &CString) -> bool {
+    // SAFETY: the name is a valid C string; a descriptor answered is closed at once
+    unsafe {
+        let descriptor = libc::shm_open(c_name.as_ptr(), libc::O_RDONLY, 0);
+        if descriptor < 0 {
+            return false;
+        }
+        libc::close(descriptor);
+        libc::shm_unlink(c_name.as_ptr());
+        true
+    }
+}
+
+/// A name for a shared memory object that no other case uses at once: short enough for macOS, which
+/// holds one to 31 bytes.
+fn shared_name(case: &str) -> String {
+    format!("/apk-{case}-{}", std::process::id())
+}
+
+/// **What of a shared memory object is the image's is the core's rule**: from `O`, `S` of it, or as many
+/// bytes as the picture's pixels where no size is given. Each is unlinked once it was read, read or not.
+#[test]
+fn a_shared_memory_object_is_read_for_its_range_and_unlinked() {
+    let bytes = [9, 9, 1, 2, 3, 4, 9, 9];
+    for (case, control, read) in [
+        ("range", ",O=2,S=4", Some(&PIXEL[..])),
+        ("pixels", ",O=4", Some(&[3, 4, 9, 9][..])),
+        ("past", ",O=1048576,S=4", None),
+        ("large", ",S=4,s=20000", None),
+    ] {
+        let name = shared_name(case);
+        let c_name = made_shared(&name, &bytes);
+        let stream =
+            command(b"\x1b_", format!("{SHOWN},t=s{control}").as_bytes(), base64(name.as_bytes()).as_bytes(), ST);
+        let made = taken(&[&stream]);
+        let gone = !still_shared(&c_name);
+        // macOS rounds an object up to a page, which is where the rest of the bytes come from
+        assert_eq!(made.image.as_deref().map(|image| &image[..read.map_or(0, <[u8]>::len)]), read, "{control}");
+        assert!(gone, "{control}: an object that was opened was not unlinked");
+    }
+}
+
+/// **A command the core answers without reading what it names is answered so here**: an image given both
+/// an id and a number, a query with no id, and a frame for an image that is not there. Nothing is read,
+/// and a shared memory object named by one is left where it is.
+#[test]
+fn a_command_the_core_refuses_unread_reads_nothing() {
+    for (case, control, told) in [
+        ("both", "a=T,i=7,I=3,f=32,s=1,v=1", "EINVAL: image ID and number are mutually exclusive"),
+        ("query", "a=q,f=32,s=1,v=1", ""),
+        ("frame", "a=f,i=7,f=32,s=1,v=1", "i=7;ENOENT"),
+    ] {
+        let name = shared_name(case);
+        let c_name = made_shared(&name, &PIXEL);
+        let stream = command(b"\x1b_", format!("{control},t=s").as_bytes(), base64(name.as_bytes()).as_bytes(), ST);
+        let made = taken(&[&stream]);
+        assert!(still_shared(&c_name), "{case}: an object the core would not have opened was read");
+        assert!(made.told.contains(told), "{case}: told {:?}", made.told);
+        assert_eq!(made.image, None);
+    }
+    // A frame for an image that is there is read
+    let directory = tempfile::tempdir().expect("a directory");
+    let mut screen = session(true);
+    screen.feed(b"\x1b_Ga=t,i=7,f=32,s=1,v=1,q=2;AQIDBA==\x1b\\");
+    screen.feed(&named_part(directory.path(), &[5, 6, 7, 8], "").replace_action());
+    assert!(screen.take_replies().concat().contains("i=7"), "a frame for an image that is there was not answered");
+}
+
+/// Turns the `a=T` of a command this file makes into `a=f`, a frame of the image already sent.
+trait ReplaceAction {
+    fn replace_action(self) -> Vec<u8>;
+}
+
+impl ReplaceAction for Vec<u8> {
+    fn replace_action(self) -> Vec<u8> {
+        String::from_utf8(self).expect("text").replacen("a=T", "a=f", 1).into_bytes()
+    }
+}
+
+/// On Linux a shared memory object is a file under `/dev/shm`, where a FIFO can be made; named as one,
+/// it is refused without a wait, and unlinked as anything opened under that name is.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_fifo_named_as_shared_memory_does_not_stall_the_session() {
+    let name = shared_name("fifo");
+    let path = PathBuf::from(format!("/dev/shm{name}"));
+    fifo(&path);
+    let stream = command(b"\x1b_", format!("{ASKED},t=s").as_bytes(), base64(name.as_bytes()).as_bytes(), ST);
+    let made = unstalled(move || taken(&[&stream]));
+    assert!(made.told.contains("\x1b_Gi=7;E"), "the program was not told no: {:?}", made.told);
+    let left = path.exists();
+    let _ = std::fs::remove_file(&path);
+    assert!(!left, "a FIFO opened under the name was not unlinked");
+}
+
+/// **A file larger than one command carries is sent in pieces**, and is the same image; asked about, it is
+/// answered in one, as the core loads a query.
+#[test]
+fn a_file_larger_than_a_command_is_sent_in_pieces() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let (width, height) = (1024u32, 1024u32);
+    let pixels: Vec<u8> = (0..width * height * 4).map(|at| (at % 251) as u8).collect();
+    assert!(pixels.len() > CHUNK_BYTES, "a picture that fits one command shows nothing about pieces");
+    let path = directory.path().join("large");
+    std::fs::write(&path, &pixels).expect("a file is written");
+    for action in ["T", "q"] {
+        let stream = command(
+            b"\x1b_",
+            format!("a={action},i=7,f=32,s={width},v={height},t=f").as_bytes(),
+            named(&path).as_bytes(),
+            ST,
+        );
+        let made = taken(&[&stream]);
+        assert!(made.told.contains("\x1b_Gi=7;OK"), "a={action}: told {:?}", made.told);
+        if action == "T" {
+            let mut screen = session(true);
+            screen.feed(&stream);
+            let mut read = Vec::new();
+            while read.len() < pixels.len() {
+                read.extend(screen.image(7, read.len() as u32).expect("the image").bytes);
+            }
+            assert!(read == pixels, "the pieces did not make the picture");
+        }
+    }
+}
+
+/// **A named image after a transmission the program left part sent is a transmission of its own**, as
+/// the core makes it: the part sent is abandoned, and the bytes read are not taken for its next piece.
+#[test]
+fn a_named_image_abandons_a_transmission_left_part_sent() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let named = named_part(directory.path(), &PIXEL, "");
+    let stream = [b"\x1b_Ga=T,i=9,f=32,s=2,v=1,m=1;AQID\x1b\\".as_slice(), &named].concat();
+    assert_eq!(core_alone(&stream).as_deref(), Some(&PIXEL[..]));
+    let made = at_every_boundary(&stream);
+    assert_eq!(made.image.as_deref(), Some(&PIXEL[..]));
+    assert!(made.told.contains("\x1b_Gi=7;OK"), "told {:?}", made.told);
+}
+
+/// **The feed stops at a named image, and the rest waits for it**: nothing the program wrote after the
+/// command is parsed until it is answered, and the screen is the caller's to read meanwhile.
+#[test]
+fn the_feed_stops_at_a_named_image_and_the_rest_waits_for_it() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let stream = [b"before ".as_slice(), &named_part(directory.path(), &PIXEL, ""), b"after"].concat();
+    let mut screen = session(true);
+    let (taken, image) = screen.feed_until_image(&stream);
+    let image: PendingImage = image.expect("the feed did not stop at the image");
+    assert_eq!(&stream[taken..taken + 2], ST, "it stopped somewhere other than the end of the command");
+    let before: Snapshot = screen.snapshot(0);
+    assert_eq!(before.lines[0], "before");
+    assert!(matches!(image.load().source(), Source::File(_)));
+
+    let read = image.read();
+    assert!(read.read());
+    screen.finish_image(read);
+    assert_eq!(screen.feed_until_image(&stream[taken..]).0, stream.len() - taken);
+    let made = made(&mut screen);
+    assert_eq!(made.image.as_deref(), Some(&PIXEL[..]));
+    assert_eq!(made.screen.lines[0], "before after");
+}
+
+/// **What else reaches the core while a read is outstanding answers it first, with a refusal**, so the
+/// core is never left with the command's string open under bytes that are not its: the program is told
+/// no, the answer that comes later is let go of, and what follows is read as it was.
+#[test]
+fn a_read_outstanding_when_something_else_reaches_the_core_is_refused() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let stream = [&named_part(directory.path(), &PIXEL, "")[..], b"after"].concat();
+    for interrupted in [true, false] {
+        let mut screen = session(true);
+        let (taken, image) = screen.feed_until_image(&stream);
+        let read = image.expect("the feed stopped").read();
+        if interrupted {
+            screen
+                .set_cursor_defaults(
+                    apack_terminal::protocol::CursorStyle::Block,
+                    apack_terminal::protocol::CursorBlink::Program,
+                )
+                .expect("the cursor is set");
+        }
+        screen.finish_image(read);
+        screen.feed(&stream[taken..]);
+        let made = made(&mut screen);
+        assert_eq!(made.image.is_some(), !interrupted);
+        assert!(made.told.contains(if interrupted { "i=7;E" } else { "i=7;OK" }), "{:?}", made.told);
+        assert_eq!(made.screen.lines[0], "after");
     }
 }

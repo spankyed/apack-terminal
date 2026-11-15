@@ -229,17 +229,17 @@ unlinked once read, as the protocol says; a file is left alone. A replay reads n
 the name a program wrote and not the pixels, so an image sent by name is absent from a replay and from a
 session restored from one (`screen.rs`, `rebuild`).
 
-**A file's name is asked about before the core is told of it, on POSIX** (`vt/image_paths.rs`). The core
-opens a path and then looks at what it opened, and opening a FIFO waits for a writer while the session's
-output goes unread. So the name is held until its command ends — only the name: a command's control
-data, and every payload that is not a file's name, is fed as it comes — then asked about without being
-opened, and passed on only if it is a regular file, a link followed as opening it would follow it. A
-FIFO, a directory, a device, a socket, a path that is not there, and a name longer than any path are
-left out, and the program is told what it is told of a file that could not be opened. So is a name that
-is not base64 as the protocol has it: the core's decoder passes over what it does not know, and a name
-it would read one way and this another is fed to it in neither. What this does not look at — a path
-swapped after it was asked about, a shared memory object, Windows — is in
-[design.md](design.md#known-limits).
+**A named image is read by the broker, never by the core** (`vt/image_sources/`). The core opens a path
+and then looks at what it opened, inside the write that parses the session's output, so a FIFO stopped a
+session being read. A session's core takes no file and no shared memory object; each command naming one is
+taken out of the stream instead — only it: control data that names no source, and every payload of sent
+bytes, is fed as it comes — and its source opened without waiting, asked about through the descriptor it
+was opened as, and read with the screen let go of. What was read is fed to the core as the bytes it holds,
+in pieces where it is large, with the program's keys as the core read them, so the program is answered as
+the core would answer it. A FIFO, a directory, a device, a socket, a path that is not there, a file on
+`/proc`, `/sys` or `/dev`, a name longer than any path, and a name that is not base64 as the protocol has
+it are refused, and the program told what it is told of a file that could not be read. What is not looked
+at is in [design.md](design.md#known-limits).
 
 ## The two halves meet in a file
 

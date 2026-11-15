@@ -649,6 +649,45 @@ fn an_image_named_as_a_file_and_shown_through_cells_is_sent_with_its_row() {
     assert!(path.exists(), "a file a program named was removed");
 }
 
+/// **A FIFO named as an image's file does not stop a session being read**, through the broker's own
+/// reading of the pty: the session's output goes on, the view is sent it, and no image is shown. Before
+/// the broker read named images itself, the core opened the FIFO inside that read and it never returned.
+#[cfg(unix)]
+#[test]
+fn a_fifo_named_as_an_image_file_does_not_stop_the_session() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let path = directory.path().join("images");
+    let fifo = std::ffi::CString::new(path.to_str().expect("a path that is text")).expect("a path");
+    // SAFETY: the name is a valid C string
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0, "a FIFO is made");
+    let name = {
+        const DIGITS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut text = String::new();
+        for chunk in path.to_str().expect("a path that is text").as_bytes().chunks(3) {
+            let bits =
+                chunk.iter().enumerate().fold(0u32, |bits, (at, byte)| bits | (u32::from(*byte) << (16 - 8 * at)));
+            for index in 0..4 {
+                text.push(if index <= chunk.len() {
+                    char::from(DIGITS[((bits >> (18 - 6 * index)) & 63) as usize])
+                } else {
+                    '='
+                });
+            }
+        }
+        text
+    };
+
+    let broker = start();
+    let client = Client::greeting(&broker);
+    let session = client.shell_reading_files();
+    let mut view = View::attached(&broker, &session);
+    view.until_shows("$ ");
+    view.type_line(&format!("printf '\\033_Ga=T,f=32,i=7,s=1,v=1,t=f,q=2;{name}\\033\\\\'; echo sh$((1+1))own"));
+    view.until_shows("sh2own");
+    let pieces: Vec<_> = view.rows.values().flat_map(|row| row.pieces().to_vec()).collect();
+    assert!(pieces.is_empty(), "a FIFO was shown as an image: {pieces:?}");
+}
+
 /// An image a program places is told to a view that asks where the images are, and its pixels to one that
 /// asks for them — in a session that was started taking images, with cells whose size is known.
 #[cfg(unix)]

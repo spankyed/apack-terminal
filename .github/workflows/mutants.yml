@@ -5,9 +5,9 @@ name: mutants
 # is minutes of mutants nobody edited and a survivor outside the change is not this change's to answer for.
 # `cargo xtask pre-push` runs the same thing before a push, so a survivor is normally found before CI sees it.
 #
-# Windows-only code is mutated on Windows, and nowhere else: `src/tree.rs`'s Job Objects and every
-# `cfg(windows)` arm compile on no other platform, so a Linux run reports every one of their mutants as
-# unviable. A change with none installs nothing there.
+# Windows-only code is mutated on Windows, and nowhere else: the files `.cargo/windows-only` lists compile on
+# no other platform, so a run elsewhere would report every one of their mutants as missed, and the Linux
+# job leaves them out. A change with none installs nothing there.
 #
 # **It runs on a push too, and that is not belt and braces.** This repository's work lands on `master`
 # directly, so a gate that fires only on a pull request had never fired at all — and `.cargo/mutants.toml`
@@ -16,9 +16,8 @@ name: mutants
 # Windows half is the one no developer here can run, which is the point of having it.
 #
 # **A dispatch is for a file rather than a change**, which is how Windows-only code gets answered at all:
-# `src/tree.rs` is `#[cfg(windows)]` in its entirety and is excluded from no run, so until something mutates
-# it on Windows its mutants are missed everywhere. The Linux half sits a dispatch out, since a
-# whole-repository Linux run would report exactly those as missed.
+# a file `.cargo/windows-only` lists is mutated nowhere else, so until something mutates it on Windows its
+# mutants are answered by nobody. The Linux half sits a dispatch out.
 on:
   pull_request:
   push:
@@ -79,12 +78,16 @@ jobs:
       # Exit 3 is a timeout, which is the suite's deadline catching a mutant rather than a survivor — the
       # credit-accounting mutants in `output.rs` hang the writer by design. It is also what a run with a
       # timeout *and* a survivor exits with, so the survivors are read from the list rather than the code.
-      # Two at a time: a runner has four cores, and the suite under one mutant uses more than one
+      # Two at a time: a runner has four cores, and the suite under one mutant uses more than one.
+      # **Without what only Windows compiles** (`.cargo/windows-only`): nothing here builds it, so a mutant
+      # of it changes nothing and the suite passes over it. The job below answers it
       - if: steps.scope.outputs.code == 'true'
         env:
           SHARD: ${{ matrix.shard }}
         run: |
-          cargo mutants --in-diff change.diff --shard "$SHARD/8" --sharding round-robin --jobs 2 || [ $? = 3 ]
+          excluded=()
+          while read -r file; do excluded+=(--exclude "$file"); done < <(grep -v -e '^#' -e '^ *$' .cargo/windows-only)
+          cargo mutants --in-diff change.diff --shard "$SHARD/8" --sharding round-robin --jobs 2 "${excluded[@]}" || [ $? = 3 ]
           if [ -s target/mutants.out/missed.txt ]; then cat target/mutants.out/missed.txt; exit 1; fi
       - uses: actions/upload-artifact@v4
         if: always() && steps.scope.outputs.code == 'true'
@@ -145,8 +148,8 @@ jobs:
           # A mixed file's Windows arms are answered by a dispatch (`-f files=src/session.rs`): nothing here
           # can tell a Windows mutant from a POSIX one inside one file, and a developer naming the file is
           # the claim being made deliberately rather than by a grep.
-          windows_only="src/tree.rs"
-          mapfile -t files < <(git diff --name-only --diff-filter=d "$base" -- $windows_only)
+          mapfile -t windows_only < <(grep -v -e '^#' -e '^ *$' .cargo/windows-only)
+          mapfile -t files < <(git diff --name-only --diff-filter=d "$base" -- "${windows_only[@]}")
           if [ ${#files[@]} -gt 0 ]; then
             args=""
             for file in "${files[@]}"; do args="$args --file $file"; done

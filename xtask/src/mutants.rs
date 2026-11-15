@@ -97,8 +97,33 @@ pub fn verdict(patterns: &[String], count: impl Fn(&str) -> Result<usize, String
     ))
 }
 
-/// Fails naming every exclusion that excludes nothing.
+/// The files only Windows compiles (`.cargo/windows-only`), whose mutants a run elsewhere leaves out.
+pub const WINDOWS_ONLY: &str = ".cargo/windows-only";
+
+/// The files `WINDOWS_ONLY` lists: each line that is neither blank nor a comment.
+pub fn windows_only(listed: &str) -> Vec<String> {
+    listed.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')).map(str::to_owned).collect()
+}
+
+/// The same, read from where they are listed, refusing a list that names nothing or a file that is not
+/// there: a run told to leave out a file that has gone leaves out nothing, and says it did.
+pub fn windows_only_files(root: &Path) -> Result<Vec<String>, String> {
+    let listed =
+        std::fs::read_to_string(root.join(WINDOWS_ONLY)).map_err(|error| format!("{WINDOWS_ONLY}: {error}"))?;
+    let files = windows_only(&listed);
+    if files.is_empty() {
+        return Err(format!("{WINDOWS_ONLY} lists no file, so there is nothing to leave out"));
+    }
+    let gone: Vec<&String> = files.iter().filter(|file| !root.join(file).is_file()).collect();
+    if !gone.is_empty() {
+        return Err(format!("{WINDOWS_ONLY} lists files that are not there: {gone:?}"));
+    }
+    Ok(files)
+}
+
+/// Fails naming every exclusion that excludes nothing, and every Windows-only file that is not there.
 pub fn check_exclusions(root: &Path) -> Result<(), String> {
     let config = std::fs::read_to_string(root.join(CONFIG)).map_err(|error| format!("{CONFIG}: {error}"))?;
+    windows_only_files(root)?;
     verdict(&exclusions(&config)?, |pattern| matches(root, pattern))
 }
