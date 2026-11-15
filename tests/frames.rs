@@ -67,8 +67,12 @@ fn says_why(frame: &Frame) -> bool {
 /// One of every request, so the round trip covers the whole message set rather than the easy variants.
 fn requests() -> impl Strategy<Value = Request> {
     prop_oneof![
-        (any::<u32>(), prop_oneof![Just(Role::Client), Just(Role::Lifetime), Just(Role::View)])
-            .prop_map(|(protocol, role)| Request::Hello { protocol, role }),
+        (
+            any::<u32>(),
+            prop_oneof![Just(Role::Client), Just(Role::Lifetime), Just(Role::View)],
+            proptest::option::of("[0-9a-f]{0,64}")
+        )
+            .prop_map(|(protocol, role, challenge)| Request::Hello { protocol, role, challenge }),
         (
             any::<u16>(),
             any::<u16>(),
@@ -327,9 +331,10 @@ fn bytes_that_are_not_text_end_the_connection() {
 #[test]
 fn a_hello_without_a_role_is_a_client() {
     match frame_of(b"{\"kind\":\"hello\",\"protocol\":1}\n") {
-        Frame::Request(Request::Hello { protocol, role }) => {
+        Frame::Request(Request::Hello { protocol, role, challenge }) => {
             assert_eq!(protocol, 1);
             assert_eq!(role, Role::Client);
+            assert_eq!(challenge, None);
         }
         other => panic!("a hello without a role read as {}", kind_of(&other)),
     }

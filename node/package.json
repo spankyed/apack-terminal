@@ -18,7 +18,9 @@
     "protocol.ts",
     "view-vectors.json",
     "apack-terminal",
-    "apack-terminal.exe"
+    "apack-terminal.exe",
+    "conpty.dll",
+    "OpenConsole.exe"
   ],
   "engines": {
     "node": ">=22.17.0"

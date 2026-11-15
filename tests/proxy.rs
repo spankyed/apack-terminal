@@ -104,7 +104,7 @@ impl Proxy {
     }
 
     fn greet(&mut self, role: Role) {
-        self.say(&Request::Hello { protocol: PROTOCOL_VERSION, role });
+        self.say(&Request::Hello { protocol: PROTOCOL_VERSION, role, challenge: None });
         let answered = self.event();
         assert!(matches!(answered, Event::Hello { .. }), "a greeting was answered {answered:?}");
     }
@@ -345,7 +345,8 @@ fn greeted(socket: &Path) -> Stream {
     let name = socket.to_str().expect("a utf-8 path").to_fs_name::<GenericFilePath>().expect("a socket name");
     let stream = Stream::connect(name).expect("the broker accepts");
     let hello =
-        serde_json::to_string(&Request::Hello { protocol: PROTOCOL_VERSION, role: Role::Client }).expect("hello");
+        serde_json::to_string(&Request::Hello { protocol: PROTOCOL_VERSION, role: Role::Client, challenge: None })
+            .expect("hello");
     (&stream).write_all(format!("{hello}\n").as_bytes()).expect("the broker reads");
     // A byte at a time, so that nothing past the answer is taken off the connection
     let mut answer = Vec::new();
@@ -381,6 +382,7 @@ fn a_second_broker_on_a_socket_leaves_the_first_alone_and_says_why_it_left() {
 
 /// A broker that was killed leaves its socket file behind, and nothing holding the socket: the next
 /// broker replaces the file and listens.
+// POSIX only: a named pipe leaves no file behind; it goes with the last handle to it.
 #[cfg(unix)]
 #[test]
 fn a_socket_file_a_dead_broker_left_is_replaced() {
@@ -399,6 +401,8 @@ fn a_socket_file_a_dead_broker_left_is_replaced() {
 
 /// What crosses the socket is a user's terminals, so the socket is theirs alone to open, and a directory
 /// made for it is theirs alone to look in.
+// POSIX only: these are mode bits. A pipe's access is its descriptor, which `security.rs` builds and
+// `tests/security.rs` reads back, and which refuses another user (`docs/architecture/windows-pipe-access.md`).
 #[cfg(unix)]
 #[test]
 fn a_socket_and_a_directory_made_for_it_are_their_owners_alone() {
@@ -415,6 +419,8 @@ fn a_socket_and_a_directory_made_for_it_are_their_owners_alone() {
 
 /// A directory other users can write to is one where the socket can be swapped for theirs: a broker will
 /// not listen in it, and a proxy will not look for one there.
+// POSIX only: a pipe has no directory. A pipe another user made first is refused by whose it is
+// (`pipe::owned_by_this_user`).
 #[cfg(unix)]
 #[test]
 fn a_directory_others_can_write_to_is_refused() {
@@ -483,7 +489,7 @@ fn a_proxy_whose_input_has_ended_still_carries_the_answer_to_what_it_was_last_se
     let mut input = process.stdin.take().expect("piped stdin");
     let mut said = String::new();
     for request in [
-        Request::Hello { protocol: PROTOCOL_VERSION, role: Role::Client },
+        Request::Hello { protocol: PROTOCOL_VERSION, role: Role::Client, challenge: None },
         Request::Sessions,
         Request::Facts { session: "s-404".to_owned() },
     ] {
@@ -549,6 +555,7 @@ fn a_broker_nothing_can_reach_exits() {
 
 /// A socket named with no directory is in the directory the broker was started in, and that directory
 /// is asked what any other is: one other users can write to is refused.
+// POSIX only: a pipe has no directory.
 #[cfg(unix)]
 #[test]
 fn a_socket_named_without_a_directory_is_checked_where_it_would_be_made() {
@@ -582,7 +589,8 @@ fn a_socket_named_without_a_directory_is_checked_where_it_would_be_made() {
 /// **A proxy told no socket uses the one place a user is known to have**: under the runtime directory
 /// the system gives them, or failing that under their home, in a directory made for them alone. So
 /// `ssh host apack-terminal proxy` needs nothing set up on the host, and two proxies told nothing meet.
-// POSIX only: the default socket and its directory are checked for Unix mode bits.
+// POSIX only: the default socket and its directory are checked for Unix mode bits. On Windows the default is
+// a pipe, and the case after this one is its own.
 #[cfg(unix)]
 #[test]
 fn a_proxy_told_no_socket_uses_the_users_own() {
@@ -633,10 +641,44 @@ fn a_proxy_told_no_socket_uses_the_users_own() {
     assert_eq!(mode(&runtime.path().join("apack-terminal")), 0o700);
 }
 
+/// **A proxy told no socket on Windows uses the pipe named for its user**, so `apack-terminal proxy` needs
+/// nothing set up there either, and two proxies told nothing meet. A pipe's name is the whole machine's, so the
+/// user's SID is what is in it (`listening::default_socket`). Whatever broker is already listening there is the
+/// one reached, so the case's job ends only a broker this case started.
+#[cfg(windows)]
+#[test]
+fn a_proxy_told_no_socket_uses_the_pipe_named_for_its_user() {
+    let named = apack_terminal::listening::default_socket().expect("a user has a pipe of their own");
+    let _ending = crate::reaper::ending_with_the_case(Path::new(&named), env!("CARGO_BIN_EXE_apack-terminal"));
+    let told_nothing = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_apack-terminal"));
+        command.arg("proxy").stdin(Stdio::piped()).stdout(Stdio::piped());
+        let mut process = crate::reaper::spawn_contained(&mut command).expect("the proxy starts");
+        let input = process.stdin.take().expect("piped stdin");
+        let events = read_events(process.stdout.take().expect("piped stdout"));
+        Proxy { process, input, events }
+    };
+
+    let mut first = told_nothing();
+    first.greet(Role::Client);
+    let session = first.shell();
+    let mut second = told_nothing();
+    second.greet(Role::Client);
+    second.say(&Request::Facts { session: session.clone() });
+    loop {
+        match second.event() {
+            Event::Facts { session: asked, .. } => break assert_eq!(asked, session),
+            Event::Failed { message, .. } => panic!("the second proxy reached another broker: {message}"),
+            _ => {}
+        }
+    }
+}
+
 /// **A connection whose far end has said all it will can still be hung up on.** A caller that has
 /// finished speaking closes the side it sends on and may go on being owed answers; one that then stops
 /// reading has whatever writes to it parked, and hanging up is what lets that go. The far end's half
 /// being closed already is the state a hang-up most often finds a connection in.
+// POSIX only: a named pipe cannot be closed one way, so its far end is never in this state.
 #[cfg(unix)]
 #[test]
 fn a_connection_whose_far_end_has_stopped_sending_is_hung_up_on_and_a_write_to_it_ends() {

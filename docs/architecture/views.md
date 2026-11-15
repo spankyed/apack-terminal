@@ -22,11 +22,10 @@ it to read, what was waiting is dropped, nothing more is queued for it, and it i
 view that closed its side and then took nothing it was still owed for three seconds: finishing speaking
 is what a view that is listening does, and listening is taking messages.
 
-**On Windows the queue ends and the connection does not.** A named pipe cannot be closed from under a
-thread that is writing to it, so there a view past the limit is sent nothing more and holds none of the
-broker's memory, and its connection — with the one thread parked writing to it — lasts until the view
-reads or closes its end. A view that finds itself sent nothing should reconnect; one that has stopped
-reading altogether costs a thread until its process goes.
+**On Windows the hang-up is a cancel and a disconnect.** A named pipe cannot be shut down from under a thread
+that is writing to it, so the broker cancels the pipe's pending I/O, which lets that thread go, and then
+disconnects it (`listening/pipe.rs`); the view's next write is refused, as on POSIX. The suite's cases for a
+view past the limit and a view that stops making sense run on Windows and say so.
 
 A channel's session is looked up when the view attaches, and what the view asks from then on is that
 session's work alone. An `attach` to a session that is not there is answered `ended`; one to a session

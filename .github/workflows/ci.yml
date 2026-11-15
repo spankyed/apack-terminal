@@ -133,6 +133,11 @@ jobs:
       - name: the package holds a binary
         run: test -x "node/apack-terminal" || test -f "node/apack-terminal.exe"
         shell: bash
+      # And on Windows the ConPTY it runs its sessions on, which is found only beside it (`windows/conpty/`)
+      - name: the package holds the ConPTY beside the binary
+        if: runner.os == 'Windows'
+        run: test -f node/conpty.dll && test -f node/OpenConsole.exe
+        shell: bash
 
   # The view (`view/`): its types, its suite and the build a consumer bundles. One platform, since it is
   # TypeScript drawing on a canvas and nothing in it asks the operating system anything. Its suite reads

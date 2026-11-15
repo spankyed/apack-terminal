@@ -33,6 +33,21 @@ the connection's role being what it is counted as and how it is spoken to from t
 **It is a contract across a pin boundary.** A consumer pins a commit of this repository, so a stale pin has
 to be a clear refusal rather than a message that means something else.
 
+**A greeting can ask the broker to prove it is the caller's own.** A socket's or pipe's name says where a
+caller connected, not to whom, and on Windows any account may create a pipe under a name nobody holds yet. So a
+caller that started its broker with a key (`APACK_TERMINAL_KEY`, which the broker takes out of its environment
+before any session can inherit it) adds a fresh `challenge` to its `hello`, and goes on only if the answer's
+`proof` is HMAC-SHA256 of the challenge under that key, in lowercase hexadecimal:
+
+```json
+{"kind":"hello","protocol":1,"role":"client","challenge":"<random hex>"}
+{"kind":"hello","protocol":1,"history":100000,"proof":"<hmac hex>"}
+```
+
+A broker started without a key answers `proof: null`, as does every broker to a greeting that asks nothing. A
+caller that asked must take `null` as a broker that is not its own: the key is kept where only its user can
+read it, so another account's process has nothing to answer with.
+
 `role` is `client` or `lifetime`, and **a caller that omits it is a client** — so a raw caller, a probe or
 anything speaking the older handshake behaves exactly as before. [design.md](design.md) has what each role
 means for a session's lifetime.
