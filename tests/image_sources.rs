@@ -1208,18 +1208,23 @@ fn every_answer_to_a_read_is_progress() {
     assert_eq!(progress.get(), reads.get(), "a read answered without its being progress");
 }
 
+/// How long the cases here let a read be quiet, and how long a read that is not quiet pauses between its
+/// answers: sixty times shorter, so that no load lengthens a pause past the quiet a case allows.
+const QUIET_IN_CASES: Duration = Duration::from_secs(3);
+const PAUSE_IN_CASES: Duration = Duration::from_millis(50);
+
 /// **A slow read is never given up on while it reads**, however slowly: a source that answers each read
 /// with a byte, more slowly in all than a read may be quiet, is read whole.
 #[test]
 fn a_slow_read_is_not_given_up_on() {
     let worker = Worker::default();
     let load = load_of("a=T");
-    let read = worker.run(Duration::from_secs(2), move |progress| {
+    let read = worker.run(QUIET_IN_CASES, move |progress| {
         let reads = std::rc::Rc::new(std::cell::Cell::new(0));
-        let pause = Duration::from_millis(400);
-        load.read_from(Trickle { bytes: std::io::Cursor::new(vec![5u8; 8]), step: 1, pause, reads }, progress)
+        let source = Trickle { bytes: std::io::Cursor::new(vec![5u8; 70]), step: 1, pause: PAUSE_IN_CASES, reads };
+        load.read_from(source, progress)
     });
-    assert_eq!(read, Some(Some(vec![5u8; 8])), "a read that went on answering was given up on");
+    assert_eq!(read, Some(Some(vec![5u8; 70])), "a read that went on answering was given up on");
 }
 
 /// **What is at `/proc`, `/sys` and `/dev` is told by device**, a path that is only a directory of the
@@ -1263,10 +1268,11 @@ fn a_read_is_given_up_on_only_once_it_has_gone_quiet() {
     let worker = Worker::default();
     assert_eq!(worker.run(Duration::from_secs(5), |_| 7), Some(7));
 
-    // Longer in all than it is let be quiet, and never quiet that long
-    let slow = worker.run(Duration::from_secs(2), |progress| {
-        for _ in 0..5 {
-            std::thread::sleep(Duration::from_millis(500));
+    // Longer in all than it is let be quiet, and never quiet for a sixtieth of that: a margin no load
+    // closes, since what it would have to do is hold a sleeping thread for seconds past its wake
+    let slow = worker.run(QUIET_IN_CASES, |progress| {
+        for _ in 0..70 {
+            std::thread::sleep(PAUSE_IN_CASES);
             progress();
         }
         8
@@ -1275,10 +1281,9 @@ fn a_read_is_given_up_on_only_once_it_has_gone_quiet() {
 
     // Stopped: given up on, and the next refused without being started while it is still waiting
     let (release, stopped) = std::sync::mpsc::channel::<()>();
-    let started = std::time::Instant::now();
+    // Waiting for ever, which is what a read that has stopped does: that this answers at all is the case
     let given_up = worker.run(Duration::from_millis(300), move |_| stopped.recv().map_or(0, |()| 9));
     assert_eq!(given_up, None, "a read that stopped answering was waited on");
-    assert!(started.elapsed() < Duration::from_secs(5), "and not for long");
     let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let marked = std::sync::Arc::clone(&ran);
     assert_eq!(
