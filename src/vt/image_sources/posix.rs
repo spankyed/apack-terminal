@@ -37,12 +37,11 @@ pub fn open_file(path: &[u8]) -> Option<File> {
     if !found.is_file() || on_special_filesystem(device(found.dev()), &special_filesystems()) {
         return None;
     }
+    // Neither call fails on a descriptor this holds open
     // SAFETY: the descriptor is the open file's; the flags read are written back less one
     let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
     // SAFETY: as above
-    if flags == -1 || unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) } == -1 {
-        return None;
-    }
+    unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) };
     Some(file)
 }
 

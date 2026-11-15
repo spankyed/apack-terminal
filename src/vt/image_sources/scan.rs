@@ -274,7 +274,11 @@ impl Named {
     /// What is to be read for the command, its name having been decoded as `name`.
     fn load(self, name: Option<Vec<u8>>) -> Load {
         let source = match name {
-            Some(name) if self.shared => Source::SharedMemory(name),
+            // A name the core would not pass to `shm_open` is one it reaches and cannot read
+            Some(name) if self.shared => match super::shared_memory_name(&name) {
+                true => Source::SharedMemory(name),
+                false => Source::Unreadable,
+            },
             Some(path) => Source::File(path),
             None => Source::Unreadable,
         };
