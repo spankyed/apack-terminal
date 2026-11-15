@@ -231,7 +231,9 @@ impl Terminal {
     /// session's output is, only whoever started it knows, so it is theirs to say (`Request::Spawn`).
     ///
     /// **What the core then refuses is the core's to refuse**: a path that is not a regular file, one
-    /// under `/proc`, `/sys` or `/dev`, a file or object past what an image may be. A shared memory object
+    /// under `/proc`, `/sys` or `/dev`, a file or object past what an image may be. It refuses the first
+    /// only once it has opened it, which for a FIFO is a wait, so whoever feeds a terminal set this way
+    /// keeps such a name from it (`image_paths`, `Screen::feed`). A shared memory object
     /// is unlinked once read, as the protocol says, and is the one thing here that is removed. The
     /// protocol's third way in, a temporary file the terminal deletes, stays off: nothing a session is
     /// started for sends one, and it is the one that removes a file.

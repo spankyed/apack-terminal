@@ -254,14 +254,31 @@ session ending settles every wait on it, because nothing is coming.
   `signal` answers `UNSUPPORTED`, and the pipe's directory and peer are not checked as a socket's are
   on POSIX.
 
-- **A session that reads images by name reads what it is named.** `Spawn.image_files` has the core open
-  the file or shared memory object a program's output names. The core refuses what is not a regular file
-  and anything under `/proc`, `/sys` or `/dev`, and reads no more than an image may be — but it opens the
-  path before it looks at what it is, and opening a FIFO waits for a writer. So a program in such a
-  session that names a FIFO stops that session's output being read until something opens the other end
-  (observed on macOS: the read did not return in four seconds). Nothing checks a path before the core
-  opens it. That is why the option is the caller's, for a session running a program it trusts, and why a
-  shell is not started with it.
+- **A session that reads images by name reads what it is named, and on POSIX a file's name is asked
+  about first.** `Spawn.image_files` has the core open the file or shared memory object a program's
+  output names. The core refuses what is not a regular file and anything under `/proc`, `/sys` or `/dev`,
+  and reads no more than an image may be — but it opens the path before it looks at what it is, and
+  opening a FIFO waits for a writer, inside the write that parses the session's output. A program that
+  named one stopped its session being read until something opened the other end (observed on macOS: the
+  read had not returned after four seconds). The core takes no file it did not open itself, so the name
+  is kept from it instead (`vt/image_paths.rs`): until the command it is in has ended, when the path is
+  asked about without being opened and passed on only if it is a regular file. Any other is left out,
+  and the program is told what it is told of a file that could not be opened. Where such a command
+  begins is asked of the core, which begins one in more places than `ESC _ G`; what its body means is
+  repeated there, and `tests/image_paths.rs` holds the repeat to the core. What is not looked at:
+  - **A path changed between being asked about and being opened.** Whatever can do that runs as the
+    user on this machine, and needs no terminal to open a FIFO. This is against a name, not against a
+    program racing the check.
+  - **A shared memory object** (`t=s`), which is named to `shm_open` as it came. On macOS such an object
+    is not a file. On Linux it is one under `/dev/shm`, where a FIFO can be made, and `shm_open` waits
+    on it as `open` does (observed with glibc 2.41: still waiting after three seconds). So there a
+    session that takes names can still be stopped by one.
+  - **A regular file that is slow to open** — on a mount that has gone away — which is as slow to be
+    asked about.
+  - **Windows**, where nothing is asked: what stands in for a FIFO there has not been looked at.
+
+  That is why the option stays the caller's, for a session running a program it trusts, and why a shell
+  is not started with it.
 
 ## What the broker will not do
 
