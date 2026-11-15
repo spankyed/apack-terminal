@@ -251,10 +251,12 @@ and then looks at what it opened, inside the write that parses the session's out
 session being read. A session's core takes no file and no shared memory object; each command naming one is
 taken out of the stream instead — only it: control data that names no source, and every payload of sent
 bytes, is fed as it comes — and its source opened without waiting, asked about through the descriptor it
-was opened as, and read with the screen let go of. What was read is fed to the core as the bytes it holds,
+was opened as, and read with the screen let go of — on a thread of its own, given up on once it has gone
+five seconds without reading anything, so a mount that has stopped answering holds the session up that
+long and no longer. What was read is fed to the core as the bytes it holds,
 in pieces where it is large, with the program's keys as the core read them, so the program is answered as
-the core would answer it. A FIFO, a directory, a device, a socket, a path that is not there, a file on
-`/proc`, `/sys` or `/dev`, a name longer than any path, and a name that is not base64 as the protocol has
+the core would answer it. A FIFO, a directory, a device, a socket, a path that is not there, a file on a
+filesystem mounted at or beneath `/proc`, `/sys` or `/dev` (but for `/dev/shm`), a name longer than any path, and a name that is not base64 as the protocol has
 it are refused, and the program told what it is told of a file that could not be read. What is not looked
 at is in [design.md](design.md#known-limits).
 

@@ -1173,6 +1173,8 @@ impl Sessions {
         let reader_events = events.clone();
         let reader_session = session.clone();
         let reading_flow = Arc::clone(&flow);
+        // Where this session's named images are read, each on a thread that can be left behind
+        let sources = crate::vt::image_sources::Worker::default();
         std::thread::spawn(move || {
             let mut reader = reader;
             let mut buffer = [0u8; 8 * 1024];
@@ -1188,12 +1190,13 @@ impl Sessions {
                         // let go of**: the read reaches a disk, and a slow one would otherwise hold up every
                         // view, snapshot and client of this screen with it (`Screen::feed_until_image`). The
                         // rest is fed once it has been, so nothing the program wrote after it is parsed before
-                        // it. This thread waits on the read either way, which is the session's own output
-                        // waiting, as it would on a program writing slowly
+                        // it. This thread waits on the read, which is the session's own output waiting, as it
+                        // would on a program writing slowly — and gives up on one that has stopped answering
+                        // (`image_sources::Worker`)
                         let (mut fed, mut image) = (0, None);
                         let (mut replies, mut met, mut effects) = (Vec::new(), 0, Vec::new());
                         loop {
-                            let read_image = image.take().map(PendingImage::read);
+                            let read_image = image.take().map(|image: PendingImage| image.read_on(&sources));
                             // The authority first, then the renderer's copy. The waits are settled inside this
                             // same lock, in one order everywhere — screen, then waiters — so the two threads
                             // that take both cannot deadlock on each other

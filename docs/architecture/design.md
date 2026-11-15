@@ -280,24 +280,32 @@ session ending settles every wait on it, because nothing is coming.
   - **Opened without waiting, and asked about through what was opened.** On POSIX a source is opened
     with `O_NONBLOCK`, so a FIFO answers at once, and `fstat`ed on the same descriptor: only a regular
     file is read (a shared memory object is a regular file on Linux and of no file type on macOS), and
-    not one on the filesystems mounted at `/proc`, `/sys` or `/dev`, told apart by device rather than by
-    path. On Windows the path is held to the core's rules before it is opened (no share, no device
+    not one on a filesystem mounted at or beneath `/proc`, `/sys` or `/dev` but for `/dev/shm` — those
+    three, and on Linux every mount the mount table (`/proc/self/mountinfo`) lists beneath them, which is
+    where debugfs, tracefs and the cgroups are — told apart by device rather than by path. On Windows the path is held to the core's rules before it is opened (no share, no device
     namespace, no device name), and what was opened to them after, with its type a disk file's. Nothing
     can be swapped in between the question and the read, because the question is asked of what was
     opened.
-  - **Read with the screen let go of.** The pty's reader stops at such a command, reads its source with
-    nothing locked, and feeds the rest once it has (`Screen::feed_until_image`). A source that is slow to
-    read — a regular file on a mount that has stopped answering — holds up that session's own output, as a
+  - **Read with the screen let go of, and given up on once it stops answering.** The pty's reader stops
+    at such a command, has its source read with nothing locked, and feeds the rest once it has
+    (`Screen::feed_until_image`). A source that is slow to read holds up that session's own output, as a
     program writing slowly does, and nothing else: views, snapshots and other clients of the screen go
-    on. Nothing cancels a read the system is in the middle of, so that session waits for it.
+    on. **A read the system is in the middle of cannot be cancelled** — a file on a mount that has
+    stopped answering holds `open` and `read` in a wait no signal ends — so it is made on a thread of its
+    own, which reports each megabyte it reads (`image_sources::Worker`). After `QUIET` (five seconds)
+    with none, the session stops waiting: the program is told no and its output goes on. A file being
+    read slowly is never cut off, only one that has stopped. The thread is left in its wait, and while
+    it is, that session's next named source is refused without another being started, so a mount that
+    never answers costs a session one thread.
   - **A command this does not read as the core would is the core's, and refused.** Where the core begins
     such a command is asked of the core, which begins one in more places than `ESC _ G`; what its body
     means is repeated, and `tests/image_sources.rs` holds the repeat to the core over every spelling it
     can make. Every way the repeat gives up hands the command over as it came, to a core that opens
     nothing — so a disagreement is an image not shown, never a path opened.
 
-  What is not looked at: a regular file on another filesystem mounted beneath `/proc` or `/sys`, which is
-  read like any other; and no shared memory object is read on Windows, where the core reads none either.
+  What is not looked at: no shared memory object is read on Windows, where the core reads none either.
+  What is bounded rather than prevented: a source on a mount that has stopped answering holds its
+  session's output for `QUIET`, and one thread for as long as the mount does not answer.
   The option stays the caller's, for a session running a program it trusts — a file it names is read as
   the user — and a shell is not started with it.
 

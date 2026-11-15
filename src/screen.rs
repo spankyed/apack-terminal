@@ -23,7 +23,7 @@ use crate::protocol::{CursorBlink, CursorStyle};
 use crate::recording::{self, Entry, Recorder, Timed};
 use crate::view::publish::{Outlet, Publication, ViewId};
 use crate::view::wire::{MAX_MESSAGE_BYTES, Position, Rows, Span};
-use crate::vt::image_sources::{Load, Loaded, Scanner};
+use crate::vt::image_sources::{Load, Loaded, QUIET, Scanner, Worker};
 use crate::vt::images::{ImageRead, PlacementRead};
 use crate::vt::input::{self, Encoders, Key, Pasted, Pointer};
 use crate::vt::reads;
@@ -261,6 +261,15 @@ impl PendingImage {
     /// Reads what the command named (`Load::read`).
     pub fn read(self) -> ReadImage {
         ReadImage { ticket: self.ticket, loaded: self.load.read() }
+    }
+
+    /// The same, on `worker`'s thread: refused — the session going on without it — where the read goes
+    /// `QUIET` without reading anything, or another the worker gave up on has not ended.
+    pub fn read_on(self, worker: &Worker) -> ReadImage {
+        let refused = self.load.clone().refuse();
+        let load = self.load;
+        let loaded = worker.run(QUIET, move |progress| load.read_with(progress)).unwrap_or(refused);
+        ReadImage { ticket: self.ticket, loaded }
     }
 
     /// Refuses it without reading anything (`Load::refuse`).

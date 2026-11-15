@@ -17,7 +17,7 @@ const SHARED_MEMORY_FLAGS: libc::c_int = libc::O_NONBLOCK;
 const _: () = assert!(libc::O_RDONLY == 0);
 
 /// The file a path names, opened to be read, if it is a regular file on none of the filesystems the core
-/// refuses: what is behind `/proc`, `/sys` and `/dev`.
+/// refuses: what is mounted at or beneath `/proc`, `/sys` and `/dev`, but for `/dev/shm`.
 ///
 /// **By filesystem rather than by name**, which the core does with the path it reads back for the file:
 /// the device a file is on is a fact of the descriptor, so no link or rename can make it another, and a
@@ -28,19 +28,66 @@ pub fn open_file(path: &[u8]) -> Option<File> {
     }
     let file = OpenOptions::new().read(true).custom_flags(FILE_FLAGS).open(OsStr::from_bytes(path)).ok()?;
     let found = file.metadata().ok()?;
-    (found.is_file() && !on_special_filesystem(found.dev(), &special_filesystems())).then_some(file)
+    (found.is_file() && !on_special_filesystem(device(found.dev()), &special_filesystems())).then_some(file)
 }
 
-/// The devices of the filesystems mounted at `/proc`, `/sys` and `/dev`: each one that is mounted there,
-/// and not one that is a directory of the filesystem holding `/`.
-pub fn special_filesystems() -> Vec<u64> {
-    let device = |path: &str| std::fs::metadata(path).ok().map(|found| found.dev());
-    let root = device("/");
-    ["/proc", "/sys", "/dev"].into_iter().filter_map(device).filter(|special| Some(*special) != root).collect()
+/// A device as its major and minor numbers: how a mount table names one, and so how they are compared.
+pub type Device = (u64, u64);
+
+/// A device number as its major and minor numbers, in the system's own packing of them.
+pub fn device(number: u64) -> Device {
+    let number = number as libc::dev_t;
+    (libc::major(number) as u64, libc::minor(number) as u64)
+}
+
+/// Where a filesystem the core refuses may be mounted: at or beneath each of these.
+const REFUSED_MOUNTS: [&str; 3] = ["/proc", "/sys", "/dev"];
+
+/// What beneath them is not refused: the core takes a file under `/dev/shm`, which is where a shared
+/// memory object lives on Linux.
+const TAKEN_MOUNT: &str = "/dev/shm";
+
+/// The filesystems the core refuses, as devices: those mounted at `/proc`, `/sys` and `/dev`, and — where
+/// the system says what is mounted where (`/proc/self/mountinfo`) — every one mounted beneath them, which
+/// is where debugfs, tracefs, cgroups and the rest of the kernel's are, but for `/dev/shm`.
+///
+/// **One of the three that is only a directory of the filesystem holding `/` is not one**: refusing its
+/// device would refuse every file beside it.
+pub fn special_filesystems() -> Vec<Device> {
+    let device_of = |path: &str| std::fs::metadata(path).ok().map(|found| device(found.dev()));
+    let root = device_of("/");
+    let mut special: Vec<Device> =
+        REFUSED_MOUNTS.into_iter().filter_map(device_of).filter(|special| Some(*special) != root).collect();
+    if let Ok(table) = std::fs::read_to_string("/proc/self/mountinfo") {
+        special.extend(mounted_beneath(&table));
+    }
+    special
+}
+
+/// The devices of the mounts a mount table (`/proc/self/mountinfo`) lists at or beneath `/proc`, `/sys`
+/// or `/dev`, but for `/dev/shm`: its third field is a mount's device as `major:minor`, and its fifth
+/// where it is mounted. A line it cannot read is passed over.
+///
+/// **The mount point is compared as the table spells it**, which escapes a space and a few other
+/// characters in octal: none is in the three names compared against, so a mount beneath one of them
+/// starts with that name and a `/` however the rest of it is spelled.
+pub fn mounted_beneath(table: &str) -> Vec<Device> {
+    let within =
+        |path: &str, root: &str| path.strip_prefix(root).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'));
+    table
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split(' ');
+            let (major, minor) = fields.nth(2)?.split_once(':')?;
+            let point = fields.nth(1)?;
+            let refused = REFUSED_MOUNTS.iter().any(|root| within(point, root)) && !within(point, TAKEN_MOUNT);
+            refused.then_some((major.parse().ok()?, minor.parse().ok()?))
+        })
+        .collect()
 }
 
 /// Whether a file on `device` is on one of `special`.
-pub fn on_special_filesystem(device: u64, special: &[u64]) -> bool {
+pub fn on_special_filesystem(device: Device, special: &[Device]) -> bool {
     special.contains(&device)
 }
 

@@ -13,6 +13,7 @@
 
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -21,9 +22,11 @@ use apack_terminal::screen::Screen;
 use apack_terminal::screen::{PendingImage, Snapshot};
 use apack_terminal::vt::Terminal;
 use apack_terminal::vt::image_sources::posix::{
-    on_special_filesystem, open_file, shared_memory_kind, special_filesystems,
+    device, mounted_beneath, on_special_filesystem, open_file, shared_memory_kind, special_filesystems,
 };
-use apack_terminal::vt::image_sources::{CHUNK_BYTES, CONTROL_BYTES, Load, PATH_BYTES, SOURCE_BYTES, Scanner, Source};
+use apack_terminal::vt::image_sources::{
+    CHUNK_BYTES, CONTROL_BYTES, Load, PATH_BYTES, READ_BYTES, SOURCE_BYTES, Scanner, Source, Worker,
+};
 use proptest::prelude::*;
 
 /// One pixel: red, green, blue and alpha.
@@ -580,14 +583,62 @@ fn only_a_regular_file_is_read() {
 /// what holds `/` never is, so a directory of it that nothing is mounted on refuses nothing.
 #[test]
 fn the_filesystems_refused_are_the_ones_mounted_where_the_core_refuses() {
-    use std::os::unix::fs::MetadataExt;
-    let device = |path: &str| std::fs::metadata(path).expect("a path that is there").dev();
+    let device_of = |path: &str| device(std::fs::metadata(path).expect("a path that is there").dev());
     let special = special_filesystems();
-    assert!(special.contains(&device("/dev")), "{special:?}");
-    assert!(!special.contains(&device("/")), "{special:?}");
-    assert!(on_special_filesystem(7, &[3, 7]));
-    assert!(!on_special_filesystem(7, &[3, 5]));
-    assert!(!on_special_filesystem(7, &[]));
+    assert!(special.contains(&device_of("/dev")), "{special:?}");
+    assert!(!special.contains(&device_of("/")), "{special:?}");
+    assert_ne!(device_of("/dev"), device_of("/"), "two devices that are one say nothing about either");
+    assert!(on_special_filesystem((0, 7), &[(0, 3), (0, 7)]));
+    assert!(!on_special_filesystem((0, 7), &[(0, 3), (1, 7)]));
+    assert!(!on_special_filesystem((0, 7), &[]));
+}
+
+/// **What is mounted beneath them is refused too, but for `/dev/shm`**, read from the mount table as Linux
+/// writes it: a device as `major:minor` in its third field and where it is mounted in its fifth, spelled
+/// with octal escapes. A mount whose name only begins like one of them is not beneath it, and a line the
+/// table could not have written is passed over.
+#[test]
+fn what_is_mounted_beneath_them_is_refused_but_for_shared_memory() {
+    let table = "\
+22 1 0:21 / /proc rw,nosuid shared:5 - proc proc rw
+25 1 0:24 / /sys rw shared:2 - sysfs sysfs rw
+30 25 0:7 / /sys/kernel/debug rw - debugfs debugfs rw
+31 22 0:40 / /proc/sys/fs/binfmt_misc rw - binfmt_misc binfmt_misc rw
+32 25 0:300 / /sys/fs/cgroup\\040two rw - cgroup2 cgroup2 rw
+40 1 0:5 / /dev rw - devtmpfs udev rw
+41 40 0:26 / /dev/shm rw - tmpfs tmpfs rw
+43 41 0:27 / /dev/shm/inner rw - tmpfs tmpfs rw
+42 40 0:30 / /dev/mqueue rw - mqueue mqueue rw
+50 1 8:1 / / rw - ext4 /dev/sda1 rw
+51 1 259:3 / /home rw - ext4 /dev/nvme0n1p3 rw
+52 1 0:51 / /procfs rw - tmpfs tmpfs rw
+53 1 0:52 / /sys2 rw - tmpfs tmpfs rw
+54 1 0:53 / /devices rw - tmpfs tmpfs rw
+not a line of the table
+60 1 x:1 / /proc/broken rw - proc proc rw
+";
+    assert_eq!(mounted_beneath(table), [(0, 21), (0, 24), (0, 7), (0, 40), (0, 300), (0, 5), (0, 30)]);
+    assert!(mounted_beneath("").is_empty());
+}
+
+/// **On Linux the mount table is read**: every filesystem it says is mounted beneath `/sys` is refused —
+/// which is where the cgroups are, a filesystem of regular files of its own — and a file on one is not read.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_file_on_a_filesystem_mounted_beneath_sys_is_not_read() {
+    let table = std::fs::read_to_string("/proc/self/mountinfo").expect("the mount table");
+    let beneath = mounted_beneath(&table);
+    let special = special_filesystems();
+    assert!(beneath.iter().all(|mounted| special.contains(mounted)), "{beneath:?} against {special:?}");
+    let controllers = "/sys/fs/cgroup/cgroup.controllers";
+    let found = std::fs::metadata(controllers).expect("the cgroup filesystem");
+    assert!(found.is_file());
+    assert_ne!(
+        device(found.dev()),
+        device(std::fs::metadata("/sys").expect("sysfs").dev()),
+        "not a filesystem of its own"
+    );
+    assert!(open_file(controllers.as_bytes()).is_none(), "a file beneath /sys was read");
 }
 
 /// A file on `/proc` is a regular file, and is refused for where it is.
@@ -1003,14 +1054,21 @@ fn load_of(control: &str) -> Load {
 #[test]
 fn a_source_is_read_to_the_limit_and_not_past_it() {
     let at_limit = vec![7u8; SOURCE_BYTES as usize];
-    let read = load_of("a=T").read_from(std::io::Cursor::new(&at_limit)).expect("a source at the limit is read");
+    let read =
+        load_of("a=T").read_from(std::io::Cursor::new(&at_limit), &|| {}).expect("a source at the limit is read");
     assert_eq!(read.len(), at_limit.len());
     let past = vec![7u8; SOURCE_BYTES as usize + 1];
-    assert!(load_of("a=T").read_from(std::io::Cursor::new(&past)).is_none(), "a source past the limit was read");
-    assert!(load_of("a=T,S=4294967295").read_from(std::io::Cursor::new(&past)).is_none(), "a size past the limit");
+    assert!(
+        load_of("a=T").read_from(std::io::Cursor::new(&past), &|| {}).is_none(),
+        "a source past the limit was read"
+    );
+    assert!(
+        load_of("a=T,S=4294967295").read_from(std::io::Cursor::new(&past), &|| {}).is_none(),
+        "a size past the limit"
+    );
 
     let bytes = [9u8, 9, 1, 2, 3, 4, 9, 9];
-    let read_with = |control: &str| load_of(control).read_from(std::io::Cursor::new(&bytes));
+    let read_with = |control: &str| load_of(control).read_from(std::io::Cursor::new(&bytes), &|| {});
     assert_eq!(read_with("a=T,O=2,S=4").as_deref(), Some(&PIXEL[..]));
     assert_eq!(read_with("a=T,O=4").as_deref(), Some(&[3, 4, 9, 9][..]));
     assert_eq!(read_with("a=T").as_deref(), Some(&bytes[..]));
@@ -1071,4 +1129,71 @@ fn a_late_answer_is_not_taken_for_the_next_reads() {
     screen.feed(&stream[taken + more..]);
     assert_eq!(screen.image(8, 0).map(|read| read.bytes), Some(vec![5, 6, 7, 8]), "the second was not its own");
     assert_eq!(screen.image(7, 0), None, "the first was answered after it was refused");
+}
+
+/// **A file is read a piece at a time, and each piece is progress**: what a read that has stopped
+/// answering is told from one that is slow by.
+#[test]
+fn a_file_is_read_a_piece_at_a_time() {
+    let bytes = vec![3u8; READ_BYTES as usize * 3 + 5];
+    let pieces = std::cell::Cell::new(0);
+    let read = load_of("a=T").read_from(std::io::Cursor::new(&bytes), &|| pieces.set(pieces.get() + 1));
+    assert_eq!(read.map(|read| read.len()), Some(bytes.len()));
+    assert_eq!(pieces.get(), 4, "a piece of each megabyte begun");
+}
+
+/// **A read that has stopped answering is given up on, and one that goes on answering is not**, however
+/// long it takes in all: only going `quiet` without progress ends the wait.
+#[test]
+fn a_read_is_given_up_on_only_once_it_has_gone_quiet() {
+    let worker = Worker::default();
+    assert_eq!(worker.run(Duration::from_secs(5), |_| 7), Some(7));
+
+    // Longer in all than it is let be quiet, and never quiet that long
+    let slow = worker.run(Duration::from_secs(2), |progress| {
+        for _ in 0..5 {
+            std::thread::sleep(Duration::from_millis(500));
+            progress();
+        }
+        8
+    });
+    assert_eq!(slow, Some(8), "a read that went on answering was given up on");
+
+    // Stopped: given up on, and the next refused without being started while it is still waiting
+    let (release, stopped) = std::sync::mpsc::channel::<()>();
+    let started = std::time::Instant::now();
+    let given_up = worker.run(Duration::from_millis(300), move |_| stopped.recv().map_or(0, |()| 9));
+    assert_eq!(given_up, None, "a read that stopped answering was waited on");
+    assert!(started.elapsed() < Duration::from_secs(5), "and not for long");
+    let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let marked = std::sync::Arc::clone(&ran);
+    assert_eq!(
+        worker.run(Duration::from_secs(5), move |_| marked.store(true, std::sync::atomic::Ordering::SeqCst)),
+        None
+    );
+    assert!(!ran.load(std::sync::atomic::Ordering::SeqCst), "a read was started beside one still waiting");
+
+    // Once the one given up on ends, the worker reads again
+    release.send(()).expect("the read given up on is still there");
+    assert!(answers_again(&worker), "the worker did not read again once the read given up on ended");
+}
+
+/// **A read that fails without an answer frees the worker as one that ends does.**
+#[test]
+fn a_read_that_fails_frees_the_worker() {
+    let worker = Worker::default();
+    assert_eq!(worker.run(Duration::from_secs(5), |_| -> u8 { panic!("a read that failed") }), None);
+    assert!(answers_again(&worker), "a read that failed left the worker busy");
+}
+
+/// Whether the worker answers a read once the one before it has ended, which is soon after it says it has:
+/// tried until it does, a tenth of a second apart, for ten seconds.
+fn answers_again(worker: &Worker) -> bool {
+    (0..100).any(|_| {
+        let answered = worker.run(Duration::from_secs(5), |_| 1) == Some(1);
+        if !answered {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        answered
+    })
 }

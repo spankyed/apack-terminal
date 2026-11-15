@@ -10,17 +10,19 @@
 //! the core read them, so it answers the program as it would have.
 //!
 //! **What follows from that.** A FIFO, a directory, a device or a socket is refused without a wait, and
-//! so is a file on the filesystems the core refuses (`/proc`, `/sys`, `/dev`). Nothing can be swapped in
-//! between the question and the read, because the question is asked of what was opened. And a file
-//! that is slow to read holds up its own session's output — as any program writing slowly does — and
-//! nothing else: not a view, not a snapshot, not another client of the screen.
+//! so is a file on the filesystems the core refuses: what is mounted at or beneath `/proc`, `/sys` and
+//! `/dev`, but for `/dev/shm`. Nothing can be swapped in between the question and the read, because the
+//! question is asked of what was opened. And a file that is slow to read holds up its own session's
+//! output — as any program writing slowly does — and nothing else: not a view, not a snapshot, not
+//! another client of the screen.
 //!
-//! **What is not looked at.** A regular file on a mount that has stopped answering is read until it
-//! answers, and nothing can cancel a read the system is in the middle of; the session's own output waits
-//! for it. A regular file on another filesystem mounted beneath `/proc` or `/sys` is read like any other.
+//! **A source that has stopped answering is given up on rather than waited for** (`Worker`): it is read
+//! on a thread that can be left in a wait nothing can end, and the session goes on once that read has
+//! gone `QUIET` without reading anything.
 
 pub mod rules;
 mod scan;
+mod worker;
 
 #[cfg(unix)]
 pub mod posix;
@@ -33,6 +35,7 @@ pub mod windows;
 use windows as platform;
 
 pub use scan::{CONTROL_BYTES, Keys, PATH_BYTES, Scanner, encoded};
+pub use worker::{QUIET, Worker};
 
 use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
@@ -42,6 +45,9 @@ use super::images::IMAGE_STORAGE_BYTES;
 /// The most of a source read: no more than a session's images may hold altogether, which is all an image
 /// read from one could be — compressed or a PNG it is smaller than its pixels, and its pixels are kept.
 pub const SOURCE_BYTES: u64 = IMAGE_STORAGE_BYTES;
+
+/// How much of a file is read at a time, each piece being progress (`Worker`).
+pub const READ_BYTES: u64 = 1 << 20;
 
 /// How much of a source one command carries. A multiple of three, so every piece but the last is whole
 /// groups of base64, and well inside what the core takes in one command.
@@ -126,11 +132,16 @@ impl Load {
     /// Reads what the command named, as the core would have and refusing what it refuses. This is the
     /// part that reaches the disk, and the one to do with nothing locked.
     pub fn read(self) -> Loaded {
+        self.read_with(&|| {})
+    }
+
+    /// The same, calling `progress` each time some of a file has been read (`Worker`).
+    pub fn read_with(self, progress: &dyn Fn()) -> Loaded {
         let data = match (&self.source, bytes_a_pixel(&self.keys)) {
             _ if self.answered_unread() => None,
             // A format the core does not take is refused before anything is opened
             (_, None) | (Source::Unreadable, _) => None,
-            (Source::File(path), Some(_)) => platform::open_file(path).and_then(|file| self.read_from(file)),
+            (Source::File(path), Some(_)) => platform::open_file(path).and_then(|file| self.read_from(file, progress)),
             (Source::SharedMemory(name), Some(_)) => platform::shared_memory(name, |size| self.range(size)),
         };
         self.answered(data)
@@ -153,14 +164,17 @@ impl Load {
     ///
     /// **Read up to what could be kept and no further**, so a size or a file of gigabytes costs what the
     /// limit does: one byte past it is read where no size is given, to tell a file that ends at the limit
-    /// from one that goes on.
-    pub fn read_from(&self, mut source: impl Read + Seek) -> Option<Vec<u8>> {
+    /// from one that goes on. Read `READ_BYTES` at a time, `progress` being called after each.
+    pub fn read_from(&self, mut source: impl Read + Seek, progress: &dyn Fn()) -> Option<Vec<u8>> {
         let offset = u64::from(self.keys.get(b'O').unwrap_or(0));
         let size = u64::from(self.keys.get(b'S').unwrap_or(0));
         source.seek(SeekFrom::Start(offset)).ok()?;
         let limit = if size == 0 { SOURCE_BYTES + 1 } else { size.min(SOURCE_BYTES) };
+        let mut source = source.take(limit);
         let mut data = Vec::new();
-        source.take(limit).read_to_end(&mut data).ok()?;
+        while (&mut source).take(READ_BYTES).read_to_end(&mut data).ok()? > 0 {
+            progress();
+        }
         let read = data.len() as u64;
         (read <= SOURCE_BYTES && (size == 0 || read == size)).then_some(data)
     }
