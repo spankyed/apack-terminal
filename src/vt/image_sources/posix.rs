@@ -11,8 +11,10 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 /// something writes to it — and never becomes the broker's terminal. Read-only is no bits.
 const FILE_FLAGS: libc::c_int = libc::O_NONBLOCK | libc::O_NOCTTY;
 
-/// A shared memory object likewise: on Linux one is a file under `/dev/shm`, where a FIFO can be made.
-const SHARED_MEMORY_FLAGS: libc::c_int = libc::O_RDONLY | libc::O_NONBLOCK;
+/// A shared memory object likewise, to be read — which is no bits: on Linux one is a file under
+/// `/dev/shm`, where a FIFO can be made.
+const SHARED_MEMORY_FLAGS: libc::c_int = libc::O_NONBLOCK;
+const _: () = assert!(libc::O_RDONLY == 0);
 
 /// The file a path names, opened to be read, if it is a regular file on none of the filesystems the core
 /// refuses: what is behind `/proc`, `/sys` and `/dev`.
@@ -93,7 +95,7 @@ pub fn shared_memory(name: &[u8], range: impl FnOnce(u64) -> Option<Range<u64>>)
     if mapped == libc::MAP_FAILED {
         return None;
     }
-    // SAFETY: `length` bytes are mapped at `mapped`, and `range` is within them (`Load::range`)
+    // SAFETY: `length` bytes are mapped at `mapped`; what is copied is only what of `range` lies in them
     let bytes = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), length) };
     let copied = bytes.get(start..end).map(<[u8]>::to_vec);
     // SAFETY: mapped above with this length, and unmapped once

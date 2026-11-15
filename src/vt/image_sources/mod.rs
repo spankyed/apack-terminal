@@ -34,6 +34,9 @@ use windows as platform;
 
 pub use scan::{CONTROL_BYTES, Keys, PATH_BYTES, Scanner, encoded};
 
+use std::io::{Read, Seek, SeekFrom};
+use std::ops::Range;
+
 use super::images::IMAGE_STORAGE_BYTES;
 
 /// The most of a source read: no more than a session's images may hold altogether, which is all an image
@@ -127,8 +130,8 @@ impl Load {
             _ if self.answered_unread() => None,
             // A format the core does not take is refused before anything is opened
             (_, None) | (Source::Unreadable, _) => None,
-            (Source::File(path), Some(_)) => platform::open_file(path).and_then(|file| self.read_file(file)),
-            (Source::SharedMemory(name), Some(pixel)) => platform::shared_memory(name, |size| self.range(size, pixel)),
+            (Source::File(path), Some(_)) => platform::open_file(path).and_then(|file| self.read_from(file)),
+            (Source::SharedMemory(name), Some(_)) => platform::shared_memory(name, |size| self.range(size)),
         };
         self.answered(data)
     }
@@ -145,53 +148,48 @@ impl Load {
         Loaded { keys: self.keys, query, data: data.filter(|data| data.len() <= limit) }
     }
 
-    /// A file's bytes, from its `O` offset on: its `S` size of them exactly, or to its end where no size
-    /// is given (`readFile`).
-    fn read_file(&self, mut file: std::fs::File) -> Option<Vec<u8>> {
-        use std::io::{Read, Seek, SeekFrom};
+    /// The bytes of a file the command names, from its `O` offset: its `S` size of them exactly, or to its
+    /// end where no size is given (`readFile`), and no more than `SOURCE_BYTES` either way.
+    ///
+    /// **Read up to what could be kept and no further**, so a size or a file of gigabytes costs what the
+    /// limit does: one byte past it is read where no size is given, to tell a file that ends at the limit
+    /// from one that goes on.
+    pub fn read_from(&self, mut source: impl Read + Seek) -> Option<Vec<u8>> {
         let offset = u64::from(self.keys.get(b'O').unwrap_or(0));
         let size = u64::from(self.keys.get(b'S').unwrap_or(0));
-        file.seek(SeekFrom::Start(offset)).ok()?;
-        if size > 0 {
-            if size > SOURCE_BYTES {
-                return None;
-            }
-            let mut data = vec![0; usize::try_from(size).ok()?];
-            file.read_exact(&mut data).ok()?;
-            return Some(data);
-        }
+        source.seek(SeekFrom::Start(offset)).ok()?;
+        let limit = if size == 0 { SOURCE_BYTES + 1 } else { size.min(SOURCE_BYTES) };
         let mut data = Vec::new();
-        file.take(SOURCE_BYTES + 1).read_to_end(&mut data).ok()?;
-        (data.len() as u64 <= SOURCE_BYTES).then_some(data)
+        source.take(limit).read_to_end(&mut data).ok()?;
+        let read = data.len() as u64;
+        (read <= SOURCE_BYTES && (size == 0 || read == size)).then_some(data)
     }
 
     /// Which bytes of a shared memory object `size` long are the image's (`sharedMemoryRange`): from its
     /// `O` offset, its `S` size of them; or with no size given, as many as the picture's pixels are where
-    /// those are not compressed, and the rest of the object where they are.
-    fn range(&self, size: u64, pixel: Option<u32>) -> Option<std::ops::Range<u64>> {
+    /// those are not compressed, and the rest of the object where they are. A range may run past the
+    /// object's end, which whatever takes it out refuses.
+    pub fn range(&self, size: u64) -> Option<Range<u64>> {
+        let pixel = bytes_a_pixel(&self.keys)?;
         if size == 0 {
             return None;
         }
-        let picture = |bytes: u32| -> Option<u64> {
-            let (width, height) = (self.keys.get(b's').unwrap_or(0), self.keys.get(b'v').unwrap_or(0));
-            if width > DIMENSION || height > DIMENSION {
-                return None;
-            }
-            Some(u64::from(width) * u64::from(height) * u64::from(bytes))
-        };
+        let (width, height) = (self.keys.get(b's').unwrap_or(0), self.keys.get(b'v').unwrap_or(0));
         // Asked of every picture whose size is its pixels, whether or not it is what decides the range
         let pixels = match pixel {
-            Some(bytes) => Some(picture(bytes)?),
+            Some(bytes) if width <= DIMENSION && height <= DIMENSION => {
+                Some(u64::from(width) * u64::from(height) * u64::from(bytes))
+            }
+            Some(_) => return None,
             None => None,
         };
         let start = u64::from(self.keys.get(b'O').unwrap_or(0));
-        let available = size.checked_sub(start)?;
         let length = match (self.keys.get(b'S').unwrap_or(0), self.keys.get(b'o'), pixels) {
             (0, None, Some(pixels)) => pixels,
-            (0, _, _) => available,
+            (0, _, _) => size.checked_sub(start)?,
             (given, _, _) => u64::from(given),
         };
-        (length <= available && length <= SOURCE_BYTES).then_some(start..start + length)
+        (length <= SOURCE_BYTES).then_some(start..start + length)
     }
 }
 
@@ -204,11 +202,6 @@ pub struct Loaded {
 }
 
 impl Loaded {
-    /// Whether what was named was read.
-    pub fn read(&self) -> bool {
-        self.data.is_some()
-    }
-
     /// The body to feed the core inside the string the program began, the program's own byte ending the
     /// string after it.
     ///

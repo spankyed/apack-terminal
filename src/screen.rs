@@ -281,13 +281,6 @@ pub struct ReadImage {
     loaded: Loaded,
 }
 
-impl ReadImage {
-    /// Whether what was named was read.
-    pub fn read(&self) -> bool {
-        self.loaded.read()
-    }
-}
-
 /// The epoch a session's lines are in, one cell in pixels, and each image with the line it is on.
 pub type ImagesAt = (u32, (u16, u16), Vec<(u64, PlacementRead)>);
 

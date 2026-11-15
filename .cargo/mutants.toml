@@ -104,6 +104,10 @@ exclude_re = [
     # instead — none, a zero, a one — is no image either, the picture asking for four, and is refused in
     # the same words; nothing a program is told tells them apart
     "image_sources/windows.rs:.*replace shared_memory -> Option<Vec<u8>> with Some",
+    # **A file is opened with `O_NONBLOCK | O_NOCTTY`**, two distinct single bits, so `|` and `^` are the
+    # same number and there is nothing to tell apart. Its sibling `| with &` asks for neither and is
+    # caught, a FIFO then holding the open until something writes to it
+    "image_sources/posix.rs:.*replace \\| with \\^",
     # The POSIX arm of `Tree::owning`, which answers `None` because POSIX needs no job: nothing observes a
     # `Tree` there — the type has no fields off Windows and nothing reads it — so `None` and `Some` are the
     # same answer, and off Windows the mutant does not even compile, there being no `Default` for `Tree`

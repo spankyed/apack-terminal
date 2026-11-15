@@ -23,7 +23,7 @@ use apack_terminal::vt::Terminal;
 use apack_terminal::vt::image_sources::posix::{
     on_special_filesystem, open_file, shared_memory_kind, special_filesystems,
 };
-use apack_terminal::vt::image_sources::{CHUNK_BYTES, CONTROL_BYTES, Load, PATH_BYTES, Scanner, Source};
+use apack_terminal::vt::image_sources::{CHUNK_BYTES, CONTROL_BYTES, Load, PATH_BYTES, SOURCE_BYTES, Scanner, Source};
 use proptest::prelude::*;
 
 /// One pixel: red, green, blue and alpha.
@@ -296,7 +296,7 @@ const BEGUN: [(&[u8], bool); 21] = [
 
 /// Control data, each a way of saying or not saying that the source is a file. `SHOWN` comes first in
 /// every one, so a pair the core ignores takes none of what it needs to show an image away.
-const CONTROLS: [&[u8]; 44] = [
+const CONTROLS: [&[u8]; 46] = [
     b"",
     b",t=f",
     b",t=d",
@@ -341,6 +341,8 @@ const CONTROLS: [&[u8]; 44] = [
     b",t=\xa0f",
     b",t=f\x9f",
     b",t\xff=f",
+    b",t=f,z=-5",
+    b",t=f,i=-0",
 ];
 
 /// How each string here ends, or is cut short.
@@ -815,7 +817,8 @@ fn a_command_the_core_refuses_unread_reads_nothing() {
     let mut screen = session(true);
     screen.feed(b"\x1b_Ga=t,i=7,f=32,s=1,v=1,q=2;AQIDBA==\x1b\\");
     screen.feed(&named_part(directory.path(), &[5, 6, 7, 8], "").replace_action());
-    assert!(screen.take_replies().concat().contains("i=7"), "a frame for an image that is there was not answered");
+    let told = screen.take_replies().concat();
+    assert!(told.contains("\x1b_Gi=7,r=2;OK"), "a frame for an image that is there was not read: {told:?}");
 }
 
 /// Turns the `a=T` of a command this file makes into `a=f`, a frame of the image already sent.
@@ -903,9 +906,7 @@ fn the_feed_stops_at_a_named_image_and_the_rest_waits_for_it() {
     assert_eq!(before.lines[0], "before");
     assert!(matches!(image.load().source(), Source::File(_)));
 
-    let read = image.read();
-    assert!(read.read());
-    screen.finish_image(read);
+    screen.finish_image(image.read());
     assert_eq!(screen.feed_until_image(&stream[taken..]).0, stream.len() - taken);
     let made = made(&mut screen);
     assert_eq!(made.image.as_deref(), Some(&PIXEL[..]));
@@ -938,4 +939,102 @@ fn a_read_outstanding_when_something_else_reaches_the_core_is_refused() {
         assert!(made.told.contains(if interrupted { "i=7;E" } else { "i=7;OK" }), "{:?}", made.told);
         assert_eq!(made.screen.lines[0], "after");
     }
+}
+
+/// **An image named by its number rather than its id is read**, sent or as a frame of one already sent,
+/// as the core reads it: only an id and a number together, and a frame naming neither, are refused unread.
+#[test]
+fn an_image_named_by_its_number_is_read() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let file = named(&picture(&directory.path().join("picture")));
+    let mut screen = session(true);
+    screen.feed(format!("\x1b_Ga=T,I=5,f=32,s=1,v=1,t=f;{file}\x1b\\").as_bytes());
+    let told = screen.take_replies().concat();
+    assert!(told.contains("I=5;OK"), "an image sent by its number was not read: {told:?}");
+    screen.feed(format!("\x1b_Ga=f,I=5,f=32,s=1,v=1,t=f;{file}\x1b\\").as_bytes());
+    let told = screen.take_replies().concat();
+    assert!(told.contains("I=5,r=2;OK"), "a frame named by its image's number was not read: {told:?}");
+}
+
+/// **An image named with neither an id nor a number is sent, and a frame so named is not**: the core gives
+/// the first an id of its own, and refuses the second before it reads anything.
+#[test]
+fn an_image_named_by_neither_id_nor_number_is_read_and_a_frame_so_named_is_not() {
+    for (case, control, read) in [("anonymous", "a=T,f=32,s=1,v=1", true), ("nameless", "a=f,f=32,s=1,v=1", false)] {
+        let name = shared_name(case);
+        let c_name = made_shared(&name, &PIXEL);
+        let stream = command(b"\x1b_", format!("{control},t=s").as_bytes(), base64(name.as_bytes()).as_bytes(), ST);
+        taken(&[&stream]);
+        assert_eq!(!still_shared(&c_name), read, "{case}: read is {read}");
+    }
+}
+
+/// **A name nothing has is told no**, and nothing is unlinked for it.
+#[test]
+fn a_shared_memory_object_that_is_not_there_is_told_no() {
+    let name = shared_name("absent");
+    let stream = command(b"\x1b_", format!("{SHOWN},t=s").as_bytes(), base64(name.as_bytes()).as_bytes(), ST);
+    let made = unstalled(move || taken(&[&stream]));
+    assert!(made.told.contains("\x1b_Gi=7;E"), "told {:?}", made.told);
+}
+
+/// **A compressed source is read as it is, and the core inflates it** (`o=z`), which is the one value of
+/// `o` the core takes.
+#[test]
+fn a_compressed_source_is_read_and_inflated() {
+    let directory = tempfile::tempdir().expect("a directory");
+    // `PIXEL`, deflated with zlib's framing
+    let deflated = [120, 156, 99, 100, 98, 102, 1, 0, 0, 24, 0, 11];
+    let stream = named_part(directory.path(), &deflated, ",o=z");
+    assert_eq!(core_alone(&stream).as_deref(), Some(&PIXEL[..]));
+    assert_eq!(at_every_boundary(&stream).image.as_deref(), Some(&PIXEL[..]));
+}
+
+/// The command a stream of control data makes, naming a file: its keys as the scanner read them.
+fn load_of(control: &str) -> Load {
+    let mut scanner = Scanner::default();
+    scanner.begin();
+    let (_, load) = scanner.read(format!("G{control},t=f;L3RtcA==\x1b").as_bytes(), |_| {});
+    load.expect("a command naming a file")
+}
+
+/// **What is read is no more than what could be kept**: a source of exactly `SOURCE_BYTES` is read whole,
+/// one byte longer is refused, and a size given is read exactly or not at all.
+#[test]
+fn a_source_is_read_to_the_limit_and_not_past_it() {
+    let at_limit = vec![7u8; SOURCE_BYTES as usize];
+    let read = load_of("a=T").read_from(std::io::Cursor::new(&at_limit)).expect("a source at the limit is read");
+    assert_eq!(read.len(), at_limit.len());
+    let past = vec![7u8; SOURCE_BYTES as usize + 1];
+    assert!(load_of("a=T").read_from(std::io::Cursor::new(&past)).is_none(), "a source past the limit was read");
+    assert!(load_of("a=T,S=4294967295").read_from(std::io::Cursor::new(&past)).is_none(), "a size past the limit");
+
+    let bytes = [9u8, 9, 1, 2, 3, 4, 9, 9];
+    let read_with = |control: &str| load_of(control).read_from(std::io::Cursor::new(&bytes));
+    assert_eq!(read_with("a=T,O=2,S=4").as_deref(), Some(&PIXEL[..]));
+    assert_eq!(read_with("a=T,O=4").as_deref(), Some(&[3, 4, 9, 9][..]));
+    assert_eq!(read_with("a=T").as_deref(), Some(&bytes[..]));
+    assert_eq!(read_with("a=T,O=6,S=4"), None, "a size past the end");
+    assert_eq!(read_with("a=T,O=9").as_deref(), Some(&[][..]), "an offset past the end reads nothing");
+}
+
+/// **A shared memory object's range is the core's**: the picture's pixels where no size is given and they
+/// are not compressed — for a picture no wider or taller than the core takes — and the rest of the object
+/// where they are.
+#[test]
+fn a_shared_memory_range_is_the_cores() {
+    let range = |control: &str, size: u64| load_of(control).range(size);
+    assert_eq!(range("a=T,f=32,s=2,v=3", 100), Some(0..24));
+    assert_eq!(range("a=T,f=24,s=2,v=3,O=10", 100), Some(10..28));
+    assert_eq!(range("a=T,f=32,s=2,v=3,o=z", 100), Some(0..100), "compressed: the rest of the object");
+    assert_eq!(range("a=T,f=100,O=10", 100), Some(10..100), "a PNG: the rest of the object");
+    assert_eq!(range("a=T,f=32,s=2,v=3,O=4,S=6", 100), Some(4..10), "a size given");
+    assert_eq!(range("a=T,f=32,s=10000,v=10000,S=4", 100), Some(0..4), "as large a picture as is taken");
+    assert_eq!(range("a=T,f=32,s=10001,v=1,S=4", 100), None, "too wide");
+    assert_eq!(range("a=T,f=32,s=1,v=10001,S=4", 100), None, "too tall");
+    assert_eq!(range("a=T,f=32,s=1,v=1", 0), None, "an empty object");
+    assert_eq!(range("a=T,f=100,O=101", 100), None, "an offset past the end, with no size");
+    assert_eq!(range("a=T,f=7,s=1,v=1", 100), None, "a format the core does not take");
+    assert_eq!(range(&format!("a=T,f=100,S={}", SOURCE_BYTES + 1), u64::MAX), None, "past what could be kept");
+    assert_eq!(range(&format!("a=T,f=100,S={SOURCE_BYTES}"), u64::MAX), Some(0..SOURCE_BYTES));
 }

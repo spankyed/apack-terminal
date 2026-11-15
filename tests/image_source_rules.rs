@@ -40,6 +40,10 @@ fn a_path_the_core_refuses_is_refused_before_it_is_opened() {
         r"C:\images\LPT1x",
         r"C:\images\nul-and-more",
         r"C:\?\picture.rgba",
+        r"a??\picture.rgba",
+        r"\??x\picture.rgba",
+        r"C:\images\CON1",
+        r"C:\images\COMx",
     ] {
         assert!(!refused(path.as_bytes()), "{path} was refused");
     }
