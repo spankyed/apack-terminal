@@ -53,18 +53,25 @@ pub fn start_grace(asked: Option<&str>) -> Duration {
 
 /// Where a broker is when nobody says where: `$XDG_RUNTIME_DIR/apack-terminal/broker.sock` on a system
 /// that gives each user a runtime directory, and `~/.apack-terminal/broker.sock` otherwise. `None` with
-/// neither that nor a home directory.
+/// neither that nor a home directory. On Windows, a pipe named for the user (`pipe::default_name`).
 ///
 /// **So that a proxy needs no path.** A proxy is run by whatever carries it — `ssh host`, `docker exec` —
 /// on a machine nobody has set anything up on, where the one directory known to be the user's own is the
 /// one the system made for them. The directory is made for its owner alone (`private_directory`).
 pub fn default_socket() -> Option<String> {
-    let set = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
-    let directory = match set("XDG_RUNTIME_DIR") {
-        Some(runtime) => Path::new(&runtime).join("apack-terminal"),
-        None => Path::new(&set("HOME")?).join(".apack-terminal"),
-    };
-    Some(directory.join("broker.sock").to_string_lossy().into_owned())
+    #[cfg(windows)]
+    {
+        pipe::default_name()
+    }
+    #[cfg(unix)]
+    {
+        let set = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+        let directory = match set("XDG_RUNTIME_DIR") {
+            Some(runtime) => Path::new(&runtime).join("apack-terminal"),
+            None => Path::new(&set("HOME")?).join(".apack-terminal"),
+        };
+        Some(directory.join("broker.sock").to_string_lossy().into_owned())
+    }
 }
 
 /// The hold on a socket that makes this process its broker, for as long as the value lives.
@@ -229,13 +236,13 @@ pub fn listen(socket: &str) -> Result<Listener, Refused> {
 /// that path would be handed a user's keystrokes. The kernel records who made each end of a connection,
 /// and that cannot be dressed up.
 ///
-/// **Windows answers yes without asking**: the pipe's own descriptor admits this user alone
-/// (`security.rs`), so a connection that was made is one to this user's broker.
+/// **Windows asks whose the pipe is** (`pipe::owned_by_this_user`): a name there is the machine's, and
+/// another account can create the pipe before this user's broker does.
 pub fn peer_is_this_user(stream: &Stream) -> io::Result<bool> {
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let _ = stream;
-        Ok(true)
+        let Stream::NamedPipe(pipe) = stream;
+        pipe::owned_by_this_user(pipe)
     }
     #[cfg(unix)]
     {

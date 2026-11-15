@@ -80,7 +80,7 @@ npm --prefix view ci && npm --prefix view test    # the view
 |---|---|
 | Rust | pinned by `rust-toolchain.toml` |
 | Node | 24.12 or later, for the view |
-| Platforms | macOS and Linux: the whole suite. Windows: most of it, with the POSIX-only cases gated and named in `tests/` (see [Known limits](docs/architecture/design.md#known-limits)) |
+| Platforms | macOS and Linux: the whole suite. Windows: the whole suite but for the cases about what a Windows pipe or console does not have (socket files, mode bits, a connection closed one way, an ignored hangup), each gated and named in `tests/`; sessions run on the ConPTY the broker carries (`windows/conpty/`). See [Known limits](docs/architecture/design.md#known-limits) |
 | Transport | a Unix socket, or a named pipe on Windows |
 | Crash | a session ends when the broker stops; there is no handoff of a session to another broker |
 | Not in scope | agent status rules, command semantics beyond what a shell reports, storage, a recording or a path link on a remote target, `signal` on Windows, accessibility |
@@ -92,7 +92,8 @@ holds the broker and the view, which is why they are one repository.
 **The binary reaches a consumer as an npm package.** `node/` is that package, and its one job is answering
 where the binary is — the name differs by platform, and a consumer that derived the path itself was wrong
 about `apack-terminal.exe` and started no terminal on Windows. `cargo xtask package` stages a release build
-into it, beside the generated protocol types; apack installs it as `file:…/vendor/apack-terminal/node`, so
+into it, beside the generated protocol types, and on Windows the ConPTY the binary runs its sessions on
+(`windows/conpty/`); apack installs it as `file:…/vendor/apack-terminal/node`, so
 its packaged app collects the binary with every other dependency rather than needing a rule of its own, and
 imports the protocol's types from the package rather than keeping a copy of them.
 
