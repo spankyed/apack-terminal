@@ -429,6 +429,11 @@ fn a_session_does_what_the_core_alone_would_with_commands_the_list_does_not_spel
         format!("{part_sent}\x1b_Ga=T,i=7,I=3,t=f;{name}\x1b\\{last_piece}"),
         format!("{part_sent}\x1b_Ga=T,i=7,f=32,s=1,v=1,t=f;{name}\x1b\\{last_piece}"),
         format!("{part_sent}\x1b_Ga=q,i=7,f=32,s=1,v=1,t=f;{name}\x1b\\{last_piece}"),
+        // With neither an id nor a number, refused by the core outright: it abandons what was part sent
+        format!("{part_sent}\x1b_Ga=T,t=f;{missing}\x1b\\{last_piece}"),
+        format!("{part_sent}\x1b_Ga=f,t=f;{name}\x1b\\{last_piece}"),
+        format!("{part_sent}\x1b_Ga=T,f=7,t=f;{name}\x1b\\{last_piece}"),
+        format!("{part_sent}\x1b_Ga=q,t=f;{name}\x1b\\{last_piece}"),
         format!("\x1b_Ga=t,i=7,f=32,s=1,v=1;AQIDBA==\x1b\\\x1b_Ga=T,i=7,t=f;{missing}\x1b\\"),
         "\x1b_Ga=t,i=7,f=32,s=1,v=1;AQIDBA==\x1b\\\x1b_Ga=T,i=7,t=f;!!!!\x1b\\".to_owned(),
         format!("\x1b_Ga=t,I=4,f=32,s=1,v=1;AQIDBA==\x1b\\\x1b_Ga=f,I=4,t=f;{name}\x1b\\"),
@@ -570,9 +575,15 @@ fn only_what_the_core_keeps_is_held() {
     let shared = Some(Source::SharedMemory(b"/tmp".to_vec()));
     assert_eq!(body(&[b"Gt=115,a=q;L3RtcA==\x1b"]).3, shared, "shared memory, its medium as a number");
     assert_eq!(body(&[b"Ga=T,t=f\x1b"]).3, Some(Source::File(Vec::new())), "named with no payload");
+    // A shared memory object's name the core would not pass to `shm_open` is one it cannot read
+    let named_shared = |name: &[u8]| body(&[&[b"Gt=s;".as_slice(), base64(name).as_bytes(), b"\x1b"].concat()]).3;
+    assert_eq!(named_shared(&[b'a'; 255]), Some(Source::SharedMemory(vec![b'a'; 255])));
+    for name in [&[b'a'; 256][..], b"/", b""] {
+        assert_eq!(named_shared(name), Some(Source::Unreadable), "{name:?}");
+    }
     // One the core drops — on a byte that drops it, or a name it does not decode — is given as nothing
     assert_eq!(body(&[b"Ga=T,t=f;L3RtcA==\x18"]), (Vec::new(), vec![17], false, None));
-    for name in [&b"L3Rt!cA=="[..], b"L3RtcA=", b"L3RtcA=A", b"L3RtcAA==", b"L3Rt\x0bcA==", b"=", b"L3R-"] {
+    for name in [&b"L3Rt!cA=="[..], b"L3RtcA=", b"L3RtcA=A", b"L3RtcAA==", b"L3Rt\x0bcA==", b"=", b"L3R-", b"L3Rtc"] {
         let stream = [b"Ga=T,t=f;".as_slice(), name, b"\x1b"].concat();
         assert_eq!(body(&[&stream]), (Vec::new(), vec![stream.len() - 1], false, None), "{name:?}");
     }

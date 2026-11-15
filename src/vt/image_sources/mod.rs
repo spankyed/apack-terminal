@@ -210,7 +210,7 @@ impl Load {
     /// The command, not read: what a replay answers, its recording holding the names it was shown and not
     /// what they named, and what a read given up on answers.
     pub fn refuse(self) -> Loaded {
-        Loaded { keys: self.keys, query: self.action == b'q', data: Err(Refused::InvalidData) }
+        Loaded { keys: self.keys, data: Err(Refused::InvalidData) }
     }
 
     /// Reads what the command named, as the core would have and refusing what it refuses. This is the
@@ -226,15 +226,17 @@ impl Load {
             (Source::File(path), Some(_)) => {
                 platform::open_file(path).and_then(|file| self.read_from(file, progress)).ok_or(Refused::InvalidData)
             }
-            (Source::SharedMemory(name), Some(_)) if shared_memory_name(name) => {
-                platform::shared_memory(name, |size| self.range(size))
-            }
-            (Source::SharedMemory(_), Some(_)) => Err(Refused::InvalidData),
+            (Source::SharedMemory(name), Some(_)) => platform::shared_memory(name, |size| self.range(size)),
         };
         let query = self.action == b'q';
         let limit = if query { QUERY_BYTES } else { SOURCE_BYTES as usize };
-        let data = data.and_then(|data| if data.len() <= limit { Ok(data) } else { Err(Refused::InvalidData) });
-        Loaded { keys: self.keys, query, data }
+        let data =
+            data.and_then(
+                |bytes| {
+                    if bytes.len() <= limit { Ok(Bytes { bytes, query }) } else { Err(Refused::InvalidData) }
+                },
+            );
+        Loaded { keys: self.keys, data }
     }
 
     /// The bytes of a file the command names, from its `O` offset: its `S` size of them exactly, or to its
@@ -300,8 +302,14 @@ impl<R: Read> Read for Progressing<'_, R> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Loaded {
     keys: Keys,
+    data: Result<Bytes, Refused>,
+}
+
+/// What was read, and whether it answers a query, which is sent in one command and abandons nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Bytes {
+    bytes: Vec<u8>,
     query: bool,
-    data: Result<Vec<u8>, Refused>,
 }
 
 impl Loaded {
@@ -323,9 +331,10 @@ impl Loaded {
     /// taken for that transmission's next piece. A query takes no part in one, and leaves it alone.
     pub fn body(&self) -> Option<Vec<u8>> {
         const NEXT: &[u8] = b"\x1b\\\x1b_G";
-        let data = self.data.as_deref().ok()?;
+        let Bytes { bytes: data, query } = self.data.as_ref().ok()?;
+        let (data, query) = (data.as_slice(), *query);
         let mut body = Vec::new();
-        if !self.query {
+        if !query {
             // A transmission named by a temporary file, which the core abandons the part sent for and then
             // refuses, saying nothing
             body.extend_from_slice(b"Ga=t,t=116,q=2");
@@ -334,7 +343,7 @@ impl Loaded {
             body.push(b'G');
         }
         body.extend_from_slice(&self.keys.spelled(b"tmOS"));
-        let pieces: Vec<&[u8]> = if self.query { vec![data] } else { data.chunks(CHUNK_BYTES).collect() };
+        let pieces: Vec<&[u8]> = if query { vec![data] } else { data.chunks(CHUNK_BYTES).collect() };
         for (index, piece) in pieces.iter().enumerate() {
             let more = index + 1 < pieces.len();
             if index > 0 {
