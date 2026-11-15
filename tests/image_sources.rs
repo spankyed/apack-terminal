@@ -1038,3 +1038,37 @@ fn a_shared_memory_range_is_the_cores() {
     assert_eq!(range(&format!("a=T,f=100,S={}", SOURCE_BYTES + 1), u64::MAX), None, "past what could be kept");
     assert_eq!(range(&format!("a=T,f=100,S={SOURCE_BYTES}"), u64::MAX), Some(0..SOURCE_BYTES));
 }
+
+/// **A late answer is to the read it was asked for, and no other.** A read settled by something else
+/// reaching the core, and answered once the next command's read is outstanding, is let go of: the next
+/// command is answered by its own read, and the first image is not made out of what was meant for it.
+#[test]
+fn a_late_answer_is_not_taken_for_the_next_reads() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let first = directory.path().join("first");
+    std::fs::write(&first, PIXEL).expect("a file is written");
+    let second = directory.path().join("second");
+    std::fs::write(&second, [5u8, 6, 7, 8]).expect("a file is written");
+    let stream = [
+        command(b"\x1b_", b"a=T,i=7,f=32,s=1,v=1,t=f", named(&first).as_bytes(), ST),
+        command(b"\x1b_", b"a=T,i=8,f=32,s=1,v=1,t=f", named(&second).as_bytes(), ST),
+    ]
+    .concat();
+
+    let mut screen = session(true);
+    let (taken, image) = screen.feed_until_image(&stream);
+    let late = image.expect("the feed stopped at the first").read();
+    screen
+        .set_cursor_defaults(
+            apack_terminal::protocol::CursorStyle::Block,
+            apack_terminal::protocol::CursorBlink::Program,
+        )
+        .expect("the cursor is set");
+    let (more, image) = screen.feed_until_image(&stream[taken..]);
+    let next = image.expect("the feed stopped at the second").read();
+    screen.finish_image(late);
+    screen.finish_image(next);
+    screen.feed(&stream[taken + more..]);
+    assert_eq!(screen.image(8, 0).map(|read| read.bytes), Some(vec![5, 6, 7, 8]), "the second was not its own");
+    assert_eq!(screen.image(7, 0), None, "the first was answered after it was refused");
+}

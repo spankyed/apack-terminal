@@ -1201,10 +1201,11 @@ impl Sessions {
                             if let Some(read_image) = read_image {
                                 screen.finish_image(read_image);
                             }
-                            let (taken, next) = screen.feed_until_image(&buffer[fed..read]);
+                            let unfed = &buffer[fed..read];
+                            let (taken, next) = screen.feed_until_image(unfed);
                             replies.extend(screen.take_replies());
                             effects.extend(screen.take_effects());
-                            let recent = rows_added(&buffer[fed..fed + taken], screen.cols());
+                            let recent = rows_added(&unfed[..taken], screen.cols());
                             met += settle_met(&waiting, &screen, recent);
                             // Each view that has drawn its last frame is sent what changed, here
                             // where the change landed
