@@ -272,7 +272,7 @@ impl Connection {
             }
         });
         let connection = Self { stream, events };
-        connection.say(&Request::Hello { protocol: PROTOCOL_VERSION, role });
+        connection.say(&Request::Hello { protocol: PROTOCOL_VERSION, role, challenge: None });
         assert!(matches!(connection.event(), Event::Hello { .. }));
         connection
     }
@@ -397,8 +397,9 @@ struct View {
 impl View {
     fn attached(broker: &Broker, session: &str) -> Self {
         let stream = connect(&broker.socket);
-        let mut hello = serde_json::to_string(&Request::Hello { protocol: PROTOCOL_VERSION, role: Role::View })
-            .expect("a request serializes");
+        let mut hello =
+            serde_json::to_string(&Request::Hello { protocol: PROTOCOL_VERSION, role: Role::View, challenge: None })
+                .expect("a request serializes");
         hello.push('\n');
         (&*stream.0).write_all(hello.as_bytes()).expect("the broker reads");
         let (sender, incoming) = channel();
@@ -975,7 +976,9 @@ fn a_view_that_sends_nonsense_and_stops_reading_does_not_keep_the_broker() {
 
     // Greets as a view, attaches, and never reads a byte
     let vandal = connect(&broker.socket);
-    let hello = serde_json::to_string(&Request::Hello { protocol: PROTOCOL_VERSION, role: Role::View }).expect("hello");
+    let hello =
+        serde_json::to_string(&Request::Hello { protocol: PROTOCOL_VERSION, role: Role::View, challenge: None })
+            .expect("hello");
     (&*vandal.0).write_all(format!("{hello}\n").as_bytes()).expect("the broker reads");
     (&*vandal.0)
         .write_all(&ToBroker::Attach { channel: 1, session: session.clone() }.encode())
@@ -1144,7 +1147,9 @@ fn a_view_that_stops_speaking_and_never_reads_does_not_keep_the_broker() {
     }
 
     let silent = connect(&broker.socket);
-    let hello = serde_json::to_string(&Request::Hello { protocol: PROTOCOL_VERSION, role: Role::View }).expect("hello");
+    let hello =
+        serde_json::to_string(&Request::Hello { protocol: PROTOCOL_VERSION, role: Role::View, challenge: None })
+            .expect("hello");
     (&*silent.0).write_all(format!("{hello}\n").as_bytes()).expect("the broker reads");
     (&*silent.0)
         .write_all(&ToBroker::Attach { channel: 1, session: session.clone() }.encode())
