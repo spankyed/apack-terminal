@@ -102,7 +102,7 @@ impl Proxy {
     }
 
     fn greet(&mut self, role: Role) {
-        self.say(&Request::Hello { protocol: PROTOCOL_VERSION, role });
+        self.say(&Request::Hello { protocol: PROTOCOL_VERSION, role, challenge: None });
         let answered = self.event();
         assert!(matches!(answered, Event::Hello { .. }), "a greeting was answered {answered:?}");
     }
@@ -343,7 +343,8 @@ fn greeted(socket: &Path) -> Stream {
     let name = socket.to_str().expect("a utf-8 path").to_fs_name::<GenericFilePath>().expect("a socket name");
     let stream = Stream::connect(name).expect("the broker accepts");
     let hello =
-        serde_json::to_string(&Request::Hello { protocol: PROTOCOL_VERSION, role: Role::Client }).expect("hello");
+        serde_json::to_string(&Request::Hello { protocol: PROTOCOL_VERSION, role: Role::Client, challenge: None })
+            .expect("hello");
     (&stream).write_all(format!("{hello}\n").as_bytes()).expect("the broker reads");
     // A byte at a time, so that nothing past the answer is taken off the connection
     let mut answer = Vec::new();
@@ -486,7 +487,7 @@ fn a_proxy_whose_input_has_ended_still_carries_the_answer_to_what_it_was_last_se
     let mut input = process.stdin.take().expect("piped stdin");
     let mut said = String::new();
     for request in [
-        Request::Hello { protocol: PROTOCOL_VERSION, role: Role::Client },
+        Request::Hello { protocol: PROTOCOL_VERSION, role: Role::Client, challenge: None },
         Request::Sessions,
         Request::Facts { session: "s-404".to_owned() },
     ] {

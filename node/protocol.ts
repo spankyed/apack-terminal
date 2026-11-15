@@ -67,7 +67,7 @@ export type ErrorCode = "HANDSHAKE" | "MALFORMED" | "NO_SUCH_SESSION" | "PTY" | 
 /**
  * What the broker tells the app, unprompted or in answer.
  */
-export type Event = { "kind": "hello", protocol: number, history: number, } | { "kind": "spawned", session: string, pid: number, recorded: boolean, restored: boolean, } | { "kind": "output", session: string, text: string, } | { "kind": "exited", session: string, code: number | null, signal: string | null, } | { "kind": "throttled", session: string, waited_us: number, } | { "kind": "screen", session: string, lines: Array<string>, 
+export type Event = { "kind": "hello", protocol: number, history: number, proof: string | null, } | { "kind": "spawned", session: string, pid: number, recorded: boolean, restored: boolean, } | { "kind": "output", session: string, text: string, } | { "kind": "exited", session: string, code: number | null, signal: string | null, } | { "kind": "throttled", session: string, waited_us: number, } | { "kind": "screen", session: string, lines: Array<string>, 
 /**
  * For each line, whether it runs on into the next. A line longer than the grid is wide is drawn
  * over several rows, and a caller reading them as text joins the ones this marks.
@@ -130,7 +130,17 @@ export type ProgressState = "none" | "running" | "error" | "indeterminate" | "pa
 /**
  * What the app asks the broker to do.
  */
-export type Request = { "kind": "done" } | { "kind": "hello", protocol: number, role: Role, } | { "kind": "spawn", cols: number, rows: number, shell: string | null, 
+export type Request = { "kind": "done" } | { "kind": "hello", protocol: number, role: Role, 
+/**
+ * **A question only the caller's own broker can answer**, asked before the caller says anything
+ * else. A socket's or pipe's name says where a caller connected and not to whom: on Windows any
+ * account may create a pipe under a name nobody holds yet, so whatever answers there may be another
+ * user's process, which would be handed every key typed. The caller starts its broker with a key it
+ * keeps where only its user can read it (`BROKER_KEY_ENV`), sends a fresh challenge here, and goes on
+ * only if the answer's `proof` is that key's HMAC of it (`proof_of`). Another account has no key to
+ * answer with. Absent, nothing is proved and `proof` is absent.
+ */
+challenge: string | null, } | { "kind": "spawn", cols: number, rows: number, shell: string | null, 
 /**
  * The shell's own launch arguments, in order. Empty starts it as the user would.
  */

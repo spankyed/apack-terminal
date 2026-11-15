@@ -25,7 +25,9 @@ use apack_terminal::feed::{FEED_BYTES_ENV, Feed, feed_bytes};
 use apack_terminal::frames::{Frame, read_frame};
 use apack_terminal::listening::{self, HELD_EXIT, Refused, START_GRACE_ENV, hang_up};
 use apack_terminal::output::{Outgoing, channel_with_credit};
-use apack_terminal::protocol::{CommandRecord, ErrorCode, Event, PROTOCOL_VERSION, Request, Role, SearchMatch};
+use apack_terminal::protocol::{
+    BROKER_KEY_ENV, CommandRecord, ErrorCode, Event, PROTOCOL_VERSION, Request, Role, SearchMatch, proof_of,
+};
 use apack_terminal::recording;
 use apack_terminal::screen::{Colors, HISTORY_LINES};
 use apack_terminal::session::{Handle, Refusal, Sessions, Spawning};
@@ -61,6 +63,11 @@ fn refuse(socket: &str, refused: &Refused) -> ! {
 }
 
 fn main() -> std::io::Result<()> {
+    // **The key is taken out of the environment before anything can inherit it**: every session's shell starts
+    // from this process's environment, and the key is the broker's alone (`Request::Hello`'s `challenge`)
+    let key = std::env::var(BROKER_KEY_ENV).ok().filter(|key| !key.is_empty()).map(Arc::new);
+    // SAFETY: no thread has been started yet, so nothing can be reading the environment while it changes
+    unsafe { std::env::remove_var(BROKER_KEY_ENV) };
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let socket = match arguments.as_slice() {
         // This process's stdin and stdout as a connection to the broker there (`proxy`), or to the one
@@ -113,6 +120,7 @@ fn main() -> std::io::Result<()> {
         clients: Arc::new(AtomicUsize::new(0)),
         connections: Arc::new(AtomicUsize::new(0)),
         accepted: Arc::new(AtomicU64::new(0)),
+        key,
     };
     // One thread takes everything off the queue for the broker's life, so what is reported is in one
     // order, and a client arriving or leaving changes where it goes rather than who decides that
@@ -197,6 +205,8 @@ struct Broker {
     /// How many connections there have ever been, which is what tells one connection's views — and the
     /// recordings it opened — from another's, and whether anything has connected at all.
     accepted: Arc<AtomicU64>,
+    /// What answers a greeting's challenge, when whoever started the broker gave it one (`BROKER_KEY_ENV`)
+    key: Option<Arc<String>>,
 }
 
 /// Deals with everything the sessions report, for as long as the broker runs: what a report means for
@@ -467,7 +477,7 @@ fn converse(wire: &Arc<Wire>, connection: u64, broker: &Broker, role: &mut Optio
                 );
                 continue;
             }
-            (Request::Hello { protocol, role: asked }, None) => {
+            (Request::Hello { protocol, role: asked, challenge }, None) => {
                 if *protocol != PROTOCOL_VERSION {
                     say(
                         wire,
@@ -489,7 +499,8 @@ fn converse(wire: &Arc<Wire>, connection: u64, broker: &Broker, role: &mut Optio
                     Role::Lifetime => broker.owned.store(true, Ordering::SeqCst),
                     Role::View => {}
                 }
-                say(wire, &Event::Hello { protocol: PROTOCOL_VERSION, history: HISTORY_LINES as u32 });
+                let proof = broker.key.as_deref().zip(challenge.as_deref()).map(|(key, asked)| proof_of(key, asked));
+                say(wire, &Event::Hello { protocol: PROTOCOL_VERSION, history: HISTORY_LINES as u32, proof });
                 match asked {
                     // Last greeting wins the feed: one app, one broker per data dir, and a client that
                     // reconnects after its service restarted is the one that should be receiving.

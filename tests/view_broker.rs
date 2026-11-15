@@ -252,7 +252,7 @@ struct Client {
 impl Client {
     fn greeting(broker: &Broker) -> Self {
         let stream = connect(broker);
-        say(&stream, &Request::Hello { protocol: PROTOCOL_VERSION, role: Role::Client });
+        say(&stream, &Request::Hello { protocol: PROTOCOL_VERSION, role: Role::Client, challenge: None });
         let (sender, events) = channel();
         std::thread::spawn({
             let stream = Arc::clone(&stream);
@@ -343,7 +343,7 @@ struct View {
 impl View {
     fn greeting(broker: &Broker) -> Self {
         let stream = connect(broker);
-        say(&stream, &Request::Hello { protocol: PROTOCOL_VERSION, role: Role::View });
+        say(&stream, &Request::Hello { protocol: PROTOCOL_VERSION, role: Role::View, challenge: None });
         let (sender, incoming) = channel();
         std::thread::spawn({
             let stream = Arc::clone(&stream);
@@ -1094,7 +1094,7 @@ fn a_view_that_asks_without_reading_is_hung_up_on() {
 
     // A connection that greets as a view, attaches, reads its first frame, and from then on only writes
     let stream = connect(&broker);
-    say(&stream, &Request::Hello { protocol: PROTOCOL_VERSION, role: Role::View });
+    say(&stream, &Request::Hello { protocol: PROTOCOL_VERSION, role: Role::View, challenge: None });
     let send = |message: &ToBroker| (&*stream).write_all(&message.encode());
     send(&ToBroker::Attach { channel: 1, session: session.clone() }).expect("the broker reads");
     let first = {
@@ -1143,7 +1143,7 @@ struct Unread {
 impl Unread {
     fn attached(broker: &Broker, session: &str) -> Self {
         let stream = connect(broker);
-        say(&stream, &Request::Hello { protocol: PROTOCOL_VERSION, role: Role::View });
+        say(&stream, &Request::Hello { protocol: PROTOCOL_VERSION, role: Role::View, challenge: None });
         (&*stream)
             .write_all(&ToBroker::Attach { channel: 1, session: session.to_owned() }.encode())
             .expect("the broker reads");
@@ -1314,7 +1314,7 @@ fn a_second_hello_is_refused_and_changes_nothing() {
     let client = Client::greeting(&broker);
     assert!(matches!(client.event(), Event::Hello { .. }));
     for role in [Role::Client, Role::View, Role::Lifetime] {
-        say(&client.stream, &Request::Hello { protocol: PROTOCOL_VERSION, role });
+        say(&client.stream, &Request::Hello { protocol: PROTOCOL_VERSION, role, challenge: None });
         match client.event() {
             Event::Failed { message, .. } => assert!(message.contains("already said hello"), "{message}"),
             other => panic!("a second hello was answered {other:?}"),
@@ -1478,7 +1478,7 @@ fn a_session_that_ends_is_over_for_its_view_while_the_client_reads_nothing() {
     let broker = start();
     // Greeted and answered by hand, so that from the spawn's answer on nothing reads this connection
     let stream = connect(&broker);
-    say(&stream, &Request::Hello { protocol: PROTOCOL_VERSION, role: Role::Client });
+    say(&stream, &Request::Hello { protocol: PROTOCOL_VERSION, role: Role::Client, challenge: None });
     say(
         &stream,
         &Request::Spawn {

@@ -9,7 +9,7 @@ use std::process::{Child, Command, Stdio};
 
 use interprocess::local_socket::{GenericFilePath, Stream, ToFsName, prelude::*};
 
-use apack_terminal::protocol::PROTOCOL_VERSION;
+use apack_terminal::protocol::{BROKER_KEY_ENV, PROTOCOL_VERSION};
 
 /// The broker, listening, with the socket it said it was listening on.
 struct Broker {
@@ -413,6 +413,70 @@ fn the_handshake_says_how_much_history_the_broker_keeps() {
         Some(apack_terminal::screen::HISTORY_LINES as u64),
         "the handshake's history is not what the screen keeps: {greeting}"
     );
+}
+
+/// **A broker started with a key proves it is the one its caller started**: a greeting's challenge is answered
+/// with HMAC-SHA256 of it under that key, so a caller that reached a socket or pipe somebody else is listening
+/// on can tell before it says anything more. The key and challenge are RFC 4231's second case, whose answer is
+/// published, so this is checked against the standard rather than against `proof_of`.
+#[test]
+fn a_greetings_challenge_is_answered_with_the_keys_proof() {
+    let broker = start_with_env(|command| {
+        command.env(BROKER_KEY_ENV, "Jefe");
+    });
+    let (mut reading, mut writing) = connect(&broker);
+    let asking = serde_json::json!({
+        "kind": "hello", "protocol": PROTOCOL_VERSION, "challenge": "what do ya want for nothing?",
+    });
+    ask(&mut writing, &asking.to_string());
+    assert_eq!(
+        next(&mut reading)["proof"],
+        "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843",
+        "the challenge was not answered with the key's HMAC of it"
+    );
+
+    // A greeting that asks nothing is told nothing
+    let (mut reading, mut writing) = connect(&broker);
+    ask(&mut writing, &hello(None));
+    assert_eq!(next(&mut reading)["proof"], serde_json::Value::Null);
+}
+
+/// **A broker started without a key proves nothing**, which a caller that asked must take as a broker that is
+/// not its own: there is no answer it could give that one started with the key could not.
+#[test]
+fn a_broker_without_a_key_answers_a_challenge_with_no_proof() {
+    let broker = start();
+    let (mut reading, mut writing) = connect(&broker);
+    let asking = serde_json::json!({ "kind": "hello", "protocol": PROTOCOL_VERSION, "challenge": "c0ffee" });
+    ask(&mut writing, &asking.to_string());
+    let greeting = next(&mut reading);
+    assert_eq!(greeting["kind"], "hello");
+    assert_eq!(greeting["proof"], serde_json::Value::Null);
+}
+
+/// **The key is the broker's and no shell's.** Every session starts from the broker's environment, which is
+/// where the key arrives, so a shell would otherwise hold it and anything it runs could answer for the broker.
+#[test]
+fn a_brokers_key_does_not_reach_its_sessions() {
+    let broker = start_with_env(|command| {
+        command.env(BROKER_KEY_ENV, "kept-from-shells");
+    });
+    let (mut reading, mut writing) = connect(&broker);
+    ask(&mut writing, &hello(None));
+    next(&mut reading);
+    #[cfg(unix)]
+    let (shell, args) = ("/bin/sh", ["-c", "printf 'key=[%s]\\n' \"$APACK_TERMINAL_KEY\""]);
+    #[cfg(windows)]
+    let (shell, args) = ("cmd.exe", ["/C", "echo key=[%APACK_TERMINAL_KEY%]"]);
+    let frame = serde_json::json!({
+        "kind": "spawn", "cols": 80, "rows": 24, "shell": shell, "args": args, "env": [], "unset": [], "cwd": null,
+    });
+    ask(&mut writing, &frame.to_string());
+    let session = next(&mut reading)["session"].as_str().expect("a session").to_owned();
+
+    let seen = output_until(&mut reading, Some(&session), |seen| seen.contains("]"));
+    assert!(seen.contains("key=["), "the shell did not run: {seen:?}");
+    assert!(!seen.contains("kept-from-shells"), "a session's shell was given the broker's key: {seen:?}");
 }
 
 #[test]
