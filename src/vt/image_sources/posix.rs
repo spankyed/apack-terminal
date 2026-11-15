@@ -74,8 +74,9 @@ pub fn shared_memory(name: &[u8], range: impl FnOnce(u64) -> Option<Range<u64>>)
     // SAFETY: a descriptor just opened, which nothing else holds; it is closed when this is dropped
     let object = unsafe { OwnedFd::from_raw_fd(opened) };
     let _unlinked = Unlinked(name);
-    // SAFETY: `stat` is written by `fstat` before it is read, and the descriptor is open
+    // SAFETY: a `stat` is plain data, for which all zeroes is a value
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: the descriptor is open, and `stat` is a valid place for `fstat` to write one
     if unsafe { libc::fstat(object.as_raw_fd(), &raw mut stat) } != 0 {
         return None;
     }
