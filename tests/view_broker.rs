@@ -1613,8 +1613,24 @@ fn a_key_release_is_reported_to_a_program_that_asked_for_event_types() {
     let session = client.running("sh", &["-c", asking], false);
     let mut view = View::attached(&broker, &session);
     view.until_shows("ready");
-    view.send(&ToBroker::Key { channel: 1, action: 0, modifiers: 0, code: "Escape".to_owned(), text: String::new(), unshifted: 0, composed: false });
-    view.send(&ToBroker::Key { channel: 1, action: 2, modifiers: 0, code: "Escape".to_owned(), text: String::new(), unshifted: 0, composed: false });
+    view.send(&ToBroker::Key {
+        channel: 1,
+        action: 0,
+        modifiers: 0,
+        code: "Escape".to_owned(),
+        text: String::new(),
+        unshifted: 0,
+        composed: false,
+    });
+    view.send(&ToBroker::Key {
+        channel: 1,
+        action: 2,
+        modifiers: 0,
+        code: "Escape".to_owned(),
+        text: String::new(),
+        unshifted: 0,
+        composed: false,
+    });
     // ESC [ 2 7 u for the press, then ESC [ 2 7 ; 1 : 3 u for the release
     view.until_shows("1b5b3237751b5b32373b313a3375");
 }
@@ -1631,7 +1647,15 @@ fn a_control_chord_is_sent_to_a_program_that_asked_for_the_protocol_as_csi_u() {
     let mut view = View::attached(&broker, &session);
     view.until_shows("ready");
     // Modifiers in the core's bits: control is 2
-    view.send(&ToBroker::Key { channel: 1, action: 0, modifiers: 2, code: "KeyC".to_owned(), text: String::new(), unshifted: 99, composed: false });
+    view.send(&ToBroker::Key {
+        channel: 1,
+        action: 0,
+        modifiers: 2,
+        code: "KeyC".to_owned(),
+        text: String::new(),
+        unshifted: 99,
+        composed: false,
+    });
     view.until_shows("1b5b39393b3575");
 }
 
