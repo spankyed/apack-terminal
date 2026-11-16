@@ -43,6 +43,22 @@ export class RowStore {
    * until the owner says what it holds has changed — the epoch, where history starts, or `staleFrom`.
    */
   private readonly absent = new Set<number>()
+  /**
+   * History lines held that may no longer be what the owner holds, and are asked for again (`doubtPictured`).
+   * A doubted row is still drawn: it is the best there is until the answer comes.
+   */
+  private readonly doubted = new Set<number>()
+  /**
+   * How many times `doubtPictured` has been called: what an asker notes when it asks, so `absorb` can tell
+   * an answer asked for before the images last changed from one asked for since.
+   */
+  imagesChanged = 0
+  /**
+   * How many frames have named history stale, and from where the last did: what an asker notes when it
+   * asks, so an answer taken after a frame that named the lines it covers stale is not put back as it was.
+   */
+  staleFrames = 0
+  private staleLine = Infinity
 
   /** The oldest line the owner still holds */
   get oldest(): number {
@@ -77,6 +93,7 @@ export class RowStore {
     const oldest = this.oldest
     if (reset) {
       this.rows.clear()
+      this.doubted.clear()
       this.epoch = frame.epoch
     }
     this.firstActive = frame.firstActive
@@ -90,13 +107,17 @@ export class RowStore {
     // History the owner changed and did not resend. Before the new rows, so one of them that is in that
     // range is kept
     if (frame.staleFrom !== undefined) {
+      this.staleFrames += 1
+      this.staleLine = frame.staleFrom
       for (let line = frame.staleFrom; line < frame.firstActive; line += 1) {
         if (this.rows.delete(line)) changed.add(line)
+        this.doubted.delete(line)
       }
     }
     for (const row of frame.rows) {
       this.rows.set(row.line, row)
       this.absent.delete(row.line)
+      this.doubted.delete(row.line)
       changed.add(row.line)
     }
     this.forget(near)
@@ -110,24 +131,38 @@ export class RowStore {
    *
    * **What the answer covers and has no row for is not held by the owner**, and is remembered as that, so
    * it is not missing. What it does not cover it says nothing about.
+   *
+   * **An answer asked for before the images last changed may be of either side of the change.** `asked` is
+   * `imagesChanged` when the fetch was made. An answer and the frame that says the images changed can
+   * arrive together, and the frame is taken first whichever was sent first, so there is no telling from
+   * the order which of them the answer's rows are older than. A row of placeholder cells brought by such
+   * an answer is taken, and stays doubted: asked for once more, by a fetch made after the change.
    */
-  absorb(fetched: Fetched, near = this.firstActive): number[] {
+  absorb(fetched: Fetched, near = this.firstActive, asked = this.imagesChanged, askedStale = this.staleFrames): number[] {
     if (fetched.epoch !== this.epoch) return []
     const told: number[] = []
+    // Lines a frame has since named stale were changed after this was asked for: what the answer holds of
+    // them is the old text, and it is not put back
+    const stale = this.staleFrames !== askedStale ? this.staleLine : Infinity
     // The screen is only ever told by a frame: a fetched copy of a line a program can still write to may
     // be older than the frame that last described it
     const from = Math.max(fetched.first, this.oldest)
     const to = Math.min(fetched.first + fetched.count, this.firstActive)
     const brought = new Set<number>()
     for (const row of fetched.rows) {
-      if (row.line < from || row.line >= to) continue
+      if (row.line < from || row.line >= to || row.line >= stale) continue
       this.rows.set(row.line, row)
       this.absent.delete(row.line)
+      if (row.images !== undefined && asked !== this.imagesChanged) this.doubted.add(row.line)
+      else this.doubted.delete(row.line)
       brought.add(row.line)
       told.push(row.line)
     }
-    for (let line = from; line < to; line += 1) {
-      if (brought.has(line) || this.rows.has(line) || this.absent.has(line)) continue
+    for (let line = from; line < Math.min(to, stale); line += 1) {
+      if (brought.has(line) || this.absent.has(line)) continue
+      // A row asked for again and not brought is one the owner no longer holds
+      if (this.rows.has(line) && !this.doubted.delete(line)) continue
+      this.rows.delete(line)
       this.absent.add(line)
       told.push(line)
     }
@@ -148,7 +183,7 @@ export class RowStore {
     const runs: Array<[number, number]> = []
     let start = -1
     for (let line = from; line < to; line += 1) {
-      if (this.rows.has(line) || this.absent.has(line)) {
+      if ((this.rows.has(line) && !this.doubted.has(line)) || this.absent.has(line)) {
         if (start !== -1) runs.push([start, line - start])
         start = -1
       } else if (start === -1) {
@@ -157,6 +192,28 @@ export class RowStore {
     }
     if (start !== -1) runs.push([start, to - start])
     return runs
+  }
+
+  /**
+   * The images changed: a history row of placeholder cells may show something else now — another picture
+   * under the same number, nothing, or a picture where it showed none — and the owner sends history again
+   * only when asked. So each such row is doubted: kept and drawn, and among what `missing` names until it
+   * is brought again. The screen's rows are not: a frame brings those.
+   */
+  doubtPictured(): void {
+    this.imagesChanged += 1
+    for (const [line, row] of this.rows) {
+      if (line < this.firstActive && row.images !== undefined) this.doubted.add(line)
+    }
+  }
+
+  /** The images the rows held show part of, by number */
+  pictured(): Set<number> {
+    const images = new Set<number>()
+    for (const row of this.rows.values()) {
+      for (const piece of row.images?.pieces ?? []) images.add(piece.image)
+    }
+    return images
   }
 
   /**
@@ -173,6 +230,7 @@ export class RowStore {
     for (const line of this.rows.keys()) {
       if (line < oldest || line >= this.end) this.rows.delete(line)
     }
+    for (const line of this.doubted) if (!this.rows.has(line)) this.doubted.delete(line)
     if (this.rows.size <= KEPT_LINES + KEPT_SLACK) return
     // The widest reach around `near` that holds no more than may be kept, found by halving: at most two
     // lines are any one distance away, so the count is within one of the bound
@@ -188,6 +246,11 @@ export class RowStore {
       if (within(middle) <= KEPT_LINES) reach = middle
       else beyond = middle
     }
-    for (const line of this.rows.keys()) if (line < this.firstActive && Math.abs(line - near) > reach) this.rows.delete(line)
+    for (const line of this.rows.keys()) {
+      if (line < this.firstActive && Math.abs(line - near) > reach) {
+        this.rows.delete(line)
+        this.doubted.delete(line)
+      }
+    }
   }
 }

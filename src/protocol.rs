@@ -29,6 +29,19 @@ use crate::commands::{Outcome, Unknown};
 /// exists that cannot move with it.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// The variable a broker is given its key in, which it takes out of its own environment before it starts a
+/// session, so no shell inherits it (`Request::Hello`'s `challenge`).
+pub const BROKER_KEY_ENV: &str = "APACK_TERMINAL_KEY";
+
+/// The answer to `challenge` under `key`: HMAC-SHA256, as lowercase hexadecimal (`Event::Hello`'s `proof`).
+pub fn proof_of(key: &str, challenge: &str) -> String {
+    use hmac::{Hmac, Mac};
+
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(key.as_bytes()).expect("HMAC takes a key of any length");
+    mac.update(challenge.as_bytes());
+    mac.finalize().into_bytes().iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// A session's identity, minted by the broker: the app never invents one.
 pub type SessionId = String;
 
@@ -57,6 +70,15 @@ pub enum Request {
         protocol: u32,
         #[serde(default)]
         role: Role,
+        /// **A question only the caller's own broker can answer**, asked before the caller says anything
+        /// else. A socket's or pipe's name says where a caller connected and not to whom: on Windows any
+        /// account may create a pipe under a name nobody holds yet, so whatever answers there may be another
+        /// user's process, which would be handed every key typed. The caller starts its broker with a key it
+        /// keeps where only its user can read it (`BROKER_KEY_ENV`), sends a fresh challenge here, and goes on
+        /// only if the answer's `proof` is that key's HMAC of it (`proof_of`). Another account has no key to
+        /// answer with. Absent, nothing is proved and `proof` is absent.
+        #[serde(default)]
+        challenge: Option<String>,
     },
     /// Start a shell in a pty. `shell` absent means the platform's default.
     ///
@@ -112,6 +134,16 @@ pub enum Request {
         /// views draw them; absent, a program is told no and prints what it would have otherwise.
         #[serde(default)]
         images: bool,
+        /// **Whether an image may be named instead of sent**: as a file on this machine, or a shared
+        /// memory object, which the terminal then reads (the protocol's `t=f` and `t=s`). Only read where
+        /// `images` is on. It is the caller's to say because only the caller knows what the session's
+        /// output is: a program on this machine could have read the file itself, and asks the terminal
+        /// to because megabytes need not then cross the pty; a file shown with `cat` or the far end of
+        /// an `ssh` that spells the same request is asking this machine to open a path of its choosing.
+        /// So yes is for a session started to run one program the caller trusts, and absent — a shell —
+        /// such an image is refused and its program told so, which is how one learns to send the bytes.
+        #[serde(default)]
+        image_files: bool,
         /// **What vouches for the shell's marks**: 32 lowercase hexadecimal characters the caller also
         /// gave the shell, and nothing else (`markers::MarksKey`). A session spawned with one records a
         /// command, and says one is running, only on the word of a mark carrying it — so a file shown
@@ -143,6 +175,14 @@ pub enum Request {
         #[serde(default)]
         cell_height: u16,
     },
+    /// **The cursor a session starts with and returns to when a program resets it (`CSI 0 q`)**, set from
+    /// the app's settings. The cursor is taken to the new default at once, so a session shows it before any
+    /// program has chosen one; a program that chooses its own (DECSCUSR) keeps it until it resets again.
+    /// Refused for an unknown session, as any request is.
+    ///
+    /// **The broker reports blinking as the program left it.** `blink` sets what a reset returns to; a view
+    /// applies `On` and `Off` over what a program asks, which is the one place a program's blink is ignored.
+    SetCursorDefaults { session: SessionId, style: CursorStyle, blink: CursorBlink },
     /// **Stop reading this session's pty**, so the process feels the reader stop.
     ///
     /// This is flow control for a consumer whose own sink is slower than a shell can write — the app's
@@ -252,6 +292,30 @@ pub enum Request {
     },
     /// End the session and its process tree.
     Kill { session: SessionId },
+}
+
+/// The shape a session's cursor is drawn in when no program has chosen one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "protocol.ts")]
+pub enum CursorStyle {
+    Block,
+    Bar,
+    Underline,
+}
+
+/// Whether a session's cursor blinks when no program has chosen. `On` and `Off` are the app's answer and
+/// override the program's blink, in a view; `Program` leaves the blink to the program. In the core, DECSCUSR's
+/// blink and DEC mode 12 are one setting, so a program's choice of either is what `Program` means.
+///
+/// A reset (`CSI 0 q`) returns to a blinking cursor for `On` and `Program`, and to a steady one for `Off`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "protocol.ts")]
+pub enum CursorBlink {
+    On,
+    Off,
+    Program,
 }
 
 /// The colours a session is drawn in, each as red, green and blue.
@@ -430,7 +494,11 @@ pub enum Event {
     /// independent constants produced: 10,000 in the window against 1,000 here, so closing and reopening a
     /// window silently lost nine tenths of the scrollback. Taken from the handshake rather than pinned in
     /// both places, so the two cannot drift.
-    Hello { protocol: u32, history: u32 },
+    ///
+    /// `proof` answers `Request::Hello`'s `challenge`: HMAC-SHA256 of the challenge under the broker's key,
+    /// as lowercase hexadecimal. Absent when no challenge was asked, or when the broker was started with no
+    /// key — which a caller that asked has to treat as a broker that is not its own.
+    Hello { protocol: u32, history: u32, proof: Option<String> },
     /// A session exists and its process is running.
     ///
     /// **What was asked for and what was got are both said.** `recorded` is whether the session is being

@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use apack_terminal::holds::{HOLD_LIMIT, Holds};
+use apack_terminal::protocol::{CursorBlink, CursorStyle};
 use apack_terminal::screen::{Screen, TEXT_BYTES, Unanswered};
 use apack_terminal::view::publish::{FETCH_LINES, Publication, ViewId};
 use apack_terminal::view::wire::{
@@ -237,6 +238,29 @@ fn a_program_holding_the_screen_is_not_shown_half_drawn() {
     assert_eq!(lines(&view.frame()), vec![(0, "half done".to_owned())]);
 }
 
+/// **A snapshot read during a hold is the screen from before it.** A view that asks for lines by number
+/// while a program is redrawing gets what the program last let go of, not the half-drawn rows it is
+/// writing: the same rule the frames follow.
+#[test]
+fn lines_fetched_while_the_program_is_holding_the_screen_are_those_from_before_the_hold() {
+    let mut screen = Screen::new(20, 3);
+    screen.feed(b"old text");
+    let view = View::attached(&mut screen, 1, 1);
+    let first = view.frame();
+    let epoch = first.epoch;
+    screen.acknowledge(view.id, first.sequence).expect("an acknowledgement is taken");
+
+    write(&mut screen, "\x1b[?2026h\x1b[1;1Hnew text");
+    let fetched = screen.fetch(epoch, 0, 1).expect("a fetch reads");
+    let rows = fetched.rows.block().expect("the rows read back").rows.iter().map(text).collect::<Vec<_>>();
+    assert_eq!(rows, vec!["old text".to_owned()], "a fetch during a hold shows the screen before it");
+
+    write(&mut screen, "\x1b[?2026l");
+    let fetched = screen.fetch(epoch, 0, 1).expect("a fetch reads");
+    let rows = fetched.rows.block().expect("the rows read back").rows.iter().map(text).collect::<Vec<_>>();
+    assert_eq!(rows, vec!["new text".to_owned()], "and what the program let go of once it has");
+}
+
 /// A program that asks and never lets go is drawn anyway, once it has had the time the limit allows.
 #[test]
 fn a_hold_nobody_ends_is_drawn_after_the_limit() {
@@ -456,8 +480,27 @@ fn a_frame_says_how_the_cursor_is_drawn_and_whether_the_program_took_the_mouse()
             "\x1b[4 q",
             Box::new(|frame: &Frame| frame.cursor.is_some_and(|cursor| cursor.shape == 2 && !cursor.blinking)),
         ),
-        ("\x1b[?25l", Box::new(|frame: &Frame| frame.cursor.is_none())),
-        ("\x1b[?25h\x1b[?1000h", Box::new(|frame: &Frame| frame.cursor.is_some() && frame.mouse)),
+        // Hidden, and still where it is: an input method composes beside it whether or not it is drawn
+        (
+            "\x1b[?25l\x1b[3;8H",
+            Box::new(|frame: &Frame| {
+                frame.cursor.is_some_and(|cursor| cursor.hidden && (cursor.column, cursor.row) == (7, 2))
+            }),
+        ),
+        // And followed while it is: a program that draws its own cursor moves this one with it
+        (
+            "\x1b[2;3H",
+            Box::new(|frame: &Frame| {
+                frame.cursor.is_some_and(|cursor| cursor.hidden && (cursor.column, cursor.row) == (2, 1))
+            }),
+        ),
+        (
+            "\x1b[?25h\x1b[?1000h",
+            Box::new(|frame: &Frame| {
+                frame.mouse
+                    && frame.cursor.is_some_and(|cursor| !cursor.hidden && (cursor.column, cursor.row) == (2, 1))
+            }),
+        ),
         ("\x1b[?1000l", Box::new(|frame: &Frame| !frame.mouse)),
     ] {
         screen.acknowledge(view.id, last.sequence).expect("an acknowledgement is taken");
@@ -465,6 +508,124 @@ fn a_frame_says_how_the_cursor_is_drawn_and_whether_the_program_took_the_mouse()
         last = view.frame();
         assert!(check(&last), "after {written:?}: {last:?}");
         assert!(last.block.rows.is_empty(), "no row changed, so none is sent");
+    }
+}
+
+/// What a frame says the cursor is drawn as: its shape, and whether it blinks.
+fn drawn_as(frame: &Frame) -> Option<(u8, bool)> {
+    frame.cursor.map(|cursor| (cursor.shape, cursor.blinking))
+}
+
+/// Applies `change` to the screen, and returns the frame a view is sent for it.
+fn after(screen: &mut Screen, view: &View, last: &Frame, change: impl FnOnce(&mut Screen)) -> Frame {
+    screen.acknowledge(view.id, last.sequence).expect("an acknowledgement is taken");
+    change(screen);
+    view.frame()
+}
+
+#[test]
+fn a_default_cursor_set_by_the_app_is_the_one_a_frame_shows() {
+    let mut screen = Screen::new(20, 4);
+    let view = View::attached(&mut screen, 1, 1);
+    let first = view.frame();
+    assert_eq!(drawn_as(&first), Some((1, true)), "the blinking bar a session starts with");
+
+    let block = after(&mut screen, &view, &first, |screen| {
+        screen.set_cursor_defaults(CursorStyle::Block, CursorBlink::Off).expect("the defaults are set")
+    });
+    assert_eq!(drawn_as(&block), Some((0, false)));
+
+    let underline = after(&mut screen, &view, &block, |screen| {
+        screen.set_cursor_defaults(CursorStyle::Underline, CursorBlink::On).expect("the defaults are set")
+    });
+    assert_eq!(drawn_as(&underline), Some((2, true)));
+}
+
+#[test]
+fn a_program_choice_wins_over_the_default_until_the_program_resets_it() {
+    let mut screen = Screen::new(20, 4);
+    let view = View::attached(&mut screen, 1, 1);
+    let first = view.frame();
+    let set = after(&mut screen, &view, &first, |screen| {
+        screen.set_cursor_defaults(CursorStyle::Block, CursorBlink::Off).expect("the defaults are set")
+    });
+
+    let chosen = after(&mut screen, &view, &set, |screen| write(screen, "\x1b[5 q"));
+    assert_eq!(drawn_as(&chosen), Some((1, true)), "DECSCUSR wins over the default");
+
+    let reset = after(&mut screen, &view, &chosen, |screen| write(screen, "\x1b[0 q"));
+    assert_eq!(drawn_as(&reset), Some((0, false)), "a reset returns to the default");
+}
+
+#[test]
+fn a_reset_returns_to_a_blinking_cursor_for_on_and_program_and_a_steady_one_for_off() {
+    for (blink, blinking) in [(CursorBlink::On, true), (CursorBlink::Program, true), (CursorBlink::Off, false)] {
+        let mut screen = Screen::new(20, 4);
+        let view = View::attached(&mut screen, 1, 1);
+        let first = view.frame();
+        let set = after(&mut screen, &view, &first, |screen| {
+            screen.set_cursor_defaults(CursorStyle::Block, blink).expect("the defaults are set")
+        });
+        let chosen = after(&mut screen, &view, &set, |screen| write(screen, "\x1b[6 q"));
+        let reset = after(&mut screen, &view, &chosen, |screen| write(screen, "\x1b[0 q"));
+        assert_eq!(drawn_as(&reset), Some((0, blinking)), "after a reset with {blink:?}");
+    }
+}
+
+/// **A default set part way through a program's sequence takes the cursor, and leaves the sequence whole**:
+/// taking the cursor is a write to the parser, which waits for the sequence to end — made in the middle of
+/// it, the write would end it early and the rest would be printed. It is taken where the sequence ends, so a
+/// cursor the program chooses after that is the one drawn. A program that had chosen a cursor of its own is
+/// the one the write is for, so each case begins by choosing one; and each is run in a session that takes
+/// images by name as well, whose output is fed another way.
+#[test]
+fn a_default_set_part_way_through_a_program_sequence_takes_the_cursor_once_it_ends() {
+    // What a steady underline, chosen by a program, is drawn as
+    let chosen = {
+        let mut screen = Screen::new(20, 4);
+        screen.feed(b"\x1b[4 q");
+        drawn_as(&View::attached(&mut screen, 1, 1).frame())
+    };
+    for images in [false, true] {
+        for (begun, rest) in [("\x1b[", "1mbold"), ("\x1b]0;a ti", "tle\x07bold"), ("\x1b_Gq=2", "\x1b\\bold")] {
+            for (then, drawn) in [("", Some((0, false))), ("\x1b[4 q", chosen)] {
+                let mut screen = Screen::new(20, 4);
+                if images {
+                    screen.allow_images(true).expect("images are allowed");
+                }
+                screen.feed(b"\x1b[5 q");
+                let view = View::attached(&mut screen, 1, 1);
+                let first = view.frame();
+                screen.acknowledge(view.id, first.sequence).expect("an acknowledgement is taken");
+                write(&mut screen, begun);
+                screen.set_cursor_defaults(CursorStyle::Block, CursorBlink::Off).expect("the defaults are set");
+                // Nothing the program sees has changed while its sequence is unfinished, nor once more of it
+                // has come that does not finish it
+                view.nothing();
+                write(&mut screen, &rest[..1]);
+                view.nothing();
+                write(&mut screen, &format!("{}{then}", &rest[1..]));
+                let ended = view.frame();
+                let case = format!("{begun:?} then {then:?}, images {images}");
+                assert_eq!(drawn_as(&ended), drawn, "{case}: the cursor was not taken where the sequence ended");
+                assert_eq!(screen.snapshot(0).lines[0], "bold", "{case}: the sequence was cut short");
+            }
+        }
+    }
+}
+
+/// DECSCUSR's blink and DEC mode 12 are one setting in the core: each sets what the other reads. The
+/// app's blink setting is a view's to apply over this, so it has to know this much to be right.
+#[test]
+fn decscusr_and_dec_mode_12_set_one_blink_between_them() {
+    let mut screen = Screen::new(20, 4);
+    let view = View::attached(&mut screen, 1, 1);
+    let mut last = view.frame();
+    for (written, expected) in
+        [("\x1b[2 q", (0, false)), ("\x1b[?12h", (0, true)), ("\x1b[5 q", (1, true)), ("\x1b[?12l", (1, false))]
+    {
+        last = after(&mut screen, &view, &last, |screen| write(screen, written));
+        assert_eq!(drawn_as(&last), Some(expected), "after {written:?}");
     }
 }
 
@@ -509,6 +670,42 @@ fn a_row_carries_each_characters_style_and_link() {
     let bar = &block.rows[2];
     assert_eq!(bar.glyphs.len(), 30);
     assert!(bar.glyphs.iter().all(|glyph| glyph.text == " " && styled(2, glyph).bg == Color::Palette(4)));
+}
+
+/// **A hyperlink covers the cells written inside its sequence and no others.** The cell after the close is
+/// unlinked. An id parameter does not change the URI reported: the core's only hyperlink accessor answers
+/// the URI, and no id, so grouping by id is not something a row can carry.
+#[test]
+fn a_hyperlink_covers_its_cells_until_it_is_closed_and_an_id_does_not_change_the_uri() {
+    let mut screen = Screen::new(30, 2);
+    screen.feed(b"\x1b]8;id=one;https://example.com\x1b\\in\x1b]8;;\x1b\\out");
+    let view = View::attached(&mut screen, 1, 1);
+    let frame = view.frame();
+    let row = &frame.block.rows[0];
+    let glyph_at =
+        |column: u16| row.glyphs.iter().find(|glyph| glyph.column == column).expect("a glyph at that column");
+
+    assert_eq!(row.link_of(glyph_at(0)), Some("https://example.com"), "a cell inside the sequence, with an id on it");
+    assert_eq!(row.link_of(glyph_at(1)), Some("https://example.com"));
+    assert_eq!(row.link_of(glyph_at(2)), None, "the cell after the close");
+}
+
+/// **A hyperlink that wraps reports its URI on each row it covers**, the same string both times, so a view
+/// that groups cells by URI can see that they are one link across the wrap.
+#[test]
+fn a_hyperlink_that_wraps_reports_its_uri_on_each_row_it_covers() {
+    let mut screen = Screen::new(10, 3);
+    screen.feed(b"\x1b]8;;https://example.com/long\x1b\\abcdefghijkl\x1b]8;;\x1b\\");
+    let view = View::attached(&mut screen, 1, 1);
+    let frame = view.frame();
+    let rows = &frame.block.rows;
+    let last_of_first = rows[0].glyphs.iter().find(|glyph| glyph.column == 9).expect("the last cell of the first row");
+    let first_of_second =
+        rows[1].glyphs.iter().find(|glyph| glyph.column == 0).expect("the first cell of the second row");
+
+    assert!(rows[0].wrapped, "the first row wraps onto the second");
+    assert_eq!(rows[0].link_of(last_of_first), Some("https://example.com/long"));
+    assert_eq!(rows[1].link_of(first_of_second), Some("https://example.com/long"));
 }
 
 /// A colour named exactly rather than by the palette is a cell of background all the same, and a wide

@@ -9,16 +9,11 @@
     "directory": "node"
   },
   "private": true,
-  "type": "commonjs",
-  "main": "index.js",
   "types": "index.d.ts",
   "files": [
-    "index.js",
     "index.d.ts",
     "protocol.ts",
-    "view-vectors.json",
-    "apack-terminal",
-    "apack-terminal.exe"
+    "view-vectors.json"
   ],
   "engines": {
     "node": ">=22.17.0"

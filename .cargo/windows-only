@@ -1,0 +1,10 @@
+# The files whose mutants only Windows can answer, one a line: what a mutation of them could change is
+# compiled on Windows alone, so elsewhere a mutant of one changes nothing and the suite passes over it.
+#
+# Read by `cargo xtask pre-push` and by `.github/workflows/mutants.yml`, which leave these out of a run on
+# any other platform and mutate them on Windows; `cargo xtask check-exclusions` refuses a line naming a
+# file that is not there. A file holding Windows arms beside other code is not one of these: its Windows
+# arms are answered by a dispatch (`gh workflow run mutants.yml -f files=<file>`).
+src/listening/pipe.rs
+src/tree.rs
+src/vt/image_sources/windows.rs

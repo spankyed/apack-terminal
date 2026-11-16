@@ -57,7 +57,13 @@ jobs:
       - uses: actions/checkout@v4
       # rust-toolchain.toml names the toolchain; rustup installs it on first use
       - run: rustup show active-toolchain
+      # **Only `master` saves a build cache; every run restores one.** A pull request's cache is readable by that
+      # pull request alone, so saving one spends a gigabyte or more of the repository's ten on something no other
+      # run can use, and the cache evicts by least recent use: `master`'s caches were what went. A pull request
+      # restores `master`'s, which is the one that matches it best. The same in every workflow that builds
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - run: cargo fetch --locked
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
@@ -105,21 +111,20 @@ jobs:
       - if: runner.os == 'Windows'
         shell: bash
         run: echo "GHOSTTY_VT_RS_SYS_OPTIMIZE=fast" >> "$GITHUB_ENV"
+      # Saved from `master` only, as in `checks`
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.148
+      # **Windows is linted where it is built.** `checks` lints Linux, where `cfg(windows)` code and what only a
+      # POSIX case uses look different: a helper only POSIX cases call is unused here, and nothing else says so
+      - if: runner.os == 'Windows'
+        run: cargo clippy --workspace --all-targets -- -D warnings
       # Each test in its own process, killed at `.config/nextest.toml`'s deadline: a regression here loses a
       # signal, which is a read that never returns rather than a wrong answer
       - run: cargo nextest run --workspace --no-fail-fast
-      # The npm package with this platform's binary in it, which is how the broker reaches a packaged app.
-      # Staged on every platform because the binary's *name* is what was wrong before: `cargo` writes
-      # `apack-terminal.exe` on Windows, and a consumer looking for the extensionless name there found
-      # nothing and started no terminal
-      - run: cargo xtask package
-      - name: the package holds a binary
-        run: test -x "node/apack-terminal" || test -f "node/apack-terminal.exe"
-        shell: bash
 
   # The view (`view/`): its types, its suite and the build a consumer bundles. One platform, since it is
   # TypeScript drawing on a canvas and nothing in it asks the operating system anything. Its suite reads

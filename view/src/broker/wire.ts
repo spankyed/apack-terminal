@@ -11,6 +11,8 @@
  * and its UTF-8.
  */
 import {
+  type Anchored,
+  type AnchoredImages,
   CURSOR_SHAPES,
   KEY_ACTIONS,
   POINTER_ACTIONS,
@@ -23,11 +25,13 @@ import {
   type Frame,
   type KeyInput,
   type PasteOutcome,
+  type Piece,
   type Placement,
   type Placements,
   type PointerInput,
   type Position,
   type Row,
+  type RowImages,
   type Rows,
   type SessionColors,
   type Span,
@@ -54,7 +58,7 @@ export type ToBroker =
   | { readonly kind: 'focus'; readonly channel: number; readonly gained: boolean }
   | { readonly kind: 'wordAt' | 'lineAt'; readonly channel: number; readonly request: number; readonly epoch: number; readonly at: Position }
   | { readonly kind: 'textOf'; readonly channel: number; readonly request: number; readonly epoch: number; readonly span: Span }
-  | { readonly kind: 'search'; readonly channel: number; readonly request: number; readonly needle: string }
+  | { readonly kind: 'search'; readonly channel: number; readonly request: number; readonly needle: string; readonly caseSensitive: boolean }
   | { readonly kind: 'commands'; readonly channel: number; readonly request: number }
   | { readonly kind: 'images'; readonly channel: number; readonly request: number }
   | { readonly kind: 'image'; readonly channel: number; readonly request: number; readonly image: number; readonly offset: number }
@@ -100,6 +104,10 @@ const FRAME_STALE = 8
 const FRAME_BLINKING = 16
 const FRAME_REVERSE = 32
 const FRAME_COLORS = 64
+const FRAME_HIDDEN = 128
+const FRAME_ANCHORED = 256
+/** The first bit a frame's flags do not define */
+const FRAME_FLAGS = 512
 
 const COLOR_FOREGROUND = 1
 const COLOR_BACKGROUND = 2
@@ -239,6 +247,7 @@ export function encodeToBroker(message: ToBroker): Uint8Array {
     case 'search':
       out.number(message.request)
       out.text(message.needle)
+      out.flag(message.caseSensitive)
       break
     case 'commands':
     case 'images':
@@ -353,7 +362,24 @@ class Reader {
     }
   }
 
-  /** An exit status. Zigzag, as the broker writes it: the low bit is the sign */
+  /** The images a frame says are placed relative to another: the cell they are measured in, and each */
+  anchored(): AnchoredImages {
+    const cellWidth = this.number()
+    const cellHeight = this.number()
+    const omitted = this.number()
+    const list: Anchored[] = []
+    for (let more = this.count(); more > 0; more -= 1) {
+      list.push({
+        image: this.number(), generation: this.number(), z: this.status(), row: this.status(), column: this.status(),
+        columns: this.number(), rows: this.number(),
+        offsetX: this.number(), offsetY: this.number(), width: this.number(), height: this.number(),
+        sourceX: this.number(), sourceY: this.number(), sourceWidth: this.number(), sourceHeight: this.number(),
+      })
+    }
+    return { cellWidth, cellHeight, omitted, list }
+  }
+
+  /** A number that may be below zero. Zigzag, as the broker writes it: the low bit is the sign */
   status(): number {
     const zigzag = this.number()
     if (zigzag > 0xffffffff) throw new Malformed('an integer did not fit its field')
@@ -407,7 +433,7 @@ class Reader {
   private row(): Row {
     const line = this.number()
     const flags = this.byte()
-    if (flags > 3) throw new Malformed("a row's flags are outside what the format defines")
+    if (flags > 7) throw new Malformed("a row's flags are outside what the format defines")
     // The row's own tables, which its characters count from one: the plain style and no link are put in
     // front, so an index is where the thing is
     const styles: Style[] = [PLAIN]
@@ -450,6 +476,22 @@ class Reader {
       }
       if (column > 0xffff) throw new Malformed('an integer did not fit its field')
     }
+    // For a row its flags say holds placeholder cells: the cell what they show is measured in, how many
+    // pieces that is, and each
+    let images: RowImages | undefined
+    if (flags & 4) {
+      const cellWidth = this.number()
+      const cellHeight = this.number()
+      const pieces: Piece[] = []
+      for (let more = this.count(); more > 0; more -= 1) {
+        pieces.push({
+          image: this.number(), generation: this.number(), column: this.number(), columns: this.number(),
+          offsetX: this.number(), offsetY: this.number(), width: this.number(), height: this.number(),
+          sourceX: this.number(), sourceY: this.number(), sourceWidth: this.number(), sourceHeight: this.number(),
+        })
+      }
+      images = { cellWidth, cellHeight, pieces }
+    }
     return {
       line,
       wrapped: (flags & 1) !== 0,
@@ -461,6 +503,7 @@ class Reader {
       link: Uint16Array.from(link),
       styles,
       links,
+      ...(images === undefined ? {} : { images }),
     }
   }
 
@@ -485,23 +528,28 @@ export function decodeToView(body: Uint8Array): ToView {
       const scrollback = read.number()
       const commands = read.number()
       const images = read.number()
-      const flags = read.byte()
-      if (flags >= 128) throw new Malformed("a frame's flags are outside what the format defines")
+      const flags = read.number()
+      // Blinking and hidden are said of a cursor, and of nothing when there is none
+      if (flags >= FRAME_FLAGS || (!(flags & FRAME_CURSOR) && flags & (FRAME_BLINKING | FRAME_HIDDEN))) {
+        throw new Malformed("a frame's flags are outside what the format defines")
+      }
       let cursor: Cursor | null = null
       if (flags & FRAME_CURSOR) {
         const column = read.number()
         const row = read.number()
         const shape = CURSOR_SHAPES[read.byte()]
         if (shape === undefined) throw new Malformed("a cursor's shape is outside what the format defines")
-        cursor = { column, row, shape, blinking: (flags & FRAME_BLINKING) !== 0 }
+        cursor = { column, row, shape, blinking: (flags & FRAME_BLINKING) !== 0, hidden: (flags & FRAME_HIDDEN) !== 0 }
       }
       const staleFrom = flags & FRAME_STALE ? read.number() : undefined
       const colors = flags & FRAME_COLORS ? read.colors() : undefined
+      const anchored = flags & FRAME_ANCHORED ? read.anchored() : undefined
       const frame: Frame = {
         sequence, epoch, firstActive, columns, screenRows, scrollback, commands, images, cursor,
         modes: { alternateScreen: (flags & FRAME_ALTERNATE) !== 0, mouse: (flags & FRAME_MOUSE) !== 0 },
         reverseVideo: (flags & FRAME_REVERSE) !== 0,
         ...(colors === undefined ? {} : { colors }),
+        ...(anchored === undefined ? {} : { anchored }),
         ...(staleFrom === undefined ? {} : { staleFrom }),
         ...read.rows(),
       }

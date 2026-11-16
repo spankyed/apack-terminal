@@ -59,7 +59,7 @@ pub fn owner_only() -> std::io::Result<interprocess::os::windows::security_descr
 /// and `IU` (interactive users) is every account logged in at this machine — which on a shared or
 /// terminal-services host is exactly who must not read this pipe. So the token is asked.
 #[cfg(windows)]
-fn current_user_sid() -> std::io::Result<widestring::U16CString> {
+pub(crate) fn current_user_sid() -> std::io::Result<widestring::U16CString> {
     use std::io::Error;
     use widestring::U16CStr;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};

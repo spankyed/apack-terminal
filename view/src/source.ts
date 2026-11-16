@@ -98,17 +98,75 @@ export interface Row {
   readonly styles: readonly Style[]
   /** The links on this row. `links[0]` is the empty string, so a character's `0` means none */
   readonly links: readonly string[]
+  /**
+   * What this row's placeholder cells show, on a row that holds any — which it may while they show
+   * nothing, and then `pieces` is empty. Absent on a row with no such cells
+   */
+  readonly images?: RowImages
+}
+
+/**
+ * Part of an image shown in a run of placeholder cells on one row.
+ *
+ * **It is the row's, because the cells are.** A program that wants an image to move with its text prints
+ * placeholder characters where the image is to be, and the image is wherever those characters are. So what
+ * they show comes with the row that holds them, in the message that brings the row: the picture and the
+ * text beside it are drawn from one frame, and a row scrolled back to shows what it showed. The cells
+ * themselves arrive blank.
+ *
+ * `offsetX`, `offsetY`, `width` and `height` are in the pixels of a cell as the terminal was told one is
+ * (`RowImages.cellWidth`), which a view scales to the cell it draws. A piece is drawn under the text.
+ */
+export interface Piece {
+  readonly image: number
+  /** Moves when the image's pixels do, so the ones a view holds are known stale */
+  readonly generation: number
+  /** The first cell of the run, and how many cells it is */
+  readonly column: number
+  readonly columns: number
+  readonly offsetX: number
+  readonly offsetY: number
+  readonly width: number
+  readonly height: number
+  /** The part of the picture drawn, in its own pixels */
+  readonly sourceX: number
+  readonly sourceY: number
+  readonly sourceWidth: number
+  readonly sourceHeight: number
+}
+
+/**
+ * What a row's placeholder cells show, and one cell in the pixels that is measured in.
+ *
+ * **Said of every row that holds such cells, whether or not they show anything now.** What they show
+ * depends on the image they name as well as on the cells: one not yet all there, or deleted, shows nothing,
+ * and shows again when it arrives. A view keeps rows, so this is how it knows which to ask after when the
+ * images change.
+ */
+export interface RowImages {
+  readonly cellWidth: number
+  readonly cellHeight: number
+  readonly pieces: readonly Piece[]
 }
 
 export const CURSOR_SHAPES = ['block', 'bar', 'underline', 'hollow'] as const
 export type CursorShape = (typeof CURSOR_SHAPES)[number]
 
+/**
+ * Where the cursor is, and how it is drawn when it is.
+ *
+ * **Where it is and whether it is drawn are two facts.** A program that draws a cursor of its own hides
+ * the terminal's and still moves it to where typing goes, because that is where an input method composes.
+ * So a view puts its input there whether or not it draws anything.
+ */
 export interface Cursor {
   /** The cell, within the screen: `row` counts from `firstActive` */
   readonly column: number
   readonly row: number
   readonly shape: CursorShape
   readonly blinking: boolean
+  /** The program has hidden it: nothing is drawn, and it is still where this says */
+  readonly hidden: boolean
 }
 
 /** What a view has to know about the program's modes, which is very little: the terminal's owner encodes input */
@@ -160,9 +218,12 @@ export interface Frame extends Rows {
   readonly scrollback: number
   /** Moves whenever the shell reports a command, which is when `commands()` has something new to say */
   readonly commands: number
-  /** Moves whenever an image is sent, placed, replaced or deleted: the cue to ask where they are again */
+  /**
+   * Moves whenever an image is sent, placed, replaced or deleted, and whenever the size of a cell the
+   * terminal was told changes: the cue to ask where the images are again
+   */
   readonly images: number
-  /** Absent while the program has hidden it */
+  /** Absent when it is not on the screen. One the program has hidden is here, and says so */
   readonly cursor: Cursor | null
   readonly modes: Modes
   /**
@@ -178,6 +239,63 @@ export interface Frame extends Rows {
    * they were.
    */
   readonly colors?: SessionColors
+  /**
+   * The images on the screen that are placed relative to another, when this frame says where they are:
+   * an attachment's first frame does, and so does any frame since in which one is somewhere else, new
+   * or gone. Absent, they are on the lines they were on.
+   */
+  readonly anchored?: AnchoredImages
+}
+
+/**
+ * One image placed relative to another, where it is on the screen.
+ *
+ * **It comes with the frame, because it moves with what the frame brings.** Such an image has no cell of
+ * its own: it is so many cells from its parent, and where the parent is shown through placeholder cells
+ * that is wherever a program last wrote them. So where it is belongs to the screen as a frame tells it.
+ *
+ * `offsetX`, `offsetY`, `width` and `height` are in the pixels of a cell as the terminal was told one is
+ * (`AnchoredImages.cellWidth`), which a view scales to the cell it draws.
+ */
+export interface Anchored {
+  readonly image: number
+  /** Moves when the image's pixels do, so the ones a view holds are known stale */
+  readonly generation: number
+  /** Orders images that overlap; below zero is under the text */
+  readonly z: number
+  /**
+   * Its top-left cell: the row counted from the frame's `firstActive`, and the column. Either is below
+   * zero for one that starts above or to the left of the screen and reaches into it
+   */
+  readonly row: number
+  readonly column: number
+  /** How many cells it covers */
+  readonly columns: number
+  readonly rows: number
+  readonly offsetX: number
+  readonly offsetY: number
+  readonly width: number
+  readonly height: number
+  /** The part of the picture drawn, in its own pixels */
+  readonly sourceX: number
+  readonly sourceY: number
+  readonly sourceWidth: number
+  readonly sourceHeight: number
+}
+
+/**
+ * Every image on the screen that is placed relative to another, as far as a frame lists them, and one
+ * cell in the pixels they are measured in.
+ *
+ * **All of them, every time, and only the screen's.** What this lists replaces what a view held. One
+ * whose parent has scrolled into the history is not told, and is not drawn there.
+ */
+export interface AnchoredImages {
+  readonly cellWidth: number
+  readonly cellHeight: number
+  /** How many more there are than are listed */
+  readonly omitted: number
+  readonly list: readonly Anchored[]
 }
 
 /**
@@ -389,8 +507,11 @@ export interface TerminalSource {
    * rejection, for a span numbered in an epoch that is over, and for text longer than an owner will carry
    */
   textOf(span: Span): Promise<string>
-  /** Every place `needle` appears, newest first — as many of the newest as the owner looks for */
-  search(needle: string): Promise<readonly Span[]>
+  /**
+   * Every place `needle` appears, newest first — as many of the newest as the owner looks for. Letters match in
+   * either case unless `caseSensitive` says the needle's own case only
+   */
+  search(needle: string, caseSensitive: boolean): Promise<readonly Span[]>
   /** The commands the shell has reported, oldest first. Empty for a shell that marks none */
   commands(): Promise<readonly Command[]>
   /** Where every image is. Their lines are in the epoch of the frame that prompted the question */

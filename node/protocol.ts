@@ -44,6 +44,20 @@ cwd: string | null,
 started_ms: number | null, finished_ms: number | null, outcome: CommandOutcome, };
 
 /**
+ * Whether a session's cursor blinks when no program has chosen. `On` and `Off` are the app's answer and
+ * override the program's blink, in a view; `Program` leaves the blink to the program. In the core, DECSCUSR's
+ * blink and DEC mode 12 are one setting, so a program's choice of either is what `Program` means.
+ *
+ * A reset (`CSI 0 q`) returns to a blinking cursor for `On` and `Program`, and to a steady one for `Off`.
+ */
+export type CursorBlink = "on" | "off" | "program";
+
+/**
+ * The shape a session's cursor is drawn in when no program has chosen one.
+ */
+export type CursorStyle = "block" | "bar" | "underline";
+
+/**
  * **A closed set, generated into the TypeScript as a string union** — elmdb's `ErrorCode` arrangement, and
  * what #372's name-matching should become. A caller switches on a value the compiler knows, rather than
  * matching on a message that is free to be reworded.
@@ -53,7 +67,7 @@ export type ErrorCode = "HANDSHAKE" | "MALFORMED" | "NO_SUCH_SESSION" | "PTY" | 
 /**
  * What the broker tells the app, unprompted or in answer.
  */
-export type Event = { "kind": "hello", protocol: number, history: number, } | { "kind": "spawned", session: string, pid: number, recorded: boolean, restored: boolean, } | { "kind": "output", session: string, text: string, } | { "kind": "exited", session: string, code: number | null, signal: string | null, } | { "kind": "throttled", session: string, waited_us: number, } | { "kind": "screen", session: string, lines: Array<string>, 
+export type Event = { "kind": "hello", protocol: number, history: number, proof: string | null, } | { "kind": "spawned", session: string, pid: number, recorded: boolean, restored: boolean, } | { "kind": "output", session: string, text: string, } | { "kind": "exited", session: string, code: number | null, signal: string | null, } | { "kind": "throttled", session: string, waited_us: number, } | { "kind": "screen", session: string, lines: Array<string>, 
 /**
  * For each line, whether it runs on into the next. A line longer than the grid is wide is drawn
  * over several rows, and a caller reading them as text joins the ones this marks.
@@ -116,7 +130,17 @@ export type ProgressState = "none" | "running" | "error" | "indeterminate" | "pa
 /**
  * What the app asks the broker to do.
  */
-export type Request = { "kind": "done" } | { "kind": "hello", protocol: number, role: Role, } | { "kind": "spawn", cols: number, rows: number, shell: string | null, 
+export type Request = { "kind": "done" } | { "kind": "hello", protocol: number, role: Role, 
+/**
+ * **A question only the caller's own broker can answer**, asked before the caller says anything
+ * else. A socket's or pipe's name says where a caller connected and not to whom: on Windows any
+ * account may create a pipe under a name nobody holds yet, so whatever answers there may be another
+ * user's process, which would be handed every key typed. The caller starts its broker with a key it
+ * keeps where only its user can read it (`BROKER_KEY_ENV`), sends a fresh challenge here, and goes on
+ * only if the answer's `proof` is that key's HMAC of it (`proof_of`). Another account has no key to
+ * answer with. Absent, nothing is proved and `proof` is absent.
+ */
+challenge: string | null, } | { "kind": "spawn", cols: number, rows: number, shell: string | null, 
 /**
  * The shell's own launch arguments, in order. Empty starts it as the user would.
  */
@@ -167,6 +191,17 @@ restore: boolean,
  */
 images: boolean, 
 /**
+ * **Whether an image may be named instead of sent**: as a file on this machine, or a shared
+ * memory object, which the terminal then reads (the protocol's `t=f` and `t=s`). Only read where
+ * `images` is on. It is the caller's to say because only the caller knows what the session's
+ * output is: a program on this machine could have read the file itself, and asks the terminal
+ * to because megabytes need not then cross the pty; a file shown with `cat` or the far end of
+ * an `ssh` that spells the same request is asking this machine to open a path of its choosing.
+ * So yes is for a session started to run one program the caller trusts, and absent — a shell —
+ * such an image is refused and its program told so, which is how one learns to send the bytes.
+ */
+image_files: boolean, 
+/**
  * **What vouches for the shell's marks**: 32 lowercase hexadecimal characters the caller also
  * gave the shell, and nothing else (`markers::MarksKey`). A session spawned with one records a
  * command, and says one is running, only on the word of a mark carrying it — so a file shown
@@ -178,7 +213,7 @@ images: boolean,
  * that shell can read the key and write any mark it likes; nothing here is a boundary against
  * one. A key that is not one is refused (`ErrorCode::Malformed`) rather than spawned without.
  */
-marks_key: string | null, } | { "kind": "write", session: string, text: string, } | { "kind": "resize", session: string, cols: number, rows: number, cell_width: number, cell_height: number, } | { "kind": "pause", session: string, } | { "kind": "resume", session: string, } | { "kind": "signal", session: string, signal: Signal, scope: Scope, } | { "kind": "owns", session: string, pid: number, } | { "kind": "screen", session: string, history: number, } | { "kind": "facts", session: string, } | { "kind": "search", session: string, text: string, history: number, } | { "kind": "wait", session: string, until: Until, timeout_ms: number, } | { "kind": "commands", session: string, } | { "kind": "command_output", session: string, command: number, } | { "kind": "keep", session: string, kept: boolean, } | { "kind": "sessions" } | { "kind": "rewind", recording: string, cols: number, rows: number, } | { "kind": "seek", session: string, at: number, } | { "kind": "kill", session: string, };
+marks_key: string | null, } | { "kind": "write", session: string, text: string, } | { "kind": "resize", session: string, cols: number, rows: number, cell_width: number, cell_height: number, } | { "kind": "set_cursor_defaults", session: string, style: CursorStyle, blink: CursorBlink, } | { "kind": "pause", session: string, } | { "kind": "resume", session: string, } | { "kind": "signal", session: string, signal: Signal, scope: Scope, } | { "kind": "owns", session: string, pid: number, } | { "kind": "screen", session: string, history: number, } | { "kind": "facts", session: string, } | { "kind": "search", session: string, text: string, history: number, } | { "kind": "wait", session: string, until: Until, timeout_ms: number, } | { "kind": "commands", session: string, } | { "kind": "command_output", session: string, command: number, } | { "kind": "keep", session: string, kept: boolean, } | { "kind": "sessions" } | { "kind": "rewind", recording: string, cols: number, rows: number, } | { "kind": "seek", session: string, at: number, } | { "kind": "kill", session: string, };
 
 /**
  * What a connection is for.

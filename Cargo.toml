@@ -16,14 +16,22 @@ autotests = false
 name = "suite"
 path = "tests/suite.rs"
 
+# P1: the broker's numbers as a client drives it (`benches/broker.rs`). Reports, never fails
+[[bench]]
+name = "broker"
+path = "benches/broker.rs"
+harness = false
+
 [dependencies]
 interprocess = "2.4.7"
-portable-pty = "0.9.0"
+portable-pty = { git = "https://github.com/wez/wezterm", rev = "8afe0ad30739c5aa106c19e8a75b1dfc83bcfb56" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 ts-rs = "12.0.1"
 # Decodes a PNG a program sends as an image, which the VT core leaves to whoever embeds it (`src/vt/images.rs`)
 png = "0.18.1"
+hmac = "0.12"
+sha2 = "0.10"
 
 # Windows only: Job Objects, which is how a session owns its process tree there (`src/tree.rs`). POSIX needs
 # none — the kernel's SIGHUP to a pty's foreground group does it.
@@ -38,7 +46,7 @@ sysinfo = { version = "0.40.1", default-features = false, features = ["system"] 
 libc = "0.2.191"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading"] }
 # The SDDL string the pipe's security descriptor is built from, which `interprocess` takes as a `U16CStr`
 widestring = "1.0.2"
 

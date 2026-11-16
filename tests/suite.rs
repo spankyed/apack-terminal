@@ -26,11 +26,14 @@ mod feed;
 mod frames;
 mod holds;
 mod housekeeping;
-mod images;
+mod image_source_rules;
 #[cfg(unix)]
+mod image_sources;
+mod images;
 mod keeping;
 mod markers;
 mod parser;
+mod placeholders;
 mod proxy;
 mod reaper;
 mod recording;

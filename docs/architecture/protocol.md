@@ -33,6 +33,21 @@ the connection's role being what it is counted as and how it is spoken to from t
 **It is a contract across a pin boundary.** A consumer pins a commit of this repository, so a stale pin has
 to be a clear refusal rather than a message that means something else.
 
+**A greeting can ask the broker to prove it is the caller's own.** A socket's or pipe's name says where a
+caller connected, not to whom, and on Windows any account may create a pipe under a name nobody holds yet. So a
+caller that started its broker with a key (`APACK_TERMINAL_KEY`, which the broker takes out of its environment
+before any session can inherit it) adds a fresh `challenge` to its `hello`, and goes on only if the answer's
+`proof` is HMAC-SHA256 of the challenge under that key, in lowercase hexadecimal:
+
+```json
+{"kind":"hello","protocol":1,"role":"client","challenge":"<random hex>"}
+{"kind":"hello","protocol":1,"history":100000,"proof":"<hmac hex>"}
+```
+
+A broker started without a key answers `proof: null`, as does every broker to a greeting that asks nothing. A
+caller that asked must take `null` as a broker that is not its own: the key is kept where only its user can
+read it, so another account's process has nothing to answer with.
+
 `role` is `client` or `lifetime`, and **a caller that omits it is a client** — so a raw caller, a probe or
 anything speaking the older handshake behaves exactly as before. [design.md](design.md) has what each role
 means for a session's lifetime.
@@ -49,7 +64,7 @@ among it, left unread.
 | kind | asks for |
 |---|---|
 | `hello` | the handshake, with a protocol version and a role |
-| `spawn` | a shell in a new pty: `cols`, `rows`, `shell`, `args`, `env`, `unset`, `cwd`, and optionally `colors`, `output`, `record`, `restore`, `images`, `marks_key` |
+| `spawn` | a shell in a new pty: `cols`, `rows`, `shell`, `args`, `env`, `unset`, `cwd`, and optionally `colors`, `output`, `record`, `restore`, `images`, `image_files`, `marks_key` |
 | `write` | bytes the user typed |
 | `resize` | the viewport changed; one size per session, because a pty has one |
 | `pause` | stop reading this session's pty, so its process feels the reader stop |
@@ -73,6 +88,14 @@ bytes wants them; a terminal a person looks at is drawn by a view, which is sent
 ([views.md](views.md)), and its bytes would cross the socket to be thrown away and stall the program on
 their credit. `record` and `restore` are a file to record the session in and whether to begin with what it
 holds; `images` is whether its programs may send any ([design.md](design.md)).
+
+`image_files` is whether an image may be *named* rather than sent: as a file on this machine or a shared
+memory object, which the broker then reads and hands to the terminal as its bytes. It is read only where `images` is on, and it is the caller's
+to say because only the caller knows what a session's output is. A program on this machine could have read
+the file itself; a file shown with `cat`, a log, or the far end of an `ssh` that spells the same request
+is asking this machine to open a path of its choosing. So it is for a session started to run one program
+the caller trusts, and absent — a shell — such an image is refused and the program told so
+([design.md](design.md#known-limits)).
 
 `marks_key` is what vouches for the shell's marks: 32 lowercase hexadecimal characters the caller also
 gives the shell — the broker does not; it spawns what it is handed — and nothing else. A session spawned

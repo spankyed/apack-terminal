@@ -20,11 +20,13 @@ use crate::housekeeping::Housekeeping;
 use crate::markers::MarksKey;
 use crate::output::{Credit, Flow, Outgoing, READ_AHEAD, coalesce};
 use crate::protocol::{
-    ErrorCode, Event, Foreground, ProgressState, Scope, SessionId, SessionSummary, Signal, Until, WaitOutcome,
+    CursorBlink, CursorStyle, ErrorCode, Event, Foreground, ProgressState, Scope, SessionId, SessionSummary, Signal,
+    Until, WaitOutcome,
 };
 use crate::recording;
 use crate::screen::{
-    Colors, CommandAt, Facts, Fetched, HISTORY_LINES, ImagesAt, Match, Screen, Snapshot, Unanswered, Vouching,
+    Colors, CommandAt, Facts, Fetched, HISTORY_LINES, ImagesAt, Match, PendingImage, Screen, Snapshot, Unanswered,
+    Vouching,
 };
 use crate::tree::Tree;
 use crate::view::publish::{Outlet, ViewId};
@@ -618,8 +620,10 @@ pub struct Spawning {
     /// Where to record it, if anywhere, and whether to begin with what is recorded there.
     pub record: Option<String>,
     pub restore: bool,
-    /// Whether its programs may send images (`Request::Spawn`)
+    /// Whether its programs may send images, and whether they may name one as a file or a shared memory
+    /// object on this machine (`Request::Spawn`)
     pub images: bool,
+    pub image_files: bool,
     /// What vouches for its shell's marks, if anything does (`Request::Spawn`)
     pub marks_key: Option<String>,
 }
@@ -780,6 +784,11 @@ impl Handle {
         self.on_screen(|screen| screen.resize(cols, rows, cell_width, cell_height))
     }
 
+    /// The cursor the session starts with and returns to; see `Screen::set_cursor_defaults`.
+    pub fn set_cursor_defaults(&self, style: CursorStyle, blink: CursorBlink) -> Outcome {
+        Ok(self.on_screen(|screen| screen.set_cursor_defaults(style, blink))??)
+    }
+
     /// The screen as this session has it, with up to `history` lines above the viewport.
     pub fn snapshot(&self, history: u32) -> Result<Snapshot, Refusal> {
         self.on_screen(|screen| screen.snapshot(history))
@@ -874,8 +883,8 @@ impl Handle {
         Ok(self.on_screen(|screen| screen.text_of(epoch, span))??)
     }
 
-    pub fn find(&self, needle: &str) -> Result<(u32, Vec<Span>), Refusal> {
-        Ok(self.on_screen(|screen| screen.find(needle))??)
+    pub fn find(&self, needle: &str, case_sensitive: bool) -> Result<(u32, Vec<Span>), Refusal> {
+        Ok(self.on_screen(|screen| screen.find(needle, case_sensitive))??)
     }
 
     /// Every image in the session, with the epoch their lines are in and one cell in pixels.
@@ -973,8 +982,22 @@ impl Sessions {
 
     /// Starts a shell in a new pty and begins reading it. The id is the broker's to mint.
     pub fn spawn(&self, asked: Spawning) -> Outcome {
-        let Spawning { cols, rows, shell, args, env, unset, cwd, colors, output, record, restore, images, marks_key } =
-            asked;
+        let Spawning {
+            cols,
+            rows,
+            shell,
+            args,
+            env,
+            unset,
+            cwd,
+            colors,
+            output,
+            record,
+            restore,
+            images,
+            image_files,
+            marks_key,
+        } = asked;
         // **Before anything is started.** A key that is not one is a request this cannot carry out as
         // asked, and a session spawned without it would report as vouched what nothing vouches for
         let marks_key = match marks_key {
@@ -1045,7 +1068,7 @@ impl Sessions {
             screen.set_colors(colors);
         }
         if images {
-            let _ = screen.allow_images();
+            let _ = screen.allow_images(image_files);
         }
         // **Before the process is read**, so what it prints lands after what the last session left and
         // is recorded from its first byte. A recording that cannot be opened — or that another session is
@@ -1150,6 +1173,8 @@ impl Sessions {
         let reader_events = events.clone();
         let reader_session = session.clone();
         let reading_flow = Arc::clone(&flow);
+        // Where this session's named images are read, each on a thread that can be left behind
+        let sources = crate::vt::image_sources::Worker::default();
         std::thread::spawn(move || {
             let mut reader = reader;
             let mut buffer = [0u8; 8 * 1024];
@@ -1161,23 +1186,39 @@ impl Sessions {
                 match reader.read(&mut buffer) {
                     Ok(0) | Err(_) => break,
                     Ok(read) => {
-                        // The authority first, then the renderer's copy. The waits are settled inside this
-                        // same lock, in one order everywhere — screen, then waiters — so the two threads
-                        // that take both cannot deadlock on each other
-                        let (replies, met, effects) = match parsing.lock() {
-                            Ok(mut screen) => {
-                                screen.feed(&buffer[..read]);
-                                let replies = screen.take_replies();
-                                let effects = screen.take_effects();
-                                let recent = rows_added(&buffer[..read], screen.cols());
-                                let met = settle_met(&waiting, &screen, recent);
-                                // Each view that has drawn its last frame is sent what changed, here
-                                // where the change landed
-                                screen.publish();
-                                (replies, met, effects)
+                        // **Fed as far as a command naming an image's source, which is read with the screen
+                        // let go of**: the read reaches a disk, and a slow one would otherwise hold up every
+                        // view, snapshot and client of this screen with it (`Screen::feed_until_image`). The
+                        // rest is fed once it has been, so nothing the program wrote after it is parsed before
+                        // it. This thread waits on the read, which is the session's own output waiting, as it
+                        // would on a program writing slowly — and gives up on one that has stopped answering
+                        // (`image_sources::Worker`)
+                        let (mut fed, mut image) = (0, None);
+                        let (mut replies, mut met, mut effects) = (Vec::new(), 0, Vec::new());
+                        loop {
+                            let read_image = image.take().map(|image: PendingImage| image.read_on(&sources));
+                            // The authority first, then the renderer's copy. The waits are settled inside this
+                            // same lock, in one order everywhere — screen, then waiters — so the two threads
+                            // that take both cannot deadlock on each other
+                            let Ok(mut screen) = parsing.lock() else { break };
+                            if let Some(read_image) = read_image {
+                                screen.finish_image(read_image);
                             }
-                            Err(_) => (Vec::new(), 0, Vec::new()),
-                        };
+                            let unfed = &buffer[fed..read];
+                            let (taken, next) = screen.feed_until_image(unfed);
+                            replies.extend(screen.take_replies());
+                            effects.extend(screen.take_effects());
+                            let recent = rows_added(&unfed[..taken], screen.cols());
+                            met += settle_met(&waiting, &screen, recent);
+                            // Each view that has drawn its last frame is sent what changed, here
+                            // where the change landed
+                            screen.publish();
+                            fed += taken;
+                            image = next;
+                            if image.is_none() {
+                                break;
+                            }
+                        }
                         // Written to, so not quiet: its history is compressed once it has been (`housekeeping`)
                         quiet.wrote();
                         for effect in effects {

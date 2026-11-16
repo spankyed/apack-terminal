@@ -48,6 +48,8 @@ pub const OUTPUT_WINDOW: Duration = Duration::from_millis(16);
 pub const OUTPUT_CAP: usize = 64 * 1024;
 /// How many coalesced output messages may be in flight. Phase G's ceiling, in messages
 pub const OUTPUT_CREDIT: usize = 64;
+/// How long the output must stay quiet before what is held is sent, when the window has not yet elapsed
+pub const OUTPUT_QUIET: Duration = Duration::from_millis(1);
 /// How many of the reader's chunks may wait for the coalescer.
 ///
 /// **This is what turns a stalled consumer into a blocked program rather than a growing broker.** The
@@ -301,7 +303,8 @@ pub fn coalesce_within(
         let wait = if sendable(&buffer) == 0 {
             None
         } else {
-            Some(flushed.map_or(Duration::ZERO, |at| window.saturating_sub(at.elapsed())))
+            let window_left = flushed.map_or(Duration::ZERO, |at| window.saturating_sub(at.elapsed()));
+            Some(window_left.min(OUTPUT_QUIET))
         };
         // A wait of nothing left is still asked of the queue: it answers `Timeout` when nothing is there,
         // which is the flush, and hands over a chunk that already is

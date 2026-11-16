@@ -5,7 +5,7 @@ import { BrokerViews } from '../src/index.ts'
 import { rgbaOf } from '../src/broker/source.ts'
 import { CanvasPainter } from '../src/canvas-painter.ts'
 import { drawRow, type SelectedCells, type Theme } from '../src/draw.ts'
-import { PLAIN, type Picture, type Placement, type Row, type Style } from '../src/source.ts'
+import { PLAIN, type Anchored, type AnchoredImages, type Picture, type Piece, type Placement, type Row, type Style } from '../src/source.ts'
 import { FakeBroker } from './_broker.ts'
 import { recordingContext } from './_canvas.ts'
 import { installFrames, runFrames } from './_frames.ts'
@@ -23,12 +23,314 @@ const placement = (parts: Partial<Placement>): Placement => ({
 })
 const pixels = (width: number, height: number): Picture => ({ generation: 1, width, height, pixels: new Uint8ClampedArray(width * height * 4) })
 
+const piece = (parts: Partial<Piece>): Piece => ({
+  image: 1, generation: 1, column: 0, columns: 4, offsetX: 0, offsetY: 0, width: 40, height: 20,
+  sourceX: 0, sourceY: 0, sourceWidth: 40, sourceHeight: 20, ...parts,
+})
+/** A row of blank cells that shows `pieces`, measured in a cell of `cellWidth` by `cellHeight` */
+const showing = (line: number, pieces: Piece[], cellWidth = 10, cellHeight = 20): Row => ({ ...row(line, '    '), images: { cellWidth, cellHeight, pieces } })
+
+/** Runs what a view has waiting until it has nothing: a paint, what the paint asked for, the paint that prompts */
+async function quiet(view: { painted: () => unknown }): Promise<void> {
+  for (let round = 0; round < 6; round += 1) {
+    view.painted()
+    await settled()
+  }
+}
+
 /** A view whose pictures are the pixels they were made from, so a case can say which one was drawn */
 function viewing() {
   const made: Picture[] = []
   const setup = mountedView({ picture: async (read) => { made.push(read); return read as unknown as CanvasImageSource } })
   return { ...setup, made }
 }
+
+describe('an image shown through placeholder cells', () => {
+  it('is drawn where its row is, under the text, in this view\'s cells', async () => {
+    const view = viewing()
+    const picture = pixels(40, 40)
+    view.source.pictures.set(7, picture)
+    // The terminal was told a cell is five by ten; this view draws one at ten by twenty
+    view.source.send(frame({
+      rows: [
+        row(0, 'text'),
+        showing(1, [piece({ image: 7, column: 3, offsetX: 2, offsetY: 1, width: 18, height: 9, sourceY: 0 })], 5, 10),
+        showing(2, [piece({ image: 7, column: 3, offsetX: 2, width: 18, height: 10, sourceY: 20 })], 5, 10),
+      ],
+    }))
+    await settled()
+    await settled()
+    expect(view.source.picturesAsked, 'one picture shown by two rows is one picture').toEqual([7])
+    expect(view.painted().images).toEqual([
+      { picture, x: 34, y: 22, width: 36, height: 18, source: { x: 0, y: 0, width: 40, height: 20 }, above: false, z: -1 },
+      { picture, x: 34, y: 40, width: 36, height: 20, source: { x: 0, y: 20, width: 40, height: 20 }, above: false, z: -1 },
+    ])
+  })
+
+  it('moves with its row in the frame that moves the row', async () => {
+    const view = viewing()
+    view.source.pictures.set(7, pixels(40, 20))
+    view.source.send(frame({ rows: [showing(1, [piece({ image: 7 })])] }))
+    await settled()
+    await settled()
+    expect(view.painted().images?.map((image) => image.y)).toEqual([20])
+
+    // The program wrote the cells a row further down, as one that redraws its screen does
+    view.source.send(frame({ sequence: 2, rows: [row(1, ''), showing(2, [piece({ image: 7 })])] }))
+    expect(view.painted().images?.map((image) => image.y), 'drawn where the cells were a frame ago').toEqual([40])
+    expect(view.source.picturesAsked, 'the same picture, wherever it is').toEqual([7])
+  })
+
+  it('has its pixels asked for again when its rows say they are another generation', async () => {
+    const view = viewing()
+    view.source.pictures.set(7, pixels(40, 20))
+    view.source.send(frame({ images: 1, rows: [showing(1, [piece({ image: 7 })])] }))
+    await settled()
+    await settled()
+    expect(view.source.picturesAsked).toEqual([7])
+
+    view.source.pictures.set(7, { ...pixels(40, 20), generation: 2 })
+    view.source.send(frame({ sequence: 2, images: 2, rows: [showing(1, [piece({ image: 7, generation: 2 })])] }))
+    await settled()
+    await settled()
+    expect(view.source.picturesAsked).toEqual([7, 7])
+    expect(view.made.at(-1)?.generation).toBe(2)
+  })
+
+  it('keeps its picture while a row held shows it, and lets it go when none does', async () => {
+    const view = viewing()
+    view.source.pictures.set(7, pixels(40, 20))
+    view.source.send(frame({ images: 1, rows: [showing(1, [piece({ image: 7 })])] }))
+    await settled()
+    await settled()
+    expect(view.painted().images).toHaveLength(1)
+
+    // The images are told again, and none is placed: the one a row shows is still shown
+    view.source.send(frame({ sequence: 2, images: 2 }))
+    await settled()
+    await settled()
+    expect(view.painted().images, 'a picture a row still shows was let go').toHaveLength(1)
+    expect(view.source.picturesAsked).toEqual([7])
+
+    // The row is written over: nothing shows it, and shown again it is asked for again
+    view.source.send(frame({ sequence: 3, images: 3, rows: [row(1, 'text')] }))
+    await settled()
+    await settled()
+    expect(view.painted().images).toEqual([])
+    view.source.send(frame({ sequence: 4, images: 3, rows: [showing(1, [piece({ image: 7 })])] }))
+    await quiet(view)
+    expect(view.source.picturesAsked).toEqual([7, 7])
+  })
+
+  it('is asked after again in the history when the images change, and drawn as it was until told', async () => {
+    const view = viewing()
+    view.source.pictures.set(7, pixels(40, 20))
+    // Scrolled up to a history line that shows the picture
+    view.source.history.set(98, showing(98, [piece({ image: 7 })]))
+    view.source.send(frame({ firstActive: 100, scrollback: 100, images: 1 }))
+    view.view.scrollTo(98)
+    await quiet(view)
+    expect(view.painted().images).toHaveLength(1)
+    const fetched = view.source.fetched.length
+
+    // The image is deleted: the owner holds the row with nothing to show
+    view.source.history.set(98, row(98, '    '))
+    view.source.send(frame({ sequence: 2, firstActive: 100, scrollback: 100, images: 2 }))
+    expect(view.painted().images, 'a row asked for again is blank until the answer comes').toHaveLength(1)
+    await quiet(view)
+    expect(view.source.fetched.length, 'a history row that showed an image was not asked for again').toBeGreaterThan(fetched)
+    expect(view.painted().images).toEqual([])
+  })
+
+  it('is not asked after again where the frame that says the images changed brought the row', async () => {
+    const view = viewing()
+    view.source.pictures.set(7, pixels(40, 20))
+    view.source.history.set(99, showing(99, [piece({ image: 7 })]))
+    view.source.send(frame({ firstActive: 100, scrollback: 100, images: 1 }))
+    await quiet(view)
+    const covers = (line: number) => view.source.fetched.filter(([first, count]) => first <= line && line < first + count).length
+    const asked = covers(99)
+
+    // The line left the screen in this frame, which brings it as it ended up
+    view.source.send(frame({ sequence: 2, firstActive: 100, scrollback: 100, images: 2, rows: [showing(99, [piece({ image: 7, generation: 2 })])] }))
+    await quiet(view)
+    expect(covers(99), 'a row the frame brought was asked for again').toBe(asked)
+  })
+
+  it('is asked for once at its newest generation where two rows in view show it at two', async () => {
+    const view = viewing()
+    view.source.pictures.set(7, { ...pixels(40, 20), generation: 2 })
+    // A history row brought before the image was sent again, beside a screen row brought since
+    view.source.history.set(99, showing(99, [piece({ image: 7, generation: 1 })]))
+    view.source.send(frame({ firstActive: 100, scrollback: 100, images: 1, rows: [showing(100, [piece({ image: 7, generation: 2 })])] }))
+    view.view.scrollTo(98)
+    await quiet(view)
+    await quiet(view)
+    expect(view.source.picturesAsked, 'its pixels were fetched again at every paint').toEqual([7])
+    expect(view.painted().images).toHaveLength(2)
+  })
+
+  it('is asked after again when the answer that brought its row crossed the frame that changed the images', async () => {
+    const view = viewing()
+    view.source.pictures.set(7, pixels(40, 20))
+    view.source.history.set(98, showing(98, [piece({ image: 7, width: 40 })]))
+    view.source.send(frame({ firstActive: 100, scrollback: 100, images: 1 }))
+    view.view.scrollTo(98)
+    // The paint asks for the history; before its answer is taken, the image is replaced and the frame
+    // that says so arrives. The answer holds the row as it was
+    view.painted()
+    view.source.history.set(98, showing(98, [piece({ image: 7, generation: 2, width: 20 })]))
+    view.source.pictures.set(7, { ...pixels(20, 20), generation: 2 })
+    view.source.send(frame({ sequence: 2, firstActive: 100, scrollback: 100, images: 2 }))
+    await quiet(view)
+    await quiet(view)
+    expect(view.painted().images?.map((image) => image.width), 'the row stayed as the older answer had it').toEqual([20])
+  })
+
+  it('is drawn once its image arrives, in a history row whose cells showed nothing', async () => {
+    const view = viewing()
+    view.source.pictures.set(7, pixels(40, 20))
+    view.source.history.set(98, { ...row(98, '    '), images: { cellWidth: 10, cellHeight: 20, pieces: [] } })
+    view.source.send(frame({ firstActive: 100, scrollback: 100, images: 1 }))
+    view.view.scrollTo(98)
+    await quiet(view)
+    expect(view.painted().images).toEqual([])
+
+    view.source.history.set(98, showing(98, [piece({ image: 7 })]))
+    view.source.send(frame({ sequence: 2, firstActive: 100, scrollback: 100, images: 2 }))
+    await quiet(view)
+    await quiet(view)
+    expect(view.painted().images, 'a row whose cells showed nothing was not asked for again').toHaveLength(1)
+  })
+
+  it('is asked after when the images change though asking where they are had failed', async () => {
+    const view = viewing()
+    view.source.pictures.set(7, pixels(40, 20))
+    view.source.history.set(98, showing(98, [piece({ image: 7, width: 40 })]))
+    // Where the images are cannot be asked this once
+    const images = view.source.images.bind(view.source)
+    view.source.images = () => Promise.reject(new Error('not now'))
+    view.source.send(frame({ firstActive: 100, scrollback: 100, images: 1 }))
+    view.view.scrollTo(98)
+    await quiet(view)
+    view.source.images = images
+
+    view.source.history.set(98, showing(98, [piece({ image: 7, width: 20 })]))
+    view.source.send(frame({ sequence: 2, firstActive: 100, scrollback: 100, images: 2 }))
+    await quiet(view)
+    await quiet(view)
+    expect(view.painted().images?.map((image) => image.width)).toEqual([20])
+  })
+})
+
+const anchored = (parts: Partial<Anchored>): Anchored => ({
+  image: 7, generation: 1, z: 0, row: 0, column: 0, columns: 2, rows: 1, offsetX: 0, offsetY: 0, width: 20, height: 20,
+  sourceX: 0, sourceY: 0, sourceWidth: 20, sourceHeight: 20, ...parts,
+})
+/** What a frame says of the images placed relative to another, measured in a cell of ten by twenty unless told */
+const anchoring = (list: Anchored[], cellWidth = 10, cellHeight = 20): AnchoredImages => ({ cellWidth, cellHeight, omitted: 0, list })
+
+describe('an image placed relative to another', () => {
+  it('is drawn where the frame says it is, in this view\'s cells, the ones under the text first', async () => {
+    const view = viewing()
+    const picture = pixels(20, 20)
+    view.source.pictures.set(7, picture)
+    // The terminal was told a cell is five by ten; this view draws one at ten by twenty
+    view.source.send(frame({
+      anchored: anchoring([
+        anchored({ z: 4, row: 1, column: 3, offsetX: 2, offsetY: 1, width: 10, height: 10 }),
+        // One that starts above and left of the screen and reaches into it
+        anchored({ z: -3, row: -1, column: -1, rows: 3, width: 10, height: 30 }),
+      ], 5, 10),
+    }))
+    await settled()
+    await settled()
+    expect(view.source.picturesAsked, 'one picture placed twice is one picture').toEqual([7])
+    expect(view.painted().images).toEqual([
+      { picture, x: -10, y: -20, width: 20, height: 60, source: { x: 0, y: 0, width: 20, height: 20 }, above: false, z: -3 },
+      { picture, x: 34, y: 22, width: 20, height: 20, source: { x: 0, y: 0, width: 20, height: 20 }, above: true, z: 4 },
+    ])
+  })
+
+  it('stays on its line when a frame that says nothing of it moves the screen', async () => {
+    const view = viewing()
+    view.source.pictures.set(7, pixels(20, 20))
+    view.source.send(frame({ firstActive: 5, scrollback: 5, anchored: anchoring([anchored({ row: 2 })]) }))
+    await settled()
+    await settled()
+    expect(view.painted().images?.map((image) => image.y)).toEqual([40])
+
+    // One line left the screen: a row is counted from the first line of the frame that told it
+    view.source.send(frame({ sequence: 2, firstActive: 6, scrollback: 6, rows: [row(9, 'more')] }))
+    expect(view.painted().images?.map((image) => image.y)).toEqual([20])
+  })
+
+  it('moves, and is gone, in the frame that says so', async () => {
+    const view = viewing()
+    view.source.pictures.set(7, pixels(20, 20))
+    view.source.send(frame({ anchored: anchoring([anchored({ row: 1 })]) }))
+    await settled()
+    await settled()
+    view.source.send(frame({ sequence: 2, anchored: anchoring([anchored({ row: 3, column: 5 })]) }))
+    expect(view.painted().images?.map((image) => [image.x, image.y])).toEqual([[50, 60]])
+    expect(view.source.picturesAsked, 'the same picture, wherever it is').toEqual([7])
+
+    view.source.send(frame({ sequence: 3, anchored: anchoring([]) }))
+    expect(view.painted().images).toEqual([])
+  })
+
+  it('keeps its picture while it is told, and lets it go once it is not', async () => {
+    const view = viewing()
+    view.source.pictures.set(7, pixels(20, 20))
+    view.source.send(frame({ images: 1, anchored: anchoring([anchored({})]) }))
+    await settled()
+    await settled()
+    // The images are told again, and none is placed by itself: the one placed relative to another is still shown
+    view.source.send(frame({ sequence: 2, images: 2 }))
+    await settled()
+    await settled()
+    expect(view.painted().images).toHaveLength(1)
+    expect(view.source.picturesAsked).toEqual([7])
+
+    // Gone, and then back: its picture was let go, so it is asked for again
+    view.source.send(frame({ sequence: 3, images: 3, anchored: anchoring([]) }))
+    await settled()
+    await settled()
+    view.source.send(frame({ sequence: 4, images: 4, anchored: anchoring([anchored({})]) }))
+    await settled()
+    await settled()
+    expect(view.source.picturesAsked).toEqual([7, 7])
+    expect(view.painted().images).toHaveLength(1)
+  })
+
+  it('has its pixels asked for again when a frame says they are another generation', async () => {
+    const view = viewing()
+    view.source.pictures.set(7, pixels(20, 20))
+    view.source.send(frame({ anchored: anchoring([anchored({})]) }))
+    await settled()
+    await settled()
+    view.source.pictures.set(7, { ...pixels(20, 20), generation: 2 })
+    view.source.send(frame({ sequence: 2, anchored: anchoring([anchored({ generation: 2 })]) }))
+    await settled()
+    await settled()
+    expect(view.source.picturesAsked).toEqual([7, 7])
+    expect(view.made.at(-1)?.generation).toBe(2)
+  })
+
+  it('loses its place when the screen is reflowed, unless the frame that says so tells it', async () => {
+    const view = viewing()
+    view.source.pictures.set(7, pixels(20, 20))
+    view.source.send(frame({ anchored: anchoring([anchored({ row: 1 })]) }))
+    await settled()
+    await settled()
+    expect(view.painted().images).toHaveLength(1)
+
+    view.source.send(frame({ sequence: 2, epoch: 2 }))
+    expect(view.painted().images).toEqual([])
+    view.source.send(frame({ sequence: 3, epoch: 3, anchored: anchoring([anchored({ row: 2 })]) }))
+    expect(view.painted().images?.map((image) => image.y)).toEqual([40])
+  })
+})
 
 describe('the images of a session', () => {
   it('are asked for when a frame says they changed, and their pixels once for each picture', async () => {

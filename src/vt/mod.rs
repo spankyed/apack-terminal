@@ -12,13 +12,16 @@ use std::time::SystemTime;
 
 use ghostty_vt_rs_sys as sys;
 
+pub mod image_sources;
 pub mod images;
 pub mod input;
+pub mod placeholders;
 pub mod reads;
 pub mod rows;
 
 use crate::commands::{Commands, Machine, Moment, Outcome, Step, Unknown};
 use crate::markers::{self, Marker, MarksKey, PAYLOAD_CAP, Read, Vouched, cwd_from_url};
+use crate::protocol::{CursorBlink, CursorStyle};
 use crate::screen::Facts;
 use rows::Mark;
 
@@ -69,6 +72,9 @@ pub fn features() -> Features {
 /// One terminal, freed with the value.
 pub struct Terminal {
     handle: sys::Terminal,
+    /// What placeholder cells can name, as of the image storage's generation when it was last asked
+    /// (`images::Virtual`)
+    virtual_placements: std::cell::RefCell<images::Virtual>,
 }
 
 // SAFETY: the library allocates and frees this handle and nothing here shares it between threads: the broker gives
@@ -86,7 +92,7 @@ impl Terminal {
         if handle.is_null() {
             return Err(Failed { call: "ghostty_terminal_new", code: sys::Result::SUCCESS });
         }
-        Ok(Self { handle })
+        Ok(Self { handle, virtual_placements: std::cell::RefCell::default() })
     }
 
     /// Parses `bytes`, exactly as the pty delivered them.
@@ -114,14 +120,36 @@ impl Terminal {
     /// **Ground is a state, so it can be reached having taken nothing**: asked of a parser that is already
     /// between sequences, this answers `(0, true)`.
     pub fn feed_to(&mut self, bytes: &[u8], or_ground: bool) -> (usize, bool) {
+        let (taken, ground, _) = self.feed_until(bytes, or_ground, false);
+        (taken, ground)
+    }
+
+    /// As `feed_to`, and no further than the byte that begins an APC, SOS or PM string either. Answers
+    /// also whether that is where it stopped, which is with the string begun and none of it parsed.
+    ///
+    /// **Where a string begins is asked of the core, which is the only thing that knows.** It is not only
+    /// `ESC _`: the core takes `ESC X` and `ESC ^` the same way, and the single bytes `0x9f`, `0x98` and
+    /// `0x9e` wherever it is part way through a sequence — after an `ESC`, inside a CSI — though not
+    /// between sequences, where they are read as text. What follows the stop is the string's body, and
+    /// that is what `image_sources` reads before the core does.
+    pub fn feed_to_string(&mut self, bytes: &[u8], or_ground: bool) -> (usize, bool, bool) {
+        self.feed_until(bytes, or_ground, true)
+    }
+
+    /// Parses `bytes` up to the first boundary asked for: the byte that ends an OSC string always, ground
+    /// when `or_ground`, the byte that begins a string when `or_string`. Answers how many were taken, and
+    /// whether it stopped at ground and whether it stopped having begun a string.
+    fn feed_until(&mut self, bytes: &[u8], or_ground: bool, or_string: bool) -> (usize, bool, bool) {
         if bytes.is_empty() {
-            return (0, or_ground && self.at_ground());
+            return (0, or_ground && self.at_ground(), false);
         }
-        let boundaries = if or_ground {
-            sys::TerminalBoundary::OSC_END | sys::TerminalBoundary::GROUND
-        } else {
-            sys::TerminalBoundary::OSC_END
-        };
+        let mut boundaries = sys::TerminalBoundary::OSC_END;
+        if or_ground {
+            boundaries |= sys::TerminalBoundary::GROUND;
+        }
+        if or_string {
+            boundaries |= sys::TerminalBoundary::APC_START;
+        }
         let mut stop =
             sys::TerminalWriteStop { size: std::mem::size_of::<sys::TerminalWriteStop>(), ..Default::default() };
         // SAFETY: the handle is live for `&mut self`, the slice outlives the call, and `stop` is sized
@@ -131,16 +159,17 @@ impl Terminal {
         match result {
             sys::Result::SUCCESS => {
                 let ground = stop.reached & sys::TerminalBoundary::GROUND != 0;
-                // Only ground stops on no byte at all; an OSC ends on one
+                let string = stop.reached & sys::TerminalBoundary::APC_START != 0;
+                // Only ground stops on no byte at all; an OSC ends on one, and a string begins on one
                 let least = usize::from(!ground);
-                (stop.consumed.clamp(least, bytes.len()), ground)
+                (stop.consumed.clamp(least, bytes.len()), ground, string)
             }
             // No boundary was reached in these bytes, and all of them were parsed
-            sys::Result::NO_VALUE => (bytes.len(), false),
+            sys::Result::NO_VALUE => (bytes.len(), false, false),
             // Refused outright, with nothing parsed: parsed the plain way, so a byte is never lost to it
             _ => {
                 self.feed(bytes);
-                (bytes.len(), false)
+                (bytes.len(), false, false)
             }
         }
     }
@@ -559,14 +588,19 @@ impl Terminal {
         Ok(())
     }
 
-    /// The cursor a program gets when it asks for the default one: a bar, blinking.
+    /// Sets the cursor a program gets when it asks for the default one (`CSI 0 q`). A session starts with a
+    /// blinking bar, which is `set_cursor_defaults(Bar, Program)`.
     ///
-    /// **And the one it starts with**, which takes saying so: the option is what a reset to the default
-    /// means, not what the terminal is showing, so the reset is written once here, before any program has
-    /// written a byte.
-    pub fn default_cursor_is_a_blinking_bar(&mut self) -> Result<(), Failed> {
-        let style: sys::CursorStyle::Type = sys::CursorStyle::BAR;
-        let blink = true;
+    /// **The option is what a reset returns to, and only a reset reads it**, so the cursor is taken there by
+    /// `reset_cursor`, which is a separate call because it is a write: it goes through the parser like any
+    /// output, so it belongs where the parser is between sequences (`Screen::set_cursor_defaults`).
+    pub fn set_cursor_defaults(&mut self, style: CursorStyle, blink: CursorBlink) -> Result<(), Failed> {
+        let style: sys::CursorStyle::Type = match style {
+            CursorStyle::Block => sys::CursorStyle::BLOCK,
+            CursorStyle::Bar => sys::CursorStyle::BAR,
+            CursorStyle::Underline => sys::CursorStyle::UNDERLINE,
+        };
+        let blink = blink != CursorBlink::Off;
         // SAFETY: DEFAULT_CURSOR_STYLE takes a `GhosttyCursorStyle*` and DEFAULT_CURSOR_BLINK a `bool*`
         unsafe {
             Failed::check(
@@ -586,8 +620,13 @@ impl Terminal {
                 ),
             )?;
         }
-        self.feed(b"\x1b[0 q");
         Ok(())
+    }
+
+    /// Takes the cursor to the defaults (`set_cursor_defaults`), as a program asking for them does. Fed to the
+    /// parser, so it is fed only where the parser is between sequences.
+    pub fn reset_cursor(&mut self) {
+        self.feed(b"\x1b[0 q");
     }
 
     /// Turns the Kitty graphics protocol off, so a program asking whether it may send images is not told
@@ -838,6 +877,21 @@ impl Reported {
     /// Each reply is written once, so they are taken rather than read.
     pub fn take_replies(&mut self) -> Vec<String> {
         std::mem::take(&mut self.replies)
+    }
+
+    /// How many replies are waiting to be taken.
+    pub fn reply_count(&self) -> usize {
+        self.replies.len()
+    }
+
+    /// The replies made since there were `count` waiting, taken.
+    pub fn take_replies_from(&mut self, count: usize) -> Vec<String> {
+        self.replies.split_off(count.min(self.replies.len()))
+    }
+
+    /// A reply made for the terminal rather than by it: the core's own, given when it was asked.
+    pub fn reply(&mut self, reply: String) {
+        self.replies.push(reply);
     }
 
     pub fn facts(&self) -> &Facts {

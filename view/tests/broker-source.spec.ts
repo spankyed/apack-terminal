@@ -73,7 +73,7 @@ describe('a session on a broker', () => {
     const { broker, frames } = attached()
     const sent = frame({
       sequence: 3, epoch: 4, firstActive: 100, scrollback: 100, staleFrom: 90,
-      cursor: { column: 2, row: 1, shape: 'bar', blinking: true },
+      cursor: { column: 2, row: 1, shape: 'bar', blinking: true, hidden: false },
       modes: { alternateScreen: true, mouse: true },
       rows: [row(100, 'hello', { wrapped: true }), row(101, '$ ', { prompt: true })],
     })
@@ -140,7 +140,7 @@ describe('a question a view asks', () => {
     const { broker, source } = attached()
     broker.say({ kind: 'frame', channel: 1, frame: frame({ epoch: 6 }) })
     const word = source.wordAt({ line: 41, column: 3 })
-    const found = source.search('needle')
+    const found = source.search('needle', false)
     // The answers name lines of an epoch the view has since been told is over
     broker.say(
       { kind: 'frame', channel: 1, frame: frame({ epoch: 7 }) },

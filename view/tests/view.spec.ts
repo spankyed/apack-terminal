@@ -4,7 +4,7 @@ import { CanvasPainter } from '../src/canvas-painter.ts'
 import type { Theme } from '../src/draw.ts'
 import type { Painter, Scene } from '../src/painter.ts'
 import { PLAIN, StyleFlag, paletteColor, type Fetched } from '../src/source.ts'
-import { BLINK_MS, TerminalView } from '../src/view.ts'
+import { BLINK_MS, TerminalView, type CursorBlink } from '../src/view.ts'
 import { recordingContext } from './_canvas.ts'
 import { framesWaiting, installFrames, runFrames } from './_frames.ts'
 import { FakeSource } from './_source.ts'
@@ -397,7 +397,7 @@ describe('the colours a program set for itself', () => {
   function coloured() {
     const view = mountedView()
     const rows = [row(0, 'p'), row(1, 'n', { style: 1, styles: [{ ...PLAIN, fg: paletteColor(1) }] }), row(2, 'x', { style: 1, styles: [{ ...PLAIN, fg: 0x123456, bg: 0x654321 }] })]
-    view.source.send(frame({ rows, colors: none, cursor: { column: 0, row: 3, shape: 'block', blinking: false } }))
+    view.source.send(frame({ rows, colors: none, cursor: { column: 0, row: 3, shape: 'block', blinking: false, hidden: false } }))
     const colours = () => {
       const scene = view.painted()
       return { background: scene.theme.background, cursor: scene.theme.cursor, glyphs: scene.rows.slice(0, 3).map((drawn) => drawn?.glyphs[0]?.color) }
@@ -666,7 +666,7 @@ describe('scrolling back', () => {
 
 describe('the cursor', () => {
   const withCursor = (blinking: boolean) =>
-    frame({ rows: [row(0, 'ab')], cursor: { column: 1, row: 0, shape: 'bar', blinking } })
+    frame({ rows: [row(0, 'ab')], cursor: { column: 1, row: 0, shape: 'bar', blinking, hidden: false } })
 
   it('is hollow while the view does not have the keyboard, and takes its shape when it does', () => {
     const { source, view, painter } = mounted()
@@ -724,13 +724,122 @@ describe('the cursor', () => {
     })
   })
 
+  it('is drawn in the inactive style the view is given while the view does not have the keyboard', () => {
+    const { source, view, painter } = mountedView({ cursorInactive: 'underline' })
+    source.send(withCursor(false))
+    runFrames()
+    expect(painter.scenes.at(-1)?.cursor?.shape).toBe('underline')
+
+    view.setFocused(true)
+    runFrames()
+    expect(painter.scenes.at(-1)?.cursor?.shape, 'the program\'s shape once focused').toBe('bar')
+  })
+
+  describe('whose blink the view is given', () => {
+    beforeEach(() => { vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] }) })
+    afterEach(() => { vi.useRealTimers() })
+
+    function focused(cursorBlink: CursorBlink, blinking: boolean) {
+      const view = mountedView({ cursorBlink })
+      view.view.setFocused(true)
+      view.source.send(withCursor(blinking))
+      return view
+    }
+
+    it('blinks a cursor the program steadied when the view is given on', () => {
+      const view = focused('on', false)
+      expect(view.painted().cursor).toBeDefined()
+      vi.advanceTimersByTime(BLINK_MS)
+      expect(view.painted().cursor, 'did not blink').toBeUndefined()
+    })
+
+    it('never hides a cursor the program blinks when the view is given off', () => {
+      const view = focused('off', true)
+      vi.advanceTimersByTime(BLINK_MS * 3)
+      expect(view.painted().cursor, 'hidden').toBeDefined()
+      expect(vi.getTimerCount(), 'a clock for a cursor that does not blink').toBe(0)
+    })
+
+    it('blinks as the program asks when the view is given program', () => {
+      const view = focused('program', true)
+      vi.advanceTimersByTime(BLINK_MS)
+      expect(view.painted().cursor, 'did not blink for a program that asked').toBeUndefined()
+    })
+
+    it('does not blink as the program asks when the view is given program and the program steadied it', () => {
+      const view = focused('program', false)
+      vi.advanceTimersByTime(BLINK_MS * 3)
+      expect(view.painted().cursor, 'hidden for a program that steadied it').toBeDefined()
+      expect(vi.getTimerCount(), 'a clock for a cursor the program steadied').toBe(0)
+    })
+  })
+
   it('is not drawn while the view is scrolled away from it', () => {
     const { source, view, painter } = mounted()
-    source.send(frame({ firstActive: 100, scrollback: 100, cursor: { column: 0, row: 0, shape: 'block', blinking: false } }))
+    source.send(frame({ firstActive: 100, scrollback: 100, cursor: { column: 0, row: 0, shape: 'block', blinking: false, hidden: false } }))
     view.scrollTo(50)
     runFrames()
 
     expect(painter.scenes.at(-1)?.cursor).toBeUndefined()
+  })
+})
+
+describe('cursor settings changed on a view that is up', () => {
+  beforeEach(() => { vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] }) })
+  afterEach(() => { vi.useRealTimers() })
+
+  /** A view at the foot of a screen of history, with text selected: the state a remake would lose */
+  function working(options: Parameters<typeof mountedView>[0], focused: boolean) {
+    const view = mountedView(options)
+    view.source.send(frame({ firstActive: 100, scrollback: 100, rows: [row(100, 'alpha beta'), row(101, 'gamma')], cursor: { column: 1, row: 1, shape: 'bar', blinking: true, hidden: false } }))
+    view.view.selection.select({ start: { line: 100, column: 0 }, end: { line: 100, column: 4 } })
+    view.view.setFocused(focused)
+    runFrames()
+    return view
+  }
+  const kept = (view: ReturnType<typeof working>) => ({ top: view.view.viewport.top, span: view.view.selection.span, element: view.view.element })
+
+  it('setCursorInactive: the next paint draws the new shape, and the view keeps its scroll and selection', () => {
+    const view = working({ cursorInactive: 'underline' }, false)
+    const before = kept(view)
+    expect(view.painted().cursor?.shape).toBe('underline')
+
+    view.view.setCursorInactive('bar')
+    expect(view.painted().cursor?.shape, 'the paint kept the old shape').toBe('bar')
+    expect(kept(view)).toEqual(before)
+
+    view.view.scrollTo(50)
+    const scrolled = kept(view)
+    view.view.setCursorInactive('block')
+    expect(kept(view), 'a scrolled-up view was moved').toEqual(scrolled)
+    expect(scrolled.top).toBe(50)
+  })
+
+  it('setCursorBlink: the next paint uses the new mode, and the view keeps its scroll and selection', () => {
+    const view = working({ cursorBlink: 'program' }, true)
+    const before = kept(view)
+    vi.advanceTimersByTime(BLINK_MS)
+    expect(view.painted().cursor, 'the program blinks the cursor').toBeUndefined()
+
+    view.view.setCursorBlink('off')
+    expect(view.painted().cursor, 'the cursor is hidden after a change to off').toBeDefined()
+    expect(vi.getTimerCount(), 'a clock for a cursor that does not blink').toBe(0)
+    expect(kept(view)).toEqual(before)
+
+    view.view.scrollTo(50)
+    const scrolled = kept(view)
+    view.view.setCursorBlink('on')
+    expect(vi.getTimerCount(), 'no clock after a change to on').toBe(1)
+    expect(kept(view), 'a scrolled-up view was moved').toEqual(scrolled)
+    expect(scrolled.top).toBe(50)
+  })
+
+  it('setCursorBlink: a cursor made to blink is hidden on its own schedule, not left shown until the program moves it', () => {
+    const view = working({ cursorBlink: 'off' }, true)
+    view.view.setCursorBlink('on')
+    expect(view.painted().cursor).toBeDefined()
+    vi.advanceTimersByTime(BLINK_MS)
+    expect(view.painted().cursor, 'did not blink after a change to on').toBeUndefined()
   })
 })
 

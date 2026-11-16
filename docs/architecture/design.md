@@ -3,6 +3,13 @@
 The broker is one process that owns ptys, so that no terminal session's lifetime is the lifetime of
 whatever asked for it. Everything else here follows from that sentence.
 
+## What v1 is
+
+The scope, platforms and crash behaviour are stated in the [README's status table](../../README.md#status);
+this document says how each is built and where each platform's limits are. v1 is macOS and Linux in full,
+and Windows with the POSIX-only cases gated and named (see Known limits). A session ends when the broker stops:
+there is no handoff to a second broker, and a kept session is the one case that outlives its app.
+
 ## The two layers
 
 **The process layer** — `session.rs`, `output.rs`, `tree.rs` — spawns a shell in a pty, moves bytes, owns a
@@ -240,19 +247,81 @@ session ending settles every wait on it, because nothing is coming.
   none, because an answer made to wait for room is a deadlock, so it is counted instead: past the bound
   the queue is dropped and the connection closed, and the client is where one whose broker went away
   is. On Windows the queue ends and the connection does not, as for a view (`views.md`).
-- **Windows builds and passes what runs there, which is not everything.** CI's Windows job builds the
-  terminal core from source — nobody publishes one for Windows, so the job installs the Zig its commit
-  wants and builds it for speed, as the library every other platform links was — and runs the suite.
-  The suites that drive the real binary run there over a named pipe and `cmd.exe`: a view attaching,
-  drawing, typing and being told its session ended; a proxy starting a broker, a second joining it and
-  several arriving at once; and a second broker refused the pipe the first holds. What is typed in
-  `sh`'s syntax, and what closes one direction of a connection, is POSIX only and says so case by
-  case. **Kept sessions and recordings (`keeping`) run nowhere on Windows**: each of its cases ends by
-  hanging up a connection its own reader thread is reading, which a named pipe does not allow. What is
-  known to differ there is said where it applies: a view or a client past its limit is not hung up on
-  (`views.md`), a proxy whose input ends leaves without carrying what the broker had still to say,
-  `signal` answers `UNSUPPORTED`, and the pipe's directory and peer are not checked as a socket's are
-  on POSIX.
+- **Windows builds and runs the suite, less the cases Windows has nothing to test with.** CI's Windows job
+  builds the terminal core from source (nobody publishes one for Windows, so the job installs the Zig its commit
+  wants and builds it for speed, as the library every other platform links was) and runs the suite. The suites
+  that drive the real binary run there over a named pipe, with PowerShell as the shell (with the same `$ `
+  prompt every case waits for). A named pipe is hung up by cancelling its pending I/O (`CancelIoEx`), since it
+  cannot be shut down one way and a disconnect waits behind a read parked on the same handle.
+  **Sessions run on the ConPTY the broker carries** (`windows/conpty/`): Microsoft's own, from its
+  `Microsoft.Windows.Console.ConPTY` package, beside the binary. The one built into Windows drops the image
+  APC, the mouse-mode request and a program's clipboard question before the broker sees them, so on it images
+  and mouse reporting do not work at all.
+  **Still POSIX only, each case says why, and each is something a Windows pipe or console does not have:** a
+  socket file left behind or taken away, a directory's or a socket's mode bits (a pipe's access is its
+  descriptor, `windows-pipe-access.md`), one direction of a connection closed, and a hangup a program ignores.
+  What is known to differ on Windows: a proxy whose input ends leaves without carrying what the broker had still
+  to say, and `signal` answers `UNSUPPORTED`.
+- **A session ends when the broker stops** (decision D4 in the v1 goal). Accepted for v1: there is no
+  handoff of a session to another broker.
+
+- **A session that reads images by name has the broker read them, and the core reads none.**
+  `Spawn.image_files` lets a program name an image's source — a file on this machine, or a shared memory
+  object — rather than send its bytes. The core would open what is named itself, inside the write that
+  parses the session's output and before it looks at what it opened, so a FIFO stopped the session being
+  read (observed on macOS: the read had not returned after four seconds), and so did one under `/dev/shm`
+  named as shared memory (glibc 2.41: still waiting after three seconds). So each command naming one is
+  taken out of the stream (`vt/image_sources/`), its source read by the broker, and the core fed a
+  transmission of the bytes, with the program's other keys as the core read them.
+  - **The core decides everything up to the opening, and says so itself.** It is fed the command with
+    a source it refuses before opening anything — a name with a NUL in it — with its file and shared
+    memory sources allowed for that one command (`Load::asked`). It does all it would have done first:
+    looks for a frame's image by id or number, refuses an id given with a number and a format it does
+    not take, abandons what a program left part sent, lets go of an image of the same id. Its answer says
+    whether it got as far as the source, and only then is the source read. A source that cannot be read
+    is refused with that same answer. A command with neither an id nor a number gets no answer to read
+    that from, so what the core would do with it is decided here, and one not to be read is refused by
+    the core outright. So a session tells a program, keeps and shows what the core alone would;
+    `tests/image_sources.rs` holds it to the core reading files itself, over every spelling of a command
+    it can make and random spellings of a name.
+  - **Opened without waiting, and asked about through what was opened.** On POSIX a source is opened
+    with `O_NONBLOCK`, so a FIFO answers at once, and `fstat`ed on the same descriptor: only a regular
+    file is read (a shared memory object is a regular file on Linux and of no file type on macOS), and
+    not one on a filesystem mounted at or beneath `/proc`, `/sys` or `/dev` but for `/dev/shm` — those
+    three, and on Linux every mount the mount table (`/proc/self/mountinfo`) lists beneath them, which is
+    where debugfs, tracefs and the cgroups are — told apart by device rather than by path. A file is then
+    read as any file is, waiting for its reads. On Windows the path is held to the core's rules before it
+    is opened (no share, no device namespace, no device name), and what was opened to them after, with
+    its type a disk file's. Nothing can be swapped in between the question and the read, because the
+    question is asked of what was opened.
+  - **Read with the screen let go of, and given up on once it stops answering.** The pty's reader stops
+    at such a command, has its source read with nothing locked, and feeds the rest once it has
+    (`Screen::feed_until_image`). A source that is slow to read holds up that session's own output, as a
+    program writing slowly does, and nothing else: views, snapshots and other clients of the screen go
+    on. **A read the system is in the middle of cannot be cancelled** — a file on a mount that has
+    stopped answering holds `open` and `read` in a wait no signal ends — so it is made on a thread of its
+    own, and every answer the system gives a read counts as progress (`image_sources::Worker`). After
+    `QUIET` (five seconds) with none, the session stops waiting: the program is told no and its output
+    goes on. A file read slowly is never cut off, only one that has stopped. The thread is left in its
+    wait, and while it is, that session's next named source is refused without another being started,
+    so a mount that never answers costs a session one thread.
+  - **What the scanner holds is what the core keeps.** Where such a command begins is asked of the core,
+    which begins one in more places than `ESC _ G`. Of its body only what the core keeps is held: its
+    keys, read as the core reads them, and a name, decoded as the core's decoder decodes it; a command
+    that names no source is fed as those keys, and one the core would drop is given to it as nothing.
+  - **What was read is the core's to judge.** A source is read up to the most the core reads of one itself
+    (400 MiB, `SOURCE_BYTES`) and sent whole: a transmission a piece to a command, a query in one command
+    the core is let take whole for that command alone. So an image too large for a session's images to
+    hold is refused by the core, in its own words. Each piece is let go of once it has been sent, so a
+    source is held about once, as the core alone holds it — a query a third more, the core holding its
+    one command as base64 until it is whole.
+
+  Where a session answers otherwise than the core alone: a source given up on as quiet is refused as one
+  that could not be read, where the core alone would have waited on it. No shared memory object is read
+  on Windows, where the core reads none either. A source on a mount that has
+  stopped answering holds its session's output for `QUIET`, and one thread for as long as it does not
+  answer. The option stays the caller's, for a session running a program it trusts — a file it names is
+  read as the user — and a shell is not started with it.
 
 ## What the broker will not do
 

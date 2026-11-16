@@ -129,6 +129,76 @@ export function linkAt(row: Row, column: number, detectors: readonly Detector[],
   return null
 }
 
+/** The cells one link covers on one row, `from` up to but not including `to` */
+export interface LinkRun {
+  readonly line: number
+  readonly from: number
+  readonly to: number
+}
+
+/**
+ * Every run of cells the link at `column` of `row` covers, from the first row it wraps over to the last.
+ *
+ * A declared link is the same URI on consecutive cells, and each row holds its own table of links, so a
+ * link that wraps is two runs with one URI between them: the run at the end of a row that wrapped onto the
+ * next, and the run at the start of that next row. The URI is what joins them, since the row has no other
+ * name for a link. A link a detector found is one run, `linkAt` gives its cells on this row.
+ */
+export function linkRuns(link: Link, row: Row, column: number, rowAt: (line: number) => Row | undefined): LinkRun[] {
+  const own: LinkRun = { line: row.line, from: link.from, to: link.to }
+  if (link.kind !== 'declared') return [own]
+  const at = glyphAt(row, column)
+  if (at === -1) return [own]
+  const target = link.target
+  let first = at
+  let last = at
+  while (first > 0 && targetAt(row, first - 1) === target) first -= 1
+  while (last + 1 < row.text.length && targetAt(row, last + 1) === target) last += 1
+
+  // Upward, while the run reaches the start of its row and the row above wrapped onto it
+  const above: LinkRun[] = []
+  let top = row
+  let start = first
+  while (start === 0) {
+    const previous = rowAt(top.line - 1)
+    if (!previous?.wrapped || previous.text.length === 0) break
+    const end = previous.text.length - 1
+    if (targetAt(previous, end) !== target) break
+    let begin = end
+    while (begin > 0 && targetAt(previous, begin - 1) === target) begin -= 1
+    above.unshift(runOf(previous, begin, end))
+    top = previous
+    start = begin
+  }
+
+  // Downward, while the run reaches the end of its row and the row reaches onto the next
+  const below: LinkRun[] = []
+  let bottom = row
+  let stop = last
+  while (stop === bottom.text.length - 1 && bottom.wrapped) {
+    const next = rowAt(bottom.line + 1)
+    if (!next || next.text.length === 0 || targetAt(next, 0) !== target) break
+    let end = 0
+    while (end + 1 < next.text.length && targetAt(next, end + 1) === target) end += 1
+    below.push(runOf(next, 0, end))
+    bottom = next
+    stop = end
+  }
+
+  return [...above, runOf(row, first, last), ...below]
+}
+
+/** The URI a character of a row declared, or `undefined` where it declared none */
+function targetAt(row: Row, index: number): string | undefined {
+  const declared = row.link[index]!
+  return declared === 0 ? undefined : row.links[declared]
+}
+
+/** The cells from character `first` to character `last` of a row, inclusive */
+function runOf(row: Row, first: number, last: number): LinkRun {
+  return { line: row.line, from: row.column[first]!, to: row.column[last]! + row.width[last]! }
+}
+
 /** The index of the character covering a cell, or `-1` where the cell is blank */
 function glyphAt(row: Row, column: number): number {
   for (let index = 0; index < row.text.length; index += 1) {
