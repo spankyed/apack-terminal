@@ -44,11 +44,17 @@ cwd: string | null,
 started_ms: number | null, finished_ms: number | null, outcome: CommandOutcome, };
 
 /**
- * Whether a session's cursor blinks when no program has chosen. `On` and `Off` are the app's answer and
- * override the program's blink, in a view; `Program` leaves the blink to the program. In the core, DECSCUSR's
- * blink and DEC mode 12 are one setting, so a program's choice of either is what `Program` means.
+ * Whether a session's cursor blinks when no program has asked for a cursor, and whether a program's DEC
+ * mode 12 changes that.
  *
- * A reset (`CSI 0 q`) returns to a blinking cursor for `On` and `Program`, and to a steady one for `Off`.
+ * **`On` and `Off` are a person's answer, and mode 12 then leaves the blink as it is.** Mode 12 is what
+ * `cnorm` and `cvvis` carry in most terminfo entries, so a program that only shows its cursor again turns
+ * the blink off with it, and one that makes it very visible turns it on. `Program` leaves mode 12 to the
+ * program, which is how a session starts.
+ *
+ * **A program asking for a cursor (DECSCUSR) is given its blink, whichever this is**: that is a program
+ * saying what its cursor is, as an editor does for each of its modes. A reset (`CSI 0 q`) returns to a
+ * blinking cursor for `On` and `Program`, and to a steady one for `Off`.
  */
 export type CursorBlink = "on" | "off" | "program";
 

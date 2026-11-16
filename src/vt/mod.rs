@@ -75,6 +75,76 @@ pub struct Terminal {
     /// What placeholder cells can name, as of the image storage's generation when it was last asked
     /// (`images::Virtual`)
     virtual_placements: std::cell::RefCell<images::Virtual>,
+    /// Whether a program's DEC mode 12 leaves the cursor's blink as it was (`set_cursor_defaults`).
+    blink_mode_ignored: bool,
+    /// The escape sequence the parser is part way through, while it may be one that sets a private mode
+    /// (`watched`).
+    opened: Option<Opened>,
+}
+
+/// DEC mode 12, by which a program turns the cursor's blink on and off (`CSI ? 12 h`, `CSI ? 12 l`).
+const CURSOR_BLINK_MODE: u16 = 12;
+
+/// The byte every escape sequence begins with.
+const ESCAPE: u8 = 0x1b;
+
+/// How a sequence that sets, resets or restores private modes begins: `CSI ?`.
+const PRIVATE_MODES: &[u8] = b"\x1b[?";
+
+/// An escape sequence being parsed under watch (`Terminal::watched`).
+struct Opened {
+    /// Whether the cursor blinked when the sequence began.
+    blinked: bool,
+    /// The sequence's first bytes, as many as say whether it sets private modes.
+    head: [u8; PRIVATE_MODES.len()],
+    /// How many of them have been parsed.
+    held: usize,
+}
+
+/// Where in `bytes` a sequence begins that may change mode 12: the first `CSI ?` that is not plainly a
+/// sequence naming other modes, or failing one, where the bytes end part way through those three — an
+/// escape at their very end may begin one, and is known only by what the next read brings.
+fn may_set_blink_mode(bytes: &[u8]) -> Option<usize> {
+    let mut from = 0;
+    while let Some(found) = memchr::memmem::find(&bytes[from..], PRIVATE_MODES) {
+        let at = from + found;
+        from = at + PRIVATE_MODES.len();
+        if !names_only_other_modes(&bytes[from..]) {
+            return Some(at);
+        }
+    }
+    let cut_short = bytes.len().saturating_sub(PRIVATE_MODES.len() - 1).max(from);
+    (cut_short..bytes.len()).find(|&at| PRIVATE_MODES.starts_with(&bytes[at..]))
+}
+
+/// Whether what follows `CSI ?` is, all of it here, numbers apart by semicolons and then the byte that ends
+/// the sequence, with no 12 among the numbers: a sequence that sets, resets or restores other modes.
+///
+/// **Only ever a reason not to watch.** Such a sequence is what the core parses it as, since nothing in it
+/// is anything but a number, a separator or its end. Anything else — a sequence these bytes stop short of,
+/// one with another byte in it — is not judged here: it is watched, and the core says what it did.
+fn names_only_other_modes(parameters: &[u8]) -> bool {
+    let mut number: Option<u32> = None;
+    for &byte in parameters {
+        match byte {
+            b'0'..=b'9' => {
+                number = Some(number.unwrap_or(0).saturating_mul(10).saturating_add(u32::from(byte - b'0')));
+            }
+            b';' if number != Some(u32::from(CURSOR_BLINK_MODE)) => number = None,
+            0x40..=0x7e => return number != Some(u32::from(CURSOR_BLINK_MODE)),
+            _ => return false,
+        }
+    }
+    false
+}
+
+impl Opened {
+    fn take(&mut self, parsed: &[u8]) {
+        for &byte in parsed.iter().take(self.head.len() - self.held) {
+            self.head[self.held] = byte;
+            self.held += 1;
+        }
+    }
 }
 
 // SAFETY: the library allocates and frees this handle and nothing here shares it between threads: the broker gives
@@ -92,7 +162,7 @@ impl Terminal {
         if handle.is_null() {
             return Err(Failed { call: "ghostty_terminal_new", code: sys::Result::SUCCESS });
         }
-        Ok(Self { handle, virtual_placements: std::cell::RefCell::default() })
+        Ok(Self { handle, virtual_placements: std::cell::RefCell::default(), blink_mode_ignored: false, opened: None })
     }
 
     /// Parses `bytes`, exactly as the pty delivered them.
@@ -104,8 +174,136 @@ impl Terminal {
         if bytes.is_empty() {
             return;
         }
+        if self.blink_mode_ignored {
+            self.watched(bytes, 0);
+        } else {
+            self.write(bytes);
+        }
+    }
+
+    /// Hands the core `bytes` to parse, all of them.
+    fn write(&mut self, bytes: &[u8]) {
         // SAFETY: the handle is live for `&mut self`, and the slice outlives the call
         unsafe { sys::ghostty_terminal_vt_write(self.handle, bytes.as_ptr(), bytes.len()) };
+    }
+
+    /// Hands the core `bytes` to parse up to the first of `boundaries` (`sys::TerminalBoundary`), or all of
+    /// them when there are none to stop at. Answers how many it parsed and which boundaries it stopped at.
+    fn write_until(&mut self, bytes: &[u8], boundaries: u32) -> (usize, u32) {
+        if boundaries == 0 || bytes.is_empty() {
+            self.write(bytes);
+            return (bytes.len(), 0);
+        }
+        let mut stop =
+            sys::TerminalWriteStop { size: std::mem::size_of::<sys::TerminalWriteStop>(), ..Default::default() };
+        // SAFETY: the handle is live for `&mut self`, the slice outlives the call, and `stop` is sized
+        let result = unsafe {
+            sys::ghostty_terminal_vt_write_until(self.handle, bytes.as_ptr(), bytes.len(), boundaries, &raw mut stop)
+        };
+        match result {
+            sys::Result::SUCCESS => {
+                // Only ground stops on no byte at all; an OSC ends on one, and a string begins on one
+                let least = usize::from(stop.reached & sys::TerminalBoundary::GROUND == 0);
+                (stop.consumed.clamp(least, bytes.len()), stop.reached)
+            }
+            // No boundary was reached in these bytes, and all of them were parsed
+            sys::Result::NO_VALUE => (bytes.len(), 0),
+            // Refused outright, with nothing parsed: parsed the plain way, so a byte is never lost to it
+            _ => {
+                self.write(bytes);
+                (bytes.len(), 0)
+            }
+        }
+    }
+
+    /// Parses `bytes` as `write_until` does, and leaves the cursor's blink as it was wherever a program
+    /// changed it by a mode rather than by asking for a cursor.
+    ///
+    /// **Two sequences change whether the cursor blinks, and the core keeps one answer for both.** A
+    /// program asking for a cursor says whether it blinks (DECSCUSR, `CSI Ps SP q`), and DEC mode 12 turns
+    /// the blink of whatever cursor there is on and off (`CSI ? 12 h`). The second is what `cnorm` and
+    /// `cvvis` carry in most terminfo entries, so a program that only shows the cursor again on its way
+    /// out turns the blink off with it. A person who has said whether their cursor blinks is asking that
+    /// the second be ignored and the first still honoured, which is the rule Ghostty documents for a set
+    /// `cursor-style-blink`, and the core has no such option.
+    ///
+    /// **The core parses every byte, and is asked what happened.** Nothing here decides what a sequence
+    /// is or where it ends: a sequence that begins `CSI ?` is parsed up to where the core says it is
+    /// between sequences again, and if the blink is not what it was, mode 12 is put back. So a sequence
+    /// that sets several private modes has the others, a `CSI ?` inside a string or cut short by another
+    /// escape changes nothing it did not change, and the worst a sequence written some way this does not
+    /// recognise can do is be honoured. What is read of the bytes is only how a sequence begins — an
+    /// escape begins one from any state — which may be split across reads, so it is kept until it ends.
+    fn watched(&mut self, bytes: &[u8], boundaries: u32) -> (usize, u32) {
+        let ground = sys::TerminalBoundary::GROUND;
+        // Already between sequences is a boundary met with nothing parsed, as it is unwatched
+        if boundaries & ground != 0 && self.opened.is_none() && self.at_ground() {
+            return (0, ground);
+        }
+        let mut at = 0;
+        while at < bytes.len() {
+            let rest = &bytes[at..];
+            if self.opened.is_some() {
+                let escape = memchr::memchr(ESCAPE, rest);
+                // An escape inside a sequence abandons it and begins another, which is watched in its place
+                if escape == Some(0) {
+                    self.open(rest);
+                    at += 1;
+                    continue;
+                }
+                let within = &rest[..escape.unwrap_or(rest.len())];
+                let (parsed, reached) = self.write_until(within, boundaries | ground);
+                if let Some(opened) = &mut self.opened {
+                    opened.take(&within[..parsed]);
+                }
+                at += parsed;
+                if reached & ground != 0 {
+                    self.close();
+                }
+                if reached & boundaries != 0 {
+                    return (at, reached & boundaries);
+                }
+                continue;
+            }
+            // Everything up to the next sequence that may change mode 12 is parsed as one piece: what is
+            // looked for in a program's output is how such a sequence begins, and nothing else
+            match may_set_blink_mode(rest) {
+                Some(0) => {
+                    self.open(rest);
+                    at += 1;
+                }
+                next => {
+                    let next = next.unwrap_or(rest.len());
+                    let (parsed, reached) = self.write_until(&rest[..next], boundaries);
+                    at += parsed;
+                    if reached != 0 || parsed < next {
+                        return (at, reached);
+                    }
+                }
+            }
+        }
+        (at, 0)
+    }
+
+    /// Begins watching the sequence `rest` begins with, and parses the escape that begins it.
+    fn open(&mut self, rest: &[u8]) {
+        let mut opened =
+            Opened { blinked: self.mode(CURSOR_BLINK_MODE).unwrap_or(false), head: [0; PRIVATE_MODES.len()], held: 0 };
+        opened.take(&rest[..1]);
+        self.write(&rest[..1]);
+        self.opened = Some(opened);
+    }
+
+    /// The watched sequence has ended. If it set private modes and the cursor's blink is not what it was,
+    /// that was mode 12, which is put back.
+    fn close(&mut self) {
+        let Some(opened) = self.opened.take() else { return };
+        if opened.held == PRIVATE_MODES.len()
+            && opened.head == PRIVATE_MODES
+            && self.mode(CURSOR_BLINK_MODE).is_ok_and(|blinks| blinks != opened.blinked)
+        {
+            let _ = self.set_mode_now(CURSOR_BLINK_MODE, opened.blinked);
+        }
     }
 
     /// Parses `bytes` up to and including the byte that ends the next OSC string, and — when `or_ground` —
@@ -150,28 +348,9 @@ impl Terminal {
         if or_string {
             boundaries |= sys::TerminalBoundary::APC_START;
         }
-        let mut stop =
-            sys::TerminalWriteStop { size: std::mem::size_of::<sys::TerminalWriteStop>(), ..Default::default() };
-        // SAFETY: the handle is live for `&mut self`, the slice outlives the call, and `stop` is sized
-        let result = unsafe {
-            sys::ghostty_terminal_vt_write_until(self.handle, bytes.as_ptr(), bytes.len(), boundaries, &raw mut stop)
-        };
-        match result {
-            sys::Result::SUCCESS => {
-                let ground = stop.reached & sys::TerminalBoundary::GROUND != 0;
-                let string = stop.reached & sys::TerminalBoundary::APC_START != 0;
-                // Only ground stops on no byte at all; an OSC ends on one, and a string begins on one
-                let least = usize::from(!ground);
-                (stop.consumed.clamp(least, bytes.len()), ground, string)
-            }
-            // No boundary was reached in these bytes, and all of them were parsed
-            sys::Result::NO_VALUE => (bytes.len(), false, false),
-            // Refused outright, with nothing parsed: parsed the plain way, so a byte is never lost to it
-            _ => {
-                self.feed(bytes);
-                (bytes.len(), false, false)
-            }
-        }
+        let (parsed, reached) =
+            if self.blink_mode_ignored { self.watched(bytes, boundaries) } else { self.write_until(bytes, boundaries) };
+        (parsed, reached & sys::TerminalBoundary::GROUND != 0, reached & sys::TerminalBoundary::APC_START != 0)
     }
 
     /// Whether the parser is between sequences: not part way through an escape sequence, a control string
@@ -588,6 +767,20 @@ impl Terminal {
         Ok(())
     }
 
+    /// Turns a mode on or off now, leaving what a reset returns it to.
+    fn set_mode_now(&self, mode: u16, value: bool) -> Result<(), Failed> {
+        let config = sys::TerminalModeConfig { mode, value };
+        // SAFETY: MODE takes a `GhosttyTerminalModeConfig*`, which `config` is
+        let result = unsafe {
+            sys::ghostty_terminal_set(
+                self.handle,
+                sys::TerminalOption::MODE,
+                (&raw const config).cast::<std::ffi::c_void>(),
+            )
+        };
+        Failed::check("ghostty_terminal_set(MODE)", result)
+    }
+
     /// Sets the cursor a program gets when it asks for the default one (`CSI 0 q`). A session starts with a
     /// blinking bar, which is `set_cursor_defaults(Bar, Program)`.
     ///
@@ -600,6 +793,8 @@ impl Terminal {
             CursorStyle::Bar => sys::CursorStyle::BAR,
             CursorStyle::Underline => sys::CursorStyle::UNDERLINE,
         };
+        // Said by a person, the blink is theirs: a program's mode 12 no longer changes it (`watched`)
+        self.blink_mode_ignored = blink != CursorBlink::Program;
         let blink = blink != CursorBlink::Off;
         // SAFETY: DEFAULT_CURSOR_STYLE takes a `GhosttyCursorStyle*` and DEFAULT_CURSOR_BLINK a `bool*`
         unsafe {

@@ -768,8 +768,8 @@ fn a_default_set_part_way_through_a_program_sequence_takes_the_cursor_once_it_en
     }
 }
 
-/// DECSCUSR's blink and DEC mode 12 are one setting in the core: each sets what the other reads. The
-/// app's blink setting is a view's to apply over this, so it has to know this much to be right.
+/// DECSCUSR's blink and DEC mode 12 are one setting in the core: each sets what the other reads. That is
+/// what a session shows while nobody has said whether its cursor blinks, which is how one starts.
 #[test]
 fn decscusr_and_dec_mode_12_set_one_blink_between_them() {
     let mut screen = Screen::new(20, 4);
@@ -780,6 +780,113 @@ fn decscusr_and_dec_mode_12_set_one_blink_between_them() {
     {
         last = after(&mut screen, &view, &last, |screen| write(screen, written));
         assert_eq!(drawn_as(&last), Some(expected), "after {written:?}");
+    }
+}
+
+/// A screen whose person has said whether the cursor blinks, with a view of it and the frame that says so.
+/// Run once as a session is by default and once as one that takes images by name, whose output is fed
+/// another way.
+fn with_a_blink_chosen(blink: CursorBlink, images: bool) -> (Screen, View, Frame) {
+    let mut screen = Screen::new(20, 4);
+    if images {
+        screen.allow_images(true).expect("images are allowed");
+    }
+    let view = View::attached(&mut screen, 1, 1);
+    let first = view.frame();
+    let set = after(&mut screen, &view, &first, |screen| {
+        screen.set_cursor_defaults(CursorStyle::Block, blink).expect("the defaults are set")
+    });
+    (screen, view, set)
+}
+
+/// **A blink a person chose is not a program's mode to change.** DEC mode 12 is what `cnorm` and `cvvis`
+/// carry, so a program that only shows the cursor again on its way out would turn the blink off with it,
+/// and one that makes it very visible would turn it on. Once a person has said, mode 12 leaves the blink
+/// as it was — set, reset or restored, alone or among other modes, which are still set.
+#[test]
+fn dec_mode_12_leaves_the_blink_a_person_chose() {
+    for images in [false, true] {
+        for (blink, blinking, against) in [(CursorBlink::On, true, 'l'), (CursorBlink::Off, false, 'h')] {
+            let (mut screen, view, set) = with_a_blink_chosen(blink, images);
+            assert_eq!(drawn_as(&set), Some((0, blinking)));
+            let case = format!("{blink:?}, images {images}");
+
+            // Each is followed by a letter, so there is a frame to read the cursor from
+            let alone = after(&mut screen, &view, &set, |screen| write(screen, &format!("\x1b[?12{against}a")));
+            assert_eq!(drawn_as(&alone), Some((0, blinking)), "{case}: mode 12 alone");
+
+            // The mouse is taken by the same sequence, and that much of it is done
+            let among = after(&mut screen, &view, &alone, |screen| write(screen, "\x1b[?12;1000hb\x1b[?1000;12lc"));
+            assert_eq!(drawn_as(&among), Some((0, blinking)), "{case}: mode 12 among others");
+            let mouse = after(&mut screen, &view, &among, |screen| write(screen, "\x1b[?12;1000hd"));
+            assert!(mouse.mouse, "{case}: the other mode of the sequence was not set");
+            assert_eq!(drawn_as(&mouse), Some((0, blinking)), "{case}: mode 12 among others");
+
+            // Saved as it is and restored after a program changed it, which changes nothing either
+            let restored = after(&mut screen, &view, &mouse, |screen| write(screen, "\x1b[?12s\x1b[?12re"));
+            assert_eq!(drawn_as(&restored), Some((0, blinking)), "{case}: mode 12 saved and restored");
+        }
+    }
+}
+
+/// **A program asking for a cursor is still given the one it asks for**, blink and all, whatever a person
+/// chose: that is a program saying what its cursor is, as an editor does for each of its modes, where mode
+/// 12 is a side effect of showing one. A reset returns to what the person chose.
+#[test]
+fn a_program_asking_for_a_cursor_is_given_its_blink_whatever_a_person_chose() {
+    for images in [false, true] {
+        for (blink, blinking, asked, given) in
+            [(CursorBlink::On, true, "\x1b[2 q", (0, false)), (CursorBlink::Off, false, "\x1b[5 q", (1, true))]
+        {
+            let (mut screen, view, set) = with_a_blink_chosen(blink, images);
+            let case = format!("{blink:?}, images {images}");
+            let chosen = after(&mut screen, &view, &set, |screen| write(screen, asked));
+            assert_eq!(drawn_as(&chosen), Some(given), "{case}: the cursor the program asked for");
+
+            // And mode 12 does not undo what the program asked for, any more than what the person chose
+            let kept = after(&mut screen, &view, &chosen, |screen| {
+                write(screen, if given.1 { "\x1b[?12la" } else { "\x1b[?12ha" });
+            });
+            assert_eq!(drawn_as(&kept), Some(given), "{case}: mode 12 after the program's cursor");
+
+            let reset = after(&mut screen, &view, &kept, |screen| write(screen, "\x1b[0 q"));
+            assert_eq!(drawn_as(&reset), Some((0, blinking)), "{case}: a reset returns to the person's");
+        }
+    }
+}
+
+/// **A sequence is what the parser says it is, however it arrives.** One split across reads at every byte
+/// is the same sequence; one cut short by an escape never happened, and the cursor asked for by what cut
+/// it short is given; and the same characters with no escape before them are text.
+#[test]
+fn a_blink_is_kept_or_given_whatever_shape_the_bytes_come_in() {
+    for images in [false, true] {
+        let case = format!("images {images}");
+        let (mut screen, view, set) = with_a_blink_chosen(CursorBlink::Off, images);
+
+        let split = after(&mut screen, &view, &set, |screen| {
+            for piece in ["\x1b", "[", "?", "1", "2", "h", "a"] {
+                write(screen, piece);
+            }
+        });
+        assert_eq!(drawn_as(&split), Some((0, false)), "{case}: mode 12 a byte at a time");
+
+        let asked = after(&mut screen, &view, &split, |screen| {
+            for piece in ["\x1b", "[", "5", " ", "q"] {
+                write(screen, piece);
+            }
+        });
+        assert_eq!(drawn_as(&asked), Some((1, true)), "{case}: a cursor asked for a byte at a time");
+
+        let reset = after(&mut screen, &view, &asked, |screen| write(screen, "\x1b[0 q"));
+        assert_eq!(drawn_as(&reset), Some((0, false)));
+        let cut_short = after(&mut screen, &view, &reset, |screen| write(screen, "\x1b[?12\x1b[5 q"));
+        assert_eq!(drawn_as(&cut_short), Some((1, true)), "{case}: the cursor asked for by what cut a sequence short");
+
+        let reset = after(&mut screen, &view, &cut_short, |screen| write(screen, "\x1b[0 q\r\x1b[2K"));
+        let text = after(&mut screen, &view, &reset, |screen| write(screen, "[?12h"));
+        assert_eq!(drawn_as(&text), Some((0, false)), "{case}");
+        assert_eq!(lines(&text), vec![(0, "[?12h".to_owned())], "{case}: with no escape before them they are text");
     }
 }
 

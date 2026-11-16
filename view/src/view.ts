@@ -60,13 +60,6 @@ const CLICK_AGAIN_PIXELS = 4
 const THUMB_MIN = 20
 
 /**
- * Whether the cursor blinks while the view has the keyboard. `on` and `off` are the app's setting, and
- * override what the program asks for: in the core, DECSCUSR's blink and DEC mode 12 are one setting, so
- * `program` is whichever of those the program last set.
- */
-export type CursorBlink = 'on' | 'off' | 'program'
-
-/**
  * What hovering a link shows of where it opens, as the pointer's title: `osc8` for a link a program declared
  * with a hyperlink sequence, `all` for any link (text that looks like a URL, or what a detector found), and
  * `off` for none. The pointer is a pointer over every link either way.
@@ -122,12 +115,6 @@ export interface ViewOptions {
    * The shape the cursor is drawn in while the view does not have the keyboard. Left out, a hollow block.
    */
   readonly cursorInactive?: CursorShape
-  /**
-   * Whether the cursor blinks while the view has the keyboard (`CursorBlink`). Left out, `program`: the
-   * blink the broker reports, as the program left it. A host that has an app setting passes it, with
-   * "unset" resolved to the value that setting means.
-   */
-  readonly cursorBlink?: CursorBlink
   /**
    * Whether a Mac's option key is alt rather than the key that composes characters: a key held with it is
    * then sent as what the key types without it. Left out, option composes, as it does everywhere else on
@@ -344,9 +331,8 @@ export class TerminalView {
   private wheelOwed = 0
   /** Whether a selection is copied as the pointer is let go: the option at construction, then `setCopyOnSelect` */
   private copyOnSelect: boolean
-  /** The cursor's shape without the keyboard, its blink and the link previews: the options at construction, then their setters */
+  /** The cursor's shape without the keyboard and the link previews: the options at construction, then their setters */
   private cursorInactive: CursorShape
-  private cursorBlink: CursorBlink
   private linkPreview: LinkPreview
   /** What is selected. It asks the source what a word or a line is and draws nothing itself */
   readonly selection: Selection
@@ -356,7 +342,6 @@ export class TerminalView {
     this.gutter = options.gutter ?? 0
     this.copyOnSelect = options.copyOnSelect ?? false
     this.cursorInactive = options.cursorInactive ?? 'hollow'
-    this.cursorBlink = options.cursorBlink ?? 'program'
     this.linkPreview = options.linkPreview ?? 'osc8'
     this.font = options.font
     this.theme = options.theme
@@ -437,16 +422,6 @@ export class TerminalView {
    */
   setCursorInactive(style: CursorShape): void {
     this.cursorInactive = style
-    this.schedule()
-  }
-
-  /**
-   * Changes whether the cursor blinks (`cursorBlink`). The blink starts over in the new mode, as it does after
-   * anything is typed, and the view keeps its scroll position and selection.
-   */
-  setCursorBlink(mode: CursorBlink): void {
-    this.cursorBlink = mode
-    this.blinkAgain()
     this.schedule()
   }
 
@@ -1354,15 +1329,14 @@ export class TerminalView {
     this.schedule()
   }
 
-  /** Whether the cursor blinks now: the view's setting where it has one, and the program's where it does not */
+  /**
+   * Whether the cursor blinks now, which is the source's to say: a frame's cursor is the one to draw. What a
+   * person chose and what a program asked for are settled where the session's output is parsed, the one
+   * place that can tell a program asking for a cursor from one that only showed it again
+   */
   private cursorBlinks(): boolean {
     const cursor = this.frame?.cursor
-    if (!cursor || cursor.hidden) return false
-    switch (this.cursorBlink) {
-      case 'on': return true
-      case 'off': return false
-      case 'program': return cursor.blinking
-    }
+    return cursor !== null && cursor !== undefined && !cursor.hidden && cursor.blinking
   }
 
   /**
