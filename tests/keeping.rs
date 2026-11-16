@@ -438,8 +438,8 @@ impl View {
         }
     }
 
-    fn step(&mut self) {
-        let message = self.incoming.recv_timeout(PATIENCE).expect("the broker sends");
+    /// Applies a message: a frame as a view that has drawn it would, acknowledging it.
+    fn take(&mut self, message: ToView) {
         if let ToView::Frame(frame) = message {
             if self.last.as_ref().is_some_and(|last| last.epoch != frame.epoch) {
                 self.rows.clear();
@@ -469,10 +469,16 @@ impl View {
     }
 
     fn until(&mut self, what: &str, mut holds: impl FnMut(&Self) -> bool) {
-        let waiting_since = Instant::now();
+        // **Waits for what is left of `PATIENCE` and no longer**, so a wait that runs out says what it was
+        // waiting for and what the view held, rather than only that nothing came
+        let until = Instant::now() + PATIENCE;
         while !holds(self) {
-            assert!(waiting_since.elapsed() < PATIENCE, "never {what}:\n{}", self.held());
-            self.step();
+            match self.incoming.recv_timeout(until.saturating_duration_since(Instant::now())) {
+                Ok(message) => self.take(message),
+                Err(why) => {
+                    panic!("never {what} ({why}); the screen:\n{}\nall it holds:\n{}", self.screen(), self.held())
+                }
+            }
         }
     }
 

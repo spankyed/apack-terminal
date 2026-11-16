@@ -378,6 +378,10 @@ impl View {
     /// Takes the next message, applying a frame and acknowledging it as a view that has drawn it would.
     fn step(&mut self) -> ToView {
         let message = self.incoming.recv_timeout(PATIENCE).expect("the broker sends");
+        self.take(message)
+    }
+
+    fn take(&mut self, message: ToView) -> ToView {
         match &message {
             ToView::Frame(frame) => {
                 if self.last.as_ref().is_some_and(|last| last.epoch != frame.epoch) {
@@ -406,11 +410,17 @@ impl View {
             .join("\n")
     }
 
-    /// Frames until the screen shows `expected`.
+    /// Frames until the screen shows `expected`. **A wait that runs out says what the screen showed**,
+    /// rather than only that nothing came.
     fn until_shows(&mut self, expected: &str) {
         while !self.screen().contains(expected) {
             assert!(!self.ended, "the session ended without showing {expected:?}:\n{}", self.screen());
-            self.step();
+            match self.incoming.recv_timeout(PATIENCE) {
+                Ok(message) => {
+                    self.take(message);
+                }
+                Err(why) => panic!("never showed {expected:?} ({why}); the screen:\n{}", self.screen()),
+            }
         }
     }
 
