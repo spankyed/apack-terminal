@@ -30,10 +30,14 @@
 //! on a thread that can be left in a wait nothing can end, and the session goes on once that read has
 //! gone `QUIET` without the system answering it.
 //!
-//! **Where a session answers otherwise than the core alone would**, each because the core alone would do
-//! what a session cannot: a query naming more than `QUERY_BYTES`, which the core loads in one command and
-//! one command cannot carry, and a source of more than `SOURCE_BYTES`, are refused as a source that could
-//! not be read; and a source given up on is refused so too.
+//! **What was read is sent as the core would have read it, and the core decides the rest**: a source is
+//! read up to the most the core reads of one itself (`SOURCE_BYTES`), so an image too large to keep is
+//! refused by the core in its own words. It is held in the pieces it is sent in, each let go of once it
+//! has been, so a source is held about once, as the core alone holds it — a query a third more, the core
+//! holding its one command as base64 until it is whole.
+//!
+//! **Where a session answers otherwise than the core alone would**: a source given up on as quiet is
+//! refused as one that could not be read, where the core alone would have waited on it for ever.
 
 pub mod rules;
 mod scan;
@@ -55,19 +59,14 @@ pub use worker::{QUIET, Worker};
 use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
 
-use super::images::IMAGE_STORAGE_BYTES;
+/// The most of a source read: the most the core reads of one itself (`max_size`), whether named as a file
+/// or as shared memory, and whether or not what is made of it could be kept.
+pub const SOURCE_BYTES: u64 = 400 << 20;
 
-/// The most of a source read: no more than a session's images may hold altogether, which is all an image
-/// read from one could be — compressed or a PNG it is smaller than its pixels, and its pixels are kept.
-pub const SOURCE_BYTES: u64 = IMAGE_STORAGE_BYTES;
-
-/// How much of a source one command carries. A multiple of three, so every piece but the last is whole
-/// groups of base64, and well inside what the core takes in one command.
+/// How much of a source one command carries, and so the pieces it is read and held in. A multiple of
+/// three, so every piece but the last is whole groups of base64, and well inside what the core takes in
+/// one command.
 pub const CHUNK_BYTES: usize = 3 << 20;
-
-/// The most a query may name. The core loads what a query names in one command and keeps none of it
-/// (`a=q`), and one command holds at most 65 MiB of base64.
-pub const QUERY_BYTES: usize = 48 << 20;
 
 /// The largest width or height the core takes for pixels it is not told the size of (`max_dimension`).
 const DIMENSION: u32 = 10_000;
@@ -229,31 +228,38 @@ impl Load {
             (Source::SharedMemory(name), Some(_)) => platform::shared_memory(name, |size| self.range(size)),
         };
         let query = self.action == b'q';
-        let limit = if query { QUERY_BYTES } else { SOURCE_BYTES as usize };
-        let data =
-            data.and_then(
-                |bytes| {
-                    if bytes.len() <= limit { Ok(Bytes { bytes, query }) } else { Err(Refused::InvalidData) }
-                },
-            );
-        Loaded { keys: self.keys, data }
+        Loaded { keys: self.keys, data: data.map(|pieces| Bytes { pieces, query }) }
     }
 
     /// The bytes of a file the command names, from its `O` offset: its `S` size of them exactly, or to its
-    /// end where no size is given (`readFile`), and no more than `SOURCE_BYTES` either way.
+    /// end where no size is given (`readFile`), and no more than `SOURCE_BYTES` either way: in pieces of
+    /// `CHUNK_BYTES`, the last of them short, and empty where the rest were all there was.
     ///
-    /// **Read up to what could be kept and no further**, so a size or a file of gigabytes costs what the
-    /// limit does: one byte past it is read where no size is given, to tell a file that ends at the limit
-    /// from one that goes on. `progress` is called each time the system answers a read.
-    pub fn read_from(&self, mut source: impl Read + Seek, progress: &dyn Fn()) -> Option<Vec<u8>> {
+    /// **Read up to the limit and no further**, so a size or a file of gigabytes costs what the limit does:
+    /// a size past it is refused before anything is read, and where no size is given one byte past it is
+    /// read, to tell a file that ends at the limit from one that goes on. `progress` is called each time
+    /// the system answers a read.
+    pub fn read_from(&self, mut source: impl Read + Seek, progress: &dyn Fn()) -> Option<Vec<Vec<u8>>> {
         let offset = u64::from(self.keys.get(b'O').unwrap_or(0));
         let size = u64::from(self.keys.get(b'S').unwrap_or(0));
+        if size > SOURCE_BYTES {
+            return None;
+        }
         source.seek(SeekFrom::Start(offset)).ok()?;
-        let limit = if size == 0 { SOURCE_BYTES + 1 } else { size.min(SOURCE_BYTES) };
-        let mut data = Vec::new();
-        Progressing { source: source.take(limit), progress }.read_to_end(&mut data).ok()?;
-        let read = data.len() as u64;
-        (read <= SOURCE_BYTES && (size == 0 || read == size)).then_some(data)
+        let limit = if size == 0 { SOURCE_BYTES + 1 } else { size };
+        let mut source = Progressing { source: source.take(limit), progress };
+        let (mut pieces, mut read) = (Vec::new(), 0);
+        loop {
+            let mut piece = Vec::new();
+            source.by_ref().take(CHUNK_BYTES as u64).read_to_end(&mut piece).ok()?;
+            read += piece.len() as u64;
+            let ended = piece.len() < CHUNK_BYTES;
+            pieces.push(piece);
+            if ended {
+                break;
+            }
+        }
+        (read <= SOURCE_BYTES && (size == 0 || read == size)).then_some(pieces)
     }
 
     /// Which bytes of a shared memory object `size` long are the image's (`sharedMemoryRange`): from its
@@ -305,59 +311,89 @@ pub struct Loaded {
     data: Result<Bytes, Refused>,
 }
 
-/// What was read, and whether it answers a query, which is sent in one command and abandons nothing.
+/// What was read, in the pieces it is sent in, and whether it answers a query, which is sent in one command
+/// and abandons nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Bytes {
-    bytes: Vec<u8>,
+    pieces: Vec<Vec<u8>>,
     query: bool,
 }
 
 impl Loaded {
-    /// Why what was named was not read, if it was not.
-    pub fn refused(&self) -> Option<Refused> {
-        self.data.as_ref().err().copied()
-    }
-
-    /// The body to feed the core for a source that was read, inside the string the program began, the
-    /// program's own byte ending the string after it; `None` for one that was not.
+    /// What to feed the core for a source that was read, inside the string the program began, the
+    /// program's own byte ending the string after it; or why it was not read.
     ///
     /// **The command as the core read it, sending what was read.** Its keys are the program's in the
     /// core's own spelling, less the four that said where the bytes were and how many of them (`t`, `O`,
-    /// `S`) and whether more were to follow (`m`), which mean something else of bytes that are sent. Sent
-    /// in pieces of `CHUNK_BYTES`, the first with the keys and each saying whether another follows.
+    /// `S`) and whether more were to follow (`m`), which mean something else of bytes that are sent. A
+    /// transmission is sent a piece to a command, the first with the keys and each saying whether another
+    /// follows; a query is one command, which the core reads whole and keeps nothing of.
     ///
     /// **A transmission begins by abandoning one the program left part sent**, as the core does on a
     /// command whose bytes are named rather than sent: the bytes here are sent, and would otherwise be
     /// taken for that transmission's next piece. A query takes no part in one, and leaves it alone.
-    pub fn body(&self) -> Option<Vec<u8>> {
-        const NEXT: &[u8] = b"\x1b\\\x1b_G";
-        let Bytes { bytes: data, query } = self.data.as_ref().ok()?;
-        let (data, query) = (data.as_slice(), *query);
-        let mut body = Vec::new();
-        if !query {
-            // A transmission named by a temporary file, which the core abandons the part sent for and then
-            // refuses, saying nothing
-            body.extend_from_slice(b"Ga=t,t=116,q=2");
-            body.extend_from_slice(NEXT);
-        } else {
-            body.push(b'G');
-        }
-        body.extend_from_slice(&self.keys.spelled(b"tmOS"));
-        let pieces: Vec<&[u8]> = if query { vec![data] } else { data.chunks(CHUNK_BYTES).collect() };
-        for (index, piece) in pieces.iter().enumerate() {
-            let more = index + 1 < pieces.len();
-            if index > 0 {
-                body.extend_from_slice(NEXT);
-                body.extend_from_slice(if more { b"m=1" } else { b"m=0" });
-            } else if more {
-                body.extend_from_slice(if body.ends_with(b"G") { b"m=1" } else { b",m=1" });
+    pub fn body(self) -> Result<Body, Refused> {
+        let Bytes { pieces, query } = self.data?;
+        let mut head = if query { b"G".to_vec() } else { [ABANDON, NEXT].concat() };
+        head.extend_from_slice(&self.keys.spelled(b"tmOS"));
+        let payload = pieces.iter().map(|piece| piece.len().div_ceil(3) * 4).sum();
+        let payload = query.then_some(payload);
+        Ok(Body { head: Some(head), pieces: pieces.into_iter().peekable(), query, payload })
+    }
+}
+
+/// A transmission named by a temporary file, which the core abandons the part sent for and then refuses,
+/// saying nothing.
+const ABANDON: &[u8] = b"Ga=t,t=116,q=2";
+
+/// What ends one command and begins the next.
+const NEXT: &[u8] = b"\x1b\\\x1b_G";
+
+/// What the core is fed for a command whose source was read (`Loaded::body`), a piece at a time: each
+/// piece of the source is let go of once it has been encoded to be fed.
+#[derive(Debug)]
+pub struct Body {
+    /// What comes before the first piece, until it has been
+    head: Option<Vec<u8>>,
+    pieces: std::iter::Peekable<std::vec::IntoIter<Vec<u8>>>,
+    query: bool,
+    /// What a query's one command carries
+    payload: Option<usize>,
+}
+
+impl Body {
+    /// What the one command a query is sent in carries, as the core counts it — its payload — for the core
+    /// to be let take it whole; `None` for a transmission, whose every command is well inside what the core
+    /// takes.
+    pub fn query_bytes(&self) -> Option<usize> {
+        self.payload
+    }
+}
+
+impl Iterator for Body {
+    type Item = Vec<u8>;
+
+    fn next(&mut self) -> Option<Vec<u8>> {
+        let piece = match (self.pieces.next(), &self.head) {
+            (Some(piece), _) => piece,
+            // Nothing was read of a range that was empty, and the command is still sent
+            (None, Some(_)) => Vec::new(),
+            (None, None) => return None,
+        };
+        let more = self.pieces.peek().is_some();
+        let mut fed = match self.head.take() {
+            Some(mut head) if more && !self.query => {
+                head.extend_from_slice(if head.ends_with(b"G") { b"m=1;" } else { b",m=1;" });
+                head
             }
-            body.push(b';');
-            body.extend_from_slice(&encoded(piece));
-        }
-        if pieces.is_empty() {
-            body.push(b';');
-        }
-        Some(body)
+            Some(mut head) => {
+                head.push(b';');
+                head
+            }
+            None if self.query => Vec::new(),
+            None => [NEXT, if more { b"m=1;" } else { b"m=0;" }].concat(),
+        };
+        fed.extend_from_slice(&encoded(&piece));
+        Some(fed)
     }
 }

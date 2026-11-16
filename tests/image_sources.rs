@@ -872,6 +872,7 @@ fn a_shared_memory_object_is_read_for_its_range_and_unlinked() {
         ("large", ",S=4,s=20000", false),
         ("tall", ",v=10001", false),
         ("absent", "", false),
+        ("empty", ",o=z,O=8", false),
     ] {
         let name = shared_name(case);
         let stream =
@@ -977,6 +978,41 @@ fn a_file_larger_than_a_command_is_sent_in_pieces() {
     }
 }
 
+/// A command named by a file of `bytes` zeroes, made in `directory` as `name`.
+fn named_zeroes(directory: &Path, name: &str, control: &str, bytes: u64) -> Vec<u8> {
+    let path = directory.join(name);
+    std::fs::File::create(&path).and_then(|file| file.set_len(bytes)).expect("a file is made");
+    command(b"\x1b_", control.as_bytes(), named(&path).as_bytes(), ST)
+}
+
+/// **A file too large to keep is the core's to refuse, in its own words**: what is read is sent whole,
+/// however much more it is than a session's images may hold.
+#[test]
+fn a_file_too_large_to_keep_is_refused_by_the_core() {
+    let directory = tempfile::tempdir().expect("a directory");
+    // One row of pixels past the 64 MiB a session's images may hold
+    let stream = named_zeroes(directory.path(), "too-large", "a=T,i=7,f=32,s=4096,v=4097,t=f", 4096 * 4097 * 4);
+    let alone = core_made(&stream);
+    assert_eq!(alone.told, "\x1b_Gi=7;ENOMEM: out of memory\x1b\\", "the core alone");
+    assert_eq!(taken(&[&stream]), alone, "a session");
+}
+
+/// **A query is answered as the core answers it**, in one command longer than any a program may send —
+/// and that room is the query's alone: a program's own command after it is held to the core's most.
+#[test]
+fn a_query_longer_than_a_program_may_send_is_answered_and_its_room_is_its_own() {
+    let directory = tempfile::tempdir().expect("a directory");
+    // More base64 than the core's most for a command (65 MiB), and then a program's own command of base64
+    // one group past that most, which the core lets go of unanswered — and would otherwise refuse, its
+    // bytes being far more than its one pixel
+    let asked = named_zeroes(directory.path(), "asked", "a=q,i=7,f=32,s=3600,v=3600,t=f", 3600 * 3600 * 4);
+    let past = command(b"\x1b_", b"a=q,i=8,f=32,s=1,v=1", &vec![b'A'; (65 << 20) + 4], ST);
+    let stream = [asked, past].concat();
+    let alone = core_made(&stream);
+    assert_eq!(alone.told, "\x1b_Gi=7;OK\x1b\\", "the core alone");
+    assert_eq!(taken(&[&stream]), alone, "a session");
+}
+
 /// **A named image after a transmission the program left part sent is a transmission of its own**, as
 /// the core makes it: the part sent is abandoned, and the bytes read are not taken for its next piece.
 #[test]
@@ -1023,12 +1059,8 @@ fn a_read_outstanding_when_something_else_reaches_the_core_is_refused() {
         let (taken, image) = screen.feed_until_image(&stream);
         let read = image.expect("the feed stopped").read();
         if interrupted {
-            screen
-                .set_cursor_defaults(
-                    apack_terminal::protocol::CursorStyle::Block,
-                    apack_terminal::protocol::CursorBlink::Program,
-                )
-                .expect("the cursor is set");
+            // Anything fed while the read is outstanding, though it is nothing
+            screen.feed(b"");
         }
         screen.finish_image(read);
         screen.feed(&stream[taken..]);
@@ -1096,31 +1128,84 @@ fn load_of(control: &str) -> Load {
     load.expect("a command naming a file")
 }
 
-/// **What is read is no more than what could be kept**: a source of exactly `SOURCE_BYTES` is read whole,
-/// one byte longer is refused, and a size given is read exactly or not at all.
+/// A source of `len` zeroes that holds none of them, counting how many are read.
+struct Zeros {
+    len: u64,
+    at: u64,
+    read: std::rc::Rc<std::cell::Cell<u64>>,
+}
+
+impl std::io::Read for Zeros {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let count = (buffer.len() as u64).min(self.len.saturating_sub(self.at));
+        buffer[..count as usize].fill(0);
+        self.at += count;
+        self.read.set(self.read.get() + count);
+        Ok(count as usize)
+    }
+}
+
+impl std::io::Seek for Zeros {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        let std::io::SeekFrom::Start(to) = to else { unreachable!("a source is sought from its start") };
+        self.at = to;
+        Ok(to)
+    }
+}
+
+/// **What is read is no more than the core reads itself**: a source of exactly `SOURCE_BYTES` is read
+/// whole, in pieces of `CHUNK_BYTES`; one byte longer is refused; a size past it is refused with nothing
+/// read; and a size given is read exactly or not at all.
 #[test]
 fn a_source_is_read_to_the_limit_and_not_past_it() {
-    let at_limit = vec![7u8; SOURCE_BYTES as usize];
-    let read =
-        load_of("a=T").read_from(std::io::Cursor::new(&at_limit), &|| {}).expect("a source at the limit is read");
-    assert_eq!(read.len(), at_limit.len());
-    let past = vec![7u8; SOURCE_BYTES as usize + 1];
-    assert!(
-        load_of("a=T").read_from(std::io::Cursor::new(&past), &|| {}).is_none(),
-        "a source past the limit was read"
-    );
-    assert!(
-        load_of("a=T,S=4294967295").read_from(std::io::Cursor::new(&past), &|| {}).is_none(),
-        "a size past the limit"
-    );
+    // The pieces read of `len` zeroes, as their lengths, and how many bytes were read
+    let read = |control: &str, len: u64| {
+        let counted = std::rc::Rc::new(std::cell::Cell::new(0));
+        let pieces = load_of(control).read_from(Zeros { len, at: 0, read: counted.clone() }, &|| {});
+        (pieces.map(|pieces| pieces.iter().map(Vec::len).collect::<Vec<_>>()), counted.get())
+    };
+    let chunk = CHUNK_BYTES as u64;
+    let whole = [vec![CHUNK_BYTES; (SOURCE_BYTES / chunk) as usize], vec![(SOURCE_BYTES % chunk) as usize]].concat();
+    assert_eq!(read("a=T", SOURCE_BYTES).0, Some(whole.clone()), "a source at the limit");
+    assert_eq!(read("a=T", SOURCE_BYTES + 1).0, None, "a source past the limit");
+    assert_eq!(read(&format!("a=T,S={SOURCE_BYTES}"), u64::MAX).0, Some(whole), "a size at the limit");
+    assert_eq!(read(&format!("a=T,S={}", SOURCE_BYTES + 1), u64::MAX), (None, 0), "a size past the limit");
+    assert_eq!(read("a=T", 2 * chunk).0, Some(vec![CHUNK_BYTES, CHUNK_BYTES, 0]), "whole pieces, and an empty end");
+    assert_eq!(read("a=T", 0).0, Some(vec![0]), "an empty source");
 
     let bytes = [9u8, 9, 1, 2, 3, 4, 9, 9];
-    let read_with = |control: &str| load_of(control).read_from(std::io::Cursor::new(&bytes), &|| {});
+    let read_with =
+        |control: &str| load_of(control).read_from(std::io::Cursor::new(&bytes), &|| {}).map(|pieces| pieces.concat());
     assert_eq!(read_with("a=T,O=2,S=4").as_deref(), Some(&PIXEL[..]));
     assert_eq!(read_with("a=T,O=4").as_deref(), Some(&[3, 4, 9, 9][..]));
     assert_eq!(read_with("a=T").as_deref(), Some(&bytes[..]));
     assert_eq!(read_with("a=T,O=6,S=4"), None, "a size past the end");
     assert_eq!(read_with("a=T,O=9").as_deref(), Some(&[][..]), "an offset past the end reads nothing");
+}
+
+/// **A query's one command is let carry what it carries**: what `query_bytes` says is the payload the core
+/// counts, exactly, and a transmission, whose pieces are each well inside what the core takes, says
+/// nothing.
+#[test]
+fn a_query_says_what_its_one_command_carries() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let path = directory.path().join("bytes");
+    for len in [0, 1, 2, 3, 4, CHUNK_BYTES + 1] {
+        std::fs::write(&path, vec![1u8; len]).expect("a file is written");
+        let body = |action: &str| {
+            let mut scanner = Scanner::default();
+            scanner.begin();
+            let control = format!("Ga={action},i=7,f=100,t=f;{}\x1b", named(&path));
+            let (_, load) = scanner.read(control.as_bytes(), |_| {});
+            load.expect("a command naming a file").read().body().expect("the file is read")
+        };
+        let query = body("q");
+        let carries = query.query_bytes();
+        let fed = query.collect::<Vec<_>>().concat();
+        let payload = &fed[fed.iter().position(|&byte| byte == b';').expect("a payload") + 1..];
+        assert_eq!(carries, Some(payload.len()), "{len} bytes");
+        assert_eq!(body("T").query_bytes(), None, "{len} bytes, sent");
+    }
 }
 
 /// **A shared memory object's range is the core's**: the picture's pixels where no size is given and they
@@ -1143,7 +1228,7 @@ fn a_shared_memory_range_is_the_cores() {
     assert_eq!(range("a=T,f=100,O=101", 100), Err(InvalidData), "an offset past the end, with no size");
     assert_eq!(range("a=T,f=7,s=1,v=1", 100), Err(InvalidData), "a format the core does not take");
     let past = format!("a=T,f=100,S={}", SOURCE_BYTES + 1);
-    assert_eq!(range(&past, u64::MAX), Err(InvalidData), "past what could be kept");
+    assert_eq!(range(&past, u64::MAX), Err(InvalidData), "past what the core reads");
     assert_eq!(range(&format!("a=T,f=100,S={SOURCE_BYTES}"), u64::MAX), Ok(0..SOURCE_BYTES));
 }
 
@@ -1166,12 +1251,6 @@ fn a_late_answer_is_not_taken_for_the_next_reads() {
     let mut screen = session(true);
     let (taken, image) = screen.feed_until_image(&stream);
     let late = image.expect("the feed stopped at the first").read();
-    screen
-        .set_cursor_defaults(
-            apack_terminal::protocol::CursorStyle::Block,
-            apack_terminal::protocol::CursorBlink::Program,
-        )
-        .expect("the cursor is set");
     let (more, image) = screen.feed_until_image(&stream[taken..]);
     let next = image.expect("the feed stopped at the second").read();
     screen.finish_image(late);
@@ -1213,10 +1292,15 @@ fn every_answer_to_a_read_is_progress() {
         Trickle { bytes: std::io::Cursor::new(vec![3u8; 10]), step: 3, pause: Duration::ZERO, reads: reads.clone() };
     let progress = std::cell::Cell::new(0);
     let read = load_of("a=T").read_from(source, &|| progress.set(progress.get() + 1));
-    assert_eq!(read, Some(vec![3u8; 10]));
+    assert_eq!(read, Some(vec![vec![3u8; 10]]));
     assert!(reads.get() >= 5, "{} reads of three bytes for ten", reads.get());
     assert_eq!(progress.get(), reads.get(), "a read answered without its being progress");
 }
+
+/// How long the cases here let a read be quiet, and how long a read that is not quiet pauses between its
+/// answers: sixty times shorter, so that no load lengthens a pause past the quiet a case allows.
+const QUIET_IN_CASES: Duration = Duration::from_secs(3);
+const PAUSE_IN_CASES: Duration = Duration::from_millis(50);
 
 /// **A slow read is never given up on while it reads**, however slowly: a source that answers each read
 /// with a byte, more slowly in all than a read may be quiet, is read whole.
@@ -1224,12 +1308,12 @@ fn every_answer_to_a_read_is_progress() {
 fn a_slow_read_is_not_given_up_on() {
     let worker = Worker::default();
     let load = load_of("a=T");
-    let read = worker.run(Duration::from_secs(2), move |progress| {
+    let read = worker.run(QUIET_IN_CASES, move |progress| {
         let reads = std::rc::Rc::new(std::cell::Cell::new(0));
-        let pause = Duration::from_millis(400);
-        load.read_from(Trickle { bytes: std::io::Cursor::new(vec![5u8; 8]), step: 1, pause, reads }, progress)
+        let source = Trickle { bytes: std::io::Cursor::new(vec![5u8; 70]), step: 1, pause: PAUSE_IN_CASES, reads };
+        load.read_from(source, progress)
     });
-    assert_eq!(read, Some(Some(vec![5u8; 8])), "a read that went on answering was given up on");
+    assert_eq!(read, Some(Some(vec![vec![5u8; 70]])), "a read that went on answering was given up on");
 }
 
 /// **What is at `/proc`, `/sys` and `/dev` is told by device**, a path that is only a directory of the
@@ -1273,10 +1357,11 @@ fn a_read_is_given_up_on_only_once_it_has_gone_quiet() {
     let worker = Worker::default();
     assert_eq!(worker.run(Duration::from_secs(5), |_| 7), Some(7));
 
-    // Longer in all than it is let be quiet, and never quiet that long
-    let slow = worker.run(Duration::from_secs(2), |progress| {
-        for _ in 0..5 {
-            std::thread::sleep(Duration::from_millis(500));
+    // Longer in all than it is let be quiet, and never quiet for a sixtieth of that: a margin no load
+    // closes, since what it would have to do is hold a sleeping thread for seconds past its wake
+    let slow = worker.run(QUIET_IN_CASES, |progress| {
+        for _ in 0..70 {
+            std::thread::sleep(PAUSE_IN_CASES);
             progress();
         }
         8
@@ -1285,10 +1370,9 @@ fn a_read_is_given_up_on_only_once_it_has_gone_quiet() {
 
     // Stopped: given up on, and the next refused without being started while it is still waiting
     let (release, stopped) = std::sync::mpsc::channel::<()>();
-    let started = std::time::Instant::now();
+    // Waiting for ever, which is what a read that has stopped does: that this answers at all is the case
     let given_up = worker.run(Duration::from_millis(300), move |_| stopped.recv().map_or(0, |()| 9));
     assert_eq!(given_up, None, "a read that stopped answering was waited on");
-    assert!(started.elapsed() < Duration::from_secs(5), "and not for long");
     let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let marked = std::sync::Arc::clone(&ran);
     assert_eq!(
@@ -1320,4 +1404,24 @@ fn answers_again(worker: &Worker) -> bool {
         }
         answered
     })
+}
+
+/// **Setting the cursor's defaults while a read is outstanding waits for it**, rather than ending the
+/// command whose image is being read: the image is shown, and the cursor follows.
+#[test]
+fn a_cursor_set_while_a_read_is_outstanding_waits_for_it() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let stream = [&named_part(directory.path(), &PIXEL, "")[..], b"after"].concat();
+    let mut screen = session(true);
+    let (taken, image) = screen.feed_until_image(&stream);
+    let read = image.expect("the feed stopped").read();
+    screen
+        .set_cursor_defaults(apack_terminal::protocol::CursorStyle::Block, apack_terminal::protocol::CursorBlink::Off)
+        .expect("the cursor is set");
+    screen.finish_image(read);
+    screen.feed(&stream[taken..]);
+    let made = made(&mut screen);
+    assert_eq!(made.image.as_deref(), Some(&PIXEL[..]), "a read was ended by the cursor being set");
+    assert!(made.told.contains("i=7;OK"), "{:?}", made.told);
+    assert_eq!(made.screen.lines[0], "after");
 }

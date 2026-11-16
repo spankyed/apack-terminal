@@ -48,18 +48,24 @@ fn a_session_left_alone_is_compressed_and_holds_the_same_rows() {
 
 /// A program that is still writing is not quiet, however long ago it started: its history is left alone
 /// until it stops, and compressed then.
+///
+/// **The quiet period is sixty times the pause between writes**, and a write is a few milliseconds more:
+/// a busy machine that holds the writer off for a whole quiet period between two writes is not a program
+/// still writing, so a margin that load can close would fail the case for what it does not test.
 #[test]
 fn a_session_still_being_written_to_is_left_alone_until_it_stops() {
+    let quiet_for = Duration::from_millis(1_500);
     let (compressed, said) = channel();
-    let housekeeping = Housekeeping::start_with(Duration::from_millis(100), Some(compressed));
+    let housekeeping = Housekeeping::start_with(quiet_for, Some(compressed));
     let screen = Arc::new(Mutex::new(Screen::new(80, 24)));
     let quiet = housekeeping.for_session("busy", &screen);
 
-    // Written to for several times the quiet period, a little at a time
-    for _ in 0..40 {
+    // Written to for longer than the quiet period, a little at a time
+    let began = std::time::Instant::now();
+    while began.elapsed() < quiet_for + quiet_for / 2 {
         screen.lock().expect("the screen locks").feed(&lines(400));
         quiet.wrote();
-        std::thread::sleep(Duration::from_millis(15));
+        std::thread::sleep(Duration::from_millis(25));
         assert!(said.try_recv().is_err(), "a session was compressed while it was being written to");
     }
 

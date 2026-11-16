@@ -1175,6 +1175,7 @@ impl Read for Reading {
 /// it cannot be a view that has stopped reading.
 struct Unread {
     stream: Arc<Stream>,
+    #[cfg_attr(not(unix), expect(dead_code, reason = "read by a case only POSIX runs"))]
     reader: BufReader<Reading>,
     first: Frame,
 }

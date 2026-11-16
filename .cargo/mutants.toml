@@ -108,9 +108,9 @@ exclude_re = [
     # **Windows reads no shared memory object**, as the core reads none there. A command naming one with
     # an id or a number is refused by the core before anything is read (`Load::asked`), so its
     # `shared_memory` is reached only by a transmission with neither — to which the core says nothing,
-    # having no number to say it with. Each bytes it could answer instead — none, a zero, a one — is no
-    # image either, and is answered with the same silence
-    "image_sources/windows.rs:.*replace shared_memory -> Result<Vec<u8>, super::Refused> with Ok",
+    # having no number to say it with. Each bytes it could answer instead — none, an empty piece, a one —
+    # is no image either, and is answered with the same silence
+    "image_sources/windows.rs:.*replace shared_memory -> Result<Vec<Vec<u8>>, super::Refused> with Ok",
     # **A file is opened with `O_NONBLOCK | O_NOCTTY`**, two distinct single bits, so `|` and `^` are the
     # same number and there is nothing to tell apart. Its sibling `| with &` asks for neither and is
     # caught, a FIFO then holding the open until something writes to it

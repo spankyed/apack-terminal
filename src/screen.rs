@@ -23,7 +23,7 @@ use crate::protocol::{CursorBlink, CursorStyle};
 use crate::recording::{self, Entry, Recorder, Timed};
 use crate::view::publish::{Outlet, Publication, ViewId};
 use crate::view::wire::{MAX_MESSAGE_BYTES, Position, Rows, Span};
-use crate::vt::image_sources::{Load, Loaded, QUIET, Quiet, Refused, Scanner, Worker, says_unreadable};
+use crate::vt::image_sources::{Body, Load, Loaded, QUIET, Quiet, Refused, Scanner, Worker, says_unreadable};
 use crate::vt::images::{ImageRead, PlacementRead};
 use crate::vt::input::{self, Encoders, Key, Pasted, Pointer};
 use crate::vt::reads;
@@ -241,6 +241,12 @@ pub struct Screen {
     recorder: Option<Recorder>,
     /// A keyframe is due and is waiting for the parser to be between sequences (`keyframe_when_due`).
     keyframe_waits: bool,
+    /// The cursor is to be taken to new defaults, and is waiting for the parser to be between sequences
+    /// (`set_cursor_defaults`).
+    cursor_waits: bool,
+    /// A keyframe was taken part way through a sequence, and what follows up to the sequence's end is the
+    /// rest of it, which is not recorded (`keyframe_when_due`).
+    unrecorded: bool,
     /// What the program last named its terminal, for a caller that was not there to be told.
     title: Option<String>,
     /// The session is over and its views have been told (`end_views`). The screen itself may be read a
@@ -442,6 +448,8 @@ impl Screen {
         let reported = Collector::new();
         let mut terminal = Terminal::new(cols, rows)?;
         terminal.set_cursor_defaults(CursorStyle::Bar, CursorBlink::Program)?;
+        // A new terminal is between sequences
+        terminal.reset_cursor();
         // Never less than what a client reading the screen as text is promised (`SCROLLBACK_ASKED`)
         terminal.set_scrollback_lines(history.max(SCROLLBACK_ASKED))?;
         terminal.set_scrollback_bytes(HISTORY_BYTES)?;
@@ -472,6 +480,8 @@ impl Screen {
             loads: 0,
             recorder: None,
             keyframe_waits: false,
+            cursor_waits: false,
+            unrecorded: false,
             title: None,
             ended: false,
         })
@@ -524,7 +534,9 @@ impl Screen {
             let piece = fed + hold_piece(&bytes[fed..]);
             while fed < piece {
                 let (taken, ground) = match &mut self.image_sources {
-                    None => self.terminal.feed_to(&bytes[fed..piece], self.keyframe_waits),
+                    None => self
+                        .terminal
+                        .feed_to(&bytes[fed..piece], self.keyframe_waits || self.cursor_waits || self.unrecorded),
                     // Never nothing: a body is read up to the byte that ends it, and then is not being read
                     // — unless it is a command naming its source, which is where the feed stops
                     Some(scanner) if scanner.reading() => {
@@ -538,8 +550,10 @@ impl Screen {
                         continue;
                     }
                     Some(scanner) => {
-                        let (taken, ground, string) =
-                            self.terminal.feed_to_string(&bytes[fed..piece], self.keyframe_waits);
+                        let (taken, ground, string) = self.terminal.feed_to_string(
+                            &bytes[fed..piece],
+                            self.keyframe_waits || self.cursor_waits || self.unrecorded,
+                        );
                         if string {
                             scanner.begin();
                         }
@@ -548,7 +562,18 @@ impl Screen {
                 };
                 fed += taken;
                 self.reported.get_mut().place_marks(&self.terminal);
-                if ground {
+                if ground && self.cursor_waits {
+                    self.cursor_waits = false;
+                    self.terminal.reset_cursor();
+                }
+                if ground && self.unrecorded {
+                    // The rest of the sequence a keyframe was taken in, which a replay from that keyframe is
+                    // not part way through: not recorded, and a whole keyframe taken where it has ended
+                    self.unrecorded = false;
+                    recorded = fed;
+                    self.keyframe_waits = false;
+                    self.take_keyframe();
+                } else if ground {
                     // What was parsed before the keyframe is recorded before it, and the rest after
                     self.record(|recorder| recorder.output(&bytes[recorded..fed]));
                     recorded = fed;
@@ -561,7 +586,9 @@ impl Screen {
         if let Some(publication) = &mut self.publication {
             publication.touch();
         }
-        self.record(|recorder| recorder.output(&bytes[recorded..fed]));
+        if !self.unrecorded {
+            self.record(|recorder| recorder.output(&bytes[recorded..fed]));
+        }
         self.keyframe_when_due();
         (fed, pending)
     }
@@ -608,9 +635,18 @@ impl Screen {
         }
         let Some((_, load, refusal)) = self.outstanding.take() else { return };
         match read.loaded.body() {
-            Some(body) => self.terminal.feed(&body),
-            None => self.refuse(&load, refusal, read.loaded.refused().unwrap_or(Refused::InvalidData)),
+            Ok(body) => self.feed_body(body),
+            Err(why) => self.refuse(&load, refusal, why),
         }
+    }
+
+    /// Feeds the core what was read, a piece at a time, a query's one command let be as long as it is.
+    fn feed_body(&mut self, body: Body) {
+        let _ = self.terminal.kitty_command_bytes(body.query_bytes());
+        for piece in body {
+            self.terminal.feed(&piece);
+        }
+        let _ = self.terminal.kitty_command_bytes(None);
     }
 
     /// Answers a command still waiting for its source with a refusal, before anything else reaches the
@@ -642,9 +678,9 @@ impl Screen {
     /// Feeds the core a command with its file and shared memory sources allowed, for the one it refuses
     /// to open (`Load::asked`, `Load::refusal`), and turns them off again.
     fn by_core(&mut self, command: &[u8]) {
-        let _ = self.terminal.allow_images(true);
+        let _ = self.terminal.read_named_images(true);
         self.terminal.feed(command);
-        let _ = self.terminal.allow_images(false);
+        let _ = self.terminal.read_named_images(false);
     }
 
     /// Acts on each hold the program began or ended since this was last called.
@@ -744,6 +780,7 @@ impl Screen {
     pub fn stop_recording(&mut self) {
         self.recorder = None;
         self.keyframe_waits = false;
+        self.unrecorded = false;
     }
 
     /// Waits until the recording's file holds everything recorded so far, for whoever is about to read it.
@@ -809,19 +846,31 @@ impl Screen {
     /// **And it waits for the parser to be between sequences.** A keyframe is the screen as it stands,
     /// and says nothing of a sequence the parser is part way through: a replay that began at one taken
     /// there would redraw the screen and then be fed the rest of that sequence as if it were text. So a
-    /// keyframe that falls due mid-sequence is taken at the byte that ends the sequence (`feed`). A
-    /// sequence that never ends would put it off for ever and the recording would grow without bound, so
-    /// at twice its budget the keyframe is taken regardless.
+    /// keyframe that falls due mid-sequence is taken at the byte that ends the sequence (`feed`).
+    ///
+    /// **A sequence that never ends would put it off for ever**, and the recording would grow without
+    /// bound, so at twice its budget the keyframe is taken regardless — and the rest of that sequence is
+    /// not recorded: a replay from the keyframe is not part way through it, and would print it. A whole
+    /// keyframe is taken where the sequence ends, after which what the program writes is recorded again.
+    /// A replay from before that comes to the keyframe part way through the sequence, and starts again
+    /// from it (`rebuild`).
     fn keyframe_when_due(&mut self) {
         let Some(recorder) = &self.recorder else { return };
         let primary = !self.terminal.alt_screen().unwrap_or(false);
         if !(recorder.keyframe_due() && (primary || recorder.over_budget())) {
             return;
         }
-        if !recorder.far_over_budget() && !self.terminal.at_ground() {
+        let between = self.terminal.at_ground();
+        if !recorder.far_over_budget() && !between {
             self.keyframe_waits = true;
             return;
         }
+        self.take_keyframe();
+        self.unrecorded = !between;
+    }
+
+    /// Records the screen as it stands, as the sequences that redraw it.
+    fn take_keyframe(&mut self) {
         let (cols, rows) = (self.cols, self.rows);
         let redraw = self.redraw();
         self.record(|recorder| {
@@ -903,6 +952,13 @@ impl Screen {
             self.reported.get_mut().set_clock(Some(at));
             match &timed.entry {
                 Entry::Keyframe { cols, rows, redraw } if index == 0 => {
+                    self.resize(*cols, *rows, 0, 0);
+                    self.feed(redraw);
+                }
+                // Come to part way through a sequence: one the recording took part way through it, whose
+                // rest it did not record, so the replay starts again from it
+                Entry::Keyframe { cols, rows, redraw } if !self.terminal.at_ground() => {
+                    self.feed(b"\x18\x1bc\x1b[3J");
                     self.resize(*cols, *rows, 0, 0);
                     self.feed(redraw);
                 }
@@ -1073,11 +1129,20 @@ impl Screen {
         input::paste(&self.terminal, text, allow_unsafe)
     }
 
-    /// Sets the cursor a session starts with and returns to, and takes the cursor to it now; see
+    /// Sets the cursor a session starts with and returns to, and takes the cursor to it; see
     /// `Terminal::set_cursor_defaults`. The cursor a view is sent is the one that stands after it.
+    ///
+    /// **Taken there where the parser is between sequences**: now, if it is, and otherwise at the byte that
+    /// ends the sequence the program is part way through (`feed_until_image`). Taking the cursor is a write
+    /// to the parser, and made in the middle of a program's sequence it would end that sequence early, the
+    /// rest of which would then be read as text; it would end a command whose image is being read too.
     pub fn set_cursor_defaults(&mut self, style: CursorStyle, blink: CursorBlink) -> Result<(), Failed> {
-        self.settle_outstanding();
         self.terminal.set_cursor_defaults(style, blink)?;
+        if self.outstanding.is_none() && self.terminal.at_ground() {
+            self.terminal.reset_cursor();
+        } else {
+            self.cursor_waits = true;
+        }
         if let Some(publication) = &mut self.publication {
             publication.touch();
         }

@@ -588,12 +588,12 @@ impl Terminal {
         Ok(())
     }
 
-    /// Sets the cursor a program gets when it asks for the default one (`CSI 0 q`), and takes the cursor to
-    /// it now. A session starts with a blinking bar, which is `set_cursor_defaults(Bar, Program)`.
+    /// Sets the cursor a program gets when it asks for the default one (`CSI 0 q`). A session starts with a
+    /// blinking bar, which is `set_cursor_defaults(Bar, Program)`.
     ///
     /// **The option is what a reset returns to, and only a reset reads it**, so the cursor is taken there by
-    /// feeding the reset as well. The reset goes through the parser like any output, so it lands wherever the
-    /// parser is: a program part way through an escape sequence when this is called is not protected from it.
+    /// `reset_cursor`, which is a separate call because it is a write: it goes through the parser like any
+    /// output, so it belongs where the parser is between sequences (`Screen::set_cursor_defaults`).
     pub fn set_cursor_defaults(&mut self, style: CursorStyle, blink: CursorBlink) -> Result<(), Failed> {
         let style: sys::CursorStyle::Type = match style {
             CursorStyle::Block => sys::CursorStyle::BLOCK,
@@ -620,8 +620,13 @@ impl Terminal {
                 ),
             )?;
         }
-        self.feed(b"\x1b[0 q");
         Ok(())
+    }
+
+    /// Takes the cursor to the defaults (`set_cursor_defaults`), as a program asking for them does. Fed to the
+    /// parser, so it is fed only where the parser is between sequences.
+    pub fn reset_cursor(&mut self) {
+        self.feed(b"\x1b[0 q");
     }
 
     /// Turns the Kitty graphics protocol off, so a program asking whether it may send images is not told

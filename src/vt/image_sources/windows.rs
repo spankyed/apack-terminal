@@ -72,6 +72,6 @@ const _: () = assert!(VOLUME_NAME_DOS == 0);
 pub fn shared_memory(
     _name: &[u8],
     _range: impl FnOnce(u64) -> Result<std::ops::Range<u64>, super::Refused>,
-) -> Result<Vec<u8>, super::Refused> {
+) -> Result<Vec<Vec<u8>>, super::Refused> {
     Err(super::Refused::InvalidData)
 }
