@@ -1128,41 +1128,74 @@ fn recorder_resume(path: &Path) -> std::io::Result<()> {
 /// any keyframe — before that one, at it, or after — holds what the live screen holds.
 #[test]
 fn a_keyframe_taken_part_way_through_a_sequence_leaves_no_replay_printing_the_rest_of_it() {
+    for images in [false, true] {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join(format!("images-{images}.recording"));
+        let mut live = Screen::new(40, 10);
+        if images {
+            live.allow_images(true).expect("images are allowed");
+        }
+        // A budget room for two keyframes, which are some five kilobytes here for the history they carry
+        live.start_recording_with(Recorder::start_with(&path, 20_000, 1_000).expect("the recording starts"))
+            .expect("the first keyframe is written");
+        live.feed(b"before\r\n");
+        // A title far longer than twice the budget, in pieces, as a program writes one
+        live.feed(b"\x1b]0;");
+        for _ in 0..100 {
+            live.feed(&[b'x'; 500]);
+        }
+        // The last of the title, its end and what follows, in one piece
+        live.feed(b"xxxx\x07after\r\n");
+        live.feed(b"end\r\n");
+
+        let entries = recorded(&mut live, &path);
+        let outputs: Vec<&Vec<u8>> = entries
+            .iter()
+            .filter_map(|timed| if let Entry::Output(bytes) = &timed.entry { Some(bytes) } else { None })
+            .collect();
+        assert!(
+            !outputs.iter().any(|bytes| bytes.windows(2).any(|pair| pair == b"x\x07")),
+            "the end of the sequence a keyframe was taken in was recorded, images {images}"
+        );
+        let keyframes: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, timed)| matches!(timed.entry, Entry::Keyframe { .. }).then_some(index))
+            .collect();
+        assert!(keyframes.len() >= 2, "{} keyframes", keyframes.len());
+        for from in keyframes {
+            let mut replayed = Screen::new(40, 10);
+            assert!(replayed.replay_all(&entries[from..]));
+            assert_eq!(
+                held(&replayed, 10),
+                held(&live, 10),
+                "a replay from the keyframe at entry {from}, images {images}"
+            );
+        }
+    }
+}
+
+/// **What a program writes after a keyframe taken between its sequences is recorded as it was written**:
+/// only a keyframe taken part way through a sequence leaves the rest of that sequence unrecorded, and
+/// the next thing written after an ordinary one is output, not another keyframe.
+#[test]
+fn output_after_a_keyframe_taken_between_sequences_is_recorded_as_output() {
     let directory = tempfile::tempdir().expect("a directory");
     let path = directory.path().join("one.recording");
     let mut live = Screen::new(40, 10);
-    // A budget room for two keyframes, which are some five kilobytes here for the history they carry
-    live.start_recording_with(Recorder::start_with(&path, 20_000, 1_000).expect("the recording starts"))
+    live.start_recording_with(Recorder::start_with(&path, 1 << 20, 1_000).expect("the recording starts"))
         .expect("the first keyframe is written");
-    live.feed(b"before\r\n");
-    // A title far longer than twice the budget, in pieces, as a program writes one
-    live.feed(b"\x1b]0;");
-    for _ in 0..100 {
-        live.feed(&[b'x'; 500]);
-    }
-    live.feed(b"\x07after\r\n");
-    live.feed(b"end\r\n");
-
+    // Past the keyframe distance, ending between sequences, where a keyframe is then taken
+    live.feed(&[b'a'; 2_000]);
+    live.feed(b"hello");
     let entries = recorded(&mut live, &path);
-    let outputs: Vec<&Vec<u8>> = entries
-        .iter()
-        .filter_map(|timed| if let Entry::Output(bytes) = &timed.entry { Some(bytes) } else { None })
-        .collect();
+    let keyframes = entries.iter().filter(|timed| matches!(timed.entry, Entry::Keyframe { .. })).count();
+    assert_eq!(keyframes, 2, "the first keyframe and the one taken after the distance");
     assert!(
-        !outputs.iter().any(|bytes| bytes.windows(2).any(|pair| pair == b"x\x07")),
-        "the end of the sequence a keyframe was taken in was recorded"
+        matches!(&entries.last().expect("entries").entry, Entry::Output(bytes) if bytes == b"hello"),
+        "what was written after the keyframe was not recorded as output: {:?}",
+        entries.last().map(|timed| &timed.entry)
     );
-    let keyframes: Vec<usize> = entries
-        .iter()
-        .enumerate()
-        .filter_map(|(index, timed)| matches!(timed.entry, Entry::Keyframe { .. }).then_some(index))
-        .collect();
-    assert!(keyframes.len() >= 2, "{} keyframes", keyframes.len());
-    for from in keyframes {
-        let mut replayed = Screen::new(40, 10);
-        assert!(replayed.replay_all(&entries[from..]));
-        assert_eq!(held(&replayed, 10), held(&live, 10), "a replay from the keyframe at entry {from}");
-    }
 }
 
 /// **A replay that comes to a keyframe part way through a sequence starts again from it**: the keyframe was
