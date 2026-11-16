@@ -3,7 +3,6 @@
 pub mod generate;
 pub mod leftovers;
 pub mod mutants;
-pub mod package;
 pub mod pre_push;
 pub mod safety;
 pub mod vt_prebuilt;

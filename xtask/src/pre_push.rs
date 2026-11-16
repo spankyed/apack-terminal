@@ -54,6 +54,8 @@ const THEN: &[Step] = &[
     step("view: types", &["npm", "--prefix", "view", "run", "typecheck"]),
     step("view: tests", &["npm", "--prefix", "view", "test"]),
     step("view: build", &["npm", "--prefix", "view", "run", "build"]),
+    // The release build, which is what `binaries.yml` publishes and the app runs. Last because it is the longest
+    step("release build", &["cargo", "build", "--release", "--locked", "--bin", "apack-terminal"]),
 ];
 
 /// A repository check this task runs in-process, by the name it prints
@@ -190,11 +192,6 @@ pub fn pre_push(root: &Path, args: &[String], checks: &[Check<'_>]) -> Result<()
     for step in THEN {
         run(root, step)?;
     }
-    // The release build and the stage, which is how the broker reaches a packaged app. Last of the checks
-    // because it is the longest, and before the mutants because a mutants run that cannot build is a
-    // failure about the build
-    println!("pre-push: npm package");
-    crate::package::package(root)?;
     mutants_of_the_change(root, &base)?;
     println!("pre-push: everything passed in {:.0?}", started.elapsed());
     Ok(())

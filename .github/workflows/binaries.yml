@@ -1,0 +1,107 @@
+name: binaries
+
+# **The broker as the app consumes it: built once per commit, published, and pinned by hash.** The app runs the
+# release build of a commit it pins, on each platform it ships for, and downloads it rather than building it —
+# so what a developer's app runs and what CI tested are the same bytes, and nobody working on the app needs a
+# Rust toolchain. Each `master` commit gets a release, `bin-<commit>`, holding every platform's files and a
+# `SHA256SUMS`; the app's `npm run pin:apack-terminal -- <commit>` copies those sums into its pin, and its
+# install verifies every file against them.
+#
+# **An asset is `<platform>__<file>`**: `<platform>` is Node's `<process.platform>-<process.arch>`, which is how
+# the app names the one it is on, and `<file>` is the name the file takes beside the others — the binary, and on
+# Windows the ConPTY it loads from its own directory (`windows/conpty/`). A release has no folders, so the
+# platform is in the name.
+#
+# A dispatch builds a commit that has none, such as one from before this workflow.
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: The commit to build and publish binaries for
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: binaries-${{ inputs.commit || github.sha }}
+  cancel-in-progress: false
+
+env:
+  COMMIT: ${{ inputs.commit || github.sha }}
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: darwin-arm64, runner: macos-15, binary: apack-terminal }
+          - { platform: linux-x64, runner: ubuntu-24.04, binary: apack-terminal }
+          - { platform: win32-x64, runner: windows-latest, binary: apack-terminal.exe }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.COMMIT }}
+      - run: rustup show active-toolchain
+      # As `ci.yml`'s tests job: Windows builds the terminal core from source with the Zig its commit wants, for
+      # speed; the other platforms link the prebuilt library
+      - if: runner.os == 'Windows'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - if: runner.os == 'Windows'
+        shell: bash
+        run: echo "GHOSTTY_VT_RS_SYS_OPTIMIZE=fast" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - run: cargo build --release --locked --bin apack-terminal
+      # The binary, and whatever `build.rs` put beside it that the npm package ships with it (the ConPTY on
+      # Windows): what `cargo xtask package` stages, renamed for a release that has no folders
+      - name: Collect this platform's files
+        shell: bash
+        run: |
+          mkdir -p out
+          for file in ${{ matrix.binary }} conpty.dll OpenConsole.exe; do
+            if [ -f "target/release/$file" ]; then cp "target/release/$file" "out/${{ matrix.platform }}__$file"; fi
+          done
+          ls -l out
+          test -f "out/${{ matrix.platform }}__${{ matrix.binary }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.platform }}
+          path: out/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          merge-multiple: true
+          path: out
+      - name: Sums
+        working-directory: out
+        run: sha256sum -- * | tee SHA256SUMS
+      # **A release per commit, written once.** One that is already there keeps its files: the pin of every app
+      # that copied its sums is to those bytes, and replacing them would break each of those installs
+      - name: Publish bin-${{ env.COMMIT }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="bin-$COMMIT"
+          if gh release view "$tag" > /dev/null 2>&1; then
+            echo "$tag is already published; leaving its files as they are"
+            exit 0
+          fi
+          gh release create "$tag" out/* --target "$COMMIT" --title "binaries for ${COMMIT:0:7}" \
+            --latest=false --notes "The broker's release build of $COMMIT for each platform the app ships, with SHA256SUMS. Pinned by apack, never replaced."
