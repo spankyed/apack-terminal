@@ -89,18 +89,16 @@ Consumed by pinning a commit: apack keeps a gitignored `vendor/apack-terminal` s
 `vendor/apack-terminal.rev`, and derives one Rust toolchain across every checkout linked that way. One pin
 holds the broker and the view, which is why they are one repository.
 
-**The binary reaches a consumer as an npm package.** `node/` is that package, and its one job is answering
-where the binary is — the name differs by platform, and a consumer that derived the path itself was wrong
-about `apack-terminal.exe` and started no terminal on Windows. `cargo xtask package` stages a release build
-into it, beside the generated protocol types, and on Windows the ConPTY the binary runs its sessions on
-(`windows/conpty/`); apack installs it as `file:…/vendor/apack-terminal/node`, so
-its packaged app collects the binary with every other dependency rather than needing a rule of its own, and
-imports the protocol's types from the package rather than keeping a copy of them.
+**The binary reaches a consumer as a release build, pinned by hash.** Every `master` commit is built for
+each platform the app ships and published as the release `bin-<commit>` (`.github/workflows/binaries.yml`):
+each file named `<platform>__<file>` — Node's `<platform>-<arch>`, and on Windows the ConPTY the binary runs
+its sessions on beside it (`windows/conpty/`) — with a `SHA256SUMS`. apack pins a commit with those sums and
+its install downloads and verifies the files for the platform it is on, so the app runs exactly what this
+repository's CI built, and nothing working on the app needs a Rust toolchain.
 
-```js
-const { brokerBinary } = require('apack-terminal');
-brokerBinary(); // the path, or undefined when this checkout has not staged one
-```
+`node/` is the npm package of what a consumer compiles against: the protocol's generated types and the view's
+vectors. apack installs it as `file:…/vendor/apack-terminal/node` and imports the protocol's types from it
+rather than keeping a copy of them.
 
 **The view reaches a consumer the same way**, as `file:…/vendor/apack-terminal/view`. What it ships is its
 compiled `dist/`, which is not tracked, so whatever links or clones the checkout builds it
@@ -133,7 +131,6 @@ cargo nextest run --workspace                # every suite, each test in its own
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 cargo xtask generate                         # regenerate the protocol's TypeScript; commit it if it moved
-cargo xtask package                          # release build, staged into the npm package in node/
 cargo run -- ~/.apack-terminal/broker.sock   # run one, and talk to it
 npm --prefix view test                       # the view's suite (also: run typecheck, run build)
 ```

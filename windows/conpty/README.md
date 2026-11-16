@@ -14,8 +14,8 @@ this one carried each.
 
 **How it is found.** `portable-pty` loads a `conpty.dll` that sits beside the executable in preference to the
 system's, and that `conpty.dll` starts the `OpenConsole.exe` beside it. So the two files go wherever the broker
-binary goes: `build.rs` puts them beside the one `cargo` builds, and `cargo xtask package` beside the one the npm
-package ships. Each directory here is one architecture's; the build takes the target's.
+binary goes: `build.rs` puts them beside the one `cargo` builds, and `binaries.yml` publishes them beside the
+Windows binary it releases. Each directory here is one architecture's; the build takes the target's.
 
 | File | SHA-256 |
 |---|---|

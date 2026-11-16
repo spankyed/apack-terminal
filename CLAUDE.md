@@ -23,7 +23,8 @@ holds.
 | `src/lib.rs` | so the parser can be tested as a parser |
 | `node/protocol.ts`, `node/view-vectors.json` | **generated** from `src/protocol.rs` and `src/view/wire.rs`; never edited by hand, and shipped by the package |
 | `xtask/` | the repository's own tasks (`cargo xtask <task>`): the protocol's derivation, the mutation gate's own checks, and pre-push |
-| `node/` | the npm package a consumer installs: the protocol's types, where the binary is, and the binary `cargo xtask package` stages into it |
+| `node/` | the npm package a consumer compiles against: the protocol's types and the view's vectors, both generated |
+| `.github/workflows/binaries.yml` | the broker as a consumer runs it: each `master` commit's release build for each platform, published as `bin-<commit>` with its sums |
 | `windows/conpty/`, `build.rs` | Microsoft's ConPTY, which the broker runs its sessions on in Windows in place of the system's (its README says why and where it is from), and the build script that puts it beside every binary `cargo` builds |
 | `view/` | the `apack-terminal-view` npm package: what a window draws a session with, from the rows `src/view/` sends. TypeScript on npm, vite and vitest (`npm test`, `npm run typecheck`, `npm run build` there); its codec (`view/src/broker/wire.ts`) is the other half of `src/view/wire.rs`, and its suite reads `node/view-vectors.json` in place, so a change to the wire is one commit holding both halves |
 
@@ -63,7 +64,6 @@ cargo xtask generate                         # re-derive node/protocol.ts from s
 cargo xtask check-generated                  # fails when that file has fallen behind
 cargo xtask check-exclusions                 # fails when a mutants exclusion excludes nothing
 cargo xtask clear-mutants                    # removes the working copies a mutants run that was ended left behind
-cargo xtask package                          # release build, staged into the npm package in node/
 npm --prefix view test                       # the view's suite (also: run typecheck, run build)
 ```
 
@@ -81,13 +81,11 @@ npm --prefix view test                       # the view's suite (also: run typec
   before the change, and it catches that by the numbers disagreeing — which works at 1 and does not need 1
   to become 2. **It moves when a consumer exists that cannot move with it**: a published package, or a
   release in someone else's hands. That is the condition, and it is a fact to check rather than assume.
-- **The broker reaches a consumer as an npm package**, `node/`, whose one job is answering where the binary
-  is: the name differs by platform and a consumer that derived the path itself was wrong about the
-  extension on Windows, so the terminal never started there. `cargo xtask package` stages a release build
-  into it, beside the protocol's types; the binary is gitignored, as elmdb gitignores the `*.node` its own
-  package ships. A development
-  checkout does not use it — the consumer prefers the debug build in `target/`, which is what a
-  contributor editing the broker has.
+- **The broker reaches a consumer as a release build, pinned by hash.** `binaries.yml` builds every
+  `master` commit for each platform the app ships and publishes the files, with their `SHA256SUMS`, as the
+  release `bin-<commit>`; apack pins a commit and those sums, and its install downloads and verifies them. So
+  what an app runs is what this repository's CI built, and nobody working on the app builds Rust. `node/` is
+  the npm package of the protocol's types and the view's vectors, which a consumer compiles against.
 - **Each test runs in its own process**, so a regression that loses a signal is killed at its deadline
   instead of hanging the run (`.config/nextest.toml`). A deadline there is several times the slowest
   reading, never near it: it is for a test that has stopped ending at all.
