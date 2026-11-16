@@ -279,3 +279,19 @@ pub fn hang_up(stream: &Stream) -> bool {
         Stream::NamedPipe(pipe) => pipe::hang_up(pipe),
     }
 }
+
+/// Lets a connection go whose far end has been written everything it is owed: whatever is parked on it ends,
+/// and **what was written stays for the far end to read**.
+///
+/// A socket's shutdown leaves what was sent readable, so on POSIX this is `hang_up`. A named pipe's disconnect
+/// throws away what the far end has not read yet, so on Windows only the pending I/O is cancelled and the pipe
+/// ends with its handle. A far end that will not read is hung up on (`hang_up`); one that has finished
+/// speaking is let go.
+pub fn let_go(stream: &Stream) -> bool {
+    match stream {
+        #[cfg(unix)]
+        Stream::UdSocket(_) => hang_up(stream),
+        #[cfg(windows)]
+        Stream::NamedPipe(pipe) => pipe::let_go(pipe),
+    }
+}

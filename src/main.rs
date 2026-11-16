@@ -23,7 +23,7 @@ use interprocess::local_socket::{GenericFilePath, Stream, ToFsName, prelude::*};
 
 use apack_terminal::feed::{FEED_BYTES_ENV, Feed, feed_bytes};
 use apack_terminal::frames::{Frame, read_frame};
-use apack_terminal::listening::{self, HELD_EXIT, Refused, START_GRACE_ENV, hang_up};
+use apack_terminal::listening::{self, HELD_EXIT, Refused, START_GRACE_ENV, hang_up, let_go};
 use apack_terminal::output::{Outgoing, channel_with_credit};
 use apack_terminal::protocol::{
     BROKER_KEY_ENV, CommandRecord, ErrorCode, Event, PROTOCOL_VERSION, Request, Role, SearchMatch, proof_of,
@@ -400,11 +400,12 @@ impl Drop for Leaving {
                 detach(&self.broker, &self.wire);
                 // Its writer has nothing more to write and ends. One held in a write by a client that
                 // stopped reading is let go by the connection closing, which is what this connection
-                // ending is
+                // ending is. **Let go, not hung up on**: what it was answered is written and still unread,
+                // and a named pipe's disconnect would throw that away
                 if let Some(feed) = &self.feed {
                     feed.close();
                 }
-                hang_up(&self.wire.stream);
+                let_go(&self.wire.stream);
                 // The recordings it opened to look back through were its alone to name
                 self.broker.sessions.end_rewound_by(self.connection);
                 let left = self.broker.clients.fetch_sub(1, Ordering::SeqCst) - 1;

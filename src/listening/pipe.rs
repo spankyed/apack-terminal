@@ -30,6 +30,17 @@ pub fn hang_up(pipe: &impl AsHandle) -> bool {
     }
 }
 
+/// Lets a pipe go once everything has been written to it: cancels its pending reads and writes, and answers
+/// whether one was cancelled. **It does not disconnect**, because a disconnect throws away whatever the far end
+/// has not read yet, answers included. The pipe ends for the far end when its handle closes, after it has read
+/// what was written.
+pub fn let_go(pipe: &impl AsHandle) -> bool {
+    let handle = pipe.as_handle().as_raw_handle() as HANDLE;
+    // SAFETY: `handle` is the pipe's own handle, which lives for the length of this borrow, and a null
+    // overlapped pointer cancels every pending operation on it
+    unsafe { CancelIoEx(handle, std::ptr::null()) != 0 }
+}
+
 /// Where a user's broker is when nobody says where: a pipe named for the user, by their SID.
 ///
 /// **A pipe's name is one namespace for the whole machine**, so it is the SID that keeps two users' brokers apart,
@@ -91,16 +102,66 @@ fn owned_by(pipe: &impl AsHandle, sid: &widestring::U16CStr) -> std::io::Result<
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::sync::Arc;
     use std::sync::mpsc::channel;
     use std::time::Duration;
 
     use interprocess::local_socket::{GenericFilePath, ListenerOptions, Stream, ToFsName, prelude::*};
 
-    use crate::listening::hang_up;
+    use crate::listening::{hang_up, let_go};
 
     use super::{owned_by, owned_by_this_user};
+
+    /// Letting a connection go ends a read parked on it, says that it did, and **leaves what was written for the
+    /// far end to read**: a disconnect would have thrown it away, which is the difference from hanging up.
+    ///
+    /// Let go until the read ends, since one made before the read is parked cancels nothing and says so.
+    #[test]
+    fn letting_go_ends_a_parked_read_and_leaves_what_was_written_to_be_read() {
+        let name = format!(r"\\.\pipe\apack-let-go-test-{}", std::process::id());
+        let listener = ListenerOptions::new()
+            .name(name.clone().to_fs_name::<GenericFilePath>().expect("a pipe name"))
+            .create_sync()
+            .expect("the pipe is created");
+        let connecting = std::thread::spawn({
+            let name = name.clone();
+            move || {
+                Stream::connect(name.to_fs_name::<GenericFilePath>().expect("a pipe name")).expect("the pipe accepts")
+            }
+        });
+        let server = Arc::new(listener.accept().expect("a connection is accepted"));
+        let client = connecting.join().expect("the client connects");
+        (&*server).write_all(b"answered\n").expect("the answer is written");
+
+        let (outcome_tx, outcome_rx) = channel();
+        std::thread::spawn({
+            let server = Arc::clone(&server);
+            move || {
+                let mut buffer = [0u8; 16];
+                let mut reader: &Stream = &server;
+                let _ = outcome_tx.send(reader.read(&mut buffer).map_err(|error| error.raw_os_error()));
+            }
+        });
+        let mut cancelled = false;
+        let started = std::time::Instant::now();
+        let outcome = loop {
+            assert!(started.elapsed() < Duration::from_secs(10), "the read stayed parked after being let go");
+            cancelled |= let_go(&server);
+            match outcome_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(outcome) => break outcome,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(gone) => panic!("the reading thread ended without saying how: {gone}"),
+            }
+        };
+        assert!(cancelled, "letting go reported that it cancelled nothing");
+        assert_eq!(outcome, Err(Some(995)), "the read did not end as a cancelled one");
+
+        drop(server);
+        let mut read = String::new();
+        let _ = (&client).read_to_string(&mut read);
+        assert_eq!(read, "answered\n", "what was written before letting go was not there to read");
+    }
 
     /// Hanging up a connection ends a read that is parked on it, and says that it did.
     ///
