@@ -25,33 +25,53 @@ function blend(color: number, target: number, amount: number): number {
   return (mix(16) << 16) | (mix(8) << 8) | mix(0)
 }
 
-const cache = new Map<string, number>()
-/** A bound on the cache: a program that paints many colours cannot grow it without limit */
+/** The results for one minimum, keyed by the colour pair; a session holds one minimum at a time, so a few are plenty */
+const caches = new Map<number, Map<number, number>>()
+/** A bound on each cache: a program that paints many colours cannot grow it without limit */
 const CACHE_LIMIT = 4096
+const MINIMUMS_KEPT = 8
+
+function cacheFor(minimum: number): Map<number, number> {
+  let cache = caches.get(minimum)
+  if (!cache) {
+    if (caches.size >= MINIMUMS_KEPT) caches.clear()
+    cache = new Map()
+    caches.set(minimum, cache)
+  }
+  return cache
+}
 
 /**
  * The colour nearest `foreground` that is at least `minimum` away from `background`, moving it toward black or white,
  * whichever gives more contrast. A foreground that is already far enough is returned as it is. When even black or white
  * is not far enough, the one nearer to the minimum is.
+ *
+ * **Pass and fail are both cached.** A character that is already far enough is the common case, and deciding it costs
+ * a luminance pair on every paint of every glyph, so the answer is kept as well as the adjusted colour.
  */
 export function ensureContrast(foreground: number, background: number, minimum: number): number {
-  if (minimum <= 1 || contrastRatio(foreground, background) >= minimum) return foreground
-  const key = `${foreground}:${background}:${minimum}`
+  if (minimum <= 1) return foreground
+  const cache = cacheFor(minimum)
+  // Both colours are 24 bits, so the pair is an exact number
+  const key = foreground * 0x1000000 + background
   const known = cache.get(key)
   if (known !== undefined) return known
 
-  const target = contrastRatio(0xffffff, background) >= contrastRatio(0x000000, background) ? 0xffffff : 0x000000
-  let result = target
-  if (contrastRatio(target, background) >= minimum) {
-    // The smallest step toward the target that is far enough: contrast grows with the step, so a search finds it
-    let near = 0
-    let far = 1
-    for (let step = 0; step < 16; step += 1) {
-      const middle = (near + far) / 2
-      if (contrastRatio(blend(foreground, target, middle), background) >= minimum) far = middle
-      else near = middle
+  let result = foreground
+  if (contrastRatio(foreground, background) < minimum) {
+    const target = contrastRatio(0xffffff, background) >= contrastRatio(0x000000, background) ? 0xffffff : 0x000000
+    result = target
+    if (contrastRatio(target, background) >= minimum) {
+      // The smallest step toward the target that is far enough: contrast grows with the step, so a search finds it
+      let near = 0
+      let far = 1
+      for (let step = 0; step < 16; step += 1) {
+        const middle = (near + far) / 2
+        if (contrastRatio(blend(foreground, target, middle), background) >= minimum) far = middle
+        else near = middle
+      }
+      result = blend(foreground, target, far)
     }
-    result = blend(foreground, target, far)
   }
 
   if (cache.size >= CACHE_LIMIT) cache.clear()
