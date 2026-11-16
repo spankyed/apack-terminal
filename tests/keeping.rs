@@ -646,10 +646,15 @@ fn a_session_begins_with_the_screen_its_recording_holds() {
         first: frame.first_active - u64::from(frame.scrollback),
         count: frame.scrollback,
     });
+    // **Whatever arrives before the rows is taken as a view takes it.** The new shell's prompt comes when it
+    // comes, and a frame is acknowledged or the view is sent no more: one dropped here left the rest of this
+    // case waiting for output that was never sent to it
     let fetched = loop {
-        let message = view.incoming.recv_timeout(PATIENCE).expect("the broker sends");
-        if let ToView::Rows { block, .. } = message {
-            break block.rows.iter().map(text).collect::<Vec<_>>().join("\n");
+        match view.incoming.recv_timeout(PATIENCE) {
+            Ok(ToView::Rows { block, .. }) => break block.rows.iter().map(text).collect::<Vec<_>>().join("\n"),
+            Ok(ToView::Failed { request: 1, message, .. }) => panic!("the history was refused: {message}"),
+            Ok(message) => view.take(message),
+            Err(why) => panic!("never sent the history asked for ({why}); the screen:\n{}", view.screen()),
         }
     };
     assert!(fetched.contains("row-1-of-the-first"), "{fetched}");
