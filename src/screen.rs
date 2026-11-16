@@ -384,6 +384,17 @@ fn hold_piece(bytes: &[u8]) -> usize {
         .map_or(bytes.len(), |at| at + 5)
 }
 
+/// What a view's search found (`Screen::find`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoundAt {
+    /// The numbering the spans' lines are in.
+    pub epoch: u32,
+    /// Each match, newest first.
+    pub spans: Vec<Span>,
+    /// Whether there are, or may be, matches older than these.
+    pub more: bool,
+}
+
 /// A command the shell reported, with the line each of its moments is on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandAt {
@@ -1337,11 +1348,13 @@ impl Screen {
             .map_err(|bytes| Unanswered::TooLong { bytes })
     }
 
-    /// Every place `needle` appears, newest first, with the epoch the line numbers are in.
-    pub fn find(&mut self, needle: &str, case_sensitive: bool) -> Result<(u32, Vec<Span>), Unanswered> {
+    /// The newest places `needle` appears, newest first, in line numbers, and whether there are or may be
+    /// older ones (`Terminal::find`).
+    pub fn find(&mut self, needle: &str, case_sensitive: bool) -> Result<FoundAt, Unanswered> {
         let found = self.terminal.find(needle, case_sensitive)?;
         let publication = self.positioned()?;
-        Ok((publication.epoch(), found.into_iter().map(|cells| Self::span_of(publication, cells)).collect()))
+        let spans = found.matches.into_iter().map(|cells| Self::span_of(publication, cells)).collect();
+        Ok(FoundAt { epoch: publication.epoch(), spans, more: found.more })
     }
 
     /// What this session's screens and history hold in memory now.

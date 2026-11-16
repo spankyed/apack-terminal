@@ -136,6 +136,26 @@ describe('a question a view asks', () => {
     expect(await fetched).toEqual({ epoch: 6, first: 40, count: 2, rows: [row(40, 'forty')] })
   })
 
+  it('answers a search with what was found and whether there may be more than that', async () => {
+    const { broker, source } = attached()
+    broker.say({ kind: 'frame', channel: 1, frame: frame({ epoch: 6 }) })
+    broker.taken()
+
+    const stopped = source.search('needle', true)
+    const all = source.search('needle', false)
+    expect(broker.taken()).toEqual([
+      { kind: 'search', channel: 1, request: 1, needle: 'needle', caseSensitive: true },
+      { kind: 'search', channel: 1, request: 2, needle: 'needle', caseSensitive: false },
+    ])
+    const spans = [{ start: { line: 1, column: 0 }, end: { line: 1, column: 5 } }]
+    broker.say(
+      { kind: 'spans', channel: 1, request: 1, epoch: 6, more: true, spans: [] },
+      { kind: 'spans', channel: 1, request: 2, epoch: 6, more: false, spans },
+    )
+    expect(await stopped, 'nothing found is not nothing there, when the search stopped short').toEqual({ spans: [], more: true })
+    expect(await all).toEqual({ spans, more: false })
+  })
+
   it('has no answer when the screen was reflowed while it was on its way', async () => {
     const { broker, source } = attached()
     broker.say({ kind: 'frame', channel: 1, frame: frame({ epoch: 6 }) })
@@ -145,10 +165,10 @@ describe('a question a view asks', () => {
     broker.say(
       { kind: 'frame', channel: 1, frame: frame({ epoch: 7 }) },
       { kind: 'span', channel: 1, request: 1, epoch: 6, span: { start: { line: 41, column: 0 }, end: { line: 41, column: 4 } } },
-      { kind: 'spans', channel: 1, request: 2, epoch: 6, spans: [{ start: { line: 1, column: 0 }, end: { line: 1, column: 5 } }] },
+      { kind: 'spans', channel: 1, request: 2, epoch: 6, more: true, spans: [{ start: { line: 1, column: 0 }, end: { line: 1, column: 5 } }] },
     )
     expect(await word).toBeNull()
-    expect(await found).toEqual([])
+    expect(await found, 'not even that there may be more: the answer is of lines that are gone').toEqual({ spans: [], more: false })
   })
 
   it('says whether a paste went or was refused, and asks again when the person allows it', async () => {

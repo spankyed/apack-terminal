@@ -827,9 +827,14 @@ fn carry_out_view(
             let told = Arc::clone(sink);
             let asked = session_of(channel).and_then(|handle| {
                 handle.once_whole(move |screen| {
-                    let found = screen.find(&needle, case_sensitive);
-                    let spans = found.map(|(epoch, spans)| ToView::Spans { channel, request, epoch, spans });
-                    tell(&told, channel, request, spans);
+                    let found = screen.find(&needle, case_sensitive).map(|found| ToView::Spans {
+                        channel,
+                        request,
+                        epoch: found.epoch,
+                        more: found.more,
+                        spans: found.spans,
+                    });
+                    tell(&told, channel, request, found);
                 })
             });
             if let Err(refusal) = asked {

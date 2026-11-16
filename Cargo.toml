@@ -22,6 +22,12 @@ name = "broker"
 path = "benches/broker.rs"
 harness = false
 
+# What a view's search costs over a full history (`benches/search.rs`). Reports, never fails
+[[bench]]
+name = "search"
+path = "benches/search.rs"
+harness = false
+
 [dependencies]
 interprocess = "2.4.7"
 portable-pty = { git = "https://github.com/wez/wezterm", rev = "8afe0ad30739c5aa106c19e8a75b1dfc83bcfb56" }

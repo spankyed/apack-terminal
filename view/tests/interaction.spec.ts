@@ -1,7 +1,7 @@
 // A view, used: what a click, a drag, a wheel and a pointer over a link each do — and who they are for,
 // which changes when a program asks for the mouse.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { Command, Placements, Span } from '../src/source.ts'
+import type { Command, Found, Placements, Span } from '../src/source.ts'
 import { MATCH_HIGHLIGHTS } from '../src/view.ts'
 import { framesWaiting, installFrames, runFrames } from './_frames.ts'
 import { FakeSource } from './_source.ts'
@@ -904,10 +904,12 @@ describe('finding text', () => {
     asked: string[] = []
     askedCase: boolean[] = []
     found: Span[] = []
-    override async search(needle: string, caseSensitive: boolean): Promise<readonly Span[]> {
+    /** Whether the source says there are, or may be, matches older than the ones it answers with */
+    more = false
+    override async search(needle: string, caseSensitive: boolean): Promise<Found> {
       this.asked.push(needle)
       this.askedCase.push(caseSensitive)
-      return this.found
+      return { spans: this.found, more: this.more }
     }
   }
   const span = (line: number, from: number, to: number, endLine = line): Span => ({ start: { line, column: from }, end: { line: endLine, column: to } })
@@ -999,10 +1001,10 @@ describe('finding text', () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
     const source = new (class extends Searchable {
       waiting: Array<(found: Span[]) => void> = []
-      override search(needle: string, caseSensitive: boolean): Promise<readonly Span[]> {
+      override search(needle: string, caseSensitive: boolean): Promise<Found> {
         this.asked.push(needle)
         this.askedCase.push(caseSensitive)
-        return new Promise((resolve) => { this.waiting.push(resolve) })
+        return new Promise((resolve) => { this.waiting.push((spans) => resolve({ spans, more: false })) })
       }
     })()
     const view = mountedView({}, source)
@@ -1091,12 +1093,28 @@ describe('finding text', () => {
     expect(matchedOn(view, 2), 'a line below the newest match').toBeUndefined()
   })
 
+  it('says there may be more when the source did not look through all of the history, however few it found', async () => {
+    const source = new Searchable()
+    source.found = [span(100, 0, 4)]
+    source.more = true
+    const view = mountedView({}, source)
+    showing(view, { firstActive: 100, scrollback: 100 })
+
+    expect(await view.view.find('exact', { matchCase: true })).toBe(1)
+    expect(view.view.found, 'one match is not all there is when the search stopped short').toEqual({ current: 1, total: 1, more: true })
+
+    // And a search that looked through everything says so again
+    source.more = false
+    expect(await view.view.find('exact', { matchCase: true })).toBe(1)
+    expect(view.view.found).toEqual({ current: 1, total: 1, more: false })
+  })
+
   it('takes the answer to the latest search, whichever answer arrives last', async () => {
     const source = new (class extends Searchable {
       waiting: Array<(found: Span[]) => void> = []
-      override search(needle: string): Promise<readonly Span[]> {
+      override search(needle: string): Promise<Found> {
         this.asked.push(needle)
-        return new Promise((resolve) => { this.waiting.push(resolve) })
+        return new Promise((resolve) => { this.waiting.push((spans) => resolve({ spans, more: false })) })
       }
     })()
     const view = mountedView({}, source)

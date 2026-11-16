@@ -365,7 +365,7 @@ fn a_word_a_line_and_a_search_asked_during_a_hold_are_answered_about_the_frame_i
         line.send(format!("line {:?}", screen.line_at(epoch, cell(0, 0)).expect("a line reads"))).expect("heard");
     });
     screen.once_whole(move |screen| {
-        found.send(format!("found {:?}", screen.find("text", false).expect("a search runs").1)).expect("heard");
+        found.send(format!("found {:?}", screen.find("text", false).expect("a search runs").spans)).expect("heard");
     });
     assert!(answers.try_recv().is_err(), "nothing is answered while the program holds the screen");
 

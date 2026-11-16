@@ -785,10 +785,13 @@ pub enum ToView {
         epoch: u32,
         text: String,
     },
+    /// The answer to a `Search`: the newest matches, newest first, and whether there are or may be older
+    /// ones — more than an answer carries, or a search that stopped before the oldest line.
     Spans {
         channel: u32,
         request: u32,
         epoch: u32,
+        more: bool,
         spans: Vec<Span>,
     },
     /// The answer to `Commands`, oldest first.
@@ -1578,10 +1581,11 @@ impl ToView {
                 out.number(*epoch);
                 out.text(text);
             }),
-            Self::Spans { channel, request, epoch, spans } => framed(kind::SPANS, |out| {
+            Self::Spans { channel, request, epoch, more, spans } => framed(kind::SPANS, |out| {
                 out.number(*channel);
                 out.number(*request);
                 out.number(*epoch);
+                out.flag(*more);
                 out.number(spans.len() as u64);
                 for span in spans {
                     out.span(*span);
@@ -1771,13 +1775,13 @@ impl ToView {
                 Self::Text { channel: read.u32()?, request: read.u32()?, epoch: read.u32()?, text: read.text()? }
             }
             kind::SPANS => {
-                let (channel, request, epoch) = (read.u32()?, read.u32()?, read.u32()?);
+                let (channel, request, epoch, more) = (read.u32()?, read.u32()?, read.u32()?, read.flag()?);
                 let mut spans = Vec::new();
                 // Four numbers a span, each at least a byte
                 for _ in 0..read.count()? {
                     spans.push(read.span()?);
                 }
-                Self::Spans { channel, request, epoch, spans }
+                Self::Spans { channel, request, epoch, more, spans }
             }
             kind::FAILED => Self::Failed { channel: read.u32()?, request: read.u32()?, message: read.text()? },
             kind::COMMAND_LIST => {
