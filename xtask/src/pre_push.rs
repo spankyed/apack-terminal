@@ -129,6 +129,26 @@ fn mutants_of_the_change(root: &Path, base: &str) -> Result<(), String> {
     println!("pre-push: mutants of the change");
     // What only Windows compiles is not mutated here, where nothing builds it (`.cargo/windows-only`)
     let windows_only = crate::mutants::windows_only_files(root)?;
+    // **Asked first whether the change has any**, because a run with none writes no list, and a missing list
+    // is otherwise read as a run that failed. A change that only deletes Rust is the case: it touches Rust and
+    // leaves nothing to mutate
+    let listed = Command::new("cargo")
+        .args(["mutants", "--list", "--in-diff", CHANGE_DIFF])
+        .args(windows_only.iter().flat_map(|file| ["--exclude", file.as_str()]))
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("pre-push: listing the change's mutants didn't start: {e}"))?;
+    if !listed.status.success() {
+        return Err(format!(
+            "pre-push: listing the change's mutants failed ({}): {}",
+            listed.status,
+            String::from_utf8_lossy(&listed.stderr).trim()
+        ));
+    }
+    if survivors(&String::from_utf8_lossy(&listed.stdout)).is_empty() {
+        println!("pre-push: mutants of the change: the change has none");
+        return Ok(());
+    }
     let status = Command::new("cargo")
         .args(["mutants", "--in-diff", CHANGE_DIFF])
         .args(windows_only.iter().flat_map(|file| ["--exclude", file.as_str()]))
