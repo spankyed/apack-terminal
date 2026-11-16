@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use apack_terminal::holds::{HOLD_LIMIT, Holds};
 use apack_terminal::protocol::{CursorBlink, CursorStyle};
-use apack_terminal::screen::{Screen, TEXT_BYTES, Unanswered};
+use apack_terminal::screen::{POSTPONED_READS, Screen, TEXT_BYTES, Unanswered};
 use apack_terminal::view::publish::{FETCH_LINES, Publication, ViewId};
 use apack_terminal::view::wire::{
     Color, ColorChanges, Frame, Glyph, MAX_MESSAGE_BYTES, Position, Row, Span, ToView, body, rows as rows_message,
@@ -294,6 +294,160 @@ fn a_hold_nobody_ends_is_drawn_after_the_limit() {
     let drawn = next("the hold is ended for the program");
     assert_eq!(lines(&drawn), vec![(0, "stuck and still".to_owned())]);
     assert!(began.elapsed() >= HOLD_LIMIT, "drawn {:?} into a hold it had a second of", began.elapsed());
+}
+
+/// A view attached with its own end of the channel kept, so a test can send on it what a session would:
+/// the answer to a question, in the order it falls among the frames.
+fn attached_with_its_sink(screen: &mut Screen) -> (View, std::sync::mpsc::Sender<Vec<u8>>) {
+    let (sink, incoming) = channel();
+    let id = ViewId { connection: 1, channel: 1 };
+    screen.attach_view(id, sink.clone()).expect("a view attaches");
+    (View { id, incoming }, sink)
+}
+
+fn cell(line: u64, column: u16) -> Position {
+    Position { line, column }
+}
+
+fn cells(start: (u64, u16), end: (u64, u16)) -> Span {
+    Span { start: cell(start.0, start.1), end: cell(end.0, end.1) }
+}
+
+/// **What a view asks of the text waits out a hold.** A copy made while a program is part way through
+/// redrawing is answered when the program lets go, with the text of the frame it let go of, and after
+/// that frame: a view is never told the text of a screen it was not shown.
+#[test]
+fn the_text_a_view_asks_for_during_a_hold_is_answered_after_the_frame_the_program_lets_go_of() {
+    let mut screen = Screen::new(20, 3);
+    screen.feed(b"old text");
+    let (view, sink) = attached_with_its_sink(&mut screen);
+    let first = view.frame();
+    let epoch = first.epoch;
+    screen.acknowledge(view.id, first.sequence).expect("an acknowledgement is taken");
+
+    write(&mut screen, "\x1b[?2026h\x1b[1;1H\x1b[2Knew");
+    screen.once_whole(move |screen| {
+        let text = screen.text_of(epoch, cells((0, 0), (0, 9))).expect("the text reads");
+        let told = ToView::Text { channel: 1, request: 7, epoch, text }.encode().expect("an answer encodes");
+        sink.send(told).expect("the view is there");
+    });
+    view.nothing();
+
+    write(&mut screen, "er text\x1b[?2026l");
+    match view.messages().as_slice() {
+        [ToView::Frame(frame), ToView::Text { request: 7, text, .. }] => {
+            assert_eq!(lines(frame), vec![(0, "newer text".to_owned())]);
+            assert_eq!(text, "newer text", "the text of the frame the view was just sent");
+        }
+        other => panic!("expected the frame and then the answer, found {other:?}"),
+    }
+}
+
+/// **Every question about the text waits the same way**: the word at a cell, the line it is on and the
+/// places a needle appears are each answered about the frame the hold ends with, none about the half of
+/// it that was there when they were asked.
+#[test]
+fn a_word_a_line_and_a_search_asked_during_a_hold_are_answered_about_the_frame_it_ends_with() {
+    let mut screen = Screen::new(20, 3);
+    screen.feed(b"old text");
+    let view = View::attached(&mut screen, 1, 1);
+    let first = view.frame();
+    let epoch = first.epoch;
+    screen.acknowledge(view.id, first.sequence).expect("an acknowledgement is taken");
+
+    write(&mut screen, "\x1b[?2026h\x1b[1;1H\x1b[2Kne");
+    let (told, answers) = channel();
+    let (word, line, found) = (told.clone(), told.clone(), told);
+    screen.once_whole(move |screen| {
+        word.send(format!("word {:?}", screen.word_at(epoch, cell(0, 0)).expect("a word reads"))).expect("heard");
+    });
+    screen.once_whole(move |screen| {
+        line.send(format!("line {:?}", screen.line_at(epoch, cell(0, 0)).expect("a line reads"))).expect("heard");
+    });
+    screen.once_whole(move |screen| {
+        found.send(format!("found {:?}", screen.find("text", false).expect("a search runs").1)).expect("heard");
+    });
+    assert!(answers.try_recv().is_err(), "nothing is answered while the program holds the screen");
+
+    write(&mut screen, "wer text\x1b[?2026l");
+    assert_eq!(
+        answers.try_iter().collect::<Vec<_>>(),
+        vec![
+            format!("word {:?}", Some(cells((0, 0), (0, 4)))),
+            format!("line {:?}", Some(cells((0, 0), (0, 9)))),
+            format!("found {:?}", vec![cells((0, 6), (0, 9))]),
+        ],
+        "each in the order it was asked, about `newer text`"
+    );
+}
+
+/// A screen nobody is holding is whole already, so what is asked of it is answered there and then.
+#[test]
+fn what_is_asked_of_a_screen_nobody_is_holding_is_answered_at_once() {
+    let mut screen = Screen::new(20, 3);
+    screen.feed(b"plain text");
+    let view = View::attached(&mut screen, 1, 1);
+    let epoch = view.frame().epoch;
+
+    let (told, answers) = channel();
+    screen.once_whole(move |screen| told.send(screen.text_of(epoch, cells((0, 0), (0, 4)))).expect("heard"));
+    assert_eq!(answers.try_recv().expect("answered at once").expect("the text reads"), "plain");
+}
+
+/// **A hold that runs out answers what waited for it**, as it draws what was withheld: a program that
+/// takes the screen and never lets go keeps a view's questions no longer than it keeps its frames.
+#[test]
+fn a_hold_that_runs_out_answers_what_waited_for_it() {
+    let mut screen = Screen::new(20, 3);
+    let view = View::attached(&mut screen, 1, 1);
+    let first = view.frame();
+    let epoch = first.epoch;
+    screen.acknowledge(view.id, first.sequence).expect("an acknowledgement is taken");
+
+    let screen = Arc::new(Mutex::new(screen));
+    let holds = Holds::start();
+    screen.lock().expect("the screen").limit_holds(holds.for_screen(Arc::downgrade(&screen)));
+    let (told, answers) = channel();
+    {
+        let mut screen = screen.lock().expect("the screen");
+        screen.feed(b"\x1b[?2026hstuck");
+        screen.once_whole(move |screen| told.send(screen.text_of(epoch, cells((0, 0), (0, 4)))).expect("heard"));
+    }
+    assert!(answers.try_recv().is_err(), "nothing is answered while the hold has time left");
+
+    let answered = answers.recv_timeout(HOLD_LIMIT * 30).expect("the hold is ended for the program");
+    assert_eq!(answered.expect("the text reads"), "stuck");
+}
+
+/// **A hold keeps a bounded number of questions waiting.** The one asked past that is answered from the
+/// screen as it stands, and the ones that waited are still answered when the program lets go.
+#[test]
+fn a_question_past_what_a_hold_keeps_waiting_is_answered_from_the_screen_as_it_stands() {
+    let mut screen = Screen::new(20, 3);
+    screen.feed(b"old text");
+    let view = View::attached(&mut screen, 1, 1);
+    let first = view.frame();
+    let epoch = first.epoch;
+    screen.acknowledge(view.id, first.sequence).expect("an acknowledgement is taken");
+
+    write(&mut screen, "\x1b[?2026h\x1b[1;1H\x1b[2Khalf");
+    let (told, answers) = channel();
+    for asked in 0..=POSTPONED_READS {
+        let told = told.clone();
+        screen.once_whole(move |screen| {
+            told.send((asked, screen.text_of(epoch, cells((0, 0), (0, 9))).expect("the text reads"))).expect("heard");
+        });
+    }
+    assert_eq!(
+        answers.try_iter().collect::<Vec<_>>(),
+        vec![(POSTPONED_READS, "half".to_owned())],
+        "only the one past the limit is answered during the hold"
+    );
+
+    write(&mut screen, " whole\x1b[?2026l");
+    let waited: Vec<_> = answers.try_iter().collect();
+    assert_eq!(waited.len(), POSTPONED_READS);
+    assert!(waited.iter().enumerate().all(|(nth, (asked, text))| *asked == nth && text == "half whole"), "{waited:?}");
 }
 
 /// **One session's hold does not wait on another session's work.** A screen that is busy when its hold

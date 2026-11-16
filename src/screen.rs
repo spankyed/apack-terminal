@@ -87,6 +87,12 @@ pub const TERMINFO_NAME: &str = "xterm-256color";
 /// ones it wanted.
 pub const SEARCH_MATCHES: usize = 100;
 
+/// A question a view asked of the text while the program held the screen (`Screen::once_whole`).
+type Postponed = Box<dyn FnOnce(&mut Screen) + Send>;
+
+/// How many of a view's questions one hold keeps waiting (`Screen::once_whole`).
+pub const POSTPONED_READS: usize = 64;
+
 /// What a shell has reported about itself, accumulated from the markers it emitted.
 ///
 /// **Every field is something that was said, not a measurement of the machine**, which is why there is
@@ -226,6 +232,9 @@ pub struct Screen {
     /// What says when a hold must be over. A screen with none is drawn when its program lets go and not
     /// before, which is what a screen nothing views needs.
     hold_limit: Option<HoldLimit>,
+    /// What a view asked of the text while the program held the screen, to be answered when it lets go
+    /// (`once_whole`).
+    postponed: Vec<Postponed>,
     /// The screen is being rebuilt from a recording: what the replay provokes is not acted on.
     replaying: bool,
     /// What takes each command that names an image's source out of the output, for the source to be read
@@ -474,6 +483,7 @@ impl Screen {
             hold: None,
             holds: 0,
             hold_limit: None,
+            postponed: Vec::new(),
             replaying: false,
             image_sources: None,
             outstanding: None,
@@ -706,6 +716,7 @@ impl Screen {
                     publication.touch();
                 }
                 self.publish();
+                self.answer_postponed();
             }
         }
     }
@@ -726,6 +737,36 @@ impl Screen {
         if self.hold == Some(hold) {
             self.hold = None;
             self.publish();
+            self.answer_postponed();
+        }
+    }
+
+    /// Runs `read` on the screen when it is a whole frame: now, or — while the program holds the screen
+    /// (mode 2026) — once it lets go or its hold runs out.
+    ///
+    /// **A question about the text answered during a hold is answered about a frame its program has not
+    /// finished**: the word under a cell, the text of a selection and the places a needle appears, read
+    /// from a screen part way through being redrawn, which no view is shown. A view's frames wait out a
+    /// hold (`publish::owed`), and so do its questions, which are then answered about the frame it is
+    /// sent as the hold ends — after that frame, so a view has the rows an answer names. Lines fetched by
+    /// number do not wait: they are answered with the rows last sent (`Publication::fetch`), which a view
+    /// scrolling back needs in order to draw at all.
+    ///
+    /// **No more than `POSTPONED_READS` wait.** A view asks these as a person clicks, copies or types in
+    /// a find bar. One that has asked that many inside one hold is answered from the screen as it stands,
+    /// which is what every one of them was before any waited, rather than left to grow a queue.
+    pub fn once_whole(&mut self, read: impl FnOnce(&mut Self) + Send + 'static) {
+        if self.hold.is_some() && self.postponed.len() < POSTPONED_READS {
+            self.postponed.push(Box::new(read));
+        } else {
+            read(self);
+        }
+    }
+
+    /// Answers what waited for the hold that has just ended, in the order it was asked.
+    fn answer_postponed(&mut self) {
+        for read in std::mem::take(&mut self.postponed) {
+            read(self);
         }
     }
 
@@ -978,6 +1019,7 @@ impl Screen {
         self.replaying = false;
         // Whatever the recorded program was holding when the recording stops, nothing is holding now
         self.hold = None;
+        self.answer_postponed();
         self.recorder = recorder;
     }
 
