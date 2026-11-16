@@ -24,6 +24,12 @@ slow-timeout = { period = "30s", terminate-after = 2 }
 filter = "test(=view_broker::a_paste_of_megabytes_into_a_program_that_echoes_holds_nothing_up)"
 slow-timeout = { period = "30s", terminate-after = 2 }
 
+# Ten thousand commands through ConPTY, a Windows case run only by `load.yml` (it is `#[ignore]`d on each push).
+# Its length is the volume, as the two above
+[[profile.default.overrides]]
+filter = "test(=broker::ten_thousand_commands_from_a_powershell_session_come_back_in_order)"
+slow-timeout = { period = "300s", terminate-after = 2 }
+
 # **ts-rs generates one `export_bindings_*` test per exported type, and every one of them writes the same
 # file.** Under `cargo test` they were threads in one process and the writes interleaved harmlessly often
 # enough; as separate processes they truncate and write `bindings/protocol.ts` on top of each other, and one

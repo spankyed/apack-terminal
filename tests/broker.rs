@@ -1245,7 +1245,6 @@ fn facts_of(reading: &mut Events, writing: &mut Wire, session: &str) -> serde_js
     until(reading, "facts").0
 }
 
-#[cfg(any(unix, windows))]
 fn commands_of(reading: &mut Events, writing: &mut Wire, session: &str) -> Vec<serde_json::Value> {
     ask(writing, &format!(r#"{{"kind":"commands","session":"{session}"}}"#));
     until(reading, "commands").0["commands"].as_array().expect("commands").clone()
@@ -2616,6 +2615,7 @@ Write-Output 'DONE'
 /// in order, each finished with status zero. A reordered or dropped mark shows as a wrong, missing or misstated entry.
 #[cfg(windows)]
 #[test]
+#[ignore = "ten thousand commands through ConPTY: run nightly by `load.yml`, not on each push"]
 fn ten_thousand_commands_from_a_powershell_session_come_back_in_order() {
     let broker = start();
     let directory = tempfile::tempdir().expect("a directory");
