@@ -2615,7 +2615,6 @@ Write-Output 'DONE'
 /// in order, each finished with status zero. A reordered or dropped mark shows as a wrong, missing or misstated entry.
 #[cfg(windows)]
 #[test]
-#[ignore = "ten thousand commands through ConPTY: run nightly by `load.yml`, not on each push"]
 fn ten_thousand_commands_from_a_powershell_session_come_back_in_order() {
     let broker = start();
     let directory = tempfile::tempdir().expect("a directory");
