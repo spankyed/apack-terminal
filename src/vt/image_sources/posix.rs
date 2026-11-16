@@ -7,7 +7,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
-use super::Refused;
+use super::{CHUNK_BYTES, Refused};
 
 /// A file is opened without waiting — a FIFO opened to be read answers at once, rather than when
 /// something writes to it — and never becomes the broker's terminal. Read-only is no bits.
@@ -129,9 +129,12 @@ impl Drop for Unlinked {
 }
 
 /// The bytes of a shared memory object that `range` says are the image's, given how large the object is,
-/// or why not. The name is one the core passes on (`super::shared_memory_name`), and goes to `shm_open` as
-/// it came.
-pub fn shared_memory(name: &[u8], range: impl FnOnce(u64) -> Result<Range<u64>, Refused>) -> Result<Vec<u8>, Refused> {
+/// in pieces of `CHUNK_BYTES` (none, for a range that is empty), or why not. The name is one the core
+/// passes on (`super::shared_memory_name`), and goes to `shm_open` as it came.
+pub fn shared_memory(
+    name: &[u8],
+    range: impl FnOnce(u64) -> Result<Range<u64>, Refused>,
+) -> Result<Vec<Vec<u8>>, Refused> {
     let invalid = Refused::InvalidData;
     let name = CString::new(name).map_err(|_| invalid)?;
     // SAFETY: the name is a valid C string; what is answered is a descriptor, or -1 and nothing opened
@@ -166,7 +169,7 @@ pub fn shared_memory(name: &[u8], range: impl FnOnce(u64) -> Result<Range<u64>, 
     }
     // SAFETY: `length` bytes are mapped at `mapped`; what is copied is only what of `range` lies in them
     let bytes = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), length) };
-    let copied = bytes.get(start..end).map(<[u8]>::to_vec);
+    let copied = bytes.get(start..end).map(|image| image.chunks(CHUNK_BYTES).map(<[u8]>::to_vec).collect());
     // SAFETY: mapped above with this length, and unmapped once
     unsafe { libc::munmap(mapped, length) };
     copied.ok_or(invalid)

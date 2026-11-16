@@ -261,6 +261,17 @@ impl Terminal {
         Ok(())
     }
 
+    /// How much one Kitty graphics command may carry: `bytes` of it, or the core's own most where `None`.
+    /// The core takes the most when a command begins, so one set around a single command is that
+    /// command's alone.
+    pub fn kitty_command_bytes(&self, bytes: Option<usize>) -> Result<(), Failed> {
+        let value =
+            bytes.as_ref().map_or(std::ptr::null(), |bytes| std::ptr::from_ref(bytes).cast::<std::ffi::c_void>());
+        // SAFETY: APC_MAX_BYTES_KITTY takes a `size_t*`, or NULL for the core's own
+        let result = unsafe { sys::ghostty_terminal_set(self.handle, sys::TerminalOption::APC_MAX_BYTES_KITTY, value) };
+        Failed::check("ghostty_terminal_set(APC_MAX_BYTES_KITTY)", result)
+    }
+
     /// One cell in pixels as a window last measured it, or zero where none has: the terminal's size in
     /// pixels over its size in cells, which is how the core reckons a cell.
     pub fn cell_pixels(&self) -> (u16, u16) {

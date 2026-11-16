@@ -23,7 +23,7 @@ use crate::protocol::{CursorBlink, CursorStyle};
 use crate::recording::{self, Entry, Recorder, Timed};
 use crate::view::publish::{Outlet, Publication, ViewId};
 use crate::view::wire::{MAX_MESSAGE_BYTES, Position, Rows, Span};
-use crate::vt::image_sources::{Load, Loaded, QUIET, Quiet, Refused, Scanner, Worker, says_unreadable};
+use crate::vt::image_sources::{Body, Load, Loaded, QUIET, Quiet, Refused, Scanner, Worker, says_unreadable};
 use crate::vt::images::{ImageRead, PlacementRead};
 use crate::vt::input::{self, Encoders, Key, Pasted, Pointer};
 use crate::vt::reads;
@@ -635,9 +635,18 @@ impl Screen {
         }
         let Some((_, load, refusal)) = self.outstanding.take() else { return };
         match read.loaded.body() {
-            Some(body) => self.terminal.feed(&body),
-            None => self.refuse(&load, refusal, read.loaded.refused().unwrap_or(Refused::InvalidData)),
+            Ok(body) => self.feed_body(body),
+            Err(why) => self.refuse(&load, refusal, why),
         }
+    }
+
+    /// Feeds the core what was read, a piece at a time, a query's one command let be as long as it is.
+    fn feed_body(&mut self, body: Body) {
+        let _ = self.terminal.kitty_command_bytes(body.query_bytes());
+        for piece in body {
+            self.terminal.feed(&piece);
+        }
+        let _ = self.terminal.kitty_command_bytes(None);
     }
 
     /// Answers a command still waiting for its source with a refusal, before anything else reaches the

@@ -309,11 +309,16 @@ session ending settles every wait on it, because nothing is coming.
     which begins one in more places than `ESC _ G`. Of its body only what the core keeps is held: its
     keys, read as the core reads them, and a name, decoded as the core's decoder decodes it; a command
     that names no source is fed as those keys, and one the core would drop is given to it as nothing.
+  - **What was read is the core's to judge.** A source is read up to the most the core reads of one itself
+    (400 MiB, `SOURCE_BYTES`) and sent whole: a transmission a piece to a command, a query in one command
+    the core is let take whole for that command alone. So an image too large for a session's images to
+    hold is refused by the core, in its own words. Each piece is let go of once it has been sent, so a
+    source is held about once, as the core alone holds it — a query a third more, the core holding its
+    one command as base64 until it is whole.
 
-  Where a session answers otherwise than the core alone: a query naming more than 48 MiB, which the core
-  would load in one command and one command cannot carry, a source of more than the 64 MiB a session's
-  images may hold, and a source given up on as quiet, are refused as a source that could not be read. No
-  shared memory object is read on Windows, where the core reads none either. A source on a mount that has
+  Where a session answers otherwise than the core alone: a source given up on as quiet is refused as one
+  that could not be read, where the core alone would have waited on it. No shared memory object is read
+  on Windows, where the core reads none either. A source on a mount that has
   stopped answering holds its session's output for `QUIET`, and one thread for as long as it does not
   answer. The option stays the caller's, for a session running a program it trusts — a file it names is
   read as the user — and a shell is not started with it.
