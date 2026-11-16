@@ -890,6 +890,71 @@ fn a_blink_is_kept_or_given_whatever_shape_the_bytes_come_in() {
     }
 }
 
+/// **What a watched sequence stopped at is what its caller is told, and no more.** A session asks the parse
+/// to stop where it is between sequences, to take the cursor to a new default there; a watched sequence ends
+/// at exactly such a place, so the stop that is the watch's own must be told apart from the one asked for.
+/// Here a default is set part way through a sequence that names mode 12: the cursor is taken where it ends,
+/// in the frame that shows what was written after it, and that text is whole. In a session that takes images
+/// by name the parse also stops where a string begins, and one said to have begun when none did would have
+/// the text read as its body.
+#[test]
+fn a_default_set_part_way_through_a_watched_sequence_takes_the_cursor_where_it_ends() {
+    for images in [false, true] {
+        let case = format!("images {images}");
+        let (mut screen, view, set) = with_a_blink_chosen(CursorBlink::Off, images);
+        // A program that has chosen a cursor of its own is the one a new default waits for
+        let chosen = after(&mut screen, &view, &set, |screen| write(screen, "\x1b[5 q"));
+        assert_eq!(drawn_as(&chosen), Some((1, true)));
+        screen.acknowledge(view.id, chosen.sequence).expect("an acknowledgement is taken");
+
+        write(&mut screen, "\x1b[?1");
+        screen.set_cursor_defaults(CursorStyle::Underline, CursorBlink::Off).expect("the defaults are set");
+        view.nothing();
+        write(&mut screen, "2hbold");
+        let ended = view.frame();
+        assert_eq!(drawn_as(&ended), Some((2, false)), "{case}: the cursor was not taken where the sequence ended");
+        assert_eq!(lines(&ended), vec![(0, "bold".to_owned())], "{case}: what followed the sequence");
+    }
+}
+
+/// **A string that begins is not the parser between sequences.** In a session that takes images by name the
+/// parse stops where a string begins, and one waiting to take the cursor also stops where the parser is
+/// between sequences: the two are told apart, or the cursor is taken inside the string, where the write
+/// that takes it is read as part of the string and lost. Here the default is set part way through a
+/// sequence, which an image command then cuts short, with a blink chosen so the parse goes by the watch.
+#[test]
+fn a_default_waiting_for_the_end_of_a_sequence_is_not_taken_where_a_string_begins() {
+    for images in [false, true] {
+        let case = format!("images {images}");
+        let (mut screen, view, set) = with_a_blink_chosen(CursorBlink::Off, images);
+        let chosen = after(&mut screen, &view, &set, |screen| write(screen, "\x1b[5 q"));
+        assert_eq!(drawn_as(&chosen), Some((1, true)));
+        screen.acknowledge(view.id, chosen.sequence).expect("an acknowledgement is taken");
+
+        write(&mut screen, "\x1b[");
+        screen.set_cursor_defaults(CursorStyle::Underline, CursorBlink::Off).expect("the defaults are set");
+        view.nothing();
+        write(&mut screen, "\x1b_Gq=2\x1b\\bold");
+        let ended = view.frame();
+        assert_eq!(drawn_as(&ended), Some((2, false)), "{case}: the cursor was not taken once the string had ended");
+        assert_eq!(lines(&ended), vec![(0, "bold".to_owned())], "{case}: what followed the string");
+    }
+}
+
+/// **A string that ends is said to have ended, and nothing is said to have begun.** With a blink chosen the
+/// parse goes by way of the watch for every byte, watched or not, and what it stopped at is passed on as it
+/// was: a title's end is the end of a string, after which a session that takes images by name reads text
+/// as text.
+#[test]
+fn text_after_a_title_is_text_in_a_session_with_a_blink_chosen() {
+    for images in [false, true] {
+        let (mut screen, view, set) = with_a_blink_chosen(CursorBlink::On, images);
+        let titled =
+            after(&mut screen, &view, &set, |screen| write(screen, "\x1b]0;a title\x07text\x1b]0;another\x1b\\ more"));
+        assert_eq!(lines(&titled), vec![(0, "text more".to_owned())], "images {images}");
+    }
+}
+
 #[test]
 fn a_row_carries_each_characters_style_and_link() {
     let mut screen = Screen::new(30, 3);

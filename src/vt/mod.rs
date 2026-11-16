@@ -80,6 +80,8 @@ pub struct Terminal {
     /// The escape sequence the parser is part way through, while it may be one that sets a private mode
     /// (`watched`).
     opened: Option<Opened>,
+    /// How many sequences have been parsed under watch (`sequences_watched`).
+    sequences_watched: u64,
 }
 
 /// DEC mode 12, by which a program turns the cursor's blink on and off (`CSI ? 12 h`, `CSI ? 12 l`).
@@ -113,8 +115,8 @@ fn may_set_blink_mode(bytes: &[u8]) -> Option<usize> {
             return Some(at);
         }
     }
-    let cut_short = bytes.len().saturating_sub(PRIVATE_MODES.len() - 1).max(from);
-    (cut_short..bytes.len()).find(|&at| PRIVATE_MODES.starts_with(&bytes[at..]))
+    // Or the bytes end part way through how one begins: at an escape and `[`, or at an escape
+    (1..PRIVATE_MODES.len()).rev().find(|&held| bytes.ends_with(&PRIVATE_MODES[..held])).map(|held| bytes.len() - held)
 }
 
 /// Whether what follows `CSI ?` is, all of it here, numbers apart by semicolons and then the byte that ends
@@ -162,7 +164,13 @@ impl Terminal {
         if handle.is_null() {
             return Err(Failed { call: "ghostty_terminal_new", code: sys::Result::SUCCESS });
         }
-        Ok(Self { handle, virtual_placements: std::cell::RefCell::default(), blink_mode_ignored: false, opened: None })
+        Ok(Self {
+            handle,
+            virtual_placements: std::cell::RefCell::default(),
+            blink_mode_ignored: false,
+            opened: None,
+            sequences_watched: 0,
+        })
     }
 
     /// Parses `bytes`, exactly as the pty delivered them.
@@ -190,7 +198,7 @@ impl Terminal {
     /// Hands the core `bytes` to parse up to the first of `boundaries` (`sys::TerminalBoundary`), or all of
     /// them when there are none to stop at. Answers how many it parsed and which boundaries it stopped at.
     fn write_until(&mut self, bytes: &[u8], boundaries: u32) -> (usize, u32) {
-        if boundaries == 0 || bytes.is_empty() {
+        if boundaries == 0 {
             self.write(bytes);
             return (bytes.len(), 0);
         }
@@ -236,57 +244,46 @@ impl Terminal {
     /// escape begins one from any state — which may be split across reads, so it is kept until it ends.
     fn watched(&mut self, bytes: &[u8], boundaries: u32) -> (usize, u32) {
         let ground = sys::TerminalBoundary::GROUND;
-        // Already between sequences is a boundary met with nothing parsed, as it is unwatched
-        if boundaries & ground != 0 && self.opened.is_none() && self.at_ground() {
-            return (0, ground);
-        }
         let mut at = 0;
         while at < bytes.len() {
             let rest = &bytes[at..];
-            if self.opened.is_some() {
-                let escape = memchr::memchr(ESCAPE, rest);
-                // An escape inside a sequence abandons it and begins another, which is watched in its place
-                if escape == Some(0) {
-                    self.open(rest);
-                    at += 1;
-                    continue;
-                }
-                let within = &rest[..escape.unwrap_or(rest.len())];
-                let (parsed, reached) = self.write_until(within, boundaries | ground);
-                if let Some(opened) = &mut self.opened {
-                    opened.take(&within[..parsed]);
-                }
-                at += parsed;
-                if reached & ground != 0 {
-                    self.close();
-                }
-                if reached & boundaries != 0 {
-                    return (at, reached & boundaries);
-                }
+            // Where the next sequence to watch begins. With one under watch that is any escape, which
+            // abandons it and begins another; with none, the next that may change mode 12
+            let watching = self.opened.is_some();
+            let begins = if watching { memchr::memchr(ESCAPE, rest) } else { may_set_blink_mode(rest) };
+            if begins == Some(0) {
+                self.open(rest);
+                at += 1;
                 continue;
             }
-            // Everything up to the next sequence that may change mode 12 is parsed as one piece: what is
-            // looked for in a program's output is how such a sequence begins, and nothing else
-            match may_set_blink_mode(rest) {
-                Some(0) => {
-                    self.open(rest);
-                    at += 1;
-                }
-                next => {
-                    let next = next.unwrap_or(rest.len());
-                    let (parsed, reached) = self.write_until(&rest[..next], boundaries);
-                    at += parsed;
-                    if reached != 0 || parsed < next {
-                        return (at, reached);
-                    }
-                }
+            // Everything before it is parsed as one piece — to where the core is between sequences again,
+            // when that is where a watched one ends
+            let piece = &rest[..begins.unwrap_or(rest.len())];
+            let (parsed, reached) = self.write_until(piece, if watching { boundaries | ground } else { boundaries });
+            if let Some(opened) = &mut self.opened {
+                opened.take(&piece[..parsed]);
+            }
+            at += parsed;
+            if watching && reached & ground != 0 {
+                self.close();
+            }
+            if reached & boundaries != 0 {
+                return (at, reached & boundaries);
             }
         }
         (at, 0)
     }
 
+    /// How many escape sequences have been parsed under watch (`watched`), which is what a chosen blink costs
+    /// a session's output. **Counted because it cannot otherwise be seen**: watching every sequence a program
+    /// writes answers exactly as watching the few that may change mode 12 does, and is many times the work.
+    pub fn sequences_watched(&self) -> u64 {
+        self.sequences_watched
+    }
+
     /// Begins watching the sequence `rest` begins with, and parses the escape that begins it.
     fn open(&mut self, rest: &[u8]) {
+        self.sequences_watched += 1;
         let mut opened =
             Opened { blinked: self.mode(CURSOR_BLINK_MODE).unwrap_or(false), head: [0; PRIVATE_MODES.len()], held: 0 };
         opened.take(&rest[..1]);
