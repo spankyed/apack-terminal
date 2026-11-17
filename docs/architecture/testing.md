@@ -130,6 +130,18 @@ correctly.
 `disconnect` wakes it on purpose — the receiver goes, then one malformed frame the broker is certain to
 answer. This is worth knowing before writing a case about a client going away.
 
+## A wait for the broker says what it waited for
+
+**Every case that listens to the broker or a process it started listens through `tests/_support/heard.rs`.**
+A thread reads and a channel hands over what it read, so a wait is bounded by silence (`QUIET`): everything
+heard resets it, a slow machine makes a wait longer and never fails it, and one that runs out fails as the
+case's own panic — at the line that waited, with the last few things heard — before the run's deadline would
+end the case with nothing but how long it took. A lost signal is then a message saying where output stopped.
+
+**Read at the case's pace where the subject is not reading** (`Heard::paced`): nothing is read until the case
+asks, so a case about backpressure fills the channel it means to. Everywhere else the reader runs ahead, so a
+case whose subject is a reader that keeps up has one.
+
 ## A test runs in its own process, and has a deadline
 
 `cargo nextest run` runs each test in a process of its own, so a test that has stopped ending is killed at
