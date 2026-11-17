@@ -45,6 +45,7 @@ mod screen;
 mod security;
 #[cfg(unix)]
 mod signals;
+mod status;
 mod view_broker;
 mod view_frames;
 mod view_input;

@@ -74,7 +74,7 @@ among it, left unread.
 | `screen` | the screen as the broker has it, with up to `history` lines above the viewport |
 | `facts` | what the shell reported about itself: directory, command line, whether one is running, how the last one ended, how many have finished — and whether the session's marks are vouched for, and how many were refused |
 | `search` | where text appears in the screen and the history above it |
-| `wait` | until idle, until text appears, or until the process ends, with a deadline |
+| `wait` | until idle, until text appears, until the program says it is in one of some states (`status`, below), or until the process ends, with a deadline |
 | `commands` | the commands the session's shell has marked, oldest first |
 | `command_output` | what one of them printed, as text |
 | `keep` | whether the session outlives whoever holds the broker |
@@ -152,10 +152,11 @@ is what a caller gets when it asks for both.
 | `search` | where the text was found, with the whole line for context |
 | `waited` | how a wait ended: `MET`, `TIMEOUT` or `EXITED`. Once per wait, however it ended |
 | `title`, `bell`, `clipboard`, `notification`, `progress` | what the program did that is not on its screen. Reported, never acted on |
+| `program_status` | what the session's programs say they are doing (OSC 7501): every record the session holds, as it stands. Below |
 | `command_started`, `command_finished`, `cwd_changed` | what the shell marked, as it happened. `command_finished` carries how it ended (`outcome`), and a keyed session that ends with a command running sends one for it before `exited` |
 | `commands`, `command_output` | the answers to the requests of those names |
 | `kept` | whether the session outlives the broker's holder, answering `keep` |
-| `sessions` | every session there is: its size, whether it is kept and recorded, its title and its shell's claims |
+| `sessions` | every session there is: its size, whether it is kept and recorded, its title, its shell's claims and what its programs say they are doing |
 | `rewound` | a recording opened as a session, with the moments it runs between |
 | `sought` | the moment a rewound session now shows |
 | `failed` | a request could not be carried out |
@@ -182,6 +183,58 @@ ended, in one with — which is what a keyed finish carries.
 Lines in a `screen` are **text, not cells**: a wide character appears once rather than beside the spacer cell
 it occupies, and the padding a row carries to its full width is not there. What it answers is what was
 written, which is what matching against it means.
+
+## What a program says it is doing is kept here, and sent whole
+
+A program can say what it is doing — idle, working, done, blocked on the person, failed — by writing
+OSC 7501, the [Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status), to
+its own terminal. The core reads each report and holds it to that specification. The specification leaves
+keeping the records to the terminal, and `src/status.rs` is the only place they are kept and the only
+place the rules are written:
+
+- one record for each `id`, and a report replaces its record whole;
+- a `clear` takes a record and every record beneath it (`build` takes `build/test`), and all of them
+  when it names none; a full reset is a clear of all;
+- a record that names no `app` is told with its nearest ancestor's;
+- at most 256, letting go of the one changed longest ago;
+- when the program's command ends, or its session does, `idle`, `working` and `blocked` records go and
+  `done` and `error` stay. A command ends where `facts` says it does: at a prompt in a session without a
+  key, and at the keyed finish in one with, where a prompt mark anything can print ends nothing.
+
+**`program_status` carries every record of the session, never a change to them**, at most once for what
+one read of the pty changed. A client replaces what it held. `facts` and each entry of `sessions` carry
+the same set, which is what a client that did not see the events starts from.
+
+| field | says |
+|---|---|
+| `id` | which record. Empty for the program itself |
+| `state` | `idle`, `working`, `blocked`, `done` or `error` |
+| `kind` | what a blocked program needs: `permission`, `question` or `auth`. Absent otherwise, and where it did not say |
+| `progress` | 0 to 100, where it gave a figure |
+| `app`, `title`, `message` | the program's name for a machine to match on, a short label, and one line for a person. Text the program chose: free of control characters, and not markup |
+| `changed` | moved by every report that changed a record of the session. A later change is a larger number, which is what "has the person seen this" is compared on |
+| `since_ms` | when the record entered the state it is in. For showing and ordering; nothing is decided on it |
+| `confirmed` | `matched`, `mismatched` or `unknown`, below |
+
+**A record is a claim, and `confirmed` is what could be checked of it.** Anything in the pty can write a
+report, and one naming another program is as well formed as an honest one: a file printed to the
+terminal can say an agent is asking for permission. So for a read that changed the records, the broker
+reads the foreground process group's leader once and says of each record that read took whether that is
+the program it names: `matched` when the leader was run as the record's `app` — or, being an
+interpreter, was run with a script of that name — `mismatched` when a leader was read and is another
+program, and `unknown` when there is nothing to compare: the record names no program, no leader could
+be read, or the platform has no foreground group, which is Windows. The names a program is run by where
+they differ from the one it reports as are data in `src/status.rs`. Nothing here acts on a record
+whatever it says.
+
+**Recorded bytes report nothing.** A screen rebuilt from a recording holds no record and answers no
+query: what a program said it was doing then is not what anything is doing now.
+
+**A program that asks is answered.** `OSC 7501 ; ?` gets the states and kinds this terminal takes, which
+some programs wait for before they report at all.
+
+A `wait` until `{"kind":"status","states":[…]}` is met while the program's own record — the one with no
+`id` — is in one of those states, and never by a session that reports nothing.
 
 ## Flow control has two classes, and a `pause` is the second
 

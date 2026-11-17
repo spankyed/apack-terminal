@@ -11,7 +11,7 @@ holds.
 | Path | What it is |
 |---|---|
 | `src/session.rs`, `src/output.rs`, `src/tree.rs`, `src/writer.rs` | the process layer: the pty, the lifetime, the bounded output channel, the owned process tree, and the queue everything typed at a program goes through |
-| `src/screen.rs`, `src/markers.rs`, `src/commands.rs` | the terminal capability: the VT core, the facts a shell reported, and the commands it ran |
+| `src/screen.rs`, `src/markers.rs`, `src/commands.rs`, `src/status.rs` | the terminal capability: the VT core, the facts a shell reported, the commands it ran, and what its programs say they are doing (OSC 7501), kept by that protocol's rules |
 | `src/vt/` | the core itself, behind the one module that calls it: the terminal, what it is told about where it runs (`settings.rs`), the terminal written out whole and put back, which is a recording's keyframe (`keyframe.rs`), input encoding, row and text reads, images, and the sources an image is named by, read here so the core opens nothing (`image_sources/`, whose `windows.rs` only Windows compiles: `.cargo/windows-only`) |
 | `src/feed.rs` | what is waiting to be written to the client a broker reports to: one bounded queue a client, and what becomes of what it will not write |
 | `src/view/` | what a view is sent: the binary wire (`wire.rs`), what changed since a view's last frame (`publish.rs`), and a connection's bounded queue (`sink.rs`) |

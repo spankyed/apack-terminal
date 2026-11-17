@@ -1,0 +1,6 @@
+?
+state=idle:app=claude-code
+state=working:app=claude-code
+state=blocked:app=claude-code:kind=auth:msg=TG9naW4gcmVhY2hlZCBpdHMgdGltZSBsaW1pdCDCtyBQbGVhc2UgcnVuIC9sb2dpbg==
+state=working:app=claude-code
+state=clear

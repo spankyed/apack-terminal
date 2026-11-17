@@ -443,6 +443,10 @@ pub enum Until {
     Text { text: String },
     /// The process ended.
     Exit,
+    /// The session's program says it is in one of `states` (OSC 7501): what it reports of itself, not of
+    /// anything it reports on. Never met by a program that reports nothing. **A claim**, as the status
+    /// itself is: anything in the pty can write the report that meets it.
+    Status { states: Vec<StatusState> },
 }
 
 /// How a `Wait` ended.
@@ -623,6 +627,8 @@ pub enum Event {
         /// it, where a shell that marks nothing moves nothing. It stops at the largest number it holds.
         refused: u32,
         foreground: Option<Foreground>,
+        /// What the session's programs say they are doing, as `ProgramStatus` last carried it.
+        statuses: Vec<StatusRecord>,
     },
     /// Where a search found its text, answering `Search`.
     Search { session: SessionId, matches: Vec<SearchMatch> },
@@ -664,6 +670,13 @@ pub enum Event {
     Notification { session: SessionId, title: String, body: String },
     /// How far along the program says it is (OSC 9;4). `percent` is absent where it gave none.
     Progress { session: SessionId, state: ProgressState, percent: Option<u8> },
+    /// **What the session's programs say they are doing, whole** (OSC 7501): every record the session
+    /// holds as it stands, sent when one changes, at most once for what one read of the pty changed.
+    ///
+    /// The rules a record is kept by are the broker's alone (`status::Records`), which is why this is
+    /// the set and never a change to it: a client replaces what it held and merges nothing. Empty when
+    /// the last record went.
+    ProgramStatus { session: SessionId, statuses: Vec<StatusRecord> },
     /// **The shell is about to run a command**, with the line it read where it said.
     ///
     /// Pushed, as the two below are, because each is a moment: a caller asking `Facts` on a timer learns
@@ -695,6 +708,8 @@ pub struct SessionSummary {
     pub cwd: Option<String>,
     pub command: Option<String>,
     pub running: bool,
+    /// What its programs say they are doing, as `Event::ProgramStatus` last carried it
+    pub statuses: Vec<StatusRecord>,
 }
 
 /// How a command ended, or that it has not: one value, which says who said so.
@@ -770,6 +785,125 @@ pub struct CommandRecord {
     #[ts(type = "number | null")]
     pub finished_ms: Option<u64>,
     pub outcome: CommandOutcome,
+}
+
+/// One thing a program says it is doing (OSC 7501, the Program Status Protocol).
+///
+/// **A claim, shown and never acted on.** Anything in the pty can write a report, and one naming
+/// another program is as well formed as an honest one; `confirmed` is what the broker could check of it.
+/// `title` and `message` are text the program chose: decoded and free of control characters, and still
+/// not markup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "protocol.ts")]
+pub struct StatusRecord {
+    /// Which record this is. Empty for the program itself; `build/test` is beneath `build`.
+    pub id: String,
+    pub state: StatusState,
+    /// What a blocked program needs. Absent for every other state, and where it did not say.
+    pub kind: Option<BlockedKind>,
+    /// How far along, from 0 to 100, where the program gave a figure.
+    pub progress: Option<u8>,
+    /// The program's name for a machine to match on: its own, or its nearest ancestor record's.
+    pub app: Option<String>,
+    /// A short label for the record.
+    pub title: Option<String>,
+    /// One line saying what it is doing, waiting for or finished.
+    pub message: Option<String>,
+    /// Moved by every report that changed a record of this session, so a later change is a larger
+    /// number. What "has the person seen this" is compared on.
+    pub changed: u32,
+    /// When the record entered the state it is in, in milliseconds since the Unix epoch. For showing
+    /// and ordering; nothing is decided on it.
+    #[ts(type = "number")]
+    pub since_ms: u64,
+    pub confirmed: Confirmed,
+}
+
+/// What a program says it is doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "protocol.ts")]
+pub enum StatusState {
+    /// At rest, waiting for the person's next instruction
+    Idle,
+    Working,
+    /// Cannot continue until the person does something
+    Blocked,
+    /// Finished a piece of work the person has not looked at yet
+    Done,
+    /// Failed and stopped
+    Error,
+}
+
+/// What a blocked program needs from the person.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "protocol.ts")]
+pub enum BlockedKind {
+    Permission,
+    Question,
+    Auth,
+}
+
+/// Whether the program in front of the pty was the one a record names, when the record was taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "protocol.ts")]
+pub enum Confirmed {
+    /// The foreground process group's leader is the program the record names
+    Matched,
+    /// A leader was read, and it is another program
+    Mismatched,
+    /// Nothing to compare: the record names no program, no leader could be read, or the platform has
+    /// no foreground process group (Windows)
+    Unknown,
+}
+
+impl From<crate::status::Record> for StatusRecord {
+    fn from(record: crate::status::Record) -> Self {
+        use crate::status::{Confirmed as Checked, Kind, State};
+        Self {
+            id: record.id,
+            state: match record.state {
+                State::Idle => StatusState::Idle,
+                State::Working => StatusState::Working,
+                State::Blocked => StatusState::Blocked,
+                State::Done => StatusState::Done,
+                State::Error => StatusState::Error,
+            },
+            kind: record.kind.map(|kind| match kind {
+                Kind::Permission => BlockedKind::Permission,
+                Kind::Question => BlockedKind::Question,
+                Kind::Auth => BlockedKind::Auth,
+            }),
+            progress: record.progress,
+            app: record.app,
+            title: record.title,
+            message: record.message,
+            changed: record.changed,
+            since_ms: record
+                .since
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX)),
+            confirmed: match record.confirmed {
+                Checked::Matched => Confirmed::Matched,
+                Checked::Mismatched => Confirmed::Mismatched,
+                Checked::Unknown => Confirmed::Unknown,
+            },
+        }
+    }
+}
+
+impl From<StatusState> for crate::status::State {
+    fn from(state: StatusState) -> Self {
+        match state {
+            StatusState::Idle => Self::Idle,
+            StatusState::Working => Self::Working,
+            StatusState::Blocked => Self::Blocked,
+            StatusState::Done => Self::Done,
+            StatusState::Error => Self::Error,
+        }
+    }
 }
 
 /// What a program says about how far along it is.

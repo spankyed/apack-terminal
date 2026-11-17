@@ -21,13 +21,14 @@ use crate::markers::MarksKey;
 use crate::output::{Credit, Flow, Outgoing, READ_AHEAD, coalesce};
 use crate::protocol::{
     CursorBlink, CursorStyle, ErrorCode, Event, Foreground, ProgressState, Scope, SessionId, SessionSummary, Signal,
-    Until, WaitOutcome,
+    StatusRecord, Until, WaitOutcome,
 };
 use crate::recording;
 use crate::screen::{
     Colors, CommandAt, Facts, Fetched, HISTORY_LINES, ImagesAt, Match, PendingImage, Screen, Snapshot, Unanswered,
     Vouching,
 };
+use crate::status;
 use crate::tree::Tree;
 use crate::view::publish::{Outlet, ViewId};
 use crate::vt::images::ImageRead;
@@ -242,6 +243,9 @@ impl Waiter {
             Until::Idle => !screen.facts().running,
             Until::Text { text } => screen.shows_recently(text, recent),
             Until::Exit => false,
+            Until::Status { states } => {
+                screen.status().is_some_and(|now| states.iter().any(|&state| status::State::from(state) == now))
+            }
         }
     }
 }
@@ -296,6 +300,35 @@ pub fn rows_added(bytes: &[u8], cols: u16) -> u32 {
 /// position: off Windows the second one is not compiled, so every mutant of it survives a suite that cannot
 /// reach it, and a run on any developer's machine reports a survivor nothing can kill. One function has one
 /// set of mutants, and they land in code the suite runs.
+/// The arguments the program in front of a pty was run with: its foreground process group's leader's.
+/// `None` where there is no leader to read, which is also every pty on Windows (`foreground_of`).
+///
+/// What a status record is checked against (`status::confirmed`): a record is a claim any program in
+/// the pty can make, and this is the one thing about who made it that the broker can measure.
+fn front_of(master: &(dyn MasterPty + Send)) -> Option<Vec<String>> {
+    #[cfg(not(unix))]
+    {
+        let _ = master;
+        None
+    }
+    #[cfg(unix)]
+    {
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+        let pid: i32 = master.process_group_leader()?;
+        let of = Pid::from_u32(u32::try_from(pid).ok()?);
+        let mut system = System::new().ok()?;
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[of]),
+            true,
+            ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+        );
+        let argv: Vec<String> =
+            system.process(of)?.cmd().iter().map(|argument| argument.to_string_lossy().into_owned()).collect();
+        (!argv.is_empty()).then_some(argv)
+    }
+}
+
 fn foreground_of(master: &(dyn MasterPty + Send)) -> Option<Foreground> {
     #[cfg(not(unix))]
     {
@@ -806,6 +839,11 @@ impl Handle {
         self.on_screen(|screen| (screen.facts().clone(), screen.vouching()))
     }
 
+    /// What the session's programs say they are doing, as a client is told it.
+    pub fn statuses(&self) -> Result<Vec<StatusRecord>, Refusal> {
+        self.on_screen(|screen| screen.statuses().into_iter().map(Into::into).collect())
+    }
+
     /// Where `text` appears in the screen and the `history` lines above it.
     pub fn search(&self, text: &str, history: u32) -> Result<Vec<Match>, Refusal> {
         self.on_screen(|screen| screen.search(text, history))
@@ -1104,6 +1142,7 @@ impl Sessions {
         let answering = Arc::clone(&process.input);
         let ending_input = Arc::clone(&process.input);
         let ending_pty = Arc::clone(&process.pty);
+        let fronting = Arc::clone(&process.pty);
         let (reaping, reaped) = channel::<()>();
 
         // **In the record before anything can report its end.** The thread that waits on the child tells
@@ -1197,6 +1236,7 @@ impl Sessions {
                         // (`image_sources::Worker`)
                         let (mut fed, mut image) = (0, None);
                         let (mut replies, mut met, mut effects) = (Vec::new(), 0, Vec::new());
+                        let mut stirred = false;
                         loop {
                             let read_image = image.take().map(|image: PendingImage| image.read_on(&sources));
                             // The authority first, then the renderer's copy. The waits are settled inside this
@@ -1210,6 +1250,7 @@ impl Sessions {
                             let (taken, next) = screen.feed_until_image(unfed);
                             replies.extend(screen.take_replies());
                             effects.extend(screen.take_effects());
+                            stirred |= screen.statuses_stirred();
                             let recent = rows_added(&unfed[..taken], screen.cols());
                             met += settle_met(&waiting, &screen, recent);
                             // Each view that has drawn its last frame is sent what changed, here
@@ -1231,6 +1272,21 @@ impl Sessions {
                                 session: reader_session.clone(),
                                 outcome: WaitOutcome::Met,
                             }));
+                        }
+                        // **What a program said it is doing is checked against the program in front,
+                        // once for a read that changed it.** Looked up with the screen let go of: it asks
+                        // the system about a process, which nothing drawing or reading this screen should
+                        // wait on. The records are then sent whole, as they stand
+                        if stirred {
+                            let front = fronting.lock().ok().and_then(|pty| pty.as_deref().and_then(front_of));
+                            let told =
+                                parsing.lock().ok().and_then(|mut screen| screen.take_statuses(front.as_deref()));
+                            if let Some(statuses) = told {
+                                let _ = reader_events.send(Outgoing::answer(Event::ProgramStatus {
+                                    session: reader_session.clone(),
+                                    statuses: statuses.into_iter().map(Into::into).collect(),
+                                }));
+                            }
                         }
                         // **What the program asked the terminal, answered by the terminal that is here.**
                         // ConPTY opens with a cursor-position request and waits for the reply before it
@@ -1292,15 +1348,25 @@ impl Sessions {
             // **A command the shell left running is over, and is told before the exit is**: a shell that
             // is told to exit begins a command and never ends it. After the last of the output, so a
             // finish the shell did print is the one that closes it
-            let left = ended.lock().map_or_else(
-                |_| Vec::new(),
+            let (left, statuses) = ended.lock().map_or_else(
+                |_| (Vec::new(), None),
                 |mut screen| {
                     screen.session_ended();
-                    screen.take_effects()
+                    // Nothing is in front of a pty that is gone, so a record the last read took and
+                    // nothing has checked stays unconfirmed
+                    (screen.take_effects(), screen.take_statuses(None))
                 },
             );
             for effect in left {
                 let _ = exiting.send(Outgoing::answer(event_of(&waited, effect)));
+            }
+            // What the session's programs were in the middle of ended with it; what they finished or
+            // failed at is what is left, told before the exit is
+            if let Some(statuses) = statuses {
+                let _ = exiting.send(Outgoing::answer(Event::ProgramStatus {
+                    session: waited.clone(),
+                    statuses: statuses.into_iter().map(Into::into).collect(),
+                }));
             }
             // **A session ending settles every wait on it**, because nothing is coming: an `Exit` wait has
             // reached what it asked for and every other has not and never will. Without this a caller
@@ -1544,6 +1610,7 @@ impl Sessions {
                     cwd: facts.cwd.clone(),
                     command: facts.command.clone(),
                     running: facts.running,
+                    statuses: screen.statuses().into_iter().map(Into::into).collect(),
                 })
             })
             .collect();
