@@ -34,11 +34,20 @@ pub fn hang_up(pipe: &impl AsHandle) -> bool {
 /// whether one was cancelled. **It does not disconnect**, because a disconnect throws away whatever the far end
 /// has not read yet, answers included. The pipe ends for the far end when its handle closes, after it has read
 /// what was written.
-pub fn let_go(pipe: &impl AsHandle) -> bool {
+///
+/// **And its handle closes when it is dropped, whether or not the far end has read.** interprocess otherwise
+/// hands a pipe written to since its last flush to one thread that flushes such pipes in turn before closing
+/// them, and a flush waits for the far end to read. A caller that finished and stopped reading would hold that
+/// thread, and every pipe dropped after it would wait behind it with its far end never told the connection
+/// ended. Closing the handle unflushed loses nothing: what was written stays for the far end to read.
+pub fn let_go(pipe: &interprocess::os::windows::named_pipe::local_socket::Stream) -> bool {
     let handle = pipe.as_handle().as_raw_handle() as HANDLE;
     // SAFETY: `handle` is the pipe's own handle, which lives for the length of this borrow, and a null
     // overlapped pointer cancels every pending operation on it
-    unsafe { CancelIoEx(handle, std::ptr::null()) != 0 }
+    let cancelled = unsafe { CancelIoEx(handle, std::ptr::null()) != 0 };
+    // After the cancel, so a write it ended or that finished just before it leaves nothing to flush
+    pipe.inner().assume_flushed();
+    cancelled
 }
 
 /// Where a user's broker is when nobody says where: a pipe named for the user, by their SID.
@@ -158,6 +167,34 @@ mod tests {
         assert_eq!(outcome, Err(Some(995)), "the read did not end as a cancelled one");
 
         drop(server);
+        let mut read = String::new();
+        let _ = (&client).read_to_string(&mut read);
+        assert_eq!(read, "answered\n", "what was written before letting go was not there to read");
+    }
+
+    /// A pipe that was let go closes when it is dropped, however little of it the far end has read: the far end's
+    /// next write fails at once rather than once a flush it never answers is over. What was written before is
+    /// still there to read.
+    #[test]
+    fn a_pipe_let_go_closes_when_dropped_and_leaves_what_was_written_to_be_read() {
+        let name = format!(r"\\.\pipe\apack-let-go-close-test-{}", std::process::id());
+        let listener = ListenerOptions::new()
+            .name(name.clone().to_fs_name::<GenericFilePath>().expect("a pipe name"))
+            .create_sync()
+            .expect("the pipe is created");
+        let connecting = std::thread::spawn({
+            let name = name.clone();
+            move || {
+                Stream::connect(name.to_fs_name::<GenericFilePath>().expect("a pipe name")).expect("the pipe accepts")
+            }
+        });
+        let server = listener.accept().expect("a connection is accepted");
+        let client = connecting.join().expect("the client connects");
+        (&server).write_all(b"answered\n").expect("the answer is written");
+
+        let_go(&server);
+        drop(server);
+        assert!((&client).write_all(b"more\n").is_err(), "the pipe was still open after it was let go and dropped");
         let mut read = String::new();
         let _ = (&client).read_to_string(&mut read);
         assert_eq!(read, "answered\n", "what was written before letting go was not there to read");
