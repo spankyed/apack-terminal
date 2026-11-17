@@ -724,7 +724,7 @@ fn a_connection_whose_far_end_has_stopped_sending_is_hung_up_on_and_a_write_to_i
     use apack_terminal::listening::{hang_up, let_go};
 
     // Letting a connection go is hanging up on it where a hang-up leaves what was written, which a socket's does
-    for (ending, end) in [("hung up on", hang_up as fn(&Stream) -> bool), ("let go", let_go)] {
+    for (ending, end) in [("hung up on", hang_up as fn(&Stream) -> bool), ("let go", |stream| let_go(stream, || {}))] {
         ends_a_write_to_a_far_end_that_stopped_sending(ending, end);
     }
 }

@@ -287,11 +287,19 @@ pub fn hang_up(stream: &Stream) -> bool {
 /// throws away what the far end has not read yet, so on Windows only the pending I/O is cancelled and the pipe
 /// ends with its handle. A far end that will not read is hung up on (`hang_up`); one that has finished
 /// speaking is let go.
-pub fn let_go(stream: &Stream) -> bool {
+///
+/// `writers_ended` waits for whatever writes to the connection to stop, which once it is let go they do
+/// promptly: a write that was parked is ended, and one begun later fails or takes only the room there is. It
+/// is called before the connection is done with, so no write is still being made when its handle closes.
+pub fn let_go(stream: &Stream, writers_ended: impl FnOnce()) -> bool {
     match stream {
         #[cfg(unix)]
-        Stream::UdSocket(_) => hang_up(stream),
+        Stream::UdSocket(_) => {
+            let cancelled = hang_up(stream);
+            writers_ended();
+            cancelled
+        }
         #[cfg(windows)]
-        Stream::NamedPipe(pipe) => pipe::let_go(pipe),
+        Stream::NamedPipe(pipe) => pipe::let_go(pipe, writers_ended),
     }
 }
