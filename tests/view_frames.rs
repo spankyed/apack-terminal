@@ -543,7 +543,8 @@ fn a_question_that_would_keep_more_than_a_hold_keeps_waiting_is_answered_from_th
             told.send((asked, screen.text_of(epoch, cells((0, 0), (0, 9))).expect("the text reads"))).expect("heard");
         });
     };
-    ask(&mut screen, "all a hold keeps", POSTPONED_BYTES);
+    ask(&mut screen, "a needle a person types", 64);
+    ask(&mut screen, "the rest a hold keeps", POSTPONED_BYTES - 64);
     ask(&mut screen, "one byte more", 1);
     ask(&mut screen, "nothing more", 0);
     assert_eq!(
@@ -555,7 +556,11 @@ fn a_question_that_would_keep_more_than_a_hold_keeps_waiting_is_answered_from_th
     write(&mut screen, " whole\x1b[?2026l");
     assert_eq!(
         answers.try_iter().collect::<Vec<_>>(),
-        vec![("all a hold keeps", "half whole".to_owned()), ("nothing more", "half whole".to_owned())]
+        vec![
+            ("a needle a person types", "half whole".to_owned()),
+            ("the rest a hold keeps", "half whole".to_owned()),
+            ("nothing more", "half whole".to_owned())
+        ]
     );
 }
 
