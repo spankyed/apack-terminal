@@ -343,6 +343,79 @@ fn the_text_a_view_asks_for_during_a_hold_is_answered_after_the_frame_the_progra
     }
 }
 
+/// **What a view asks with a frame it has not drawn is answered after the frame that follows it.** A view
+/// is sent no frame until it has drawn its last, so with the screen moved on from that one an answer given
+/// at once would be of rows it does not hold. It is given as the view says it has drawn, behind the frame
+/// that is then sent. A view whose undrawn frame is still the screen is answered at once.
+#[test]
+fn what_a_view_asks_before_it_has_drawn_is_answered_after_the_frame_that_brings_it_the_screen() {
+    let mut screen = Screen::new(20, 3);
+    screen.feed(b"old text");
+    let (view, sink) = attached_with_its_sink(&mut screen);
+    let first = view.frame();
+    let epoch = first.epoch;
+    let ask = |screen: &mut Screen, request: u32| {
+        let sink = sink.clone();
+        screen.once_whole(view.id, move |screen| {
+            let text = screen.text_of(epoch, cells((0, 0), (0, 9))).expect("the text reads");
+            sink.send(ToView::Text { channel: 1, request, epoch, text }.encode().expect("an answer encodes"))
+                .expect("the view is there");
+        });
+    };
+
+    ask(&mut screen, 1);
+    match view.messages().as_slice() {
+        [ToView::Text { request: 1, text, .. }] => assert_eq!(text, "old text", "the frame it was sent is the screen"),
+        other => panic!("expected the answer at once, found {other:?}"),
+    }
+
+    write(&mut screen, "\x1b[1;1H\x1b[2Knew text");
+    ask(&mut screen, 2);
+    view.nothing();
+
+    screen.acknowledge(view.id, first.sequence).expect("an acknowledgement is taken");
+    match view.messages().as_slice() {
+        [ToView::Frame(frame), ToView::Text { request: 2, text, .. }] => {
+            assert_eq!(lines(frame), vec![(0, "new text".to_owned())]);
+            assert_eq!(text, "new text", "the text of the frame the view was just sent");
+        }
+        other => panic!("expected the frame and then the answer, found {other:?}"),
+    }
+}
+
+/// **One view's undrawn frame keeps no other view waiting.** Two views of a session are each sent frames as
+/// they draw, so one can hold the screen as it stands while the other has yet to draw a frame from before
+/// it: what the first asks is answered at once, and what the second asks when it has drawn.
+#[test]
+fn a_view_that_has_the_screen_is_answered_while_another_has_yet_to_draw() {
+    let mut screen = Screen::new(20, 3);
+    screen.feed(b"old text");
+    let drawn = View::attached(&mut screen, 1, 1);
+    let slow = View::attached(&mut screen, 2, 1);
+    let first = drawn.frame();
+    let epoch = first.epoch;
+    let undrawn = slow.frame();
+    screen.acknowledge(drawn.id, first.sequence).expect("an acknowledgement is taken");
+
+    write(&mut screen, "\x1b[1;1H\x1b[2Knew text");
+    let second = drawn.frame();
+    screen.acknowledge(drawn.id, second.sequence).expect("an acknowledgement is taken");
+    slow.nothing();
+
+    let (told, answers) = channel();
+    for asking in [slow.id, drawn.id] {
+        let told = told.clone();
+        screen.once_whole(asking, move |screen| {
+            told.send((asking, screen.text_of(epoch, cells((0, 0), (0, 9))).expect("the text reads"))).expect("heard");
+        });
+    }
+    assert_eq!(answers.try_iter().collect::<Vec<_>>(), vec![(drawn.id, "new text".to_owned())]);
+
+    screen.acknowledge(slow.id, undrawn.sequence).expect("an acknowledgement is taken");
+    assert_eq!(lines(&slow.frame()), vec![(0, "new text".to_owned())]);
+    assert_eq!(answers.try_iter().collect::<Vec<_>>(), vec![(slow.id, "new text".to_owned())]);
+}
+
 /// **Every question about the text waits the same way**: the word at a cell, the line it is on and the
 /// places a needle appears are each answered about the frame the hold ends with, none about the half of
 /// it that was there when they were asked.
@@ -1794,8 +1867,13 @@ fn what_a_view_asked_during_a_hold_is_answered_when_it_goes_or_its_session_ends(
         assert_eq!(answered.len(), if ended { 2 } else { 1 }, "{way}: {answered:?}");
         assert_eq!(answered[0], (view.id, Ok("half".to_owned())), "{way}");
         if !ended {
+            // The other view was sent the half-drawn screen as it attached, and has not drawn it: what it
+            // asked is answered once it has, after the frame the hold ended with
             write(&mut screen, " whole\x1b[?2026l");
-            assert_eq!(answers.try_recv().expect("the other is answered as the hold ends").0, other.id, "{way}");
+            assert!(answers.try_recv().is_err(), "{way}: answered about a screen its view has not been sent");
+            let shown = other.frame();
+            screen.acknowledge(other.id, shown.sequence).expect("an acknowledgement is taken");
+            assert_eq!(answers.try_recv().expect("the other is answered").0, other.id, "{way}");
         }
     }
 }
