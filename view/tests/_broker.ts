@@ -128,7 +128,7 @@ export function encodeToView(message: ToView): Uint8Array {
       break
     case 'text': out.number(message.request); out.number(message.epoch); out.text(message.text); break
     case 'spans':
-      out.number(message.request); out.number(message.epoch); out.number(message.spans.length)
+      out.number(message.request); out.number(message.epoch); out.flag(message.more); out.number(message.spans.length)
       for (const span of message.spans) { out.position(span.start); out.position(span.end) }
       break
     case 'failed': out.number(message.request); out.text(message.message); break

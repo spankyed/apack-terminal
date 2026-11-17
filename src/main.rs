@@ -29,7 +29,7 @@ use apack_terminal::protocol::{
     BROKER_KEY_ENV, CommandRecord, ErrorCode, Event, PROTOCOL_VERSION, Request, Role, SearchMatch, proof_of,
 };
 use apack_terminal::recording;
-use apack_terminal::screen::{Colors, HISTORY_LINES};
+use apack_terminal::screen::{Colors, HISTORY_LINES, Unanswered};
 use apack_terminal::session::{Handle, Refusal, Sessions, Spawning};
 use apack_terminal::view::publish::ViewId;
 use apack_terminal::view::sink::Sink;
@@ -659,6 +659,19 @@ impl Drop for ViewLeaving<'_> {
     }
 }
 
+/// Tells a view the answer to something it asked of a session's text, or why there is none: what an
+/// answer that waited for the program to let go of the screen is sent with, from whichever thread the
+/// hold ended on. An answer too long to be one message is a refusal, to the request it would have answered.
+fn tell(sink: &Sink, channel: u32, request: u32, answer: Result<ToView, Unanswered>) {
+    let message = answer
+        .map_err(|unanswered| Refusal::from(unanswered).message)
+        .and_then(|message| message.encode().map_err(|too_long| too_long.to_string()));
+    let message = message.or_else(|message| (ToView::Failed { channel, request, message }).encode());
+    if let Ok(message) = message {
+        sink.deliver(message);
+    }
+}
+
 /// One message from a view. Whatever it asked, it is answered on its own connection.
 ///
 /// **With no lock of the broker's held.** A channel's session is looked up once, when the view attaches,
@@ -771,28 +784,62 @@ fn carry_out_view(
                 Err(refusal) => failed(channel, request, refusal),
             }
         }
+        // **What a view asks of the text is answered about a whole frame** (`Screen::once_whole`): at once,
+        // or, while the program is holding the screen, when it lets go. So each of these hands the
+        // session what answers the view rather than waiting here for an answer, and only a session that
+        // is not there is refused from this thread
         ToBroker::WordAt { channel, request, epoch, at } => {
-            match session_of(channel).and_then(|handle| handle.word_at(epoch, at)) {
-                Ok(span) => answer(channel, request, ToView::Span { channel, request, epoch, span }),
-                Err(refusal) => failed(channel, request, refusal),
+            let told = Arc::clone(sink);
+            let asked = session_of(channel).and_then(|handle| {
+                handle.once_whole(ViewId { connection, channel }, move |screen| {
+                    let span = screen.word_at(epoch, at);
+                    tell(&told, channel, request, span.map(|span| ToView::Span { channel, request, epoch, span }));
+                })
+            });
+            if let Err(refusal) = asked {
+                failed(channel, request, refusal);
             }
         }
         ToBroker::LineAt { channel, request, epoch, at } => {
-            match session_of(channel).and_then(|handle| handle.line_at(epoch, at)) {
-                Ok(span) => answer(channel, request, ToView::Span { channel, request, epoch, span }),
-                Err(refusal) => failed(channel, request, refusal),
+            let told = Arc::clone(sink);
+            let asked = session_of(channel).and_then(|handle| {
+                handle.once_whole(ViewId { connection, channel }, move |screen| {
+                    let span = screen.line_at(epoch, at);
+                    tell(&told, channel, request, span.map(|span| ToView::Span { channel, request, epoch, span }));
+                })
+            });
+            if let Err(refusal) = asked {
+                failed(channel, request, refusal);
             }
         }
         ToBroker::TextOf { channel, request, epoch, span } => {
-            match session_of(channel).and_then(|handle| handle.text_of(epoch, span)) {
-                Ok(text) => answer(channel, request, ToView::Text { channel, request, epoch, text }),
-                Err(refusal) => failed(channel, request, refusal),
+            let told = Arc::clone(sink);
+            let asked = session_of(channel).and_then(|handle| {
+                handle.once_whole(ViewId { connection, channel }, move |screen| {
+                    let text = screen.text_of(epoch, span);
+                    tell(&told, channel, request, text.map(|text| ToView::Text { channel, request, epoch, text }));
+                })
+            });
+            if let Err(refusal) = asked {
+                failed(channel, request, refusal);
             }
         }
         ToBroker::Search { channel, request, needle, case_sensitive } => {
-            match session_of(channel).and_then(|handle| handle.find(&needle, case_sensitive)) {
-                Ok((epoch, spans)) => answer(channel, request, ToView::Spans { channel, request, epoch, spans }),
-                Err(refusal) => failed(channel, request, refusal),
+            let told = Arc::clone(sink);
+            let asked = session_of(channel).and_then(|handle| {
+                handle.once_whole(ViewId { connection, channel }, move |screen| {
+                    let found = screen.find(&needle, case_sensitive).map(|found| ToView::Spans {
+                        channel,
+                        request,
+                        epoch: found.epoch,
+                        more: found.more,
+                        spans: found.spans,
+                    });
+                    tell(&told, channel, request, found);
+                })
+            });
+            if let Err(refusal) = asked {
+                failed(channel, request, refusal);
             }
         }
         ToBroker::Commands { channel, request } => match session_of(channel).and_then(Handle::commands) {

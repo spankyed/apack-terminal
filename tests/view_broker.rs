@@ -525,6 +525,69 @@ fn history_is_fetched_by_line_and_text_is_read_and_searched() {
     assert_eq!(read, "line-7\nline-8");
 }
 
+/// **What a view asks of the text while a program holds the screen is answered after the frame it is
+/// sent**, through the broker: the program takes the screen (mode 2026), draws half a frame and waits; the
+/// view asks for the text of that row; and its answer comes once the program lets go, after the frame that
+/// shows the row, and says what that frame shows. An answer given at once would name text the view was
+/// never sent.
+///
+/// **A view attached during a hold is how the hold is seen.** It is sent the screen as it stands, so the
+/// half-drawn row reaching one is the program holding the screen. **Whichever way the hold ends, the answer
+/// is the row the view holds**: the program letting go, or the broker's limit on a slow machine.
+#[cfg(unix)]
+#[test]
+fn text_asked_for_while_a_program_holds_the_screen_is_answered_after_the_frame_the_view_is_sent() {
+    let broker = start();
+    let client = Client::greeting(&broker);
+    let session = client.shell();
+    let mut view = View::attached(&broker, &session);
+    view.until_shows("$ ");
+    view.type_line("printf '\\033[?2026h\\033[H\\033[Kha%slf' $((1+1)); read go; printf ' whole\\033[?2026l'");
+
+    let looking_since = std::time::Instant::now();
+    loop {
+        let mut probe = View::attached(&broker, &session);
+        probe.answer(|message| matches!(message, ToView::Frame(_)).then_some(()));
+        if probe.screen().contains("ha2lf") {
+            break;
+        }
+        assert!(looking_since.elapsed() < PATIENCE, "the program never took the screen:\n{}", probe.screen());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // **The view has drawn everything it was sent before it asks**, as a view a person is looking at has.
+    // A frame it had not drawn would keep the next from being sent (`publish::owed`), and the answer would
+    // then come ahead of the frame it is about. Lines fetched by number are answered at once, hold or no
+    // hold, so the answer to a fetch is behind every frame sent before it
+    view.send(&ToBroker::Fetch { channel: 1, request: 8, epoch: 0, first: 0, count: 1 });
+    view.answer(|message| {
+        matches!(message, ToView::Rows { request: 8, .. } | ToView::Failed { request: 8, .. }).then_some(())
+    });
+
+    let asked_at = view.last.clone().expect("the view has been sent a frame");
+    let row = Span {
+        start: Position { line: asked_at.first_active, column: 0 },
+        end: Position { line: asked_at.first_active, column: 30 },
+    };
+    view.send(&ToBroker::TextOf { channel: 1, request: 9, epoch: asked_at.epoch, span: row });
+    // Told to finish the frame only once the question is on its way, on the same connection
+    view.key("Enter", "");
+
+    let mut frames = 0;
+    let answered = loop {
+        match view.step() {
+            ToView::Frame(_) => frames += 1,
+            ToView::Text { request: 9, text, .. } => break text,
+            ToView::Failed { request: 9, message, .. } => panic!("the text was refused: {message}"),
+            _ => {}
+        }
+    };
+    assert!(frames > 0, "answered {answered:?} before any frame: text the view was never sent");
+    let shown = view.rows.get(&asked_at.first_active).map(text).unwrap_or_default();
+    assert_eq!(answered, shown, "the answer is the row as the view holds it");
+    assert!(answered.starts_with("ha2lf"), "{answered:?}");
+}
+
 #[test]
 fn a_paste_that_could_run_a_command_is_refused_until_the_person_allows_it() {
     let broker = start();

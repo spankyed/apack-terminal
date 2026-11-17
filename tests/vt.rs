@@ -4,6 +4,7 @@
 //! snapshot hides most of what the layer below it does: a setter that silently did nothing, or a read that
 //! answered a plausible constant, would leave the grid looking right. Each case here drives one call and
 //! observes its effect through a different one, which is what makes a mutant of it visible.
+use apack_terminal::protocol::{CursorBlink, CursorStyle};
 use apack_terminal::vt::Terminal;
 use apack_terminal::vt::rows::{Changed, ROW_LINK_BYTES, Rendering, Space};
 
@@ -264,4 +265,224 @@ fn a_look_names_the_rows_written_since_the_last_one_that_was_seen() {
     rendering.seen().expect("seen");
     assert_eq!(rendering.look(&terminal, &mut changed), Ok(Changed::Rows));
     assert_eq!(changed, [false; 4], "what was seen is not said again");
+}
+
+/// A terminal whose person has said whether the cursor blinks, with the cursor taken there.
+fn with_a_blink_chosen(blink: CursorBlink) -> Terminal {
+    let mut terminal = Terminal::new(40, 4).expect("a terminal");
+    terminal.set_cursor_defaults(CursorStyle::Block, blink).expect("the defaults are set");
+    terminal.reset_cursor();
+    terminal
+}
+
+/// Whether the cursor blinks, as the mode a program sets and a cursor it asks for both leave it: DEC mode 12.
+fn blinks(terminal: &Terminal) -> bool {
+    terminal.mode(12).expect("the mode reads")
+}
+
+fn first_row(terminal: &Terminal) -> String {
+    terminal.text_between((0, 0), (39, 0)).expect("the row reads")
+}
+
+/// **Output parsed whole is all of it parsed, around a sequence that is watched.** A session's output is
+/// usually parsed up to a boundary and the rest asked for again, which hides a parse that stopped early:
+/// the rest is asked for anyway. Parsed with nothing to stop at — as an image's body is, and a recording's
+/// redraw — what is before a watched sequence, what is after it, and a sequence naming other modes ahead
+/// of it in the same bytes are each parsed, and mode 12 still leaves the blink as it was.
+#[test]
+fn output_parsed_whole_is_all_parsed_around_a_sequence_that_is_watched() {
+    for (blink, blinking, against) in [(CursorBlink::On, true, 'l'), (CursorBlink::Off, false, 'h')] {
+        let mut terminal = with_a_blink_chosen(blink);
+        terminal.feed(format!("before\x1b[?12{against}after").as_bytes());
+        assert_eq!(first_row(&terminal), "beforeafter", "{blink:?}");
+        assert_eq!(blinks(&terminal), blinking, "{blink:?}: mode 12 changed a chosen blink");
+
+        terminal.feed(format!(" \x1b[?25l\x1b[?25hand\x1b[?12{against} more").as_bytes());
+        assert_eq!(first_row(&terminal), "beforeafter and more", "{blink:?}");
+        assert_eq!(blinks(&terminal), blinking, "{blink:?}: mode 12 after a sequence naming other modes");
+    }
+}
+
+/// **A chosen blink has the sequences that may change mode 12 watched, and no others.** Watching is what
+/// lets mode 12 be undone, and costs a sequence several calls into the core; a program writes thousands of
+/// sequences that have nothing to do with it. So what is counted here is the work: none for text, colours
+/// and the private modes a full-screen program sets all day, one for each sequence that names mode 12 or
+/// that cannot be told from one that does, and none at all while nobody has chosen a blink.
+#[test]
+fn a_chosen_blink_watches_the_sequences_that_may_change_mode_12_and_no_others() {
+    let unwatched = [
+        "plain text\r\n",
+        "\x1b[31mred\x1b[0m \x1b[1;38;5;208mbold\x1b[0m",
+        "\x1b[H\x1b[2K\x1b[5;10H",
+        "\x1b]0;a title\x07",
+        "\x1b[?25l\x1b[?25h",
+        "\x1b[?1049h\x1b[?1049l",
+        "\x1b[?2026h\x1b[?2026l",
+        "\x1b[?25;1000h\x1b[?1000;25l",
+        "\x1b[?120h\x1b[?112l\x1b[?1;2h",
+        "\x1b[?h\x1b[?;25l",
+    ];
+    let watched = [
+        "\x1b[?12h",
+        "\x1b[?12l",
+        "\x1b[?25;12h",
+        "\x1b[?12;25l",
+        "\x1b[?25;12;1000h",
+        "\x1b[?012h",
+        "\x1b[?12s",
+        "\x1b[?12r",
+        // Not all numbers and separators, so not judged: the core says what it is
+        "\x1b[?1:2h",
+        "\x1b[?25$p",
+    ];
+
+    let mut chosen = with_a_blink_chosen(CursorBlink::On);
+    for written in unwatched {
+        chosen.feed(written.as_bytes());
+        assert_eq!(chosen.sequences_watched(), 0, "watched {written:?}, which names no mode 12");
+    }
+    for (nth, written) in watched.iter().enumerate() {
+        chosen.feed(written.as_bytes());
+        assert_eq!(chosen.sequences_watched(), nth as u64 + 1, "after {written:?}");
+    }
+
+    let mut left_alone = Terminal::new(40, 4).expect("a terminal");
+    for written in unwatched.iter().chain(&watched) {
+        left_alone.feed(written.as_bytes());
+    }
+    assert_eq!(left_alone.sequences_watched(), 0, "a blink nobody chose has nothing to watch for");
+}
+
+/// **A sequence cut anywhere by the end of a read is the same sequence.** What begins one may be the last
+/// byte read, or the last two, and is then known only by what comes next: it is watched until it is, once,
+/// and mode 12 leaves the blink as it was wherever the cut fell.
+#[test]
+fn a_sequence_naming_mode_12_is_watched_once_wherever_a_read_ends_inside_it() {
+    let sequence = "\x1b[?12h";
+    for cut in 1..sequence.len() {
+        let mut terminal = with_a_blink_chosen(CursorBlink::Off);
+        terminal.feed(b"a");
+        terminal.feed(&sequence.as_bytes()[..cut]);
+        terminal.feed(&sequence.as_bytes()[cut..]);
+        terminal.feed(b"b");
+        assert!(!blinks(&terminal), "cut after {cut} bytes: mode 12 changed a chosen blink");
+        assert_eq!(terminal.sequences_watched(), 1, "cut after {cut} bytes");
+        assert_eq!(first_row(&terminal), "ab", "cut after {cut} bytes");
+    }
+}
+
+/// **A sequence abandoned for another is parsed once.** An escape inside a sequence ends it and begins the
+/// next, which is watched in its place. The byte before that escape is one the core would act on if it
+/// were handed it again after the escape — `ESC 8` puts the cursor back where it was saved — so text
+/// written after lands where it should only if every byte was parsed once.
+#[test]
+fn a_sequence_abandoned_for_another_leaves_the_rest_parsed_once() {
+    let mut terminal = with_a_blink_chosen(CursorBlink::Off);
+    terminal.feed(b"ab\x1b[?8\x1b[5 qcd");
+    assert_eq!(first_row(&terminal), "abcd");
+    assert!(blinks(&terminal), "the cursor asked for by what cut the sequence short was not given");
+}
+
+/// Where a parse stops over `reads`, each fed until it is all taken: the read, how far into it, whether
+/// ground was where, and whether a string beginning was.
+fn stops(blink: CursorBlink, reads: &[&[u8]], or_ground: bool, or_string: bool) -> Vec<(usize, usize, bool, bool)> {
+    let mut terminal = Terminal::new(80, 24).expect("a terminal");
+    terminal.set_cursor_defaults(CursorStyle::Bar, blink).expect("the defaults are set");
+    let mut stops = Vec::new();
+    for (read, bytes) in reads.iter().enumerate() {
+        let mut at = 0;
+        while at < bytes.len() {
+            let (taken, ground, string) = if or_string {
+                terminal.feed_to_string(&bytes[at..], or_ground)
+            } else {
+                let (taken, ground) = terminal.feed_to(&bytes[at..], or_ground);
+                (taken, ground, false)
+            };
+            at += taken;
+            stops.push((read, at, ground, string));
+            if taken == 0 {
+                // Stopped between sequences having taken nothing: the rest is fed without that stop
+                at += terminal.feed_to(&bytes[at..], false).0;
+                stops.push((read, at, false, false));
+            }
+        }
+    }
+    stops
+}
+
+/// **A chosen blink stops a parse where any session's stops, and says the same of each stop.** The escape
+/// that begins a watched sequence is parsed as any byte is: it is where an OSC string ends when it is the
+/// first byte of the string's terminator or cuts the string short, and a parser asked for ground while
+/// between sequences stops there having taken nothing. A marker a shell wrote is read at such a stop.
+#[test]
+fn a_chosen_blink_stops_where_a_string_ends_and_between_sequences_as_any_session_does() {
+    let cases: &[&[&[u8]]] = &[
+        // A read that ends on the escape of the string's end, and on the escape that begins the next string
+        &[b"\x1b]0;one\x1b", b"\\after"],
+        &[b"\x1b]0;one\x1b\\\x1b", b"]0;two\x1b\\after"],
+        &[b"text\x1b", b"]0;two\x1b\\after\x1b]0;three\x07z"],
+        // A string cut short by a sequence that is watched
+        &[b"\x1b]0;one\x1b[?12hafter"],
+        // Between sequences, with a watched sequence next
+        &[b"\x1b[?12hafter"],
+        &[b"ab\x1b[?25l\x1b[?12l"],
+        // A string that begins after a watched sequence, and one a read ends on the escape of
+        &[b"\x1b[?12h\x1b_Ga=q\x1b\\z"],
+        &[b"ab\x1b", b"_Ga=q\x1b\\z"],
+    ];
+    for reads in cases {
+        for (or_ground, or_string) in [(false, false), (true, false), (false, true), (true, true)] {
+            let left_to_programs = stops(CursorBlink::Program, reads, or_ground, or_string);
+            for chosen in [CursorBlink::On, CursorBlink::Off] {
+                assert_eq!(
+                    stops(chosen, reads, or_ground, or_string),
+                    left_to_programs,
+                    "{chosen:?} over {reads:?}, ground {or_ground}, string {or_string}"
+                );
+            }
+        }
+    }
+}
+
+/// **A cursor a program asks for is given, though the sequence asking begins inside a watched one.** The
+/// single byte `0x9b` begins a sequence wherever the core is part way through another, so what follows it
+/// is not the private modes the watched one began as: a blink it changes was asked for, and is not put back.
+#[test]
+fn a_cursor_asked_for_by_a_sequence_begun_inside_a_watched_one_is_given() {
+    for cut_short in [&b"\x1b[?\x9b5 q"[..], b"\x1b[?12\x9b5 q"] {
+        let mut terminal = with_a_blink_chosen(CursorBlink::Off);
+        terminal.feed(cut_short);
+        assert!(blinks(&terminal), "the blinking cursor asked for after {cut_short:?} was taken back");
+    }
+}
+
+/// **A sequence under watch when a person answers again is not put back to the answer before.** What a
+/// watched sequence is put back to is the blink as it began, under the answer of that moment.
+#[test]
+fn a_blink_chosen_part_way_through_a_watched_sequence_is_not_put_back_to_the_one_before() {
+    let mut terminal = with_a_blink_chosen(CursorBlink::On);
+    terminal.feed(b"\x1b[?");
+    terminal.set_cursor_defaults(CursorStyle::Block, CursorBlink::Program).expect("the defaults are set");
+    terminal.feed(b"25h\x1b[2 q");
+    terminal.set_cursor_defaults(CursorStyle::Block, CursorBlink::Off).expect("the defaults are set");
+    terminal.feed(b"hello");
+    assert!(!blinks(&terminal), "the steady cursor was set blinking again, as it was before either answer");
+}
+
+/// **A sequence is found however far into a read it is, and wherever a look through the read ends.** The
+/// output is looked through a stretch at a time, so a sequence that begins in one stretch and ends in the
+/// next is still one sequence: watched once when it names mode 12, and not at all when it names another.
+#[test]
+fn a_sequence_is_found_wherever_in_a_read_a_look_ends() {
+    // Looks double from 64 bytes, so they end 64, 192, 448 and 960 bytes into a read
+    for before in (58..68).chain(186..196).chain(442..452).chain(954..964) {
+        let text = "x".repeat(before);
+        let mut terminal = with_a_blink_chosen(CursorBlink::On);
+        let watched = terminal.sequences_watched();
+        terminal.feed(format!("{text}\x1b[?25l{text}\x1b[?1049h").as_bytes());
+        assert_eq!(terminal.sequences_watched(), watched, "{before} bytes ahead of sequences naming other modes");
+        terminal.feed(format!("{text}\x1b[?12l{text}").as_bytes());
+        assert!(blinks(&terminal), "mode 12 changed the blink {before} bytes into a read");
+        assert_eq!(terminal.sequences_watched(), watched + 1, "{before} bytes ahead of one naming mode 12");
+    }
 }

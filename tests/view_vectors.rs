@@ -161,9 +161,9 @@ fn to_view(message: &ToView) -> Value {
         ToView::Text { channel, request, epoch, text } => {
             json!({ "kind": "text", "channel": channel, "request": request, "epoch": epoch, "text": text })
         }
-        ToView::Spans { channel, request, epoch, spans } => {
+        ToView::Spans { channel, request, epoch, more, spans } => {
             let spans: Vec<Value> = spans.iter().copied().map(span).collect();
-            json!({ "kind": "spans", "channel": channel, "request": request, "epoch": epoch, "spans": spans })
+            json!({ "kind": "spans", "channel": channel, "request": request, "epoch": epoch, "more": more, "spans": spans })
         }
         ToView::Failed { channel, request, message } => {
             json!({ "kind": "failed", "channel": channel, "request": request, "message": message })
@@ -526,9 +526,15 @@ fn vectors() -> Value {
         ("text", ToView::Text { channel: 3, request: 12, epoch: 2, text: "one\ntwo \u{4e16}".to_owned() }),
         (
             "matches",
-            ToView::Spans { channel: 3, request: 13, epoch: 2, spans: vec![across, Span { start: at, end: at }] },
+            ToView::Spans {
+                channel: 3,
+                request: 13,
+                epoch: 2,
+                more: true,
+                spans: vec![across, Span { start: at, end: at }],
+            },
         ),
-        ("no matches", ToView::Spans { channel: 3, request: 14, epoch: 2, spans: Vec::new() }),
+        ("no matches", ToView::Spans { channel: 3, request: 14, epoch: 2, more: false, spans: Vec::new() }),
         ("a refusal", ToView::Failed { channel: 3, request: 15, message: "no session s-9".to_owned() }),
         (
             "an attach refused, which has no request of its own and is answered as request zero",

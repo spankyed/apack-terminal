@@ -22,8 +22,22 @@ name = "broker"
 path = "benches/broker.rs"
 harness = false
 
+# What a view's search costs over a full history (`benches/search.rs`). Reports, never fails
+[[bench]]
+name = "search"
+path = "benches/search.rs"
+harness = false
+
+# What a chosen cursor blink costs a session's output (`benches/blink.rs`). Reports, never fails
+[[bench]]
+name = "blink"
+path = "benches/blink.rs"
+harness = false
+
 [dependencies]
 interprocess = "2.4.7"
+# Finding the escapes in a program's output (`vt::Terminal::watched`), which is every byte a session parses
+memchr = "2.8.3"
 portable-pty = { git = "https://github.com/wez/wezterm", rev = "8afe0ad30739c5aa106c19e8a75b1dfc83bcfb56" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

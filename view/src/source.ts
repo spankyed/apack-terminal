@@ -406,6 +406,17 @@ export interface Span {
   readonly end: Position
 }
 
+/** What a search found */
+export interface Found {
+  /** Each place the needle appears, newest first */
+  readonly spans: readonly Span[]
+  /**
+   * Whether there are, or may be, matches older than these: more than an owner answers with, or a search that
+   * stopped before the oldest line. A search that says so has not shown that there is nothing further back
+   */
+  readonly more: boolean
+}
+
 export const KEY_ACTIONS = ['press', 'repeat', 'release'] as const
 export type KeyAction = (typeof KEY_ACTIONS)[number]
 
@@ -508,10 +519,10 @@ export interface TerminalSource {
    */
   textOf(span: Span): Promise<string>
   /**
-   * Every place `needle` appears, newest first — as many of the newest as the owner looks for. Letters match in
-   * either case unless `caseSensitive` says the needle's own case only
+   * The newest places `needle` appears, newest first — as many as the owner answers with — and whether there are
+   * or may be older ones. Letters match in either case unless `caseSensitive` says the needle's own case only
    */
-  search(needle: string, caseSensitive: boolean): Promise<readonly Span[]>
+  search(needle: string, caseSensitive: boolean): Promise<Found>
   /** The commands the shell has reported, oldest first. Empty for a shell that marks none */
   commands(): Promise<readonly Command[]>
   /** Where every image is. Their lines are in the epoch of the frame that prompted the question */

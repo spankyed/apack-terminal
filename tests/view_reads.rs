@@ -6,10 +6,10 @@
 
 use std::sync::mpsc::{Receiver, channel};
 
-use apack_terminal::screen::Screen;
+use apack_terminal::screen::{FoundAt, Screen};
 use apack_terminal::view::publish::ViewId;
 use apack_terminal::view::wire::{Position, Span};
-use apack_terminal::vt::reads::SEARCH_MATCHES;
+use apack_terminal::vt::reads::{SEARCH_CANDIDATES, SEARCH_MATCHES};
 
 /// Attaches a view, which is what gives a session's lines their numbers, and answers the epoch those
 /// numbers are in. The receiver is the view's end, kept so the view stays attached.
@@ -89,13 +89,14 @@ fn a_search_answers_every_match_newest_first_in_either_case() {
     screen.feed(written.as_bytes());
     let (viewed_in, _view) = viewed(&mut screen);
 
-    let (epoch, found) = screen.find("needle", false).expect("a search runs");
+    let FoundAt { epoch, spans: found, more } = screen.find("needle", false).expect("a search runs");
     assert_eq!(epoch, viewed_in);
     assert_eq!(found.len(), 8);
+    assert!(!more, "a search that reached the oldest line and answered all it found has no more to say");
     assert_eq!(found[0], span((7, 6), (7, 11)), "the newest first");
     assert_eq!(found[7], span((0, 6), (0, 11)), "and the oldest, from history, last");
-    assert!(screen.find("absent", false).expect("a search runs").1.is_empty());
-    assert!(screen.find("", false).expect("a search runs").1.is_empty());
+    assert!(screen.find("absent", false).expect("a search runs").spans.is_empty());
+    assert!(screen.find("", false).expect("a search runs").spans.is_empty());
 }
 
 /// A match can run across the end of a row, where the line wrapped.
@@ -104,7 +105,7 @@ fn a_search_finds_text_that_wrapped() {
     let mut screen = Screen::new(10, 4);
     screen.feed(b"0123456needle");
     let _view = viewed(&mut screen);
-    let (_, found) = screen.find("needle", false).expect("a search runs");
+    let found = screen.find("needle", false).expect("a search runs").spans;
     assert_eq!(found, vec![span((0, 7), (1, 2))]);
 }
 
@@ -117,29 +118,71 @@ fn a_case_sensitive_search_keeps_only_the_matches_in_the_needles_case() {
     screen.feed(b"Hello there\r\nhello again\r\n");
     let _view = viewed(&mut screen);
 
-    let (_, either) = screen.find("hello", false).expect("a search runs");
+    let either = screen.find("hello", false).expect("a search runs").spans;
     assert_eq!(either, vec![span((1, 0), (1, 4)), span((0, 0), (0, 4))]);
-    let (_, exact) = screen.find("hello", true).expect("a search runs");
+    let exact = screen.find("hello", true).expect("a search runs").spans;
     assert_eq!(exact, vec![span((1, 0), (1, 4))]);
-    assert!(screen.find("HELLO", true).expect("a search runs").1.is_empty());
+    assert!(screen.find("HELLO", true).expect("a search runs").spans.is_empty());
 }
 
 /// **A case-sensitive search finds an exact match older than the newest `SEARCH_MATCHES` case-insensitive
-/// ones.** The oldest line is the only exact `needle`; every line after it is `Needle`, so the case-insensitive
-/// matches are more than the cap and the exact one is the oldest of them all. The history is long enough that
-/// the core is given it in several parts, so the stop a case-insensitive search makes after one part is reached.
+/// ones.** The oldest line is the only exact `needle`; every line after it is `Needle`, so the matches in
+/// either case are more than a search answers and the exact one is the oldest of them all. It is found
+/// because the candidates a case-sensitive search reads back are more than it answers, and it is the whole
+/// answer: the search reached the oldest line, so there is no more.
 #[test]
 fn a_case_sensitive_search_finds_an_exact_match_older_than_the_case_insensitive_cap() {
+    let others_written = SEARCH_MATCHES * 2;
+    assert!(others_written < SEARCH_CANDIDATES, "the case is of candidates the search does read back");
     let mut screen = Screen::with_history(40, 4, 50_000);
     screen.feed(b"needle, exact\r\n");
-    let others: String = (0..40_000).map(|_| "Needle, other\r\n").collect();
+    let others: String = (0..others_written).map(|_| "Needle, other\r\n").collect();
     screen.feed(others.as_bytes());
     let _view = viewed(&mut screen);
 
-    let (_, exact) = screen.find("needle", true).expect("a search runs");
-    assert_eq!(exact, vec![span((0, 0), (0, 5))]);
-    let (_, either) = screen.find("needle", false).expect("a search runs");
-    assert_eq!(either.len(), SEARCH_MATCHES, "the case-insensitive search keeps its cap");
+    let exact = screen.find("needle", true).expect("a search runs");
+    assert_eq!(exact.spans, vec![span((0, 0), (0, 5))]);
+    assert!(!exact.more, "every candidate there is was read back");
+    let either = screen.find("needle", false).expect("a search runs");
+    assert_eq!(either.spans.len(), SEARCH_MATCHES, "the case-insensitive search keeps its cap");
+    assert!(either.more, "and says there are older matches than it answered");
+}
+
+/// **A case-sensitive search reads back `SEARCH_CANDIDATES` of the matches in either case and says when it
+/// stopped there.** The core keeps every match it finds and has no rule for case, so each is a candidate
+/// read back to see whether it is exact: looking through all of a history of them is work and memory with
+/// no ceiling. Here the one exact `needle` is older than more candidates than a search reads, so it is not
+/// found — and the answer says there may be more, rather than that there is nothing.
+#[test]
+fn a_case_sensitive_search_stops_at_its_candidates_and_says_there_may_be_more() {
+    let mut screen = Screen::with_history(40, 4, 50_000);
+    screen.feed(b"needle, exact\r\n");
+    // More than a search reads back, by more than the one part of the history it may run past its limit by
+    let others: String = (0..SEARCH_CANDIDATES * 2).map(|_| "Needle, other\r\n").collect();
+    screen.feed(others.as_bytes());
+    let _view = viewed(&mut screen);
+
+    let exact = screen.find("needle", true).expect("a search runs");
+    assert!(exact.spans.is_empty(), "found {:?} beyond the candidates a search reads back", exact.spans);
+    assert!(exact.more, "a search that stopped short of the oldest line says there may be more");
+}
+
+/// **A search that looked through everything still says when it found more than it answers.** A
+/// case-sensitive search reads back more candidates than it answers with, so it can reach the oldest line
+/// holding more exact matches than an answer carries: it stopped because the history ran out, not because
+/// it had enough, and the answer still says there are more.
+#[test]
+fn a_search_that_reached_the_oldest_line_with_more_than_it_answers_says_there_are_more() {
+    let written = SEARCH_MATCHES + SEARCH_MATCHES / 2;
+    assert!(written < SEARCH_CANDIDATES, "the case is of a search that reads every candidate back");
+    let mut screen = Screen::with_history(40, 4, 20_000);
+    let lines: String = (0..written).map(|_| "needle\r\n").collect();
+    screen.feed(lines.as_bytes());
+    let _view = viewed(&mut screen);
+
+    let found = screen.find("needle", true).expect("a search runs");
+    assert_eq!(found.spans.len(), SEARCH_MATCHES, "of the {written} there are");
+    assert!(found.more, "the thousand older than those are not in the answer, which says so");
 }
 
 /// **A search goes on to the far end of the history.** The core is handed the history a part at a time,
@@ -154,7 +197,7 @@ fn a_search_finds_a_match_on_the_oldest_line_of_a_long_history() {
     screen.feed(b"and a needle, last");
     let _view = viewed(&mut screen);
 
-    let (_, found) = screen.find("needle", false).expect("a search runs");
+    let found = screen.find("needle", false).expect("a search runs").spans;
     assert_eq!(found, vec![span((8_000, 6), (8_000, 11)), span((0, 4), (0, 9))]);
 }
 
@@ -171,7 +214,8 @@ fn a_search_matching_everywhere_answers_the_newest_and_no_more() {
     let _view = viewed(&mut screen);
     let (_, first_active) = screen.view_position().expect("a position reads");
 
-    let (_, found) = screen.find("a", false).expect("a search runs");
+    let FoundAt { spans: found, more, .. } = screen.find("a", false).expect("a search runs");
+    assert!(more, "tens of thousands of lines were not looked through, and the answer says so");
     assert_eq!(found.len(), SEARCH_MATCHES);
     // The newest is the last letter written, on the row above the cursor's, and they run back from there
     assert_eq!(found[0], span((first_active + 2, 38), (first_active + 2, 38)));

@@ -30,7 +30,6 @@ use crate::screen::{
 };
 use crate::tree::Tree;
 use crate::view::publish::{Outlet, ViewId};
-use crate::view::wire::{Position, Span};
 use crate::vt::images::ImageRead;
 use crate::vt::input::{Key, Pasted, Pointer};
 use crate::vt::{Effect, Progress};
@@ -871,20 +870,11 @@ impl Handle {
         self.send(bytes)
     }
 
-    pub fn word_at(&self, epoch: u32, at: Position) -> Result<Option<Span>, Refusal> {
-        Ok(self.on_screen(|screen| screen.word_at(epoch, at))??)
-    }
-
-    pub fn line_at(&self, epoch: u32, at: Position) -> Result<Option<Span>, Refusal> {
-        Ok(self.on_screen(|screen| screen.line_at(epoch, at))??)
-    }
-
-    pub fn text_of(&self, epoch: u32, span: Span) -> Result<String, Refusal> {
-        Ok(self.on_screen(|screen| screen.text_of(epoch, span))??)
-    }
-
-    pub fn find(&self, needle: &str, case_sensitive: bool) -> Result<(u32, Vec<Span>), Refusal> {
-        Ok(self.on_screen(|screen| screen.find(needle, case_sensitive))??)
+    /// Asks the session's screen something about its text — the word at a cell, the text of a span,
+    /// where a needle appears — once the screen is a whole frame (`Screen::once_whole`). `read` is what
+    /// answers the view, and is run now unless the program is holding the screen.
+    pub fn once_whole(&self, view: ViewId, read: impl FnOnce(&mut Screen) + Send + 'static) -> Outcome {
+        self.on_screen(|screen| screen.once_whole(view, read))
     }
 
     /// Every image in the session, with the epoch their lines are in and one cell in pixels.
