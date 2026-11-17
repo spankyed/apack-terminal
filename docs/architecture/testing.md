@@ -224,8 +224,10 @@ Recorded 2026-11-12 on the developer's Mac (Apple Silicon, macOS), load average 
 | Keystroke echo, spaced 60 ms apart (300), median | 0.16 ms |
 | Broker resident memory, 1 / 10 / 50 idle sessions | 10.6 / 12.0 / 15.7 MB |
 
-The back-to-back echo is the 16 ms output window showing: a write's echo waits for the window to close. A quiet gap
-is what P2 changes; the spaced figure is the behaviour that already holds.
+The back-to-back echo is the 16 ms output window showing: a write's echo waits for the window to close. Bytes
+arriving within a window of the last flush wait out the rest of it, so a burst that pauses is still one message a
+window; only a session quiet for a window sends at once, which is the spaced figure. On 2026-11-17, at a load
+average of about 90, the back-to-back median was 19.4 ms and the spaced one 0.18 ms.
 
 The throughput figure is not the broker's alone. The benchmark's client parses each output event as JSON, and that
 parsing is on the same thread that times the run, so this number is the floor of what a client that reads the broker

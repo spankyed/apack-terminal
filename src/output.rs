@@ -48,8 +48,6 @@ pub const OUTPUT_WINDOW: Duration = Duration::from_millis(16);
 pub const OUTPUT_CAP: usize = 64 * 1024;
 /// How many coalesced output messages may be in flight. Phase G's ceiling, in messages
 pub const OUTPUT_CREDIT: usize = 64;
-/// How long the output must stay quiet before what is held is sent, when the window has not yet elapsed
-pub const OUTPUT_QUIET: Duration = Duration::from_millis(1);
 /// How many of the reader's chunks may wait for the coalescer.
 ///
 /// **This is what turns a stalled consumer into a blocked program rather than a growing broker.** The
@@ -295,7 +293,11 @@ pub fn coalesce_within(
         // **A quiet session's bytes leave at once, and only a busy one is batched.** The window exists to
         // turn a burst into a few messages; applied to a keystroke's echo it is nothing but delay, a mean
         // of half the window on every character typed. So what is held waits out only what is left of the
-        // window since the last flush, which for a session that has been quiet is nothing.
+        // window since the last flush, which for a session that has been quiet for a window is nothing.
+        //
+        // **And a pause inside the window does not end the burst.** A producer pauses whenever a busy
+        // machine holds it up, so sending at each pause sent a busy session's output a read at a time, which
+        // is what the window is for: at most one message a window, plus one each time the cap fills.
         //
         // **And nothing held is nothing to wake for.** With no sendable byte this blocks until a chunk
         // arrives, however long that is: an idle session costs no timer. A trailing partial character
@@ -304,7 +306,7 @@ pub fn coalesce_within(
             None
         } else {
             let window_left = flushed.map_or(Duration::ZERO, |at| window.saturating_sub(at.elapsed()));
-            Some(window_left.min(OUTPUT_QUIET))
+            Some(window_left)
         };
         // A wait of nothing left is still asked of the queue: it answers `Timeout` when nothing is there,
         // which is the flush, and hands over a chunk that already is
