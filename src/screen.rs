@@ -73,8 +73,10 @@ pub const KEYFRAME_HISTORY_LINES: u32 = 1_000;
 ///
 /// **Room for what a keyframe must hold, and a bound on what it may.** A screen and a thousand lines above
 /// it are a few hundred kilobytes, and a keyframe of them is cut there, well short of this. What reaches
-/// it is a screen of images, whose pixels a keyframe holds before any history: this is how much of a
-/// recording one keyframe of those may be, and a screen whose state alone is more is not recorded.
+/// it is images: the pixels of the ones on screen, which a keyframe holds before any history, and what
+/// has arrived of one a program is part way through sending, which is written out with the screen. This
+/// is how much of a recording one keyframe may be, and a terminal that is more has its keyframe put off
+/// (`take_keyframe`).
 pub const KEYFRAME_BYTES: usize = 4 << 20;
 
 /// The most memory one session's history may hold, whatever its line limit allows.
@@ -610,12 +612,10 @@ impl Screen {
                 if ground && self.unrecorded {
                     // The rest of a sequence the recording stopped taking: not recorded, and a keyframe
                     // taken where it has ended, from which what is written is recorded again
-                    if self.terminal.writes_out_whole() {
-                        self.unrecorded = false;
-                        recorded = fed;
-                        self.keyframe_waits = false;
-                        self.take_keyframe();
-                    }
+                    self.unrecorded = false;
+                    recorded = fed;
+                    self.keyframe_waits = false;
+                    self.take_keyframe();
                 } else if ground {
                     // What was parsed before the keyframe is recorded before it, and the rest after
                     self.record(|recorder| recorder.output(&bytes[recorded..fed]));
@@ -972,9 +972,6 @@ impl Screen {
     /// out and where nothing but the core is part way through anything: a keyframe that falls due
     /// mid-sequence is taken at the byte that ends the sequence (`feed`).
     ///
-    /// **And for a terminal the core writes out whole** (`Terminal::writes_out_whole`): due in the one
-    /// state it does not, the keyframe is taken once what is written next has ended.
-    ///
     /// **A sequence that never ends would put it off for ever**, and the recording would grow without
     /// bound, so at twice its budget nothing more is recorded until the sequence ends, where the
     /// keyframe is taken and what the program writes is recorded again. A replay comes to that keyframe
@@ -987,9 +984,7 @@ impl Screen {
         }
         let far_over_budget = recorder.far_over_budget();
         if self.terminal.at_ground() {
-            if self.terminal.writes_out_whole() {
-                self.take_keyframe();
-            }
+            self.take_keyframe();
         } else if far_over_budget {
             self.unrecorded = true;
         } else {
@@ -997,17 +992,25 @@ impl Screen {
         }
     }
 
-    /// Whether a keyframe taken now would be all of the terminal (`Terminal::writes_out_whole`).
-    pub fn writes_out_whole(&self) -> bool {
-        self.terminal.writes_out_whole()
-    }
-
-    /// Records the terminal as it stands.
+    /// Records the terminal as it stands, where it can be written out.
+    ///
+    /// **A terminal that is more than a keyframe holds is asked again later.** What makes a terminal
+    /// renderable has to fit a keyframe whole, and an image a program is part way through sending is
+    /// part of that, megabytes of it: the keyframe is put off for as much output again as lies between
+    /// two (`Recorder::put_off_keyframe`), by when the image has arrived and is no longer in the way.
+    /// The bytes are recorded all the while, so nothing is missing; the keyframe is only later. **Past
+    /// twice its budget the recording stops instead**, a keyframe being the only way its oldest part
+    /// can go.
     fn take_keyframe(&mut self) {
         let (cols, rows) = (self.cols, self.rows);
         let keyframe = self.keyframe();
-        self.record(|recorder| {
-            recorder.keyframe(cols, rows, &keyframe.map_err(|failed| std::io::Error::other(failed.to_string()))?)
+        self.record(|recorder| match keyframe {
+            Ok(keyframe) => recorder.keyframe(cols, rows, &keyframe),
+            Err(_) if !recorder.far_over_budget() => {
+                recorder.put_off_keyframe();
+                Ok(())
+            }
+            Err(failed) => Err(std::io::Error::other(failed.to_string())),
         });
         if self.reported.get().vouched_by().is_some() {
             self.record_marks();
@@ -1090,8 +1093,11 @@ impl Screen {
             match &timed.entry {
                 // Come to part way through a sequence: one the recording stopped at part way through,
                 // whose rest it did not record, so the replay starts again from the keyframe taken where
-                // it ended. One that cannot be read is where what the recording can show ends
+                // it ended. The sequence is ended first, for whatever else was reading it with the core
+                // (`image_sources`). A keyframe that cannot be read is where what the recording can show
+                // ends
                 Entry::Keyframe { cols, rows, state } if !self.terminal.at_ground() => {
+                    self.feed(b"\x18");
                     if self.terminal.restore(state).is_err() {
                         break;
                     }

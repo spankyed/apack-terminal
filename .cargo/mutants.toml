@@ -135,6 +135,15 @@ exclude_re = [
     # Matched without `in`, for the reason `security.rs`' entry above records: this mutant replaces the
     # function rather than something inside it, and `in <fn>` prints only for the latter
     "vt/mod.rs:.*<impl Drop for Terminal>::drop",
+    # **The same of a snapshot's decoder**, which is made and freed inside one call each time a keyframe is
+    # taken or put back: nothing outside the process can tell one that was not freed from one that was
+    "vt/keyframe.rs:.*<impl Drop for Decoding>::drop",
+
+    # **Which cuts are tried is what a keyframe costs, never what it is.** A snapshot's beginning is taken
+    # in a sixty-fourth, an eighth and then all of the room a keyframe may have, stopping at the first
+    # that holds it; with the middle one some other size the same keyframe is found one cut later, or one
+    # sooner, and it is cut where the same record ends. `benches/keyframe.rs` is where the cost shows
+    "vt/keyframe.rs:.*replace / with % in Terminal::keyframe",
     # The same for the key and mouse encoders a session keeps, which are four more handles with one owner
     "vt/input.rs:.*<impl Drop for Encoders>::drop",
 

@@ -4,7 +4,7 @@
 //! **The core's own account of itself, and so all of it.** `libghostty-vt` encodes a terminal's complete
 //! state as a *snapshot* and decodes one into a terminal: both screens, the cursor a program asked for
 //! and the one it saved, its modes, tab stops, margins, colours, character sets and images, with
-//! nothing for this broker to list and so nothing for it to leave out. The sequences that redraw a
+//! nothing for this broker to list and so nothing for it to forget. The sequences that redraw a
 //! screen are not that: they are one screen, as its text and the state the core's formatter knows to
 //! write, which is not the cursor's shape, nor a saved cursor, nor the screen under a full-screen
 //! program.
@@ -21,18 +21,20 @@
 //! brought and how far into the bytes it has read. So a keyframe is cut where a record ends, it says
 //! how many records of history it holds, and one that is written is one that has been restored.
 //!
-//! **It says one thing more: what cursor its terminal was told a reset returns to.** That is a setting
-//! and not the terminal's state, and it is here because it is the one setting the core does not take
-//! without touching state (`Terminal::tell_again`): a terminal put back under the same one is not told
-//! it again.
+//! **It says two things more.** What cursor its terminal was told a reset returns to, which is a
+//! setting and not the terminal's state, and is here because it is the one setting the core does not
+//! take without touching state (`Terminal::tell_again`): a terminal put back under the same one is not
+//! told it again. And whether it holds the pixels of every image its terminal held, which a keyframe
+//! cut for its history may not (`Terminal::keyframe`).
 //!
 //! **Held to it, not taken on trust.** That a terminal put back goes on as the one written out is a
 //! property `tests/keyframes.rs` checks over generated output. It holds outside left and right margins
-//! (`DECSLRM`), and found what the core does not hold inside them: a line about to wrap at a right
-//! margin, which a session takes no keyframe in (`Terminal::writes_out_whole`); the same of a cursor
-//! that was saved, which nothing can ask about and a keyframe is therefore without; and which rows
-//! keep the shell's prompt mark once a program scrolls between margins. Each is said there with a case
-//! that fails the day the core holds it.
+//! (`DECSLRM`), and found what the core's snapshot does not hold inside them: a line about to wrap at a
+//! right margin short of the screen's edge, of the cursor and of a cursor that was saved, and which
+//! rows keep the shell's prompt mark once a program scrolls between margins. A keyframe taken in the
+//! first state is put back with the cursor at the margin and no wrap pending, so the next character
+//! is printed over the last where it would have begun a line. Each is said there with a case that
+//! fails the day the core holds it.
 //!
 //! **A keyframe is read by the core that wrote it.** The snapshot's format is the core's and moves with
 //! it, which upstream says of its first version in so many words. A recording whose keyframes a later
@@ -46,9 +48,10 @@ use super::{Failed, Terminal};
 /// How many of its snapshot's history records a keyframe holds: the four bytes it begins with.
 const RECORDS: usize = std::mem::size_of::<u32>();
 
-/// The bytes a keyframe begins with, before its snapshot: `RECORDS`, and the two that say what cursor
-/// its terminal was told a reset returns to (`Terminal::told_cursor`).
-const HEAD: usize = RECORDS + 2;
+/// The bytes a keyframe begins with, before its snapshot: `RECORDS`, the two that say what cursor its
+/// terminal was told a reset returns to (`Terminal::told_cursor`), and one that is `1` where the
+/// keyframe holds the pixels of every image its terminal held.
+const HEAD: usize = RECORDS + 3;
 
 /// What an encoding is written into: the snapshot's first `most` bytes, and no more.
 struct Beginning {
@@ -82,8 +85,9 @@ unsafe extern "C" fn take(userdata: *mut std::ffi::c_void, data: *const u8, len:
 struct Decoding(sys::SnapshotDecoder);
 
 impl Decoding {
-    /// A decoder over `snapshot`, which it borrows: the bytes outlive the value.
-    fn of(snapshot: &[u8], image_storage: Option<u64>) -> Result<Self, Failed> {
+    /// A decoder over `snapshot`, which it borrows: the bytes outlive the value. With `images` false the
+    /// terminal it decodes holds none of the snapshot's images.
+    fn of(snapshot: &[u8], images: bool) -> Result<Self, Failed> {
         let mut decoder: sys::SnapshotDecoder = std::ptr::null_mut();
         // SAFETY: `decoder` is a valid out-pointer, a null allocator asks for the library's own, and the
         // slice is borrowed for as long as the value this returns
@@ -92,15 +96,14 @@ impl Decoding {
         };
         Failed::check("ghostty_snapshot_decoder_new_buf", result)?;
         let decoding = Self(decoder);
-        // **A snapshot does not say how many bytes of images its terminal kept**, so the decoder is told:
-        // none, for a terminal that takes no images, whatever the one that was written out held
-        if let Some(limit) = image_storage {
+        if !images {
+            let none: u64 = 0;
             // SAFETY: KITTY_IMAGE_STORAGE_LIMIT takes a `uint64_t*`
             let result = unsafe {
                 sys::ghostty_snapshot_decoder_set(
                     decoding.0,
                     sys::SnapshotDecoderOption::KITTY_IMAGE_STORAGE_LIMIT,
-                    (&raw const limit).cast::<std::ffi::c_void>(),
+                    (&raw const none).cast::<std::ffi::c_void>(),
                 )
             };
             Failed::check("ghostty_snapshot_decoder_set(KITTY_IMAGE_STORAGE_LIMIT)", result)?;
@@ -128,13 +131,27 @@ impl Decoding {
         unsafe { sys::ghostty_snapshot_decoder_next(self.0) == sys::Result::SUCCESS }
     }
 
-    /// One of the decoder's counts, or zero where it has none to give: the lines of a record that was
-    /// an image's pixels.
+    /// One of the decoder's counts that is a `size_t`, or zero where it has none to give: the lines of
+    /// a record that was an image's pixels, the bytes of one that was a page.
     fn count(&self, what: sys::SnapshotDecoderData::Type) -> usize {
         let mut count: usize = 0;
-        // SAFETY: both counts asked for here are documented as writing a `size_t`
+        // SAFETY: each count asked for through this is documented as writing a `size_t`
         let result = unsafe { sys::ghostty_snapshot_decoder_get(self.0, what, (&raw mut count).cast()) };
         if result == sys::Result::SUCCESS { count } else { 0 }
+    }
+
+    /// How many bytes of pixels the snapshot's images had still to come once the terminal was
+    /// renderable, on both screens.
+    fn pixels_to_come(&self) -> u64 {
+        [sys::SnapshotDecoderData::KITTY_PENDING_BYTES_PRIMARY, sys::SnapshotDecoderData::KITTY_PENDING_BYTES_ALTERNATE]
+            .into_iter()
+            .map(|what| {
+                let mut bytes: u64 = 0;
+                // SAFETY: both are documented as writing a `uint64_t`
+                let result = unsafe { sys::ghostty_snapshot_decoder_get(self.0, what, (&raw mut bytes).cast()) };
+                if result == sys::Result::SUCCESS { bytes } else { 0 }
+            })
+            .sum()
     }
 }
 
@@ -153,14 +170,23 @@ impl Terminal {
     /// and one that is not only where it was told beforehand to keep the bytes it is part way through,
     /// which a session's is not: a keyframe is taken where a sequence ends (`Screen::keyframe_when_due`).
     ///
-    /// **Refused where the terminal's renderable state does not fit `most`**, which a screen of images
-    /// can do: half a screen is not a keyframe. History is what gives way first, as the core orders it,
-    /// and then the pixels of the images on screen.
+    /// **Refused where what makes the terminal renderable does not fit `most`**, which an image a
+    /// program is part way through sending can do: the core writes out what has arrived of it with the
+    /// screen. Half a screen is not a keyframe, and a session takes the one it is due once the image
+    /// has arrived (`Screen::take_keyframe`).
+    ///
+    /// **Its images are all of them or none.** A snapshot holds the pixels of the images on screen with
+    /// the screen, those of an image up the history after the page it is on, and after everything
+    /// those of an image shown nowhere; so a keyframe cut for its history may hold an image without
+    /// its pixels, which would be drawn as an empty place wherever it is, or is next, shown. A keyframe
+    /// says whether it holds every image's pixels, and one that does not is put back with no images,
+    /// which is what its recording then shows of them: the ones sent after it.
     ///
     /// **The smallest cut that holds it is found from below**, an eighth of the last each time, because
     /// encoding stops where the cut is and not where the lines asked for end: a history of short lines is
     /// tens of thousands of them in the room a thousand long ones take, all encoded to be cut away.
     pub fn keyframe(&self, history: u32, most: usize) -> Result<Vec<u8>, Failed> {
+        let most = most.saturating_sub(HEAD);
         let mut last = Err(Failed { call: "ghostty_snapshot_encode", code: sys::Result::OUT_OF_SPACE });
         for most in [most / 64, most / 8, most] {
             let beginning = self.encoded(most)?;
@@ -170,20 +196,6 @@ impl Terminal {
             }
         }
         last.map(|(keyframe, _)| keyframe)
-    }
-
-    /// Whether this terminal, written out now, would be all of itself.
-    ///
-    /// **The core's snapshot does not hold a line about to wrap at a right margin** that is not the
-    /// screen's last column (`DECSLRM`). Put back, the cursor is at the margin with no wrap pending, and
-    /// the next character is printed over the last one where it would have begun a line. So a session
-    /// takes no keyframe there (`Screen::keyframe_when_due`), and the next thing its program writes
-    /// moves it on. `tests/keyframes.rs` holds the core to dropping it, so that the day it does not,
-    /// this and what asks it can go.
-    pub fn writes_out_whole(&self) -> bool {
-        let pending = self.cursor_pending_wrap().unwrap_or(false);
-        let last = self.cols().map_or(0, |columns| columns.saturating_sub(1));
-        !(pending && self.cursor_column().is_ok_and(|column| column < last))
     }
 
     /// The first `most` bytes of this terminal's snapshot.
@@ -203,13 +215,15 @@ impl Terminal {
     /// The keyframe a snapshot's beginning makes: cut where the last record ends that is needed for
     /// `history` lines, or that there is. Answers it with the lines of history those records brought.
     fn cut(&self, beginning: &Beginning, history: u32) -> Result<(Vec<u8>, usize), Failed> {
-        let decoding = Decoding::of(&beginning.taken, self.image_storage())?;
+        let decoding = Decoding::of(&beginning.taken, true)?;
         let scratch = decoding.ready()?;
-        let (mut records, mut lines) = (0u32, 0usize);
+        let to_come = decoding.pixels_to_come();
+        let (mut records, mut lines, mut pixels) = (0u32, 0usize, 0u64);
         let mut kept = decoding.count(sys::SnapshotDecoderData::SOURCE_OFFSET);
         while lines < history as usize && decoding.next() {
             records += 1;
             lines += decoding.count(sys::SnapshotDecoderData::PROGRESS_ROWS);
+            pixels += decoding.count(sys::SnapshotDecoderData::PROGRESS_IMAGE_BYTES) as u64;
             kept = decoding.count(sys::SnapshotDecoderData::SOURCE_OFFSET);
         }
         drop(decoding);
@@ -218,6 +232,7 @@ impl Terminal {
         let mut keyframe = Vec::with_capacity(HEAD + kept);
         keyframe.extend_from_slice(&records.to_le_bytes());
         keyframe.extend_from_slice(&self.told_cursor());
+        keyframe.push(u8::from(pixels >= to_come));
         keyframe.extend_from_slice(&beginning.taken[..kept]);
         Ok((keyframe, lines))
     }
@@ -233,8 +248,8 @@ impl Terminal {
     pub fn restore(&mut self, keyframe: &[u8]) -> Result<(), Failed> {
         let damaged = Failed { call: "ghostty_snapshot_decoder_next", code: sys::Result::INVALID_VALUE };
         let Some((head, snapshot)) = keyframe.split_first_chunk::<HEAD>() else { return Err(damaged) };
-        let [records @ .., style, blinks] = *head;
-        let decoding = Decoding::of(snapshot, self.image_storage())?;
+        let [records @ .., style, blinks, images] = *head;
+        let decoding = Decoding::of(snapshot, images == 1)?;
         let handle = decoding.ready()?;
         let whole = (0..u32::from_le_bytes(records)).all(|_| decoding.next());
         drop(decoding);

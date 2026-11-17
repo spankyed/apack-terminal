@@ -15,10 +15,11 @@ use apack_terminal::screen::{Colors, KEYFRAME_BYTES, KEYFRAME_HISTORY_LINES, Scr
 use apack_terminal::view::publish::ViewId;
 use apack_terminal::view::wire::{ColorChanges, Cursor, Frame, ToView, body};
 use apack_terminal::vt::Terminal;
+use apack_terminal::vt::input::{Encoders, Key};
 use apack_terminal::vt::rows::{CursorRead, Rendering, RowRead, Space};
 use proptest::prelude::*;
 
-use crate::screens::{keyframe, keyframe_of};
+use crate::screens::{keyframe, keyframe_of, picture};
 
 const COLUMNS: u16 = 24;
 const ROWS: u16 = 6;
@@ -39,7 +40,8 @@ fn terminal(columns: u16, rows: u16) -> Terminal {
 const MODES: [u16; 22] =
     [1, 3, 5, 6, 7, 8, 9, 12, 25, 45, 66, 69, 1000, 1002, 1003, 1004, 1005, 1006, 1015, 1016, 1049, 2004];
 
-/// Everything of a terminal that can be read.
+/// Everything of a terminal that is read here. Not its title, which nothing in the broker asks the core
+/// for: a session is told it as it is set.
 #[derive(Debug, PartialEq)]
 struct Seen {
     rows: Vec<RowRead>,
@@ -49,7 +51,14 @@ struct Seen {
     mouse: bool,
     modes: Vec<Option<bool>>,
     colors: ColorChanges,
+    /// What each of `KEYS` sends the program, which is what the modes a program is typed at through
+    /// come to: the cursor keys' and the keypad's, the Kitty keyboard's flags, and `modifyOtherKeys`
+    keys: Vec<Vec<u8>>,
 }
+
+/// An arrow, a keypad digit, and three keys that say nothing of their modifiers unless a program asked.
+const KEYS: [(&str, u16, &str, u32); 5] =
+    [("ArrowUp", 0, "", 0), ("Numpad5", 0, "5", 0x35), ("Enter", 1, "", 0), ("Tab", 2, "", 0), ("KeyI", 2, "", 0x69)];
 
 fn seen(terminal: &Terminal) -> Seen {
     let held = terminal.scrollback_rows().expect("the history is counted") + u32::from(terminal.rows().expect("rows"));
@@ -65,6 +74,16 @@ fn seen(terminal: &Terminal) -> Seen {
         mouse: terminal.mouse_tracking().expect("the mouse reads"),
         modes: MODES.iter().map(|mode| terminal.mode(*mode).ok()).collect(),
         colors: terminal.color_changes().expect("the colours read"),
+        keys: {
+            let mut encoders = Encoders::new().expect("the encoders");
+            KEYS.iter()
+                .map(|(code, modifiers, text, unshifted)| {
+                    let key =
+                        Key { action: 0, code, modifiers: *modifiers, text, unshifted: *unshifted, composed: false };
+                    encoders.key(terminal, &key).expect("a key encodes")
+                })
+                .collect()
+        },
     }
 }
 
@@ -113,6 +132,8 @@ const WRITTEN: &[&str] = &[
     "\x1b]8;;\x1b\\",
     "\x1b[1\"q",
     "\x1b[0\"q",
+    "\x1b[?2J",
+    "\x1b[?K",
     "\x1b(0",
     "\x1b(B",
     "\x1b)0",
@@ -217,13 +238,20 @@ fn written_in_margins(most: usize) -> impl Strategy<Value = Vec<u8>> {
     prop::collection::vec(pieces, 0..most).prop_map(|pieces| pieces.concat().into_bytes())
 }
 
+/// Whether the cursor is about to wrap at a right margin that is not the screen's last column.
+fn wrap_pending_at_a_margin(terminal: &Terminal) -> bool {
+    terminal.cursor_pending_wrap().expect("the wrap reads")
+        && terminal.cursor_column().expect("the column reads") + 1 < terminal.cols().expect("the columns read")
+}
+
 /// A terminal written out after `before`, put back in place of one that held `replaced`, and both fed
 /// `after`: what each reads as when put back, and after what was written next.
 fn put_back(before: &[u8], after: &[u8], replaced: &[u8]) -> Option<[(Seen, Seen); 2]> {
     let mut live = terminal(COLUMNS, ROWS);
     live.feed(before);
-    // Where a session takes one: not in the one state the core does not write out
-    if !live.writes_out_whole() {
+    // Not with a line about to wrap at a right margin, which the core does not write out
+    // (`a_wrap_pending_at_a_right_margin_is_not_written_out`)
+    if wrap_pending_at_a_margin(&live) {
         return None;
     }
     let taken =
@@ -267,10 +295,10 @@ proptest! {
     /// before the scroll. It is recorded here rather than explained, and the marks are left out of what
     /// is compared.
     ///
-    /// *A cursor saved with a wrap pending at a margin.* The core writes out no wrap pending short of
-    /// the screen's edge (`a_wrap_pending_at_a_right_margin_…`), and a saved cursor carries one as the
-    /// cursor does. A session takes no keyframe while its own cursor is in that state; a saved cursor
-    /// cannot be asked about, so nothing here saves one.
+    /// *A wrap pending at a margin.* The core writes out no wrap pending short of the screen's edge
+    /// (`a_wrap_pending_at_a_right_margin_is_not_written_out`), of the cursor or of a cursor that was
+    /// saved. No keyframe is taken here with the cursor's pending; a saved cursor cannot be asked
+    /// about, so nothing here saves one.
     ///
     /// Every row's text and style, the cursor and the modes are held to the same as above.
     #[test]
@@ -296,20 +324,17 @@ proptest! {
     fn a_moment_is_the_same_screen_from_whichever_keyframe_it_is_replayed(
         stretches in prop::collection::vec(written(12), 1..6),
     ) {
+        // What is written here sets no left or right margin, so the terminal is written out whole wherever
+        // a keyframe falls
         let mut live = Screen::new(COLUMNS, ROWS);
         let mut entries = Vec::new();
-        let mut keyframes = Vec::new();
         for (index, stretch) in stretches.iter().enumerate() {
-            // Where a session takes one: not in the one state the core does not write out
-            if live.writes_out_whole() {
-                keyframes.push(entries.len());
-                entries.push(Timed { at: index as u64, entry: keyframe_of(&live, COLUMNS, ROWS) });
-            }
+            entries.push(Timed { at: index as u64, entry: keyframe_of(&live, COLUMNS, ROWS) });
             live.feed(stretch);
             entries.push(Timed { at: index as u64, entry: Entry::Output(stretch.clone()) });
         }
         let ended = showing(&mut live);
-        for from in keyframes {
+        for from in (0..entries.len()).step_by(2) {
             let mut replayed = Screen::new(COLUMNS, ROWS);
             prop_assert!(replayed.replay_all(&entries[from..]));
             prop_assert_eq!(showing(&mut replayed), ended.clone(), "replayed from the keyframe at entry {}", from);
@@ -366,36 +391,37 @@ fn a_keyframe_holds_a_saved_cursor_a_cursors_shape_and_the_screen_under_a_progra
     let mut shaped = terminal(COLUMNS, ROWS);
     shaped.feed(b"\x1b[4 q");
     assert_eq!(seen(&shaped).cursor.map(|cursor| (cursor.shape, cursor.blinking)), Some((2, false)));
+    // And what is read of how a terminal is typed at does read it: each of these changes what a key sends
+    let plain = seen(&terminal(COLUMNS, ROWS)).keys;
+    for typed_at in ["\x1b[?1h", "\x1b[>5u"] {
+        let mut asked = terminal(COLUMNS, ROWS);
+        asked.feed(typed_at.as_bytes());
+        assert_ne!(seen(&asked).keys, plain, "{typed_at:?} changed nothing a key sends");
+    }
 }
 
-/// **What the core's snapshot does not hold, and that a session takes no keyframe where it can tell.** A
-/// line about to wrap at a right margin short of the screen's edge is written out as a cursor at the
-/// margin with no wrap pending, so the next character overwrites the last where it would have begun a
-/// line. **When the first assertion of this fails the core holds it**, and `Terminal::writes_out_whole`
-/// and what asks it can go. Until then a recording takes its keyframe once the next thing written has
-/// ended, and a replay from it is what the session showed.
+/// **What the core's snapshot does not hold: a line about to wrap at a right margin.** Short of the
+/// screen's edge, a wrap that is pending is written out as a cursor at the margin with none, so the next
+/// character is printed over the last where it would have begun a line; and a cursor saved in that state
+/// is put back without it too. A keyframe taken then is the terminal less that, which is the one thing a
+/// replay from it shows wrong, inside left and right margins only. **Each assertion here that the wrap is
+/// gone fails the day the core holds it**, and what is said of it in `vt/keyframe.rs` and in the property
+/// above can go.
 #[test]
-fn a_wrap_pending_at_a_right_margin_is_not_written_out_and_no_keyframe_is_taken_there() {
+fn a_wrap_pending_at_a_right_margin_is_not_written_out() {
     // Margins at columns 3 and 12, and a line that ends exactly at the right one
     let at_the_margin = b"\x1b[?69h\x1b[3;12s\x1b[1;3Hten chars!";
     let mut live = terminal(COLUMNS, ROWS);
     live.feed(at_the_margin);
-    assert!(live.cursor_pending_wrap().expect("the wrap reads"), "the line did not end at the margin");
-    assert!(!live.writes_out_whole());
+    assert!(wrap_pending_at_a_margin(&live), "the line did not end at the margin");
     let taken = live.keyframe(KEYFRAME_HISTORY_LINES, KEYFRAME_BYTES).expect("the terminal is written out");
     let mut back = terminal(COLUMNS, ROWS);
     back.restore(&taken).expect("a keyframe is put back");
-    assert!(
-        !back.cursor_pending_wrap().expect("the wrap reads"),
-        "the core now writes out a wrap pending at a right margin: `writes_out_whole` can go"
-    );
-    // **A cursor saved in that state is put back without the wrap too, and a session cannot know**: nothing
-    // asks the core about a saved cursor, so a keyframe taken while one is held is the terminal less
-    // that. When this fails the core holds it
+    assert!(!back.cursor_pending_wrap().expect("the wrap reads"), "the core now writes out a wrap pending at a margin");
+
     let mut saved = terminal(COLUMNS, ROWS);
     saved.feed(at_the_margin);
     saved.feed(b"\x1b7\r\n");
-    assert!(saved.writes_out_whole());
     let taken = saved.keyframe(KEYFRAME_HISTORY_LINES, KEYFRAME_BYTES).expect("the terminal is written out");
     let mut back = terminal(COLUMNS, ROWS);
     back.restore(&taken).expect("a keyframe is put back");
@@ -405,42 +431,17 @@ fn a_wrap_pending_at_a_right_margin_is_not_written_out_and_no_keyframe_is_taken_
     assert!(saved.cursor_pending_wrap().expect("the wrap reads"), "a saved cursor does not carry a pending wrap");
     assert!(
         !back.cursor_pending_wrap().expect("the wrap reads"),
-        "the core now writes out a saved cursor's wrap pending at a right margin"
+        "the core now writes out a saved cursor's wrap pending at a margin"
     );
 
-    // At the screen's own edge the wrap is held, and that is written out whole
+    // At the screen's own edge the wrap is written out
     let mut edge = terminal(COLUMNS, ROWS);
     edge.feed("x".repeat(usize::from(COLUMNS)).as_bytes());
-    assert!(edge.cursor_pending_wrap().expect("the wrap reads") && edge.writes_out_whole());
-
-    // A recording due a keyframe after every byte takes none while the wrap is pending
-    let directory = tempfile::tempdir().expect("a directory");
-    let path = directory.path().join("one.recording");
-    let recorder = apack_terminal::recording::Recorder::start_with(&path, u64::MAX, 1).expect("the recording starts");
-    let mut session = Screen::new(COLUMNS, ROWS);
-    session.start_recording_with(recorder).expect("the first keyframe is written");
-    let keyframes = |session: &mut Screen| {
-        session.flush_recording();
-        apack_terminal::recording::read(&path)
-            .iter()
-            .filter(|timed| matches!(timed.entry, Entry::Keyframe { .. }))
-            .count()
-    };
-    session.feed(b"\x1b[?69h\x1b[3;12s\x1b[1;3H");
-    let before = keyframes(&mut session);
-    session.feed(b"ten chars!");
-    assert_eq!(keyframes(&mut session), before, "a keyframe was taken with a wrap pending at the margin");
-    session.feed(b"next");
-    assert_eq!(keyframes(&mut session), before + 1, "no keyframe once the line had wrapped");
-
-    session.flush_recording();
-    let entries = apack_terminal::recording::read(&path);
-    let last = entries.iter().rposition(|timed| matches!(timed.entry, Entry::Keyframe { .. })).expect("a keyframe");
-    let mut replayed = Screen::new(COLUMNS, ROWS);
-    assert!(replayed.replay_all(&entries[last..]));
-    session.feed(b" and on");
-    replayed.feed(b" and on");
-    assert_eq!(showing(&mut replayed), showing(&mut session));
+    assert!(edge.cursor_pending_wrap().expect("the wrap reads"));
+    let taken = edge.keyframe(KEYFRAME_HISTORY_LINES, KEYFRAME_BYTES).expect("the terminal is written out");
+    let mut back = terminal(COLUMNS, ROWS);
+    back.restore(&taken).expect("a keyframe is put back");
+    assert_eq!(seen(&back), seen(&edge));
 }
 
 /// **A cursor a program asked for is kept, whichever default the terminal put back is under.** Telling
@@ -518,9 +519,10 @@ fn a_keyframe_of_a_long_history_holds_the_newest_of_it_and_all_of_the_terminals_
     assert_eq!(kept.cursor, all.cursor);
     assert_eq!(kept.rows[kept.rows.len() - 24..], all.rows[all.rows.len() - 24..]);
 
-    // Asked for no history, it is the screen and what the core writes out with it
+    // Asked for no history, it is the screen and what the core writes out with it, and no record more
     let screen_only = live.keyframe(0, KEYFRAME_BYTES).expect("the terminal is written out");
     assert!(screen_only.len() < taken.len());
+    assert_eq!(screen_only[..4], [0; 4], "a keyframe asked for no history holds records of it");
     let mut back = terminal(80, 24);
     back.restore(&screen_only).expect("a keyframe is put back");
     assert_eq!(rows_of(&back)[rows_of(&back).len() - 24..], all.rows[all.rows.len() - 24..]);
@@ -546,7 +548,7 @@ fn a_keyframe_is_cut_larger_where_the_smaller_cut_does_not_hold_it() {
     // With room for less than those thousand lines, it holds the newest that fit, and all of the screen
     let room = taken.len() * 2 / 3;
     let short = live.keyframe(KEYFRAME_HISTORY_LINES, room).expect("the terminal is written out");
-    assert!(short.len() <= room + 6, "{} bytes in room for {room}", short.len());
+    assert!(short.len() <= room, "{} bytes in room for {room}", short.len());
     let mut back = terminal(360, 40);
     back.restore(&short).expect("a keyframe is put back");
     let (kept, all) = (rows_of(&back), rows_of(&live));
@@ -683,6 +685,147 @@ fn a_terminal_put_back_is_told_what_the_one_it_replaces_was_told() {
     assert!(screen.scrollback_rows() < 4_000, "{} lines kept by a session that keeps 2,000", screen.scrollback_rows());
 }
 
+/// **Each mode's default is kept, and a colour a session was not given is not left from the keyframe.** Two
+/// modes told a default are two settings and not one made twice; and a session with no cursor colour and
+/// no palette of its own answers with none, whatever the terminal written out was given.
+#[test]
+fn every_mode_default_is_told_again_and_a_colour_not_given_is_cleared() {
+    let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+    let mut written_out = Terminal::new(40, 6).expect("a terminal");
+    written_out.set_colors([9, 9, 9], [8, 8, 8], Some([7, 7, 7]), &[[1, 1, 1], [2, 2, 2]]).expect("colours are set");
+    let taken = written_out.keyframe(KEYFRAME_HISTORY_LINES, KEYFRAME_BYTES).expect("the terminal is written out");
+
+    let mut back = Terminal::new(40, 6).expect("a terminal");
+    back.set_mode(2027, true).expect("clustering is on by default");
+    back.set_mode(7, false).expect("wrapping is off by default");
+    back.set_colors([1, 2, 3], [4, 5, 6], None, &[]).expect("colours are set");
+    back.restore(&taken).expect("a keyframe is put back");
+    // A reset returns to both defaults: a family is one character, and a long line does not wrap
+    back.feed(format!("\x1bc{family}{}", "w".repeat(60)).as_bytes());
+    assert_eq!(back.cursor_row().expect("the row reads"), 0, "a line wrapped under a default of not wrapping");
+    // Two cells of family, which is five code points, and the thirty-eight that fit beside it
+    assert_eq!(back.text_between((0, 0), (39, 0)).expect("the row reads").chars().count(), 5 + 38);
+    // Its colours: the two it was given, and none of the keyframe's others
+    let mut plain = Terminal::new(40, 6).expect("a terminal");
+    plain.set_colors([1, 2, 3], [4, 5, 6], None, &[]).expect("colours are set");
+    let changed = |terminal: &mut Terminal, to: &str| {
+        terminal.feed(to.as_bytes());
+        terminal.color_changes().expect("the colours read")
+    };
+    // A program setting each colour to what the keyframe's terminal was given changes it, which it
+    // would not were that still what this terminal was given
+    let set = "\x1b]12;#070707\x07\x1b]4;1;#020202\x07";
+    assert_eq!(changed(&mut back, set), changed(&mut plain, set));
+    assert_eq!(back.color_changes().expect("the colours read").cursor, Some([7, 7, 7]));
+    assert_eq!(back.color_changes().expect("the colours read").palette, [(1, [2, 2, 2])]);
+}
+
+/// A screen that takes images as bytes, as a session's does, with a cell of ten by twenty: a picture is
+/// placed over the cells its pixels cover.
+fn pictured(columns: u16, rows: u16) -> Screen {
+    let mut screen = Screen::new(columns, rows);
+    screen.allow_images(false).expect("images are allowed");
+    screen.resize(columns, rows, 10, 20);
+    screen
+}
+
+/// The pictures `screen` holds placed, by id, and whether each has its pixels.
+fn pictures(screen: &mut Screen) -> Vec<(u32, bool)> {
+    // Asked as a view asks, which is what numbers the lines an image is on
+    let (sink, _incoming) = channel();
+    let id = ViewId { connection: 8, channel: 8 };
+    screen.attach_view(id, sink).expect("a view attaches");
+    let (_, _, placed) = screen.images().expect("the images read");
+    screen.detach_view(id);
+    let mut held: Vec<(u32, bool)> =
+        placed.iter().map(|(_, placement)| (placement.image, screen.image(placement.image, 0).is_some())).collect();
+    held.sort_unstable();
+    held.dedup();
+    held
+}
+
+/// **A keyframe's images are all of them, each whole, or none.** A snapshot holds an image's pixels after
+/// the page it is shown on, so a keyframe cut for its history can hold an image without them, which would
+/// be drawn as an empty place. One whose every image is whole is put back with them; one cut short of any
+/// is put back with none, which is what a recording shows of the images sent before a keyframe.
+#[test]
+fn a_keyframe_holds_every_image_whole_or_none_of_them() {
+    let shown = |screen: &mut Screen, id: u32| picture(id, 20, 20, 'T').iter().for_each(|piece| screen.feed(piece));
+    // A picture on the screen and one a few lines up, in a short history: both are held, pixels and all
+    let mut live = pictured(40, 6);
+    shown(&mut live, 3);
+    live.feed(b"\r\none\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven\r\n");
+    shown(&mut live, 4);
+    assert_eq!(pictures(&mut live), [(3, true), (4, true)]);
+    let entries = [Timed { at: 1, entry: keyframe_of(&live, 40, 6) }];
+    let mut back = pictured(40, 6);
+    assert!(back.replay(&entries, u64::MAX));
+    assert_eq!(pictures(&mut back), [(3, true), (4, true)]);
+    assert_eq!(back.image(3, 0).map(|read| read.bytes), live.image(3, 0).map(|read| read.bytes));
+
+    // One kept and shown nowhere, under a history longer than a keyframe holds: its pixels are after all
+    // of the history, past the cut. So no image is held — and where the program then shows the one it
+    // kept, the terminal put back shows nothing rather than a place with nothing in it
+    let mut long = pictured(40, 6);
+    picture(5, 20, 20, 't').iter().for_each(|piece| long.feed(piece));
+    let lines: String = (0..6_000).map(|number| format!("line {number}\r\n")).collect();
+    long.feed(lines.as_bytes());
+    shown(&mut long, 6);
+    let entries = [Timed { at: 1, entry: keyframe_of(&long, 40, 6) }];
+    let mut back = pictured(40, 6);
+    assert!(back.replay(&entries, u64::MAX));
+    assert!(back.scrollback_rows() >= KEYFRAME_HISTORY_LINES, "the history gave way to an image");
+    for screen in [&mut long, &mut back] {
+        screen.feed(b"\x1b_Ga=p,i=5,q=2\x1b\\");
+    }
+    assert_eq!(pictures(&mut long), [(5, true), (6, true)]);
+    assert_eq!(pictures(&mut back), [], "an image was put back from a keyframe that does not hold every image");
+    // And a session that takes no images is put back with none, whatever the keyframe holds
+    let entries = [Timed { at: 1, entry: keyframe_of(&live, 40, 6) }];
+    let mut refusing = Screen::new(40, 6);
+    assert!(refusing.replay(&entries, u64::MAX));
+    assert_eq!(pictures(&mut refusing), []);
+}
+
+/// **An image a program is part way through sending does not end the recording.** What has arrived of it is
+/// written out with the screen, and megabytes of it are more than a keyframe holds: the keyframe due then
+/// is put off, what the program writes goes on being recorded, and a keyframe is taken once the image has
+/// arrived. A replay of the recording ends as the session did.
+#[test]
+fn an_image_larger_than_a_keyframe_holds_puts_the_keyframe_off_and_the_recording_goes_on() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let path = directory.path().join("one.recording");
+    let recorder =
+        apack_terminal::recording::Recorder::start_with(&path, u64::MAX, 1 << 20).expect("the recording starts");
+    let mut live = pictured(80, 24);
+    live.start_recording_with(recorder).expect("the first keyframe is written");
+    live.feed(b"before\r\n");
+    // Nearly six megabytes of pixels, which is eight megabytes sent
+    for piece in picture(9, 1_200, 1_200, 'T') {
+        live.feed(&piece);
+    }
+    assert!(live.recorded(), "the recording ended on a keyframe it could not take");
+    // And a megabyte more, by when the image has arrived and a keyframe can be taken
+    let line = format!("{}\r\n", "after the image ".repeat(4));
+    for _ in 0..20_000 {
+        live.feed(line.as_bytes());
+    }
+    assert!(live.recorded());
+    live.flush_recording();
+    let entries = apack_terminal::recording::read(&path);
+    let keyframes: Vec<usize> =
+        (0..entries.len()).filter(|at| matches!(entries[*at].entry, Entry::Keyframe { .. })).collect();
+    let image_ends = entries
+        .iter()
+        .rposition(|timed| matches!(&timed.entry, Entry::Output(bytes) if bytes.starts_with(b"\x1b_Gm=0")))
+        .expect("the end of the image was recorded");
+    assert!(keyframes.iter().any(|at| *at > image_ends), "no keyframe was taken once the image had arrived");
+
+    let mut replayed = pictured(80, 24);
+    assert!(replayed.replay(&entries, u64::MAX));
+    assert_eq!(showing(&mut replayed), showing(&mut live));
+}
+
 /// **And what a program did to the terminal is not undone by telling it.** A mode a session turns on by
 /// default and a program turned off is off in the terminal put back, where telling the core a mode's
 /// default would turn it on again: a setting is what a reset returns to, and the state is the keyframe's.
@@ -748,6 +891,13 @@ fn a_view_of_a_screen_that_is_rebuilt_is_sent_the_screen_it_became() {
     let (earlier, rows) = drawn(&mut screen);
     assert_ne!(earlier, latest);
     assert_eq!(rows[..2], ["early", ""]);
+
+    // And its lines are counted on from there: what is written next is a change to the screen the view
+    // holds, not another screen
+    screen.feed(b"and on");
+    screen.publish();
+    let (after, _) = drawn(&mut screen);
+    assert_eq!(after, earlier, "a screen that was rebuilt once went on being another screen");
 }
 
 /// **A recording begun with keyframes this core does not read is picked up from the first it does**, and
@@ -797,7 +947,7 @@ fn a_replay_ends_at_a_keyframe_it_cannot_read_part_way_through_a_sequence() {
     assert!(screen.replay_all(&entries));
     assert_eq!(screen.snapshot(0).lines[..3], ["first", "shown", ""]);
     // What is written to it afterwards is a new sequence's, not the rest of the one the replay ended in
-    screen.feed(b"\x18\r\nnext");
+    screen.feed(b"\r\nnext");
     assert_eq!(screen.snapshot(0).lines[..3], ["first", "shown", "next"]);
 }
 

@@ -176,7 +176,8 @@ fn mode_of(handle: sys::Terminal, mode: u16) -> Result<bool, Failed> {
 }
 
 /// `ansi` replaces the first entries of the palette — the sixteen a theme names — and leaves the rest at
-/// the library's, which are the standard cube and greys no theme redefines.
+/// the library's, which are the standard cube and greys no theme redefines. **A colour the session was
+/// not given is cleared, not left**: a terminal put back was given another session's.
 fn tell_colors(
     handle: sys::Terminal,
     foreground: [u8; 3],
@@ -187,9 +188,14 @@ fn tell_colors(
     let rgb = |[r, g, b]: [u8; 3]| sys::ColorRgb { r, g, b };
     set(handle, sys::TerminalOption::COLOR_FOREGROUND, &rgb(foreground), "ghostty_terminal_set(COLOR_FOREGROUND)")?;
     set(handle, sys::TerminalOption::COLOR_BACKGROUND, &rgb(background), "ghostty_terminal_set(COLOR_BACKGROUND)")?;
-    if let Some(cursor) = cursor {
-        set(handle, sys::TerminalOption::COLOR_CURSOR, &rgb(cursor), "ghostty_terminal_set(COLOR_CURSOR)")?;
+    match cursor {
+        Some(cursor) => {
+            set(handle, sys::TerminalOption::COLOR_CURSOR, &rgb(cursor), "ghostty_terminal_set(COLOR_CURSOR)")?;
+        }
+        None => unset(handle, sys::TerminalOption::COLOR_CURSOR, "ghostty_terminal_set(COLOR_CURSOR)")?,
     }
+    // The library's own palette, which is what the first entries of are then replaced
+    unset(handle, sys::TerminalOption::COLOR_PALETTE, "ghostty_terminal_set(COLOR_PALETTE)")?;
     if ansi.is_empty() {
         return Ok(());
     }
@@ -208,6 +214,13 @@ fn tell_colors(
     }
     // COLOR_PALETTE takes a pointer to exactly 256 `GhosttyColorRgb`
     set(handle, sys::TerminalOption::COLOR_PALETTE, &palette, "ghostty_terminal_set(COLOR_PALETTE)")
+}
+
+/// Puts an option back to the core's own, which a null value does for the options this is asked of: a
+/// default colour, cleared, and the default palette, the library's again.
+fn unset(handle: sys::Terminal, option: sys::TerminalOption::Type, what: &'static str) -> Result<(), Failed> {
+    // SAFETY: the handle is live, and both options this is called with document a null value
+    Failed::check(what, unsafe { sys::ghostty_terminal_set(handle, option, std::ptr::null()) })
 }
 
 /// Routes what the terminal reports to `collector` (`Terminal::route_reports`, which says what must be
@@ -326,13 +339,5 @@ impl Terminal {
                 _ => None,
             })
             .unwrap_or([u8::MAX; 2])
-    }
-
-    /// How many bytes of images this terminal was told to keep, where it was told.
-    pub(super) fn image_storage(&self) -> Option<u64> {
-        self.settings.iter().find_map(|setting| match setting {
-            Setting::ImageStorage(limit) => Some(*limit),
-            _ => None,
-        })
     }
 }

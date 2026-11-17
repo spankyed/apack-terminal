@@ -1157,13 +1157,17 @@ fn a_sequence_not_recorded_to_its_end_leaves_no_replay_printing_the_rest_of_it()
         live.start_recording_with(Recorder::start_with(&path, 20_000, 1_000).expect("the recording starts"))
             .expect("the first keyframe is written");
         live.feed(b"before\r\n");
-        // A title far longer than twice the budget, in pieces, as a program writes one
-        live.feed(b"\x1b]0;");
+        // A string far longer than twice the budget, in pieces, as a program writes one: a title, and
+        // where the session reads images a program names, a command naming one, which the session
+        // reads with the core
+        let (begins, ends): (&[u8], &[u8]) =
+            if images { (b"\x1b_Gi=1,a=T,t=f,f=24,s=1,v=1;", b"\x1b\\") } else { (b"\x1b]0;", b"\x07") };
+        live.feed(begins);
         for _ in 0..100 {
             live.feed(&[b'x'; 500]);
         }
-        // The last of the title, its end and what follows, in one piece
-        live.feed(b"xxxx\x07after\r\n");
+        // The last of the string, its end and what follows, in one piece
+        live.feed(&[b"xxxx", ends, b"after\r\n"].concat());
         live.feed(b"end\r\n");
 
         let entries = recorded(&mut live, &path);
@@ -1171,8 +1175,9 @@ fn a_sequence_not_recorded_to_its_end_leaves_no_replay_printing_the_rest_of_it()
             .iter()
             .filter_map(|timed| if let Entry::Output(bytes) = &timed.entry { Some(bytes) } else { None })
             .collect();
+        let ended = [b"x", ends].concat();
         assert!(
-            !outputs.iter().any(|bytes| bytes.windows(2).any(|pair| pair == b"x\x07")),
+            !outputs.iter().any(|bytes| bytes.windows(ended.len()).any(|end| end == ended)),
             "the end of a sequence the recording had stopped taking was recorded, images {images}"
         );
         let keyframes: Vec<usize> = entries
@@ -1230,6 +1235,19 @@ fn a_replay_part_way_through_a_sequence_at_a_keyframe_starts_again_from_it() {
         at(400, Entry::Output(b"\r\nafter".to_vec())),
     ];
     let mut replayed = Screen::new(40, 10);
+    assert!(replayed.replay_all(&entries));
+    assert_eq!(replayed.snapshot(0).lines[..2], ["second", "after"]);
+
+    // The same where the sequence is a command naming an image's source, in a session that reads those
+    // itself: what was reading the command with the core starts again too
+    let entries = vec![
+        at(100, keyframe(b"first")),
+        at(200, Entry::Output(b"\r\n\x1b_Gi=1,a=T,t=f,f=24,s=1,v=1;L3Rt".to_vec())),
+        at(300, keyframe(b"second")),
+        at(400, Entry::Output(b"\r\nafter".to_vec())),
+    ];
+    let mut replayed = Screen::new(40, 10);
+    replayed.allow_images(true).expect("images are allowed");
     assert!(replayed.replay_all(&entries));
     assert_eq!(replayed.snapshot(0).lines[..2], ["second", "after"]);
 

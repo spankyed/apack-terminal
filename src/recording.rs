@@ -794,6 +794,12 @@ impl Recorder {
         self.keyframes.is_empty() || self.since_keyframe >= self.every
     }
 
+    /// Puts the keyframe that is due off until as much again has been written as lies between two: for a
+    /// terminal that could not be written out now.
+    pub fn put_off_keyframe(&mut self) {
+        self.since_keyframe = 0;
+    }
+
     /// Whether the recording is past its budget, where only a keyframe lets its oldest part go.
     pub fn over_budget(&self) -> bool {
         self.written > self.budget

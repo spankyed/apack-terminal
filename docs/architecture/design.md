@@ -188,8 +188,15 @@ where there are a thousand lines of it. A replay puts that terminal in place rat
 so it goes on exactly as the session did. The sequences that redraw a screen are not that: they are one
 screen as the core's formatter writes it, which leaves out the cursor's shape, a saved cursor, and the
 shell's screen under a full-screen program. That a terminal put back
-goes on as the one written out is held as a property over generated output (`tests/keyframes.rs`), which
-is what found the one state the core does not write out, where a session takes no keyframe.
+goes on as the one written out is held as a property over generated output (`tests/keyframes.rs`). It
+holds outside left and right margins; inside them it found what the core's snapshot does not hold — a
+line about to wrap at a right margin short of the screen's edge, and which rows keep the shell's prompt
+mark across a scroll — each pinned by a case that fails the day the core holds it.
+
+A keyframe's images are all of them or none: one cut for its history that would hold an image without
+its pixels is put back with no images, and what its recording then shows of them is the ones sent
+after it. A terminal that does not fit a keyframe — an image a program is part way through sending is
+megabytes written out with the screen — has its keyframe put off, and is recorded all the while.
 
 A keyframe is taken on whichever screen is showing, waits for the parser to be between sequences — which
 is where the core writes a terminal out — and is what lets a recording past its budget drop its oldest
