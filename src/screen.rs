@@ -91,11 +91,18 @@ pub const SEARCH_MATCHES: usize = 100;
 /// it is, and what answers it.
 pub struct Postponed {
     view: ViewId,
+    /// The bytes it keeps while it waits: a search's needle
+    bytes: usize,
     read: Box<dyn FnOnce(&mut Screen) + Send>,
 }
 
 /// How many of a view's questions one hold keeps waiting (`Screen::once_whole`).
 pub const POSTPONED_READS: usize = 64;
+
+/// How many bytes the questions one hold keeps waiting may hold between them (`Screen::once_whole_keeping`):
+/// far more than every needle a person types into a find bar during one hold, and far less than the
+/// messages that many questions could each be.
+pub const POSTPONED_BYTES: usize = 1 << 20;
 
 /// What a shell has reported about itself, accumulated from the markers it emitted.
 ///
@@ -768,7 +775,7 @@ impl Screen {
     /// Asks what waited for a hold that ran out (`end_hold`): now, unless the program has taken the
     /// screen again since.
     pub fn ask_again(&mut self, postponed: Postponed) {
-        self.once_whole(postponed.view, postponed.read);
+        self.once_whole_keeping(postponed.view, postponed.bytes, postponed.read);
     }
 
     /// Runs `read` on the screen when it is a whole frame: now, or — while the program holds the screen
@@ -790,14 +797,22 @@ impl Screen {
     ///
     /// **No more than `POSTPONED_READS` wait.** A view asks these as a person clicks, copies or types in
     /// a find bar. One that has asked that many inside one hold is answered from the screen as it stands,
-    /// which is what every one of them was before any waited, rather than left to grow a queue.
+    /// which is what every one of them was before any waited, rather than left to grow a queue. So is
+    /// one whose bytes would take what waits past `POSTPONED_BYTES` (`once_whole_keeping`).
     ///
     /// **A view that goes, or a session that ends, is answered then** (`detach_view`, `detach_connection`,
     /// `end_views`), from the screen as it stands: a question is answered or refused, never dropped, and
     /// a view that has finished speaking is still owed what it asked.
     pub fn once_whole(&mut self, view: ViewId, read: impl FnOnce(&mut Self) + Send + 'static) {
-        if self.hold.is_some() && self.postponed.len() < POSTPONED_READS {
-            self.postponed.push(Postponed { view, read: Box::new(read) });
+        self.once_whole_keeping(view, 0, read);
+    }
+
+    /// As `once_whole`, for a question that keeps `bytes` of its own while it waits: a search's needle,
+    /// which is as long as its view made it.
+    pub fn once_whole_keeping(&mut self, view: ViewId, bytes: usize, read: impl FnOnce(&mut Self) + Send + 'static) {
+        let waiting: usize = self.postponed.iter().map(|asked| asked.bytes).sum();
+        if self.hold.is_some() && self.postponed.len() < POSTPONED_READS && waiting + bytes <= POSTPONED_BYTES {
+            self.postponed.push(Postponed { view, bytes, read: Box::new(read) });
         } else {
             read(self);
         }

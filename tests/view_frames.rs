@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use apack_terminal::holds::{HOLD_LIMIT, Holds};
 use apack_terminal::protocol::{CursorBlink, CursorStyle};
-use apack_terminal::screen::{POSTPONED_READS, Screen, TEXT_BYTES, Unanswered};
+use apack_terminal::screen::{POSTPONED_BYTES, POSTPONED_READS, Screen, TEXT_BYTES, Unanswered};
 use apack_terminal::view::publish::{FETCH_LINES, Publication, ViewId};
 use apack_terminal::view::wire::{
     Color, ColorChanges, Frame, Glyph, MAX_MESSAGE_BYTES, Position, Row, Span, ToView, body, rows as rows_message,
@@ -449,6 +449,41 @@ fn a_question_past_what_a_hold_keeps_waiting_is_answered_from_the_screen_as_it_s
     let waited: Vec<_> = answers.try_iter().collect();
     assert_eq!(waited.len(), POSTPONED_READS);
     assert!(waited.iter().enumerate().all(|(nth, (asked, text))| *asked == nth && text == "half whole"), "{waited:?}");
+}
+
+/// **And a bounded number of bytes.** A question keeps what it was asked with while it waits, a search its
+/// needle, and one that would take what waits past the limit is answered from the screen as it stands.
+#[test]
+fn a_question_that_would_keep_more_than_a_hold_keeps_waiting_is_answered_from_the_screen_as_it_stands() {
+    let mut screen = Screen::new(20, 3);
+    screen.feed(b"old text");
+    let view = View::attached(&mut screen, 1, 1);
+    let first = view.frame();
+    let epoch = first.epoch;
+    screen.acknowledge(view.id, first.sequence).expect("an acknowledgement is taken");
+
+    write(&mut screen, "\x1b[?2026h\x1b[1;1H\x1b[2Khalf");
+    let (told, answers) = channel();
+    let ask = |screen: &mut Screen, asked: &'static str, bytes: usize| {
+        let told = told.clone();
+        screen.once_whole_keeping(view.id, bytes, move |screen| {
+            told.send((asked, screen.text_of(epoch, cells((0, 0), (0, 9))).expect("the text reads"))).expect("heard");
+        });
+    };
+    ask(&mut screen, "all a hold keeps", POSTPONED_BYTES);
+    ask(&mut screen, "one byte more", 1);
+    ask(&mut screen, "nothing more", 0);
+    assert_eq!(
+        answers.try_iter().collect::<Vec<_>>(),
+        vec![("one byte more", "half".to_owned())],
+        "only the one that would take the wait past the limit is answered during the hold"
+    );
+
+    write(&mut screen, " whole\x1b[?2026l");
+    assert_eq!(
+        answers.try_iter().collect::<Vec<_>>(),
+        vec![("all a hold keeps", "half whole".to_owned()), ("nothing more", "half whole".to_owned())]
+    );
 }
 
 /// **One session's hold does not wait on another session's work.** A screen that is busy when its hold
