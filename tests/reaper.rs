@@ -33,6 +33,7 @@ pub struct Reaper {
 pub fn watching(broker: &Child, program: &str) -> Reaper {
     use std::os::unix::process::CommandExt;
 
+    required_by_the_watcher(&["ps"]);
     let pid = broker.id();
     assert!(pid > 1, "a broker's pid is its own: {pid}");
     let mut command = Command::new("/bin/sh");
@@ -52,6 +53,32 @@ pub fn watching(broker: &Child, program: &str) -> Reaper {
     let mut watcher = command.spawn().expect("a watcher starts");
     let held = watcher.stdin.take().expect("piped stdin");
     Reaper { watcher: Some((watcher, held)) }
+}
+
+/// Refuses a machine without one of `tools`, which a watcher's script runs.
+///
+/// **A watcher that cannot run its tools ends nothing, and says nothing.** It is a shell whose output goes
+/// nowhere, so `lsof` not found reads as no broker holding the lock, and `ps` not found as a pid that is no
+/// longer the broker's: either way the broker it was there for is left running after the case, and only a
+/// case that asserts the broker went (`proxy::a_broker_a_proxy_started_is_ended_with_the_case_that_had_it_started`)
+/// would notice. So the case fails here, naming what to install, before anything is started.
+#[cfg(unix)]
+fn required_by_the_watcher(tools: &[&str]) {
+    for tool in tools {
+        let found = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(r#"command -v "$1""#)
+            .arg("sh")
+            .arg(tool)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(
+            found,
+            "`{tool}` is not on this machine's PATH: the watcher that ends a case's broker runs it, and without it leaves the broker running"
+        );
+    }
 }
 
 #[cfg(not(unix))]
@@ -83,7 +110,7 @@ pub struct Ending {
 /// has that file open is the broker on that socket: the system is asked who does, each answer is checked
 /// to be `program`, and that one process is killed. Asked only then, so there is no moment a broker
 /// exists and nothing knows of it, and no pid is carried from an earlier time to be somebody else's by
-/// now. Where the system has no `lsof` nothing is found and nothing is ended.
+/// now. A system without `lsof` is refused when the watch begins (`required_by_the_watcher`).
 ///
 /// **The watcher stays until the broker has gone, and not for ever.** A kill is asked for and happens
 /// a moment later, and what follows a case — its directory removed, the next case's broker on a socket
@@ -96,6 +123,7 @@ pub struct Ending {
 pub fn ending_with_the_case(socket: &std::path::Path, program: &str) -> Ending {
     use std::os::unix::process::CommandExt;
 
+    required_by_the_watcher(&["lsof", "ps"]);
     let mut lock = socket.as_os_str().to_owned();
     lock.push(".lock");
     let mut command = Command::new("/bin/sh");
