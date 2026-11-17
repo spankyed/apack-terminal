@@ -8,9 +8,9 @@ name: binaries
 # install verifies every file against them.
 #
 # **An asset is `<platform>__<file>`**: `<platform>` is Node's `<process.platform>-<process.arch>`, which is how
-# the app names the one it is on, and `<file>` is the name the file takes beside the others — the binary, and on
-# Windows the ConPTY it loads from its own directory (`windows/conpty/`). A release has no folders, so the
-# platform is in the name.
+# the app names the one it is on, and `<file>` is the name the file takes beside the others — the binary, on
+# Windows the ConPTY it loads from its own directory (`windows/conpty/`), and the notices the binary's licenses ask
+# a redistribution to carry. A release has no folders, so the platform is in the name.
 #
 # A dispatch builds a commit that has none, such as one from before this workflow.
 on:
@@ -71,6 +71,14 @@ jobs:
           for file in ${{ matrix.binary }} conpty.dll OpenConsole.exe; do
             if [ -f "target/release/$file" ]; then cp "target/release/$file" "out/${{ matrix.platform }}__$file"; fi
           done
+          # **The notices go with each platform's binary**, which their licenses ask a binary redistribution to
+          # carry: the crates', libghostty-vt's code's and ConPTY's, the Rust standard library's, and the broker's
+          # own (`cargo xtask check-notices` holds the first two to the lockfile and the toolchain). Named like the
+          # binary, so the app's pin lists them and its install puts them beside it. A commit from before the
+          # notices has only the license files, and its release is published with those alone
+          for file in THIRD-PARTY-NOTICES COPYRIGHT-rust-library.html LICENSE-MIT LICENSE-APACHE; do
+            if [ -f "$file" ]; then cp "$file" "out/${{ matrix.platform }}__$file"; fi
+          done
           ls -l out
           test -f "out/${{ matrix.platform }}__${{ matrix.binary }}"
       - uses: actions/upload-artifact@v4
@@ -104,4 +112,4 @@ jobs:
             exit 0
           fi
           gh release create "$tag" out/* --target "$COMMIT" --title "binaries for ${COMMIT:0:7}" \
-            --latest=false --notes "The broker's release build of $COMMIT for each platform the app ships, with SHA256SUMS. Pinned by apack, never replaced."
+            --latest=false --notes "The broker's release build of $COMMIT for each platform the app ships, with SHA256SUMS and the notices its licenses ask a redistribution to carry. Pinned by apack, never replaced."
