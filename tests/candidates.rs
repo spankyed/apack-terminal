@@ -50,7 +50,12 @@ fn a_pty_runs_a_command_and_its_output_comes_back() {
 
     let pty =
         native_pty_system().openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }).expect("a pty");
-    let mut child = pty.slave.spawn_command(CommandBuilder::new_default_prog()).expect("a shell");
+    // **The default program, with `SHELL` naming the one it is.** `portable-pty` reads the builder's own
+    // `SHELL` to choose it, so this is still the path a spawn naming no program takes, and not the login
+    // shell of whoever runs the suite — whose configuration took this case past its deadline on a busy machine
+    let mut program = CommandBuilder::new_default_prog();
+    program.env("SHELL", "/bin/sh");
+    let mut child = pty.slave.spawn_command(program).expect("a shell");
     // **Drop the slave, or the master never sees EOF.** Holding it keeps the slave fd open, so the read loop
     // below blocks for ever after the shell exits instead of ending — which is what it did first, and is the
     // lifetime the broker's session has to get right too.

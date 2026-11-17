@@ -147,7 +147,8 @@ most of what a changed line cost to build. **Its cases run cheapest first** (the
 shell, with the two longest started at the beginning so the run does not end waiting for them. **A case
 names its shell.** A spawn that names none runs the login shell of whoever ran the suite, with their
 configuration, which is seconds where `/bin/sh` is milliseconds and is what made cases go quiet on a busy
-machine; `tests/channel.rs` is where the default is run. **A case about a wait gives the broker a short
+machine. `tests/channel.rs` and `tests/candidates.rs` are where the default program is run, and they name
+it too: `portable-pty` chooses it from the spawn's own `SHELL`, which they set to `/bin/sh`. **A case about a wait gives the broker a short
 one** (`APACK_TERMINAL_START_GRACE_MS`): that a broker nothing connects to leaves when its grace is over
 is the same claim at half a second as at ten.
 

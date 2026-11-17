@@ -70,6 +70,8 @@ pub struct RowRead {
     cells: Vec<Placed>,
     /// Each distinct style on the row but the plain one, in the order they first appear
     styles: Vec<Style>,
+    /// Where each of `styles` is in it
+    style_at: StyleIndex,
     /// Each distinct link on the row, in the order they first appear
     links: Vec<String>,
     /// The runs of placeholder cells on the row, as the cells say them, left to right
@@ -78,6 +80,22 @@ pub struct RowRead {
     pieces: Vec<Piece>,
     cell: (u16, u16),
 }
+
+/// Where each style in a row's table is.
+///
+/// **Looked up rather than searched for, because a row can hold as many styles as it has cells**, and
+/// searching the table for each cell's made reading such a row cost the square of its width. It is derived
+/// from the table, so it says nothing about whether two rows are drawn alike: any two are equal.
+#[derive(Debug, Clone, Default)]
+struct StyleIndex(std::collections::HashMap<Style, usize>);
+
+impl PartialEq for StyleIndex {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for StyleIndex {}
 
 impl RowRead {
     /// Every character on the row, left to right.
@@ -106,6 +124,7 @@ impl RowRead {
         self.text.clear();
         self.cells.clear();
         self.styles.clear();
+        self.style_at.0.clear();
         self.links.clear();
         self.runs.clear();
         self.pieces.clear();
@@ -134,11 +153,16 @@ impl RowRead {
         if style == Style::default() {
             return 0;
         }
-        // The newest first: a run of cells shares the style of the cell before it
-        let found = self.styles.iter().rposition(|held| *held == style).unwrap_or_else(|| {
-            self.styles.push(style);
+        // A run of cells shares the style of the cell before it, which is found without hashing it
+        let found = if self.styles.last() == Some(&style) {
             self.styles.len() - 1
-        });
+        } else {
+            let next = self.styles.len();
+            *self.style_at.0.entry(style).or_insert_with(|| {
+                self.styles.push(style);
+                next
+            })
+        };
         // A row has at most a grid's width of cells, which is far inside sixteen bits
         u16::try_from(found + 1).unwrap_or(0)
     }
