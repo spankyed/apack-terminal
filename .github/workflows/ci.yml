@@ -68,6 +68,11 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo xtask check-generated
+      # The release's third-party notices, held to the lockfile, libghostty-vt's licenses and the toolchain
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.3
+      - run: cargo xtask check-notices
       # **The mutation gate's own exclusions, checked where every change is checked.** A pattern matching no
       # mutant leaves the survivor it was written for reported while reading as a settled question, and the
       # gate cannot notice that about itself. It belongs here rather than in `mutants.yml`, whose jobs are

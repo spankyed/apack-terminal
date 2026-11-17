@@ -147,5 +147,12 @@ Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE). The view
 ([`view/LICENSE`](view/LICENSE)), which carries the notice of
 [coder/ghostty-web](https://github.com/coder/ghostty-web), whose input handling it draws on.
 
+A release binary also holds the code it is built from, each under its own license: the Rust standard library, the
+crates the broker depends on, and libghostty-vt, which is Ghostty's code compiled with Zig together with Highway,
+simdutf, Wuffs and uucode; the Windows release ships Microsoft's ConPTY beside its binary. Redistributing one means
+complying with those licenses too. Each `bin-<commit>` release of a commit that has them carries their texts and
+notices beside each platform's binary: the crates', libghostty-vt's and ConPTY's in `THIRD-PARTY-NOTICES`, and the
+Rust standard library's in `COPYRIGHT-rust-library.html`.
+
 Unless you explicitly state otherwise, any contribution you intentionally submit for inclusion in this work,
 as defined in the Apache-2.0 license, is dual-licensed as above, without any additional terms or conditions.

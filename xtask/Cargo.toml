@@ -7,6 +7,8 @@ publish = false
 
 [dependencies]
 tempfile = "3.27.0"
+# For `notices`, which finds the libghostty-vt `ghostty-vt-rs-sys` links in `cargo metadata`'s output
+serde_json = "1.0.154"
 # For `vt-prebuilt`'s one digest. A platform branch between `shasum` and `sha256sum` is what this replaces,
 # and neither is reliably present on the Windows VM where Phase B has to run this task.
 sha2 = "0.10.9"
