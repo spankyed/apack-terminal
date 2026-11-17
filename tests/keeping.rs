@@ -1122,6 +1122,71 @@ fn a_job_in_a_group_of_its_own_ends_with_a_shell_that_had_to_be_killed() {
     assert!(gone, "the job {job} outlived the shell it was started in");
 }
 
+/// **A recording whose keyframes this broker's core does not read is said to be one, and is carried on.** A
+/// keyframe is the core's own account of a terminal, written in the core's format, so a recording begun
+/// under another core begins with keyframes this one cannot put back. Looked back through, it is refused
+/// with why rather than opened on an empty screen. A session asked to begin from it begins with nothing
+/// restored and records on in the same file, and the session after that begins from what the first wrote.
+#[test]
+fn a_recording_of_keyframes_this_broker_does_not_read_is_refused_and_carried_on() {
+    let broker = Broker::start();
+    let recording = broker.recording("from-another-core");
+    std::fs::create_dir_all(recording.parent().expect("a directory")).expect("the directory is made");
+    let mut written = apack_terminal::recording::Recorder::start(&recording).expect("the recording starts");
+    written.keyframe(60, 8, b"a terminal as another core wrote it out").expect("a keyframe is written");
+    written.output(b"what it printed\r\n").expect("output is written");
+    drop(written);
+    assert!(apack_terminal::recording::settled(&recording));
+
+    let hold = Connection::greeting(&broker, Role::Lifetime);
+    let client = Connection::greeting(&broker, Role::Client);
+    client.say(&Request::Rewind { recording: recording.to_str().expect("a utf-8 path").to_owned(), cols: 60, rows: 8 });
+    let why = loop {
+        match client.event() {
+            Event::Failed { message, .. } => break message,
+            Event::Rewound { .. } => panic!("a recording this broker does not read was opened"),
+            _ => {}
+        }
+    };
+    assert!(why.contains("does not read"), "{why}");
+
+    let (first, recorded, restored) = client.spawned(Some(&recording), true);
+    assert_eq!((recorded, restored), (true, false), "recorded on in the same file, with nothing restored");
+    let mut view = View::attached(&broker, &first);
+    view.until_shows("$ ");
+    view.type_line(&echo_sum("carried-", 2, 3, "-on"));
+    view.until_shows("carried-5-on");
+    client.kill(&first);
+
+    let (second, recorded, restored) = client.spawned(Some(&recording), true);
+    assert_eq!((recorded, restored), (true, true), "begun from the first keyframe this broker wrote");
+    let mut view = View::attached(&broker, &second);
+    view.until_shows("carried-5-on");
+    assert!(!view.held().contains("what it printed"), "what came before a keyframe that cannot be read was shown");
+
+    // Looked back through now, it opens at its end; a moment from before the keyframes this broker reads
+    // is refused, and the moment that was showing still is
+    client.say(&Request::Rewind { recording: recording.to_str().expect("a utf-8 path").to_owned(), cols: 60, rows: 8 });
+    let (rewound, first, last) = client.answer(|event| {
+        if let Event::Rewound { session, first, last } = event { Some((session, first, last)) } else { None }
+    });
+    let mut looking = View::attached(&broker, &rewound);
+    looking.until_shows("carried-5-on");
+    client.say(&Request::Seek { session: rewound.clone(), at: first });
+    let why = loop {
+        match client.event() {
+            Event::Failed { message, .. } => break message,
+            Event::Sought { .. } => panic!("a moment whose keyframe this broker does not read was shown"),
+            _ => {}
+        }
+    };
+    assert!(why.contains("does not read"), "{why}");
+    client.say(&Request::Seek { session: rewound, at: last });
+    client.answer(|event| matches!(event, Event::Sought { .. }).then_some(()));
+    looking.until_shows("carried-5-on");
+    drop(hold);
+}
+
 /// **Asking after a recording makes nothing.** A recording that is not there is answered as not there,
 /// and the directory it would have been in is not there afterwards either.
 #[test]

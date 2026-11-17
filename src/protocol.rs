@@ -284,8 +284,14 @@ pub enum Request {
     /// **A recording, as a session to look at.** Answers `Rewound` with a session that has no process: a
     /// view attaches to it like any other and is sent the screen as the recording had it, at the moment
     /// `Seek` names — the recording's end, to begin with. What a view types at it goes nowhere.
+    ///
+    /// **Refused for a recording this broker cannot begin from.** A moment is replayed from the keyframe
+    /// before it, which is its terminal as the VT core wrote it out and is read only by the core that
+    /// wrote it: a recording made under another core is answered `Failed`, saying so.
     Rewind { recording: String, cols: u16, rows: u16 },
     /// Shows a rewound session's recording as it was at `at`, in milliseconds since the Unix epoch.
+    /// Refused, with the moment that was showing left showing, where the keyframe before `at` is one this
+    /// broker does not read (`Rewind`).
     Seek {
         session: SessionId,
         #[ts(type = "number")]
