@@ -21,7 +21,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
-use crate::screen::Screen;
+use crate::screen::{Postponed, Screen};
 
 /// The longest a program may hold the screen. One that asks and never lets go is drawn anyway.
 pub const HOLD_LIMIT: Duration = Duration::from_secs(1);
@@ -147,13 +147,15 @@ fn keep(set: &Receiver<Deadline>, outstanding: &AtomicUsize) {
                 return forget(outstanding);
             };
             match screen.try_lock() {
-                Ok(mut screen) => {
+                Ok(mut held) => {
                     // Before the screen is told: a hold that begins as this one is ended finds no
                     // deadline outstanding, and asks for one
                     clock.outstanding = false;
                     let hold = clock.hold;
                     drop(clock);
-                    screen.end_hold(hold);
+                    let waited = held.end_hold(hold);
+                    drop(held);
+                    ask_apart(&screen, waited);
                     forget(outstanding)
                 }
                 Err(TryLockError::WouldBlock) => {
@@ -167,6 +169,22 @@ fn keep(set: &Receiver<Deadline>, outstanding: &AtomicUsize) {
             }
         });
     }
+}
+
+/// Asks a screen what waited for the hold that has just run out (`Screen::end_hold`), on a thread of its
+/// own and taking the screen's lock for each: what a view asked can be a search of a whole history, and
+/// neither the thread that ends holds nor the session's own output waits for all of them.
+fn ask_apart(screen: &Arc<Mutex<Screen>>, waited: Vec<Postponed>) {
+    if waited.is_empty() {
+        return;
+    }
+    let screen = Arc::clone(screen);
+    std::thread::spawn(move || {
+        for postponed in waited {
+            let Ok(mut screen) = screen.lock() else { return };
+            screen.ask_again(postponed);
+        }
+    });
 }
 
 /// One fewer deadline is outstanding. Answers `false`, which is what dropping it from the list is.

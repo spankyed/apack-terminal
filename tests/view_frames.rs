@@ -326,7 +326,7 @@ fn the_text_a_view_asks_for_during_a_hold_is_answered_after_the_frame_the_progra
     screen.acknowledge(view.id, first.sequence).expect("an acknowledgement is taken");
 
     write(&mut screen, "\x1b[?2026h\x1b[1;1H\x1b[2Knew");
-    screen.once_whole(move |screen| {
+    screen.once_whole(view.id, move |screen| {
         let text = screen.text_of(epoch, cells((0, 0), (0, 9))).expect("the text reads");
         let told = ToView::Text { channel: 1, request: 7, epoch, text }.encode().expect("an answer encodes");
         sink.send(told).expect("the view is there");
@@ -358,13 +358,13 @@ fn a_word_a_line_and_a_search_asked_during_a_hold_are_answered_about_the_frame_i
     write(&mut screen, "\x1b[?2026h\x1b[1;1H\x1b[2Kne");
     let (told, answers) = channel();
     let (word, line, found) = (told.clone(), told.clone(), told);
-    screen.once_whole(move |screen| {
+    screen.once_whole(view.id, move |screen| {
         word.send(format!("word {:?}", screen.word_at(epoch, cell(0, 0)).expect("a word reads"))).expect("heard");
     });
-    screen.once_whole(move |screen| {
+    screen.once_whole(view.id, move |screen| {
         line.send(format!("line {:?}", screen.line_at(epoch, cell(0, 0)).expect("a line reads"))).expect("heard");
     });
-    screen.once_whole(move |screen| {
+    screen.once_whole(view.id, move |screen| {
         found.send(format!("found {:?}", screen.find("text", false).expect("a search runs").spans)).expect("heard");
     });
     assert!(answers.try_recv().is_err(), "nothing is answered while the program holds the screen");
@@ -390,7 +390,7 @@ fn what_is_asked_of_a_screen_nobody_is_holding_is_answered_at_once() {
     let epoch = view.frame().epoch;
 
     let (told, answers) = channel();
-    screen.once_whole(move |screen| told.send(screen.text_of(epoch, cells((0, 0), (0, 4)))).expect("heard"));
+    screen.once_whole(view.id, move |screen| told.send(screen.text_of(epoch, cells((0, 0), (0, 4)))).expect("heard"));
     assert_eq!(answers.try_recv().expect("answered at once").expect("the text reads"), "plain");
 }
 
@@ -411,7 +411,8 @@ fn a_hold_that_runs_out_answers_what_waited_for_it() {
     {
         let mut screen = screen.lock().expect("the screen");
         screen.feed(b"\x1b[?2026hstuck");
-        screen.once_whole(move |screen| told.send(screen.text_of(epoch, cells((0, 0), (0, 4)))).expect("heard"));
+        screen
+            .once_whole(view.id, move |screen| told.send(screen.text_of(epoch, cells((0, 0), (0, 4)))).expect("heard"));
     }
     assert!(answers.try_recv().is_err(), "nothing is answered while the hold has time left");
 
@@ -434,7 +435,7 @@ fn a_question_past_what_a_hold_keeps_waiting_is_answered_from_the_screen_as_it_s
     let (told, answers) = channel();
     for asked in 0..=POSTPONED_READS {
         let told = told.clone();
-        screen.once_whole(move |screen| {
+        screen.once_whole(view.id, move |screen| {
             told.send((asked, screen.text_of(epoch, cells((0, 0), (0, 9))).expect("the text reads"))).expect("heard");
         });
     }
@@ -1685,4 +1686,118 @@ fn a_rows_links_come_to_no_more_than_a_row_may_carry() {
     assert!(row.links.len() > 100, "{} links: too few for this case to have reached the limit", row.links.len());
     assert_eq!(row.glyphs.len(), 1_000, "a cell past the limit is still drawn");
     assert!(row.glyphs.iter().any(|glyph| glyph.link == 0), "every cell was linked, so the limit was not reached");
+}
+
+/// **A recording's keyframe says a cursor blinks by mode 12, and is believed.** A keyframe is the core's own
+/// account of a screen, and a blinking cursor is written there as `CSI ? 12 h` whichever way its program
+/// asked for it. So a session whose person chose a steady cursor still replays the blinking one a program
+/// asked for, the program's own mode 12 in the output after the keyframe is still left alone, and a session
+/// that leaves the blink to programs still has it changed by mode 12 once the replay is over.
+#[test]
+fn a_replay_draws_the_cursor_its_keyframe_says_whatever_blink_a_person_chose() {
+    use apack_terminal::recording::{Entry, Timed};
+    let entries = [
+        Timed { at: 100, entry: Entry::Keyframe { cols: 20, rows: 4, redraw: b"hello\x1b[?12h".to_vec() } },
+        Timed { at: 150, entry: Entry::Output(b"\x1b[?12l more".to_vec()) },
+    ];
+    let mut chosen = Screen::new(20, 4);
+    chosen.set_cursor_defaults(CursorStyle::Block, CursorBlink::Off).expect("the defaults are set");
+    assert!(chosen.replay(&entries, 200));
+    let view = View::attached(&mut chosen, 1, 1);
+    let replayed = view.frame();
+    assert_eq!(drawn_as(&replayed), Some((0, true)), "the keyframe's blinking cursor");
+    assert_eq!(lines(&replayed)[0], (0, "hello more".to_owned()));
+
+    let mut left = Screen::new(20, 4);
+    left.set_cursor_defaults(CursorStyle::Block, CursorBlink::Program).expect("the defaults are set");
+    assert!(left.replay(&entries[..1], 200));
+    let view = View::attached(&mut left, 1, 1);
+    let replayed = view.frame();
+    assert_eq!(drawn_as(&replayed), Some((0, true)));
+    let steady = after(&mut left, &view, &replayed, |screen| write(screen, "\x1b[?12l"));
+    assert_eq!(drawn_as(&steady), Some((0, false)), "mode 12 left alone in a session that leaves it to programs");
+}
+
+/// A screen held by its program, with a view of it that has drawn what came before, and the epoch its
+/// lines are numbered in.
+fn held_with_a_view(drawn: &str) -> (Screen, View, u32) {
+    let mut screen = Screen::new(20, 3);
+    screen.feed(b"old text");
+    let view = View::attached(&mut screen, 1, 1);
+    let first = view.frame();
+    screen.acknowledge(view.id, first.sequence).expect("an acknowledgement is taken");
+    write(&mut screen, &format!("\x1b[?2026h\x1b[1;1H\x1b[2K{drawn}"));
+    (screen, view, first.epoch)
+}
+
+/// **What a view asked during a hold is answered when the view goes, or its session ends**, from the
+/// screen as it stands: a question is answered or refused and never dropped, whichever of them ends
+/// first. A view of another connection that asked is left waiting for the hold.
+#[test]
+fn what_a_view_asked_during_a_hold_is_answered_when_it_goes_or_its_session_ends() {
+    type Going = fn(&mut Screen, ViewId);
+    let ways: [(&str, Going); 3] = [
+        ("the view detaching", |screen, id| screen.detach_view(id)),
+        ("its connection going", |screen, id| screen.detach_connection(id.connection)),
+        ("the session ending", |screen, _| screen.end_views()),
+    ];
+    for (way, go) in ways {
+        let (mut screen, view, epoch) = held_with_a_view("half");
+        let other = View::attached(&mut screen, 2, 1);
+        let (told, answers) = channel();
+        for asking in [view.id, other.id] {
+            let told = told.clone();
+            screen.once_whole(asking, move |screen| {
+                told.send((asking, screen.text_of(epoch, cells((0, 0), (0, 3))))).expect("heard");
+            });
+        }
+        assert!(answers.try_recv().is_err(), "{way}: answered while the program held the screen");
+
+        go(&mut screen, view.id);
+        let answered: Vec<_> = answers.try_iter().collect();
+        let ended = way == "the session ending";
+        assert_eq!(answered.len(), if ended { 2 } else { 1 }, "{way}: {answered:?}");
+        assert_eq!(answered[0], (view.id, Ok("half".to_owned())), "{way}");
+        if !ended {
+            write(&mut screen, " whole\x1b[?2026l");
+            assert_eq!(answers.try_recv().expect("the other is answered as the hold ends").0, other.id, "{way}");
+        }
+    }
+}
+
+/// **One session's questions do not keep another's hold from ending.** Every session's hold is ended by
+/// one thread, and what a view asked can be a search of a whole history: here a question that does not
+/// finish until it is let, asked of one screen whose hold runs out, and a second screen whose hold must
+/// still run out on time.
+#[test]
+fn a_question_that_waited_for_one_screens_hold_does_not_keep_anothers_from_ending() {
+    let holds = Holds::start();
+    let held = |text: &str| {
+        let mut screen = Screen::new(20, 3);
+        let view = View::attached(&mut screen, 1, 1);
+        let first = view.frame();
+        screen.acknowledge(view.id, first.sequence).expect("an acknowledgement is taken");
+        let screen = Arc::new(Mutex::new(screen));
+        screen.lock().expect("the screen").limit_holds(holds.for_screen(Arc::downgrade(&screen)));
+        screen.lock().expect("the screen").feed(format!("\x1b[?2026h{text}").as_bytes());
+        (screen, view)
+    };
+    let (slow, slow_view) = held("slow");
+    let (begun, beginning) = channel();
+    let (finish, finishing) = channel::<()>();
+    slow.lock().expect("the screen").once_whole(slow_view.id, move |_| {
+        begun.send(()).expect("heard");
+        let _ = finishing.recv();
+    });
+    beginning.recv_timeout(HOLD_LIMIT * 30).expect("the question is asked once its hold runs out");
+
+    // With that question still being answered, another screen's hold begins, and runs out
+    let (other, other_view) = held("other");
+    let drawn = other_view.incoming.recv_timeout(HOLD_LIMIT * 30).expect("the other screen's hold is ended");
+    match ToView::decode(body(&drawn)).expect("a message decodes") {
+        ToView::Frame(frame) => assert_eq!(lines(&frame)[0], (0, "other".to_owned())),
+        other => panic!("expected the frame the hold kept back, found {other:?}"),
+    }
+    drop(finish);
+    drop((slow, other));
 }

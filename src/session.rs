@@ -873,8 +873,8 @@ impl Handle {
     /// Asks the session's screen something about its text — the word at a cell, the text of a span,
     /// where a needle appears — once the screen is a whole frame (`Screen::once_whole`). `read` is what
     /// answers the view, and is run now unless the program is holding the screen.
-    pub fn once_whole(&self, read: impl FnOnce(&mut Screen) + Send + 'static) -> Outcome {
-        self.on_screen(|screen| screen.once_whole(read))
+    pub fn once_whole(&self, view: ViewId, read: impl FnOnce(&mut Screen) + Send + 'static) -> Outcome {
+        self.on_screen(|screen| screen.once_whole(view, read))
     }
 
     /// Every image in the session, with the epoch their lines are in and one cell in pixels.

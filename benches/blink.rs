@@ -5,8 +5,9 @@
 //! It reports and never fails. A measurement is taken on the machine it names and read against that
 //! machine's load, which the caller records.
 //!
-//! **The output is the kind that has the most escapes in it**: text coloured a word at a time, and a
-//! full-screen program's redraw, which sets private modes as it goes. Plain text has none, and is parsed in
+//! **The output is the kind that has the most escapes in it**: text coloured a word at a time, links and
+//! titles whose strings the parse stops at the end of, and a full-screen program's redraw, which sets
+//! private modes as it goes. Plain text has none, and is parsed in
 //! one piece either way.
 
 use std::time::Instant;
@@ -33,9 +34,11 @@ fn rate(bytes: &[u8], blink: CursorBlink) -> f64 {
 }
 
 /// What each kind of output is made of, by name.
-const OUTPUTS: [(&str, &str); 3] = [
+const OUTPUTS: [(&str, &str); 4] = [
     ("plain text", "the quick brown fox jumps over the lazy dog\r\n"),
     ("a colour a word", "\x1b[31mthe\x1b[0m \x1b[32mquick\x1b[0m \x1b[1;34mbrown\x1b[0m \x1b[38;5;208mfox\x1b[0m\r\n"),
+    // A string ends at every word, and the parse stops at each end: what is left is looked through from there
+    ("a link a word", "\x1b]8;;https://example.com/a\x1b\\word\x1b]8;;\x1b\\ and \x1b]0;a title\x07\r\n"),
     ("a redraw", "\x1b[?25l\x1b[H\x1b[2K\x1b[7mstatus\x1b[0m\x1b[5;10Hrow\x1b[?25h\x1b[?12l\x1b[?12h"),
 ];
 

@@ -87,8 +87,12 @@ pub const TERMINFO_NAME: &str = "xterm-256color";
 /// ones it wanted.
 pub const SEARCH_MATCHES: usize = 100;
 
-/// A question a view asked of the text while the program held the screen (`Screen::once_whole`).
-type Postponed = Box<dyn FnOnce(&mut Screen) + Send>;
+/// A question a view asked of the text while the program held the screen (`Screen::once_whole`): whose
+/// it is, and what answers it.
+pub struct Postponed {
+    view: ViewId,
+    read: Box<dyn FnOnce(&mut Screen) + Send>,
+}
 
 /// How many of a view's questions one hold keeps waiting (`Screen::once_whole`).
 pub const POSTPONED_READS: usize = 64;
@@ -727,7 +731,9 @@ impl Screen {
                     publication.touch();
                 }
                 self.publish();
-                self.answer_postponed();
+                for postponed in std::mem::take(&mut self.postponed) {
+                    (postponed.read)(self);
+                }
             }
         }
     }
@@ -743,13 +749,26 @@ impl Screen {
     }
 
     /// The hold numbered `hold` has gone on as long as one may: if it is still the one in force, the
-    /// screen is drawn as it stands and the program's hold on it is over.
-    pub fn end_hold(&mut self, hold: u64) {
-        if self.hold == Some(hold) {
-            self.hold = None;
-            self.publish();
-            self.answer_postponed();
+    /// screen is drawn as it stands and the program's hold on it is over. Answers what waited for it
+    /// (`once_whole`), still to be asked: of this screen again, with `ask_again`.
+    ///
+    /// **Handed back rather than answered here**, because here is the one thread that ends every
+    /// session's hold (`holds`): a search is the work of reading a history, and that thread doing one
+    /// session's is every other session's hold going on past its limit.
+    #[must_use]
+    pub fn end_hold(&mut self, hold: u64) -> Vec<Postponed> {
+        if self.hold != Some(hold) {
+            return Vec::new();
         }
+        self.hold = None;
+        self.publish();
+        std::mem::take(&mut self.postponed)
+    }
+
+    /// Asks what waited for a hold that ran out (`end_hold`): now, unless the program has taken the
+    /// screen again since.
+    pub fn ask_again(&mut self, postponed: Postponed) {
+        self.once_whole(postponed.view, postponed.read);
     }
 
     /// Runs `read` on the screen when it is a whole frame: now, or — while the program holds the screen
@@ -758,26 +777,40 @@ impl Screen {
     /// **A question about the text answered during a hold is answered about a frame its program has not
     /// finished**: the word under a cell, the text of a selection and the places a needle appears, read
     /// from a screen part way through being redrawn, which no view is shown. A view's frames wait out a
-    /// hold (`publish::owed`), and so do its questions, which are then answered about the frame it is
-    /// sent as the hold ends — after that frame, so a view has the rows an answer names. Lines fetched by
-    /// number do not wait: they are answered with the rows last sent (`Publication::fetch`), which a view
-    /// scrolling back needs in order to draw at all.
+    /// hold (`publish::owed`), and so do its questions, which are then answered about the frame the
+    /// hold ends with, once that frame has been sent to whoever is due one. Lines fetched by number do
+    /// not wait: they are answered with the rows last sent (`Publication::fetch`), which a view scrolling
+    /// back needs in order to draw at all.
+    ///
+    /// **An answer is about a whole frame, which is not always one its view has been sent yet.** A view
+    /// that has not drawn its last frame is sent no other until it has (`publish::owed`), so its answer
+    /// can come ahead of the frame it is about, as an answer about a screen nobody holds can when output
+    /// arrives between a view's last frame and its question. What a hold changes is only that no answer
+    /// is about a frame half drawn.
     ///
     /// **No more than `POSTPONED_READS` wait.** A view asks these as a person clicks, copies or types in
     /// a find bar. One that has asked that many inside one hold is answered from the screen as it stands,
     /// which is what every one of them was before any waited, rather than left to grow a queue.
-    pub fn once_whole(&mut self, read: impl FnOnce(&mut Self) + Send + 'static) {
+    ///
+    /// **A view that goes, or a session that ends, is answered then** (`detach_view`, `detach_connection`,
+    /// `end_views`), from the screen as it stands: a question is answered or refused, never dropped, and
+    /// a view that has finished speaking is still owed what it asked.
+    pub fn once_whole(&mut self, view: ViewId, read: impl FnOnce(&mut Self) + Send + 'static) {
         if self.hold.is_some() && self.postponed.len() < POSTPONED_READS {
-            self.postponed.push(Box::new(read));
+            self.postponed.push(Postponed { view, read: Box::new(read) });
         } else {
             read(self);
         }
     }
 
-    /// Answers what waited for the hold that has just ended, in the order it was asked.
-    fn answer_postponed(&mut self) {
-        for read in std::mem::take(&mut self.postponed) {
-            read(self);
+    /// Answers what the views `going` picks out asked during the hold in force, in the order it was
+    /// asked, from the screen as it stands.
+    fn answer_postponed_of(&mut self, going: impl Fn(ViewId) -> bool) {
+        let (theirs, kept) = std::mem::take(&mut self.postponed).into_iter().partition(|asked| going(asked.view));
+        self.postponed = kept;
+        let theirs: Vec<Postponed> = theirs;
+        for postponed in theirs {
+            (postponed.read)(self);
         }
     }
 
@@ -1005,14 +1038,14 @@ impl Screen {
             match &timed.entry {
                 Entry::Keyframe { cols, rows, redraw } if index == 0 => {
                     self.resize(*cols, *rows, 0, 0);
-                    self.feed(redraw);
+                    self.feed_redraw(redraw);
                 }
                 // Come to part way through a sequence: one the recording took part way through it, whose
                 // rest it did not record, so the replay starts again from it
                 Entry::Keyframe { cols, rows, redraw } if !self.terminal.at_ground() => {
                     self.feed(b"\x18\x1bc\x1b[3J");
                     self.resize(*cols, *rows, 0, 0);
-                    self.feed(redraw);
+                    self.feed_redraw(redraw);
                 }
                 Entry::Keyframe { .. } => {}
                 Entry::Output(bytes) => self.feed(bytes),
@@ -1030,8 +1063,17 @@ impl Screen {
         self.replaying = false;
         // Whatever the recorded program was holding when the recording stops, nothing is holding now
         self.hold = None;
-        self.answer_postponed();
+        self.answer_postponed_of(|_| true);
         self.recorder = recorder;
+    }
+
+    /// Feeds a keyframe's redraw: the core's own account of a screen, whose cursor is the one it says. A
+    /// blinking cursor is written there as mode 12 whichever way the program asked for it, so a blink a
+    /// person chose does not leave it as it was (`Terminal::pause_blink_watch`).
+    fn feed_redraw(&mut self, redraw: &[u8]) {
+        let watch = self.terminal.pause_blink_watch();
+        self.feed(redraw);
+        self.terminal.resume_blink_watch(watch);
     }
 
     /// Forgets what the shell said about itself (`Reported::forget_the_shell`), and gives the command it
@@ -1244,6 +1286,7 @@ impl Screen {
     }
 
     pub fn detach_view(&mut self, id: ViewId) {
+        self.answer_postponed_of(|view| view == id);
         if let Some(publication) = &mut self.publication {
             publication.detach(id);
         }
@@ -1253,6 +1296,7 @@ impl Screen {
 
     /// Every view a connection had, when the connection goes.
     pub fn detach_connection(&mut self, connection: u64) {
+        self.answer_postponed_of(|view| view.connection == connection);
         if let Some(publication) = &mut self.publication {
             publication.detach_connection(connection);
         }
@@ -1510,6 +1554,7 @@ impl Screen {
 
     /// Tells every view the session is over, after the screen as it ended.
     pub fn end_views(&mut self) {
+        self.answer_postponed_of(|_| true);
         let commands = self.reported.get().commands().generation();
         if let Some(mut publication) = self.publication.take() {
             publication.end(&self.terminal, commands);

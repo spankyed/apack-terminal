@@ -790,7 +790,7 @@ fn carry_out_view(
         ToBroker::WordAt { channel, request, epoch, at } => {
             let told = Arc::clone(sink);
             let asked = session_of(channel).and_then(|handle| {
-                handle.once_whole(move |screen| {
+                handle.once_whole(ViewId { connection, channel }, move |screen| {
                     let span = screen.word_at(epoch, at);
                     tell(&told, channel, request, span.map(|span| ToView::Span { channel, request, epoch, span }));
                 })
@@ -802,7 +802,7 @@ fn carry_out_view(
         ToBroker::LineAt { channel, request, epoch, at } => {
             let told = Arc::clone(sink);
             let asked = session_of(channel).and_then(|handle| {
-                handle.once_whole(move |screen| {
+                handle.once_whole(ViewId { connection, channel }, move |screen| {
                     let span = screen.line_at(epoch, at);
                     tell(&told, channel, request, span.map(|span| ToView::Span { channel, request, epoch, span }));
                 })
@@ -814,7 +814,7 @@ fn carry_out_view(
         ToBroker::TextOf { channel, request, epoch, span } => {
             let told = Arc::clone(sink);
             let asked = session_of(channel).and_then(|handle| {
-                handle.once_whole(move |screen| {
+                handle.once_whole(ViewId { connection, channel }, move |screen| {
                     let text = screen.text_of(epoch, span);
                     tell(&told, channel, request, text.map(|text| ToView::Text { channel, request, epoch, text }));
                 })
@@ -826,7 +826,7 @@ fn carry_out_view(
         ToBroker::Search { channel, request, needle, case_sensitive } => {
             let told = Arc::clone(sink);
             let asked = session_of(channel).and_then(|handle| {
-                handle.once_whole(move |screen| {
+                handle.once_whole(ViewId { connection, channel }, move |screen| {
                     let found = screen.find(&needle, case_sensitive).map(|found| ToView::Spans {
                         channel,
                         request,

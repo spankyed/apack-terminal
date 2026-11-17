@@ -303,7 +303,7 @@ exclude_re = [
     # give the same count for everything it does answer — with `|` the floor is simply never applied. What
     # would make the floor matter is a core that stops for an OSC's end having parsed nothing, which no
     # input produces; the two replacements beside this one are real and are killed.
-    "vt/mod.rs:214:54: replace & with \\| in Terminal::write_until",
+    "vt/mod.rs:.*replace & with \\| in Terminal::write_until",
 ]
 
 # **What only Windows compiles is not excluded here, and is left out of every other run instead.**
