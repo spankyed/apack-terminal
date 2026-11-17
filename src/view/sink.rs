@@ -8,6 +8,8 @@
 //! is one that is not reading: the queue is closed, what it held is dropped, and the connection ends.
 
 use std::collections::VecDeque;
+use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use super::publish::Outlet;
@@ -18,6 +20,10 @@ use super::publish::Outlet;
 /// window shows to be owed a whole screen at once, and for the answers to what the window asked meanwhile.
 pub const SINK_BYTES: usize = 64 << 20;
 
+/// The most a writer hands the connection at once (`Sink::write_to`), and so the finest that a view's reading
+/// can be seen: a write the far end has taken this much of returns, and is counted.
+pub const WRITE_STEP: usize = 64 << 10;
+
 /// One view connection's queue: filled by whatever has something for it, emptied by its writer.
 pub struct Sink {
     queue: Mutex<Queue>,
@@ -26,6 +32,8 @@ pub struct Sink {
     /// Closes the connection, which is what being overrun leads to. Called by whatever queued the
     /// message that overran it — a session's reader, with its screen locked — so it must not wait.
     hang_up: Box<dyn Fn() + Send + Sync>,
+    /// How many bytes the connection has taken (`write_to`)
+    written: AtomicU64,
 }
 
 #[derive(Default)]
@@ -34,8 +42,6 @@ struct Queue {
     bytes: usize,
     /// Nothing more is taken, and what was waiting is gone
     closed: bool,
-    /// How many messages the writer has been handed
-    handed: u64,
     /// Nothing more will be queued: what is waiting is the last of it
     finished: bool,
 }
@@ -58,6 +64,7 @@ impl Sink {
             changed: Condvar::new(),
             limit,
             hang_up: Box::new(hang_up),
+            written: AtomicU64::new(0),
         })
     }
 
@@ -93,7 +100,6 @@ impl Sink {
             }
             if let Some(message) = queue.waiting.pop_front() {
                 queue.bytes -= message.len();
-                queue.handed += 1;
                 return Some(message);
             }
             if queue.finished {
@@ -121,10 +127,24 @@ impl Sink {
         self.changed.notify_all();
     }
 
-    /// How many messages the writer has been handed so far: what moves while the view is reading and
+    /// Writes `message` to `out` a `WRITE_STEP` at a time, counting each step as the connection takes it.
+    ///
+    /// **A step at a time, so a view part-way through reading one message is seen to be reading.** A message
+    /// can be megabytes (`wire::MAX_MESSAGE_BYTES`), and a write of the whole of it returns only once the view
+    /// has read nearly all of it: counted a message at a time, a view slowly reading a large answer would look
+    /// like one that had stopped.
+    pub fn write_to(&self, mut out: impl Write, message: &[u8]) -> std::io::Result<()> {
+        for step in message.chunks(WRITE_STEP) {
+            out.write_all(step)?;
+            self.written.fetch_add(step.len() as u64, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    /// How many bytes the connection has taken so far (`write_to`): what moves while the view is reading and
     /// stands still while it is not.
-    pub fn handed_out(&self) -> u64 {
-        self.queue.lock().map_or(0, |queue| queue.handed)
+    pub fn written(&self) -> u64 {
+        self.written.load(Ordering::SeqCst)
     }
 }
 

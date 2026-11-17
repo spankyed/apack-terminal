@@ -587,7 +587,7 @@ fn serve_view(reader: &mut BufReader<&Stream>, stream: &Arc<Stream>, connection:
             // Dropped when this thread ends, which is how whoever waits for it knows without joining
             let _ended = writer_ended;
             while let Some(message) = sink.next() {
-                if (&*stream).write_all(&message).is_err() {
+                if sink.write_to(&*stream, &message).is_err() {
                     sink.close();
                     return;
                 }
@@ -638,7 +638,7 @@ struct ViewLeaving<'a> {
     writing: Option<std::thread::JoinHandle<()>>,
     /// Closed when the thread writing to the view has ended
     written: Receiver<()>,
-    /// How many messages the view had been handed when that was last looked at
+    /// How many bytes the view had taken when that was last looked at
     taken: u64,
     /// The view closed its side, having said everything it was going to. Anything else that ends the
     /// reading — a message that is not one, a view hung up on — is a view that may never read again
@@ -656,12 +656,13 @@ impl Drop for ViewLeaving<'_> {
         self.sink.finish();
         // **Listening is something a view does, not something it said.** One that finished speaking and
         // then takes nothing — alive, its side of the connection open, reading no more — has the thread
-        // writing to it parked for as long as it likes. So what is waited for is the view taking
-        // messages: a stretch of `UNREAD_PATIENCE` in which it took none is a view that is not
-        // listening, and it is hung up on like any other
-        self.taken = self.sink.handed_out();
+        // writing to it parked for as long as it likes. So what is waited for is the view taking what it
+        // is written, counted in bytes so that one slowly reading a large answer is seen to be reading:
+        // a stretch of `UNREAD_PATIENCE` in which it took nothing is a view that is not listening, and it
+        // is hung up on like any other
+        self.taken = self.sink.written();
         while self.said_all && self.written.recv_timeout(UNREAD_PATIENCE) == Err(RecvTimeoutError::Timeout) {
-            let taken = std::mem::replace(&mut self.taken, self.sink.handed_out());
+            let taken = std::mem::replace(&mut self.taken, self.sink.written());
             if taken == self.taken {
                 closed = hang_up(&self.stream);
                 break;
