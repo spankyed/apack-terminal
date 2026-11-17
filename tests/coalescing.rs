@@ -257,3 +257,34 @@ mod pacing {
         assert_eq!(full.len(), apack_terminal::output::OUTPUT_CAP);
     }
 }
+
+/// **Chunks that arrive together leave as one message a cap, and a message is the whole cap.**
+///
+/// Every chunk is queued before the coalescer starts, so none of them arrives after a quiet spell: what is
+/// measured is how much a message holds, and not how a machine happened to schedule a producer. Through a
+/// shell the same claim was a budget of one message a window and one a cap, which a busy machine broke —
+/// a producer held up for the quiet gap (`OUTPUT_QUIET`) has its bytes sent at once, as it should.
+///
+/// **The sizes are a literal**, so the cap moving is a failure rather than a budget that moves with it: a
+/// cap of 1,088 bytes sends these as sixty-four messages of two chunks each. apack's Phase G measured the
+/// before, one bus event per pty chunk: 115 messages for 64 KiB.
+#[test]
+fn chunks_that_arrive_together_leave_as_one_message_a_cap() {
+    let (sending, incoming) = channel::<Vec<u8>>();
+    let (outgoing, answers) = channel();
+    // A pty read is at most eight kilobytes; one kilobyte is a hundred and twenty-eight of them
+    for _ in 0..128 {
+        sending.send(vec![b'x'; 1024]).expect("the coalescer has not started");
+    }
+    drop(sending);
+    std::thread::spawn(move || coalesce("s-1".to_owned(), incoming, outgoing, Credit::new(OUTPUT_CREDIT)));
+
+    let mut sizes = Vec::new();
+    // Ends when the coalescer does, which is once it has flushed the last of what it was given
+    while let Ok(out) = answers.recv() {
+        if let Some(Event::Output { text, .. }) = out.event {
+            sizes.push(text.len());
+        }
+    }
+    assert_eq!(sizes, [64 * 1024, 64 * 1024], "128 chunks of 1 KiB, sent as messages of these sizes");
+}
