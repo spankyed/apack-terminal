@@ -8,3 +8,6 @@
 /bindings
 
 mutants.out/
+
+# macOS Finder's per-folder view settings
+.DS_Store
