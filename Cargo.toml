@@ -108,6 +108,18 @@ tempfile = "3.27.0"
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2.191"
 
+# **The PNG decoder is built optimised in a debug build too**: it is a dependency, so it is compiled once and
+# never mutated, and unoptimised it is two thirds of what the suite's PNG cases spend — CPU a busy machine
+# multiplies against a deadline that is a clock. `fdeflate` and `miniz_oxide` inflate, `crc32fast` checks
+[profile.dev.package.png]
+opt-level = 3
+[profile.dev.package.fdeflate]
+opt-level = 3
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+[profile.dev.package.crc32fast]
+opt-level = 3
+
 # What cargo-mutants builds each mutant with (`.cargo/mutants.toml`): a debug build without the debug info,
 # since nothing debugs a mutant and each one is a fresh copy of the build directory
 [profile.mutants]

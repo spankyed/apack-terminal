@@ -2,7 +2,8 @@
 //!
 //! These are the firing cases apack's Phase B asks for, and one thing it asks for that has no case.
 //!
-//! **Coalescing and the overload report are guarded here**, each failing under its own mutation. **The
+//! **The overload report is guarded here**, and how much a message holds is guarded in `tests/coalescing.rs`,
+//! where the chunks' arrival is the case's to arrange rather than a busy machine's. **The
 //! credit split is not**, and the attempt to guard it is recorded in `src/output.rs`: three mutations that
 //! gave answers output's credit passed every case written for them, because in this design an answer is
 //! never waiting on anything. What deadlocks is a shared *bounded* queue, which this is not and which no
@@ -22,7 +23,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 
-use apack_terminal::output::{OUTPUT_CAP, OUTPUT_CREDIT, OUTPUT_WINDOW};
+use apack_terminal::output::{OUTPUT_CAP, OUTPUT_CREDIT};
 use interprocess::local_socket::{GenericFilePath, Stream, ToFsName, prelude::*};
 
 struct Broker {
@@ -136,79 +137,6 @@ const SATURATE: &str = "head -c 1048576 /dev/zero | tr '\\0' x\n";
 ///
 /// **`awk` rather than `seq`**, whose BSD form prints through `%g`: past 999999 every line is `1e+06`.
 const OVERLOAD: &str = "awk 'BEGIN { for (i = 1; ; i++) print i }'\n";
-
-/// **A flush reaches the cap, which is the one thing the case below cannot say.**
-///
-/// That case derives its budget *from* `OUTPUT_CAP`, deliberately, so that a slower machine is allowed more
-/// windows and the budget stays load-independent. The cost is that it cannot notice the cap itself moving:
-/// shrink it sixtyfold and the expected message count shrinks with it, and the case still passes — which a
-/// mutation run found, `64 * 1024` surviving as `64 + 1024`.
-///
-/// So this asserts a size rather than a count, against a literal, and the direction is what makes it safe:
-/// coalescing can only put *more* into a message than the window alone would, never less, and nothing above
-/// the cap is ever held back. A busy machine therefore pushes this measurement up. A cap of 1,088 bytes caps
-/// every message at 1,088 and fails here; the real cap clears the floor sixteenfold.
-#[test]
-fn output_is_coalesced_up_to_the_cap_rather_than_to_some_smaller_size() {
-    let broker = start();
-    let (mut reading, mut writing) = greeted(&broker);
-    let session = run(&mut reading, &mut writing, SATURATE);
-
-    /// A sixteenth of the real cap: past any plausible window's worth at this rate, and far under 64 KiB
-    const FLOOR: usize = 4 * 1024;
-
-    let mut largest = 0usize;
-    let mut bytes = 0usize;
-    while bytes < 1_048_576 {
-        let event = next(&mut reading);
-        if event["kind"] == "output" && event["session"] == session.as_str() {
-            let held = event["text"].as_str().unwrap_or_default().len();
-            bytes += held;
-            largest = largest.max(held);
-        }
-    }
-
-    assert!(
-        largest > FLOOR,
-        "a megabyte arrived in messages of at most {largest} bytes, under the {FLOOR} a cap of \
-         {OUTPUT_CAP} has to clear: the cap is not what is bounding a flush"
-    );
-}
-
-#[test]
-fn a_megabyte_of_output_is_coalesced_into_far_fewer_messages_than_chunks() {
-    let broker = start();
-    let (mut reading, mut writing) = greeted(&broker);
-    let session = run(&mut reading, &mut writing, SATURATE);
-
-    let started = std::time::Instant::now();
-    let mut messages = 0usize;
-    let mut bytes = 0usize;
-    while bytes < 1_048_576 {
-        let event = next(&mut reading);
-        if event["kind"] == "output" && event["session"] == session.as_str() {
-            messages += 1;
-            bytes += event["text"].as_str().unwrap_or_default().len();
-        }
-    }
-    let took = started.elapsed();
-
-    // **The ceiling is derived from the two bounds, not chosen.** A message leaves when the window closes or
-    // the cap fills, so a run of this length cannot have produced more than one per window plus one per cap,
-    // and one more for whatever was held when the shell exited. That makes the budget load-independent: a
-    // slower machine takes more windows and is allowed more messages, where a round number would have been
-    // either slack on this machine or flaky on a busy one.
-    //
-    // apack's Phase G measured the before, one bus event per pty chunk: 115 messages for 64 KiB, about 1,840
-    // per MB (F4). The same corpus in the app now costs 6 messages for 64 KiB.
-    let budget = took.as_millis().div_ceil(OUTPUT_WINDOW.as_millis()) as usize + bytes.div_ceil(OUTPUT_CAP) + 1;
-    assert!(
-        messages <= budget,
-        "a megabyte arrived as {messages} messages carrying {bytes} bytes, past the {budget} that \
-         {took:?} of windows and {OUTPUT_CAP}-byte caps allow"
-    );
-    assert!(bytes >= 1_048_576, "every byte arrived: {bytes}");
-}
 
 /// A producer nobody is holding up reports no throttling at all — the half the saturating case cannot say.
 ///
