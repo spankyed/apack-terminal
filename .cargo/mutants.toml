@@ -145,11 +145,6 @@ exclude_re = [
     # sooner, and it is cut where the same record ends. `benches/keyframe.rs` is where the cost shows
     "vt/keyframe.rs:.*replace / with % in Terminal::keyframe",
 
-    # **When a keyframe that could not be taken is asked for again is what the asking costs.** Not put
-    # off, it is asked for at the end of every read until it can be taken, and the recording holds the
-    # same entries either way: the same output, and the same keyframe once the terminal fits one
-    "recording.rs:.*replace Recorder::put_off_keyframe with \\(\\)",
-
     # **A keyframe given the pixels its cut left behind is decoded before it is kept**, to hold the
     # reading of the snapshot's framing those pixels were found by: it fails only for a core that frames a
     # snapshot some other way, which no case here can be. With it answering yes, or yes to either half,
@@ -159,8 +154,9 @@ exclude_re = [
 
     # **Whether a cut already holds every image's pixels is what finding them costs.** Counted wrongly as
     # not holding them, the rest of the snapshot is read for pixels that are not there and the keyframe
-    # is decoded once more, to the same keyframe
-    "vt/keyframe.rs:.*replace \\+= with \\*= in Terminal::cut",
+    # is decoded once more, to the same keyframe. Pinned to its line: the two counts beside it are of the
+    # records and the lines a keyframe holds, and are caught
+    "vt/keyframe.rs:387:.*replace \\+= with \\*= in Terminal::cut",
     # The same for the key and mouse encoders a session keeps, which are four more handles with one owner
     "vt/input.rs:.*<impl Drop for Encoders>::drop",
 

@@ -79,6 +79,10 @@ pub const KEYFRAME_HISTORY_LINES: u32 = 1_000;
 /// (`take_keyframe`).
 pub const KEYFRAME_BYTES: usize = 4 << 20;
 
+/// The room a keyframe is given for each cell of the grid, where that is more than `KEYFRAME_BYTES`: twice
+/// what a cell of styled text on each of the two screens was measured to take, which is eight bytes.
+const KEYFRAME_CELL_BYTES: usize = 16;
+
 /// The most memory one session's history may hold, whatever its line limit allows.
 ///
 /// **Lines bound a narrow terminal and bytes bound a wide one.** A row costs what its width does, so a
@@ -1004,6 +1008,7 @@ impl Screen {
     fn take_keyframe(&mut self) {
         let (cols, rows) = (self.cols, self.rows);
         let keyframe = self.keyframe();
+        let taken = keyframe.is_ok();
         self.record(|recorder| match keyframe {
             Ok(keyframe) => recorder.keyframe(cols, rows, &keyframe),
             Err(_) if !recorder.far_over_budget() => {
@@ -1012,7 +1017,7 @@ impl Screen {
             }
             Err(failed) => Err(std::io::Error::other(failed.to_string())),
         });
-        if self.reported.get().vouched_by().is_some() {
+        if taken && self.reported.get().vouched_by().is_some() {
             self.record_marks();
         }
     }
@@ -1022,8 +1027,13 @@ impl Screen {
     /// **Not the whole history**, which a keyframe would then write out again every `KEYFRAME_EVERY` bytes:
     /// at a hundred thousand lines that is tens of megabytes a time. What a keyframe leaves out is still
     /// in the recording, as the bytes that printed it, for as far back as the recording goes.
+    ///
+    /// **A grid too large for `KEYFRAME_BYTES` has the room its cells take**: both screens are written
+    /// out whole whatever is cut, and a million cells of styled text on each are more than a keyframe of
+    /// an ordinary grid may be.
     pub fn keyframe(&self) -> Result<Vec<u8>, Failed> {
-        self.terminal.keyframe(KEYFRAME_HISTORY_LINES, KEYFRAME_BYTES)
+        let cells = usize::from(self.cols) * usize::from(self.rows);
+        self.terminal.keyframe(KEYFRAME_HISTORY_LINES, KEYFRAME_BYTES.max(cells * KEYFRAME_CELL_BYTES))
     }
 
     /// Rebuilds this screen as a recording had it at `until`: the last keyframe at or before then, and
@@ -1056,8 +1066,10 @@ impl Screen {
     }
 
     /// Makes this screen what `entries` leave a terminal as, the first of them being a keyframe, and
-    /// answers whether that keyframe could be read: where it could not, the screen is as it was. A
-    /// keyframe after the first is passed over: it says again what the bytes before it already drew.
+    /// answers whether every keyframe it had to read could be: where the first could not, the screen is
+    /// as it was, and where a later one could not, it is what the recording shows up to there. A keyframe
+    /// after the first is passed over, unless the replay comes to it part way through a sequence: it
+    /// says again what the bytes before it already drew.
     ///
     /// **The commands are the recording's, with the recording's times.** The ones this screen held are
     /// forgotten first — the replay reports them again, and kept they would each be listed twice — and
@@ -1087,6 +1099,7 @@ impl Screen {
         let live = self.reported.get_mut().begin_replay();
         self.reported.get_mut().forget_commands();
         self.resize(*cols, *rows, 0, 0);
+        let mut whole = true;
         for timed in &entries[1..] {
             let at = SystemTime::UNIX_EPOCH + Duration::from_millis(timed.at);
             self.reported.get_mut().set_clock(Some(at));
@@ -1099,6 +1112,7 @@ impl Screen {
                 Entry::Keyframe { cols, rows, state } if !self.terminal.at_ground() => {
                     self.feed(b"\x18");
                     if self.terminal.restore(state).is_err() {
+                        whole = false;
                         break;
                     }
                     self.resize(*cols, *rows, 0, 0);
@@ -1121,7 +1135,7 @@ impl Screen {
         self.hold = None;
         self.answer_postponed_of(|_| true);
         self.recorder = recorder;
-        true
+        whole
     }
 
     /// Forgets what the shell said about itself (`Reported::forget_the_shell`), and gives the command it

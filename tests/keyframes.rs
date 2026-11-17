@@ -836,6 +836,25 @@ fn a_keyframe_holds_every_image_whole_or_none_of_them() {
     assert_eq!(pictures(&mut refusing), []);
 }
 
+/// **A grid too large for a keyframe of the usual size is given the room its cells take.** Both screens are
+/// written out whole, and a thousand columns by a thousand rows of styled text on each are more than four
+/// megabytes: a session with a grid that size is recorded all the same.
+#[test]
+fn a_very_large_grid_full_of_styled_text_is_written_out() {
+    let mut screen = Screen::new(1_000, 1_000);
+    let row: String = (0..500).map(|cell| format!("\x1b[3{}m{}", cell % 8, cell % 10)).collect::<String>().repeat(2);
+    let full: String = (0..1_000).map(|_| row.as_str()).collect();
+    screen.feed(full.as_bytes());
+    screen.feed(b"\x1b[?1049h");
+    screen.feed(full.as_bytes());
+    let taken = screen.keyframe().expect("a large grid is written out");
+    assert!(taken.len() > KEYFRAME_BYTES, "{} bytes fitted a keyframe of the usual size", taken.len());
+    let entries = [Timed { at: 1, entry: Entry::Keyframe { cols: 1_000, rows: 1_000, state: taken } }];
+    let mut back = Screen::new(1_000, 1_000);
+    assert!(back.replay(&entries, u64::MAX));
+    assert_eq!(back.snapshot(0).lines[999], screen.snapshot(0).lines[999]);
+}
+
 /// **An image a program is part way through sending does not end the recording.** What has arrived of it is
 /// written out with the screen, and megabytes of it are more than a keyframe holds: the keyframe due then
 /// is put off, what the program writes goes on being recorded, and a keyframe is taken once the image has
@@ -868,7 +887,13 @@ fn an_image_larger_than_a_keyframe_holds_puts_the_keyframe_off_and_the_recording
         .iter()
         .rposition(|timed| matches!(&timed.entry, Entry::Output(bytes) if bytes.starts_with(b"\x1b_Gm=0")))
         .expect("the end of the image was recorded");
-    assert!(keyframes.iter().any(|at| *at > image_ends), "no keyframe was taken once the image had arrived");
+    let next = *keyframes.iter().find(|at| **at > image_ends).expect("a keyframe once the image had arrived");
+    // And not at the first thing written once it could be: put off, it waits for a keyframe's distance
+    let between: usize = entries[image_ends + 1..next]
+        .iter()
+        .map(|timed| if let Entry::Output(bytes) = &timed.entry { bytes.len() } else { 0 })
+        .sum();
+    assert!(between > 100_000, "a keyframe put off was taken {between} bytes after the image");
 
     let mut replayed = pictured(80, 24);
     assert!(replayed.replay(&entries, u64::MAX));
@@ -1005,7 +1030,7 @@ fn a_replay_ends_at_a_keyframe_it_cannot_read_part_way_through_a_sequence() {
         Timed { at: 400, entry: Entry::Output(b"\x07\r\nnot shown".to_vec()) },
     ];
     let mut screen = Screen::new(40, 6);
-    assert!(screen.replay_all(&entries));
+    assert!(!screen.replay_all(&entries), "a recording was said to be replayed that ended at a keyframe");
     assert_eq!(screen.snapshot(0).lines[..3], ["first", "shown", ""]);
     // What is written to it afterwards is a new sequence's, not the rest of the one the replay ended in
     screen.feed(b"\r\nnext");

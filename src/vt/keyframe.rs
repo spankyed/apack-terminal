@@ -277,7 +277,8 @@ impl Terminal {
     /// are then read out of the rest of the snapshot and kept after the history (`with_pixels`), where
     /// the core takes them as well. Where they do not fit `most` the keyframe says so and is put back
     /// with no images, rather than with places that would be drawn empty: what its recording then
-    /// shows of them is the ones sent after it.
+    /// shows of them is the ones a program began sending after it. One it was part way through sending
+    /// when the keyframe was taken goes with the rest.
     ///
     /// **The smallest cut that holds it is found from below**, an eighth of the last each time, because
     /// encoding stops where the cut is and not where the lines asked for end: a history of short lines is
