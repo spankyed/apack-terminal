@@ -382,3 +382,46 @@ fn a_sequence_abandoned_for_another_leaves_the_rest_parsed_once() {
     assert_eq!(first_row(&terminal), "abcd");
     assert!(blinks(&terminal), "the cursor asked for by what cut the sequence short was not given");
 }
+
+/// Where `feed_to` stops over `reads`, each fed until it is all taken: the read, how far into it, and
+/// whether ground was where.
+fn stops(blink: CursorBlink, reads: &[&[u8]], or_ground: bool) -> Vec<(usize, usize, bool)> {
+    let mut terminal = Terminal::new(80, 24).expect("a terminal");
+    terminal.set_cursor_defaults(CursorStyle::Bar, blink).expect("the defaults are set");
+    let mut stops = Vec::new();
+    for (read, bytes) in reads.iter().enumerate() {
+        let mut at = 0;
+        while at < bytes.len() {
+            let (taken, ground) = terminal.feed_to(&bytes[at..], or_ground);
+            at += taken;
+            stops.push((read, at, ground));
+            if taken == 0 {
+                // Stopped between sequences having taken nothing: the rest is fed without that stop
+                at += terminal.feed_to(&bytes[at..], false).0;
+                stops.push((read, at, false));
+            }
+        }
+    }
+    stops
+}
+
+#[test]
+fn a_chosen_blink_stops_where_a_string_ends_and_between_sequences_as_any_session_does() {
+    let cases: &[(&[&[u8]], bool)] = &[
+        // A read that ends on the escape of the string's end, and on the escape that begins the next string
+        (&[b"\x1b]0;one\x1b", b"\\after"], false),
+        (&[b"\x1b]0;one\x1b\\\x1b", b"]0;two\x1b\\after"], false),
+        (&[b"text\x1b", b"]0;two\x1b\\after\x1b]0;three\x07z"], false),
+        // A string cut short by a sequence that is watched
+        (&[b"\x1b]0;one\x1b[?12hafter"], false),
+        // Between sequences, with a watched sequence next: stopped having taken nothing
+        (&[b"\x1b[?12hafter"], true),
+        (&[b"ab\x1b[?25l\x1b[?12l"], true),
+    ];
+    for (reads, or_ground) in cases {
+        let left_to_programs = stops(CursorBlink::Program, reads, *or_ground);
+        for chosen in [CursorBlink::On, CursorBlink::Off] {
+            assert_eq!(stops(chosen, reads, *or_ground), left_to_programs, "{chosen:?} over {reads:?}");
+        }
+    }
+}

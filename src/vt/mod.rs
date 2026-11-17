@@ -252,8 +252,13 @@ impl Terminal {
             let watching = self.opened.is_some();
             let begins = if watching { memchr::memchr(ESCAPE, rest) } else { may_set_blink_mode(rest) };
             if begins == Some(0) {
-                self.open(rest);
-                at += 1;
+                // The escape is parsed as any byte is: it may be where an OSC string ends, and a parser
+                // already between sequences stops there having taken nothing
+                let (parsed, reached) = self.open(rest, boundaries);
+                at += parsed;
+                if parsed == 0 || reached & boundaries != 0 {
+                    return (at, reached & boundaries);
+                }
                 continue;
             }
             // Everything before it is parsed as one piece — to where the core is between sequences again,
@@ -281,14 +286,20 @@ impl Terminal {
         self.sequences_watched
     }
 
-    /// Begins watching the sequence `rest` begins with, and parses the escape that begins it.
-    fn open(&mut self, rest: &[u8]) {
+    /// Begins watching the sequence `rest` begins with, and parses the escape that begins it, up to the first
+    /// of `boundaries` as `write_until` does. Answers what that answered: an escape not taken, because the
+    /// parser was stopped between sequences, begins nothing.
+    fn open(&mut self, rest: &[u8], boundaries: u32) -> (usize, u32) {
+        let blinked = self.mode(CURSOR_BLINK_MODE).unwrap_or(false);
+        let (parsed, reached) = self.write_until(&rest[..1], boundaries);
+        if parsed == 0 {
+            return (0, reached);
+        }
         self.sequences_watched += 1;
-        let mut opened =
-            Opened { blinked: self.mode(CURSOR_BLINK_MODE).unwrap_or(false), head: [0; PRIVATE_MODES.len()], held: 0 };
+        let mut opened = Opened { blinked, head: [0; PRIVATE_MODES.len()], held: 0 };
         opened.take(&rest[..1]);
-        self.write(&rest[..1]);
         self.opened = Some(opened);
+        (parsed, reached)
     }
 
     /// The watched sequence has ended. If it set private modes and the cursor's blink is not what it was,
