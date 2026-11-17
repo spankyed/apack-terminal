@@ -11,6 +11,7 @@
 import type {
   Command,
   Fetched,
+  Found,
   KeyInput,
   PasteOutcome,
   Picture,
@@ -343,9 +344,10 @@ class SessionSource implements TerminalSource {
     return answer.text
   }
 
-  async search(needle: string, caseSensitive: boolean): Promise<readonly Span[]> {
+  async search(needle: string, caseSensitive: boolean): Promise<Found> {
     const answer = await this.ask('spans', (channel, request) => ({ kind: 'search', channel, request, needle, caseSensitive }))
-    return answer.epoch === this.epoch ? answer.spans : []
+    // Matches numbered in an epoch that is over name no lines of this one: nothing found, and nothing said of more
+    return answer.epoch === this.epoch ? { spans: answer.spans, more: answer.more } : { spans: [], more: false }
   }
 
   /**

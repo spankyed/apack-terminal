@@ -21,6 +21,21 @@ pub type Cell = (u16, u32);
 /// The most matches one search answers with, newest first.
 pub const SEARCH_MATCHES: usize = 2_000;
 
+/// How many of the core's matches a case-sensitive search reads back to find the exact ones
+/// (`Terminal::find`): ten times what it answers, which is where the work of one search and what the
+/// core holds for it stop growing with what the history holds.
+pub const SEARCH_CANDIDATES: usize = 20_000;
+
+/// What a search found (`Terminal::find`).
+#[derive(Debug, Default)]
+pub struct Found {
+    /// The cells each match covers, newest first.
+    pub matches: Vec<(Cell, Cell)>,
+    /// Whether there are, or may be, matches older than these: more than are answered, or a search that
+    /// stopped before the oldest line.
+    pub more: bool,
+}
+
 impl Terminal {
     fn reference_at(&self, cell: Cell) -> Option<sys::GridRef> {
         let point = sys::Point {
@@ -204,21 +219,26 @@ impl Terminal {
         Ok(copied)
     }
 
-    /// Every place `needle` appears, newest first, as the cells each match covers — the newest
-    /// `SEARCH_MATCHES` of them. Letters match in either case, which is the core's rule; `case_sensitive`
-    /// keeps only the matches whose text is the needle exactly, checked against the text of each match.
+    /// The newest places `needle` appears, newest first, as the cells each match covers — `SEARCH_MATCHES`
+    /// of them at most — and whether there are, or may be, older ones. Letters match in either case, which
+    /// is the core's rule; `case_sensitive` keeps only the matches whose text is the needle exactly, checked
+    /// against the text of each.
     ///
-    /// **A case-insensitive search stops when it has enough, rather than finding everything and keeping some.**
-    /// The core searches the screen and then the history a part at a time, newest first, so it is given parts
-    /// until it has the matches a view is answered with and no further: a single letter looked for in a
-    /// hundred thousand lines is the work of finding two thousand of it, not of finding every one.
+    /// **A search stops when it has enough, rather than finding everything and keeping some.** The core
+    /// searches the screen and then the history a part at a time, newest first, so it is given parts until
+    /// it has what a view is answered with and no further: a single letter looked for in a hundred thousand
+    /// lines is the work of finding two thousand of it, not of finding every one.
     ///
-    /// **A case-sensitive search goes to the end of the history.** Its matches are only the core's matches
-    /// that are exact, so stopping at the core's first two thousand would drop an exact match older than
-    /// those. The filter is lazy, so it reads text only until it has two thousand exact matches.
-    pub fn find(&self, needle: &str, case_sensitive: bool) -> Result<Vec<(Cell, Cell)>, Failed> {
+    /// **A case-sensitive search looks through `SEARCH_CANDIDATES` of the core's matches and no more.** The
+    /// core has no rule for case, so its matches in either case are candidates, each read back to see
+    /// whether it is the needle exactly — and the core keeps every one it has found. Looking to the end of
+    /// the history whatever it holds is unbounded in both: `benches/search.rs` measured a search for `a`
+    /// in a full history of `A` at ten seconds with the session's lock held, and four gigabytes. So it
+    /// stops at that many candidates, and an exact match older than all of them is not found, which the
+    /// answer says: `more` is true whenever the search stopped short of the oldest line.
+    pub fn find(&self, needle: &str, case_sensitive: bool) -> Result<Found, Failed> {
         if needle.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Found::default());
         }
         let mut search: sys::Search = std::ptr::null_mut();
         // SAFETY: `search` is a valid out-pointer; it is freed below, before this returns
@@ -227,6 +247,8 @@ impl Terminal {
         })?;
         let text = sys::String::from(needle);
         let mut found: Vec<sys::Selection> = Vec::new();
+        let wanted = if case_sensitive { SEARCH_CANDIDATES } else { SEARCH_MATCHES };
+        let mut complete = false;
         // SAFETY: NEEDLE copies its `GhosttyString`; STATUS and TOTAL_MATCHES write the types their
         // out-pointers are; the buffer handed to MATCHES is `cap` entries long
         let result = unsafe {
@@ -243,8 +265,8 @@ impl Terminal {
                 if result == sys::Result::SUCCESS {
                     result = sys::ghostty_search_get(search, sys::SearchData::TOTAL_MATCHES, (&raw mut total).cast());
                 }
-                let enough = !case_sensitive && total >= SEARCH_MATCHES;
-                if status == sys::SearchStatus::COMPLETE || enough {
+                complete = status == sys::SearchStatus::COMPLETE;
+                if complete || total >= wanted {
                     break;
                 }
             }
@@ -258,15 +280,17 @@ impl Terminal {
             }
             result
         };
-        let matches = found
+        let mut kept = found
             .iter()
             .filter_map(|selection| self.cells_of(selection))
-            .filter(|&(start, end)| !case_sensitive || self.text_between(start, end).is_ok_and(|text| text == needle))
-            .take(SEARCH_MATCHES)
-            .collect();
+            .filter(|&(start, end)| !case_sensitive || self.text_between(start, end).is_ok_and(|text| text == needle));
+        let matches: Vec<_> = kept.by_ref().take(SEARCH_MATCHES).collect();
+        // Older ones there are, where one more was kept than is answered; older ones there may be, where
+        // the search stopped before the oldest line
+        let more = !complete || kept.next().is_some();
         // SAFETY: freed once, with the terminal still live
         unsafe { sys::ghostty_search_free(search) };
         Failed::check("ghostty_search", result)?;
-        Ok(matches)
+        Ok(Found { matches, more })
     }
 }

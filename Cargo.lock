@@ -23,6 +23,7 @@ dependencies = [
  "insta",
  "interprocess",
  "libc",
+ "memchr",
  "png",
  "portable-pty",
  "proptest",

@@ -71,7 +71,7 @@ export type ToView =
   | { readonly kind: 'pasted'; readonly channel: number; readonly request: number; readonly outcome: PasteOutcome }
   | { readonly kind: 'span'; readonly channel: number; readonly request: number; readonly epoch: number; readonly span: Span | null }
   | { readonly kind: 'text'; readonly channel: number; readonly request: number; readonly epoch: number; readonly text: string }
-  | { readonly kind: 'spans'; readonly channel: number; readonly request: number; readonly epoch: number; readonly spans: readonly Span[] }
+  | { readonly kind: 'spans'; readonly channel: number; readonly request: number; readonly epoch: number; readonly more: boolean; readonly spans: readonly Span[] }
   | { readonly kind: 'failed'; readonly channel: number; readonly request: number; readonly message: string }
   | { readonly kind: 'commands'; readonly channel: number; readonly request: number; readonly epoch: number; readonly commands: readonly Command[] }
   | ({ readonly kind: 'images'; readonly channel: number; readonly request: number; readonly epoch: number } & Placements)
@@ -583,9 +583,10 @@ export function decodeToView(body: Uint8Array): ToView {
     case SPANS: {
       const request = read.number()
       const epoch = read.number()
+      const more = read.flag()
       const spans: Span[] = []
-      for (let more = read.count(); more > 0; more -= 1) spans.push(read.span())
-      return read.finish({ kind: 'spans', channel, request, epoch, spans })
+      for (let left = read.count(); left > 0; left -= 1) spans.push(read.span())
+      return read.finish({ kind: 'spans', channel, request, epoch, more, spans })
     }
     case FAILED: {
       const request = read.number()

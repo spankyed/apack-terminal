@@ -866,11 +866,12 @@
     "to": "view"
   },
   {
-    "hex": "1100000047030d020209000b4ff0a2040cf0a2040c",
+    "hex": "1200000047030d02010209000b4ff0a2040cf0a2040c",
     "message": {
       "channel": 3,
       "epoch": 2,
       "kind": "spans",
+      "more": true,
       "request": 13,
       "spans": [
         {
@@ -899,11 +900,12 @@
     "to": "view"
   },
   {
-    "hex": "0500000047030e0200",
+    "hex": "0600000047030e020000",
     "message": {
       "channel": 3,
       "epoch": 2,
       "kind": "spans",
+      "more": false,
       "request": 14,
       "spans": []
     },

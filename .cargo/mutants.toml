@@ -296,6 +296,14 @@ exclude_re = [
     # these round (`<` with `>`, `>` with `<`) or into an equality is a different fit, and
     # `every_row_reads_as_the_core_says_it_shows` fails on each
     "vt/placeholders.rs:.*replace (<|>) with (<=|>=) in fit",
+    # **`write_until`'s floor on what the core says it parsed is a claim about the core, not an answer.** A
+    # stop for ground can be on no byte at all, where every other stop is on the byte that reached it, so a
+    # stop that is not for ground is held to at least one byte: a core that answered none would have its
+    # caller ask for the same bytes for ever. The core never answers none for those, so `&` and `|` there
+    # give the same count for everything it does answer — with `|` the floor is simply never applied. What
+    # would make the floor matter is a core that stops for an OSC's end having parsed nothing, which no
+    # input produces; the two replacements beside this one are real and are killed.
+    "vt/mod.rs:.*replace & with \\| in Terminal::write_until",
 ]
 
 # **What only Windows compiles is not excluded here, and is left out of every other run instead.**

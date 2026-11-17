@@ -241,8 +241,8 @@ fn to_view() -> impl Strategy<Value = ToView> {
             .prop_map(|(channel, request, epoch, span)| ToView::Span { channel, request, epoch, span }),
         (any::<u32>(), any::<u32>(), any::<u32>(), ".{0,40}")
             .prop_map(|(channel, request, epoch, text)| { ToView::Text { channel, request, epoch, text } }),
-        (any::<u32>(), any::<u32>(), any::<u32>(), prop::collection::vec(span(), 0..5))
-            .prop_map(|(channel, request, epoch, spans)| ToView::Spans { channel, request, epoch, spans }),
+        (any::<u32>(), any::<u32>(), any::<u32>(), any::<bool>(), prop::collection::vec(span(), 0..5))
+            .prop_map(|(channel, request, epoch, more, spans)| ToView::Spans { channel, request, epoch, more, spans }),
         (any::<u32>(), any::<u32>(), ".{0,40}").prop_map(|(channel, request, message)| ToView::Failed {
             channel,
             request,

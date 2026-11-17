@@ -4,7 +4,7 @@ import { CanvasPainter } from '../src/canvas-painter.ts'
 import type { Theme } from '../src/draw.ts'
 import type { Painter, Scene } from '../src/painter.ts'
 import { PLAIN, StyleFlag, paletteColor, type Fetched } from '../src/source.ts'
-import { BLINK_MS, TerminalView, type CursorBlink } from '../src/view.ts'
+import { BLINK_MS, TerminalView } from '../src/view.ts'
 import { recordingContext } from './_canvas.ts'
 import { framesWaiting, installFrames, runFrames } from './_frames.ts'
 import { FakeSource } from './_source.ts'
@@ -735,42 +735,41 @@ describe('the cursor', () => {
     expect(painter.scenes.at(-1)?.cursor?.shape, 'the program\'s shape once focused').toBe('bar')
   })
 
-  describe('whose blink the view is given', () => {
+  describe('whose blink is the source\'s to say', () => {
     beforeEach(() => { vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] }) })
     afterEach(() => { vi.useRealTimers() })
 
-    function focused(cursorBlink: CursorBlink, blinking: boolean) {
-      const view = mountedView({ cursorBlink })
+    function focused(blinking: boolean) {
+      const view = mountedView({})
       view.view.setFocused(true)
       view.source.send(withCursor(blinking))
       return view
     }
 
-    it('blinks a cursor the program steadied when the view is given on', () => {
-      const view = focused('on', false)
+    it('blinks a cursor a frame says blinks', () => {
+      const view = focused(true)
       expect(view.painted().cursor).toBeDefined()
       vi.advanceTimersByTime(BLINK_MS)
       expect(view.painted().cursor, 'did not blink').toBeUndefined()
     })
 
-    it('never hides a cursor the program blinks when the view is given off', () => {
-      const view = focused('off', true)
+    it('never hides a cursor a frame says is steady, and keeps no clock for it', () => {
+      const view = focused(false)
       vi.advanceTimersByTime(BLINK_MS * 3)
       expect(view.painted().cursor, 'hidden').toBeDefined()
       expect(vi.getTimerCount(), 'a clock for a cursor that does not blink').toBe(0)
     })
 
-    it('blinks as the program asks when the view is given program', () => {
-      const view = focused('program', true)
-      vi.advanceTimersByTime(BLINK_MS)
-      expect(view.painted().cursor, 'did not blink for a program that asked').toBeUndefined()
-    })
-
-    it('does not blink as the program asks when the view is given program and the program steadied it', () => {
-      const view = focused('program', false)
+    it('stops blinking when the next frame says the cursor is steady, and starts when one says it blinks', () => {
+      const view = focused(true)
+      view.source.send(withCursor(false))
       vi.advanceTimersByTime(BLINK_MS * 3)
-      expect(view.painted().cursor, 'hidden for a program that steadied it').toBeDefined()
-      expect(vi.getTimerCount(), 'a clock for a cursor the program steadied').toBe(0)
+      expect(view.painted().cursor, 'still blinking a cursor the source steadied').toBeDefined()
+      expect(vi.getTimerCount()).toBe(0)
+
+      view.source.send(withCursor(true))
+      vi.advanceTimersByTime(BLINK_MS)
+      expect(view.painted().cursor, 'did not blink again').toBeUndefined()
     })
   })
 
@@ -813,33 +812,6 @@ describe('cursor settings changed on a view that is up', () => {
     view.view.setCursorInactive('block')
     expect(kept(view), 'a scrolled-up view was moved').toEqual(scrolled)
     expect(scrolled.top).toBe(50)
-  })
-
-  it('setCursorBlink: the next paint uses the new mode, and the view keeps its scroll and selection', () => {
-    const view = working({ cursorBlink: 'program' }, true)
-    const before = kept(view)
-    vi.advanceTimersByTime(BLINK_MS)
-    expect(view.painted().cursor, 'the program blinks the cursor').toBeUndefined()
-
-    view.view.setCursorBlink('off')
-    expect(view.painted().cursor, 'the cursor is hidden after a change to off').toBeDefined()
-    expect(vi.getTimerCount(), 'a clock for a cursor that does not blink').toBe(0)
-    expect(kept(view)).toEqual(before)
-
-    view.view.scrollTo(50)
-    const scrolled = kept(view)
-    view.view.setCursorBlink('on')
-    expect(vi.getTimerCount(), 'no clock after a change to on').toBe(1)
-    expect(kept(view), 'a scrolled-up view was moved').toEqual(scrolled)
-    expect(scrolled.top).toBe(50)
-  })
-
-  it('setCursorBlink: a cursor made to blink is hidden on its own schedule, not left shown until the program moves it', () => {
-    const view = working({ cursorBlink: 'off' }, true)
-    view.view.setCursorBlink('on')
-    expect(view.painted().cursor).toBeDefined()
-    vi.advanceTimersByTime(BLINK_MS)
-    expect(view.painted().cursor, 'did not blink after a change to on').toBeUndefined()
   })
 })
 

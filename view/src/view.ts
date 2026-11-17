@@ -5,7 +5,7 @@ import { linkAt, linkRuns, urls, type Detector, type Link, type LinkRun } from '
 import { fontOf, type Font, type Painter, type Scene } from './painter.ts'
 import { RowStore } from './row-store.ts'
 import { Selection, type Granularity } from './selection.ts'
-import { Modifier, PLAIN, TooLarge, type Anchored, type Command, type Frame, type Picture, type Placements, type PointerInput, type CursorShape, type Position, type Row, type SessionColors, type Span, type TerminalSource } from './source.ts'
+import { Modifier, PLAIN, TooLarge, type Anchored, type Command, type Frame, type Picture, type Placements, type PointerInput, type CursorShape, type Found, type Position, type Row, type SessionColors, type Span, type TerminalSource } from './source.ts'
 import { Viewport } from './viewport.ts'
 import { cellsOfCodePoint } from './width.ts'
 
@@ -46,6 +46,8 @@ export const PAGE_LINES = 256
 export const MATCH_HIGHLIGHTS = 1000
 /** At most one refresh of the matches in this long: what changed while it waits is the next one's to find */
 const MATCH_REFRESH_MS = 200
+/** What a search of nothing finds, and what one that could not be answered is taken as */
+const NOTHING_FOUND: Found = { spans: [], more: false }
 
 /** How fast a selection dragged past an edge scrolls: lines a second, for each row the pointer is past it */
 const DRAG_LINES_PER_SECOND = 15
@@ -56,13 +58,6 @@ const CLICK_AGAIN_PIXELS = 4
 
 /** The shortest the scrollbar's thumb is drawn, in pixels, however much history it stands for */
 const THUMB_MIN = 20
-
-/**
- * Whether the cursor blinks while the view has the keyboard. `on` and `off` are the app's setting, and
- * override what the program asks for: in the core, DECSCUSR's blink and DEC mode 12 are one setting, so
- * `program` is whichever of those the program last set.
- */
-export type CursorBlink = 'on' | 'off' | 'program'
 
 /**
  * What hovering a link shows of where it opens, as the pointer's title: `osc8` for a link a program declared
@@ -120,12 +115,6 @@ export interface ViewOptions {
    * The shape the cursor is drawn in while the view does not have the keyboard. Left out, a hollow block.
    */
   readonly cursorInactive?: CursorShape
-  /**
-   * Whether the cursor blinks while the view has the keyboard (`CursorBlink`). Left out, `program`: the
-   * blink the broker reports, as the program left it. A host that has an app setting passes it, with
-   * "unset" resolved to the value that setting means.
-   */
-  readonly cursorBlink?: CursorBlink
   /**
    * Whether a Mac's option key is alt rather than the key that composes characters: a key held with it is
    * then sent as what the key types without it. Left out, option composes, as it does everywhere else on
@@ -277,7 +266,10 @@ export class TerminalView {
    */
   private needle = ''
   private matches: readonly Span[] = []
-  /** Whether the search found more than `MATCH_HIGHLIGHTS` matches, of which the first are held */
+  /**
+   * Whether there are, or may be, matches beyond the ones held: more than `MATCH_HIGHLIGHTS` were found, or the
+   * source says its search did not reach the oldest line
+   */
   private moreMatches = false
   private matchCase = false
   private refreshTimer: ReturnType<typeof setTimeout> | undefined
@@ -339,9 +331,8 @@ export class TerminalView {
   private wheelOwed = 0
   /** Whether a selection is copied as the pointer is let go: the option at construction, then `setCopyOnSelect` */
   private copyOnSelect: boolean
-  /** The cursor's shape without the keyboard, its blink and the link previews: the options at construction, then their setters */
+  /** The cursor's shape without the keyboard and the link previews: the options at construction, then their setters */
   private cursorInactive: CursorShape
-  private cursorBlink: CursorBlink
   private linkPreview: LinkPreview
   /** What is selected. It asks the source what a word or a line is and draws nothing itself */
   readonly selection: Selection
@@ -351,7 +342,6 @@ export class TerminalView {
     this.gutter = options.gutter ?? 0
     this.copyOnSelect = options.copyOnSelect ?? false
     this.cursorInactive = options.cursorInactive ?? 'hollow'
-    this.cursorBlink = options.cursorBlink ?? 'program'
     this.linkPreview = options.linkPreview ?? 'osc8'
     this.font = options.font
     this.theme = options.theme
@@ -435,16 +425,6 @@ export class TerminalView {
     this.schedule()
   }
 
-  /**
-   * Changes whether the cursor blinks (`cursorBlink`). The blink starts over in the new mode, as it does after
-   * anything is typed, and the view keeps its scroll position and selection.
-   */
-  setCursorBlink(mode: CursorBlink): void {
-    this.cursorBlink = mode
-    this.blinkAgain()
-    this.schedule()
-  }
-
   /** Changes which links show where they open (`linkPreview`), and the link under the pointer shows it at once */
   setLinkPreview(mode: LinkPreview): void {
     this.linkPreview = mode
@@ -512,7 +492,7 @@ export class TerminalView {
     const asked = (this.finding += 1)
     this.needle = needle
     this.matchCase = options.matchCase ?? false
-    const found = (await this.search(needle)) ?? []
+    const found = (await this.search(needle)) ?? NOTHING_FOUND
     // A search that was overtaken by a later one has nothing to say
     if (asked !== this.finding) return this.matches.length
     this.setMatches(found)
@@ -522,15 +502,15 @@ export class TerminalView {
     return this.matches.length
   }
 
-  /** Holds what a search found, up to `MATCH_HIGHLIGHTS` of it */
-  private setMatches(found: readonly Span[]): void {
-    this.matches = found.slice(0, MATCH_HIGHLIGHTS)
-    this.moreMatches = found.length > MATCH_HIGHLIGHTS
+  /** Holds what a search found, up to `MATCH_HIGHLIGHTS` of it, and whether that is all there is */
+  private setMatches(found: Found): void {
+    this.matches = found.spans.slice(0, MATCH_HIGHLIGHTS)
+    this.moreMatches = found.more || found.spans.length > MATCH_HIGHLIGHTS
   }
 
   /** Where the source finds `needle`, or `null` when it could not say */
-  private async search(needle: string): Promise<readonly Span[] | null> {
-    if (needle === '') return []
+  private async search(needle: string): Promise<Found | null> {
+    if (needle === '') return NOTHING_FOUND
     try {
       return await this.source.search(needle, this.matchCase)
     } catch {
@@ -560,11 +540,12 @@ export class TerminalView {
     this.refreshing = true
     this.refreshAgain = false
     const asked = this.finding
-    void this.search(this.needle).then((found) => {
+    void this.search(this.needle).then((answer) => {
       this.refreshing = false
       if (this.disposed) return
       // Nothing to say when the person has searched again since, or the source could not answer
-      if (found && asked === this.finding) {
+      if (answer && asked === this.finding) {
+        const found = answer.spans
         const on = this.matches[this.currentMatch]
         const still = on ? found.findIndex((match) => match.start.line === on.start.line && match.start.column === on.start.column) : -1
         // On the match they were on; failing that the nearest there is, which for a search that had found
@@ -572,7 +553,7 @@ export class TerminalView {
         const current = found.length === 0 ? -1 : still !== -1 ? still : Math.max(0, Math.min(this.currentMatch, found.length - 1))
         const held = found.slice(0, MATCH_HIGHLIGHTS)
         const same = current === this.currentMatch && held.length === this.matches.length && held.every((match, index) => sameSpan(match, this.matches[index]!))
-        this.setMatches(found)
+        this.setMatches(answer)
         this.currentMatch = current
         // A row's drawing is kept by what matches are on it, so only the rows whose matches moved are
         // drawn again — and with none moved, nothing is
@@ -582,7 +563,10 @@ export class TerminalView {
     })
   }
 
-  /** Which match the person is on, counting from one at the newest, and how many there are */
+  /**
+   * Which match the person is on, counting from one at the newest, how many are held, and whether there are or
+   * may be more: past the `MATCH_HIGHLIGHTS` held, or further back than the source's search looked
+   */
   get found(): { current: number; total: number; more: boolean } {
     return { current: this.currentMatch + 1, total: this.matches.length, more: this.moreMatches }
   }
@@ -1285,7 +1269,7 @@ export class TerminalView {
       this.anchored = { ...this.anchored, list: [] }
       this.imagesSeen = -1
       this.needle = ''
-      this.setMatches([])
+      this.setMatches(NOTHING_FOUND)
       this.currentMatch = -1
       this.finding += 1
     } else {
@@ -1345,15 +1329,14 @@ export class TerminalView {
     this.schedule()
   }
 
-  /** Whether the cursor blinks now: the view's setting where it has one, and the program's where it does not */
+  /**
+   * Whether the cursor blinks now, which is the source's to say: a frame's cursor is the one to draw. What a
+   * person chose and what a program asked for are settled where the session's output is parsed, the one
+   * place that can tell a program asking for a cursor from one that only showed it again
+   */
   private cursorBlinks(): boolean {
     const cursor = this.frame?.cursor
-    if (!cursor || cursor.hidden) return false
-    switch (this.cursorBlink) {
-      case 'on': return true
-      case 'off': return false
-      case 'program': return cursor.blinking
-    }
+    return cursor !== null && cursor !== undefined && !cursor.hidden && cursor.blinking
   }
 
   /**
