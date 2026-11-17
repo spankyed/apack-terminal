@@ -85,7 +85,7 @@ pub struct Terminal {
 }
 
 /// DEC mode 12, by which a program turns the cursor's blink on and off (`CSI ? 12 h`, `CSI ? 12 l`).
-const CURSOR_BLINK_MODE: u16 = 12;
+pub(super) const CURSOR_BLINK_MODE: u16 = 12;
 
 /// The byte every escape sequence begins with.
 const ESCAPE: u8 = 0x1b;

@@ -13,7 +13,7 @@ use std::ptr::NonNull;
 
 use ghostty_vt_rs_sys as sys;
 
-use super::{Failed, Terminal};
+use super::{CURSOR_BLINK_MODE, Failed, Terminal};
 
 /// A cell: its column, and its row counted from the oldest line held.
 pub type Cell = (u16, u32);
@@ -156,6 +156,10 @@ impl Terminal {
     /// as the sequences that redraw it in another terminal of the same size. `from` is a row counted from
     /// the oldest line held, and `last` the bottom-right cell.
     ///
+    /// **A cursor that does not blink is said to be one.** The core writes a blinking cursor as mode 12 set
+    /// and a steady one as nothing, which leaves the terminal redrawing it with whatever cursor it had: a
+    /// session's default, which blinks. So mode 12 reset is written for it here.
+    ///
     /// **Wrapped rows are written as the one line they are**, so the terminal redrawing them wraps them
     /// itself and knows they are one line: written a row at a time, each would arrive as a line of its own
     /// and a later resize would no longer rejoin them.
@@ -216,6 +220,10 @@ impl Terminal {
             sys::ghostty_formatter_free(formatter);
         }
         Failed::check("ghostty_formatter_format_alloc", result)?;
+        let mut copied = copied;
+        if !self.mode(CURSOR_BLINK_MODE)? {
+            copied.extend_from_slice(b"\x1b[?12l");
+        }
         Ok(copied)
     }
 

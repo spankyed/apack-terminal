@@ -843,7 +843,7 @@ fn carry_out_view(
         ToBroker::Search { channel, request, needle, case_sensitive } => {
             let told = Arc::clone(sink);
             let asked = session_of(channel).and_then(|handle| {
-                handle.once_whole(ViewId { connection, channel }, move |screen| {
+                handle.once_whole_keeping(ViewId { connection, channel }, needle.len(), move |screen| {
                     let found = screen.find(&needle, case_sensitive).map(|found| ToView::Spans {
                         channel,
                         request,

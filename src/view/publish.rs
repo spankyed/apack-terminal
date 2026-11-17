@@ -648,6 +648,13 @@ impl Publication {
         self.viewers.retain(|viewer| viewer.id.connection != connection);
     }
 
+    /// Whether a view has yet to draw a frame that is no longer the screen: one is on its way to it, and
+    /// the screen has changed since. It is sent no other until it has drawn that one (`owed`), so what
+    /// it is told of the text meanwhile would be of a screen it has not been sent.
+    pub fn undrawn(&self, id: ViewId) -> bool {
+        self.viewers.iter().any(|viewer| viewer.id == id && viewer.in_flight && (self.stale || self.behind(viewer)))
+    }
+
     /// A view drew the frame with this sequence, so it may be sent the next.
     ///
     /// An acknowledgement of anything but the frame in flight is ignored: it is late, for a frame since

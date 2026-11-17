@@ -129,6 +129,11 @@ export interface ViewOptions {
   readonly detectors?: readonly Detector[]
   /** Whether anything is selected changed, which a host draws its copy control from */
   readonly onSelectionChange?: (selected: boolean) => void
+  /**
+   * What a search has found changed with the session's output, with no one having searched or stepped: the
+   * count a host shows is `found` as of its last `find` or `findNext` until it is told so here
+   */
+  readonly onFound?: (found: { current: number; total: number; more: boolean }) => void
   /** Text was copied. Left out, it is written to the clipboard the page has */
   readonly onCopy?: (text: string) => void
   /** The commands the shell has reported, each time the view hears them: a host draws its command list from this */
@@ -553,8 +558,11 @@ export class TerminalView {
         const current = found.length === 0 ? -1 : still !== -1 ? still : Math.max(0, Math.min(this.currentMatch, found.length - 1))
         const held = found.slice(0, MATCH_HIGHLIGHTS)
         const same = current === this.currentMatch && held.length === this.matches.length && held.every((match, index) => sameSpan(match, this.matches[index]!))
+        const before = this.found
         this.setMatches(answer)
         this.currentMatch = current
+        const now = this.found
+        if (now.current !== before.current || now.total !== before.total || now.more !== before.more) this.options.onFound?.(now)
         // A row's drawing is kept by what matches are on it, so only the rows whose matches moved are
         // drawn again — and with none moved, nothing is
         if (!same) this.schedule()

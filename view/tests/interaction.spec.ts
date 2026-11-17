@@ -973,6 +973,35 @@ describe('finding text', () => {
     expect(matchedOn(view, 1)).toEqual([[0, 5, 'current']])
   })
 
+  it('tells its host when output changed what there is to count, and not when it did not', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const source = new Searchable()
+    source.found = [span(101, 0, 4)]
+    const told: Array<{ current: number; total: number; more: boolean }> = []
+    const view = mountedView({ onFound: (found) => told.push(found) }, source)
+    showing(view, { firstActive: 100, scrollback: 100 })
+    await view.view.find('a')
+    expect(told, 'a search the host made is one it reads the answer of').toEqual([])
+
+    // Output that leaves the same matches where they were says nothing
+    view.source.send(frame({ sequence: 2, firstActive: 100, scrollback: 100, rows: [row(103, 'unrelated')] }))
+    await vi.advanceTimersByTimeAsync(MATCH_REFRESH_MS)
+    expect(told).toEqual([])
+
+    // The same matches, and now older ones the search did not reach: the count is no longer all there is
+    source.more = true
+    view.source.send(frame({ sequence: 3, firstActive: 100, scrollback: 100, rows: [row(103, 'pushed back')] }))
+    await vi.advanceTimersByTimeAsync(MATCH_REFRESH_MS)
+    expect(told).toEqual([{ current: 1, total: 1, more: true }])
+
+    // And one more match
+    source.found = [span(102, 0, 1), span(101, 0, 4)]
+    view.source.send(frame({ sequence: 4, firstActive: 100, scrollback: 100, rows: [row(102, 'a')] }))
+    await vi.advanceTimersByTimeAsync(MATCH_REFRESH_MS)
+    expect(told.at(-1)).toEqual({ current: 2, total: 2, more: true })
+    expect(told).toHaveLength(2)
+  })
+
   it('draws nothing again when rows changed and what was found did not', async () => {
     const { view } = searching([span(101, 0, 4)])
     await view.view.find('a')
