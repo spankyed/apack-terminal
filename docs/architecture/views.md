@@ -20,7 +20,8 @@ Each view connection has its own writer and its own queue. A view that has stopp
 nobody else's screen and no client's answer — and is not waited for for ever: once 64 MiB is waiting for
 it to read, what was waiting is dropped, nothing more is queued for it, and it is hung up on. So is a
 view that closed its side and then took nothing it was still owed for three seconds: finishing speaking
-is what a view that is listening does, and listening is taking messages.
+is what a view that is listening does, and listening is taking what it is written. That is counted as the
+connection takes it, 64 KiB at a time, so a view part-way through reading a large answer is reading.
 
 **On Windows the hang-up is a cancel and a disconnect.** A named pipe cannot be shut down from under a thread
 that is writing to it, so the broker cancels the pipe's pending I/O, which lets that thread go, and then
