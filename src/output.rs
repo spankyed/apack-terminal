@@ -97,6 +97,36 @@ impl Credit {
     }
 }
 
+/// When a session's program was last written to, which is what makes the output after it an answer.
+///
+/// **An echo is not a burst, though it arrives like one.** A keystroke written within a window of the last
+/// flush has its echo arrive inside that window too, and held for the rest of it, typing back to back
+/// waited out the window on every character. The broker knows when it wrote to the program, so output that
+/// follows a write it has not yet sent anything after is the program answering, and leaves at once; output
+/// nobody asked for still waits out the window. The writer notes the write once the pty has taken it
+/// (`writer::Input`), which is when the program can have begun to answer.
+#[derive(Debug, Default)]
+pub struct Wrote(Mutex<Option<Instant>>);
+
+impl Wrote {
+    /// Notes that the program has just been written to
+    pub fn now(&self) {
+        if let Ok(mut last) = self.0.lock() {
+            *last = Some(Instant::now());
+        }
+    }
+
+    /// Whether the program has been written to since `flushed`, or at all when nothing has been flushed
+    pub fn since(&self, flushed: Option<Instant>) -> bool {
+        let Ok(last) = self.0.lock() else { return false };
+        match (*last, flushed) {
+            (Some(written), Some(flushed)) => written > flushed,
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
+    }
+}
+
 /// Whether a session's pty is being read, and the wait that parks its reader while it is not.
 ///
 /// **A second class of flow control, and it is not the credit above.** Credit bounds how much output may be
@@ -238,8 +268,14 @@ fn sendable(bytes: &[u8]) -> usize {
 ///
 /// Runs as its own thread because the reader's `read` blocks: a time-based flush needs something that can
 /// wait *with a deadline*, which `recv_timeout` is and a blocking read is not.
-pub fn coalesce(session: String, chunks: Receiver<Vec<u8>>, outgoing: Sender<Outgoing>, credit: Arc<Credit>) {
-    coalesce_within(OUTPUT_WINDOW, session, chunks, outgoing, credit);
+pub fn coalesce(
+    session: String,
+    chunks: Receiver<Vec<u8>>,
+    outgoing: Sender<Outgoing>,
+    credit: Arc<Credit>,
+    wrote: Arc<Wrote>,
+) {
+    coalesce_within(OUTPUT_WINDOW, session, chunks, outgoing, credit, wrote);
 }
 
 /// `coalesce`, with the window given.
@@ -253,6 +289,7 @@ pub fn coalesce_within(
     chunks: Receiver<Vec<u8>>,
     outgoing: Sender<Outgoing>,
     credit: Arc<Credit>,
+    wrote: Arc<Wrote>,
 ) {
     let mut buffer: Vec<u8> = Vec::new();
     // When the last flush left, which is what the window is measured from. None before the first
@@ -299,11 +336,17 @@ pub fn coalesce_within(
         // machine holds it up, so sending at each pause sent a busy session's output a read at a time, which
         // is what the window is for: at most one message a window, plus one each time the cap fills.
         //
+        // **But an answer to what was just written leaves at once** (`Wrote`): output held after a write the
+        // program has had nothing sent since is its echo, and is sent without waiting out the window. The
+        // flush that sends it is after the write, so whatever follows is batched again.
+        //
         // **And nothing held is nothing to wake for.** With no sendable byte this blocks until a chunk
         // arrives, however long that is: an idle session costs no timer. A trailing partial character
         // counts as nothing held, because only the next read can complete it.
         let wait = if sendable(&buffer) == 0 {
             None
+        } else if wrote.since(flushed) {
+            Some(Duration::ZERO)
         } else {
             let window_left = flushed.map_or(Duration::ZERO, |at| window.saturating_sub(at.elapsed()));
             Some(window_left)

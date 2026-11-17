@@ -18,7 +18,7 @@ use crate::deadlines::Deadlines;
 use crate::holds::Holds;
 use crate::housekeeping::Housekeeping;
 use crate::markers::MarksKey;
-use crate::output::{Credit, Flow, Outgoing, READ_AHEAD, coalesce};
+use crate::output::{Credit, Flow, Outgoing, READ_AHEAD, Wrote, coalesce};
 use crate::protocol::{
     CursorBlink, CursorStyle, ErrorCode, Event, Foreground, ProgressState, Scope, SessionId, SessionSummary, Signal,
     StatusRecord, Until, WaitOutcome,
@@ -1132,8 +1132,10 @@ impl Sessions {
         }
         let flow = Flow::reading();
         let waiters: Arc<Mutex<Vec<Waiter>>> = Arc::new(Mutex::new(Vec::new()));
+        // Shared by the writer, which notes each write, and the coalescer, which sends what answers one at once
+        let wrote = Arc::new(Wrote::default());
         let process = Arc::new(Process {
-            input: Input::start(writer),
+            input: Input::start_noting(writer, Arc::clone(&wrote)),
             pty: Arc::new(Mutex::new(Some(pty.master))),
             waiters: Arc::clone(&waiters),
             flow: Arc::clone(&flow),
@@ -1206,7 +1208,7 @@ impl Sessions {
                 let session = session.clone();
                 let events = events.clone();
                 let credit = Arc::clone(&self.credit);
-                move || coalesce(session, incoming, events, credit)
+                move || coalesce(session, incoming, events, credit, wrote)
             });
         }
         // Told when the reader has read the last of the output, which is what the exit waits for

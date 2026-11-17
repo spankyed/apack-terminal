@@ -5,6 +5,7 @@
 //! reads used to convert each half on its own, replacing both with U+FFFD — every TUI's box drawing, all
 //! CJK and every emoji, while ASCII was never affected, which is why it went unnoticed. These drive
 //! `coalesce` with the split made on purpose, which no case through a shell can do reliably.
+use std::sync::Arc;
 use std::sync::mpsc::channel;
 use std::time::Duration;
 
@@ -21,7 +22,7 @@ fn events(chunks: &[&[u8]], ending: bool) -> Vec<String> {
     let (sending, incoming) = channel::<Vec<u8>>();
     let (outgoing, answers) = channel();
     let credit = Credit::new(OUTPUT_CREDIT);
-    std::thread::spawn(move || coalesce("s-1".to_owned(), incoming, outgoing, credit));
+    std::thread::spawn(move || coalesce("s-1".to_owned(), incoming, outgoing, credit, Arc::default()));
 
     for (at, chunk) in chunks.iter().enumerate() {
         sending.send(chunk.to_vec()).expect("the coalescer is listening");
@@ -180,10 +181,11 @@ mod flow {
 
 /// **When a session's bytes leave**, with a window long enough that "at once" and "held" cannot be confused.
 mod pacing {
+    use std::sync::Arc;
     use std::sync::mpsc::channel;
     use std::time::Duration;
 
-    use apack_terminal::output::{Credit, OUTPUT_CREDIT, Outgoing, coalesce_within};
+    use apack_terminal::output::{Credit, OUTPUT_CREDIT, Outgoing, Wrote, coalesce_within};
     use apack_terminal::protocol::Event;
 
     /// Far longer than any wait below, so a held chunk is still held when the case looks
@@ -206,7 +208,9 @@ mod pacing {
         let (sending, incoming) = channel::<Vec<u8>>();
         let (outgoing, answers) = channel();
         let credit = Credit::new(OUTPUT_CREDIT);
-        std::thread::spawn(move || coalesce_within(WINDOW, "s-1".to_owned(), incoming, outgoing, credit));
+        std::thread::spawn(move || {
+            coalesce_within(WINDOW, "s-1".to_owned(), incoming, outgoing, credit, Arc::default())
+        });
 
         sending.send(b"echo".to_vec()).expect("the coalescer is listening");
         assert_eq!(text(answers.recv_timeout(SOON).expect("held for the window")), "echo");
@@ -223,7 +227,9 @@ mod pacing {
         let (sending, incoming) = channel::<Vec<u8>>();
         let (outgoing, answers) = channel();
         let credit = Credit::new(OUTPUT_CREDIT);
-        std::thread::spawn(move || coalesce_within(WINDOW, "s-1".to_owned(), incoming, outgoing, credit));
+        std::thread::spawn(move || {
+            coalesce_within(WINDOW, "s-1".to_owned(), incoming, outgoing, credit, Arc::default())
+        });
 
         sending.send(b"echo".to_vec()).expect("the coalescer is listening");
         assert_eq!(text(answers.recv_timeout(SOON).expect("the first flush")), "echo");
@@ -237,6 +243,35 @@ mod pacing {
         assert_eq!(text(answers.recv_timeout(SOON).expect("the stream's end")), "one two three", "one message");
     }
 
+    /// **What answers a write leaves at once, though the window is open.** A keystroke typed within a window
+    /// of the last flush has its echo arrive inside that window, and held there, typing back to back waited
+    /// out the window on every character. The flush that sends it is after the write, so what follows,
+    /// asked for by nothing, waits out the window again.
+    #[test]
+    fn what_answers_a_write_leaves_at_once_though_the_window_is_open() {
+        let (sending, incoming) = channel::<Vec<u8>>();
+        let (outgoing, answers) = channel();
+        let credit = Credit::new(OUTPUT_CREDIT);
+        let wrote = Arc::new(Wrote::default());
+        std::thread::spawn({
+            let wrote = Arc::clone(&wrote);
+            move || coalesce_within(WINDOW, "s-1".to_owned(), incoming, outgoing, credit, wrote)
+        });
+
+        sending.send(b"$ ".to_vec()).expect("the coalescer is listening");
+        assert_eq!(text(answers.recv_timeout(SOON).expect("the first flush")), "$ ");
+
+        // Inside the window now: a key is written to the program, and its echo comes back
+        wrote.now();
+        sending.send(b"k".to_vec()).expect("the coalescer is listening");
+        assert_eq!(text(answers.recv_timeout(SOON).expect("the echo was held for the window")), "k");
+
+        sending.send(b"more".to_vec()).expect("the coalescer is listening");
+        assert!(answers.recv_timeout(SHORT).is_err(), "what nobody asked for left at once after an echo");
+        drop(sending);
+        assert_eq!(text(answers.recv_timeout(SOON).expect("the stream's end")), "more");
+    }
+
     /// **What a burst holds leaves when its window closes**, with nothing more arriving to push it out.
     #[test]
     fn what_a_burst_holds_is_sent_when_its_window_closes() {
@@ -245,7 +280,9 @@ mod pacing {
         let (sending, incoming) = channel::<Vec<u8>>();
         let (outgoing, answers) = channel();
         let credit = Credit::new(OUTPUT_CREDIT);
-        std::thread::spawn(move || coalesce_within(BRIEF, "s-1".to_owned(), incoming, outgoing, credit));
+        std::thread::spawn(move || {
+            coalesce_within(BRIEF, "s-1".to_owned(), incoming, outgoing, credit, Arc::default())
+        });
 
         sending.send(b"echo".to_vec()).expect("the coalescer is listening");
         assert_eq!(text(answers.recv_timeout(SOON).expect("the first flush")), "echo");
@@ -260,7 +297,9 @@ mod pacing {
         let (sending, incoming) = channel::<Vec<u8>>();
         let (outgoing, answers) = channel();
         let credit = Credit::new(OUTPUT_CREDIT);
-        std::thread::spawn(move || coalesce_within(WINDOW, "s-1".to_owned(), incoming, outgoing, credit));
+        std::thread::spawn(move || {
+            coalesce_within(WINDOW, "s-1".to_owned(), incoming, outgoing, credit, Arc::default())
+        });
 
         sending.send(b"first".to_vec()).expect("the coalescer is listening");
         assert_eq!(text(answers.recv_timeout(SOON).expect("the first flush")), "first");
@@ -288,7 +327,9 @@ fn chunks_that_arrive_together_leave_as_one_message_a_cap() {
         sending.send(vec![b'x'; 1024]).expect("the coalescer has not started");
     }
     drop(sending);
-    std::thread::spawn(move || coalesce("s-1".to_owned(), incoming, outgoing, Credit::new(OUTPUT_CREDIT)));
+    std::thread::spawn(move || {
+        coalesce("s-1".to_owned(), incoming, outgoing, Credit::new(OUTPUT_CREDIT), Arc::default())
+    });
 
     let mut sizes = Vec::new();
     // Ends when the coalescer does, which is once it has flushed the last of what it was given
