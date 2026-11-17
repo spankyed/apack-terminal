@@ -329,7 +329,8 @@ impl Terminal {
         // SAFETY: the handle is live and nothing writes to it for `&self`; `pixels` outlives the call,
         // which is the only thing that calls `take_pixels` with it
         let result = unsafe { sys::ghostty_snapshot_encode(self.handle, writer) };
-        if pixels.over || result != sys::Result::SUCCESS {
+        // Ended by the refusal above, where the pixels did not fit, or by the core
+        if result != sys::Result::SUCCESS {
             return;
         }
         let with = [&kept.snapshot[..ends], &pixels.kept].concat();

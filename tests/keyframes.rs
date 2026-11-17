@@ -873,6 +873,18 @@ fn an_image_larger_than_a_keyframe_holds_puts_the_keyframe_off_and_the_recording
     let mut replayed = pictured(80, 24);
     assert!(replayed.replay(&entries, u64::MAX));
     assert_eq!(showing(&mut replayed), showing(&mut live));
+
+    // **Past twice its budget the recording stops instead**: a keyframe is the only way its oldest part
+    // can go, and one that cannot be taken would have it grow for as long as the image arrives
+    let path = directory.path().join("bounded.recording");
+    let recorder =
+        apack_terminal::recording::Recorder::start_with(&path, 1 << 20, 1 << 20).expect("the recording starts");
+    let mut bounded = pictured(80, 24);
+    bounded.start_recording_with(recorder).expect("the first keyframe is written");
+    for piece in picture(9, 1_200, 1_200, 'T') {
+        bounded.feed(&piece);
+    }
+    assert!(!bounded.recorded(), "a recording far past its budget went on without a keyframe");
 }
 
 /// **And what a program did to the terminal is not undone by telling it.** A mode a session turns on by
