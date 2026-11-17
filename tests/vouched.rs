@@ -529,7 +529,7 @@ fn output(at: u64, bytes: &str) -> Timed {
 #[test]
 fn a_replay_that_begins_part_way_through_a_session_refuses_what_the_session_refused() {
     let entries = vec![
-        Timed { at: 1_000, entry: Entry::Keyframe { cols: 40, rows: 6, redraw: b"$ cat log\r\n".to_vec() } },
+        Timed { at: 1_000, entry: crate::screens::keyframe(40, 6, b"$ cat log\r\n") },
         Timed { at: 1_000, entry: Entry::Marks { key: Some(key(KEY)), last: 7 } },
         // The rest of what command 7 printed: marks the session had already taken
         output(2_000, &[start(3, "make"), finish(3, "0", "/"), start(7, "cat log")].concat()),
@@ -553,7 +553,7 @@ fn a_replay_moves_nothing_of_what_a_sessions_own_shell_has_been_heard_to_say() {
     assert_eq!(refused(&screen), 1);
 
     let entries = vec![
-        Timed { at: 1_000, entry: Entry::Keyframe { cols: 40, rows: 6, redraw: Vec::new() } },
+        Timed { at: 1_000, entry: crate::screens::keyframe(40, 6, b"") },
         Timed { at: 1_000, entry: Entry::Marks { key: Some(key(ANOTHER)), last: 0 } },
         output(2_000, &[start_with(ANOTHER, 41, "theirs"), start(1, "refused there"), start(2, "and this")].concat()),
     ];
@@ -575,7 +575,7 @@ fn a_replay_moves_nothing_of_what_a_sessions_own_shell_has_been_heard_to_say() {
 /// numbering its commands from one. Said again with nothing changed, it changes nothing.
 #[test]
 fn a_recording_naming_its_key_again_changes_nothing_unless_the_number_is_another_shells() {
-    let keyframe = Timed { at: 1_000, entry: Entry::Keyframe { cols: 40, rows: 6, redraw: Vec::new() } };
+    let keyframe = Timed { at: 1_000, entry: crate::screens::keyframe(40, 6, b"") };
     let named = |at: u64, last: u64| Timed { at, entry: Entry::Marks { key: Some(key(KEY)), last } };
 
     // The same key at the number the session had reached: the same shell, part way through a command
@@ -674,7 +674,7 @@ fn a_recording_passed_between_sessions_with_and_without_a_key_is_read_back_as_ea
 #[test]
 fn a_keyed_command_is_a_record_of_its_own_and_not_the_prompt_a_replay_left_waiting() {
     let entries = vec![
-        Timed { at: 1_000, entry: Entry::Keyframe { cols: 40, rows: 6, redraw: Vec::new() } },
+        Timed { at: 1_000, entry: crate::screens::keyframe(40, 6, b"") },
         output(2_000, &format!("\x1b]133;C{BEL}out\r\n\x1b]133;D;0{BEL}\x1b]133;A{BEL}$ ")),
     ];
     let mut screen = keyed();

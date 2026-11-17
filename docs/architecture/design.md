@@ -179,11 +179,38 @@ boundary against one, and nothing should be described as if it were.
 
 Opt-in per session (`Spawn.record`), because a recording holds everything the program printed, including
 what it printed once and erased. It is a log of what arrived — the pty's bytes and each resize, stamped —
-with the screen written out whole every megabyte, so a replay starts from the last such keyframe before
-the moment it wants rather than from the beginning (`recording.rs`). A keyframe carries the screen and a
-thousand lines above it, waits for the primary screen and for the parser to be between sequences — a
-replay may begin at any keyframe, and one taken part way through a sequence would be followed by the rest
-of it — and is what lets a recording past its budget drop its oldest part.
+with the terminal written out whole every megabyte, so a replay starts from the last such keyframe before
+the moment it wants rather than from the beginning (`recording.rs`). **A keyframe is the core's own
+account of its terminal** (`vt/keyframe.rs`): the beginning of the snapshot `libghostty-vt` encodes, which
+is everything that makes the terminal what it is — both screens, the cursor a program asked for and the
+one it saved, modes, margins, tab stops, colours — and then its history from the newest line back, cut
+where there are a thousand lines of it. A replay puts that terminal in place rather than redrawing one,
+so it goes on exactly as the session did. The sequences that redraw a screen are not that: they are one
+screen as the core's formatter writes it, which leaves out the cursor's shape, a saved cursor, and the
+shell's screen under a full-screen program. That a terminal put back
+goes on as the one written out is held as a property over generated output (`tests/keyframes.rs`). It
+holds outside left and right margins; inside them it found what the core's snapshot does not hold — a
+line about to wrap at a right margin short of the screen's edge, and which rows keep the shell's prompt
+mark across a scroll — each pinned by a case that fails the day the core holds it.
+
+A keyframe holds its terminal's images: the pixels a cut for its history leaves behind are kept after the
+history, where the core takes them as well. Where they are more than a keyframe has room for it holds
+none, rather than an image that would be drawn as an empty place, and what its recording then shows of
+them is the ones sent after it. A terminal that does not fit a keyframe — an image a program is part way through sending is
+megabytes written out with the screen — has its keyframe put off, and is recorded all the while.
+
+A keyframe is taken on whichever screen is showing, waits for the parser to be between sequences — which
+is where the core writes a terminal out — and is what lets a recording past its budget drop its oldest
+part. What the broker told a terminal is not that terminal's state and is not the keyframe's: how much
+history a session keeps, the colours and name it answers with, the cursor a reset returns to, whether it
+takes images and where its reports go are told again to a terminal put back (`vt/settings.rs`), so a
+recording is replayed under the settings of the session replaying it.
+
+**A keyframe is read by the core that wrote it.** The snapshot's format is the core's, and upstream says
+of its first version that it will change. A recording therefore outlives a change of core as a log, not
+as something to pick up: one whose keyframes this build's core does not read is begun again from the
+first it does read, and a moment before that is not shown. That is the price of a keyframe that is the
+whole terminal, and it is paid once, where the core is moved.
 
 The file is written by a thread of its own, so a slow disk holds up no session. What that leaves is this:
 an entry is in the operating system's hands moments after it happened and survives the broker dying,

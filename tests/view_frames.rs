@@ -1801,16 +1801,17 @@ fn a_rows_links_come_to_no_more_than_a_row_may_carry() {
     assert!(row.glyphs.iter().any(|glyph| glyph.link == 0), "every cell was linked, so the limit was not reached");
 }
 
-/// **A recording's keyframe says a cursor blinks by mode 12, and is believed.** A keyframe is the core's own
-/// account of a screen, and a blinking cursor is written there as `CSI ? 12 h` whichever way its program
-/// asked for it. So a session whose person chose a steady cursor still replays the blinking one a program
-/// asked for, the program's own mode 12 in the output after the keyframe is still left alone, and a session
-/// that leaves the blink to programs still has it changed by mode 12 once the replay is over.
+/// **A replay draws the cursor its keyframe holds, whatever blink a person chose.** A keyframe is the
+/// terminal as it was, the cursor its program asked for included: its shape, and whether it blinks. So
+/// a session whose person chose a steady cursor still replays the blinking one a program asked for, the
+/// program's own mode 12 in the output after the keyframe is still left alone there, and a session that
+/// leaves the blink to programs still has it changed by mode 12 once the replay is over.
 #[test]
-fn a_replay_draws_the_cursor_its_keyframe_says_whatever_blink_a_person_chose() {
+fn a_replay_draws_the_cursor_its_keyframe_holds_whatever_blink_a_person_chose() {
     use apack_terminal::recording::{Entry, Timed};
+    // A blinking underline, which is neither the cursor a session starts with nor either one chosen below
     let entries = [
-        Timed { at: 100, entry: Entry::Keyframe { cols: 20, rows: 4, redraw: b"hello\x1b[?12h".to_vec() } },
+        Timed { at: 100, entry: crate::screens::keyframe(20, 4, b"hello\x1b[3 q") },
         Timed { at: 150, entry: Entry::Output(b"\x1b[?12l more".to_vec()) },
     ];
     let mut chosen = Screen::new(20, 4);
@@ -1818,7 +1819,7 @@ fn a_replay_draws_the_cursor_its_keyframe_says_whatever_blink_a_person_chose() {
     assert!(chosen.replay(&entries, 200));
     let view = View::attached(&mut chosen, 1, 1);
     let replayed = view.frame();
-    assert_eq!(drawn_as(&replayed), Some((0, true)), "the keyframe's blinking cursor");
+    assert_eq!(drawn_as(&replayed), Some((2, true)), "the keyframe's blinking underline");
     assert_eq!(lines(&replayed)[0], (0, "hello more".to_owned()));
 
     let mut left = Screen::new(20, 4);
@@ -1826,9 +1827,9 @@ fn a_replay_draws_the_cursor_its_keyframe_says_whatever_blink_a_person_chose() {
     assert!(left.replay(&entries[..1], 200));
     let view = View::attached(&mut left, 1, 1);
     let replayed = view.frame();
-    assert_eq!(drawn_as(&replayed), Some((0, true)));
+    assert_eq!(drawn_as(&replayed), Some((2, true)));
     let steady = after(&mut left, &view, &replayed, |screen| write(screen, "\x1b[?12l"));
-    assert_eq!(drawn_as(&steady), Some((0, false)), "mode 12 left alone in a session that leaves it to programs");
+    assert_eq!(drawn_as(&steady), Some((2, false)), "mode 12 left alone in a session that leaves it to programs");
 }
 
 /// A screen held by its program, with a view of it that has drawn what came before, and the epoch its

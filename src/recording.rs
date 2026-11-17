@@ -4,9 +4,15 @@
 //! that happened to the terminal — bytes from the pty, a resize, a change of what vouches for the shell's
 //! marks — stamped with when. Replaying them all
 //! from an empty terminal reproduces the session exactly, and costs everything it ever printed; so every
-//! `KEYFRAME_EVERY` bytes the terminal is written out as the sequences that redraw it (a *keyframe*), and a
-//! replay starts from the last one before the moment it wants. That bounds a replay's work by the distance
-//! between keyframes rather than by the session's age.
+//! `KEYFRAME_EVERY` bytes the terminal is written out whole (a *keyframe*), and a replay starts from the
+//! last one before the moment it wants. That bounds a replay's work by the distance between keyframes
+//! rather than by the session's age.
+//!
+//! **A keyframe is the terminal's core's own account of it**, held here and not read: all of the
+//! terminal's state, so a replay from it goes on exactly as the session did (`vt::keyframe`). It is read
+//! by the core that wrote it. The core's format moves with the core, so a recording outlives a change of
+//! core as a log and not as something to pick up: one whose keyframes this build's core does not read is
+//! begun again from the first it does, or not at all.
 //!
 //! **Bounded on disk, by dropping its oldest part at a keyframe.** A recording past its budget is rewritten
 //! from the first keyframe in its newer half, so what remains still starts with a whole screen. How far
@@ -116,11 +122,12 @@ pub fn check(path: &Path) -> Result<(), String> {
 /// One thing that happened to a recorded terminal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Entry {
-    /// The whole terminal at this moment, as the sequences that redraw it in one of this size.
+    /// The whole terminal at this moment, of this size: its state as its core wrote it out, which this
+    /// module holds and does not read (`vt::keyframe`).
     Keyframe {
         cols: u16,
         rows: u16,
-        redraw: Vec<u8>,
+        state: Vec<u8>,
     },
     /// Bytes the program wrote.
     Output(Vec<u8>),
@@ -182,7 +189,7 @@ fn size(payload: &[u8]) -> Option<(u16, u16)> {
 /// How long an entry is in the file.
 fn length(entry: &Entry) -> u64 {
     let payload = match entry {
-        Entry::Keyframe { redraw, .. } => 4 + redraw.len(),
+        Entry::Keyframe { state, .. } => 4 + state.len(),
         Entry::Output(bytes) => bytes.len(),
         Entry::Resize { .. } => 4,
         Entry::Marks { key, .. } => 8 + key.as_ref().map_or(0, |key| key.as_str().len()),
@@ -206,7 +213,7 @@ pub fn decode(bytes: &[u8]) -> Vec<Timed> {
         let Some(payload) = rest.get(HEADER..HEADER + length) else { break };
         let entry = match kind {
             KEYFRAME => match size(payload) {
-                Some((cols, rows)) => Entry::Keyframe { cols, rows, redraw: payload[4..].to_vec() },
+                Some((cols, rows)) => Entry::Keyframe { cols, rows, state: payload[4..].to_vec() },
                 None => break,
             },
             OUTPUT => Entry::Output(payload.to_vec()),
@@ -787,6 +794,12 @@ impl Recorder {
         self.keyframes.is_empty() || self.since_keyframe >= self.every
     }
 
+    /// Puts the keyframe that is due off until as much again has been written as lies between two: for a
+    /// terminal that could not be written out now.
+    pub fn put_off_keyframe(&mut self) {
+        self.since_keyframe = 0;
+    }
+
     /// Whether the recording is past its budget, where only a keyframe lets its oldest part go.
     pub fn over_budget(&self) -> bool {
         self.written > self.budget
@@ -798,9 +811,9 @@ impl Recorder {
     }
 
     /// Records the whole terminal, and drops the recording's oldest part if it is past its budget.
-    pub fn keyframe(&mut self, cols: u16, rows: u16, redraw: &[u8]) -> std::io::Result<()> {
+    pub fn keyframe(&mut self, cols: u16, rows: u16, state: &[u8]) -> std::io::Result<()> {
         let at = self.written;
-        self.append(KEYFRAME, &[&cols.to_le_bytes(), &rows.to_le_bytes(), redraw])?;
+        self.append(KEYFRAME, &[&cols.to_le_bytes(), &rows.to_le_bytes(), state])?;
         self.keyframes.push(at);
         self.since_keyframe = 0;
         if self.over_budget() {

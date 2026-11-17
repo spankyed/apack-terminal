@@ -921,12 +921,14 @@ impl Handle {
         let entries = look.index.moment(at).map_err(|error| Refusal::pty("reading a recording", error))?;
         let size = look.size;
         // Its views are sent the moment now showing by the resize that ends this, as they would be
-        // anything else that changed
-        self.on_screen(|screen| {
-            screen.replay(&entries, at);
+        // anything else that changed. A moment whose keyframe this build's core does not read is not
+        // shown, and the screen is left at the moment it was showing
+        let shown = self.on_screen(|screen| {
+            let shown = screen.replay(&entries, at);
             screen.resize(size.0, size.1, 0, 0);
+            shown
         })?;
-        Ok(at)
+        if shown { Ok(at) } else { Err(unread(&self.session)) }
     }
 }
 
@@ -1598,7 +1600,9 @@ impl Sessions {
         let entries = index.moment(last).map_err(|error| Refusal::pty("reading a recording", error))?;
         let (cols, rows) = grid(cols, rows);
         let mut screen = Screen::new(cols, rows);
-        screen.replay(&entries, last);
+        if !screen.replay(&entries, last) {
+            return Err(unread(recording));
+        }
         screen.resize(cols, rows, 0, 0);
         let screen = Arc::new(Mutex::new(screen));
         if let Ok(mut held) = screen.lock() {
@@ -1656,6 +1660,15 @@ fn event_of(session: &str, effect: Effect) -> Event {
         Effect::CommandStarted { command } => Event::CommandStarted { session, command },
         Effect::CommandFinished { outcome } => Event::CommandFinished { session, outcome: outcome.into() },
         Effect::CwdChanged(cwd) => Event::CwdChanged { session, cwd },
+    }
+}
+
+/// The refusal for a recording, or a moment of one, whose keyframe this build's core does not read
+/// (`vt::keyframe`): written by another core, or damaged.
+fn unread(recording: &str) -> Refusal {
+    Refusal {
+        code: ErrorCode::NoSuchSession,
+        message: format!("{recording} holds a keyframe this broker does not read, and was not looked back through"),
     }
 }
 

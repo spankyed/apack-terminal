@@ -135,6 +135,28 @@ exclude_re = [
     # Matched without `in`, for the reason `security.rs`' entry above records: this mutant replaces the
     # function rather than something inside it, and `in <fn>` prints only for the latter
     "vt/mod.rs:.*<impl Drop for Terminal>::drop",
+    # **The same of a snapshot's decoder**, which is made and freed inside one call each time a keyframe is
+    # taken or put back: nothing outside the process can tell one that was not freed from one that was
+    "vt/keyframe.rs:.*<impl Drop for Decoding>::drop",
+
+    # **Which cuts are tried is what a keyframe costs, never what it is.** A snapshot's beginning is taken
+    # in a sixty-fourth, an eighth and then all of the room a keyframe may have, stopping at the first
+    # that holds it; with the middle one some other size the same keyframe is found one cut later, or one
+    # sooner, and it is cut where the same record ends. `benches/keyframe.rs` is where the cost shows
+    "vt/keyframe.rs:.*replace / with % in Terminal::keyframe",
+
+    # **A keyframe given the pixels its cut left behind is decoded before it is kept**, to hold the
+    # reading of the snapshot's framing those pixels were found by: it fails only for a core that frames a
+    # snapshot some other way, which no case here can be. With it answering yes, or yes to either half,
+    # every keyframe this core writes is the same keyframe
+    "vt/keyframe.rs:.*replace Terminal::holds_every_image -> bool with true",
+    "vt/keyframe.rs:.*replace && with \\|\\| in Terminal::holds_every_image",
+
+    # **Whether a cut already holds every image's pixels is what finding them costs.** Counted wrongly as
+    # not holding them, the rest of the snapshot is read for pixels that are not there and the keyframe
+    # is decoded once more, to the same keyframe. Pinned to its line: the two counts beside it are of the
+    # records and the lines a keyframe holds, and are caught
+    "vt/keyframe.rs:387:.*replace \\+= with \\*= in Terminal::cut",
     # The same for the key and mouse encoders a session keeps, which are four more handles with one owner
     "vt/input.rs:.*<impl Drop for Encoders>::drop",
 

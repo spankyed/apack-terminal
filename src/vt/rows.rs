@@ -637,10 +637,17 @@ impl Mark {
     }
 
     /// Moves the mark back to the first row a program can write to, on whichever screen is showing.
+    ///
+    /// **A mark is its terminal's.** One made on a terminal that has since been replaced
+    /// (`Terminal::restore`) is on no row and cannot be moved to one of another terminal's, so it is made
+    /// again on this one.
     pub fn reset(&mut self, terminal: &Terminal) -> Result<(), Failed> {
         // SAFETY: both handles are live
         let result = unsafe { sys::ghostty_tracked_grid_ref_set(self.handle, terminal.handle, active(0, 0)) };
-        Failed::check("ghostty_tracked_grid_ref_set", result)
+        if result != sys::Result::SUCCESS {
+            *self = Self::at_active_top(terminal)?;
+        }
+        Ok(())
     }
 
     /// The cell the mark is on now — its column, and its row counted from the oldest line held — or `None`
