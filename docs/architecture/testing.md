@@ -7,6 +7,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 cargo xtask generate                           # regenerates node/protocol.ts; commit it if it moved
 cargo xtask check-generated                    # fails when it has fallen behind
+cargo xtask notices                            # regenerates the release's third-party notices (cargo-about 0.9.3)
+cargo xtask check-notices                      # fails when they have fallen behind
 cargo xtask check-exclusions                   # fails when a mutants exclusion excludes nothing
 cargo xtask clear-mutants                      # removes the working copies a mutants run that was ended left behind
 ```

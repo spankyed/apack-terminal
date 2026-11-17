@@ -30,6 +30,37 @@ pub fn hang_up(pipe: &impl AsHandle) -> bool {
     }
 }
 
+/// Lets a pipe go once everything has been written to it: cancels its pending reads and writes, and answers
+/// whether one was cancelled. **It does not disconnect**, because a disconnect throws away whatever the far end
+/// has not read yet, answers included. The pipe ends for the far end when its handle closes, after it has read
+/// what was written.
+///
+/// **And its handle closes when it is dropped, whether or not the far end has read.** interprocess otherwise
+/// hands a pipe written to since its last flush to one thread that flushes such pipes in turn before closing
+/// them, and a flush waits for the far end to read. A caller that finished and stopped reading would hold that
+/// thread, and every pipe dropped after it would wait behind it with its far end never told the connection
+/// ended. Closing the handle unflushed loses nothing: what was written stays for the far end to read.
+///
+/// **No write can be left parked or pending a flush, however late it begins.** The pipe stops waiting on its far
+/// end before the cancel, so a write that begins after the cancel takes what room there is and returns rather
+/// than waiting for a reader. `writers_ended` waits for whatever writes to the pipe to have stopped, and only
+/// then is the pipe taken to need no flush, so a write that went in before that is not one the drop waits on.
+pub fn let_go(
+    pipe: &interprocess::os::windows::named_pipe::local_socket::Stream,
+    writers_ended: impl FnOnce(),
+) -> bool {
+    let handle = pipe.as_handle().as_raw_handle() as HANDLE;
+    // Before the cancel: a write made between the two would otherwise wait on a far end that need never read.
+    // Failing to change the mode leaves such a write as a hang-up's would be, which `writers_ended` then waits on
+    let _ = pipe.inner().set_nonblocking(true);
+    // SAFETY: `handle` is the pipe's own handle, which lives for the length of this borrow, and a null
+    // overlapped pointer cancels every pending operation on it
+    let cancelled = unsafe { CancelIoEx(handle, std::ptr::null()) != 0 };
+    writers_ended();
+    pipe.inner().assume_flushed();
+    cancelled
+}
+
 /// Where a user's broker is when nobody says where: a pipe named for the user, by their SID.
 ///
 /// **A pipe's name is one namespace for the whole machine**, so it is the SID that keeps two users' brokers apart,
@@ -91,16 +122,129 @@ fn owned_by(pipe: &impl AsHandle, sid: &widestring::U16CStr) -> std::io::Result<
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::sync::Arc;
     use std::sync::mpsc::channel;
     use std::time::Duration;
 
     use interprocess::local_socket::{GenericFilePath, ListenerOptions, Stream, ToFsName, prelude::*};
 
-    use crate::listening::hang_up;
+    use crate::listening::{hang_up, let_go};
 
     use super::{owned_by, owned_by_this_user};
+
+    /// Letting a connection go ends a read parked on it, says that it did, and **leaves what was written for the
+    /// far end to read**: a disconnect would have thrown it away, which is the difference from hanging up.
+    ///
+    /// Let go until the read ends, since one made before the read is parked cancels nothing and says so.
+    #[test]
+    fn letting_go_ends_a_parked_read_and_leaves_what_was_written_to_be_read() {
+        let name = format!(r"\\.\pipe\apack-let-go-test-{}", std::process::id());
+        let listener = ListenerOptions::new()
+            .name(name.clone().to_fs_name::<GenericFilePath>().expect("a pipe name"))
+            .create_sync()
+            .expect("the pipe is created");
+        let connecting = std::thread::spawn({
+            let name = name.clone();
+            move || {
+                Stream::connect(name.to_fs_name::<GenericFilePath>().expect("a pipe name")).expect("the pipe accepts")
+            }
+        });
+        let server = Arc::new(listener.accept().expect("a connection is accepted"));
+        let client = connecting.join().expect("the client connects");
+        (&*server).write_all(b"answered\n").expect("the answer is written");
+
+        let (outcome_tx, outcome_rx) = channel();
+        std::thread::spawn({
+            let server = Arc::clone(&server);
+            move || {
+                let mut buffer = [0u8; 16];
+                let mut reader: &Stream = &server;
+                let _ = outcome_tx.send(reader.read(&mut buffer).map_err(|error| error.raw_os_error()));
+            }
+        });
+        let mut cancelled = false;
+        let started = std::time::Instant::now();
+        let outcome = loop {
+            assert!(started.elapsed() < Duration::from_secs(10), "the read stayed parked after being let go");
+            cancelled |= let_go(&server, || {});
+            match outcome_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(outcome) => break outcome,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(gone) => panic!("the reading thread ended without saying how: {gone}"),
+            }
+        };
+        assert!(cancelled, "letting go reported that it cancelled nothing");
+        assert_eq!(outcome, Err(Some(995)), "the read did not end as a cancelled one");
+
+        drop(server);
+        let mut read = String::new();
+        let _ = (&client).read_to_string(&mut read);
+        assert_eq!(read, "answered\n", "what was written before letting go was not there to read");
+    }
+
+    /// A pipe that was let go closes when it is dropped, however little of it the far end has read: the far end's
+    /// next write fails at once rather than once a flush it never answers is over. What was written before is
+    /// still there to read. With nothing pending on it, letting go answers that it cancelled nothing.
+    #[test]
+    fn a_pipe_let_go_closes_when_dropped_and_leaves_what_was_written_to_be_read() {
+        let name = format!(r"\\.\pipe\apack-let-go-close-test-{}", std::process::id());
+        let listener = ListenerOptions::new()
+            .name(name.clone().to_fs_name::<GenericFilePath>().expect("a pipe name"))
+            .create_sync()
+            .expect("the pipe is created");
+        let connecting = std::thread::spawn({
+            let name = name.clone();
+            move || {
+                Stream::connect(name.to_fs_name::<GenericFilePath>().expect("a pipe name")).expect("the pipe accepts")
+            }
+        });
+        let server = listener.accept().expect("a connection is accepted");
+        let client = connecting.join().expect("the client connects");
+        (&server).write_all(b"answered\n").expect("the answer is written");
+
+        // Nothing is pending on it, so there is nothing to cancel, and letting go says so
+        assert!(!let_go(&server, || {}), "letting go of a pipe with nothing pending said it cancelled something");
+        drop(server);
+        assert!((&client).write_all(b"more\n").is_err(), "the pipe was still open after it was let go and dropped");
+        let mut read = String::new();
+        let _ = (&client).read_to_string(&mut read);
+        assert_eq!(read, "answered\n", "what was written before letting go was not there to read");
+    }
+
+    /// A write that begins after a pipe is let go, to a far end that reads none of it, **returns rather than
+    /// parks**, and the pipe still closes when it is dropped: the broker's writer can take its last message from
+    /// the feed before the feed is closed and write it after the connection is let go.
+    ///
+    /// The write is made from `writers_ended`, which is after the cancel and before the pipe is taken to need no
+    /// flush. It is far more than a pipe holds, so one that waits on the far end never returns.
+    #[test]
+    fn a_write_begun_after_letting_go_returns_and_the_pipe_still_closes_when_dropped() {
+        let name = format!(r"\\.\pipe\apack-let-go-late-test-{}", std::process::id());
+        let listener = ListenerOptions::new()
+            .name(name.clone().to_fs_name::<GenericFilePath>().expect("a pipe name"))
+            .create_sync()
+            .expect("the pipe is created");
+        let connecting = std::thread::spawn({
+            let name = name.clone();
+            move || {
+                Stream::connect(name.to_fs_name::<GenericFilePath>().expect("a pipe name")).expect("the pipe accepts")
+            }
+        });
+        let server = listener.accept().expect("a connection is accepted");
+        let client = connecting.join().expect("the client connects");
+
+        let (done_tx, done_rx) = channel();
+        std::thread::spawn(move || {
+            let mut written = Ok(());
+            let_go(&server, || written = (&server).write_all(&vec![0u8; 8 << 20]));
+            drop(server);
+            let _ = done_tx.send(written.is_err());
+        });
+        let refused = done_rx.recv_timeout(Duration::from_secs(10)).expect("a write begun after letting go parked");
+        assert!(refused, "megabytes were written to a far end that read none of them");
+        assert!((&client).write_all(b"more\n").is_err(), "the pipe was still open after it was let go and dropped");
+    }
 
     /// Hanging up a connection ends a read that is parked on it, and says that it did.
     ///

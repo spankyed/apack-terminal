@@ -1,7 +1,11 @@
 # What is generated here and read byte for byte elsewhere keeps the line endings it was written with,
-# whatever a checkout's platform would make of them
+# whatever a checkout's platform would make of them, as do the license files every platform's release publishes
 node/view-vectors.json text eol=lf
 node/protocol.ts text eol=lf
+THIRD-PARTY-NOTICES text eol=lf
+LICENSE-MIT text eol=lf
+LICENSE-APACHE text eol=lf
+COPYRIGHT-rust-library.html text eol=lf
 # A golden recording is compared byte for byte, and its payload has line endings in it
 tests/fixtures/*.apkrec binary
 # Microsoft's ConPTY, shipped unchanged (`windows/conpty/README.md`)

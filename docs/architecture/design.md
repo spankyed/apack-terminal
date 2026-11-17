@@ -279,7 +279,10 @@ session ending settles every wait on it, because nothing is coming.
   wants and builds it for speed, as the library every other platform links was) and runs the suite. The suites
   that drive the real binary run there over a named pipe, with PowerShell as the shell (with the same `$ `
   prompt every case waits for). A named pipe is hung up by cancelling its pending I/O (`CancelIoEx`), since it
-  cannot be shut down one way and a disconnect waits behind a read parked on the same handle.
+  cannot be shut down one way and a disconnect waits behind a read parked on the same handle. **A client that
+  finished is let go rather than hung up on** (`listening::let_go`): a disconnect throws away what the far end has
+  not read, its last answers included, so only the pending I/O is cancelled and the handle closes unflushed,
+  which leaves what was written for the far end to read.
   **Sessions run on the ConPTY the broker carries** (`windows/conpty/`): Microsoft's own, from its
   `Microsoft.Windows.Console.ConPTY` package, beside the binary. The one built into Windows drops the image
   APC, the mouse-mode request and a program's clipboard question before the broker sees them, so on it images
