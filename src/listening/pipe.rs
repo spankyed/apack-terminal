@@ -185,7 +185,7 @@ mod tests {
 
     /// A pipe that was let go closes when it is dropped, however little of it the far end has read: the far end's
     /// next write fails at once rather than once a flush it never answers is over. What was written before is
-    /// still there to read.
+    /// still there to read. With nothing pending on it, letting go answers that it cancelled nothing.
     #[test]
     fn a_pipe_let_go_closes_when_dropped_and_leaves_what_was_written_to_be_read() {
         let name = format!(r"\\.\pipe\apack-let-go-close-test-{}", std::process::id());
@@ -203,7 +203,8 @@ mod tests {
         let client = connecting.join().expect("the client connects");
         (&server).write_all(b"answered\n").expect("the answer is written");
 
-        let_go(&server, || {});
+        // Nothing is pending on it, so there is nothing to cancel, and letting go says so
+        assert!(!let_go(&server, || {}), "letting go of a pipe with nothing pending said it cancelled something");
         drop(server);
         assert!((&client).write_all(b"more\n").is_err(), "the pipe was still open after it was let go and dropped");
         let mut read = String::new();
