@@ -631,7 +631,12 @@ fn a_session_begins_with_the_screen_its_recording_holds() {
 
     let second = client.shell(Some(&recording), true);
     let mut view = View::attached(&broker, &second);
-    view.until_shows("$ ");
+    // **The new shell's own prompt, on the last line written to.** `$ ` alone is already on the restored
+    // screen, at the start of the line the first session typed, so it is met before the new shell has
+    // printed anything
+    view.until("showed the new shell's prompt", |view| {
+        view.screen().lines().rev().find(|line| !line.trim().is_empty()).is_some_and(|line| line.trim_end() == "$")
+    });
     // The new shell's prompt is under what the first one printed, not inside its application
     assert!(!view.screen().contains("APP-2-SHOWN"), "{}", view.screen());
     assert!(view.screen().contains("row-12-of-the-first"), "{}", view.screen());
@@ -646,15 +651,13 @@ fn a_session_begins_with_the_screen_its_recording_holds() {
         first: frame.first_active - u64::from(frame.scrollback),
         count: frame.scrollback,
     });
-    // **Whatever arrives before the rows is taken as a view takes it.** The new shell's prompt comes when it
-    // comes, and a frame is acknowledged or the view is sent no more: one dropped here left the rest of this
-    // case waiting for output that was never sent to it
+    // **A frame that arrives before the rows is drawn and acknowledged, not passed over.** The broker sends a
+    // view nothing more until it acknowledges the frame it was sent, so one passed over here leaves this
+    // view on that screen for good, and every wait after it runs out
     let fetched = loop {
-        match view.incoming.recv_timeout(PATIENCE) {
-            Ok(ToView::Rows { block, .. }) => break block.rows.iter().map(text).collect::<Vec<_>>().join("\n"),
-            Ok(ToView::Failed { request: 1, message, .. }) => panic!("the history was refused: {message}"),
-            Ok(message) => view.take(message),
-            Err(why) => panic!("never sent the history asked for ({why}); the screen:\n{}", view.screen()),
+        match view.incoming.recv_timeout(PATIENCE).expect("the broker sends") {
+            ToView::Rows { block, .. } => break block.rows.iter().map(text).collect::<Vec<_>>().join("\n"),
+            other => view.take(other),
         }
     };
     assert!(fetched.contains("row-1-of-the-first"), "{fetched}");
