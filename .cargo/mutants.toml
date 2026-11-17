@@ -234,13 +234,12 @@ exclude_re = [
     # address from being sent as a link if it ever did
     "vt/rows.rs:.*replace match guard written == 0 with false in Terminal::read_link",
 
-    # **Where a read is cut to look for a hold, not what is parsed.** Both only add cuts: every byte is
+    # **Where a read is cut to look for a hold, not what is parsed.** It only adds cuts: every byte is
     # still fed in order and every hold the scan finds is still settled after its sequence, so what
     # differs is how many calls into the core one read is. The one thing a case could see is a hold
     # toggled by a spelling the scan does not know being settled sooner, and a case holding the later
     # moment would be holding the scan's own blind spot
     "screen.rs:.*replace hold_piece -> usize with 1",
-    "screen.rs:.*replace && with \\|\\| in hold_piece",
 
     # **The rows a capture does not read again.** A row the core says was not written to, on a screen
     # that has not scrolled, is kept as it is held without being read. Either of these turns that off:
@@ -258,7 +257,7 @@ exclude_re = [
     # read again, and one held as exactly that is kept on the core's word alone — and of the ways such a
     # row's flags change, the one a stream can cause, the shell marking its prompt there, the core does
     # flag. Not proven for every way; found for none
-    "vt/rows.rs:243:.*replace != with == in Terminal::row_flags",
+    "vt/rows.rs:267:.*replace != with == in Terminal::row_flags",
     "vt/rows.rs:.*replace Terminal::row_flags -> Result<Option<u8>, Failed> with Ok\\(Some\\(1\\)\\)",
 
     # **A refusal nothing sent to a broker produces.** An attach is refused for a reason other than there

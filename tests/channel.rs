@@ -22,7 +22,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 
-use apack_terminal::output::{OUTPUT_CAP, OUTPUT_WINDOW};
+use apack_terminal::output::{OUTPUT_CAP, OUTPUT_CREDIT, OUTPUT_WINDOW};
 use interprocess::local_socket::{GenericFilePath, Stream, ToFsName, prelude::*};
 
 struct Broker {
@@ -95,13 +95,19 @@ fn next(reading: &mut impl BufRead) -> serde_json::Value {
     serde_json::from_str(&line).unwrap_or_else(|error| panic!("{error}: {line:?}"))
 }
 
-/// Opens a session and runs `command` in it, returning the session id
+/// Opens a session and runs `command` in it, returning the session id.
+///
+/// **The spawn names no program, and its `SHELL` names `/bin/sh`.** A spawn naming none is the default
+/// program — `portable-pty` runs whatever the builder's `SHELL` says as a login shell — and that path is
+/// what runs here. Left to inherit `SHELL`, it is the login shell of whoever ran the suite with all of
+/// their configuration, and on a busy machine these cases waited out their deadline on somebody's prompt
+/// rather than on the channel they are about.
 fn run(reading: &mut impl BufRead, writing: &mut impl Write, command: &str) -> String {
     ask(
         writing,
         &serde_json::json!({
             "kind": "spawn", "cols": 80, "rows": 24, "shell": null,
-            "args": [], "env": [], "unset": [], "cwd": null,
+            "args": [], "env": [["SHELL", "/bin/sh"]], "unset": [], "cwd": null,
         })
         .to_string(),
     );
@@ -116,16 +122,20 @@ fn run(reading: &mut impl BufRead, writing: &mut impl Write, command: &str) -> S
 /// A megabyte, written as fast as the shell can
 const SATURATE: &str = "head -c 1048576 /dev/zero | tr '\\0' x\n";
 
-/// Enough to fill the channel's credit while nobody is reading, which a megabyte is not.
+/// A producer with no end, whose every line says where it is: `1`, `2`, `3`, … for as long as it is let run.
 ///
-/// **The arithmetic is the point, and getting it wrong is how the overload case came to prove nothing.**
-/// Credit runs out only when `OUTPUT_CREDIT` coalesced messages are in flight, and a message holds up to
-/// `OUTPUT_CAP`, so the bound is about 4 MiB — on top of whatever the socket's own buffers absorb, which on
-/// macOS auto-tune into the megabytes. A megabyte of output arrives as sixteen messages and never touches
-/// any of it. The case passed anyway, because `take` was timing the mutex rather than the condvar and so
-/// reported every flush as throttled; with that fixed it reported nothing, which is what sent this number
-/// up. 64 MiB is past every buffer in the path.
-const OVERLOAD: &str = "head -c 67108864 /dev/zero | tr '\\0' x\n";
+/// **No end, because the throttle has to come before the producer stops.** Credit runs out once
+/// `OUTPUT_CREDIT` coalesced messages are in flight, on top of what the socket's buffers absorb — eight
+/// kilobytes each way for a local socket on macOS (`net.local.stream.sendspace`), and on a reader as slow as
+/// the one below it came after under a megabyte. A producer of a fixed size has to be sized past every buffer
+/// on every platform, and then all of it has to be read to say none was lost, which made this case its
+/// volume: sixty-four megabytes, several times the deadline on a busy machine.
+///
+/// **Numbered, because a loss is then a gap rather than a count.** What follows a throttle is read for gaps
+/// for a credit's worth of output, which is everything that can have been waiting while it was reported.
+///
+/// **`awk` rather than `seq`**, whose BSD form prints through `%g`: past 999999 every line is `1e+06`.
+const OVERLOAD: &str = "awk 'BEGIN { for (i = 1; ; i++) print i }'\n";
 
 /// **A flush reaches the cap, which is the one thing the case below cannot say.**
 ///
@@ -274,14 +284,46 @@ fn a_saturating_producer_reports_that_it_was_throttled_rather_than_losing_output
     // **And it is a wait rather than a loss**, read after the throttle rather than in a case of its own: once
     // this reader stops sleeping it is faster than the shell, so a second run would not be throttled again and
     // the no-loss assertion would be the one that went flaky. The throttle above has already happened.
-    while bytes < 67_108_864 {
+    //
+    // A throttle is reported once the wait is over and ahead of what was held through it, so whatever a lossy
+    // channel let go of is a gap within the credit's worth of output that follows it. A line cut between two
+    // messages is joined before it is read, and the first is passed over, since its start came before the
+    // throttle and was not kept.
+    let past = OUTPUT_CREDIT * OUTPUT_CAP;
+    let (mut text, mut after, mut last, mut joined) = (String::new(), 0usize, None::<u64>, false);
+    while after < past {
         let event = next(&mut reading);
-        if event["kind"] == "output" && event["session"] == session.as_str() {
-            bytes += event["text"].as_str().unwrap_or_default().len();
+        if event["kind"] != "output" || event["session"] != session.as_str() {
+            continue;
         }
+        let arrived = event["text"].as_str().unwrap_or_default();
+        after += arrived.len();
+        text.push_str(arrived);
+        if !joined {
+            let Some(end) = text.find("\r\n") else { continue };
+            text.drain(..end + 2);
+            joined = true;
+        }
+        // Everything up to the last whole line; the rest waits for the message that ends it
+        let whole = text.rfind("\r\n").map_or(0, |at| at + 2);
+        // **A line may end in more than one carriage return.** The macOS tty, which turns a newline into `\r\n`,
+        // sends `\r\r\n` for one now and then while this producer is held up — once in about one run in four
+        // here. A terminal draws it as it draws `\r\n`, and no number is missing from around it
+        for line in text[..whole].split("\r\n").map(|line| line.trim_end_matches('\r')).filter(|line| !line.is_empty())
+        {
+            // The shell's prompt and its echo of the command come before the first number, and nothing after it
+            let Ok(number) = line.parse::<u64>() else {
+                assert!(last.is_none(), "a line that is not the next number followed {last:?}: {line:?}");
+                continue;
+            };
+            if let Some(before) = last {
+                assert_eq!(number, before + 1, "output was dropped: {before} was followed by {number}");
+            }
+            last = Some(number);
+        }
+        text.drain(..whole);
     }
-    // At least, not exactly: the shell's prompt and its echo of the command are output too
-    assert!(bytes >= 67_108_864, "output was dropped: {bytes} of 67108864 bytes");
+    assert!(last.is_some(), "no numbered line arrived after the throttle in {after} bytes");
 }
 
 #[test]

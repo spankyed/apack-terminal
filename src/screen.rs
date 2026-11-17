@@ -403,10 +403,13 @@ pub struct Fetched {
 /// **Only where to look, never what was said.** The parser is fed every byte either way and reports a
 /// hold through its own callback; a cut in the wrong place costs nothing, and a hold spelled some other
 /// way is still learnt of, at the end of the read it was in.
+///
+/// **Every byte a session parses passes through here**, so it is found with `memmem`, which looks at many
+/// bytes at once, rather than a window of five at a time — which cost more than the parse itself for a
+/// command of tens of megabytes.
 fn hold_piece(bytes: &[u8]) -> usize {
-    bytes
-        .windows(5)
-        .position(|window| window.starts_with(b"2026") && matches!(window[4], b'h' | b'l'))
+    memchr::memmem::find_iter(bytes, b"2026")
+        .find(|&at| matches!(bytes.get(at + 4), Some(b'h' | b'l')))
         .map_or(bytes.len(), |at| at + 5)
 }
 
