@@ -2,8 +2,12 @@ name: asan
 
 # The broker's suite under AddressSanitizer on a native x86_64 Linux runner. The Mac's Linux container runs
 # arm64 natively and x86_64 under emulation, where the sanitizer reports addresses the emulator, not the
-# broker, produced. Dispatch only: run it on a branch that has this file, to answer the x86_64 question.
+# broker, produced. It runs with every change, as the mutants do: the broker's unsafe code and the VT library it
+# calls into are where a memory error would land, and the sanitizer finds one where the tests pass over it.
 on:
+  pull_request:
+  push:
+    branches: [master]
   workflow_dispatch:
 
 env:
