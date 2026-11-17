@@ -67,13 +67,12 @@ exclude_re = [
     # nothing produces a leader of 0 to tell them apart — a case that killed these would have to invent a
     # session whose leader is init, which the broker cannot be asked for.
     #
-    # **Exactly the five, by line and by replacement**, because the two beside them are real and are killed:
-    # `< with >` admits no real pid at all, and `== with !=` at the line below answers for the wrong
-    # process. Excluding the guard wholesale would have taken both with it. The lines are pinned, which
-    # `cargo xtask check-exclusions` is what makes safe: a pattern left behind by an edit above matches
-    # nothing and fails that check.
-    "session.rs:466:(12|26): replace < with (==|<=) in inside_tree",
-    "session.rs:466:16: replace \\|\\| with && in inside_tree",
+    # **Exactly the five, by replacement**, because the two beside them are real and are killed: `< with >`
+    # admits no real pid at all, and `== with !=` in the lines below answers for the wrong process.
+    # Excluding the guard wholesale would have taken both with it. The guard holds the function's only `<`
+    # and `||`, so the replacement names it and no line is pinned.
+    "session.rs:.*replace < with (==|<=) in inside_tree",
+    "session.rs:.*replace \\|\\| with && in inside_tree",
 
     # `sendable`'s ASCII arm gives 1 and so does the `_` fallback, so deleting it changes no answer. It is
     # there to say that ASCII is one byte, where `_` says "not a lead byte at all" — removing the arm to kill
@@ -194,9 +193,8 @@ exclude_re = [
     # answer one pass later, with nothing read. No input can tell the two apart
     "recording.rs:.*replace < with <= in check",
 
-    # **Two bits that are never the same bit**, so `|` and `^` build one value: the two boundaries a parse
-    # may stop at, and the two flags a socket's lock is taken with (the `tree.rs` entry above, again)
-    "vt/mod.rs:.*replace \\| with \\^ in Terminal::feed_to",
+    # **Two bits that are never the same bit**, so `|` and `^` build one value: the two flags a socket's
+    # lock is taken with (the `tree.rs` entry above, again)
     "listening.rs:.*replace \\| with \\^ in hold",
 
     # **The two bytes of a frame's head no frame can use.** The head is allowed a count of rows at its
@@ -227,7 +225,7 @@ exclude_re = [
     # each row is then read and its bytes compared with what is held, which keeps the same rows and sends
     # the same frames. Only the number of rows read differs, and nothing outside the process counts them.
     # The first is pinned to its place: the other `==` in `capture` decide what is sent
-    "view/publish.rs:265:30: replace == with != in Publication::capture",
+    "view/publish.rs:310:30: replace == with != in Publication::capture",
     "view/publish.rs:.*replace match guard shift == 0 .* with false in Publication::capture",
 
     # **What a capture asks of a row it is about to keep unread** (the entry above): whether the row still
@@ -238,7 +236,7 @@ exclude_re = [
     # read again, and one held as exactly that is kept on the core's word alone — and of the ways such a
     # row's flags change, the one a stream can cause, the shell marking its prompt there, the core does
     # flag. Not proven for every way; found for none
-    "vt/rows.rs:210:.*replace != with == in Terminal::row_flags",
+    "vt/rows.rs:243:.*replace != with == in Terminal::row_flags",
     "vt/rows.rs:.*replace Terminal::row_flags -> Result<Option<u8>, Failed> with Ok\\(Some\\(1\\)\\)",
 
     # **A refusal nothing sent to a broker produces.** An attach is refused for a reason other than there

@@ -52,8 +52,12 @@ pub fn exclusions(config: &str) -> Result<Vec<String>, String> {
     Ok(patterns)
 }
 
-/// Lists the mutants matching `pattern`, with the config out of the way so an exclusion cannot hide itself.
-fn matches(root: &Path, pattern: &str) -> Result<usize, String> {
+/// A pattern no mutant's name can match: what cargo-mutants lists for it, it lists whatever it is asked.
+const MATCHES_NOTHING: &str = r"[^\s\S]";
+
+/// Lists the mutants cargo-mutants answers `pattern` with, with the config out of the way so an exclusion
+/// cannot hide itself.
+fn listed(root: &Path, pattern: &str) -> Result<Vec<String>, String> {
     let output = Command::new("cargo")
         .args(["mutants", "--list", "--no-config", "--re", pattern])
         .current_dir(root)
@@ -65,7 +69,23 @@ fn matches(root: &Path, pattern: &str) -> Result<usize, String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).lines().filter(|line| !line.trim().is_empty()).count())
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+/// How many of the mutants `listing` names a pattern chose: the ones not in `unfiltered`, which is what
+/// cargo-mutants lists for a pattern that can match nothing.
+///
+/// **cargo-mutants 27.1 lists some mutants whatever it is asked** (its `delete field … from struct`
+/// mutants pass `--re` and `--exclude-re` alike), so a count of every line it prints is never zero and no
+/// pattern would ever read as dead. Those mutants are not a pattern's doing, and an exclusion written for
+/// one excludes nothing, so they count for no pattern.
+pub fn chosen(listing: &[String], unfiltered: &[String]) -> usize {
+    listing.iter().filter(|mutant| !unfiltered.contains(mutant)).count()
 }
 
 /// The verdict, over whatever counts the mutants are: separated from the subprocess so the decision can be
@@ -125,5 +145,6 @@ pub fn windows_only_files(root: &Path) -> Result<Vec<String>, String> {
 pub fn check_exclusions(root: &Path) -> Result<(), String> {
     let config = std::fs::read_to_string(root.join(CONFIG)).map_err(|error| format!("{CONFIG}: {error}"))?;
     windows_only_files(root)?;
-    verdict(&exclusions(&config)?, |pattern| matches(root, pattern))
+    let unfiltered = listed(root, MATCHES_NOTHING)?;
+    verdict(&exclusions(&config)?, |pattern| Ok(chosen(&listed(root, pattern)?, &unfiltered)))
 }

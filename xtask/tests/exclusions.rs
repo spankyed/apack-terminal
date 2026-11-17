@@ -4,7 +4,7 @@
 //! the alternative is committing a dead pattern to `.cargo/mutants.toml` to watch the gate fire and then
 //! remembering to take it out again.
 
-use xtask::mutants::{exclusions, verdict};
+use xtask::mutants::{chosen, exclusions, verdict};
 use xtask::pre_push::survivors;
 
 /// Counts by a table, so a case says exactly which patterns match what.
@@ -26,6 +26,24 @@ fn an_exclusion_that_matches_nothing_is_named() {
 fn exclusions_that_all_match_pass() {
     let patterns = vec!["a.rs:.*one".to_owned()];
     verdict(&patterns, counting(&[(".", 40), ("a.rs:.*one", 3)])).expect("every exclusion excludes something");
+}
+
+/// **A mutant listed whatever was asked is no pattern's doing.** cargo-mutants answers every pattern with
+/// some mutants its filter never reaches, so a pattern that matches nothing is still answered with those,
+/// and counting them would leave no pattern dead.
+#[test]
+fn a_pattern_answered_only_with_what_every_pattern_is_answered_with_is_named() {
+    let unfiltered = vec!["a.rs:1:1: delete field size".to_owned(), "b.rs:2:2: delete field row".to_owned()];
+    let lives = vec![unfiltered[0].clone(), "a.rs:9:3: replace + with -".to_owned(), unfiltered[1].clone()];
+    let listings =
+        [("lives.rs:.*a", lives), ("dead.rs:.*b", unfiltered.clone()), (".", vec!["c.rs:1:1: x".to_owned()])];
+    let count = |pattern: &str| {
+        let listing = &listings.iter().find(|(name, _)| *name == pattern).expect("a pattern the case lists").1;
+        Ok(chosen(listing, &unfiltered))
+    };
+    let patterns = vec!["lives.rs:.*a".to_owned(), "dead.rs:.*b".to_owned()];
+    let error = verdict(&patterns, count).expect_err("a pattern that chose no mutant fails the check");
+    assert!(error.contains("dead.rs:.*b") && !error.contains("lives.rs:.*a"), "only the dead one is named: {error}");
 }
 
 /// **A run that listed no mutants would make every pattern look dead**, which is the shape of a check that
