@@ -61,6 +61,42 @@ describe('a block selected with Alt', () => {
     expect(source.asked.map((span) => span.start.line)).toEqual([0, 1, 2])
   })
 
+  it('is copied with a wide character whole when the rectangle starts on its second cell, as it is highlighted', async () => {
+    const source = new Named()
+    const copied: string[] = []
+    const view = mountedView({ onCopy: (text) => { copied.push(text) } }, source)
+    // The wide character takes cells 2 and 3, so the characters after it start at 4
+    const wide = { ...row(0, 'ab中cd'), column: Uint16Array.from([0, 1, 2, 4, 5]), width: Uint8Array.from([1, 1, 2, 1, 1]) }
+    view.source.send(frame({ columns: 20, screenRows: 1, rows: [wide] }))
+    runFrames()
+    // The rectangle is cells 3 to 4: its left column is the wide character's second cell, which is highlighted with it
+    view.point('pointerdown', 3, 0, { altKey: true })
+    view.point('pointermove', 4, 0, { altKey: true })
+    view.point('pointerup', 4, 0, { altKey: true })
+    expect(view.view.selection.on(0)).toEqual({ from: 3, to: 5 })
+    await settled()
+    expect(await view.view.copy()).toBe(true)
+    expect(source.asked.at(-1)).toEqual({ start: { line: 0, column: 2 }, end: { line: 0, column: 4 } })
+    expect(copied).toEqual(['L0:2-4'])
+  })
+
+  it('is copied with a wide character whole when the rectangle ends on its first cell', async () => {
+    const source = new Named()
+    const copied: string[] = []
+    const view = mountedView({ onCopy: (text) => { copied.push(text) } }, source)
+    const wide = { ...row(0, 'ab中cd'), column: Uint16Array.from([0, 1, 2, 4, 5]), width: Uint8Array.from([1, 1, 2, 1, 1]) }
+    view.source.send(frame({ columns: 20, screenRows: 1, rows: [wide] }))
+    runFrames()
+    // The rectangle ends on the wide character's first cell, so the character is in it and is copied to its last cell
+    view.point('pointerdown', 0, 0, { altKey: true })
+    view.point('pointermove', 2, 0, { altKey: true })
+    view.point('pointerup', 2, 0, { altKey: true })
+    await settled()
+    expect(await view.view.copy()).toBe(true)
+    expect(source.asked.at(-1)).toEqual({ start: { line: 0, column: 0 }, end: { line: 0, column: 3 } })
+    expect(copied).toEqual(['L0:0-3'])
+  })
+
   it('is not made by a drag without Alt, which selects the text between its ends', () => {
     const view = mountedView({}, new Named())
     showing(view)

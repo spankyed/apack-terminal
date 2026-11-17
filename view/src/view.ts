@@ -7,6 +7,7 @@ import { RowStore } from './row-store.ts'
 import { Selection, type Granularity } from './selection.ts'
 import { Modifier, PLAIN, TooLarge, type Anchored, type Command, type Frame, type Picture, type Placements, type PointerInput, type CursorShape, type Position, type Row, type SessionColors, type Span, type TerminalSource } from './source.ts'
 import { Viewport } from './viewport.ts'
+import { cellsOfCodePoint } from './width.ts'
 
 /**
  * A run of lines a host folds away. The first line stays on screen as a header, which stands for the lines after it up
@@ -370,7 +371,7 @@ export class TerminalView {
         this.options.onSelectionChange?.(selected)
       }
       this.schedule()
-    }, () => ({ oldest: this.store.oldest, end: this.store.end }))
+    }, () => ({ oldest: this.store.oldest, end: this.store.end }), (line) => this.store.row(line) ?? null)
     this.input = new Input(source, {
       mac: this.mac,
       optionIsAlt: options.optionIsAlt,
@@ -649,6 +650,7 @@ export class TerminalView {
       if (sorted[index]!.first <= sorted[index - 1]!.last) throw new RangeError('folds overlap')
     }
     this.folds = sorted
+    this.viewport.setFolds(sorted)
     this.foldRows.clear()
     this.drawings.clear()
     this.schedule()
@@ -656,7 +658,7 @@ export class TerminalView {
 
   /** The fold a line is hidden in: a header is not, and neither is a line outside every fold */
   private hiddenIn(line: number): Fold | undefined {
-    return this.folds.find((fold) => line > fold.first && line <= fold.last)
+    return this.viewport.hiddenIn(line)
   }
 
   /**
@@ -698,13 +700,21 @@ export class TerminalView {
     const known = this.foldRows.get(key)
     if (known) return known
     const characters = [...text]
+    // Each character starts where the cells before it end, so a wide label lines up with what is after it
+    const widths = characters.map((character) => cellsOfCodePoint(character.codePointAt(0) ?? 0))
+    const starts: number[] = []
+    let next = 0
+    for (const cells of widths) {
+      starts.push(next)
+      next += cells
+    }
     const row: Row = {
       line: fold.first,
       wrapped: false,
       prompt: false,
       text: characters,
-      column: Uint16Array.from(characters, (_, index) => index),
-      width: Uint8Array.from(characters, () => 1),
+      column: Uint16Array.from(starts),
+      width: Uint8Array.from(widths),
       style: new Uint16Array(characters.length),
       link: new Uint16Array(characters.length),
       styles: [PLAIN],
@@ -1132,8 +1142,15 @@ export class TerminalView {
     this.schedule()
   }
 
-  scrollBy(lines: number): void {
-    this.viewport.scrollBy(lines)
+  /** Moves by drawn rows, negative for back: a fold's hidden lines are not counted */
+  scrollBy(rows: number): void {
+    this.viewport.scrollBy(rows)
+    this.scrolled()
+  }
+
+  /** Shows from a row of the history counted from its oldest line, as the scrollbar counts them */
+  private scrollToPosition(position: number): void {
+    this.viewport.scrollToPosition(position)
     this.scrolled()
   }
 
@@ -1655,11 +1672,11 @@ export class TerminalView {
     event.preventDefault()
     event.stopPropagation()
     this.thumbRelease?.()
-    const start = { y: event.clientY, top: this.viewport.top }
+    const start = { y: event.clientY, position: this.viewport.extent.position }
     const move = (moved: PointerEvent) => {
       const { total, shown } = this.viewport.extent
       const travel = this.thumbAt()?.travel ?? 0
-      if (travel > 0) this.scrollTo(start.top + ((moved.clientY - start.y) / travel) * (total - shown))
+      if (travel > 0) this.scrollToPosition(start.position + ((moved.clientY - start.y) / travel) * (total - shown))
     }
     const up = () => {
       window.removeEventListener('pointermove', move)
@@ -1758,7 +1775,9 @@ export class TerminalView {
     const { cellWidth, cellHeight } = this.painter.metrics
     // Where the cursor is, drawn or not: a program that hides it still puts it where typing goes
     if (frame.cursor) {
-      const row = this.rowsBetween(first, frame.firstActive + frame.cursor.row)
+      // A cursor on a line a fold hides is drawn at the fold's header, so the input is placed where the header is
+      const cursorLine = frame.firstActive + frame.cursor.row
+      const row = this.rowsBetween(first, this.hiddenIn(cursorLine)?.first ?? cursorLine)
       this.input.moveTo(this.gutter + frame.cursor.column * cellWidth, Math.max(0, row - this.viewport.offset) * cellHeight, cellHeight)
     }
     // How far a page looking for output to be on screen can count on: this frame, and these lines
@@ -1780,18 +1799,9 @@ export class TerminalView {
       + `|${matched.map((match) => `${match.from}-${match.to}${match.current ? '!' : ''}`).join(',')}|${blinkedOff ? 'off' : ''}`
     const kept = this.drawings.get(line)
     if (kept && kept.row === row && kept.selected === key) return kept.drawing
-    let drawing = drawRow(row, this.theme, selected, blinkedOff)
-    // Behind what a search found, over whatever background the cells had: later rectangles cover earlier
-    if (matched.length > 0) {
-      const { matchBackground = 0x623315, currentMatchBackground = 0x9e6a03 } = this.theme
-      drawing = {
-        ...drawing,
-        backgrounds: [
-          ...drawing.backgrounds,
-          ...matched.map((match) => ({ column: match.from, cells: match.to - match.from, color: match.current ? currentMatchBackground : matchBackground })),
-        ],
-      }
-    }
+    const { matchBackground = 0x623315, currentMatchBackground = 0x9e6a03 } = this.theme
+    const found = matched.map((match) => ({ from: match.from, to: match.to, color: match.current ? currentMatchBackground : matchBackground }))
+    let drawing = drawRow(row, this.theme, selected, blinkedOff, found)
     // A link under the pointer is underlined, whatever it looked like before
     if (hovered.length > 0) {
       drawing = {
@@ -1880,15 +1890,13 @@ function hex(color: number): string {
 }
 
 /**
- * Which of the theme's sixteen colours marks a command: grey (8) for one still to run, blue (4) for one
- * running, green (2) for one that ended with zero and red (1) for one that ended with anything else.
+ * Which of the theme's sixteen colours marks a command: grey (8) for one still to run, blue (4) for one running, green (2)
+ * for one that exited with zero, red (1) for one that exited with anything else, and yellow (3) for one whose status is
+ * only claimed. A command whose end nothing reported is grey.
  *
- * **A status is drawn as the status it is, whoever reported it.** The mark is for a person, who is
- * looking at the output it stands beside and to whom everything on a screen is what a program printed:
- * a session with no key — a shell on a target, `cmd` — would otherwise draw every command that
- * succeeded as a warning. What tells a status that was vouched for from one that was only claimed is
- * the command's `outcome`, which is what a program reads. A command whose end nothing reported, or
- * that ended with no status, is grey.
+ * **A claim is drawn as a claim, whatever its code.** What separates a vouched status from a claimed one is the
+ * command's `outcome` kind, which is what a program reads; the code of a claim is not evidence of anything, so a claim
+ * of zero is yellow, the same as a claim of failure.
  */
 function markColor(command: Command): number {
   if (command.startedMs === null) return 8
@@ -1897,7 +1905,7 @@ function markColor(command: Command): number {
     case 'running': return 4
     case 'exited': return outcome.code === 0 ? 2 : 1
     case 'unknown': return 8
-    case 'claimed': return outcome.code === null ? 8 : outcome.code === 0 ? 2 : 1
+    case 'claimed': return 3
   }
 }
 

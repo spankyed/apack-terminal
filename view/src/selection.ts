@@ -1,5 +1,5 @@
 import type { SelectedCells } from './draw.ts'
-import type { Position, Span, TerminalSource } from './source.ts'
+import type { Position, Row, Span, TerminalSource } from './source.ts'
 
 /** What a click selects by, which is how many times it was clicked */
 export type Granularity = 'cell' | 'word' | 'line'
@@ -9,6 +9,19 @@ export type Granularity = 'cell' | 'word' | 'line'
  * `block` is the rectangle between two cells, which is each line's own columns (Alt-drag, Option-drag on a Mac).
  */
 export type Shape = 'linear' | 'block'
+
+/**
+ * The first (`start`) or last (`end`) column of the character that covers `column` in `row`, or `column` itself where
+ * no character does: a blank cell is its own column.
+ */
+function glyphCovering(row: Row, column: number, edge: 'start' | 'end'): number {
+  for (let index = 0; index < row.column.length; index += 1) {
+    const from = row.column[index]!
+    const to = from + row.width[index]! - 1
+    if (column >= from && column <= to) return edge === 'start' ? from : to
+  }
+  return column
+}
 
 const before = (a: Position, b: Position): boolean => a.line < b.line || (a.line === b.line && a.column < b.column)
 
@@ -47,6 +60,8 @@ export class Selection {
     private readonly changed: () => void,
     /** The lines the terminal still holds, `oldest` up to but not including `end`. Left out, every line */
     private readonly held?: () => { readonly oldest: number; readonly end: number },
+    /** The row a line is drawn from, when the view has it: what its wide characters span, for a block's copy */
+    private readonly rowOf?: (line: number) => Row | null,
   ) {}
 
   /**
@@ -169,6 +184,10 @@ export class Selection {
   /**
    * A block's text is each line's own columns, joined by newlines. Each line is asked for on its own, which is what a
    * source has: a span of text that runs from one line's column to the next is a different text.
+   *
+   * **A character the rectangle touches is in it, as it is highlighted.** A wide character takes two cells, and the
+   * rectangle may begin on its second, or end on its first; the span asked for widens to take the whole character, the
+   * same rule `drawRow` highlights by.
    */
   private async blockText(rectangle: { top: number; bottom: number; left: number; right: number }): Promise<string> {
     const held = this.held?.()
@@ -177,7 +196,10 @@ export class Selection {
     if (bottom < top) return ''
     const lines: string[] = []
     for (let line = top; line <= bottom; line += 1) {
-      lines.push(await this.source.textOf({ start: { line, column: rectangle.left }, end: { line, column: rectangle.right } }))
+      const row = this.rowOf?.(line) ?? null
+      const left = row ? glyphCovering(row, rectangle.left, 'start') : rectangle.left
+      const right = row ? glyphCovering(row, rectangle.right, 'end') : rectangle.right
+      lines.push(await this.source.textOf({ start: { line, column: left }, end: { line, column: right } }))
     }
     return lines.join('\n')
   }

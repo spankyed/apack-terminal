@@ -112,6 +112,73 @@ describe('a folded run of lines', () => {
     expect(drawnText(view)).toEqual(['L0', '▸ output', 'L4'])
   })
 
+  it('is headed by a label whose wide characters take two cells, so what follows lines up with them', () => {
+    const view = mountedView({}, new FakeSource())
+    sevenLines(view)
+    view.view.setFolds([{ first: 1, last: 3, label: '中x' }])
+    runFrames()
+    // The header is "▸ 中x": the wide character is on cells 2 and 3, so the x is on cell 4
+    const header = view.painted().rows[1]!
+    expect(header.glyphs.map((glyph) => [glyph.text, glyph.column])).toEqual([['▸', 0], ['中', 2], ['x', 4]])
+  })
+
+  it('places the input at the fold header when the cursor sits on a line the fold hides', () => {
+    const view = mountedView({}, new FakeSource())
+    // The cursor is on line 5, which a fold over lines 4 to 6 hides. The view is shown from line 0, so the header, line 4,
+    // is the fifth row; rows are twenty pixels high in the test painter. Placed on line 5 it would be a row lower still.
+    sevenLines(view, { row: 2, column: 0 })
+    view.view.setFolds([{ first: 4, last: 6 }])
+    runFrames()
+    expect(view.field.style.top).toBe('80px')
+  })
+
+  describe('scrolling across a fold', () => {
+    /** Thirty lines of history over a four-row screen, with lines 10 to 24 folded to the header on line 9 */
+    function thirtyLines() {
+      const view = mountedView({}, new FakeSource())
+      view.source.send(frame({ screenRows: 4, columns: 20, firstActive: 30, scrollback: 30, rows: Array.from({ length: 34 }, (_, line) => row(line, `L${line}`)) }))
+      runFrames()
+      view.view.setFolds([{ first: 9, last: 24, label: 'output' }])
+      runFrames()
+      return view
+    }
+
+    it('moves one drawn row a notch: a fold is one row, so no notch is spent turning over its hidden lines', () => {
+      const view = thirtyLines()
+      const tops: number[] = []
+      for (let notch = 0; notch < 15; notch += 1) {
+        view.view.scrollBy(-1)
+        runFrames()
+        tops.push(view.view.viewport.top)
+        if (notch === 5) expect(drawnText(view)[0], 'the notch that reaches the fold shows its header').toBe('▸ output')
+      }
+      expect(tops).toEqual([29, 28, 27, 26, 25, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0])
+      view.view.scrollBy(-1)
+      expect(view.view.viewport.top, 'the oldest line is where it stops').toBe(0)
+    })
+
+    it('drags the scrollbar through every drawn row, the fold\'s header among them and none of its hidden lines', () => {
+      const view = thirtyLines()
+      Object.defineProperty(view.view.element, 'clientHeight', { get: () => 80, configurable: true })
+      view.view.fit()
+      view.view.scrollTo(0)
+      view.painted()
+      const thumb = view.view.element.lastElementChild as HTMLElement
+      thumb.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, cancelable: true, clientY: 40 }))
+      const visited: Array<number | 'following'> = []
+      // Every pixel of the track, top to bottom: each row is reached and none is skipped
+      for (let clientY = 40; clientY <= 100; clientY += 1) {
+        window.dispatchEvent(new MouseEvent('pointermove', { clientY }))
+        const top = view.view.viewport.top
+        // The track is 60 pixels for 15 drawn rows, so each four pixels is one row of the scrollbar's own measure
+        if ((clientY - 40) % 4 === 0) expect(view.view.viewport.extent.position, `${(clientY - 40) / 4} rows down the track`).toBe((clientY - 40) / 4)
+        const shown = view.view.viewport.following ? 'following' : Math.floor(top)
+        if (visited.at(-1) !== shown) visited.push(shown)
+      }
+      expect(visited).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 25, 26, 27, 28, 29, 'following'])
+    })
+  })
+
   it('takes folds that do not overlap, and refuses ones that do', () => {
     const view = mountedView({}, new FakeSource())
     expect(() => view.view.setFolds([{ first: 1, last: 3 }, { first: 3, last: 5 }])).toThrow(RangeError)

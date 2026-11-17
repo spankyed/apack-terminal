@@ -55,6 +55,13 @@ export function sessionTheme(theme: Theme, colors: SessionColors | null, reverse
 
 export type LineKind = Exclude<Underline, 'none'> | 'strikethrough' | 'overline'
 
+/** A background painted over cells after the row's own, such as where a search found its text */
+export interface Highlight {
+  readonly from: number
+  readonly to: number
+  readonly color: number
+}
+
 /**
  * One row as things to draw, in cells: a painter multiplies by the size of a cell.
  *
@@ -109,7 +116,7 @@ function colorIn(theme: Theme, color: Color): number | null {
  * would have a hole wherever nothing was written. The rectangle is the selection's own; the characters
  * under it give up their backgrounds and take its text colour.
  */
-export function drawRow(row: Row, theme: Theme, selected?: SelectedCells, blinkedOff = false): RowDrawing {
+export function drawRow(row: Row, theme: Theme, selected?: SelectedCells, blinkedOff = false, found: readonly Highlight[] = []): RowDrawing {
   const backgrounds: Array<{ column: number; cells: number; color: number }> = []
   const glyphs: Array<RowDrawing['glyphs'][number]> = []
   const lines: Array<{ kind: LineKind; column: number; cells: number; color: number }> = []
@@ -148,7 +155,9 @@ export function drawRow(row: Row, theme: Theme, selected?: SelectedCells, blinke
     const visible = !(flags & StyleFlag.invisible) && !(blinkedOff && flags & StyleFlag.blink)
     if (visible && text !== ' ' && text !== '') {
       // What the character sits on is the selection's when it is selected, and the cell's own otherwise
-      const behind = isSelected ? theme.selectionBackground : (bg ?? theme.background)
+      let behind = isSelected ? theme.selectionBackground : (bg ?? theme.background)
+      // Highlights are painted later, so the last one a character is under is the colour it is drawn on
+      for (const highlight of found) if (column < highlight.to && column + cells > highlight.from) behind = highlight.color
       glyphs.push({
         text,
         column,
@@ -179,6 +188,7 @@ export function drawRow(row: Row, theme: Theme, selected?: SelectedCells, blinke
     const after = backgrounds.findIndex((run) => run.column >= selectedTo)
     backgrounds.splice(after === -1 ? backgrounds.length : after, 0, { column: selectedFrom, cells: selectedTo - selectedFrom, color: theme.selectionBackground })
   }
+  for (const highlight of found) backgrounds.push({ column: highlight.from, cells: highlight.to - highlight.from, color: highlight.color })
 
   return { backgrounds, glyphs, lines }
 }
