@@ -250,8 +250,7 @@ impl Load {
         let mut source = Progressing { source: source.take(limit), progress };
         let (mut pieces, mut read) = (Vec::new(), 0);
         loop {
-            let mut piece = Vec::new();
-            source.by_ref().take(CHUNK_BYTES as u64).read_to_end(&mut piece).ok()?;
+            let piece = read_piece(&mut source)?;
             read += piece.len() as u64;
             let ended = piece.len() < CHUNK_BYTES;
             pieces.push(piece);
@@ -288,6 +287,28 @@ impl Load {
         };
         if length <= SOURCE_BYTES { Ok(start..start + length) } else { Err(Refused::InvalidData) }
     }
+}
+
+/// The next `CHUNK_BYTES` of `source`, or as many as are left of it.
+///
+/// **Read into room made whole and zeroed by the allocator**, rather than by `read_to_end`, which grows a
+/// piece by doubling and zeroes each stretch of it a byte at a time before letting a read write there: a
+/// source is up to `SOURCE_BYTES`, and in a debug build — the suite's — that zeroing costs more than the
+/// reads, CPU that a busy machine multiplies against a test's deadline, which is a clock.
+fn read_piece(source: &mut impl Read) -> Option<Vec<u8>> {
+    let mut piece = vec![0; CHUNK_BYTES];
+    let mut room = piece.as_mut_slice();
+    while !room.is_empty() {
+        match source.read(room) {
+            Ok(0) => break,
+            Ok(count) => room = &mut std::mem::take(&mut room)[count..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    let filled = CHUNK_BYTES - room.len();
+    piece.truncate(filled);
+    Some(piece)
 }
 
 /// A source being read, calling `progress` each time the system answers.

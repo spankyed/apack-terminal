@@ -119,6 +119,10 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.crc32fast]
 opt-level = 3
+# `memchr` finds where a program's output may be held (`screen::hold_piece`), over every byte fed — a named
+# image's encoded source included, which is tens of megabytes
+[profile.dev.package.memchr]
+opt-level = 3
 
 # What cargo-mutants builds each mutant with (`.cargo/mutants.toml`): a debug build without the debug info,
 # since nothing debugs a mutant and each one is a fresh copy of the build directory

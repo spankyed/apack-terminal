@@ -823,12 +823,18 @@ fn a_file_is_read_from_its_offset_for_its_size() {
 }
 
 /// A shared memory object holding `bytes`, made under `name`, and closed.
+///
+/// **An object already under the name is one a process gone before left**, and is unlinked first: a name
+/// holds this process's id (`shared_name`), so no other process running now makes it, and one that
+/// ended before unlinking — a case that failed, or one ended at its deadline — leaves its object until
+/// the machine restarts, for whichever process is given that id next.
 fn made_shared(name: &str, bytes: &[u8]) -> CString {
     let c_name = CString::new(name).expect("a name");
     // SAFETY: the name is a valid C string; the descriptor is used for this object only and closed here
     unsafe {
+        libc::shm_unlink(c_name.as_ptr());
         let descriptor = libc::shm_open(c_name.as_ptr(), libc::O_CREAT | libc::O_EXCL | libc::O_RDWR, 0o600);
-        assert!(descriptor >= 0, "a shared memory object is made");
+        assert!(descriptor >= 0, "a shared memory object is made: {}", std::io::Error::last_os_error());
         assert_eq!(libc::ftruncate(descriptor, bytes.len() as libc::off_t), 0);
         let mapped = libc::mmap(std::ptr::null_mut(), bytes.len(), libc::PROT_WRITE, libc::MAP_SHARED, descriptor, 0);
         assert_ne!(mapped, libc::MAP_FAILED);
@@ -1295,6 +1301,44 @@ fn every_answer_to_a_read_is_progress() {
     assert_eq!(read, Some(vec![vec![3u8; 10]]));
     assert!(reads.get() >= 5, "{} reads of three bytes for ten", reads.get());
     assert_eq!(progress.get(), reads.get(), "a read answered without its being progress");
+}
+
+/// A source whose every other read fails with `error` before it reads anything, and which otherwise
+/// answers a byte at a time.
+struct Failing {
+    bytes: std::io::Cursor<Vec<u8>>,
+    error: std::io::ErrorKind,
+    failing: bool,
+}
+
+impl std::io::Read for Failing {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.failing = !self.failing;
+        if self.failing {
+            return Err(self.error.into());
+        }
+        let one = 1.min(buffer.len());
+        self.bytes.read(&mut buffer[..one])
+    }
+}
+
+impl std::io::Seek for Failing {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.bytes.seek(to)
+    }
+}
+
+/// **A read the system interrupts is asked again**, as a signal arriving at the broker does to one, rather
+/// than taken for a source that cannot be read; **one that fails is the source refused**, as the core
+/// refuses it, and is not asked again.
+#[test]
+fn an_interrupted_read_is_asked_again_and_a_failed_one_is_not() {
+    let read = |error| {
+        let source = Failing { bytes: std::io::Cursor::new(PIXEL.to_vec()), error, failing: false };
+        load_of("a=T").read_from(source, &|| {})
+    };
+    assert_eq!(read(std::io::ErrorKind::Interrupted), Some(vec![PIXEL.to_vec()]));
+    assert_eq!(read(std::io::ErrorKind::Other), None);
 }
 
 /// How long the cases here let a read be quiet, and how long a read that is not quiet pauses between its
