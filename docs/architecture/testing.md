@@ -139,14 +139,14 @@ returns rather than a wrong answer — and under `cargo test` one such case hold
 
 The deadlines are in [`.config/nextest.toml`](../../.config/nextest.toml). Each is several times the slowest
 reading rather than near it, because what it is for is a test that has stopped ending at all: the whole
-suite is 8 s on an Apple-silicon laptop (352 tests, 2026-11-11), and its slowest case 7.2 s against a
-deadline of its own. **A reading, never a bound** — a slower machine reports, it does not fail.
+suite is 16 s on an Apple-silicon laptop at a load average of 60 (599 tests, 2026-11-17), and its slowest
+case 6.2 s against the default deadline of 20 s. **A reading, never a bound** — a slower machine reports, it does not fail.
 
 **The suite is one program** (`tests/suite.rs`), whose modules are the files beside it: a file of its own
 under `tests/` would be a binary of its own, linked against the whole library, and thirty of those were
 most of what a changed line cost to build. **Its cases run cheapest first** (the priorities in
 `.config/nextest.toml`): the ones that are a function call before the ones that start the broker and a
-shell, with the two longest started at the beginning so the run does not end waiting for them. **A case
+shell, with the three longest started at the beginning so the run does not end waiting for them. **A case
 names its shell.** A spawn that names none runs the login shell of whoever ran the suite, with their
 configuration, which is seconds where `/bin/sh` is milliseconds and is what made cases go quiet on a busy
 machine. `tests/channel.rs` and `tests/candidates.rs` are where the default program is run, and they name
