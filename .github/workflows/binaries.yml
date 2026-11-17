@@ -62,8 +62,8 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - run: cargo build --release --locked --bin apack-terminal
-      # **The binary's SBOM**, CycloneDX: every crate its target compiles in, as cargo-cyclonedx reads them from the
-      # lockfile. libghostty-vt's C and Zig libraries are no crate's, so it lists them nowhere; THIRD-PARTY-NOTICES
+      # **The binary's SBOM**, CycloneDX: every crate its target is built from, as cargo-cyclonedx reads them from the
+      # lockfile, build scripts' dependencies left out and procedural macros, which run while it compiles, kept in. libghostty-vt's C and Zig libraries are no crate's, so it lists them nowhere; THIRD-PARTY-NOTICES
       # credits them (`licenses/README.md`)
       - uses: taiki-e/install-action@v2
         with:

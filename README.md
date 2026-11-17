@@ -153,7 +153,7 @@ simdutf, Wuffs and uucode; the Windows release ships Microsoft's ConPTY beside i
 complying with those licenses too. Each `bin-<commit>` release of a commit that has them carries their texts and
 notices beside each platform's binary: the crates', libghostty-vt's and ConPTY's in `THIRD-PARTY-NOTICES`, and the
 Rust standard library's in `COPYRIGHT-rust-library.html`, with the binary's CycloneDX SBOM, `apack-terminal.cdx.json`,
-listing the crates it compiles in.
+listing the crates it is built from, the procedural macros that run while it compiles among them.
 
 Unless you explicitly state otherwise, any contribution you intentionally submit for inclusion in this work,
 as defined in the Apache-2.0 license, is dual-licensed as above, without any additional terms or conditions.
