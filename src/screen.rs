@@ -65,8 +65,17 @@ const SCROLLBACK_ASKED: usize = HISTORY_LINES * 2;
 /// promised, and it does not grow because a view can scroll further.
 pub const VIEW_HISTORY_LINES: usize = 100_000;
 
-/// How many lines of history a recording's keyframe carries above the screen (`recording`).
+/// How many lines of history a recording's keyframe carries above the screen (`recording`), or as many
+/// more as the core's history is written out in: a keyframe is cut where one of its pages ends.
 pub const KEYFRAME_HISTORY_LINES: u32 = 1_000;
+
+/// The most bytes a keyframe is (`vt::keyframe`).
+///
+/// **Room for what a keyframe must hold, and a bound on what it may.** A screen and a thousand lines above
+/// it are a few hundred kilobytes, and a keyframe of them is cut there, well short of this. What reaches
+/// it is a screen of images, whose pixels a keyframe holds before any history: this is how much of a
+/// recording one keyframe of those may be, and a screen whose state alone is more is not recorded.
+pub const KEYFRAME_BYTES: usize = 4 << 20;
 
 /// The most memory one session's history may hold, whatever its line limit allows.
 ///
@@ -930,8 +939,8 @@ impl Screen {
 
     /// The same into a recorder of the caller's making.
     pub fn start_recording_with(&mut self, mut recorder: Recorder) -> std::io::Result<()> {
-        let redraw = self.redraw().map_err(|failed| std::io::Error::other(failed.to_string()))?;
-        recorder.keyframe(self.cols, self.rows, &redraw)?;
+        let keyframe = self.keyframe().map_err(|failed| std::io::Error::other(failed.to_string()))?;
+        recorder.keyframe(self.cols, self.rows, &keyframe)?;
         self.recorder = Some(recorder);
         if self.reported.get().vouched_by().is_some() {
             self.record_marks();
@@ -953,59 +962,52 @@ impl Screen {
 
     /// Takes the keyframe the recording is due, if it is due one and one can be taken.
     ///
-    /// **A keyframe waits for the primary screen**, because one taken while `vim` is showing would hold the
-    /// editor and not the shell history under it — and a replay starting there would have lost it. The
-    /// bytes are still recorded, so nothing is missing; the keyframe is only later. It stops waiting when
-    /// the recording is past its budget, where a keyframe is the only way its oldest part can go.
+    /// **Whichever screen is showing.** A keyframe is the whole terminal (`vt::keyframe`), so one taken
+    /// while `vim` is showing holds the shell's screen under it too, and a replay from it leaves the
+    /// editor to the history it was started over.
     ///
-    /// **And it waits for the parser to be between sequences.** A keyframe is the screen as it stands,
-    /// and says nothing of a sequence the parser is part way through: a replay that began at one taken
-    /// there would redraw the screen and then be fed the rest of that sequence as if it were text. So a
-    /// keyframe that falls due mid-sequence is taken at the byte that ends the sequence (`feed`).
+    /// **It waits for the parser to be between sequences**, which is where the core writes a terminal
+    /// out and where nothing but the core is part way through anything: a keyframe that falls due
+    /// mid-sequence is taken at the byte that ends the sequence (`feed`).
     ///
     /// **A sequence that never ends would put it off for ever**, and the recording would grow without
-    /// bound, so at twice its budget the keyframe is taken regardless — and the rest of that sequence is
-    /// not recorded: a replay from the keyframe is not part way through it, and would print it. A whole
-    /// keyframe is taken where the sequence ends, after which what the program writes is recorded again.
-    /// A replay from before that comes to the keyframe part way through the sequence, and starts again
-    /// from it (`rebuild`).
+    /// bound, so at twice its budget nothing more is recorded until the sequence ends, where the
+    /// keyframe is taken and what the program writes is recorded again. A replay comes to that keyframe
+    /// part way through the sequence, the rest of which it was not given, and starts again from it
+    /// (`rebuild`).
     fn keyframe_when_due(&mut self) {
         let Some(recorder) = &self.recorder else { return };
-        let primary = !self.terminal.alt_screen().unwrap_or(false);
-        if !(recorder.keyframe_due() && (primary || recorder.over_budget())) {
+        if !recorder.keyframe_due() {
             return;
         }
-        let between = self.terminal.at_ground();
-        if !recorder.far_over_budget() && !between {
+        if self.terminal.at_ground() {
+            self.take_keyframe();
+        } else if recorder.far_over_budget() {
+            self.unrecorded = true;
+        } else {
             self.keyframe_waits = true;
-            return;
         }
-        self.take_keyframe();
-        self.unrecorded = !between;
     }
 
-    /// Records the screen as it stands, as the sequences that redraw it.
+    /// Records the terminal as it stands.
     fn take_keyframe(&mut self) {
         let (cols, rows) = (self.cols, self.rows);
-        let redraw = self.redraw();
+        let keyframe = self.keyframe();
         self.record(|recorder| {
-            recorder.keyframe(cols, rows, &redraw.map_err(|failed| std::io::Error::other(failed.to_string()))?)
+            recorder.keyframe(cols, rows, &keyframe.map_err(|failed| std::io::Error::other(failed.to_string()))?)
         });
         if self.reported.get().vouched_by().is_some() {
             self.record_marks();
         }
     }
 
-    /// The screen and the `KEYFRAME_HISTORY_LINES` above it, as the sequences that redraw them.
+    /// The terminal, with the `KEYFRAME_HISTORY_LINES` above its screen (`Terminal::keyframe`).
     ///
     /// **Not the whole history**, which a keyframe would then write out again every `KEYFRAME_EVERY` bytes:
     /// at a hundred thousand lines that is tens of megabytes a time. What a keyframe leaves out is still
     /// in the recording, as the bytes that printed it, for as far back as the recording goes.
-    fn redraw(&self) -> Result<Vec<u8>, Failed> {
-        let scrollback = self.terminal.scrollback_rows()?;
-        let from = scrollback.saturating_sub(KEYFRAME_HISTORY_LINES);
-        let last = (self.cols.saturating_sub(1), scrollback + u32::from(self.rows) - 1);
-        self.terminal.redraw(from, last)
+    pub fn keyframe(&self) -> Result<Vec<u8>, Failed> {
+        self.terminal.keyframe(KEYFRAME_HISTORY_LINES, KEYFRAME_BYTES)
     }
 
     /// Rebuilds this screen as a recording had it at `until`: the last keyframe at or before then, and
@@ -1018,25 +1020,27 @@ impl Screen {
     /// past.
     pub fn replay(&mut self, entries: &[Timed], until: u64) -> bool {
         let Some((start, end)) = recording::span(entries, until) else { return false };
-        self.rebuild(&entries[start..end]);
-        true
+        self.rebuild(&entries[start..end])
     }
 
     /// Rebuilds this screen from everything a recording holds: its first keyframe and all that was fed
-    /// after it. `false` for a recording with no keyframe, and the screen is as it was.
+    /// after it. `false` for a recording with no keyframe this core reads, and the screen is as it was.
     ///
     /// **From the first keyframe rather than the last**, which is what a session picking up where one left
     /// off wants and a rewind does not: a keyframe carries a bounded history, and the bytes after the
     /// first one rebuild all the history the recording covers.
+    ///
+    /// **The first that can be read.** A keyframe is the core's (`vt::keyframe`), and a recording begun
+    /// under one core and carried on under another begins with keyframes the second does not read: it is
+    /// picked up from where the ones it does read begin.
     pub fn replay_all(&mut self, entries: &[Timed]) -> bool {
-        let Some(first) = entries.iter().position(|timed| matches!(timed.entry, Entry::Keyframe { .. })) else {
-            return false;
-        };
-        self.rebuild(&entries[first..]);
-        true
+        (0..entries.len())
+            .filter(|at| matches!(entries[*at].entry, Entry::Keyframe { .. }))
+            .any(|at| self.rebuild(&entries[at..]))
     }
 
-    /// Makes this screen what `entries` leave a terminal as, the first of them being a keyframe. A
+    /// Makes this screen what `entries` leave a terminal as, the first of them being a keyframe, and
+    /// answers whether that keyframe could be read: where it could not, the screen is as it was. A
     /// keyframe after the first is passed over: it says again what the bytes before it already drew.
     ///
     /// **The commands are the recording's, with the recording's times.** The ones this screen held are
@@ -1048,34 +1052,37 @@ impl Screen {
     /// was vouched with (`Entry::Marks`), and the replay reads each stretch with that key and that
     /// numbering: a mark the session refused is refused again, and a command it recorded ends as it
     /// ended. This screen's own key and numbering are set aside for the replay and put back after it.
-    fn rebuild(&mut self, entries: &[Timed]) {
+    fn rebuild(&mut self, entries: &[Timed]) -> bool {
+        let Some(Timed { entry: Entry::Keyframe { cols, rows, state }, .. }) = entries.first() else { return false };
+        // **The terminal is put in place whole, and before anything else is touched**: a keyframe that
+        // cannot be read leaves this screen what it was
+        if self.terminal.restore(state).is_err() {
+            return false;
+        }
         // The recording is of another moment: writing the replay into it would record the past as now
         let recorder = self.recorder.take();
         self.replaying = true;
         // **A recording names the files it was shown; it does not hold them.** Read again now they would
         // be whatever is at those paths today, and a shared memory object would be unlinked a second
         // time under whoever has since made one of that name. So a replay takes images from its own
-        // bytes only, and one that was sent by name is absent from it: `feed` refuses it while replaying.
-        // It is still taken out of the stream like any other, so a replay that stops part way through
-        // one leaves what reads the stream where the core is
+        // bytes only, and one that was sent by name after the keyframe is absent from it: `feed` refuses
+        // it while replaying. It is still taken out of the stream like any other, so a replay that stops
+        // part way through one leaves what reads the stream where the core is
         let live = self.reported.get_mut().begin_replay();
         self.reported.get_mut().forget_commands();
-        // A full reset, and the history it leaves erased: the keyframe redraws both
-        self.feed(b"\x1bc\x1b[3J");
-        for (index, timed) in entries.iter().enumerate() {
+        self.resize(*cols, *rows, 0, 0);
+        for timed in &entries[1..] {
             let at = SystemTime::UNIX_EPOCH + Duration::from_millis(timed.at);
             self.reported.get_mut().set_clock(Some(at));
             match &timed.entry {
-                Entry::Keyframe { cols, rows, redraw } if index == 0 => {
+                // Come to part way through a sequence: one the recording stopped at part way through,
+                // whose rest it did not record, so the replay starts again from the keyframe taken where
+                // it ended. One that cannot be read is where what the recording can show ends
+                Entry::Keyframe { cols, rows, state } if !self.terminal.at_ground() => {
+                    if self.terminal.restore(state).is_err() {
+                        break;
+                    }
                     self.resize(*cols, *rows, 0, 0);
-                    self.feed_redraw(redraw);
-                }
-                // Come to part way through a sequence: one the recording took part way through it, whose
-                // rest it did not record, so the replay starts again from it
-                Entry::Keyframe { cols, rows, redraw } if !self.terminal.at_ground() => {
-                    self.feed(b"\x18\x1bc\x1b[3J");
-                    self.resize(*cols, *rows, 0, 0);
-                    self.feed_redraw(redraw);
                 }
                 Entry::Keyframe { .. } => {}
                 Entry::Output(bytes) => self.feed(bytes),
@@ -1095,15 +1102,7 @@ impl Screen {
         self.hold = None;
         self.answer_postponed_of(|_| true);
         self.recorder = recorder;
-    }
-
-    /// Feeds a keyframe's redraw: the core's own account of a screen, whose cursor is the one it says. A
-    /// blinking cursor is written there as mode 12 whichever way the program asked for it, so a blink a
-    /// person chose does not leave it as it was (`Terminal::pause_blink_watch`).
-    fn feed_redraw(&mut self, redraw: &[u8]) {
-        let watch = self.terminal.pause_blink_watch();
-        self.feed(redraw);
-        self.terminal.resume_blink_watch(watch);
+        true
     }
 
     /// Forgets what the shell said about itself (`Reported::forget_the_shell`), and gives the command it

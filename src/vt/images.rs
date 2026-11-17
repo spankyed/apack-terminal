@@ -14,6 +14,7 @@ use std::ptr::NonNull;
 
 use ghostty_vt_rs_sys as sys;
 
+use super::settings::Setting;
 use super::{Failed, Terminal};
 
 /// How much a session's images may hold, in bytes of pixels, before the oldest go.
@@ -231,45 +232,22 @@ impl Terminal {
     /// a source with a NUL in it, which the core refuses before it opens anything. `files` is also what the
     /// suite holds that reading to: the core doing it itself, over sources that answer. The protocol's third way in, a temporary file the
     /// terminal deletes, stays off either way.
-    pub fn allow_images(&self, files: bool) -> Result<(), Failed> {
-        let limit: u64 = IMAGE_STORAGE_BYTES;
-        // SAFETY: KITTY_IMAGE_STORAGE_LIMIT takes a `uint64_t*`
-        let result = unsafe {
-            sys::ghostty_terminal_set(
-                self.handle,
-                sys::TerminalOption::KITTY_IMAGE_STORAGE_LIMIT,
-                (&raw const limit).cast::<std::ffi::c_void>(),
-            )
-        };
-        Failed::check("ghostty_terminal_set(KITTY_IMAGE_STORAGE_LIMIT)", result)?;
+    pub fn allow_images(&mut self, files: bool) -> Result<(), Failed> {
+        self.set(Setting::ImageStorage(IMAGE_STORAGE_BYTES))?;
         self.read_named_images(files)
     }
 
     /// Whether the core reads a file or a shared memory object a program names, and nothing else: the
     /// switch `allow_images` sets, on its own, for a terminal whose images are already allowed.
-    pub fn read_named_images(&self, files: bool) -> Result<(), Failed> {
-        for (option, call) in [
-            (sys::TerminalOption::KITTY_IMAGE_MEDIUM_FILE, "ghostty_terminal_set(KITTY_IMAGE_MEDIUM_FILE)"),
-            (sys::TerminalOption::KITTY_IMAGE_MEDIUM_SHARED_MEM, "ghostty_terminal_set(KITTY_IMAGE_MEDIUM_SHARED_MEM)"),
-        ] {
-            // SAFETY: both options take a `bool*`
-            let result = unsafe {
-                sys::ghostty_terminal_set(self.handle, option, (&raw const files).cast::<std::ffi::c_void>())
-            };
-            Failed::check(call, result)?;
-        }
-        Ok(())
+    pub fn read_named_images(&mut self, files: bool) -> Result<(), Failed> {
+        self.set(Setting::NamedImages(files))
     }
 
     /// How much one Kitty graphics command may carry: `bytes` of it, or the core's own most where `None`.
     /// The core takes the most when a command begins, so one set around a single command is that
     /// command's alone.
-    pub fn kitty_command_bytes(&self, bytes: Option<usize>) -> Result<(), Failed> {
-        let value =
-            bytes.as_ref().map_or(std::ptr::null(), |bytes| std::ptr::from_ref(bytes).cast::<std::ffi::c_void>());
-        // SAFETY: APC_MAX_BYTES_KITTY takes a `size_t*`, or NULL for the core's own
-        let result = unsafe { sys::ghostty_terminal_set(self.handle, sys::TerminalOption::APC_MAX_BYTES_KITTY, value) };
-        Failed::check("ghostty_terminal_set(APC_MAX_BYTES_KITTY)", result)
+    pub fn kitty_command_bytes(&mut self, bytes: Option<usize>) -> Result<(), Failed> {
+        self.set(Setting::KittyCommandBytes(bytes))
     }
 
     /// One cell in pixels as a window last measured it, or zero where none has: the terminal's size in

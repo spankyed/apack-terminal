@@ -15,15 +15,18 @@ use ghostty_vt_rs_sys as sys;
 pub mod image_sources;
 pub mod images;
 pub mod input;
+mod keyframe;
 pub mod placeholders;
 pub mod reads;
 pub mod rows;
+mod settings;
 
 use crate::commands::{Commands, Machine, Moment, Outcome, Step, Unknown};
-use crate::markers::{self, Marker, MarksKey, PAYLOAD_CAP, Read, Vouched, cwd_from_url};
+use crate::markers::{self, Marker, MarksKey, Read, Vouched, cwd_from_url};
 use crate::protocol::{CursorBlink, CursorStyle};
 use crate::screen::Facts;
 use rows::Mark;
+use settings::Setting;
 
 /// The most code points one cell's character is read as.
 ///
@@ -82,10 +85,13 @@ pub struct Terminal {
     opened: Option<Opened>,
     /// How many sequences have been parsed under watch (`sequences_watched`).
     sequences_watched: u64,
+    /// What this terminal has been told about where it runs, to be told again to one restored in its
+    /// place (`settings`).
+    settings: Vec<settings::Setting>,
 }
 
 /// DEC mode 12, by which a program turns the cursor's blink on and off (`CSI ? 12 h`, `CSI ? 12 l`).
-pub(super) const CURSOR_BLINK_MODE: u16 = 12;
+const CURSOR_BLINK_MODE: u16 = 12;
 
 /// The byte every escape sequence begins with.
 const ESCAPE: u8 = 0x1b;
@@ -184,6 +190,7 @@ impl Terminal {
             blink_mode_ignored: false,
             opened: None,
             sequences_watched: 0,
+            settings: Vec::new(),
         })
     }
 
@@ -339,19 +346,6 @@ impl Terminal {
         {
             let _ = self.set_mode_now(CURSOR_BLINK_MODE, blinked);
         }
-    }
-
-    /// Stops leaving mode 12 as it is, until `resume_blink_watch` is handed what this answers. For bytes
-    /// that are the core's own account of a screen rather than a program's output: a recording's keyframe
-    /// says a cursor blinks the only way the core writes it, which is mode 12.
-    pub fn pause_blink_watch(&mut self) -> bool {
-        self.opened = None;
-        std::mem::replace(&mut self.blink_mode_ignored, false)
-    }
-
-    /// Puts back what `pause_blink_watch` answered.
-    pub fn resume_blink_watch(&mut self, ignored: bool) {
-        self.blink_mode_ignored = ignored;
     }
 
     /// Parses `bytes` up to and including the byte that ends the next OSC string, and — when `or_ground` —
@@ -580,8 +574,8 @@ impl Terminal {
     }
 
     /// Bounds the history's memory, whatever its line limit would allow at the grid's width.
-    pub fn set_scrollback_bytes(&self, bytes: usize) -> Result<(), Failed> {
-        self.set_usize(sys::TerminalOption::SCROLLBACK_MAX_BYTES, bytes, "ghostty_terminal_set(SCROLLBACK_MAX_BYTES)")
+    pub fn set_scrollback_bytes(&mut self, bytes: usize) -> Result<(), Failed> {
+        self.set(Setting::ScrollbackBytes(bytes))
     }
 
     /// Compresses history that is not being looked at. Answers whether there is more to do.
@@ -600,8 +594,8 @@ impl Terminal {
     }
 
     /// Bounds the scrollback to `lines`, which the core does not do by default.
-    pub fn set_scrollback_lines(&self, lines: usize) -> Result<(), Failed> {
-        self.set_usize(sys::TerminalOption::SCROLLBACK_MAX_LINES, lines, "ghostty_terminal_set(SCROLLBACK_MAX_LINES)")
+    pub fn set_scrollback_lines(&mut self, lines: usize) -> Result<(), Failed> {
+        self.set(Setting::ScrollbackLines(lines))
     }
 
     /// Lifts the byte ceiling, so the line limit is the only rule bounding history.
@@ -612,17 +606,13 @@ impl Terminal {
     /// promises `HISTORY_LINES`, and fewer the longer the lines were; a reattach would then read back less
     /// than the window was told it could have. Lifting it is what makes the line limit the one bound the
     /// snapshots in `tests/parser.rs` were recorded under.
-    pub fn set_scrollback_unbounded_bytes(&self) -> Result<(), Failed> {
-        self.set_usize(
-            sys::TerminalOption::SCROLLBACK_MAX_BYTES,
-            usize::MAX,
-            "ghostty_terminal_set(SCROLLBACK_MAX_BYTES)",
-        )
+    pub fn set_scrollback_unbounded_bytes(&mut self) -> Result<(), Failed> {
+        self.set(Setting::ScrollbackBytes(usize::MAX))
     }
 
     /// The terminal name a program reads from `TERM`, which decides what it emits.
-    pub fn set_terminfo_name(&self, name: &str) -> Result<(), Failed> {
-        self.set_str(sys::TerminalOption::TERMINFO_NAME, name, "ghostty_terminal_set(TERMINFO_NAME)")
+    pub fn set_terminfo_name(&mut self, name: &str) -> Result<(), Failed> {
+        self.set(Setting::TerminfoName(name.to_owned()))
     }
 
     /// Whether a cell is one of the two spacers a wide character leaves beside itself, holding no
@@ -645,79 +635,8 @@ impl Terminal {
     /// must outlive the handle, and nothing may hold a reference to it across a call that parses: the
     /// callbacks below each make one of their own. `screen::Screen` owns both, declares the terminal first
     /// so it is freed first, and reaches the collector only through its pointer.
-    pub(crate) unsafe fn route_reports(&self, collector: *mut Reported) -> Result<(), Failed> {
-        // SAFETY: userdata is an untyped pointer the library only ever hands back to the callback below
-        let result = unsafe { sys::ghostty_terminal_set(self.handle, sys::TerminalOption::USERDATA, collector.cast()) };
-        Failed::check("ghostty_terminal_set(USERDATA)", result)?;
-
-        // **The function pointer itself, not a pointer to it.** A callback option is documented that way
-        // and the difference is not subtle: passing `&callback` had the library call the address of a stack
-        // local, which is a SIGBUS rather than a wrong answer.
-        let callback = collect_reply as *const std::ffi::c_void;
-        // SAFETY: `collect_reply` has the signature `GhosttyTerminalWritePtyFn` declares, and the library
-        // only calls it with the userdata set above
-        let result = unsafe { sys::ghostty_terminal_set(self.handle, sys::TerminalOption::WRITE_PTY, callback) };
-        Failed::check("ghostty_terminal_set(WRITE_PTY)", result)?;
-
-        // **The shell's own account of itself, in the standard family** (OSC 133). The core reports each
-        // step of a command as an event and decodes the command line for us; what it does not do is
-        // interpret, so the mapping below is the broker's contract rather than the core's reading of it.
-        let semantic = note_semantic_prompt as *const std::ffi::c_void;
-        // SAFETY: the signature matches `GhosttyTerminalSemanticPromptFn`
-        let result = unsafe { sys::ghostty_terminal_set(self.handle, sys::TerminalOption::SEMANTIC_PROMPT, semantic) };
-        Failed::check("ghostty_terminal_set(SEMANTIC_PROMPT)", result)?;
-
-        let pwd = note_pwd as *const std::ffi::c_void;
-        // SAFETY: the signature matches `GhosttyTerminalPwdChangedFn`
-        let result = unsafe { sys::ghostty_terminal_set(self.handle, sys::TerminalOption::PWD_CHANGED, pwd) };
-        Failed::check("ghostty_terminal_set(PWD_CHANGED)", result)?;
-
-        let size = report_size as *const std::ffi::c_void;
-        // SAFETY: the signature matches `GhosttyTerminalSizeFn`
-        let result = unsafe { sys::ghostty_terminal_set(self.handle, sys::TerminalOption::SIZE, size) };
-        Failed::check("ghostty_terminal_set(SIZE)", result)?;
-
-        let hold = note_render_hold as *const std::ffi::c_void;
-        // SAFETY: the signature matches `GhosttyTerminalRenderHoldFn`
-        let result = unsafe { sys::ghostty_terminal_set(self.handle, sys::TerminalOption::RENDER_HOLD, hold) };
-        Failed::check("ghostty_terminal_set(RENDER_HOLD)", result)?;
-
-        // **What a program asks of the world outside its screen**: a title, a bell, the clipboard, a
-        // notification, how far along it is. The core reads each and reports it; none of them is drawn
-        // here, so each is handed on as something that happened.
-        for (option, callback, what) in [
-            (
-                sys::TerminalOption::TITLE_CHANGED,
-                note_title as *const std::ffi::c_void,
-                "ghostty_terminal_set(TITLE_CHANGED)",
-            ),
-            (sys::TerminalOption::BELL, note_bell as *const std::ffi::c_void, "ghostty_terminal_set(BELL)"),
-            (
-                sys::TerminalOption::CLIPBOARD_WRITE,
-                note_clipboard_write as *const std::ffi::c_void,
-                "ghostty_terminal_set(CLIPBOARD_WRITE)",
-            ),
-            (
-                sys::TerminalOption::DESKTOP_NOTIFICATION,
-                note_notification as *const std::ffi::c_void,
-                "ghostty_terminal_set(DESKTOP_NOTIFICATION)",
-            ),
-            (
-                sys::TerminalOption::PROGRESS_REPORT,
-                note_progress as *const std::ffi::c_void,
-                "ghostty_terminal_set(PROGRESS_REPORT)",
-            ),
-            (
-                sys::TerminalOption::UNKNOWN_SEQUENCE,
-                note_unknown_sequence as *const std::ffi::c_void,
-                "ghostty_terminal_set(UNKNOWN_SEQUENCE)",
-            ),
-        ] {
-            // SAFETY: each function has the signature its option documents
-            Failed::check(what, unsafe { sys::ghostty_terminal_set(self.handle, option, callback) })?;
-        }
-        // Without a limit the core keeps nothing of a sequence it does not read, and reports none
-        self.set_usize(sys::TerminalOption::UNKNOWN_MAX_BYTES, PAYLOAD_CAP, "ghostty_terminal_set(UNKNOWN_MAX_BYTES)")
+    pub(crate) unsafe fn route_reports(&mut self, collector: *mut Reported) -> Result<(), Failed> {
+        self.set(Setting::Reports(collector))
     }
 
     /// Whether the row at a **screen** coordinate runs on into the next one.
@@ -800,19 +719,9 @@ impl Terminal {
     /// **Both, because a reset is something a program can send.** Setting only the current value would
     /// hold until the first `reset` typed at a shell, and then the terminal would quietly go back to a
     /// default the window drawing it does not share.
-    pub fn set_mode(&self, mode: u16, value: bool) -> Result<(), Failed> {
-        let config = sys::TerminalModeConfig { mode, value };
-        for (option, what) in [
-            (sys::TerminalOption::MODE_DEFAULT, "ghostty_terminal_set(MODE_DEFAULT)"),
-            (sys::TerminalOption::MODE, "ghostty_terminal_set(MODE)"),
-        ] {
-            // SAFETY: both options take a `GhosttyTerminalModeConfig*`, which `config` is
-            let result = unsafe {
-                sys::ghostty_terminal_set(self.handle, option, (&raw const config).cast::<std::ffi::c_void>())
-            };
-            Failed::check(what, result)?;
-        }
-        Ok(())
+    pub fn set_mode(&mut self, mode: u16, value: bool) -> Result<(), Failed> {
+        // The core sets a mode's current value with its default
+        self.set(Setting::ModeDefault { mode, value })
     }
 
     /// Turns a mode on or off now, leaving what a reset returns it to.
@@ -841,30 +750,11 @@ impl Terminal {
             CursorStyle::Bar => sys::CursorStyle::BAR,
             CursorStyle::Underline => sys::CursorStyle::UNDERLINE,
         };
+        self.set(Setting::CursorDefaults { style, blinks: blink != CursorBlink::Off })?;
         // Said by a person, the blink is theirs: a program's mode 12 no longer changes it (`watched`). A
         // sequence under watch began under the last answer, and what it would be put back to is that one's
         self.blink_mode_ignored = blink != CursorBlink::Program;
         self.opened = None;
-        let blink = blink != CursorBlink::Off;
-        // SAFETY: DEFAULT_CURSOR_STYLE takes a `GhosttyCursorStyle*` and DEFAULT_CURSOR_BLINK a `bool*`
-        unsafe {
-            Failed::check(
-                "ghostty_terminal_set(DEFAULT_CURSOR_STYLE)",
-                sys::ghostty_terminal_set(
-                    self.handle,
-                    sys::TerminalOption::DEFAULT_CURSOR_STYLE,
-                    (&raw const style).cast(),
-                ),
-            )?;
-            Failed::check(
-                "ghostty_terminal_set(DEFAULT_CURSOR_BLINK)",
-                sys::ghostty_terminal_set(
-                    self.handle,
-                    sys::TerminalOption::DEFAULT_CURSOR_BLINK,
-                    (&raw const blink).cast(),
-                ),
-            )?;
-        }
         Ok(())
     }
 
@@ -876,17 +766,8 @@ impl Terminal {
 
     /// Turns the Kitty graphics protocol off, so a program asking whether it may send images is not told
     /// yes by a terminal with nothing to draw them.
-    pub fn refuse_images(&self) -> Result<(), Failed> {
-        let limit: u64 = 0;
-        // SAFETY: KITTY_IMAGE_STORAGE_LIMIT takes a `uint64_t*`
-        let result = unsafe {
-            sys::ghostty_terminal_set(
-                self.handle,
-                sys::TerminalOption::KITTY_IMAGE_STORAGE_LIMIT,
-                (&raw const limit).cast::<std::ffi::c_void>(),
-            )
-        };
-        Failed::check("ghostty_terminal_set(KITTY_IMAGE_STORAGE_LIMIT)", result)
+    pub fn refuse_images(&mut self) -> Result<(), Failed> {
+        self.set(Setting::ImageStorage(0))
     }
 
     /// Tells the terminal what colours it is drawn in, which is what it answers when a program asks.
@@ -894,80 +775,13 @@ impl Terminal {
     /// `ansi` replaces the first entries of the palette — the sixteen a theme names — and leaves the rest
     /// at the library's, which are the standard cube and greys no theme redefines.
     pub fn set_colors(
-        &self,
+        &mut self,
         foreground: [u8; 3],
         background: [u8; 3],
         cursor: Option<[u8; 3]>,
         ansi: &[[u8; 3]],
     ) -> Result<(), Failed> {
-        let rgb = |[r, g, b]: [u8; 3]| sys::ColorRgb { r, g, b };
-        self.set_color(
-            sys::TerminalOption::COLOR_FOREGROUND,
-            rgb(foreground),
-            "ghostty_terminal_set(COLOR_FOREGROUND)",
-        )?;
-        self.set_color(
-            sys::TerminalOption::COLOR_BACKGROUND,
-            rgb(background),
-            "ghostty_terminal_set(COLOR_BACKGROUND)",
-        )?;
-        if let Some(cursor) = cursor {
-            self.set_color(sys::TerminalOption::COLOR_CURSOR, rgb(cursor), "ghostty_terminal_set(COLOR_CURSOR)")?;
-        }
-        if ansi.is_empty() {
-            return Ok(());
-        }
-        let mut palette = [sys::ColorRgb { r: 0, g: 0, b: 0 }; 256];
-        // SAFETY: COLOR_PALETTE_DEFAULT writes exactly 256 `GhosttyColorRgb`, which is what `palette` is
-        let result = unsafe {
-            sys::ghostty_terminal_get(
-                self.handle,
-                sys::TerminalData::COLOR_PALETTE_DEFAULT,
-                palette.as_mut_ptr().cast::<std::ffi::c_void>(),
-            )
-        };
-        Failed::check("ghostty_terminal_get(COLOR_PALETTE_DEFAULT)", result)?;
-        for (slot, color) in palette.iter_mut().zip(ansi) {
-            *slot = rgb(*color);
-        }
-        // SAFETY: COLOR_PALETTE takes a pointer to exactly 256 `GhosttyColorRgb`
-        let result = unsafe {
-            sys::ghostty_terminal_set(
-                self.handle,
-                sys::TerminalOption::COLOR_PALETTE,
-                palette.as_ptr().cast::<std::ffi::c_void>(),
-            )
-        };
-        Failed::check("ghostty_terminal_set(COLOR_PALETTE)", result)
-    }
-
-    fn set_color(
-        &self,
-        option: sys::TerminalOption::Type,
-        color: sys::ColorRgb,
-        what: &'static str,
-    ) -> Result<(), Failed> {
-        // SAFETY: the caller names an option documented as taking a `GhosttyColorRgb*`
-        let result =
-            unsafe { sys::ghostty_terminal_set(self.handle, option, (&raw const color).cast::<std::ffi::c_void>()) };
-        Failed::check(what, result)
-    }
-
-    /// Sets an option whose value is a `size_t`.
-    fn set_usize(&self, option: sys::TerminalOption::Type, value: usize, what: &'static str) -> Result<(), Failed> {
-        // SAFETY: the caller names an option documented as taking a `size_t*`
-        let result =
-            unsafe { sys::ghostty_terminal_set(self.handle, option, (&raw const value).cast::<std::ffi::c_void>()) };
-        Failed::check(what, result)
-    }
-
-    /// Sets an option whose value is a borrowed string.
-    fn set_str(&self, option: sys::TerminalOption::Type, value: &str, what: &'static str) -> Result<(), Failed> {
-        let text = sys::String::from(value);
-        // SAFETY: `text` borrows `value`, which outlives the call
-        let result =
-            unsafe { sys::ghostty_terminal_set(self.handle, option, (&raw const text).cast::<std::ffi::c_void>()) };
-        Failed::check(what, result)
+        self.set(Setting::Colors { foreground, background, cursor, ansi: ansi.to_vec() })
     }
 }
 
