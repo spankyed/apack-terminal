@@ -510,6 +510,45 @@ fn a_proxy_whose_input_has_ended_still_carries_the_answer_to_what_it_was_last_se
     assert!(process.wait().expect("the proxy is waited for").success());
 }
 
+/// **What a broker has written to a caller is the caller's to read, however long after it lets the
+/// connection go.** A caller that says `done` and reads only once the broker has gone is the slowest a
+/// proxy carrying the answers on can be; the answers are still there, the last one included.
+///
+/// On Windows, disconnecting a named pipe throws away whatever the far end has not yet read, so a
+/// broker that let a caller go by disconnecting raced the caller's reads, and sometimes won.
+#[test]
+fn a_caller_that_reads_only_after_the_broker_let_it_go_still_reads_every_answer() {
+    let directory = tempfile::tempdir().expect("a directory for the socket");
+    let socket = socket_in(directory.path(), "broker.sock");
+    let mut broker = broker(&socket);
+    assert!(broker.said.starts_with("listening "), "{}", broker.said);
+    let name = socket.to_str().expect("a utf-8 path").to_fs_name::<GenericFilePath>().expect("a socket name");
+    let stream = Stream::connect(name).expect("the broker accepts");
+    let mut said = String::new();
+    for request in [
+        Request::Hello { protocol: PROTOCOL_VERSION, role: Role::Client, challenge: None },
+        Request::Sessions,
+        Request::Facts { session: "s-404".to_owned() },
+        Request::Done,
+    ] {
+        said.push_str(&serde_json::to_string(&request).expect("a request serializes"));
+        said.push('\n');
+    }
+    (&stream).write_all(said.as_bytes()).expect("the broker reads");
+
+    // Its only connection let go and nothing running, the broker exits: nothing it does is still to come
+    let (code, _) = broker.ended();
+    assert_eq!(code, Some(0));
+
+    let mut answered = String::new();
+    let read = (&stream).read_to_string(&mut answered);
+    let events: Vec<Event> = answered.lines().filter_map(|line| serde_json::from_str(line).ok()).collect();
+    assert!(
+        matches!(events.as_slice(), [Event::Hello { .. }, Event::Sessions { .. }, Event::Failed { .. }]),
+        "read {read:?}: {answered:?}"
+    );
+}
+
 /// A broker is started to be connected to. One that nothing ever connects to — whatever started it died
 /// first — has no connection closing to tell it to go, and goes of its own accord once the time it
 /// allows for that first connection has passed.
@@ -682,7 +721,16 @@ fn a_proxy_told_no_socket_uses_the_pipe_named_for_its_user() {
 #[cfg(unix)]
 #[test]
 fn a_connection_whose_far_end_has_stopped_sending_is_hung_up_on_and_a_write_to_it_ends() {
-    use apack_terminal::listening::hang_up;
+    use apack_terminal::listening::{hang_up, let_go};
+
+    // Letting a connection go is hanging up on it where a hang-up leaves what was written, which a socket's does
+    for (ending, end) in [("hung up on", hang_up as fn(&Stream) -> bool), ("let go", |stream| let_go(stream, || {}))] {
+        ends_a_write_to_a_far_end_that_stopped_sending(ending, end);
+    }
+}
+
+#[cfg(unix)]
+fn ends_a_write_to_a_far_end_that_stopped_sending(ending: &str, end: fn(&Stream) -> bool) {
     use interprocess::local_socket::{GenericFilePath, ListenerOptions, ToFsName, prelude::*};
 
     let directory = tempfile::tempdir().expect("a directory for the socket");
@@ -696,9 +744,9 @@ fn a_connection_whose_far_end_has_stopped_sending_is_hung_up_on_and_a_write_to_i
     let mut heard = [0u8; 1];
     assert_eq!((&near).read(&mut heard).expect("the near end reads"), 0, "the near end hears that it finished");
 
-    assert!(hang_up(&near), "a connection half closed by its far end could not be hung up on");
+    assert!(end(&near), "a connection half closed by its far end could not be {ending}");
     // Far more than a socket holds, to a far end that reads none of it: a write left open would park here
     let written = (&near).write_all(&vec![0u8; 8 << 20]);
-    assert!(written.is_err(), "megabytes were written to a connection that had been hung up on");
+    assert!(written.is_err(), "megabytes were written to a connection that had been {ending}");
     drop(far);
 }

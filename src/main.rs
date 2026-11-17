@@ -23,7 +23,7 @@ use interprocess::local_socket::{GenericFilePath, Stream, ToFsName, prelude::*};
 
 use apack_terminal::feed::{FEED_BYTES_ENV, Feed, feed_bytes};
 use apack_terminal::frames::{Frame, read_frame};
-use apack_terminal::listening::{self, HELD_EXIT, Refused, START_GRACE_ENV, hang_up};
+use apack_terminal::listening::{self, HELD_EXIT, Refused, START_GRACE_ENV, hang_up, let_go};
 use apack_terminal::output::{Outgoing, channel_with_credit};
 use apack_terminal::protocol::{
     BROKER_KEY_ENV, CommandRecord, ErrorCode, Event, PROTOCOL_VERSION, Request, Role, SearchMatch, proof_of,
@@ -258,6 +258,8 @@ fn write_out(outgoing: Receiver<Outgoing>, broker: Broker) {
 struct Client {
     wire: Arc<Wire>,
     feed: Arc<Feed>,
+    /// The thread writing what is queued, for its connection's leaving to wait on
+    writing: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 /// Makes `wire` a client the broker can report to, with a thread that writes what is queued for it.
@@ -273,8 +275,8 @@ fn attachable(wire: &Arc<Wire>, broker: &Broker) -> Arc<Client> {
             hang_up(&stream);
         }
     });
-    let client = Arc::new(Client { wire: Arc::clone(wire), feed });
-    std::thread::spawn({
+    let client = Arc::new(Client { wire: Arc::clone(wire), feed, writing: Mutex::new(None) });
+    let writing = std::thread::spawn({
         let (client, broker) = (Arc::clone(&client), broker.clone());
         move || {
             while let Some((frame, message)) = client.feed.next() {
@@ -288,6 +290,7 @@ fn attachable(wire: &Arc<Wire>, broker: &Broker) -> Arc<Client> {
             detach(&broker, &client.wire);
         }
     });
+    *client.writing.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(writing);
     client
 }
 
@@ -359,8 +362,8 @@ fn serve(stream: Stream, connection: u64, broker: Broker) {
     // crate's deprecated `split` says to do instead — and dropping a half there does not shut it down, so
     // the halves were a shape that reads like a socket's and is not one.
     let wire = Arc::new(Wire { stream: Arc::new(stream), line: Mutex::new(()) });
-    let mut leaving = Leaving { wire: Arc::clone(&wire), connection, broker: broker.clone(), role: None, feed: None };
-    converse(&wire, connection, &broker, &mut leaving.role, &mut leaving.feed);
+    let mut leaving = Leaving { wire: Arc::clone(&wire), connection, broker: broker.clone(), role: None, client: None };
+    converse(&wire, connection, &broker, &mut leaving.role, &mut leaving.client);
 }
 
 /// What a connection ending leads to, as a value whose going is the ending.
@@ -373,8 +376,8 @@ struct Leaving {
     connection: u64,
     broker: Broker,
     role: Option<Role>,
-    /// What was waiting to be written to it, for a connection that greeted as a client
-    feed: Option<Arc<Feed>>,
+    /// What was waiting to be written to it and what writes it, for a connection that greeted as a client
+    client: Option<Arc<Client>>,
 }
 
 impl Drop for Leaving {
@@ -398,13 +401,21 @@ impl Drop for Leaving {
                 // the feed and closed
                 self.broker.sessions.settled();
                 detach(&self.broker, &self.wire);
-                // Its writer has nothing more to write and ends. One held in a write by a client that
-                // stopped reading is let go by the connection closing, which is what this connection
-                // ending is
-                if let Some(feed) = &self.feed {
-                    feed.close();
+                // Its writer has nothing more to write and ends, and is waited for: one held in a write by a
+                // client that stopped reading, or that took a message before the feed closed and writes it
+                // after, is ended by the connection being let go. **Let go, not hung up on**: what it was
+                // answered is written and still unread, and a named pipe's disconnect would throw that away
+                if let Some(client) = &self.client {
+                    client.feed.close();
                 }
-                hang_up(&self.wire.stream);
+                let_go(&self.wire.stream, || {
+                    let writing = self.client.as_ref().and_then(|client| {
+                        client.writing.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
+                    });
+                    if let Some(writing) = writing {
+                        let _ = writing.join();
+                    }
+                });
                 // The recordings it opened to look back through were its alone to name
                 self.broker.sessions.end_rewound_by(self.connection);
                 let left = self.broker.clients.fetch_sub(1, Ordering::SeqCst) - 1;
@@ -431,7 +442,13 @@ impl Drop for Leaving {
 
 /// Reads a connection's requests and carries them out, until it has no more. `role` is what the
 /// connection greeted as, once it has.
-fn converse(wire: &Arc<Wire>, connection: u64, broker: &Broker, role: &mut Option<Role>, feed: &mut Option<Arc<Feed>>) {
+fn converse(
+    wire: &Arc<Wire>,
+    connection: u64,
+    broker: &Broker,
+    role: &mut Option<Role>,
+    attached: &mut Option<Arc<Client>>,
+) {
     let mut reader = BufReader::new(&*wire.stream);
     let mut line = String::new();
 
@@ -509,7 +526,7 @@ fn converse(wire: &Arc<Wire>, connection: u64, broker: &Broker, role: &mut Optio
                     // says what those reports mean
                     Role::Client => {
                         let client = attachable(wire, broker);
-                        *feed = Some(Arc::clone(&client.feed));
+                        *attached = Some(Arc::clone(&client));
                         if let Ok(mut attached) = broker.feed.lock() {
                             *attached = Some(client);
                         }
