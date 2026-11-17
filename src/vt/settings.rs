@@ -12,11 +12,17 @@
 //! **There is one way to make a setting, and it is the way it is kept.** `Terminal::set` tells the core
 //! and keeps what it was told, and `Setting::tell` is the one place a setting reaches the core. A
 //! setting a restore forgets is therefore one that was never made here, and `tests/keyframes.rs` holds
-//! every kind to an answer a terminal gives only when it was told.
+//! the ones a session makes to an answer a terminal gives only when it was told.
+//!
+//! **Telling is not always only telling.** The core changes a terminal's state with two of these: a
+//! mode's default sets the mode, and a cursor's default sets whether the cursor blinks and, where the
+//! core holds the cursor to be the default one, how it is drawn. A terminal put back has a state that
+//! is not this session's to change, so what can be read is read first and put back (`Setting::tell`),
+//! and what cannot is not told where it is already so (`Terminal::tell_again`).
 
 use ghostty_vt_rs_sys as sys;
 
-use super::{Failed, Reported, Terminal};
+use super::{CURSOR_BLINK_MODE, Failed, Reported, Terminal};
 use crate::markers::PAYLOAD_CAP;
 
 /// One thing a terminal is told about where it runs.
@@ -57,8 +63,8 @@ impl Setting {
     /// Tells the terminal `handle` this setting.
     ///
     /// `again` is for a terminal that has a state of its own already — one a restore decoded — which a
-    /// setting must leave as it is: the core sets a mode's current value with its default, so the
-    /// current value is read first and put back.
+    /// setting must leave as it is. The core sets a mode's current value with its default, and whether
+    /// the cursor blinks now with whether its default does, so each is read first and put back.
     fn tell(&self, handle: sys::Terminal, again: bool) -> Result<(), Failed> {
         match self {
             Self::ScrollbackLines(lines) => set(
@@ -78,18 +84,15 @@ impl Setting {
                 set(handle, sys::TerminalOption::TERMINFO_NAME, &text, "ghostty_terminal_set(TERMINFO_NAME)")
             }
             Self::ModeDefault { mode, value } => {
+                // The core sets a mode's current value with its default
                 let now = again.then(|| mode_of(handle, *mode)).transpose()?;
                 let config = sys::TerminalModeConfig { mode: *mode, value: *value };
                 set(handle, sys::TerminalOption::MODE_DEFAULT, &config, "ghostty_terminal_set(MODE_DEFAULT)")?;
-                match now {
-                    Some(now) if now != *value => {
-                        let config = sys::TerminalModeConfig { mode: *mode, value: now };
-                        set(handle, sys::TerminalOption::MODE, &config, "ghostty_terminal_set(MODE)")
-                    }
-                    _ => Ok(()),
-                }
+                now.map_or(Ok(()), |now| set_mode(handle, *mode, now))
             }
             Self::CursorDefaults { style, blinks } => {
+                // The core sets whether the cursor blinks now with whether its default does
+                let now = again.then(|| mode_of(handle, CURSOR_BLINK_MODE)).transpose()?;
                 set(
                     handle,
                     sys::TerminalOption::DEFAULT_CURSOR_STYLE,
@@ -101,7 +104,8 @@ impl Setting {
                     sys::TerminalOption::DEFAULT_CURSOR_BLINK,
                     blinks,
                     "ghostty_terminal_set(DEFAULT_CURSOR_BLINK)",
-                )
+                )?;
+                now.map_or(Ok(()), |now| set_mode(handle, CURSOR_BLINK_MODE, now))
             }
             Self::ImageStorage(limit) => set(
                 handle,
@@ -154,6 +158,12 @@ fn set<T>(
     let result =
         unsafe { sys::ghostty_terminal_set(handle, option, std::ptr::from_ref(value).cast::<std::ffi::c_void>()) };
     Failed::check(what, result)
+}
+
+/// Sets `mode` on `handle` now, leaving what a reset returns it to.
+fn set_mode(handle: sys::Terminal, mode: u16, value: bool) -> Result<(), Failed> {
+    let config = sys::TerminalModeConfig { mode, value };
+    set(handle, sys::TerminalOption::MODE, &config, "ghostty_terminal_set(MODE)")
 }
 
 /// Whether `mode` is set on `handle` now.
@@ -285,9 +295,37 @@ impl Terminal {
         Ok(())
     }
 
-    /// Tells the terminal `handle`, which has a state of its own, every setting this one was told.
-    pub(super) fn tell_again(&self, handle: sys::Terminal) -> Result<(), Failed> {
-        self.settings.iter().try_for_each(|setting| setting.tell(handle, true))
+    /// Tells the terminal `handle`, which has a state of its own, every setting this one was told —
+    /// but not the cursor a reset returns to where `told` says that terminal was told the same one
+    /// (`told_cursor`).
+    ///
+    /// **The core does not take a cursor's default without touching the cursor.** Told one, it gives it
+    /// to a cursor it holds to be the default one, on whichever screen is showing, and that is not
+    /// always the cursor a program left there: one that asked for a cursor on one screen and for the
+    /// default on the other is drawn the default on both once the default is told again. What a cursor
+    /// is drawn as cannot be asked of the terminal and so cannot be put back, where a mode can. So a
+    /// terminal under the default it was written out under is left as it is, and one put back under
+    /// another has the cursor the core gives it.
+    pub(super) fn tell_again(&self, handle: sys::Terminal, told: [u8; 2]) -> Result<(), Failed> {
+        let same = told == self.told_cursor();
+        self.settings
+            .iter()
+            .filter(|setting| !(same && matches!(setting, Setting::CursorDefaults { .. })))
+            .try_for_each(|setting| setting.tell(handle, true))
+    }
+
+    /// The cursor this terminal was told a reset returns to, as the two bytes a keyframe says it in: its
+    /// style and whether it blinks, or `0xff` twice for a terminal that was told none.
+    pub(super) fn told_cursor(&self) -> [u8; 2] {
+        self.settings
+            .iter()
+            .find_map(|setting| match setting {
+                Setting::CursorDefaults { style, blinks } => {
+                    Some([u8::try_from(*style).unwrap_or(u8::MAX), u8::from(*blinks)])
+                }
+                _ => None,
+            })
+            .unwrap_or([u8::MAX; 2])
     }
 
     /// How many bytes of images this terminal was told to keep, where it was told.

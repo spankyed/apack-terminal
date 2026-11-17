@@ -1811,7 +1811,7 @@ fn a_replay_draws_the_cursor_its_keyframe_holds_whatever_blink_a_person_chose() 
     use apack_terminal::recording::{Entry, Timed};
     // A blinking underline, which is neither the cursor a session starts with nor either one chosen below
     let entries = [
-        Timed { at: 100, entry: crate::keyframes::keyframe(20, 4, b"hello\x1b[3 q") },
+        Timed { at: 100, entry: crate::screens::keyframe(20, 4, b"hello\x1b[3 q") },
         Timed { at: 150, entry: Entry::Output(b"\x1b[?12l more".to_vec()) },
     ];
     let mut chosen = Screen::new(20, 4);

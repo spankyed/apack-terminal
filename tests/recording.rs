@@ -1221,7 +1221,7 @@ fn output_after_a_keyframe_taken_between_sequences_is_recorded_as_output() {
 /// sequence's and would otherwise be read as part of it.
 #[test]
 fn a_replay_part_way_through_a_sequence_at_a_keyframe_starts_again_from_it() {
-    let keyframe = |text: &[u8]| crate::keyframes::keyframe(40, 10, text);
+    let keyframe = |text: &[u8]| crate::screens::keyframe(40, 10, text);
     let at = |at: u64, entry| Timed { at, entry };
     let entries = vec![
         at(100, keyframe(b"first")),

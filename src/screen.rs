@@ -608,12 +608,14 @@ impl Screen {
                     self.terminal.reset_cursor();
                 }
                 if ground && self.unrecorded {
-                    // The rest of the sequence a keyframe was taken in, which a replay from that keyframe is
-                    // not part way through: not recorded, and a whole keyframe taken where it has ended
-                    self.unrecorded = false;
-                    recorded = fed;
-                    self.keyframe_waits = false;
-                    self.take_keyframe();
+                    // The rest of a sequence the recording stopped taking: not recorded, and a keyframe
+                    // taken where it has ended, from which what is written is recorded again
+                    if self.terminal.writes_out_whole() {
+                        self.unrecorded = false;
+                        recorded = fed;
+                        self.keyframe_waits = false;
+                        self.take_keyframe();
+                    }
                 } else if ground {
                     // What was parsed before the keyframe is recorded before it, and the rest after
                     self.record(|recorder| recorder.output(&bytes[recorded..fed]));
@@ -970,6 +972,9 @@ impl Screen {
     /// out and where nothing but the core is part way through anything: a keyframe that falls due
     /// mid-sequence is taken at the byte that ends the sequence (`feed`).
     ///
+    /// **And for a terminal the core writes out whole** (`Terminal::writes_out_whole`): due in the one
+    /// state it does not, the keyframe is taken once what is written next has ended.
+    ///
     /// **A sequence that never ends would put it off for ever**, and the recording would grow without
     /// bound, so at twice its budget nothing more is recorded until the sequence ends, where the
     /// keyframe is taken and what the program writes is recorded again. A replay comes to that keyframe
@@ -980,13 +985,21 @@ impl Screen {
         if !recorder.keyframe_due() {
             return;
         }
+        let far_over_budget = recorder.far_over_budget();
         if self.terminal.at_ground() {
-            self.take_keyframe();
-        } else if recorder.far_over_budget() {
+            if self.terminal.writes_out_whole() {
+                self.take_keyframe();
+            }
+        } else if far_over_budget {
             self.unrecorded = true;
         } else {
             self.keyframe_waits = true;
         }
+    }
+
+    /// Whether a keyframe taken now would be all of the terminal (`Terminal::writes_out_whole`).
+    pub fn writes_out_whole(&self) -> bool {
+        self.terminal.writes_out_whole()
     }
 
     /// Records the terminal as it stands.
@@ -1127,9 +1140,10 @@ impl Screen {
             self.feed(b"\x1b[?1049l");
         }
         // No mouse reporting, bracketed paste, focus reports or hold on the screen; a soft reset for the
-        // rest (keypad, cursor keys, margins, attributes); the cursor shown, on a fresh line
+        // rest (keypad, cursor keys, margins, attributes); the cursor shown, the session's own rather than
+        // the one the last program asked for, on a fresh line
         self.feed(
-            b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[?2026l\x1b[!p\x1b[?25h\x1b[0m\r\n",
+            b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[?2026l\x1b[!p\x1b[?25h\x1b[0 q\x1b[0m\r\n",
         );
         self.forget_the_shell();
     }

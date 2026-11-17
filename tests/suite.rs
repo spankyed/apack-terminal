@@ -10,8 +10,8 @@
 //! A file that runs on both says so a case at a time: the ones that type `sh`'s syntax or close one
 //! direction of a connection are POSIX only.
 
-#[path = "_support/keyframes.rs"]
-mod keyframes;
+#[path = "_support/screens.rs"]
+mod screens;
 
 mod broker;
 #[cfg(unix)]
@@ -34,6 +34,7 @@ mod image_source_rules;
 mod image_sources;
 mod images;
 mod keeping;
+mod keyframes;
 mod markers;
 mod parser;
 mod placeholders;

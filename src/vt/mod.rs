@@ -741,9 +741,12 @@ impl Terminal {
     /// Sets the cursor a program gets when it asks for the default one (`CSI 0 q`). A session starts with a
     /// blinking bar, which is `set_cursor_defaults(Bar, Program)`.
     ///
-    /// **The option is what a reset returns to, and only a reset reads it**, so the cursor is taken there by
-    /// `reset_cursor`, which is a separate call because it is a write: it goes through the parser like any
-    /// output, so it belongs where the parser is between sequences (`Screen::set_cursor_defaults`).
+    /// **The option is what a reset returns to**, and the cursor is taken there by `reset_cursor`, which is
+    /// a separate call because it is a write: it goes through the parser like any output, so it belongs
+    /// where the parser is between sequences (`Screen::set_cursor_defaults`). The core does more with the
+    /// option than keep it — it sets whether the cursor blinks now, and draws the default cursor where it
+    /// holds the cursor to be the default one — which is what a terminal put back has to be kept from
+    /// (`settings`).
     pub fn set_cursor_defaults(&mut self, style: CursorStyle, blink: CursorBlink) -> Result<(), Failed> {
         let style: sys::CursorStyle::Type = match style {
             CursorStyle::Block => sys::CursorStyle::BLOCK,
