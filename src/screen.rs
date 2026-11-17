@@ -91,11 +91,18 @@ pub const SEARCH_MATCHES: usize = 100;
 /// it is, and what answers it.
 pub struct Postponed {
     view: ViewId,
+    /// The bytes it keeps while it waits: a search's needle
+    bytes: usize,
     read: Box<dyn FnOnce(&mut Screen) + Send>,
 }
 
 /// How many of a view's questions one hold keeps waiting (`Screen::once_whole`).
 pub const POSTPONED_READS: usize = 64;
+
+/// How many bytes the questions one hold keeps waiting may hold between them (`Screen::once_whole_keeping`):
+/// far more than every needle a person types into a find bar during one hold, and far less than the
+/// messages that many questions could each be.
+pub const POSTPONED_BYTES: usize = 1 << 20;
 
 /// What a shell has reported about itself, accumulated from the markers it emitted.
 ///
@@ -731,9 +738,7 @@ impl Screen {
                     publication.touch();
                 }
                 self.publish();
-                for postponed in std::mem::take(&mut self.postponed) {
-                    (postponed.read)(self);
-                }
+                self.answer_drawn();
             }
         }
     }
@@ -768,7 +773,7 @@ impl Screen {
     /// Asks what waited for a hold that ran out (`end_hold`): now, unless the program has taken the
     /// screen again since.
     pub fn ask_again(&mut self, postponed: Postponed) {
-        self.once_whole(postponed.view, postponed.read);
+        self.once_whole_keeping(postponed.view, postponed.bytes, postponed.read);
     }
 
     /// Runs `read` on the screen when it is a whole frame: now, or — while the program holds the screen
@@ -782,29 +787,54 @@ impl Screen {
     /// not wait: they are answered with the rows last sent (`Publication::fetch`), which a view scrolling
     /// back needs in order to draw at all.
     ///
-    /// **An answer is about a whole frame, which is not always one its view has been sent yet.** A view
-    /// that has not drawn its last frame is sent no other until it has (`publish::owed`), so its answer
-    /// can come ahead of the frame it is about, as an answer about a screen nobody holds can when output
-    /// arrives between a view's last frame and its question. What a hold changes is only that no answer
-    /// is about a frame half drawn.
+    /// **And about a frame its view has been sent.** A view that has not drawn its last frame is sent no
+    /// other until it has (`publish::owed`), so while the screen has moved on from that frame its
+    /// questions wait too (`Publication::undrawn`): they are answered as it acknowledges, after the frame
+    /// that acknowledgement has it sent, and so about rows it holds. A view whose last frame is still the
+    /// screen is answered at once, drawn or not.
     ///
     /// **No more than `POSTPONED_READS` wait.** A view asks these as a person clicks, copies or types in
     /// a find bar. One that has asked that many inside one hold is answered from the screen as it stands,
-    /// which is what every one of them was before any waited, rather than left to grow a queue.
+    /// which is what every one of them was before any waited, rather than left to grow a queue. So is
+    /// one whose bytes would take what waits past `POSTPONED_BYTES` (`once_whole_keeping`).
     ///
     /// **A view that goes, or a session that ends, is answered then** (`detach_view`, `detach_connection`,
     /// `end_views`), from the screen as it stands: a question is answered or refused, never dropped, and
     /// a view that has finished speaking is still owed what it asked.
     pub fn once_whole(&mut self, view: ViewId, read: impl FnOnce(&mut Self) + Send + 'static) {
-        if self.hold.is_some() && self.postponed.len() < POSTPONED_READS {
-            self.postponed.push(Postponed { view, read: Box::new(read) });
+        self.once_whole_keeping(view, 0, read);
+    }
+
+    /// As `once_whole`, for a question that keeps `bytes` of its own while it waits: a search's needle,
+    /// which is as long as its view made it.
+    pub fn once_whole_keeping(&mut self, view: ViewId, bytes: usize, read: impl FnOnce(&mut Self) + Send + 'static) {
+        let waiting: usize = self.postponed.iter().map(|asked| asked.bytes).sum();
+        let whole = self.hold.is_none() && !self.undrawn(view);
+        if !whole && self.postponed.len() < POSTPONED_READS && waiting + bytes <= POSTPONED_BYTES {
+            self.postponed.push(Postponed { view, bytes, read: Box::new(read) });
         } else {
             read(self);
         }
     }
 
-    /// Answers what the views `going` picks out asked during the hold in force, in the order it was
-    /// asked, from the screen as it stands.
+    /// Whether `view` has yet to draw a frame the screen has moved on from (`Publication::undrawn`).
+    fn undrawn(&self, view: ViewId) -> bool {
+        self.publication.as_ref().is_some_and(|publication| publication.undrawn(view))
+    }
+
+    /// Answers what waited and need wait no longer: with no hold in force, the questions of every view
+    /// that holds the screen as it stands, or has just been sent it.
+    fn answer_drawn(&mut self) {
+        if self.hold.is_some() {
+            return;
+        }
+        let undrawn: Vec<ViewId> =
+            self.postponed.iter().map(|asked| asked.view).filter(|view| self.undrawn(*view)).collect();
+        self.answer_postponed_of(|view| !undrawn.contains(&view));
+    }
+
+    /// Answers what the views `going` picks out asked and are waiting to hear, in the order it was asked,
+    /// from the screen as it stands.
     fn answer_postponed_of(&mut self, going: impl Fn(ViewId) -> bool) {
         let (theirs, kept) = std::mem::take(&mut self.postponed).into_iter().partition(|asked| going(asked.view));
         self.postponed = kept;
@@ -1312,6 +1342,7 @@ impl Screen {
             Some(publication) => publication.acknowledge(&self.terminal, commands, held, id, sequence),
             None => Ok(()),
         };
+        self.answer_drawn();
         self.drop_unviewed();
         acknowledged
     }

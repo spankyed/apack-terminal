@@ -874,7 +874,17 @@ impl Handle {
     /// where a needle appears — once the screen is a whole frame (`Screen::once_whole`). `read` is what
     /// answers the view, and is run now unless the program is holding the screen.
     pub fn once_whole(&self, view: ViewId, read: impl FnOnce(&mut Screen) + Send + 'static) -> Outcome {
-        self.on_screen(|screen| screen.once_whole(view, read))
+        self.once_whole_keeping(view, 0, read)
+    }
+
+    /// As `once_whole`, for a question that keeps `bytes` of its own while it waits (`Screen::once_whole_keeping`).
+    pub fn once_whole_keeping(
+        &self,
+        view: ViewId,
+        bytes: usize,
+        read: impl FnOnce(&mut Screen) + Send + 'static,
+    ) -> Outcome {
+        self.on_screen(|screen| screen.once_whole_keeping(view, bytes, read))
     }
 
     /// Every image in the session, with the epoch their lines are in and one cell in pixels.

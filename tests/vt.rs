@@ -486,3 +486,25 @@ fn a_sequence_is_found_wherever_in_a_read_a_look_ends() {
         assert_eq!(terminal.sequences_watched(), watched + 1, "{before} bytes ahead of one naming mode 12");
     }
 }
+
+/// **A redraw leaves the terminal it is fed to with the cursor blinking, or not, as the one it was taken
+/// from.** A session's cursor blinks until a program says otherwise, so a redraw that said nothing of a
+/// steady cursor would leave it blinking in the terminal a recording is replayed in.
+#[test]
+fn a_redraw_says_whether_the_cursor_blinks_either_way() {
+    for (asked, blinking) in [("\x1b[2 q", false), ("\x1b[1 q", true), ("\x1b[?12l", false), ("", true)] {
+        let mut drawn = with_a_blink_chosen(CursorBlink::Program);
+        drawn.feed(format!("text{asked}").as_bytes());
+        assert_eq!(blinks(&drawn), blinking, "{asked:?}");
+        let redraw = drawn.redraw(0, (39, 3)).expect("the terminal redraws");
+
+        for before in ["\x1b[1 q", "\x1b[2 q"] {
+            let mut replayed = with_a_blink_chosen(CursorBlink::Program);
+            replayed.feed(before.as_bytes());
+            replayed.feed(b"\x1bc\x1b[3J");
+            replayed.feed(&redraw);
+            assert_eq!(blinks(&replayed), blinking, "{asked:?} redrawn in a terminal left at {before:?}");
+            assert_eq!(first_row(&replayed).trim_end(), "text");
+        }
+    }
+}

@@ -556,9 +556,9 @@ fn text_asked_for_while_a_program_holds_the_screen_is_answered_after_the_frame_t
     }
 
     // **The view has drawn everything it was sent before it asks**, as a view a person is looking at has.
-    // A frame it had not drawn would keep the next from being sent (`publish::owed`), and the answer would
-    // then come ahead of the frame it is about. Lines fetched by number are answered at once, hold or no
-    // hold, so the answer to a fetch is behind every frame sent before it
+    // A frame it had not drawn would keep the next from being sent (`publish::owed`), and what it asks
+    // waiting with it past the hold. Lines fetched by number are answered at once, hold or no hold, so
+    // the answer to a fetch is behind every frame sent before it
     view.send(&ToBroker::Fetch { channel: 1, request: 8, epoch: 0, first: 0, count: 1 });
     view.answer(|message| {
         matches!(message, ToView::Rows { request: 8, .. } | ToView::Failed { request: 8, .. }).then_some(())
