@@ -237,9 +237,10 @@ fn tell_reports(handle: sys::Terminal, collector: *mut Reported) -> Result<(), F
     // The first is what a terminal answers a program with. The second is the shell's own account of
     // itself, in the standard family (OSC 133): the core reports each step of a command as an event and
     // decodes the command line; what it does not do is interpret, so the mapping is the broker's contract
-    // rather than the core's reading of it. The last six are what a program asks of the world outside
-    // its screen — a title, a bell, the clipboard, a notification, how far along it is — which the core
-    // reads and reports, and none of which is drawn here.
+    // rather than the core's reading of it. The rest are what a program asks of the world outside its
+    // screen — a title, a bell, the clipboard, a notification, how far along it is, what it is doing —
+    // which the core reads and reports, and none of which is drawn here. While the last of those is
+    // set, the core answers a program that asks whether it is (`OSC 7501 ; ?`).
     for (option, callback, what) in [
         (
             sys::TerminalOption::WRITE_PTY,
@@ -282,6 +283,11 @@ fn tell_reports(handle: sys::Terminal, collector: *mut Reported) -> Result<(), F
             sys::TerminalOption::PROGRESS_REPORT,
             super::note_progress as *const std::ffi::c_void,
             "ghostty_terminal_set(PROGRESS_REPORT)",
+        ),
+        (
+            sys::TerminalOption::PROGRAM_STATUS,
+            super::note_program_status as *const std::ffi::c_void,
+            "ghostty_terminal_set(PROGRAM_STATUS)",
         ),
         (
             sys::TerminalOption::UNKNOWN_SEQUENCE,

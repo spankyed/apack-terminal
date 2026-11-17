@@ -36,7 +36,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [frames, view_wire, markers, png, recording]
+        target: [frames, view_wire, markers, png, recording, status]
     steps:
       - uses: actions/checkout@v4
 

@@ -21,6 +21,7 @@ use crate::holds::HoldLimit;
 use crate::markers::MarksKey;
 use crate::protocol::{CursorBlink, CursorStyle};
 use crate::recording::{self, Entry, Recorder, Timed};
+use crate::status;
 use crate::view::publish::{Outlet, Publication, ViewId};
 use crate::view::wire::{MAX_MESSAGE_BYTES, Position, Rows, Span};
 use crate::vt::image_sources::{Body, Load, Loaded, QUIET, Quiet, Refused, Scanner, Worker, says_unreadable};
@@ -1185,6 +1186,30 @@ impl Screen {
             }
         }
         effects
+    }
+
+    /// What the session's programs say they are doing, as a client is told it.
+    pub fn statuses(&self) -> Vec<status::Record> {
+        self.reported.get().statuses().told()
+    }
+
+    /// What the program itself says it is doing, where it has said.
+    pub fn status(&self) -> Option<status::State> {
+        self.reported.get().statuses().root()
+    }
+
+    /// Whether what the programs say they are doing has changed since this was last asked. Asking takes
+    /// it, and whoever asked owes its clients the records (`tell_statuses`).
+    pub fn take_statuses_stirred(&mut self) -> bool {
+        self.reported.get_mut().statuses_mut().take_stirred()
+    }
+
+    /// The records as a client is told them, having first said of each one taken since the last time
+    /// whether `front`, the foreground process group leader's arguments, is the program it names.
+    pub fn tell_statuses(&mut self, front: Option<&[String]>) -> Vec<status::Record> {
+        let statuses = self.reported.get_mut().statuses_mut();
+        statuses.confirm(front);
+        statuses.told()
     }
 
     /// What the shell has said about itself.

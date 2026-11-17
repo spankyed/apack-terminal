@@ -2650,3 +2650,119 @@ fn ten_thousand_commands_from_a_powershell_session_come_back_in_order() {
         );
     }
 }
+
+/// A report a program writes, as the text a shell's `printf` is typed (OSC 7501).
+#[cfg(unix)]
+fn says(body: &str) -> String {
+    prints(&format!("\\033]7501;{body}\\033\\\\"))
+}
+
+/// **What a session's programs say they are doing reaches a client whole, three ways.**
+///
+/// As it changes, in what the session is asked about itself, and in what a client that did not start
+/// the session is told of it — the last being what an app that restarted picks its terminals up from.
+/// Each carries every record as it stands, so nothing a client holds is merged with anything.
+///
+/// The shell's own `printf` writes the reports, so the shell is the program in front: the record that
+/// names it is confirmed, and the one naming a program that is not there is not.
+#[cfg(unix)]
+#[test]
+fn what_a_program_says_it_is_doing_reaches_a_client_whole() {
+    let broker = start();
+    let (mut reading, mut writing, session) = a_session(&broker);
+
+    types(&mut writing, &session, &says("state=working:app=sh:progress=30"));
+    let (told, _) = until(&mut reading, "program_status");
+    assert_eq!(told["session"], session.as_str());
+    let record = &told["statuses"][0];
+    assert_eq!(told["statuses"].as_array().expect("records").len(), 1);
+    assert_eq!(
+        (&record["id"], &record["state"], &record["app"], &record["progress"], &record["kind"]),
+        (
+            &serde_json::json!(""),
+            &serde_json::json!("working"),
+            &serde_json::json!("sh"),
+            &serde_json::json!(30),
+            &serde_json::Value::Null
+        )
+    );
+    assert_eq!(record["confirmed"], "matched", "the shell wrote it, and the shell is in front: {record}");
+
+    types(&mut writing, &session, &says("state=blocked:kind=permission:id=other:app=codex"));
+    let (told, _) = until(&mut reading, "program_status");
+    let records = told["statuses"].as_array().expect("records");
+    assert_eq!(records.len(), 2, "both, as they stand: {told}");
+    assert_eq!(records[0]["confirmed"], "matched", "what was confirmed stays so");
+    assert_eq!(
+        (&records[1]["id"], &records[1]["kind"]),
+        (&serde_json::json!("other"), &serde_json::json!("permission"))
+    );
+    assert_eq!(records[1]["confirmed"], "mismatched", "it says codex, and codex is not what is in front");
+    assert!(records[1]["changed"].as_u64() > records[0]["changed"].as_u64());
+
+    ask(&mut writing, &format!(r#"{{"kind":"facts","session":"{session}"}}"#));
+    assert_eq!(until(&mut reading, "facts").0["statuses"], told["statuses"]);
+    ask(&mut writing, r#"{"kind":"sessions"}"#);
+    assert_eq!(until(&mut reading, "sessions").0["sessions"][0]["statuses"], told["statuses"]);
+}
+
+/// **A wait can name what a program says of itself**, and is answered where the report lands.
+#[cfg(unix)]
+#[test]
+fn a_wait_for_a_status_is_answered_when_the_program_says_it() {
+    let broker = start();
+    let (mut reading, mut writing, session) = a_session(&broker);
+    let waits = |states: &str, timeout_ms: u32| {
+        format!(
+            r#"{{"kind":"wait","session":"{session}","until":{{"kind":"status","states":{states}}},"timeout_ms":{timeout_ms}}}"#
+        )
+    };
+
+    // Nothing has reported, so nothing is in any state: the wait is not met by a session that says nothing
+    ask(&mut writing, &waits(r#"["idle","done"]"#, 400));
+    assert_eq!(until(&mut reading, "waited").0["outcome"], "TIMEOUT");
+
+    types(&mut writing, &session, &says("state=working"));
+    until(&mut reading, "program_status");
+    ask(&mut writing, &waits(r#"["blocked","done"]"#, 30_000));
+    // What it reports on is not what it says of itself
+    types(&mut writing, &session, &says("state=done:id=step"));
+    until(&mut reading, "program_status");
+    for _ in 0..3 {
+        if let Ok(line) = reading.line(std::time::Duration::from_millis(300)) {
+            let event: serde_json::Value = serde_json::from_str(&line).expect("an event");
+            assert_ne!(event["kind"], "waited", "the program itself is still working: {event}");
+        }
+    }
+    types(&mut writing, &session, &says("state=blocked:kind=question"));
+    assert_eq!(until(&mut reading, "waited").0["outcome"], "MET");
+
+    // Already so when asked: answered at once
+    ask(&mut writing, &waits(r#"["blocked"]"#, 30_000));
+    assert_eq!(until(&mut reading, "waited").0["outcome"], "MET");
+
+    ask(&mut writing, &waits(r#"["idle"]"#, 30_000));
+    types(&mut writing, &session, &format!("exit{SUBMIT}"));
+    assert_eq!(until(&mut reading, "waited").0["outcome"], "EXITED", "nothing will say it now");
+}
+
+/// **A session ending tells what is left before it tells the exit**: what its programs were in the
+/// middle of ended with it, and what they finished is still there to be looked at.
+#[cfg(unix)]
+#[test]
+fn a_session_ending_tells_what_its_programs_finished_before_the_exit() {
+    let broker = start();
+    let (mut reading, mut writing, session) = a_session(&broker);
+
+    types(&mut writing, &session, &says("state=working"));
+    until(&mut reading, "program_status");
+    types(&mut writing, &session, &says("state=done:id=build"));
+    until(&mut reading, "program_status");
+
+    types(&mut writing, &session, &format!("exit{SUBMIT}"));
+    let (told, _) = until(&mut reading, "program_status");
+    let records = told["statuses"].as_array().expect("records");
+    assert_eq!(records.len(), 1, "{told}");
+    assert_eq!((&records[0]["id"], &records[0]["state"]), (&serde_json::json!("build"), &serde_json::json!("done")));
+    until(&mut reading, "exited");
+}

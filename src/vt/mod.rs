@@ -25,6 +25,7 @@ use crate::commands::{Commands, Machine, Moment, Outcome, Step, Unknown};
 use crate::markers::{self, Marker, MarksKey, Read, Vouched, cwd_from_url};
 use crate::protocol::{CursorBlink, CursorStyle};
 use crate::screen::Facts;
+use crate::status::{self, Records};
 use rows::Mark;
 use settings::Setting;
 
@@ -855,6 +856,8 @@ pub struct Reported {
     clock: Option<SystemTime>,
     /// Whose marks the commands above are taken from.
     marks: Marks,
+    /// What the session's programs say they are doing (OSC 7501), kept by the specification's rules.
+    statuses: Records,
 }
 
 /// Whose marks a session's commands are taken from, and how many keyed marks it has turned away.
@@ -1021,6 +1024,8 @@ impl Reported {
         if self.marks.keyed.as_mut().is_some_and(|(_, machine)| machine.end()) {
             self.finished(Outcome::Unknown(Unknown::SessionEnded), None);
         }
+        // Whatever was reporting is gone with the session, whether or not a mark said its command ended
+        self.statuses.ended();
     }
 
     /// Forgets what the shell said about itself and what is waiting to be told, keeping the commands and
@@ -1041,6 +1046,9 @@ impl Reported {
         self.line = None;
         self.effects.clear();
         self.replies.clear();
+        // What a program said it was doing is not what anything is doing now: a record a replay made
+        // would outlive it as a live one, and the last shell's programs are not the next one's
+        self.statuses = Records::default();
     }
 
     /// Forgets every command, for a screen about to be rebuilt from a recording: the replay reports them
@@ -1083,6 +1091,16 @@ impl Reported {
             }
         });
         effects
+    }
+
+    /// What the session's programs say they are doing.
+    pub fn statuses(&self) -> &Records {
+        &self.statuses
+    }
+
+    /// The same, to say which of them the program in front confirms and to take that they changed.
+    pub fn statuses_mut(&mut self) -> &mut Records {
+        &mut self.statuses
     }
 
     /// Each time the program began holding the screen (`true`) or let it go, in order, since last taken.
@@ -1220,6 +1238,8 @@ impl Reported {
         let now = self.now();
         self.commands.ended(outcome, cwd, now);
         self.effects.push(Effect::CommandFinished { outcome });
+        // The program that was reporting has ended with its command
+        self.statuses.ended();
     }
 
     fn moved(&mut self, cwd: String) {
@@ -1471,6 +1491,54 @@ unsafe extern "C" fn note_progress(
         _ => Progress::None,
     };
     reported.effects.push(Effect::Progress { state, percent: u8::try_from(report.progress).ok() });
+}
+
+/// A program said what it is doing (OSC 7501). The core has already held the report to the
+/// specification; what is kept of it, and for how long, is `status::Records`.
+// SAFETY: the core calls this during a parse of the terminal that `route_reports` gave `Reported` as its
+// userdata, which is live for the call; the pointers are those the core documents for this option
+pub(super) unsafe extern "C" fn note_program_status(
+    _terminal: sys::Terminal,
+    userdata: *mut std::ffi::c_void,
+    report: *const sys::TerminalProgramStatus,
+) {
+    if userdata.is_null() || report.is_null() {
+        return;
+    }
+    // SAFETY: both pointers are the library's, valid for this call
+    let (reported, report) = unsafe { (&mut *userdata.cast::<Reported>(), &*report) };
+    let state = match report.state {
+        sys::ProgramStatusState::IDLE => Some(status::State::Idle),
+        sys::ProgramStatusState::WORKING => Some(status::State::Working),
+        sys::ProgramStatusState::DONE => Some(status::State::Done),
+        sys::ProgramStatusState::BLOCKED => Some(status::State::Blocked),
+        sys::ProgramStatusState::ERROR => Some(status::State::Error),
+        sys::ProgramStatusState::CLEAR => None,
+        // A state this build does not know is not one it can keep a record in
+        _ => return,
+    };
+    let kind = match report.kind {
+        sys::ProgramStatusKind::PERMISSION => Some(status::Kind::Permission),
+        sys::ProgramStatusKind::QUESTION => Some(status::Kind::Question),
+        sys::ProgramStatusKind::AUTH => Some(status::Kind::Auth),
+        _ => None,
+    };
+    // SAFETY: the library owns each string for this call, and `text_of` copies it
+    let (id, app, title, message) =
+        unsafe { (text_of(&report.id), text_of(&report.app), text_of(&report.title), text_of(&report.message)) };
+    let now = reported.now();
+    reported.statuses.apply(
+        status::Report {
+            state,
+            kind,
+            progress: u8::try_from(report.progress).ok(),
+            id: id.unwrap_or_default(),
+            app,
+            title,
+            message,
+        },
+        now,
+    );
 }
 
 /// The program began holding the screen (mode 2026), or let it go.

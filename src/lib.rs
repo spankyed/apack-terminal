@@ -20,6 +20,7 @@ pub mod recording;
 pub mod screen;
 pub mod security;
 pub mod session;
+pub mod status;
 pub mod tree;
 pub mod view;
 pub mod writer;

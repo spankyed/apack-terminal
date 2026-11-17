@@ -1058,8 +1058,11 @@ fn carry_out(live: &Sessions, connection: u64, request: Request) {
         Request::Facts { session } => {
             // What the shell said and what the pty measures, one after the other: nothing holds the
             // process still between them, and nothing could
-            match live.handle(&session).and_then(|handle| Ok((handle.facts()?, handle.foreground()))) {
-                Ok(((facts, vouching), foreground)) => {
+            match live
+                .handle(&session)
+                .and_then(|handle| Ok((handle.facts()?, handle.foreground(), handle.statuses()?)))
+            {
+                Ok(((facts, vouching), foreground, statuses)) => {
                     live.answer(Event::Facts {
                         session,
                         cwd: facts.cwd,
@@ -1070,6 +1073,7 @@ fn carry_out(live: &Sessions, connection: u64, request: Request) {
                         vouched: vouching.keyed,
                         refused: vouching.refused,
                         foreground,
+                        statuses,
                     });
                     Ok(())
                 }
