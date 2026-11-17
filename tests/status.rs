@@ -189,21 +189,24 @@ fn a_program_that_asks_is_told_the_protocol_is_read() {
     );
 }
 
-/// The records are told once for what one read changed, however many reports it held, and not again
-/// until something changes.
+/// A change is noticed once, however many reports one read held, and not again until something changes:
+/// that is what a client being told the records hangs on.
 #[test]
-fn what_one_read_changed_is_told_once() {
+fn what_one_read_changed_is_noticed_once() {
     let mut screen = fed(&[report("state=working"), report("state=blocked"), report("state=working:id=a")].concat());
-    let told = screen.take_statuses(None).expect("the read changed them");
-    assert_eq!(told.len(), 2);
-    assert_eq!(screen.take_statuses(None), None, "nothing since");
+    assert!(screen.take_statuses_stirred(), "the read changed them");
+    assert_eq!(screen.tell_statuses(None).len(), 2);
+    assert!(!screen.take_statuses_stirred(), "nothing since");
     // Saying again what a record already says changes nothing
     screen.feed(report("state=blocked").as_bytes());
-    assert_eq!(screen.take_statuses(None), None);
+    assert!(!screen.take_statuses_stirred());
     screen.feed(report("state=clear:id=nothing-by-this-name").as_bytes());
-    assert_eq!(screen.take_statuses(None), None, "a clear that took nothing");
+    assert!(!screen.take_statuses_stirred(), "a clear that took nothing");
+    screen.feed(b"plain output");
+    assert!(!screen.take_statuses_stirred(), "output that reports nothing");
     screen.feed(report("state=clear").as_bytes());
-    assert_eq!(screen.take_statuses(None), Some(vec![]), "the last record going is a change");
+    assert!(screen.take_statuses_stirred(), "the last record going is a change");
+    assert_eq!(screen.tell_statuses(None), vec![]);
 }
 
 /// A record is checked against the program in front when it is taken, and keeps that answer: what is
@@ -212,12 +215,12 @@ fn what_one_read_changed_is_told_once() {
 fn a_record_is_checked_once_against_the_program_in_front_when_it_is_taken() {
     let mut screen = fed(&[report("state=working:app=codex"), report("state=working:id=other:app=cargo")].concat());
     let codex = args(&["/usr/local/lib/codex/bin/codex", "-s", "read-only"]);
-    let told = screen.take_statuses(Some(&codex)).expect("changed");
+    let told = screen.tell_statuses(Some(&codex));
     assert_eq!(told[0].confirmed, Confirmed::Matched);
     assert_eq!(told[1].confirmed, Confirmed::Mismatched, "codex is in front, and this one says cargo");
 
     screen.feed(report("state=done:id=later:app=codex").as_bytes());
-    let told = screen.take_statuses(Some(&args(&["cat", "codex"]))).expect("changed");
+    let told = screen.tell_statuses(Some(&args(&["cat", "codex"])));
     assert_eq!(
         told.iter().find(|record| record.id.is_empty()).map(|record| record.confirmed),
         Some(Confirmed::Matched)
@@ -232,7 +235,7 @@ fn a_record_is_checked_once_against_the_program_in_front_when_it_is_taken() {
 #[test]
 fn a_record_is_checked_as_the_program_it_inherits() {
     let mut screen = fed(&[report("state=working:app=deploy"), report("state=working:id=us-east")].concat());
-    let told = screen.take_statuses(Some(&args(&["deploy"]))).expect("changed");
+    let told = screen.tell_statuses(Some(&args(&["deploy"])));
     assert_eq!(told[1].confirmed, Confirmed::Matched);
 }
 
@@ -251,6 +254,7 @@ fn the_program_in_front_is_what_it_was_run_as_or_the_script_an_interpreter_runs(
     assert_eq!(matched("codex", &["cat", "codex"]), Confirmed::Mismatched, "an argument is not the program");
     assert_eq!(matched("codex", &["node", "other.js", "codex"]), Confirmed::Mismatched);
     assert_eq!(matched("claude", &["claude-code"]), Confirmed::Mismatched, "an alias reads one way");
+    assert_eq!(matched("codex", &["claude"]), Confirmed::Mismatched, "another program's alias is not this one's");
     assert_eq!(matched("codex", &["codex-helper"]), Confirmed::Mismatched);
 }
 
@@ -261,7 +265,7 @@ fn nothing_to_compare_is_unknown_and_never_a_mismatch() {
     assert_eq!(confirmed(Some("codex"), Some(&[])), Confirmed::Unknown);
     assert_eq!(confirmed(Some("codex"), Some(&args(&[""]))), Confirmed::Unknown);
     let mut screen = fed(&report("state=working:app=codex"));
-    assert_eq!(screen.take_statuses(None).expect("changed")[0].confirmed, Confirmed::Unknown);
+    assert_eq!(screen.tell_statuses(None)[0].confirmed, Confirmed::Unknown);
 }
 
 /// What a program said it was doing in a recording is not what anything is doing now.
@@ -273,7 +277,7 @@ fn a_recording_replayed_holds_no_record_and_answers_nothing() {
     let mut screen = Screen::new(80, 24);
     assert!(screen.replay_all(&entries));
     assert_eq!(states(&screen), vec![]);
-    assert_eq!(screen.take_statuses(None), None);
+    assert!(!screen.take_statuses_stirred());
     assert_eq!(screen.take_replies(), Vec::<String>::new());
     // And what the last shell's programs said is not carried into the next one's
     let mut live = fed(&report("state=done:app=codex"));

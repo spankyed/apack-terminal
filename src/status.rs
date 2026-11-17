@@ -181,11 +181,6 @@ impl Records {
         std::mem::take(&mut self.stirred)
     }
 
-    /// Whether a record has changed since it was last taken.
-    pub fn stirred(&self) -> bool {
-        self.stirred
-    }
-
     /// Every record as a client is told it, by id, each with the program it names or inherits.
     pub fn told(&self) -> Vec<Record> {
         let mut told: Vec<Record> =

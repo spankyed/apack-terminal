@@ -1198,18 +1198,18 @@ impl Screen {
         self.reported.get().statuses().root()
     }
 
-    /// Whether what the programs say they are doing has changed and not been taken.
-    pub fn statuses_stirred(&self) -> bool {
-        self.reported.get().statuses().stirred()
+    /// Whether what the programs say they are doing has changed since this was last asked. Asking takes
+    /// it, and whoever asked owes its clients the records (`tell_statuses`).
+    pub fn take_statuses_stirred(&mut self) -> bool {
+        self.reported.get_mut().statuses_mut().take_stirred()
     }
 
-    /// The records as they stand, where one has changed since this was last called — having first said
-    /// of each new one whether `front`, the foreground process group leader's arguments, is the program
-    /// it names.
-    pub fn take_statuses(&mut self, front: Option<&[String]>) -> Option<Vec<status::Record>> {
+    /// The records as a client is told them, having first said of each one taken since the last time
+    /// whether `front`, the foreground process group leader's arguments, is the program it names.
+    pub fn tell_statuses(&mut self, front: Option<&[String]>) -> Vec<status::Record> {
         let statuses = self.reported.get_mut().statuses_mut();
         statuses.confirm(front);
-        statuses.take_stirred().then(|| statuses.told())
+        statuses.told()
     }
 
     /// What the shell has said about itself.

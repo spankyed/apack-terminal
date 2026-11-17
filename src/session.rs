@@ -1250,7 +1250,7 @@ impl Sessions {
                             let (taken, next) = screen.feed_until_image(unfed);
                             replies.extend(screen.take_replies());
                             effects.extend(screen.take_effects());
-                            stirred |= screen.statuses_stirred();
+                            stirred |= screen.take_statuses_stirred();
                             let recent = rows_added(&unfed[..taken], screen.cols());
                             met += settle_met(&waiting, &screen, recent);
                             // Each view that has drawn its last frame is sent what changed, here
@@ -1279,8 +1279,7 @@ impl Sessions {
                         // wait on. The records are then sent whole, as they stand
                         if stirred {
                             let front = fronting.lock().ok().and_then(|pty| pty.as_deref().and_then(front_of));
-                            let told =
-                                parsing.lock().ok().and_then(|mut screen| screen.take_statuses(front.as_deref()));
+                            let told = parsing.lock().ok().map(|mut screen| screen.tell_statuses(front.as_deref()));
                             if let Some(statuses) = told {
                                 let _ = reader_events.send(Outgoing::answer(Event::ProgramStatus {
                                     session: reader_session.clone(),
@@ -1354,7 +1353,8 @@ impl Sessions {
                     screen.session_ended();
                     // Nothing is in front of a pty that is gone, so a record the last read took and
                     // nothing has checked stays unconfirmed
-                    (screen.take_effects(), screen.take_statuses(None))
+                    let left = screen.take_effects();
+                    (left, screen.take_statuses_stirred().then(|| screen.tell_statuses(None)))
                 },
             );
             for effect in left {
