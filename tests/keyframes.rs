@@ -231,9 +231,14 @@ fn written(most: usize) -> impl Strategy<Value = Vec<u8>> {
 /// while margins are not allowed and a pair of margins while they are.
 const SAVES_THE_CURSOR: &[&str] = &["\x1b7", "\x1b[s", "\x1b[?1048h", "\x1b[?1049h"];
 
-/// The same, with left and right margins among them, and nothing that saves the cursor.
+/// The same, with left and right margins among them, and nothing that saves the cursor or is a mark of
+/// the shell's.
 fn written_in_margins(most: usize) -> impl Strategy<Value = Vec<u8>> {
-    let unsaved: Vec<&str> = WRITTEN.iter().copied().filter(|piece| !SAVES_THE_CURSOR.contains(piece)).collect();
+    let unsaved: Vec<&str> = WRITTEN
+        .iter()
+        .copied()
+        .filter(|piece| !SAVES_THE_CURSOR.contains(piece) && !piece.starts_with("\x1b]133;"))
+        .collect();
     let pieces = prop_oneof![9 => prop::sample::select(unsaved), 1 => prop::sample::select(MARGINS)];
     prop::collection::vec(pieces, 0..most).prop_map(|pieces| pieces.concat().into_bytes())
 }
@@ -288,12 +293,9 @@ proptest! {
 
     /// **And inside left and right margins, less two things the core does not hold there.**
     ///
-    /// *Which rows carry the shell's prompt mark.* With margins set, a scroll moves the cells between
-    /// them and leaves the rows where they are, and whether a row keeps the mark the shell put on it
-    /// then differs between a terminal and the one put back from a keyframe taken earlier — with nothing
-    /// else of the two differing before or after, and no difference where the keyframe is taken just
-    /// before the scroll. It is recorded here rather than explained, and the marks are left out of what
-    /// is compared.
+    /// *Which rows carry the shell's prompt mark* once a program scrolls between margins
+    /// (`a_prompt_mark_is_not_kept_alike_across_a_scroll_between_margins`), and with it what the core
+    /// does by where a prompt is: nothing here is a mark of the shell's.
     ///
     /// *A wrap pending at a margin.* The core writes out no wrap pending short of the screen's edge
     /// (`a_wrap_pending_at_a_right_margin_is_not_written_out`), of the cursor or of a cursor that was
@@ -308,12 +310,9 @@ proptest! {
     ) {
         let put_back = put_back(&before, &after, &[]);
         prop_assume!(put_back.is_some());
-        for (what, (mut back, mut live)) in ["as it was put back", "after what was written next"].into_iter().zip(put_back.expect("assumed")) {
-            for row in back.rows.iter_mut().chain(live.rows.iter_mut()) {
-                row.prompt = false;
-            }
-            prop_assert_eq!(back, live, "{}", what);
-        }
+        let [(back, live), (back_later, live_later)] = put_back.expect("assumed");
+        prop_assert_eq!(back, live, "as it was put back");
+        prop_assert_eq!(back_later, live_later, "after what was written next");
     }
 
     /// **A moment is the same screen from whichever keyframe it is replayed.** A recording holds a
@@ -442,6 +441,35 @@ fn a_wrap_pending_at_a_right_margin_is_not_written_out() {
     let mut back = terminal(COLUMNS, ROWS);
     back.restore(&taken).expect("a keyframe is put back");
     assert_eq!(seen(&back), seen(&edge));
+}
+
+/// **Which rows keep the shell's prompt mark across a scroll between margins is not the same in a terminal
+/// put back.** With left and right margins set, a scroll moves the cells between them and leaves the rows
+/// where they are; a row the shell marked as its prompt then keeps the mark in the terminal that was
+/// written out and loses it in the one put back from a keyframe taken before the mark was made, with
+/// every row's text the same in both. Nothing a keyframe holds differs between the two when it is taken,
+/// so this is the core's, by something of how it lays a terminal out. **When this fails the core treats
+/// the two alike**, and the shell's marks can go back among what the property above writes.
+#[test]
+fn a_prompt_mark_is_not_kept_alike_across_a_scroll_between_margins() {
+    let mut live = terminal(COLUMNS, ROWS);
+    live.feed(b"\x1b[?69h");
+    let taken = live.keyframe(KEYFRAME_HISTORY_LINES, KEYFRAME_BYTES).expect("the terminal is written out");
+    let mut back = terminal(COLUMNS, ROWS);
+    back.restore(&taken).expect("a keyframe is put back");
+    assert_eq!(seen(&back), seen(&live));
+    // A prompt marked, the screen cleared and scrolled, margins set, and a scroll between them
+    for terminal in [&mut live, &mut back] {
+        terminal.feed(b"\x1b]133;A\x07$ \x1b[2J\x1b[2S\x1b[3;12s\x1bE\x1b[2S");
+    }
+    let marked = |terminal: &Terminal| seen(terminal).rows.iter().filter(|row| row.prompt).count();
+    let text = |terminal: &Terminal| -> Vec<RowRead> {
+        let mut rows = seen(terminal).rows;
+        rows.iter_mut().for_each(|row| row.prompt = false);
+        rows
+    };
+    assert_eq!(text(&back), text(&live), "the rows differ in more than the shell's mark");
+    assert_ne!(marked(&back), marked(&live), "the core now keeps a prompt's mark alike in a terminal put back");
 }
 
 /// **A cursor a program asked for is kept, whichever default the terminal put back is under.** Telling
@@ -744,13 +772,16 @@ fn pictures(screen: &mut Screen) -> Vec<(u32, bool)> {
     held
 }
 
-/// **A keyframe's images are all of them, each whole, or none.** A snapshot holds an image's pixels after
-/// the page it is shown on, so a keyframe cut for its history can hold an image without them, which would
-/// be drawn as an empty place. One whose every image is whole is put back with them; one cut short of any
-/// is put back with none, which is what a recording shows of the images sent before a keyframe.
+/// **A keyframe holds its terminal's images, each whole, or none of them.** A snapshot holds an image's
+/// pixels after the page it is shown on, and after everything those of an image shown nowhere, so a
+/// keyframe cut for its history is cut short of them: they are kept after the history, and the terminal
+/// put back shows the image wherever it is, or is next, shown. Where they are more than a keyframe has
+/// room for it holds no image, and nothing is put back as a place with nothing in it.
 #[test]
 fn a_keyframe_holds_every_image_whole_or_none_of_them() {
     let shown = |screen: &mut Screen, id: u32| picture(id, 20, 20, 'T').iter().for_each(|piece| screen.feed(piece));
+    let lines: String = (0..6_000).map(|number| format!("line {number}\r\n")).collect();
+    let place = |screen: &mut Screen, id: u32| screen.feed(format!("\x1b_Ga=p,i={id},q=2\x1b\\").as_bytes());
     // A picture on the screen and one a few lines up, in a short history: both are held, pixels and all
     let mut live = pictured(40, 6);
     shown(&mut live, 3);
@@ -764,21 +795,39 @@ fn a_keyframe_holds_every_image_whole_or_none_of_them() {
     assert_eq!(back.image(3, 0).map(|read| read.bytes), live.image(3, 0).map(|read| read.bytes));
 
     // One kept and shown nowhere, under a history longer than a keyframe holds: its pixels are after all
-    // of the history, past the cut. So no image is held — and where the program then shows the one it
-    // kept, the terminal put back shows nothing rather than a place with nothing in it
+    // of the history, past the cut, and are kept all the same. Shown later, it is the picture it was
     let mut long = pictured(40, 6);
     picture(5, 20, 20, 't').iter().for_each(|piece| long.feed(piece));
-    let lines: String = (0..6_000).map(|number| format!("line {number}\r\n")).collect();
     long.feed(lines.as_bytes());
     shown(&mut long, 6);
-    let entries = [Timed { at: 1, entry: keyframe_of(&long, 40, 6) }];
+    let Entry::Keyframe { state, .. } = keyframe_of(&long, 40, 6) else { unreachable!() };
+    assert!(state.len() < KEYFRAME_BYTES / 8, "{} bytes for a screen, a thousand lines and two pictures", state.len());
+    let entries = [Timed { at: 1, entry: Entry::Keyframe { cols: 40, rows: 6, state } }];
+    let mut back = pictured(40, 6);
+    assert!(back.replay(&entries, u64::MAX));
+    let history = back.scrollback_rows();
+    assert!((KEYFRAME_HISTORY_LINES..3 * KEYFRAME_HISTORY_LINES).contains(&history), "{history} lines of history");
+    for screen in [&mut long, &mut back] {
+        place(screen, 5);
+    }
+    assert_eq!(pictures(&mut back), [(5, true), (6, true)]);
+    assert_eq!(pictures(&mut long), [(5, true), (6, true)]);
+    assert_eq!(back.image(5, 0).map(|read| read.bytes), long.image(5, 0).map(|read| read.bytes));
+
+    // One of more pixels than a keyframe has room for, kept the same way: no image is held, and where the
+    // program then shows it the terminal put back shows nothing rather than a place with nothing in it
+    let mut large = pictured(40, 6);
+    picture(7, 1_200, 1_200, 't').iter().for_each(|piece| large.feed(piece));
+    large.feed(lines.as_bytes());
+    shown(&mut large, 8);
+    let entries = [Timed { at: 1, entry: keyframe_of(&large, 40, 6) }];
     let mut back = pictured(40, 6);
     assert!(back.replay(&entries, u64::MAX));
     assert!(back.scrollback_rows() >= KEYFRAME_HISTORY_LINES, "the history gave way to an image");
-    for screen in [&mut long, &mut back] {
-        screen.feed(b"\x1b_Ga=p,i=5,q=2\x1b\\");
+    for screen in [&mut large, &mut back] {
+        place(screen, 7);
     }
-    assert_eq!(pictures(&mut long), [(5, true), (6, true)]);
+    assert_eq!(pictures(&mut large), [(7, true), (8, true)]);
     assert_eq!(pictures(&mut back), [], "an image was put back from a keyframe that does not hold every image");
     // And a session that takes no images is put back with none, whatever the keyframe holds
     let entries = [Timed { at: 1, entry: keyframe_of(&live, 40, 6) }];

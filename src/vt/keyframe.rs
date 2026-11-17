@@ -16,16 +16,16 @@
 //! snapshot: what is renderable, and history until there are `history` lines of it. What a keyframe
 //! leaves out is still in its recording, as the bytes that printed it.
 //!
-//! **Where to stop is asked of the core.** The snapshot's bytes are the core's and are not read here:
-//! what was encoded is decoded once, a record at a time, and the decoder says how many lines each
-//! brought and how far into the bytes it has read. So a keyframe is cut where a record ends, it says
+//! **Where to stop is asked of the core.** What was encoded is decoded once, a record at a time, and the
+//! decoder says how many lines each brought and how far into the bytes it has read. So a keyframe is cut where a record ends, it says
 //! how many records of history it holds, and one that is written is one that has been restored.
 //!
 //! **It says two things more.** What cursor its terminal was told a reset returns to, which is a
 //! setting and not the terminal's state, and is here because it is the one setting the core does not
 //! take without touching state (`Terminal::tell_again`): a terminal put back under the same one is not
-//! told it again. And whether it holds the pixels of every image its terminal held, which a keyframe
-//! cut for its history may not (`Terminal::keyframe`).
+//! told it again. And whether it holds the pixels of every image its terminal held: a keyframe cut for
+//! its history is cut short of some, which are kept after the history where they fit, and where they
+//! do not the keyframe is put back with no images (`Terminal::keyframe`).
 //!
 //! **Held to it, not taken on trust.** That a terminal put back goes on as the one written out is a
 //! property `tests/keyframes.rs` checks over generated output. It holds outside left and right margins
@@ -79,6 +79,102 @@ unsafe extern "C" fn take(userdata: *mut std::ffi::c_void, data: *const u8, len:
         beginning.taken.extend_from_slice(unsafe { std::slice::from_raw_parts(data, len) });
     }
     true
+}
+
+/// What a cut of a snapshot's beginning keeps (`Terminal::cut`).
+struct Kept {
+    /// The snapshot up to where its last kept record ends
+    snapshot: Vec<u8>,
+    /// How many records after what makes the terminal renderable that is
+    records: u32,
+    /// The lines of history those records brought
+    lines: usize,
+    /// Whether they hold the pixels of every image the terminal holds
+    whole: bool,
+}
+
+/// The tag of a record that is one image's pixels, and the bytes a record begins with: its tag, its
+/// payload's length and a checksum, as upstream documents a snapshot's framing.
+const PIXELS: u16 = 9;
+const RECORD_HEAD: usize = 2 + 4 + 4;
+
+/// What an encoding is read through for the pixels a cut left behind: every record past `skip` bytes
+/// that is an image's pixels, whole, while they fit `room`.
+struct Pixels {
+    skip: usize,
+    room: usize,
+    kept: Vec<u8>,
+    records: u32,
+    /// The head of the record being read, and how much of it has arrived
+    head: [u8; RECORD_HEAD],
+    held: usize,
+    /// How much of the record's payload has yet to arrive, and whether it is being kept
+    left: usize,
+    keeping: bool,
+    /// The pixels did not fit, and the encoding was ended
+    over: bool,
+}
+
+/// Reads the records the encoder writes, keeping those that are pixels.
+///
+/// # Safety
+///
+/// `userdata` is the `Pixels` handed to `ghostty_snapshot_encode` with this function, live for that call,
+/// and `data` is `len` bytes the encoder owns for the length of this one.
+unsafe extern "C" fn take_pixels(userdata: *mut std::ffi::c_void, data: *const u8, len: usize) -> bool {
+    // SAFETY: the caller's contract, above
+    let pixels = unsafe { &mut *userdata.cast::<Pixels>() };
+    // SAFETY: the caller's contract, above
+    let mut data: &[u8] = if len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(data, len) } };
+    let skipped = pixels.skip.min(data.len());
+    pixels.skip -= skipped;
+    data = &data[skipped..];
+    while !data.is_empty() {
+        if pixels.left == 0 {
+            let more = (RECORD_HEAD - pixels.held).min(data.len());
+            pixels.head[pixels.held..pixels.held + more].copy_from_slice(&data[..more]);
+            pixels.held += more;
+            data = &data[more..];
+            if pixels.held < RECORD_HEAD {
+                break;
+            }
+            let [tag_low, tag_high, length @ .., _, _, _, _] = pixels.head;
+            pixels.held = 0;
+            pixels.left = u32::from_le_bytes(length) as usize;
+            pixels.keeping = u16::from_le_bytes([tag_low, tag_high]) == PIXELS;
+            if pixels.keeping {
+                if RECORD_HEAD + pixels.left > pixels.room - pixels.kept.len() {
+                    pixels.over = true;
+                    return false;
+                }
+                pixels.kept.extend_from_slice(&pixels.head);
+                pixels.records += 1;
+            }
+        } else {
+            let more = pixels.left.min(data.len());
+            if pixels.keeping {
+                pixels.kept.extend_from_slice(&data[..more]);
+            }
+            pixels.left -= more;
+            data = &data[more..];
+        }
+    }
+    true
+}
+
+/// Where the last whole record of `snapshot` ends. A decoder that has read a record has read the head
+/// of the next as well, so what it says it has read is that much past where the record ended.
+fn last_record_end(snapshot: &[u8]) -> usize {
+    // A snapshot begins with ten bytes that say it is one, and its records follow
+    let mut at = 10.min(snapshot.len());
+    while let Some(head) = snapshot.get(at..at + RECORD_HEAD) {
+        let length = u32::from_le_bytes([head[2], head[3], head[4], head[5]]) as usize;
+        match at.checked_add(RECORD_HEAD + length) {
+            Some(next) if next <= snapshot.len() => at = next,
+            _ => break,
+        }
+    }
+    at
 }
 
 /// A snapshot being decoded, freed with the value.
@@ -177,10 +273,11 @@ impl Terminal {
     ///
     /// **Its images are all of them or none.** A snapshot holds the pixels of the images on screen with
     /// the screen, those of an image up the history after the page it is on, and after everything
-    /// those of an image shown nowhere; so a keyframe cut for its history may hold an image without
-    /// its pixels, which would be drawn as an empty place wherever it is, or is next, shown. A keyframe
-    /// says whether it holds every image's pixels, and one that does not is put back with no images,
-    /// which is what its recording then shows of them: the ones sent after it.
+    /// those of an image shown nowhere; so a keyframe cut for its history is cut short of some. Those
+    /// are then read out of the rest of the snapshot and kept after the history (`with_pixels`), where
+    /// the core takes them as well. Where they do not fit `most` the keyframe says so and is put back
+    /// with no images, rather than with places that would be drawn empty: what its recording then
+    /// shows of them is the ones sent after it.
     ///
     /// **The smallest cut that holds it is found from below**, an eighth of the last each time, because
     /// encoding stops where the cut is and not where the lines asked for end: a history of short lines is
@@ -191,11 +288,73 @@ impl Terminal {
         for most in [most / 64, most / 8, most] {
             let beginning = self.encoded(most)?;
             last = self.cut(&beginning, history);
-            if matches!(&last, Ok((_, lines)) if !beginning.cut || *lines >= history as usize) {
+            if matches!(&last, Ok(kept) if !beginning.cut || kept.lines >= history as usize) {
                 break;
             }
         }
-        last.map(|(keyframe, _)| keyframe)
+        let mut kept = last?;
+        if !kept.whole {
+            self.with_pixels(&mut kept, most);
+        }
+        let mut keyframe = Vec::with_capacity(HEAD + kept.snapshot.len());
+        keyframe.extend_from_slice(&kept.records.to_le_bytes());
+        keyframe.extend_from_slice(&self.told_cursor());
+        keyframe.push(u8::from(kept.whole));
+        keyframe.extend_from_slice(&kept.snapshot);
+        Ok(keyframe)
+    }
+
+    /// Adds to a cut the pixels it was cut short of, where all of them fit `most` with it.
+    ///
+    /// **The one thing read of a snapshot's bytes is where its records begin and which are pixels**, as
+    /// upstream documents the framing, and the core takes an image's pixels anywhere after what makes
+    /// the terminal renderable. What results is decoded before it is kept, so were the framing another
+    /// the keyframe would be one without images, never a wrong one. The whole snapshot is encoded for
+    /// this and read past, which is the cost of a whole history's encoding: paid only by a terminal
+    /// holding an image that is not on its screen.
+    fn with_pixels(&self, kept: &mut Kept, most: usize) {
+        let ends = last_record_end(&kept.snapshot);
+        let mut pixels = Pixels {
+            skip: ends,
+            room: most.saturating_sub(ends),
+            kept: Vec::new(),
+            records: 0,
+            head: [0; RECORD_HEAD],
+            held: 0,
+            left: 0,
+            keeping: false,
+            over: false,
+        };
+        let writer = sys::Writer { write: Some(take_pixels), userdata: (&raw mut pixels).cast() };
+        // SAFETY: the handle is live and nothing writes to it for `&self`; `pixels` outlives the call,
+        // which is the only thing that calls `take_pixels` with it
+        let result = unsafe { sys::ghostty_snapshot_encode(self.handle, writer) };
+        if pixels.over || result != sys::Result::SUCCESS {
+            return;
+        }
+        let with = [&kept.snapshot[..ends], &pixels.kept].concat();
+        let records = kept.records + pixels.records;
+        if Self::holds_every_image(&with, records) {
+            (kept.snapshot, kept.records, kept.whole) = (with, records, true);
+        }
+    }
+
+    /// Whether `snapshot`, of which `records` records follow what makes its terminal renderable, decodes
+    /// to a terminal with the pixels of every image it holds.
+    fn holds_every_image(snapshot: &[u8], records: u32) -> bool {
+        let Ok(decoding) = Decoding::of(snapshot, true) else { return false };
+        let Ok(scratch) = decoding.ready() else { return false };
+        let to_come = decoding.pixels_to_come();
+        let mut pixels = 0u64;
+        let decoded = (0..records).all(|_| {
+            let more = decoding.next();
+            pixels += decoding.count(sys::SnapshotDecoderData::PROGRESS_IMAGE_BYTES) as u64;
+            more
+        });
+        drop(decoding);
+        // SAFETY: the terminal `ready` answered is this function's, and its decoder is gone
+        unsafe { sys::ghostty_terminal_free(scratch) };
+        decoded && pixels >= to_come
     }
 
     /// The first `most` bytes of this terminal's snapshot.
@@ -214,7 +373,7 @@ impl Terminal {
 
     /// The keyframe a snapshot's beginning makes: cut where the last record ends that is needed for
     /// `history` lines, or that there is. Answers it with the lines of history those records brought.
-    fn cut(&self, beginning: &Beginning, history: u32) -> Result<(Vec<u8>, usize), Failed> {
+    fn cut(&self, beginning: &Beginning, history: u32) -> Result<Kept, Failed> {
         let decoding = Decoding::of(&beginning.taken, true)?;
         let scratch = decoding.ready()?;
         let to_come = decoding.pixels_to_come();
@@ -229,12 +388,7 @@ impl Terminal {
         drop(decoding);
         // SAFETY: the terminal `ready` answered is this function's, and its decoder is gone
         unsafe { sys::ghostty_terminal_free(scratch) };
-        let mut keyframe = Vec::with_capacity(HEAD + kept);
-        keyframe.extend_from_slice(&records.to_le_bytes());
-        keyframe.extend_from_slice(&self.told_cursor());
-        keyframe.push(u8::from(pixels >= to_come));
-        keyframe.extend_from_slice(&beginning.taken[..kept]);
-        Ok((keyframe, lines))
+        Ok(Kept { snapshot: beginning.taken[..kept].to_vec(), records, lines, whole: pixels >= to_come })
     }
 
     /// Puts the terminal `keyframe` holds in this one's place, under this one's settings.

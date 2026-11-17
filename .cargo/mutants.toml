@@ -144,6 +144,11 @@ exclude_re = [
     # that holds it; with the middle one some other size the same keyframe is found one cut later, or one
     # sooner, and it is cut where the same record ends. `benches/keyframe.rs` is where the cost shows
     "vt/keyframe.rs:.*replace / with % in Terminal::keyframe",
+
+    # **When a keyframe that could not be taken is asked for again is what the asking costs.** Not put
+    # off, it is asked for at the end of every read until it can be taken, and the recording holds the
+    # same entries either way: the same output, and the same keyframe once the terminal fits one
+    "recording.rs:.*replace Recorder::put_off_keyframe with \\(\\)",
     # The same for the key and mouse encoders a session keeps, which are four more handles with one owner
     "vt/input.rs:.*<impl Drop for Encoders>::drop",
 

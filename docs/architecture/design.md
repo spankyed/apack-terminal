@@ -193,9 +193,10 @@ holds outside left and right margins; inside them it found what the core's snaps
 line about to wrap at a right margin short of the screen's edge, and which rows keep the shell's prompt
 mark across a scroll — each pinned by a case that fails the day the core holds it.
 
-A keyframe's images are all of them or none: one cut for its history that would hold an image without
-its pixels is put back with no images, and what its recording then shows of them is the ones sent
-after it. A terminal that does not fit a keyframe — an image a program is part way through sending is
+A keyframe holds its terminal's images: the pixels a cut for its history leaves behind are kept after the
+history, where the core takes them as well. Where they are more than a keyframe has room for it holds
+none, rather than an image that would be drawn as an empty place, and what its recording then shows of
+them is the ones sent after it. A terminal that does not fit a keyframe — an image a program is part way through sending is
 megabytes written out with the screen — has its keyframe put off, and is recorded all the while.
 
 A keyframe is taken on whichever screen is showing, waits for the parser to be between sequences — which
