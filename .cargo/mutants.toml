@@ -234,6 +234,11 @@ exclude_re = [
     # address from being sent as a link if it ever did
     "vt/rows.rs:.*replace match guard written == 0 with false in Terminal::read_link",
 
+    # **A write and a flush at the same instant.** `>` and `>=` answer alike for every pair of moments but
+    # one in which the program was written to and output flushed on the same tick of the clock, which no case
+    # can arrange and nothing depends on: either way, output after it is sent at once or within a window
+    "output.rs:.*replace > with >= in Wrote::since",
+
     # **Where a read is cut to look for a hold, not what is parsed.** It only adds cuts: every byte is
     # still fed in order and every hold the scan finds is still settled after its sequence, so what
     # differs is how many calls into the core one read is. The one thing a case could see is a hold
