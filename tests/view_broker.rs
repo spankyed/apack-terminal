@@ -424,6 +424,25 @@ impl View {
         }
     }
 
+    /// Resizes the session over `client`'s connection, as a window does, and takes frames until one is of
+    /// the grid asked for.
+    ///
+    /// **A resize is answered by nothing but its frame, and comes on another connection than this view's**,
+    /// so without the wait a case reads the screen before the resize has landed: placeholder cells under a
+    /// cell of no size show no image, and that row is sent again with its pieces a frame later. The grid
+    /// and the cell's size are set in one call under the screen's lock (`Screen::resize`), so a frame of the
+    /// new grid is one after the cell's size too — which is why `rows` has to differ from what the session
+    /// was spawned with (`Client::started`), or a frame before the resize would meet the wait.
+    fn resized(&mut self, client: &Client, session: &str, rows: u16, cell: (u16, u16)) {
+        say(
+            &client.stream,
+            &Request::Resize { session: session.to_owned(), cols: 60, rows, cell_width: cell.0, cell_height: cell.1 },
+        );
+        while !self.last.as_ref().is_some_and(|frame| frame.screen_rows == rows) {
+            self.step();
+        }
+    }
+
     /// Messages until one is the answer being waited for.
     fn answer<T>(&mut self, mut pick: impl FnMut(&ToView) -> Option<T>) -> T {
         loop {
@@ -864,11 +883,8 @@ fn an_image_named_as_a_file_and_shown_through_cells_is_sent_with_its_row() {
     let broker = start();
     let client = Client::greeting(&broker);
     for (session, reads) in [(client.shell_reading_files(), true), (client.shell_taking(true), false)] {
-        say(
-            &client.stream,
-            &Request::Resize { session: session.clone(), cols: 60, rows: 8, cell_width: 10, cell_height: 20 },
-        );
         let mut view = View::attached(&broker, &session);
+        view.resized(&client, &session, 9, (10, 20));
         view.until_shows("$ ");
         view.type_line(&shown);
         view.until_shows("sh2own");
@@ -937,11 +953,8 @@ fn a_placed_image_and_its_pixels_are_answered_to_the_view_that_asked() {
     let broker = start();
     let client = Client::greeting(&broker);
     let session = client.shell_taking(true);
-    say(
-        &client.stream,
-        &Request::Resize { session: session.clone(), cols: 60, rows: 8, cell_width: 10, cell_height: 20 },
-    );
     let mut view = View::attached(&broker, &session);
+    view.resized(&client, &session, 9, (10, 20));
     view.until_shows("$ ");
     // One red pixel, sent whole and shown where the cursor is
     view.type_line(&format!(
@@ -981,11 +994,8 @@ fn a_session_holding_more_images_than_are_listed_says_so_and_one_holding_as_many
     });
     let client = Client::greeting(&broker);
     let session = client.shell_taking(true);
-    say(
-        &client.stream,
-        &Request::Resize { session: session.clone(), cols: 60, rows: 8, cell_width: 10, cell_height: 20 },
-    );
     let mut view = View::attached(&broker, &session);
+    view.resized(&client, &session, 9, (10, 20));
     view.until_shows("$ ");
     let place = |image: u32| printed(&format!("\\033_Ga=T,f=32,i={image},s=1,v=1,q=2;/wAA/w==\\033\\\\"));
 
