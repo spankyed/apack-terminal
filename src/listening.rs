@@ -82,7 +82,20 @@ pub fn default_socket() -> Option<String> {
 /// The hold on a socket that makes this process its broker, for as long as the value lives.
 pub struct Held {
     #[cfg(unix)]
-    _lock: std::fs::File,
+    lock: std::fs::File,
+}
+
+/// **Let go of, not only closed.** An advisory lock belongs to the open file, and a process this one starts
+/// holds a copy of every descriptor from its fork until its exec closes them: a hold that is only closed
+/// lives on in that copy, and refuses the next broker on the socket, for as long as a child takes to exec.
+/// Unlocking ends it for every copy at once.
+#[cfg(unix)]
+impl Drop for Held {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `flock` takes a descriptor this value owns and one flag, and answers through errno
+        unsafe { libc::flock(self.lock.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 /// Why a broker may not listen on a socket.
@@ -141,7 +154,7 @@ pub fn hold(socket: &str) -> Result<Held, Refused> {
             std::fs::OpenOptions::new().write(true).create(true).truncate(false).mode(0o600).open(lock_file(socket))?;
         // SAFETY: `flock` takes a descriptor this function owns and two flags, and answers through errno
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Ok(Held { _lock: lock });
+            return Ok(Held { lock });
         }
         let error = io::Error::last_os_error();
         if error.kind() == io::ErrorKind::WouldBlock { Err(Refused::Held) } else { Err(Refused::Failed(error)) }

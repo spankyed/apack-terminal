@@ -252,6 +252,48 @@ fn broker_holds(socket: &str) -> bool {
     Stream::connect(name).is_ok()
 }
 
+/// **A broker's hold is let go of, not only closed** (`listening::Held`). The lock is the open file's, and a
+/// process forked from the broker holds a copy of it until it execs: here a child that is never let exec
+/// holds that copy for as long as the case likes, and the socket is free to the next broker all the same.
+#[cfg(unix)]
+#[test]
+fn a_hold_let_go_is_free_though_a_child_still_has_its_descriptor() {
+    let directory = tempfile::tempdir().expect("a directory for the socket");
+    let socket = directory.path().join("broker.sock");
+    let name = socket.to_str().expect("a utf-8 path");
+    let held = hold(name).expect("the socket is held");
+    let mut ends = [0; 2];
+    // SAFETY: `pipe` fills the two descriptors it is given
+    assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0, "a pipe is made");
+    // SAFETY: the child calls only async-signal-safe functions — `close`, `read` and `_exit` — before it ends
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        // The child: holds every descriptor this process had, the hold's among them, until the pipe closes
+        // SAFETY: `close`, `read` and `_exit` are async-signal-safe, the descriptors are the pipe's, and the
+        // byte read into is this frame's
+        unsafe {
+            libc::close(ends[1]);
+            let mut byte = 0u8;
+            libc::read(ends[0], (&raw mut byte).cast(), 1);
+            libc::_exit(0);
+        }
+    }
+    assert!(child > 0, "a child is forked");
+    // SAFETY: the read end is the child's to use; this process keeps the write end
+    unsafe { libc::close(ends[0]) };
+
+    drop(held);
+    let again = hold(name);
+
+    // The child is let go before anything is asserted, and waited for by the pid its fork returned
+    // SAFETY: the write end is this process's, and the pid is the child it forked
+    unsafe {
+        libc::close(ends[1]);
+        libc::waitpid(child, std::ptr::null_mut(), 0);
+    }
+    assert!(again.is_ok(), "a hold let go of was still held by a child that had its descriptor");
+}
+
 /// `proxy` is a word, not a position: two arguments of which the first is anything else are not a request
 /// to be one, and are refused as any other mistyped invocation is.
 #[test]

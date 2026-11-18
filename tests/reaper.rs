@@ -204,6 +204,14 @@ fn lock_beside(socket: &std::path::Path) -> std::io::Result<Option<std::fs::File
     }
 }
 
+/// Unlocks `lock`, for every descriptor that shares it.
+#[cfg(unix)]
+fn let_go(lock: &std::fs::File) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `flock` takes a descriptor `lock` owns and one flag, and answers through errno
+    unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) };
+}
+
 /// Takes `lock` as `operation` asks (`flock`), answering whether it was taken.
 #[cfg(unix)]
 fn taken(lock: &std::fs::File, operation: libc::c_int) -> bool {
@@ -376,19 +384,29 @@ impl Drop for Ending {
         // (`ending_with_the_case` on why the lock is what is waited for)
         #[cfg(unix)]
         if let Some((mut watcher, held)) = self.watcher.take() {
+            let mut held = Some(held);
             let gone = match lock_beside(&self.socket) {
                 Ok(None) => true,
-                Ok(Some(lock)) if taken(&lock, libc::LOCK_EX | libc::LOCK_NB) => true,
-                // A broker holds it: the watcher is let go of, to end one that will not go by itself, and the
-                // lock is taken once the broker has gone either way. The case's own hold on the file is one the
-                // watcher passes over, the case not being `program`
                 Ok(Some(lock)) => {
-                    drop(held);
-                    taken(&lock, libc::LOCK_EX)
+                    // Where a broker holds it, the watcher is let go of, to end one that will not go by itself,
+                    // and the lock is taken once the broker has gone either way. The case's own hold on the
+                    // file is one the watcher passes over, the case not being `program`
+                    let taken = taken(&lock, libc::LOCK_EX | libc::LOCK_NB) || {
+                        drop(held.take());
+                        taken(&lock, libc::LOCK_EX)
+                    };
+                    // **Let go of before it is closed**: the lock is the open file's, and a process another
+                    // case in this program is starting holds a copy of this descriptor until it execs, so a
+                    // lock only closed can still be held when the case looks next (`listening::Held` says the
+                    // same of a broker's)
+                    if taken {
+                        let_go(&lock);
+                    }
+                    taken
                 }
                 // A lock that cannot be read or waited on is left to the watcher, which is waited for
                 Err(_) => {
-                    drop(held);
+                    drop(held.take());
                     false
                 }
             };
