@@ -980,6 +980,110 @@ fn an_entry_of_all_that_may_wait_is_recorded_and_a_byte_more_stops_the_recording
     assert!(recorder.failed(), "and the recording carried on after it");
 }
 
+/// A recorder whose disk takes nothing until it is let: its file is a FIFO that is held open and not read, so
+/// what it is handed waits past the pipe's own buffer for as long as the case likes. Letting it read drains
+/// everything it is handed from then on.
+#[cfg(unix)]
+struct Stalled {
+    recorder: Option<Recorder>,
+    letting: Option<std::sync::mpsc::Sender<()>>,
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl Stalled {
+    fn start(directory: &Path, name: &str, budget: u64) -> Self {
+        let path = directory.join(name);
+        // The recorder writes its file under this name before it takes the recording's own
+        let fifo = directory.join(format!("{name}.rewriting"));
+        let c_fifo = std::ffi::CString::new(fifo.to_str().expect("utf-8")).expect("a C string");
+        // SAFETY: the name is a valid C string
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0, "a FIFO is made");
+        let (letting, let_read) = std::sync::mpsc::channel::<()>();
+        let reader = std::thread::spawn(move || {
+            // Opening waits for the recorder to open its end; the header fits the pipe without a read
+            let mut file = std::fs::File::open(&fifo).expect("the FIFO opens to read");
+            let _ = let_read.recv();
+            let _ = std::io::copy(&mut file, &mut std::io::sink());
+        });
+        let recorder = Recorder::start_with(&path, budget, u64::MAX).expect("the recording starts");
+        Self { recorder: Some(recorder), letting: Some(letting), reader: Some(reader) }
+    }
+
+    fn recorder(&mut self) -> &mut Recorder {
+        self.recorder.as_mut().expect("the recorder")
+    }
+
+    /// Lets the disk take what it was handed, and waits until it has
+    fn let_it_write(&mut self) {
+        drop(self.letting.take());
+        self.recorder().flush();
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Stalled {
+    fn drop(&mut self) {
+        drop(self.letting.take());
+        drop(self.recorder.take());
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+/// **A recorder is behind while more than half of what may wait is waiting**, which is what a keyframe waits
+/// for (`Recorder::behind`). Its disk is stalled, so what it was handed is still waiting when it is asked:
+/// exactly half is not behind, a byte more is, and once the disk has taken it all it is not.
+#[cfg(unix)]
+#[test]
+fn a_recorder_is_behind_while_more_than_half_of_what_may_wait_is_waiting() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let beside = entry_overhead(directory.path());
+    let mut stalled = Stalled::start(directory.path(), "behind.recording", u64::MAX);
+    assert!(!stalled.recorder().behind(), "a recorder with nothing waiting was behind");
+    stalled.recorder().output(&vec![b'o'; recording::BACKLOG / 2 - beside]).expect("output is taken");
+    assert!(!stalled.recorder().behind(), "exactly half of what may wait was counted as behind");
+    stalled.recorder().output(b"o").expect("output is taken");
+    assert!(stalled.recorder().behind(), "past half of what may wait was not behind");
+    stalled.let_it_write();
+    assert!(!stalled.recorder().behind(), "what had been written was still counted as waiting");
+}
+
+/// What one output entry is beside the bytes it carries, read off a recording of one byte.
+#[cfg(unix)]
+fn entry_overhead(directory: &Path) -> usize {
+    let length_of = |path: &Path| {
+        recording::settled(path);
+        usize::try_from(std::fs::metadata(path).expect("the recording is there").len()).expect("a length")
+    };
+    let empty = directory.join("overhead-empty.recording");
+    drop(Recorder::start_with(&empty, u64::MAX, u64::MAX).expect("the recording starts"));
+    let small = directory.join("overhead-small.recording");
+    let mut recorder = Recorder::start_with(&small, u64::MAX, u64::MAX).expect("the recording starts");
+    recorder.output(b"o").expect("output is taken");
+    drop(recorder);
+    length_of(&small) - length_of(&empty) - 1
+}
+
+/// **A keyframe may wait for a disk that is behind, unless the recording is past twice its budget**, where a
+/// keyframe is the only way its oldest part can go (`Recorder::keyframe_may_wait`).
+#[cfg(unix)]
+#[test]
+fn a_keyframe_may_wait_for_the_disk_unless_the_recording_is_far_past_its_budget() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let mut within = Stalled::start(directory.path(), "within.recording", u64::MAX);
+    assert!(!within.recorder().keyframe_may_wait(), "a keyframe waited for a disk that was not behind");
+    within.recorder().output(&vec![b'o'; recording::BACKLOG - (1 << 20)]).expect("output is taken");
+    assert!(within.recorder().keyframe_may_wait(), "a keyframe was not let wait for a disk fifteen megabytes behind");
+
+    // A budget of a byte, which any output is twice past
+    let mut past = Stalled::start(directory.path(), "past.recording", 1);
+    past.recorder().output(&vec![b'o'; recording::BACKLOG - (1 << 20)]).expect("output is taken");
+    assert!(past.recorder().far_over_budget(), "fifteen megabytes are not twice past a budget of a byte");
+    assert!(!past.recorder().keyframe_may_wait(), "a keyframe was let wait though only it can drop the oldest part");
+}
+
 /// **A process about to exit waits for what its recorders were handed.** A recorder that is stopped
 /// leaves the last of its recording to its own thread, which ends with the process; `settle_all` is what
 /// a broker calls on its way out, and after it every recording that was stopped holds all it was given
