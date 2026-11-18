@@ -23,25 +23,35 @@ pub struct Reaper {
     watcher: Option<(Child, ChildStdin)>,
 }
 
-/// Starts watching `broker`, which is the program at `program`.
+/// A watcher started for a broker that does not exist yet, waiting to be told which process it is (`of`).
+pub struct Watching {
+    #[cfg(unix)]
+    watcher: (Child, ChildStdin),
+}
+
+/// Starts a watcher for a broker that is the program at `program`, **before that broker is started**.
+///
+/// **A broker gives whatever started it `START_GRACE` from its ready line to connect, and leaves if
+/// nothing has** (`listening::START_GRACE`). Starting a process is the slowest thing a case does: started
+/// between that line and the connect, at a load of three to four hundred, the watcher took up to 5.5 s of
+/// the ten (2026-11-17), and cases whose first connect was refused had each spent over eleven seconds by
+/// then. So the watcher is started first, and what is left between the line and the connect is a read.
 ///
 /// **The watcher kills by pid, and only a pid that is still that program.** A pid is a number the system
 /// hands out again; one that no longer names the broker's executable is somebody else's process, and is
 /// left alone. A single process, never a group: the broker's sessions end when it does, their terminals
-/// having closed.
+/// having closed. A watcher never told a pid, its case having ended first, has nothing to name and kills
+/// nothing.
 #[cfg(unix)]
-pub fn watching(broker: &Child, program: &str) -> Reaper {
+pub fn watching(program: &str) -> Watching {
     use std::os::unix::process::CommandExt;
 
     required_by_the_watcher(&["ps"]);
-    let pid = broker.id();
-    assert!(pid > 1, "a broker's pid is its own: {pid}");
     let mut command = Command::new("/bin/sh");
     command
         .arg("-c")
-        .arg(r#"read _; case "$(ps -o command= -p "$1")" in "$2"*) kill -KILL "$1" ;; esac"#)
+        .arg(r#"read pid || exit; read _; case "$(ps -o command= -p "$pid")" in "$1"*) kill -KILL "$pid" ;; esac"#)
         .arg("sh")
-        .arg(pid.to_string())
         .arg(program)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -52,7 +62,26 @@ pub fn watching(broker: &Child, program: &str) -> Reaper {
     unsafe { command.pre_exec(|| if libc::setsid() == -1 { Err(std::io::Error::last_os_error()) } else { Ok(()) }) };
     let mut watcher = command.spawn().expect("a watcher starts");
     let held = watcher.stdin.take().expect("piped stdin");
-    Reaper { watcher: Some((watcher, held)) }
+    Watching { watcher: (watcher, held) }
+}
+
+impl Watching {
+    /// Tells the watcher which process its broker is, and holds it for as long as the case does.
+    #[cfg(unix)]
+    pub fn of(self, broker: &Child) -> Reaper {
+        use std::io::Write as _;
+
+        let pid = broker.id();
+        assert!(pid > 1, "a broker's pid is its own: {pid}");
+        let (watcher, mut held) = self.watcher;
+        writeln!(held, "{pid}").expect("the watcher is told its broker's pid");
+        Reaper { watcher: Some((watcher, held)) }
+    }
+
+    #[cfg(not(unix))]
+    pub fn of(self, _broker: &std::process::Child) -> Reaper {
+        Reaper {}
+    }
 }
 
 /// Refuses a machine without one of `tools`, which a watcher's script runs.
@@ -85,10 +114,10 @@ fn required_by_the_watcher(tools: &[&str]) {
 }
 
 #[cfg(not(unix))]
-pub fn watching(_broker: &std::process::Child, _program: &str) -> Reaper {
+pub fn watching(_program: &str) -> Watching {
     // A session's processes are in a job that ends with its broker (`src/tree.rs`), and a broker a
     // case leaves is ended by its own rules; there is no pipe to a shell to hold here
-    Reaper {}
+    Watching {}
 }
 
 /// What ends the broker on a socket when the case that had one started is over, however it ended.

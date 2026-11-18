@@ -35,6 +35,11 @@ pub const HELD_EXIT: i32 = 3;
 /// thing that can end the wait is that enough time has passed. It measures nothing about this machine's
 /// load, so a busy machine cannot make it wrong: whatever starts a broker connects as soon as the broker
 /// says it is listening, which is far inside this however slowly either runs.
+///
+/// **That holds only for a starter that does nothing in between**, a process of its own above all: the
+/// suite started one there, which took seconds on a loaded machine, and its first connect was refused by a
+/// broker that had left. Whatever a starter needs beyond the connect, it does before the broker is started
+/// or after it has connected (`tests/reaper.rs`, `watching`).
 pub const START_GRACE: Duration = Duration::from_secs(10);
 
 /// The variable a broker is told a grace other than `START_GRACE` by, in milliseconds.
