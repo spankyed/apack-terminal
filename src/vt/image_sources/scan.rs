@@ -375,18 +375,34 @@ fn bits_in(name: &mut Base64, value: u32) {
 }
 
 /// `bytes` as base64, padded.
+///
+/// **Four characters are written as one**, into room made for all of them, rather than pushed one at a
+/// time: a source is up to `SOURCE_BYTES` and every byte of it comes through here, and in a debug build —
+/// the suite's — four pushes' checks a group cost more than reading and feeding the source together, CPU
+/// that a busy machine multiplies against a test's deadline, which is a clock.
 pub fn encoded(bytes: &[u8]) -> Vec<u8> {
-    let mut text = Vec::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
+    let mut text = vec![b'='; bytes.len().div_ceil(3) * 4];
+    let (groups, rest) = bytes.as_chunks::<3>();
+    for (group, characters) in groups.iter().zip(text.as_chunks_mut::<4>().0) {
+        *characters = characters_of([0, group[0], group[1], group[2]]);
+    }
+    if !rest.is_empty() {
         let mut group = [0u8; 4];
-        group[1..=chunk.len()].copy_from_slice(chunk);
-        let bits = u32::from_be_bytes(group);
-        // A character for each byte and one more, and the rest of the four is padding
-        for index in 0..4 {
-            text.push(if index <= chunk.len() { ALPHABET[(bits >> (18 - 6 * index) & 63) as usize] } else { b'=' });
-        }
+        group[1..=rest.len()].copy_from_slice(rest);
+        // A character for each byte and one more, and the rest of the four is the padding already there
+        let at = groups.len() * 4;
+        text[at..=at + rest.len()].copy_from_slice(&characters_of(group)[..=rest.len()]);
     }
     text
+}
+
+/// The four characters that spell the three bytes after the first of `group`. Inlined in a debug build
+/// too, where a call for each of a large source's groups is a tenth of what encoding it costs.
+#[inline(always)]
+fn characters_of(group: [u8; 4]) -> [u8; 4] {
+    let bits = u32::from_be_bytes(group) as usize;
+    // Spelled out rather than mapped over the shifts, which unoptimised is calls to the array's machinery
+    [ALPHABET[bits >> 18 & 63], ALPHABET[bits >> 12 & 63], ALPHABET[bits >> 6 & 63], ALPHABET[bits & 63]]
 }
 
 /// Where the next byte of a session's output falls.

@@ -859,6 +859,11 @@ fn a_very_large_grid_full_of_styled_text_is_written_out() {
 /// written out with the screen, and megabytes of it are more than a keyframe holds: the keyframe due then
 /// is put off, what the program writes goes on being recorded, and a keyframe is taken once the image has
 /// arrived. A replay of the recording ends as the session did.
+///
+/// **Nor is it recorded over again in keyframes.** Each keyframe taken while it arrives holds all of it so
+/// far, and is followed by at least as much output as it holds before the next (`Recorder::keyframe_due`):
+/// so what is handed over while the image arrives is short of what may wait to be written, and a writer
+/// that wrote none of it until the image had arrived would not have stopped the recording.
 #[test]
 fn an_image_larger_than_a_keyframe_holds_puts_the_keyframe_off_and_the_recording_goes_on() {
     let directory = tempfile::tempdir().expect("a directory");
@@ -877,9 +882,38 @@ fn an_image_larger_than_a_keyframe_holds_puts_the_keyframe_off_and_the_recording
     // (`Recorder::behind`), which a machine slow to run the writer makes it after megabytes handed over at
     // once; this case is about one put off for its size
     live.flush_recording();
-    // And a megabyte more, by when the image has arrived and a keyframe can be taken
+    let arrived = apack_terminal::recording::read(&path);
+    let image_ends = arrived
+        .iter()
+        .rposition(|timed| matches!(&timed.entry, Entry::Output(bytes) if bytes.starts_with(b"\x1b_Gm=0")))
+        .expect("the end of the image was recorded");
+    let held = |timed: &Timed| match &timed.entry {
+        Entry::Keyframe { state, .. } => (state.len(), 0),
+        Entry::Output(bytes) => (0, bytes.len()),
+        Entry::Resize { .. } | Entry::Marks { .. } => (0, 0),
+    };
+    let mut last = 0;
+    let mut since = 0;
+    for timed in &arrived[..=image_ends] {
+        match &timed.entry {
+            Entry::Keyframe { state, .. } => {
+                assert!(since >= last, "a keyframe of {last} bytes was followed by {since} of output before the next");
+                (last, since) = (state.len(), 0);
+            }
+            Entry::Output(bytes) => since += bytes.len(),
+            Entry::Resize { .. } | Entry::Marks { .. } => {}
+        }
+    }
+    let (keyframed, output) =
+        arrived[1..=image_ends].iter().map(held).fold((0, 0), |(k, o), (keyframe, bytes)| (k + keyframe, o + bytes));
+    assert!(keyframed <= output, "{keyframed} bytes of keyframes for {output} of output while the image arrived");
+    assert!(
+        keyframed + output < apack_terminal::recording::BACKLOG,
+        "{keyframed} bytes of keyframes and {output} of output were handed over while the image arrived"
+    );
+    // And as much more as the last keyframe held, by when the image has arrived and a keyframe can be taken
     let line = format!("{}\r\n", "after the image ".repeat(4));
-    for _ in 0..20_000 {
+    for _ in 0..=last.max(1 << 20) / line.len() {
         live.feed(line.as_bytes());
     }
     assert!(live.recorded());
@@ -887,10 +921,6 @@ fn an_image_larger_than_a_keyframe_holds_puts_the_keyframe_off_and_the_recording
     let entries = apack_terminal::recording::read(&path);
     let keyframes: Vec<usize> =
         (0..entries.len()).filter(|at| matches!(entries[*at].entry, Entry::Keyframe { .. })).collect();
-    let image_ends = entries
-        .iter()
-        .rposition(|timed| matches!(&timed.entry, Entry::Output(bytes) if bytes.starts_with(b"\x1b_Gm=0")))
-        .expect("the end of the image was recorded");
     let next = *keyframes.iter().find(|at| **at > image_ends).expect("a keyframe once the image had arrived");
     // And not at the first thing written once it could be: put off, it waits for a keyframe's distance
     let between: usize = entries[image_ends + 1..next]

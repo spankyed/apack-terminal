@@ -145,10 +145,11 @@ impl Broker {
                 command.pre_exec(|| if libc::setsid() == -1 { Err(std::io::Error::last_os_error()) } else { Ok(()) })
             };
         }
+        let watching = crate::reaper::watching(env!("CARGO_BIN_EXE_apack-terminal"));
         let mut process = command.spawn().expect("the broker starts");
+        let reaper = watching.of(&process);
         let ready = crate::heard::lines(process.stdout.take().expect("piped stdout")).next();
         assert!(ready.starts_with("listening "), "{ready:?}");
-        let reaper = crate::reaper::watching(&process, env!("CARGO_BIN_EXE_apack-terminal"));
         Self { process, socket, directory, reaper }
     }
 

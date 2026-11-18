@@ -139,13 +139,19 @@ fn main() -> std::io::Result<()> {
     // **A broker that cannot reach its own socket leaves without the connection.** Its socket's file was
     // removed, or the directory it is in: nothing else can reach it there either, so with nothing ever
     // accepted and nothing connected there is nobody to be hung up on by going
+    //
+    // **It says so on stderr**, because the exit is otherwise silent: a starter that connects after it
+    // reads only a refused connection, which names no cause. Written and not `eprintln!`ed, since a
+    // stderr whose reader has gone must not stop the broker leaving
     std::thread::spawn({
         let (broker, socket) = (broker.clone(), socket.clone());
         move || {
-            std::thread::sleep(listening::start_grace(std::env::var(START_GRACE_ENV).ok().as_deref()));
+            let grace = listening::start_grace(std::env::var(START_GRACE_ENV).ok().as_deref());
+            std::thread::sleep(grace);
             if broker.accepted.load(Ordering::SeqCst) != 0 {
                 return;
             }
+            let _ = writeln!(std::io::stderr(), "apack-terminal: nothing connected within {grace:?} of listening");
             let reached = socket.as_str().to_fs_name::<GenericFilePath>().and_then(Stream::connect).is_ok();
             if !reached && broker.accepted.load(Ordering::SeqCst) == 0 && broker.connections.load(Ordering::SeqCst) == 0
             {

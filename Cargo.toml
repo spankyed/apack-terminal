@@ -119,6 +119,18 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.crc32fast]
 opt-level = 3
+# `memchr` finds where a program's output may be held (`screen::hold_piece`), over every byte fed — a named
+# image's encoded source included, which is tens of megabytes
+[profile.dev.package.memchr]
+opt-level = 3
+
+# **The suite is built optimised, a little.** A case's deadline is a clock (`.config/nextest.toml`), so what a
+# case spends in debug code is what a busy machine multiplies against it: unoptimised, the suite spent 33 s of CPU
+# and its heaviest cases about 2 s each; at this level 14 s and 0.15 s (2026-11-17). A one-line change to `src/`
+# rebuilds in about 4 s either way, and assertions and overflow checks are kept. Mutants build with their own
+# profile (below), so what a mutant costs is unchanged.
+[profile.test]
+opt-level = 1
 
 # What cargo-mutants builds each mutant with (`.cargo/mutants.toml`): a debug build without the debug info,
 # since nothing debugs a mutant and each one is a fresh copy of the build directory
