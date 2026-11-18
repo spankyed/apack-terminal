@@ -73,7 +73,7 @@ fn a_replay_holds_what_the_live_screen_held() {
     let directory = tempfile::tempdir().expect("a directory");
     let path = directory.path().join("one.recording");
     let mut live = Screen::new(40, 10);
-    // A keyframe every two kilobytes, so the replay crosses several
+    // A keyframe every two kilobytes, or as many as the last held, so the replay crosses several
     live.start_recording_with(Recorder::start_with(&path, u64::MAX, 2_000).expect("the recording starts"))
         .expect("the first keyframe is written");
     for round in 0..8 {
@@ -83,7 +83,8 @@ fn a_replay_holds_what_the_live_screen_held() {
     live.resize(52, 14, 0, 0);
     live.feed(&busy(12));
     live.feed(b"\x1b[?1049h\x1b[2J\x1b[Han application\r\nwith its own screen");
-    for _ in 0..40 {
+    // More than the keyframe before it holds, which with the history above it is tens of kilobytes
+    for _ in 0..1_500 {
         live.feed(format!("\x1b[3;1H{}", "x".repeat(50)).as_bytes());
     }
 
@@ -93,9 +94,11 @@ fn a_replay_holds_what_the_live_screen_held() {
     // One while the application was showing: it drew more than a keyframe's distance, so the last
     // keyframe is of the application, with the shell's screen under it
     let last = entries.iter().rposition(|timed| matches!(timed.entry, Entry::Keyframe { .. })).expect("a keyframe");
-    let after: usize =
-        entries[last..].iter().map(|timed| if let Entry::Output(bytes) = &timed.entry { bytes.len() } else { 0 }).sum();
-    assert!(after < 2_000, "{after} bytes after the last keyframe, so none was taken over the application");
+    let began = entries
+        .iter()
+        .position(|timed| matches!(&timed.entry, Entry::Output(bytes) if bytes.starts_with(b"\x1b[?1049h")))
+        .expect("the application's beginning was recorded");
+    assert!(last > began, "no keyframe was taken over the application");
 
     let mut replayed = Screen::new(80, 24);
     assert!(replayed.replay(&entries, u64::MAX));
@@ -413,7 +416,8 @@ fn a_recording_past_its_budget_takes_a_keyframe_a_distance_and_not_a_keyframe_a_
     let mut live = Screen::new(40, 10);
     live.feed(&busy(30));
     // A budget of a hundred bytes, which the first keyframe alone is many times over, and a keyframe due
-    // every four thousand
+    // every four thousand, or as many as the first held where that is more
+    let distance = 4_000.max(live.keyframe().expect("the screen is written out").len());
     live.start_recording_with(Recorder::start_with(&path, 100, 4_000).expect("the recording starts"))
         .expect("the first keyframe is written");
     for _ in 0..100 {
@@ -421,16 +425,19 @@ fn a_recording_past_its_budget_takes_a_keyframe_a_distance_and_not_a_keyframe_a_
     }
     let keyframes =
         recorded(&mut live, &path).iter().filter(|timed| matches!(timed.entry, Entry::Keyframe { .. })).count();
-    assert_eq!(keyframes, 1, "a thousand bytes were written, which is a quarter of the way to the next keyframe");
+    assert_eq!(
+        keyframes, 1,
+        "a thousand bytes were written, which is at most a quarter of the way to the next keyframe"
+    );
 
     // And the distance does bring one, on the alternate screen too, since nothing else lets the oldest go
     live.feed(b"\x1b[?1049h");
-    for _ in 0..400 {
+    for _ in 0..distance / 10 {
         live.feed(b"0123456789");
     }
     let entries = recorded(&mut live, &path);
     assert!(matches!(entries.first(), Some(Timed { entry: Entry::Keyframe { .. }, .. })));
-    assert!(entries.len() < 400, "{} entries: the oldest part was never dropped", entries.len());
+    assert!(entries.len() < distance / 10, "{} entries: the oldest part was never dropped", entries.len());
 }
 
 /// The same through a screen: an application that never leaves the alternate screen does not grow its
@@ -536,8 +543,8 @@ fn a_recording_whose_file_has_gone_has_stopped_and_the_session_carries_on() {
     assert!(live.recorded());
     std::fs::remove_file(&path).expect("the recording is removed");
 
-    // One read, long enough to bring the keyframe due
-    live.feed("0123456789".repeat(400).as_bytes());
+    // One read, long enough to bring the keyframe due: past the distance, and past what the first held
+    live.feed("0123456789".repeat(4_000).as_bytes());
     live.flush_recording();
     assert!(!live.recorded(), "a recording that could not be rewritten is still called one");
 
@@ -1048,6 +1055,54 @@ fn a_recorder_is_behind_while_more_than_half_of_what_may_wait_is_waiting() {
     assert!(stalled.recorder().behind(), "past half of what may wait was not behind");
     stalled.let_it_write();
     assert!(!stalled.recorder().behind(), "what had been written was still counted as waiting");
+}
+
+/// **A keyframe larger than the distance between two is followed by as much output as it holds** before the
+/// next falls due (`Recorder::keyframe_due`), so keyframes are never more of a recording than its output;
+/// one smaller waits for the distance alone.
+#[test]
+fn a_keyframe_larger_than_the_distance_waits_for_as_much_output_as_it_holds() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let mut recorder =
+        Recorder::start_with(&directory.path().join("spaced.recording"), u64::MAX, 100).expect("it starts");
+    recorder.keyframe(40, 6, &[b'k'; 1_000]).expect("a keyframe is taken");
+    recorder.output(&[b'o'; 999]).expect("output is taken");
+    assert!(!recorder.keyframe_due(), "a keyframe of a thousand bytes was due after 999 of output");
+    recorder.output(b"o").expect("output is taken");
+    assert!(recorder.keyframe_due(), "a keyframe of a thousand bytes was not due after a thousand of output");
+
+    // One smaller than the distance waits for the distance
+    recorder.keyframe(40, 6, &[b'k'; 10]).expect("a keyframe is taken");
+    recorder.output(&[b'o'; 99]).expect("output is taken");
+    assert!(!recorder.keyframe_due(), "a keyframe was due short of the distance");
+    recorder.output(b"o").expect("output is taken");
+    assert!(recorder.keyframe_due(), "a keyframe was not due at the distance");
+
+    // And one put off waits for as much again as the last one taken held
+    recorder.keyframe(40, 6, &[b'k'; 1_000]).expect("a keyframe is taken");
+    recorder.output(&[b'o'; 1_000]).expect("output is taken");
+    recorder.put_off_keyframe();
+    recorder.output(&[b'o'; 999]).expect("output is taken");
+    assert!(!recorder.keyframe_due(), "a keyframe put off was due short of what the last one held");
+    recorder.output(b"o").expect("output is taken");
+    assert!(recorder.keyframe_due());
+}
+
+/// **A recording picked up goes on spacing its keyframes by the last one it holds.**
+#[test]
+fn a_recording_picked_up_spaces_its_next_keyframe_by_the_last_it_holds() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let path = directory.path().join("picked-up.recording");
+    let mut recorder = Recorder::start(&path).expect("it starts");
+    let held = usize::try_from(recording::KEYFRAME_EVERY).expect("a size") + 1_000;
+    recorder.keyframe(40, 6, &vec![b'k'; held]).expect("a keyframe is taken");
+    recorder.output(&vec![b'o'; held - 1]).expect("output is taken");
+    drop(recorder);
+    recording::settled(&path);
+    let (mut recorder, _) = Recorder::resume(&path).expect("it is picked up");
+    assert!(!recorder.keyframe_due(), "a keyframe was due short of what the last one held");
+    recorder.output(b"o").expect("output is taken");
+    assert!(recorder.keyframe_due());
 }
 
 /// What one output entry is beside the bytes it carries, read off a recording of one byte.

@@ -57,7 +57,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::markers::MarksKey;
 
-/// How many bytes a program writes between two keyframes: what a replay feeds at most, after the keyframe.
+/// How many bytes a program writes between two keyframes: what a replay feeds at most, after the keyframe —
+/// or as many as that keyframe held, where it is larger (`Recorder::keyframe_due`).
 pub const KEYFRAME_EVERY: u64 = 1 << 20;
 
 /// How large a recording grows before its oldest part is dropped.
@@ -383,6 +384,9 @@ pub struct Recorder {
     written: u64,
     /// Bytes of output since the last keyframe.
     since_keyframe: u64,
+    /// How many bytes the last keyframe held: as much output again comes before the next
+    /// (`keyframe_due`).
+    last_keyframe: u64,
     /// Where each keyframe in the file starts.
     keyframes: Vec<u64>,
     budget: u64,
@@ -677,6 +681,7 @@ impl Recorder {
             shared,
             written: FILE_HEADER.len() as u64,
             since_keyframe: 0,
+            last_keyframe: 0,
             keyframes: Vec::new(),
             budget,
             every,
@@ -727,9 +732,10 @@ impl Recorder {
         let mut offset = FILE_HEADER.len() as u64;
         for timed in &entries {
             match &timed.entry {
-                Entry::Keyframe { .. } => {
+                Entry::Keyframe { state, .. } => {
                     recorder.keyframes.push(offset);
                     recorder.since_keyframe = 0;
+                    recorder.last_keyframe = state.len() as u64;
                 }
                 Entry::Output(output) => recorder.since_keyframe += output.len() as u64,
                 Entry::Resize { .. } | Entry::Marks { .. } => {}
@@ -789,9 +795,19 @@ impl Recorder {
         self.append(MARKS, &[&last.to_le_bytes(), key.map_or("", MarksKey::as_str).as_bytes()])
     }
 
-    /// Whether enough has been written since the last keyframe for another, or none has been written yet.
+    /// Whether enough has been written since the last keyframe for another, or none has been written yet:
+    /// `KEYFRAME_EVERY` bytes of output, or as many as the last keyframe held where that is more.
+    ///
+    /// **Keyframes are never more of a recording than its output.** A keyframe that is more than the
+    /// distance between two is something growing in the terminal, and the core does not say what: an
+    /// image a program is part way through sending is written out with the screen, and nothing the core
+    /// can be asked says a transmission is open until its last piece arrives. Taken every
+    /// `KEYFRAME_EVERY` regardless, each would hold all of the image so far, and an image of megabytes
+    /// would be recorded half as many times again as it was sent — keyframes growing with the output in
+    /// front of them, which is quadratic in the image. Spaced by their own size, the keyframes between
+    /// two moments are at most the output between them and one keyframe more, whatever is growing.
     pub fn keyframe_due(&self) -> bool {
-        self.keyframes.is_empty() || self.since_keyframe >= self.every
+        self.keyframes.is_empty() || self.since_keyframe >= self.every.max(self.last_keyframe)
     }
 
     /// Puts the keyframe that is due off until as much again has been written as lies between two: for a
@@ -809,10 +825,9 @@ impl Recorder {
     ///
     /// **What a keyframe waits for.** A keyframe repeats what the recording already holds, so one put off
     /// loses nothing, where output it is queued beside cannot be put off at all. Taken while the disk is
-    /// behind, each is one more copy of the screen in what is waiting: an image arriving over megabytes
-    /// has a keyframe of what has arrived of it fall due each `KEYFRAME_EVERY`, about one and a half times
-    /// the image again, and a writer the machine was slow to run reached `BACKLOG` on that and stopped the
-    /// recording, with nothing wrong with the disk.
+    /// behind, each is one more copy of the screen in what is waiting, up to as much again as the output
+    /// it follows (`keyframe_due`), which a writer the machine is slow to run would have to catch up on
+    /// with nothing wrong with the disk.
     pub fn behind(&self) -> bool {
         self.shared.waiting.load(Ordering::Acquire) > BACKLOG / 2
     }
@@ -834,6 +849,7 @@ impl Recorder {
         self.append(KEYFRAME, &[&cols.to_le_bytes(), &rows.to_le_bytes(), state])?;
         self.keyframes.push(at);
         self.since_keyframe = 0;
+        self.last_keyframe = state.len() as u64;
         if self.over_budget() {
             self.drop_oldest()?;
         }
