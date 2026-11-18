@@ -45,14 +45,15 @@ impl Drop for Broker {
 fn start() -> Broker {
     let directory = tempfile::tempdir().expect("a directory for the socket");
     let socket = directory.path().join("broker.sock");
+    let watching = crate::reaper::watching(env!("CARGO_BIN_EXE_apack-terminal"));
     let mut process = Command::new(env!("CARGO_BIN_EXE_apack-terminal"))
         .arg(&socket)
         .stdout(Stdio::piped())
         .spawn()
         .expect("the broker starts");
+    let reaper = watching.of(&process);
     let mut ready = String::new();
     BufReader::new(process.stdout.as_mut().expect("piped stdout")).read_line(&mut ready).expect("a ready line");
-    let reaper = crate::reaper::watching(&process, env!("CARGO_BIN_EXE_apack-terminal"));
     Broker { process, socket, _directory: directory, reaper }
 }
 

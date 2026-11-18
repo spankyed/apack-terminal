@@ -311,6 +311,7 @@ fn broker_given(socket: &Path, grace: Option<Duration>) -> Broker {
         // Whatever ran the suite may have set one
         None => command.env_remove(START_GRACE_ENV),
     };
+    let watching = crate::reaper::watching(env!("CARGO_BIN_EXE_apack-terminal"));
     let mut process = command
         .arg(socket)
         .stdin(Stdio::null())
@@ -318,11 +319,11 @@ fn broker_given(socket: &Path, grace: Option<Duration>) -> Broker {
         .stderr(Stdio::piped())
         .spawn()
         .expect("the broker starts");
+    let reaper = watching.of(&process);
     let mut said = String::new();
     BufReader::new(process.stdout.take().expect("piped stdout"))
         .read_line(&mut said)
         .expect("the broker's stdout reads");
-    let reaper = crate::reaper::watching(&process, env!("CARGO_BIN_EXE_apack-terminal"));
     Broker { process, said, reaper }
 }
 
@@ -561,9 +562,11 @@ fn a_broker_nothing_ever_connects_to_exits() {
     let started = Instant::now();
     let mut alone = broker_given(&socket, Some(grace));
     assert!(alone.said.starts_with("listening "), "{}", alone.said);
-    let (code, _) = alone.ended();
+    let (code, errors) = alone.ended();
     assert_eq!(code, Some(0));
     assert!(started.elapsed() >= grace, "it left after {:?}, before anything could have connected", started.elapsed());
+    // What a starter that connects too late is left to read, in place of a refused connection alone
+    assert!(errors.contains("nothing connected within 500ms of listening"), "{errors:?}");
 }
 
 /// A broker waits as long as it does in use unless it is told a number of milliseconds.

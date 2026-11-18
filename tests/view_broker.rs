@@ -224,11 +224,12 @@ fn start_with_env(arrange: impl FnOnce(&mut Command)) -> Broker {
         };
     }
     arrange(&mut command);
+    let watching = crate::reaper::watching(env!("CARGO_BIN_EXE_apack-terminal"));
     let mut process = command.spawn().expect("the broker starts");
+    let reaper = watching.of(&process);
     let mut ready = String::new();
     BufReader::new(process.stdout.as_mut().expect("piped stdout")).read_line(&mut ready).expect("a ready line");
     assert!(ready.starts_with("listening "), "{ready:?}");
-    let reaper = crate::reaper::watching(&process, env!("CARGO_BIN_EXE_apack-terminal"));
     Broker { process, socket, _directory: directory, reaper }
 }
 
