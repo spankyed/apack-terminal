@@ -10,6 +10,8 @@
 //! A file that runs on both says so a case at a time: the ones that type `sh`'s syntax or close one
 //! direction of a connection are POSIX only.
 
+#[path = "_support/heard.rs"]
+mod heard;
 #[path = "_support/screens.rs"]
 mod screens;
 
