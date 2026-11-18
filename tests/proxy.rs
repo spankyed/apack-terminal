@@ -14,7 +14,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use interprocess::local_socket::{GenericFilePath, ListenerOptions, Stream, ToFsName, prelude::*};
+use interprocess::local_socket::{GenericFilePath, Stream, ToFsName, prelude::*};
 
 use crate::heard::Heard;
 
@@ -593,9 +593,12 @@ fn a_caller_that_reads_only_after_the_broker_let_it_go_still_reads_every_answer(
 /// Stands in on `socket` for a broker on its way out, which takes a connection into its queue as it goes and
 /// never says a word on it. It takes one connection for each of `readings`, reads that many bytes from it,
 /// lets it go and hands over what it read; after the last it stops listening.
+///
+/// **Listening as a broker does** (`listening::listen`), so it is this user's to a proxy that asks: on Windows
+/// a pipe made with the default descriptor is refused as somebody else's before a byte is carried.
 fn leaving(socket: &Path, readings: Vec<usize>) -> std::sync::mpsc::Receiver<Vec<u8>> {
-    let name = socket.to_str().expect("a utf-8 path").to_fs_name::<GenericFilePath>().expect("a socket name");
-    let listener = ListenerOptions::new().name(name).create_sync().expect("something listens on the socket");
+    let listener = apack_terminal::listening::listen(socket.to_str().expect("a utf-8 path"))
+        .unwrap_or_else(|refused| panic!("something listens on the socket: {refused}"));
     let (read, reads) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         for reading in readings {
