@@ -721,14 +721,15 @@ fn a_recording_names_its_key_after_each_keyframe_and_a_session_without_one_names
     next.feed(format!("\x1b]133;C{BEL}more\r\n\x1b]133;D;0{BEL}").as_bytes());
     assert_eq!(marks(&recorded(&mut next, &unkeyed)), vec![]);
 
-    // A keyframe every 64 bytes, so a few commands are several
+    // A keyframe every 64 bytes, or as many as the last held, and commands that print more than one holds,
+    // so a few commands are several
     let path = directory.path().join("keyed.rec");
     let mut screen = Screen::keyed(40, 6, key(KEY));
     screen
         .start_recording_with(Recorder::start_with(&path, recording::BUDGET, 64).expect("the recording starts"))
         .expect("the first keyframe is taken");
     for number in 1..=4 {
-        screen.feed([start(number, "make"), "output\r\n".repeat(4), finish(number, "0", "/")].concat().as_bytes());
+        screen.feed([start(number, "make"), "output\r\n".repeat(1_000), finish(number, "0", "/")].concat().as_bytes());
     }
     let entries = recorded(&mut screen, &path);
     let (marks, keyframes) = (marks(&entries), keyframes(&entries));

@@ -199,6 +199,16 @@ none, rather than an image that would be drawn as an empty place, and what its r
 them is the ones sent after it. A terminal that does not fit a keyframe — an image a program is part way through sending is
 megabytes written out with the screen — has its keyframe put off, and is recorded all the while.
 
+**Keyframes are never more of a recording than its output.** The next keyframe falls due a megabyte of
+output after the last, or as much output as the last held where that is more. A keyframe larger than the
+distance is something growing in the terminal, and the core does not say what: nothing it can be asked
+says a transmission is open until its last piece arrives, and until then the image is in the keyframe and
+nowhere else. Taken every megabyte regardless, each would hold all of the image so far, and an image of
+eight megabytes would be written again as twelve megabytes of keyframes — quadratic in the image, and with
+the image itself enough to fill what may wait (`BACKLOG`) for a writer the machine is slow to run. Spaced
+by their own size, the keyframes between two moments are at most the output between them and one keyframe
+more, whatever is growing, and a replay feeds at most a megabyte after one or as much as it holds.
+
 A keyframe is taken on whichever screen is showing, waits for the parser to be between sequences — which
 is where the core writes a terminal out — and is what lets a recording past its budget drop its oldest
 part. What the broker told a terminal is not that terminal's state and is not the keyframe's: how much
