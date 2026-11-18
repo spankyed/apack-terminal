@@ -68,6 +68,12 @@ pub const SOURCE_BYTES: u64 = 400 << 20;
 /// one command.
 pub const CHUNK_BYTES: usize = 3 << 20;
 
+/// The most one read of a source asks the system for. **Each answer is progress** (`Worker`), and a read
+/// that has gone `QUIET` without one is given up on, so a read asks for no more than a slow source — a
+/// network or FUSE mount — answers well inside that: a megabyte in five seconds is 0.2 MB/s. A piece
+/// (`CHUNK_BYTES`) is several reads.
+pub const READ_BYTES: usize = 1 << 20;
+
 /// The largest width or height the core takes for pixels it is not told the size of (`max_dimension`).
 const DIMENSION: u32 = 10_000;
 
@@ -250,8 +256,7 @@ impl Load {
         let mut source = Progressing { source: source.take(limit), progress };
         let (mut pieces, mut read) = (Vec::new(), 0);
         loop {
-            let mut piece = Vec::new();
-            source.by_ref().take(CHUNK_BYTES as u64).read_to_end(&mut piece).ok()?;
+            let piece = read_piece(&mut source)?;
             read += piece.len() as u64;
             let ended = piece.len() < CHUNK_BYTES;
             pieces.push(piece);
@@ -288,6 +293,35 @@ impl Load {
         };
         if length <= SOURCE_BYTES { Ok(start..start + length) } else { Err(Refused::InvalidData) }
     }
+}
+
+/// The next `CHUNK_BYTES` of `source`, or as many as are left of it.
+///
+/// **Read into room made whole and zeroed by the allocator**, rather than by `read_to_end`, which grows a
+/// piece by doubling and zeroes each stretch of it a byte at a time before letting a read write there: a
+/// source is up to `SOURCE_BYTES`, and in a debug build — the suite's — that zeroing costs more than the
+/// reads, CPU that a busy machine multiplies against a test's deadline, which is a clock.
+fn read_piece(source: &mut impl Read) -> Option<Vec<u8>> {
+    let mut piece = vec![0; CHUNK_BYTES];
+    // **Counted as each read answers, not worked out from the room left.** A full piece is what tells
+    // `read_from` there may be more, so a piece is never longer than what was read into it: one said to be
+    // full that the source did not fill would have the next piece read, and the next, for ever
+    let mut filled = 0;
+    let mut room = piece.as_mut_slice();
+    while !room.is_empty() {
+        let asked = room.len().min(READ_BYTES);
+        match source.read(&mut room[..asked]) {
+            Ok(0) => break,
+            Ok(count) => {
+                room = &mut std::mem::take(&mut room)[count..];
+                filled += count;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    piece.truncate(filled);
+    Some(piece)
 }
 
 /// A source being read, calling `progress` each time the system answers.

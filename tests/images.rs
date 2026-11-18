@@ -620,8 +620,11 @@ fn an_image_named_as_shared_memory_is_read_and_unlinked() {
     let c_name = std::ffi::CString::new(name.clone()).expect("a name");
     // SAFETY: the name is a valid C string; the descriptor is used for this object only and closed below
     let made = unsafe {
+        // An object already under the name was left by a process gone before that had this id, which a
+        // failure of this case can do, and is not this one's to read
+        libc::shm_unlink(c_name.as_ptr());
         let descriptor = libc::shm_open(c_name.as_ptr(), libc::O_CREAT | libc::O_EXCL | libc::O_RDWR, 0o600);
-        assert!(descriptor >= 0, "a shared memory object is made");
+        assert!(descriptor >= 0, "a shared memory object is made: {}", std::io::Error::last_os_error());
         assert_eq!(libc::ftruncate(descriptor, pixels.len() as libc::off_t), 0);
         let mapped = libc::mmap(std::ptr::null_mut(), pixels.len(), libc::PROT_WRITE, libc::MAP_SHARED, descriptor, 0);
         assert_ne!(mapped, libc::MAP_FAILED);
