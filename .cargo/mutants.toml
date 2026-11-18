@@ -234,6 +234,11 @@ exclude_re = [
     # address from being sent as a link if it ever did
     "vt/rows.rs:.*replace match guard written == 0 with false in Terminal::read_link",
 
+    # **Input exactly a window ago.** `<` and `<=` answer alike for every moment but the one on which exactly
+    # `OUTPUT_WINDOW` has passed since the session was typed at, to the tick, which no case can arrange and
+    # nothing depends on: either way the output then leaves at once or within a window
+    "output.rs:.*replace < with <= in Wrote::within",
+
     # **Where a read is cut to look for a hold, not what is parsed.** It only adds cuts: every byte is
     # still fed in order and every hold the scan finds is still settled after its sequence, so what
     # differs is how many calls into the core one read is. The one thing a case could see is a hold
