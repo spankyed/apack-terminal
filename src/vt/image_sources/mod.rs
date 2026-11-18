@@ -68,6 +68,12 @@ pub const SOURCE_BYTES: u64 = 400 << 20;
 /// one command.
 pub const CHUNK_BYTES: usize = 3 << 20;
 
+/// The most one read of a source asks the system for. **Each answer is progress** (`Worker`), and a read
+/// that has gone `QUIET` without one is given up on, so a read asks for no more than a slow source — a
+/// network or FUSE mount — answers well inside that: a megabyte in five seconds is 0.2 MB/s. A piece
+/// (`CHUNK_BYTES`) is several reads.
+pub const READ_BYTES: usize = 1 << 20;
+
 /// The largest width or height the core takes for pixels it is not told the size of (`max_dimension`).
 const DIMENSION: u32 = 10_000;
 
@@ -299,7 +305,8 @@ fn read_piece(source: &mut impl Read) -> Option<Vec<u8>> {
     let mut piece = vec![0; CHUNK_BYTES];
     let mut room = piece.as_mut_slice();
     while !room.is_empty() {
-        match source.read(room) {
+        let asked = room.len().min(READ_BYTES);
+        match source.read(&mut room[..asked]) {
             Ok(0) => break,
             Ok(count) => room = &mut std::mem::take(&mut room)[count..],
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}

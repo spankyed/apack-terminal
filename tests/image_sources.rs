@@ -25,7 +25,7 @@ use apack_terminal::vt::image_sources::posix::{
     device, mounted_at, mounted_beneath, on_special_filesystem, open_file, shared_memory_kind, special_filesystems,
 };
 use apack_terminal::vt::image_sources::{
-    CHUNK_BYTES, Load, PATH_BYTES, SOURCE_BYTES, Scanner, Source, Worker, shared_memory_name,
+    CHUNK_BYTES, Load, PATH_BYTES, READ_BYTES, SOURCE_BYTES, Scanner, Source, Worker, shared_memory_name,
 };
 use proptest::prelude::*;
 
@@ -1339,6 +1339,40 @@ fn an_interrupted_read_is_asked_again_and_a_failed_one_is_not() {
     };
     assert_eq!(read(std::io::ErrorKind::Interrupted), Some(vec![PIXEL.to_vec()]));
     assert_eq!(read(std::io::ErrorKind::Other), None);
+}
+
+/// A source that answers every read with all it is asked for, keeping how much each asked.
+struct Answering {
+    bytes: std::io::Cursor<Vec<u8>>,
+    asked: std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
+}
+
+impl std::io::Read for Answering {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.asked.borrow_mut().push(buffer.len());
+        self.bytes.read(buffer)
+    }
+}
+
+impl std::io::Seek for Answering {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.bytes.seek(to)
+    }
+}
+
+/// **No read asks for more than `READ_BYTES`**, however much is left of a piece: a source that answers
+/// only as much as it is asked, as a slow mount does, answers each piece in several reads, each of them
+/// progress, rather than in one that may outlast the quiet a read is allowed.
+#[test]
+fn a_read_asks_for_no_more_than_a_slow_source_answers_while_it_is_not_quiet() {
+    let bytes: Vec<u8> = (0..CHUNK_BYTES + 5).map(|at| (at % 251) as u8).collect();
+    let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let source = Answering { bytes: std::io::Cursor::new(bytes.clone()), asked: asked.clone() };
+    let read = load_of("a=T").read_from(source, &|| {}).map(|pieces| pieces.concat());
+    assert!(read == Some(bytes), "the source was not read whole");
+    let asked = asked.borrow();
+    assert!(asked.iter().all(|&size| size <= READ_BYTES), "a read asked for more than READ_BYTES: {asked:?}");
+    assert!(asked.len() > CHUNK_BYTES / READ_BYTES, "a piece was read in one read: {asked:?}");
 }
 
 /// How long the cases here let a read be quiet, and how long a read that is not quiet pauses between its
