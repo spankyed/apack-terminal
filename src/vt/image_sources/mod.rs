@@ -303,17 +303,23 @@ impl Load {
 /// reads, CPU that a busy machine multiplies against a test's deadline, which is a clock.
 fn read_piece(source: &mut impl Read) -> Option<Vec<u8>> {
     let mut piece = vec![0; CHUNK_BYTES];
+    // **Counted as each read answers, not worked out from the room left.** A full piece is what tells
+    // `read_from` there may be more, so a piece is never longer than what was read into it: one said to be
+    // full that the source did not fill would have the next piece read, and the next, for ever
+    let mut filled = 0;
     let mut room = piece.as_mut_slice();
     while !room.is_empty() {
         let asked = room.len().min(READ_BYTES);
         match source.read(&mut room[..asked]) {
             Ok(0) => break,
-            Ok(count) => room = &mut std::mem::take(&mut room)[count..],
+            Ok(count) => {
+                room = &mut std::mem::take(&mut room)[count..];
+                filled += count;
+            }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => return None,
         }
     }
-    let filled = CHUNK_BYTES - room.len();
     piece.truncate(filled);
     Some(piece)
 }
