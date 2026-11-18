@@ -97,33 +97,31 @@ impl Credit {
     }
 }
 
-/// When a session's program was last written to, which is what makes the output after it an answer.
+/// When a session was last typed at, which is what makes the output soon after it an answer.
 ///
-/// **An echo is not a burst, though it arrives like one.** A keystroke written within a window of the last
-/// flush has its echo arrive inside that window too, and held for the rest of it, typing back to back
-/// waited out the window on every character. The broker knows when it wrote to the program, so output that
-/// follows a write it has not yet sent anything after is the program answering, and leaves at once; output
-/// nobody asked for still waits out the window. The writer notes the write once the pty has taken it
-/// (`writer::Input`), which is when the program can have begun to answer.
+/// **An echo is not a burst, though it arrives like one.** A key typed within a window of the last flush has
+/// its echo arrive inside that window too, and held for the rest of it, typing back to back waited out the
+/// window on every character. So output arriving within a window of input is sent at once, and output with
+/// none before it waits out the window.
+///
+/// **Noted as the input is queued, before it is written** (`Session::send`): a pty in cooked mode echoes
+/// during the write itself, so a note made after the write can arrive after the echo it is for. And only
+/// input someone typed, sent or pasted: the terminal's own answers to a program's questions go to the
+/// program too, and a program that asks one every frame would otherwise never be batched.
 #[derive(Debug, Default)]
 pub struct Wrote(Mutex<Option<Instant>>);
 
 impl Wrote {
-    /// Notes that the program has just been written to
+    /// Notes that the session has just been sent input
     pub fn now(&self) {
         if let Ok(mut last) = self.0.lock() {
             *last = Some(Instant::now());
         }
     }
 
-    /// Whether the program has been written to since `flushed`, or at all when nothing has been flushed
-    pub fn since(&self, flushed: Option<Instant>) -> bool {
-        let Ok(last) = self.0.lock() else { return false };
-        match (*last, flushed) {
-            (Some(written), Some(flushed)) => written > flushed,
-            (Some(_), None) => true,
-            (None, _) => false,
-        }
+    /// Whether the session was sent input less than `window` ago
+    pub fn within(&self, window: Duration) -> bool {
+        self.0.lock().ok().and_then(|last| *last).is_some_and(|written| written.elapsed() < window)
     }
 }
 
@@ -336,16 +334,16 @@ pub fn coalesce_within(
         // machine holds it up, so sending at each pause sent a busy session's output a read at a time, which
         // is what the window is for: at most one message a window, plus one each time the cap fills.
         //
-        // **But an answer to what was just written leaves at once** (`Wrote`): output held after a write the
-        // program has had nothing sent since is its echo, and is sent without waiting out the window. The
-        // flush that sends it is after the write, so whatever follows is batched again.
+        // **But an answer to input leaves at once** (`Wrote`): output arriving within a window of the session
+        // being typed at is its echo, and is sent without waiting out the window. A window after the input,
+        // whatever follows is batched again.
         //
         // **And nothing held is nothing to wake for.** With no sendable byte this blocks until a chunk
         // arrives, however long that is: an idle session costs no timer. A trailing partial character
         // counts as nothing held, because only the next read can complete it.
         let wait = if sendable(&buffer) == 0 {
             None
-        } else if wrote.since(flushed) {
+        } else if wrote.within(window) {
             Some(Duration::ZERO)
         } else {
             let window_left = flushed.map_or(Duration::ZERO, |at| window.saturating_sub(at.elapsed()));

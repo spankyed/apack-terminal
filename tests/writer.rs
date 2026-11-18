@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
-use apack_terminal::output::Wrote;
 use apack_terminal::writer::{INPUT_BYTES, Input, Refused};
 
 /// How long a wait for another thread goes on with nothing arriving. **Shorter than the runner's deadline for a
@@ -137,35 +136,4 @@ fn a_program_gone_before_its_input_is_closed_has_its_pty_let_go_of_at_the_close(
 
     input.close();
     gone.recv_timeout(PATIENCE).expect("the pty's writer is let go of when the thread that held it stops");
-}
-
-/// A pty that takes everything, and says what it took.
-struct Telling(Sender<Vec<u8>>);
-
-impl Write for Telling {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        let _ = self.0.send(bytes.to_vec());
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// **A write is noted once the pty has taken it**, which is what tells the coalescer that output after it is
-/// the program answering (`output::Wrote`), and not before: nothing queued has been written yet.
-#[test]
-fn a_write_is_noted_once_the_pty_has_taken_it() {
-    let wrote = Arc::new(Wrote::default());
-    assert!(!wrote.since(None), "a program nothing has been written to was noted as written to");
-    let (telling, took) = channel();
-    let input = Input::start_noting(Box::new(Telling(telling)), Arc::clone(&wrote));
-    input.send(b"k".to_vec()).expect("queued");
-    input.send(b"j".to_vec()).expect("queued");
-    // The thread that writes takes them in order: by the time the pty has the second, the first was noted
-    assert_eq!(took.recv_timeout(PATIENCE).expect("the first write"), b"k");
-    assert_eq!(took.recv_timeout(PATIENCE).expect("the second write"), b"j");
-    assert!(wrote.since(None), "a write the pty took was not noted");
-    input.close();
 }

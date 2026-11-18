@@ -17,8 +17,6 @@ use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::{Arc, Condvar, Mutex};
 
-use crate::output::Wrote;
-
 /// How much may be waiting for a program to read before more is refused.
 ///
 /// **A ceiling on what a program that does not read can make the broker hold.** Far more than anything
@@ -42,8 +40,6 @@ pub struct Input {
     queue: Mutex<Queue>,
     /// Something was queued, or the queue was closed
     changed: Condvar,
-    /// Told each time the pty takes a write, for the coalescer to know an answer from a burst
-    wrote: Arc<Wrote>,
 }
 
 #[derive(Default)]
@@ -64,12 +60,7 @@ impl Input {
     /// Starts the thread that writes to `writer`, which is the pty's and from here on this thread's
     /// alone. It ends when the input is closed or the pty refuses a write.
     pub fn start(writer: Box<dyn Write + Send>) -> Arc<Self> {
-        Self::start_noting(writer, Arc::default())
-    }
-
-    /// The same, telling `wrote` each time the pty takes a write (`output::Wrote`).
-    pub fn start_noting(writer: Box<dyn Write + Send>, wrote: Arc<Wrote>) -> Arc<Self> {
-        let input = Arc::new(Self { queue: Mutex::new(Queue::default()), changed: Condvar::new(), wrote });
+        let input = Arc::new(Self { queue: Mutex::new(Queue::default()), changed: Condvar::new() });
         std::thread::spawn({
             let input = Arc::clone(&input);
             move || input.write_to(writer)
@@ -148,7 +139,6 @@ impl Input {
                 self.close();
                 break;
             }
-            self.wrote.now();
             if let Ok(mut queue) = self.queue.lock() {
                 queue.bytes = queue.bytes.saturating_sub(next.len());
             }

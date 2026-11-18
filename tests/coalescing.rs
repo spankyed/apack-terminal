@@ -243,12 +243,11 @@ mod pacing {
         assert_eq!(text(answers.recv_timeout(SOON).expect("the stream's end")), "one two three", "one message");
     }
 
-    /// **What answers a write leaves at once, though the window is open.** A keystroke typed within a window
-    /// of the last flush has its echo arrive inside that window, and held there, typing back to back waited
-    /// out the window on every character. The flush that sends it is after the write, so what follows,
-    /// asked for by nothing, waits out the window again.
+    /// **What answers input leaves at once, though the window is open.** A keystroke typed within a window of
+    /// the last flush has its echo arrive inside that window, and held there, typing back to back waited out
+    /// the window on every character. What arrives with no input before it waits, which the burst case holds.
     #[test]
-    fn what_answers_a_write_leaves_at_once_though_the_window_is_open() {
+    fn what_answers_input_leaves_at_once_though_the_window_is_open() {
         let (sending, incoming) = channel::<Vec<u8>>();
         let (outgoing, answers) = channel();
         let credit = Credit::new(OUTPUT_CREDIT);
@@ -261,15 +260,10 @@ mod pacing {
         sending.send(b"$ ".to_vec()).expect("the coalescer is listening");
         assert_eq!(text(answers.recv_timeout(SOON).expect("the first flush")), "$ ");
 
-        // Inside the window now: a key is written to the program, and its echo comes back
+        // Inside the window now: a key is typed, and its echo comes back
         wrote.now();
         sending.send(b"k".to_vec()).expect("the coalescer is listening");
         assert_eq!(text(answers.recv_timeout(SOON).expect("the echo was held for the window")), "k");
-
-        sending.send(b"more".to_vec()).expect("the coalescer is listening");
-        assert!(answers.recv_timeout(SHORT).is_err(), "what nobody asked for left at once after an echo");
-        drop(sending);
-        assert_eq!(text(answers.recv_timeout(SOON).expect("the stream's end")), "more");
     }
 
     /// **What a burst holds leaves when its window closes**, with nothing more arriving to push it out.
