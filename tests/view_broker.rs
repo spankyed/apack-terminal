@@ -406,14 +406,17 @@ impl View {
     /// so without the wait a case reads the screen before the resize has landed: placeholder cells under a
     /// cell of no size show no image, and that row is sent again with its pieces a frame later. The grid
     /// and the cell's size are set in one call under the screen's lock (`Screen::resize`), so a frame of the
-    /// new grid is one after the cell's size too — which is why `rows` has to differ from what the session
-    /// was spawned with (`Client::started`), or a frame before the resize would meet the wait.
-    fn resized(&mut self, client: &Client, session: &str, rows: u16, cell: (u16, u16)) {
+    /// new grid is one after the cell's size too — which is why `grid` has to differ from what the session
+    /// was spawned with (`Client::started`), or a frame before the resize would meet the wait. A case that
+    /// asks about lines by number waits for the same reason: a resize renumbers them (`publish::advance`),
+    /// so one that lands after the question was asked answers it with a refusal.
+    fn resized(&mut self, client: &Client, session: &str, grid: (u16, u16), cell: (u16, u16)) {
+        let (cols, rows) = grid;
         say(
             &client.stream,
-            &Request::Resize { session: session.to_owned(), cols: 60, rows, cell_width: cell.0, cell_height: cell.1 },
+            &Request::Resize { session: session.to_owned(), cols, rows, cell_width: cell.0, cell_height: cell.1 },
         );
-        while !self.last.as_ref().is_some_and(|frame| frame.screen_rows == rows) {
+        while !self.last.as_ref().is_some_and(|frame| (frame.columns, frame.screen_rows) == grid) {
             self.step();
         }
     }
@@ -860,7 +863,7 @@ fn an_image_named_as_a_file_and_shown_through_cells_is_sent_with_its_row() {
     let client = Client::greeting(&broker);
     for (session, reads) in [(client.shell_reading_files(), true), (client.shell_taking(true), false)] {
         let mut view = View::attached(&broker, &session);
-        view.resized(&client, &session, 9, (10, 20));
+        view.resized(&client, &session, (60, 9), (10, 20));
         view.until_shows("$ ");
         view.type_line(&shown);
         view.until_shows("sh2own");
@@ -930,7 +933,7 @@ fn a_placed_image_and_its_pixels_are_answered_to_the_view_that_asked() {
     let client = Client::greeting(&broker);
     let session = client.shell_taking(true);
     let mut view = View::attached(&broker, &session);
-    view.resized(&client, &session, 9, (10, 20));
+    view.resized(&client, &session, (60, 9), (10, 20));
     view.until_shows("$ ");
     // One red pixel, sent whole and shown where the cursor is
     view.type_line(&format!(
@@ -971,7 +974,7 @@ fn a_session_holding_more_images_than_are_listed_says_so_and_one_holding_as_many
     let client = Client::greeting(&broker);
     let session = client.shell_taking(true);
     let mut view = View::attached(&broker, &session);
-    view.resized(&client, &session, 9, (10, 20));
+    view.resized(&client, &session, (60, 9), (10, 20));
     view.until_shows("$ ");
     let place = |image: u32| printed(&format!("\\033_Ga=T,f=32,i={image},s=1,v=1,q=2;/wAA/w==\\033\\\\"));
 
@@ -1181,10 +1184,7 @@ fn a_view_that_asks_without_reading_is_hung_up_on() {
     {
         // Something worth asking for: a screen wide and tall enough that its lines are a megabyte
         let mut filling = View::attached(&broker, &session);
-        say(
-            &client.stream,
-            &Request::Resize { session: session.clone(), cols: 500, rows: 100, cell_width: 0, cell_height: 0 },
-        );
+        filling.resized(&client, &session, (500, 100), (0, 0));
         filling.until_shows("$ ");
         filling.type_line(&padded_lines(200, 500, &echo_sum("fil", 1, 1, "led")));
         filling.until_shows("fil2led");
@@ -1266,10 +1266,7 @@ impl Unread {
 fn a_session_holding_a_megabyte(broker: &Broker, client: &Client) -> (String, View) {
     let session = client.shell();
     let mut filling = View::attached(broker, &session);
-    say(
-        &client.stream,
-        &Request::Resize { session: session.clone(), cols: 1000, rows: 100, cell_width: 0, cell_height: 0 },
-    );
+    filling.resized(client, &session, (1000, 100), (0, 0));
     filling.until_shows("$ ");
     filling.type_line(&padded_lines(900, 1000, &echo_sum("fil", 1, 1, "led")));
     filling.until_shows("fil2led");
