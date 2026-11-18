@@ -130,6 +130,35 @@ correctly.
 `disconnect` wakes it on purpose — the receiver goes, then one malformed frame the broker is certain to
 answer. This is worth knowing before writing a case about a client going away.
 
+## A wait for the broker says what it waited for
+
+**Every case that waits on the broker or a process it started while it runs listens through
+`tests/_support/heard.rs`.**
+A thread reads and a channel hands over what it read, so a wait is bounded by silence (`QUIET`): everything
+heard resets it, a slow machine makes a wait longer and never fails it, and one that runs out fails as the
+case's own panic — at the line that waited, with the last few things heard — before the run's deadline would
+end the case with nothing but how long it took. A lost signal is then a message saying where output stopped.
+
+**Read at the case's pace where the subject is not reading** (`Heard::paced`): nothing is read until the case
+asks, so a case about backpressure fills the channel it means to. Everywhere else the reader runs ahead, so a
+case whose subject is a reader that keeps up has one.
+
+## A case nextest calls leaky on a busy machine
+
+**`LEAK` on a case that starts no process is the machine, not the case.** nextest calls a case leaky when its
+output pipes are still open 100 ms after the process exits. Under twenty busy loops on ten cores, each full run
+flagged from one to nine cases. All of them were cases that start no process (`images`, `placeholders`,
+`recording`, `view_frames`, `view_input`, `view_reads`, `vouched`, `keyframes`, `coalescing`), and the set was
+different in every run.
+Run alone under the same load, two of them were flagged in none of two hundred runs. With nextest's window
+raised to a second for a diagnostic run, most of the flags went, though `coalescing`'s in-process cases were
+still flagged once. So these flags mark how long a saturated machine took to tear a process down or to tell
+nextest so, not something left running (2026-11-17).
+
+What would be a finding is a case that **does** start the broker or a shell being flagged when the machine is
+quiet: that is a process outliving its case, which the reaper (`tests/reaper.rs`) exists to stop. List what
+is running from the worktree's `target/` after the run before concluding either way.
+
 ## A test runs in its own process, and has a deadline
 
 `cargo nextest run` runs each test in a process of its own, so a test that has stopped ending is killed at
@@ -139,14 +168,17 @@ returns rather than a wrong answer — and under `cargo test` one such case hold
 
 The deadlines are in [`.config/nextest.toml`](../../.config/nextest.toml). Each is several times the slowest
 reading rather than near it, because what it is for is a test that has stopped ending at all: the whole
-suite is 8 s on an Apple-silicon laptop (352 tests, 2026-11-11), and its slowest case 7.2 s against a
-deadline of its own. **A reading, never a bound** — a slower machine reports, it does not fail.
+suite is 16 s on an Apple-silicon laptop at a load average of 60 (599 tests, 2026-11-17), and its slowest
+case 6.2 s against the default deadline of 20 s. **The deadline is a clock**, so a case's own work counts
+against it: on a machine busy enough, a case that does real work can time out though nothing is wrong. That
+is why a case's work is kept small and a wait is bounded by silence rather than by time, and why a timeout
+under load is read as a possible lost signal first — the ones found so far were.
 
 **The suite is one program** (`tests/suite.rs`), whose modules are the files beside it: a file of its own
 under `tests/` would be a binary of its own, linked against the whole library, and thirty of those were
 most of what a changed line cost to build. **Its cases run cheapest first** (the priorities in
 `.config/nextest.toml`): the ones that are a function call before the ones that start the broker and a
-shell, with the two longest started at the beginning so the run does not end waiting for them. **A case
+shell, with the three longest started at the beginning so the run does not end waiting for them. **A case
 names its shell.** A spawn that names none runs the login shell of whoever ran the suite, with their
 configuration, which is seconds where `/bin/sh` is milliseconds and is what made cases go quiet on a busy
 machine. `tests/channel.rs` and `tests/candidates.rs` are where the default program is run, and they name
