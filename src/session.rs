@@ -1503,12 +1503,17 @@ impl Sessions {
         // Its jobs first, while the shell that could say whose they are is still there
         hang_up_the_rest(&[live.process.pid]);
         // **Killed first, and only then tidied up after.** Between the two its program can still read,
-        // and nothing that ending a session does may reach a program that is being ended
-        let killed = live.killer.kill().map_err(|error| Refusal::pty("killing a session", error));
+        // and nothing that ending a session does may reach a program that is being ended.
+        //
+        // **What becomes of the hangup is not the kill's answer.** A program that ends with what it started
+        // — `sh -c` waiting on the command it forked — can be gone, and reaped by the thread waiting on it,
+        // before its own hangup is sent: hanging up its jobs ended it. That hangup then finds no process,
+        // and the session has ended as asked. One that is there and ignores it is `end_for_certain`'s
+        let _ = live.killer.kill();
         self.end(&live);
         // What was sent is a hangup, which a program may ignore
         end_for_certain(live.process.pid, live.reaped);
-        killed
+        Ok(())
     }
 
     /// Drops the record of a session whose process has ended, which the writer thread does when it sees the
