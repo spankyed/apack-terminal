@@ -140,7 +140,10 @@ returns rather than a wrong answer — and under `cargo test` one such case hold
 The deadlines are in [`.config/nextest.toml`](../../.config/nextest.toml). Each is several times the slowest
 reading rather than near it, because what it is for is a test that has stopped ending at all: the whole
 suite is 16 s on an Apple-silicon laptop at a load average of 60 (599 tests, 2026-11-17), and its slowest
-case 6.2 s against the default deadline of 20 s. **A reading, never a bound** — a slower machine reports, it does not fail.
+case 6.2 s against the default deadline of 20 s. **The deadline is a clock**, so a case's own work counts
+against it: on a machine busy enough, a case that does real work can time out though nothing is wrong. That
+is why a case's work is kept small and a wait is bounded by silence rather than by time, and why a timeout
+under load is read as a possible lost signal first — the ones found so far were.
 
 **The suite is one program** (`tests/suite.rs`), whose modules are the files beside it: a file of its own
 under `tests/` would be a binary of its own, linked against the whole library, and thirty of those were
