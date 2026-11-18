@@ -257,8 +257,8 @@ Recorded 2026-11-12 on the developer's Mac (Apple Silicon, macOS), load average 
 | Broker resident memory, 1 / 10 / 50 idle sessions | 10.6 / 12.0 / 15.7 MB |
 
 Bytes arriving within a window of the last flush wait out the rest of it, so a burst that pauses is still one
-message a window, unless the session was typed at within a window: then what arrives is its answer and leaves at
-once (`output::Wrote`), which is what the back-to-back figure measures. On 2026-11-17, alternating with
+message a window, unless the session was typed at since the last flush began: then what arrives is its answer and
+leaves at once (`output::Wrote`), which is what the back-to-back figure measures. On 2026-11-17, alternating with
 the commit before, at load averages of 131–189, the back-to-back median was 0.05–0.14 ms against 1.39–2.93 ms.
 
 The throughput figure is not the broker's alone. The benchmark's client parses each output event as JSON, and that

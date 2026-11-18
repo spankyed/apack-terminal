@@ -97,12 +97,13 @@ impl Credit {
     }
 }
 
-/// When a session was last typed at, which is what makes the output soon after it an answer.
+/// When a session was last typed at, which is what makes the output after it an answer.
 ///
 /// **An echo is not a burst, though it arrives like one.** A key typed within a window of the last flush has
 /// its echo arrive inside that window too, and held for the rest of it, typing back to back waited out the
-/// window on every character. So output arriving within a window of input is sent at once, and output with
-/// none before it waits out the window.
+/// window on every character. So output held after input that no flush has begun since is sent at once,
+/// and the flush that sends it is the input's answer: what follows, a flood the key started included, waits
+/// out the window as any burst does, one message a window rather than one a read.
 ///
 /// **Noted as the input is queued, before it is written** (`Session::send`): a pty in cooked mode echoes
 /// during the write itself, so a note made after the write can arrive after the echo it is for. And only
@@ -119,9 +120,16 @@ impl Wrote {
         }
     }
 
-    /// Whether the session was sent input less than `window` ago
-    pub fn within(&self, window: Duration) -> bool {
-        self.0.lock().ok().and_then(|last| *last).is_some_and(|written| written.elapsed() < window)
+    /// Whether the session has been sent input since the flush that began at `began`, or at all when
+    /// nothing has been flushed. **Since the flush began, not since it ended**: input that arrives while a
+    /// flush is sending is after the output that flush carries, and its echo is still to come
+    pub fn since(&self, began: Option<Instant>) -> bool {
+        let Ok(last) = self.0.lock() else { return false };
+        match (*last, began) {
+            (Some(written), Some(began)) => written >= began,
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
     }
 }
 
@@ -334,16 +342,16 @@ pub fn coalesce_within(
         // machine holds it up, so sending at each pause sent a busy session's output a read at a time, which
         // is what the window is for: at most one message a window, plus one each time the cap fills.
         //
-        // **But an answer to input leaves at once** (`Wrote`): output arriving within a window of the session
-        // being typed at is its echo, and is sent without waiting out the window. A window after the input,
-        // whatever follows is batched again.
+        // **But an answer to input leaves at once** (`Wrote`): output held after input that no flush has
+        // begun since is its echo, and is sent without waiting out the window. That flush answers the input,
+        // so whatever follows is batched again.
         //
         // **And nothing held is nothing to wake for.** With no sendable byte this blocks until a chunk
         // arrives, however long that is: an idle session costs no timer. A trailing partial character
         // counts as nothing held, because only the next read can complete it.
         let wait = if sendable(&buffer) == 0 {
             None
-        } else if wrote.within(window) {
+        } else if wrote.since(flushed) {
             Some(Duration::ZERO)
         } else {
             let window_left = flushed.map_or(Duration::ZERO, |at| window.saturating_sub(at.elapsed()));
@@ -361,17 +369,20 @@ pub fn coalesce_within(
                 // A fast producer fills the cap before the window elapses; flushing on size keeps the
                 // window from becoming a latency floor under saturation
                 if buffer.len() >= OUTPUT_CAP {
+                    // Taken before the flush sends: input arriving while it does is after this output
+                    let began = Instant::now();
                     if !flush(&mut buffer, &credit, false) {
                         return;
                     }
-                    flushed = Some(Instant::now());
+                    flushed = Some(began);
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
+                let began = Instant::now();
                 if !flush(&mut buffer, &credit, false) {
                     return;
                 }
-                flushed = Some(Instant::now());
+                flushed = Some(began);
             }
             Err(RecvTimeoutError::Disconnected) => {
                 let _ = flush(&mut buffer, &credit, true);

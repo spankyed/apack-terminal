@@ -245,7 +245,8 @@ mod pacing {
 
     /// **What answers input leaves at once, though the window is open.** A keystroke typed within a window of
     /// the last flush has its echo arrive inside that window, and held there, typing back to back waited out
-    /// the window on every character. What arrives with no input before it waits, which the burst case holds.
+    /// the window on every character. The flush that sends the echo answers the key, so what follows it,
+    /// asked for by nothing, waits out the window: a flood a key starts is batched like any other.
     #[test]
     fn what_answers_input_leaves_at_once_though_the_window_is_open() {
         let (sending, incoming) = channel::<Vec<u8>>();
@@ -264,6 +265,11 @@ mod pacing {
         wrote.now();
         sending.send(b"k".to_vec()).expect("the coalescer is listening");
         assert_eq!(text(answers.recv_timeout(SOON).expect("the echo was held for the window")), "k");
+
+        sending.send(b"more".to_vec()).expect("the coalescer is listening");
+        assert!(answers.recv_timeout(SHORT).is_err(), "what followed the echo, unasked, left at once");
+        drop(sending);
+        assert_eq!(text(answers.recv_timeout(SOON).expect("the stream's end")), "more");
     }
 
     /// **What a burst holds leaves when its window closes**, with nothing more arriving to push it out.
