@@ -10,16 +10,17 @@
 //! that Windows has no name for, which are marked where they are.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
 use apack_terminal::protocol::{CommandOutcome, Event, PROTOCOL_VERSION, Request, Role, SessionSummary, Unreported};
-use apack_terminal::view::wire::{Frame, Incoming, Row, ToBroker, ToView, read_message};
+use apack_terminal::view::wire::{Frame, Row, ToBroker, ToView};
 use interprocess::local_socket::{GenericFilePath, Stream, ToFsName, prelude::*};
+
+use crate::heard::{Heard, QUIET};
 
 /// How long a wait in this file goes on with nothing arriving. **Shorter than the runner's deadline for a
 /// case** (`.config/nextest.toml`), so a wait that runs out fails saying what it was waiting for, where
@@ -76,7 +77,7 @@ fn connect(socket: &Path) -> Wire {
 /// the reader thread holds the pipe open until something wakes it: so the receiver goes first and one
 /// message the broker answers is sent, which the reader takes, fails to hand on, and returns from. That drops
 /// its clone, and the last reference is what closes the pipe.
-fn hang_up_stream<T>(events: Receiver<T>, stream: Wire, nonsense: &[u8]) {
+fn hang_up_stream<T>(events: Heard<T>, stream: Wire, nonsense: &[u8]) {
     #[cfg(unix)]
     {
         let Stream::UdSocket(socket) = &*stream.0;
@@ -99,13 +100,13 @@ fn hang_up_stream<T>(events: Receiver<T>, stream: Wire, nonsense: &[u8]) {
 /// POSIX closes its sending side and waits for the broker to close the other. A named pipe has no half close,
 /// so there the connection is let go as `hang_up_stream` lets it go, and the broker sees the client leave; the
 /// wait is for the pipe to be closed, which is a sleep rather than an answer.
-fn closed_stream<T>(events: Receiver<T>, stream: Wire, nonsense: &[u8]) {
+fn closed_stream<T: Clone + std::fmt::Debug + Send + 'static>(events: Heard<T>, stream: Wire, nonsense: &[u8]) {
     #[cfg(unix)]
     {
         let Stream::UdSocket(socket) = &*stream.0;
         let _ = socket.inner().shutdown(std::net::Shutdown::Write);
         let _ = nonsense;
-        while events.recv_timeout(PATIENCE).is_ok() {}
+        while events.within(QUIET).is_ok() {}
     }
     #[cfg(windows)]
     {
@@ -145,8 +146,7 @@ impl Broker {
             };
         }
         let mut process = command.spawn().expect("the broker starts");
-        let mut ready = String::new();
-        BufReader::new(process.stdout.as_mut().expect("piped stdout")).read_line(&mut ready).expect("a ready line");
+        let ready = crate::heard::lines(process.stdout.take().expect("piped stdout")).next();
         assert!(ready.starts_with("listening "), "{ready:?}");
         let reaper = crate::reaper::watching(&process, env!("CARGO_BIN_EXE_apack-terminal"));
         Self { process, socket, directory, reaper }
@@ -251,26 +251,13 @@ fn touch_line(path: &Path) -> String {
 /// Connection: the hold on the broker, or the one that asks for sessions.
 struct Connection {
     stream: Wire,
-    events: Receiver<Event>,
+    events: Heard<Event>,
 }
 
 impl Connection {
     fn greeting(broker: &Broker, role: Role) -> Self {
         let stream = connect(&broker.socket);
-        let (sender, events) = channel();
-        std::thread::spawn({
-            let stream = stream.clone();
-            move || {
-                for line in BufReader::new(stream).lines() {
-                    let Ok(line) = line else { return };
-                    if let Ok(event) = serde_json::from_str::<Event>(&line)
-                        && sender.send(event).is_err()
-                    {
-                        return;
-                    }
-                }
-            }
-        });
+        let events = crate::heard::events(stream.clone());
         let connection = Self { stream, events };
         connection.say(&Request::Hello { protocol: PROTOCOL_VERSION, role, challenge: None });
         assert!(matches!(connection.event(), Event::Hello { .. }));
@@ -283,8 +270,9 @@ impl Connection {
         (&*self.stream.0).write_all(line.as_bytes()).expect("the broker reads");
     }
 
+    #[track_caller]
     fn event(&self) -> Event {
-        self.events.recv_timeout(PATIENCE).expect("the broker answers")
+        self.events.next()
     }
 
     /// The next event `pick` takes, past whatever else is told on the way.
@@ -389,7 +377,7 @@ impl Connection {
 /// A view's connection, and the screen it has been sent.
 struct View {
     stream: Wire,
-    incoming: Receiver<ToView>,
+    incoming: Heard<ToView>,
     rows: BTreeMap<u64, Row>,
     last: Option<Frame>,
 }
@@ -402,23 +390,7 @@ impl View {
                 .expect("a request serializes");
         hello.push('\n');
         (&*stream.0).write_all(hello.as_bytes()).expect("the broker reads");
-        let (sender, incoming) = channel();
-        std::thread::spawn({
-            let stream = stream.clone();
-            move || {
-                let mut reader = BufReader::new(stream);
-                let mut hello = String::new();
-                if reader.read_line(&mut hello).is_err() {
-                    return;
-                }
-                while let Incoming::Message(body) = read_message(&mut reader) {
-                    let Ok(message) = ToView::decode(&body) else { return };
-                    if sender.send(message).is_err() {
-                        return;
-                    }
-                }
-            }
-        });
+        let incoming = crate::heard::view_messages(stream.clone());
         let view = Self { stream, incoming, rows: BTreeMap::new(), last: None };
         view.send(&ToBroker::Attach { channel: 1, session: session.to_owned() });
         view
@@ -431,7 +403,7 @@ impl View {
     /// Messages until the view is told its session is over.
     fn until_ended(&mut self) {
         loop {
-            let message = self.incoming.recv_timeout(PATIENCE).expect("the broker sends");
+            let message = self.incoming.next();
             if matches!(message, ToView::Ended { .. }) {
                 return;
             }
@@ -468,20 +440,24 @@ impl View {
             .join("\n")
     }
 
+    /// **Waits for as long as the broker goes on sending, and fails once it has sent nothing for `QUIET`**,
+    /// saying what it was waiting for and what the view held rather than only that nothing came. A frame
+    /// arriving is the broker still working, which on a busy machine is slow and not wrong.
+    #[track_caller]
     fn until(&mut self, what: &str, mut holds: impl FnMut(&Self) -> bool) {
-        // **Waits for what is left of `PATIENCE` and no longer**, so a wait that runs out says what it was
-        // waiting for and what the view held, rather than only that nothing came
-        let until = Instant::now() + PATIENCE;
         while !holds(self) {
-            match self.incoming.recv_timeout(until.saturating_duration_since(Instant::now())) {
+            match self.incoming.within(QUIET) {
                 Ok(message) => self.take(message),
-                Err(why) => {
-                    panic!("never {what} ({why}); the screen:\n{}\nall it holds:\n{}", self.screen(), self.held())
-                }
+                Err(why) => panic!(
+                    "never {what}: nothing was heard for {QUIET:?} ({why}); the screen:\n{}\nall it holds:\n{}",
+                    self.screen(),
+                    self.held()
+                ),
             }
         }
     }
 
+    #[track_caller]
     fn until_shows(&mut self, expected: &str) {
         self.until(&format!("showed {expected:?}"), |view| view.screen().contains(expected));
     }
@@ -655,7 +631,7 @@ fn a_session_begins_with_the_screen_its_recording_holds() {
     // view nothing more until it acknowledges the frame it was sent, so one passed over here leaves this
     // view on that screen for good, and every wait after it runs out
     let fetched = loop {
-        match view.incoming.recv_timeout(PATIENCE).expect("the broker sends") {
+        match view.incoming.next() {
             ToView::Rows { block, .. } => break block.rows.iter().map(text).collect::<Vec<_>>().join("\n"),
             other => view.take(other),
         }

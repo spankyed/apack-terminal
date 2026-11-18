@@ -4,12 +4,14 @@
 //! back through the protocol — proven here before any of it is wired into the app, so that the protocol is
 //! derived from a client that exists rather than proposed to one that does not.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::process::{Child, Command, Stdio};
 
 use interprocess::local_socket::{GenericFilePath, Stream, ToFsName, prelude::*};
 
 use apack_terminal::protocol::{BROKER_KEY_ENV, PROTOCOL_VERSION};
+
+use crate::heard::QUIET;
 
 /// The broker, listening, with the socket it said it was listening on.
 struct Broker {
@@ -67,10 +69,7 @@ fn start_with_env(arrange: impl FnOnce(&mut Command)) -> Broker {
     arrange(&mut command);
     let mut process = command.spawn().expect("the broker starts");
 
-    let mut ready = String::new();
-    BufReader::new(process.stdout.as_mut().expect("piped stdout"))
-        .read_line(&mut ready)
-        .expect("the broker says where it is listening");
+    let ready = crate::heard::lines(process.stdout.take().expect("piped stdout")).next();
     assert!(ready.starts_with("listening "), "{ready:?}");
 
     let reaper = crate::reaper::watching(&process, env!("CARGO_BIN_EXE_apack-terminal"));
@@ -123,47 +122,16 @@ fn connect(broker: &Broker) -> (Events, Wire) {
         broker.socket.to_str().expect("a utf-8 socket path").to_fs_name::<GenericFilePath>().expect("a socket name");
     let stream = Stream::connect(name).expect("the broker accepts");
     let wire = Wire(std::sync::Arc::new(stream));
-    (Events::reading(wire.clone()), wire)
+    (crate::heard::lines(wire.clone()), wire)
 }
 
-/// A connection's events, read on a thread of their own so that **every wait is bounded**.
+/// A connection's events, heard on a thread of their own so that every wait is bounded (`tests/_support/heard.rs`).
 ///
-/// A case waiting for something that will never come has to fail rather than hang — a mutation that stopped
-/// resizes reaching the pty turned a blocking read into a ten-minute wait, which is why this file bounds
-/// them at all. It used to ask the socket, with `set_recv_timeout`; `interprocess` refuses that for a
-/// Windows named pipe, and the first Windows run of this suite hung for want of it.
-///
-/// So the bound moved off the socket: a reader thread and a channel do it the same way on both platforms,
-/// which is one mechanism rather than one per platform and a guard that cannot quietly not apply.
-///
-/// **Its receiver is private, and that is load-bearing rather than tidy.** Reaching it is how a case comes
-/// to match a pattern against one `output` event, which the protocol promises nothing about: an escape
-/// sequence splits across two whenever a flush falls inside it (`tests/coalescing.rs`). Everything here
-/// reads through `output_until`, which accumulates first, or through `event`, which is for the one-answer
-/// events — `spawned`, `exited`, `facts` — where a single frame *is* the unit.
-struct Events(std::sync::mpsc::Receiver<String>);
-
-impl Events {
-    /// The next line, waiting at most `step`. The one accessor, so the receiver stays private.
-    fn line(&mut self, step: std::time::Duration) -> Result<String, std::sync::mpsc::RecvTimeoutError> {
-        self.0.recv_timeout(step)
-    }
-}
-
-impl Events {
-    fn reading(wire: Wire) -> Self {
-        let (lines, events) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(wire).lines() {
-                // A send that fails means the case has finished with this connection
-                if line.is_err() || lines.send(line.unwrap_or_default()).is_err() {
-                    return;
-                }
-            }
-        });
-        Self(events)
-    }
-}
+/// **Read as lines and never as one `output` event matched on its own**, which the protocol promises nothing
+/// about: an escape sequence splits across two whenever a flush falls inside it (`tests/coalescing.rs`).
+/// Everything here reads through `output_until`, which accumulates first, or through `event`, which is for the
+/// one-answer events — `spawned`, `exited`, `facts` — where a single frame *is* the unit.
+type Events = crate::heard::Heard<String>;
 
 /// Ends a connection, the way a client process going away ends one.
 ///
@@ -224,15 +192,6 @@ fn ask(writing: &mut impl Write, frame: &str) {
     writing.flush().expect("the request is flushed");
 }
 
-/// How long the broker may say **nothing at all** before a read gives up.
-///
-/// **A window of silence, not a budget for a read.** Every event resets it, so a slow machine — a CI runner
-/// with three cores and another case's pty on each — makes a read take longer and never makes it fail. What
-/// spends this is a broker that has stopped answering, which is the thing worth failing over, and a guard
-/// that hangs is worse than one that fails: a mutation that stopped resizes reaching the pty left `less`
-/// with nothing to redraw, and a blocking read turned that into a ten-minute wait.
-const QUIET: std::time::Duration = std::time::Duration::from_secs(10);
-
 /// A command whose *output* is `token` while the line the shell echoes back is not.
 ///
 /// **A case cannot count the echo.** The shell writes the typed line back at the terminal's width, so on a
@@ -254,19 +213,17 @@ fn probe(token: &str) -> String {
 }
 
 /// The next event, or `None` once the broker has said nothing for `QUIET`.
+#[track_caller]
 fn event(reading: &mut Events) -> Option<serde_json::Value> {
-    match reading.line(QUIET) {
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            panic!("the broker closed the connection")
-        }
-        Ok(line) => Some(serde_json::from_str(&line).unwrap_or_else(|error| panic!("{error}: {line:?}"))),
-    }
+    let line = reading.until_quiet()?;
+    Some(serde_json::from_str(&line).unwrap_or_else(|error| panic!("{error}: {line:?}")))
 }
 
-/// One event, or a failure saying none came.
+/// One event, or a failure saying none came, where the case waited and what it heard last.
+#[track_caller]
 fn next(reading: &mut Events) -> serde_json::Value {
-    event(reading).unwrap_or_else(|| panic!("no event arrived within {QUIET:?}"))
+    let line = reading.next();
+    serde_json::from_str(&line).unwrap_or_else(|error| panic!("{error}: {line:?}"))
 }
 
 /// **A session's output, read until `enough` is true of all of it**, or until the broker goes quiet.
@@ -280,6 +237,7 @@ fn next(reading: &mut Events) -> serde_json::Value {
 ///
 /// It answers with everything it read either way, so the caller's own assertion is what fails and says
 /// what came instead.
+#[track_caller]
 fn output_until(reading: &mut Events, session: Option<&str>, enough: impl Fn(&str) -> bool) -> String {
     let mut seen = String::new();
     while let Some(event) = event(reading) {
@@ -298,6 +256,7 @@ fn output_until(reading: &mut Events, session: Option<&str>, enough: impl Fn(&st
 }
 
 /// Reads until an event of `kind` arrives, returning it with everything seen on the way.
+#[track_caller]
 fn until(reading: &mut Events, kind: &str) -> (serde_json::Value, Vec<serde_json::Value>) {
     let mut seen = Vec::new();
     while let Some(event) = event(reading) {
@@ -665,7 +624,7 @@ fn pid_written_to(reading: &mut Events, pid_file: &std::path::Path) -> i32 {
         {
             return pid;
         }
-        match reading.line(STEP) {
+        match reading.within(STEP) {
             // The shell is still working, so the wait starts over: progress, not elapsed time
             Ok(_) => silence = std::time::Duration::ZERO,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -812,7 +771,7 @@ fn an_alternate_screen_app_survives_a_resize_and_keeps_answering() {
     let mut left = String::new();
     for _ in 0..TYPED {
         ask(&mut writing, &format!(r#"{{"kind":"write","session":"{session}","text":"q"}}"#));
-        while let Ok(line) = reading.line(std::time::Duration::from_millis(500)) {
+        while let Ok(line) = reading.within(std::time::Duration::from_millis(500)) {
             let event: serde_json::Value = serde_json::from_str(&line).expect("an event");
             if event["kind"] == "output" {
                 left.push_str(event["text"].as_str().unwrap_or_default());
@@ -1129,7 +1088,7 @@ fn a_wait_for_idle_is_answered_when_the_command_finishes() {
     );
     // Nothing has finished the command, so nothing may answer yet
     for _ in 0..3 {
-        if let Ok(line) = reading.line(std::time::Duration::from_millis(300)) {
+        if let Ok(line) = reading.within(std::time::Duration::from_millis(300)) {
             let event: serde_json::Value = serde_json::from_str(&line).expect("an event");
             assert_ne!(event["kind"], "waited", "the session is still busy: {event}");
         }
@@ -1917,7 +1876,7 @@ fn a_paused_session_stops_being_read_and_a_resume_delivers_what_it_missed() {
     // this read less, which cannot fail the case falsely — it is the tail arriving *after* the resume that
     // the assertion is about
     let mut before = String::new();
-    while let Ok(line) = reading.line(std::time::Duration::from_millis(500)) {
+    while let Ok(line) = reading.within(std::time::Duration::from_millis(500)) {
         let event: serde_json::Value = serde_json::from_str(&line).expect("an event");
         if event["kind"] == "output" {
             before.push_str(event["text"].as_str().unwrap_or_default());
@@ -1949,7 +1908,7 @@ fn finish_speaking(writing: &Wire) {
 #[cfg(unix)]
 fn closed_by_the_broker(reading: &mut Events) {
     loop {
-        match reading.line(QUIET) {
+        match reading.within(QUIET) {
             Ok(_) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -2442,11 +2401,10 @@ fn a_client_that_stops_reading_stalls_the_program_rather_than_filling_the_broker
         broker.socket.to_str().expect("a utf-8 socket path").to_fs_name::<GenericFilePath>().expect("a socket name");
     let mut wire = Wire(std::sync::Arc::new(Stream::connect(name).expect("the broker accepts")));
 
-    // Read by hand up to `spawned`, so that nothing is reading once the program starts writing
-    let mut greeting = BufReader::new(wire.clone());
+    // Read at the case's pace up to `spawned`, so that nothing is reading once the program starts writing
+    let greeting = crate::heard::paced_events::<serde_json::Value, _>(wire.clone());
     ask(&mut wire, &hello(None));
-    let mut line = String::new();
-    greeting.read_line(&mut line).expect("the greeting is answered");
+    greeting.next();
     let spawn = serde_json::json!({
         "kind": "spawn", "cols": 80, "rows": 24, "shell": "/bin/sh",
         "args": ["-c", "yes a-line-of-output-that-a-program-writes-as-fast-as-it-can"],
@@ -2454,9 +2412,7 @@ fn a_client_that_stops_reading_stalls_the_program_rather_than_filling_the_broker
     });
     ask(&mut wire, &spawn.to_string());
     let session = loop {
-        line.clear();
-        greeting.read_line(&mut line).expect("the spawn is answered");
-        let event: serde_json::Value = serde_json::from_str(&line).expect("a frame");
+        let event = greeting.next();
         if event["kind"] == "spawned" {
             break event["session"].as_str().expect("a session id").to_owned();
         }
@@ -2469,9 +2425,9 @@ fn a_client_that_stops_reading_stalls_the_program_rather_than_filling_the_broker
 
     // Now read what had been waiting. Bytes, not frames: the first read starts mid-line
     const BOUNDED: usize = 24 * 1024 * 1024;
-    let mut events = Events::reading(wire.clone());
+    let events = crate::heard::lines(wire.clone());
     let mut waiting = 0usize;
-    while let Ok(line) = events.line(std::time::Duration::from_secs(3)) {
+    while let Ok(line) = events.within(std::time::Duration::from_secs(3)) {
         waiting += line.len();
         assert!(
             waiting < BOUNDED,
@@ -2574,14 +2530,13 @@ fn a_client_that_asks_and_never_reads_is_hung_up_on_and_the_broker_goes_on() {
     ask(&mut owner, &hello(Some("lifetime")));
     assert_eq!(next(&mut owning)["kind"], "hello");
 
-    // Greeted by hand, so that nothing is reading from here on
+    // Greeted at the case's pace, so that nothing is reading from here on
     let name =
         broker.socket.to_str().expect("a utf-8 socket path").to_fs_name::<GenericFilePath>().expect("a socket name");
     let mut deaf = Wire(std::sync::Arc::new(Stream::connect(name).expect("the broker accepts")));
     ask(&mut deaf, &hello(None));
-    let mut greeting = String::new();
-    BufReader::new(deaf.clone()).read_line(&mut greeting).expect("the greeting is answered");
-    assert!(greeting.contains(r#""kind":"hello""#), "{greeting}");
+    let greeting = crate::heard::paced_events::<serde_json::Value, _>(deaf.clone()).next();
+    assert_eq!(greeting["kind"], "hello", "{greeting}");
 
     // Far more requests than it takes: a broker that kept every answer would take them all
     let hung_up_after = (0..2_000_000).find(|_| deaf.write_all(b"{\"kind\":\"sessions\"}\n").is_err());
@@ -2729,7 +2684,7 @@ fn a_wait_for_a_status_is_answered_when_the_program_says_it() {
     types(&mut writing, &session, &says("state=done:id=step"));
     until(&mut reading, "program_status");
     for _ in 0..3 {
-        if let Ok(line) = reading.line(std::time::Duration::from_millis(300)) {
+        if let Ok(line) = reading.within(std::time::Duration::from_millis(300)) {
             let event: serde_json::Value = serde_json::from_str(&line).expect("an event");
             assert_ne!(event["kind"], "waited", "the program itself is still working: {event}");
         }
