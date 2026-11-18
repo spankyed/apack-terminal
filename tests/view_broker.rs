@@ -6,19 +6,19 @@
 //! misbehaving costs the session nothing.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-#[cfg(unix)]
-use std::sync::mpsc::RecvTimeoutError;
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::channel;
 use std::time::Duration;
 
 use interprocess::local_socket::{GenericFilePath, Stream, ToFsName, prelude::*};
 
+use crate::heard::{Heard, QUIET};
+
 use apack_terminal::protocol::CommandOutcome;
 use apack_terminal::protocol::{Event, PROTOCOL_VERSION, Request, Role};
-use apack_terminal::view::wire::{Frame, Incoming, Position, Row, Span, ToBroker, ToView, read_message};
+use apack_terminal::view::wire::{Frame, Position, Row, Span, ToBroker, ToView};
 
 /// How long a case waits for something a working broker does at once: generous, so a busy machine does
 /// not fail one. **Shorter than the runner's deadline for a
@@ -225,8 +225,7 @@ fn start_with_env(arrange: impl FnOnce(&mut Command)) -> Broker {
     }
     arrange(&mut command);
     let mut process = command.spawn().expect("the broker starts");
-    let mut ready = String::new();
-    BufReader::new(process.stdout.as_mut().expect("piped stdout")).read_line(&mut ready).expect("a ready line");
+    let ready = crate::heard::lines(process.stdout.take().expect("piped stdout")).next();
     assert!(ready.starts_with("listening "), "{ready:?}");
     let reaper = crate::reaper::watching(&process, env!("CARGO_BIN_EXE_apack-terminal"));
     Broker { process, socket, _directory: directory, reaper }
@@ -246,33 +245,21 @@ fn say(stream: &Arc<Stream>, request: &Request) {
 /// The app's own connection: it asks for sessions and hears what became of them.
 struct Client {
     stream: Arc<Stream>,
-    events: Receiver<Event>,
+    events: Heard<Event>,
 }
 
 impl Client {
     fn greeting(broker: &Broker) -> Self {
         let stream = connect(broker);
         say(&stream, &Request::Hello { protocol: PROTOCOL_VERSION, role: Role::Client, challenge: None });
-        let (sender, events) = channel();
-        std::thread::spawn({
-            let stream = Arc::clone(&stream);
-            move || {
-                for line in BufReader::new(&*stream).lines() {
-                    let Ok(line) = line else { return };
-                    if let Ok(event) = serde_json::from_str::<Event>(&line)
-                        && sender.send(event).is_err()
-                    {
-                        return;
-                    }
-                }
-            }
-        });
+        let events = crate::heard::events(Reading(Arc::clone(&stream)));
         Self { stream, events }
     }
 
     /// The next event that is not about how the stream is flowing.
+    #[track_caller]
     fn event(&self) -> Event {
-        self.events.recv_timeout(PATIENCE).expect("the broker answers")
+        self.events.next()
     }
 
     /// A shell whose bytes nobody reads: it is there to be viewed.
@@ -334,7 +321,7 @@ impl Client {
 /// A view's connection, and what the view holds.
 struct View {
     stream: Arc<Stream>,
-    incoming: Receiver<ToView>,
+    incoming: Heard<ToView>,
     rows: BTreeMap<u64, Row>,
     last: Option<Frame>,
     ended: bool,
@@ -344,24 +331,7 @@ impl View {
     fn greeting(broker: &Broker) -> Self {
         let stream = connect(broker);
         say(&stream, &Request::Hello { protocol: PROTOCOL_VERSION, role: Role::View, challenge: None });
-        let (sender, incoming) = channel();
-        std::thread::spawn({
-            let stream = Arc::clone(&stream);
-            move || {
-                let mut reader = BufReader::new(&*stream);
-                // The handshake's answer is the one JSON line this connection is ever sent
-                let mut hello = String::new();
-                if reader.read_line(&mut hello).is_err() {
-                    return;
-                }
-                while let Incoming::Message(body) = read_message(&mut reader) {
-                    let Ok(message) = ToView::decode(&body) else { return };
-                    if sender.send(message).is_err() {
-                        return;
-                    }
-                }
-            }
-        });
+        let incoming = crate::heard::view_messages(Reading(Arc::clone(&stream)));
         Self { stream, incoming, rows: BTreeMap::new(), last: None, ended: false }
     }
 
@@ -376,8 +346,9 @@ impl View {
     }
 
     /// Takes the next message, applying a frame and acknowledging it as a view that has drawn it would.
+    #[track_caller]
     fn step(&mut self) -> ToView {
-        let message = self.incoming.recv_timeout(PATIENCE).expect("the broker sends");
+        let message = self.incoming.next();
         self.take(message)
     }
 
@@ -410,21 +381,45 @@ impl View {
             .join("\n")
     }
 
-    /// Frames until the screen shows `expected`. **A wait that runs out says what the screen showed**,
-    /// rather than only that nothing came.
+    /// Frames until the screen shows `expected`, for as long as the broker goes on sending. **A wait that
+    /// runs out says what the screen showed**, rather than only that nothing came.
+    #[track_caller]
     fn until_shows(&mut self, expected: &str) {
         while !self.screen().contains(expected) {
             assert!(!self.ended, "the session ended without showing {expected:?}:\n{}", self.screen());
-            match self.incoming.recv_timeout(PATIENCE) {
+            match self.incoming.within(QUIET) {
                 Ok(message) => {
                     self.take(message);
                 }
-                Err(why) => panic!("never showed {expected:?} ({why}); the screen:\n{}", self.screen()),
+                Err(why) => panic!(
+                    "never showed {expected:?}: nothing was heard for {QUIET:?} ({why}); the screen:\n{}",
+                    self.screen()
+                ),
             }
         }
     }
 
+    /// Resizes the session over `client`'s connection, as a window does, and takes frames until one is of
+    /// the grid asked for.
+    ///
+    /// **A resize is answered by nothing but its frame, and comes on another connection than this view's**,
+    /// so without the wait a case reads the screen before the resize has landed: placeholder cells under a
+    /// cell of no size show no image, and that row is sent again with its pieces a frame later. The grid
+    /// and the cell's size are set in one call under the screen's lock (`Screen::resize`), so a frame of the
+    /// new grid is one after the cell's size too — which is why `rows` has to differ from what the session
+    /// was spawned with (`Client::started`), or a frame before the resize would meet the wait.
+    fn resized(&mut self, client: &Client, session: &str, rows: u16, cell: (u16, u16)) {
+        say(
+            &client.stream,
+            &Request::Resize { session: session.to_owned(), cols: 60, rows, cell_width: cell.0, cell_height: cell.1 },
+        );
+        while !self.last.as_ref().is_some_and(|frame| frame.screen_rows == rows) {
+            self.step();
+        }
+    }
+
     /// Messages until one is the answer being waited for.
+    #[track_caller]
     fn answer<T>(&mut self, mut pick: impl FnMut(&ToView) -> Option<T>) -> T {
         loop {
             let message = self.step();
@@ -479,7 +474,8 @@ fn a_view_draws_a_shell_and_its_keys_reach_it() {
     view.until_shows("vi42ew");
 
     // And none of it crossed the app's own connection as bytes: this session was spawned to be viewed
-    let leaked: Vec<Event> = client.events.try_iter().filter(|event| matches!(event, Event::Output { .. })).collect();
+    let leaked: Vec<Event> =
+        client.events.waiting().into_iter().filter(|event| matches!(event, Event::Output { .. })).collect();
     assert!(leaked.is_empty(), "the client was sent {leaked:?}");
 }
 
@@ -649,9 +645,9 @@ fn a_view_that_stops_acknowledging_does_not_hold_up_another() {
 
     // The stuck view was sent its first frame and, never having acknowledged it, nothing since. The
     // frame is waited for: it was sent before the live view's, and is read by a thread of its own
-    let first = stuck.incoming.recv_timeout(PATIENCE).expect("the stuck view's first frame");
+    let first = stuck.incoming.next();
     assert!(matches!(first, ToView::Frame { .. }), "{first:?}");
-    let since: Vec<ToView> = stuck.incoming.try_iter().collect();
+    let since = stuck.incoming.waiting();
     assert!(since.is_empty(), "{since:?}");
 }
 
@@ -667,8 +663,7 @@ fn a_view_leaving_or_sending_nonsense_leaves_the_session_running() {
     // Not the protocol: a length, a kind no message has, and then anything
     let vandal = View::greeting(&broker);
     (&*vandal.stream).write_all(&[3, 0, 0, 0, 250, 1, 2]).expect("the broker reads");
-    let mut closed = [0u8; 1];
-    let _ = (&*vandal.stream).read(&mut closed);
+    vandal.incoming.until_closed();
 
     let mut second = View::attached(&broker, &session);
     second.until_shows("$ ");
@@ -864,11 +859,8 @@ fn an_image_named_as_a_file_and_shown_through_cells_is_sent_with_its_row() {
     let broker = start();
     let client = Client::greeting(&broker);
     for (session, reads) in [(client.shell_reading_files(), true), (client.shell_taking(true), false)] {
-        say(
-            &client.stream,
-            &Request::Resize { session: session.clone(), cols: 60, rows: 8, cell_width: 10, cell_height: 20 },
-        );
         let mut view = View::attached(&broker, &session);
+        view.resized(&client, &session, 9, (10, 20));
         view.until_shows("$ ");
         view.type_line(&shown);
         view.until_shows("sh2own");
@@ -937,11 +929,8 @@ fn a_placed_image_and_its_pixels_are_answered_to_the_view_that_asked() {
     let broker = start();
     let client = Client::greeting(&broker);
     let session = client.shell_taking(true);
-    say(
-        &client.stream,
-        &Request::Resize { session: session.clone(), cols: 60, rows: 8, cell_width: 10, cell_height: 20 },
-    );
     let mut view = View::attached(&broker, &session);
+    view.resized(&client, &session, 9, (10, 20));
     view.until_shows("$ ");
     // One red pixel, sent whole and shown where the cursor is
     view.type_line(&format!(
@@ -981,11 +970,8 @@ fn a_session_holding_more_images_than_are_listed_says_so_and_one_holding_as_many
     });
     let client = Client::greeting(&broker);
     let session = client.shell_taking(true);
-    say(
-        &client.stream,
-        &Request::Resize { session: session.clone(), cols: 60, rows: 8, cell_width: 10, cell_height: 20 },
-    );
     let mut view = View::attached(&broker, &session);
+    view.resized(&client, &session, 9, (10, 20));
     view.until_shows("$ ");
     let place = |image: u32| printed(&format!("\\033_Ga=T,f=32,i={image},s=1,v=1,q=2;/wAA/w==\\033\\\\"));
 
@@ -1209,15 +1195,9 @@ fn a_view_that_asks_without_reading_is_hung_up_on() {
     say(&stream, &Request::Hello { protocol: PROTOCOL_VERSION, role: Role::View, challenge: None });
     let send = |message: &ToBroker| (&*stream).write_all(&message.encode());
     send(&ToBroker::Attach { channel: 1, session: session.clone() }).expect("the broker reads");
-    let first = {
-        let mut reader = BufReader::new(&*stream);
-        let mut hello = String::new();
-        reader.read_line(&mut hello).expect("the handshake is answered");
-        let Incoming::Message(body) = read_message(&mut reader) else { panic!("the first frame did not come") };
-        match ToView::decode(&body) {
-            Ok(ToView::Frame(frame)) => frame,
-            other => panic!("expected the first frame, was sent {other:?}"),
-        }
+    let first = match crate::heard::paced_view_messages(Reading(Arc::clone(&stream))).next() {
+        ToView::Frame(frame) => frame,
+        other => panic!("expected the first frame, was sent {other:?}"),
     };
     // Everything the session holds, as text: a hundred kilobytes an answer. Far more are asked for than
     // may wait, and the broker — which reads every request — stops reading this connection's, and closes it
@@ -1248,8 +1228,9 @@ impl Read for Reading {
 /// it cannot be a view that has stopped reading.
 struct Unread {
     stream: Arc<Stream>,
+    /// Read at the case's pace, which past the first frame is not at all until a case asks
     #[cfg_attr(not(unix), expect(dead_code, reason = "read by a case only POSIX runs"))]
-    reader: BufReader<Reading>,
+    heard: Heard<ToView>,
     first: Frame,
 }
 
@@ -1260,12 +1241,9 @@ impl Unread {
         (&*stream)
             .write_all(&ToBroker::Attach { channel: 1, session: session.to_owned() }.encode())
             .expect("the broker reads");
-        let mut reader = BufReader::new(Reading(Arc::clone(&stream)));
-        let mut hello = String::new();
-        reader.read_line(&mut hello).expect("the handshake is answered");
-        let Incoming::Message(body) = read_message(&mut reader) else { panic!("the first frame did not come") };
-        match ToView::decode(&body) {
-            Ok(ToView::Frame(first)) => Self { stream, reader, first },
+        let heard = crate::heard::paced_view_messages(Reading(Arc::clone(&stream)));
+        match heard.next() {
+            ToView::Frame(first) => Self { stream, heard, first },
             other => panic!("expected the first frame, was sent {other:?}"),
         }
     }
@@ -1304,7 +1282,7 @@ fn a_session_holding_a_megabyte(broker: &Broker, client: &Client) -> (String, Vi
 /// one for as long as it is parked in a read: so the receiver it hands on to goes first, then `answered` — a
 /// message the broker answers — is sent, and the reader takes the answer, cannot hand it on, and returns,
 /// letting its handle go. The caller's handle is the other one.
-fn hang_up<T>(stream: Arc<Stream>, incoming: Receiver<T>, answered: &[u8]) {
+fn hang_up<T>(stream: Arc<Stream>, incoming: Heard<T>, answered: &[u8]) {
     #[cfg(unix)]
     {
         let Stream::UdSocket(socket) = &*stream;
@@ -1325,16 +1303,11 @@ fn hang_up<T>(stream: Arc<Stream>, incoming: Receiver<T>, answered: &[u8]) {
 /// `incoming` is what the connection's reader hands on, which ends when the reader is told there is
 /// no more.
 #[cfg(unix)]
-fn gone<T>(stream: &Stream, incoming: &Receiver<T>) {
+#[track_caller]
+fn gone<T: Clone + std::fmt::Debug + Send + 'static>(stream: &Stream, incoming: &Heard<T>) {
     let Stream::UdSocket(socket) = stream;
     socket.inner().shutdown(std::net::Shutdown::Write).expect("the connection closes one way");
-    loop {
-        match incoming.recv_timeout(PATIENCE) {
-            Ok(_) => {}
-            Err(RecvTimeoutError::Disconnected) => return,
-            Err(RecvTimeoutError::Timeout) => panic!("the broker kept open a connection that had finished with it"),
-        }
-    }
+    incoming.until_closed();
 }
 
 /// **A view that has finished speaking is still listening, and still connected.** It asked, closed its
@@ -1352,7 +1325,7 @@ fn a_view_that_finished_speaking_is_sent_its_answer_though_it_is_all_the_broker_
     let (session, mut beside) = a_session_holding_a_megabyte(&broker, &client);
     beside.send(&ToBroker::Detach { channel: 1 });
 
-    let mut view = Unread::attached(&broker, &session);
+    let view = Unread::attached(&broker, &session);
     view.ask_for_all_of_it(1);
     let Stream::UdSocket(socket) = &*view.stream;
     socket.inner().shutdown(std::net::Shutdown::Write).expect("the connection closes one way");
@@ -1372,12 +1345,10 @@ fn a_view_that_finished_speaking_is_sent_its_answer_though_it_is_all_the_broker_
     gone(&client.stream, &client.events);
     gone(&beside.stream, &beside.incoming);
 
-    let mut answer = None;
-    while let Incoming::Message(body) = read_message(&mut view.reader) {
-        if let Ok(ToView::Text { request: 1, text, .. }) = ToView::decode(&body) {
-            answer = Some(text);
-        }
-    }
+    let answer = view.heard.until_closed().into_iter().find_map(|message| match message {
+        ToView::Text { request: 1, text, .. } => Some(text),
+        _ => None,
+    });
     let answer = answer.expect("the connection closed before the view was sent what it had asked for");
     assert!(answer.contains("fil2led"), "the answer is {} bytes and stops short", answer.len());
 }
@@ -1615,12 +1586,13 @@ fn a_session_that_ends_is_over_for_its_view_while_the_client_reads_nothing() {
             marks_key: None,
         },
     );
-    let mut answers = BufReader::new(&*stream);
-    let session = loop {
-        let mut line = String::new();
-        answers.read_line(&mut line).expect("the broker answers");
-        if let Ok(Event::Spawned { session, .. }) = serde_json::from_str::<Event>(&line) {
-            break session;
+    // Read only as far as the answer: past it this connection is not read at all
+    let session = {
+        let answers = crate::heard::paced_events::<Event, _>(Reading(Arc::clone(&stream)));
+        loop {
+            if let Event::Spawned { session, .. } = answers.next() {
+                break session;
+            }
         }
     };
     let mut view = View::attached(&broker, &session);
@@ -1765,6 +1737,7 @@ fn a_program_that_asks_what_the_clipboard_holds_is_answered_nothing() {
     // The byte typed, in hex: a reply to the question would have arrived first, and been printed instead
     view.until_shows("78");
 
-    let told: Vec<Event> = client.events.try_iter().filter(|event| matches!(event, Event::Clipboard { .. })).collect();
+    let told: Vec<Event> =
+        client.events.waiting().into_iter().filter(|event| matches!(event, Event::Clipboard { .. })).collect();
     assert!(told.is_empty(), "a read was reported as a write: {told:?}");
 }

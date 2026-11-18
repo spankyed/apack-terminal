@@ -873,6 +873,10 @@ fn an_image_larger_than_a_keyframe_holds_puts_the_keyframe_off_and_the_recording
         live.feed(&piece);
     }
     assert!(live.recorded(), "the recording ended on a keyframe it could not take");
+    // **The disk is let catch up first.** A keyframe also waits while the disk is behind
+    // (`Recorder::behind`), which a machine slow to run the writer makes it after megabytes handed over at
+    // once; this case is about one put off for its size
+    live.flush_recording();
     // And a megabyte more, by when the image has arrived and a keyframe can be taken
     let line = format!("{}\r\n", "after the image ".repeat(4));
     for _ in 0..20_000 {

@@ -62,18 +62,21 @@ pub fn watching(broker: &Child, program: &str) -> Reaper {
 /// longer the broker's: either way the broker it was there for is left running after the case, and only a
 /// case that asserts the broker went (`proxy::a_broker_a_proxy_started_is_ended_with_the_case_that_had_it_started`)
 /// would notice. So the case fails here, naming what to install, before anything is started.
+///
+/// **Looked for on `PATH` by this process, as the watcher's shell would find it, rather than by asking a
+/// shell.** This runs for every broker a case starts, and on a loaded machine each process started is
+/// a measurable share of a case's deadline: two shells per watcher were seconds of it at a load of a
+/// hundred and more.
 #[cfg(unix)]
 fn required_by_the_watcher(tools: &[&str]) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = std::env::var_os("PATH").unwrap_or_default();
     for tool in tools {
-        let found = Command::new("/bin/sh")
-            .arg("-c")
-            .arg(r#"command -v "$1""#)
-            .arg("sh")
-            .arg(tool)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
+        let found = std::env::split_paths(&path).any(|directory| {
+            std::fs::metadata(directory.join(tool))
+                .is_ok_and(|found| found.is_file() && found.permissions().mode() & 0o111 != 0)
+        });
         assert!(
             found,
             "`{tool}` is not on this machine's PATH: the watcher that ends a case's broker runs it, and without it leaves the broker running"
@@ -96,6 +99,9 @@ pub fn watching(_broker: &std::process::Child, _program: &str) -> Reaper {
 pub struct Ending {
     #[cfg(unix)]
     watcher: Option<(Child, ChildStdin)>,
+    /// The socket whose broker the watcher is for
+    #[cfg(unix)]
+    socket: std::path::PathBuf,
     /// Held for what dropping it does: the job, and every process in it, ends
     #[cfg(windows)]
     _job: Option<contained::CaseJob>,
@@ -117,8 +123,18 @@ pub struct Ending {
 /// of the same name — is owed a broker that is no longer holding anything. A process its parent has not
 /// collected still answers to its pid, so the wait is counted: five seconds, then it is left.
 ///
-/// **It acts at every ending, a clean one included.** A case that fails drops what it holds as one that
-/// passes does, and a broker that will not go by itself is as much left behind by either.
+/// **It acts at every ending where a broker holds the socket, a clean one included.** A case that fails
+/// drops what it holds as one that passes does, and a broker that will not go by itself is as much left
+/// behind by either.
+///
+/// **At an ending the case reaches, what is waited for is the lock, not the watcher.** A broker lets go of
+/// its lock as it exits, so the lock is the event that says it is gone, whether it went by its own rules
+/// or was killed: the case takes it, blocking, while the watcher looks for a broker that will not go. Where
+/// nothing holds it there is no broker, and the watcher is stood down before it looks. `lsof` reads every
+/// process on the machine, which is a second and more on a loaded one, and a case's broker is almost
+/// always on its way out by itself once the case's connections have closed — so a case no longer waits
+/// out a search that, by the time it answers, has nothing to find. A broker that neither goes nor is ended
+/// holds the case until the runner's deadline, which reports it.
 #[cfg(unix)]
 pub fn ending_with_the_case(socket: &std::path::Path, program: &str) -> Ending {
     use std::os::unix::process::CommandExt;
@@ -143,7 +159,36 @@ pub fn ending_with_the_case(socket: &std::path::Path, program: &str) -> Ending {
     unsafe { command.pre_exec(|| if libc::setsid() == -1 { Err(std::io::Error::last_os_error()) } else { Ok(()) }) };
     let mut watcher = command.spawn().expect("a watcher starts");
     let held = watcher.stdin.take().expect("piped stdin");
-    Ending { watcher: Some((watcher, held)) }
+    Ending { watcher: Some((watcher, held)), socket: socket.to_owned() }
+}
+
+/// The lock beside `socket`, open, and `None` where there is none: nothing was started on it, or its directory
+/// was never made.
+#[cfg(unix)]
+fn lock_beside(socket: &std::path::Path) -> std::io::Result<Option<std::fs::File>> {
+    let mut lock = socket.as_os_str().to_owned();
+    lock.push(".lock");
+    match std::fs::File::open(lock) {
+        Ok(lock) => Ok(Some(lock)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Takes `lock` as `operation` asks (`flock`), answering whether it was taken.
+#[cfg(unix)]
+fn taken(lock: &std::fs::File, operation: libc::c_int) -> bool {
+    use std::os::fd::AsRawFd;
+
+    loop {
+        // SAFETY: `flock` takes a descriptor `lock` owns and two flags, and answers through errno
+        if unsafe { libc::flock(lock.as_raw_fd(), operation) } == 0 {
+            return true;
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return false;
+        }
+    }
 }
 
 /// On Windows the case's processes are in a job of its own, which the case's `Ending` ends when it is
@@ -298,11 +343,31 @@ mod contained {
 
 impl Drop for Ending {
     fn drop(&mut self) {
-        // Let go of, which is what the watcher is waiting for, and waited for: when this returns the
-        // broker has been ended, so a directory removed next is one nothing is still using
+        // When this returns the broker has gone, so a directory removed next is one nothing is still using
+        // (`ending_with_the_case` on why the lock is what is waited for)
         #[cfg(unix)]
         if let Some((mut watcher, held)) = self.watcher.take() {
-            drop(held);
+            let gone = match lock_beside(&self.socket) {
+                Ok(None) => true,
+                Ok(Some(lock)) if taken(&lock, libc::LOCK_EX | libc::LOCK_NB) => true,
+                // A broker holds it: the watcher is let go of, to end one that will not go by itself, and the
+                // lock is taken once the broker has gone either way. The case's own hold on the file is one the
+                // watcher passes over, the case not being `program`
+                Ok(Some(lock)) => {
+                    drop(held);
+                    taken(&lock, libc::LOCK_EX)
+                }
+                // A lock that cannot be read or waited on is left to the watcher, which is waited for
+                Err(_) => {
+                    drop(held);
+                    false
+                }
+            };
+            // Stood down as a `Reaper` is: the broker is gone, and a search the watcher began finishes by
+            // itself, reading only
+            if gone {
+                let _ = watcher.kill();
+            }
             let _ = watcher.wait();
         }
     }

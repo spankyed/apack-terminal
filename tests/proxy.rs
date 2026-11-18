@@ -4,32 +4,29 @@
 //! real binary: that a broker is started when there is none, that the pipe is the broker's protocol byte
 //! for byte, and that a second proxy joins the first's broker rather than starting another.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use interprocess::local_socket::{GenericFilePath, Stream, ToFsName, prelude::*};
+
+use crate::heard::Heard;
 
 use apack_terminal::listening::{HELD_EXIT, START_GRACE, START_GRACE_ENV, start_grace};
 #[cfg(unix)]
 use apack_terminal::listening::{Refused, hold};
 use apack_terminal::protocol::{Event, PROTOCOL_VERSION, Request, Role};
 
-/// How long a wait in this file goes on with nothing arriving. **Shorter than the runner's deadline for a
-/// case** (`.config/nextest.toml`), so a wait that runs out fails saying what it was waiting for, where
-/// one as long as the deadline is ended by the runner saying nothing.
-const PATIENCE: Duration = Duration::from_secs(15);
-
 struct Proxy {
     process: Child,
     input: ChildStdin,
-    events: Receiver<Event>,
+    events: Heard<Event>,
 }
 
 impl Drop for Proxy {
@@ -39,19 +36,8 @@ impl Drop for Proxy {
     }
 }
 
-fn read_events(output: ChildStdout) -> Receiver<Event> {
-    let (sender, events) = channel();
-    std::thread::spawn(move || {
-        for line in BufReader::new(output).lines() {
-            let Ok(line) = line else { return };
-            if let Ok(event) = serde_json::from_str::<Event>(&line)
-                && sender.send(event).is_err()
-            {
-                return;
-            }
-        }
-    });
-    events
+fn read_events(output: ChildStdout) -> Heard<Event> {
+    crate::heard::events(output)
 }
 
 /// Where a broker listens: `name` in `directory` on POSIX, and on Windows a named pipe, where a path
@@ -99,8 +85,9 @@ impl Proxy {
         self.input.write_all(line.as_bytes()).expect("the proxy reads");
     }
 
+    #[track_caller]
     fn event(&self) -> Event {
-        self.events.recv_timeout(PATIENCE).expect("the broker answers through the proxy")
+        self.events.next()
     }
 
     fn greet(&mut self, role: Role) {
@@ -318,10 +305,7 @@ fn broker_given(socket: &Path, grace: Option<Duration>) -> Broker {
         .stderr(Stdio::piped())
         .spawn()
         .expect("the broker starts");
-    let mut said = String::new();
-    BufReader::new(process.stdout.take().expect("piped stdout"))
-        .read_line(&mut said)
-        .expect("the broker's stdout reads");
+    let said = crate::heard::lines(process.stdout.take().expect("piped stdout")).next();
     let reaper = crate::reaper::watching(&process, env!("CARGO_BIN_EXE_apack-terminal"));
     Broker { process, said, reaper }
 }
@@ -341,22 +325,35 @@ impl Broker {
 }
 
 /// Greets a broker over its socket as a client, answering the connection once the broker has answered.
-fn greeted(socket: &Path) -> Stream {
+fn greeted(socket: &Path) -> Arc<Stream> {
     let name = socket.to_str().expect("a utf-8 path").to_fs_name::<GenericFilePath>().expect("a socket name");
-    let stream = Stream::connect(name).expect("the broker accepts");
+    let stream = Arc::new(Stream::connect(name).expect("the broker accepts"));
     let hello =
         serde_json::to_string(&Request::Hello { protocol: PROTOCOL_VERSION, role: Role::Client, challenge: None })
             .expect("hello");
-    (&stream).write_all(format!("{hello}\n").as_bytes()).expect("the broker reads");
-    // A byte at a time, so that nothing past the answer is taken off the connection
-    let mut answer = Vec::new();
-    let mut byte = [0u8];
-    while (&stream).read(&mut byte).expect("the broker answers") == 1 && byte[0] != b'\n' {
-        answer.push(byte[0]);
-    }
-    let answer = String::from_utf8_lossy(&answer);
+    (&*stream).write_all(format!("{hello}\n").as_bytes()).expect("the broker reads");
+    // A byte at a time and past the reader's buffer, so that nothing past the answer is taken off the
+    // connection; read at the case's pace, so nothing more is read once it has been
+    let answer = Heard::paced(Shared(Arc::clone(&stream)), |reader| {
+        let mut answer = Vec::new();
+        let mut byte = [0u8];
+        while reader.get_mut().read(&mut byte).ok()? == 1 && byte[0] != b'\n' {
+            answer.push(byte[0]);
+        }
+        Some(String::from_utf8_lossy(&answer).into_owned())
+    })
+    .next();
     assert!(matches!(serde_json::from_str::<Event>(&answer), Ok(Event::Hello { .. })), "{answer}");
     stream
+}
+
+/// A connection read on one thread and held on another
+struct Shared(Arc<Stream>);
+
+impl Read for Shared {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        (&*self.0).read(buffer)
+    }
 }
 
 /// **One broker a socket.** A second broker asked to listen where one already is does not take the socket
@@ -613,8 +610,7 @@ fn a_socket_named_without_a_directory_is_checked_where_it_would_be_made() {
             .expect("the broker starts")
     };
     let said = |mut process: Child| {
-        let mut line = String::new();
-        BufReader::new(process.stdout.take().expect("piped stdout")).read_line(&mut line).expect("stdout reads");
+        let line = crate::heard::lines(process.stdout.take().expect("piped stdout")).next();
         let _ = process.kill();
         let _ = process.wait();
         line

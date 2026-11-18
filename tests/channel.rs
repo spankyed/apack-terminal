@@ -20,11 +20,13 @@
 //! code and platform-independent; how much output it takes to fill the pipe is not. The transport itself is
 //! covered on Windows by `tests/broker.rs`, which passes there in full.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::process::{Child, Command, Stdio};
 
 use apack_terminal::output::{OUTPUT_CAP, OUTPUT_CREDIT};
 use interprocess::local_socket::{GenericFilePath, Stream, ToFsName, prelude::*};
+
+use crate::heard::Heard;
 
 struct Broker {
     process: Child,
@@ -50,8 +52,7 @@ fn start() -> Broker {
         .stdout(Stdio::piped())
         .spawn()
         .expect("the broker starts");
-    let mut ready = String::new();
-    BufReader::new(process.stdout.as_mut().expect("piped stdout")).read_line(&mut ready).expect("a ready line");
+    crate::heard::lines(process.stdout.take().expect("piped stdout")).next();
     let reaper = crate::reaper::watching(&process, env!("CARGO_BIN_EXE_apack-terminal"));
     Broker { process, socket, _directory: directory, reaper }
 }
@@ -74,13 +75,25 @@ impl Write for Wire {
     }
 }
 
-fn greeted(broker: &Broker) -> (BufReader<Wire>, Wire) {
+/// A connection that has been greeted, read as fast as the broker sends.
+fn greeted(broker: &Broker) -> (Heard<serde_json::Value>, Wire) {
+    greeted_as(broker, crate::heard::events)
+}
+
+/// The same, **read at the case's pace** (`Heard::paced`): for a case about what the broker does while its
+/// client is not reading, which a reader running ahead would empty the channel under. Only those: pacing hands
+/// over each event between two threads, and a case whose subject is a reader that keeps up is then one that
+/// does not.
+fn greeted_paced(broker: &Broker) -> (Heard<serde_json::Value>, Wire) {
+    greeted_as(broker, crate::heard::paced_events)
+}
+
+fn greeted_as(broker: &Broker, hearing: fn(Wire) -> Heard<serde_json::Value>) -> (Heard<serde_json::Value>, Wire) {
     let name = broker.socket.to_str().expect("utf-8").to_fs_name::<GenericFilePath>().expect("a name");
     let wire = Wire(std::sync::Arc::new(Stream::connect(name).expect("the broker accepts")));
-    let (mut reading, mut writing) = (BufReader::new(wire.clone()), wire);
+    let (reading, mut writing) = (hearing(wire.clone()), wire);
     ask(&mut writing, &format!(r#"{{"kind":"hello","protocol":{}}}"#, apack_terminal::protocol::PROTOCOL_VERSION));
-    let mut line = String::new();
-    reading.read_line(&mut line).expect("the greeting");
+    reading.next();
     (reading, writing)
 }
 
@@ -90,10 +103,9 @@ fn ask(writing: &mut impl Write, frame: &str) {
     writing.flush().expect("flushed");
 }
 
-fn next(reading: &mut impl BufRead) -> serde_json::Value {
-    let mut line = String::new();
-    reading.read_line(&mut line).expect("an event");
-    serde_json::from_str(&line).unwrap_or_else(|error| panic!("{error}: {line:?}"))
+#[track_caller]
+fn next(reading: &mut Heard<serde_json::Value>) -> serde_json::Value {
+    reading.next()
 }
 
 /// Opens a session and runs `command` in it, returning the session id.
@@ -103,7 +115,7 @@ fn next(reading: &mut impl BufRead) -> serde_json::Value {
 /// what runs here. Left to inherit `SHELL`, it is the login shell of whoever ran the suite with all of
 /// their configuration, and on a busy machine these cases waited out their deadline on somebody's prompt
 /// rather than on the channel they are about.
-fn run(reading: &mut impl BufRead, writing: &mut impl Write, command: &str) -> String {
+fn run(reading: &mut Heard<serde_json::Value>, writing: &mut impl Write, command: &str) -> String {
     ask(
         writing,
         &serde_json::json!({
@@ -173,7 +185,7 @@ fn a_producer_nobody_is_holding_up_reports_no_throttling() {
 #[test]
 fn a_saturating_producer_reports_that_it_was_throttled_rather_than_losing_output() {
     let broker = start();
-    let (mut reading, mut writing) = greeted(&broker);
+    let (mut reading, mut writing) = greeted_paced(&broker);
     let session = run(&mut reading, &mut writing, OVERLOAD);
 
     // **A deliberately slow reader, not a reader that races the producer.** Saturation used to depend on the
@@ -257,7 +269,7 @@ fn a_saturating_producer_reports_that_it_was_throttled_rather_than_losing_output
 #[test]
 fn an_answer_arrives_while_a_producer_is_saturating_the_channel() {
     let broker = start();
-    let (mut reading, mut writing) = greeted(&broker);
+    let (mut reading, mut writing) = greeted_paced(&broker);
     let flooding = run(&mut reading, &mut writing, SATURATE);
 
     // Let the channel fill, then ask a question whose answer must not queue behind a megabyte of output
@@ -290,7 +302,7 @@ fn an_answer_arrives_while_a_producer_is_saturating_the_channel() {
 #[test]
 fn a_request_is_still_carried_out_while_output_has_filled_the_channel() {
     let broker = start();
-    let (mut reading, mut writing) = greeted(&broker);
+    let (mut reading, mut writing) = greeted_paced(&broker);
     let session = run(&mut reading, &mut writing, SATURATE);
 
     // **Nobody reads**, so output backs up behind the socket's own buffer and the coalescer waits on credit.

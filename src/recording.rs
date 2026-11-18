@@ -805,6 +805,24 @@ impl Recorder {
         self.written > self.budget
     }
 
+    /// Whether the disk is behind: more than half of what may wait to be written (`BACKLOG`) is waiting.
+    ///
+    /// **What a keyframe waits for.** A keyframe repeats what the recording already holds, so one put off
+    /// loses nothing, where output it is queued beside cannot be put off at all. Taken while the disk is
+    /// behind, each is one more copy of the screen in what is waiting: an image arriving over megabytes
+    /// has a keyframe of what has arrived of it fall due each `KEYFRAME_EVERY`, about one and a half times
+    /// the image again, and a writer the machine was slow to run reached `BACKLOG` on that and stopped the
+    /// recording, with nothing wrong with the disk.
+    pub fn behind(&self) -> bool {
+        self.shared.waiting.load(Ordering::Acquire) > BACKLOG / 2
+    }
+
+    /// Whether a keyframe that is due may be put off for the disk: while it is behind, unless the recording
+    /// is past twice its budget, where a keyframe is the only way its oldest part can go.
+    pub fn keyframe_may_wait(&self) -> bool {
+        self.behind() && !self.far_over_budget()
+    }
+
     /// Whether the recording is so far past its budget that a keyframe can wait for nothing more.
     pub fn far_over_budget(&self) -> bool {
         self.written > self.budget.saturating_mul(2)
