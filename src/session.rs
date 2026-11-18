@@ -18,7 +18,7 @@ use crate::deadlines::Deadlines;
 use crate::holds::Holds;
 use crate::housekeeping::Housekeeping;
 use crate::markers::MarksKey;
-use crate::output::{Credit, Flow, Outgoing, READ_AHEAD, coalesce};
+use crate::output::{Credit, Flow, Outgoing, READ_AHEAD, Wrote, coalesce};
 use crate::protocol::{
     CursorBlink, CursorStyle, ErrorCode, Event, Foreground, ProgressState, Scope, SessionId, SessionSummary, Signal,
     StatusRecord, Until, WaitOutcome,
@@ -154,6 +154,8 @@ fn hang_up_the_rest(leaders: &[u32]) {
 struct Process {
     /// What is written to the program, by the one thread that writes to its pty (`writer::Input`).
     input: Arc<Input>,
+    /// When it was last sent input, for its output to be told an answer from a burst (`output::Wrote`)
+    wrote: Arc<Wrote>,
     /// The master side of its pty, which is what is resized and what knows the foreground process.
     ///
     /// **`None` once its shell has exited**, which is when it is let go of: a ConPTY's output ends only
@@ -751,6 +753,8 @@ impl Handle {
         // A recording has no program to be typed at: what a view sends it goes nowhere
         let Behind::Process(process) = &self.behind else { return Ok(()) };
         let process = process.upgrade().ok_or_else(|| missing(&self.session))?;
+        // Before it is queued: a pty in cooked mode echoes while the write is still in progress
+        process.wrote.now();
         process.input.send(bytes).map_err(|refused| match refused {
             Refused::Closed => missing(&self.session),
             // The session is still there, whatever became of its pty: saying otherwise would have a
@@ -1132,8 +1136,11 @@ impl Sessions {
         }
         let flow = Flow::reading();
         let waiters: Arc<Mutex<Vec<Waiter>>> = Arc::new(Mutex::new(Vec::new()));
+        // Noted by what the session is sent, and read by the coalescer, which sends what answers it at once
+        let wrote = Arc::new(Wrote::default());
         let process = Arc::new(Process {
             input: Input::start(writer),
+            wrote: Arc::clone(&wrote),
             pty: Arc::new(Mutex::new(Some(pty.master))),
             waiters: Arc::clone(&waiters),
             flow: Arc::clone(&flow),
@@ -1206,7 +1213,7 @@ impl Sessions {
                 let session = session.clone();
                 let events = events.clone();
                 let credit = Arc::clone(&self.credit);
-                move || coalesce(session, incoming, events, credit)
+                move || coalesce(session, incoming, events, credit, wrote)
             });
         }
         // Told when the reader has read the last of the output, which is what the exit waits for

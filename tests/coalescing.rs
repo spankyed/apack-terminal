@@ -5,6 +5,7 @@
 //! reads used to convert each half on its own, replacing both with U+FFFD — every TUI's box drawing, all
 //! CJK and every emoji, while ASCII was never affected, which is why it went unnoticed. These drive
 //! `coalesce` with the split made on purpose, which no case through a shell can do reliably.
+use std::sync::Arc;
 use std::sync::mpsc::channel;
 use std::time::Duration;
 
@@ -21,7 +22,7 @@ fn events(chunks: &[&[u8]], ending: bool) -> Vec<String> {
     let (sending, incoming) = channel::<Vec<u8>>();
     let (outgoing, answers) = channel();
     let credit = Credit::new(OUTPUT_CREDIT);
-    std::thread::spawn(move || coalesce("s-1".to_owned(), incoming, outgoing, credit));
+    std::thread::spawn(move || coalesce("s-1".to_owned(), incoming, outgoing, credit, Arc::default()));
 
     for (at, chunk) in chunks.iter().enumerate() {
         sending.send(chunk.to_vec()).expect("the coalescer is listening");
@@ -180,10 +181,11 @@ mod flow {
 
 /// **When a session's bytes leave**, with a window long enough that "at once" and "held" cannot be confused.
 mod pacing {
+    use std::sync::Arc;
     use std::sync::mpsc::channel;
     use std::time::Duration;
 
-    use apack_terminal::output::{Credit, OUTPUT_CREDIT, Outgoing, coalesce_within};
+    use apack_terminal::output::{Credit, OUTPUT_CREDIT, Outgoing, Wrote, coalesce_within};
     use apack_terminal::protocol::Event;
 
     /// Far longer than any wait below, so a held chunk is still held when the case looks
@@ -202,42 +204,90 @@ mod pacing {
     /// **A quiet session's bytes are not held.** The window exists to batch a burst; on a keystroke's echo
     /// it is only delay — a median of 8.8 ms per character, measured, when it applied to everything.
     #[test]
-    fn the_first_bytes_after_a_quiet_spell_leave_at_once_and_the_next_are_batched() {
+    fn the_first_bytes_after_a_quiet_spell_leave_at_once() {
         let (sending, incoming) = channel::<Vec<u8>>();
         let (outgoing, answers) = channel();
         let credit = Credit::new(OUTPUT_CREDIT);
-        std::thread::spawn(move || coalesce_within(WINDOW, "s-1".to_owned(), incoming, outgoing, credit));
+        std::thread::spawn(move || {
+            coalesce_within(WINDOW, "s-1".to_owned(), incoming, outgoing, credit, Arc::default())
+        });
 
         sending.send(b"echo".to_vec()).expect("the coalescer is listening");
         assert_eq!(text(answers.recv_timeout(SOON).expect("held for the window")), "echo");
-
-        // Inside the window now: these are held until the output goes quiet, and leave together as one message
-        sending.send(b"one ".to_vec()).expect("the coalescer is listening");
-        sending.send(b"two".to_vec()).expect("the coalescer is listening");
-        assert_eq!(
-            text(answers.recv_timeout(SOON).expect("held for the quiet gap, not the window")),
-            "one two",
-            "one message, not two"
-        );
     }
 
-    /// **Bytes that arrive a moment apart are not held for the whole window either.** After the quiet gap the
-    /// coalescer sends what it has, so a second burst after a pause leaves promptly and is not batched with the
-    /// first.
+    /// **A burst that stutters is still one burst.** Bytes that arrive inside the window after a flush wait
+    /// out the window, however long the pauses between them: a producer a busy machine holds up pauses often,
+    /// and sending at each pause made its output a message a read.
+    ///
+    /// The window here is longer than the case, so what is held is still held when the stream ends, and the
+    /// last flush says what the window had gathered without the case waiting for it.
     #[test]
-    fn a_pause_sends_what_is_held_and_the_next_burst_is_not_batched_with_it() {
+    fn a_burst_that_pauses_inside_the_window_is_sent_as_one_message() {
         let (sending, incoming) = channel::<Vec<u8>>();
         let (outgoing, answers) = channel();
         let credit = Credit::new(OUTPUT_CREDIT);
-        std::thread::spawn(move || coalesce_within(WINDOW, "s-1".to_owned(), incoming, outgoing, credit));
+        std::thread::spawn(move || {
+            coalesce_within(WINDOW, "s-1".to_owned(), incoming, outgoing, credit, Arc::default())
+        });
 
-        sending.send(b"first".to_vec()).expect("the coalescer is listening");
-        assert_eq!(text(answers.recv_timeout(SOON).expect("the first flush")), "first");
+        sending.send(b"echo".to_vec()).expect("the coalescer is listening");
+        assert_eq!(text(answers.recv_timeout(SOON).expect("the first flush")), "echo");
 
-        std::thread::sleep(SHORT);
-        sending.send(b"second".to_vec()).expect("the coalescer is listening");
-        assert_eq!(text(answers.recv_timeout(SOON).expect("a pause ended the hold")), "second");
+        for piece in [b"one ".as_slice(), b"two ", b"three"] {
+            sending.send(piece.to_vec()).expect("the coalescer is listening");
+            // A pause hundreds of times what a quiet gap was: nothing is sent during it
+            assert!(answers.recv_timeout(SHORT).is_err(), "a pause inside the window sent what it held");
+        }
+        drop(sending);
+        assert_eq!(text(answers.recv_timeout(SOON).expect("the stream's end")), "one two three", "one message");
+    }
 
+    /// **What answers input leaves at once, though the window is open.** A keystroke typed within a window of
+    /// the last flush has its echo arrive inside that window, and held there, typing back to back waited out
+    /// the window on every character. The flush that sends the echo answers the key, so what follows it,
+    /// asked for by nothing, waits out the window: a flood a key starts is batched like any other.
+    #[test]
+    fn what_answers_input_leaves_at_once_though_the_window_is_open() {
+        let (sending, incoming) = channel::<Vec<u8>>();
+        let (outgoing, answers) = channel();
+        let credit = Credit::new(OUTPUT_CREDIT);
+        let wrote = Arc::new(Wrote::default());
+        std::thread::spawn({
+            let wrote = Arc::clone(&wrote);
+            move || coalesce_within(WINDOW, "s-1".to_owned(), incoming, outgoing, credit, wrote)
+        });
+
+        sending.send(b"$ ".to_vec()).expect("the coalescer is listening");
+        assert_eq!(text(answers.recv_timeout(SOON).expect("the first flush")), "$ ");
+
+        // Inside the window now: a key is typed, and its echo comes back
+        wrote.now();
+        sending.send(b"k".to_vec()).expect("the coalescer is listening");
+        assert_eq!(text(answers.recv_timeout(SOON).expect("the echo was held for the window")), "k");
+
+        sending.send(b"more".to_vec()).expect("the coalescer is listening");
+        assert!(answers.recv_timeout(SHORT).is_err(), "what followed the echo, unasked, left at once");
+        drop(sending);
+        assert_eq!(text(answers.recv_timeout(SOON).expect("the stream's end")), "more");
+    }
+
+    /// **What a burst holds leaves when its window closes**, with nothing more arriving to push it out.
+    #[test]
+    fn what_a_burst_holds_is_sent_when_its_window_closes() {
+        /// Short enough to wait out here, and far under `SOON`
+        const BRIEF: Duration = Duration::from_millis(500);
+        let (sending, incoming) = channel::<Vec<u8>>();
+        let (outgoing, answers) = channel();
+        let credit = Credit::new(OUTPUT_CREDIT);
+        std::thread::spawn(move || {
+            coalesce_within(BRIEF, "s-1".to_owned(), incoming, outgoing, credit, Arc::default())
+        });
+
+        sending.send(b"echo".to_vec()).expect("the coalescer is listening");
+        assert_eq!(text(answers.recv_timeout(SOON).expect("the first flush")), "echo");
+        sending.send(b"held".to_vec()).expect("the coalescer is listening");
+        assert_eq!(text(answers.recv_timeout(SOON).expect("the window closed on it")), "held");
         drop(sending);
     }
 
@@ -247,7 +297,9 @@ mod pacing {
         let (sending, incoming) = channel::<Vec<u8>>();
         let (outgoing, answers) = channel();
         let credit = Credit::new(OUTPUT_CREDIT);
-        std::thread::spawn(move || coalesce_within(WINDOW, "s-1".to_owned(), incoming, outgoing, credit));
+        std::thread::spawn(move || {
+            coalesce_within(WINDOW, "s-1".to_owned(), incoming, outgoing, credit, Arc::default())
+        });
 
         sending.send(b"first".to_vec()).expect("the coalescer is listening");
         assert_eq!(text(answers.recv_timeout(SOON).expect("the first flush")), "first");
@@ -261,9 +313,7 @@ mod pacing {
 /// **Chunks that arrive together leave as one message a cap, and a message is the whole cap.**
 ///
 /// Every chunk is queued before the coalescer starts, so none of them arrives after a quiet spell: what is
-/// measured is how much a message holds, and not how a machine happened to schedule a producer. Through a
-/// shell the same claim was a budget of one message a window and one a cap, which a busy machine broke —
-/// a producer held up for the quiet gap (`OUTPUT_QUIET`) has its bytes sent at once, as it should.
+/// measured is how much a message holds, and not how a machine happened to schedule a producer.
 ///
 /// **The sizes are a literal**, so the cap moving is a failure rather than a budget that moves with it: a
 /// cap of 1,088 bytes sends these as sixty-four messages of two chunks each. apack's Phase G measured the
@@ -277,7 +327,9 @@ fn chunks_that_arrive_together_leave_as_one_message_a_cap() {
         sending.send(vec![b'x'; 1024]).expect("the coalescer has not started");
     }
     drop(sending);
-    std::thread::spawn(move || coalesce("s-1".to_owned(), incoming, outgoing, Credit::new(OUTPUT_CREDIT)));
+    std::thread::spawn(move || {
+        coalesce("s-1".to_owned(), incoming, outgoing, Credit::new(OUTPUT_CREDIT), Arc::default())
+    });
 
     let mut sizes = Vec::new();
     // Ends when the coalescer does, which is once it has flushed the last of what it was given
