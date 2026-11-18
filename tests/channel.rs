@@ -269,7 +269,7 @@ fn a_saturating_producer_reports_that_it_was_throttled_rather_than_losing_output
 #[test]
 fn an_answer_arrives_while_a_producer_is_saturating_the_channel() {
     let broker = start();
-    let (mut reading, mut writing) = greeted(&broker);
+    let (mut reading, mut writing) = greeted_paced(&broker);
     let flooding = run(&mut reading, &mut writing, SATURATE);
 
     // Let the channel fill, then ask a question whose answer must not queue behind a megabyte of output

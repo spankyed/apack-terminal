@@ -9,7 +9,6 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-#[cfg(unix)]
 use std::sync::mpsc::channel;
 use std::time::Duration;
 

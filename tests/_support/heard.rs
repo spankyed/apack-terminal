@@ -72,7 +72,7 @@ impl<T: Clone + Debug + Send + 'static> Heard<T> {
     }
 
     /// The same, read **at the case's pace**: nothing is read until the case asks for the next thing, so the
-    /// far end sees exactly the reading the case does. For a case whose subject is what the far end does
+    /// far end sees the case's reading and no more than a buffer's worth beyond it. For a case whose subject is what the far end does
     /// while it is not being read — backpressure, a channel filling — which a reader running ahead of it
     /// would quietly empty: a saturating producer read that way is never throttled.
     pub fn paced<R: Read + Send + 'static>(
@@ -115,13 +115,21 @@ impl<T: Clone + Debug + Send + 'static> Heard<T> {
         }
     }
 
-    /// Everything heard so far that the case has not taken, without waiting for more.
+    /// Everything heard so far that the case has not taken, without waiting for more — and, read at the
+    /// case's pace, without asking for more: only an answer to an ask already made.
     pub fn waiting(&self) -> Vec<T> {
-        std::iter::from_fn(|| self.within(Duration::ZERO).ok()).collect()
+        let mut heard = Vec::new();
+        while let Ok(more) = self.incoming.try_recv() {
+            self.asked.set(false);
+            self.remember(&more);
+            heard.push(more);
+        }
+        heard
     }
 
     /// Everything heard until the far end closes, **failing if it goes quiet for `QUIET` without closing**:
-    /// for a case whose claim is that the far end lets the connection go.
+    /// for a case whose claim is that the far end lets the connection go. A reader also stops at something it
+    /// cannot decode, which reads here as the connection ending.
     #[track_caller]
     pub fn until_closed(&self) -> Vec<T> {
         let mut heard = Vec::new();
@@ -147,12 +155,16 @@ impl<T: Clone + Debug + Send + 'static> Heard<T> {
         }
         let heard = self.incoming.recv_timeout(step)?;
         self.asked.set(false);
+        self.remember(&heard);
+        Ok(heard)
+    }
+
+    fn remember(&self, heard: &T) {
         let mut recent = self.recent.borrow_mut();
         if recent.len() == REMEMBERED {
             recent.pop_front();
         }
         recent.push_back(heard.clone());
-        Ok(heard)
     }
 
     /// What was heard last, as a failure shows it
