@@ -14,7 +14,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use interprocess::local_socket::{GenericFilePath, Stream, ToFsName, prelude::*};
+use interprocess::local_socket::{GenericFilePath, ListenerOptions, Stream, ToFsName, prelude::*};
 
 use crate::heard::Heard;
 
@@ -22,6 +22,7 @@ use apack_terminal::listening::{HELD_EXIT, START_GRACE, START_GRACE_ENV, start_g
 #[cfg(unix)]
 use apack_terminal::listening::{Refused, hold};
 use apack_terminal::protocol::{Event, PROTOCOL_VERSION, Request, Role};
+use apack_terminal::proxy::{KEPT_BYTES, LOOKS};
 
 struct Proxy {
     process: Child,
@@ -545,6 +546,149 @@ fn a_caller_that_reads_only_after_the_broker_let_it_go_still_reads_every_answer(
         matches!(events.as_slice(), [Event::Hello { .. }, Event::Sessions { .. }, Event::Failed { .. }]),
         "read {read:?}: {answered:?}"
     );
+}
+
+/// Stands in on `socket` for a broker on its way out, which takes a connection into its queue as it goes and
+/// never says a word on it. It takes one connection for each of `readings`, reads that many bytes from it,
+/// lets it go and hands over what it read; after the last it stops listening.
+fn leaving(socket: &Path, readings: Vec<usize>) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let name = socket.to_str().expect("a utf-8 path").to_fs_name::<GenericFilePath>().expect("a socket name");
+    let listener = ListenerOptions::new().name(name).create_sync().expect("something listens on the socket");
+    let (read, reads) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for reading in readings {
+            let Ok(connection) = listener.accept() else { return };
+            let mut bytes = vec![0; reading];
+            if (&connection).read_exact(&mut bytes).is_err() || read.send(bytes).is_err() {
+                return;
+            }
+        }
+    });
+    reads
+}
+
+/// What `leaving` read from the next connection it let go of, once it has.
+#[track_caller]
+fn let_go(reads: &std::sync::mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
+    reads
+        .recv_timeout(crate::heard::QUIET)
+        .unwrap_or_else(|why| panic!("no connection was made and let go of within {:?} ({why})", crate::heard::QUIET))
+}
+
+/// A greeting, as a line.
+fn hello_line() -> String {
+    let hello = Request::Hello { protocol: PROTOCOL_VERSION, role: Role::Client, challenge: None };
+    format!("{}\n", serde_json::to_string(&hello).expect("a request serializes"))
+}
+
+/// **A broker that lets a proxy's connection go without a word never served it, and the proxy reaches
+/// another.** A broker leaving — its last caller gone, or nothing having reached it within its grace —
+/// takes a connection that arrives as it goes into its queue, and exits with it unread; the proxy that made
+/// it went with it, saying nothing, and whoever was speaking through it found its input closed. Here
+/// something listening stands for that broker twice: once before the caller has said anything, and once
+/// after, and what was said is said again to the broker the proxy starts when nothing is listening.
+#[test]
+fn a_connection_let_go_of_without_a_word_is_made_again_and_what_was_said_is_said_again() {
+    let directory = tempfile::tempdir().expect("a directory for the socket");
+    let socket = socket_in(directory.path(), "broker.sock");
+    let _ending = crate::reaper::ending_with_the_case(&socket, env!("CARGO_BIN_EXE_apack-terminal"));
+    let hello = hello_line();
+    let reads = leaving(&socket, vec![0, hello.len()]);
+    let mut through = proxy(&socket);
+    assert!(let_go(&reads).is_empty());
+
+    // Said once the first connection has gone, so it is on the second, or kept and said again on it
+    through.say(&Request::Hello { protocol: PROTOCOL_VERSION, role: Role::Client, challenge: None });
+    assert_eq!(String::from_utf8_lossy(&let_go(&reads)), hello);
+    let answered = through.event();
+    assert!(matches!(answered, Event::Hello { .. }), "a greeting said again was answered {answered:?}");
+}
+
+/// **What was said before a word came back is said again whole, up to `KEPT_BYTES`, and past that the
+/// proxy says why it cannot go on** rather than leaving its caller to find its input closed. A greeting
+/// padded with blank lines, which a broker reads past, to the most that is kept and to one byte more.
+#[test]
+fn as_much_as_is_kept_is_said_again_and_a_caller_that_said_more_is_told_why_not() {
+    for (padding, kept) in [(0, true), (1, false)] {
+        let directory = tempfile::tempdir().expect("a directory for the socket");
+        let socket = socket_in(directory.path(), "broker.sock");
+        let _ending = crate::reaper::ending_with_the_case(&socket, env!("CARGO_BIN_EXE_apack-terminal"));
+        let mut said = hello_line();
+        said.push_str(&"\n".repeat(KEPT_BYTES + padding - said.len()));
+        let reads = leaving(&socket, vec![said.len()]);
+        let mut process = Command::new(env!("CARGO_BIN_EXE_apack-terminal"))
+            .arg("proxy")
+            .arg(&socket)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the proxy starts");
+        let mut input = process.stdin.take().expect("piped stdin");
+        input.write_all(said.as_bytes()).expect("the proxy reads");
+        assert_eq!(let_go(&reads).len(), said.len());
+        let events = read_events(process.stdout.take().expect("piped stdout"));
+        if kept {
+            let answered = events.next();
+            assert!(matches!(answered, Event::Hello { .. }), "{answered:?}");
+            drop(input);
+        } else {
+            drop(input);
+            let status = process.wait().expect("the proxy is waited for");
+            let mut why = String::new();
+            process.stderr.take().expect("piped stderr").read_to_string(&mut why).expect("its errors read");
+            assert!(!status.success() && why.contains("more had been said"), "{status}: {why:?}");
+        }
+        let _ = process.kill();
+        let _ = process.wait();
+    }
+}
+
+/// **A socket where every connection is let go of without a word is given up on, saying so**, once as many
+/// have been made as a broker is looked for: whatever is listening there is not a broker that answers, and
+/// reaching it again for ever would be a proxy that never ends.
+#[test]
+fn a_proxy_whose_connections_are_all_let_go_of_without_a_word_gives_up_saying_why() {
+    let directory = tempfile::tempdir().expect("a directory for the socket");
+    let socket = socket_in(directory.path(), "broker.sock");
+    let _ending = crate::reaper::ending_with_the_case(&socket, env!("CARGO_BIN_EXE_apack-terminal"));
+    let reads = leaving(&socket, vec![0; LOOKS + 1]);
+    let mut process = Command::new(env!("CARGO_BIN_EXE_apack-terminal"))
+        .arg("proxy")
+        .arg(&socket)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the proxy starts");
+    for _ in 0..LOOKS {
+        let_go(&reads);
+    }
+    let status = process.wait().expect("the proxy is waited for");
+    let mut why = String::new();
+    process.stderr.take().expect("piped stderr").read_to_string(&mut why).expect("its errors read");
+    assert!(!status.success() && why.contains(&format!("let {LOOKS} connections go")), "{status}: {why:?}");
+    assert!(reads.try_recv().is_err(), "a connection was made after the proxy gave up");
+}
+
+/// A caller that says nothing and is done is answered by the connection being let go of, and the proxy
+/// leaves with it: nothing was said for a broker to have left unanswered.
+#[test]
+fn a_proxy_whose_caller_said_nothing_leaves_once_it_is_done() {
+    let directory = tempfile::tempdir().expect("a directory for the socket");
+    let socket = socket_in(directory.path(), "broker.sock");
+    let _ending = crate::reaper::ending_with_the_case(&socket, env!("CARGO_BIN_EXE_apack-terminal"));
+    let mut process = Command::new(env!("CARGO_BIN_EXE_apack-terminal"))
+        .arg("proxy")
+        .arg(&socket)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("the proxy starts");
+    let mut said = String::new();
+    process.stdout.take().expect("piped stdout").read_to_string(&mut said).expect("its output reads");
+    assert!(said.is_empty(), "{said:?}");
+    assert!(process.wait().expect("the proxy is waited for").success());
 }
 
 /// A broker is started to be connected to. One that nothing ever connects to — whatever started it died
