@@ -1010,6 +1010,16 @@ impl Screen {
     /// twice its budget the recording stops instead**, a keyframe being the only way its oldest part
     /// can go.
     fn take_keyframe(&mut self) {
+        // **Put off while the disk is behind** (`Recorder::behind`), as one too large is: a keyframe only
+        // repeats what is recorded. Past twice its budget it is taken whatever, a keyframe being the only
+        // way the recording's oldest part can go
+        if self.recorder.as_ref().is_some_and(Recorder::keyframe_may_wait) {
+            self.record(|recorder| {
+                recorder.put_off_keyframe();
+                Ok(())
+            });
+            return;
+        }
         let (cols, rows) = (self.cols, self.rows);
         let keyframe = self.keyframe();
         let taken = keyframe.is_ok();

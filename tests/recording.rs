@@ -980,6 +980,66 @@ fn an_entry_of_all_that_may_wait_is_recorded_and_a_byte_more_stops_the_recording
     assert!(recorder.failed(), "and the recording carried on after it");
 }
 
+/// **A recorder is behind while more than half of what may wait is waiting**, which is what a keyframe waits
+/// for (`Recorder::behind`). An entry is counted as waiting before it is handed over and counted off once it
+/// is written, so one of most of `BACKLOG` is behind at once on any disk, and a busy machine only makes it
+/// more so; a recorder with nothing waiting is not.
+#[test]
+fn a_recorder_is_behind_while_more_than_half_of_what_may_wait_is_waiting() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let mut recorder =
+        Recorder::start_with(&directory.path().join("behind.recording"), u64::MAX, u64::MAX).expect("it starts");
+    assert!(!recorder.behind(), "a recorder with nothing waiting was behind");
+    recorder.output(&vec![b'o'; recording::BACKLOG - (1 << 20)]).expect("output is taken");
+    assert!(recorder.behind(), "fifteen megabytes handed over at once were not waiting");
+    // And once they are written, it is not
+    recorder.flush();
+    assert!(!recorder.behind(), "what had been written was still counted as waiting");
+
+    // **Exactly half is not behind, and a byte more is**: what is waiting is counted as it is handed over,
+    // so the second answer holds on any disk, and the first is the boundary's
+    let beside = entry_overhead(directory.path());
+    recorder.output(&vec![b'o'; recording::BACKLOG / 2 - beside]).expect("output is taken");
+    assert!(!recorder.behind(), "exactly half of what may wait was counted as behind");
+    recorder.flush();
+    recorder.output(&vec![b'o'; recording::BACKLOG / 2 - beside + 1]).expect("output is taken");
+    assert!(recorder.behind(), "a byte past half of what may wait was not behind");
+}
+
+/// What one output entry is beside the bytes it carries, read off a recording of one byte.
+fn entry_overhead(directory: &Path) -> usize {
+    let length_of = |path: &Path| {
+        recording::settled(path);
+        usize::try_from(std::fs::metadata(path).expect("the recording is there").len()).expect("a length")
+    };
+    let empty = directory.join("overhead-empty.recording");
+    drop(Recorder::start_with(&empty, u64::MAX, u64::MAX).expect("the recording starts"));
+    let small = directory.join("overhead-small.recording");
+    let mut recorder = Recorder::start_with(&small, u64::MAX, u64::MAX).expect("the recording starts");
+    recorder.output(b"o").expect("output is taken");
+    drop(recorder);
+    length_of(&small) - length_of(&empty) - 1
+}
+
+/// **A keyframe may wait for a disk that is behind, unless the recording is past twice its budget**, where a
+/// keyframe is the only way its oldest part can go (`Recorder::keyframe_may_wait`).
+#[test]
+fn a_keyframe_may_wait_for_the_disk_unless_the_recording_is_far_past_its_budget() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let within = Recorder::start_with(&directory.path().join("within.recording"), u64::MAX, u64::MAX);
+    let mut within = within.expect("it starts");
+    assert!(!within.keyframe_may_wait(), "a keyframe waited for a disk that was not behind");
+    within.output(&vec![b'o'; recording::BACKLOG - (1 << 20)]).expect("output is taken");
+    assert!(within.keyframe_may_wait(), "a keyframe was not let wait for a disk fifteen megabytes behind");
+
+    // A budget of a byte, which any output is twice past
+    let past = Recorder::start_with(&directory.path().join("past.recording"), 1, u64::MAX);
+    let mut past = past.expect("it starts");
+    past.output(&vec![b'o'; recording::BACKLOG - (1 << 20)]).expect("output is taken");
+    assert!(past.far_over_budget(), "fifteen megabytes are not twice past a budget of a byte");
+    assert!(!past.keyframe_may_wait(), "a keyframe was let wait though only it can drop the oldest part");
+}
+
 /// **A process about to exit waits for what its recorders were handed.** A recorder that is stopped
 /// leaves the last of its recording to its own thread, which ends with the process; `settle_all` is what
 /// a broker calls on its way out, and after it every recording that was stopped holds all it was given
