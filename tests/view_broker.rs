@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::mpsc::channel;
+use std::sync::mpsc::{RecvTimeoutError, channel};
 use std::time::Duration;
 
 use interprocess::local_socket::{GenericFilePath, Stream, ToFsName, prelude::*};
@@ -1191,12 +1191,14 @@ fn a_view_that_asks_without_reading_is_hung_up_on() {
         filling.until_shows("fil2led");
     }
 
-    // A connection that greets as a view, attaches, reads its first frame, and from then on only writes
+    // A connection that greets as a view, attaches, reads its first frame, and then only writes. It is read
+    // at the case's pace, so nothing more is taken from it until the asking is over
     let stream = connect(&broker);
     say(&stream, &Request::Hello { protocol: PROTOCOL_VERSION, role: Role::View, challenge: None });
     let send = |message: &ToBroker| (&*stream).write_all(&message.encode());
     send(&ToBroker::Attach { channel: 1, session: session.clone() }).expect("the broker reads");
-    let first = match crate::heard::paced_view_messages(Reading(Arc::clone(&stream))).next() {
+    let heard = crate::heard::paced_view_messages(Reading(Arc::clone(&stream)));
+    let first = match heard.next() {
         ToView::Frame(frame) => frame,
         other => panic!("expected the first frame, was sent {other:?}"),
     };
@@ -1207,8 +1209,24 @@ fn a_view_that_asks_without_reading_is_hung_up_on() {
         end: Position { line: first.first_active + u64::from(first.screen_rows) - 1, column: 499 },
     };
     let ask = ToBroker::TextOf { channel: 1, request: 1, epoch: first.epoch, span: all };
-    let hung_up = (0..HELD_ANSWERS).any(|_| send(&ask).is_err());
-    assert!(hung_up, "twenty thousand answers were kept for a view that read none of them");
+    // **A write failing is not the measure.** It does on Linux once the broker has hung up, but on macOS a
+    // write to a socket shut down at the far end is taken and thrown away until that end's handle closes,
+    // which the broker does only once it has detached the connection — so a fast enough writer can ask all
+    // of these and be refused none. The asking stops early when it does fail
+    let _ = (0..HELD_ANSWERS).try_for_each(|_| send(&ask));
+    // What the connection ends with is the measure: a view hung up on is sent what was on its way, and then
+    // the end; a view whose answers were kept is sent every one of them
+    let mut answered = 0;
+    loop {
+        match heard.within(QUIET) {
+            Ok(_) => {
+                answered += 1;
+                assert!(answered < HELD_ANSWERS, "twenty thousand answers were kept for a view that read none of them");
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) => panic!("the broker kept the connection of a view that read nothing"),
+        }
+    }
 
     // The session, and a view that does read, are none the worse
     let mut reading = View::attached(&broker, &session);
