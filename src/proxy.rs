@@ -18,11 +18,12 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use interprocess::local_socket::{GenericFilePath, Stream, ToFsName, prelude::*};
 
+use crate::frames::MAX_FRAME_BYTES;
 use crate::listening::{self, HELD_EXIT};
 use crate::protocol::Request;
 
@@ -30,7 +31,7 @@ use crate::protocol::Request;
 ///
 /// Each look that finds none starts a broker, so this is reached only when brokers keep starting and
 /// none ends up listening — which is something wrong with the machine, not a race to be waited out.
-const LOOKS: usize = 50;
+pub const LOOKS: usize = 50;
 
 /// How long a proxy leaves a broker that beat its own to the socket to finish starting to listen.
 ///
@@ -105,15 +106,102 @@ fn reach(socket: &str) -> std::io::Result<Stream> {
     Err(std::io::Error::other(format!("nothing started listening on {socket}")))
 }
 
-/// Copies everything from `from` to `to`, a read at a time, until either ends.
-fn pump(mut from: impl Read, mut to: impl Write) {
+/// A connection to the broker on `socket` that is this user's own, starting a broker when none is there.
+fn reach_own(socket: &str) -> std::io::Result<Stream> {
+    let stream = reach(socket)?;
+    // Before a byte is carried either way: what is about to be handed over is somebody's terminals
+    if !listening::peer_is_this_user(&stream)? {
+        return Err(std::io::Error::other(format!(
+            "what is listening on {socket} is another user's, not a broker of this one's"
+        )));
+    }
+    Ok(stream)
+}
+
+/// The most of what the far end says before the broker has answered any of it that is kept to be said
+/// again (`Carrying`): one frame's ceiling. A greeting and whatever a caller sends behind it before hearing
+/// back is a few frames; one that says more than this without waiting for a word is told why it cannot be
+/// carried on, should the broker let it go unanswered.
+pub const KEPT_BYTES: usize = MAX_FRAME_BYTES;
+
+/// What the far end has said, and the connection it is carried on.
+///
+/// **A broker answers everything a connection says, beginning with its greeting**, so a connection it lets
+/// go of without a word is one it never served. That is a broker that was leaving as this proxy reached it
+/// — its last caller had gone, or nothing had reached it within its start grace — and took the connection
+/// into its queue as it went. So what is said is kept until the broker has answered any of it, and said
+/// again on the next connection. Nothing a broker acts on comes before its answer to a greeting, so nothing
+/// said again has been acted on.
+struct Carrying {
+    /// Where what the far end says goes now
+    stream: Arc<Stream>,
+    kept: Kept,
+    /// The far end has said something of its own, which the `done` said for it is not
+    spoke: bool,
+    /// The far end's input has ended, and `done` has been said for it
+    ended: bool,
+}
+
+enum Kept {
+    /// Said since the broker last answered, which it has not yet on this connection
+    Unanswered(Vec<u8>),
+    /// The broker has answered: the connection is the conversation, and its ending is the end
+    Answered,
+    /// More was said before an answer than `KEPT_BYTES`, so it cannot be said again
+    TooLong,
+}
+
+/// Who is saying what is carried.
+enum Saying {
+    /// The far end, through this process's stdin
+    FarEnd,
+    /// This process, saying `done` for a far end whose input has ended
+    Done,
+}
+
+fn carrying_of(carrying: &Mutex<Carrying>) -> MutexGuard<'_, Carrying> {
+    carrying.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Carries `bytes` to the broker, keeping them while it has answered nothing.
+///
+/// **Written with the lock let go of**, to the connection there was when they were kept. Should that
+/// connection be let go of without a word, everything kept is said again on the next before anything said
+/// after it, so a write that fails here has lost nothing.
+fn carry(carrying: &Mutex<Carrying>, bytes: &[u8], saying: Saying) {
+    let stream = {
+        let mut carrying = carrying_of(carrying);
+        match saying {
+            Saying::FarEnd => carrying.spoke = true,
+            Saying::Done => carrying.ended = true,
+        }
+        if let Kept::Unanswered(kept) = &mut carrying.kept {
+            if kept.len() + bytes.len() > KEPT_BYTES {
+                carrying.kept = Kept::TooLong;
+            } else {
+                kept.extend_from_slice(bytes);
+            }
+        }
+        Arc::clone(&carrying.stream)
+    };
+    let _ = (&*stream).write_all(bytes).and_then(|()| (&*stream).flush());
+}
+
+/// Copies what the broker says on `stream` to `to` until it lets the connection go or `to` refuses it,
+/// answering whether the broker said anything at all.
+fn heard(stream: &Stream, mut to: impl Write, carrying: &Mutex<Carrying>) -> bool {
     let mut buffer = [0u8; 64 * 1024];
+    let mut answered = false;
     loop {
-        match from.read(&mut buffer) {
-            Ok(0) | Err(_) => return,
+        match (&*stream).read(&mut buffer) {
+            Ok(0) | Err(_) => return answered,
             Ok(read) => {
+                if !answered {
+                    answered = true;
+                    carrying_of(carrying).kept = Kept::Answered;
+                }
                 if to.write_all(&buffer[..read]).and_then(|()| to.flush()).is_err() {
-                    return;
+                    return answered;
                 }
             }
         }
@@ -124,27 +212,59 @@ fn pump(mut from: impl Read, mut to: impl Write) {
 /// the broker has said everything it had to say.
 pub fn run(socket: &str) -> std::io::Result<()> {
     listening::private_directory(socket).map_err(|refused| std::io::Error::other(refused.to_string()))?;
-    let stream = Arc::new(reach(socket)?);
-    // Before a byte is carried either way: what is about to be handed over is somebody's terminals
-    if !listening::peer_is_this_user(&stream)? {
-        return Err(std::io::Error::other(format!(
-            "what is listening on {socket} is another user's, not a broker of this one's"
-        )));
-    }
+    let mut stream = Arc::new(reach_own(socket)?);
+    let carrying = Arc::new(Mutex::new(Carrying {
+        stream: Arc::clone(&stream),
+        kept: Kept::Unanswered(Vec::new()),
+        spoke: false,
+        ended: false,
+    }));
     // **Stdin ending is the far end having said all it will, not the end of the conversation.** The
     // broker may still be answering what it was last asked, so the caller says so with `Done` and goes on
     // reading until the broker lets the connection go; ending the process here would cut off the answer
     // to the request just carried. A named pipe cannot be closed one way, so this is the same on every
     // platform, rather than a half-close where there is one and an exit where there is not
     std::thread::spawn({
-        let stream = Arc::clone(&stream);
+        let carrying = Arc::clone(&carrying);
         move || {
-            pump(std::io::stdin().lock(), &*stream);
+            let mut input = std::io::stdin().lock();
+            let mut buffer = [0u8; 64 * 1024];
+            while let Ok(read @ 1..) = input.read(&mut buffer) {
+                carry(&carrying, &buffer[..read], Saying::FarEnd);
+            }
             let done = serde_json::to_string(&Request::Done).expect("a request serializes");
-            let _ = (&*stream).write_all(format!("{done}\n").as_bytes());
+            carry(&carrying, format!("{done}\n").as_bytes(), Saying::Done);
         }
     });
-    // The broker hanging up leaves nothing to read, and a thread still parked on stdin is no reason to stay
-    pump(&*stream, std::io::stdout().lock());
+    // The broker hanging up leaves nothing to read, and a thread still parked on stdin is no reason to stay.
+    // A connection let go of without a word was never served (`Carrying`), and is made again, as many times
+    // as a broker is looked for
+    let mut stdout = std::io::stdout().lock();
+    let mut made = 1;
+    while !heard(&stream, &mut stdout, &carrying) {
+        // Held while the next is reached, so nothing the far end says goes anywhere until what it said
+        // before has been said again
+        let mut carrying = carrying_of(&carrying);
+        let kept = match &carrying.kept {
+            // A far end that said nothing and has finished is answered by the connection being let go
+            _ if carrying.ended && !carrying.spoke => return Ok(()),
+            Kept::Unanswered(kept) => kept.clone(),
+            Kept::Answered | Kept::TooLong => {
+                return Err(std::io::Error::other(format!(
+                    "the broker on {socket} let the connection go without answering, and more had been said \
+                     on it than the {KEPT_BYTES} bytes that are said again"
+                )));
+            }
+        };
+        if made == LOOKS {
+            return Err(std::io::Error::other(format!(
+                "the broker on {socket} let {LOOKS} connections go without answering"
+            )));
+        }
+        stream = Arc::new(reach_own(socket)?);
+        made += 1;
+        let _ = (&*stream).write_all(&kept).and_then(|()| (&*stream).flush());
+        carrying.stream = Arc::clone(&stream);
+    }
     Ok(())
 }

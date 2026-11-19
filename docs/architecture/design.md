@@ -266,7 +266,10 @@ so a remote terminal is the same protocol over a different pipe. Proxies arrivin
 broker between them: each that finds none starts one, and all but the first to take the socket's lock
 exit, leaving their proxies to connect to the one that is there. A proxy carries nothing until the kernel
 has said the broker it reached runs as its own user, and when its input ends it goes on carrying what the
-broker says until the broker has said it.
+broker says until the broker has said it. **A connection let go of before the broker said a word was never
+served**: a broker leaving — its last caller gone, or nothing having reached it within its start grace —
+takes a connection that arrives as it goes into its queue and exits with it unread. So a proxy keeps what it
+carried until the broker answers any of it, and carries it again on a connection made again.
 
 ## Nothing polls
 

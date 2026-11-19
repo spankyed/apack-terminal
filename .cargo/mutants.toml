@@ -160,9 +160,10 @@ exclude_re = [
     # The same for the key and mouse encoders a session keeps, which are four more handles with one owner
     "vt/input.rs:.*<impl Drop for Encoders>::drop",
 
-    # **Sizes that are how much is moved at a time, not what is moved.** The proxy's buffer is how much one
-    # `read` may hand over; a smaller one carries the same bytes in more passes, as the reader's above does
-    "proxy.rs:.*replace \\* with \\+ in pump",
+    # **Sizes that are how much is moved at a time, not what is moved.** The proxy's buffers are how much one
+    # `read` may hand over, from the broker and from stdin; a smaller one carries the same bytes in more
+    # passes, as the reader's above does
+    "proxy.rs:.*replace \\* with \\+ in (heard|run)",
 
     # **Flags that are distinct bits, joined.** `|` and `^` differ only where two operands share a bit, and
     # these share none: a frame's flags are one bit each (`FRAME_CURSOR` … `FRAME_HIDDEN`), a row's are

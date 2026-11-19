@@ -38,7 +38,7 @@ cargo xtask clear-mutants                      # removes the working copies a mu
 | `tests/image_source_rules.rs` | the rules a Windows path is held to before and after it is opened, on every platform; and on Windows, what is opened by them |
 | `tests/holds.rs` | the deadlines kept for screens a program is holding still: one a screen, and none left once each has been drawn or its session has ended |
 | `tests/housekeeping.rs` | history compressed once a session has gone quiet |
-| `tests/proxy.rs` | a broker reached through a process's stdin and stdout, proxies arriving together starting one, and the one broker a socket has: its lock, its socket's mode, and when it leaves |
+| `tests/proxy.rs` | a broker reached through a process's stdin and stdout, proxies arriving together starting one, a connection a leaving broker never answered made again with what was said on it, and the one broker a socket has: its lock, its socket's mode, and when it leaves |
 | `tests/core_features.rs` | that the core this was built against has what the broker uses |
 | `tests/frames.rs` | the frame decoder as a decoder — arbitrary bytes, mutated frames, the round trip |
 | `tests/screen.rs` | what a snapshot answers: the viewport, the history asked for, the alternate screen |
