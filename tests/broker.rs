@@ -2536,12 +2536,31 @@ fn a_client_that_asks_and_never_reads_is_hung_up_on_and_the_broker_goes_on() {
         broker.socket.to_str().expect("a utf-8 socket path").to_fs_name::<GenericFilePath>().expect("a socket name");
     let mut deaf = Wire(std::sync::Arc::new(Stream::connect(name).expect("the broker accepts")));
     ask(&mut deaf, &hello(None));
-    let greeting = crate::heard::paced_events::<serde_json::Value, _>(deaf.clone()).next();
+    let heard = crate::heard::paced_events::<serde_json::Value, _>(deaf.clone());
+    let greeting = heard.next();
     assert_eq!(greeting["kind"], "hello", "{greeting}");
 
-    // Far more requests than it takes: a broker that kept every answer would take them all
-    let hung_up_after = (0..2_000_000).find(|_| deaf.write_all(b"{\"kind\":\"sessions\"}\n").is_err());
-    assert!(hung_up_after.is_some(), "two million answers were kept for a client that read none of them");
+    // Far more requests than it takes. **A write failing is not the measure**: it does on Linux once the
+    // broker has hung up, but on macOS a write to a socket shut down at the far end is taken and thrown away
+    // until that end's handle closes, which the broker does only once it has let the connection go — so a
+    // fast enough writer can make every one of these. The asking stops early when it does fail
+    const ASKED: u32 = 2_000_000;
+    let _ = (0..ASKED).try_for_each(|_| deaf.write_all(b"{\"kind\":\"sessions\"}\n"));
+    // What the connection ends with is the measure: a client hung up on is sent what was on its way, and then the end;
+    // a client whose answers were kept is sent every one of them
+    let mut answered = 0;
+    loop {
+        match heard.within(QUIET) {
+            Ok(_) => {
+                answered += 1;
+                assert!(answered < ASKED, "two million answers were kept for a client that read none of them");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("the broker kept the connection of a client that read nothing")
+            }
+        }
+    }
 
     // The next client is greeted and answered
     let (mut reading, mut writing) = connect(&broker);
