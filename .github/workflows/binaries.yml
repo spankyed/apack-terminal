@@ -12,6 +12,10 @@ name: binaries
 # Windows the ConPTY it loads from its own directory (`windows/conpty/`), the notices the binary's licenses ask a
 # redistribution to carry, and its CycloneDX SBOM. A release has no folders, so the platform is in the name.
 #
+# **The Linux binary needs glibc 2.39 or later** (Ubuntu 24.04, Debian 13, Fedora 40), its runner's: the build fails
+# when it needs a newer one, so a runner image moving on can't raise what the app's users need without a change here,
+# and the app's own Linux release holds its binaries to the same floor (its build-linux.yml).
+#
 # A dispatch builds a commit that has none, such as one from before this workflow.
 on:
   push:
@@ -62,8 +66,20 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - run: cargo build --release --locked --bin apack-terminal
+      # The newest glibc symbol version the Linux binary needs, held to the floor stated above
+      - if: runner.os == 'Linux'
+        run: |
+          floor=2.39
+          newest=$(nm -D --undefined-only target/release/${{ matrix.binary }} | grep -o '@GLIBC_[0-9.]*' | sed 's/@GLIBC_//' | sort -uV | tail -1)
+          echo "the binary needs glibc ${newest:-(none read)}; the floor is $floor"
+          if [ -z "$newest" ] || [ "$(printf '%s\n%s\n' "$newest" "$floor" | sort -V | tail -1)" != "$floor" ]; then
+            echo "::error::The broker needs glibc ${newest:-(none read)}, past the floor $floor this workflow states"
+            exit 1
+          fi
       # **The binary's SBOM**, CycloneDX: every crate its target is built from, as cargo-cyclonedx reads them from the
-      # lockfile, build scripts' dependencies left out and procedural macros, which run while it compiles, kept in. libghostty-vt's C and Zig libraries are no crate's, so it lists them nowhere; THIRD-PARTY-NOTICES
+      # lockfile, build scripts' dependencies left out and procedural macros, which run while it compiles, kept in.
+      # What isn't a crate it lists nowhere: libghostty-vt's C and Zig libraries, which a crate links prebuilt, and on
+      # Windows the ConPTY files shipped beside the binary (`conpty.dll`, `OpenConsole.exe`). THIRD-PARTY-NOTICES
       # credits them (`licenses/README.md`)
       - uses: taiki-e/install-action@v2
         with:
@@ -109,17 +125,26 @@ jobs:
       - name: Sums
         working-directory: out
         run: sha256sum -- * | tee SHA256SUMS
-      # **A release per commit, written once.** One that is already there keeps its files: the pin of every app
-      # that copied its sums is to those bytes, and replacing them would break each of those installs
+      # **A release per commit, written once.** One that is published keeps its files: the pin of every app that
+      # copied its sums is to those bytes, and replacing them would break each of those installs. A draft is what a run
+      # stopped mid-upload leaves, which nobody can have pinned, so it is made again. Any other failure to read the
+      # release fails the step, rather than passing as a release that isn't there
       - name: Publish bin-${{ env.COMMIT }}
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           tag="bin-$COMMIT"
-          if gh release view "$tag" > /dev/null 2>&1; then
-            echo "$tag is already published; leaving its files as they are"
-            exit 0
+          if draft=$(gh release view "$tag" --json isDraft --jq .isDraft 2> view.err); then
+            if [ "$draft" != true ]; then
+              echo "$tag is already published; leaving its files as they are"
+              exit 0
+            fi
+            echo "$tag is a draft a run before left; making it again"
+            gh release delete "$tag" --yes
+          elif ! grep -q 'release not found' view.err; then
+            cat view.err
+            exit 1
           fi
           gh release create "$tag" out/* --target "$COMMIT" --title "binaries for ${COMMIT:0:7}" \
             --latest=false --notes "The broker's release build of $COMMIT for each platform the app ships, with SHA256SUMS and the notices its licenses ask a redistribution to carry. Pinned by apack, never replaced."
