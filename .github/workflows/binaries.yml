@@ -12,9 +12,11 @@ name: binaries
 # Windows the ConPTY it loads from its own directory (`windows/conpty/`), the notices the binary's licenses ask a
 # redistribution to carry, and its CycloneDX SBOM. A release has no folders, so the platform is in the name.
 #
-# **The Linux binary needs glibc 2.39 or later** (Ubuntu 24.04, Debian 13, Fedora 40), its runner's: the build fails
-# when it needs a newer one, so a runner image moving on can't raise what the app's users need without a change here,
-# and the app's own Linux release holds its binaries to the same floor (its build-linux.yml).
+# **The Linux binary needs glibc 2.28 or later** (RHEL 8, Debian 10, Ubuntu 18.10), which Node 22's and Electron's own
+# Linux builds need too. It is built in manylinux_2_28 (AlmaLinux 8, glibc 2.28), the terminal core from source with it:
+# the library `ghostty-vt-rs-sys` links prebuilt on Linux calls `arc4random_buf`, which glibc has from 2.36. The build
+# fails when the binary needs a newer glibc, and the app's own Linux release holds its binaries to a floor of its own
+# (its build-linux.yml).
 #
 # A dispatch builds a commit that has none, such as one from before this workflow.
 on:
@@ -53,32 +55,61 @@ jobs:
         with:
           ref: ${{ env.COMMIT }}
       - run: rustup show active-toolchain
-      # As `ci.yml`'s tests job: Windows builds the terminal core from source with the Zig its commit wants, for
-      # speed; the other platforms link the prebuilt library
-      - if: runner.os == 'Windows'
+      # Windows and Linux build the terminal core from source with the Zig its commit wants, for speed: nobody
+      # publishes one for Windows, and the one published for Linux needs glibc 2.36. macOS links the prebuilt library
+      - if: runner.os != 'macOS'
         uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0
-      - if: runner.os == 'Windows'
+      - if: runner.os != 'macOS'
         shell: bash
         run: echo "GHOSTTY_VT_RS_SYS_OPTIMIZE=fast" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
-      - run: cargo build --release --locked --bin apack-terminal
-      # The newest glibc symbol version the Linux binary needs, held to the floor stated above
+      - if: runner.os != 'Linux'
+        run: cargo build --release --locked --bin apack-terminal
+      # In manylinux_2_28 (AlmaLinux 8, glibc 2.28): every object compiled and linked there is built against glibc
+      # 2.28's headers and library, the terminal core among them, since Zig building for the machine it is on targets
+      # the glibc it finds there. The runner's Zig is mounted in, being one static binary beside its library. The
+      # binary is then run there, so it is seen loading at that glibc: with no socket named it prints its usage
       - if: runner.os == 'Linux'
         run: |
-          floor=2.39
+          zig=$(dirname "$(readlink -f "$(command -v zig)")")
+          docker run --rm -v "$PWD:/w" -w /w -v "$zig:/opt/zig:ro" -e CARGO_TERM_COLOR -e GHOSTTY_VT_RS_SYS_OPTIMIZE \
+            quay.io/pypa/manylinux_2_28_x86_64 bash -euc '
+            curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            export PATH="$HOME/.cargo/bin:/opt/zig:$PATH"
+            git config --global --add safe.directory /w
+            rustup toolchain install
+            rustup show active-toolchain
+            zig version
+            ldd --version | head -1
+            cargo build --release --locked --bin apack-terminal
+            target/release/apack-terminal 2>&1 | grep usage
+          '
+          sudo chown -R "$(id -u):$(id -g)" .
+      # The newest glibc symbol version the Linux binary needs, held to the floor stated above. A symbol left with no
+      # version at all is one the C library it was linked against doesn't have, which a binary built against newer
+      # headers than its library leaves (`__isoc23_strtol`)
+      - if: runner.os == 'Linux'
+        run: |
+          floor=2.28
+          nm -D --undefined-only target/release/${{ matrix.binary }} | grep -o '@GLIBC_[0-9.]*' | sort -V | uniq -c
           newest=$(nm -D --undefined-only target/release/${{ matrix.binary }} | grep -o '@GLIBC_[0-9.]*' | sed 's/@GLIBC_//' | sort -uV | tail -1)
+          unversioned=$(nm -D --undefined-only target/release/${{ matrix.binary }} | awk '$1 == "U" && $2 !~ /@/ { print $2 }')
           echo "the binary needs glibc ${newest:-(none read)}; the floor is $floor"
           if [ -z "$newest" ] || [ "$(printf '%s\n%s\n' "$newest" "$floor" | sort -V | tail -1)" != "$floor" ]; then
             echo "::error::The broker needs glibc ${newest:-(none read)}, past the floor $floor this workflow states"
             exit 1
           fi
+          if [ -n "$unversioned" ]; then
+            echo "::error::The broker leaves symbols no C library it was linked against defines: $unversioned"
+            exit 1
+          fi
       # **The binary's SBOM**, CycloneDX: every crate its target is built from, as cargo-cyclonedx reads them from the
       # lockfile, build scripts' dependencies left out and procedural macros, which run while it compiles, kept in.
-      # What isn't a crate it lists nowhere: libghostty-vt's C and Zig libraries, which a crate links prebuilt, and on
+      # What isn't a crate it lists nowhere: libghostty-vt's C and Zig libraries, which a crate links as one static library, and on
       # Windows the ConPTY files shipped beside the binary (`conpty.dll`, `OpenConsole.exe`). THIRD-PARTY-NOTICES
       # credits them (`licenses/README.md`)
       - uses: taiki-e/install-action@v2
@@ -113,8 +144,10 @@ jobs:
           path: out/*
           if-no-files-found: error
 
+  # From `master` or a dispatch alone: a release is what an app pins, and no other branch's build is one
   publish:
     needs: build
+    if: github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4

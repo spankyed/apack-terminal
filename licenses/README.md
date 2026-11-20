@@ -13,9 +13,9 @@ Ghostty's own license is shipped by `ghostty-vt-rs-sys` and listed with the crat
 
 **Which libraries.** Those Ghostty's `deps/libghostty-vt-third-party.json` names as `linked`, at Ghostty
 `0fa3d577a5614150ff8e2c152de5fb9d5c6d2dec`, the commit `ghostty-vt-rs-sys` 0.3.0 builds and links (`GHOSTTY_COMMIT` in its
-`build.rs`, which `cargo xtask notices` reads). The macOS and Linux releases link the archive its upstream builds with Zig 0.17.0
-(`ghostty-vt-rs`'s `.github/workflows/prebuilt.yml`); the Windows release builds it from that commit's sources with
-Zig 0.17.0 (`binaries.yml`). So Zig's standard library and `compiler_rt` are compiled in too, whose math is in part
+`build.rs`, which `cargo xtask notices` reads). The macOS release links the archive its upstream builds with Zig 0.17.0
+(`ghostty-vt-rs`'s `.github/workflows/prebuilt.yml`); the Linux and Windows releases build it from that commit's sources
+with Zig 0.17.0 (`binaries.yml`). So Zig's standard library and `compiler_rt` are compiled in too, whose math is in part
 ported from musl's and Go's, and Ghostty's own code holds two tables taken from elsewhere: X11's `rgb.txt`
 (`src/terminal/x11_color.zig`) and Foot's Kitty keymap (`src/input/kitty.zig`). `cargo xtask notices` fails when the
 crate links another commit, until these are read again for it.
