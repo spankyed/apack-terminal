@@ -21,7 +21,7 @@ name: binaries
 # A dispatch builds a commit that has none, such as one from before this workflow.
 on:
   push:
-    branches: [master]
+    branches: [master, build/linux-glibc-2.28]
   workflow_dispatch:
     inputs:
       commit:
