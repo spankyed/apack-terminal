@@ -12,6 +12,12 @@ name: binaries
 # Windows the ConPTY it loads from its own directory (`windows/conpty/`), the notices the binary's licenses ask a
 # redistribution to carry, and its CycloneDX SBOM. A release has no folders, so the platform is in the name.
 #
+# **The same files, as npm packages a consumer installs by URL.** The release also carries `.tgz` files: one package
+# per platform (`@apackdev/terminal-<platform>`, installed by its `os` and `cpu`) holding that platform's files,
+# `@apackdev/terminal`, whose optional dependencies name those three by their URLs on this same release, and
+# `@apackdev/terminal-view`. A consumer depends on `@apackdev/terminal` by its URL here and gets the broker for the
+# platform it installs on (`node/release/pack.mjs` says how the URLs get in). Nothing is published to npm.
+#
 # **The Linux binary needs glibc 2.28 or later** (RHEL 8, Debian 10, Ubuntu 18.10), which Node 22's and Electron's own
 # Linux builds need too. It is built in manylinux_2_28 (AlmaLinux 8, glibc 2.28), the terminal core from source with it:
 # the library `ghostty-vt-rs-sys` links prebuilt on Linux calls `arc4random_buf`, which glibc has from 2.36. The build
@@ -144,16 +150,106 @@ jobs:
           path: out/*
           if-no-files-found: error
 
+  # **The npm packages, packed once from the files every platform built** (`node/release/pack.mjs`): one package per
+  # platform holding that platform's files, `@apackdev/terminal` naming each of them by its URL on this commit's
+  # release, and `@apackdev/terminal-view`. Packed on one runner so every platform's smoke installs the same bytes
+  # the release publishes. A commit from before the packages has no `node/release/pack.mjs`, and its release is
+  # published with the binaries' files alone
+  package:
+    needs: build
+    runs-on: ubuntu-24.04
+    outputs:
+      packed: ${{ steps.pack.outputs.packed }}
+      version: ${{ steps.pack.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.COMMIT }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          merge-multiple: true
+          path: assets
+      - id: pack
+        run: |
+          if [ ! -f node/release/pack.mjs ]; then
+            echo "$COMMIT has no npm packages to pack"
+            echo "packed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          node node/release/pack.mjs --commit "$COMMIT" --files assets --out packages --repo "$GITHUB_REPOSITORY"
+          npm --prefix view ci --no-audit --no-fund
+          npm --prefix view run build
+          (cd view && npm pack --pack-destination ../packages)
+          ls -l packages
+          echo "packed=true" >> "$GITHUB_OUTPUT"
+          echo "version=$(node -p 'require("./node/package.json").version')" >> "$GITHUB_OUTPUT"
+      - if: steps.pack.outputs.packed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: packages/*.tgz
+          if-no-files-found: error
+
+  # **Each platform installs the packed packages and runs the broker they hold**, before the release exists: this
+  # platform's package and `@apackdev/terminal` installed from their tarballs into a new project, then asked for the
+  # binary, which is run (`node/release/smoke.mjs`). The main package's URLs name a release not yet published, which
+  # npm, finding no optional dependency there, passes over; `consume` installs through them once it is
+  smoke:
+    name: smoke (${{ matrix.platform }})
+    needs: package
+    if: needs.package.outputs.packed == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: darwin-arm64, runner: macos-15 }
+          - { platform: linux-x64, runner: ubuntu-24.04 }
+          - { platform: win32-x64, runner: windows-latest }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.COMMIT }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: packages
+      - shell: bash
+        env:
+          VERSION: ${{ needs.package.outputs.version }}
+        run: |
+          mkdir smoke-project && cd smoke-project
+          echo '{ "name": "smoke", "private": true }' > package.json
+          npm install --no-audit --no-fund "../packages/apackdev-terminal-${{ matrix.platform }}-$VERSION.tgz" "../packages/apackdev-terminal-$VERSION.tgz"
+          node ../node/release/smoke.mjs .
+
   # From `master` or a dispatch alone: a release is what an app pins, and no other branch's build is one
   publish:
-    needs: build
-    if: github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
+    needs: [build, package, smoke]
+    if: >-
+      !cancelled() && needs.build.result == 'success' && needs.package.result == 'success'
+      && (needs.smoke.result == 'success' || needs.smoke.result == 'skipped')
+      && (github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-24.04
+    outputs:
+      created: ${{ steps.publish.outputs.created }}
     steps:
       - uses: actions/download-artifact@v4
         with:
           pattern: binaries-*
           merge-multiple: true
+          path: out
+      - if: needs.package.outputs.packed == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: packages
           path: out
       - name: Sums
         working-directory: out
@@ -163,6 +259,7 @@ jobs:
       # stopped mid-upload leaves, which nobody can have pinned, so it is made again. Any other failure to read the
       # release fails the step, rather than passing as a release that isn't there
       - name: Publish bin-${{ env.COMMIT }}
+        id: publish
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -180,4 +277,39 @@ jobs:
             exit 1
           fi
           gh release create "$tag" out/* --target "$COMMIT" --title "binaries for ${COMMIT:0:7}" \
-            --latest=false --notes "The broker's release build of $COMMIT for each platform the app ships, with SHA256SUMS and the notices its licenses ask a redistribution to carry. Pinned by apack, never replaced."
+            --latest=false --notes "The broker's release build of $COMMIT for each platform the app ships, with SHA256SUMS and the notices its licenses ask a redistribution to carry, and its npm packages as .tgz files: install @apackdev/terminal by this release's URL for its tarball, which names this platform's package by its URL here. Pinned by apack, never replaced."
+          echo "created=true" >> "$GITHUB_OUTPUT"
+
+  # **The packages as a consumer installs them: by the release's URL.** On each platform, a new project installs
+  # `@apackdev/terminal` from this release, which installs this platform's package from its URL and no other, runs
+  # the broker it holds, and does it again from the lockfile with `npm ci`
+  consume:
+    name: consume (${{ matrix.platform }})
+    needs: [package, publish]
+    if: needs.publish.outputs.created == 'true' && needs.package.outputs.packed == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: darwin-arm64, runner: macos-15 }
+          - { platform: linux-x64, runner: ubuntu-24.04 }
+          - { platform: win32-x64, runner: windows-latest }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.COMMIT }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - shell: bash
+        env:
+          VERSION: ${{ needs.package.outputs.version }}
+        run: |
+          mkdir consume-project && cd consume-project
+          echo '{ "name": "consume", "private": true }' > package.json
+          npm install --no-audit --no-fund "https://github.com/$GITHUB_REPOSITORY/releases/download/bin-$COMMIT/apackdev-terminal-$VERSION.tgz"
+          node ../node/release/smoke.mjs .
+          rm -rf node_modules
+          npm ci --no-audit --no-fund
+          node ../node/release/smoke.mjs .
