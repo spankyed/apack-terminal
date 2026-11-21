@@ -13,7 +13,7 @@ and the view paints, so they are the two halves of one protocol and change in on
 | | |
 |---|---|
 | `src/`, `tests/`, `xtask/` | the broker, in Rust |
-| [`node/`](node) | the `@apackdev/terminal` npm package: the protocol's generated types and the view's vectors |
+| [`node/`](node) | the `@apackdev/terminal` npm package: the protocol's generated types, the view's vectors, and where the installed broker binary is |
 | [`view/`](view) | the `@apackdev/terminal-view` npm package, in TypeScript ([its README](view/README.md)) |
 
 - **Sessions outlive their client.** The connection that opened a session is not what ends it; whoever
@@ -89,25 +89,28 @@ Consumed by pinning a commit: apack keeps a gitignored `vendor/apack-terminal` s
 `vendor/apack-terminal.rev`, and derives one Rust toolchain across every checkout linked that way. One pin
 holds the broker and the view, which is why they are one repository.
 
-**The binary reaches a consumer as a release build, pinned by hash.** Every `master` commit is built for
-each platform the app ships and published as the release `bin-<commit>` (`.github/workflows/binaries.yml`):
-each file named `<platform>__<file>` — Node's `<platform>-<arch>`, and on Windows the ConPTY the binary runs
-its sessions on beside it (`windows/conpty/`) — with a `SHA256SUMS`. apack pins a commit with those sums and
-its install downloads and verifies the files for the platform it is on, so the app runs exactly what this
-repository's CI built, and nothing working on the app needs a Rust toolchain.
+**The broker reaches a consumer as a release build, as npm packages installed by URL.** Every `master` commit is
+built for each platform the app ships and published as the release `bin-<commit>` (`.github/workflows/binaries.yml`):
+each file named `<platform>__<file>` — Node's `<platform>-<arch>`, and on Windows the ConPTY the binary runs its
+sessions on beside it (`windows/conpty/`) — with a `SHA256SUMS`, and the same files packed as npm packages: one
+`@apackdev/terminal-<platform>` per platform, `@apackdev/terminal`, and `@apackdev/terminal-view`. A consumer
+depends on `@apackdev/terminal` by its release URL; its optional dependencies name that release's platform packages
+by URL, so npm installs the one for the platform it is on, and `brokerBinary()` answers where its binary is. So the
+app runs exactly what this repository's CI built, and nothing working on the app needs a Rust toolchain
+([design.md](docs/architecture/design.md#how-a-consumer-gets-the-broker)).
 
-`node/` is the npm package of what a consumer compiles against: the protocol's generated types and the view's
-vectors. apack installs it as `file:…/vendor/apack-terminal/node` and imports the protocol's types from it
-rather than keeping a copy of them.
+`node/` is that package's source: the protocol's generated types, the view's vectors, and the runtime entry
+(`index.js`). Its manifest names the platform packages at its own version, which a release's tarball replaces with
+URLs (`node/release/pack.mjs`).
 
-**Both packages are publishable and not yet published**, under the owner's npm scope as `@apackdev/terminal`
-and `@apackdev/terminal-view`: `npm publish` in `node/` or `view/` is the whole publish, public by
-`publishConfig`, after a `prepublishOnly` that checks the generated protocol (`node/`) or typechecks, tests
-and builds (`view/`). Neither is `private`; what keeps either from being published by accident is that only
-the scope's owner can publish to it, and only by running that command.
+**None is published to npm.** The packages are named under the owner's npm scope and publishable, public by
+`publishConfig`; publishing `@apackdev/terminal` would take the three platform packages published first at its
+version. Neither source package is `private`; what keeps either from being published by accident is that only
+the scope's owner can publish to it, and only by running `npm publish`.
 
-**The view reaches a consumer the same way**, as `file:…/vendor/apack-terminal/view`. What it ships is its
-compiled `dist/`, which is not tracked, so whatever links or clones the checkout builds it
+**The view reaches a consumer as its release tarball too**, built, or from a checkout as
+`file:…/vendor/apack-terminal/view`. What it ships is its compiled `dist/`, which is not tracked, so whatever links
+or clones the checkout builds it
 (`npm run build` in `view/`): apack's linker does when `dist/` is missing or older than its sources, and
 its CI does after the clone.
 
@@ -139,6 +142,7 @@ cargo fmt --all --check
 cargo xtask generate                         # regenerate the protocol's TypeScript; commit it if it moved
 cargo run -- ~/.apack-terminal/broker.sock   # run one, and talk to it
 npm --prefix view test                       # the view's suite (also: run typecheck, run build)
+npm --prefix node test                       # the broker package's runtime entry and the release's packing
 ```
 
 `cargo xtask pre-push` is the one to run before a push: it is every check

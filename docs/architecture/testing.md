@@ -11,6 +11,7 @@ cargo xtask notices                            # regenerates the release's third
 cargo xtask check-notices                      # fails when they have fallen behind
 cargo xtask check-exclusions                   # fails when a mutants exclusion excludes nothing
 cargo xtask clear-mutants                      # removes the working copies a mutants run that was ended left behind
+npm --prefix node test                         # the npm package's runtime entry and the release's packing
 ```
 
 ## What each suite is for
@@ -46,6 +47,7 @@ cargo xtask clear-mutants                      # removes the working copies a mu
 | `tests/coalescing.rs` | output gathered into one event rather than one per read |
 | `tests/security.rs` | the pipe's descriptor as a string, on every platform |
 | `tests/candidates.rs` | the crates that were tried, kept as tests so the answers stay checked |
+| `node/test/` | `@apackdev/terminal` installed beside (or without) a platform package: the binary it answers, and when it answers none; the packing of each `bin-<commit>` release's packages, read back out of the tarballs, and that the platform packages' versions are the main package's. `binaries.yml` installs the real ones on each platform (`smoke`, `consume`) |
 
 `src/lib.rs` exists so the parser can be tested as a parser and the decoder as a decoder. Neither the grid,
 the scanner nor the bytes a stranger sends is a thing you write through a pty and a socket.
