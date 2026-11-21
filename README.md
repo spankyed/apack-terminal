@@ -13,7 +13,7 @@ and the view paints, so they are the two halves of one protocol and change in on
 | | |
 |---|---|
 | `src/`, `tests/`, `xtask/` | the broker, in Rust |
-| [`node/`](node) | the `@apackdev/terminal` npm package: where the broker's binary is, and the protocol's generated types |
+| [`node/`](node) | the `@apackdev/terminal` npm package: the protocol's generated types and the view's vectors |
 | [`view/`](view) | the `@apackdev/terminal-view` npm package, in TypeScript ([its README](view/README.md)) |
 
 - **Sessions outlive their client.** The connection that opened a session is not what ends it; whoever
@@ -100,6 +100,12 @@ repository's CI built, and nothing working on the app needs a Rust toolchain.
 vectors. apack installs it as `file:…/vendor/apack-terminal/node` and imports the protocol's types from it
 rather than keeping a copy of them.
 
+**Both packages are publishable and not yet published**, under the owner's npm scope as `@apackdev/terminal`
+and `@apackdev/terminal-view`: `npm publish` in `node/` or `view/` is the whole publish, public by
+`publishConfig`, after a `prepublishOnly` that checks the generated protocol (`node/`) or typechecks, tests
+and builds (`view/`). Neither is `private`; what keeps either from being published by accident is that only
+the scope's owner can publish to it, and only by running that command.
+
 **The view reaches a consumer the same way**, as `file:…/vendor/apack-terminal/view`. What it ships is its
 compiled `dist/`, which is not tracked, so whatever links or clones the checkout builds it
 (`npm run build` in `view/`): apack's linker does when `dist/` is missing or older than its sources, and
@@ -143,9 +149,10 @@ broker's suites, since the view's suite reads the vectors those hold to the enco
 
 ## License
 
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE). The view is MIT
-([`view/LICENSE`](view/LICENSE)), which carries the notice of
-[coder/ghostty-web](https://github.com/coder/ghostty-web), whose input handling it draws on.
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), both npm packages included, each of
+which ships the two texts. The view's input handling draws on
+[coder/ghostty-web](https://github.com/coder/ghostty-web), under MIT, whose notice
+[`view/NOTICE`](view/NOTICE) carries and the view's package ships.
 
 A release binary also holds the code it is built from, each under its own license: the Rust standard library, the
 crates the broker depends on, and libghostty-vt, which is Ghostty's code compiled with Zig together with Highway,

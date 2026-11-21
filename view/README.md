@@ -35,10 +35,12 @@ after the broker's suites.
 
 ## Using it
 
-Not published. A consumer depends on this directory (apack: `file:…/vendor/apack-terminal/view`, through
-its link to a checkout of this repository) and bundles `dist/`, which is not tracked — so it is built
-wherever the checkout is linked or cloned. There is no WebAssembly and nothing to load at runtime: one ES
-module and its declarations.
+Publishable to npm under the owner's scope, and not yet published: `npm publish` from this directory checks,
+tests and builds it first (`prepublishOnly`), then publishes it public. Until then a consumer depends on this
+directory (apack: `file:…/vendor/apack-terminal/view`, through its link to a checkout of this repository)
+and bundles `dist/`, which is not tracked — so it is built wherever the checkout is linked or cloned. There
+is no WebAssembly and nothing to load at runtime: one ES module and its declarations, the package's one
+entry point.
 
 ## What is where
 
@@ -105,5 +107,6 @@ since both halves are in it.
 
 ## License
 
-MIT ([LICENSE](LICENSE)). The input handling draws on
-[coder/ghostty-web](https://github.com/coder/ghostty-web), whose notice that file carries.
+MIT OR Apache-2.0, the repository's ([LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE)). The
+input handling draws on [coder/ghostty-web](https://github.com/coder/ghostty-web), under MIT, whose notice
+[NOTICE](NOTICE) carries and the package ships.

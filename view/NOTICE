@@ -1,3 +1,6 @@
+The input handling here draws on coder/ghostty-web (https://github.com/coder/ghostty-web), whose license
+asks that its notice be carried with it. That notice, verbatim:
+
 MIT License
 
 Copyright (c) 2025 Coder
