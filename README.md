@@ -6,15 +6,15 @@ so that no terminal session's lifetime is tied to the process that asked for it.
 Written for [apack](https://github.com/spankyed/apack), whose backend is a separate Node process. A session
 survives that process restarting, and ends when the app that claimed it goes.
 
-The repository also holds what draws a session in a window: [`view/`](view) is the `apack-terminal-view`
+The repository also holds what draws a session in a window: [`view/`](view) is the `@apackdev/terminal-view`
 package, a view over the rows the broker sends, with no terminal core of its own. The broker interprets
 and the view paints, so they are the two halves of one protocol and change in one commit.
 
 | | |
 |---|---|
 | `src/`, `tests/`, `xtask/` | the broker, in Rust |
-| [`node/`](node) | the `apack-terminal` npm package: where the broker's binary is, and the protocol's generated types |
-| [`view/`](view) | the `apack-terminal-view` npm package, in TypeScript ([its README](view/README.md)) |
+| [`node/`](node) | the `@apackdev/terminal` npm package: the protocol's generated types and the view's vectors |
+| [`view/`](view) | the `@apackdev/terminal-view` npm package, in TypeScript ([its README](view/README.md)) |
 
 - **Sessions outlive their client.** The connection that opened a session is not what ends it; whoever
   claimed the broker's lifetime is, and a descriptor closes on process death however the process died.
@@ -34,7 +34,7 @@ and the view paints, so they are the two halves of one protocol and change in on
 ## The protocol
 
 Two, on one socket. A client that opens and ends sessions speaks newline-delimited JSON: Rust is the source
-of truth and `node/protocol.ts` is generated from it and shipped by the npm package, so a consumer imports
+of truth and `node/protocol.d.ts` is generated from it and shipped by the npm package, so a consumer imports
 the types without building Rust. A view that draws a session speaks length-prefixed binary after the same
 greeting.
 
@@ -53,7 +53,7 @@ greeting.
 
 A window draws a session over a connection of its own, greeting as a `view`: it is sent the rows that
 changed and paints them, interpreting nothing ([views.md](docs/architecture/views.md)). What paints them
-is the `apack-terminal-view` package in [`view/`](view), whose codec (`view/src/broker/wire.ts`) is the
+is the `@apackdev/terminal-view` package in [`view/`](view), whose codec (`view/src/broker/wire.ts`) is the
 other half of `src/view/wire.rs`. The two meet in `node/view-vectors.json`: the broker's suite writes every
 kind of message there as bytes and as the value they mean, and the view's suite reads that file where it
 lies, so a change to the wire that taught only one half fails.
@@ -100,6 +100,12 @@ repository's CI built, and nothing working on the app needs a Rust toolchain.
 vectors. apack installs it as `file:…/vendor/apack-terminal/node` and imports the protocol's types from it
 rather than keeping a copy of them.
 
+**Both packages are publishable and not yet published**, under the owner's npm scope as `@apackdev/terminal`
+and `@apackdev/terminal-view`: `npm publish` in `node/` or `view/` is the whole publish, public by
+`publishConfig`, after a `prepublishOnly` that checks the generated protocol (`node/`) or typechecks, tests
+and builds (`view/`). Neither is `private`; what keeps either from being published by accident is that only
+the scope's owner can publish to it, and only by running that command.
+
 **The view reaches a consumer the same way**, as `file:…/vendor/apack-terminal/view`. What it ships is its
 compiled `dist/`, which is not tracked, so whatever links or clones the checkout builds it
 (`npm run build` in `view/`): apack's linker does when `dist/` is missing or older than its sources, and
@@ -143,9 +149,10 @@ broker's suites, since the view's suite reads the vectors those hold to the enco
 
 ## License
 
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE). The view is MIT
-([`view/LICENSE`](view/LICENSE)), which carries the notice of
-[coder/ghostty-web](https://github.com/coder/ghostty-web), whose input handling it draws on.
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), both npm packages included, each of
+which ships the two texts. The view's input handling draws on
+[coder/ghostty-web](https://github.com/coder/ghostty-web), under MIT, whose notice
+[`view/NOTICE`](view/NOTICE) carries and the view's package ships.
 
 A release binary also holds the code it is built from, each under its own license: the Rust standard library, the
 crates the broker depends on, and libghostty-vt, which is Ghostty's code compiled with Zig together with Highway,

@@ -1,8 +1,8 @@
 //! The messages the app and the broker exchange, and the one place their shape is defined.
 //!
 //! **Rust is the source of truth and the TypeScript is generated**, which is `elmdb-node/protocol/`'s
-//! arrangement reused rather than chosen again: `cargo xtask generate` writes `node/protocol.ts`, inside the
-//! npm package, which ships it — so a consumer imports these types from `apack-terminal` like any
+//! arrangement reused rather than chosen again: `cargo xtask generate` writes `node/protocol.d.ts`, inside the
+//! npm package, which ships it — so a consumer imports these types from `@apackdev/terminal` like any
 //! dependency's, and `cargo xtask check-generated` fails when the file has fallen behind the Rust.
 //!
 //! **It is a contract across a `.rev` boundary**, not an internal detail: the monorepo pins a commit of this
@@ -53,7 +53,7 @@ fn sent() -> bool {
 /// What the app asks the broker to do.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-#[ts(export, export_to = "protocol.ts")]
+#[ts(export, export_to = "protocol.d.ts")]
 pub enum Request {
     /// The caller has said all it will, and will send nothing more; what the broker still owes it is
     /// sent, and then the connection is let go. It is how a proxy whose input has ended says so on any
@@ -304,7 +304,7 @@ pub enum Request {
 /// The shape a session's cursor is drawn in when no program has chosen one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "protocol.ts")]
+#[ts(export, export_to = "protocol.d.ts")]
 pub enum CursorStyle {
     Block,
     Bar,
@@ -324,7 +324,7 @@ pub enum CursorStyle {
 /// blinking cursor for `On` and `Program`, and to a steady one for `Off`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "protocol.ts")]
+#[ts(export, export_to = "protocol.d.ts")]
 pub enum CursorBlink {
     On,
     Off,
@@ -333,7 +333,7 @@ pub enum CursorBlink {
 
 /// The colours a session is drawn in, each as red, green and blue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[ts(export, export_to = "protocol.d.ts")]
 pub struct Colors {
     pub foreground: [u8; 3],
     pub background: [u8; 3],
@@ -356,7 +356,7 @@ pub struct Colors {
 /// outlive its client, never a shell left running after the app is gone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "protocol.ts")]
+#[ts(export, export_to = "protocol.d.ts")]
 pub enum Role {
     /// Asks for sessions and receives their output. The default.
     #[default]
@@ -376,7 +376,7 @@ pub enum Role {
 /// a program down is written with: hang up, interrupt, quit, terminate, and the one that cannot be caught.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-#[ts(export, export_to = "protocol.ts")]
+#[ts(export, export_to = "protocol.d.ts")]
 pub enum Signal {
     Sighup,
     Sigint,
@@ -407,7 +407,7 @@ impl Signal {
 /// would take the servers it is still tidying up with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-#[ts(export, export_to = "protocol.ts")]
+#[ts(export, export_to = "protocol.d.ts")]
 pub enum Scope {
     /// The process the broker started for this session.
     Leader,
@@ -427,7 +427,7 @@ pub enum Scope {
 /// What a `Wait` is waiting for.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-#[ts(export, export_to = "protocol.ts")]
+#[ts(export, export_to = "protocol.d.ts")]
 pub enum Until {
     /// No command is running: the shell has reported a prompt or a finish. **Needs shell integration** —
     /// without the markers nothing ever reports a command starting, so a session that emits none is idle
@@ -452,7 +452,7 @@ pub enum Until {
 /// How a `Wait` ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-#[ts(export, export_to = "protocol.ts")]
+#[ts(export, export_to = "protocol.d.ts")]
 pub enum WaitOutcome {
     /// The condition held.
     Met,
@@ -474,7 +474,7 @@ pub enum WaitOutcome {
 /// there is the job object `tree.rs` already holds (`JobObjectBasicProcessIdList`). Unimplemented rather
 /// than approximated, because a platform claim is made on that platform.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[ts(export, export_to = "protocol.d.ts")]
 pub struct Foreground {
     /// The process group leader reading the pty.
     pub pid: i32,
@@ -485,7 +485,7 @@ pub struct Foreground {
 
 /// Where a search found what it was asked for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[ts(export, export_to = "protocol.d.ts")]
 pub struct SearchMatch {
     /// The row the matching line starts on, into the lines the same request's `Screen` would answer.
     pub line: u32,
@@ -499,7 +499,7 @@ pub struct SearchMatch {
 /// What the broker tells the app, unprompted or in answer.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-#[ts(export, export_to = "protocol.ts")]
+#[ts(export, export_to = "protocol.d.ts")]
 pub enum Event {
     /// The broker's own version, answering `Hello`.
     /// The broker's own version, and the history it keeps.
@@ -692,7 +692,7 @@ pub enum Event {
 
 /// A session, as a caller that did not start it needs to know it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[ts(export, export_to = "protocol.d.ts")]
 pub struct SessionSummary {
     pub session: SessionId,
     pub pid: u32,
@@ -720,7 +720,7 @@ pub struct SessionSummary {
 /// `exited` with a code of zero, and nothing a program printed can be handed to it as that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-#[ts(export, export_to = "protocol.ts")]
+#[ts(export, export_to = "protocol.d.ts")]
 pub enum CommandOutcome {
     /// It has not ended. A command still waiting at its prompt has not begun either, which its
     /// `started_ms` says.
@@ -738,7 +738,7 @@ pub enum CommandOutcome {
 /// Why a command in a session spawned with a key is over with no exit status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "protocol.ts")]
+#[ts(export, export_to = "protocol.d.ts")]
 pub enum Unreported {
     /// The shell reported its end and had no status to give.
     NoStatus,
@@ -770,7 +770,7 @@ impl From<Outcome> for CommandOutcome {
 /// One command a session's shell reported. What vouches for its fields is the session's: in one
 /// spawned without a key every field but the id is a claim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[ts(export, export_to = "protocol.d.ts")]
 pub struct CommandRecord {
     /// Counts from one in a session, and is never reused
     pub id: u32,
@@ -794,7 +794,7 @@ pub struct CommandRecord {
 /// `title` and `message` are text the program chose: decoded and free of control characters, and still
 /// not markup.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[ts(export, export_to = "protocol.d.ts")]
 pub struct StatusRecord {
     /// Which record this is. Empty for the program itself; `build/test` is beneath `build`.
     pub id: String,
@@ -822,7 +822,7 @@ pub struct StatusRecord {
 /// What a program says it is doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "protocol.ts")]
+#[ts(export, export_to = "protocol.d.ts")]
 pub enum StatusState {
     /// At rest, waiting for the person's next instruction
     Idle,
@@ -838,7 +838,7 @@ pub enum StatusState {
 /// What a blocked program needs from the person.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "protocol.ts")]
+#[ts(export, export_to = "protocol.d.ts")]
 pub enum BlockedKind {
     Permission,
     Question,
@@ -848,7 +848,7 @@ pub enum BlockedKind {
 /// Whether the program in front of the pty was the one a record names, when the record was taken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "protocol.ts")]
+#[ts(export, export_to = "protocol.d.ts")]
 pub enum Confirmed {
     /// The foreground process group's leader is the program the record names
     Matched,
@@ -909,7 +909,7 @@ impl From<StatusState> for crate::status::State {
 /// What a program says about how far along it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "protocol.ts")]
+#[ts(export, export_to = "protocol.d.ts")]
 pub enum ProgressState {
     /// Nothing to report any more
     None,
@@ -926,7 +926,7 @@ pub enum ProgressState {
 /// matching on a message that is free to be reworded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-#[ts(export, export_to = "protocol.ts")]
+#[ts(export, export_to = "protocol.d.ts")]
 pub enum ErrorCode {
     /// The connection's first message was not `Hello`, or its version is not ours.
     Handshake,

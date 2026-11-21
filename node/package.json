@@ -1,5 +1,5 @@
 {
-  "name": "apack-terminal",
+  "name": "@apackdev/terminal",
   "version": "0.1.0",
   "description": "The terminal broker: one process that owns the ptys, so a session's lifetime is not the lifetime of whatever asked for it.",
   "license": "MIT OR Apache-2.0",
@@ -8,14 +8,25 @@
     "url": "git+https://github.com/spankyed/apack-terminal.git",
     "directory": "node"
   },
-  "private": true,
-  "types": "index.d.ts",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts"
+    },
+    "./view-vectors.json": "./view-vectors.json",
+    "./package.json": "./package.json"
+  },
   "files": [
     "index.d.ts",
-    "protocol.ts",
-    "view-vectors.json"
+    "protocol.d.ts",
+    "view-vectors.json",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
   ],
-  "engines": {
-    "node": ">=22.17.0"
+  "scripts": {
+    "prepublishOnly": "cargo xtask check-generated"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

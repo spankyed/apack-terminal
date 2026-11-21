@@ -21,14 +21,14 @@ holds.
 | `src/listening.rs`, `src/security.rs`, `src/proxy.rs` | who may reach a broker: the lock that makes it the only one on its socket, the socket's directory and permissions, the Windows pipe's descriptor, and `proxy`, which is a process's stdin and stdout as a connection |
 | `src/main.rs` | the process: a socket, a handshake, the request loop for a client and for a view |
 | `src/lib.rs` | so the parser can be tested as a parser |
-| `node/protocol.ts`, `node/view-vectors.json` | **generated** from `src/protocol.rs` and `src/view/wire.rs`; never edited by hand, and shipped by the package |
+| `node/protocol.d.ts`, `node/view-vectors.json` | **generated** from `src/protocol.rs` and `src/view/wire.rs`; never edited by hand, and shipped by the package |
 | `xtask/` | the repository's own tasks (`cargo xtask <task>`): the protocol's derivation, the mutation gate's own checks, and pre-push |
 | `node/` | the npm package a consumer compiles against: the protocol's types and the view's vectors, both generated |
 | `.github/workflows/binaries.yml` | the broker as a consumer runs it: each `master` commit's release build for each platform, published as `bin-<commit>` with its sums |
 | `windows/conpty/`, `build.rs` | Microsoft's ConPTY, which the broker runs its sessions on in Windows in place of the system's (its README says why and where it is from), and the build script that puts it beside every binary `cargo` builds |
 | `about.toml`, `about.hbs`, `licenses/` | what `cargo xtask notices` writes `THIRD-PARTY-NOTICES` from: cargo-about's configuration and template for the crates, and the verbatim license files of code no crate's metadata names (`licenses/README.md` says where each is from) |
 | `THIRD-PARTY-NOTICES`, `COPYRIGHT-rust-library.html` | **generated** by `cargo xtask notices`: the notices the release binaries' licenses ask a redistribution to carry, which `binaries.yml` publishes beside each platform's binary |
-| `view/` | the `apack-terminal-view` npm package: what a window draws a session with, from the rows `src/view/` sends. TypeScript on npm, vite and vitest (`npm test`, `npm run typecheck`, `npm run build` there); its codec (`view/src/broker/wire.ts`) is the other half of `src/view/wire.rs`, and its suite reads `node/view-vectors.json` in place, so a change to the wire is one commit holding both halves |
+| `view/` | the `@apackdev/terminal-view` npm package: what a window draws a session with, from the rows `src/view/` sends. TypeScript on npm, vite and vitest (`npm test`, `npm run typecheck`, `npm run build` there); its codec (`view/src/broker/wire.ts`) is the other half of `src/view/wire.rs`, and its suite reads `node/view-vectors.json` in place, so a change to the wire is one commit holding both halves |
 
 ## Checks
 
@@ -62,7 +62,7 @@ cargo xtask pre-push                         # before a push: everything below, 
 cargo nextest run --workspace                # every suite, each test in its own process
 cargo clippy --workspace --all-targets -- -D warnings    # the gate is zero warnings
 cargo fmt --all --check                      # the layout rustfmt.toml pins, which is elmdb's
-cargo xtask generate                         # re-derive node/protocol.ts from src/protocol.rs
+cargo xtask generate                         # re-derive node/protocol.d.ts from src/protocol.rs
 cargo xtask check-generated                  # fails when that file has fallen behind
 cargo xtask notices                          # re-derive the release's third-party notices (needs cargo-about 0.9.3)
 cargo xtask check-notices                    # fails when either has fallen behind
@@ -71,11 +71,11 @@ cargo xtask clear-mutants                    # removes the working copies a muta
 npm --prefix view test                       # the view's suite (also: run typecheck, run build)
 ```
 
-- **Changed a protocol type?** `cargo xtask generate`, and commit `node/protocol.ts`. It is one place
+- **Changed a protocol type?** `cargo xtask generate`, and commit `node/protocol.d.ts`. It is one place
   rather than the `TS_RS_EXPORT_DIR=protocol cargo test` it replaced, because without that variable ts-rs
   writes to a gitignored `bindings/`, which is a second answer to the same question that nobody reads. It
   lives *inside* the npm package, which is what ships it: a consumer imports the types from
-  `apack-terminal` like any dependency's, rather than keeping a copy and a script to keep it fresh.
+  `@apackdev/terminal` like any dependency's, rather than keeping a copy and a script to keep it fresh.
 - **Changed a dependency, the toolchain, or the Ghostty `ghostty-vt-rs-sys` links?** `cargo xtask notices`, and
   commit `THIRD-PARTY-NOTICES` and `COPYRIGHT-rust-library.html`, which every release publishes beside the binaries.
   It fails on a dependency under a license `about.toml` doesn't accept, on one whose clarified license file there

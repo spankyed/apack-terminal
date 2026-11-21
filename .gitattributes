@@ -1,7 +1,7 @@
 # What is generated here and read byte for byte elsewhere keeps the line endings it was written with,
 # whatever a checkout's platform would make of them, as do the license files every platform's release publishes
 node/view-vectors.json text eol=lf
-node/protocol.ts text eol=lf
+node/protocol.d.ts text eol=lf
 THIRD-PARTY-NOTICES text eol=lf
 LICENSE-MIT text eol=lf
 LICENSE-APACHE text eol=lf

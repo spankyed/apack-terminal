@@ -1,6 +1,6 @@
 //! The repository's own tasks, run as `cargo xtask <task>`:
 //!
-//! - `generate`: writes the protocol's TypeScript declarations into `protocol/`, derived from `src/protocol.rs`.
+//! - `generate`: writes the protocol's TypeScript declarations into `node/protocol.d.ts`, derived from `src/protocol.rs`.
 //! - `check-generated`: fails when what `generate` would write differs from what is committed.
 //! - `notices`: writes the release binaries' third-party notices, `THIRD-PARTY-NOTICES` and
 //!   `COPYRIGHT-rust-library.html`, at the repository's root (`src/notices.rs`).
