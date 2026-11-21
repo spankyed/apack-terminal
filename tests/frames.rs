@@ -15,7 +15,7 @@
 //!   belongs and a truncated string.
 //! - **A request round-trips.** Serialize every variant and read it back: a field whose `Serialize` and
 //!   `Deserialize` disagree is a frame the app can send and the broker cannot read, which no amount of
-//!   fuzzing the broker's side would show — and the generated `node/protocol.ts` is written from the same
+//!   fuzzing the broker's side would show — and the generated `node/protocol.d.ts` is written from the same
 //!   derives, so it is the app's half of this seam too.
 
 use std::io::BufReader;

@@ -34,7 +34,7 @@ and the view paints, so they are the two halves of one protocol and change in on
 ## The protocol
 
 Two, on one socket. A client that opens and ends sessions speaks newline-delimited JSON: Rust is the source
-of truth and `node/protocol.ts` is generated from it and shipped by the npm package, so a consumer imports
+of truth and `node/protocol.d.ts` is generated from it and shipped by the npm package, so a consumer imports
 the types without building Rust. A view that draws a session speaks length-prefixed binary after the same
 greeting.
 

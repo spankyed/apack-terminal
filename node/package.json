@@ -9,10 +9,17 @@
     "directory": "node"
   },
   "private": true,
-  "types": "index.d.ts",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts"
+    },
+    "./view-vectors.json": "./view-vectors.json",
+    "./package.json": "./package.json"
+  },
   "files": [
     "index.d.ts",
-    "protocol.ts",
+    "protocol.d.ts",
     "view-vectors.json"
   ],
   "engines": {

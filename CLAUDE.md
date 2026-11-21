@@ -21,7 +21,7 @@ holds.
 | `src/listening.rs`, `src/security.rs`, `src/proxy.rs` | who may reach a broker: the lock that makes it the only one on its socket, the socket's directory and permissions, the Windows pipe's descriptor, and `proxy`, which is a process's stdin and stdout as a connection |
 | `src/main.rs` | the process: a socket, a handshake, the request loop for a client and for a view |
 | `src/lib.rs` | so the parser can be tested as a parser |
-| `node/protocol.ts`, `node/view-vectors.json` | **generated** from `src/protocol.rs` and `src/view/wire.rs`; never edited by hand, and shipped by the package |
+| `node/protocol.d.ts`, `node/view-vectors.json` | **generated** from `src/protocol.rs` and `src/view/wire.rs`; never edited by hand, and shipped by the package |
 | `xtask/` | the repository's own tasks (`cargo xtask <task>`): the protocol's derivation, the mutation gate's own checks, and pre-push |
 | `node/` | the npm package a consumer compiles against: the protocol's types and the view's vectors, both generated |
 | `.github/workflows/binaries.yml` | the broker as a consumer runs it: each `master` commit's release build for each platform, published as `bin-<commit>` with its sums |
@@ -62,7 +62,7 @@ cargo xtask pre-push                         # before a push: everything below, 
 cargo nextest run --workspace                # every suite, each test in its own process
 cargo clippy --workspace --all-targets -- -D warnings    # the gate is zero warnings
 cargo fmt --all --check                      # the layout rustfmt.toml pins, which is elmdb's
-cargo xtask generate                         # re-derive node/protocol.ts from src/protocol.rs
+cargo xtask generate                         # re-derive node/protocol.d.ts from src/protocol.rs
 cargo xtask check-generated                  # fails when that file has fallen behind
 cargo xtask notices                          # re-derive the release's third-party notices (needs cargo-about 0.9.3)
 cargo xtask check-notices                    # fails when either has fallen behind
@@ -71,7 +71,7 @@ cargo xtask clear-mutants                    # removes the working copies a muta
 npm --prefix view test                       # the view's suite (also: run typecheck, run build)
 ```
 
-- **Changed a protocol type?** `cargo xtask generate`, and commit `node/protocol.ts`. It is one place
+- **Changed a protocol type?** `cargo xtask generate`, and commit `node/protocol.d.ts`. It is one place
   rather than the `TS_RS_EXPORT_DIR=protocol cargo test` it replaced, because without that variable ts-rs
   writes to a gitignored `bindings/`, which is a second answer to the same question that nobody reads. It
   lives *inside* the npm package, which is what ships it: a consumer imports the types from

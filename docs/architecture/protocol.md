@@ -3,7 +3,7 @@
 Newline-delimited JSON, both ways, over a Unix socket — or a named pipe on Windows, where the transport
 refuses a filesystem path outright.
 
-**Rust is the source of truth and `node/protocol.ts` is generated from it**:
+**Rust is the source of truth and `node/protocol.d.ts` is generated from it**:
 
 ```sh
 cargo xtask generate         # re-derive it

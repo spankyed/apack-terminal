@@ -5,7 +5,7 @@ cargo xtask pre-push                           # before a push: every check CI r
 cargo nextest run --workspace                  # everything, each test in its own process
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
-cargo xtask generate                           # regenerates node/protocol.ts; commit it if it moved
+cargo xtask generate                           # regenerates node/protocol.d.ts; commit it if it moved
 cargo xtask check-generated                    # fails when it has fallen behind
 cargo xtask notices                            # regenerates the release's third-party notices (cargo-about 0.9.3)
 cargo xtask check-notices                      # fails when they have fallen behind
@@ -82,7 +82,7 @@ Three strategies, in increasing order of what they find:
   bytes are never nearly-valid JSON, so without this the deserializer is barely exercised.
 - **Every request serialized and read back**, which is the app's half of the seam: a `Serialize` and a
   `Deserialize` that disagree is a frame the app can send and the broker cannot read, and no amount of
-  fuzzing the broker's side would show it. `node/protocol.ts` is generated from the same derives.
+  fuzzing the broker's side would show it. `node/protocol.d.ts` is generated from the same derives.
 
 Beside them the cap's boundary is asserted by example, because it is one byte and not a distribution: a
 frame whose line is exactly `MAX_FRAME_BYTES` is read, and one byte longer is refused. That is what the
