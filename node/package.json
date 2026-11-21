@@ -8,23 +8,32 @@
     "url": "git+https://github.com/spankyed/apack-terminal.git",
     "directory": "node"
   },
+  "main": "./index.js",
   "types": "./index.d.ts",
   "exports": {
     ".": {
-      "types": "./index.d.ts"
+      "types": "./index.d.ts",
+      "default": "./index.js"
     },
     "./view-vectors.json": "./view-vectors.json",
     "./package.json": "./package.json"
   },
   "files": [
+    "index.js",
     "index.d.ts",
     "protocol.d.ts",
     "view-vectors.json",
     "LICENSE-MIT",
     "LICENSE-APACHE"
   ],
+  "optionalDependencies": {
+    "@apackdev/terminal-darwin-arm64": "0.1.0",
+    "@apackdev/terminal-linux-x64": "0.1.0",
+    "@apackdev/terminal-win32-x64": "0.1.0"
+  },
   "scripts": {
-    "prepublishOnly": "cargo xtask check-generated"
+    "test": "node --test",
+    "prepublishOnly": "cargo xtask check-generated && node --test"
   },
   "publishConfig": {
     "access": "public"

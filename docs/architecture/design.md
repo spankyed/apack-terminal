@@ -271,6 +271,41 @@ served**: a broker leaving — its last caller gone, or nothing having reached i
 takes a connection that arrives as it goes into its queue and exits with it unread. So a proxy keeps what it
 carried until the broker answers any of it, and carries it again on a connection made again.
 
+## How a consumer gets the broker
+
+**As npm packages attached to a release, one per platform.** `binaries.yml` builds every `master` commit for each
+platform the app ships and publishes the release `bin-<commit>`, which carries the built files (`<platform>__<file>`,
+with `SHA256SUMS`) and, packed from those same files, these `.tgz` files:
+
+| Package | Holds |
+|---|---|
+| `@apackdev/terminal-darwin-arm64`, `-linux-x64`, `-win32-x64` | that platform's binary (executable), on Windows the ConPTY it loads from its own directory, and the notices, licenses and SBOM shipped beside it; `os` and `cpu` say where it installs |
+| `@apackdev/terminal` | the protocol's types, the view's vectors, and `index.js`, which finds the binary in the platform package installed beside it |
+| `@apackdev/terminal-view` | the view (`view/`), built |
+
+A consumer depends on `@apackdev/terminal` by its URL on a release. Its optional dependencies name the three
+platform packages by their URLs on that same release, so npm installs the one whose `os` and `cpu` match and skips
+the others, and the lockfile records each URL with its integrity. A release is never replaced, so the URL keeps
+naming the same bytes.
+
+**The source manifest names versions; the released one names URLs.** `node/package.json` lists each platform
+package at exactly its own version, which is what a registry would resolve, and its suite fails when one is not.
+`node/release/pack.mjs` packs the platform packages at that version and packs `@apackdev/terminal` with those
+specs replaced by the release's URLs and the commit as `gitHead`. Nothing is published to npm.
+
+The runtime entry, CommonJS and so reachable by `require`, `createRequire` and `import` alike:
+
+- `brokerBinary()`: the binary's path, or `undefined` when no package for this platform is installed or not every
+  file it lists is there, since a Windows binary without its ConPTY beside it runs on the system's.
+- `brokerBinaryPath()`, `brokerDirectory()`: where the binary is and the directory of this platform's files,
+  `undefined` with no package.
+- `BINARY_NAME`, `PLATFORM` (Node's `<platform>-<arch>`), `PACKAGE_NAME` (the package that holds this platform's
+  broker), and `commit`, the commit a release packed the package for.
+
+Before the release exists each platform installs the packed tarballs into a new project and runs the binary
+`brokerBinary()` answers (`smoke`); after it, each installs `@apackdev/terminal` by its release URL, then again with
+`npm ci`, and does the same (`consume`). The binary is run with no arguments and answers with its usage and exit 2.
+
 ## Nothing polls
 
 A `wait` registers a condition that is checked where the bytes land. The broker already knows when something

@@ -23,8 +23,9 @@ holds.
 | `src/lib.rs` | so the parser can be tested as a parser |
 | `node/protocol.d.ts`, `node/view-vectors.json` | **generated** from `src/protocol.rs` and `src/view/wire.rs`; never edited by hand, and shipped by the package |
 | `xtask/` | the repository's own tasks (`cargo xtask <task>`): the protocol's derivation, the mutation gate's own checks, and pre-push |
-| `node/` | the npm package a consumer compiles against: the protocol's types and the view's vectors, both generated |
-| `.github/workflows/binaries.yml` | the broker as a consumer runs it: each `master` commit's release build for each platform, published as `bin-<commit>` with its sums |
+| `node/` | the `@apackdev/terminal` npm package: the protocol's types and the view's vectors, both generated, and `index.js`, which answers where the broker binary in the platform package installed beside it is (`brokerBinary()`); `node/test/` is its suite (`npm --prefix node test`) |
+| `node/release/` | not shipped: `pack.mjs` packs a release's npm packages (one per platform from its built files, and `@apackdev/terminal` naming them by their release URLs), and `smoke.mjs` runs the broker as a project that installed them finds it |
+| `.github/workflows/binaries.yml` | the broker as a consumer runs it: each `master` commit's release build for each platform, published as `bin-<commit>` with its sums and, as `.tgz` files, the npm packages a consumer installs by URL ([design.md](docs/architecture/design.md#how-a-consumer-gets-the-broker)) |
 | `windows/conpty/`, `build.rs` | Microsoft's ConPTY, which the broker runs its sessions on in Windows in place of the system's (its README says why and where it is from), and the build script that puts it beside every binary `cargo` builds |
 | `about.toml`, `about.hbs`, `licenses/` | what `cargo xtask notices` writes `THIRD-PARTY-NOTICES` from: cargo-about's configuration and template for the crates, and the verbatim license files of code no crate's metadata names (`licenses/README.md` says where each is from) |
 | `THIRD-PARTY-NOTICES`, `COPYRIGHT-rust-library.html` | **generated** by `cargo xtask notices`: the notices the release binaries' licenses ask a redistribution to carry, which `binaries.yml` publishes beside each platform's binary |
@@ -69,6 +70,7 @@ cargo xtask check-notices                    # fails when either has fallen behi
 cargo xtask check-exclusions                 # fails when a mutants exclusion excludes nothing
 cargo xtask clear-mutants                    # removes the working copies a mutants run that was ended left behind
 npm --prefix view test                       # the view's suite (also: run typecheck, run build)
+npm --prefix node test                       # the broker package's runtime entry and the release's packing
 ```
 
 - **Changed a protocol type?** `cargo xtask generate`, and commit `node/protocol.d.ts`. It is one place
@@ -90,11 +92,14 @@ npm --prefix view test                       # the view's suite (also: run typec
   before the change, and it catches that by the numbers disagreeing — which works at 1 and does not need 1
   to become 2. **It moves when a consumer exists that cannot move with it**: a published package, or a
   release in someone else's hands. That is the condition, and it is a fact to check rather than assume.
-- **The broker reaches a consumer as a release build, pinned by hash.** `binaries.yml` builds every
-  `master` commit for each platform the app ships and publishes the files, with their `SHA256SUMS`, as the
-  release `bin-<commit>`; apack pins a commit and those sums, and its install downloads and verifies them. So
-  what an app runs is what this repository's CI built, and nobody working on the app builds Rust. `node/` is
-  the npm package of the protocol's types and the view's vectors, which a consumer compiles against.
+- **The broker reaches a consumer as a release build, as npm packages installed by URL.** `binaries.yml` builds
+  every `master` commit for each platform the app ships and publishes the files, with their `SHA256SUMS`, as the
+  release `bin-<commit>`, together with `.tgz` files of `@apackdev/terminal`, one `@apackdev/terminal-<platform>`
+  package per platform and `@apackdev/terminal-view`. A consumer depends on `@apackdev/terminal` by its URL there,
+  and its optional dependencies name that release's platform packages by URL, so npm installs this platform's and
+  its lockfile pins each by integrity. So what an app runs is what this repository's CI built, and nobody working on
+  the app builds Rust. The platform packages' versions are `node/package.json`'s, which its suite holds; nothing is
+  published to npm ([design.md](docs/architecture/design.md#how-a-consumer-gets-the-broker)).
 - **Each test runs in its own process**, so a regression that loses a signal is killed at its deadline
   instead of hanging the run (`.config/nextest.toml`). A deadline there is several times the slowest
   reading, never near it: it is for a test that has stopped ending at all.
