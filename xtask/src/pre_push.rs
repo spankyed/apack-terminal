@@ -54,6 +54,8 @@ const THEN: &[Step] = &[
     step("view: types", &["npm", "--prefix", "view", "run", "typecheck"]),
     step("view: tests", &["npm", "--prefix", "view", "test"]),
     step("view: build", &["npm", "--prefix", "view", "run", "build"]),
+    // The broker's npm package (`node/`): its runtime entry and the release's packing, which need no install
+    step("node: tests", &["npm", "--prefix", "node", "test"]),
     // The release build, which is what `binaries.yml` publishes and the app runs. Last because it is the longest
     step("release build", &["cargo", "build", "--release", "--locked", "--bin", "apack-terminal"]),
 ];

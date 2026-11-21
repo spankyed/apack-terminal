@@ -153,10 +153,27 @@ jobs:
       - run: npm test
       - run: npm run build
 
+  # The broker's npm package (`node/`): its runtime entry, which finds the binary in the platform package
+  # installed beside it, and the release's packing of the platform packages, whose versions must be its own
+  node:
+    name: node (Linux x64)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: node
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm test
+
   # The one check a merge waits on: every job above passed or was skipped (a documentation-only change)
   ci-pass:
     if: always()
-    needs: [changes, checks, platforms, view]
+    needs: [changes, checks, platforms, view, node]
     runs-on: ubuntu-24.04
     steps:
       - env:
