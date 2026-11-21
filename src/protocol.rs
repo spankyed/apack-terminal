@@ -2,7 +2,7 @@
 //!
 //! **Rust is the source of truth and the TypeScript is generated**, which is `elmdb-node/protocol/`'s
 //! arrangement reused rather than chosen again: `cargo xtask generate` writes `node/protocol.ts`, inside the
-//! npm package, which ships it — so a consumer imports these types from `apack-terminal` like any
+//! npm package, which ships it — so a consumer imports these types from `@apackdev/terminal` like any
 //! dependency's, and `cargo xtask check-generated` fails when the file has fallen behind the Rust.
 //!
 //! **It is a contract across a `.rev` boundary**, not an internal detail: the monorepo pins a commit of this

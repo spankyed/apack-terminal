@@ -28,7 +28,7 @@ holds.
 | `windows/conpty/`, `build.rs` | Microsoft's ConPTY, which the broker runs its sessions on in Windows in place of the system's (its README says why and where it is from), and the build script that puts it beside every binary `cargo` builds |
 | `about.toml`, `about.hbs`, `licenses/` | what `cargo xtask notices` writes `THIRD-PARTY-NOTICES` from: cargo-about's configuration and template for the crates, and the verbatim license files of code no crate's metadata names (`licenses/README.md` says where each is from) |
 | `THIRD-PARTY-NOTICES`, `COPYRIGHT-rust-library.html` | **generated** by `cargo xtask notices`: the notices the release binaries' licenses ask a redistribution to carry, which `binaries.yml` publishes beside each platform's binary |
-| `view/` | the `apack-terminal-view` npm package: what a window draws a session with, from the rows `src/view/` sends. TypeScript on npm, vite and vitest (`npm test`, `npm run typecheck`, `npm run build` there); its codec (`view/src/broker/wire.ts`) is the other half of `src/view/wire.rs`, and its suite reads `node/view-vectors.json` in place, so a change to the wire is one commit holding both halves |
+| `view/` | the `@apackdev/terminal-view` npm package: what a window draws a session with, from the rows `src/view/` sends. TypeScript on npm, vite and vitest (`npm test`, `npm run typecheck`, `npm run build` there); its codec (`view/src/broker/wire.ts`) is the other half of `src/view/wire.rs`, and its suite reads `node/view-vectors.json` in place, so a change to the wire is one commit holding both halves |
 
 ## Checks
 
@@ -75,7 +75,7 @@ npm --prefix view test                       # the view's suite (also: run typec
   rather than the `TS_RS_EXPORT_DIR=protocol cargo test` it replaced, because without that variable ts-rs
   writes to a gitignored `bindings/`, which is a second answer to the same question that nobody reads. It
   lives *inside* the npm package, which is what ships it: a consumer imports the types from
-  `apack-terminal` like any dependency's, rather than keeping a copy and a script to keep it fresh.
+  `@apackdev/terminal` like any dependency's, rather than keeping a copy and a script to keep it fresh.
 - **Changed a dependency, the toolchain, or the Ghostty `ghostty-vt-rs-sys` links?** `cargo xtask notices`, and
   commit `THIRD-PARTY-NOTICES` and `COPYRIGHT-rust-library.html`, which every release publishes beside the binaries.
   It fails on a dependency under a license `about.toml` doesn't accept, on one whose clarified license file there

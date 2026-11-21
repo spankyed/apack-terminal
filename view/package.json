@@ -1,5 +1,5 @@
 {
-  "name": "apack-terminal-view",
+  "name": "@apackdev/terminal-view",
   "version": "0.1.0",
   "description": "Draws a terminal from rows something else interpreted: painting, scrolling, selection and input, with no terminal core of its own.",
   "private": true,

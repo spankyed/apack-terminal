@@ -1,4 +1,4 @@
-# apack-terminal-view
+# @apackdev/terminal-view
 
 Draws a terminal from rows something else interpreted.
 
@@ -13,7 +13,7 @@ owner knows.
 `src/source.ts` is the contract.
 
 ```ts
-import { BrokerViews, TerminalView } from 'apack-terminal-view'
+import { BrokerViews, TerminalView } from '@apackdev/terminal-view'
 
 // `stream` is a connection to a broker that has already greeted it as a view
 const views = new BrokerViews(stream)

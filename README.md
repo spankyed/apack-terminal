@@ -6,15 +6,15 @@ so that no terminal session's lifetime is tied to the process that asked for it.
 Written for [apack](https://github.com/spankyed/apack), whose backend is a separate Node process. A session
 survives that process restarting, and ends when the app that claimed it goes.
 
-The repository also holds what draws a session in a window: [`view/`](view) is the `apack-terminal-view`
+The repository also holds what draws a session in a window: [`view/`](view) is the `@apackdev/terminal-view`
 package, a view over the rows the broker sends, with no terminal core of its own. The broker interprets
 and the view paints, so they are the two halves of one protocol and change in one commit.
 
 | | |
 |---|---|
 | `src/`, `tests/`, `xtask/` | the broker, in Rust |
-| [`node/`](node) | the `apack-terminal` npm package: where the broker's binary is, and the protocol's generated types |
-| [`view/`](view) | the `apack-terminal-view` npm package, in TypeScript ([its README](view/README.md)) |
+| [`node/`](node) | the `@apackdev/terminal` npm package: where the broker's binary is, and the protocol's generated types |
+| [`view/`](view) | the `@apackdev/terminal-view` npm package, in TypeScript ([its README](view/README.md)) |
 
 - **Sessions outlive their client.** The connection that opened a session is not what ends it; whoever
   claimed the broker's lifetime is, and a descriptor closes on process death however the process died.
@@ -53,7 +53,7 @@ greeting.
 
 A window draws a session over a connection of its own, greeting as a `view`: it is sent the rows that
 changed and paints them, interpreting nothing ([views.md](docs/architecture/views.md)). What paints them
-is the `apack-terminal-view` package in [`view/`](view), whose codec (`view/src/broker/wire.ts`) is the
+is the `@apackdev/terminal-view` package in [`view/`](view), whose codec (`view/src/broker/wire.ts`) is the
 other half of `src/view/wire.rs`. The two meet in `node/view-vectors.json`: the broker's suite writes every
 kind of message there as bytes and as the value they mean, and the view's suite reads that file where it
 lies, so a change to the wire that taught only one half fails.

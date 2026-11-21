@@ -11,7 +11,7 @@ cargo xtask check-generated  # fail when it has fallen behind
 ```
 
 It is written **inside the npm package**, which is what ships it: a consumer imports these types from
-`apack-terminal` like any dependency's, rather than keeping its own copy and a script to keep that copy
+`@apackdev/terminal` like any dependency's, rather than keeping its own copy and a script to keep that copy
 fresh. The file is committed, so reading it needs no Rust toolchain. `cargo xtask generate` rather than
 `TS_RS_EXPORT_DIR=… cargo test`, because without that variable ts-rs writes to a gitignored `bindings/`,
 which is a second answer to the same question that nobody reads.

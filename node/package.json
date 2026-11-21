@@ -1,5 +1,5 @@
 {
-  "name": "apack-terminal",
+  "name": "@apackdev/terminal",
   "version": "0.1.0",
   "description": "The terminal broker: one process that owns the ptys, so a session's lifetime is not the lifetime of whatever asked for it.",
   "license": "MIT OR Apache-2.0",

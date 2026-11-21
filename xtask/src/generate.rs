@@ -75,7 +75,7 @@ pub fn check(root: &Path) -> Result<(), String> {
     Err(format!(
         "{COMMITTED_DIR}/{GENERATED} is not what src/protocol.rs generates; run `cargo xtask generate` and \
          commit the result. It ships inside the npm package, so a consumer imports these types from \
-         `apack-terminal` like any dependency's — a stale file here is the contract a pinned consumer \
+         `@apackdev/terminal` like any dependency's — a stale file here is the contract a pinned consumer \
          compiles against"
     ))
 }

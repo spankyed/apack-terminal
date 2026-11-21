@@ -6,7 +6,7 @@ changed, with their styles — and paints it. So there is one copy of a screen, 
 about is the cursor that is drawn, and a question a program asks its terminal is answered once however
 many windows are showing it.
 
-The view's half is the `apack-terminal-view` package in [`view/`](../../view), in TypeScript. This is
+The view's half is the `@apackdev/terminal-view` package in [`view/`](../../view), in TypeScript. This is
 the broker's half: `src/view/wire.rs` is the bytes, `src/view/publish.rs` is what is sent and when.
 
 ## A connection of its own
