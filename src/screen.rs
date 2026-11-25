@@ -95,6 +95,10 @@ const HISTORY_BYTES: usize = 256 << 20;
 /// The terminal advertised to a program, which has to be what the pty says.
 pub const TERMINFO_NAME: &str = "xterm-256color";
 
+/// The largest grid dimension a recording replay will apply to a terminal, matching the broker's own
+/// grid ceiling so a corrupted or untrusted recording cannot allocate a 65535×65535 grid.
+const MAX_GRID: u16 = 1_000;
+
 /// How many matches a search answers.
 ///
 /// **A ceiling, because the question a caller asks is "where is this" and not "every place it occurs"**: a
@@ -593,12 +597,12 @@ impl Screen {
                     Some(scanner) if scanner.reading() => {
                         let terminal = &mut self.terminal;
                         let (taken, load) = scanner.read(&bytes[fed..piece], |passed| terminal.feed(passed));
-                        fed += taken;
                         if let Some(image) = load.and_then(|load| self.hand_out(load)) {
+                            fed += taken;
                             pending = Some(image);
                             break 'feeding;
                         }
-                        continue;
+                        (taken, self.terminal.at_ground())
                     }
                     Some(scanner) => {
                         let (taken, ground, string) = self.terminal.feed_to_string(
@@ -829,7 +833,7 @@ impl Screen {
     pub fn once_whole_keeping(&mut self, view: ViewId, bytes: usize, read: impl FnOnce(&mut Self) + Send + 'static) {
         let waiting: usize = self.postponed.iter().map(|asked| asked.bytes).sum();
         let whole = self.hold.is_none() && !self.undrawn(view);
-        if !whole && self.postponed.len() < POSTPONED_READS && waiting + bytes <= POSTPONED_BYTES {
+        if !whole && self.postponed.len() < POSTPONED_READS && waiting.saturating_add(bytes) <= POSTPONED_BYTES {
             self.postponed.push(Postponed { view, bytes, read: Box::new(read) });
         } else {
             read(self);
@@ -966,7 +970,7 @@ impl Screen {
         if let Some(recorder) = &mut self.recorder
             && write(recorder).is_err()
         {
-            self.recorder = None;
+            self.stop_recording();
         }
     }
 
@@ -1101,6 +1105,17 @@ impl Screen {
         if self.terminal.restore(state).is_err() {
             return false;
         }
+        // Clear any pre-restore pending image command and APC scanner state so the restored terminal
+        // starts cleanly at ground without stale state from before the restore.
+        self.outstanding = None;
+        if let Some(scanner) = &mut self.image_sources {
+            *scanner = Scanner::default();
+        }
+        // Adopt cell pixel metrics from the restored terminal if this screen has none measured yet,
+        // so the resize below does not clobber them back to `(0, 0)`.
+        if self.cell == (0, 0) {
+            self.cell = self.terminal.cell_pixels();
+        }
         // The recording is of another moment: writing the replay into it would record the past as now
         let recorder = self.recorder.take();
         self.replaying = true;
@@ -1112,10 +1127,12 @@ impl Screen {
         // part way through one leaves what reads the stream where the core is
         let live = self.reported.get_mut().begin_replay();
         self.reported.get_mut().forget_commands();
-        self.resize(*cols, *rows, 0, 0);
+        self.title = None;
+        self.resize((*cols).min(MAX_GRID), (*rows).min(MAX_GRID), 0, 0);
         let mut whole = true;
         for timed in &entries[1..] {
-            let at = SystemTime::UNIX_EPOCH + Duration::from_millis(timed.at);
+            let at =
+                SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(timed.at)).unwrap_or(SystemTime::UNIX_EPOCH);
             self.reported.get_mut().set_clock(Some(at));
             match &timed.entry {
                 // Come to part way through a sequence: one the recording stopped at part way through,
@@ -1129,11 +1146,15 @@ impl Screen {
                         whole = false;
                         break;
                     }
-                    self.resize(*cols, *rows, 0, 0);
+                    self.outstanding = None;
+                    if let Some(scanner) = &mut self.image_sources {
+                        *scanner = Scanner::default();
+                    }
+                    self.resize((*cols).min(MAX_GRID), (*rows).min(MAX_GRID), 0, 0);
                 }
                 Entry::Keyframe { .. } => {}
                 Entry::Output(bytes) => self.feed(bytes),
-                Entry::Resize { cols, rows } => self.resize(*cols, *rows, 0, 0),
+                Entry::Resize { cols, rows } => self.resize((*cols).min(MAX_GRID), (*rows).min(MAX_GRID), 0, 0),
                 Entry::Marks { key, last } => {
                     self.reported.get_mut().replay_vouched_with(key.clone(), *last);
                     // A command the shell before this one left running ended here, where the cursor is
@@ -1166,6 +1187,14 @@ impl Screen {
     /// the mouse was being reported, that the keypad was in application mode — and would be typed at
     /// through all of it.
     pub fn settle_restored(&mut self) {
+        // Cancel any unfinished escape/APC sequence left open when the previous recording ended,
+        // so the reset sequences below and the new shell's output are not swallowed by it.
+        if !self.terminal.at_ground() {
+            if let Some(scanner) = &mut self.image_sources {
+                *scanner = Scanner::default();
+            }
+            self.feed(b"\x18");
+        }
         // **Out of the alternate screen only when on it.** Leaving it also puts the cursor back where it
         // was saved, which is right for an application that was showing — that is where the shell's cursor
         // was — and wrong for a shell that was not in one: the cursor would go to wherever some program

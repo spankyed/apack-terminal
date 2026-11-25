@@ -1088,7 +1088,96 @@ fn a_session_picked_up_from_a_recording_starts_with_its_own_cursor() {
     let mut next = Screen::new(40, 6);
     next.set_cursor_defaults(CursorStyle::Underline, CursorBlink::Program).expect("the defaults are set");
     assert!(next.resume_recording(&path).expect("the recording is picked up"));
+    next.flush_recording();
+    assert!(
+        !apack_terminal::recording::read(&path)
+            .iter()
+            .any(|timed| matches!(&timed.entry, Entry::Output(bytes) if bytes.contains(&0x18))),
+        "a clean resume must not record a spurious CAN byte"
+    );
     let cursor = first_frame(&mut next).cursor.expect("a cursor");
     assert_eq!((cursor.shape, cursor.blinking), (2, true), "the cursor the last program left");
     assert_eq!(next.snapshot(0).lines[0], "$ vim");
+}
+
+/// **Replay survives `u64::MAX` timestamps, clamps huge grid resizes, clears stale titles, preserves
+/// restored cell pixel dimensions, and cancels an unfinished APC sequence at end of recording.**
+#[test]
+fn replay_handles_hostile_timestamps_huge_resizes_and_mid_apc_truncation() {
+    let mut source = pictured(40, 6);
+    source.feed(b"before");
+    let kf = keyframe_of(&source, 40, 6);
+
+    // 1. u64::MAX timestamp does not panic, huge resize clamps to 1000x1000, and stale title clears.
+    let entries = [
+        Timed { at: 100, entry: kf.clone() },
+        Timed { at: u64::MAX, entry: Entry::Resize { cols: u16::MAX, rows: u16::MAX } },
+        Timed { at: u64::MAX, entry: Entry::Output(b"\r\n\x1b_Gi=1,a=T,t=f,f=24,s=1,v=1;L3Rt".to_vec()) },
+    ];
+    let mut screen = Screen::new(40, 6);
+    screen.allow_images(true).expect("images are allowed");
+    screen.feed(b"\x1b]0;stale title\x07");
+    let _ = screen.take_effects();
+    assert_eq!(screen.title(), Some("stale title"));
+
+    assert!(screen.replay_all(&entries));
+    assert_eq!((screen.cols(), screen.rows()), (1_000, 1_000));
+    assert_eq!(screen.title(), None, "stale pre-replay title was cleared");
+    // Settling a restored session for a new shell cancels an unfinished APC so subsequent live
+    // output is not swallowed.
+    screen.settle_restored();
+    screen.feed(b"after");
+    assert!(
+        screen.snapshot(0).lines.iter().any(|line| line.contains("after")),
+        "live output after settled truncated APC must not be swallowed"
+    );
+
+    // 2. An unmeasured screen adopting a keyframe preserves the keyframe's cell pixel size.
+    let mut fresh = Screen::new(40, 6);
+    fresh.allow_images(false).expect("images are allowed");
+    assert!(fresh.replay(&[Timed { at: 100, entry: kf }], u64::MAX));
+    let (sink, _incoming) = channel();
+    let id = ViewId { connection: 9, channel: 9 };
+    fresh.attach_view(id, sink).expect("a view attaches");
+    let (_, cell, _) = fresh.images().expect("images metadata");
+    fresh.detach_view(id);
+    assert_eq!(cell, (10, 20), "restored cell pixel metrics must not be overwritten with (0, 0)");
+
+    // 3. Settling a truncated APC without image sources also cancels the unfinished sequence.
+    let mut apc_screen = Screen::new(40, 6);
+    assert!(apc_screen.replay_all(&[
+        Timed { at: 100, entry: keyframe(40, 6, b"start") },
+        Timed { at: 200, entry: Entry::Output(b"\r\n\x1b_Gunterminated".to_vec()) },
+    ]));
+    apc_screen.settle_restored();
+    apc_screen.feed(b"visible");
+    assert!(
+        apc_screen.snapshot(0).lines.iter().any(|line| line.contains("visible")),
+        "live output after settled truncated APC without image sources must not be swallowed"
+    );
+}
+
+/// **A terminal holding images larger than the core's 10 MB decoder default round-trips through
+/// `Terminal::keyframe` and `Terminal::restore` under `IMAGE_STORAGE_BYTES`.**
+#[test]
+fn keyframe_round_trips_images_larger_than_ten_megabytes() {
+    // 2048 x 1536 RGBA = 12 MiB of stored pixels (> 10 MB core default, < 64 MiB IMAGE_STORAGE_BYTES).
+    let (width, height) = (2_048u32, 1_536u32);
+    let mut live = Terminal::new(40, 6).expect("terminal");
+    live.allow_images(false).expect("images allowed");
+    live.resize(40, 6, 10, 20).expect("resized");
+    let pieces = picture(11, width, height, 'T');
+    for piece in &pieces {
+        live.feed(piece);
+    }
+    assert!(live.image(11, 0).is_some(), "12 MiB image is stored in live terminal");
+
+    let keyframe = live.keyframe(0, 16 << 20).expect("keyframe with 12 MiB image");
+    let mut restored = Terminal::new(40, 6).expect("restored terminal");
+    restored.allow_images(false).expect("images allowed");
+    restored.restore(&keyframe).expect("restore succeeds");
+    assert!(
+        restored.image(11, 0).is_some(),
+        "12 MiB image must survive keyframe restore instead of being dropped by the 10 MB default"
+    );
 }
