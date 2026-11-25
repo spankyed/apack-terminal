@@ -87,7 +87,16 @@ fn fast_pty_concurrent_resizes_and_view_churn_completes_cleanly() {
     let greeted = events_rx.recv_timeout(Duration::from_secs(10)).expect("hello");
     assert!(matches!(greeted, Event::Hello { .. }));
 
-    // Spawn a fast producer that emits ~40,000 lines with ANSI styles and exits cleanly.
+    // Connect and greet the binary view stream before spawning so it attaches as soon as the session starts.
+    let view_stream = broker.connect();
+    send_json(&view_stream, &Request::Hello { protocol: PROTOCOL_VERSION, role: Role::View, challenge: None });
+    let mut view_reader = BufReader::new(&view_stream);
+    let mut hello_line = String::new();
+    view_reader.read_line(&mut hello_line).expect("view hello");
+    assert!(matches!(serde_json::from_str::<Event>(&hello_line), Ok(Event::Hello { .. })));
+    drop(view_reader);
+
+    // Spawn a fast producer that emits ~20,000 lines with ANSI styles and exits cleanly.
     send_json(
         &client,
         &Request::Spawn {
@@ -143,18 +152,11 @@ fn fast_pty_concurrent_resizes_and_view_churn_completes_cleanly() {
     });
 
     // View churner: repeatedly attaches, receives and acknowledges a few frames, detaches, and reconnects
-    let view_stream = broker.connect();
-    send_json(&view_stream, &Request::Hello { protocol: PROTOCOL_VERSION, role: Role::View, challenge: None });
-
     let viewer = std::thread::spawn({
         let session = session.clone();
         let done = Arc::clone(&done);
         move || {
             let mut view_reader = BufReader::new(&view_stream);
-            let mut hello_line = String::new();
-            view_reader.read_line(&mut hello_line).expect("view hello");
-            assert!(matches!(serde_json::from_str::<Event>(&hello_line), Ok(Event::Hello { .. })));
-
             let mut channel = 1u32;
             let mut frames_seen = 0usize;
             while !done.load(Ordering::Relaxed) {
@@ -174,6 +176,7 @@ fn fast_pty_concurrent_resizes_and_view_churn_completes_cleanly() {
                                 }
                             }
                             Ok(ToView::Ended { .. }) => return frames_seen,
+                            Ok(ToView::Failed { message, .. }) => panic!("view failed under load: {message}"),
                             Ok(_) => {}
                             Err(err) => panic!("malformed ToView under load: {err}"),
                         },
@@ -200,6 +203,7 @@ fn fast_pty_concurrent_resizes_and_view_churn_completes_cleanly() {
     };
     done.store(true, Ordering::Relaxed);
     resizer.join().expect("resizer exits");
-    let _ = viewer.join().expect("viewer exits cleanly");
+    let frames_seen = viewer.join().expect("viewer exits cleanly");
+    assert!(frames_seen > 0, "viewer must decode and acknowledge at least one frame during the flood");
     assert_eq!(exit_code, Some(0), "flood command exited cleanly");
 }

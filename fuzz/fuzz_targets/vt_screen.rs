@@ -5,11 +5,14 @@ use apack_terminal::screen::Screen;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
+    let Some((&first, payload)) = data.split_first() else {
+        return;
+    };
     let mut screen = Screen::new(40, 12);
     let _ = screen.allow_images(false);
-    // Split on a data-chosen chunk size to exercise cross-chunk escape/UTF-8 parsing
-    let step = data.first().map_or(1, |&b| (usize::from(b) % 31) + 1);
-    for chunk in data.chunks(step) {
+    // Split on a data-chosen chunk size independent of payload prefix bytes
+    let step = (usize::from(first) % 31) + 1;
+    for chunk in payload.chunks(step) {
         screen.feed(chunk);
     }
     let _ = screen.snapshot(4);

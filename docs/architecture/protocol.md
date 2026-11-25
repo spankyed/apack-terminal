@@ -67,7 +67,7 @@ among it, left unread.
 | `done` | the caller has said all it will; drain pending answers and let the connection go |
 | `spawn` | a shell in a new pty: `cols`, `rows`, `shell`, `args`, `env`, `unset`, `cwd`, and optionally `colors`, `output`, `record`, `restore`, `images`, `image_files`, `marks_key` |
 | `write` | bytes the user typed |
-| `resize` | the viewport changed; one size per session, because a pty has one |
+| `resize` | the viewport changed (`cols`, `rows`, and optionally `cell_width`, `cell_height`); one size per session, because a pty has one |
 | `set_cursor_defaults` | set the session's default cursor style and blink mode, and reset the cursor to them |
 | `pause` | stop reading this session's pty, so its process feels the reader stop |
 | `resume` | read it again, and send what arrived while it was not being read |

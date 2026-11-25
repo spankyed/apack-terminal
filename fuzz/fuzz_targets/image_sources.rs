@@ -5,16 +5,19 @@ use apack_terminal::vt::image_sources::Scanner;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
+    let Some((&first, payload)) = data.split_first() else {
+        return;
+    };
     let mut scanner = Scanner::default();
     scanner.begin();
-    let step = data.first().map_or(1, |&b| (usize::from(b) % 19) + 1);
+    let step = (usize::from(first) % 19) + 1;
     let mut offset = 0;
-    while offset < data.len() {
+    while offset < payload.len() {
         if !scanner.reading() {
             scanner.begin();
         }
-        let end = (offset + step).min(data.len());
-        let (taken, load) = scanner.read(&data[offset..end], |_| {});
+        let end = (offset + step).min(payload.len());
+        let (taken, load) = scanner.read(&payload[offset..end], |_| {});
         if let Some(load) = load {
             let _ = load.askable();
             let _ = load.read_unasked();
