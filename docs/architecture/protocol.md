@@ -41,16 +41,16 @@ before any session can inherit it) adds a fresh `challenge` to its `hello`, and 
 
 ```json
 {"kind":"hello","protocol":1,"role":"client","challenge":"<random hex>"}
-{"kind":"hello","protocol":1,"history":100000,"proof":"<hmac hex>"}
+{"kind":"hello","protocol":1,"history":1000,"proof":"<hmac hex>"}
 ```
 
 A broker started without a key answers `proof: null`, as does every broker to a greeting that asks nothing. A
 caller that asked must take `null` as a broker that is not its own: the key is kept where only its user can
 read it, so another account's process has nothing to answer with.
 
-`role` is `client` or `lifetime`, and **a caller that omits it is a client** — so a raw caller, a probe or
+`role` is `client`, `lifetime`, or `view`, and **a caller that omits it is a client** — so a raw caller, a probe or
 anything speaking the older handshake behaves exactly as before. [design.md](design.md) has what each role
-means for a session's lifetime.
+means for a session's lifetime, and [views.md](views.md) covers `view`.
 
 **A client is told what the sessions report for as long as it reads.** The last client to greet is the
 one reported to. What it has not yet read waits in a queue of its own, and a client that has left more
@@ -64,9 +64,11 @@ among it, left unread.
 | kind | asks for |
 |---|---|
 | `hello` | the handshake, with a protocol version and a role |
+| `done` | the caller has said all it will; drain pending answers and let the connection go |
 | `spawn` | a shell in a new pty: `cols`, `rows`, `shell`, `args`, `env`, `unset`, `cwd`, and optionally `colors`, `output`, `record`, `restore`, `images`, `image_files`, `marks_key` |
 | `write` | bytes the user typed |
 | `resize` | the viewport changed; one size per session, because a pty has one |
+| `set_cursor_defaults` | set the session's default cursor style and blink mode, and reset the cursor to them |
 | `pause` | stop reading this session's pty, so its process feels the reader stop |
 | `resume` | read it again, and send what arrived while it was not being read |
 | `signal` | a signal to the session's process, its process group, or one process inside its tree |

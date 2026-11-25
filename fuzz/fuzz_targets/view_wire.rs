@@ -4,7 +4,7 @@
 
 use std::io::Cursor;
 
-use apack_terminal::view::wire::{Incoming, ToBroker, read_message};
+use apack_terminal::view::wire::{Incoming, ToBroker, ToView, read_message};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -13,6 +13,7 @@ fuzz_target!(|data: &[u8]| {
         match read_message(&mut reader) {
             Incoming::Message(body) => {
                 let _ = ToBroker::decode(&body);
+                let _ = ToView::decode(&body);
             }
             Incoming::TooLong | Incoming::Ended => break,
         }

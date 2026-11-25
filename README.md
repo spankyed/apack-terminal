@@ -83,11 +83,10 @@ npm --prefix view ci && npm --prefix view test    # the view
 | Platforms | macOS and Linux: the whole suite. Windows: the whole suite but for the cases about what a Windows pipe or console does not have (socket files, mode bits, a connection closed one way, an ignored hangup), each gated and named in `tests/`; sessions run on the ConPTY the broker carries (`windows/conpty/`). See [Known limits](docs/architecture/design.md#known-limits) |
 | Transport | a Unix socket, or a named pipe on Windows |
 | Crash | a session ends when the broker stops; there is no handoff of a session to another broker |
-| Not in scope | agent status rules, command semantics beyond what a shell reports, storage, a recording or a path link on a remote target, `signal` on Windows, accessibility |
+| Not in scope | agent status rules, command semantics beyond what a shell reports, storage, a recording or a path link on a remote target, `signal` on Windows |
 
-Consumed by pinning a commit: apack keeps a gitignored `vendor/apack-terminal` symlink beside a committed
-`vendor/apack-terminal.rev`, and derives one Rust toolchain across every checkout linked that way. One pin
-holds the broker and the view, which is why they are one repository.
+Consumed by pinning a release commit (e.g. `npm run deps:pin` in apack). One pin holds the broker and the view,
+which is why they are one repository.
 
 **The broker reaches a consumer as a release build, as npm packages installed by URL.** Every `master` commit is
 built for each platform the app ships and published as the release `bin-<commit>` (`.github/workflows/binaries.yml`):
@@ -108,11 +107,8 @@ URLs (`node/release/pack.mjs`).
 version. Neither source package is `private`; what keeps either from being published by accident is that only
 the scope's owner can publish to it, and only by running `npm publish`.
 
-**The view reaches a consumer as its release tarball too**, built, or from a checkout as
-`file:…/vendor/apack-terminal/view`. What it ships is its compiled `dist/`, which is not tracked, so whatever links
-or clones the checkout builds it
-(`npm run build` in `view/`): apack's linker does when `dist/` is missing or older than its sources, and
-its CI does after the clone.
+**The view reaches a consumer as its release tarball too**, pre-built (`dist/`), or from a local checkout
+built with `npm run build` in `view/`. What it ships is its compiled `dist/`, which is not tracked in git.
 
 **v1 scope.** What v1 is: a broker that owns processes and screens, serves views over a protocol, records
 sessions and restores them from their recordings, keeps sessions the app asked to keep, and reports what a shell

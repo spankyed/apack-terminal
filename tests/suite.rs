@@ -48,6 +48,8 @@ mod security;
 #[cfg(unix)]
 mod signals;
 mod status;
+#[cfg(unix)]
+mod stress;
 mod view_broker;
 mod view_frames;
 mod view_input;
