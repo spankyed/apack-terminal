@@ -25,8 +25,24 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Discover every `[[bin]]` target from `fuzz/Cargo.toml` so newly added targets are always fuzzed.
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      targets: ${{ steps.list.outputs.targets }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: list
+        run: |
+          targets="$(python3 -c 'import json, tomllib; d = tomllib.load(open("fuzz/Cargo.toml", "rb")); print(json.dumps([b["name"] for b in d.get("bin", [])]))')"
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+
   fuzz:
     name: fuzz ${{ matrix.target }}
+    needs: discover
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -36,7 +52,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [frames, view_wire, markers, png, recording, status]
+        target: ${{ fromJson(needs.discover.outputs.targets) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -88,9 +104,13 @@ jobs:
             echo "::error::seconds must be a positive integer, got: $SECONDS"
             exit 1
           fi
-          # The run grows corpus/; seeds/ is read as well and never written, so the seeds stay the tracked ones
+          # The run grows corpus/; seeds/ is read as well (when present) and never written, so the seeds stay tracked.
           # Named explicitly: the prebuilt cargo-fuzz defaults to the musl target, which the sanitizer cannot use
-          cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} corpus/${{ matrix.target }} seeds/${{ matrix.target }} -- \
+          seed_args=()
+          if [ -d "seeds/${{ matrix.target }}" ]; then
+            seed_args+=("seeds/${{ matrix.target }}")
+          fi
+          cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} corpus/${{ matrix.target }} "${seed_args[@]}" -- \
             -max_total_time="$SECONDS"
 
       # Also after a crash: the corpus holds the inputs that found new code, and the one that crashed is in

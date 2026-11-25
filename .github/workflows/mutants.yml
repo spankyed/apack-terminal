@@ -174,7 +174,10 @@ jobs:
           while IFS= read -r file; do
             [ -n "$file" ] && win_only+=("$file")
           done < <(tr -d '\r' < .cargo/windows-only | grep -v -e '^#' -e '^ *$')
-          names="$(git diff --name-only --diff-filter=d $base -- "${win_only[@]}")"
+          names=""
+          if [ "${#win_only[@]}" -gt 0 ]; then
+            names="$(git diff --name-only --diff-filter=d $base -- "${win_only[@]}")"
+          fi
           files=()
           while IFS= read -r name; do
             [ -n "$name" ] && files+=("$name")

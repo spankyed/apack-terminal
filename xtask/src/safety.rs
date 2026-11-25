@@ -33,7 +33,7 @@ pub fn check(root: &Path) -> Result<(), String> {
         let lines: Vec<&str> = text.lines().collect();
         let stripped = strip_comments_and_literals(&lines);
         for (index, line) in lines.iter().enumerate() {
-            if !contains_word(&stripped[index], "unsafe") {
+            if !contains_word(&stripped[index].code, "unsafe") {
                 continue;
             }
             sites += 1;
@@ -73,11 +73,17 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
 /// Whether a line has `unsafe` as code: not inside a string or char literal, not in a comment, and as a whole word.
 pub fn is_unsafe_site(line: &str) -> bool {
     let stripped = strip_comments_and_literals(&[line]);
-    contains_word(&stripped[0], "unsafe")
+    contains_word(&stripped[0].code, "unsafe")
 }
 
-/// Code portions of each line with string/raw-string/char literals and `//` or `/* ... */` comments stripped.
-fn strip_comments_and_literals(lines: &[&str]) -> Vec<String> {
+struct StrippedLine<'a> {
+    code: String,
+    trailing_comment: Option<&'a str>,
+}
+
+/// Code portions of each line with string/raw-string/char literals and `//` or `/* ... */` comments stripped,
+/// preserving a space separator for omitted tokens and capturing any real trailing `//` comment.
+fn strip_comments_and_literals<'a>(lines: &[&'a str]) -> Vec<StrippedLine<'a>> {
     #[derive(Clone, Copy)]
     enum State {
         Code,
@@ -91,14 +97,17 @@ fn strip_comments_and_literals(lines: &[&str]) -> Vec<String> {
     for line in lines {
         let bytes = line.as_bytes();
         let mut out = String::new();
+        let mut trailing_comment = None;
         let mut i = 0;
         while i < bytes.len() {
             match state {
                 State::Code => {
                     if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                        trailing_comment = Some(&line[i..]);
                         break;
                     }
                     if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                        out.push(' ');
                         state = State::BlockComment(1);
                         i += 2;
                         continue;
@@ -115,12 +124,14 @@ fn strip_comments_and_literals(lines: &[&str]) -> Vec<String> {
                             j += 1;
                         }
                         if j < bytes.len() && bytes[j] == b'"' {
+                            out.push(' ');
                             state = State::RawString(hashes);
                             i = j + 1;
                             continue;
                         }
                     }
                     if bytes[i] == b'"' {
+                        out.push(' ');
                         state = State::String;
                         i += 1;
                         continue;
@@ -129,6 +140,7 @@ fn strip_comments_and_literals(lines: &[&str]) -> Vec<String> {
                     if bytes[i] == b'\''
                         && let Some(end) = char_literal_end(bytes, i)
                     {
+                        out.push(' ');
                         i = end;
                         continue;
                     }
@@ -170,7 +182,7 @@ fn strip_comments_and_literals(lines: &[&str]) -> Vec<String> {
                 }
             }
         }
-        result.push(out);
+        result.push(StrippedLine { code: out, trailing_comment });
     }
     result
 }
@@ -211,30 +223,37 @@ fn contains_word(text: &str, word: &str) -> bool {
     })
 }
 
-/// Trailing line comment text on `line`, if any (ignoring `//` inside string/char literals).
-fn trailing_comment<'a>(line: &'a str, code: &str) -> Option<&'a str> {
-    let trimmed = line.trim_start();
-    if trimmed.starts_with("//") {
-        return Some(trimmed);
-    }
-    if code.len() < line.len() { line.rfind("//").map(|at| &line[at..]) } else { None }
-}
-
 /// Whether `code` declares an `unsafe fn` (including `unsafe extern "C" fn`), which `# Safety` docs may justify.
 fn is_unsafe_fn_decl(code: &str) -> bool {
-    contains_word(code, "fn") && contains_word(code, "unsafe")
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    code.match_indices("unsafe").any(|(at, _)| {
+        let before_ok = !code[..at].chars().next_back().is_some_and(is_word);
+        let after_pos = at + "unsafe".len();
+        let after_ok = !code[after_pos..].chars().next().is_some_and(is_word);
+        if !(before_ok && after_ok) {
+            return false;
+        }
+        let header = code[after_pos..].split(['{', ';', '=']).next().unwrap_or("");
+        header.match_indices("fn").any(|(fn_at, _)| {
+            let fb = !header[..fn_at].chars().next_back().is_some_and(is_word);
+            let after_fn = &header[fn_at + 2..];
+            let fa = !after_fn.chars().next().is_some_and(is_word);
+            let named = after_fn.trim_start().chars().next().is_some_and(|c| c.is_alphabetic() || c == '_');
+            fb && fa && named
+        })
+    })
 }
 
 /// Whether the site at `index` has a justification above it: a `SAFETY:` comment, or a `# Safety` doc section
 /// (for an `unsafe fn` declaration), within [`WINDOW`] lines and before the previous site.
-fn justified(lines: &[&str], stripped: &[String], index: usize) -> bool {
-    if trailing_comment(lines[index], &stripped[index]).is_some_and(|comment| comment.contains("SAFETY:")) {
+fn justified(lines: &[&str], stripped: &[StrippedLine<'_>], index: usize) -> bool {
+    if stripped[index].trailing_comment.is_some_and(|comment| comment.contains("SAFETY:")) {
         return true;
     }
-    let fn_decl = is_unsafe_fn_decl(&stripped[index]);
+    let fn_decl = is_unsafe_fn_decl(&stripped[index].code);
     let lowest = index.saturating_sub(WINDOW);
     for at in (lowest..index).rev() {
-        if contains_word(&stripped[at], "unsafe") {
+        if contains_word(&stripped[at].code, "unsafe") {
             return false;
         }
         let trimmed = lines[at].trim_start();
@@ -267,6 +286,7 @@ mod tests {
         // Char literal `'"'` and raw strings must not hide an `unsafe` later on the line
         assert!(is_unsafe_site("    let q = '\"'; unsafe { f() };"));
         assert!(is_unsafe_site("    let s = r#\"\\\"#; unsafe { f() };"));
+        assert!(is_unsafe_site("    foo/*comment*/unsafe { f() }"));
         assert!(!is_unsafe_site("    /* unsafe { f() } */ let x = 1;"));
     }
 
@@ -275,12 +295,17 @@ mod tests {
         let justified_site = ["// SAFETY: the handle is live", "let x = unsafe { f() };"];
         assert!(is_justified(&justified_site, 1));
 
+        let trailing = ["let x = unsafe { f() }; // SAFETY: inline justification"];
+        assert!(is_justified(&trailing, 0));
+
         let bare = ["let y = 1;", "let x = unsafe { f() };"];
         assert!(!is_justified(&bare, 1));
 
-        // SAFETY: inside a string literal does not justify the line
+        // SAFETY: (including `// SAFETY:`) inside a string literal does not justify the line
         let string_safety = ["let _ = \"SAFETY: fake\"; unsafe { f() };"];
         assert!(!is_justified(&string_safety, 0));
+        let string_slash_safety = ["let _ = \"// SAFETY: fake\"; unsafe { f() };"];
+        assert!(!is_justified(&string_slash_safety, 0));
 
         // The comment above the first site does not justify the second
         let shared = ["// SAFETY: the first", "let a = unsafe { f() };", "let b = unsafe { g() };"];
@@ -290,8 +315,16 @@ mod tests {
         // `# Safety` justifies an `unsafe fn` declaration, not an `unsafe {}` block inside a safe fn
         let doc = ["/// # Safety", "/// The caller holds the lock.", "pub unsafe fn f() {}"];
         assert!(is_justified(&doc, 2));
+        let doc_extern = ["/// # Safety", "pub unsafe extern \"C\" fn f() {}"];
+        assert!(is_justified(&doc_extern, 1));
         let doc_block = ["/// # Safety", "fn f() {", "    unsafe { g() }", "}"];
         assert!(!is_justified(&doc_block, 2));
+        let single_line_safe_fn = ["/// # Safety", "fn f() { unsafe { g() } }"];
+        assert!(!is_justified(&single_line_safe_fn, 1));
+        let fn_ptr = ["/// # Safety", "let f: fn() = unsafe { g() };"];
+        assert!(!is_justified(&fn_ptr, 1));
+        let unsafe_fn_ptr = ["/// # Safety", "let f: unsafe fn() = h;"];
+        assert!(!is_justified(&unsafe_fn_ptr, 1));
     }
 
     #[test]
