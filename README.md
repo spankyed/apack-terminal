@@ -40,13 +40,13 @@ greeting.
 
 ```jsonc
 → {"kind":"hello","protocol":1,"role":"client"}
-← {"kind":"hello","protocol":1,"history":1000}
+← {"kind":"hello","protocol":1,"history":1000,"proof":null}
 → {"kind":"spawn","cols":80,"rows":24,"shell":null,"args":[],"env":[],"unset":[],"cwd":null}
 ← {"kind":"spawned","session":"s-1","pid":4242,"recorded":false,"restored":false}
 → {"kind":"write","session":"s-1","text":"echo hi\n"}
 ← {"kind":"output","session":"s-1","text":"echo hi\r\nhi\r\n"}
 → {"kind":"facts","session":"s-1"}
-← {"kind":"facts","session":"s-1","cwd":"/home/me","command":"echo hi","running":false,"outcome":{"kind":"claimed","code":0},"finished":1,"vouched":false,"refused":0}
+← {"kind":"facts","session":"s-1","cwd":"/home/me","command":"echo hi","running":false,"outcome":{"kind":"claimed","code":0},"finished":1,"vouched":false,"refused":0,"foreground":{"pid":4242,"name":"zsh"},"statuses":[]}
 ```
 
 [protocol.md](docs/architecture/protocol.md) has every message, the roles, and the closed error set.

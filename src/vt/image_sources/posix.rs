@@ -18,6 +18,17 @@ const FILE_FLAGS: libc::c_int = libc::O_NONBLOCK | libc::O_NOCTTY;
 const SHARED_MEMORY_FLAGS: libc::c_int = libc::O_NONBLOCK | libc::O_CLOEXEC;
 const _: () = assert!(libc::O_RDONLY == 0);
 
+/// Whether normalized absolute path `components` enter `/proc`, `/sys`, or `/dev` (other than `/dev/shm`
+/// and what sits beneath it).
+fn is_refused_components<S: AsRef<[u8]>>(components: &[S]) -> bool {
+    match components {
+        [first, ..] if first.as_ref() == b"proc" || first.as_ref() == b"sys" => true,
+        [first, second, ..] if first.as_ref() == b"dev" && second.as_ref() == b"shm" => false,
+        [first, ..] if first.as_ref() == b"dev" => true,
+        _ => false,
+    }
+}
+
 /// Whether `path` lexically names `/proc`, `/sys`, or `/dev` (other than `/dev/shm` and what sits
 /// beneath it), after collapsing empty and `.` segments and resolving `..` on absolute paths.
 ///
@@ -38,12 +49,7 @@ pub fn refused_path(path: &[u8]) -> bool {
             other => components.push(other),
         }
     }
-    match components.as_slice() {
-        [b"proc", ..] | [b"sys", ..] => true,
-        [b"dev", b"shm", ..] => false,
-        [b"dev", ..] => true,
-        _ => false,
-    }
+    is_refused_components(&components)
 }
 
 /// Clears `O_NONBLOCK` from the flags `fcntl(F_GETFL)` returned, or `None` when `fcntl` failed (`-1`).
@@ -54,91 +60,69 @@ pub fn clear_nonblock(flags: libc::c_int) -> Option<libc::c_int> {
 /// Maximum symlink hops followed while checking whether a path traverses a refused directory.
 const MAX_SYMLINK_HOPS: usize = 40;
 
-/// Normalizes an absolute path by resolving `.`, `..`, and empty segments.
-fn normalize_absolute(path: &[u8]) -> Vec<u8> {
-    let mut components: Vec<&[u8]> = Vec::new();
-    for segment in path.split(|&byte| byte == b'/') {
-        match segment {
-            b"" | b"." => {}
-            b".." => {
-                components.pop();
-            }
-            other => components.push(other),
-        }
-    }
-    let mut out = Vec::with_capacity(path.len().max(1));
-    if components.is_empty() {
-        out.push(b'/');
-        return out;
-    }
-    for component in components {
-        out.push(b'/');
-        out.extend_from_slice(component);
-    }
-    out
-}
-
-/// Resolves relative paths against `cwd` and follows any symlink prefixes (up to `MAX_SYMLINK_HOPS`),
-/// returning `true` if the path or any intermediate symlink target enters `/proc`, `/sys`, or `/dev`
-/// (other than `/dev/shm`), or if resolution fails closed (e.g. symlink loop).
+/// Resolves relative paths against `cwd` and walks components strictly left-to-right (expanding symlinks
+/// before applying any following `..`, up to `MAX_SYMLINK_HOPS`), returning `true` if the path or any
+/// intermediate symlink target enters `/proc`, `/sys`, or `/dev` (other than `/dev/shm`), or if
+/// resolution fails closed (e.g. symlink loop).
 fn path_reaches_refused(path: &[u8]) -> bool {
-    let abs = if path.starts_with(b"/") {
-        normalize_absolute(path)
+    let owned;
+    let combined = if path.starts_with(b"/") {
+        path
     } else {
         let Ok(cwd) = std::env::current_dir() else { return true };
-        let mut combined = cwd.as_os_str().as_bytes().to_vec();
-        combined.push(b'/');
-        combined.extend_from_slice(path);
-        normalize_absolute(&combined)
+        owned = [cwd.as_os_str().as_bytes(), b"/", path].concat();
+        &owned
     };
-    if refused_path(&abs) {
-        return true;
-    }
-    let mut current = abs;
-    for _ in 0..MAX_SYMLINK_HOPS {
-        // Walk each prefix component to catch symlinks both at the leaf and in parent directories.
-        let mut prefix = Vec::with_capacity(current.len());
-        let mut redirected = None;
-        let parts: Vec<&[u8]> = current.split(|&byte| byte == b'/').filter(|s| !s.is_empty()).collect();
-        let mut iter = parts.iter();
-        while let Some(part) = iter.next() {
-            let parent_len = prefix.len();
-            prefix.push(b'/');
-            prefix.extend_from_slice(part);
-            let Ok(meta) = std::fs::symlink_metadata(OsStr::from_bytes(&prefix)) else {
-                // Non-existent or inaccessible component: nothing more to redirect; open() will fail.
-                break;
+    let mut pending: std::collections::VecDeque<Vec<u8>> =
+        combined.split(|&byte| byte == b'/').filter(|s| !s.is_empty()).map(ToOwned::to_owned).collect();
+
+    let mut resolved: Vec<Vec<u8>> = Vec::new();
+    let mut remaining_hops = MAX_SYMLINK_HOPS;
+    while let Some(segment) = pending.pop_front() {
+        if segment == b"." {
+            continue;
+        }
+        if segment == b".." {
+            resolved.pop();
+            continue;
+        }
+        resolved.push(segment);
+        // Refuse immediately once resolution enters `/proc`, `/sys`, or any child of `/dev` other than
+        // `/dev/shm` (leaving bare `/dev` open until the next component reveals whether it continues to `/dev/shm`).
+        if resolved.as_slice() != [b"dev".as_slice()] && is_refused_components(&resolved) {
+            return true;
+        }
+        let mut joined = Vec::new();
+        for component in &resolved {
+            joined.push(b'/');
+            joined.extend_from_slice(component);
+        }
+        let meta = match std::fs::symlink_metadata(OsStr::from_bytes(&joined)) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return true,
+        };
+        if meta.file_type().is_symlink() {
+            let Some(next_hops) = remaining_hops.checked_sub(1) else {
+                // Exceeded MAX_SYMLINK_HOPS (symlink loop): fail closed.
+                return true;
             };
-            if meta.file_type().is_symlink() {
-                let Ok(target) = std::fs::read_link(OsStr::from_bytes(&prefix)) else { return true };
-                let target_bytes = target.as_os_str().as_bytes();
-                let mut next = if target_bytes.starts_with(b"/") {
-                    target_bytes.to_vec()
-                } else {
-                    let mut joined = prefix[..parent_len].to_vec();
-                    joined.push(b'/');
-                    joined.extend_from_slice(target_bytes);
-                    joined
-                };
-                for tail in iter {
-                    next.push(b'/');
-                    next.extend_from_slice(tail);
-                }
-                let normalized = normalize_absolute(&next);
-                if refused_path(&normalized) {
-                    return true;
-                }
-                redirected = Some(normalized);
-                break;
+            remaining_hops = next_hops;
+            let Ok(target) = std::fs::read_link(OsStr::from_bytes(&joined)) else {
+                return true;
+            };
+            let target_bytes = target.as_os_str().as_bytes();
+            if target_bytes.starts_with(b"/") {
+                resolved.clear();
+            } else {
+                resolved.pop();
+            }
+            for part in target_bytes.split(|&byte| byte == b'/').filter(|s| !s.is_empty()).rev() {
+                pending.push_front(part.to_vec());
             }
         }
-        match redirected {
-            Some(next) => current = next,
-            None => return false,
-        }
     }
-    // Exceeded MAX_SYMLINK_HOPS (symlink loop): fail closed.
-    true
+    is_refused_components(&resolved)
 }
 
 /// The file a path names, opened to be read, if it is a regular file on none of the filesystems the core
@@ -353,6 +337,7 @@ pub fn read_fd_range(object: OwnedFd, range: Range<u64>) -> Result<Vec<Vec<u8>>,
 /// # Safety
 /// `src` must be valid for volatile reads of `dst.len()` bytes.
 unsafe fn copy_volatile(mut src: *const u8, dst: &mut [u8]) {
+    const WORD: usize = std::mem::size_of::<u64>();
     let align = std::mem::align_of::<u64>();
     let mut offset = 0usize;
     let head = src.align_offset(align).min(dst.len());
@@ -363,14 +348,14 @@ unsafe fn copy_volatile(mut src: *const u8, dst: &mut [u8]) {
         src = unsafe { src.add(1) };
         offset += 1;
     }
-    let words = (dst.len() - offset) / align;
+    let words = (dst.len() - offset) / WORD;
     for _ in 0..words {
-        // SAFETY: `src` is `u64`-aligned after the head loop and at least 8 bytes remain in `dst`
+        // SAFETY: `src` is `u64`-aligned after the head loop and at least `WORD` (8) bytes remain in `dst`
         let word = unsafe { std::ptr::read_volatile(src.cast::<u64>()) };
-        dst[offset..offset + align].copy_from_slice(&word.to_ne_bytes());
-        // SAFETY: advancing by 8 stays within or one-past the valid range
-        src = unsafe { src.add(align) };
-        offset += align;
+        dst[offset..offset + WORD].copy_from_slice(&word.to_ne_bytes());
+        // SAFETY: advancing by `WORD` stays within or one-past the valid range
+        src = unsafe { src.add(WORD) };
+        offset += WORD;
     }
     while offset < dst.len() {
         // SAFETY: caller guarantees `src` is valid for `dst.len()` bytes and `offset < dst.len()`
@@ -489,6 +474,35 @@ mod tests {
         assert!(!path_reaches_refused(good_link.as_os_str().as_bytes()));
         assert!(open_file(good_link.as_os_str().as_bytes()).is_some());
 
+        // Symlink to /dev/shm followed by `../fd/0`: lexical normalization before symlink expansion
+        // would erroneously collapse `shm_link/..` and miss `/dev/fd/0`, whereas left-to-right resolution catches it.
+        let shm_link = dir.path().join("shm_link");
+        std::os::unix::fs::symlink("/dev/shm", &shm_link).expect("shm symlink");
+        let escaped_through_shm = shm_link.join("../fd/0");
+        assert!(path_reaches_refused(escaped_through_shm.as_os_str().as_bytes()));
+        assert!(open_file(escaped_through_shm.as_os_str().as_bytes()).is_none());
+        // Direct `/dev/shm/...` and `/dev/./shm/...` remain allowed, while bare `/dev` and `/dev/fd/../shm/ok` are refused.
+        assert!(!path_reaches_refused(b"/dev/shm/picture"));
+        assert!(!path_reaches_refused(b"/dev/./shm/picture"));
+        assert!(path_reaches_refused(b"/dev"));
+        assert!(path_reaches_refused(b"/dev/fd/../shm/ok"));
+        assert!(path_reaches_refused(b"/proc/../tmp/ok"));
+        // Relative path climbing out to `/dev/fd/0` is refused, while climbing one level short stays under cwd's root.
+        let cwd = std::env::current_dir().expect("cwd");
+        let depth = cwd.as_os_str().as_bytes().split(|&b| b == b'/').filter(|s| !s.is_empty()).count();
+        assert!(depth >= 1, "test expects non-root cwd");
+        let to_root = format!("{}dev/fd/0", "../".repeat(depth));
+        let one_short = format!("{}dev/fd/0", "../".repeat(depth - 1));
+        assert!(path_reaches_refused(to_root.as_bytes()));
+        assert!(!path_reaches_refused(one_short.as_bytes()));
+        assert!(!path_reaches_refused(b"nonexistent_apack_relative_image.bin"));
+
+        // Non-NotFound metadata errors (e.g. ENAMETOOLONG / ENOTDIR) fail closed rather than skipping symlink checks.
+        let too_long = format!("/{}/file", "a".repeat(5000));
+        assert!(path_reaches_refused(too_long.as_bytes()));
+        let not_a_dir = real.join("child");
+        assert!(path_reaches_refused(not_a_dir.as_os_str().as_bytes()));
+
         // Legitimate directory symlink with trailing components is allowed
         let sub = dir.path().join("sub");
         std::fs::create_dir(&sub).expect("sub dir");
@@ -498,5 +512,11 @@ mod tests {
         let through_good_dir = dir_link.join("inside.bin");
         assert!(!path_reaches_refused(through_good_dir.as_os_str().as_bytes()));
         assert!(open_file(through_good_dir.as_os_str().as_bytes()).is_some());
+
+        // Relative symlink inside `sub` jumping via `..` through `shm_link` into `../fd/0` is refused.
+        let nested_escape = sub.join("nested_escape");
+        std::os::unix::fs::symlink("../shm_link/../fd/0", &nested_escape).expect("nested escape symlink");
+        assert!(path_reaches_refused(nested_escape.as_os_str().as_bytes()));
+        assert!(open_file(nested_escape.as_os_str().as_bytes()).is_none());
     }
 }

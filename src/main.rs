@@ -181,6 +181,12 @@ fn main() -> std::io::Result<()> {
             Ok(stream) => {
                 if broker.leaving.load(Ordering::SeqCst) {
                     drop(stream);
+                    // Keep `listener` alive until `leave()` exits (preserving Unix socket ownership
+                    // without `ReclaimGuard` unlinking a replacement broker's socket, and preserving
+                    // Windows `FILE_FLAG_FIRST_PIPE_INSTANCE` mutual exclusion while recordings drain),
+                    // while pacing rejected connects so a reconnecting Windows proxy does not burn
+                    // through its retry budget in milliseconds.
+                    std::thread::sleep(Duration::from_millis(100));
                     continue;
                 }
                 let broker = broker.clone();

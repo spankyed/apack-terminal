@@ -114,8 +114,9 @@ npm --prefix node test                       # the broker package's runtime entr
   one is never given the type of an exit (`commands::Outcome`). A mark that fails to be vouched for is
   refused and counted, never read as a claim instead. None of it is a boundary against a program running
   as the user, which can read the key ([design.md](docs/architecture/design.md#a-sessions-marks-can-be-vouched-for)).
-- **Feed the authority before the bytes leave.** The renderer's copy is a replica, and the only acceptable
-  disagreement is one where the authority is ahead.
+- **Feed the authority before the bytes leave.** The broker's core is the single VT authority; views draw
+  rendered rows from it rather than running a second emulator, and any raw output subscriber sees bytes
+  only after the authority has ingested them.
 - **Nothing polls.** The broker knows when bytes arrived, so a condition is checked where they land. A
   timer is the symptom of a missing signal.
 - **A partial result says so.** An overload is reported with what it cost; it is never silent.
@@ -130,6 +131,5 @@ npm --prefix node test                       # the broker package's runtime entr
 
 ## The toolchain is pinned to the consumer's
 
-`rust-toolchain.toml` names the channel apack's `elmdb` checkout names. apack derives one toolchain from
-every Rust checkout linked under `vendor/` and refuses a disagreement, naming both paths, because its Linux
-test container builds them all with one image. Moving this pin means moving elmdb's in the same change.
+`rust-toolchain.toml` names the same Rust channel as apack's other Rust repositories (such as `elmdb`)
+so CI and local workspace builds share one toolchain. Moving this pin means keeping those pins aligned.

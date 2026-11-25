@@ -161,11 +161,11 @@ class SessionSource implements TerminalSource {
 
   attach(listener: SourceListener): () => void {
     this.detach()
-    this.listener = listener
     if (this.ended) {
       listener.ended()
       return () => {}
     }
+    this.listener = listener
     const channel = this.connection.channel(this)
     this.channel = channel
     try {
@@ -263,8 +263,10 @@ class SessionSource implements TerminalSource {
     } catch {
       // Failing to send detach on a refused attachment must not skip releasing the channel or telling the view
     }
+    const listener = this.listener
+    this.listener = null
     this.connection.release(channel)
-    this.listener?.ended(reason)
+    listener?.ended(reason)
   }
 
   /** The session is over, or the connection to it is: whoever is waiting is told, once */
@@ -277,9 +279,11 @@ class SessionSource implements TerminalSource {
       if (channel !== null) this.connection.release(channel)
     }
     this.channel = null
+    const listener = this.listener
+    this.listener = null
     this.connection.forget(this)
     for (const one of waiting) one.reject(new Unanswered('the session ended'))
-    this.listener?.ended()
+    listener?.ended()
   }
 
   /**

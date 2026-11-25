@@ -162,18 +162,35 @@ enum Greeting {
 }
 
 impl Greeting {
-    fn observe(&mut self, bytes: &[u8]) {
-        let Self::Pending(line) = self else { return };
-        if let Some(end) = bytes.iter().position(|&byte| byte == b'\n') {
-            let take = end.min(MAX_FRAME_BYTES.saturating_sub(line.len()));
-            line.extend_from_slice(&bytes[..take]);
-            let is_view =
-                matches!(serde_json::from_slice::<Request>(line), Ok(Request::Hello { role: Role::View, .. }));
-            *self = if is_view { Self::View } else { Self::Json };
-        } else if line.len().saturating_add(bytes.len()) > MAX_FRAME_BYTES {
-            *self = Self::Json;
-        } else {
-            line.extend_from_slice(bytes);
+    fn observe(&mut self, mut bytes: &[u8]) {
+        loop {
+            let Self::Pending(line) = self else { return };
+            let mut parts = bytes.splitn(2, |&byte| byte == b'\n');
+            let head = parts.next().unwrap_or_default();
+            if let Some(rest) = parts.next() {
+                // `frames::read_frame` counts the trailing `\n` toward `MAX_FRAME_BYTES`, so the
+                // payload before `\n` may be at most `MAX_FRAME_BYTES - 1` bytes.
+                if line.len().saturating_add(head.len()) >= MAX_FRAME_BYTES {
+                    *self = Self::Json;
+                    return;
+                }
+                line.extend_from_slice(head);
+                if line.iter().all(u8::is_ascii_whitespace) {
+                    line.clear();
+                    bytes = rest;
+                    continue;
+                }
+                let is_view =
+                    matches!(serde_json::from_slice::<Request>(line), Ok(Request::Hello { role: Role::View, .. }));
+                *self = if is_view { Self::View } else { Self::Json };
+                return;
+            }
+            if line.len().saturating_add(head.len()) >= MAX_FRAME_BYTES {
+                *self = Self::Json;
+                return;
+            }
+            line.extend_from_slice(head);
+            return;
         }
     }
 
@@ -377,18 +394,39 @@ mod tests {
         client.observe(format!("{client_hello}\n").as_bytes());
         assert!(!client.is_view());
 
-        // Exact MAX_FRAME_BYTES before newline still parses as View (tests `>` vs `>=`/`==`/`<`).
-        let pad = MAX_FRAME_BYTES - view_hello.len();
+        // Exact MAX_FRAME_BYTES wire frame (payload of MAX_FRAME_BYTES - 1 plus `\n`) still parses as View.
+        let pad = MAX_FRAME_BYTES - 1 - view_hello.len();
         let mut exact = Greeting::Pending(Vec::new());
         exact.observe(format!("{view_hello}{}", " ".repeat(pad)).as_bytes());
         exact.observe(b"\n");
-        assert!(exact.is_view(), "a View hello of exactly MAX_FRAME_BYTES before newline must stay pending");
+        assert!(exact.is_view(), "a View hello of exact MAX_FRAME_BYTES including newline must stay pending");
 
-        // Exceeding MAX_FRAME_BYTES without newline gives up and becomes Json.
+        // Exceeding MAX_FRAME_BYTES (including eventual newline) gives up and becomes Json.
         let mut oversized = Greeting::Pending(Vec::new());
         oversized.observe(format!("{view_hello}{}", " ".repeat(pad + 1)).as_bytes());
         oversized.observe(b"\n");
         assert!(!oversized.is_view(), "an oversized first line without newline must stop buffering");
+
+        // Exact and oversized MAX_FRAME_BYTES with newline in the same chunk.
+        let mut exact_inline = Greeting::Pending(Vec::new());
+        exact_inline.observe(format!("{view_hello}{}\n", " ".repeat(pad)).as_bytes());
+        assert!(exact_inline.is_view(), "a View hello of exact MAX_FRAME_BYTES with inline newline must parse");
+        let mut oversized_inline = Greeting::Pending(Vec::new());
+        oversized_inline.observe(format!("{view_hello}{}\n", " ".repeat(pad + 1)).as_bytes());
+        assert!(!oversized_inline.is_view(), "an oversized line with inline newline must become Json");
+
+        // Leading blank or whitespace-only lines before hello are skipped (matching broker Frame::Blank).
+        let mut leading_blank = Greeting::Pending(Vec::new());
+        leading_blank.observe(format!("\n  \r\n{view_hello}\n").as_bytes());
+        assert!(leading_blank.is_view(), "leading blank lines before a View hello must be skipped");
+
+        let mut split_blank = Greeting::Pending(Vec::new());
+        split_blank.observe(b"  ");
+        split_blank.observe(b"\n");
+        split_blank.observe(&view_hello.as_bytes()[..10]);
+        split_blank.observe(&view_hello.as_bytes()[10..]);
+        split_blank.observe(b"\n");
+        assert!(split_blank.is_view(), "chunked leading blank line before a View hello must be skipped");
     }
 
     #[test]

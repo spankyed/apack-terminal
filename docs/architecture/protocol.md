@@ -341,9 +341,10 @@ values. Revisit only with a measurement showing sustained output above that cros
 
 ## The scrollback is one number, and the handshake answers it
 
-`hello` carries `history`: how many lines the broker keeps for every session, drawn or not. A consumer sets
-its emulator's scrollback from it rather than pinning its own, because anything beyond it cannot survive a
-reattach — the broker is what answers a `screen` read when no window holds the bytes.
+`hello` carries `history`: the guaranteed line depth (`HISTORY_LINES`, 1,000) that the broker keeps and
+caps `screen` text reads at. The broker holds the single grid and scrollback per session — views draw
+rows served from that same buffer (scrolling deeper, up to `VIEW_HISTORY_LINES` = 100,000) rather than
+maintaining a second terminal emulator — so closing and reopening a window never loses scrollback.
 
 Two independent constants is what this replaced: 10,000 in apack's window against `HISTORY_LINES` of 1,000
 here, so closing and reopening a window silently lost nine tenths of the scrollback. Raising the broker's is
