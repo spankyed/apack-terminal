@@ -35,7 +35,7 @@ on:
         required: true
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: binaries-${{ inputs.commit || github.sha }}
@@ -48,6 +48,7 @@ env:
 jobs:
   build:
     name: build (${{ matrix.platform }})
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -57,6 +58,13 @@ jobs:
           - { platform: win32-x64, runner: windows-latest, binary: apack-terminal.exe, target: x86_64-pc-windows-msvc }
     runs-on: ${{ matrix.runner }}
     steps:
+      - name: Validate commit SHA
+        shell: bash
+        run: |
+          if ! [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::commit must be a full 40-character lowercase hex SHA, got: $COMMIT"
+            exit 1
+          fi
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.COMMIT }}
@@ -72,7 +80,7 @@ jobs:
         run: echo "GHOSTTY_VT_RS_SYS_OPTIMIZE=fast" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
         with:
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
       - if: runner.os != 'Linux'
         run: cargo build --release --locked --bin apack-terminal
       # In manylinux_2_28 (AlmaLinux 8, glibc 2.28): every object compiled and linked there is built against glibc
@@ -124,23 +132,31 @@ jobs:
       - name: SBOM
         shell: bash
         run: cargo cyclonedx --format json --spec-version 1.5 --describe binaries --no-build-deps --target ${{ matrix.target }}
-      # The binary, and whatever `build.rs` put beside it that the npm package ships with it (the ConPTY on
-      # Windows): what `cargo xtask package` stages, renamed for a release that has no folders
+      # The binary and what `build.rs` placed beside it (the ConPTY on Windows), renamed for a release that has no
+      # folders
       - name: Collect this platform's files
         shell: bash
         run: |
           mkdir -p out
-          for file in ${{ matrix.binary }} conpty.dll OpenConsole.exe; do
-            if [ -f "target/release/$file" ]; then cp "target/release/$file" "out/${{ matrix.platform }}__$file"; fi
-          done
+          cp "target/release/${{ matrix.binary }}" "out/${{ matrix.platform }}__${{ matrix.binary }}"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            for file in conpty.dll OpenConsole.exe; do
+              cp "target/release/$file" "out/${{ matrix.platform }}__$file"
+            done
+          fi
           # **The notices go with each platform's binary**, which their licenses ask a binary redistribution to
           # carry: the crates', libghostty-vt's code's and ConPTY's, the Rust standard library's, and the broker's
           # own (`cargo xtask check-notices` holds the first two to the lockfile and the toolchain). Named like the
           # binary, so the app's pin lists them and its install puts them beside it. A commit from before the
-          # notices has only the license files, and its release is published with those alone
-          for file in THIRD-PARTY-NOTICES COPYRIGHT-rust-library.html LICENSE-MIT LICENSE-APACHE; do
-            if [ -f "$file" ]; then cp "$file" "out/${{ matrix.platform }}__$file"; fi
+          # notices has no `about.toml`, and its release is published with the license files alone
+          for file in LICENSE-MIT LICENSE-APACHE; do
+            cp "$file" "out/${{ matrix.platform }}__$file"
           done
+          if [ -f about.toml ]; then
+            for file in THIRD-PARTY-NOTICES COPYRIGHT-rust-library.html; do
+              cp "$file" "out/${{ matrix.platform }}__$file"
+            done
+          fi
           cp apack-terminal_bin.cdx.json "out/${{ matrix.platform }}__apack-terminal.cdx.json"
           ls -l out
           test -f "out/${{ matrix.platform }}__${{ matrix.binary }}"
@@ -158,6 +174,7 @@ jobs:
   package:
     needs: build
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     outputs:
       packed: ${{ steps.pack.outputs.packed }}
       version: ${{ steps.pack.outputs.version }}
@@ -202,6 +219,7 @@ jobs:
     name: smoke (${{ matrix.platform }})
     needs: package
     if: needs.package.outputs.packed == 'true'
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -237,7 +255,10 @@ jobs:
       !cancelled() && needs.build.result == 'success' && needs.package.result == 'success'
       && (needs.smoke.result == 'success' || needs.smoke.result == 'skipped')
       && (github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch')
+    permissions:
+      contents: write
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     outputs:
       created: ${{ steps.publish.outputs.created }}
     steps:
@@ -287,6 +308,7 @@ jobs:
     name: consume (${{ matrix.platform }})
     needs: [package, publish]
     if: needs.publish.outputs.created == 'true' && needs.package.outputs.packed == 'true'
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:

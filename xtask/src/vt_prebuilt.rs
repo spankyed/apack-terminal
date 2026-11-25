@@ -1,4 +1,4 @@
-//! Fetches the prebuilt `libghostty-vt` archive the `ghostty` feature links, and verifies it.
+//! Fetches the prebuilt `libghostty-vt` archive `ghostty-vt-rs-sys` links, and verifies it.
 //!
 //! **The point is that the build does not do this.** `ghostty-vt-rs-sys`' own `build.rs` will download and
 //! check the same archive on a first build, which is mechanically what happens here — the difference is
@@ -94,10 +94,7 @@ fn locked_version(root: &Path) -> Result<String, String> {
         }
         return Err(format!("{CRATE} is in Cargo.lock with no version beside it"));
     }
-    Err(format!(
-        "{CRATE} is not in Cargo.lock: run `cargo metadata --features ghostty` once so the feature's \
-         dependency is resolved and locked"
-    ))
+    Err(format!("{CRATE} is not in Cargo.lock: run `cargo metadata` once so the dependency is resolved and locked"))
 }
 
 /// The unpacked crate in the registry, which is where its `prebuilt.rs` is.
@@ -119,7 +116,7 @@ fn crate_source(version: &str) -> Result<PathBuf, String> {
             return Ok(candidate);
         }
     }
-    Err(format!("{wanted} is not unpacked under {}: run `cargo fetch --features ghostty` first", registry.display()))
+    Err(format!("{wanted} is not unpacked under {}: run `cargo fetch --locked` first", registry.display()))
 }
 
 /// The Ghostty commit the archives were built from, and this target's archive checksum.

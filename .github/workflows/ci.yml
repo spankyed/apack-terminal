@@ -1,21 +1,25 @@
 name: CI
 
-# Every push to main and every pull request runs the checks on Linux and the suite on all three platforms.
+# Every push to master and every pull request runs the checks on Linux and the suite on all three platforms.
 # **All three is the point, not thoroughness**: everything in `src/tree.rs`, ConPTY's missing EOF, its
 # cursor-position request and `\r\n` submitting a line are reachable from no Mac, and every one of them was
 # wrong before it was run on Windows (`CLAUDE.md`, "A platform claim is made on that platform"). A change to
-# documentation alone runs nothing past `changes`, and a newer push to the same pull request or branch cancels
-# the run before it. `ci-pass` is the one check a merge waits on. Mutants of a pull request's change run beside
-# this in mutants.yml, which a surviving mutant fails.
+# documentation alone runs nothing past `changes`, and a newer push to the same pull request cancels the run
+# before it; `master` runs never cancel each other so a docs-only follow-up cannot supersede an unverified code
+# commit. `ci-pass` is the one check a merge waits on. Mutants of a pull request's change run beside this in
+# mutants.yml, which a surviving mutant fails.
 on:
   push:
     branches: [master]
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -24,6 +28,7 @@ jobs:
   # Whether the change holds anything but documentation, which no check reads
   changes:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     outputs:
       code: ${{ steps.diff.outputs.code }}
     steps:
@@ -46,13 +51,14 @@ jobs:
             echo "code=true" >> "$GITHUB_OUTPUT"
           fi
 
-  # The cheap checks and the repository's own, which need one platform: a format, a lint and the generated
-  # protocol, which the apack monorepo keeps a second copy of and re-derives the same way
+  # The cheap checks and the repository's own, which need one platform: format, lint, generated protocol,
+  # safety comments, third-party notices and mutant exclusions
   checks:
     name: checks (Linux x64)
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       # rust-toolchain.toml names the toolchain; rustup installs it on first use
@@ -66,8 +72,9 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - run: cargo fetch --locked
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo xtask check-generated
+      - run: cargo xtask check-safety
       # The release's third-party notices, held to the lockfile, libghostty-vt's licenses and the toolchain
       - uses: taiki-e/install-action@v2
         with:
@@ -82,7 +89,7 @@ jobs:
         with:
           tool: cargo-mutants@27.1.0
       - run: cargo xtask check-exclusions
-      - run: cargo test --workspace --doc
+      - run: cargo test --locked --workspace --doc
 
   # The suite on each platform the broker runs on. A pty, a process tree and a shell's own reports are the
   # platform's answers, so each one is asked here
@@ -90,6 +97,7 @@ jobs:
     name: tests (${{ matrix.name }})
     needs: changes
     if: needs.changes.outputs.code == 'true'
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -126,10 +134,10 @@ jobs:
       # **Windows is linted where it is built.** `checks` lints Linux, where `cfg(windows)` code and what only a
       # POSIX case uses look different: a helper only POSIX cases call is unused here, and nothing else says so
       - if: runner.os == 'Windows'
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
       # Each test in its own process, killed at `.config/nextest.toml`'s deadline: a regression here loses a
       # signal, which is a read that never returns rather than a wrong answer
-      - run: cargo nextest run --workspace --no-fail-fast
+      - run: cargo nextest run --locked --workspace --no-fail-fast
 
   # The view (`view/`): its types, its suite and the build a consumer bundles. One platform, since it is
   # TypeScript drawing on a canvas and nothing in it asks the operating system anything. Its suite reads
@@ -140,6 +148,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: view
@@ -160,6 +169,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: node
@@ -175,6 +185,7 @@ jobs:
     if: always()
     needs: [changes, checks, platforms, view, node]
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
       - env:
           RESULTS: ${{ join(needs.*.result, ' ') }}

@@ -43,6 +43,11 @@ jobs:
       - name: Install nightly
         uses: dtolnay/rust-toolchain@nightly
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
       - name: Install cargo-fuzz
         uses: taiki-e/install-action@v2
         with:
@@ -74,23 +79,31 @@ jobs:
           echo "starting from $(find corpus/${{ matrix.target }} -type f | wc -l) inputs, artifact $id"
 
       - name: Fuzz
+        id: fuzz
         working-directory: fuzz
+        env:
+          SECONDS: ${{ github.event.inputs.seconds || '1200' }}
         run: |
+          if ! [[ "$SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::seconds must be a positive integer, got: $SECONDS"
+            exit 1
+          fi
           # The run grows corpus/; seeds/ is read as well and never written, so the seeds stay the tracked ones
           # Named explicitly: the prebuilt cargo-fuzz defaults to the musl target, which the sanitizer cannot use
           cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} corpus/${{ matrix.target }} seeds/${{ matrix.target }} -- \
-            -max_total_time=${{ github.event.inputs.seconds || '1200' }}
+            -max_total_time="$SECONDS"
 
       # Also after a crash: the corpus holds the inputs that found new code, and the one that crashed is in
-      # artifacts/, not here. Fourteen days covers a run of missed nights; past that a run starts from the seeds
+      # artifacts/, not here. Fourteen days covers a run of missed nights; past that a run starts from the seeds.
+      # Skip if the corpus directory is empty (for instance, a build failure before fuzzing began)
       - name: Upload corpus
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.fuzz.outcome != 'skipped' }}
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-corpus-${{ matrix.target }}
           path: fuzz/corpus/${{ matrix.target }}
           retention-days: 14
-          if-no-files-found: error
+          if-no-files-found: ignore
 
       - name: Upload crash
         if: failure()
