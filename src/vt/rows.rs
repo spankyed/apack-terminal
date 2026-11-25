@@ -1045,4 +1045,19 @@ mod tests {
         let first = row.cells().next().expect("cell");
         assert_eq!(first.link, Some(uri.as_str()));
     }
+
+    #[test]
+    fn mark_reset_recreates_mark_after_restore() {
+        let mut source = Terminal::new(20, 4).expect("source");
+        source.feed(b"hello");
+        let snapshot = source.keyframe(0, 64 * 1024).expect("keyframe");
+
+        let mut target = Terminal::new(20, 4).expect("target");
+        let mut mark = Mark::at_active_top(&target).expect("initial mark");
+        assert!(mark.screen_cell().is_some());
+        target.restore(&snapshot).expect("restore replaces terminal state");
+        // After restore, reset recreates a valid mark on the restored terminal.
+        mark.reset(&target).expect("reset succeeds after restore");
+        assert!(mark.screen_cell().is_some());
+    }
 }

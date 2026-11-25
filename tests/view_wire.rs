@@ -732,9 +732,33 @@ fn column_65535_round_trips_and_zero_width_complex_glyph_is_rejected() {
     assert_eq!(ToView::decode(&zero_width), Err(Malformed::Value("a glyph's width")));
 }
 
-/// **`ToView::decode` and `ToBroker::decode` reject out-of-range enum tags and non-finite floats.**
+/// **`ToView::decode` and `ToBroker::decode` reject out-of-range enum tags and non-finite floats,
+/// while accepting the boundary cursor shape `3` (hollow block).**
 #[test]
 fn decode_rejects_invalid_tags_and_non_finite_floats() {
+    // Cursor shape == 3 (hollow block) is valid and round-trips cleanly.
+    let valid_cursor = ToView::Frame(Frame {
+        channel: 1,
+        sequence: 1,
+        epoch: 1,
+        first_active: 0,
+        columns: 80,
+        screen_rows: 24,
+        scrollback: 0,
+        commands: 0,
+        images: 0,
+        cursor: Some(Cursor { column: 0, row: 0, shape: 3, blinking: false, hidden: false }),
+        alternate_screen: false,
+        mouse: false,
+        reverse_video: false,
+        stale_from: None,
+        colors: None,
+        anchored: None,
+        block: Block { rows: Vec::new() },
+    });
+    let encoded = valid_cursor.encode().expect("encodes");
+    assert_eq!(ToView::decode(body(&encoded)), Ok(valid_cursor));
+
     // Cursor shape > 3 in Frame
     let bad_cursor = [65, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 4, 0];
     assert_eq!(ToView::decode(&bad_cursor), Err(Malformed::Value("a cursor's shape")));

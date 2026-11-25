@@ -163,7 +163,7 @@ fn keep(notes: &Receiver<Note>, quiet: Duration, compressed: Option<&Sender<Stri
 }
 
 fn defer_due(now: Instant, quiet: Duration) -> Instant {
-    now + quiet.min(Duration::from_millis(50))
+    now + quiet.clamp(Duration::from_millis(1), Duration::from_millis(50))
 }
 
 #[cfg(test)]
@@ -173,6 +173,7 @@ mod tests {
     #[test]
     fn defer_due_pushes_deadline_into_future_and_caps_at_50ms() {
         let now = Instant::now();
+        assert_eq!(defer_due(now, Duration::ZERO).duration_since(now), Duration::from_millis(1));
         assert_eq!(defer_due(now, Duration::from_millis(20)).duration_since(now), Duration::from_millis(20));
         assert_eq!(defer_due(now, Duration::from_secs(5)).duration_since(now), Duration::from_millis(50));
     }

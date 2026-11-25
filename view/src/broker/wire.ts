@@ -174,7 +174,7 @@ class Writer {
   }
 
   float(value: number): void {
-    if (!Number.isFinite(value)) throw new RangeError(`${value} is not a finite float`)
+    if (!Number.isFinite(Math.fround(value))) throw new RangeError(`${value} is not a finite f32 float`)
     this.room(4)
     new DataView(this.bytes.buffer).setFloat32(this.length, value, true)
     this.length += 4

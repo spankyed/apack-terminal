@@ -262,6 +262,11 @@ describe('what a view cannot say', () => {
       kind: 'pointer', channel: 1, action: 'press', button: 0, modifiers: 0,
       x: Number.NaN, y: 1, cellWidth: 10, cellHeight: 20,
     })).toThrow(RangeError)
+    // Finite f64 that overflows f32 to Infinity must be rejected before encoding
+    expect(() => encodeToBroker({
+      kind: 'pointer', channel: 1, action: 'press', button: 0, modifiers: 0,
+      x: 1e40, y: 1, cellWidth: 10, cellHeight: 20,
+    })).toThrow(RangeError)
     expect(() => encodeToBroker({
       kind: 'pointer', channel: 1, action: 'press', button: 255, modifiers: 0,
       x: 1, y: 1, cellWidth: 10, cellHeight: 20,

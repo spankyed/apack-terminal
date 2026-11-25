@@ -281,3 +281,26 @@ fn selection_matches_exact(formatter: sys::Formatter, selection: &sys::Selection
     }
     exact
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn find_reuses_formatter_for_wrapped_and_multiple_case_sensitive_matches() {
+        // 8-column grid forces "AlphaBeta" to wrap across rows while keeping case-sensitive exact matching.
+        let mut terminal = Terminal::new(8, 6).expect("terminal");
+        terminal.feed(b"123456AlphaBeta\r\n");
+        terminal.feed(b"alphabeta\r\n");
+        terminal.feed(b"AlphaBeta\r\n");
+
+        let exact = terminal.find("AlphaBeta", true).expect("case-sensitive search");
+        assert_eq!(exact.matches.len(), 2, "must match both exact-case occurrences (including wrapped)");
+
+        let insensitive = terminal.find("AlphaBeta", false).expect("case-insensitive search");
+        assert_eq!(insensitive.matches.len(), 3);
+
+        let absent = terminal.find("NoSuchNeedle", true).expect("absent search");
+        assert!(absent.matches.is_empty());
+    }
+}
