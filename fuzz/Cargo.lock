@@ -22,6 +22,7 @@ dependencies = [
  "hmac",
  "interprocess",
  "libc",
+ "memchr",
  "png",
  "portable-pty",
  "serde",
