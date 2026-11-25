@@ -92,6 +92,10 @@ package's one entry point.
 - **`BrokerViews.onClose(listener)`** hears, once, that a connection has stopped — it was closed, its stream
   ended, or what arrived was not the protocol — which is when an owner that keeps one per broker makes
   another.
+- **`clock`** (optional): a structural `{ after(ms, run): () => void }` timer source for cursor/text blink,
+  search refresh, and input dedupe timers — letting a host share one timer queue across open views (or drive
+  timers deterministically in tests) with no runtime dependency. Dispose views before closing a shared clock.
+  Left out, uses `setTimeout`/`clearTimeout`.
 - **`onEnded(reason)`** hears that no more frames will come: with no reason the session is over, and with
   one it is there and the broker could not show it.
 

@@ -1,11 +1,13 @@
 // A view: when it draws, when it says a frame is drawn, and what it asks for.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CanvasPainter } from '../src/canvas-painter.ts'
+import type { Clock } from '../src/clock.ts'
 import type { Theme } from '../src/draw.ts'
 import type { Painter, Scene } from '../src/painter.ts'
 import { PLAIN, StyleFlag, paletteColor, type Fetched } from '../src/source.ts'
 import { BLINK_MS, TerminalView } from '../src/view.ts'
 import { recordingContext } from './_canvas.ts'
+import { TestClock } from './_clock.ts'
 import { framesWaiting, installFrames, runFrames } from './_frames.ts'
 import { FakeSource } from './_source.ts'
 import { frame, row, PALETTE } from './_support.ts'
@@ -688,29 +690,27 @@ describe('the cursor', () => {
   })
 
   describe('that blinks', () => {
-    beforeEach(() => { vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] }) })
-    afterEach(() => { vi.useRealTimers() })
-
     function blinking() {
-      const view = mountedView()
+      const clock = new TestClock()
+      const view = mountedView({ clock })
       view.view.setFocused(true)
       view.source.send(withCursor(true))
-      return view
+      return { ...view, clock }
     }
 
     it('is shown and hidden in turn, and shown from the start of a turn by anything typed or printed', () => {
       const view = blinking()
       expect(view.painted().cursor).toBeDefined()
-      vi.advanceTimersByTime(BLINK_MS)
+      view.clock.advance(BLINK_MS)
       expect(view.painted().cursor, 'did not blink').toBeUndefined()
 
       // Typed half way through the hidden half: shown at once, and for a whole turn from then
-      vi.advanceTimersByTime(BLINK_MS / 2)
+      view.clock.advance(BLINK_MS / 2)
       view.key('keydown', { code: 'KeyA', key: 'a' })
       expect(view.painted().cursor).toBeDefined()
-      vi.advanceTimersByTime(BLINK_MS - 1)
+      view.clock.advance(BLINK_MS - 1)
       expect(view.painted().cursor, 'hidden again part way through its turn').toBeDefined()
-      vi.advanceTimersByTime(1)
+      view.clock.advance(1)
       expect(view.painted().cursor).toBeUndefined()
 
       view.source.send({ ...withCursor(true), sequence: 2 })
@@ -721,12 +721,12 @@ describe('the cursor', () => {
       const view = blinking()
       runFrames()
       view.view.unmount()
-      expect(vi.getTimerCount(), 'a view that is not on the page went on blinking').toBe(0)
+      expect(view.clock.pending, 'a view that is not on the page went on blinking').toBe(0)
 
       view.view.mount(view.host)
       view.view.setFocused(true)
       view.source.send({ ...withCursor(true), sequence: 2 })
-      vi.advanceTimersByTime(BLINK_MS)
+      view.clock.advance(BLINK_MS)
       expect(view.painted().cursor).toBeUndefined()
     })
   })
@@ -743,39 +743,37 @@ describe('the cursor', () => {
   })
 
   describe('whose blink is the source\'s to say', () => {
-    beforeEach(() => { vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] }) })
-    afterEach(() => { vi.useRealTimers() })
-
     function focused(blinking: boolean) {
-      const view = mountedView({})
+      const clock = new TestClock()
+      const view = mountedView({ clock })
       view.view.setFocused(true)
       view.source.send(withCursor(blinking))
-      return view
+      return { ...view, clock }
     }
 
     it('blinks a cursor a frame says blinks', () => {
       const view = focused(true)
       expect(view.painted().cursor).toBeDefined()
-      vi.advanceTimersByTime(BLINK_MS)
+      view.clock.advance(BLINK_MS)
       expect(view.painted().cursor, 'did not blink').toBeUndefined()
     })
 
     it('never hides a cursor a frame says is steady, and keeps no clock for it', () => {
       const view = focused(false)
-      vi.advanceTimersByTime(BLINK_MS * 3)
+      view.clock.advance(BLINK_MS * 3)
       expect(view.painted().cursor, 'hidden').toBeDefined()
-      expect(vi.getTimerCount(), 'a clock for a cursor that does not blink').toBe(0)
+      expect(view.clock.pending, 'a clock for a cursor that does not blink').toBe(0)
     })
 
     it('stops blinking when the next frame says the cursor is steady, and starts when one says it blinks', () => {
       const view = focused(true)
       view.source.send(withCursor(false))
-      vi.advanceTimersByTime(BLINK_MS * 3)
+      view.clock.advance(BLINK_MS * 3)
       expect(view.painted().cursor, 'still blinking a cursor the source steadied').toBeDefined()
-      expect(vi.getTimerCount()).toBe(0)
+      expect(view.clock.pending).toBe(0)
 
       view.source.send(withCursor(true))
-      vi.advanceTimersByTime(BLINK_MS)
+      view.clock.advance(BLINK_MS)
       expect(view.painted().cursor, 'did not blink again').toBeUndefined()
     })
   })
@@ -791,12 +789,10 @@ describe('the cursor', () => {
 })
 
 describe('cursor settings changed on a view that is up', () => {
-  beforeEach(() => { vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] }) })
-  afterEach(() => { vi.useRealTimers() })
-
   /** A view at the foot of a screen of history, with text selected: the state a remake would lose */
   function working(options: Parameters<typeof mountedView>[0], focused: boolean) {
-    const view = mountedView(options)
+    const clock = new TestClock()
+    const view = mountedView({ clock, ...options })
     view.source.send(frame({ firstActive: 100, scrollback: 100, rows: [row(100, 'alpha beta'), row(101, 'gamma')], cursor: { column: 1, row: 1, shape: 'bar', blinking: true, hidden: false } }))
     view.view.selection.select({ start: { line: 100, column: 0 }, end: { line: 100, column: 4 } })
     view.view.setFocused(focused)
@@ -823,50 +819,50 @@ describe('cursor settings changed on a view that is up', () => {
 })
 
 describe('text that blinks', () => {
-  beforeEach(() => { vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] }) })
-  afterEach(() => { vi.useRealTimers() })
-
   /** `ab`, of which the `a` blinks */
   const blinkingRow = () => ({ ...row(0, 'ab'), style: Uint16Array.from([1, 0]), styles: [PLAIN, { ...PLAIN, flags: StyleFlag.blink }] })
   const drawn = (view: ReturnType<typeof mountedView>) => view.painted().rows[0]?.glyphs.map((glyph) => glyph.text)
 
   it('is drawn and hidden in turn, by a clock that what is printed does not start over', () => {
-    const view = mountedView()
+    const clock = new TestClock()
+    const view = mountedView({ clock })
     view.source.send(frame({ rows: [blinkingRow()] }))
     expect(drawn(view)).toEqual(['a', 'b'])
-    vi.advanceTimersByTime(BLINK_MS)
+    clock.advance(BLINK_MS)
     expect(drawn(view), 'did not blink').toEqual(['b'])
 
     // Printed half way through the hidden half: a program that keeps printing must not keep it shown
-    vi.advanceTimersByTime(BLINK_MS / 2)
+    clock.advance(BLINK_MS / 2)
     view.source.send(frame({ sequence: 2, rows: [blinkingRow()] }))
     expect(drawn(view), 'output showed it again').toEqual(['b'])
-    vi.advanceTimersByTime(BLINK_MS / 2)
+    clock.advance(BLINK_MS / 2)
     expect(drawn(view)).toEqual(['a', 'b'])
   })
 
   it('costs no clock where none is in view, and is shown once the last of it has gone', () => {
-    const view = mountedView()
+    const clock = new TestClock()
+    const view = mountedView({ clock })
     view.source.send(frame({ rows: [row(0, 'ab')] }))
     view.painted()
-    expect(vi.getTimerCount(), 'a clock for text that does not blink').toBe(0)
+    expect(clock.pending, 'a clock for text that does not blink').toBe(0)
 
     view.source.send(frame({ sequence: 2, rows: [blinkingRow()] }))
     view.painted()
-    expect(vi.getTimerCount()).toBe(1)
-    vi.advanceTimersByTime(BLINK_MS)
+    expect(clock.pending).toBe(1)
+    clock.advance(BLINK_MS)
 
     view.source.send(frame({ sequence: 3, rows: [row(0, 'ab')] }))
     expect(drawn(view)).toEqual(['a', 'b'])
-    expect(vi.getTimerCount(), 'the clock outlived the text').toBe(0)
+    expect(clock.pending, 'the clock outlived the text').toBe(0)
   })
 
   it('stops with the frames when the view is taken off the page', () => {
-    const view = mountedView()
+    const clock = new TestClock()
+    const view = mountedView({ clock })
     view.source.send(frame({ rows: [blinkingRow()] }))
     view.painted()
     view.view.unmount()
-    expect(vi.getTimerCount(), 'a view that is not on the page went on blinking').toBe(0)
+    expect(clock.pending, 'a view that is not on the page went on blinking').toBe(0)
   })
 })
 
@@ -954,62 +950,56 @@ describe('view lifecycle, guards, and edge-case regressions', () => {
   })
 
   it('cleans up thumb drag, mouse press, refresh timer on unmount, blocks mount after dispose, and guards find/paste after dispose', async () => {
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
-    try {
-      const source = new FakeSource()
-      let resolveSearch!: (f: import('../src/source.ts').Found) => void
-      source.search = () => new Promise((r) => { resolveSearch = r })
-      let resolvePaste!: (o: import('../src/source.ts').PasteOutcome) => void
-      source.paste = () => new Promise((r) => { resolvePaste = r })
-      const view = mountedView({}, source)
-      source.send(frame({ firstActive: 100, scrollback: 100, modes: { alternateScreen: false, mouse: true }, rows: [row(100, 'hi')] }))
-      runFrames()
+    const clock = new TestClock()
+    const source = new FakeSource()
+    let resolveSearch!: (f: import('../src/source.ts').Found) => void
+    source.search = () => new Promise((r) => { resolveSearch = r })
+    let resolvePaste!: (o: import('../src/source.ts').PasteOutcome) => void
+    source.paste = () => new Promise((r) => { resolvePaste = r })
+    const view = mountedView({ clock }, source)
+    source.send(frame({ firstActive: 100, scrollback: 100, modes: { alternateScreen: false, mouse: true }, rows: [row(100, 'hi')] }))
+    runFrames()
 
-      // Active mouse reporting press is released on unmount
-      view.point('pointerdown', 1, 0)
-      view.view.unmount()
-      expect(source.pointers.map((p) => p.action)).toEqual(['press', 'release'])
+    // Active mouse reporting press is released on unmount
+    view.point('pointerdown', 1, 0)
+    view.view.unmount()
+    expect(source.pointers.map((p) => p.action)).toEqual(['press', 'release'])
+    expect(clock.pending).toBe(0)
 
-      // Remount, start search & paste, then dispose before they resolve
-      view.view.mount(view.host)
-      const findPromise = view.view.find('hi')
-      const pastePromise = view.view.paste('abc')
-      view.view.scrollTo(50)
-      view.view.dispose()
-      // mount() after dispose is a no-op
-      const attachedBefore = source.attached
-      view.view.mount(view.host)
-      expect(source.attached).toBe(attachedBefore)
+    // Remount, start search & paste, then dispose before they resolve
+    view.view.mount(view.host)
+    const findPromise = view.view.find('hi')
+    const pastePromise = view.view.paste('abc')
+    view.view.scrollTo(50)
+    view.view.dispose()
+    expect(clock.pending).toBe(0)
+    // mount() after dispose is a no-op
+    const attachedBefore = source.attached
+    view.view.mount(view.host)
+    expect(source.attached).toBe(attachedBefore)
 
-      resolveSearch({ spans: [{ start: { line: 100, column: 0 }, end: { line: 100, column: 1 } }], more: false })
-      resolvePaste('pasted')
-      await Promise.all([findPromise, pastePromise])
-      expect(view.view.found.total).toBe(0)
-      expect(view.view.viewport.following).toBe(false)
-    } finally {
-      vi.useRealTimers()
-    }
+    resolveSearch({ spans: [{ start: { line: 100, column: 0 }, end: { line: 100, column: 1 } }], more: false })
+    resolvePaste('pasted')
+    await Promise.all([findPromise, pastePromise])
+    expect(view.view.found.total).toBe(0)
+    expect(view.view.viewport.following).toBe(false)
   })
 
   it('notifies onFound on epoch reset when there was an active search and cancels refresh timer', async () => {
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
-    try {
-      const foundEvents: Array<{ current: number; total: number; more: boolean }> = []
-      const source = new FakeSource()
-      source.search = async () => ({ spans: [{ start: { line: 0, column: 0 }, end: { line: 0, column: 1 } }], more: false })
-      const view = mountedView({ onFound: (f) => foundEvents.push(f) }, source)
-      source.send(frame({ sequence: 1, epoch: 1, rows: [row(0, 'ab')] }))
-      await view.view.find('ab')
-      // Schedule a refresh timer
-      source.send(frame({ sequence: 2, epoch: 1, rows: [row(0, 'ac')] }))
-      expect(vi.getTimerCount()).toBe(1)
-      // Epoch reset cancels timer and notifies onFound
-      source.send(frame({ sequence: 3, epoch: 2, rows: [row(0, 'new')] }))
-      expect(vi.getTimerCount()).toBe(0)
-      expect(foundEvents).toEqual([{ current: 0, total: 0, more: false }])
-    } finally {
-      vi.useRealTimers()
-    }
+    const clock = new TestClock()
+    const foundEvents: Array<{ current: number; total: number; more: boolean }> = []
+    const source = new FakeSource()
+    source.search = async () => ({ spans: [{ start: { line: 0, column: 0 }, end: { line: 0, column: 1 } }], more: false })
+    const view = mountedView({ clock, onFound: (f) => foundEvents.push(f) }, source)
+    source.send(frame({ sequence: 1, epoch: 1, rows: [row(0, 'ab')] }))
+    await view.view.find('ab')
+    // Schedule a refresh timer
+    source.send(frame({ sequence: 2, epoch: 1, rows: [row(0, 'ac')] }))
+    expect(clock.pending).toBe(1)
+    // Epoch reset cancels timer and notifies onFound
+    source.send(frame({ sequence: 3, epoch: 2, rows: [row(0, 'new')] }))
+    expect(clock.pending).toBe(0)
+    expect(foundEvents).toEqual([{ current: 0, total: 0, more: false }])
   })
 
   it('clamps pointer reporting coordinates, ignores secondary press while active, sanitizes link tooltips, and hides invisible/blinked cursor text & covers wide cursor', () => {
@@ -1148,83 +1138,73 @@ describe('view lifecycle, guards, and edge-case regressions', () => {
   })
 
   it('does not re-arm search refresh timer when an in-flight refresh finishes while unmounted or after unmount reset', async () => {
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
-    try {
-      const resolvers: Array<(f: import('../src/source.ts').Found) => void> = []
-      const foundEvents: Array<{ current: number; total: number; more: boolean }> = []
-      const source = new FakeSource()
-      source.search = () => new Promise((resolve) => { resolvers.push(resolve) })
-      const view = mountedView({ onFound: (f) => foundEvents.push(f) }, source)
-      source.send(frame({ sequence: 1, rows: [row(0, 'hi')] }))
+    const clock = new TestClock()
+    const resolvers: Array<(f: import('../src/source.ts').Found) => void> = []
+    const foundEvents: Array<{ current: number; total: number; more: boolean }> = []
+    const source = new FakeSource()
+    source.search = () => new Promise((resolve) => { resolvers.push(resolve) })
+    const view = mountedView({ clock, onFound: (f) => foundEvents.push(f) }, source)
+    source.send(frame({ sequence: 1, rows: [row(0, 'hi')] }))
 
-      const initial = view.view.find('hi')
-      resolvers[0]!({ spans: [{ start: { line: 0, column: 0 }, end: { line: 0, column: 1 } }], more: false })
-      await initial
+    const initial = view.view.find('hi')
+    resolvers[0]!({ spans: [{ start: { line: 0, column: 0 }, end: { line: 0, column: 1 } }], more: false })
+    await initial
 
-      // Trigger refresh timer, advance to kick off in-flight runRefresh(), then send another frame to set refreshAgain
-      source.send(frame({ sequence: 2, rows: [row(0, 'hi there')] }))
-      expect(vi.getTimerCount()).toBe(1)
-      vi.advanceTimersByTime(200)
-      expect(resolvers).toHaveLength(2)
-      source.send(frame({ sequence: 3, rows: [row(0, 'hi again')] }))
+    // Trigger refresh timer, advance to kick off in-flight runRefresh(), then send another frame to set refreshAgain
+    source.send(frame({ sequence: 2, rows: [row(0, 'hi there')] }))
+    expect(clock.pending).toBe(1)
+    clock.advance(200)
+    expect(resolvers).toHaveLength(2)
+    source.send(frame({ sequence: 3, rows: [row(0, 'hi again')] }))
 
-      // Unmount while refresh is in flight -> resets refreshAgain and sets listening = false
-      view.view.unmount()
-      resolvers[1]!({ spans: [{ start: { line: 0, column: 0 }, end: { line: 0, column: 1 } }, { start: { line: 0, column: 3 }, end: { line: 0, column: 4 } }], more: false })
-      await Promise.resolve()
-      await Promise.resolve()
-      expect(vi.getTimerCount(), 'in-flight refresh must not re-arm timer while unmounted').toBe(0)
-      expect(foundEvents, 'in-flight refresh must not notify onFound while unmounted').toEqual([])
+    // Unmount while refresh is in flight -> resets refreshAgain and sets listening = false
+    view.view.unmount()
+    resolvers[1]!({ spans: [{ start: { line: 0, column: 0 }, end: { line: 0, column: 1 } }, { start: { line: 0, column: 3 }, end: { line: 0, column: 4 } }], more: false })
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(clock.pending, 'in-flight refresh must not re-arm timer while unmounted').toBe(0)
+    expect(foundEvents, 'in-flight refresh must not notify onFound while unmounted').toEqual([])
 
-      // Remount, start another in-flight refresh with refreshAgain, unmount + remount before it resolves -> refreshAgain was cleared
-      view.view.mount(view.host)
-      source.send(frame({ sequence: 4, rows: [row(0, 'hi remounted')] }))
-      vi.advanceTimersByTime(200)
-      expect(resolvers).toHaveLength(3)
-      source.send(frame({ sequence: 5, rows: [row(0, 'hi more')] }))
-      view.view.unmount()
-      view.view.mount(view.host)
-      resolvers[2]!({ spans: [{ start: { line: 0, column: 0 }, end: { line: 0, column: 1 } }], more: false })
-      await Promise.resolve()
-      await Promise.resolve()
-      expect(vi.getTimerCount(), 'unmount should have cleared stale refreshAgain flag').toBe(0)
-    } finally {
-      vi.useRealTimers()
-    }
+    // Remount, start another in-flight refresh with refreshAgain, unmount + remount before it resolves -> refreshAgain was cleared
+    view.view.mount(view.host)
+    source.send(frame({ sequence: 4, rows: [row(0, 'hi remounted')] }))
+    clock.advance(200)
+    expect(resolvers).toHaveLength(3)
+    source.send(frame({ sequence: 5, rows: [row(0, 'hi more')] }))
+    view.view.unmount()
+    view.view.mount(view.host)
+    resolvers[2]!({ spans: [{ start: { line: 0, column: 0 }, end: { line: 0, column: 1 } }], more: false })
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(clock.pending, 'unmount should have cleared stale refreshAgain flag').toBe(0)
   })
 
   it('clamps currentMatch to MATCH_HIGHLIGHTS when search refresh pushes the selected match past the highlight cap', async () => {
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
-    try {
-      const spanAt = (line: number) => ({ start: { line, column: 0 }, end: { line, column: 1 } })
-      // Initial search returns 1000 matches (lines 999 down to 0); navigate to the oldest match (index 999, line 0).
-      let spans = Array.from({ length: 1000 }, (_, i) => spanAt(999 - i))
-      const foundEvents: Array<{ current: number; total: number; more: boolean }> = []
-      const source = new FakeSource()
-      source.search = async () => ({ spans, more: false })
-      const { view } = mountedView({ onFound: (f) => foundEvents.push(f) }, source)
-      source.send(frame({ sequence: 1, rows: [row(0, 'hi')] }))
+    const clock = new TestClock()
+    const spanAt = (line: number) => ({ start: { line, column: 0 }, end: { line, column: 1 } })
+    // Initial search returns 1000 matches (lines 999 down to 0); navigate to the oldest match (index 999, line 0).
+    let spans = Array.from({ length: 1000 }, (_, i) => spanAt(999 - i))
+    const foundEvents: Array<{ current: number; total: number; more: boolean }> = []
+    const source = new FakeSource()
+    source.search = async () => ({ spans, more: false })
+    const { view } = mountedView({ clock, onFound: (f) => foundEvents.push(f) }, source)
+    source.send(frame({ sequence: 1, rows: [row(0, 'hi')] }))
 
-      await view.find('hi')
-      // Wrapping backwards from index 0 lands on index 999 (line 0, current = 1000).
-      view.findNext(-1)
-      expect(view.found).toEqual({ current: 1000, total: 1000, more: false })
+    await view.find('hi')
+    // Wrapping backwards from index 0 lands on index 999 (line 0, current = 1000).
+    view.findNext(-1)
+    expect(view.found).toEqual({ current: 1000, total: 1000, more: false })
 
-      // New output prepends 200 newer matches (lines 1199 down to 0, 1200 total), pushing line 0 to index 1199 (> 1000).
-      spans = Array.from({ length: 1200 }, (_, i) => spanAt(1199 - i))
-      source.send(frame({ sequence: 2, rows: [row(0, 'hi')] }))
-      vi.advanceTimersByTime(200)
-      await Promise.resolve()
-      await Promise.resolve()
+    // New output prepends 200 newer matches (lines 1199 down to 0, 1200 total), pushing line 0 to index 1199 (> 1000).
+    spans = Array.from({ length: 1200 }, (_, i) => spanAt(1199 - i))
+    source.send(frame({ sequence: 2, rows: [row(0, 'hi')] }))
+    await clock.advanceAsync(200)
 
-      expect(view.found.total).toBe(1000)
-      expect(view.found.more).toBe(true)
-      expect(view.found.current, 'current match must stay within held MATCH_HIGHLIGHTS bounds').toBeLessThanOrEqual(view.found.total)
-      expect(view.found.current).toBe(1000)
-      expect(foundEvents.at(-1)).toEqual({ current: 1000, total: 1000, more: true })
-    } finally {
-      vi.useRealTimers()
-    }
+    expect(view.found.total).toBe(1000)
+    expect(view.found.more).toBe(true)
+    expect(view.found.current, 'current match must stay within held MATCH_HIGHLIGHTS bounds').toBeLessThanOrEqual(view.found.total)
+    expect(view.found.current).toBe(1000)
+    expect(foundEvents.at(-1)).toEqual({ current: 1000, total: 1000, more: true })
   })
 
   it('fires onFollowingChange(true) when setFolds snaps a scrolled-back view back to following', () => {
@@ -1247,5 +1227,122 @@ describe('view lifecycle, guards, and edge-case regressions', () => {
     // Fold starting before oldest (0..15) hides all remaining history (5..15), advancing visibleOldest past firstActive
     view.setFolds([{ first: 0, last: 15, label: 'folded' }])
     expect(following, 'setFolds snapping back to following must notify onFollowingChange(true)').toEqual([false, true])
+  })
+
+  it('drives cursor blink, text blink, search refresh, and key-text dedupe through one shared clock with zero leaks on teardown', async () => {
+    const clock = new TestClock()
+    const blinkingRow = { ...row(0, 'ab'), style: Uint16Array.from([1, 0]), styles: [PLAIN, { ...PLAIN, flags: StyleFlag.blink }] }
+    const sourceOne = new FakeSource()
+    let searches = 0
+    sourceOne.search = async () => {
+      searches += 1
+      return { spans: [{ start: { line: 0, column: 0 }, end: { line: 0, column: 1 } }], more: false }
+    }
+    const one = mountedView({ clock }, sourceOne)
+    const two = mountedView({ clock })
+
+    one.view.setFocused(true)
+    one.source.send(frame({ sequence: 1, rows: [blinkingRow], cursor: { column: 0, row: 0, shape: 'block', blinking: true, hidden: false } }))
+    two.view.setFocused(true)
+    two.source.send(frame({ sequence: 1, rows: [row(0, 'hi')], cursor: { column: 0, row: 0, shape: 'block', blinking: true, hidden: false } }))
+    runFrames()
+    // one has cursor blink + text blink; two has cursor blink
+    expect(clock.pending).toBe(3)
+
+    // Arm search refresh on `one` via the shared clock
+    await one.view.find('a')
+    one.source.send(frame({ sequence: 2, rows: [blinkingRow], cursor: { column: 0, row: 0, shape: 'block', blinking: true, hidden: false } }))
+    expect(clock.pending).toBe(4)
+
+    // Two rapid keypresses on `two` cancel-before-arm `keyTextTimer` (only 1 pending keyText timer, not 2)
+    two.key('keydown', { code: 'KeyA', key: 'a' })
+    two.key('keydown', { code: 'KeyB', key: 'b' })
+    expect(clock.pending).toBe(5)
+
+    // Unmounting `two` clears both its cursor blink and its deferred keyText timer
+    two.view.unmount()
+    expect(clock.pending).toBe(3)
+
+    // Advancing 200ms fires `one`'s search refresh; clearing search cancels any pending refresh timer
+    await clock.advanceAsync(200)
+    expect(searches).toBe(2)
+    one.source.send(frame({ sequence: 3, rows: [blinkingRow], cursor: { column: 0, row: 0, shape: 'block', blinking: true, hidden: false } }))
+    expect(clock.pending).toBe(3)
+    await one.view.find('')
+    expect(clock.pending, 'clearing search should cancel its pending refresh timer').toBe(2)
+
+    // Advancing blinks `one`, and disposing `one` clears every remaining timer on the shared clock
+    clock.advance(BLINK_MS)
+    expect(one.painted().cursor).toBeUndefined()
+    expect(one.painted().rows[0]?.glyphs.map((g) => g.text)).toEqual(['b'])
+    one.view.dispose()
+    two.view.dispose()
+    expect(clock.pending).toBe(0)
+  })
+
+  it('handles synchronous after(0) clocks, ignores stale/duplicate callbacks, and cancels re-entrant registrations', async () => {
+    let cancels = 0
+    const captured: Array<{ ms: number; run: () => void }> = []
+    const trickyClock: Clock = {
+      after(ms, run) {
+        if (ms === 0) {
+          // Fires synchronously before returning the cancel function
+          run()
+          return () => { cancels += 1 }
+        }
+        captured.push({ ms, run })
+        return () => { cancels += 1 }
+      },
+    }
+    let searches = 0
+    const source = new FakeSource()
+    source.search = async () => {
+      searches += 1
+      return { spans: [{ start: { line: 0, column: 0 }, end: { line: 0, column: 1 } }], more: false }
+    }
+    const view = mountedView({ clock: trickyClock }, source)
+    view.view.setFocused(true)
+    view.source.send(frame({ sequence: 1, rows: [row(0, 'hi')], cursor: { column: 0, row: 0, shape: 'block', blinking: true, hidden: false } }))
+    runFrames()
+    const staleBlink = captured[0]!.run
+
+    // Keypress arms after(0) synchronously AND resets blink (superseding `staleBlink` while still mounted & focused)
+    view.key('keydown', { code: 'KeyA', key: 'a' })
+    const countBeforeStale = captured.length
+    // Invoking the superseded blink callback while mounted & focused exercises Timer's token guard directly
+    staleBlink()
+    expect(view.painted().cursor, 'superseded blink callback must not hide the cursor').toBeDefined()
+    expect(captured.length, 'superseded blink callback must not re-arm timer').toBe(countBeforeStale)
+
+    // Buggy clock invoking a one-shot refresh callback twice must only execute runRefresh once
+    await view.view.find('hi')
+    source.send(frame({ sequence: 2, rows: [row(0, 'hi again')], cursor: { column: 0, row: 0, shape: 'block', blinking: true, hidden: false } }))
+    const refreshEntry = [...captured].reverse().find((e) => e.ms === 200)!
+    refreshEntry.run()
+    refreshEntry.run()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(searches, 'duplicate invocation of a one-shot timer must be ignored').toBe(2)
+
+    // Subsequent unmount must NOT invoke a stale cancel handle for the already-fired synchronous after(0) timer
+    const cancelCountBefore = cancels
+    view.view.unmount()
+    expect(cancels, 'only the active blink timer should be cancelled, not an already-fired synchronous timer').toBe(cancelCountBefore + 1)
+  })
+
+  it('uses the default setTimeout/clearTimeout clock when options.clock is omitted', () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const view = mountedView()
+      view.view.setFocused(true)
+      view.source.send(frame({ sequence: 1, cursor: { column: 0, row: 0, shape: 'block', blinking: true, hidden: false } }))
+      expect(view.painted().cursor).toBeDefined()
+      vi.advanceTimersByTime(BLINK_MS)
+      expect(view.painted().cursor).toBeUndefined()
+      view.view.dispose()
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

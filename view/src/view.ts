@@ -1,4 +1,5 @@
 import { CanvasPainter } from './canvas-painter.ts'
+import { Timer, systemClock, type Clock } from './clock.ts'
 import { blinks, drawRow, sessionTheme, type RowDrawing, type SelectedCells, type Theme } from './draw.ts'
 import { Input, modifiersOf } from './input.ts'
 import { linkAt, linkRuns, urls, type Detector, type Link, type LinkRun } from './links.ts'
@@ -151,6 +152,12 @@ export interface ViewOptions {
    * beside its prompt, coloured by how it ended. Left out, there is none and nothing is marked.
    */
   readonly gutter?: number
+  /**
+   * Timer source for cursor/text blink, search refresh, and input dedupe timers. Matches `@apackdev/clock`,
+   * `@apackdev/link`, and `@apackdev/state` structurally so a host can share one timer queue across open
+   * views (dispose views before closing a shared clock). Left out, uses `setTimeout`/`clearTimeout`.
+   */
+  readonly clock?: Clock
 }
 
 interface Kept {
@@ -257,10 +264,11 @@ export class TerminalView {
   private pixelRatio: number | null = null
   /** How tall the view is on the page, as last measured */
   private height = 0
-  private blink: ReturnType<typeof setInterval> | null = null
+  private readonly blink: Timer
   private cursorShown = true
   /** The clock blinking text goes by, while any is in view, and which half of a blink it is in */
-  private textBlink: ReturnType<typeof setInterval> | null = null
+  private readonly textBlink: Timer
+  private textBlinking = false
   private textShown = true
   private focused = false
   private wasFollowing = true
@@ -280,7 +288,7 @@ export class TerminalView {
    */
   private moreMatches = false
   private matchCase = false
-  private refreshTimer: ReturnType<typeof setTimeout> | undefined
+  private readonly refreshTimer: Timer
   private currentMatch = -1
   private finding = 0
   /** A search made again because rows changed is on its way, and whether rows changed again since */
@@ -348,6 +356,10 @@ export class TerminalView {
   readonly selection: Selection
 
   constructor(private readonly source: TerminalSource, private readonly options: ViewOptions) {
+    const clock = options.clock ?? systemClock
+    this.blink = new Timer(clock)
+    this.textBlink = new Timer(clock)
+    this.refreshTimer = new Timer(clock)
     this.mac = options.mac ?? /Mac|iPhone|iPad/.test(navigator.platform)
     this.gutter = options.gutter ?? 0
     this.copyOnSelect = options.copyOnSelect ?? false
@@ -385,6 +397,7 @@ export class TerminalView {
       focused: (focused) => this.setFocused(focused),
       typed: () => this.typed(),
       compositionStarted: () => this.selection.clear(),
+      clock,
     })
     this.element.appendChild(this.input.field)
 
@@ -503,6 +516,8 @@ export class TerminalView {
    */
   async find(needle: string, options: { matchCase?: boolean } = {}): Promise<number> {
     if (this.disposed) return 0
+    this.refreshTimer.cancel()
+    this.refreshAgain = false
     const asked = (this.finding += 1)
     this.needle = needle
     this.matchCase = options.matchCase ?? false
@@ -538,11 +553,10 @@ export class TerminalView {
    * found once it is quiet.
    */
   private refreshMatches(): void {
-    if (this.needle === '' || this.refreshTimer !== undefined) return
-    this.refreshTimer = setTimeout(() => {
-      this.refreshTimer = undefined
+    if (this.needle === '' || this.refreshTimer.active) return
+    this.refreshTimer.arm(MATCH_REFRESH_MS, () => {
       this.runRefresh()
-    }, MATCH_REFRESH_MS)
+    })
   }
 
   private runRefresh(): void {
@@ -1094,11 +1108,7 @@ export class TerminalView {
     this.unwatch = null
     this.lastFit = null
     this.thumbRelease?.()
-    if (this.refreshTimer !== undefined) {
-      clearTimeout(this.refreshTimer)
-      this.refreshTimer = undefined
-    }
-    this.refreshAgain = false
+    this.input.clearKeyText()
     // Said while there is still an attachment to say it on: a view off the page does not have the keyboard
     // or a held button, whether or not the page gets round to saying so
     const pressed = this.pressed
@@ -1255,7 +1265,7 @@ export class TerminalView {
   }
 
   dispose(): void {
-    if (this.refreshTimer !== undefined) clearTimeout(this.refreshTimer)
+    this.refreshTimer.cancel()
     if (this.disposed) return
     this.unmount()
     this.disposed = true
@@ -1308,6 +1318,8 @@ export class TerminalView {
     this.detach = null
     this.listening = false
     this.unacknowledged = null
+    this.refreshTimer.cancel()
+    this.refreshAgain = false
     if (this.scheduled !== null) cancelAnimationFrame(this.scheduled)
     this.scheduled = null
     this.stopDragScroll()
@@ -1326,18 +1338,25 @@ export class TerminalView {
    */
   private blinkText(inView: boolean): void {
     if (inView && this.listening) {
-      this.textBlink ??= setInterval(() => {
-        this.textShown = !this.textShown
-        this.schedule()
-      }, BLINK_MS)
+      this.textBlinking = true
+      if (!this.textBlink.active) this.scheduleTextBlink()
       return
     }
-    if (this.textBlink) clearInterval(this.textBlink)
-    this.textBlink = null
+    this.textBlinking = false
+    this.textBlink.cancel()
     if (!this.textShown) {
       this.textShown = true
       this.schedule()
     }
+  }
+
+  private scheduleTextBlink(): void {
+    this.textBlink.arm(BLINK_MS, () => {
+      if (!this.textBlinking || !this.listening || this.disposed) return
+      this.textShown = !this.textShown
+      this.schedule()
+      if (this.textBlinking && this.listening && !this.disposed && !this.textBlink.active) this.scheduleTextBlink()
+    })
   }
 
   private take(frame: Frame): void {
@@ -1374,10 +1393,7 @@ export class TerminalView {
       this.placed = { ...this.placed, placements: [] }
       this.anchored = { ...this.anchored, list: [] }
       this.imagesSeen = -1
-      if (this.refreshTimer !== undefined) {
-        clearTimeout(this.refreshTimer)
-        this.refreshTimer = undefined
-      }
+      this.refreshTimer.cancel()
       this.refreshAgain = false
       const hadSearch = this.needle !== '' || this.matches.length > 0 || this.moreMatches
       this.needle = ''
@@ -1461,17 +1477,22 @@ export class TerminalView {
    * keyboard and is taking frames.
    */
   private blinkAgain(): void {
-    if (this.blink) clearInterval(this.blink)
-    this.blink = null
+    this.blink.cancel()
     if (!this.cursorShown) {
       this.cursorShown = true
       this.schedule()
     }
     if (!this.focused || !this.listening || !this.cursorBlinks()) return
-    this.blink = setInterval(() => {
+    this.scheduleBlink()
+  }
+
+  private scheduleBlink(): void {
+    this.blink.arm(BLINK_MS, () => {
+      if (!this.focused || !this.listening || this.disposed || !this.cursorBlinks()) return
       this.cursorShown = !this.cursorShown
       this.schedule()
-    }, BLINK_MS)
+      if (this.focused && this.listening && !this.disposed && this.cursorBlinks()) this.scheduleBlink()
+    })
   }
 
   /** The person typed, composed or pasted something the program was sent */
