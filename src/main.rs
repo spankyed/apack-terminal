@@ -131,6 +131,7 @@ fn main() -> std::io::Result<()> {
         connections: Arc::new(AtomicUsize::new(0)),
         accepted: Arc::new(AtomicU64::new(0)),
         leaving: Arc::new(AtomicBool::new(false)),
+        #[cfg(unix)]
         socket: Arc::new(socket.clone()),
         held: Arc::new(Mutex::new(Some(held))),
         key,
@@ -252,6 +253,7 @@ struct Broker {
     /// Set once shutdown begins so the accept loop stops serving new connections during drain.
     leaving: Arc<AtomicBool>,
     /// The socket path this broker is listening on, unlinked on clean Unix exit before releasing `held`.
+    #[cfg(unix)]
     socket: Arc<String>,
     /// The broker's lock on `socket`, kept until shutdown finishes.
     held: Arc<Mutex<Option<Held>>>,
