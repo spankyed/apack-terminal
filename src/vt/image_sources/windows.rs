@@ -48,14 +48,17 @@ pub fn open_file(path: &[u8]) -> Option<File> {
 /// **In a buffer as long as any path the system has**, so it is asked once: what is answered is the
 /// path's length, or — were it longer than the buffer — the length the buffer would have had to be, which
 /// is past its end and so not a path at all.
+fn valid_final_path_len(written: u32) -> Option<usize> {
+    let len = usize::try_from(written).ok()?;
+    (1..LONGEST_PATH).contains(&len).then_some(len)
+}
+
 fn final_path(handle: HANDLE) -> Option<String> {
     let mut wide = vec![0u16; LONGEST_PATH];
     // SAFETY: `wide` has room for `LONGEST_PATH` characters, and the handle is of an open file
     let written = unsafe { GetFinalPathNameByHandleW(handle, wide.as_mut_ptr(), LONGEST_PATH as u32, FINAL_PATH) };
-    if written == 0 || written as usize >= LONGEST_PATH {
-        return None;
-    }
-    let path = String::from_utf16(wide.get(..written as usize)?).ok()?;
+    let len = valid_final_path_len(written)?;
+    let path = String::from_utf16(wide.get(..len)?).ok()?;
     Some(match path.strip_prefix(r"\\?\UNC\") {
         Some(share) => format!(r"\\{share}"),
         None => path.strip_prefix(r"\\?\").unwrap_or(&path).to_owned(),
@@ -77,4 +80,18 @@ pub fn shared_memory(
     _range: impl FnOnce(u64) -> Result<std::ops::Range<u64>, super::Refused>,
 ) -> Result<Vec<Vec<u8>>, super::Refused> {
     Err(super::Refused::InvalidData)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_final_path_len_rejects_zero_and_truncation() {
+        assert_eq!(valid_final_path_len(0), None);
+        assert_eq!(valid_final_path_len(1), Some(1));
+        assert_eq!(valid_final_path_len((LONGEST_PATH - 1) as u32), Some(LONGEST_PATH - 1));
+        assert_eq!(valid_final_path_len(LONGEST_PATH as u32), None);
+        assert_eq!(valid_final_path_len((LONGEST_PATH + 1) as u32), None);
+    }
 }

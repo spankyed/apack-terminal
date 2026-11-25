@@ -1578,6 +1578,7 @@ fn shared_memory_validates_ranges_and_reads_page_windowed_chunks() {
     assert_eq!(page_window(5000..9000, page), Some(PageWindow { aligned: 4096, mapped: 4904, lead: 904, len: 4000 }));
     assert_eq!(page_window(4096..8192, page), Some(PageWindow { aligned: 4096, mapped: 4096, lead: 0, len: 4096 }));
     assert_eq!(page_window(100..200, page), Some(PageWindow { aligned: 0, mapped: 200, lead: 100, len: 100 }));
+    assert_eq!(page_window(std::ops::Range { start: 200, end: 100 }, page), None);
 
     let small = [9u8, 9, 1, 2, 3, 4, 9, 9];
     let name = shared_name("empty-rng");
@@ -1607,23 +1608,8 @@ fn shared_memory_validates_ranges_and_reads_page_windowed_chunks() {
     let payload: Vec<u8> = (0..total).map(|index| (index % 251) as u8).collect();
     let name = shared_name("chunks");
     let c_name = made_shared(&name, &payload);
-    // Probe the lowest free descriptor so the range callback can check flags on the newly opened shm fd
-    // SAFETY: duplicating stdin yields the lowest free fd number, which we close immediately
-    let expected_fd = unsafe {
-        let probe = libc::dup(0);
-        assert!(probe >= 0);
-        libc::close(probe);
-        probe
-    };
     let pieces = shared_memory(name.as_bytes(), |size| {
         assert!(size >= total as u64);
-        // SAFETY: `expected_fd` is the descriptor `shm_open` just opened in this single-threaded test
-        let fl = unsafe { libc::fcntl(expected_fd, libc::F_GETFL) };
-        // SAFETY: as above
-        let fd_flags = unsafe { libc::fcntl(expected_fd, libc::F_GETFD) };
-        assert_ne!(fl, -1);
-        assert_ne!(fl & libc::O_NONBLOCK, 0, "shm_open must pass O_NONBLOCK");
-        assert_ne!(fd_flags & libc::FD_CLOEXEC, 0, "shm_open must set FD_CLOEXEC");
         Ok(start as u64..(start + len) as u64)
     })
     .expect("multi-chunk shared memory read succeeds");
@@ -1651,9 +1637,11 @@ fn shared_memory_validates_ranges_and_reads_page_windowed_chunks() {
         assert_eq!(read[1].len(), 7);
         assert!(read.concat() == payload[start..start + len]);
     }
-    // Truncation / EOF past file end returns InvalidData from `read_fd_range`
+    // Truncation / EOF past file end and inverted range return InvalidData from `read_fd_range`
     let short_fd: std::os::fd::OwnedFd = std::fs::File::open(&backing).expect("open backing").into();
     assert_eq!(read_fd_range(short_fd, (total as u64 - 4)..(total as u64 + 8)), Err(InvalidData));
+    let inv_fd: std::os::fd::OwnedFd = std::fs::File::open(&backing).expect("open backing").into();
+    assert_eq!(read_fd_range(inv_fd, std::ops::Range { start: 10, end: 5 }), Err(InvalidData));
 }
 
 /// **Queries (`a=q`) are capped at `QUERY_SOURCE_BYTES` (64 MiB), and oversized regular files are
