@@ -25,8 +25,8 @@ pub fn hang_up(pipe: &impl AsHandle) -> bool {
     // no operation is pending on it.
     unsafe {
         let cancelled = CancelIoEx(handle, std::ptr::null()) != 0;
-        DisconnectNamedPipe(handle);
-        cancelled
+        let disconnected = DisconnectNamedPipe(handle) != 0;
+        cancelled || disconnected
     }
 }
 
@@ -110,9 +110,10 @@ fn owned_by(pipe: &impl AsHandle, sid: &widestring::U16CStr) -> std::io::Result<
         }
         let mut text: windows_sys::core::PWSTR = std::ptr::null_mut();
         let converted = ConvertSidToStringSidW(owner, &mut text);
+        let convert_error = (converted == 0).then(std::io::Error::last_os_error);
         LocalFree(descriptor as HLOCAL);
-        if converted == 0 {
-            return Err(std::io::Error::last_os_error());
+        if let Some(error) = convert_error {
+            return Err(error);
         }
         let found = widestring::U16CStr::from_ptr_str(text) == sid;
         LocalFree(text.cast::<core::ffi::c_void>() as HLOCAL);
@@ -293,6 +294,22 @@ mod tests {
             let _ = far_tx.send(reader.read(&mut buffer).is_ok());
         });
         far_rx.recv_timeout(Duration::from_secs(10)).expect("the far end's read ends once hung up");
+        // Hanging up an already-disconnected pipe with no pending I/O cancels and disconnects nothing.
+        assert!(!hang_up(&server), "a second hang_up on an already-disconnected pipe must return false");
+
+        // Hanging up a connected pipe with no parked read (`cancelled == false, disconnected == true`)
+        // still succeeds and returns true.
+        let idle_name = format!(r"\\.\pipe\apack-hang-up-idle-{}", std::process::id());
+        let idle_listener = ListenerOptions::new()
+            .name(idle_name.clone().to_fs_name::<GenericFilePath>().expect("a pipe name"))
+            .create_sync()
+            .expect("the idle pipe is created");
+        let idle_connect = std::thread::spawn(move || {
+            Stream::connect(idle_name.to_fs_name::<GenericFilePath>().expect("a pipe name")).expect("idle connects")
+        });
+        let idle_server = idle_listener.accept().expect("idle accepts");
+        let _idle_client = idle_connect.join().expect("idle client");
+        assert!(hang_up(&idle_server), "disconnecting a connected pipe without a parked read must return true");
     }
 
     /// A pipe made as the broker makes its own is this user's, and is not another account's: asked from the

@@ -23,7 +23,7 @@ use interprocess::local_socket::{GenericFilePath, Stream, ToFsName, prelude::*};
 
 use apack_terminal::feed::{FEED_BYTES_ENV, Feed, feed_bytes};
 use apack_terminal::frames::{Frame, read_frame};
-use apack_terminal::listening::{self, HELD_EXIT, Refused, START_GRACE_ENV, hang_up, let_go};
+use apack_terminal::listening::{self, HELD_EXIT, Held, Refused, START_GRACE_ENV, hang_up, let_go};
 use apack_terminal::output::{Outgoing, channel_with_credit};
 use apack_terminal::protocol::{
     BROKER_KEY_ENV, CommandRecord, ErrorCode, Event, PROTOCOL_VERSION, Request, Role, SearchMatch, proof_of,
@@ -68,8 +68,18 @@ fn main() -> std::io::Result<()> {
     let key = std::env::var(BROKER_KEY_ENV).ok().filter(|key| !key.is_empty()).map(Arc::new);
     // SAFETY: no thread has been started yet, so nothing can be reading the environment while it changes
     unsafe { std::env::remove_var(BROKER_KEY_ENV) };
+    // Initialize the `strsignal` table while still single-threaded (POSIX does not require thread-safety)
+    apack_terminal::session::init_signal_descriptions();
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let socket = match arguments.as_slice() {
+        [flag] if flag == "--help" || flag == "-h" => {
+            println!("usage: apack-terminal <socket>\n       apack-terminal proxy [<socket>]");
+            return Ok(());
+        }
+        [flag] if flag == "--version" || flag == "-V" => {
+            println!("apack-terminal {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
         // This process's stdin and stdout as a connection to the broker there (`proxy`), or to the one
         // at the place a broker is by default when no place is named
         [mode, rest @ ..] if mode == "proxy" && rest.len() <= 1 => {
@@ -86,7 +96,7 @@ fn main() -> std::io::Result<()> {
             };
             return apack_terminal::proxy::run(&socket).inspect_err(|error| eprintln!("apack-terminal: {error}"));
         }
-        [socket] => socket.clone(),
+        [socket] if !socket.starts_with('-') => socket.clone(),
         _ => {
             eprintln!("usage: apack-terminal <socket>\n       apack-terminal proxy [<socket>]");
             std::process::exit(2);
@@ -98,7 +108,7 @@ fn main() -> std::io::Result<()> {
     let listening = listening::private_directory(&socket)
         .and_then(|()| listening::hold(&socket))
         .and_then(|held| listening::listen(&socket).map(|listener| (held, listener)));
-    let (_held, listener) = match listening {
+    let (held, listener) = match listening {
         Ok(listening) => listening,
         Err(refused) => refuse(&socket, &refused),
     };
@@ -116,10 +126,14 @@ fn main() -> std::io::Result<()> {
             .ok()
             .and_then(|asked| asked.parse().ok())
             .unwrap_or(IMAGES_LISTED),
-        owned: Arc::new(AtomicBool::new(false)),
+        owners: Arc::new(AtomicUsize::new(0)),
         clients: Arc::new(AtomicUsize::new(0)),
         connections: Arc::new(AtomicUsize::new(0)),
         accepted: Arc::new(AtomicU64::new(0)),
+        leaving: Arc::new(AtomicBool::new(false)),
+        #[cfg(unix)]
+        socket: Arc::new(socket.clone()),
+        held: Arc::new(Mutex::new(Some(held))),
         key,
     };
     // One thread takes everything off the queue for the broker's life, so what is reported is in one
@@ -155,7 +169,7 @@ fn main() -> std::io::Result<()> {
             let reached = socket.as_str().to_fs_name::<GenericFilePath>().and_then(Stream::connect).is_ok();
             if !reached && broker.accepted.load(Ordering::SeqCst) == 0 && broker.connections.load(Ordering::SeqCst) == 0
             {
-                leave();
+                leave(&broker);
             }
         }
     });
@@ -165,27 +179,52 @@ fn main() -> std::io::Result<()> {
             // **A thread per connection**, because a lifetime connection and a client now coexist: serving
             // them in turn would mean the app's own hold on the broker blocked every session request
             Ok(stream) => {
+                if broker.leaving.load(Ordering::SeqCst) {
+                    drop(stream);
+                    continue;
+                }
                 let broker = broker.clone();
                 broker.connections.fetch_add(1, Ordering::SeqCst);
                 let connection = broker.accepted.fetch_add(1, Ordering::SeqCst);
                 std::thread::spawn(move || serve(stream, connection, broker));
             }
-            Err(error) => eprintln!("accept failed: {error}"),
+            Err(error) => {
+                eprintln!("accept failed: {error}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
     }
     Ok(())
 }
 
-/// Exits, once what was recorded is in its files.
+/// Exits once active kill escalations and stopped recordings have finished, removing the Unix socket
+/// file while still holding the socket lock.
 ///
 /// **A recording is written by a thread, and a thread ends with its process.** A session's ending stops
 /// its recording and leaves the last of it to the recorder's thread (`recording`), which is what keeps
 /// an ending from waiting on a disk — and is, at the one moment the process itself ends, the end of
 /// that recording never reaching its file. So every way out of a broker that has had sessions goes
-/// through here, and waits for the recorders that have stopped: for as long as `RECORDER_PATIENCE`,
-/// since a disk that takes nothing must not keep a broker nobody wants.
-fn leave() -> ! {
+/// through here, waits for active `end_for_certain` escalations and stopped recorders, unlinks the
+/// Unix socket before releasing the lock, and exits.
+fn leave(broker: &Broker) -> ! {
+    if broker.leaving.swap(true, Ordering::SeqCst) {
+        // Another thread is already running the bounded shutdown sequence; wait for it to call exit.
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+    // Remove the Unix socket before draining kills/recordings (while still holding the socket lock)
+    // so reconnecting proxies hit ENOENT and back off on `Held` instead of burning all retry attempts
+    // against an accept-and-drop loop.
+    #[cfg(unix)]
+    {
+        let _ = std::fs::remove_file(broker.socket.as_str());
+    }
+    broker.sessions.wait_for_kills();
     recording::settle_all();
+    if let Ok(mut held) = broker.held.lock() {
+        *held = None;
+    }
     std::process::exit(0)
 }
 
@@ -200,8 +239,8 @@ struct Broker {
     feed_bytes: usize,
     /// How many of a session's images are listed for a view at most (`IMAGES_LISTED`)
     images_listed: usize,
-    /// Whether a `lifetime` connection is open.
-    owned: Arc<AtomicBool>,
+    /// How many `lifetime` connections are open.
+    owners: Arc<AtomicUsize>,
     /// How many `client` connections are open.
     clients: Arc<AtomicUsize>,
     /// How many connections of any kind are open, **counted from the accept and not from the handshake**.
@@ -211,6 +250,13 @@ struct Broker {
     /// How many connections there have ever been, which is what tells one connection's views — and the
     /// recordings it opened — from another's, and whether anything has connected at all.
     accepted: Arc<AtomicU64>,
+    /// Set once shutdown begins so the accept loop stops serving new connections during drain.
+    leaving: Arc<AtomicBool>,
+    /// The socket path this broker is listening on, unlinked on clean Unix exit before releasing `held`.
+    #[cfg(unix)]
+    socket: Arc<String>,
+    /// The broker's lock on `socket`, kept until shutdown finishes.
+    held: Arc<Mutex<Option<Held>>>,
     /// What answers a greeting's challenge, when whoever started the broker gave it one (`BROKER_KEY_ENV`)
     key: Option<Arc<String>>,
 }
@@ -238,15 +284,15 @@ fn write_out(outgoing: Receiver<Outgoing>, broker: Broker) {
         // The last kept session ending with nobody connected is the other way a broker runs out of
         // reasons to stay (`nothing_left`)
         if exited && nothing_left(&broker) {
-            leave();
+            leave(&broker);
         }
-        let frame = message.event.take().and_then(|event| serde_json::to_string(&event).ok());
         let attached = broker.feed.lock().ok().and_then(|feed| feed.clone());
         match attached {
             // Refused by a client that has been let go: the next one to greet installs itself. Nothing
             // is ended here, because whether a client leaving ends the sessions is `Role`'s question
             // and is answered in `serve`
             Some(client) => {
+                let frame = message.event.take().and_then(|event| serde_json::to_string(&event).ok());
                 if !client.feed.deliver(frame, message) {
                     detach(&broker, &client.wire);
                 }
@@ -392,20 +438,25 @@ impl Drop for Leaving {
             // **The app is gone, so its shells are.** The descriptor closed, which it does however the process
             // died — quit, crash or kill — so this is reached without anything having remembered to call it.
             Some(Role::Lifetime) => {
-                self.broker.owned.store(false, Ordering::SeqCst);
-                end_everything(&self.broker);
+                if self.broker.owners.fetch_sub(1, Ordering::SeqCst) == 1 {
+                    end_everything(&self.broker);
+                }
             }
             // **A client leaving ends nothing while an owner holds the broker**, which is what lets the service
             // that opened a session restart without taking it down. With no owner this is the behaviour the
             // broker has always had, and it is what keeps a standalone run — the suite, tooling — from leaving
             // shells behind.
             Some(Role::Client) => {
-                // **What it asked last is answered before it is let go.** Its answers are written by the
-                // attached client's writer, behind whatever was queued first, and a client may stop sending
-                // while it still reads — a proxy whose input ended does exactly that. So that writer is
-                // waited for to reach this point in its queue; only then is the connection taken out of
-                // the feed and closed
-                self.broker.sessions.settled();
+                // **What it asked last is answered before it is let go**, only if this client is still
+                // the attached feed recipient, and bounded by `UNREAD_PATIENCE` so a stalled reader
+                // cannot wedge the connection thread indefinitely.
+                let still_attached =
+                    self.broker.feed.lock().ok().is_some_and(|feed| {
+                        feed.as_ref().is_some_and(|attached| Arc::ptr_eq(&attached.wire, &self.wire))
+                    });
+                if still_attached {
+                    self.broker.sessions.settled_within(UNREAD_PATIENCE);
+                }
                 detach(&self.broker, &self.wire);
                 // Its writer has nothing more to write and ends, and is waited for: one held in a write by a
                 // client that stopped reading, or that took a message before the feed closed and writes it
@@ -425,7 +476,7 @@ impl Drop for Leaving {
                 // The recordings it opened to look back through were its alone to name
                 self.broker.sessions.end_rewound_by(self.connection);
                 let left = self.broker.clients.fetch_sub(1, Ordering::SeqCst) - 1;
-                if left == 0 && !self.broker.owned.load(Ordering::SeqCst) {
+                if left == 0 && self.broker.owners.load(Ordering::SeqCst) == 0 {
                     end_everything(&self.broker);
                 }
             }
@@ -440,7 +491,7 @@ impl Drop for Leaving {
         if self.broker.connections.fetch_sub(1, Ordering::SeqCst) == 1 {
             end_everything(&self.broker);
             if nothing_left(&self.broker) {
-                leave();
+                leave(&self.broker);
             }
         }
     }
@@ -519,7 +570,9 @@ fn converse(
                     Role::Client => {
                         broker.clients.fetch_add(1, Ordering::SeqCst);
                     }
-                    Role::Lifetime => broker.owned.store(true, Ordering::SeqCst),
+                    Role::Lifetime => {
+                        broker.owners.fetch_add(1, Ordering::SeqCst);
+                    }
                     Role::View => {}
                 }
                 let proof = broker.key.as_deref().zip(challenge.as_deref()).map(|(key, asked)| proof_of(key, asked));
@@ -564,6 +617,17 @@ fn converse(
                     },
                 );
                 break;
+            }
+            (_, Some(Role::Lifetime)) => {
+                say(
+                    wire,
+                    &Event::Failed {
+                        session: None,
+                        code: ErrorCode::Handshake,
+                        message: "a lifetime connection holds the broker and sends no session requests".to_owned(),
+                    },
+                );
+                continue;
             }
             _ => {}
         }
@@ -614,6 +678,12 @@ fn serve_view(reader: &mut BufReader<&Stream>, stream: &Arc<Stream>, connection:
     let mut attached: HashMap<u32, Handle> = HashMap::new();
     loop {
         match read_message(reader) {
+            // A zero-length frame signals clean end-of-input (the binary counterpart of `Request::Done`),
+            // allowing proxies on platforms without half-close (Windows named pipes) to drain queued answers.
+            Incoming::Message(body) if body.is_empty() => {
+                leaving.said_all = true;
+                break;
+            }
             Incoming::Message(body) => match ToBroker::decode(&body) {
                 Ok(message) => carry_out_view(broker, connection, &sink, &mut attached, message),
                 // Not the protocol: there is no telling what the rest of the stream is either
@@ -659,7 +729,11 @@ impl Drop for ViewLeaving<'_> {
         // other reason is hung up on first, since the thread writing to it may be parked in a write to a
         // view that will never read it, and only the connection closing ends that
         let mut closed = self.said_all || hang_up(&self.stream);
-        self.sink.finish();
+        if self.said_all {
+            self.sink.finish();
+        } else {
+            self.sink.close();
+        }
         // **Listening is something a view does, not something it said.** One that finished speaking and
         // then takes nothing — alive, its side of the connection open, reading no more — has the thread
         // writing to it parked for as long as it likes. So what is waited for is the view taking what it
@@ -942,7 +1016,7 @@ fn carry_out_view(
                         height: read.height,
                         channels: read.channels,
                         total: read.total,
-                        offset,
+                        offset: offset.min(read.total),
                         bytes: read.bytes,
                     },
                 ),

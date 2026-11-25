@@ -706,10 +706,14 @@ fn a_proxy_whose_connections_are_all_let_go_of_without_a_word_gives_up_saying_wh
         .stderr(Stdio::piped())
         .spawn()
         .expect("the proxy starts");
+    // Keep stdin open across `process.wait()` — `Child::wait()` drops `process.stdin`, which would
+    // race the proxy's EOF handler (`ended && !spoke => Ok(())`) against the `LOOKS`-th disconnect.
+    let _stdin = process.stdin.take();
     for _ in 0..LOOKS {
         let_go(&reads);
     }
     let status = process.wait().expect("the proxy is waited for");
+    drop(_stdin);
     let mut why = String::new();
     process.stderr.take().expect("piped stderr").read_to_string(&mut why).expect("its errors read");
     assert!(!status.success() && why.contains(&format!("let {LOOKS} connections go")), "{status}: {why:?}");
@@ -937,4 +941,79 @@ fn ends_a_write_to_a_far_end_that_stopped_sending(ending: &str, end: fn(&Stream)
     let written = (&near).write_all(&vec![0u8; 8 << 20]);
     assert!(written.is_err(), "megabytes were written to a connection that had been {ending}");
     drop(far);
+}
+
+/// **`listening::listen` refuses to overwrite a non-socket file, and `private_directory` rejects
+/// symlinked directories.**
+#[cfg(unix)]
+#[test]
+fn listening_refuses_non_socket_file_and_symlink_directory() {
+    use apack_terminal::listening::{Refused, listen, private_directory};
+
+    let directory = tempfile::tempdir().expect("a tempdir");
+    let regular = directory.path().join("important.txt");
+    std::fs::write(&regular, b"do not delete").expect("written");
+    let refused = listen(regular.to_str().expect("utf-8")).expect_err("regular file refused");
+    assert!(matches!(refused, Refused::Unsafe(_)), "unexpected refusal: {refused}");
+    assert_eq!(std::fs::read(&regular).expect("still present"), b"do not delete");
+
+    let target = directory.path().join("real");
+    std::fs::create_dir(&target).expect("dir");
+    let link = directory.path().join("link");
+    std::os::unix::fs::symlink(&target, &link).expect("symlink");
+    let refused =
+        private_directory(link.join("broker.sock").to_str().expect("utf-8")).expect_err("symlink directory refused");
+    assert!(matches!(refused, Refused::Unsafe(_)), "unexpected refusal: {refused}");
+
+    // Non-directory parent (regular file) and nested ENOTDIR path are both refused cleanly.
+    let under_file = regular.join("broker.sock");
+    let refused = private_directory(under_file.to_str().expect("utf-8")).expect_err("non-dir parent refused");
+    assert!(matches!(refused, Refused::Unsafe(_)), "expected Unsafe refusal for non-dir parent, got: {refused}");
+    let nested_under_file = regular.join("sub").join("broker.sock");
+    let refused = private_directory(nested_under_file.to_str().expect("utf-8")).expect_err("ENOTDIR parent refused");
+    assert!(matches!(refused, Refused::Failed(_)), "expected Failed refusal for ENOTDIR parent, got: {refused}");
+    let refused = listen(under_file.to_str().expect("utf-8")).expect_err("ENOTDIR listen refused");
+    assert!(matches!(refused, Refused::Failed(_)), "expected Failed refusal for ENOTDIR listen, got: {refused}");
+}
+
+/// **A `Role::View` connection through `proxy` drains queued binary answers cleanly on stdin EOF
+/// instead of injecting JSON `{"kind":"done"}\n` into its binary frame stream.**
+#[test]
+fn proxy_view_drains_cleanly_on_stdin_eof() {
+    use std::io::BufRead;
+
+    use apack_terminal::view::wire::{Incoming, ToBroker, ToView, read_message};
+
+    let directory = tempfile::tempdir().expect("a tempdir");
+    let socket = socket_in(directory.path(), "broker.sock");
+    let _ending = crate::reaper::ending_with_the_case(&socket, env!("CARGO_BIN_EXE_apack-terminal"));
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_apack-terminal"));
+    command.arg("proxy").arg(&socket).stdin(Stdio::piped()).stdout(Stdio::piped());
+    let mut process = crate::reaper::spawn_contained(&mut command).expect("proxy starts");
+    let mut stdin = process.stdin.take().expect("stdin");
+    let stdout = process.stdout.take().expect("stdout");
+
+    let hello = Request::Hello { protocol: PROTOCOL_VERSION, role: Role::View, challenge: None };
+    writeln!(stdin, "{}", serde_json::to_string(&hello).expect("serializes")).expect("hello written");
+    let attach = ToBroker::Attach { channel: 1, session: "s-404".to_owned() }.encode();
+    stdin.write_all(&attach).expect("attach written");
+    stdin.flush().expect("flushed");
+    // Immediately close stdin (EOF) before reading responses: proxy must half-close rather than
+    // injecting JSON bytes that corrupt the binary view stream.
+    drop(stdin);
+
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("hello line");
+    let greeted: Event = serde_json::from_str(&line).expect("hello event");
+    assert!(matches!(greeted, Event::Hello { .. }), "unexpected greeting: {greeted:?}");
+
+    let frame = match read_message(&mut reader) {
+        Incoming::Message(body) => ToView::decode(&body).expect("valid ToView"),
+        other => panic!("expected ToView::Ended, got {other:?}"),
+    };
+    assert_eq!(frame, ToView::Ended { channel: 1 });
+    let status = process.wait().expect("proxy exits");
+    assert!(status.success(), "proxy exited with {status}");
 }
