@@ -150,7 +150,7 @@ export type ProgressState = "none" | "running" | "error" | "indeterminate" | "pa
 /**
  * What the app asks the broker to do.
  */
-export type Request = { "kind": "done" } | { "kind": "hello", protocol: number, role: Role, 
+export type Request = { "kind": "done" } | { "kind": "hello", protocol: number, role?: Role, 
 /**
  * **A question only the caller's own broker can answer**, asked before the caller says anything
  * else. A socket's or pipe's name says where a caller connected and not to whom: on Windows any
@@ -160,7 +160,7 @@ export type Request = { "kind": "done" } | { "kind": "hello", protocol: number, 
  * only if the answer's `proof` is that key's HMAC of it (`proof_of`). Another account has no key to
  * answer with. Absent, nothing is proved and `proof` is absent.
  */
-challenge: string | null, } | { "kind": "spawn", cols: number, rows: number, shell: string | null, 
+challenge?: string | null, } | { "kind": "spawn", cols: number, rows: number, shell: string | null, 
 /**
  * The shell's own launch arguments, in order. Empty starts it as the user would.
  */
@@ -184,32 +184,32 @@ unset: Array<string>, cwd: string | null,
  * question and draws nothing, so without this it answers with a palette nobody is looking at.
  * Absent leaves the terminal's own, which is what a caller with no window has.
  */
-colors: Colors | null, 
+colors?: Colors | null, 
 /**
  * **Whether the session's bytes are sent as `Output`.** A caller that reads a program's output —
  * to parse it, to forward it — wants them. A terminal a person looks at is drawn by a view, which
  * is sent rows, and its bytes would cross the socket to be thrown away; worse, they are bounded
  * by credit, so an unread stream would stall the program. Absent means sent, as it always was.
  */
-output: boolean, 
+output?: boolean, 
 /**
  * **A file to record the session in** (`recording`): what its program writes, so the screen can
  * be rebuilt after the session is gone and looked back through while it runs. Absent records
  * nothing, which is what a session is unless someone asks — a recording holds everything the
  * program printed, including what it printed once and erased.
  */
-record: string | null, 
+record?: string | null, 
 /**
  * Whether to begin with the screen `record` already holds, as a terminal reopened where its last
  * session left off. The recording carries on in the same file.
  */
-restore: boolean, 
+restore?: boolean, 
 /**
  * **Whether the session's programs may send images** (the Kitty graphics protocol). A program
  * asks the terminal whether it can before it sends one, so this is yes only for a session whose
  * views draw them; absent, a program is told no and prints what it would have otherwise.
  */
-images: boolean, 
+images?: boolean, 
 /**
  * **Whether an image may be named instead of sent**: as a file on this machine, or a shared
  * memory object, which the terminal then reads (the protocol's `t=f` and `t=s`). Only read where
@@ -220,7 +220,7 @@ images: boolean,
  * So yes is for a session started to run one program the caller trusts, and absent — a shell —
  * such an image is refused and its program told so, which is how one learns to send the bytes.
  */
-image_files: boolean, 
+image_files?: boolean, 
 /**
  * **What vouches for the shell's marks**: 32 lowercase hexadecimal characters the caller also
  * gave the shell, and nothing else (`markers::MarksKey`). A session spawned with one records a
@@ -233,7 +233,7 @@ image_files: boolean,
  * that shell can read the key and write any mark it likes; nothing here is a boundary against
  * one. A key that is not one is refused (`ErrorCode::Malformed`) rather than spawned without.
  */
-marks_key: string | null, } | { "kind": "write", session: string, text: string, } | { "kind": "resize", session: string, cols: number, rows: number, cell_width: number, cell_height: number, } | { "kind": "set_cursor_defaults", session: string, style: CursorStyle, blink: CursorBlink, } | { "kind": "pause", session: string, } | { "kind": "resume", session: string, } | { "kind": "signal", session: string, signal: Signal, scope: Scope, } | { "kind": "owns", session: string, pid: number, } | { "kind": "screen", session: string, history: number, } | { "kind": "facts", session: string, } | { "kind": "search", session: string, text: string, history: number, } | { "kind": "wait", session: string, until: Until, timeout_ms: number, } | { "kind": "commands", session: string, } | { "kind": "command_output", session: string, command: number, } | { "kind": "keep", session: string, kept: boolean, } | { "kind": "sessions" } | { "kind": "rewind", recording: string, cols: number, rows: number, } | { "kind": "seek", session: string, at: number, } | { "kind": "kill", session: string, };
+marks_key?: string | null, } | { "kind": "write", session: string, text: string, } | { "kind": "resize", session: string, cols: number, rows: number, cell_width?: number, cell_height?: number, } | { "kind": "set_cursor_defaults", session: string, style: CursorStyle, blink: CursorBlink, } | { "kind": "pause", session: string, } | { "kind": "resume", session: string, } | { "kind": "signal", session: string, signal: Signal, scope: Scope, } | { "kind": "owns", session: string, pid: number, } | { "kind": "screen", session: string, history: number, } | { "kind": "facts", session: string, } | { "kind": "search", session: string, text: string, history: number, } | { "kind": "wait", session: string, until: Until, timeout_ms: number, } | { "kind": "commands", session: string, } | { "kind": "command_output", session: string, command: number, } | { "kind": "keep", session: string, kept: boolean, } | { "kind": "sessions" } | { "kind": "rewind", recording: string, cols: number, rows: number, } | { "kind": "seek", session: string, at: number, } | { "kind": "kill", session: string, };
 
 /**
  * What a connection is for.

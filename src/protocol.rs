@@ -52,7 +52,7 @@ fn sent() -> bool {
 
 /// What the app asks the broker to do.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 #[ts(export, export_to = "protocol.d.ts")]
 pub enum Request {
     /// The caller has said all it will, and will send nothing more; what the broker still owes it is
@@ -69,6 +69,7 @@ pub enum Request {
     Hello {
         protocol: u32,
         #[serde(default)]
+        #[ts(optional = nullable)]
         role: Role,
         /// **A question only the caller's own broker can answer**, asked before the caller says anything
         /// else. A socket's or pipe's name says where a caller connected and not to whom: on Windows any
@@ -78,6 +79,7 @@ pub enum Request {
         /// only if the answer's `proof` is that key's HMAC of it (`proof_of`). Another account has no key to
         /// answer with. Absent, nothing is proved and `proof` is absent.
         #[serde(default)]
+        #[ts(optional = nullable)]
         challenge: Option<String>,
     },
     /// Start a shell in a pty. `shell` absent means the platform's default.
@@ -112,27 +114,32 @@ pub enum Request {
         /// question and draws nothing, so without this it answers with a palette nobody is looking at.
         /// Absent leaves the terminal's own, which is what a caller with no window has.
         #[serde(default)]
+        #[ts(optional = nullable)]
         colors: Option<Colors>,
         /// **Whether the session's bytes are sent as `Output`.** A caller that reads a program's output —
         /// to parse it, to forward it — wants them. A terminal a person looks at is drawn by a view, which
         /// is sent rows, and its bytes would cross the socket to be thrown away; worse, they are bounded
         /// by credit, so an unread stream would stall the program. Absent means sent, as it always was.
         #[serde(default = "sent")]
+        #[ts(optional = nullable)]
         output: bool,
         /// **A file to record the session in** (`recording`): what its program writes, so the screen can
         /// be rebuilt after the session is gone and looked back through while it runs. Absent records
         /// nothing, which is what a session is unless someone asks — a recording holds everything the
         /// program printed, including what it printed once and erased.
         #[serde(default)]
+        #[ts(optional = nullable)]
         record: Option<String>,
         /// Whether to begin with the screen `record` already holds, as a terminal reopened where its last
         /// session left off. The recording carries on in the same file.
         #[serde(default)]
+        #[ts(optional = nullable)]
         restore: bool,
         /// **Whether the session's programs may send images** (the Kitty graphics protocol). A program
         /// asks the terminal whether it can before it sends one, so this is yes only for a session whose
         /// views draw them; absent, a program is told no and prints what it would have otherwise.
         #[serde(default)]
+        #[ts(optional = nullable)]
         images: bool,
         /// **Whether an image may be named instead of sent**: as a file on this machine, or a shared
         /// memory object, which the terminal then reads (the protocol's `t=f` and `t=s`). Only read where
@@ -143,6 +150,7 @@ pub enum Request {
         /// So yes is for a session started to run one program the caller trusts, and absent — a shell —
         /// such an image is refused and its program told so, which is how one learns to send the bytes.
         #[serde(default)]
+        #[ts(optional = nullable)]
         image_files: bool,
         /// **What vouches for the shell's marks**: 32 lowercase hexadecimal characters the caller also
         /// gave the shell, and nothing else (`markers::MarksKey`). A session spawned with one records a
@@ -155,6 +163,7 @@ pub enum Request {
         /// that shell can read the key and write any mark it likes; nothing here is a boundary against
         /// one. A key that is not one is refused (`ErrorCode::Malformed`) rather than spawned without.
         #[serde(default)]
+        #[ts(optional = nullable)]
         marks_key: Option<String>,
     },
     /// Bytes the user typed.
@@ -171,8 +180,10 @@ pub enum Request {
         cols: u16,
         rows: u16,
         #[serde(default)]
+        #[ts(optional = nullable)]
         cell_width: u16,
         #[serde(default)]
+        #[ts(optional = nullable)]
         cell_height: u16,
     },
     /// **The cursor a session starts with and returns to when a program resets it (`CSI 0 q`)**, set from
@@ -333,6 +344,7 @@ pub enum CursorBlink {
 
 /// The colours a session is drawn in, each as red, green and blue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
 #[ts(export, export_to = "protocol.d.ts")]
 pub struct Colors {
     pub foreground: [u8; 3],
@@ -406,7 +418,7 @@ impl Signal {
 /// for a consumer that knows which of a tree's processes it means — the CLI's own pid, where the group
 /// would take the servers it is still tidying up with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 #[ts(export, export_to = "protocol.d.ts")]
 pub enum Scope {
     /// The process the broker started for this session.
@@ -426,7 +438,7 @@ pub enum Scope {
 
 /// What a `Wait` is waiting for.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 #[ts(export, export_to = "protocol.d.ts")]
 pub enum Until {
     /// No command is running: the shell has reported a prompt or a finish. **Needs shell integration** —
@@ -944,4 +956,32 @@ pub enum ErrorCode {
     /// This platform has no such operation — signals, on Windows. Distinct from a refusal by the OS: the
     /// request can never succeed here, however it is retried.
     Unsupported,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_and_nested_input_structs_reject_unknown_fields() {
+        let malformed = [
+            r#"{"kind":"hello","protocol":1,"extra":true}"#,
+            r#"{"kind":"resize","session":"s1","cols":80,"rows":24,"typo":1}"#,
+            r#"{"kind":"spawn","cols":80,"rows":24,"shell":null,"args":[],"env":[],"unset":[],"cwd":null,"colors":{"foreground":[0,0,0],"background":[0,0,0],"cursor":null,"ansi":[],"extra":1}}"#,
+            r#"{"kind":"signal","session":"s1","signal":"SIGTERM","scope":{"kind":"pid","pid":1,"extra":1}}"#,
+            r#"{"kind":"wait","session":"s1","until":{"kind":"text","text":"hi","extra":1},"timeout_ms":100}"#,
+        ];
+        for json in malformed {
+            let error = serde_json::from_str::<Request>(json)
+                .expect_err(&format!("expected unknown field to be rejected: {json}"));
+            assert!(error.to_string().contains("unknown field"), "unexpected error for {json}: {error}");
+        }
+
+        // Defaulted optional fields remain omitted-friendly.
+        let spawn: Request = serde_json::from_str(
+            r#"{"kind":"spawn","cols":80,"rows":24,"shell":null,"args":[],"env":[],"unset":[],"cwd":null}"#,
+        )
+        .expect("spawn with defaulted optional fields parses");
+        assert!(matches!(spawn, Request::Spawn { .. }));
+    }
 }
