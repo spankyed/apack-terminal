@@ -15,7 +15,10 @@ function rewriteDir(dir) {
     }
     if (!entry.name.endsWith('.d.ts')) continue
     const before = fs.readFileSync(full, 'utf8')
-    const after = before.replace(/((?:from|import)\s*['"]\.\.?\/[^'"]+?)\.ts(['"])/g, '$1.js$2')
+    const after = before.replace(/((?:from|import\s*\(?)\s*['"]\.\.?\/[^'"]+?)\.ts(['"])/g, '$1.js$2')
+    if (/['"]\.\.?\/[^'"]+?\.ts['"]/.test(after)) {
+      throw new Error(`rewrite-dts: leftover relative .ts specifier in ${path.relative(dist, full)}`)
+    }
     if (after !== before) {
       fs.writeFileSync(full, after, 'utf8')
     }
