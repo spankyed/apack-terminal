@@ -691,7 +691,7 @@ impl Terminal {
         // A cluster longer than the buffer is answered with its first code point, which is what this read
         // gave for every cell before it read clusters at all: degraded, never wrong about the cell's place
         if result != sys::Result::SUCCESS {
-            text.push(char::from_u32(self.cell_codepoint(cell)?).unwrap_or(' '));
+            text.push(char::from_u32(self.cell_codepoint(cell)?).filter(|&character| character != '\0').unwrap_or(' '));
             return Ok(());
         }
         let held = &codepoints[..written.min(codepoints.len())];

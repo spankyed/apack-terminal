@@ -127,7 +127,7 @@ pub struct Fit {
 /// picture narrower than its cells.
 pub fn fit(run: &Run, grid: (u32, u32), picture: (u32, u32), cell: (u32, u32)) -> Option<Fit> {
     let (cell_width, cell_height) = cell;
-    if cell_width.min(cell_height) == 0 {
+    if cell_width.min(cell_height) == 0 || picture.0.min(picture.1) == 0 {
         return None;
     }
     // A placement left to the picture's size takes as many cells as the picture needs
@@ -136,8 +136,8 @@ pub fn fit(run: &Run, grid: (u32, u32), picture: (u32, u32), cell: (u32, u32)) -
     let (columns, rows) = (u32::from(u16::try_from(columns).ok()?), u32::from(u16::try_from(rows).ok()?));
 
     let (picture_width, picture_height) = (f64::from(picture.0), f64::from(picture.1));
-    let grid_width = f64::from(columns * cell_width);
-    let grid_height = f64::from(rows * cell_height);
+    let grid_width = f64::from(columns) * f64::from(cell_width);
+    let grid_height = f64::from(rows) * f64::from(cell_height);
 
     // The scale that fits the picture in the grid, and the margin left on the side it does not fill
     let (scale, margin_x, margin_y) = if picture_width * grid_height > picture_height * grid_width {
@@ -159,7 +159,7 @@ pub fn fit(run: &Run, grid: (u32, u32), picture: (u32, u32), cell: (u32, u32)) -
     let mut source_y = padded_height * (f64::from(run.image_row) / f64::from(rows));
 
     let (mut offset_x, mut offset_y) = (0.0, 0.0);
-    let mut width = f64::from(u32::from(run.width) * cell_width);
+    let mut width = f64::from(run.width) * f64::from(cell_width);
     let mut height = f64::from(cell_height);
 
     // The margins hold no pixels, so a slice that begins in one begins where the picture does, and one

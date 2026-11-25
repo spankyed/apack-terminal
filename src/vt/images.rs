@@ -112,6 +112,10 @@ pub fn rgba_of_png(encoded: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
 /// pixel back, so that needs no second buffer either.
 fn decode_png_into<'a>(encoded: &[u8], allocate: impl FnOnce(usize) -> Option<&'a mut [u8]>) -> Option<(u32, u32)> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(encoded));
+    // Text and colour-profile chunks are never shown; skipping them avoids inflating compressed
+    // metadata (`zTXt`, `iTXt`, `iCCP`) up to the decoder's default 64 MiB limit on a small picture
+    decoder.set_ignore_text_chunk(true);
+    decoder.set_ignore_iccp_chunk(true);
     // A palette or a few bits a pixel widened to bytes, sixteen bits narrowed to eight, and an alpha
     // channel added where there is none: what is left is grey and alpha, or red green blue and alpha
     decoder.set_transformations(
@@ -209,14 +213,11 @@ unsafe extern "C" fn decode_png(
 pub(super) fn install_decoders() {
     static INSTALLED: std::sync::Once = std::sync::Once::new();
     INSTALLED.call_once(|| {
-        let decoder: sys::SysDecodePngFn = Some(decode_png);
-        // SAFETY: DECODE_PNG takes the function itself as its value, which a `SysDecodePngFn` holding one
-        // is. A build that does not know the option refuses it, and PNGs are then refused as before
+        let _: sys::SysDecodePngFn = Some(decode_png);
+        // SAFETY: DECODE_PNG takes the function pointer itself as its value, which `decode_png` matches.
+        // A build that does not know the option refuses it, and PNGs are then refused as before
         unsafe {
-            sys::ghostty_sys_set(
-                sys::SysOption::GHOSTTY_SYS_OPT_DECODE_PNG,
-                std::mem::transmute::<sys::SysDecodePngFn, *const std::ffi::c_void>(decoder),
-            );
+            sys::ghostty_sys_set(sys::SysOption::GHOSTTY_SYS_OPT_DECODE_PNG, decode_png as *const std::ffi::c_void);
         }
     });
 }

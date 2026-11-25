@@ -710,3 +710,28 @@ fn an_animated_png_whose_first_frame_is_part_of_the_picture_is_no_picture() {
     assert!(rgba_of_png(&animated(&grey, 4, 2)).is_some());
     assert_eq!(rgba_of_png(&animated(&grey, 2, 2)), None);
 }
+
+/// Inserts a custom PNG chunk immediately before the first `IDAT` chunk.
+fn with_chunk(encoded: &[u8], kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    let mut chunk = (data.len() as u32).to_be_bytes().to_vec();
+    chunk.extend_from_slice(kind);
+    chunk.extend_from_slice(data);
+    chunk.extend_from_slice(&crc32(&chunk[4..]).to_be_bytes());
+    let pixels = encoded.windows(4).position(|name| name == b"IDAT").expect("a PNG has pixels") - 4;
+    [&encoded[..pixels], &chunk, &encoded[pixels..]].concat()
+}
+
+/// **Compressed metadata chunks (`zTXt`, `iCCP`) are skipped rather than inflated**, so neither a
+/// malformed metadata chunk nor a compressed metadata bomb is decompressed when decoding a picture.
+#[test]
+fn a_png_ignores_text_and_iccp_chunks() {
+    use apack_terminal::vt::images::rgba_of_png;
+
+    let pixel = vec![10u8, 20, 30, 40];
+    let base = png_of(1, 1, png::ColorType::Rgba, png::BitDepth::Eight, &pixel);
+    let with_broken_ztxt = with_chunk(&base, b"zTXt", b"comment\0\xffnot-zlib");
+    let with_broken_iccp = with_chunk(&base, b"iCCP", b"profile\0\xffnot-zlib");
+
+    assert_eq!(rgba_of_png(&with_broken_ztxt), Some((1, 1, pixel.clone())));
+    assert_eq!(rgba_of_png(&with_broken_iccp), Some((1, 1, pixel)));
+}

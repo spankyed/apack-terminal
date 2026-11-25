@@ -52,7 +52,10 @@ fn final_path(handle: HANDLE) -> Option<String> {
     let mut wide = vec![0u16; LONGEST_PATH];
     // SAFETY: `wide` has room for `LONGEST_PATH` characters, and the handle is of an open file
     let written = unsafe { GetFinalPathNameByHandleW(handle, wide.as_mut_ptr(), LONGEST_PATH as u32, FINAL_PATH) };
-    let path = String::from_utf16(wide.get(..usize::try_from(written).ok()?)?).ok()?;
+    if written == 0 || written as usize >= LONGEST_PATH {
+        return None;
+    }
+    let path = String::from_utf16(wide.get(..written as usize)?).ok()?;
     Some(match path.strip_prefix(r"\\?\UNC\") {
         Some(share) => format!(r"\\{share}"),
         None => path.strip_prefix(r"\\?\").unwrap_or(&path).to_owned(),
