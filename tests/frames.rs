@@ -339,3 +339,12 @@ fn a_hello_without_a_role_is_a_client() {
         other => panic!("a hello without a role read as {}", kind_of(&other)),
     }
 }
+
+/// **A multi-byte UTF-8 character straddling `MAX_FRAME_BYTES` is reported as `TooLong`, not `Ended`.**
+#[test]
+fn multibyte_utf8_straddling_cap_is_too_long() {
+    let mut payload = vec![b'a'; MAX_FRAME_BYTES - 1];
+    // 3-byte UTF-8 character '日' crosses the MAX_FRAME_BYTES + 1 boundary
+    payload.extend_from_slice("日\n".as_bytes());
+    assert!(matches!(frame_of(&payload), Frame::TooLong(_)), "expected Frame::TooLong");
+}

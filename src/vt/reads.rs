@@ -213,17 +213,71 @@ impl Terminal {
             }
             result
         };
-        let mut kept = found
-            .iter()
-            .filter_map(|selection| self.cells_of(selection))
-            .filter(|&(start, end)| !case_sensitive || self.text_between(start, end).is_ok_and(|text| text == needle));
+        // SAFETY: freed once, with the terminal still live
+        unsafe { sys::ghostty_search_free(search) };
+        Failed::check("ghostty_search", result)?;
+        let mut formatter: sys::Formatter = std::ptr::null_mut();
+        if case_sensitive && !found.is_empty() {
+            // SAFETY: `formatter` is a valid out-pointer and `self` outlives it; freed below
+            Failed::check("ghostty_formatter_terminal_new", unsafe {
+                sys::ghostty_formatter_terminal_new(std::ptr::null(), &raw mut formatter, self.handle)
+            })?;
+            let unwrap = true;
+            // SAFETY: UNWRAP takes a `bool*` copied by the call
+            let set = unsafe {
+                sys::ghostty_formatter_set(formatter, sys::FormatterOption::UNWRAP, (&raw const unwrap).cast())
+            };
+            if let Err(error) = Failed::check("ghostty_formatter_set(UNWRAP)", set) {
+                // SAFETY: freed once on setup failure
+                unsafe { sys::ghostty_formatter_free(formatter) };
+                return Err(error);
+            }
+        }
+        let needle_bytes = needle.as_bytes();
+        let mut kept = found.iter().filter_map(|selection| {
+            if !formatter.is_null() && !selection_matches_exact(formatter, selection, needle_bytes) {
+                return None;
+            }
+            self.cells_of(selection)
+        });
         let matches: Vec<_> = kept.by_ref().take(SEARCH_MATCHES).collect();
         // Older ones there are, where one more was kept than is answered; older ones there may be, where
         // the search stopped before the oldest line
         let more = !complete || kept.next().is_some();
-        // SAFETY: freed once, with the terminal still live
-        unsafe { sys::ghostty_search_free(search) };
-        Failed::check("ghostty_search", result)?;
+        // SAFETY: freed once; `ghostty_formatter_free` accepts a null pointer
+        unsafe { sys::ghostty_formatter_free(formatter) };
         Ok(Found { matches, more })
     }
+}
+
+/// Checks whether `selection` formats to `needle` verbatim using a reused unwrapped formatter.
+fn selection_matches_exact(formatter: sys::Formatter, selection: &sys::Selection, needle: &[u8]) -> bool {
+    let mut text: *mut u8 = std::ptr::null_mut();
+    let mut length: usize = 0;
+    // SAFETY: SELECTION takes a `GhosttySelection*`; `text` and `length` are valid out-pointers
+    // and the allocated buffer is freed below with the same null allocator
+    let result = unsafe {
+        let mut result = sys::ghostty_formatter_set(
+            formatter,
+            sys::FormatterOption::SELECTION,
+            std::ptr::from_ref(selection).cast(),
+        );
+        if result == sys::Result::SUCCESS {
+            result = sys::ghostty_formatter_format_alloc(formatter, std::ptr::null(), &raw mut text, &raw mut length);
+        }
+        result
+    };
+    let exact = match NonNull::new(text).filter(|_| result == sys::Result::SUCCESS) {
+        None => needle.is_empty(),
+        Some(ptr) => {
+            // SAFETY: the library wrote `length` bytes at `ptr`
+            let bytes = unsafe { std::slice::from_raw_parts(ptr.as_ptr(), length) };
+            bytes == needle
+        }
+    };
+    // SAFETY: freed once; `ghostty_free` accepts a null buffer
+    unsafe {
+        sys::ghostty_free(std::ptr::null(), text, length);
+    }
+    exact
 }

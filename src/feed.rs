@@ -92,7 +92,7 @@ impl Feed {
             message.written();
             return false;
         }
-        if queue.bytes + size > self.limit {
+        if queue.bytes.saturating_add(size) > self.limit {
             let dropped = close(&mut queue);
             drop(queue);
             self.changed.notify_all();

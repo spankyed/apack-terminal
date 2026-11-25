@@ -74,6 +74,7 @@ pub struct RowRead {
     style_at: StyleIndex,
     /// Each distinct link on the row, in the order they first appear
     links: Vec<String>,
+    link_at: LinkIndex,
     /// The runs of placeholder cells on the row, as the cells say them, left to right
     runs: Vec<Run>,
     /// What those runs show, for the ones that show anything, and the cell they are measured in
@@ -126,6 +127,7 @@ impl RowRead {
         self.styles.clear();
         self.style_at.0.clear();
         self.links.clear();
+        self.link_at.clear();
         self.runs.clear();
         self.pieces.clear();
         self.cell = (0, 0);
@@ -170,15 +172,13 @@ impl RowRead {
     /// The index of `link` in this row's table, added if it is new — or `0`, no link, when the row's
     /// links already come to `ROW_LINK_BYTES` and this one would be more.
     fn link_index(&mut self, link: &[u8]) -> u16 {
-        if let Some(found) = self.links.iter().rposition(|held| held.as_bytes() == link) {
-            return u16::try_from(found + 1).unwrap_or(0);
-        }
-        let held: usize = self.links.iter().map(String::len).sum();
-        if held + link.len() > ROW_LINK_BYTES {
-            return 0;
-        }
-        self.links.push(String::from_utf8_lossy(link).into_owned());
-        u16::try_from(self.links.len()).unwrap_or(0)
+        let text = String::from_utf8_lossy(link);
+        let found = match self.link_at.find(&self.links, &text) {
+            Some(found) => found,
+            None if !self.link_at.can_fit(text.len()) => return 0,
+            None => self.link_at.insert(&mut self.links, text.into_owned()),
+        };
+        u16::try_from(found + 1).unwrap_or(0)
     }
 }
 
@@ -596,6 +596,9 @@ impl Terminal {
             sys::Result::SUCCESS => read.link_index(&short[..written.min(short.len())]),
             // Too long for the buffer, and `written` is how long it is
             sys::Result::OUT_OF_SPACE => {
+                if !fits_row_link_budget(written) {
+                    return 0;
+                }
                 let mut long = vec![0u8; written];
                 // SAFETY: as above
                 let result = unsafe {
@@ -666,7 +669,13 @@ impl Mark {
     /// (`Terminal::restore`) is on no row and cannot be moved to one of another terminal's, so it is made
     /// again on this one.
     pub fn reset(&mut self, terminal: &Terminal) -> Result<(), Failed> {
-        // SAFETY: both handles are live
+        // A mark whose row was evicted or whose originating terminal was freed/restored has no
+        // current cell; recreate it directly rather than calling `set` across terminals.
+        if self.screen_cell().is_none() {
+            *self = Self::at_active_top(terminal)?;
+            return Ok(());
+        }
+        // SAFETY: both handles are live and the mark is still attached to a live row
         let result = unsafe { sys::ghostty_tracked_grid_ref_set(self.handle, terminal.handle, active(0, 0)) };
         if result != sys::Result::SUCCESS {
             *self = Self::at_active_top(terminal)?;
@@ -970,5 +979,70 @@ impl Drop for Rendering {
             sys::ghostty_render_state_row_iterator_free(self.rows);
             sys::ghostty_render_state_free(self.handle);
         }
+    }
+}
+
+/// Where each link in a row's table is, and the total UTF-8 bytes of all links held; derived from
+/// `RowRead::links`, so any two compare equal.
+#[derive(Debug, Clone, Default)]
+struct LinkIndex {
+    at: std::collections::HashMap<String, usize>,
+    bytes: usize,
+}
+
+impl LinkIndex {
+    fn clear(&mut self) {
+        self.at.clear();
+        self.bytes = 0;
+    }
+
+    fn find(&self, links: &[String], text: &str) -> Option<usize> {
+        if links.last().is_some_and(|last| last.as_str() == text) {
+            return Some(links.len() - 1);
+        }
+        self.at.get(text).copied()
+    }
+
+    fn can_fit(&self, len: usize) -> bool {
+        self.bytes.saturating_add(len) <= ROW_LINK_BYTES
+    }
+
+    fn insert(&mut self, links: &mut Vec<String>, owned: String) -> usize {
+        let next = links.len();
+        self.bytes += owned.len();
+        self.at.insert(owned.clone(), next);
+        links.push(owned);
+        next
+    }
+}
+
+impl PartialEq for LinkIndex {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for LinkIndex {}
+
+fn fits_row_link_budget(bytes: usize) -> bool {
+    bytes <= ROW_LINK_BYTES
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn row_link_budget_boundary_and_long_link_read() {
+        assert!(fits_row_link_budget(ROW_LINK_BYTES));
+        assert!(!fits_row_link_budget(ROW_LINK_BYTES + 1));
+
+        // Link longer than the 256-byte stack buffer exercises OUT_OF_SPACE in `read_link`.
+        let uri = format!("https://example.com/{}", "a".repeat(300));
+        let mut terminal = Terminal::new(20, 2).expect("terminal");
+        terminal.feed(format!("\x1b]8;;{uri}\x1b\\x\x1b]8;;\x1b\\").as_bytes());
+        let row = terminal.read_row(Space::Active, 0).expect("reads").expect("row");
+        let first = row.cells().next().expect("cell");
+        assert_eq!(first.link, Some(uri.as_str()));
     }
 }

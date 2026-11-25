@@ -257,5 +257,35 @@ describe('what a view cannot say', () => {
     expect(() => encodeToBroker({ kind: 'acknowledge', channel: 1, sequence: -1 })).toThrow(RangeError)
     expect(() => encodeToBroker({ kind: 'acknowledge', channel: 1, sequence: 2 ** 60 })).toThrow(RangeError)
     expect(() => encodeToBroker({ kind: 'acknowledge', channel: 1.5, sequence: 1 })).toThrow(RangeError)
+    expect(() => encodeToBroker({ kind: 'detach', channel: 0x1_0000_0000 })).toThrow(RangeError)
+    expect(() => encodeToBroker({
+      kind: 'pointer', channel: 1, action: 'press', button: 0, modifiers: 0,
+      x: Number.NaN, y: 1, cellWidth: 10, cellHeight: 20,
+    })).toThrow(RangeError)
+    expect(() => encodeToBroker({
+      kind: 'pointer', channel: 1, action: 'press', button: 255, modifiers: 0,
+      x: 1, y: 1, cellWidth: 10, cellHeight: 20,
+    })).toThrow(RangeError)
+    expect(() => encodeToBroker({
+      kind: 'wordAt', channel: 1, request: 1, epoch: 1, at: { line: 0, column: 0x1_0000 },
+    })).toThrow(RangeError)
+  })
+
+  it('decodes column 65535 and rejects zero-width complex glyphs and u16/u32 overflows', () => {
+    // Simple run at column 65535 (LEB128: 0xff, 0xff, 0x03) with 1 char 'x'
+    const col65535 = Uint8Array.of(66, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 0xff, 0xff, 0x03, 0, 0, 0, 1, 0x78)
+    expect(decodeToView(col65535)).toMatchObject({ rows: { rows: [{ column: Uint16Array.of(65535), text: ['x'] }] } })
+
+    // Simple run at column 65535 with 2 chars overflows u16
+    const overflowCol = Uint8Array.of(66, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 0xff, 0xff, 0x03, 0, 0, 0, 2, 0x78, 0x79)
+    expect(() => decodeToView(overflowCol)).toThrow(Malformed)
+
+    // Complex run with width 0 is rejected
+    const zeroWidth = Uint8Array.of(66, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 1, 0x61)
+    expect(() => decodeToView(zeroWidth)).toThrow(Malformed)
+
+    // Channel past u32::MAX (0x1_0000_0000 in LEB128: 0x80, 0x80, 0x80, 0x80, 0x10)
+    const hugeChannel = Uint8Array.of(67, 0x80, 0x80, 0x80, 0x80, 0x10)
+    expect(() => decodeToView(hugeChannel)).toThrow(Malformed)
   })
 })

@@ -153,3 +153,23 @@ fn a_session_is_not_compressed_until_it_has_been_left_alone() {
     let left_alone_for = written.elapsed();
     assert!(left_alone_for >= quiet_for * 2, "compressed {left_alone_for:?} after it was written to");
 }
+
+/// **A session whose lock is held does not block housekeeping from compressing another quiet session.**
+#[test]
+fn a_locked_session_does_not_block_other_quiet_sessions() {
+    let quiet_for = Duration::from_millis(80);
+    let (compressed, said) = channel();
+    let housekeeping = Housekeeping::start_with(quiet_for, Some(compressed));
+
+    let locked = Arc::new(Mutex::new(Screen::new(80, 24)));
+    locked.lock().expect("locks").feed(&lines(2_000));
+    let other = Arc::new(Mutex::new(Screen::new(80, 24)));
+    other.lock().expect("locks").feed(&lines(2_000));
+
+    // Hold `locked` across the entire wait for `other` to compress
+    let _guard = locked.lock().expect("holds lock");
+    housekeeping.for_session("locked", &locked).wrote();
+    housekeeping.for_session("other", &other).wrote();
+
+    assert_eq!(said.recv_timeout(PATIENCE).as_deref(), Ok("other"));
+}

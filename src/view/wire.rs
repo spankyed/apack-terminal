@@ -1141,7 +1141,11 @@ impl<'a> Reader<'a> {
 
     fn float(&mut self) -> Result<f32, Malformed> {
         let bytes = self.take(4)?;
-        Ok(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        let value = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        if !value.is_finite() {
+            return Err(Malformed::Value("a float"));
+        }
+        Ok(value)
     }
 
     fn text(&mut self) -> Result<String, Malformed> {
@@ -1249,7 +1253,7 @@ impl<'a> Reader<'a> {
         }
         let mut glyphs = Vec::new();
         for _ in 0..self.count()? {
-            let mut column = self.u16()?;
+            let mut column = u32::from(self.u16()?);
             let style = self.u16()?;
             let link = self.u16()?;
             if usize::from(style) > styles.len() {
@@ -1261,16 +1265,21 @@ impl<'a> Reader<'a> {
             match self.byte()? {
                 0 => {
                     for character in self.text()?.chars() {
-                        glyphs.push(Glyph { column, width: 1, text: character.to_string(), style, link });
-                        column = column.checked_add(1).ok_or(Malformed::Overflow)?;
+                        let col = u16::try_from(column).map_err(|_| Malformed::Overflow)?;
+                        glyphs.push(Glyph { column: col, width: 1, text: character.to_string(), style, link });
+                        column += 1;
                     }
                 }
                 1 => {
                     for _ in 0..self.count()? {
                         let width = self.byte()?;
+                        if width == 0 {
+                            return Err(Malformed::Value("a glyph's width"));
+                        }
                         let text = self.text()?;
-                        glyphs.push(Glyph { column, width, text, style, link });
-                        column = column.checked_add(u16::from(width)).ok_or(Malformed::Overflow)?;
+                        let col = u16::try_from(column).map_err(|_| Malformed::Overflow)?;
+                        glyphs.push(Glyph { column: col, width, text, style, link });
+                        column += u32::from(width);
                     }
                 }
                 _ => return Err(Malformed::Value("a run's kind")),
@@ -1479,26 +1488,40 @@ impl ToBroker {
                 first: read.number()?,
                 count: read.u32()?,
             },
-            kind::KEY => Self::Key {
-                channel: read.u32()?,
-                action: read.byte()?,
-                modifiers: read.u16()?,
-                code: read.text()?,
-                text: read.text()?,
-                unshifted: read.u32()?,
-                composed: read.flag()?,
-            },
+            kind::KEY => {
+                let channel = read.u32()?;
+                let action = read.byte()?;
+                if action > 2 {
+                    return Err(Malformed::Value("a key's action"));
+                }
+                Self::Key {
+                    channel,
+                    action,
+                    modifiers: read.u16()?,
+                    code: read.text()?,
+                    text: read.text()?,
+                    unshifted: read.u32()?,
+                    composed: read.flag()?,
+                }
+            }
             kind::TEXT_INPUT => Self::Text { channel: read.u32()?, text: read.text()? },
-            kind::POINTER => Self::Pointer {
-                channel: read.u32()?,
-                action: read.byte()?,
-                button: read.byte()?,
-                modifiers: read.u16()?,
-                x: read.float()?,
-                y: read.float()?,
-                cell_width: read.float()?,
-                cell_height: read.float()?,
-            },
+            kind::POINTER => {
+                let channel = read.u32()?;
+                let action = read.byte()?;
+                if action > 4 {
+                    return Err(Malformed::Value("a pointer's action"));
+                }
+                Self::Pointer {
+                    channel,
+                    action,
+                    button: read.byte()?,
+                    modifiers: read.u16()?,
+                    x: read.float()?,
+                    y: read.float()?,
+                    cell_width: read.float()?,
+                    cell_height: read.float()?,
+                }
+            }
             kind::PASTE => Self::Paste {
                 channel: read.u32()?,
                 request: read.u32()?,
@@ -1675,10 +1698,16 @@ impl ToView {
                     return Err(Malformed::Value("a frame's flags"));
                 }
                 let cursor = if flags & FRAME_CURSOR != 0 {
+                    let column = read.u16()?;
+                    let row = read.u16()?;
+                    let shape = read.byte()?;
+                    if shape > 3 {
+                        return Err(Malformed::Value("a cursor's shape"));
+                    }
                     Some(Cursor {
-                        column: read.u16()?,
-                        row: read.u16()?,
-                        shape: read.byte()?,
+                        column,
+                        row,
+                        shape,
                         blinking: flags & FRAME_BLINKING != 0,
                         hidden: flags & FRAME_HIDDEN != 0,
                     })
@@ -1765,7 +1794,15 @@ impl ToView {
                 block: read.block()?,
             },
             kind::ENDED => Self::Ended { channel: read.u32()? },
-            kind::PASTED => Self::Pasted { channel: read.u32()?, request: read.u32()?, outcome: read.byte()? },
+            kind::PASTED => {
+                let channel = read.u32()?;
+                let request = read.u32()?;
+                let outcome = read.byte()?;
+                if outcome > 1 {
+                    return Err(Malformed::Value("a paste's outcome"));
+                }
+                Self::Pasted { channel, request, outcome }
+            }
             kind::SPAN => {
                 let (channel, request, epoch) = (read.u32()?, read.u32()?, read.u32()?);
                 let span = if read.flag()? { Some(read.span()?) } else { None };

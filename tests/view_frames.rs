@@ -1920,3 +1920,56 @@ fn a_question_that_waited_for_one_screens_hold_does_not_keep_anothers_from_endin
     drop(finish);
     drop((slow, other));
 }
+
+/// **A viewer whose connection has already closed does not overwrite `Publication::shown` with an
+/// undelivered mid-hold frame.**
+#[test]
+fn a_disconnected_view_attaching_during_a_hold_does_not_overwrite_shown_rows() {
+    let mut screen = Screen::new(20, 3);
+    write(&mut screen, "old text");
+    let first_view = View::attached(&mut screen, 1, 1);
+    let first = first_view.frame();
+    let epoch = first.epoch;
+    screen.acknowledge(first_view.id, first.sequence).expect("an acknowledgement is taken");
+
+    write(&mut screen, "\x1b[?2026h\x1b[1;1Hhalf-drawn");
+    let (dead_sink, dead_rx) = channel();
+    drop(dead_rx);
+    screen.attach_view(ViewId { connection: 2, channel: 1 }, dead_sink).expect("attaches");
+
+    let fetched = screen.fetch(epoch, 0, 1).expect("a fetch reads");
+    let rows = fetched.rows.block().expect("the rows read back").rows.iter().map(text).collect::<Vec<_>>();
+    assert_eq!(rows, vec!["old text".to_owned()], "failed delivery must not overwrite settled shown rows");
+
+    write(&mut screen, "\x1b[?2026l");
+    let fetched = screen.fetch(epoch, 0, 1).expect("a fetch reads");
+    let rows = fetched.rows.block().expect("the rows read back").rows.iter().map(text).collect::<Vec<_>>();
+    assert_eq!(rows, vec!["half-drawn".to_owned()]);
+}
+
+/// **Changing cell pixel metrics while anchored images exist re-publishes anchored image geometry**
+/// even when the terminal's grid dimensions stay the same.
+#[test]
+fn cell_pixel_resize_republishes_anchored_images() {
+    let mut screen = Screen::new(20, 5);
+    screen.allow_images(false).expect("images allowed");
+    screen.resize(20, 5, 8, 16);
+    // Parent placement (i=1, p=1) and child placement anchored relative to it (P=1, Q=1).
+    let rgb = "/wAA"; // base64 of [255, 0, 0]
+    write(&mut screen, &format!("\x1b_Ga=T,f=24,s=1,v=1,i=1,p=1,q=2;{rgb}\x1b\\"));
+    write(&mut screen, &format!("\x1b_Ga=T,f=24,s=1,v=1,i=2,p=2,P=1,Q=1,H=1,V=0,q=2;{rgb}\x1b\\"));
+
+    let view = View::attached(&mut screen, 1, 1);
+    let first = view.frame();
+    let anchored = first.anchored.as_ref().expect("initial frame carries anchored images");
+    assert_eq!(anchored.cell, (8, 16));
+    assert_eq!(anchored.list.len(), 1);
+    screen.acknowledge(view.id, first.sequence).expect("ack");
+
+    // Change only cell pixel dimensions (grid cols/rows unchanged).
+    screen.resize(20, 5, 10, 20);
+    let updated = view.frame();
+    let anchored = updated.anchored.as_ref().expect("cell pixel change must re-publish anchored geometry");
+    assert_eq!(anchored.cell, (10, 20));
+    assert_eq!(anchored.list.len(), 1);
+}

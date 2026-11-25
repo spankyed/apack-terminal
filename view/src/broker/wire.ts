@@ -136,6 +136,9 @@ class Writer {
   }
 
   byte(value: number): void {
+    if (!Number.isInteger(value) || value < 0 || value > 0xff) {
+      throw new RangeError(`${value} is not a byte a message can carry`)
+    }
     this.room(1)
     this.bytes[this.length++] = value
   }
@@ -156,7 +159,22 @@ class Writer {
     }
   }
 
+  u16(value: number): void {
+    if (!Number.isInteger(value) || value < 0 || value > 0xffff) {
+      throw new RangeError(`${value} does not fit a u16 field`)
+    }
+    this.number(value)
+  }
+
+  u32(value: number): void {
+    if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) {
+      throw new RangeError(`${value} does not fit a u32 field`)
+    }
+    this.number(value)
+  }
+
   float(value: number): void {
+    if (!Number.isFinite(value)) throw new RangeError(`${value} is not a finite float`)
     this.room(4)
     new DataView(this.bytes.buffer).setFloat32(this.length, value, true)
     this.length += 4
@@ -174,7 +192,7 @@ class Writer {
 
   position(at: Position): void {
     this.number(at.line)
-    this.number(at.column)
+    this.u16(at.column)
   }
 
   /** The message with its length in front, or `TooLarge`: the broker ends a stream that sends one */
@@ -188,7 +206,7 @@ class Writer {
 /** A message for the broker, with its length in front. Throws `TooLarge` for one past `MAX_MESSAGE_BYTES` */
 export function encodeToBroker(message: ToBroker): Uint8Array {
   const out = new Writer(KIND[message.kind])
-  out.number(message.channel)
+  out.u32(message.channel)
   switch (message.kind) {
     case 'attach':
       out.text(message.session)
@@ -199,33 +217,42 @@ export function encodeToBroker(message: ToBroker): Uint8Array {
       out.number(message.sequence)
       break
     case 'fetch':
-      out.number(message.request)
-      out.number(message.epoch)
+      out.u32(message.request)
+      out.u32(message.epoch)
       out.number(message.first)
-      out.number(message.count)
+      out.u32(message.count)
       break
-    case 'key':
-      out.byte(KEY_ACTIONS.indexOf(message.action))
-      out.number(message.modifiers)
+    case 'key': {
+      const action = KEY_ACTIONS.indexOf(message.action)
+      if (action < 0) throw new RangeError(`unknown key action: ${String(message.action)}`)
+      out.byte(action)
+      out.u16(message.modifiers)
       out.text(message.code)
       out.text(message.text)
-      out.number(message.unshifted)
+      out.u32(message.unshifted)
       out.flag(message.composed)
       break
+    }
     case 'text':
       out.text(message.text)
       break
-    case 'pointer':
-      out.byte(POINTER_ACTIONS.indexOf(message.action))
+    case 'pointer': {
+      const action = POINTER_ACTIONS.indexOf(message.action)
+      if (action < 0) throw new RangeError(`unknown pointer action: ${String(message.action)}`)
+      out.byte(action)
+      if (!Number.isInteger(message.button) || message.button < -1 || message.button > 254) {
+        throw new RangeError(`invalid pointer button: ${message.button}`)
+      }
       out.byte(message.button < 0 ? NO_BUTTON : message.button)
-      out.number(message.modifiers)
+      out.u16(message.modifiers)
       out.float(message.x)
       out.float(message.y)
       out.float(message.cellWidth)
       out.float(message.cellHeight)
       break
+    }
     case 'paste':
-      out.number(message.request)
+      out.u32(message.request)
       out.flag(message.allowUnsafe)
       out.text(message.text)
       break
@@ -234,29 +261,29 @@ export function encodeToBroker(message: ToBroker): Uint8Array {
       break
     case 'wordAt':
     case 'lineAt':
-      out.number(message.request)
-      out.number(message.epoch)
+      out.u32(message.request)
+      out.u32(message.epoch)
       out.position(message.at)
       break
     case 'textOf':
-      out.number(message.request)
-      out.number(message.epoch)
+      out.u32(message.request)
+      out.u32(message.epoch)
       out.position(message.span.start)
       out.position(message.span.end)
       break
     case 'search':
-      out.number(message.request)
+      out.u32(message.request)
       out.text(message.needle)
       out.flag(message.caseSensitive)
       break
     case 'commands':
     case 'images':
-      out.number(message.request)
+      out.u32(message.request)
       break
     case 'image':
-      out.number(message.request)
-      out.number(message.image)
-      out.number(message.offset)
+      out.u32(message.request)
+      out.u32(message.image)
+      out.u32(message.offset)
       break
   }
   return out.finish()
@@ -301,6 +328,18 @@ class Reader {
     throw new Malformed('an integer did not fit its field')
   }
 
+  u16(): number {
+    const value = this.number()
+    if (value > 0xffff) throw new Malformed('an integer did not fit its field')
+    return value
+  }
+
+  u32(): number {
+    const value = this.number()
+    if (value > 0xffffffff) throw new Malformed('an integer did not fit its field')
+    return value
+  }
+
   /** A count of things that each take at least a byte, refused before anything is made for it */
   count(): number {
     const count = this.number()
@@ -318,7 +357,7 @@ class Reader {
   }
 
   position(): Position {
-    return { line: this.number(), column: this.number() }
+    return { line: this.number(), column: this.u16() }
   }
 
   span(): Span {
@@ -364,16 +403,16 @@ class Reader {
 
   /** The images a frame says are placed relative to another: the cell they are measured in, and each */
   anchored(): AnchoredImages {
-    const cellWidth = this.number()
-    const cellHeight = this.number()
-    const omitted = this.number()
+    const cellWidth = this.u16()
+    const cellHeight = this.u16()
+    const omitted = this.u32()
     const list: Anchored[] = []
     for (let more = this.count(); more > 0; more -= 1) {
       list.push({
-        image: this.number(), generation: this.number(), z: this.status(), row: this.status(), column: this.status(),
-        columns: this.number(), rows: this.number(),
-        offsetX: this.number(), offsetY: this.number(), width: this.number(), height: this.number(),
-        sourceX: this.number(), sourceY: this.number(), sourceWidth: this.number(), sourceHeight: this.number(),
+        image: this.u32(), generation: this.number(), z: this.status(), row: this.status(), column: this.status(),
+        columns: this.u32(), rows: this.u32(),
+        offsetX: this.u32(), offsetY: this.u32(), width: this.u32(), height: this.u32(),
+        sourceX: this.u32(), sourceY: this.u32(), sourceWidth: this.u32(), sourceHeight: this.u32(),
       })
     }
     return { cellWidth, cellHeight, omitted, list }
@@ -381,8 +420,7 @@ class Reader {
 
   /** A number that may be below zero. Zigzag, as the broker writes it: the low bit is the sign */
   status(): number {
-    const zigzag = this.number()
-    if (zigzag > 0xffffffff) throw new Malformed('an integer did not fit its field')
+    const zigzag = this.u32()
     return zigzag % 2 === 0 ? zigzag / 2 : -(zigzag + 1) / 2
   }
 
@@ -438,7 +476,7 @@ class Reader {
     // front, so an index is where the thing is
     const styles: Style[] = [PLAIN]
     for (let more = this.count(); more > 0; more -= 1) {
-      styles.push({ fg: this.color(), bg: this.color(), underlineColor: this.color(), flags: this.number() })
+      styles.push({ fg: this.color(), bg: this.color(), underlineColor: this.color(), flags: this.u16() })
     }
     const links: string[] = ['']
     for (let more = this.count(); more > 0; more -= 1) links.push(this.text())
@@ -448,12 +486,13 @@ class Reader {
     const style: number[] = []
     const link: number[] = []
     for (let runs = this.count(); runs > 0; runs -= 1) {
-      let column = this.number()
-      const runStyle = this.number()
-      const runLink = this.number()
+      let column = this.u16()
+      const runStyle = this.u16()
+      const runLink = this.u16()
       if (runStyle >= styles.length) throw new Malformed("a style's index is outside its row's")
       if (runLink >= links.length) throw new Malformed("a link's index is outside its row's")
       const push = (character: string, width: number) => {
+        if (column > 0xffff) throw new Malformed('an integer did not fit its field')
         characters.push(character)
         columns.push(column)
         widths.push(width)
@@ -468,26 +507,26 @@ class Reader {
         case 1:
           for (let more = this.count(); more > 0; more -= 1) {
             const width = this.byte()
+            if (width === 0) throw new Malformed("a glyph's width is outside what the format defines")
             push(this.text(), width)
           }
           break
         default:
           throw new Malformed("a run's kind is outside what the format defines")
       }
-      if (column > 0xffff) throw new Malformed('an integer did not fit its field')
     }
     // For a row its flags say holds placeholder cells: the cell what they show is measured in, how many
     // pieces that is, and each
     let images: RowImages | undefined
     if (flags & 4) {
-      const cellWidth = this.number()
-      const cellHeight = this.number()
+      const cellWidth = this.u16()
+      const cellHeight = this.u16()
       const pieces: Piece[] = []
       for (let more = this.count(); more > 0; more -= 1) {
         pieces.push({
-          image: this.number(), generation: this.number(), column: this.number(), columns: this.number(),
-          offsetX: this.number(), offsetY: this.number(), width: this.number(), height: this.number(),
-          sourceX: this.number(), sourceY: this.number(), sourceWidth: this.number(), sourceHeight: this.number(),
+          image: this.u32(), generation: this.number(), column: this.u16(), columns: this.u16(),
+          offsetX: this.u32(), offsetY: this.u32(), width: this.u32(), height: this.u32(),
+          sourceX: this.u32(), sourceY: this.u32(), sourceWidth: this.u32(), sourceHeight: this.u32(),
         })
       }
       images = { cellWidth, cellHeight, pieces }
@@ -517,26 +556,26 @@ class Reader {
 export function decodeToView(body: Uint8Array): ToView {
   const read = new Reader(body)
   const kind = read.byte()
-  const channel = read.number()
+  const channel = read.u32()
   switch (kind) {
     case FRAME: {
       const sequence = read.number()
-      const epoch = read.number()
+      const epoch = read.u32()
       const firstActive = read.number()
-      const columns = read.number()
-      const screenRows = read.number()
-      const scrollback = read.number()
-      const commands = read.number()
-      const images = read.number()
-      const flags = read.number()
+      const columns = read.u16()
+      const screenRows = read.u16()
+      const scrollback = read.u32()
+      const commands = read.u32()
+      const images = read.u32()
+      const flags = read.u16()
       // Blinking and hidden are said of a cursor, and of nothing when there is none
       if (flags >= FRAME_FLAGS || (!(flags & FRAME_CURSOR) && flags & (FRAME_BLINKING | FRAME_HIDDEN))) {
         throw new Malformed("a frame's flags are outside what the format defines")
       }
       let cursor: Cursor | null = null
       if (flags & FRAME_CURSOR) {
-        const column = read.number()
-        const row = read.number()
+        const column = read.u16()
+        const row = read.u16()
         const shape = CURSOR_SHAPES[read.byte()]
         if (shape === undefined) throw new Malformed("a cursor's shape is outside what the format defines")
         cursor = { column, row, shape, blinking: (flags & FRAME_BLINKING) !== 0, hidden: (flags & FRAME_HIDDEN) !== 0 }
@@ -556,79 +595,78 @@ export function decodeToView(body: Uint8Array): ToView {
       return read.finish({ kind: 'frame', channel, frame })
     }
     case ROWS: {
-      const request = read.number()
-      const epoch = read.number()
+      const request = read.u32()
+      const epoch = read.u32()
       const first = read.number()
-      const count = read.number()
+      const count = read.u32()
       return read.finish({ kind: 'rows', channel, request, epoch, first, count, rows: read.rows() })
     }
     case ENDED:
       return read.finish({ kind: 'ended', channel })
     case PASTED: {
-      const request = read.number()
+      const request = read.u32()
       const outcome = (['pasted', 'unsafe'] as const)[read.byte()]
       if (outcome === undefined) throw new Malformed("a paste's outcome is outside what the format defines")
       return read.finish({ kind: 'pasted', channel, request, outcome })
     }
     case SPAN: {
-      const request = read.number()
-      const epoch = read.number()
+      const request = read.u32()
+      const epoch = read.u32()
       return read.finish({ kind: 'span', channel, request, epoch, span: read.flag() ? read.span() : null })
     }
     case TEXT: {
-      const request = read.number()
-      const epoch = read.number()
+      const request = read.u32()
+      const epoch = read.u32()
       return read.finish({ kind: 'text', channel, request, epoch, text: read.text() })
     }
     case SPANS: {
-      const request = read.number()
-      const epoch = read.number()
+      const request = read.u32()
+      const epoch = read.u32()
       const more = read.flag()
       const spans: Span[] = []
       for (let left = read.count(); left > 0; left -= 1) spans.push(read.span())
       return read.finish({ kind: 'spans', channel, request, epoch, more, spans })
     }
     case FAILED: {
-      const request = read.number()
+      const request = read.u32()
       return read.finish({ kind: 'failed', channel, request, message: read.text() })
     }
     case COMMANDS: {
-      const request = read.number()
-      const epoch = read.number()
+      const request = read.u32()
+      const epoch = read.u32()
       const commands: Command[] = []
       for (let more = read.count(); more > 0; more -= 1) commands.push(read.command())
       return read.finish({ kind: 'commands', channel, request, epoch, commands })
     }
     case IMAGES: {
-      const request = read.number()
-      const epoch = read.number()
-      const cellWidth = read.number()
-      const cellHeight = read.number()
+      const request = read.u32()
+      const epoch = read.u32()
+      const cellWidth = read.u16()
+      const cellHeight = read.u16()
       const placements: Placement[] = []
       for (let more = read.count(); more > 0; more -= 1) {
-        const image = read.number()
+        const image = read.u32()
         const generation = read.number()
-        const zigzag = read.number()
-        if (zigzag > 0xffffffff) throw new Malformed('an integer did not fit its field')
+        const z = read.status()
         placements.push({
-          image, generation, z: zigzag % 2 === 0 ? zigzag / 2 : -(zigzag + 1) / 2,
-          line: read.number(), column: read.number(), columns: read.number(), rows: read.number(),
-          offsetX: read.number(), offsetY: read.number(), width: read.number(), height: read.number(),
-          sourceX: read.number(), sourceY: read.number(), sourceWidth: read.number(), sourceHeight: read.number(),
+          image, generation, z,
+          line: read.number(), column: read.u16(), columns: read.u32(), rows: read.u32(),
+          offsetX: read.u32(), offsetY: read.u32(), width: read.u32(), height: read.u32(),
+          sourceX: read.u32(), sourceY: read.u32(), sourceWidth: read.u32(), sourceHeight: read.u32(),
         })
       }
       return read.finish({ kind: 'images', channel, request, epoch, cellWidth, cellHeight, placements })
     }
     case IMAGE: {
-      const request = read.number()
-      const image = read.number()
+      const request = read.u32()
+      const image = read.u32()
       const generation = read.number()
-      const width = read.number()
-      const height = read.number()
+      const width = read.u32()
+      const height = read.u32()
       const channels = read.byte()
       if (channels < 1 || channels > 4) throw new Malformed("an image's channels are outside what the format defines")
-      const total = read.number()
-      const offset = read.number()
+      const total = read.u32()
+      const offset = read.u32()
       // Copied, because the bytes it was read from are the stream's and are reused
       const bytes = read.take(read.count()).slice()
       return read.finish({ kind: 'image', channel, request, image, generation, width, height, channels, total, offset, bytes })

@@ -20,7 +20,7 @@
 //! between two looks — starts a new `epoch`, and a view forgets its rows.
 
 use std::collections::BTreeMap;
-use std::sync::mpsc::Sender;
+use std::sync::{Arc, mpsc::Sender};
 
 use super::wire::{self, ANCHORED_LISTED, Anchored, AnchoredImages, ColorChanges, Cursor, FrameHead, Rows, ToView};
 use crate::vt::rows::{AnchoredRead, Mark, Rendering, RowRead, Space};
@@ -100,8 +100,8 @@ fn owed(viewer: &Viewer, held: bool) -> bool {
 }
 
 struct Held {
-    /// The row as a message carries it, less its line number
-    body: Vec<u8>,
+    /// The row as a message carries it, less its line number, shared across `active` and `shown`
+    body: Arc<[u8]>,
     /// What the grid flags the row as, as `Terminal::row_flags` answers it: that it runs on, and that the
     /// shell drew its prompt there
     flags: u8,
@@ -129,7 +129,7 @@ pub struct Publication {
     /// The rows of the screen as the last frame published to any view carried them, by line, with the
     /// screen's first line and height at that frame. What a view holds of the screen once it has applied
     /// the frames sent; a fetch during a hold answers from it.
-    shown: BTreeMap<u64, Vec<u8>>,
+    shown: BTreeMap<u64, Arc<[u8]>>,
     shown_first: u64,
     shown_rows: u16,
     cursor: Option<Cursor>,
@@ -321,11 +321,11 @@ impl Publication {
             self.body.clear();
             wire::write_row(&mut self.body, self.read.wrapped, self.read.prompt, &self.read);
             match was {
-                Some(held) if held.body == self.body => active.push(held),
+                Some(held) if held.body.as_ref() == self.body.as_slice() => active.push(held),
                 _ => {
                     changed = true;
                     let flags = wire::row_flags(self.read.wrapped, self.read.prompt);
-                    active.push(Held { body: self.body.clone(), flags, changed: next });
+                    active.push(Held { body: Arc::from(self.body.as_slice()), flags, changed: next });
                 }
             }
         }
@@ -361,7 +361,9 @@ impl Publication {
             self.colors = colors;
             self.colors_changed = next;
         }
-        if (&anchored, anchored_omitted) != (&self.anchored, self.anchored_omitted) {
+        if (&anchored, anchored_omitted) != (&self.anchored, self.anchored_omitted)
+            || (cell != self.cell && !anchored.is_empty())
+        {
             changed = true;
             (self.anchored, self.anchored_omitted) = (anchored, anchored_omitted);
             self.anchored_changed = next;
@@ -428,7 +430,7 @@ impl Publication {
         let mut rows = Rows::default();
         let mut stale_from = None;
         let mut cut = None;
-        let mut carried: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut carried: Vec<(u64, Arc<[u8]>)> = Vec::new();
 
         // **The lines that left the screen since.** A view holds them as they were when it was last sent
         // the screen, and a line is often written to once more before it scrolls — the one being typed
@@ -451,7 +453,7 @@ impl Publication {
                             break;
                         }
                         rows.push(line, &self.body);
-                        carried.push((line, self.body.clone()));
+                        carried.push((line, Arc::from(self.body.as_slice())));
                     }
                 } else {
                     stale_from = Some(sent.first_active);
@@ -461,17 +463,17 @@ impl Publication {
             None => {}
         }
         if cut.is_none() {
-            for (row, held) in self.active.iter().enumerate() {
+            for (row, active_row) in self.active.iter().enumerate() {
                 let line = self.first_active + row as u64;
-                if held.changed <= Sent::seen(sent, line) {
+                if active_row.changed <= Sent::seen(sent, line) {
                     continue;
                 }
-                if !rows.takes(held.body.len()) {
+                if !rows.takes(active_row.body.len()) {
                     cut = Some(line);
                     break;
                 }
-                rows.push(line, &held.body);
-                carried.push((line, held.body.clone()));
+                rows.push(line, &active_row.body);
+                carried.push((line, Arc::clone(&active_row.body)));
             }
         }
 
@@ -538,7 +540,9 @@ impl Publication {
                 });
                 viewer.in_flight = true;
                 viewer.gone = !viewer.outlet.deliver(message);
-                self.show(carried);
+                if !viewer.gone {
+                    self.show(carried);
+                }
             }
             // Past what a message carries though its rows were counted in: the view is told it cannot
             // be shown this session, and is not sent the same frame again at every change
@@ -609,7 +613,7 @@ impl Publication {
 
     /// Records what a frame sent to a view carried of the screen: a line the frame did not carry is what it
     /// was, which is what a view that applied the frame holds.
-    fn show(&mut self, carried: Vec<(u64, Vec<u8>)>) {
+    fn show(&mut self, carried: Vec<(u64, Arc<[u8]>)>) {
         self.shown_first = self.first_active;
         self.shown_rows = self.rows;
         let on_screen = self.shown_first..self.shown_first + u64::from(self.shown_rows);
