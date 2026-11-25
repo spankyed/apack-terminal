@@ -97,8 +97,10 @@ fn path_reaches_refused(path: &[u8]) -> bool {
             joined.push(b'/');
             joined.extend_from_slice(component);
         }
-        let Ok(meta) = std::fs::symlink_metadata(OsStr::from_bytes(&joined)) else {
-            continue;
+        let meta = match std::fs::symlink_metadata(OsStr::from_bytes(&joined)) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return true,
         };
         if meta.file_type().is_symlink() {
             let Some(next_hops) = remaining_hops.checked_sub(1) else {
@@ -488,12 +490,18 @@ mod tests {
         // Relative path climbing out to `/dev/fd/0` is refused, while climbing one level short stays under cwd's root.
         let cwd = std::env::current_dir().expect("cwd");
         let depth = cwd.as_os_str().as_bytes().split(|&b| b == b'/').filter(|s| !s.is_empty()).count();
-        assert!(depth >= 2, "test expects cwd at least 2 segments deep");
+        assert!(depth >= 1, "test expects non-root cwd");
         let to_root = format!("{}dev/fd/0", "../".repeat(depth));
         let one_short = format!("{}dev/fd/0", "../".repeat(depth - 1));
         assert!(path_reaches_refused(to_root.as_bytes()));
         assert!(!path_reaches_refused(one_short.as_bytes()));
         assert!(!path_reaches_refused(b"nonexistent_apack_relative_image.bin"));
+
+        // Non-NotFound metadata errors (e.g. ENAMETOOLONG / ENOTDIR) fail closed rather than skipping symlink checks.
+        let too_long = format!("/{}/file", "a".repeat(5000));
+        assert!(path_reaches_refused(too_long.as_bytes()));
+        let not_a_dir = real.join("child");
+        assert!(path_reaches_refused(not_a_dir.as_os_str().as_bytes()));
 
         // Legitimate directory symlink with trailing components is allowed
         let sub = dir.path().join("sub");

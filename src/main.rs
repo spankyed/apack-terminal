@@ -181,9 +181,13 @@ fn main() -> std::io::Result<()> {
             Ok(stream) => {
                 if broker.leaving.load(Ordering::SeqCst) {
                     drop(stream);
-                    // Exit the accept loop and drop `listener` immediately so Windows named pipes stop
-                    // creating new server instances during shutdown drain instead of burning proxy retries.
-                    break;
+                    // Keep `listener` alive until `leave()` exits (preserving Unix socket ownership
+                    // without `ReclaimGuard` unlinking a replacement broker's socket, and preserving
+                    // Windows `FILE_FLAG_FIRST_PIPE_INSTANCE` mutual exclusion while recordings drain),
+                    // while pacing rejected connects so a reconnecting Windows proxy does not burn
+                    // through its retry budget in milliseconds.
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
                 }
                 let broker = broker.clone();
                 broker.connections.fetch_add(1, Ordering::SeqCst);
@@ -191,19 +195,9 @@ fn main() -> std::io::Result<()> {
                 std::thread::spawn(move || serve(stream, connection, broker));
             }
             Err(error) => {
-                if broker.leaving.load(Ordering::SeqCst) {
-                    break;
-                }
                 eprintln!("accept failed: {error}");
                 std::thread::sleep(Duration::from_millis(50));
             }
-        }
-    }
-    drop(listener);
-    if broker.leaving.load(Ordering::SeqCst) {
-        // Another thread is running the bounded shutdown sequence (`leave`) and will exit the process.
-        loop {
-            std::thread::sleep(Duration::from_secs(1));
         }
     }
     Ok(())

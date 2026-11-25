@@ -168,7 +168,9 @@ impl Greeting {
             let mut parts = bytes.splitn(2, |&byte| byte == b'\n');
             let head = parts.next().unwrap_or_default();
             if let Some(rest) = parts.next() {
-                if line.len().saturating_add(head.len()) > MAX_FRAME_BYTES {
+                // `frames::read_frame` counts the trailing `\n` toward `MAX_FRAME_BYTES`, so the
+                // payload before `\n` may be at most `MAX_FRAME_BYTES - 1` bytes.
+                if line.len().saturating_add(head.len()) >= MAX_FRAME_BYTES {
                     *self = Self::Json;
                     return;
                 }
@@ -183,7 +185,7 @@ impl Greeting {
                 *self = if is_view { Self::View } else { Self::Json };
                 return;
             }
-            if line.len().saturating_add(head.len()) > MAX_FRAME_BYTES {
+            if line.len().saturating_add(head.len()) >= MAX_FRAME_BYTES {
                 *self = Self::Json;
                 return;
             }
@@ -392,14 +394,14 @@ mod tests {
         client.observe(format!("{client_hello}\n").as_bytes());
         assert!(!client.is_view());
 
-        // Exact MAX_FRAME_BYTES before newline still parses as View (tests `>` vs `>=`/`==`/`<`).
-        let pad = MAX_FRAME_BYTES - view_hello.len();
+        // Exact MAX_FRAME_BYTES wire frame (payload of MAX_FRAME_BYTES - 1 plus `\n`) still parses as View.
+        let pad = MAX_FRAME_BYTES - 1 - view_hello.len();
         let mut exact = Greeting::Pending(Vec::new());
         exact.observe(format!("{view_hello}{}", " ".repeat(pad)).as_bytes());
         exact.observe(b"\n");
-        assert!(exact.is_view(), "a View hello of exactly MAX_FRAME_BYTES before newline must stay pending");
+        assert!(exact.is_view(), "a View hello of exact MAX_FRAME_BYTES including newline must stay pending");
 
-        // Exceeding MAX_FRAME_BYTES without newline gives up and becomes Json.
+        // Exceeding MAX_FRAME_BYTES (including eventual newline) gives up and becomes Json.
         let mut oversized = Greeting::Pending(Vec::new());
         oversized.observe(format!("{view_hello}{}", " ".repeat(pad + 1)).as_bytes());
         oversized.observe(b"\n");
