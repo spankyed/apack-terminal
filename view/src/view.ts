@@ -1265,7 +1265,6 @@ export class TerminalView {
   }
 
   dispose(): void {
-    this.refreshTimer.cancel()
     if (this.disposed) return
     this.unmount()
     this.disposed = true
@@ -1491,7 +1490,7 @@ export class TerminalView {
       if (!this.focused || !this.listening || this.disposed || !this.cursorBlinks()) return
       this.cursorShown = !this.cursorShown
       this.schedule()
-      if (this.focused && this.listening && !this.disposed && this.cursorBlinks()) this.scheduleBlink()
+      if (this.focused && this.listening && !this.disposed && this.cursorBlinks() && !this.blink.active) this.scheduleBlink()
     })
   }
 
