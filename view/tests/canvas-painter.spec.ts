@@ -2,7 +2,7 @@
 import { describe, expect, it } from 'vitest'
 import { CanvasPainter } from '../src/canvas-painter.ts'
 import { drawRow, type SelectedCells, type Theme } from '../src/draw.ts'
-import { css } from '../src/painter.ts'
+import { css, measure } from '../src/painter.ts'
 import { PLAIN, type Row, type Style } from '../src/source.ts'
 import { recordingContext } from './_canvas.ts'
 import { row, PALETTE } from './_support.ts'
@@ -277,5 +277,60 @@ describe('a gutter', () => {
     made.paint({ theme, rows: [drawStyled(row(0, 'hi'), [PLAIN], theme)], offset: 0, marks: [{ row: 0, color: 0x00ff00 }] })
     expect(drawn.some((call) => call.color === css(0x00ff00))).toBe(false)
     expect(drawn.find((call) => call.text === 'h')).toMatchObject({ x: 0 })
+  })
+})
+
+describe('measure and painter lifecycle edge cases', () => {
+  it('treats zero fontBoundingBox metrics as missing and guards invalid pixel ratios', () => {
+    const stub = {
+      font: '',
+      measureText: () => ({ width: 8, fontBoundingBoxAscent: 0, fontBoundingBoxDescent: 0, actualBoundingBoxAscent: 12, actualBoundingBoxDescent: 3 }),
+    } as unknown as CanvasRenderingContext2D
+    expect(measure(stub, font, 0)).toEqual({ cellWidth: 8, cellHeight: 15, baseline: 12 })
+    expect(measure(stub, font, Number.NaN)).toEqual({ cellWidth: 8, cellHeight: 15, baseline: 12 })
+
+    const zeroAll = {
+      font: '',
+      measureText: () => ({ width: 8, fontBoundingBoxAscent: 0, fontBoundingBoxDescent: 0, actualBoundingBoxAscent: 0, actualBoundingBoxDescent: 0 }),
+    } as unknown as CanvasRenderingContext2D
+    const fallback = measure(zeroAll, { family: 'monospace', size: 10 }, 1)
+    expect(fallback).toEqual({ cellWidth: 8, cellHeight: 10, baseline: 8 })
+  })
+
+  it('culls images outside dirty bands, clips wide block-cursor glyphs, and releases canvas memory on dispose', () => {
+    const { canvas, drawn } = recordingContext()
+    const made = new CanvasPainter(font, canvas)
+    made.resize(20, 12, 1)
+    const rows = Array.from({ length: 12 }, (_, line) => drawStyled(row(line, `line ${line}`), [PLAIN], theme))
+    const picture = {} as CanvasImageSource
+    const images = [
+      { picture, x: 0, y: 0, width: 20, height: 20, source: { x: 0, y: 0, width: 10, height: 10 }, above: true },
+      { picture, x: 0, y: 200, width: 20, height: 20, source: { x: 0, y: 0, width: 10, height: 10 }, above: true },
+    ]
+    made.paint({ theme, rows, offset: 0, images })
+    drawn.length = 0
+
+    // Dirty band around row 10 (y=180..240) should draw the image at y=200 and cull the image at y=0
+    const next = [...rows]
+    next[10] = drawStyled(row(10, 'updated'), [PLAIN], theme)
+    made.paint({ theme, rows: next, offset: 0, images })
+    expect(drawn.filter((call) => call.kind === 'image').map((call) => call.y)).toEqual([200])
+
+    // Wide block cursor glyph (2 code units in 1 cell -> wider than cellWidth) is clipped
+    drawn.length = 0
+    made.paint({
+      theme, rows: next, offset: 0, images,
+      cursor: { column: 1, row: 1, cells: 1, shape: 'block', text: { text: 'e\u0301', bold: false, italic: false } },
+    })
+    const cursorGlyph = drawn.find((call) => call.kind === 'text' && call.text === 'e\u0301')
+    expect(cursorGlyph?.clips.at(-1)).toEqual([10, 0, 10, 60])
+
+    // dispose zeroes backing store and clears repaint callback
+    let cleared = 0
+    made.whenCleared(() => { cleared += 1 })
+    made.dispose()
+    expect([canvas.width, canvas.height]).toEqual([0, 0])
+    canvas.dispatchEvent(new Event('contextrestored'))
+    expect(cleared).toBe(0)
   })
 })

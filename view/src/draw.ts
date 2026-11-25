@@ -129,9 +129,16 @@ export function drawRow(row: Row, theme: Theme, selected?: SelectedCells, blinke
   }
 
   // The cells the selection's rectangle covers: what was asked for, widened to the whole of any character
-  // it only partly reaches
-  let selectedFrom = selected?.from ?? 0
-  let selectedTo = selected?.to ?? 0
+  // it only partly reaches. Empty ranges (`to <= from`) select nothing, even when inside a wide character
+  const hasSelection = selected !== undefined && selected.to > selected.from
+  let selectedFrom = hasSelection ? selected.from : 0
+  let selectedTo = hasSelection ? selected.to : 0
+
+  // Sort highlights ascending by `from` for an O(G + H) two-pointer scan while keeping original `order`
+  // so that if highlights ever overlap, the last one in `found` still wins (matching paint order below)
+  const orderedHighlights: Array<{ from: number; to: number; color: number; order: number }> =
+    found.length === 0 ? [] : orderedByColumn(found)
+  let highlightCursor = 0
 
   for (let index = 0; index < row.text.length; index += 1) {
     const text = row.text[index]!
@@ -143,7 +150,7 @@ export function drawRow(row: Row, theme: Theme, selected?: SelectedCells, blinke
     let fg = colorIn(theme, style.fg) ?? theme.foreground
     let bg = colorIn(theme, style.bg)
     if (flags & StyleFlag.inverse) [fg, bg] = [bg ?? theme.background, fg]
-    const isSelected = selected !== undefined && column < selected.to && column + cells > selected.from
+    const isSelected = hasSelection && column < selected.to && column + cells > selected.from
     if (isSelected) {
       fg = theme.selectionForeground ?? fg
       selectedFrom = Math.min(selectedFrom, column)
@@ -153,23 +160,38 @@ export function drawRow(row: Row, theme: Theme, selected?: SelectedCells, blinke
     }
 
     const visible = !(flags & StyleFlag.invisible) && !(blinkedOff && flags & StyleFlag.blink)
-    if (visible && text !== ' ' && text !== '') {
+    if (!visible) continue
+
+    if (theme.minimumContrast !== undefined) {
       // What the character sits on is the selection's when it is selected, and the cell's own otherwise
       let behind = isSelected ? theme.selectionBackground : (bg ?? theme.background)
       // Highlights are painted later, so the last one a character is under is the colour it is drawn on
-      for (const highlight of found) if (column < highlight.to && column + cells > highlight.from) behind = highlight.color
+      while (highlightCursor < orderedHighlights.length && orderedHighlights[highlightCursor]!.to <= column) {
+        highlightCursor += 1
+      }
+      let bestOrder = -1
+      for (let h = highlightCursor; h < orderedHighlights.length && orderedHighlights[h]!.from < column + cells; h += 1) {
+        const highlight = orderedHighlights[h]!
+        if (highlight.to > column && highlight.order > bestOrder) {
+          bestOrder = highlight.order
+          behind = highlight.color
+        }
+      }
+      fg = ensureContrast(fg, behind, theme.minimumContrast)
+    }
+
+    if (text !== ' ' && text !== '') {
       glyphs.push({
         text,
         column,
         cells,
-        color: theme.minimumContrast === undefined ? fg : ensureContrast(fg, behind, theme.minimumContrast),
+        color: fg,
         alpha: flags & StyleFlag.faint ? 0.5 : 1,
         bold: (flags & StyleFlag.bold) !== 0,
         italic: (flags & StyleFlag.italic) !== 0,
       })
     }
 
-    if (!visible) continue
     const underline = underlineOf(style)
     if (underline !== 'none') {
       const color = colorIn(theme, style.underlineColor) ?? fg
@@ -191,4 +213,38 @@ export function drawRow(row: Row, theme: Theme, selected?: SelectedCells, blinke
   for (const highlight of found) backgrounds.push({ column: highlight.from, cells: highlight.to - highlight.from, color: highlight.color })
 
   return { backgrounds, glyphs, lines }
+}
+
+/** Returns `found` ordered ascending by `from`, preserving each item's original index in O(H) for ascending/descending inputs */
+function orderedByColumn(found: readonly Highlight[]): Array<{ from: number; to: number; color: number; order: number }> {
+  const n = found.length
+  let ascending = true
+  let descending = true
+  for (let i = 1; i < n; i += 1) {
+    const prev = found[i - 1]!.from
+    const curr = found[i]!.from
+    if (curr < prev) ascending = false
+    if (curr > prev) descending = false
+  }
+  const result = new Array<{ from: number; to: number; color: number; order: number }>(n)
+  if (ascending) {
+    for (let i = 0; i < n; i += 1) {
+      const h = found[i]!
+      result[i] = { from: h.from, to: h.to, color: h.color, order: i }
+    }
+    return result
+  }
+  if (descending) {
+    for (let i = 0; i < n; i += 1) {
+      const src = n - 1 - i
+      const h = found[src]!
+      result[i] = { from: h.from, to: h.to, color: h.color, order: src }
+    }
+    return result
+  }
+  for (let i = 0; i < n; i += 1) {
+    const h = found[i]!
+    result[i] = { from: h.from, to: h.to, color: h.color, order: i }
+  }
+  return result.sort((a, b) => a.from - b.from || a.order - b.order)
 }

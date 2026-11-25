@@ -645,13 +645,123 @@ describe('an image from a broker', () => {
     broker.say({ kind: 'failed', channel: 1, request: 1, message: 'no image 7' })
     expect(await asked).toBeNull()
   })
+
+  it('rejects invalid dimensions, bad channel counts, huge totals, bad offsets, empty chunks, and runaway generation restarts', async () => {
+    const { broker, source } = attached()
+    let req = 0
+
+    // Zero dimensions
+    req += 1
+    let asked = source.image(1)
+    broker.say({ ...part, request: req, width: 0, height: 1, total: 0, offset: 0, bytes: new Uint8Array(0) })
+    expect(await asked).toBeNull()
+
+    // Invalid channels (5)
+    req += 1
+    asked = source.image(2)
+    broker.say({ ...part, request: req, channels: 5, total: 10, offset: 0, bytes: new Uint8Array(10) })
+    expect(await asked).toBeNull()
+
+    // Dimensions exceeding 64 MiB RGBA cap
+    req += 1
+    asked = source.image(3)
+    broker.say({ ...part, request: req, width: 5000, height: 5000, channels: 4, total: 5000 * 5000 * 4, offset: 0, bytes: Uint8Array.of(1) })
+    expect(await asked).toBeNull()
+
+    // Non-zero offset on first chunk
+    req += 1
+    asked = source.image(4)
+    broker.say({ ...part, request: req, offset: 2, bytes: Uint8Array.of(1, 2, 3, 4) })
+    expect(await asked).toBeNull()
+
+    // Offset past whole.length on second chunk (must return null, not throw RangeError)
+    req += 1
+    asked = source.image(5)
+    broker.say({ ...part, request: req, offset: 0, bytes: Uint8Array.of(1, 2, 3, 4) })
+    await settled()
+    req += 1
+    broker.say({ ...part, request: req, offset: 99, bytes: Uint8Array.of(5, 6, 7, 8) })
+    expect(await asked).toBeNull()
+
+    // Empty chunk before completion returns null instead of a half-zeroed Picture
+    req += 1
+    asked = source.image(6)
+    broker.say({ ...part, request: req, offset: 0, bytes: Uint8Array.of(1, 2, 3, 4) })
+    await settled()
+    req += 1
+    broker.say({ ...part, request: req, offset: 4, bytes: new Uint8Array(0) })
+    expect(await asked).toBeNull()
+
+    // Runaway generation restarts are capped at 4
+    req += 1
+    asked = source.image(7)
+    broker.say({ ...part, generation: 1, request: req, offset: 0, bytes: Uint8Array.of(1, 2, 3, 4) })
+    for (let gen = 2; gen <= 6; gen += 1) {
+      await settled()
+      req += 1
+      broker.say({ ...part, generation: gen, request: req, offset: 4, bytes: Uint8Array.of(1, 2) })
+      if (gen <= 5) {
+        await settled()
+        req += 1
+        broker.say({ ...part, generation: gen, request: req, offset: 0, bytes: Uint8Array.of(1, 2, 3, 4) })
+      }
+    }
+    expect(await asked).toBeNull()
+  })
+
+  it('drops pictures when anchored or placeholder rows disappear without images bumping, retries when generation bumps, zeroes fallback canvases, and respects folds in wantPictures', async () => {
+    const made: Array<{ canvas: HTMLCanvasElement }> = []
+    const view = mountedView({
+      picture: async (read) => {
+        const canvas = document.createElement('canvas')
+        canvas.width = read.width
+        canvas.height = read.height
+        made.push({ canvas })
+        return canvas
+      },
+    })
+    view.source.pictures.set(7, pixels(4, 4))
+    view.source.send(frame({ images: 0, anchored: anchoring([anchored({ image: 7, generation: 1 })]) }))
+    await settled()
+    await settled()
+    expect(made).toHaveLength(1)
+    expect(made[0]!.canvas.width).toBe(4)
+
+    // Anchored cleared WITHOUT frame.images bumping -> fallback canvas is released & zeroed
+    view.source.send(frame({ sequence: 2, images: 0, anchored: anchoring([]) }))
+    await settled()
+    expect([made[0]!.canvas.width, made[0]!.canvas.height]).toEqual([0, 0])
+
+    // Missing image at gen 1 is refused, then generation bumps via anchored without placed changing -> retries!
+    view.source.send(frame({ sequence: 3, images: 0, anchored: anchoring([anchored({ image: 9, generation: 1 })]) }))
+    await settled()
+    await settled()
+    expect(view.source.picturesAsked.filter((id) => id === 9)).toEqual([9])
+    view.source.pictures.set(9, { ...pixels(4, 4), generation: 2 })
+    view.source.send(frame({ sequence: 4, images: 0, anchored: anchoring([anchored({ image: 9, generation: 2 })]) }))
+    await settled()
+    await settled()
+    expect(view.source.picturesAsked.filter((id) => id === 9)).toEqual([9, 9])
+
+    // Image visible past a fold (lines 1..10 folded, screen shows lines 0, 1, 11, 12) is requested via layout span
+    view.source.pictures.set(11, pixels(4, 4))
+    view.source.placed = { cellWidth: 10, cellHeight: 20, placements: [placement({ image: 11, line: 12, rows: 1 })] }
+    view.source.send(frame({ sequence: 5, firstActive: 10, scrollback: 10, screenRows: 4, images: 1 }))
+    view.view.scrollTo(0)
+    view.view.setFolds([{ first: 1, last: 10 }])
+    await quiet(view)
+    expect(view.source.picturesAsked).toContain(11)
+  })
 })
 
 describe('pixels of fewer than four bytes', () => {
-  it('become red, green, blue and alpha', () => {
+  it('become red, green, blue and alpha, and reject invalid channel or pixel counts', () => {
     expect([...rgbaOf(1, Uint8Array.of(10, 200), 2)]).toEqual([10, 10, 10, 255, 200, 200, 200, 255])
     expect([...rgbaOf(2, Uint8Array.of(10, 128, 200, 0), 2)]).toEqual([10, 10, 10, 128, 200, 200, 200, 0])
     expect([...rgbaOf(3, Uint8Array.of(1, 2, 3, 4, 5, 6), 2)]).toEqual([1, 2, 3, 255, 4, 5, 6, 255])
     expect([...rgbaOf(4, Uint8Array.of(1, 2, 3, 4), 1)]).toEqual([1, 2, 3, 4])
+    expect(() => rgbaOf(0, Uint8Array.of(1), 1)).toThrow(RangeError)
+    expect(() => rgbaOf(5, Uint8Array.of(1), 1)).toThrow(RangeError)
+    expect(() => rgbaOf(4, Uint8Array.of(1), (64 << 20))).toThrow(RangeError)
   })
 })

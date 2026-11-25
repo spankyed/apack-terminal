@@ -16,6 +16,11 @@ export const KEPT_LINES = 50_000
  */
 export const KEPT_SLACK = KEPT_LINES >> 3
 
+/** Maximum number of absent lines remembered before capping against adversarial fetch counts */
+const MAX_ABSENT = 16_384
+/** Maximum number of per-frame `staleFrom` entries retained for in-flight fetch checks */
+const MAX_STALE_HISTORY = 64
+
 /**
  * The rows a view has been sent, by absolute line.
  *
@@ -38,6 +43,8 @@ export class RowStore {
   scrollback = 0
 
   private readonly rows = new Map<number, Row>()
+  /** Lines currently held whose `row.images !== undefined`, so `pictured` and `doubtPictured` skip plain rows */
+  private readonly picturedLines = new Set<number>()
   /**
    * History lines the owner answered for with no row: it does not hold them, so they are not missing. True
    * until the owner says what it holds has changed — the epoch, where history starts, or `staleFrom`.
@@ -54,15 +61,17 @@ export class RowStore {
    */
   imagesChanged = 0
   /**
-   * How many frames have named history stale, and from where the last did: what an asker notes when it
-   * asks, so an answer taken after a frame that named the lines it covers stale is not put back as it was.
+   * How many frames have named history stale, and a bounded history of `(staleFrames, staleFrom)` pairs:
+   * what an asker notes when it asks, so an answer taken after one or more frames that named the lines it
+   * covers stale is not put back as it was.
    */
   staleFrames = 0
-  private staleLine = Infinity
+  private readonly staleHistory: Array<{ frame: number; from: number }> = []
+  private staleOverflowFrom = Infinity
 
   /** The oldest line the owner still holds */
   get oldest(): number {
-    return this.firstActive - this.scrollback
+    return Math.max(0, this.firstActive - this.scrollback)
   }
 
   /** One past the last line of the screen */
@@ -90,17 +99,24 @@ export class RowStore {
    */
   apply(frame: Frame, near = frame.firstActive): { reset: boolean; changed: number[] } {
     const reset = frame.epoch !== this.epoch
-    const oldest = this.oldest
+    const prevOldest = this.oldest
+    const prevEnd = this.end
+    const prevFirstActive = this.firstActive
     if (reset) {
       this.rows.clear()
+      this.picturedLines.clear()
       this.doubted.clear()
+      this.staleHistory.length = 0
+      this.staleOverflowFrom = Infinity
       this.epoch = frame.epoch
     }
-    this.firstActive = frame.firstActive
-    this.screenRows = frame.screenRows
-    this.columns = frame.columns
-    this.scrollback = frame.scrollback
-    if (reset || frame.staleFrom !== undefined || this.oldest !== oldest) this.absent.clear()
+    this.firstActive = Math.max(0, frame.firstActive)
+    this.screenRows = Math.max(0, frame.screenRows)
+    this.columns = Math.max(0, frame.columns)
+    this.scrollback = Math.max(0, Math.min(frame.scrollback, this.firstActive))
+    if (reset || frame.staleFrom !== undefined || this.oldest !== prevOldest || this.firstActive < prevFirstActive) {
+      this.absent.clear()
+    }
 
     // A set, because a line can be both let go as stale and resent by the same frame
     const changed = new Set<number>()
@@ -108,20 +124,48 @@ export class RowStore {
     // range is kept
     if (frame.staleFrom !== undefined) {
       this.staleFrames += 1
-      this.staleLine = frame.staleFrom
-      for (let line = frame.staleFrom; line < frame.firstActive; line += 1) {
-        if (this.rows.delete(line)) changed.add(line)
-        this.doubted.delete(line)
+      this.staleHistory.push({ frame: this.staleFrames, from: frame.staleFrom })
+      if (this.staleHistory.length > MAX_STALE_HISTORY) {
+        const dropped = this.staleHistory.shift()!
+        if (dropped.from < this.staleOverflowFrom) this.staleOverflowFrom = dropped.from
+      }
+      for (const line of this.rows.keys()) {
+        if (line >= frame.staleFrom && line < this.firstActive) {
+          this.rows.delete(line)
+          this.picturedLines.delete(line)
+          changed.add(line)
+        }
+      }
+      for (const line of this.doubted) {
+        if (line >= frame.staleFrom && line < this.firstActive) this.doubted.delete(line)
       }
     }
+    const oldest = this.oldest
+    const end = this.end
     for (const row of frame.rows) {
+      if (row.line < oldest || row.line >= end) continue
       this.rows.set(row.line, row)
+      if (row.images !== undefined) this.picturedLines.add(row.line)
+      else this.picturedLines.delete(row.line)
       this.absent.delete(row.line)
       this.doubted.delete(row.line)
       changed.add(row.line)
     }
-    this.forget(near)
+    this.forget(near, reset ? undefined : { prevOldest, prevEnd })
     return { reset, changed: [...changed].sort((a, b) => a - b) }
+  }
+
+  /** Minimum `staleFrom` across every stale frame received after `askedStale` */
+  private staleSince(askedStale: number): number {
+    if (askedStale === this.staleFrames) return Infinity
+    let min = Infinity
+    if (this.staleHistory.length === 0 || this.staleHistory[0]!.frame > askedStale + 1) {
+      min = this.staleOverflowFrom
+    }
+    for (const entry of this.staleHistory) {
+      if (entry.frame > askedStale && entry.from < min) min = entry.from
+    }
+    return min
   }
 
   /**
@@ -140,29 +184,42 @@ export class RowStore {
    */
   absorb(fetched: Fetched, near = this.firstActive, asked = this.imagesChanged, askedStale = this.staleFrames): number[] {
     if (fetched.epoch !== this.epoch) return []
+    if (!Number.isFinite(fetched.first) || !Number.isFinite(fetched.count) || fetched.count <= 0) return []
     const told: number[] = []
     // Lines a frame has since named stale were changed after this was asked for: what the answer holds of
     // them is the old text, and it is not put back
-    const stale = this.staleFrames !== askedStale ? this.staleLine : Infinity
+    const stale = this.staleSince(askedStale)
     // The screen is only ever told by a frame: a fetched copy of a line a program can still write to may
     // be older than the frame that last described it
     const from = Math.max(fetched.first, this.oldest)
     const to = Math.min(fetched.first + fetched.count, this.firstActive)
+    if (to <= from) return []
     const brought = new Set<number>()
     for (const row of fetched.rows) {
       if (row.line < from || row.line >= to || row.line >= stale) continue
       this.rows.set(row.line, row)
+      if (row.images !== undefined) this.picturedLines.add(row.line)
+      else this.picturedLines.delete(row.line)
       this.absent.delete(row.line)
       if (row.images !== undefined && asked !== this.imagesChanged) this.doubted.add(row.line)
       else this.doubted.delete(row.line)
       brought.add(row.line)
       told.push(row.line)
     }
-    for (let line = from; line < Math.min(to, stale); line += 1) {
-      if (brought.has(line) || this.absent.has(line)) continue
-      // A row asked for again and not brought is one the owner no longer holds
-      if (this.rows.has(line) && !this.doubted.delete(line)) continue
+    const limit = Math.min(to, stale)
+    // A row asked for again and not brought is one the owner no longer holds
+    for (const line of this.doubted) {
+      if (line < from || line >= limit || brought.has(line)) continue
+      this.doubted.delete(line)
       this.rows.delete(line)
+      this.picturedLines.delete(line)
+      if (this.absent.size < MAX_ABSENT) this.absent.add(line)
+      told.push(line)
+    }
+    const absentLimit = Math.min(limit, from + MAX_ABSENT + brought.size)
+    for (let line = from; line < absentLimit; line += 1) {
+      if (brought.has(line) || this.absent.has(line) || this.rows.has(line)) continue
+      if (this.absent.size >= MAX_ABSENT) break
       this.absent.add(line)
       told.push(line)
     }
@@ -202,16 +259,16 @@ export class RowStore {
    */
   doubtPictured(): void {
     this.imagesChanged += 1
-    for (const [line, row] of this.rows) {
-      if (line < this.firstActive && row.images !== undefined) this.doubted.add(line)
+    for (const line of this.picturedLines) {
+      if (line < this.firstActive) this.doubted.add(line)
     }
   }
 
   /** The images the rows held show part of, by number */
   pictured(): Set<number> {
     const images = new Set<number>()
-    for (const row of this.rows.values()) {
-      for (const piece of row.images?.pieces ?? []) images.add(piece.image)
+    for (const line of this.picturedLines) {
+      for (const piece of this.rows.get(line)?.images?.pieces ?? []) images.add(piece.image)
     }
     return images
   }
@@ -225,12 +282,43 @@ export class RowStore {
    * exactly the lines furthest from the screen; letting those go first would let go of what was just
    * fetched for them, and it would be fetched again for ever.
    */
-  private forget(near: number): void {
+  private forget(near: number, prevBounds?: { prevOldest: number; prevEnd: number }): void {
     const oldest = this.oldest
-    for (const line of this.rows.keys()) {
-      if (line < oldest || line >= this.end) this.rows.delete(line)
+    const end = this.end
+    if (prevBounds) {
+      const { prevOldest, prevEnd } = prevBounds
+      const oldestGrew = oldest > prevOldest
+      const endShrank = end < prevEnd
+      if (oldestGrew || endShrank) {
+        const rangeCost = (oldestGrew ? oldest - prevOldest : 0) + (endShrank ? prevEnd - end : 0)
+        if (rangeCost < this.rows.size) {
+          if (oldestGrew) {
+            for (let line = prevOldest; line < oldest; line += 1) {
+              if (this.rows.delete(line)) {
+                this.picturedLines.delete(line)
+                this.doubted.delete(line)
+              }
+            }
+          }
+          if (endShrank) {
+            for (let line = end; line < prevEnd; line += 1) {
+              if (this.rows.delete(line)) {
+                this.picturedLines.delete(line)
+                this.doubted.delete(line)
+              }
+            }
+          }
+        } else {
+          for (const line of this.rows.keys()) {
+            if (line < oldest || line >= end) {
+              this.rows.delete(line)
+              this.picturedLines.delete(line)
+              this.doubted.delete(line)
+            }
+          }
+        }
+      }
     }
-    for (const line of this.doubted) if (!this.rows.has(line)) this.doubted.delete(line)
     if (this.rows.size <= KEPT_LINES + KEPT_SLACK) return
     // The widest reach around `near` that holds no more than may be kept, found by halving: at most two
     // lines are any one distance away, so the count is within one of the bound
@@ -240,7 +328,7 @@ export class RowStore {
       return count
     }
     let reach = 0
-    let beyond = Math.max(near - oldest, this.end - near, 0) + 1
+    let beyond = Math.max(near - oldest, end - near, 0) + 1
     while (beyond - reach > 1) {
       const middle = reach + Math.floor((beyond - reach) / 2)
       if (within(middle) <= KEPT_LINES) reach = middle
@@ -249,6 +337,7 @@ export class RowStore {
     for (const line of this.rows.keys()) {
       if (line < this.firstActive && Math.abs(line - near) > reach) {
         this.rows.delete(line)
+        this.picturedLines.delete(line)
         this.doubted.delete(line)
       }
     }

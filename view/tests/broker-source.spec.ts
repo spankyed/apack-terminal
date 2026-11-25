@@ -376,3 +376,68 @@ describe('the commands of a session', () => {
     expect(await asked).toEqual([{ ...ran, prompt: null, output: null, end: null }])
   })
 })
+
+describe('broker lifecycle edge cases', () => {
+  it('invokes onClose immediately when the connection is already closed, and resets buffered bytes on close', () => {
+    const broker = new FakeBroker()
+    const views = new BrokerViews(broker)
+    // Feed a partial header that should be dropped on close
+    broker.raw(Uint8Array.of(10, 0, 0, 0, 65))
+    views.close()
+    let fired = 0
+    views.onClose(() => { fired += 1 })
+    expect(fired).toBe(1)
+  })
+
+  it('releases the channel and clears listener if attach send throws', () => {
+    const broker = new FakeBroker()
+    const views = new BrokerViews(broker)
+    const source = views.open('s-1')
+    const originalSend = broker.send.bind(broker)
+    let fail = true
+    broker.send = (bytes) => {
+      if (fail) throw new Error('broken pipe')
+      originalSend(bytes)
+    }
+    expect(() => source.attach({ frame() {}, ended() {} })).toThrow('broken pipe')
+    fail = false
+    const frames: Frame[] = []
+    source.attach({ frame: (f) => { frames.push(f) }, ended() {} })
+    // Channel 1 was released so channel 2 is active and channel 1 frames are ignored
+    broker.say({ kind: 'frame', channel: 1, frame: frame({ sequence: 1 }) })
+    expect(frames).toEqual([])
+    broker.say({ kind: 'frame', channel: 2, frame: frame({ sequence: 2 }) })
+    expect(frames.map((f) => f.sequence)).toEqual([2])
+  })
+
+  it('rejects requests on a detached channel when ended or failed(request=0) arrives, and ignores mismatched channels', async () => {
+    const { broker, source, detach } = attached()
+    const pending1 = source.textOf({ start: { line: 0, column: 0 }, end: { line: 0, column: 1 } })
+    detach()
+    source.attach({ frame() {}, ended() {} })
+    const pending2 = source.textOf({ start: { line: 0, column: 0 }, end: { line: 0, column: 1 } })
+
+    // Wrong channel for request 2 must be ignored
+    broker.say({ kind: 'text', channel: 1, request: 2, epoch: 0, text: 'spoofed' })
+    // Ended on detached channel 1 rejects pending1 without ending channel 2
+    broker.say({ kind: 'ended', channel: 1 })
+    await expect(pending1).rejects.toBeInstanceOf(Unanswered)
+
+    // Channel 2 still works
+    broker.say({ kind: 'text', channel: 2, request: 2, epoch: 0, text: 'real' })
+    expect(await pending2).toBe('real')
+
+    // Detached channel receiving failed(request=0) also rejects its pending request
+    const pending3 = source.textOf({ start: { line: 0, column: 0 }, end: { line: 0, column: 1 } })
+    source.attach({ frame() {}, ended() {} })
+    broker.say({ kind: 'failed', channel: 2, request: 0, message: 'attach failed' })
+    await expect(pending3).rejects.toThrow(new Unanswered('attach failed'))
+  })
+
+  it('drops TooLarge on tell methods without throwing into DOM event handlers', () => {
+    const { broker, source } = attached()
+    broker.taken()
+    expect(() => source.text('x'.repeat(MAX_MESSAGE_BYTES + 1))).not.toThrow()
+    expect(broker.taken()).toEqual([])
+  })
+})

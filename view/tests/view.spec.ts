@@ -241,7 +241,14 @@ describe('a view that is not mounted', () => {
 describe('the grid a view draws', () => {
   it('is the one its frames describe, whatever fits where it is mounted', () => {
     const fits: unknown[] = []
-    const { source, painter } = mounted({ onFit: (fit) => fits.push(fit) })
+    const source = new FakeSource()
+    const painter = new RecordingPainter()
+    const view = new TerminalView(source, { font: { family: 'monospace', size: 14 }, theme, painter: () => painter, onFit: (fit) => fits.push(fit) })
+    const host = document.createElement('div')
+    Object.defineProperty(host, 'clientWidth', { value: 200, configurable: true })
+    Object.defineProperty(host, 'clientHeight', { value: 80, configurable: true })
+    document.body.appendChild(host)
+    view.mount(host)
     source.send(frame({ columns: 132, screenRows: 43 }))
 
     expect(painter.sizes.at(-1)).toEqual([132, 43])
@@ -860,5 +867,223 @@ describe('text that blinks', () => {
     view.painted()
     view.view.unmount()
     expect(vi.getTimerCount(), 'a view that is not on the page went on blinking').toBe(0)
+  })
+})
+
+describe('view lifecycle, guards, and edge-case regressions', () => {
+  it('guards screenRows === 0 in paint, marksIn, positionOf, and selectAll', () => {
+    const view = mountedView({ gutter: 6 })
+    view.source.send(frame({ screenRows: 0, columns: 20, rows: [] }))
+    expect(() => runFrames()).not.toThrow()
+    expect(() => view.view.selectAll()).not.toThrow()
+    expect(() => view.point('pointermove', 0, 0)).not.toThrow()
+    expect(view.view.selection.span).toBeNull()
+  })
+
+  it('reschedules fetch when an in-flight page was invalidated by staleFrom and absorbed nothing', async () => {
+    const resolvers: Array<(fetched: Fetched) => void> = []
+    const source = new (class extends FakeSource {
+      override fetch(first: number, count: number): Promise<Fetched> {
+        this.fetched.push([first, count])
+        return new Promise((resolve) => { resolvers.push(resolve) })
+      }
+    })()
+    const view = mountedView({}, source)
+    source.send(frame({ firstActive: 100, scrollback: 100, rows: [row(100, 'live')] }))
+    view.view.scrollTo(90)
+    runFrames()
+    expect(source.fetched).toHaveLength(1)
+
+    // staleFrom arrives while the first fetch is in flight
+    source.send(frame({ sequence: 2, firstActive: 100, scrollback: 100, staleFrom: 0 }))
+    runFrames()
+    // First fetch resolves with stale rows -> absorb returns [] (nothing kept), must reschedule!
+    resolvers[0]!({ epoch: 1, first: 0, count: 100, rows: [row(90, 'old')] })
+    await settled()
+    expect(framesWaiting(), 'view left invalidated lines permanently blank').toBe(1)
+    runFrames()
+    expect(source.fetched).toHaveLength(2)
+  })
+
+  it('ignores out-of-order commands() and images() responses within the same epoch', async () => {
+    const cmdResolvers: Array<(c: readonly import('../src/source.ts').Command[]) => void> = []
+    const imgResolvers: Array<(p: import('../src/source.ts').Placements) => void> = []
+    const source = new (class extends FakeSource {
+      override commands() { return new Promise<readonly import('../src/source.ts').Command[]>((r) => { cmdResolvers.push(r) }) }
+      override images() { return new Promise<import('../src/source.ts').Placements>((r) => { imgResolvers.push(r) }) }
+    })()
+    const view = mountedView({}, source)
+    source.send(frame({ sequence: 1, commands: 1, images: 1 }))
+    source.send(frame({ sequence: 2, commands: 2, images: 2 }))
+    const newerCmd = { id: 2, command: 'new', cwd: null, startedMs: null, finishedMs: null, outcome: { kind: 'running' as const }, prompt: 0, output: null, end: null }
+    const olderCmd = { id: 1, command: 'old', cwd: null, startedMs: null, finishedMs: null, outcome: { kind: 'running' as const }, prompt: 0, output: null, end: null }
+    cmdResolvers[1]!([newerCmd])
+    await settled()
+    cmdResolvers[0]!([olderCmd])
+    await settled()
+    expect(view.view.commands.map((c) => c.id)).toEqual([2])
+
+    imgResolvers[1]!({ cellWidth: 10, cellHeight: 20, placements: [{ image: 2, generation: 1, z: 0, line: 0, column: 0, columns: 1, rows: 1, offsetX: 0, offsetY: 0, width: 10, height: 20, sourceX: 0, sourceY: 0, sourceWidth: 10, sourceHeight: 20 }] })
+    await settled()
+    imgResolvers[0]!({ cellWidth: 10, cellHeight: 20, placements: [] })
+    await settled()
+    expect(source.picturesAsked).toContain(2)
+  })
+
+  it('does not emit onFit for zero-sized containers and deduplicates identical fit emissions', () => {
+    const fits: Array<{ columns: number; rows: number; cellWidth: number; cellHeight: number }> = []
+    const source = new FakeSource()
+    const painter = new RecordingPainter()
+    const view = new TerminalView(source, { font: { family: 'monospace', size: 14 }, theme, painter: () => painter, onFit: (fit) => fits.push(fit) })
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    // Zero-sized (hidden display:none) container emits nothing
+    view.mount(host)
+    expect(fits).toEqual([])
+
+    let w = 200
+    let h = 80
+    Object.defineProperty(host, 'clientWidth', { get: () => w, configurable: true })
+    Object.defineProperty(host, 'clientHeight', { get: () => h, configurable: true })
+    view.fit()
+    view.fit()
+    expect(fits).toEqual([{ columns: 20, rows: 4, cellWidth: 10, cellHeight: 20 }])
+    w = 210
+    view.fit()
+    expect(fits).toHaveLength(2)
+  })
+
+  it('cleans up thumb drag, mouse press, refresh timer on unmount, blocks mount after dispose, and guards find/paste after dispose', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const source = new FakeSource()
+      let resolveSearch!: (f: import('../src/source.ts').Found) => void
+      source.search = () => new Promise((r) => { resolveSearch = r })
+      let resolvePaste!: (o: import('../src/source.ts').PasteOutcome) => void
+      source.paste = () => new Promise((r) => { resolvePaste = r })
+      const view = mountedView({}, source)
+      source.send(frame({ firstActive: 100, scrollback: 100, modes: { alternateScreen: false, mouse: true }, rows: [row(100, 'hi')] }))
+      runFrames()
+
+      // Active mouse reporting press is released on unmount
+      view.point('pointerdown', 1, 0)
+      view.view.unmount()
+      expect(source.pointers.map((p) => p.action)).toEqual(['press', 'release'])
+
+      // Remount, start search & paste, then dispose before they resolve
+      view.view.mount(view.host)
+      const findPromise = view.view.find('hi')
+      const pastePromise = view.view.paste('abc')
+      view.view.scrollTo(50)
+      view.view.dispose()
+      // mount() after dispose is a no-op
+      const attachedBefore = source.attached
+      view.view.mount(view.host)
+      expect(source.attached).toBe(attachedBefore)
+
+      resolveSearch({ spans: [{ start: { line: 100, column: 0 }, end: { line: 100, column: 1 } }], more: false })
+      resolvePaste('pasted')
+      await Promise.all([findPromise, pastePromise])
+      expect(view.view.found.total).toBe(0)
+      expect(view.view.viewport.following).toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('notifies onFound on epoch reset when there was an active search and cancels refresh timer', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const foundEvents: Array<{ current: number; total: number; more: boolean }> = []
+      const source = new FakeSource()
+      source.search = async () => ({ spans: [{ start: { line: 0, column: 0 }, end: { line: 0, column: 1 } }], more: false })
+      const view = mountedView({ onFound: (f) => foundEvents.push(f) }, source)
+      source.send(frame({ sequence: 1, epoch: 1, rows: [row(0, 'ab')] }))
+      await view.view.find('ab')
+      // Schedule a refresh timer
+      source.send(frame({ sequence: 2, epoch: 1, rows: [row(0, 'ac')] }))
+      expect(vi.getTimerCount()).toBe(1)
+      // Epoch reset cancels timer and notifies onFound
+      source.send(frame({ sequence: 3, epoch: 2, rows: [row(0, 'new')] }))
+      expect(vi.getTimerCount()).toBe(0)
+      expect(foundEvents).toEqual([{ current: 0, total: 0, more: false }])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('clamps pointer reporting coordinates, ignores secondary press while active, sanitizes link tooltips, and hides invisible/blinked cursor text & covers wide cursor', () => {
+    const view = mountedView({ linkPreview: 'osc8' })
+    const invisibleStyle = { ...PLAIN, flags: StyleFlag.invisible }
+    const wideRow = {
+      ...row(0, 'a日b', { links: ['https://example.com/\u202eevil\x07'] }),
+      column: Uint16Array.from([0, 1, 3]),
+      width: Uint8Array.from([1, 2, 1]),
+      style: Uint16Array.from([1, 0, 0]),
+      styles: [PLAIN, invisibleStyle],
+      link: Uint16Array.from([0, 0, 1]),
+    }
+    view.source.send(frame({
+      columns: 20, screenRows: 4,
+      modes: { alternateScreen: false, mouse: true },
+      cursor: { column: 0, row: 0, shape: 'block', blinking: false, hidden: false },
+      rows: [wideRow],
+    }))
+    // Invisible cell under block cursor reveals no text
+    expect(view.painted().cursor?.text).toBeUndefined()
+
+    // Cursor on second cell of wide character snaps to column 1 with width 2
+    view.source.send(frame({
+      sequence: 2, columns: 20, screenRows: 4,
+      modes: { alternateScreen: false, mouse: true },
+      cursor: { column: 2, row: 0, shape: 'block', blinking: false, hidden: false },
+      rows: [wideRow],
+    }))
+    expect(view.painted().cursor).toMatchObject({ column: 1, cells: 2, text: { text: '日' } })
+
+    // Pointer reporting clamps coordinates to [0, columns*cellWidth] x [0, rows*cellHeight] and ignores secondary button press
+    view.point('pointerdown', 100, 100, { button: 0 })
+    view.point('pointerdown', 2, 1, { button: 2 })
+    view.point('pointerup', 2, 1, { button: 2 })
+    view.point('pointerup', 100, 100, { button: 0 })
+    expect(view.source.pointers.map((p) => [p.action, p.button, p.x, p.y])).toEqual([
+      ['press', 0, 200, 80],
+      ['release', 0, 200, 80],
+    ])
+
+    // Hovering link strips bidi override and control chars from tooltip title
+    view.source.send(frame({ sequence: 3, columns: 20, screenRows: 4, modes: { alternateScreen: false, mouse: false }, rows: [wideRow] }))
+    runFrames()
+    view.point('pointermove', 3, 0)
+    expect(view.view.element.title).toBe('https://example.com/evil')
+  })
+
+  it('falls back to min/max-resolution and window resize when fractional DPR exact query does not match', () => {
+    const queries: string[] = []
+    const originalMatchMedia = window.matchMedia
+    Object.defineProperty(window, 'devicePixelRatio', { value: 1.25, configurable: true })
+    window.matchMedia = ((query: string) => {
+      queries.push(query)
+      return { matches: !query.startsWith('(resolution:'), addEventListener() {}, removeEventListener() {} }
+    }) as unknown as typeof window.matchMedia
+    try {
+      const { canvas } = recordingContext(8)
+      const fits: Array<{ cellWidth: number }> = []
+      const view = new TerminalView(new FakeSource(), { font: { family: 'monospace', size: 14 }, theme, painter: (f) => new CanvasPainter(f, canvas), onFit: (fit) => fits.push(fit) })
+      const host = document.createElement('div')
+      Object.defineProperty(host, 'clientWidth', { value: 200, configurable: true })
+      Object.defineProperty(host, 'clientHeight', { value: 80, configurable: true })
+      document.body.appendChild(host)
+      view.mount(host)
+      expect(queries.some((q) => q.includes('min-resolution') && q.includes('max-resolution'))).toBe(true)
+
+      Object.defineProperty(window, 'devicePixelRatio', { value: 1.5, configurable: true })
+      window.dispatchEvent(new Event('resize'))
+      expect(queries.at(-1)).toContain('min-resolution')
+      view.dispose()
+    } finally {
+      Object.defineProperty(window, 'devicePixelRatio', { value: 1, configurable: true })
+      window.matchMedia = originalMatchMedia
+    }
   })
 })

@@ -306,5 +306,41 @@ describe('a fetch answered before a frame named history stale', () => {
     expect(store.row(6), 'a line named stale was put back as it was').toBeUndefined()
     expect(store.row(7)).toBeUndefined()
   })
+
+  it('tracks the minimum staleFrom across multiple stale frames for an older in-flight fetch', () => {
+    const store = new RowStore()
+    store.apply(frame({ firstActive: 300, scrollback: 300, rows: [] }))
+    const askedBeforeBoth = store.staleFrames
+    store.apply(frame({ sequence: 2, firstActive: 300, scrollback: 300, staleFrom: 100 }))
+    const askedAfterFirst = store.staleFrames
+    store.apply(frame({ sequence: 3, firstActive: 300, scrollback: 300, staleFrom: 200 }))
+
+    // Fetch started before both stale frames must not resurrect 100..199 even though the latest staleFrom is 200
+    store.absorb({ epoch: 1, first: 90, count: 120, rows: [row(95, 'ok'), row(150, 'stale1'), row(205, 'stale2')] }, 300, store.imagesChanged, askedBeforeBoth)
+    expect(store.row(95)?.text.join('')).toBe('ok')
+    expect(store.row(150)).toBeUndefined()
+    expect(store.row(205)).toBeUndefined()
+
+    // Fetch started after the first stale frame can absorb 150, but not 205
+    store.absorb({ epoch: 1, first: 140, count: 70, rows: [row(150, 'fresh1'), row(205, 'stale2')] }, 300, store.imagesChanged, askedAfterFirst)
+    expect(store.row(150)?.text.join('')).toBe('fresh1')
+    expect(store.row(205)).toBeUndefined()
+  })
+
+  it('handles huge staleFrom gaps, clamped scrollback, and adversarial fetch counts without freezing or OOM', () => {
+    const store = new RowStore()
+    store.apply(frame({ firstActive: 5, scrollback: 500, rows: [row(2, 'a')] }))
+    expect(store.oldest).toBe(0)
+
+    const start = performance.now()
+    store.apply(frame({ sequence: 2, firstActive: 10_000_000, scrollback: 10_000_000, staleFrom: 0, rows: [row(10_000_000, 'live')] }))
+    expect(store.row(2)).toBeUndefined()
+    expect(performance.now() - start).toBeLessThan(200)
+
+    const absorbStart = performance.now()
+    const told = store.absorb({ epoch: 1, first: 0, count: 10_000_000, rows: [] })
+    expect(told.length).toBeLessThanOrEqual(16_384)
+    expect(performance.now() - absorbStart).toBeLessThan(200)
+  })
 })
 

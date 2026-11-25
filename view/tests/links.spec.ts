@@ -72,6 +72,38 @@ describe('a link on a row', () => {
     const cut = row(5, 'docs: https://exampl', { wrapped: true })
     expect(linkAt(cut, 8, [urls], () => undefined)?.target).toBe('https://exampl')
   })
+
+  it('strips very long runs of trailing closing brackets in linear time', () => {
+    const url = 'https://example.com/a' + ')'.repeat(50_000)
+    const start = performance.now()
+    const found = urls.find(url)
+    expect(found).toEqual([{ start: 0, end: 'https://example.com/a'.length }])
+    expect(performance.now() - start).toBeLessThan(200)
+  })
+
+  it('rejects dangerous OSC 8 URI schemes even when obfuscated with whitespace or control characters', () => {
+    for (const bad of ['javascript:alert(1)', 'DATA:text/html,hi', 'vbscript:msgbox(1)', '  java\tscript:alert(1)', '\x01javascript:x']) {
+      const declared: Row = { ...row(0, 'click', { links: [bad] }), link: Uint16Array.from([1, 1, 1, 1, 1]) }
+      expect(linkAt(declared, 2, [urls]), bad).toBeNull()
+    }
+  })
+
+  it('does not merge separate declared links across blank-cell gaps and aligns linkAt with linkRuns', () => {
+    const gapped: Row = {
+      ...row(0, '', { links: ['https://example.com/a', 'https://example.com/a'] }),
+      text: ['a', 'b', 'c', 'd'],
+      column: Uint16Array.from([0, 1, 5, 6]),
+      width: Uint8Array.from([1, 1, 1, 1]),
+      style: new Uint16Array(4),
+      link: Uint16Array.from([1, 1, 1, 1]),
+    }
+    const left = linkAt(gapped, 0, [])!
+    const right = linkAt(gapped, 5, [])!
+    expect(left).toEqual({ target: 'https://example.com/a', kind: 'declared', from: 0, to: 2 })
+    expect(right).toEqual({ target: 'https://example.com/a', kind: 'declared', from: 5, to: 7 })
+    expect(linkRuns(left, gapped, 0, () => undefined)).toEqual([{ line: 0, from: 0, to: 2 }])
+    expect(linkRuns(right, gapped, 5, () => undefined)).toEqual([{ line: 0, from: 5, to: 7 }])
+  })
 })
 
 describe('the cells a declared link covers across a wrap', () => {

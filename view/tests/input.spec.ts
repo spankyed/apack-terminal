@@ -361,7 +361,7 @@ describe('composition', () => {
     expect(after.source.texts).toEqual(['x'])
   })
 
-  it('Enter during composition sends the composed text, then Enter', () => {
+  it('Enter during composition is left to the input method so confirming a candidate does not also submit Enter', () => {
     const view = mountedView()
     const log: string[] = []
     const { text, key } = view.source
@@ -371,11 +371,36 @@ describe('composition', () => {
     view.field.dispatchEvent(new CompositionEvent('compositionstart'))
     view.field.value = '日本'
     const enter = view.key('keydown', { code: 'Enter', key: 'Enter', keyCode: 229, isComposing: true })
-    expect(log).toEqual(['text 日本', 'key Enter'])
-    expect(enter.defaultPrevented, 'the newline is not typed into the field').toBe(true)
-    // The composition goes on until the input method ends it, and what it adds then is what is sent
+    expect(log).toEqual([])
+    expect(enter.defaultPrevented, 'Enter was stolen from the IME before it could confirm').toBe(false)
+    // The IME confirms the candidate via compositionend, sending the confirmed text once with no extra Enter
     view.field.dispatchEvent(new CompositionEvent('compositionend', { data: '日本' }))
-    expect(log).toEqual(['text 日本', 'key Enter'])
+    expect(log).toEqual(['text 日本'])
+  })
+
+  it('a non-key insertion of the same character after a prior keydown is not dropped on a later tick', async () => {
+    const view = mountedView({ mac: false })
+    view.key('keydown', { code: 'KeyA', key: 'a' })
+    await Promise.resolve()
+    view.field.value = 'a'
+    view.field.dispatchEvent(new Event('input'))
+    expect(view.source.texts).toEqual(['a'])
+  })
+
+  it('Mac Cmd+C copies only without extra modifiers, and dispose removes listeners', () => {
+    let copies = 0
+    const view = mountedView({ mac: true, onCopy: () => { copies += 1 } })
+    view.view.selection.select({ start: { line: 0, column: 0 }, end: { line: 0, column: 2 } })
+    const shifted = view.key('keydown', { code: 'KeyC', key: 'C', metaKey: true, shiftKey: true })
+    const alted = view.key('keydown', { code: 'KeyC', key: 'c', metaKey: true, altKey: true })
+    const ctrled = view.key('keydown', { code: 'KeyC', key: 'c', metaKey: true, ctrlKey: true })
+    expect([shifted.defaultPrevented, alted.defaultPrevented, ctrled.defaultPrevented]).toEqual([false, false, false])
+    expect(copies).toBe(0)
+
+    const field = view.field
+    view.view.dispose()
+    field.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, code: 'KeyA', key: 'a' }))
+    expect(view.source.keys).toEqual([])
   })
 
   it('a keydown of 229 is input-method processing: no key is sent, and composition is not ended', () => {

@@ -21,17 +21,37 @@ export class Viewport {
   private followingOutput = true
   /** The folded runs, sorted and not overlapping. Their hidden lines take no row, so scrolling counts rows past them */
   private folds: readonly FoldRange[] = []
+  /** Prefix sums of hidden line counts before each fold: `hiddenBefore[i]` is hidden lines in `folds[0..i-1]` */
+  private hiddenBefore: number[] = [0]
 
   constructor(private readonly store: RowStore) {}
 
   /** Sets the folded runs the view draws; a fold's hidden lines are passed over by every scroll */
   setFolds(folds: readonly FoldRange[]): void {
     this.folds = folds
+    this.hiddenBefore = new Array<number>(folds.length + 1)
+    this.hiddenBefore[0] = 0
+    for (let i = 0; i < folds.length; i += 1) {
+      this.hiddenBefore[i + 1] = this.hiddenBefore[i]! + (folds[i]!.last - folds[i]!.first)
+    }
+    if (!this.followingOutput) {
+      const hidden = this.hiddenIn(Math.floor(this.held))
+      if (hidden) this.held = Math.max(hidden.first, this.store.oldest)
+    }
   }
 
   /** The fold a line is hidden in: a header is not, and neither is a line outside every fold */
   hiddenIn(line: number): FoldRange | undefined {
-    return this.folds.find((fold) => line > fold.first && line <= fold.last)
+    const folds = this.folds
+    let low = 0
+    let high = folds.length
+    while (low < high) {
+      const mid = (low + high) >> 1
+      if (folds[mid]!.first < line) low = mid + 1
+      else high = mid
+    }
+    const fold = folds[low - 1]
+    return fold && line <= fold.last ? fold : undefined
   }
 
   /**
@@ -100,11 +120,14 @@ export class Viewport {
 
   /** Shows from `line`. At or past the screen, the view follows the output again */
   scrollTo(line: number): void {
-    const clamped = Math.max(line, this.store.oldest)
+    if (!Number.isFinite(line)) return
+    let clamped = Math.max(line, this.store.oldest)
     if (clamped >= this.store.firstActive) {
       this.followingOutput = true
       return
     }
+    const hidden = this.hiddenIn(Math.floor(clamped))
+    if (hidden) clamped = Math.max(hidden.first, this.store.oldest)
     this.followingOutput = false
     this.held = clamped
   }
@@ -114,37 +137,65 @@ export class Viewport {
    * fraction of the row it lands in: a whole row steps over a fold as one row, and a part-row never lands on a hidden line.
    */
   stepRows(line: number, rows: number): number {
+    if (!Number.isFinite(line)) return this.store.firstActive
     const whole = Math.floor(line)
     const hidden = this.hiddenIn(whole)
-    let row = hidden ? hidden.first : whole
+    const startRow = hidden ? hidden.first : whole
     const part = hidden ? 0 : line - whole
-    const steps = Math.trunc(rows)
-    for (let step = 0; step < Math.abs(steps); step += 1) row = steps > 0 ? this.nextRow(row) : this.previousRow(row)
-    const rest = part + (rows - steps)
-    if (rest >= 1) return this.nextRow(row) + rest - 1
-    if (rest < 0) return this.previousRow(row) + rest + 1
-    return row + rest
+    if (!Number.isFinite(rows) || rows === 0) return startRow + part
+    const total = part + rows
+    const wholeStep = Math.floor(total)
+    const frac = total - wholeStep
+    return this.lineAtDrawn(this.drawnOf(startRow) + wholeStep) + frac
   }
 
-  /** The drawn row below `line`, which is past the fold when `line` is a fold's header */
-  private nextRow(line: number): number {
-    const fold = this.folds.find((known) => known.first === line)
-    return fold ? fold.last + 1 : line + 1
+  /** Drawn-row coordinate of a non-hidden integer line */
+  private drawnOf(line: number): number {
+    const folds = this.folds
+    let low = 0
+    let high = folds.length
+    while (low < high) {
+      const mid = (low + high) >> 1
+      if (folds[mid]!.first < line) low = mid + 1
+      else high = mid
+    }
+    return line - this.hiddenBefore[low]!
   }
 
-  /** The drawn row above `line`, which is a fold's header when the line above is folded away */
-  private previousRow(line: number): number {
-    const hidden = this.hiddenIn(line - 1)
-    return hidden ? hidden.first : line - 1
+  /** Non-hidden integer line whose drawn-row coordinate is `drawn` */
+  private lineAtDrawn(drawn: number): number {
+    const folds = this.folds
+    let low = 0
+    let high = folds.length
+    while (low < high) {
+      const mid = (low + high) >> 1
+      if (folds[mid]!.first - this.hiddenBefore[mid]! < drawn) low = mid + 1
+      else high = mid
+    }
+    return drawn + this.hiddenBefore[low]!
+  }
+
+  /** Total hidden lines at or below integer line `limit` */
+  private hiddenUpTo(limit: number): number {
+    const folds = this.folds
+    let low = 0
+    let high = folds.length
+    while (low < high) {
+      const mid = (low + high) >> 1
+      if (folds[mid]!.first < limit) low = mid + 1
+      else high = mid
+    }
+    if (low === 0) return 0
+    const fold = folds[low - 1]!
+    return this.hiddenBefore[low - 1]! + Math.min(fold.last, limit) - fold.first
   }
 
   /** The number of drawn rows from line `from` up to `to`, a fold's hidden lines taking none; a fractional `to` counts its line */
   private rowsBetween(from: number, to: number): number {
     let rows = to - from
     const through = Math.ceil(to) - 1
-    for (const fold of this.folds) {
-      const hidden = Math.min(fold.last, through) - Math.max(fold.first + 1, from) + 1
-      if (hidden > 0) rows -= hidden
+    if (through >= from && this.folds.length > 0) {
+      rows -= this.hiddenUpTo(through) - this.hiddenUpTo(from - 1)
     }
     return rows
   }

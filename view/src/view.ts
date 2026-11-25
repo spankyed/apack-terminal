@@ -5,7 +5,7 @@ import { linkAt, linkRuns, urls, type Detector, type Link, type LinkRun } from '
 import { fontOf, type Font, type Painter, type Scene } from './painter.ts'
 import { RowStore } from './row-store.ts'
 import { Selection, type Granularity } from './selection.ts'
-import { Modifier, PLAIN, TooLarge, type Anchored, type Command, type Frame, type Picture, type Placements, type PointerInput, type CursorShape, type Found, type Position, type Row, type SessionColors, type Span, type TerminalSource } from './source.ts'
+import { Modifier, PLAIN, StyleFlag, TooLarge, type Anchored, type Command, type Frame, type Picture, type Placements, type PointerInput, type CursorShape, type Found, type Position, type Row, type SessionColors, type Span, type TerminalSource } from './source.ts'
 import { Viewport } from './viewport.ts'
 import { cellsOfCodePoint } from './width.ts'
 
@@ -191,6 +191,7 @@ interface HeldPicture {
   picture: CanvasImageSource | null
   asking: boolean
   refused: Placements | null
+  refusedGeneration: number
 }
 
 /** A command, by the line it is on */
@@ -288,6 +289,8 @@ export class TerminalView {
   private commandList: readonly Command[] = []
   private folds: readonly Fold[] = []
   private foldRows = new Map<string, Row>()
+  private foldDrawings = new Map<Row, RowDrawing>()
+  private lastFit: { columns: number; rows: number; cellWidth: number; cellHeight: number } | null = null
   private commandsSeen = -1
   /** Those of them that begin on a line, and those with a prompt on one: each in the order of its lines */
   private commandStarts: readonly CommandLine[] = []
@@ -410,12 +413,6 @@ export class TerminalView {
     this.thumb.addEventListener('pointerdown', this.thumbDown)
   }
 
-  /**
-   * Draws in other colours from here on: every row a view holds is drawn again, and none is asked for.
-   * A colour the session's program set for itself stays the program's, over the new theme as over the old.
-   *
-   * The theme is taken as it is when given: a host that changes one it gave gives it again.
-   */
   /** Changes whether a selection is copied as the pointer is let go (`copyOnSelect`) */
   setCopyOnSelect(on: boolean): void {
     this.copyOnSelect = on
@@ -433,9 +430,15 @@ export class TerminalView {
   /** Changes which links show where they open (`linkPreview`), and the link under the pointer shows it at once */
   setLinkPreview(mode: LinkPreview): void {
     this.linkPreview = mode
-    if (this.hovered) this.element.title = this.previews(this.hovered.link) ? this.hovered.link.target : ''
+    if (this.hovered) this.element.title = this.previews(this.hovered.link) ? sanitizeTitle(this.hovered.link.target) : ''
   }
 
+  /**
+   * Draws in other colours from here on: every row a view holds is drawn again, and none is asked for.
+   * A colour the session's program set for itself stays the program's, over the new theme as over the old.
+   *
+   * The theme is taken as it is when given: a host that changes one it gave gives it again.
+   */
   setTheme(theme: Theme): void {
     // A copy, so that the same object given again with other colours in it is other colours
     this.hostTheme = { ...theme, palette: [...theme.palette] }
@@ -449,6 +452,7 @@ export class TerminalView {
     this.theme = theme
     this.themed()
     this.drawings.clear()
+    this.foldDrawings.clear()
     this.schedule()
   }
 
@@ -477,10 +481,12 @@ export class TerminalView {
    * which `copy` answers `false` and nothing is copied.
    */
   selectAll(): void {
-    if (!this.frame) return
+    if (!this.frame || this.rows <= 0 || this.columns <= 0) return
+    const endLine = this.store.firstActive + this.rows - 1
+    if (endLine < this.store.oldest) return
     this.selection.select({
       start: { line: this.store.oldest, column: 0 },
-      end: { line: this.store.firstActive + this.rows - 1, column: Math.max(0, this.columns - 1) },
+      end: { line: endLine, column: Math.max(0, this.columns - 1) },
     })
   }
 
@@ -494,12 +500,13 @@ export class TerminalView {
    * they were on.
    */
   async find(needle: string, options: { matchCase?: boolean } = {}): Promise<number> {
+    if (this.disposed) return 0
     const asked = (this.finding += 1)
     this.needle = needle
     this.matchCase = options.matchCase ?? false
     const found = (await this.search(needle)) ?? NOTHING_FOUND
-    // A search that was overtaken by a later one has nothing to say
-    if (asked !== this.finding) return this.matches.length
+    // A search that was overtaken by a later one — or completed after disposal — has nothing to say
+    if (this.disposed || asked !== this.finding) return this.matches.length
     this.setMatches(found)
     this.currentMatch = this.matches.length > 0 ? 0 : -1
     this.drawings.clear()
@@ -591,9 +598,10 @@ export class TerminalView {
   private showMatch(): void {
     const match = this.matches[this.currentMatch]
     if (match) {
-      const [first, count] = this.viewport.visible
-      if (match.start.line < first || match.start.line >= first + count) {
-        this.scrollTo(match.start.line - Math.floor(this.rows / 2))
+      const { lines } = this.layout()
+      const target = this.hiddenIn(match.start.line)?.first ?? match.start.line
+      if (!lines.includes(target)) {
+        this.scrollTo(this.viewport.stepRows(target, -Math.floor(this.rows / 2)))
       }
     }
     this.schedule()
@@ -644,6 +652,7 @@ export class TerminalView {
     this.folds = sorted
     this.viewport.setFolds(sorted)
     this.foldRows.clear()
+    this.foldDrawings.clear()
     this.drawings.clear()
     this.schedule()
   }
@@ -716,6 +725,17 @@ export class TerminalView {
     return row
   }
 
+  /** Cached drawing for a fold header, so unchanged fold headers keep identity for dirty-band painting */
+  private foldDrawing(fold: Fold): RowDrawing {
+    const row = this.foldRow(fold)
+    let drawing = this.foldDrawings.get(row)
+    if (!drawing) {
+      drawing = drawRow(row, this.theme)
+      this.foldDrawings.set(row, drawing)
+    }
+    return drawing
+  }
+
   private setCommands(commands: readonly Command[]): void {
     this.commandList = commands
     this.options.onCommands?.(commands)
@@ -779,6 +799,7 @@ export class TerminalView {
    * of it. Known once placements are told, which is whenever the images change.
    */
   private dropPictures(): void {
+    if (this.pictures.size === 0) return
     const shown = this.store.pictured()
     for (const placement of this.placed.placements) shown.add(placement.image)
     for (const { image } of this.anchored.list) shown.add(image)
@@ -790,13 +811,20 @@ export class TerminalView {
     }
   }
 
+  /** Asks for pictures covering the lines currently laid out in view (accounting for folds) */
+  private wantPicturesInView(): void {
+    const { first, lines } = this.layout()
+    if (lines.length === 0) return
+    this.wantPictures(first, lines[lines.length - 1]! - first + 1)
+  }
+
   /**
    * Asks for the pixels of the images in view, or within a screenful of it, that this view does not hold
    * at the generation shown: the ones placed there, by themselves or relative to another, and the ones
    * the rows there show part of. One far up the history costs nothing until it is scrolled to.
    */
   private wantPictures(first: number, count: number): void {
-    if (this.ended || !this.listening) return
+    if (this.ended || !this.listening || count <= 0) return
     for (const placement of [...this.placed.placements, ...this.anchored.list]) {
       if (placement.line + placement.rows <= first - count || placement.line >= first + count * 2) continue
       this.wantPicture(placement.image, placement.generation)
@@ -816,19 +844,18 @@ export class TerminalView {
   /**
    * Asks for one image's pixels, once.
    *
-   * **An answer that is not what was asked for is not asked for again until the placements are told.**
-   * The image is gone, or could not be made into a picture, or was replaced since — and asking again gets
-   * the same answer, on every paint, until something has changed. What changes is the images, and the
-   * placements are told again whenever they do, which is when it is asked for once more.
+   * **An answer that is not what was asked for is not asked for again until the placements are told or the
+   * requested generation moves on.** The image is gone, or could not be made into a picture, or was replaced
+   * since — and asking again gets the same answer, on every paint, until something has changed.
    */
   private wantPicture(image: number, generation: number): void {
     this.wanted.set(image, generation)
     let held = this.pictures.get(image)
     if (!held) {
-      held = { generation: -1, picture: null, asking: false, refused: null }
+      held = { generation: -1, picture: null, asking: false, refused: null, refusedGeneration: -1 }
       this.pictures.set(image, held)
     }
-    if (held.generation === generation || held.asking || held.refused === this.placed) return
+    if (held.generation === generation || held.asking || (held.refused === this.placed && held.refusedGeneration === generation)) return
     const entry = held
     entry.asking = true
     const attachment = this.attachment
@@ -847,11 +874,18 @@ export class TerminalView {
       }
       // No answer for want of an attachment says nothing about the image: the next attachment asks
       if (!picture && (attachment !== this.attachment || !this.listening)) return
-      if (!picture || got !== this.wanted.get(image)) entry.refused = this.placed
+      const wanted = this.wanted.get(image) ?? generation
+      if (!picture || got !== wanted) {
+        entry.refused = this.placed
+        entry.refusedGeneration = wanted
+      }
       this.schedule()
     }, () => {
       entry.asking = false
-      if (attachment === this.attachment && this.listening) entry.refused = this.placed
+      if (attachment === this.attachment && this.listening) {
+        entry.refused = this.placed
+        entry.refusedGeneration = this.wanted.get(image) ?? generation
+      }
     })
   }
 
@@ -921,7 +955,7 @@ export class TerminalView {
 
   /** A mark for each command whose prompt is in view, coloured by how the command ended */
   private marksIn(first: number, lines: number[]): NonNullable<Scene['marks']> {
-    if (this.gutter === 0) return []
+    if (this.gutter === 0 || lines.length === 0) return []
     const prompts = this.commandPrompts
     const last = lines[lines.length - 1]!
     const marks: Array<{ row: number; color: number }> = []
@@ -965,10 +999,15 @@ export class TerminalView {
    * session that has ended goes nowhere, and says nothing.
    */
   async paste(text: string): Promise<void> {
+    if (this.disposed) return
     try {
       let outcome = await this.source.paste(text)
-      if (outcome === 'unsafe' && (await this.options.confirmPaste?.(text))) outcome = await this.source.paste(text, { allowUnsafe: true })
-      if (outcome === 'pasted') this.typed()
+      if (this.disposed) return
+      if (outcome === 'unsafe' && (await this.options.confirmPaste?.(text))) {
+        if (this.disposed) return
+        outcome = await this.source.paste(text, { allowUnsafe: true })
+      }
+      if (!this.disposed && outcome === 'pasted') this.typed()
     } catch (error) {
       if (error instanceof TooLarge) throw error
       // The session ended while the paste was on its way: there is nothing to paste into
@@ -1016,6 +1055,7 @@ export class TerminalView {
 
   /** Puts the view in `host` and starts its frames */
   mount(host: HTMLElement): void {
+    if (this.disposed) return
     // Mounted where it already is, there is nothing to do; mounted somewhere else, it is moved
     if (this.observer) {
       if (this.element.parentElement === host) return
@@ -1023,6 +1063,7 @@ export class TerminalView {
     }
     host.appendChild(this.element)
     this.observer = new ResizeObserver(() => {
+      if ((window.devicePixelRatio || 1) !== this.pixelRatio) this.size()
       this.fit()
       this.schedule()
     })
@@ -1047,8 +1088,21 @@ export class TerminalView {
     this.observer = null
     this.unwatch?.()
     this.unwatch = null
-    // Said while there is still an attachment to say it on: a view off the page does not have the keyboard,
-    // whether or not the page gets round to saying the field lost it
+    this.lastFit = null
+    this.thumbRelease?.()
+    if (this.refreshTimer !== undefined) {
+      clearTimeout(this.refreshTimer)
+      this.refreshTimer = undefined
+    }
+    // Said while there is still an attachment to say it on: a view off the page does not have the keyboard
+    // or a held button, whether or not the page gets round to saying so
+    const pressed = this.pressed
+    this.pressed = null
+    if (pressed?.reporting) {
+      this.reported = null
+      const { cellWidth, cellHeight } = this.painter.metrics
+      this.source.pointer({ action: 'release', button: pressed.button, modifiers: 0, x: 0, y: 0, cellWidth, cellHeight })
+    }
     this.setFocused(false)
     this.pause()
     this.element.remove()
@@ -1059,9 +1113,14 @@ export class TerminalView {
     const host = this.element.parentElement
     if (!host) return
     this.height = this.element.clientHeight
+    if (host.clientWidth <= 0 || host.clientHeight <= 0) return
     const { cellWidth, cellHeight } = this.painter.metrics
+    if (cellWidth <= 0 || cellHeight <= 0) return
     const columns = Math.max(1, Math.floor((host.clientWidth - this.gutter) / cellWidth))
     const rows = Math.max(1, Math.floor(host.clientHeight / cellHeight))
+    const last = this.lastFit
+    if (last && last.columns === columns && last.rows === rows && last.cellWidth === cellWidth && last.cellHeight === cellHeight) return
+    this.lastFit = { columns, rows, cellWidth, cellHeight }
     this.options.onFit?.({ columns, rows, cellWidth, cellHeight })
   }
 
@@ -1101,10 +1160,18 @@ export class TerminalView {
   private watch(): void {
     this.unwatch?.()
     const stop: Array<() => void> = []
-    // A resolution query matches one ratio, so it is asked again for each ratio the display comes to have
+    // A resolution query matches one ratio, so it is asked again for each ratio the display comes to have.
+    // Under fractional browser zoom, an exact `(resolution: ...)` query may not match due to float rounding,
+    // in which case we fall back to a narrow min/max-resolution range and also re-check on window resize.
     const display = () => {
       if (typeof matchMedia !== 'function') return
-      const query = matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`)
+      const ratio = window.devicePixelRatio || 1
+      let query = matchMedia(`(resolution: ${ratio}dppx)`)
+      if (query.matches === false) {
+        const min = Math.max(0.001, ratio - 0.001)
+        const max = ratio + 0.001
+        query = matchMedia(`(min-resolution: ${min}dppx) and (max-resolution: ${max}dppx)`)
+      }
       const changed = () => {
         query.removeEventListener?.('change', changed)
         display()
@@ -1117,6 +1184,14 @@ export class TerminalView {
     let stopDisplay = () => {}
     display()
     stop.push(() => stopDisplay())
+    const onResize = () => {
+      if ((window.devicePixelRatio || 1) === this.pixelRatio) return
+      stopDisplay()
+      display()
+      this.remeasure()
+    }
+    window.addEventListener('resize', onResize)
+    stop.push(() => window.removeEventListener('resize', onResize))
     const fonts = document.fonts
     if (fonts && typeof fonts.addEventListener === 'function') {
       fonts.addEventListener('loadingdone', this.fontsLoaded)
@@ -1203,7 +1278,7 @@ export class TerminalView {
     // A program is told who has the keyboard by the attachment that has it
     if (this.focused) this.source.focus(true)
     // What an attachment before was asked for and could not answer is asked of this one
-    this.wantPictures(...this.viewport.visible)
+    this.wantPicturesInView()
     this.blinkAgain()
   }
 
@@ -1258,6 +1333,12 @@ export class TerminalView {
     if (this.imagesTold !== -1 && frame.images !== this.imagesTold) this.store.doubtPictured()
     this.imagesTold = frame.images
     const { reset, changed } = this.store.apply(frame, near)
+    if (reset) {
+      this.folds = []
+      this.viewport.setFolds([])
+      this.foldRows.clear()
+      this.foldDrawings.clear()
+    }
     after?.()
     this.viewport.settle()
     if (reset) {
@@ -1276,10 +1357,17 @@ export class TerminalView {
       this.placed = { ...this.placed, placements: [] }
       this.anchored = { ...this.anchored, list: [] }
       this.imagesSeen = -1
+      if (this.refreshTimer !== undefined) {
+        clearTimeout(this.refreshTimer)
+        this.refreshTimer = undefined
+      }
+      this.refreshAgain = false
+      const hadSearch = this.needle !== '' || this.matches.length > 0 || this.moreMatches
       this.needle = ''
       this.setMatches(NOTHING_FOUND)
       this.currentMatch = -1
       this.finding += 1
+      if (hadSearch) this.options.onFound?.(this.found)
     } else {
       for (const line of changed) this.drawings.delete(line)
       if (changed.length > 0) this.refreshMatches()
@@ -1288,7 +1376,7 @@ export class TerminalView {
       const seen = (this.commandsSeen = frame.commands)
       const epoch = frame.epoch
       void this.source.commands().then((commands) => {
-        if (this.disposed || epoch !== this.store.epoch) return
+        if (this.disposed || epoch !== this.store.epoch || seen !== this.commandsSeen) return
         this.setCommands(commands)
         this.schedule()
       }, () => {
@@ -1300,17 +1388,20 @@ export class TerminalView {
     if (frame.anchored !== undefined) {
       const { cellWidth, cellHeight, list } = frame.anchored
       this.anchored = { cellWidth, cellHeight, list: list.map((one) => ({ ...one, line: frame.firstActive + one.row })) }
-      this.wantPictures(...this.viewport.visible)
+      this.wantPicturesInView()
+    }
+    if (!reset && frame.images === this.imagesSeen) {
+      this.dropPictures()
     }
     if (frame.images !== this.imagesSeen) {
       const seen = (this.imagesSeen = frame.images)
       const epoch = frame.epoch
       void this.source.images().then((placed) => {
-        if (this.disposed || epoch !== this.store.epoch) return
+        if (this.disposed || epoch !== this.store.epoch || seen !== this.imagesSeen) return
         this.placed = placed
         this.dropPictures()
         // Asked for as soon as they are known to be in view, rather than by the paint that would show them
-        this.wantPictures(...this.viewport.visible)
+        this.wantPicturesInView()
         this.schedule()
       }, () => {
         if (epoch === this.store.epoch && this.imagesSeen === seen) this.imagesSeen = -1
@@ -1436,8 +1527,9 @@ export class TerminalView {
     const { x, y } = this.pointIn(point)
     const { lines } = this.layout()
     const row = Math.floor(y / cellHeight + this.viewport.offset)
+    const line = lines.length > 0 ? lines[Math.max(0, Math.min(row, lines.length - 1))]! : this.store.firstActive
     return {
-      line: lines[Math.max(0, Math.min(row, lines.length - 1))]!,
+      line,
       column: Math.max(0, Math.min(Math.floor(x / cellWidth), Math.max(0, this.columns - 1))),
     }
   }
@@ -1453,7 +1545,14 @@ export class TerminalView {
   private pointerInput(event: MouseEvent, action: PointerInput['action'], button: number): PointerInput {
     const { cellWidth, cellHeight } = this.painter.metrics
     const { x, y } = this.pointIn(event)
-    return { action, button, modifiers: modifiersOf(event), x: Math.max(0, x), y: Math.max(0, y), cellWidth, cellHeight }
+    const maxX = this.columns * cellWidth
+    const maxY = this.rows * cellHeight
+    return {
+      action, button, modifiers: modifiersOf(event),
+      x: Math.max(0, Math.min(x, maxX)),
+      y: Math.max(0, Math.min(y, maxY)),
+      cellWidth, cellHeight,
+    }
   }
 
   /**
@@ -1487,6 +1586,10 @@ export class TerminalView {
   /** `0` left, `1` middle, `2` right, as a source numbers them — which is how the page does too */
   private readonly pointerDown = (event: PointerEvent) => {
     if (event.target === this.thumb) return
+    if (this.pressed) {
+      event.preventDefault()
+      return
+    }
     this.focus()
     // Keeps the focus this just gave from going to whatever the page would otherwise focus on a click
     event.preventDefault()
@@ -1562,9 +1665,10 @@ export class TerminalView {
    */
   private released(event: PointerEvent): Pressed | null {
     const pressed = this.pressed
+    if (!pressed) return null
+    if (event.type === 'pointerup' && event.button !== pressed.button) return null
     this.pressed = null
     this.stopDragScroll()
-    if (!pressed) return null
     if (this.element.hasPointerCapture?.(event.pointerId)) this.element.releasePointerCapture(event.pointerId)
     if (pressed.reporting) {
       this.reported = null
@@ -1636,7 +1740,7 @@ export class TerminalView {
     const row = at ? this.store.row(at.line) : undefined
     this.hovered = link && at && row ? { line: at.line, link, runs: linkRuns(link, row, at.column, (line) => this.store.row(line)) } : null
     this.element.style.cursor = link ? 'pointer' : 'text'
-    this.element.title = link && this.previews(link) ? link.target : ''
+    this.element.title = link && this.previews(link) ? sanitizeTitle(link.target) : ''
     this.schedule()
   }
 
@@ -1696,7 +1800,7 @@ export class TerminalView {
     try {
       const { first, lines } = this.layout()
       // The absolute lines the window covers, folded ones included: what is asked of the source and what is held
-      const span = lines[lines.length - 1]! - first + 1
+      const span = lines.length > 0 ? lines[lines.length - 1]! - first + 1 : 0
       // Decided before anything is drawn, so a blink that has just stopped draws its text shown, once
       let blinking = false
       for (const line of lines) {
@@ -1709,14 +1813,16 @@ export class TerminalView {
       this.blinkText(blinking)
       const rows: Array<RowDrawing | null> = lines.map((line) => {
         const fold = this.folds.find((known) => known.first === line)
-        return fold ? drawRow(this.foldRow(fold), this.theme) : this.drawingOf(line)
+        return fold ? this.foldDrawing(fold) : this.drawingOf(line)
       })
       // What a scroll of a screenful either way would show stays drawn; the rest is not held on to
-      for (const line of this.drawings.keys()) {
-        if (line < first - span || line >= first + span * 2) this.drawings.delete(line)
+      if (span > 0) {
+        for (const line of this.drawings.keys()) {
+          if (line < first - span || line >= first + span * 2) this.drawings.delete(line)
+        }
+        this.ask(first, span)
+        this.wantPictures(first, span)
       }
-      this.ask(first, span)
-      this.wantPictures(first, span)
 
       const cursor = this.cursorIn(frame, lines)
       const scene: Scene = {
@@ -1844,8 +1950,9 @@ export class TerminalView {
       if (this.disposed || epoch !== this.store.epoch) return
       this.asking.delete(page)
       const told = this.store.absorb(fetched, this.viewport.top, asked, askedStale)
+      if (this.imagesSeen !== -1) this.dropPictures()
       for (const line of told) this.drawings.delete(line)
-      if (told.length > 0) this.schedule()
+      if (told.length > 0 || askedStale !== this.store.staleFrames) this.schedule()
     }, () => {
       // No answer: the lines were numbered again while it was asked, or the session is over. Whatever
       // paints next asks in the numbering there is then
@@ -1859,15 +1966,30 @@ export class TerminalView {
     const line = frame.firstActive + cursor.row
     const index = lines.indexOf(line)
     if (index === -1) return undefined
-    const row = this.store.row(line)
-    const at = row ? row.column.indexOf(cursor.column) : -1
-    const style = row && at !== -1 ? row.styles[row.style[at]!] : undefined
+    const fold = this.folds.find((known) => known.first === line)
+    const row = fold ? this.foldRow(fold) : this.store.row(line)
+    let at = -1
+    if (row) {
+      for (let i = 0; i < row.column.length; i += 1) {
+        const start = row.column[i]!
+        if (cursor.column >= start && cursor.column < start + row.width[i]!) {
+          at = i
+          break
+        }
+        if (start > cursor.column) break
+      }
+    }
+    const style = row && at !== -1 ? (row.styles[row.style[at]!] ?? PLAIN) : undefined
+    const flags = style?.flags ?? 0
+    const visible = !(flags & StyleFlag.invisible) && !(!this.textShown && (flags & StyleFlag.blink))
     return {
-      column: cursor.column,
+      column: row && at !== -1 ? row.column[at]! : cursor.column,
       row: index,
       cells: row && at !== -1 ? row.width[at]! : 1,
       shape: this.focused ? cursor.shape : this.cursorInactive,
-      text: row && at !== -1 ? { text: row.text[at]!, bold: ((style?.flags ?? 0) & 1) !== 0, italic: ((style?.flags ?? 0) & 2) !== 0 } : undefined,
+      text: row && at !== -1 && visible
+        ? { text: row.text[at]!, bold: (flags & StyleFlag.bold) !== 0, italic: (flags & StyleFlag.italic) !== 0 }
+        : undefined,
     }
   }
 }
@@ -1912,9 +2034,21 @@ function firstAfter(items: ReadonlyArray<{ readonly line: number }>, line: numbe
   return low
 }
 
+/** Strips C0/C1 control characters and Unicode bidi override/isolate controls from link preview tooltips */
+const UNSAFE_TITLE_CHARS = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g
+function sanitizeTitle(text: string): string {
+  return text.replace(UNSAFE_TITLE_CHARS, '')
+}
+
 /** Gives back what a picture holds, where it holds anything: a bitmap keeps its pixels until it is closed */
 function release(picture: CanvasImageSource | null): void {
-  if (picture && 'close' in picture && typeof picture.close === 'function') picture.close()
+  if (!picture) return
+  if ('close' in picture && typeof picture.close === 'function') {
+    picture.close()
+  } else if (typeof HTMLCanvasElement !== 'undefined' && picture instanceof HTMLCanvasElement) {
+    picture.width = 0
+    picture.height = 0
+  }
 }
 
 /** A row as the text on it, with the blank cells between its characters as spaces */
