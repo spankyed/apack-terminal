@@ -25,8 +25,8 @@ pub fn hang_up(pipe: &impl AsHandle) -> bool {
     // no operation is pending on it.
     unsafe {
         let cancelled = CancelIoEx(handle, std::ptr::null()) != 0;
-        DisconnectNamedPipe(handle);
-        cancelled
+        let disconnected = DisconnectNamedPipe(handle) != 0;
+        cancelled || disconnected
     }
 }
 
@@ -110,9 +110,10 @@ fn owned_by(pipe: &impl AsHandle, sid: &widestring::U16CStr) -> std::io::Result<
         }
         let mut text: windows_sys::core::PWSTR = std::ptr::null_mut();
         let converted = ConvertSidToStringSidW(owner, &mut text);
+        let convert_error = (converted == 0).then(std::io::Error::last_os_error);
         LocalFree(descriptor as HLOCAL);
-        if converted == 0 {
-            return Err(std::io::Error::last_os_error());
+        if let Some(error) = convert_error {
+            return Err(error);
         }
         let found = widestring::U16CStr::from_ptr_str(text) == sid;
         LocalFree(text.cast::<core::ffi::c_void>() as HLOCAL);

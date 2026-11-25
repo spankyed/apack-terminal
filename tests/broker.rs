@@ -2741,3 +2741,70 @@ fn a_session_ending_tells_what_its_programs_finished_before_the_exit() {
     assert_eq!((&records[0]["id"], &records[0]["state"]), (&serde_json::json!("build"), &serde_json::json!("done")));
     until(&mut reading, "exited");
 }
+
+/// **`--help` / `--version` exit cleanly and never bind a socket named after the flag.**
+#[test]
+fn cli_flags_do_not_bind_sockets() {
+    let directory = tempfile::tempdir().expect("a tempdir");
+    for flag in ["--version", "-V", "--help", "-h"] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_apack-terminal"))
+            .arg(flag)
+            .current_dir(directory.path())
+            .output()
+            .expect("runs");
+        assert!(output.status.success(), "{flag} failed: {:?}", output.status);
+        assert!(!directory.path().join(flag).exists(), "{flag} created a socket file");
+    }
+    let bogus = std::process::Command::new(env!("CARGO_BIN_EXE_apack-terminal"))
+        .arg("--unknown-flag")
+        .current_dir(directory.path())
+        .output()
+        .expect("runs");
+    assert_eq!(bogus.status.code(), Some(2));
+    assert!(!directory.path().join("--unknown-flag").exists());
+}
+
+/// **Multiple `lifetime` connections are refcounted and reject session requests.**
+#[test]
+fn multiple_lifetime_connections_refcount_and_reject_requests() {
+    let broker = start();
+    let (mut owner1_events, mut owner1) = greet(&broker, "lifetime");
+    let (owner2_events, owner2) = greet(&broker, "lifetime");
+
+    // A lifetime connection rejects non-Done session requests directly on its own wire.
+    ask(&mut owner1, r#"{"kind":"sessions"}"#);
+    let refusal = next(&mut owner1_events);
+    assert_eq!(refusal["kind"], "failed", "{refusal}");
+    assert_eq!(refusal["code"], "HANDSHAKE", "{refusal}");
+
+    let (mut reading, mut writing) = greet(&broker, "client");
+    ask(&mut writing, &spawn_frame(80, 24, Some(DEFAULT_SHELL)));
+    let pid = next(&mut reading)["pid"].as_u64().expect("a pid") as i32;
+    once_the_shell_is_listening(&mut reading);
+    assert!(alive(pid));
+
+    // Dropping the first lifetime connection and the client keeps the shell alive while owner2 remains.
+    disconnect(owner1_events, owner1);
+    disconnect(reading, writing);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(alive(pid), "shell died while a second lifetime connection was still open");
+
+    // Dropping the last lifetime connection ends the shell.
+    disconnect(owner2_events, owner2);
+    for _ in 0..40 {
+        if !alive(pid) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("shell outlived the last lifetime connection");
+}
+
+/// **`Deadlines::set` does not panic when given a duration that overflows `Instant`.**
+#[test]
+fn deadlines_ignore_overflowing_durations_without_panicking() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let deadlines = apack_terminal::deadlines::Deadlines::keeping(tx);
+    let settled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    deadlines.set(std::time::Duration::MAX, "s-1".to_owned(), settled);
+}

@@ -172,23 +172,33 @@ pub fn hold(socket: &str) -> Result<Held, Refused> {
 /// **A bare name is a socket in the directory this process was started in**, and that directory is asked
 /// the same question as any other.
 pub fn private_directory(socket: &str) -> Result<(), Refused> {
-    let directory = match Path::new(socket).parent() {
-        Some(directory) if !directory.as_os_str().is_empty() => directory,
-        _ => Path::new("."),
-    };
     #[cfg(not(unix))]
     {
-        std::fs::create_dir_all(directory)?;
+        // Named pipes on Windows live in the pipe namespace rather than the filesystem.
+        let _ = socket;
         Ok(())
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 
-        if !directory.exists() {
+        let directory = match Path::new(socket).parent() {
+            Some(directory) if !directory.as_os_str().is_empty() => directory,
+            _ => Path::new("."),
+        };
+        if std::fs::symlink_metadata(directory).is_err() {
             std::fs::DirBuilder::new().recursive(true).mode(0o700).create(directory)?;
         }
-        let found = std::fs::metadata(directory)?;
+        let found = std::fs::symlink_metadata(directory)?;
+        if found.file_type().is_symlink() {
+            return Err(Refused::Unsafe(format!(
+                "{} is a symbolic link, which may point to a directory another user controls",
+                directory.display()
+            )));
+        }
+        if !found.is_dir() {
+            return Err(Refused::Unsafe(format!("{} is not a directory", directory.display())));
+        }
         // SAFETY: `geteuid` takes nothing and cannot fail
         let user = unsafe { libc::geteuid() };
         if found.uid() != user {
@@ -214,6 +224,16 @@ pub fn private_directory(socket: &str) -> Result<(), Refused> {
 /// The umask is the whole process's, so this is called before the broker has started a thread or a shell
 /// that could create a file meanwhile.
 pub fn listen(socket: &str) -> Result<Listener, Refused> {
+    // Refuse to unlink anything that is not already a socket file before `try_overwrite(true)` binds.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if let Ok(meta) = std::fs::symlink_metadata(socket)
+            && !meta.file_type().is_socket()
+        {
+            return Err(Refused::Unsafe(format!("{socket} already exists and is not a socket")));
+        }
+    }
     let name = socket.to_fs_name::<GenericFilePath>()?;
     // `try_overwrite` replaces the file a previous broker left behind, which would otherwise refuse the
     // bind. That it is a leftover and not a live broker's is what holding the lock established

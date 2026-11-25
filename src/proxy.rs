@@ -25,7 +25,7 @@ use interprocess::local_socket::{GenericFilePath, Stream, ToFsName, prelude::*};
 
 use crate::frames::MAX_FRAME_BYTES;
 use crate::listening::{self, HELD_EXIT};
-use crate::protocol::Request;
+use crate::protocol::{Request, Role};
 
 /// How many times a proxy looks for a broker before giving up on there being one.
 ///
@@ -71,6 +71,13 @@ fn start_broker(socket: &str) -> std::io::Result<Started> {
         unsafe {
             command.pre_exec(|| if libc::setsid() == -1 { Err(std::io::Error::last_os_error()) } else { Ok(()) })
         };
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
     let mut broker = command.spawn()?;
     let mut said = String::new();
@@ -136,10 +143,86 @@ struct Carrying {
     /// Where what the far end says goes now
     stream: Arc<Stream>,
     kept: Kept,
+    /// What role the first line greeted as, so stdin EOF closes a binary view stream cleanly
+    /// instead of injecting JSON `{"kind":"done"}\n` into length-prefixed frames.
+    greeting: Greeting,
+    /// Whether the far end's last byte ended a line, so a trailing `Done` is never glued onto a
+    /// partial JSON frame.
+    last_newline: bool,
     /// The far end has said something of its own, which the `done` said for it is not
     spoke: bool,
-    /// The far end's input has ended, and `done` has been said for it
+    /// The far end's input has ended, and `done` (or half-close for a view) has been sent for it
     ended: bool,
+}
+
+enum Greeting {
+    Pending(Vec<u8>),
+    View,
+    Json,
+}
+
+impl Greeting {
+    fn observe(&mut self, bytes: &[u8]) {
+        let Self::Pending(line) = self else { return };
+        if let Some(end) = bytes.iter().position(|&byte| byte == b'\n') {
+            let take = end.min(MAX_FRAME_BYTES.saturating_sub(line.len()));
+            line.extend_from_slice(&bytes[..take]);
+            let is_view =
+                matches!(serde_json::from_slice::<Request>(line), Ok(Request::Hello { role: Role::View, .. }));
+            *self = if is_view { Self::View } else { Self::Json };
+        } else if line.len().saturating_add(bytes.len()) > MAX_FRAME_BYTES {
+            *self = Self::Json;
+        } else {
+            line.extend_from_slice(bytes);
+        }
+    }
+
+    fn is_view(&self) -> bool {
+        matches!(self, Self::View)
+    }
+}
+
+/// Reads bytes from `reader`, retrying transparently on `EINTR`.
+pub(crate) fn read_retrying(reader: &mut impl Read, buffer: &mut [u8]) -> std::io::Result<usize> {
+    loop {
+        match reader.read(buffer) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            other => return other,
+        }
+    }
+}
+
+impl Carrying {
+    fn observe_far_end(&mut self, bytes: &[u8]) {
+        self.spoke = true;
+        self.greeting.observe(bytes);
+        if let Some(&last) = bytes.last() {
+            self.last_newline = last == b'\n';
+        }
+    }
+
+    fn done_payload(&self) -> Option<String> {
+        if self.greeting.is_view() {
+            return None;
+        }
+        let done = serde_json::to_string(&Request::Done).expect("a request serializes");
+        let prefix = if self.spoke && !self.last_newline { "\n" } else { "" };
+        Some(format!("{prefix}{done}\n"))
+    }
+
+    fn needs_half_close(&self) -> bool {
+        self.ended && self.greeting.is_view()
+    }
+}
+
+fn shutdown_write(stream: &Stream) {
+    #[cfg(unix)]
+    {
+        let Stream::UdSocket(socket) = stream;
+        let _ = socket.inner().shutdown(std::net::Shutdown::Write);
+    }
+    #[cfg(not(unix))]
+    let _ = stream;
 }
 
 enum Kept {
@@ -172,7 +255,7 @@ fn carry(carrying: &Mutex<Carrying>, bytes: &[u8], saying: Saying) {
     let stream = {
         let mut carrying = carrying_of(carrying);
         match saying {
-            Saying::FarEnd => carrying.spoke = true,
+            Saying::FarEnd => carrying.observe_far_end(bytes),
             Saying::Done => carrying.ended = true,
         }
         if let Kept::Unanswered(kept) = &mut carrying.kept {
@@ -187,13 +270,31 @@ fn carry(carrying: &Mutex<Carrying>, bytes: &[u8], saying: Saying) {
     let _ = (&*stream).write_all(bytes).and_then(|()| (&*stream).flush());
 }
 
+/// Signals to the broker that the far end's stdin has ended: half-closes a binary `Role::View` stream
+/// on Unix (without corrupting its binary framing with JSON) and sends `Request::Done` on JSON roles.
+fn finish_input(carrying: &Mutex<Carrying>) {
+    let (stream, send_done) = {
+        let mut carrying = carrying_of(carrying);
+        let payload = carrying.done_payload();
+        if payload.is_none() {
+            carrying.ended = true;
+        }
+        (Arc::clone(&carrying.stream), payload)
+    };
+    if let Some(done) = send_done {
+        carry(carrying, done.as_bytes(), Saying::Done);
+    } else {
+        shutdown_write(&stream);
+    }
+}
+
 /// Copies what the broker says on `stream` to `to` until it lets the connection go or `to` refuses it,
 /// answering whether the broker said anything at all.
 fn heard(stream: &Stream, mut to: impl Write, carrying: &Mutex<Carrying>) -> bool {
     let mut buffer = [0u8; 64 * 1024];
     let mut answered = false;
     loop {
-        match (&*stream).read(&mut buffer) {
+        match read_retrying(&mut &*stream, &mut buffer) {
             Ok(0) | Err(_) => return answered,
             Ok(read) => {
                 if !answered {
@@ -216,24 +317,27 @@ pub fn run(socket: &str) -> std::io::Result<()> {
     let carrying = Arc::new(Mutex::new(Carrying {
         stream: Arc::clone(&stream),
         kept: Kept::Unanswered(Vec::new()),
+        greeting: Greeting::Pending(Vec::new()),
+        last_newline: true,
         spoke: false,
         ended: false,
     }));
     // **Stdin ending is the far end having said all it will, not the end of the conversation.** The
-    // broker may still be answering what it was last asked, so the caller says so with `Done` and goes on
-    // reading until the broker lets the connection go; ending the process here would cut off the answer
-    // to the request just carried. A named pipe cannot be closed one way, so this is the same on every
-    // platform, rather than a half-close where there is one and an exit where there is not
+    // broker may still be answering what it was last asked, so JSON roles say so with `Done` and a
+    // binary view connection half-closes its write side, then keeps reading until the broker lets the
+    // connection go.
     std::thread::spawn({
         let carrying = Arc::clone(&carrying);
         move || {
             let mut input = std::io::stdin().lock();
             let mut buffer = [0u8; 64 * 1024];
-            while let Ok(read @ 1..) = input.read(&mut buffer) {
-                carry(&carrying, &buffer[..read], Saying::FarEnd);
+            loop {
+                match read_retrying(&mut input, &mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => carry(&carrying, &buffer[..read], Saying::FarEnd),
+                }
             }
-            let done = serde_json::to_string(&Request::Done).expect("a request serializes");
-            carry(&carrying, format!("{done}\n").as_bytes(), Saying::Done);
+            finish_input(&carrying);
         }
     });
     // The broker hanging up leaves nothing to read, and a thread still parked on stdin is no reason to stay.
@@ -264,7 +368,129 @@ pub fn run(socket: &str) -> std::io::Result<()> {
         stream = Arc::new(reach_own(socket)?);
         made += 1;
         let _ = (&*stream).write_all(&kept).and_then(|()| (&*stream).flush());
+        if carrying.needs_half_close() {
+            shutdown_write(&stream);
+        }
         carrying.stream = Arc::clone(&stream);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::PROTOCOL_VERSION;
+
+    #[test]
+    fn greeting_detects_view_role_and_bounds_buffering() {
+        let view_hello =
+            serde_json::to_string(&Request::Hello { protocol: PROTOCOL_VERSION, role: Role::View, challenge: None })
+                .expect("serializes");
+        let client_hello =
+            serde_json::to_string(&Request::Hello { protocol: PROTOCOL_VERSION, role: Role::Client, challenge: None })
+                .expect("serializes");
+
+        // Chunked View hello across two reads -> View.
+        let mut greeting = Greeting::Pending(Vec::new());
+        let mid = view_hello.len() / 2;
+        greeting.observe(&view_hello.as_bytes()[..mid]);
+        assert!(!greeting.is_view());
+        greeting.observe(format!("{}\n", &view_hello[mid..]).as_bytes());
+        assert!(greeting.is_view());
+
+        // Client hello -> Json (not View).
+        let mut client = Greeting::Pending(Vec::new());
+        client.observe(format!("{client_hello}\n").as_bytes());
+        assert!(!client.is_view());
+
+        // Exact MAX_FRAME_BYTES before newline still parses as View (tests `>` vs `>=`/`==`/`<`).
+        let pad = MAX_FRAME_BYTES - view_hello.len();
+        let mut exact = Greeting::Pending(Vec::new());
+        exact.observe(format!("{view_hello}{}", " ".repeat(pad)).as_bytes());
+        exact.observe(b"\n");
+        assert!(exact.is_view(), "a View hello of exactly MAX_FRAME_BYTES before newline must stay pending");
+
+        // Exceeding MAX_FRAME_BYTES without newline gives up and becomes Json.
+        let mut oversized = Greeting::Pending(Vec::new());
+        oversized.observe(format!("{view_hello}{}", " ".repeat(pad + 1)).as_bytes());
+        oversized.observe(b"\n");
+        assert!(!oversized.is_view(), "an oversized first line without newline must stop buffering");
+    }
+
+    #[test]
+    fn read_retrying_retries_eintr_and_propagates_other_errors() {
+        struct Scripted {
+            steps: std::collections::VecDeque<std::io::Result<Vec<u8>>>,
+        }
+        impl Read for Scripted {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                match self.steps.pop_front().expect("step") {
+                    Ok(bytes) => {
+                        buf[..bytes.len()].copy_from_slice(&bytes);
+                        Ok(bytes.len())
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        }
+        let mut reader = Scripted {
+            steps: std::collections::VecDeque::from([
+                Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+                Ok(b"ok".to_vec()),
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+            ]),
+        };
+        let mut buf = [0u8; 16];
+        assert_eq!(read_retrying(&mut reader, &mut buf).expect("retried past EINTR"), 2);
+        assert_eq!(&buf[..2], b"ok");
+        assert_eq!(
+            read_retrying(&mut reader, &mut buf).expect_err("non-EINTR propagates").kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn carrying_done_payload_and_half_close_decisions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("t.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+        let stream = Arc::new(connect(sock.to_str().expect("utf-8")).expect("connect"));
+        let _accepted = listener.accept().expect("accept");
+
+        let mut carrying = Carrying {
+            stream,
+            kept: Kept::Unanswered(Vec::new()),
+            greeting: Greeting::Pending(Vec::new()),
+            last_newline: true,
+            spoke: false,
+            ended: false,
+        };
+        // Unspoken JSON client: Done without leading newline.
+        let done = carrying.done_payload().expect("json done");
+        assert!(done.starts_with('{') && done.ends_with('\n'));
+        assert!(!carrying.needs_half_close());
+
+        // Partial line without trailing newline: Done prefixed with newline.
+        carrying.observe_far_end(b"{\"kind\":\"list\"}");
+        let done = carrying.done_payload().expect("prefixed json done");
+        assert!(done.starts_with("\n{") && done.ends_with('\n'));
+
+        // After a trailing newline: Done has no leading newline.
+        carrying.observe_far_end(b"\n");
+        let done = carrying.done_payload().expect("clean json done");
+        assert!(done.starts_with('{') && done.ends_with('\n'));
+
+        // Reconnecting after ended on JSON does not half-close.
+        carrying.ended = true;
+        assert!(!carrying.needs_half_close());
+
+        // View role: done_payload is None; needs_half_close only when ended.
+        carrying.greeting = Greeting::View;
+        carrying.ended = false;
+        assert!(carrying.done_payload().is_none());
+        assert!(!carrying.needs_half_close());
+        carrying.ended = true;
+        assert!(carrying.needs_half_close());
+    }
 }

@@ -5,12 +5,11 @@
 //! that is the pty's own shape, not because this layer models a screen.
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel, sync_channel};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
+use std::time::{Duration, Instant};
 
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
@@ -80,6 +79,58 @@ struct Session {
     reaped: Receiver<()>,
 }
 
+/// Maximum time `ActiveKills::wait_all` waits during broker shutdown for active `end_for_certain`
+/// escalation threads to finish.
+const KILL_SHUTDOWN_LIMIT: Duration = Duration::from_secs(3);
+
+/// Tracks active `end_for_certain` escalation threads so broker shutdown waits for any SIGHUP-ignoring
+/// process to receive `SIGKILL` before exiting.
+#[derive(Default)]
+struct ActiveKills {
+    active: Mutex<usize>,
+    done: Condvar,
+}
+
+impl ActiveKills {
+    #[cfg(unix)]
+    fn track(self: &Arc<Self>) -> KillGuard {
+        let mut active = self.active.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *active += 1;
+        KillGuard(Arc::clone(self))
+    }
+
+    fn wait_all(&self) {
+        self.wait_all_within(KILL_SHUTDOWN_LIMIT);
+    }
+
+    fn wait_all_within(&self, limit: Duration) {
+        let deadline = Instant::now() + limit;
+        let mut active = self.active.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *active > 0 {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            let (guard, _) = self.done.wait_timeout(active, left).unwrap_or_else(std::sync::PoisonError::into_inner);
+            active = guard;
+        }
+    }
+}
+
+#[cfg(unix)]
+struct KillGuard(Arc<ActiveKills>);
+
+#[cfg(unix)]
+impl Drop for KillGuard {
+    fn drop(&mut self) {
+        let mut active = self.0.active.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *active = active.saturating_sub(1);
+        if *active == 0 {
+            self.0.done.notify_all();
+        }
+    }
+}
+
 /// Makes sure a process that was asked to end does: one still there `KILL_GRACE` after is killed, with
 /// everything in its process group.
 ///
@@ -88,16 +139,25 @@ struct Session {
 /// unreaped**: `reaped` closes when it has been waited for, and until then its pid is its own — a pid is
 /// signalled here because nothing has collected it, never because of what it was a moment ago. On
 /// Windows there is nothing to send and nothing needed: the session's tree ends with its record (`Tree`).
-fn end_for_certain(pid: u32, reaped: Receiver<()>) {
-    std::thread::spawn(move || {
-        // A pattern rather than a comparison, so there is no operator here to turn round: the one way
-        // to the signal is the grace running out with the process unreaped
-        if let Err(RecvTimeoutError::Timeout) = reaped.recv_timeout(KILL_GRACE) {
-            // Whatever it started while it was ignoring its own hangup
-            hang_up_the_rest(&[pid]);
-            let _ = deliver(pid, Signal::Sigkill, Scope::Group);
-        }
-    });
+fn end_for_certain(pid: u32, reaped: Receiver<()>, kills: &Arc<ActiveKills>) {
+    #[cfg(not(unix))]
+    {
+        let _ = (pid, reaped, kills);
+    }
+    #[cfg(unix)]
+    {
+        let guard = kills.track();
+        std::thread::spawn(move || {
+            let _guard = guard;
+            // A pattern rather than a comparison, so there is no operator here to turn round: the one way
+            // to the signal is the grace running out with the process unreaped
+            if let Err(RecvTimeoutError::Timeout) = reaped.recv_timeout(KILL_GRACE) {
+                // Whatever it started while it was ignoring its own hangup
+                hang_up_the_rest(&[pid]);
+                let _ = deliver(pid, Signal::Sigkill, Scope::Group);
+            }
+        });
+    }
 }
 
 /// Hangs up whatever else is in the sessions these shells lead, before the shells themselves are.
@@ -166,13 +226,22 @@ struct Process {
     /// Waits outstanding on this session, shared with the reader thread that settles them. **Checked where
     /// the bytes land**: the broker already knows when something arrived, so a caller waiting for a state
     /// costs a condition check per read rather than a timer asking.
-    waiters: Arc<Mutex<Vec<Waiter>>>,
+    waiters: Arc<Mutex<Waiters>>,
     /// Whether this session's pty is being read, shared with the reader thread it parks (`output::Flow`).
     /// Closed when the session goes, so a reader parked on a pause nobody is left to lift still ends.
     flow: Arc<Flow>,
     /// The process the broker started, kept because a `Signal` names it — the leader, its group, or a pid
     /// this is the root of.
     pid: u32,
+    /// True once `child.wait()` has reaped `pid`, preventing signals against a PID the OS may reuse
+    /// during the `EXIT_DRAIN` window before `forget()`.
+    reaped: AtomicBool,
+}
+
+#[derive(Default)]
+struct Waiters {
+    pending: Vec<Waiter>,
+    exited: bool,
 }
 
 /// A recording opened to be looked at: a screen with no process behind it.
@@ -253,18 +322,19 @@ impl Waiter {
 }
 
 /// Settles the waits the screen now satisfies, answering each once. The count is what to report.
-fn settle_met(waiters: &Mutex<Vec<Waiter>>, screen: &Screen, recent: u32) -> usize {
+fn settle_met(waiters: &Mutex<Waiters>, screen: &Screen, recent: u32) -> usize {
     let Ok(mut waiters) = waiters.lock() else {
         return 0;
     };
     let mut met = 0;
-    waiters.retain(|waiter| {
+    waiters.pending.retain(|waiter| {
         if waiter.settled.load(Ordering::SeqCst) {
             return false;
         }
         if waiter.holds(screen, recent) {
-            waiter.settled.store(true, Ordering::SeqCst);
-            met += 1;
+            if !waiter.settled.swap(true, Ordering::SeqCst) {
+                met += 1;
+            }
             return false;
         }
         true
@@ -393,9 +463,20 @@ const NAMED_SIGNALS: &[(&str, i32)] = &[
 ];
 
 #[cfg(unix)]
+static NAMED_DESCRIPTIONS: std::sync::OnceLock<Vec<(&'static str, String)>> = std::sync::OnceLock::new();
+
+/// Eagerly initializes the `strsignal` lookup table while the process is still single-threaded,
+/// because POSIX does not require `strsignal` to be thread-safe.
+pub fn init_signal_descriptions() {
+    #[cfg(unix)]
+    {
+        let _ = descriptions();
+    }
+}
+
+#[cfg(unix)]
 fn descriptions() -> &'static [(&'static str, String)] {
-    static NAMED: std::sync::OnceLock<Vec<(&'static str, String)>> = std::sync::OnceLock::new();
-    NAMED.get_or_init(|| {
+    NAMED_DESCRIPTIONS.get_or_init(|| {
         NAMED_SIGNALS.iter().filter_map(|(name, number)| described(*number).map(|prose| (*name, prose))).collect()
     })
 }
@@ -570,7 +651,13 @@ fn inside_tree(leader: u32, pid: u32) -> bool {
     let mut at = Pid::from_u32(pid);
     for _ in 0..64 {
         system.refresh_processes_specifics(ProcessesToUpdate::Some(&[at]), true, ProcessRefreshKind::nothing());
-        let Some(parent) = system.process(at).and_then(sysinfo::Process::parent) else {
+        let Some(process) = system.process(at) else {
+            return false;
+        };
+        if process.session_id().is_some_and(|session| session.as_u32() == leader) {
+            return true;
+        }
+        let Some(parent) = process.parent() else {
             return false;
         };
         if parent.as_u32() == leader {
@@ -614,6 +701,8 @@ pub struct Sessions {
     housekeeping: Housekeeping,
     /// Ends a hold on a screen that its program does not
     holds: Holds,
+    /// Active `end_for_certain` escalation threads waiting to ensure SIGHUP-ignoring processes exit
+    kills: Arc<ActiveKills>,
 }
 
 /// Which sessions there are.
@@ -717,15 +806,9 @@ const DEFAULT_TERM: &str = "xterm-256color";
 /// thousand is headroom nobody meets rather than a limit anyone notices.
 const MAX_GRID: u16 = 1_000;
 
-/// The grid a request gets, which is the one it asked for unless nothing could draw it.
-///
-/// **Capped rather than refused**, because a client that asked cannot do anything useful with a refusal and
-/// the honest reading of an impossible number is "as big as you can". There is deliberately no floor: a
-/// zero was probed unguarded and is benign — a `0x0` spawn, its `screen` and a resize back all answer
-/// normally, `portable_pty` and the VT core each tolerating it — so a floor would be a guard with nothing
-/// behind it.
+/// The grid a request gets, clamped to `[1, MAX_GRID]` so PTY and VT dimensions always match.
 fn grid(cols: u16, rows: u16) -> (u16, u16) {
-    (cols.min(MAX_GRID), rows.min(MAX_GRID))
+    (cols.clamp(1, MAX_GRID), rows.clamp(1, MAX_GRID))
 }
 
 fn poisoned(what: &str) -> Refusal {
@@ -793,31 +876,39 @@ impl Handle {
     /// Its views are sent the new grid by the screen (`Screen::resize`).
     pub fn resize(&self, cols: u16, rows: u16, cell_width: u16, cell_height: u16) -> Outcome {
         let (cols, rows) = grid(cols, rows);
+        let (cell_width, cell_height) = normalized_cell(cell_width, cell_height);
         match &self.behind {
-            // A recording has no pty; its screen is the whole of what a resize changes
+            // A recording has no pty; its screen is the whole of what a resize changes, under Look -> Screen order
             Behind::Recording(look) => {
                 let look = look.upgrade().ok_or_else(|| missing(&self.session))?;
-                look.lock().map_err(|_| poisoned("resizing a screen"))?.size = (cols, rows);
+                let mut look = look.lock().map_err(|_| poisoned("resizing a screen"))?;
+                look.size = (cols, rows);
+                self.on_screen(|screen| screen.resize(cols, rows, cell_width, cell_height))
             }
             Behind::Process(_) => {
                 let process = self.process()?;
-                let pty = process.pty.lock().map_err(|_| poisoned("resizing a pty"))?;
-                // A session whose shell has exited has no pty left to tell, and its screen is still
-                // one a view is drawing
-                if let Some(pty) = pty.as_ref() {
-                    pty.resize(PtySize {
-                        rows,
-                        cols,
-                        // The pty carries the same fact for a program that asks the kernel rather than the terminal
-                        pixel_width: cols.saturating_mul(cell_width),
-                        pixel_height: rows.saturating_mul(cell_height),
-                    })
-                    .map_err(|error| Refusal::pty("resizing a pty", error))?;
-                }
+                // Hold the screen lock across pty.resize + screen.resize (Screen -> Pty order) so
+                // concurrent resizes cannot invert the final size between PTY and VT.
+                self.on_screen(|screen| {
+                    let pty = process.pty.lock().map_err(|_| poisoned("resizing a pty"))?;
+                    // A session whose shell has exited has no pty left to tell, and its screen is still
+                    // one a view is drawing
+                    if let Some(pty) = pty.as_ref() {
+                        pty.resize(PtySize {
+                            rows,
+                            cols,
+                            // The pty carries the same fact for a program that asks the kernel rather than the terminal
+                            pixel_width: cols.saturating_mul(cell_width),
+                            pixel_height: rows.saturating_mul(cell_height),
+                        })
+                        .map_err(|error| Refusal::pty("resizing a pty", error))?;
+                    }
+                    drop(pty);
+                    screen.resize(cols, rows, cell_width, cell_height);
+                    Ok(())
+                })?
             }
         }
-        // The screen is resized too, or the authority would describe a viewport the process no longer has
-        self.on_screen(|screen| screen.resize(cols, rows, cell_width, cell_height))
     }
 
     /// The cursor the session starts with and returns to; see `Screen::set_cursor_defaults`.
@@ -983,7 +1074,13 @@ impl Sessions {
             credit,
             housekeeping: Housekeeping::start(),
             holds: Holds::start(),
+            kills: Arc::new(ActiveKills::default()),
         }
+    }
+
+    /// Waits for all active `end_for_certain` escalation threads to finish before broker shutdown.
+    pub fn wait_for_kills(&self) {
+        self.kills.wait_all();
     }
 
     /// The record, locked. A thread that panicked holding it left it as whole as it found it — every
@@ -995,6 +1092,15 @@ impl Sessions {
     /// Answers this connection.
     pub fn answer(&self, event: Event) {
         let _ = self.events.send(Outgoing::answer(event));
+    }
+
+    /// Waits until every answer and report queued so far has been written to whoever is attached, or
+    /// `timeout` elapses.
+    pub fn settled_within(&self, timeout: Duration) {
+        let (reached, done) = channel();
+        if self.events.send(Outgoing::reached(reached)).is_ok() {
+            let _ = done.recv_timeout(timeout);
+        }
     }
 
     /// Waits until every answer and report queued so far has been written to whoever is attached.
@@ -1091,16 +1197,33 @@ impl Sessions {
         // **The slave is dropped here on purpose**: holding it keeps its fd open, so the master never sees
         // EOF and the reader below would block for ever after the process exits.
         drop(pty.slave);
+        let pid = child.process_id().unwrap_or_default();
+        // Assign the Windows Job Object immediately after spawn (before recording restore or locking
+        // the session record) so early child processes are captured from the start.
+        let tree = Tree::owning(pid);
 
-        let reader = pty.master.try_clone_reader().map_err(|error| Refusal::pty("reading a pty", error))?;
-        let writer = pty.master.take_writer().map_err(|error| Refusal::pty("writing to a pty", error))?;
+        let reader = match pty.master.try_clone_reader() {
+            Ok(reader) => reader,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Refusal::pty("reading a pty", error));
+            }
+        };
+        let writer = match pty.master.take_writer() {
+            Ok(writer) => writer,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Refusal::pty("writing to a pty", error));
+            }
+        };
 
         let session = {
             let mut record = self.record();
             record.next += 1;
             format!("s-{}", record.next)
         };
-        let pid = child.process_id().unwrap_or_default();
 
         // **Built before the session is anybody's to ask after**, with no lock held: a screen restored
         // from a recording replays all of it, which for a long one is the work of everything it printed.
@@ -1135,7 +1258,7 @@ impl Sessions {
             held.limit_holds(self.holds.for_screen(Arc::downgrade(&screen)));
         }
         let flow = Flow::reading();
-        let waiters: Arc<Mutex<Vec<Waiter>>> = Arc::new(Mutex::new(Vec::new()));
+        let waiters: Arc<Mutex<Waiters>> = Arc::new(Mutex::new(Waiters::default()));
         // Noted by what the session is sent, and read by the coalescer, which sends what answers it at once
         let wrote = Arc::new(Wrote::default());
         let process = Arc::new(Process {
@@ -1145,10 +1268,12 @@ impl Sessions {
             waiters: Arc::clone(&waiters),
             flow: Arc::clone(&flow),
             pid,
+            reaped: AtomicBool::new(false),
         });
         let answering = Arc::clone(&process.input);
         let ending_input = Arc::clone(&process.input);
         let ending_pty = Arc::clone(&process.pty);
+        let ending_process = Arc::clone(&process);
         let fronting = Arc::clone(&process.pty);
         let (reaping, reaped) = channel::<()>();
 
@@ -1170,7 +1295,7 @@ impl Sessions {
                 Session {
                     process,
                     killer: child.clone_killer(),
-                    _tree: Tree::owning(pid),
+                    _tree: tree,
                     screen: Arc::clone(&screen),
                     kept: false,
                     reaped,
@@ -1231,7 +1356,7 @@ impl Sessions {
                 // read, its buffer fills and the process blocks on its own write; nothing is held in the
                 // broker. A session whose record is gone closes the gate, so this is never parked for ever
                 reading_flow.wait_while_paused();
-                match reader.read(&mut buffer) {
+                match crate::proxy::read_retrying(&mut reader, &mut buffer) {
                     Ok(0) | Err(_) => break,
                     Ok(read) => {
                         // **Fed as far as a command naming an image's source, which is read with the screen
@@ -1338,7 +1463,9 @@ impl Sessions {
                 },
                 None => (None, None),
             };
-            // Waited for: whatever was making sure of this ending has nothing left to do
+            // Waited for: mark reaped before anything else so no signal can target a recycled PID
+            // during EXIT_DRAIN, and let any `end_for_certain` watcher stop immediately.
+            ending_process.reaped.store(true, Ordering::SeqCst);
             drop(reaping);
             // Nothing is left to read what is queued for it, and the thread writing it has nothing to wait for
             ending_input.close();
@@ -1379,7 +1506,8 @@ impl Sessions {
             // reached what it asked for and every other has not and never will. Without this a caller
             // waiting for a prompt from a shell the user just exited waits out its whole deadline.
             if let Ok(mut waiters) = ending.lock() {
-                for waiter in waiters.drain(..) {
+                waiters.exited = true;
+                for waiter in waiters.pending.drain(..) {
                     if waiter.settled.swap(true, Ordering::SeqCst) {
                         continue;
                     }
@@ -1417,9 +1545,12 @@ impl Sessions {
         }
     }
 
-    /// The process a session was started as, or the refusal for a session with none.
-    fn pid(&self, session: &str) -> Result<u32, Refusal> {
-        Ok(self.record().live.get(session).ok_or_else(|| missing(session))?.process.pid)
+    /// The process a session was started as, or `None` if it has already been reaped (preventing
+    /// signals against a recycled PID during `EXIT_DRAIN`).
+    fn live_pid(&self, session: &str) -> Result<Option<u32>, Refusal> {
+        let record = self.record();
+        let process = &record.live.get(session).ok_or_else(|| missing(session))?.process;
+        Ok((!process.reaped.load(Ordering::SeqCst)).then_some(process.pid))
     }
 
     /// Whether `pid` is this session's own process or something it started.
@@ -1428,12 +1559,16 @@ impl Sessions {
     /// have got cannot disagree — which is the whole reason this is a request rather than something a
     /// caller infers from trying to signal.
     pub fn owns(&self, session: &str, pid: u32) -> Result<bool, Refusal> {
-        owned_by(self.pid(session)?, pid)
+        match self.live_pid(session)? {
+            Some(leader) => owned_by(leader, pid),
+            None => Ok(false),
+        }
     }
 
     /// Sends a signal to a session's process, its group, or one process inside its tree.
     pub fn signal(&self, session: &str, signal: Signal, scope: Scope) -> Outcome {
-        deliver(self.pid(session)?, signal, scope)
+        let leader = self.live_pid(session)?.ok_or_else(|| missing(session))?;
+        deliver(leader, signal, scope)
     }
 
     /// Waits for a session to reach a state, answering once.
@@ -1452,16 +1587,16 @@ impl Sessions {
         let settled = Arc::new(AtomicBool::new(false));
         let waiter = Waiter { until, settled: Arc::clone(&settled) };
 
-        let holds = handle.on_screen(|screen| -> Result<bool, Refusal> {
+        let immediate = handle.on_screen(|screen| -> Result<Option<WaitOutcome>, Refusal> {
             if waiter.holds(screen, HISTORY_LINES as u32) {
-                return Ok(true);
+                return Ok(Some(WaitOutcome::Met));
             }
-            process.waiters.lock().map_err(|_| poisoned("waiting on a session"))?.push(waiter);
-            Ok(false)
+            let mut waiters = process.waiters.lock().map_err(|_| poisoned("waiting on a session"))?;
+            Ok(waiters.register(waiter))
         })??;
-        if holds {
+        if let Some(outcome) = immediate {
             settled.store(true, Ordering::SeqCst);
-            self.answer(Event::Waited { session: session.to_string(), outcome: WaitOutcome::Met });
+            self.answer(Event::Waited { session: session.to_string(), outcome });
             return Ok(());
         }
 
@@ -1519,7 +1654,7 @@ impl Sessions {
         let _ = live.killer.kill();
         self.end(&live);
         // What was sent is a hangup, which a program may ignore
-        end_for_certain(live.process.pid, live.reaped);
+        end_for_certain(live.process.pid, live.reaped, &self.kills);
         Ok(())
     }
 
@@ -1557,7 +1692,7 @@ impl Sessions {
         for mut live in ending {
             let _ = live.killer.kill();
             self.end(&live);
-            end_for_certain(live.process.pid, live.reaped);
+            end_for_certain(live.process.pid, live.reaped, &self.kills);
         }
         for rewound in rewound {
             rewound.end();
@@ -1751,6 +1886,98 @@ fn unread(recording: &str) -> Refusal {
     }
 }
 
+fn normalized_cell(width: u16, height: u16) -> (u16, u16) {
+    if width != 0 && height != 0 { (width, height) } else { (0, 0) }
+}
+
+impl Waiters {
+    fn register(&mut self, waiter: Waiter) -> Option<WaitOutcome> {
+        if self.exited {
+            return Some(match waiter.until {
+                Until::Exit => WaitOutcome::Met,
+                _ => WaitOutcome::Exited,
+            });
+        }
+        self.pending.push(waiter);
+        None
+    }
+}
+
 fn missing(session: &str) -> Refusal {
     Refusal { code: ErrorCode::NoSuchSession, message: format!("no session {session}") }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalized_cell_zeroes_partial_dimensions() {
+        assert_eq!(normalized_cell(0, 0), (0, 0));
+        assert_eq!(normalized_cell(0, 16), (0, 0));
+        assert_eq!(normalized_cell(8, 0), (0, 0));
+        assert_eq!(normalized_cell(8, 16), (8, 16));
+    }
+
+    #[test]
+    fn waiters_register_settles_immediately_after_exit() {
+        let mut waiters = Waiters::default();
+        let make = |until| Waiter { until, settled: Arc::new(AtomicBool::new(false)) };
+        assert_eq!(waiters.register(make(Until::Exit)), None);
+        assert_eq!(waiters.pending.len(), 1);
+
+        waiters.exited = true;
+        assert_eq!(waiters.register(make(Until::Exit)), Some(WaitOutcome::Met));
+        assert_eq!(waiters.register(make(Until::Idle)), Some(WaitOutcome::Exited));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_signal_descriptions_warms_once_lock() {
+        assert!(NAMED_DESCRIPTIONS.get().is_none());
+        init_signal_descriptions();
+        assert!(NAMED_DESCRIPTIONS.get().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_kills_and_sessions_wait_for_kills_drain_concurrent_guards() {
+        // Zero active kills returns immediately.
+        let kills = Arc::new(ActiveKills::default());
+        let start = Instant::now();
+        kills.wait_all_within(Duration::from_millis(500));
+        assert!(start.elapsed() < Duration::from_millis(200), "zero active kills must not wait");
+
+        // Two concurrent guards: wait_all_within blocks until both drop, then wakes promptly.
+        let g1 = kills.track();
+        let g2 = kills.track();
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_bg = Arc::clone(&finished);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            drop(g1);
+            std::thread::sleep(Duration::from_millis(25));
+            finished_bg.store(true, Ordering::SeqCst);
+            drop(g2);
+        });
+        let start = Instant::now();
+        kills.wait_all_within(Duration::from_millis(1_000));
+        assert!(finished.load(Ordering::SeqCst), "wait_all_within returned before all KillGuards dropped");
+        assert!(start.elapsed() < Duration::from_millis(500), "wait_all_within did not wake promptly on last drop");
+        assert_eq!(*kills.active.lock().expect("lock"), 0);
+
+        // Sessions::wait_for_kills delegates to kills.wait_all().
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let sessions = Sessions::new(tx, Credit::new(1024));
+        let guard = sessions.kills.track();
+        let done = Arc::new(AtomicBool::new(false));
+        let done_bg = Arc::clone(&done);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            done_bg.store(true, Ordering::SeqCst);
+            drop(guard);
+        });
+        sessions.wait_for_kills();
+        assert!(done.load(Ordering::SeqCst), "Sessions::wait_for_kills did not wait for tracked kill");
+    }
 }
