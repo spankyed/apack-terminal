@@ -26,8 +26,8 @@ pub fn refused_once_opened(path: &[u8]) -> bool {
 }
 
 /// Whether one component of a path names a device, whatever follows a `.` or a `:` in it and whatever
-/// spaces end the rest: `CON`, `PRN`, `AUX` and `NUL`, and `COM` and `LPT` with a digit or a superscript
-/// one, two or three.
+/// spaces end the rest: `CON`, `PRN`, `AUX`, `NUL`, `CONIN$`, `CONOUT$`, and `COM` and `LPT` with a
+/// digit or a superscript one, two or three.
 fn names_a_device(component: &[u8]) -> bool {
     let end = component.iter().position(|byte| matches!(byte, b'.' | b':')).unwrap_or(component.len());
     let mut stem = &component[..end];
@@ -40,6 +40,6 @@ fn names_a_device(component: &[u8]) -> bool {
         [] => matches!(base.as_slice(), b"CON" | b"PRN" | b"AUX" | b"NUL"),
         [digit] => matches!(base.as_slice(), b"COM" | b"LPT") && digit.is_ascii_digit(),
         [0xc2, 0xb9 | 0xb2 | 0xb3] => matches!(base.as_slice(), b"COM" | b"LPT"),
-        _ => false,
+        _ => base.as_slice() == b"CON" && matches!(rest.to_ascii_uppercase().as_slice(), b"IN$" | b"OUT$"),
     }
 }

@@ -22,10 +22,13 @@ use apack_terminal::screen::Screen;
 use apack_terminal::screen::{PendingImage, Snapshot};
 use apack_terminal::vt::Terminal;
 use apack_terminal::vt::image_sources::posix::{
-    device, mounted_at, mounted_beneath, on_special_filesystem, open_file, shared_memory_kind, special_filesystems,
+    PageWindow, bounded_range, clear_nonblock, device, mounted_at, mounted_beneath, on_special_filesystem, open_file,
+    page_window, read_fd_range, read_mapped_range, refused_path, shared_memory, shared_memory_kind,
+    special_filesystems,
 };
 use apack_terminal::vt::image_sources::{
-    CHUNK_BYTES, Load, PATH_BYTES, READ_BYTES, SOURCE_BYTES, Scanner, Source, Worker, shared_memory_name,
+    CHUNK_BYTES, Load, PATH_BYTES, QUERY_SOURCE_BYTES, READ_BYTES, SOURCE_BYTES, Scanner, Source, Worker,
+    shared_memory_name,
 };
 use proptest::prelude::*;
 
@@ -938,7 +941,8 @@ impl ReplaceAction for Vec<u8> {
 }
 
 /// On Linux a shared memory object is a file under `/dev/shm`, where a FIFO can be made; named as one,
-/// it is refused without a wait, and unlinked as anything opened under that name is.
+/// it is refused without a wait, and left in place rather than unlinked because it is not a regular
+/// shared memory object.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_fifo_named_as_shared_memory_does_not_stall_the_session() {
@@ -950,7 +954,7 @@ fn a_fifo_named_as_shared_memory_does_not_stall_the_session() {
     assert!(made.told.contains("\x1b_Gi=7;E"), "the program was not told no: {:?}", made.told);
     let left = path.exists();
     let _ = std::fs::remove_file(&path);
-    assert!(!left, "a FIFO opened under the name was not unlinked");
+    assert!(left, "a refused FIFO under /dev/shm was unlinked");
 }
 
 /// **A file larger than one command carries is sent in pieces**, and is the same image; asked about, it is
@@ -1502,4 +1506,189 @@ fn a_cursor_set_while_a_read_is_outstanding_waits_for_it() {
     assert_eq!(made.image.as_deref(), Some(&PIXEL[..]), "a read was ended by the cursor being set");
     assert!(made.told.contains("i=7;OK"), "{:?}", made.told);
     assert_eq!(made.screen.lines[0], "after");
+}
+
+/// **Paths under `/dev`, `/proc`, and `/sys` (other than `/dev/shm`) are refused before `open()`**, so
+/// `/dev/fd/N` and `/proc/self/fd/N` cannot bypass the post-open device check by duplicating an open
+/// regular-file descriptor.
+#[test]
+fn dev_fd_and_special_paths_are_refused_before_open() {
+    use std::os::fd::AsRawFd;
+
+    let directory = tempfile::tempdir().expect("a directory");
+    let file = std::fs::File::open(picture(&directory.path().join("picture"))).expect("a file is opened");
+    let via_fd = format!("/dev/fd/{}", file.as_raw_fd());
+    assert!(std::fs::File::open(&via_fd).is_ok(), "{via_fd} must resolve to the open regular file");
+    assert!(open_file(via_fd.as_bytes()).is_none(), "{via_fd} bypassed open_file");
+
+    for blocked in [
+        &b"/dev/fd"[..],
+        b"/dev/fd/3",
+        b"/dev/null",
+        b"/proc",
+        b"/proc/self/fd/3",
+        b"/proc/1234/fd/5",
+        b"/sys",
+        b"/sys/fs/cgroup",
+        b"//dev/./fd/3",
+        b"/tmp/../dev/fd/3",
+        b"/dev/shm/../fd/3",
+        b"/dev/shm_other/file",
+    ] {
+        assert!(refused_path(blocked), "{:?} was not refused", String::from_utf8_lossy(blocked));
+    }
+    for allowed in [
+        &b"/dev/shm"[..],
+        b"/dev/shm/picture",
+        b"/tmp/picture",
+        b"/procfs/file",
+        b"/sys2/file",
+        b"/dev2/file",
+        b"dev/fd/3",
+        b"picture.rgba",
+        b"",
+    ] {
+        assert!(!refused_path(allowed), "{:?} was refused", String::from_utf8_lossy(allowed));
+    }
+
+    assert_eq!(clear_nonblock(-1), None);
+    assert_eq!(clear_nonblock(1), Some(1));
+    assert_eq!(clear_nonblock(libc::O_NONBLOCK), Some(0));
+    assert_eq!(clear_nonblock(libc::O_NONBLOCK | libc::O_APPEND), Some(libc::O_APPEND));
+}
+
+/// **Shared memory reads validate their range before reading/mapping**, handle empty ranges without
+/// mapping, open with `O_NONBLOCK` and `O_CLOEXEC`, and read multi-page, multi-chunk ranges accurately.
+#[test]
+fn shared_memory_validates_ranges_and_reads_page_windowed_chunks() {
+    use std::num::NonZeroU64;
+
+    use apack_terminal::vt::image_sources::Refused::InvalidData;
+
+    assert_eq!(bounded_range(u64::MAX, 0..SOURCE_BYTES), Ok(0..SOURCE_BYTES));
+    assert_eq!(bounded_range(u64::MAX, 0..SOURCE_BYTES + 1), Err(InvalidData));
+    assert_eq!(bounded_range(u64::MAX, 10..SOURCE_BYTES + 10), Ok(10..SOURCE_BYTES + 10));
+    assert_eq!(bounded_range(u64::MAX, 10..SOURCE_BYTES + 11), Err(InvalidData));
+    assert_eq!(bounded_range(10, 4..4), Ok(4..4));
+    assert_eq!(bounded_range(10, std::ops::Range { start: 5, end: 4 }), Err(InvalidData));
+    assert_eq!(bounded_range(10, 4..10), Ok(4..10));
+    assert_eq!(bounded_range(10, 4..11), Err(InvalidData));
+
+    let page = NonZeroU64::new(4096).expect("non-zero");
+    assert_eq!(page_window(5000..9000, page), Some(PageWindow { aligned: 4096, mapped: 4904, lead: 904, len: 4000 }));
+    assert_eq!(page_window(4096..8192, page), Some(PageWindow { aligned: 4096, mapped: 4096, lead: 0, len: 4096 }));
+    assert_eq!(page_window(100..200, page), Some(PageWindow { aligned: 0, mapped: 200, lead: 100, len: 100 }));
+    assert_eq!(page_window(std::ops::Range { start: 200, end: 100 }, page), None);
+
+    let small = [9u8, 9, 1, 2, 3, 4, 9, 9];
+    let name = shared_name("empty-rng");
+    let c_name = made_shared(&name, &small);
+    assert_eq!(shared_memory(name.as_bytes(), |_| Ok(4..4)), Ok(Vec::new()));
+    assert!(!still_shared(&c_name));
+
+    let name = shared_name("inv-rng");
+    let c_name = made_shared(&name, &small);
+    assert_eq!(shared_memory(name.as_bytes(), |_| Ok(std::ops::Range { start: 6, end: 2 })), Err(InvalidData));
+    assert!(!still_shared(&c_name));
+
+    let name = shared_name("oob-rng");
+    let c_name = made_shared(&name, &small);
+    assert_eq!(shared_memory(name.as_bytes(), |size| Ok(2..size + 1)), Err(InvalidData));
+    assert!(!still_shared(&c_name));
+
+    let name = shared_name("tail-rng");
+    let c_name = made_shared(&name, &small);
+    assert_eq!(shared_memory(name.as_bytes(), |_| Ok(4..8)), Ok(vec![vec![3, 4, 9, 9]]));
+    assert!(!still_shared(&c_name));
+
+    // A multi-page, multi-chunk read starting past the first 16 KiB page with a non-zero page offset
+    let start = 20_000usize;
+    let len = CHUNK_BYTES + 7;
+    let total = start + len + 13;
+    let payload: Vec<u8> = (0..total).map(|index| (index % 251) as u8).collect();
+    let name = shared_name("chunks");
+    let c_name = made_shared(&name, &payload);
+    let pieces = shared_memory(name.as_bytes(), |size| {
+        assert!(size >= total as u64);
+        Ok(start as u64..(start + len) as u64)
+    })
+    .expect("multi-chunk shared memory read succeeds");
+    assert!(!still_shared(&c_name));
+    assert_eq!(pieces.len(), 2);
+    assert_eq!(pieces[0].len(), CHUNK_BYTES);
+    assert_eq!(pieces[1].len(), 7);
+    assert!(pieces.concat() == payload[start..start + len]);
+
+    // Exercise both range-reading backends (`read_fd_range` for Linux and `read_mapped_range` for
+    // non-Linux Unix) on every Unix platform against a real regular file
+    let directory = tempfile::tempdir().expect("a directory");
+    let backing = directory.path().join("backing");
+    std::fs::write(&backing, &payload).expect("backing file");
+    for via_fd in [true, false] {
+        let fd: std::os::fd::OwnedFd = std::fs::File::open(&backing).expect("open backing").into();
+        let read = if via_fd {
+            read_fd_range(fd, start as u64..(start + len) as u64)
+        } else {
+            read_mapped_range(fd, start as u64..(start + len) as u64)
+        }
+        .expect("range read succeeds");
+        assert_eq!(read.len(), 2);
+        assert_eq!(read[0].len(), CHUNK_BYTES);
+        assert_eq!(read[1].len(), 7);
+        assert!(read.concat() == payload[start..start + len]);
+    }
+    // Truncation / EOF past file end and inverted range return InvalidData from `read_fd_range`
+    let short_fd: std::os::fd::OwnedFd = std::fs::File::open(&backing).expect("open backing").into();
+    assert_eq!(read_fd_range(short_fd, (total as u64 - 4)..(total as u64 + 8)), Err(InvalidData));
+    let inv_fd: std::os::fd::OwnedFd = std::fs::File::open(&backing).expect("open backing").into();
+    assert_eq!(read_fd_range(inv_fd, std::ops::Range { start: 10, end: 5 }), Err(InvalidData));
+}
+
+/// **Queries (`a=q`) are capped at `QUERY_SOURCE_BYTES` (64 MiB), and oversized regular files are
+/// refused upfront from metadata before reading a single byte.**
+#[test]
+fn queries_are_capped_and_oversized_files_are_refused_before_reading() {
+    use apack_terminal::vt::image_sources::Refused::InvalidData;
+
+    assert!(load_of("a=T").within_file_limit(SOURCE_BYTES));
+    assert!(!load_of("a=T").within_file_limit(SOURCE_BYTES + 1));
+    assert!(load_of("a=T,O=10").within_file_limit(SOURCE_BYTES + 10));
+    assert!(!load_of("a=T,O=10").within_file_limit(SOURCE_BYTES + 11));
+    assert!(load_of("a=T,S=4").within_file_limit(SOURCE_BYTES + 100));
+    assert!(load_of(&format!("a=T,S={SOURCE_BYTES}")).within_file_limit(u64::MAX));
+    assert!(!load_of(&format!("a=T,S={}", SOURCE_BYTES + 1)).within_file_limit(u64::MAX));
+
+    assert!(load_of("a=q").within_file_limit(QUERY_SOURCE_BYTES));
+    assert!(!load_of("a=q").within_file_limit(QUERY_SOURCE_BYTES + 1));
+    assert!(load_of(&format!("a=q,S={QUERY_SOURCE_BYTES}")).within_file_limit(u64::MAX));
+    assert!(!load_of(&format!("a=q,S={}", QUERY_SOURCE_BYTES + 1)).within_file_limit(u64::MAX));
+
+    // Shared memory range cap for queries
+    assert_eq!(load_of(&format!("a=q,f=100,S={QUERY_SOURCE_BYTES}")).range(u64::MAX), Ok(0..QUERY_SOURCE_BYTES));
+    assert_eq!(load_of(&format!("a=q,f=100,S={}", QUERY_SOURCE_BYTES + 1)).range(u64::MAX), Err(InvalidData));
+
+    // Streaming `read_from` cap for queries
+    let read_q = |control: &str, len: u64| {
+        let counted = std::rc::Rc::new(std::cell::Cell::new(0));
+        let pieces = load_of(control).read_from(Zeros { len, at: 0, read: counted.clone() }, &|| {});
+        (pieces.is_some(), counted.get())
+    };
+    assert!(read_q("a=q", QUERY_SOURCE_BYTES).0);
+    assert!(!read_q("a=q", QUERY_SOURCE_BYTES + 1).0);
+    assert_eq!(read_q(&format!("a=q,S={}", QUERY_SOURCE_BYTES + 1), u64::MAX), (false, 0));
+
+    // Upfront metadata check on a real sparse file refuses without reading a single byte
+    let directory = tempfile::tempdir().expect("a directory");
+    for (action, size) in [("q", QUERY_SOURCE_BYTES + 1), ("T", SOURCE_BYTES + 1)] {
+        let path = directory.path().join(format!("huge-{action}"));
+        std::fs::File::create(&path).and_then(|file| file.set_len(size)).expect("a sparse file");
+        let mut scanner = Scanner::default();
+        scanner.begin();
+        let control = format!("Ga={action},i=7,f=100,t=f;{}\x1b", named(&path));
+        let (_, load) = scanner.read(control.as_bytes(), |_| {});
+        let reads = std::cell::Cell::new(0usize);
+        let loaded = load.expect("a load").read_with(&|| reads.set(reads.get() + 1));
+        assert!(loaded.body().is_err(), "a={action} oversized file was read");
+        assert_eq!(reads.get(), 0, "a={action} oversized file was read instead of refused from metadata");
+    }
 }

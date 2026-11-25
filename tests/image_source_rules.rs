@@ -24,6 +24,11 @@ fn a_path_the_core_refuses_is_refused_before_it_is_opened() {
         "C:\\images\\COM\u{b9}",
         "C:\\images\\LPT\u{b2}.png",
         "C:\\images\\com\u{b3}",
+        r"CONIN$",
+        r"C:\images\conin$.txt",
+        r"CONOUT$",
+        r"C:\images\conout$ .png",
+        r"C:\images\CONOUT$:stream",
     ] {
         assert!(refused(path.as_bytes()), "{path} was not refused");
     }
@@ -44,6 +49,11 @@ fn a_path_the_core_refuses_is_refused_before_it_is_opened() {
         r"\??x\picture.rgba",
         r"C:\images\CON1",
         r"C:\images\COMx",
+        r"C:\images\PRNIN$",
+        r"C:\images\CONIN",
+        r"C:\images\CONOUT",
+        r"C:\images\CONX$",
+        r"C:\images\CONIN$x",
     ] {
         assert!(!refused(path.as_bytes()), "{path} was refused");
     }

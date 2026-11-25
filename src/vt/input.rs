@@ -388,18 +388,21 @@ impl Encoders {
                 sys::ghostty_key_event_set_composing(self.key_event, false),
             )?;
             Failed::check(
-                "ghostty_key_event_set_utf8",
-                sys::ghostty_key_event_set_utf8(self.key_event, sys::String::from(text)),
-            )?;
-            Failed::check(
                 "ghostty_key_event_set_unshifted_codepoint",
                 sys::ghostty_key_event_set_unshifted_codepoint(self.key_event, key.unshifted),
             )?;
         }
         let (encoder, event) = (self.key, self.key_event);
-        // SAFETY: the buffer is as long as the length passed
-        let encoded = sized("ghostty_key_encoder_encode", |buffer, length, written| unsafe {
-            sys::ghostty_key_encoder_encode(encoder, event, buffer, length, written)
+        // SAFETY: every handle is live; `text` outlives the encode below, and no early `?` occurs before
+        // the event's borrow of `text` is cleared back to `""`
+        let encoded = Failed::check("ghostty_key_event_set_utf8", unsafe {
+            sys::ghostty_key_event_set_utf8(event, sys::String::from(text))
+        })
+        .and_then(|()| {
+            // SAFETY: the buffer is as long as the length passed
+            sized("ghostty_key_encoder_encode", |buffer, length, written| unsafe {
+                sys::ghostty_key_encoder_encode(encoder, event, buffer, length, written)
+            })
         });
         // **The event keeps a pointer to the text and not a copy**, and the text is the caller's: left
         // set, the event would hold a pointer into a message that has been freed until the next key

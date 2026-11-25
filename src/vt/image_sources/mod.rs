@@ -63,6 +63,11 @@ use std::ops::Range;
 /// or as shared memory, and whether or not what is made of it could be kept.
 pub const SOURCE_BYTES: u64 = 400 << 20;
 
+/// The most of a source read for a query (`a=q`): a query is sent to the core in one base64 command, so
+/// capping it at `IMAGE_STORAGE_BYTES` (64 MiB) prevents a query from spiking memory while still letting
+/// any image a session could keep be queried.
+pub const QUERY_SOURCE_BYTES: u64 = super::images::IMAGE_STORAGE_BYTES;
+
 /// How much of a source one command carries, and so the pieces it is read and held in. A multiple of
 /// three, so every piece but the last is whole groups of base64, and well inside what the core takes in
 /// one command.
@@ -224,13 +229,33 @@ impl Load {
         self.read_with(&|| {})
     }
 
+    /// The most bytes this command may read from its source: `QUERY_SOURCE_BYTES` for a query (`a=q`),
+    /// which is forwarded in a single base64 command, and `SOURCE_BYTES` otherwise.
+    fn source_limit(&self) -> u64 {
+        if self.action == b'q' { QUERY_SOURCE_BYTES } else { SOURCE_BYTES }
+    }
+
+    /// Whether a regular file `file_len` bytes long can fit inside this command's source limit without
+    /// reading it first: when `S` is given, `read_from` caps at `S` directly; when `S` is zero, the tail
+    /// from `O` to EOF is read, so a tail already longer than the limit is refused before reading a byte.
+    pub fn within_file_limit(&self, file_len: u64) -> bool {
+        let limit = self.source_limit();
+        let size = u64::from(self.keys.get(b'S').unwrap_or(0));
+        if size != 0 {
+            return size <= limit;
+        }
+        let offset = u64::from(self.keys.get(b'O').unwrap_or(0));
+        file_len.saturating_sub(offset) <= limit
+    }
+
     /// The same, calling `progress` each time the system answers a read of a file (`Worker`).
     pub fn read_with(self, progress: &dyn Fn()) -> Loaded {
         let data = match (&self.source, bytes_a_pixel(&self.keys)) {
             (_, None) | (Source::Unreadable, _) => Err(Refused::InvalidData),
-            (Source::File(path), Some(_)) => {
-                platform::open_file(path).and_then(|file| self.read_from(file, progress)).ok_or(Refused::InvalidData)
-            }
+            (Source::File(path), Some(_)) => platform::open_file(path)
+                .filter(|file| file.metadata().is_ok_and(|meta| self.within_file_limit(meta.len())))
+                .and_then(|file| self.read_from(file, progress))
+                .ok_or(Refused::InvalidData),
             (Source::SharedMemory(name), Some(_)) => platform::shared_memory(name, |size| self.range(size)),
         };
         let query = self.action == b'q';
@@ -238,21 +263,22 @@ impl Load {
     }
 
     /// The bytes of a file the command names, from its `O` offset: its `S` size of them exactly, or to its
-    /// end where no size is given (`readFile`), and no more than `SOURCE_BYTES` either way: in pieces of
-    /// `CHUNK_BYTES`, the last of them short, and empty where the rest were all there was.
+    /// end where no size is given (`readFile`), and no more than this command's source limit either way: in
+    /// pieces of `CHUNK_BYTES`, the last of them short, and empty where the rest were all there was.
     ///
     /// **Read up to the limit and no further**, so a size or a file of gigabytes costs what the limit does:
     /// a size past it is refused before anything is read, and where no size is given one byte past it is
     /// read, to tell a file that ends at the limit from one that goes on. `progress` is called each time
     /// the system answers a read.
     pub fn read_from(&self, mut source: impl Read + Seek, progress: &dyn Fn()) -> Option<Vec<Vec<u8>>> {
+        let max_bytes = self.source_limit();
         let offset = u64::from(self.keys.get(b'O').unwrap_or(0));
         let size = u64::from(self.keys.get(b'S').unwrap_or(0));
-        if size > SOURCE_BYTES {
+        if size > max_bytes {
             return None;
         }
         source.seek(SeekFrom::Start(offset)).ok()?;
-        let limit = if size == 0 { SOURCE_BYTES + 1 } else { size };
+        let limit = if size == 0 { max_bytes + 1 } else { size };
         let mut source = Progressing { source: source.take(limit), progress };
         let (mut pieces, mut read) = (Vec::new(), 0);
         loop {
@@ -264,7 +290,7 @@ impl Load {
                 break;
             }
         }
-        (read <= SOURCE_BYTES && (size == 0 || read == size)).then_some(pieces)
+        (read <= max_bytes && (size == 0 || read == size)).then_some(pieces)
     }
 
     /// Which bytes of a shared memory object `size` long are the image's (`sharedMemoryRange`): from its
@@ -291,7 +317,7 @@ impl Load {
             (0, _, _) => size.checked_sub(start).ok_or(Refused::InvalidData)?,
             (given, _, _) => u64::from(given),
         };
-        if length <= SOURCE_BYTES { Ok(start..start + length) } else { Err(Refused::InvalidData) }
+        if length <= self.source_limit() { Ok(start..start + length) } else { Err(Refused::InvalidData) }
     }
 }
 

@@ -511,3 +511,34 @@ fn the_core_places_an_image_anchored_to_another_on_the_screen() {
     // And neither is among what the storage can place
     assert_eq!(terminal.placements().expect("placements").iter().map(|one| one.image).collect::<Vec<_>>(), [6]);
 }
+
+/// **`fit` never overflows `u32` on large cell dimensions and never divides by zero on zero-sized
+/// pictures or grids.**
+#[test]
+fn fit_handles_zero_dimensions_and_large_cells_without_overflow_or_nan() {
+    use apack_terminal::view::wire::Style;
+    use apack_terminal::vt::placeholders::{Run, Said, fit};
+
+    let said = Said::of(&Style::default(), []);
+    let single = Run::begin(0, said);
+    for (grid, picture, cell) in [
+        ((0, 1), (0, 10), (10, 20)),
+        ((1, 0), (10, 0), (10, 20)),
+        ((0, 0), (0, 0), (10, 20)),
+        ((2, 2), (0, 10), (10, 20)),
+        ((2, 2), (10, 0), (10, 20)),
+        ((2, 2), (10, 10), (0, 20)),
+        ((2, 2), (10, 10), (10, 0)),
+    ] {
+        assert_eq!(fit(&single, grid, picture, cell), None, "grid={grid:?} picture={picture:?} cell={cell:?}");
+    }
+
+    // 1000 * 10_000_000 and 500 * 10_000_000 both exceed `u32::MAX`
+    let mut wide = Run::begin(0, said);
+    for column in 1..500u16 {
+        assert!(wide.takes(column, said));
+    }
+    let fitted = fit(&wide, (1000, 1000), (1000, 1000), (10_000_000, 10_000_000)).expect("fits without overflow");
+    assert_eq!(fitted.source, (0, 0, 500, 1));
+    assert_eq!(fitted.offset, (0, 0));
+}

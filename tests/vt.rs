@@ -486,3 +486,39 @@ fn a_sequence_is_found_wherever_in_a_read_a_look_ends() {
         assert_eq!(terminal.sequences_watched(), watched + 1, "{before} bytes ahead of one naming mode 12");
     }
 }
+
+/// **A cell whose grapheme cluster exceeds the read buffer falls back to its base code point**, and
+/// never pushes a NUL character.
+#[test]
+fn a_cell_with_a_cluster_longer_than_the_buffer_falls_back_to_its_base_character() {
+    let mut terminal = Terminal::new(20, 2).expect("a terminal");
+    let cluster = format!("a{}", "\u{0301}".repeat(20));
+    terminal.feed(cluster.as_bytes());
+    let mut text = String::new();
+    terminal.push_cell_text(0, 0, &mut text).expect("push_cell_text");
+    assert_eq!(text, "a");
+}
+
+/// **A failed `Encoders::key` call leaves no dangling UTF-8 pointer in the reusable key event.**
+#[test]
+fn a_key_event_with_an_invalid_unshifted_codepoint_leaves_the_encoder_clean() {
+    use apack_terminal::vt::input::{Encoders, Key};
+
+    let terminal = Terminal::new(80, 24).expect("a terminal");
+    let mut encoders = Encoders::new().expect("encoders");
+    for bad in [0x11_0000u32, 0xD800] {
+        let owned = "ephemeral".to_owned();
+        let _ = encoders.key(
+            &terminal,
+            &Key { action: 0, code: "KeyA", modifiers: 0, text: &owned, unshifted: bad, composed: false },
+        );
+        drop(owned);
+    }
+    let next = encoders
+        .key(
+            &terminal,
+            &Key { action: 0, code: "KeyB", modifiers: 0, text: "b", unshifted: u32::from('b'), composed: false },
+        )
+        .expect("a valid key encodes after a failed one");
+    assert_eq!(next, b"b");
+}
