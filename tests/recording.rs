@@ -1498,11 +1498,25 @@ fn drop_oldest_skips_rewriting_single_initial_keyframe_and_compacts_later_ones()
     let directory = tempfile::tempdir().expect("a directory");
     let path = directory.path().join("single.recording");
     let mut recorder = Recorder::start_with(&path, 128, 64).expect("started");
+    #[cfg(unix)]
+    let initial_inode = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&path).expect("initial file metadata").ino()
+    };
     // Single keyframe larger than the budget: nothing precedes offset 8 to drop.
     recorder.keyframe(80, 24, &[b'k'; 200]).expect("initial keyframe");
     recorder.flush();
     assert!(!path.with_extension("recording.rewriting").exists());
     assert_eq!(recording::read(&path).len(), 1);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::fs::metadata(&path).expect("metadata after single keyframe").ino(),
+            initial_inode,
+            "single initial keyframe at offset 8 must not trigger a rewrite"
+        );
+    }
 
     // Adding output and a second keyframe compacts past the first and still leaves no sibling file.
     recorder.output(&[b'x'; 100]).expect("output");

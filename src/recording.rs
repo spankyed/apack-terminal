@@ -328,10 +328,18 @@ pub struct Index {
 }
 
 impl Index {
-    /// Reads where a recording's keyframes are. `None` for a recording that is not there, or holds no
-    /// keyframe: there is nothing in it to look back through.
+    /// Reads where a recording's keyframes are. `None` for a recording that is not there, exceeds
+    /// `MAX_RECORDING_BYTES`, or holds no keyframe: there is nothing in it to look back through.
     pub fn open(path: &Path) -> Option<Self> {
+        Self::open_bounded(path, MAX_RECORDING_BYTES)
+    }
+
+    fn open_bounded(path: &Path, limit: u64) -> Option<Self> {
         let file = File::open(path).ok()?;
+        let total = file.metadata().ok()?.len();
+        if total > limit {
+            return None;
+        }
         let mut reader = BufReader::new(file);
         let mut prefix = [0u8; FILE_HEADER.len()];
         if reader.read_exact(&mut prefix).is_err() || prefix != FILE_HEADER {
@@ -342,7 +350,6 @@ impl Index {
         let mut header = [0u8; HEADER];
         // An entry's header, and then past its payload without reading it. A header that is not all
         // there, or a payload the file ends inside, is a recording's torn end
-        let total = reader.get_ref().metadata().ok()?.len();
         while reader.read_exact(&mut header).is_ok() {
             let length = u64::from(u32::from_le_bytes(header[9..13].try_into().unwrap_or_default()));
             let whole = match header[0] {
@@ -1078,6 +1085,10 @@ mod tests {
         rec.keyframe(80, 24, b"state").expect("keyframe");
         rec.flush();
         let entry_len = (HEADER + 4 + 5) as u64;
+        let file_len = FILE_HEADER.len() as u64 + entry_len;
+        assert!(Index::open_bounded(&path, file_len).is_some(), "index opens at exact file limit");
+        assert!(Index::open_bounded(&path, file_len - 1).is_none(), "index refuses 1 byte past limit");
+        assert!(Index::open_bounded(&path, file_len - 2).is_none(), "index refuses 2 bytes past limit");
         let mut index = Index::open(&path).expect("opened");
         assert_eq!(index.moment_bounded(u64::MAX, entry_len).expect("exact limit").len(), 1);
         assert!(index.moment_bounded(u64::MAX, entry_len - 1).is_err(), "1 byte over limit");

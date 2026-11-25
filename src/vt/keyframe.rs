@@ -341,14 +341,14 @@ impl Terminal {
         }
         let with = [&kept.snapshot[..ends], &pixels.kept].concat();
         let records = kept.records + pixels.records;
-        if self.holds_every_image(&with, records) {
+        if Self::holds_every_image(&with, records) {
             (kept.snapshot, kept.records, kept.whole) = (with, records, true);
         }
     }
 
     /// Whether `snapshot`, of which `records` records follow what makes its terminal renderable, decodes
     /// to a terminal with the pixels of every image it holds.
-    fn holds_every_image(&self, snapshot: &[u8], records: u32) -> bool {
+    fn holds_every_image(snapshot: &[u8], records: u32) -> bool {
         let Ok(decoding) = Decoding::of(snapshot, super::images::IMAGE_STORAGE_BYTES) else { return false };
         let Ok(scratch) = decoding.ready() else { return false };
         let to_come = decoding.pixels_to_come();

@@ -1150,6 +1150,9 @@ impl Screen {
                     if let Some(scanner) = &mut self.image_sources {
                         *scanner = Scanner::default();
                     }
+                    if self.cell == (0, 0) {
+                        self.cell = self.terminal.cell_pixels();
+                    }
                     self.resize((*cols).min(MAX_GRID), (*rows).min(MAX_GRID), 0, 0);
                 }
                 Entry::Keyframe { .. } => {}

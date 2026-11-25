@@ -210,7 +210,7 @@ exclude_re = [
     # list is also how many keyframes there are, and one that lied about where would be a trap for the
     # next reader of it. Pinned to the rebase line so `self.written - from + kept` in `drop_oldest`
     # stays under mutation testing.
-    "recording.rs:1023:.*replace - with / in Recorder::drop_oldest",
+    "recording.rs:1030:.*replace - with / in Recorder::drop_oldest",
 
     # **The header read stops at the same byte with `<=`.** The loop reads into `head[read..]`, and once
     # `read` is the whole header that slice is empty, so the extra pass returns `Ok(0)` and breaks: the same

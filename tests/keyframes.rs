@@ -1135,13 +1135,32 @@ fn replay_handles_hostile_timestamps_huge_resizes_and_mid_apc_truncation() {
     // 2. An unmeasured screen adopting a keyframe preserves the keyframe's cell pixel size.
     let mut fresh = Screen::new(40, 6);
     fresh.allow_images(false).expect("images are allowed");
-    assert!(fresh.replay(&[Timed { at: 100, entry: kf }], u64::MAX));
+    assert!(fresh.replay(&[Timed { at: 100, entry: kf.clone() }], u64::MAX));
     let (sink, _incoming) = channel();
     let id = ViewId { connection: 9, channel: 9 };
     fresh.attach_view(id, sink).expect("a view attaches");
     let (_, cell, _) = fresh.images().expect("images metadata");
     fresh.detach_view(id);
     assert_eq!(cell, (10, 20), "restored cell pixel metrics must not be overwritten with (0, 0)");
+
+    // 2b. A mid-replay keyframe restore (after an unfinished sequence) also adopts cell pixel metrics
+    // when the initial keyframe had `(0, 0)`.
+    let mut unmeasured_src = Screen::new(40, 6);
+    unmeasured_src.feed(b"first");
+    let kf_zero = keyframe_of(&unmeasured_src, 40, 6);
+    let mut mid_fresh = Screen::new(40, 6);
+    mid_fresh.allow_images(false).expect("images are allowed");
+    assert!(mid_fresh.replay_all(&[
+        Timed { at: 100, entry: kf_zero },
+        Timed { at: 200, entry: Entry::Output(b"\x1b]0;unfinished".to_vec()) },
+        Timed { at: 300, entry: kf },
+    ]));
+    let (sink, _incoming) = channel();
+    let id = ViewId { connection: 10, channel: 10 };
+    mid_fresh.attach_view(id, sink).expect("a view attaches");
+    let (_, mid_cell, _) = mid_fresh.images().expect("images metadata");
+    mid_fresh.detach_view(id);
+    assert_eq!(mid_cell, (10, 20), "mid-replay keyframe restore must also adopt non-zero cell metrics");
 
     // 3. Settling a truncated APC without image sources also cancels the unfinished sequence.
     let mut apc_screen = Screen::new(40, 6);
