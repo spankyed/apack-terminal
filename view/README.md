@@ -94,7 +94,8 @@ package's one entry point.
   another.
 - **`clock`** (optional): a structural `{ after(ms, run): () => void }` timer source for cursor/text blink,
   search refresh, and input dedupe timers — letting a host share one timer queue across open views (or drive
-  timers deterministically in tests) with no runtime dependency. Left out, uses `setTimeout`/`clearTimeout`.
+  timers deterministically in tests) with no runtime dependency. Dispose views before closing a shared clock.
+  Left out, uses `setTimeout`/`clearTimeout`.
 - **`onEnded(reason)`** hears that no more frames will come: with no reason the session is over, and with
   one it is there and the broker could not show it.
 

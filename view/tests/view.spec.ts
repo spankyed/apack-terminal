@@ -1232,7 +1232,13 @@ describe('view lifecycle, guards, and edge-case regressions', () => {
   it('drives cursor blink, text blink, search refresh, and key-text dedupe through one shared clock with zero leaks on teardown', async () => {
     const clock = new TestClock()
     const blinkingRow = { ...row(0, 'ab'), style: Uint16Array.from([1, 0]), styles: [PLAIN, { ...PLAIN, flags: StyleFlag.blink }] }
-    const one = mountedView({ clock })
+    const sourceOne = new FakeSource()
+    let searches = 0
+    sourceOne.search = async () => {
+      searches += 1
+      return { spans: [{ start: { line: 0, column: 0 }, end: { line: 0, column: 1 } }], more: false }
+    }
+    const one = mountedView({ clock }, sourceOne)
     const two = mountedView({ clock })
 
     one.view.setFocused(true)
@@ -1243,14 +1249,27 @@ describe('view lifecycle, guards, and edge-case regressions', () => {
     // one has cursor blink + text blink; two has cursor blink
     expect(clock.pending).toBe(3)
 
+    // Arm search refresh on `one` via the shared clock
+    await one.view.find('a')
+    one.source.send(frame({ sequence: 2, rows: [blinkingRow], cursor: { column: 0, row: 0, shape: 'block', blinking: true, hidden: false } }))
+    expect(clock.pending).toBe(4)
+
     // Two rapid keypresses on `two` cancel-before-arm `keyTextTimer` (only 1 pending keyText timer, not 2)
     two.key('keydown', { code: 'KeyA', key: 'a' })
     two.key('keydown', { code: 'KeyB', key: 'b' })
-    expect(clock.pending).toBe(4)
+    expect(clock.pending).toBe(5)
 
     // Unmounting `two` clears both its cursor blink and its deferred keyText timer
     two.view.unmount()
-    expect(clock.pending).toBe(2)
+    expect(clock.pending).toBe(3)
+
+    // Advancing 200ms fires `one`'s search refresh; clearing search cancels any pending refresh timer
+    await clock.advanceAsync(200)
+    expect(searches).toBe(2)
+    one.source.send(frame({ sequence: 3, rows: [blinkingRow], cursor: { column: 0, row: 0, shape: 'block', blinking: true, hidden: false } }))
+    expect(clock.pending).toBe(3)
+    await one.view.find('')
+    expect(clock.pending, 'clearing search should cancel its pending refresh timer').toBe(2)
 
     // Advancing blinks `one`, and disposing `one` clears every remaining timer on the shared clock
     clock.advance(BLINK_MS)
@@ -1261,9 +1280,9 @@ describe('view lifecycle, guards, and edge-case regressions', () => {
     expect(clock.pending).toBe(0)
   })
 
-  it('handles synchronous after(0) clocks and ignores stale late-firing callbacks cleanly', () => {
+  it('handles synchronous after(0) clocks, ignores stale/duplicate callbacks, and cancels re-entrant registrations', async () => {
     let cancels = 0
-    const late: Array<() => void> = []
+    const captured: Array<{ ms: number; run: () => void }> = []
     const trickyClock: Clock = {
       after(ms, run) {
         if (ms === 0) {
@@ -1271,25 +1290,44 @@ describe('view lifecycle, guards, and edge-case regressions', () => {
           run()
           return () => { cancels += 1 }
         }
-        late.push(run)
+        captured.push({ ms, run })
         return () => { cancels += 1 }
       },
     }
-    const view = mountedView({ clock: trickyClock })
+    let searches = 0
+    const source = new FakeSource()
+    source.search = async () => {
+      searches += 1
+      return { spans: [{ start: { line: 0, column: 0 }, end: { line: 0, column: 1 } }], more: false }
+    }
+    const view = mountedView({ clock: trickyClock }, source)
     view.view.setFocused(true)
-    view.source.send(frame({ sequence: 1, cursor: { column: 0, row: 0, shape: 'block', blinking: true, hidden: false } }))
+    view.source.send(frame({ sequence: 1, rows: [row(0, 'hi')], cursor: { column: 0, row: 0, shape: 'block', blinking: true, hidden: false } }))
     runFrames()
+    const staleBlink = captured[0]!.run
 
-    // Keypress arms after(0), which fires synchronously; subsequent dispose must NOT invoke a stale cancel handle for it
+    // Keypress arms after(0) synchronously AND resets blink (superseding `staleBlink` while still mounted & focused)
     view.key('keydown', { code: 'KeyA', key: 'a' })
-    const blinkCancelCountBefore = cancels
-    view.view.unmount()
-    expect(cancels, 'only the active blink timer should be cancelled, not an already-fired synchronous timer').toBe(blinkCancelCountBefore + 1)
+    const countBeforeStale = captured.length
+    // Invoking the superseded blink callback while mounted & focused exercises Timer's token guard directly
+    staleBlink()
+    expect(view.painted().cursor, 'superseded blink callback must not hide the cursor').toBeDefined()
+    expect(captured.length, 'superseded blink callback must not re-arm timer').toBe(countBeforeStale)
 
-    // A buggy clock firing a cancelled blink callback late must be ignored and must not resurrect blinking
-    const beforeLate = late.length
-    for (const stale of [...late]) stale()
-    expect(late.length, 'stale blink callback must not re-arm timer after unmount').toBe(beforeLate)
+    // Buggy clock invoking a one-shot refresh callback twice must only execute runRefresh once
+    await view.view.find('hi')
+    source.send(frame({ sequence: 2, rows: [row(0, 'hi again')], cursor: { column: 0, row: 0, shape: 'block', blinking: true, hidden: false } }))
+    const refreshEntry = [...captured].reverse().find((e) => e.ms === 200)!
+    refreshEntry.run()
+    refreshEntry.run()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(searches, 'duplicate invocation of a one-shot timer must be ignored').toBe(2)
+
+    // Subsequent unmount must NOT invoke a stale cancel handle for the already-fired synchronous after(0) timer
+    const cancelCountBefore = cancels
+    view.view.unmount()
+    expect(cancels, 'only the active blink timer should be cancelled, not an already-fired synchronous timer').toBe(cancelCountBefore + 1)
   })
 
   it('uses the default setTimeout/clearTimeout clock when options.clock is omitted', () => {

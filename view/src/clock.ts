@@ -38,12 +38,15 @@ export class Timer {
     const mine = ++this.token
     let fired = false
     const stop = this.clock.after(ms, () => {
-      if (this.token !== mine) return
+      if (fired || this.token !== mine) return
       fired = true
       this.stop = null
       run()
     })
-    if (!fired && this.token === mine) this.stop = stop
+    if (!fired) {
+      if (this.token === mine) this.stop = stop
+      else stop()
+    }
   }
 
   /** Cancels any pending timer in this slot. Safe to call repeatedly or re-entrantly. */

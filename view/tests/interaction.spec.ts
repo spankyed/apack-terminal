@@ -1003,13 +1003,14 @@ describe('finding text', () => {
   })
 
   it('draws nothing again when rows changed and what was found did not', async () => {
-    const { view, clock } = searching([span(101, 0, 4)])
+    const { view, source, clock } = searching([span(101, 0, 4)])
     await view.view.find('a')
     const before = view.painted().rows[1]
     // Output on a line with no match on it: the search is made again and says the same
     view.source.send(frame({ sequence: 2, firstActive: 100, scrollback: 100, rows: [row(103, 'unrelated')] }))
     runFrames()
     await clock.advanceAsync(MATCH_REFRESH_MS)
+    expect(source.asked).toEqual(['a', 'a'])
     expect(framesWaiting(), 'a search that found the same was a reason to paint').toBe(0)
     expect(view.painted().rows[1], 'a row whose match did not move was drawn afresh').toBe(before)
   })

@@ -155,7 +155,7 @@ export interface ViewOptions {
   /**
    * Timer source for cursor/text blink, search refresh, and input dedupe timers. Matches `@apackdev/clock`,
    * `@apackdev/link`, and `@apackdev/state` structurally so a host can share one timer queue across open
-   * views. Left out, uses `setTimeout`/`clearTimeout`.
+   * views (dispose views before closing a shared clock). Left out, uses `setTimeout`/`clearTimeout`.
    */
   readonly clock?: Clock
 }
@@ -516,6 +516,8 @@ export class TerminalView {
    */
   async find(needle: string, options: { matchCase?: boolean } = {}): Promise<number> {
     if (this.disposed) return 0
+    this.refreshTimer.cancel()
+    this.refreshAgain = false
     const asked = (this.finding += 1)
     this.needle = needle
     this.matchCase = options.matchCase ?? false
@@ -1106,8 +1108,6 @@ export class TerminalView {
     this.unwatch = null
     this.lastFit = null
     this.thumbRelease?.()
-    this.refreshTimer.cancel()
-    this.refreshAgain = false
     this.input.clearKeyText()
     // Said while there is still an attachment to say it on: a view off the page does not have the keyboard
     // or a held button, whether or not the page gets round to saying so
@@ -1318,6 +1318,8 @@ export class TerminalView {
     this.detach = null
     this.listening = false
     this.unacknowledged = null
+    this.refreshTimer.cancel()
+    this.refreshAgain = false
     if (this.scheduled !== null) cancelAnimationFrame(this.scheduled)
     this.scheduled = null
     this.stopDragScroll()
@@ -1353,7 +1355,7 @@ export class TerminalView {
       if (!this.textBlinking || !this.listening || this.disposed) return
       this.textShown = !this.textShown
       this.schedule()
-      if (this.textBlinking && this.listening && !this.disposed) this.scheduleTextBlink()
+      if (this.textBlinking && this.listening && !this.disposed && !this.textBlink.active) this.scheduleTextBlink()
     })
   }
 
