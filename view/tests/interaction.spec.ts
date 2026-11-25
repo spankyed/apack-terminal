@@ -1,8 +1,9 @@
 // A view, used: what a click, a drag, a wheel and a pointer over a link each do — and who they are for,
 // which changes when a program asks for the mouse.
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { Command, Found, Placements, Span } from '../src/source.ts'
 import { MATCH_HIGHLIGHTS } from '../src/view.ts'
+import { TestClock } from './_clock.ts'
 import { framesWaiting, installFrames, runFrames } from './_frames.ts'
 import { FakeSource } from './_source.ts'
 import { frame, row } from './_support.ts'
@@ -899,7 +900,6 @@ describe('the commands a shell ran', () => {
 })
 
 describe('finding text', () => {
-  afterEach(() => { vi.useRealTimers() })
   class Searchable extends FakeSource {
     asked: string[] = []
     askedCase: boolean[] = []
@@ -918,11 +918,12 @@ describe('finding text', () => {
     view.painted().rows[index]?.backgrounds.filter((run) => run.color === 0x623315 || run.color === 0x9e6a03).map((run) => [run.column, run.column + run.cells, run.color === 0x9e6a03 ? 'current' : 'other'])
 
   function searching(found: Span[]) {
+    const clock = new TestClock()
     const source = new Searchable()
     source.found = found
-    const view = mountedView({}, source)
+    const view = mountedView({ clock }, source)
     showing(view, { firstActive: 100, scrollback: 100 })
-    return { view, source }
+    return { view, source, clock }
   }
 
   it('asks the source, which searches the history as well, and says how many there are', async () => {
@@ -963,53 +964,52 @@ describe('finding text', () => {
   })
 
   it('that found nothing has a match to be on once output brings one', async () => {
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
-    const { view, source } = searching([])
+    const { view, source, clock } = searching([])
     expect(await view.view.find('later')).toBe(0)
     source.found = [span(101, 0, 4), span(100, 6, 9)]
     view.source.send(frame({ sequence: 2, firstActive: 100, scrollback: 100, rows: [row(101, 'later')] }))
-    await vi.advanceTimersByTimeAsync(MATCH_REFRESH_MS)
+    await clock.advanceAsync(MATCH_REFRESH_MS)
     expect(view.view.found).toEqual({ current: 1, total: 2, more: false })
     expect(matchedOn(view, 1)).toEqual([[0, 5, 'current']])
   })
 
   it('tells its host when output changed what there is to count, and not when it did not', async () => {
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const clock = new TestClock()
     const source = new Searchable()
     source.found = [span(101, 0, 4)]
     const told: Array<{ current: number; total: number; more: boolean }> = []
-    const view = mountedView({ onFound: (found) => told.push(found) }, source)
+    const view = mountedView({ clock, onFound: (found) => told.push(found) }, source)
     showing(view, { firstActive: 100, scrollback: 100 })
     await view.view.find('a')
     expect(told, 'a search the host made is one it reads the answer of').toEqual([])
 
     // Output that leaves the same matches where they were says nothing
     view.source.send(frame({ sequence: 2, firstActive: 100, scrollback: 100, rows: [row(103, 'unrelated')] }))
-    await vi.advanceTimersByTimeAsync(MATCH_REFRESH_MS)
+    await clock.advanceAsync(MATCH_REFRESH_MS)
     expect(told).toEqual([])
 
     // The same matches, and now older ones the search did not reach: the count is no longer all there is
     source.more = true
     view.source.send(frame({ sequence: 3, firstActive: 100, scrollback: 100, rows: [row(103, 'pushed back')] }))
-    await vi.advanceTimersByTimeAsync(MATCH_REFRESH_MS)
+    await clock.advanceAsync(MATCH_REFRESH_MS)
     expect(told).toEqual([{ current: 1, total: 1, more: true }])
 
     // And one more match
     source.found = [span(102, 0, 1), span(101, 0, 4)]
     view.source.send(frame({ sequence: 4, firstActive: 100, scrollback: 100, rows: [row(102, 'a')] }))
-    await vi.advanceTimersByTimeAsync(MATCH_REFRESH_MS)
+    await clock.advanceAsync(MATCH_REFRESH_MS)
     expect(told.at(-1)).toEqual({ current: 2, total: 2, more: true })
     expect(told).toHaveLength(2)
   })
 
   it('draws nothing again when rows changed and what was found did not', async () => {
-    const { view } = searching([span(101, 0, 4)])
+    const { view, clock } = searching([span(101, 0, 4)])
     await view.view.find('a')
     const before = view.painted().rows[1]
     // Output on a line with no match on it: the search is made again and says the same
     view.source.send(frame({ sequence: 2, firstActive: 100, scrollback: 100, rows: [row(103, 'unrelated')] }))
     runFrames()
-    await settled()
+    await clock.advanceAsync(MATCH_REFRESH_MS)
     expect(framesWaiting(), 'a search that found the same was a reason to paint').toBe(0)
     expect(view.painted().rows[1], 'a row whose match did not move was drawn afresh').toBe(before)
   })
@@ -1027,7 +1027,7 @@ describe('finding text', () => {
   })
 
   it('is searched for again when rows change, at most once per 200 ms, one search at a time, and the person stays on the match they were on', async () => {
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const clock = new TestClock()
     const source = new (class extends Searchable {
       waiting: Array<(found: Span[]) => void> = []
       override search(needle: string, caseSensitive: boolean): Promise<Found> {
@@ -1036,7 +1036,7 @@ describe('finding text', () => {
         return new Promise((resolve) => { this.waiting.push((spans) => resolve({ spans, more: false })) })
       }
     })()
-    const view = mountedView({}, source)
+    const view = mountedView({ clock }, source)
     showing(view, { firstActive: 100, scrollback: 100 })
     const finding = view.view.find('a')
     source.waiting[0]!([span(101, 0, 4), span(100, 6, 9)])
@@ -1046,32 +1046,31 @@ describe('finding text', () => {
 
     // A frame that changed no row is not a reason to search
     view.source.send(frame({ sequence: 2, firstActive: 100, scrollback: 100, cursor: { column: 0, row: 0, shape: 'block', blinking: false, hidden: false } }))
-    await vi.advanceTimersByTimeAsync(MATCH_REFRESH_MS)
+    await clock.advanceAsync(MATCH_REFRESH_MS)
     expect(source.asked).toEqual(['a'])
 
     // Three frames of new output in one 200 ms: one search, due 200 ms after the first of them
     for (const sequence of [3, 4, 5]) view.source.send(frame({ sequence, firstActive: 100, scrollback: 100, rows: [row(102, `more a ${sequence}`)] }))
-    await vi.advanceTimersByTimeAsync(MATCH_REFRESH_MS - 1)
+    await clock.advanceAsync(MATCH_REFRESH_MS - 1)
     expect(source.asked, 'searched before the interval was up').toEqual(['a'])
-    await vi.advanceTimersByTimeAsync(1)
+    await clock.advanceAsync(1)
     expect(source.asked).toEqual(['a', 'a'])
 
     // Output while that search is on its way is searched for once it answers, and no sooner than the interval
     view.source.send(frame({ sequence: 6, firstActive: 100, scrollback: 100, rows: [row(103, 'even more a')] }))
     source.waiting[1]!([span(102, 5, 5), span(101, 0, 4), span(100, 6, 9)])
-    await vi.advanceTimersByTimeAsync(0)
+    await clock.advanceAsync(0)
     expect(source.asked).toEqual(['a', 'a'])
-    await vi.advanceTimersByTimeAsync(MATCH_REFRESH_MS)
+    await clock.advanceAsync(MATCH_REFRESH_MS)
     expect(source.asked).toEqual(['a', 'a', 'a'])
     source.waiting[2]!([span(103, 10, 10), span(102, 5, 5), span(101, 0, 4), span(100, 6, 9)])
-    await vi.advanceTimersByTimeAsync(0)
-    await vi.advanceTimersByTimeAsync(MATCH_REFRESH_MS * 5)
+    await clock.advanceAsync(0)
+    await clock.advanceAsync(MATCH_REFRESH_MS * 5)
     expect(source.asked, 'searched again with nothing changed since').toHaveLength(3)
 
     expect(view.view.found, 'the match the person was on is still the one they are on').toEqual({ current: 4, total: 4, more: false })
     expect(matchedOn(view, 3)).toEqual([[10, 11, 'other']])
     expect(matchedOn(view, 0)).toEqual([[6, 10, 'current']])
-    vi.useRealTimers()
   })
 
   it('asks for a case-sensitive search only when the person asks, and says so to the source', async () => {

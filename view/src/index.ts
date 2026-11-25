@@ -1,4 +1,5 @@
 export * from './source.ts'
+export type { Clock } from './clock.ts'
 export { KEPT_LINES, KEPT_SLACK, RowStore } from './row-store.ts'
 export { Viewport, type FoldRange } from './viewport.ts'
 export { xtermPalette } from './palette.ts'

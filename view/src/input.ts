@@ -9,6 +9,7 @@
  * character, an emoji picker inserts one with no key at all; both arrive as text in a hidden field, which
  * is here to receive exactly that and to give the page something that can hold focus.
  */
+import { Timer, systemClock, type Clock } from './clock.ts'
 import { Modifier, type KeyInput, type TerminalSource } from './source.ts'
 
 /** What each key types with no modifier on a US keyboard, for a browser that cannot say what this one's types */
@@ -42,6 +43,8 @@ export interface InputOptions {
   readonly typed?: () => void
   /** An input method began composing: what is selected is cleared, so the composition is not drawn over it */
   readonly compositionStarted?: () => void
+  /** Timer source for deferred key-text dedupe cleanup. Left out, uses `setTimeout`/`clearTimeout`. */
+  readonly clock?: Clock
 }
 
 /** The keys that only change what another key means */
@@ -97,11 +100,12 @@ export class Input {
   private held = { start: 0, suffix: 0 }
   /** The text the last key sent, which an input event for the same text would otherwise send a second time */
   private keyText: string | null = null
-  private keyTextTimer: ReturnType<typeof setTimeout> | null = null
+  private readonly keyTextTimer: Timer
   /** The keys the source was told went down and has not been told came up */
   private readonly down = new Set<string>()
 
   constructor(private readonly source: TerminalSource, private readonly options: InputOptions) {
+    this.keyTextTimer = new Timer(options.clock ?? systemClock)
     const field = document.createElement('textarea')
     field.setAttribute('aria-label', 'Terminal input')
     field.setAttribute('autocapitalize', 'off')
@@ -164,12 +168,10 @@ export class Input {
     this.field.remove()
   }
 
-  private clearKeyText(): void {
+  /** Clears any deferred key-text dedupe timer (e.g. on unmount or dispose). */
+  clearKeyText(): void {
     this.keyText = null
-    if (this.keyTextTimer !== null) {
-      clearTimeout(this.keyTextTimer)
-      this.keyTextTimer = null
-    }
+    this.keyTextTimer.cancel()
   }
 
   private unshifted(code: string): number {
@@ -244,10 +246,9 @@ export class Input {
     this.down.add(event.code)
     if (key.text !== '') {
       this.keyText = key.text
-      this.keyTextTimer = setTimeout(() => {
-        this.keyTextTimer = null
+      this.keyTextTimer.arm(0, () => {
         this.keyText = null
-      }, 0)
+      })
     }
     this.source.key(key)
     if (!MODIFIER_KEYS.has(event.key)) this.options.typed?.()
@@ -326,6 +327,7 @@ export class Input {
   private readonly blur = () => {
     // Keys let go while something else has the keyboard are never heard of again
     this.down.clear()
+    this.clearKeyText()
     this.options.focused(false)
   }
 }

@@ -2,6 +2,7 @@
 // text, and the keys that belong to the app or the input method left alone.
 import { beforeEach, describe, expect, it } from 'vitest'
 import { TooLarge, type PasteOutcome } from '../src/source.ts'
+import { TestClock } from './_clock.ts'
 import { installFrames, runFrames } from './_frames.ts'
 import { FakeSource } from './_source.ts'
 import { frame, row } from './_support.ts'
@@ -509,5 +510,26 @@ describe('composition', () => {
     runFrames()
     const field = view.element.querySelector('textarea')!
     expect(parseFloat(field.style.height)).toBeGreaterThanOrEqual(1)
+  })
+
+  it('cancels the prior key-text dedupe timer on rapid keys and clears pending timers on blur', () => {
+    const clock = new TestClock()
+    const view = mountedView({ clock })
+
+    // Two rapid keys before the 0ms dedupe timer fires: only 1 pending timer, and the latest key's text is deduped
+    view.key('keydown', { code: 'KeyA', key: 'a' })
+    view.key('keydown', { code: 'KeyB', key: 'b' })
+    expect(clock.pending).toBe(1)
+
+    view.field.value = 'b'
+    view.field.dispatchEvent(new Event('input'))
+    expect(view.source.texts, 'duplicate input event for the second key should be suppressed').toEqual([])
+    expect(clock.pending, 'consuming keyText cancels the dedupe timer').toBe(0)
+
+    // Subsequent key followed by blur clears the pending dedupe timer cleanly
+    view.key('keydown', { code: 'KeyC', key: 'c' })
+    expect(clock.pending).toBe(1)
+    view.field.dispatchEvent(new FocusEvent('blur'))
+    expect(clock.pending).toBe(0)
   })
 })
