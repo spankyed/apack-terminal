@@ -156,7 +156,7 @@ exclude_re = [
     # not holding them, the rest of the snapshot is read for pixels that are not there and the keyframe
     # is decoded once more, to the same keyframe. Pinned to its line: the two counts beside it are of the
     # records and the lines a keyframe holds, and are caught
-    "vt/keyframe.rs:387:.*replace \\+= with \\*= in Terminal::cut",
+    "vt/keyframe.rs:392:.*replace \\+= with \\*= in Terminal::cut",
     # The same for the key and mouse encoders a session keeps, which are four more handles with one owner
     "vt/input.rs:.*<impl Drop for Encoders>::drop",
 
@@ -208,8 +208,9 @@ exclude_re = [
     # half of a recording that is by then over its budget, so no offset rewritten here is ever the one a
     # later drop chooses: that is always a keyframe written since. The offsets are kept true because the
     # list is also how many keyframes there are, and one that lied about where would be a trap for the
-    # next reader of it
-    "recording.rs:.*replace - with / in Recorder::drop_oldest",
+    # next reader of it. Pinned to the rebase line so `self.written - from + kept` in `drop_oldest`
+    # stays under mutation testing.
+    "recording.rs:1030:.*replace - with / in Recorder::drop_oldest",
 
     # **The header read stops at the same byte with `<=`.** The loop reads into `head[read..]`, and once
     # `read` is the whole header that slice is empty, so the extra pass returns `Ok(0)` and breaks: the same

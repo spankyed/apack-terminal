@@ -64,6 +64,11 @@ pub const KEYFRAME_EVERY: u64 = 1 << 20;
 /// How large a recording grows before its oldest part is dropped.
 pub const BUDGET: u64 = 32 << 20;
 
+/// The most bytes a recording reader takes into memory from disk at once: four times `BUDGET`,
+/// covering a recording that ran past twice its budget before stopping while refusing a hostile or
+/// corrupted multi-gigabyte file.
+pub const MAX_RECORDING_BYTES: u64 = BUDGET * 4;
+
 /// How much of a recording may be waiting to be written before it is given up on.
 ///
 /// **A disk that cannot keep up costs the recording, never the session.** What waits is held in memory,
@@ -78,6 +83,9 @@ const MARKS: u8 = 4;
 
 /// Kind, time and payload length.
 const HEADER: usize = 1 + 8 + 4;
+
+/// Maximum payload length of a `MARKS` entry: 8-byte counter plus `MarksKey::LENGTH`.
+const MARKS_MAX_PAYLOAD: usize = 8 + MarksKey::LENGTH;
 
 /// The format a recording file is written in. A file records its format in its first bytes, so a reader can
 /// refuse a file it does not understand rather than decode it wrongly.
@@ -198,6 +206,19 @@ fn length(entry: &Entry) -> u64 {
     (HEADER + payload) as u64
 }
 
+/// Decodes one entry from its kind byte and payload, or `None` when the kind or payload is invalid.
+fn decode_entry(kind: u8, payload: &[u8]) -> Option<Entry> {
+    match kind {
+        KEYFRAME => size(payload).map(|(cols, rows)| Entry::Keyframe { cols, rows, state: payload[4..].to_vec() }),
+        OUTPUT => Some(Entry::Output(payload.to_vec())),
+        RESIZE => {
+            (payload.len() == 4).then(|| size(payload)).flatten().map(|(cols, rows)| Entry::Resize { cols, rows })
+        }
+        MARKS => marks(payload),
+        _ => None,
+    }
+}
+
 /// Every whole entry in `bytes`, in order.
 ///
 /// **A recording is read while it is written, and after a process that was writing it died**, so its last
@@ -211,34 +232,49 @@ pub fn decode(bytes: &[u8]) -> Vec<Timed> {
         let kind = rest[0];
         let at = u64::from_le_bytes(rest[1..9].try_into().unwrap_or_default());
         let length = u32::from_le_bytes(rest[9..13].try_into().unwrap_or_default()) as usize;
-        let Some(payload) = rest.get(HEADER..HEADER + length) else { break };
-        let entry = match kind {
-            KEYFRAME => match size(payload) {
-                Some((cols, rows)) => Entry::Keyframe { cols, rows, state: payload[4..].to_vec() },
-                None => break,
-            },
-            OUTPUT => Entry::Output(payload.to_vec()),
-            RESIZE => match size(payload) {
-                Some((cols, rows)) => Entry::Resize { cols, rows },
-                None => break,
-            },
-            MARKS => match marks(payload) {
-                Some(entry) => entry,
-                None => break,
-            },
-            _ => break,
-        };
+        let Some(end) = HEADER.checked_add(length) else { break };
+        let Some(payload) = rest.get(HEADER..end) else { break };
+        let Some(entry) = decode_entry(kind, payload) else { break };
         entries.push(Timed { at, entry });
-        rest = &rest[HEADER + length..];
+        rest = &rest[end..];
     }
     entries
 }
 
-/// A recording's entries, or none for one that is not there.
-pub fn read(path: &Path) -> Vec<Timed> {
+/// Reads a recording stream up to `limit` bytes, returning `InvalidData` if more bytes follow.
+fn read_stream_bounded(reader: impl Read, limit: u64, path: &Path) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    match File::open(path).and_then(|mut file| file.read_to_end(&mut bytes)) {
-        Ok(_) if refusal(&bytes).is_none() => decode(&bytes),
+    reader.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is larger than a recording may be ({limit} bytes)", path.display()),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Reads a recording file into memory, refusing any file larger than `limit`.
+fn read_bounded_to(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
+    let file = File::open(path)?;
+    if file.metadata()?.len() > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is larger than a recording may be ({limit} bytes)", path.display()),
+        ));
+    }
+    read_stream_bounded(file, limit, path)
+}
+
+/// Reads a recording file into memory, refusing any file larger than `MAX_RECORDING_BYTES`.
+fn read_bounded(path: &Path) -> std::io::Result<Vec<u8>> {
+    read_bounded_to(path, MAX_RECORDING_BYTES)
+}
+
+/// A recording's entries, or none for one that is not there or exceeds `MAX_RECORDING_BYTES`.
+pub fn read(path: &Path) -> Vec<Timed> {
+    match read_bounded(path) {
+        Ok(bytes) if refusal(&bytes).is_none() => decode(&bytes),
         _ => Vec::new(),
     }
 }
@@ -258,7 +294,17 @@ pub fn ends_vouched(entries: &[Timed]) -> bool {
 /// Where a replay to `until` starts and ends: the last keyframe at or before it, and one past the last
 /// entry at or before it. `None` when the recording holds no keyframe that early.
 pub fn span(entries: &[Timed], until: u64) -> Option<(usize, usize)> {
-    let end = entries.partition_point(|timed| timed.at <= until);
+    // Treat timestamps monotonically, matching `Index::open` and `Index::moment`, so a recording with
+    // out-of-order timestamps never misleads a binary search.
+    let mut latest = 0u64;
+    let mut end = 0;
+    for timed in entries {
+        latest = latest.max(timed.at);
+        if latest > until {
+            break;
+        }
+        end += 1;
+    }
     let start = entries[..end].iter().rposition(|timed| matches!(timed.entry, Entry::Keyframe { .. }))?;
     Some((start, end))
 }
@@ -282,10 +328,18 @@ pub struct Index {
 }
 
 impl Index {
-    /// Reads where a recording's keyframes are. `None` for a recording that is not there, or holds no
-    /// keyframe: there is nothing in it to look back through.
+    /// Reads where a recording's keyframes are. `None` for a recording that is not there, exceeds
+    /// `MAX_RECORDING_BYTES`, or holds no keyframe: there is nothing in it to look back through.
     pub fn open(path: &Path) -> Option<Self> {
+        Self::open_bounded(path, MAX_RECORDING_BYTES)
+    }
+
+    fn open_bounded(path: &Path, limit: u64) -> Option<Self> {
         let file = File::open(path).ok()?;
+        let total = file.metadata().ok()?.len();
+        if total > limit {
+            return None;
+        }
         let mut reader = BufReader::new(file);
         let mut prefix = [0u8; FILE_HEADER.len()];
         if reader.read_exact(&mut prefix).is_err() || prefix != FILE_HEADER {
@@ -296,16 +350,28 @@ impl Index {
         let mut header = [0u8; HEADER];
         // An entry's header, and then past its payload without reading it. A header that is not all
         // there, or a payload the file ends inside, is a recording's torn end
-        let total = reader.get_ref().metadata().ok()?.len();
         while reader.read_exact(&mut header).is_ok() {
             let length = u64::from(u32::from_le_bytes(header[9..13].try_into().unwrap_or_default()));
             let whole = match header[0] {
-                KEYFRAME | RESIZE => length >= 4,
-                MARKS => length == 8 || length == (8 + MarksKey::LENGTH) as u64,
+                KEYFRAME => length >= 4,
+                RESIZE => length == 4,
+                MARKS => length == 8 || length == MARKS_MAX_PAYLOAD as u64,
                 OUTPUT => true,
                 _ => false,
             };
-            if !whole || offset + HEADER as u64 + length > total {
+            let Some(next) = offset.checked_add(HEADER as u64).and_then(|at| at.checked_add(length)) else {
+                break;
+            };
+            if !whole || next > total {
+                break;
+            }
+            if header[0] == MARKS {
+                let mut payload = [0u8; MARKS_MAX_PAYLOAD];
+                let payload = &mut payload[..length as usize];
+                if reader.read_exact(payload).is_err() || marks(payload).is_none() {
+                    break;
+                }
+            } else if reader.seek_relative(i64::try_from(length).ok()?).is_err() {
                 break;
             }
             // Never earlier than the entry before it, whatever the clock that stamped it said
@@ -313,8 +379,7 @@ impl Index {
             if header[0] == KEYFRAME {
                 keyframes.push((at, offset));
             }
-            reader.seek_relative(i64::try_from(length).ok()?).ok()?;
-            offset += HEADER as u64 + length;
+            offset = next;
         }
         (!keyframes.is_empty()).then(|| Self { file: reader.into_inner(), keyframes, end: offset, last: at })
     }
@@ -332,21 +397,51 @@ impl Index {
     /// The entries that rebuild the terminal as it was at `until`: the last keyframe at or before then,
     /// and what followed it up to then. Empty when there is no keyframe that early.
     pub fn moment(&mut self, until: u64) -> std::io::Result<Vec<Timed>> {
+        self.moment_bounded(until, MAX_RECORDING_BYTES)
+    }
+
+    fn moment_bounded(&mut self, until: u64, limit: u64) -> std::io::Result<Vec<Timed>> {
         let after = self.keyframes.partition_point(|(at, _)| *at <= until);
-        let Some(&(_, from)) = after.checked_sub(1).and_then(|at| self.keyframes.get(at)) else {
+        let Some(&(first_at, from)) = after.checked_sub(1).and_then(|at| self.keyframes.get(at)) else {
             return Ok(Vec::new());
         };
         // Up to the keyframe after it, which is past `until` or it would have been the one chosen
         let to = self.keyframes.get(after).map_or(self.end, |(_, offset)| *offset);
-        let mut bytes = vec![0u8; usize::try_from(to - from).map_err(std::io::Error::other)?];
         self.file.seek(SeekFrom::Start(from))?;
-        self.file.read_exact(&mut bytes)?;
-        let mut entries = decode(&bytes);
-        let mut latest = 0;
-        entries.retain(|timed| {
-            latest = latest.max(timed.at);
-            latest <= until
-        });
+        let mut reader = BufReader::new(&mut self.file);
+        let mut entries = Vec::new();
+        let (mut pos, mut latest, mut read_bytes) = (from, first_at, 0u64);
+        let mut header = [0u8; HEADER];
+        while pos.saturating_add(HEADER as u64) <= to {
+            if reader.read_exact(&mut header).is_err() {
+                break;
+            }
+            let kind = header[0];
+            let at = u64::from_le_bytes(header[1..9].try_into().unwrap_or_default());
+            let length = u64::from(u32::from_le_bytes(header[9..13].try_into().unwrap_or_default()));
+            latest = latest.max(at);
+            if latest > until {
+                break;
+            }
+            let Some(next) = pos.checked_add(HEADER as u64).and_then(|at| at.checked_add(length)) else {
+                break;
+            };
+            if next > to {
+                break;
+            }
+            read_bytes = read_bytes.saturating_add(HEADER as u64).saturating_add(length);
+            if read_bytes > limit {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("recording segment exceeds maximum readable size ({limit} bytes)"),
+                ));
+            }
+            let mut payload = vec![0u8; usize::try_from(length).map_err(std::io::Error::other)?];
+            reader.read_exact(&mut payload)?;
+            let Some(entry) = decode_entry(kind, &payload) else { break };
+            entries.push(Timed { at, entry });
+            pos = next;
+        }
         Ok(entries)
     }
 }
@@ -395,6 +490,54 @@ pub struct Recorder {
     stamped: u64,
 }
 
+/// Opens a fresh private recording file at `path` directly and writes `FILE_HEADER`, cleaning up
+/// `path` if setting permissions or writing the header fails.
+fn open_new(path: &Path) -> std::io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    if let Err(error) = private(&file).and_then(|()| file.write_all(&FILE_HEADER)) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(file)
+}
+
+/// Renames a freshly written sibling `beside` over `path` and returns the handle positioned at its
+/// end, removing `beside` if the rename fails.
+///
+/// On Unix, the open handle survives the rename and any reader with the old inode open continues
+/// reading it undisturbed. On Windows, the open handle must be closed before `rename` and reopened
+/// at the end of `path`.
+fn replace_with(beside: &Path, path: &Path, file: File) -> std::io::Result<File> {
+    #[cfg(unix)]
+    {
+        if let Err(error) = std::fs::rename(beside, path) {
+            drop(file);
+            let _ = std::fs::remove_file(beside);
+            return Err(error);
+        }
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    {
+        drop(file);
+        if let Err(error) = std::fs::rename(beside, path) {
+            let _ = std::fs::remove_file(beside);
+            return Err(error);
+        }
+        let mut reopened = std::fs::OpenOptions::new().write(true).open(path)?;
+        reopened.seek(SeekFrom::End(0))?;
+        Ok(reopened)
+    }
+}
+
 /// A file for a recording at `path`: new, or the one that is there, with nothing in it either way.
 ///
 /// **A new file under the name, never the old one emptied.** Something may be reading the file that is
@@ -406,18 +549,8 @@ fn create(path: &Path) -> std::io::Result<File> {
         std::fs::create_dir_all(directory)?;
     }
     let beside = beside(path);
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&beside)?;
-    private(&file)?;
-    file.write_all(&FILE_HEADER)?;
-    std::fs::rename(&beside, path)?;
-    Ok(file)
+    let file = open_new(&beside)?;
+    replace_with(&beside, path, file)
 }
 
 /// A recording's path as the one name its file has: its directory with every `..` and link in it
@@ -559,10 +692,12 @@ fn claim(path: &Path) -> std::io::Result<Claim> {
 /// when the wait was given up. For whoever is about to read the file of a recording that was just
 /// stopped, or to start a program that will be recorded there.
 pub fn settled(path: &Path) -> bool {
+    let path = canonical(path);
     // Looked up and read in one hold of the lock, so the recorder found is known to have stopped
-    let stopped = writers().lock().ok().and_then(|writers| {
-        writers.get(&canonical(path)).filter(|writing| writing.stage() != Stage::Recording).cloned()
-    });
+    let stopped = writers()
+        .lock()
+        .ok()
+        .and_then(|writers| writers.get(&path).filter(|writing| writing.stage() != Stage::Recording).cloned());
     stopped.is_none_or(|stopped| stopped.finished_by(Instant::now() + RECORDER_PATIENCE))
 }
 
@@ -609,7 +744,8 @@ fn beside(path: &Path) -> PathBuf {
 }
 
 /// The thread's half: does each job in turn, and stops at the first the disk refuses.
-fn write_file(path: &Path, mut file: File, jobs: &Receiver<Job>, shared: &Shared) {
+fn write_file(path: &Path, file: File, jobs: &Receiver<Job>, shared: &Shared) {
+    let mut file = Some(file);
     for job in jobs {
         // Given up on by the half that hands jobs over (`BACKLOG`): what is still queued is not written
         if shared.failed.load(Ordering::Acquire) {
@@ -617,11 +753,19 @@ fn write_file(path: &Path, mut file: File, jobs: &Receiver<Job>, shared: &Shared
         }
         let done = match job {
             Job::Append(bytes) => {
-                let done = file.write_all(&bytes);
+                let done = match &mut file {
+                    Some(file) => file.write_all(&bytes),
+                    None => Err(std::io::Error::other("the recording file is closed")),
+                };
                 shared.waiting.fetch_sub(bytes.len(), Ordering::AcqRel);
                 done
             }
-            Job::DropBefore(from) => drop_before(path, from).map(|kept| file = kept),
+            Job::DropBefore(from) => {
+                // Close our own handle before renaming over `path` so Windows does not reject the
+                // rename with a sharing violation.
+                drop(file.take());
+                drop_before(path, from).map(|kept| file = Some(kept))
+            }
             Job::Reached(reached) => {
                 let _ = reached.send(());
                 Ok(())
@@ -640,15 +784,23 @@ fn write_file(path: &Path, mut file: File, jobs: &Receiver<Job>, shared: &Shared
 ///
 /// Written beside it and renamed over it, so a reader never finds a recording that starts mid-entry.
 fn drop_before(path: &Path, from: u64) -> std::io::Result<File> {
-    let mut kept = Vec::new();
-    let mut reading = File::open(path)?;
-    reading.seek(SeekFrom::Start(from))?;
-    reading.read_to_end(&mut kept)?;
     let beside = beside(path);
-    let mut file = create(&beside)?;
-    file.write_all(&kept)?;
-    std::fs::rename(&beside, path)?;
-    Ok(file)
+    let copied = (|| -> std::io::Result<File> {
+        let mut reading = File::open(path)?;
+        reading.seek(SeekFrom::Start(from))?;
+        let mut file = open_new(&beside)?;
+        std::io::copy(&mut reading, &mut file)?;
+        drop(reading);
+        Ok(file)
+    })();
+    let file = match copied {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = std::fs::remove_file(&beside);
+            return Err(error);
+        }
+    };
+    replace_with(&beside, path, file)
 }
 
 impl Recorder {
@@ -662,20 +814,20 @@ impl Recorder {
     pub fn start_with(path: &Path, budget: u64, every: u64) -> std::io::Result<Self> {
         let path = in_its_directory(path);
         let claim = claim(&path)?;
-        Ok(Self::over(claim, create(&path)?, budget, every))
+        Self::over(claim, create(&path)?, budget, every)
     }
 
     /// A recorder writing to `file`, which is empty or is positioned at its end, under its claim on the
     /// file's name. The claim goes to the thread, which lets it go when it has written all it was handed.
-    fn over(claim: Claim, file: File, budget: u64, every: u64) -> Self {
+    fn over(claim: Claim, file: File, budget: u64, every: u64) -> std::io::Result<Self> {
         let (jobs, asked) = channel();
         let shared = Arc::new(Shared { waiting: AtomicUsize::new(0), failed: AtomicBool::new(false) });
         let writing = Arc::clone(&claim.writing);
-        std::thread::spawn({
+        std::thread::Builder::new().name("recording".into()).spawn({
             let shared = Arc::clone(&shared);
             move || write_file(&claim.path, file, &asked, &shared)
-        });
-        Self {
+        })?;
+        Ok(Self {
             jobs: Some(jobs),
             writing,
             shared,
@@ -686,7 +838,7 @@ impl Recorder {
             budget,
             every,
             stamped: 0,
-        }
+        })
     }
 
     /// Carries on the recording at `path`, answering what it already holds. A recording that is not
@@ -702,13 +854,13 @@ impl Recorder {
         let path = &in_its_directory(path);
         // Before the file is read: a recorder that has just stopped there may still be writing it
         let claim = claim(path)?;
-        let bytes = match std::fs::read(path) {
+        let bytes = match read_bounded(path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(error) => return Err(error),
         };
         if bytes.is_empty() || bytes == FILE_HEADER {
-            return Ok((Self::over(claim, create(path)?, BUDGET, KEYFRAME_EVERY), Vec::new()));
+            return Ok((Self::over(claim, create(path)?, BUDGET, KEYFRAME_EVERY)?, Vec::new()));
         }
         if let Some(why) = refusal(&bytes) {
             return Err(std::io::Error::new(
@@ -728,7 +880,7 @@ impl Recorder {
         let written: u64 = FILE_HEADER.len() as u64 + entries.iter().map(|timed| length(&timed.entry)).sum::<u64>();
         file.set_len(written)?;
         file.seek(SeekFrom::End(0))?;
-        let mut recorder = Self::over(claim, file, BUDGET, KEYFRAME_EVERY);
+        let mut recorder = Self::over(claim, file, BUDGET, KEYFRAME_EVERY)?;
         let mut offset = FILE_HEADER.len() as u64;
         for timed in &entries {
             match &timed.entry {
@@ -867,7 +1019,7 @@ impl Recorder {
             .find(|offset| *offset >= half)
             .or(self.keyframes.last().copied())
             .unwrap_or(0);
-        if from == 0 {
+        if from <= FILE_HEADER.len() as u64 {
             return Ok(());
         }
         self.ask(Job::DropBefore(from))?;
@@ -902,5 +1054,44 @@ impl Drop for Recorder {
         self.writing.set(Stage::Finishing);
         // The channel closing is what ends the thread, after the last job in it
         self.jobs = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+
+    #[test]
+    fn bounded_readers_enforce_exact_limit_and_reject_one_or_more_past_it() {
+        assert_eq!(MAX_RECORDING_BYTES, BUDGET * 4);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bounded.recording");
+
+        // File-level bound (`read_bounded_to`)
+        std::fs::write(&path, vec![b'a'; 16]).expect("write");
+        assert_eq!(read_bounded_to(&path, 16).expect("at limit").len(), 16);
+        assert!(read_bounded_to(&path, 15).is_err(), "1 byte over limit rejected");
+        assert!(read_bounded_to(&path, 14).is_err(), "2 bytes over limit rejected");
+
+        // Stream-level bound (`read_stream_bounded`, covers pipes/growing files)
+        assert_eq!(read_stream_bounded(Cursor::new(vec![b'b'; 16]), 16, &path).expect("at limit").len(), 16);
+        assert!(read_stream_bounded(Cursor::new(vec![b'b'; 17]), 16, &path).is_err(), "1 byte over");
+        assert!(read_stream_bounded(Cursor::new(vec![b'b'; 18]), 16, &path).is_err(), "2 bytes over");
+
+        // Segment-level bound (`Index::moment_bounded`)
+        let mut rec = Recorder::start_with(&path, 1024, 512).expect("started");
+        rec.keyframe(80, 24, b"state").expect("keyframe");
+        rec.flush();
+        let entry_len = (HEADER + 4 + 5) as u64;
+        let file_len = FILE_HEADER.len() as u64 + entry_len;
+        assert!(Index::open_bounded(&path, file_len).is_some(), "index opens at exact file limit");
+        assert!(Index::open_bounded(&path, file_len - 1).is_none(), "index refuses 1 byte past limit");
+        assert!(Index::open_bounded(&path, file_len - 2).is_none(), "index refuses 2 bytes past limit");
+        let mut index = Index::open(&path).expect("opened");
+        assert_eq!(index.moment_bounded(u64::MAX, entry_len).expect("exact limit").len(), 1);
+        assert!(index.moment_bounded(u64::MAX, entry_len - 1).is_err(), "1 byte over limit");
+        assert!(index.moment_bounded(u64::MAX, entry_len - 2).is_err(), "2 bytes over limit");
     }
 }

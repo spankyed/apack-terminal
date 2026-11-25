@@ -1421,3 +1421,123 @@ fn a_replay_part_way_through_a_sequence_at_a_keyframe_starts_again_from_it() {
     assert!(replayed.replay_all(&entries));
     assert_eq!(replayed.snapshot(0).lines[..3], ["first", "second", "after"]);
 }
+
+/// Helper to build a raw recording entry with arbitrary kind, timestamp, and payload bytes.
+fn raw_entry(kind: u8, at: u64, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(13 + payload.len());
+    out.push(kind);
+    out.extend_from_slice(&at.to_le_bytes());
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// **`decode` and `Index::open` agree on malformed `RESIZE` and `MARKS` entries.** An oversized
+/// `RESIZE` payload or a `MARKS` payload with an invalid key stops both readers at the torn entry.
+#[test]
+fn decode_and_index_reject_oversized_resize_and_invalid_marks() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let header = b"APKREC\x01\x00";
+    let keyframe = [80u16.to_le_bytes(), 24u16.to_le_bytes()].concat();
+
+    // Oversized RESIZE (5 bytes instead of 4) followed by a second keyframe
+    let resize_path = directory.path().join("bad-resize.recording");
+    let mut bytes = header.to_vec();
+    bytes.extend_from_slice(&raw_entry(1, 100, &keyframe));
+    bytes.extend_from_slice(&raw_entry(3, 200, &[80, 0, 24, 0, 99]));
+    bytes.extend_from_slice(&raw_entry(1, 300, &keyframe));
+    std::fs::write(&resize_path, &bytes).expect("written");
+    assert_eq!(recording::decode(&bytes).len(), 1, "decode stops at oversized RESIZE");
+    let mut index = recording::Index::open(&resize_path).expect("first keyframe is valid");
+    assert_eq!(index.last(), 100, "Index::open stops before oversized RESIZE");
+    assert_eq!(index.moment(u64::MAX).expect("moment").len(), 1);
+
+    // Invalid MARKS payload (right length for keyed marks, but non-hex key bytes) followed by a keyframe
+    let marks_path = directory.path().join("bad-marks.recording");
+    let mut bad_marks = vec![0u8; 8];
+    bad_marks.extend_from_slice(&[b'!'; 32]);
+    let mut bytes = header.to_vec();
+    bytes.extend_from_slice(&raw_entry(1, 100, &keyframe));
+    bytes.extend_from_slice(&raw_entry(4, 200, &bad_marks));
+    bytes.extend_from_slice(&raw_entry(1, 300, &keyframe));
+    std::fs::write(&marks_path, &bytes).expect("written");
+    assert_eq!(recording::decode(&bytes).len(), 1, "decode stops at invalid MARKS");
+    let mut index = recording::Index::open(&marks_path).expect("first keyframe is valid");
+    assert_eq!(index.last(), 100, "Index::open stops before invalid MARKS");
+    assert_eq!(index.moment(u64::MAX).expect("moment").len(), 1);
+}
+
+/// **`span` and `Index::moment` treat out-of-order timestamps monotonically.**
+#[test]
+fn span_and_index_moment_handle_out_of_order_timestamps() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let path = directory.path().join("unordered.recording");
+    let keyframe = [80u16.to_le_bytes(), 24u16.to_le_bytes()].concat();
+    let mut bytes = b"APKREC\x01\x00".to_vec();
+    bytes.extend_from_slice(&raw_entry(1, 100, &keyframe));
+    bytes.extend_from_slice(&raw_entry(2, 500, b"first"));
+    bytes.extend_from_slice(&raw_entry(2, 200, b"second"));
+    bytes.extend_from_slice(&raw_entry(2, 600, b"third"));
+    std::fs::write(&path, &bytes).expect("written");
+
+    let entries = recording::read(&path);
+    assert_eq!(recording::span(&entries, 300), Some((0, 1)));
+    assert_eq!(recording::span(&entries, 500), Some((0, 3)));
+    assert_eq!(recording::span(&entries, 600), Some((0, 4)));
+
+    let mut index = recording::Index::open(&path).expect("indexed");
+    assert_eq!(index.moment(300).expect("moment at 300").len(), 1);
+    assert_eq!(index.moment(500).expect("moment at 500").len(), 3);
+    assert_eq!(index.moment(600).expect("moment at 600").len(), 4);
+}
+
+/// **A recording whose only keyframe is already at the start does not rewrite itself on budget
+/// overflow, and compaction leaves no `.rewriting` sibling behind.**
+#[test]
+fn drop_oldest_skips_rewriting_single_initial_keyframe_and_compacts_later_ones() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let path = directory.path().join("single.recording");
+    let mut recorder = Recorder::start_with(&path, 128, 64).expect("started");
+    #[cfg(unix)]
+    let initial_inode = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&path).expect("initial file metadata").ino()
+    };
+    // Single keyframe larger than the budget: nothing precedes offset 8 to drop.
+    recorder.keyframe(80, 24, &[b'k'; 200]).expect("initial keyframe");
+    recorder.flush();
+    assert!(!path.with_extension("recording.rewriting").exists());
+    assert_eq!(recording::read(&path).len(), 1);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::fs::metadata(&path).expect("metadata after single keyframe").ino(),
+            initial_inode,
+            "single initial keyframe at offset 8 must not trigger a rewrite"
+        );
+    }
+
+    // Adding output and a second keyframe compacts past the first and still leaves no sibling file.
+    recorder.output(&[b'x'; 100]).expect("output");
+    recorder.keyframe(80, 24, &[b'm'; 40]).expect("second keyframe");
+    recorder.flush();
+    assert!(!path.with_extension("recording.rewriting").exists());
+    let entries = recording::read(&path);
+    assert_eq!(entries.len(), 1, "first keyframe and output were dropped");
+    assert!(matches!(&entries[0].entry, Entry::Keyframe { state, .. } if state == &[b'm'; 40]));
+}
+
+/// **A file larger than `MAX_RECORDING_BYTES` is refused without reading it into memory.**
+#[test]
+fn recording_read_and_resume_refuse_files_past_max_recording_bytes() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let path = directory.path().join("huge.recording");
+    let file = std::fs::File::create(&path).expect("created");
+    file.set_len(recording::MAX_RECORDING_BYTES + 1).expect("sparse length set");
+    drop(file);
+
+    assert!(recording::read(&path).is_empty(), "oversized file is not read");
+    let error = Recorder::resume(&path).err().expect("oversized file is refused");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}

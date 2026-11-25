@@ -68,14 +68,17 @@ struct Beginning {
 /// `userdata` is the `Beginning` handed to `ghostty_snapshot_encode` with this function, live for that
 /// call, and `data` is `len` bytes the encoder owns for the length of this one.
 unsafe extern "C" fn take(userdata: *mut std::ffi::c_void, data: *const u8, len: usize) -> bool {
-    // SAFETY: the caller's contract, above
+    if userdata.is_null() || (len > 0 && data.is_null()) {
+        return false;
+    }
+    // SAFETY: the caller's contract, above, with null pointers rejected
     let beginning = unsafe { &mut *userdata.cast::<Beginning>() };
     if beginning.cut || len > beginning.most - beginning.taken.len() {
         beginning.cut = true;
         return false;
     }
     if len > 0 {
-        // SAFETY: the caller's contract, above
+        // SAFETY: the caller's contract, above, and `data` is non-null
         beginning.taken.extend_from_slice(unsafe { std::slice::from_raw_parts(data, len) });
     }
     true
@@ -122,9 +125,12 @@ struct Pixels {
 /// `userdata` is the `Pixels` handed to `ghostty_snapshot_encode` with this function, live for that call,
 /// and `data` is `len` bytes the encoder owns for the length of this one.
 unsafe extern "C" fn take_pixels(userdata: *mut std::ffi::c_void, data: *const u8, len: usize) -> bool {
-    // SAFETY: the caller's contract, above
+    if userdata.is_null() || (len > 0 && data.is_null()) {
+        return false;
+    }
+    // SAFETY: the caller's contract, above, with null pointers rejected
     let pixels = unsafe { &mut *userdata.cast::<Pixels>() };
-    // SAFETY: the caller's contract, above
+    // SAFETY: the caller's contract, above, and `data` is non-null when `len > 0`
     let mut data: &[u8] = if len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(data, len) } };
     let skipped = pixels.skip.min(data.len());
     pixels.skip -= skipped;
@@ -143,7 +149,8 @@ unsafe extern "C" fn take_pixels(userdata: *mut std::ffi::c_void, data: *const u
             pixels.left = u32::from_le_bytes(length) as usize;
             pixels.keeping = u16::from_le_bytes([tag_low, tag_high]) == PIXELS;
             if pixels.keeping {
-                if RECORD_HEAD + pixels.left > pixels.room - pixels.kept.len() {
+                let needed = RECORD_HEAD.checked_add(pixels.left);
+                if needed.is_none_or(|needed| needed > pixels.room - pixels.kept.len()) {
                     pixels.over = true;
                     return false;
                 }
@@ -169,7 +176,7 @@ fn last_record_end(snapshot: &[u8]) -> usize {
     let mut at = 10.min(snapshot.len());
     while let Some(head) = snapshot.get(at..at + RECORD_HEAD) {
         let length = u32::from_le_bytes([head[2], head[3], head[4], head[5]]) as usize;
-        match at.checked_add(RECORD_HEAD + length) {
+        match RECORD_HEAD.checked_add(length).and_then(|step| at.checked_add(step)) {
             Some(next) if next <= snapshot.len() => at = next,
             _ => break,
         }
@@ -181,9 +188,10 @@ fn last_record_end(snapshot: &[u8]) -> usize {
 struct Decoding(sys::SnapshotDecoder);
 
 impl Decoding {
-    /// A decoder over `snapshot`, which it borrows: the bytes outlive the value. With `images` false the
-    /// terminal it decodes holds none of the snapshot's images.
-    fn of(snapshot: &[u8], images: bool) -> Result<Self, Failed> {
+    /// A decoder over `snapshot`, which it borrows: the bytes outlive the value. `image_limit` sets the
+    /// decoded terminal's Kitty image storage ceiling (`0` drops all images; otherwise matches the
+    /// terminal's `Setting::ImageStorage` rather than the core's smaller 10 MB default).
+    fn of(snapshot: &[u8], image_limit: u64) -> Result<Self, Failed> {
         let mut decoder: sys::SnapshotDecoder = std::ptr::null_mut();
         // SAFETY: `decoder` is a valid out-pointer, a null allocator asks for the library's own, and the
         // slice is borrowed for as long as the value this returns
@@ -192,18 +200,15 @@ impl Decoding {
         };
         Failed::check("ghostty_snapshot_decoder_new_buf", result)?;
         let decoding = Self(decoder);
-        if !images {
-            let none: u64 = 0;
-            // SAFETY: KITTY_IMAGE_STORAGE_LIMIT takes a `uint64_t*`
-            let result = unsafe {
-                sys::ghostty_snapshot_decoder_set(
-                    decoding.0,
-                    sys::SnapshotDecoderOption::KITTY_IMAGE_STORAGE_LIMIT,
-                    (&raw const none).cast::<std::ffi::c_void>(),
-                )
-            };
-            Failed::check("ghostty_snapshot_decoder_set(KITTY_IMAGE_STORAGE_LIMIT)", result)?;
-        }
+        // SAFETY: KITTY_IMAGE_STORAGE_LIMIT takes a `uint64_t*`
+        let result = unsafe {
+            sys::ghostty_snapshot_decoder_set(
+                decoding.0,
+                sys::SnapshotDecoderOption::KITTY_IMAGE_STORAGE_LIMIT,
+                (&raw const image_limit).cast::<std::ffi::c_void>(),
+            )
+        };
+        Failed::check("ghostty_snapshot_decoder_set(KITTY_IMAGE_STORAGE_LIMIT)", result)?;
         Ok(decoding)
     }
 
@@ -344,7 +349,7 @@ impl Terminal {
     /// Whether `snapshot`, of which `records` records follow what makes its terminal renderable, decodes
     /// to a terminal with the pixels of every image it holds.
     fn holds_every_image(snapshot: &[u8], records: u32) -> bool {
-        let Ok(decoding) = Decoding::of(snapshot, true) else { return false };
+        let Ok(decoding) = Decoding::of(snapshot, super::images::IMAGE_STORAGE_BYTES) else { return false };
         let Ok(scratch) = decoding.ready() else { return false };
         let to_come = decoding.pixels_to_come();
         let mut pixels = 0u64;
@@ -376,7 +381,7 @@ impl Terminal {
     /// The keyframe a snapshot's beginning makes: cut where the last record ends that is needed for
     /// `history` lines, or that there is. Answers it with the lines of history those records brought.
     fn cut(&self, beginning: &Beginning, history: u32) -> Result<Kept, Failed> {
-        let decoding = Decoding::of(&beginning.taken, true)?;
+        let decoding = Decoding::of(&beginning.taken, super::images::IMAGE_STORAGE_BYTES)?;
         let scratch = decoding.ready()?;
         let to_come = decoding.pixels_to_come();
         let (mut records, mut lines, mut pixels) = (0u32, 0usize, 0u64);
@@ -390,6 +395,7 @@ impl Terminal {
         drop(decoding);
         // SAFETY: the terminal `ready` answered is this function's, and its decoder is gone
         unsafe { sys::ghostty_terminal_free(scratch) };
+        let kept = kept.min(beginning.taken.len());
         Ok(Kept { snapshot: beginning.taken[..kept].to_vec(), records, lines, whole: pixels >= to_come })
     }
 
@@ -405,7 +411,8 @@ impl Terminal {
         let damaged = Failed { call: "ghostty_snapshot_decoder_next", code: sys::Result::INVALID_VALUE };
         let Some((head, snapshot)) = keyframe.split_first_chunk::<HEAD>() else { return Err(damaged) };
         let [records @ .., style, blinks, images] = *head;
-        let decoding = Decoding::of(snapshot, images == 1)?;
+        let image_limit = if images == 1 { super::images::IMAGE_STORAGE_BYTES } else { 0 };
+        let decoding = Decoding::of(snapshot, image_limit)?;
         let handle = decoding.ready()?;
         let whole = (0..u32::from_le_bytes(records)).all(|_| decoding.next());
         drop(decoding);
