@@ -706,10 +706,14 @@ fn a_proxy_whose_connections_are_all_let_go_of_without_a_word_gives_up_saying_wh
         .stderr(Stdio::piped())
         .spawn()
         .expect("the proxy starts");
+    // Keep stdin open across `process.wait()` — `Child::wait()` drops `process.stdin`, which would
+    // race the proxy's EOF handler (`ended && !spoke => Ok(())`) against the `LOOKS`-th disconnect.
+    let _stdin = process.stdin.take();
     for _ in 0..LOOKS {
         let_go(&reads);
     }
     let status = process.wait().expect("the proxy is waited for");
+    drop(_stdin);
     let mut why = String::new();
     process.stderr.take().expect("piped stderr").read_to_string(&mut why).expect("its errors read");
     assert!(!status.success() && why.contains(&format!("let {LOOKS} connections go")), "{status}: {why:?}");
@@ -974,7 +978,6 @@ fn listening_refuses_non_socket_file_and_symlink_directory() {
 
 /// **A `Role::View` connection through `proxy` drains queued binary answers cleanly on stdin EOF
 /// instead of injecting JSON `{"kind":"done"}\n` into its binary frame stream.**
-#[cfg(unix)]
 #[test]
 fn proxy_view_drains_cleanly_on_stdin_eof() {
     use std::io::BufRead;

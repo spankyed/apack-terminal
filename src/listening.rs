@@ -13,6 +13,7 @@
 //! owner alone, in a directory that only its owner can put files in.
 
 use std::io;
+#[cfg(unix)]
 use std::path::Path;
 use std::time::Duration;
 

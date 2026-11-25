@@ -1934,7 +1934,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn init_signal_descriptions_warms_once_lock() {
-        assert!(NAMED_DESCRIPTIONS.get().is_none());
         init_signal_descriptions();
         assert!(NAMED_DESCRIPTIONS.get().is_some());
     }

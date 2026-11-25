@@ -212,12 +212,15 @@ fn leave(broker: &Broker) -> ! {
             std::thread::sleep(Duration::from_secs(1));
         }
     }
-    broker.sessions.wait_for_kills();
-    recording::settle_all();
+    // Remove the Unix socket before draining kills/recordings (while still holding the socket lock)
+    // so reconnecting proxies hit ENOENT and back off on `Held` instead of burning all retry attempts
+    // against an accept-and-drop loop.
     #[cfg(unix)]
     {
         let _ = std::fs::remove_file(broker.socket.as_str());
     }
+    broker.sessions.wait_for_kills();
+    recording::settle_all();
     if let Ok(mut held) = broker.held.lock() {
         *held = None;
     }
@@ -673,6 +676,12 @@ fn serve_view(reader: &mut BufReader<&Stream>, stream: &Arc<Stream>, connection:
     let mut attached: HashMap<u32, Handle> = HashMap::new();
     loop {
         match read_message(reader) {
+            // A zero-length frame signals clean end-of-input (the binary counterpart of `Request::Done`),
+            // allowing proxies on platforms without half-close (Windows named pipes) to drain queued answers.
+            Incoming::Message(body) if body.is_empty() => {
+                leaving.said_all = true;
+                break;
+            }
             Incoming::Message(body) => match ToBroker::decode(&body) {
                 Ok(message) => carry_out_view(broker, connection, &sink, &mut attached, message),
                 // Not the protocol: there is no telling what the rest of the stream is either

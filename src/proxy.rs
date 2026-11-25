@@ -201,28 +201,26 @@ impl Carrying {
         }
     }
 
-    fn done_payload(&self) -> Option<String> {
+    fn done_payload(&self) -> Vec<u8> {
         if self.greeting.is_view() {
-            return None;
+            // Zero-length binary frame: signals clean end-of-input to `serve_view` on every platform
+            // (including Windows named pipes, which have no half-close syscall).
+            return vec![0u8; 4];
         }
         let done = serde_json::to_string(&Request::Done).expect("a request serializes");
         let prefix = if self.spoke && !self.last_newline { "\n" } else { "" };
-        Some(format!("{prefix}{done}\n"))
+        format!("{prefix}{done}\n").into_bytes()
     }
 
-    fn needs_half_close(&self) -> bool {
-        self.ended && self.greeting.is_view()
+    fn record_kept(&mut self, bytes: &[u8]) {
+        if let Kept::Unanswered(kept) = &mut self.kept {
+            if kept.len() + bytes.len() > KEPT_BYTES {
+                self.kept = Kept::TooLong;
+            } else {
+                kept.extend_from_slice(bytes);
+            }
+        }
     }
-}
-
-fn shutdown_write(stream: &Stream) {
-    #[cfg(unix)]
-    {
-        let Stream::UdSocket(socket) = stream;
-        let _ = socket.inner().shutdown(std::net::Shutdown::Write);
-    }
-    #[cfg(not(unix))]
-    let _ = stream;
 }
 
 enum Kept {
@@ -234,58 +232,37 @@ enum Kept {
     TooLong,
 }
 
-/// Who is saying what is carried.
-enum Saying {
-    /// The far end, through this process's stdin
-    FarEnd,
-    /// This process, saying `done` for a far end whose input has ended
-    Done,
-}
-
 fn carrying_of(carrying: &Mutex<Carrying>) -> MutexGuard<'_, Carrying> {
     carrying.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Carries `bytes` to the broker, keeping them while it has answered nothing.
+/// Carries `bytes` from the far end to the broker, keeping them while it has answered nothing.
 ///
 /// **Written with the lock let go of**, to the connection there was when they were kept. Should that
 /// connection be let go of without a word, everything kept is said again on the next before anything said
 /// after it, so a write that fails here has lost nothing.
-fn carry(carrying: &Mutex<Carrying>, bytes: &[u8], saying: Saying) {
+fn carry(carrying: &Mutex<Carrying>, bytes: &[u8]) {
     let stream = {
         let mut carrying = carrying_of(carrying);
-        match saying {
-            Saying::FarEnd => carrying.observe_far_end(bytes),
-            Saying::Done => carrying.ended = true,
-        }
-        if let Kept::Unanswered(kept) = &mut carrying.kept {
-            if kept.len() + bytes.len() > KEPT_BYTES {
-                carrying.kept = Kept::TooLong;
-            } else {
-                kept.extend_from_slice(bytes);
-            }
-        }
+        carrying.observe_far_end(bytes);
+        carrying.record_kept(bytes);
         Arc::clone(&carrying.stream)
     };
     let _ = (&*stream).write_all(bytes).and_then(|()| (&*stream).flush());
 }
 
-/// Signals to the broker that the far end's stdin has ended: half-closes a binary `Role::View` stream
-/// on Unix (without corrupting its binary framing with JSON) and sends `Request::Done` on JSON roles.
+/// Signals to the broker that the far end's stdin has ended: sends a zero-length binary sentinel on
+/// `Role::View` connections and `Request::Done` on JSON roles, updating `ended` and `kept` atomically
+/// under a single lock acquisition.
 fn finish_input(carrying: &Mutex<Carrying>) {
-    let (stream, send_done) = {
+    let (stream, done) = {
         let mut carrying = carrying_of(carrying);
-        let payload = carrying.done_payload();
-        if payload.is_none() {
-            carrying.ended = true;
-        }
-        (Arc::clone(&carrying.stream), payload)
+        carrying.ended = true;
+        let done = carrying.done_payload();
+        carrying.record_kept(&done);
+        (Arc::clone(&carrying.stream), done)
     };
-    if let Some(done) = send_done {
-        carry(carrying, done.as_bytes(), Saying::Done);
-    } else {
-        shutdown_write(&stream);
-    }
+    let _ = (&*stream).write_all(&done).and_then(|()| (&*stream).flush());
 }
 
 /// Copies what the broker says on `stream` to `to` until it lets the connection go or `to` refuses it,
@@ -334,7 +311,7 @@ pub fn run(socket: &str) -> std::io::Result<()> {
             loop {
                 match read_retrying(&mut input, &mut buffer) {
                     Ok(0) | Err(_) => break,
-                    Ok(read) => carry(&carrying, &buffer[..read], Saying::FarEnd),
+                    Ok(read) => carry(&carrying, &buffer[..read]),
                 }
             }
             finish_input(&carrying);
@@ -368,9 +345,6 @@ pub fn run(socket: &str) -> std::io::Result<()> {
         stream = Arc::new(reach_own(socket)?);
         made += 1;
         let _ = (&*stream).write_all(&kept).and_then(|()| (&*stream).flush());
-        if carrying.needs_half_close() {
-            shutdown_write(&stream);
-        }
         carrying.stream = Arc::clone(&stream);
     }
     Ok(())
@@ -467,30 +441,21 @@ mod tests {
             ended: false,
         };
         // Unspoken JSON client: Done without leading newline.
-        let done = carrying.done_payload().expect("json done");
-        assert!(done.starts_with('{') && done.ends_with('\n'));
-        assert!(!carrying.needs_half_close());
+        let done = carrying.done_payload();
+        assert!(done.starts_with(b"{") && done.ends_with(b"\n"));
 
         // Partial line without trailing newline: Done prefixed with newline.
         carrying.observe_far_end(b"{\"kind\":\"list\"}");
-        let done = carrying.done_payload().expect("prefixed json done");
-        assert!(done.starts_with("\n{") && done.ends_with('\n'));
+        let done = carrying.done_payload();
+        assert!(done.starts_with(b"\n{") && done.ends_with(b"\n"));
 
         // After a trailing newline: Done has no leading newline.
         carrying.observe_far_end(b"\n");
-        let done = carrying.done_payload().expect("clean json done");
-        assert!(done.starts_with('{') && done.ends_with('\n'));
+        let done = carrying.done_payload();
+        assert!(done.starts_with(b"{") && done.ends_with(b"\n"));
 
-        // Reconnecting after ended on JSON does not half-close.
-        carrying.ended = true;
-        assert!(!carrying.needs_half_close());
-
-        // View role: done_payload is None; needs_half_close only when ended.
+        // View role: done_payload is a 4-byte zero-length binary frame sentinel.
         carrying.greeting = Greeting::View;
-        carrying.ended = false;
-        assert!(carrying.done_payload().is_none());
-        assert!(!carrying.needs_half_close());
-        carrying.ended = true;
-        assert!(carrying.needs_half_close());
+        assert_eq!(carrying.done_payload(), vec![0u8; 4]);
     }
 }
