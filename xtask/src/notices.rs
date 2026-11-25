@@ -149,13 +149,19 @@ fn release_targets(root: &Path) -> Result<Vec<&'static str>, String> {
     let workflow = root.join(".github/workflows/binaries.yml");
     let text = std::fs::read_to_string(&workflow).map_err(|e| format!("{}: {e}", workflow.display()))?;
     let mut targets = Vec::new();
-    for platform in text.lines().filter_map(|line| line.split("platform: ").nth(1)) {
+    for platform in text
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .filter_map(|line| line.split("platform: ").nth(1))
+    {
         let name = platform.split(|c: char| c == ',' || c.is_whitespace()).next().unwrap_or_default();
         let target =
             PLATFORMS.iter().find(|(known, _)| *known == name).map(|(_, target)| *target).ok_or_else(|| {
                 format!("binaries.yml builds {name}, which PLATFORMS in xtask/src/notices.rs doesn't name")
             })?;
-        targets.push(target);
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
     }
     if targets.is_empty() {
         return Err(format!("{} names no platform", workflow.display()));

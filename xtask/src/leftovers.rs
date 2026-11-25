@@ -19,7 +19,9 @@ const PASS_LOCK: &str = "target/mutants.out/lock.json";
 /// or `[workspace]` then `[package]` is the package's.
 fn package_named(manifest: &Path) -> Option<String> {
     let text = std::fs::read_to_string(manifest).ok()?;
-    let line = text.lines().find(|line| line.trim_start().starts_with("name"))?;
+    let line = text
+        .lines()
+        .find(|line| line.trim_start().strip_prefix("name").is_some_and(|rest| rest.trim_start().starts_with('=')))?;
     Some(line.split('"').nth(1)?.to_owned())
 }
 

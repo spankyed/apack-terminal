@@ -63,10 +63,14 @@ mod measured {
 
     impl Client {
         fn connect(broker: &Broker) -> Client {
+            Self::connect_as(broker, "client")
+        }
+
+        fn connect_as(broker: &Broker, role: &str) -> Client {
             let stream = UnixStream::connect(&broker.socket).expect("the broker accepts");
             let reader = BufReader::new(stream.try_clone().expect("a second handle"));
             let mut client = Client { reader, writer: stream };
-            client.send(&format!(r#"{{"kind":"hello","protocol":{PROTOCOL_VERSION}}}"#));
+            client.send(&format!(r#"{{"kind":"hello","protocol":{PROTOCOL_VERSION},"role":"{role}"}}"#));
             assert_eq!(client.next()["kind"], "hello");
             client
         }
@@ -204,6 +208,8 @@ mod measured {
 
     pub fn main() {
         let broker = start();
+        // Hold the broker alive across the three benchmarks: dropping the only client would otherwise exit it
+        let _lifetime = Client::connect_as(&broker, "lifetime");
         throughput(&broker);
         keystrokes(&broker);
         memory(&broker);

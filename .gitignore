@@ -11,3 +11,7 @@ mutants.out/
 
 # macOS Finder's per-folder view settings
 .DS_Store
+
+# Local broker sockets and lock files created by manual runs
+*.sock
+*.sock.lock

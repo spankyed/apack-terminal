@@ -37,19 +37,44 @@ pub fn exclusions(config: &str) -> Result<Vec<String>, String> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let literal = line
-            .strip_suffix(',')
-            .unwrap_or(line)
-            .strip_prefix('"')
-            .and_then(|rest| rest.strip_suffix('"'))
-            .ok_or_else(|| format!("{CONFIG}: `{line}` is neither a comment nor a quoted pattern"))?;
-        // A TOML basic string's `\\` is one backslash by the time cargo-mutants sees it
-        patterns.push(literal.replace("\\\\", "\\"));
+        let entry = line.strip_suffix(',').unwrap_or(line);
+        let pattern = if let Some(literal) = entry.strip_prefix('\'').and_then(|rest| rest.strip_suffix('\'')) {
+            literal.to_owned()
+        } else if let Some(basic) = entry.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')) {
+            unescape_toml_basic(basic)
+        } else {
+            return Err(format!("{CONFIG}: `{line}` is neither a comment nor a quoted pattern"));
+        };
+        patterns.push(pattern);
     }
     if patterns.is_empty() {
         return Err(format!("{CONFIG} excludes nothing, so there is nothing to check"));
     }
     Ok(patterns)
+}
+
+fn unescape_toml_basic(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some('\\') => out.push('\\'),
+                Some('"') => out.push('"'),
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// A pattern no mutant's name can match: what cargo-mutants lists for it, it lists whatever it is asked.

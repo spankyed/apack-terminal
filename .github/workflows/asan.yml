@@ -2,13 +2,20 @@ name: asan
 
 # The broker's suite under AddressSanitizer on a native x86_64 Linux runner. The Mac's Linux container runs
 # arm64 natively and x86_64 under emulation, where the sanitizer reports addresses the emulator, not the
-# broker, produced. It runs with every change, as the mutants do: the broker's unsafe code and the VT library it
-# calls into are where a memory error would land, and the sanitizer finds one where the tests pass over it.
+# broker, produced. It runs with every code change: `-Zsanitizer=address` instruments the Rust broker and its
+# unsafe FFI boundary (the prebuilt `libghostty-vt` static library linked on Linux is not ASAN-instrumented).
 on:
   pull_request:
   push:
     branches: [master]
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: asan-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -20,12 +27,31 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          fetch-depth: 2
+      - id: diff
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          case "$GITHUB_EVENT_NAME" in
+            pull_request) base=HEAD^1 ;;
+            push) base=$BEFORE; git fetch --depth=1 origin "$base" 2>/dev/null || base= ;;
+            *) base= ;;
+          esac
+          if [ -n "$base" ] && ! git diff --name-only "$base" HEAD | grep -qvE '^docs/|\.md$'; then
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.diff.outputs.code == 'true'
+        uses: dtolnay/rust-toolchain@nightly
       # Saved from `master` only, as every workflow here does: a branch's cache serves that branch alone
-      - uses: Swatinem/rust-cache@v2
+      - if: steps.diff.outputs.code == 'true'
+        uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: the suite under AddressSanitizer
+        if: steps.diff.outputs.code == 'true'
         env:
           RUSTFLAGS: -Zsanitizer=address
-        run: cargo +nightly test --target x86_64-unknown-linux-gnu --test suite --no-fail-fast
+        run: cargo +nightly test --locked --target x86_64-unknown-linux-gnu --lib --test suite --no-fail-fast

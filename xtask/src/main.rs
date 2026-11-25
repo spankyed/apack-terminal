@@ -5,9 +5,12 @@
 //! - `notices`: writes the release binaries' third-party notices, `THIRD-PARTY-NOTICES` and
 //!   `COPYRIGHT-rust-library.html`, at the repository's root (`src/notices.rs`).
 //! - `check-notices`: fails when what `notices` would write differs from what is committed.
+//! - `check-exclusions`: fails when a `.cargo/mutants.toml` exclusion matches no mutant or a Windows-only file is missing.
+//! - `check-safety`: fails when any `unsafe` site lacks a `SAFETY:` comment above it.
+//! - `clear-mutants`: removes working copies left behind by an interrupted mutation pass.
 //! - `pre-push`: every check CI runs on a change, the change's mutants included, cheapest first, stopping at
 //!   the first that fails: what to run before a push.
-//! - `vt-prebuilt`: fetches and verifies the `libghostty-vt` archive the `ghostty` feature links, so the
+//! - `vt-prebuilt`: fetches and verifies the prebuilt `libghostty-vt` archive `ghostty-vt-rs-sys` links, so the
 //!   build itself reaches no network.
 
 use std::path::{Path, PathBuf};
