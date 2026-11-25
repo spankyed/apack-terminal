@@ -185,6 +185,36 @@ describe('a selection', () => {
 
     expect(drawStyled(wide, [PLAIN], theme, { from: 1, to: 2 }).backgrounds[0]).toMatchObject({ column: 0, cells: 2 })
   })
+
+  it('does not select a wide character for an empty range inside it', () => {
+    const wide: Row = { ...row(0, '日'), column: Uint16Array.from([0]), width: Uint8Array.from([2]) }
+
+    expect(drawStyled(wide, [PLAIN], theme, { from: 1, to: 1 }).backgrounds).toEqual([])
+  })
+})
+
+describe('contrast and highlights in drawRow', () => {
+  it('applies minimumContrast-adjusted foreground to underline, strikethrough, and overline', () => {
+    const style: Style = { ...PLAIN, fg: 0x222222, flags: StyleFlag.strikethrough | StyleFlag.overline | (1 << 8) }
+    const drawing = drawRow({ ...row(0, 'a'), style: Uint16Array.from([1]), styles: [PLAIN, style] }, { ...theme, minimumContrast: 4.5 })
+    const adjusted = drawing.glyphs[0]!.color
+    expect(adjusted).not.toBe(0x222222)
+    expect(drawing.lines.map((line) => line.color)).toEqual([adjusted, adjusted, adjusted])
+  })
+
+  it('resolves highlights in both descending and ascending order in linear time', () => {
+    const style: Style = { ...PLAIN, fg: 0x7a7a7a }
+    const longRow: Row = { ...row(0, 'a'.repeat(500)), style: new Uint16Array(500).fill(1), styles: [PLAIN, style] }
+    // Descending order (as produced by newest-first search)
+    const descending = Array.from({ length: 250 }, (_, i) => ({ from: (249 - i) * 2, to: (249 - i) * 2 + 1, color: 0x9e6a03 }))
+    const black = { ...theme, background: 0x000000, minimumContrast: 4.5 }
+    const drawn = drawRow(longRow, black, undefined, false, descending)
+    // Even columns are on 0x9e6a03 (adjusted), odd columns are on black (kept 0x7a7a7a)
+    expect(drawn.glyphs[0]!.color).not.toBe(0x7a7a7a)
+    expect(drawn.glyphs[1]!.color).toBe(0x7a7a7a)
+    expect(drawn.glyphs[498]!.color).not.toBe(0x7a7a7a)
+    expect(drawn.glyphs[499]!.color).toBe(0x7a7a7a)
+  })
 })
 
 describe('a numbered colour', () => {

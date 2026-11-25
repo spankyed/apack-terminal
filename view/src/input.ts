@@ -97,6 +97,7 @@ export class Input {
   private held = { start: 0, suffix: 0 }
   /** The text the last key sent, which an input event for the same text would otherwise send a second time */
   private keyText: string | null = null
+  private keyTextTimer: ReturnType<typeof setTimeout> | null = null
   /** The keys the source was told went down and has not been told came up */
   private readonly down = new Set<string>()
 
@@ -149,7 +150,26 @@ export class Input {
   }
 
   dispose(): void {
+    this.field.removeEventListener('keydown', this.keyDown)
+    this.field.removeEventListener('keyup', this.keyUp)
+    this.field.removeEventListener('compositionstart', this.compositionStart)
+    this.field.removeEventListener('compositionend', this.compositionEnd)
+    this.field.removeEventListener('input', this.inserted)
+    this.field.removeEventListener('paste', this.pasted)
+    this.field.removeEventListener('copy', this.copied)
+    this.field.removeEventListener('focus', this.focus)
+    this.field.removeEventListener('blur', this.blur)
+    this.down.clear()
+    this.clearKeyText()
     this.field.remove()
+  }
+
+  private clearKeyText(): void {
+    this.keyText = null
+    if (this.keyTextTimer !== null) {
+      clearTimeout(this.keyTextTimer)
+      this.keyTextTimer = null
+    }
   }
 
   private unshifted(code: string): number {
@@ -201,16 +221,9 @@ export class Input {
       event.preventDefault()
       return
     }
-    this.keyText = null
-    // Enter while an input method is composing sends what is composed, then Enter. The composition itself is
-    // not ended here: the field keeps its text, and the composition's end sends only what comes after this.
-    if (event.key === 'Enter' && (this.composing || event.isComposing)) {
-      this.sendComposed()
-      this.down.add(event.code)
-      this.source.key({ action: 'press', code: event.code, modifiers: modifiersOf(event), text: '', unshifted: 0, composed: false })
-      event.preventDefault()
-      return
-    }
+    this.clearKeyText()
+    // While an input method is composing, Enter (and every other key) belongs to the IME to confirm or
+    // edit the composition; `read` returns `null` so `compositionend` commits the final text naturally.
     // Copy and paste where the command key is not there to ask with: control and shift together
     if (!this.options.mac && event.ctrlKey && event.shiftKey && !event.altKey) {
       if (event.code === 'KeyC') {
@@ -220,7 +233,7 @@ export class Input {
       // The browser's own paste follows, and brings the text with it
       if (event.code === 'KeyV') return
     }
-    if (this.options.mac && event.metaKey && event.code === 'KeyC') {
+    if (this.options.mac && event.metaKey && !event.shiftKey && !event.altKey && !event.ctrlKey && event.code === 'KeyC') {
       event.preventDefault()
       return this.options.copy()
     }
@@ -229,7 +242,13 @@ export class Input {
     // Sent as a key, so it must not also arrive as text typed into the field
     event.preventDefault()
     this.down.add(event.code)
-    this.keyText = key.text !== '' ? key.text : null
+    if (key.text !== '') {
+      this.keyText = key.text
+      this.keyTextTimer = setTimeout(() => {
+        this.keyTextTimer = null
+        this.keyText = null
+      }, 0)
+    }
     this.source.key(key)
     if (!MODIFIER_KEYS.has(event.key)) this.options.typed?.()
   }
@@ -286,7 +305,7 @@ export class Input {
     this.field.value = ''
     // A key has already sent this text, and an input event for it is the same character arriving twice
     const sent = text === this.keyText ? '' : text
-    this.keyText = null
+    this.clearKeyText()
     if (sent === '') return
     this.source.text(sent)
     this.options.typed?.()

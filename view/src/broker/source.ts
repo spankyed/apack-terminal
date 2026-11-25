@@ -8,21 +8,27 @@
  * handshake — whatever carries them is the caller's — so it runs the same over a message port, a socket
  * in a test, or a recording played back.
  */
-import type {
-  Command,
-  Fetched,
-  Found,
-  KeyInput,
-  PasteOutcome,
-  Picture,
-  Placements,
-  PointerInput,
-  Position,
-  SourceListener,
-  Span,
-  TerminalSource,
+import {
+  TooLarge,
+  type Command,
+  type Fetched,
+  type Found,
+  type KeyInput,
+  type PasteOutcome,
+  type Picture,
+  type Placements,
+  type PointerInput,
+  type Position,
+  type SourceListener,
+  type Span,
+  type TerminalSource,
 } from '../source.ts'
 import { Messages, decodeToView, encodeToBroker, type ToBroker, type ToView } from './wire.ts'
+
+/** Maximum decoded image size (matching broker's IMAGE_STORAGE_BYTES) */
+const MAX_IMAGE_BYTES = 64 << 20
+/** Maximum number of generation-change restarts while reading one image */
+const MAX_IMAGE_RESTARTS = 4
 
 /** A two-way stream of bytes to a broker's view connection, after its handshake */
 export interface ByteStream {
@@ -51,7 +57,7 @@ interface Connection {
 
 /** One connection to a broker, and the sessions drawn over it */
 export class BrokerViews {
-  private readonly messages = new Messages()
+  private messages = new Messages()
   /** Every session opened that has not ended, and the one each channel in use belongs to */
   private readonly sessions = new Set<SessionSource>()
   private readonly channels = new Map<number, SessionSource>()
@@ -88,6 +94,10 @@ export class BrokerViews {
    * The returned function stops listening.
    */
   onClose(listener: () => void): () => void {
+    if (this.closed) {
+      listener()
+      return () => {}
+    }
     this.closing.add(listener)
     return () => { this.closing.delete(listener) }
   }
@@ -96,6 +106,7 @@ export class BrokerViews {
   close(): void {
     if (this.closed) return
     this.closed = true
+    this.messages = new Messages()
     for (const stop of this.stop) stop()
     for (const session of [...this.sessions]) session.end()
     this.sessions.clear()
@@ -155,8 +166,16 @@ class SessionSource implements TerminalSource {
       listener.ended()
       return () => {}
     }
-    this.channel = this.connection.channel(this)
-    this.connection.send({ kind: 'attach', channel: this.channel, session: this.session })
+    const channel = this.connection.channel(this)
+    this.channel = channel
+    try {
+      this.connection.send({ kind: 'attach', channel, session: this.session })
+    } catch (error) {
+      this.channel = null
+      this.listener = null
+      this.connection.release(channel)
+      throw error
+    }
     return () => {
       if (this.listener === listener) this.detach()
     }
@@ -168,8 +187,11 @@ class SessionSource implements TerminalSource {
     this.listener = null
     this.channel = null
     if (channel === null) return
-    this.connection.send({ kind: 'detach', channel })
-    this.settle(channel)
+    try {
+      this.connection.send({ kind: 'detach', channel })
+    } finally {
+      this.settle(channel)
+    }
   }
 
   /** Lets go of a channel no view is attached on once every question asked on it has its answer */
@@ -177,6 +199,18 @@ class SessionSource implements TerminalSource {
     if (channel === this.channel) return
     for (const waiting of this.waiting.values()) if (waiting.channel === channel) return
     this.connection.release(channel)
+  }
+
+  /** Fails every request still owed on a detached channel and releases that channel */
+  private rejectChannel(channel: number, reason: string): void {
+    const dropped: Array<(error: Error) => void> = []
+    for (const [request, waiting] of this.waiting) {
+      if (waiting.channel !== channel) continue
+      this.waiting.delete(request)
+      dropped.push(waiting.reject)
+    }
+    this.connection.release(channel)
+    for (const reject of dropped) reject(new Unanswered(reason))
   }
 
   receive(message: ToView): void {
@@ -189,16 +223,18 @@ class SessionSource implements TerminalSource {
         break
       case 'ended':
         if (message.channel === this.channel) this.end()
+        else this.rejectChannel(message.channel, 'the session ended')
         break
       default: {
         // Requests are numbered from one, so a failure of request zero answers the one thing a view sends
         // that has no number: the attach
         if (message.kind === 'failed' && message.request === 0) {
           if (message.channel === this.channel) this.refused(message.message)
+          else this.rejectChannel(message.channel, message.message)
           break
         }
         const waiting = this.waiting.get(message.request)
-        if (!waiting) break
+        if (!waiting || waiting.channel !== message.channel) break
         this.waiting.delete(message.request)
         this.settle(waiting.channel)
         if (message.kind === 'failed') waiting.reject(new Unanswered(message.message))
@@ -222,7 +258,11 @@ class SessionSource implements TerminalSource {
       this.waiting.delete(request)
       waiting.reject(new Unanswered(reason))
     }
-    this.connection.send({ kind: 'detach', channel })
+    try {
+      this.connection.send({ kind: 'detach', channel })
+    } catch {
+      // Failing to send detach on a refused attachment must not skip releasing the channel or telling the view
+    }
     this.connection.release(channel)
     this.listener?.ended(reason)
   }
@@ -247,7 +287,14 @@ class SessionSource implements TerminalSource {
    * there is none — before a view attaches, after it detaches, and once the session has ended.
    */
   private tell(build: (channel: number) => ToBroker): void {
-    if (this.channel !== null) this.connection.send(build(this.channel))
+    if (this.channel === null) return
+    try {
+      this.connection.send(build(this.channel))
+    } catch (error) {
+      // Input or acknowledgements that exceed one wire message or violate wire bounds are dropped rather than crashing DOM handlers
+      if (error instanceof TooLarge || error instanceof RangeError) return
+      throw error
+    }
   }
 
   /**
@@ -375,7 +422,11 @@ class SessionSource implements TerminalSource {
   async image(id: number): Promise<Picture | null> {
     let whole: Uint8Array | null = null
     let generation = -1
+    let width = 0
+    let height = 0
+    let channels = 0
     let read = 0
+    let restarts = 0
     for (;;) {
       const offset = read
       let part
@@ -385,18 +436,56 @@ class SessionSource implements TerminalSource {
         if (error instanceof Unanswered) return null
         throw error
       }
-      if (whole && (part.generation !== generation || part.total !== whole.length)) {
+      if (
+        !Number.isInteger(part.width) || part.width <= 0
+        || !Number.isInteger(part.height) || part.height <= 0
+        || !Number.isInteger(part.channels) || part.channels < 1 || part.channels > 4
+      ) {
+        return null
+      }
+      const pixels = part.width * part.height
+      const rgbaBytes = pixels * 4
+      const expectedTotal = pixels * part.channels
+      if (
+        !Number.isSafeInteger(rgbaBytes) || rgbaBytes > MAX_IMAGE_BYTES
+        || !Number.isSafeInteger(part.total) || part.total <= 0 || part.total > MAX_IMAGE_BYTES
+        || part.total !== expectedTotal
+      ) {
+        return null
+      }
+      if (
+        whole
+        && (
+          part.generation !== generation
+          || part.total !== whole.length
+          || part.width !== width
+          || part.height !== height
+          || part.channels !== channels
+        )
+      ) {
+        restarts += 1
+        if (restarts > MAX_IMAGE_RESTARTS) return null
         whole = null
         read = 0
         continue
       }
-      generation = part.generation
-      whole ??= new Uint8Array(part.total)
-      whole.set(part.bytes.subarray(0, Math.max(0, whole.length - part.offset)), part.offset)
-      read = part.offset + part.bytes.length
-      // An empty part of a picture not yet whole would be asked for again for ever
-      if (read >= whole.length || part.bytes.length === 0) {
-        return { generation, width: part.width, height: part.height, pixels: rgbaOf(part.channels, whole, part.width * part.height) }
+      if (whole === null) {
+        if (part.offset !== 0) return null
+        generation = part.generation
+        width = part.width
+        height = part.height
+        channels = part.channels
+        whole = new Uint8Array(part.total)
+      }
+      if (part.offset < 0 || part.offset > offset || part.offset > whole.length || part.bytes.length === 0) {
+        return null
+      }
+      const end = Math.min(whole.length, part.offset + part.bytes.length)
+      if (end <= offset) return null
+      whole.set(part.bytes.subarray(0, end - part.offset), part.offset)
+      read = end
+      if (read >= whole.length) {
+        return { generation, width, height, pixels: rgbaOf(channels, whole, pixels) }
       }
     }
   }
@@ -404,7 +493,14 @@ class SessionSource implements TerminalSource {
 
 /** Pixels of one to four bytes each — grey, grey and alpha, colour, colour and alpha — as colour and alpha */
 export function rgbaOf(channels: number, bytes: Uint8Array, pixels: number): Uint8ClampedArray {
-  const rgba = new Uint8ClampedArray(pixels * 4)
+  if (!Number.isInteger(channels) || channels < 1 || channels > 4) {
+    throw new RangeError(`invalid image channel count: ${channels}`)
+  }
+  const rgbaBytes = pixels * 4
+  if (!Number.isSafeInteger(pixels) || pixels < 0 || !Number.isSafeInteger(rgbaBytes) || rgbaBytes > MAX_IMAGE_BYTES) {
+    throw new RangeError(`invalid image pixel count: ${pixels}`)
+  }
+  const rgba = new Uint8ClampedArray(rgbaBytes)
   if (channels === 4) {
     rgba.set(bytes.subarray(0, rgba.length))
     return rgba

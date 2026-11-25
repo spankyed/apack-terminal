@@ -100,13 +100,17 @@ export function fontOf(font: Font, bold: boolean, italic: boolean): string {
  * meet between pixels. The width a browser measures is rounded to the device grid and every cell is that.
  */
 export function measure(context: CanvasRenderingContext2D, font: Font, pixelRatio: number): Metrics {
+  const ratio = Number.isFinite(pixelRatio) && pixelRatio > 0 ? pixelRatio : 1
   context.font = fontOf(font, false, false)
   const measured = context.measureText('M')
-  const snap = (value: number) => Math.max(1, Math.round(value * pixelRatio)) / pixelRatio
-  const ascent = measured.fontBoundingBoxAscent ?? measured.actualBoundingBoxAscent ?? font.size * 0.8
-  const descent = measured.fontBoundingBoxDescent ?? measured.actualBoundingBoxDescent ?? font.size * 0.2
+  const snap = (value: number) => Math.max(1, Math.round(value * ratio)) / ratio
+  const positive = (value: number | undefined): number | undefined =>
+    value !== undefined && Number.isFinite(value) && value > 0 ? value : undefined
+  const ascent = positive(measured.fontBoundingBoxAscent) ?? positive(measured.actualBoundingBoxAscent) ?? font.size * 0.8
+  const descent = positive(measured.fontBoundingBoxDescent) ?? positive(measured.actualBoundingBoxDescent) ?? font.size * 0.2
+  const width = positive(measured.width) ?? font.size * 0.6
   return {
-    cellWidth: snap(measured.width),
+    cellWidth: snap(width),
     cellHeight: snap(ascent + descent),
     baseline: snap(ascent),
   }

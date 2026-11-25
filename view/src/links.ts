@@ -24,8 +24,14 @@ export interface Detector {
   find(text: string): ReadonlyArray<{ readonly start: number; readonly end: number; readonly target?: string }>
 }
 
-/** What closes a bracket, and what opens it */
-const OPENS: Record<string, string> = { ')': '(', ']': '[', '}': '{' }
+/** Schemes a declared OSC 8 hyperlink may never open */
+const UNSAFE_SCHEME = /^(?:javascript|data|vbscript):/i
+
+/** Whether a declared link target uses a safe scheme (stripping ASCII controls/whitespace that URL parsers ignore) */
+function isSafeTarget(target: string): boolean {
+  const normalized = target.replace(/[\u0000-\u0020\u007f]+/g, '')
+  return normalized !== '' && !UNSAFE_SCHEME.test(normalized)
+}
 
 /**
  * URLs with a scheme a person would recognise. What may follow one in prose — a full stop, a bracket that
@@ -36,24 +42,44 @@ export const urls: Detector = {
   find(text) {
     const found: Array<{ start: number; end: number }> = []
     for (const match of text.matchAll(/\b(?:https?|ftp|file):\/\/[^\s<>"'`]+/g)) {
-      let url = match[0]
-      for (;;) {
-        const last = url.at(-1)!
-        const opens = OPENS[last]
-        const trailing = opens === undefined ? '.,;:!?'.includes(last) : count(url, last) > count(url, opens)
-        if (!trailing) break
-        url = url.slice(0, -1)
+      const raw = match[0]
+      let openParen = 0
+      let closeParen = 0
+      let openBracket = 0
+      let closeBracket = 0
+      let openBrace = 0
+      let closeBrace = 0
+      for (let i = 0; i < raw.length; i += 1) {
+        switch (raw[i]) {
+          case '(': openParen += 1; break
+          case ')': closeParen += 1; break
+          case '[': openBracket += 1; break
+          case ']': closeBracket += 1; break
+          case '{': openBrace += 1; break
+          case '}': closeBrace += 1; break
+        }
       }
-      found.push({ start: match.index, end: match.index + url.length })
+      let end = raw.length
+      while (end > 0) {
+        const last = raw[end - 1]!
+        if (last === ')') {
+          if (closeParen <= openParen) break
+          closeParen -= 1
+        } else if (last === ']') {
+          if (closeBracket <= openBracket) break
+          closeBracket -= 1
+        } else if (last === '}') {
+          if (closeBrace <= openBrace) break
+          closeBrace -= 1
+        } else if (!'.,;:!?'.includes(last)) {
+          break
+        }
+        end -= 1
+      }
+      if (end > 0) found.push({ start: match.index, end: match.index + end })
     }
     return found
   },
-}
-
-function count(text: string, character: string): number {
-  let found = 0
-  for (const one of text) if (one === character) found += 1
-  return found
 }
 
 /** How many rows of a wrapped line are read on each side of the one asked about */
@@ -73,11 +99,12 @@ export function linkAt(row: Row, column: number, detectors: readonly Detector[],
   // What a program declared wins: it said what this text opens
   const declared = row.link[at]!
   const target = row.links[declared]
-  if (declared !== 0 && target !== undefined) {
+  if (declared !== 0 && target !== undefined && target !== '') {
+    if (!isSafeTarget(target)) return null
     let first = at
     let last = at
-    while (first > 0 && row.link[first - 1] === declared) first -= 1
-    while (last + 1 < row.text.length && row.link[last + 1] === declared) last += 1
+    while (first > 0 && targetAt(row, first - 1) === target && contiguous(row, first - 1, first)) first -= 1
+    while (last + 1 < row.text.length && targetAt(row, last + 1) === target && contiguous(row, last, last + 1)) last += 1
     return { target, kind: 'declared', from: row.column[first]!, to: row.column[last]! + row.width[last]! }
   }
 
@@ -152,20 +179,20 @@ export function linkRuns(link: Link, row: Row, column: number, rowAt: (line: num
   const target = link.target
   let first = at
   let last = at
-  while (first > 0 && targetAt(row, first - 1) === target) first -= 1
-  while (last + 1 < row.text.length && targetAt(row, last + 1) === target) last += 1
+  while (first > 0 && targetAt(row, first - 1) === target && contiguous(row, first - 1, first)) first -= 1
+  while (last + 1 < row.text.length && targetAt(row, last + 1) === target && contiguous(row, last, last + 1)) last += 1
 
   // Upward, while the run reaches the start of its row and the row above wrapped onto it
   const above: LinkRun[] = []
   let top = row
   let start = first
-  while (start === 0) {
+  while (start === 0 && top.column[0] === 0) {
     const previous = rowAt(top.line - 1)
     if (!previous?.wrapped || previous.text.length === 0) break
     const end = previous.text.length - 1
     if (targetAt(previous, end) !== target) break
     let begin = end
-    while (begin > 0 && targetAt(previous, begin - 1) === target) begin -= 1
+    while (begin > 0 && targetAt(previous, begin - 1) === target && contiguous(previous, begin - 1, begin)) begin -= 1
     above.unshift(runOf(previous, begin, end))
     top = previous
     start = begin
@@ -177,15 +204,20 @@ export function linkRuns(link: Link, row: Row, column: number, rowAt: (line: num
   let stop = last
   while (stop === bottom.text.length - 1 && bottom.wrapped) {
     const next = rowAt(bottom.line + 1)
-    if (!next || next.text.length === 0 || targetAt(next, 0) !== target) break
+    if (!next || next.text.length === 0 || next.column[0] !== 0 || targetAt(next, 0) !== target) break
     let end = 0
-    while (end + 1 < next.text.length && targetAt(next, end + 1) === target) end += 1
+    while (end + 1 < next.text.length && targetAt(next, end + 1) === target && contiguous(next, end, end + 1)) end += 1
     below.push(runOf(next, 0, end))
     bottom = next
     stop = end
   }
 
   return [...above, runOf(row, first, last), ...below]
+}
+
+/** Whether two consecutive characters on a row touch with no blank-cell gap between them */
+function contiguous(row: Row, left: number, right: number): boolean {
+  return row.column[left]! + row.width[left]! === row.column[right]!
 }
 
 /** The URI a character of a row declared, or `undefined` where it declared none */

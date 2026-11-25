@@ -134,3 +134,84 @@ describe('line numbers changing under a view', () => {
     expect(viewport.following).toBe(true)
   })
 })
+
+describe('folds in the viewport', () => {
+  it('steps across thousands of folds and huge offsets in logarithmic time and guards non-finite inputs', () => {
+    const { viewport } = scrolledTo(1_000_000, 1_000_000)
+    // 1000 folds, each hiding 100 lines: [1000*i, 1000*i + 100]
+    const folds = Array.from({ length: 1000 }, (_, i) => ({ first: i * 1000, last: i * 1000 + 100 }))
+    viewport.setFolds(folds)
+
+    expect(viewport.hiddenIn(0)).toBeUndefined()
+    expect(viewport.hiddenIn(50)).toEqual({ first: 0, last: 100 })
+    expect(viewport.hiddenIn(101)).toBeUndefined()
+    expect(viewport.hiddenIn(500_050)).toEqual({ first: 500_000, last: 500_100 })
+
+    const start = performance.now()
+    // Stepping forward 900_000 drawn rows from 0 crosses all 1000 folds (100_000 hidden lines) -> line 1_000_000
+    expect(viewport.stepRows(0, 900_000)).toBe(1_000_000)
+    expect(viewport.stepRows(1_000_000, -900_000)).toBe(0)
+    // Fractional stepping back across a fold header lands at the header + fraction
+    expect(viewport.stepRows(101, -0.25)).toBeCloseTo(0.75)
+    expect(viewport.stepRows(0.75, 0.5)).toBeCloseTo(101.25)
+    expect(performance.now() - start).toBeLessThan(100)
+
+    // Non-finite inputs do not corrupt viewport state (hidden lines still snap to header)
+    expect(viewport.stepRows(500, Number.NaN)).toBe(500)
+    expect(viewport.stepRows(500, Number.POSITIVE_INFINITY)).toBe(500)
+    expect(viewport.stepRows(10, Number.NaN)).toBe(0)
+    viewport.scrollTo(500)
+    viewport.scrollTo(Number.NaN)
+    expect(viewport.top).toBe(500)
+  })
+
+  it('snaps scrollTo on a hidden folded line to its fold header so extent and offset agree', () => {
+    const { viewport } = scrolledTo(50, 50)
+    viewport.setFolds([{ first: 10, last: 20 }])
+    viewport.scrollTo(15.5)
+    expect(viewport.top).toBe(10)
+    expect(viewport.offset).toBe(0)
+    expect(viewport.extent.position).toBe(10)
+  })
+
+  it('advances past a fold covering store.oldest so held never lands on a hidden line, and computes signed rowsBetween', () => {
+    // store.oldest = 10, firstActive = 50; fold [5..20] covers oldest (5 < 10 <= 20)
+    const { store, viewport } = scrolledTo(50, 40)
+    expect(store.oldest).toBe(10)
+    viewport.setFolds([{ first: 5, last: 20 }])
+
+    // Scrolling to or below oldest advances past the fold to 21, never landing on hidden line 10..20
+    viewport.scrollTo(0)
+    expect(viewport.top).toBe(21)
+    expect(viewport.hiddenIn(viewport.top)).toBeUndefined()
+    expect(viewport.extent.position).toBe(0)
+
+    viewport.scrollTo(15)
+    expect(viewport.top).toBe(21)
+
+    // scrollToPosition counts from the first non-hidden line at or after oldest
+    viewport.scrollToPosition(1)
+    expect(viewport.top).toBe(22)
+    expect(viewport.extent.position).toBe(1)
+
+    // setFolds while held on a line whose fold starts before oldest also advances past the fold
+    viewport.setFolds([])
+    viewport.scrollTo(12)
+    expect(viewport.top).toBe(12)
+    viewport.setFolds([{ first: 5, last: 20 }])
+    expect(viewport.top).toBe(21)
+
+    // If scrollback trims oldest into a fold that reaches firstActive, viewport settles back to following
+    store.apply(frame({ sequence: 2, firstActive: 50, scrollback: 35 }))
+    viewport.setFolds([{ first: 10, last: 50 }])
+    viewport.scrollTo(15)
+    expect(viewport.following).toBe(true)
+    expect(viewport.top).toBe(50)
+
+    // Signed rowsBetween handles both forward and reverse (to < from) in O(log F)
+    viewport.setFolds([{ first: 10, last: 20 }])
+    expect(viewport.rowsBetween(0, 21)).toBe(11)
+    expect(viewport.rowsBetween(21, 0)).toBe(-11)
+    expect(viewport.rowsBetween(25, 10)).toBe(-5)
+  })
+})

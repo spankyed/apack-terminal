@@ -184,4 +184,37 @@ describe('a folded run of lines', () => {
     expect(() => view.view.setFolds([{ first: 1, last: 3 }, { first: 3, last: 5 }])).toThrow(RangeError)
     expect(() => view.view.setFolds([{ first: 1, last: 3 }, { first: 4, last: 6 }])).not.toThrow()
   })
+
+  it('caches fold header RowDrawing across paints, clears folds on epoch reset, and accounts for folds in cursor and showMatch', async () => {
+    const source = new FakeSource()
+    source.search = async () => ({ spans: [{ start: { line: 25, column: 0 }, end: { line: 25, column: 2 } }], more: false })
+    const view = mountedView({}, source)
+    view.source.send(frame({
+      screenRows: 4, columns: 20, firstActive: 25, scrollback: 25,
+      cursor: { column: 0, row: 0, shape: 'block', blinking: false, hidden: false },
+      rows: Array.from({ length: 29 }, (_, line) => row(line, `L${line}`)),
+    }))
+    view.view.setFolds([{ first: 5, last: 20, label: 'folded' }, { first: 25, last: 27, label: 'tail' }])
+    view.view.scrollTo(4)
+    const firstPaint = view.painted()
+    const headerBefore = firstPaint.rows[1]
+    view.view.redraw()
+    const secondPaint = view.painted()
+    expect(secondPaint.rows[1], 'fold header drawing was rebuilt every paint').toBe(headerBefore)
+
+    // Cursor on fold.first reads the fold header text, not the underlying row
+    view.view.follow()
+    expect(view.painted().cursor?.text?.text).toBe('▸')
+
+    // showMatch checks layout().lines with folds: line 25 is visible at top=4 (lines [4, 5, 21, 22])? No, 25 is offscreen -> steps back over folds
+    view.view.scrollTo(0)
+    await view.view.find('L25')
+    expect(view.view.viewport.top).toBe(23)
+
+    // Epoch reset clears folds
+    view.source.send(frame({ sequence: 2, epoch: 2, screenRows: 4, columns: 20, firstActive: 0, scrollback: 0, rows: [row(0, 'fresh')] }))
+    runFrames()
+    expect(view.view.viewport.hiddenIn(10)).toBeUndefined()
+    expect(drawnText(view)[0]).toBe('fresh')
+  })
 })

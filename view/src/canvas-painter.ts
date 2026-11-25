@@ -40,10 +40,11 @@ export class CanvasPainter implements Painter {
   constructor(private font: Font, canvas = document.createElement('canvas'), private pixelRatio = globalThis.devicePixelRatio || 1) {
     const context = canvas.getContext('2d')
     if (!context) throw new Error('This canvas has no 2D context to draw a terminal on')
+    this.pixelRatio = Number.isFinite(pixelRatio) && pixelRatio > 0 ? pixelRatio : 1
     this.canvas = canvas
     this.context = context
     this.faces = facesOf(font)
-    this.metrics = measure(context, font, pixelRatio)
+    this.metrics = measure(context, font, this.pixelRatio)
     // A context the browser took away comes back blank, whatever was on it
     canvas.addEventListener('contextrestored', this.cleared)
   }
@@ -60,16 +61,17 @@ export class CanvasPainter implements Painter {
   }
 
   resize(columns: number, rows: number, pixelRatio: number, gutter = 0): void {
+    const ratio = Number.isFinite(pixelRatio) && pixelRatio > 0 ? pixelRatio : 1
     this.columns = columns
     this.rows = rows
-    this.pixelRatio = pixelRatio
+    this.pixelRatio = ratio
     this.gutter = gutter
-    this.metrics = measure(this.context, this.font, pixelRatio)
+    this.metrics = measure(this.context, this.font, ratio)
     const width = columns * this.metrics.cellWidth + gutter
     const height = rows * this.metrics.cellHeight
     // Sizing a canvas clears it, and a cell may no longer be the size the widths were measured against
-    this.canvas.width = Math.round(width * pixelRatio)
-    this.canvas.height = Math.round(height * pixelRatio)
+    this.canvas.width = Math.round(width * ratio)
+    this.canvas.height = Math.round(height * ratio)
     this.canvas.style.width = `${width}px`
     this.canvas.style.height = `${height}px`
     this.shown = null
@@ -95,13 +97,15 @@ export class CanvasPainter implements Painter {
       this.draw(scene, 0, scene.rows.length)
     } else {
       for (const [first, end] of bands) {
+        const bandTop = first * metrics.cellHeight
+        const bandBottom = end * metrics.cellHeight
         context.save()
         context.beginPath()
-        context.rect(0, first * metrics.cellHeight, this.columns * metrics.cellWidth + this.gutter, (end - first) * metrics.cellHeight)
+        context.rect(0, bandTop, this.columns * metrics.cellWidth + this.gutter, bandBottom - bandTop)
         context.clip()
         // A character can reach into the rows beside its own, so those are drawn too, and the clip keeps
         // of them only what falls in the band
-        this.draw(scene, first - 1, end + 1)
+        this.draw(scene, first - 1, end + 1, [bandTop, bandBottom])
         context.restore()
         this.face = null
         this.fill = null
@@ -112,6 +116,14 @@ export class CanvasPainter implements Painter {
 
   dispose(): void {
     this.canvas.removeEventListener('contextrestored', this.cleared)
+    this.shown = null
+    this.repaint = null
+    this.face = null
+    this.fill = null
+    this.colors.clear()
+    this.wider.clear()
+    this.canvas.width = 0
+    this.canvas.height = 0
     this.canvas.remove()
   }
 
@@ -146,7 +158,7 @@ export class CanvasPainter implements Painter {
   }
 
   /** Draws the scene's rows from `first` up to `end`, and everything of it that is not a row */
-  private draw(scene: Scene, first: number, end: number): void {
+  private draw(scene: Scene, first: number, end: number, clipBand?: readonly [number, number]): void {
     const { context, metrics } = this
     const { cellWidth, cellHeight } = metrics
     const from = Math.max(0, first)
@@ -170,12 +182,12 @@ export class CanvasPainter implements Painter {
       const row = scene.rows[index]
       if (row) this.backgrounds(row, (index - scene.offset) * cellHeight)
     }
-    this.images(scene, false)
+    this.images(scene, false, clipBand)
     for (let index = from; index < to; index += 1) {
       const row = scene.rows[index]
       if (row) this.foreground(row, (index - scene.offset) * cellHeight)
     }
-    this.images(scene, true)
+    this.images(scene, true, clipBand)
     if (scene.cursor && scene.cursor.row >= from && scene.cursor.row < to) this.cursor(scene)
     context.translate(-this.gutter, 0)
   }
@@ -226,13 +238,15 @@ export class CanvasPainter implements Painter {
   }
 
   /** The images on one side of the text: over the cell backgrounds and under the characters, or over both */
-  private images(scene: Scene, above: boolean): void {
+  private images(scene: Scene, above: boolean, clipBand?: readonly [number, number]): void {
     for (const image of scene.images ?? []) {
       if (image.above !== above || image.source.width <= 0 || image.source.height <= 0) continue
+      const y = image.y - scene.offset * this.metrics.cellHeight
+      if (clipBand && (y + image.height <= clipBand[0] || y >= clipBand[1])) continue
       this.context.drawImage(
         image.picture,
         image.source.x, image.source.y, image.source.width, image.source.height,
-        image.x, image.y - scene.offset * this.metrics.cellHeight, image.width, image.height,
+        image.x, y, image.width, image.height,
       )
     }
   }
@@ -360,9 +374,18 @@ export class CanvasPainter implements Painter {
       case 'block':
         context.fillRect(x, y, width, metrics.cellHeight)
         if (cursor.text) {
-          this.fontFace(cursor.text.bold, cursor.text.italic)
+          const face = this.fontFace(cursor.text.bold, cursor.text.italic)
           this.fillStyle(this.color(scene.theme.cursorText))
-          context.fillText(cursor.text.text, x, y + metrics.baseline)
+          if (!this.isWider(cursor.text.text, cursor.cells, face)) {
+            context.fillText(cursor.text.text, x, y + metrics.baseline)
+          } else {
+            context.save()
+            context.beginPath()
+            context.rect(x, y - metrics.cellHeight, width, metrics.cellHeight * 3)
+            context.clip()
+            context.fillText(cursor.text.text, x, y + metrics.baseline)
+            context.restore()
+          }
         }
         break
     }

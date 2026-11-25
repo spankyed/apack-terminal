@@ -90,15 +90,22 @@ export class Selection {
 
   /** The cells of `line` that are selected, for drawing */
   on(line: number): SelectedCells | undefined {
+    const cols = this.columns()
+    if (cols <= 0) return undefined
+    const maxCol = cols - 1
     const rectangle = this.block
-    if (rectangle) return line < rectangle.top || line > rectangle.bottom ? undefined : { from: rectangle.left, to: rectangle.right + 1 }
+    if (rectangle) {
+      if (line < rectangle.top || line > rectangle.bottom) return undefined
+      const from = Math.max(0, Math.min(rectangle.left, maxCol))
+      const to = Math.max(from + 1, Math.min(rectangle.right + 1, cols))
+      return { from, to }
+    }
     const span = this.span
     if (!span || line < span.start.line || line > span.end.line) return undefined
-    return {
-      from: line === span.start.line ? span.start.column : 0,
-      // A line the selection runs through is selected to its edge, blank cells and all
-      to: line === span.end.line ? span.end.column + 1 : this.columns(),
-    }
+    const from = line === span.start.line ? Math.max(0, Math.min(span.start.column, maxCol)) : 0
+    // A line the selection runs through is selected to its edge, blank cells and all
+    const to = line === span.end.line ? Math.max(0, Math.min(span.end.column + 1, cols)) : cols
+    return to > from ? { from, to } : undefined
   }
 
   /**
@@ -170,14 +177,22 @@ export class Selection {
    * the text of those has none to give for any of it.
    */
   async text(): Promise<string> {
+    const cols = this.columns()
+    if (cols <= 0) return ''
+    const maxCol = cols - 1
+    const clamp = (pos: Position): Position => ({ line: pos.line, column: Math.max(0, Math.min(pos.column, maxCol)) })
     const rectangle = this.block
     if (rectangle) return this.blockText(rectangle)
     const span = this.span
     if (!span) return ''
     const held = this.held?.()
-    if (!held) return this.source.textOf(span)
-    const start = span.start.line < held.oldest ? { line: held.oldest, column: 0 } : span.start
-    const end = span.end.line >= held.end ? { line: held.end - 1, column: Math.max(0, this.columns() - 1) } : span.end
+    if (!held) {
+      const start = clamp(span.start)
+      const end = clamp(span.end)
+      return before(end, start) ? '' : this.source.textOf({ start, end })
+    }
+    const start = clamp(span.start.line < held.oldest ? { line: held.oldest, column: 0 } : span.start)
+    const end = clamp(span.end.line >= held.end ? { line: held.end - 1, column: maxCol } : span.end)
     return before(end, start) ? '' : this.source.textOf({ start, end })
   }
 
@@ -194,12 +209,21 @@ export class Selection {
     const top = held ? Math.max(rectangle.top, held.oldest) : rectangle.top
     const bottom = held ? Math.min(rectangle.bottom, held.end - 1) : rectangle.bottom
     if (bottom < top) return ''
+    const maxCol = Math.max(0, this.columns() - 1)
+    const rectLeft = Math.max(0, Math.min(rectangle.left, maxCol))
+    const rectRight = Math.max(rectLeft, Math.min(rectangle.right, maxCol))
+    const BATCH = 32
     const lines: string[] = []
-    for (let line = top; line <= bottom; line += 1) {
-      const row = this.rowOf?.(line) ?? null
-      const left = row ? glyphCovering(row, rectangle.left, 'start') : rectangle.left
-      const right = row ? glyphCovering(row, rectangle.right, 'end') : rectangle.right
-      lines.push(await this.source.textOf({ start: { line, column: left }, end: { line, column: right } }))
+    for (let start = top; start <= bottom; start += BATCH) {
+      const end = Math.min(bottom, start + BATCH - 1)
+      const batch: Array<Promise<string>> = []
+      for (let line = start; line <= end; line += 1) {
+        const row = this.rowOf?.(line) ?? null
+        const left = Math.max(0, Math.min(row ? glyphCovering(row, rectLeft, 'start') : rectLeft, maxCol))
+        const right = Math.max(left, Math.min(row ? glyphCovering(row, rectRight, 'end') : rectRight, maxCol))
+        batch.push(this.source.textOf({ start: { line, column: left }, end: { line, column: right } }))
+      }
+      lines.push(...(await Promise.all(batch)))
     }
     return lines.join('\n')
   }

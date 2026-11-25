@@ -159,4 +159,35 @@ describe('the selected text', () => {
   it('is empty with nothing selected', async () => {
     expect(await selection().made.text()).toBe('')
   })
+
+  it('clamps columns to columns - 1 in on() and text(), and batches blockText fetches concurrently', async () => {
+    let active = 0
+    let maxConcurrent = 0
+    const asked: Span[] = []
+    class Concurrent extends FakeSource {
+      override async textOf(span: Span): Promise<string> {
+        asked.push(span)
+        active += 1
+        maxConcurrent = Math.max(maxConcurrent, active)
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        active -= 1
+        return `L${span.start.line}`
+      }
+    }
+    const source = new Concurrent()
+    const made = new Selection(source, () => 10, () => {})
+    made.select({ start: at(0, 50), end: at(0, 90) })
+    expect(made.on(0)).toEqual({ from: 9, to: 10 })
+    await made.text()
+    expect(asked[0]).toEqual({ start: at(0, 9), end: at(0, 9) })
+
+    // Block selection spanning 10 lines with out-of-range columns fetches concurrently
+    made.begin(at(0, 2), 'cell', 'block')
+    made.extendTo(at(9, 50))
+    expect(made.on(3)).toEqual({ from: 2, to: 10 })
+    const text = await made.text()
+    expect(text.split('\n')).toHaveLength(10)
+    expect(maxConcurrent).toBeGreaterThan(1)
+    expect(asked.at(-1)).toEqual({ start: at(9, 2), end: at(9, 9) })
+  })
 })
