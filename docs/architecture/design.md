@@ -321,7 +321,8 @@ session ending settles every wait on it, because nothing is coming.
   Everything else a client is told (a title, a bell, a command ending, the answer to a request) spends
   none, because an answer made to wait for room is a deadlock, so it is counted instead: past the bound
   the queue is dropped and the connection closed, and the client is where one whose broker went away
-  is. On Windows the queue ends and the connection does not, as for a view (`views.md`).
+  is. On Windows, `hang_up` cancels the pipe's pending I/O (`CancelIoEx`) and calls
+  `DisconnectNamedPipe` (`listening/pipe.rs`), matching the hang-up behaviour described in `views.md`.
 - **Windows builds and runs the suite, less the cases Windows has nothing to test with.** CI's Windows job
   builds the terminal core from source (nobody publishes one for Windows, so the job installs the Zig its commit
   wants and builds it for speed, as the library every other platform links was) and runs the suite. The suites

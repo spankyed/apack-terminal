@@ -62,10 +62,10 @@ package's one entry point.
 - **Asks the source what only it knows**: the word or line at a cell, the text of a selection, where a
   string appears (`find`, `findNext`), the commands a shell marked (`commands`, `scrollToCommand`,
   `selectOutput`) and where images are.
-- **Marks commands** in a gutter where the host gives it one, coloured by how each ended: green for a
-  status of zero, red for any other, grey where there was no status or nothing reported the end. The
-  colour is the same whether the status was vouched for or only claimed; a command's `outcome` is what
-  says which, for whatever reads it.
+- **Marks commands** in a gutter where the host gives it one, coloured by how each ended: blue while
+  running, green for a vouched exit status of zero, red for any other vouched exit status, yellow for a
+  claimed status regardless of code, and grey where a command has not started or nothing reported its end.
+  A command's `outcome` carries the same distinction for whatever reads it.
 - **Draws images** a program placed: their pixels are fetched once per generation and drawn under or over
   the text as the program asked, scaled from the cell the terminal measured them in to the cell drawn. One
   shown through placeholder cells comes with the rows that hold the cells, and is drawn under their text

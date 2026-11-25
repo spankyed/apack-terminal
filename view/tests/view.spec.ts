@@ -1192,4 +1192,60 @@ describe('view lifecycle, guards, and edge-case regressions', () => {
       vi.useRealTimers()
     }
   })
+
+  it('clamps currentMatch to MATCH_HIGHLIGHTS when search refresh pushes the selected match past the highlight cap', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const spanAt = (line: number) => ({ start: { line, column: 0 }, end: { line, column: 1 } })
+      // Initial search returns 1000 matches (lines 999 down to 0); navigate to the oldest match (index 999, line 0).
+      let spans = Array.from({ length: 1000 }, (_, i) => spanAt(999 - i))
+      const foundEvents: Array<{ current: number; total: number; more: boolean }> = []
+      const source = new FakeSource()
+      source.search = async () => ({ spans, more: false })
+      const { view } = mountedView({ onFound: (f) => foundEvents.push(f) }, source)
+      source.send(frame({ sequence: 1, rows: [row(0, 'hi')] }))
+
+      await view.find('hi')
+      // Wrapping backwards from index 0 lands on index 999 (line 0, current = 1000).
+      view.findNext(-1)
+      expect(view.found).toEqual({ current: 1000, total: 1000, more: false })
+
+      // New output prepends 200 newer matches (lines 1199 down to 0, 1200 total), pushing line 0 to index 1199 (> 1000).
+      spans = Array.from({ length: 1200 }, (_, i) => spanAt(1199 - i))
+      source.send(frame({ sequence: 2, rows: [row(0, 'hi')] }))
+      vi.advanceTimersByTime(200)
+      await Promise.resolve()
+      await Promise.resolve()
+
+      expect(view.found.total).toBe(1000)
+      expect(view.found.more).toBe(true)
+      expect(view.found.current, 'current match must stay within held MATCH_HIGHLIGHTS bounds').toBeLessThanOrEqual(view.found.total)
+      expect(view.found.current).toBe(1000)
+      expect(foundEvents.at(-1)).toEqual({ current: 1000, total: 1000, more: true })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('fires onFollowingChange(true) when setFolds snaps a scrolled-back view back to following', () => {
+    const following: boolean[] = []
+    const { source, view } = mounted({ onFollowingChange: (value) => following.push(value) })
+    // Lines 5..19 (oldest = 5, firstActive = 15, screenRows = 5)
+    source.send(frame({
+      sequence: 1,
+      screenRows: 5,
+      scrollback: 10,
+      firstActive: 15,
+      rows: Array.from({ length: 5 }, (_, i) => row(15 + i, `line ${15 + i}`)),
+    }))
+    runFrames()
+
+    // Scroll back into history -> following becomes false
+    view.scrollTo(5)
+    expect(following).toEqual([false])
+
+    // Fold starting before oldest (0..15) hides all remaining history (5..15), advancing visibleOldest past firstActive
+    view.setFolds([{ first: 0, last: 15, label: 'folded' }])
+    expect(following, 'setFolds snapping back to following must notify onFollowingChange(true)').toEqual([false, true])
+  })
 })

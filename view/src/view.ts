@@ -559,13 +559,12 @@ export class TerminalView {
       if (this.disposed || !this.listening) return
       // Nothing to say when the person has searched again since, or the source could not answer
       if (answer && asked === this.finding) {
-        const found = answer.spans
+        const held = answer.spans.slice(0, MATCH_HIGHLIGHTS)
         const on = this.matches[this.currentMatch]
-        const still = on ? found.findIndex((match) => match.start.line === on.start.line && match.start.column === on.start.column) : -1
+        const still = on ? held.findIndex((match) => match.start.line === on.start.line && match.start.column === on.start.column) : -1
         // On the match they were on; failing that the nearest there is, which for a search that had found
         // nothing is the newest
-        const current = found.length === 0 ? -1 : still !== -1 ? still : Math.max(0, Math.min(this.currentMatch, found.length - 1))
-        const held = found.slice(0, MATCH_HIGHLIGHTS)
+        const current = held.length === 0 ? -1 : still !== -1 ? still : Math.max(0, Math.min(this.currentMatch, held.length - 1))
         const same = current === this.currentMatch && held.length === this.matches.length && held.every((match, index) => sameSpan(match, this.matches[index]!))
         const before = this.found
         this.setMatches(answer)
@@ -656,6 +655,7 @@ export class TerminalView {
     this.foldRows.clear()
     this.foldDrawings.clear()
     this.drawings.clear()
+    this.followingMayHaveChanged()
     this.schedule()
   }
 

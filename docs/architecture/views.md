@@ -176,10 +176,10 @@ commands have none while an alternate-screen application is up.
 told ([protocol.md](protocol.md)): `running`, `exited` with a status a keyed mark reported, `unknown` with
 why, and `claimed` with whatever status a session without a key heard. On the wire each kind is a byte of
 its own and no two share a field, so a status that was claimed is never one flag away from reading as an
-exit; a byte that is no kind is refused. The view draws a status as the status it is, green for zero and
-red otherwise, whichever of `exited` and `claimed` carried it, and `unknown` grey: the mark is for a
-person looking at the output, and the kind is for whatever reads the command (`view/src/view.ts`,
-`markColor`).
+exit; a byte that is no kind is refused. The view draws each kind distinctly: blue for `running`, green
+for a vouched `exited` with zero, red for a non-zero `exited`, yellow for `claimed` regardless of code,
+and grey for `unknown` or not yet started (`view/src/view.ts`, `markColor`), so a claimed status is never
+mistaken visually for a vouched exit.
 
 A session asked to take images (`Spawn.images`) accepts the Kitty graphics protocol: raw pixels, or a PNG,
 which the broker decodes for the core (`rgba_of_png`) since the core leaves that to whoever embeds it. A

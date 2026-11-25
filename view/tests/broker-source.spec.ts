@@ -476,4 +476,19 @@ describe('broker lifecycle edge cases', () => {
     broker.say({ kind: 'frame', channel: 2, frame: frame({ sequence: 2 }) })
     expect(frames.map((f) => f.sequence)).toEqual([2])
   })
+
+  it('notifies listener.ended exactly once when a refused attachment is later closed', () => {
+    const broker = new FakeBroker()
+    const views = new BrokerViews(broker)
+    const source = views.open('s-1')
+    const reasons: Array<string | undefined> = []
+    source.attach({ frame: () => {}, ended: (reason) => { reasons.push(reason) } })
+    broker.taken()
+
+    broker.say({ kind: 'failed', channel: 1, request: 0, message: 'frame too large' })
+    expect(reasons).toEqual(['frame too large'])
+
+    views.close()
+    expect(reasons, 'closing after a refused attachment must not invoke ended() a second time').toEqual(['frame too large'])
+  })
 })
