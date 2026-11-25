@@ -100,7 +100,8 @@ fn path_reaches_refused(path: &[u8]) -> bool {
         let mut prefix = Vec::with_capacity(current.len());
         let mut redirected = None;
         let parts: Vec<&[u8]> = current.split(|&byte| byte == b'/').filter(|s| !s.is_empty()).collect();
-        for (index, part) in parts.iter().enumerate() {
+        let mut iter = parts.iter();
+        while let Some(part) = iter.next() {
             let parent_len = prefix.len();
             prefix.push(b'/');
             prefix.extend_from_slice(part);
@@ -119,7 +120,7 @@ fn path_reaches_refused(path: &[u8]) -> bool {
                     joined.extend_from_slice(target_bytes);
                     joined
                 };
-                for tail in &parts[index + 1..] {
+                for tail in iter {
                     next.push(b'/');
                     next.extend_from_slice(tail);
                 }
@@ -487,5 +488,15 @@ mod tests {
         std::os::unix::fs::symlink("real.bin", &good_link).expect("good symlink");
         assert!(!path_reaches_refused(good_link.as_os_str().as_bytes()));
         assert!(open_file(good_link.as_os_str().as_bytes()).is_some());
+
+        // Legitimate directory symlink with trailing components is allowed
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).expect("sub dir");
+        std::fs::write(sub.join("inside.bin"), b"ok").expect("write");
+        let dir_link = dir.path().join("dir_link");
+        std::os::unix::fs::symlink(&sub, &dir_link).expect("dir symlink");
+        let through_good_dir = dir_link.join("inside.bin");
+        assert!(!path_reaches_refused(through_good_dir.as_os_str().as_bytes()));
+        assert!(open_file(through_good_dir.as_os_str().as_bytes()).is_some());
     }
 }
