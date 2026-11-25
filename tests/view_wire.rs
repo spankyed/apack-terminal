@@ -701,3 +701,109 @@ fn the_longest_head_there_is_fits_with_rows_taken_to_the_last_byte() {
     let fetched = apack_terminal::view::wire::rows(u32::MAX, u32::MAX, u32::MAX, u64::MAX, u32::MAX, &rows);
     assert!(fetched.is_ok_and(|answer| body(&answer).len() < body(&message).len()));
 }
+
+/// **A single glyph at column `65535` round-trips, a second glyph past `65535` overflows, and a
+/// zero-width complex glyph is rejected.**
+#[test]
+fn column_65535_round_trips_and_zero_width_complex_glyph_is_rejected() {
+    let last_col = Row {
+        line: 0,
+        wrapped: false,
+        prompt: false,
+        styles: Vec::new(),
+        links: Vec::new(),
+        glyphs: vec![Glyph { column: u16::MAX, width: 1, text: "x".to_owned(), style: 0, link: 0 }],
+        pictured: None,
+    };
+    let msg = ToView::Rows {
+        channel: 1,
+        request: 1,
+        epoch: 1,
+        first: 0,
+        count: 1,
+        block: Block { rows: vec![last_col.clone()] },
+    };
+    let encoded = msg.encode().expect("encodes");
+    assert_eq!(ToView::decode(body(&encoded)), Ok(msg));
+
+    // Zero-width complex glyph in a `Rows` message: kind=66, ch=0, req=0, ep=0, first=0, count=1,
+    // rows=1, line=0, flags=0, styles=0, links=0, runs=1, col=0, style=0, link=0, kind=1, count=1, width=0, text="a"
+    let zero_width = [66, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 1, b'a'];
+    assert_eq!(ToView::decode(&zero_width), Err(Malformed::Value("a glyph's width")));
+}
+
+/// **`ToView::decode` and `ToBroker::decode` reject out-of-range enum tags and non-finite floats,
+/// while accepting the boundary cursor shape `3` (hollow block).**
+#[test]
+fn decode_rejects_invalid_tags_and_non_finite_floats() {
+    // Cursor shape == 3 (hollow block) is valid and round-trips cleanly.
+    let valid_cursor = ToView::Frame(Frame {
+        channel: 1,
+        sequence: 1,
+        epoch: 1,
+        first_active: 0,
+        columns: 80,
+        screen_rows: 24,
+        scrollback: 0,
+        commands: 0,
+        images: 0,
+        cursor: Some(Cursor { column: 0, row: 0, shape: 3, blinking: false, hidden: false }),
+        alternate_screen: false,
+        mouse: false,
+        reverse_video: false,
+        stale_from: None,
+        colors: None,
+        anchored: None,
+        block: Block { rows: Vec::new() },
+    });
+    let encoded = valid_cursor.encode().expect("encodes");
+    assert_eq!(ToView::decode(body(&encoded)), Ok(valid_cursor));
+
+    // Cursor shape > 3 in Frame
+    let bad_cursor = [65, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 4, 0];
+    assert_eq!(ToView::decode(&bad_cursor), Err(Malformed::Value("a cursor's shape")));
+
+    // Paste outcome > 1 in Pasted
+    let bad_paste = [68, 0, 0, 2];
+    assert_eq!(ToView::decode(&bad_paste), Err(Malformed::Value("a paste's outcome")));
+
+    // Key action > 2 in ToBroker::Key
+    let bad_key = ToBroker::Key {
+        channel: 1,
+        action: 3,
+        modifiers: 0,
+        code: "KeyA".to_owned(),
+        text: "a".to_owned(),
+        unshifted: 0,
+        composed: false,
+    }
+    .encode();
+    assert_eq!(ToBroker::decode(body(&bad_key)), Err(Malformed::Value("a key's action")));
+
+    // Pointer action > 4 and NaN coordinate in ToBroker::Pointer
+    let bad_action = ToBroker::Pointer {
+        channel: 1,
+        action: 5,
+        button: 0,
+        modifiers: 0,
+        x: 1.0,
+        y: 1.0,
+        cell_width: 10.0,
+        cell_height: 20.0,
+    }
+    .encode();
+    assert_eq!(ToBroker::decode(body(&bad_action)), Err(Malformed::Value("a pointer's action")));
+
+    let bad_float = ToBroker::Pointer {
+        channel: 1,
+        action: 0,
+        button: 0,
+        modifiers: 0,
+        x: f32::NAN,
+        y: 1.0,
+        cell_width: 10.0,
+        cell_height: 20.0,
+    }
+    .encode();
+    assert_eq!(ToBroker::decode(body(&bad_float)), Err(Malformed::Value("a float")));
+}

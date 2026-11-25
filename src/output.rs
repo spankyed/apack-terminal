@@ -201,20 +201,37 @@ impl Flow {
     }
 }
 
-/// What the writer takes off the queue: an event, and the credit to return once it is written.
-pub struct Outgoing {
-    /// What to write, or nothing for a place in the queue somebody is waiting for the writer to reach
-    /// (`Outgoing::reached`)
-    pub event: Option<Event>,
+/// Returns spent credit and notifies any `reached` waiter whenever an `Outgoing` is finished or dropped,
+/// while keeping `Outgoing` itself free of `Drop` so callers can still move `Outgoing::event` directly.
+struct Settlement {
     credit: Option<Arc<Credit>>,
     /// Told when the writer has dealt with this
     reached: Option<Sender<()>>,
 }
 
+impl Drop for Settlement {
+    fn drop(&mut self) {
+        if let Some(credit) = self.credit.take() {
+            credit.give();
+        }
+        if let Some(reached) = self.reached.take() {
+            let _ = reached.send(());
+        }
+    }
+}
+
+/// What the writer takes off the queue: an event, and the credit to return once it is written.
+pub struct Outgoing {
+    /// What to write, or nothing for a place in the queue somebody is waiting for the writer to reach
+    /// (`Outgoing::reached`)
+    pub event: Option<Event>,
+    _settlement: Settlement,
+}
+
 impl Outgoing {
     /// An answer: no credit, so it is never held behind output
     pub fn answer(event: Event) -> Self {
-        Self { event: Some(event), credit: None, reached: None }
+        Self { event: Some(event), _settlement: Settlement { credit: None, reached: None } }
     }
 
     /// Nothing to write: a place in the queue, and `reached` is told when the writer gets to it — which
@@ -224,18 +241,11 @@ impl Outgoing {
     /// this queue behind whatever was there first, and its connection must stay open until they have
     /// gone down it.
     pub fn reached(reached: Sender<()>) -> Self {
-        Self { event: None, credit: None, reached: Some(reached) }
+        Self { event: None, _settlement: Settlement { credit: None, reached: Some(reached) } }
     }
 
     /// Returns the credit this message spent, once it has actually been written
-    pub fn written(self) {
-        if let Some(credit) = self.credit {
-            credit.give();
-        }
-        if let Some(reached) = self.reached {
-            let _ = reached.send(());
-        }
-    }
+    pub fn written(self) {}
 }
 
 /// Where to cut a buffer so the part sent holds no half-arrived character.
@@ -311,6 +321,12 @@ pub fn coalesce_within(
         let waited = credit.take();
         let text = String::from_utf8_lossy(&buffer[..cut]).into_owned();
         buffer.drain(..cut);
+        // Attach the taken credit to `Outgoing` immediately so any early return or failed send
+        // returns it automatically via `Settlement::drop`.
+        let message = Outgoing {
+            event: Some(Event::Output { session: session.clone(), text }),
+            _settlement: Settlement { credit: Some(Arc::clone(credit)), reached: None },
+        };
         if waited > Duration::ZERO {
             // The overload is reported rather than silent, and it is a *wait* rather than a loss: the
             // reader's bounded queue fills behind this and then the pty's own buffer, which is
@@ -323,13 +339,7 @@ pub fn coalesce_within(
                 return false;
             }
         }
-        outgoing
-            .send(Outgoing {
-                event: Some(Event::Output { session: session.clone(), text }),
-                credit: Some(Arc::clone(credit)),
-                reached: None,
-            })
-            .is_ok()
+        outgoing.send(message).is_ok()
     };
 
     loop {
@@ -396,4 +406,21 @@ pub fn coalesce_within(
 pub fn channel_with_credit() -> (Sender<Outgoing>, Receiver<Outgoing>, Arc<Credit>) {
     let (sender, receiver) = channel();
     (sender, receiver, Credit::new(OUTPUT_CREDIT))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropping_outgoing_returns_credit_and_notifies_reached() {
+        let credit = Credit::new(1);
+        assert_eq!(credit.take(), Duration::ZERO);
+        let (tx, rx) = channel();
+        let message =
+            Outgoing { event: None, _settlement: Settlement { credit: Some(Arc::clone(&credit)), reached: Some(tx) } };
+        drop(message);
+        rx.try_recv().expect("reached notified on drop");
+        assert_eq!(credit.take(), Duration::ZERO, "credit returned on drop");
+    }
 }

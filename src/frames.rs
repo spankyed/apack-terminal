@@ -42,17 +42,23 @@ pub enum Frame {
 
 /// Read the next frame, reusing `line`'s allocation across calls.
 ///
-/// Taking a byte more than the cap is what tells a frame at the limit from one past it.
+/// Taking a byte more than the cap is what tells a frame at the limit from one past it. Raw bytes
+/// are read before UTF-8 conversion so a multi-byte character straddling `MAX_FRAME_BYTES` is
+/// reported as `Frame::TooLong` rather than `Frame::Ended`.
 pub fn read_frame<R: BufRead>(reader: &mut R, line: &mut String) -> Frame {
-    line.clear();
-    match (&mut *reader).take(MAX_FRAME_BYTES as u64 + 1).read_line(line) {
-        Ok(0) => return Frame::Ended,
+    let mut bytes = std::mem::take(line).into_bytes();
+    bytes.clear();
+    match (&mut *reader).take(MAX_FRAME_BYTES as u64 + 1).read_until(b'\n', &mut bytes) {
+        Ok(0) | Err(_) => return Frame::Ended,
         Ok(_) => {}
-        Err(_) => return Frame::Ended,
     }
-    if line.len() > MAX_FRAME_BYTES {
+    if bytes.len() > MAX_FRAME_BYTES {
         return Frame::TooLong(format!("a frame may be at most {MAX_FRAME_BYTES} bytes"));
     }
+    let Ok(text) = String::from_utf8(bytes) else {
+        return Frame::Ended;
+    };
+    *line = text;
     if line.trim().is_empty() {
         return Frame::Blank;
     }

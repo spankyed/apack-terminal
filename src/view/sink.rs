@@ -75,7 +75,7 @@ impl Sink {
         if queue.closed || queue.finished {
             return false;
         }
-        if queue.bytes + message.len() > self.limit {
+        if queue.bytes.saturating_add(message.len()) > self.limit {
             queue.closed = true;
             queue.waiting.clear();
             queue.bytes = 0;

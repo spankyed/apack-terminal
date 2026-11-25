@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
 use crate::screen::Screen;
@@ -96,6 +96,10 @@ struct Waiting {
     activity: Option<u64>,
 }
 
+fn record_note(waiting: &mut HashMap<Arc<str>, Waiting>, note: Note, now: Instant, quiet: Duration) {
+    waiting.insert(note.session, Waiting { screen: note.screen, noted: note.noted, due: now + quiet, activity: None });
+}
+
 fn keep(notes: &Receiver<Note>, quiet: Duration, compressed: Option<&Sender<String>>) {
     let mut waiting: HashMap<Arc<str>, Waiting> = HashMap::new();
     loop {
@@ -112,22 +116,29 @@ fn keep(notes: &Receiver<Note>, quiet: Duration, compressed: Option<&Sender<Stri
                 Err(RecvTimeoutError::Disconnected) => return,
             },
         };
+        let now = Instant::now();
         if let Some(note) = note {
-            waiting.insert(
-                note.session,
-                Waiting { screen: note.screen, noted: note.noted, due: Instant::now() + quiet, activity: None },
-            );
-            continue;
+            record_note(&mut waiting, note, now, quiet);
+            while let Ok(more) = notes.try_recv() {
+                record_note(&mut waiting, more, now, quiet);
+            }
         }
 
-        let now = Instant::now();
         waiting.retain(|session, one| {
             if one.due > now {
                 return true;
             }
             // A session that has ended has nothing left to compress
             let Some(screen) = one.screen.upgrade() else { return false };
-            let Ok(mut screen) = screen.lock() else { return false };
+            let mut screen = match screen.try_lock() {
+                Ok(screen) => screen,
+                // Contended by a live request: defer briefly instead of stalling other quiet sessions
+                Err(TryLockError::WouldBlock) => {
+                    one.due = defer_due(now, quiet);
+                    return true;
+                }
+                Err(TryLockError::Poisoned(_)) => return false,
+            };
             let activity = screen.compression_activity();
             if one.activity != Some(activity) {
                 // It did something since it was last looked at, so it is not quiet yet
@@ -148,5 +159,22 @@ fn keep(notes: &Receiver<Note>, quiet: Duration, compressed: Option<&Sender<Stri
             }
             false
         });
+    }
+}
+
+fn defer_due(now: Instant, quiet: Duration) -> Instant {
+    now + quiet.clamp(Duration::from_millis(1), Duration::from_millis(50))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defer_due_pushes_deadline_into_future_and_caps_at_50ms() {
+        let now = Instant::now();
+        assert_eq!(defer_due(now, Duration::ZERO).duration_since(now), Duration::from_millis(1));
+        assert_eq!(defer_due(now, Duration::from_millis(20)).duration_since(now), Duration::from_millis(20));
+        assert_eq!(defer_due(now, Duration::from_secs(5)).duration_since(now), Duration::from_millis(50));
     }
 }
