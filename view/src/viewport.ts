@@ -35,9 +35,22 @@ export class Viewport {
       this.hiddenBefore[i + 1] = this.hiddenBefore[i]! + (folds[i]!.last - folds[i]!.first)
     }
     if (!this.followingOutput) {
-      const hidden = this.hiddenIn(Math.floor(this.held))
-      if (hidden) this.held = Math.max(hidden.first, this.store.oldest)
+      const min = this.visibleOldest()
+      if (this.held < min) {
+        this.held = min
+      } else {
+        const hidden = this.hiddenIn(Math.floor(this.held))
+        if (hidden) this.held = hidden.first < this.store.oldest ? hidden.last + 1 : hidden.first
+      }
+      if (this.held >= this.store.firstActive) this.followingOutput = true
     }
+  }
+
+  /** The oldest non-hidden line in the store: advances past any fold covering `store.oldest` */
+  private visibleOldest(): number {
+    const oldest = this.store.oldest
+    const hidden = this.hiddenIn(oldest)
+    return hidden ? hidden.last + 1 : oldest
   }
 
   /** The fold a line is hidden in: a header is not, and neither is a line outside every fold */
@@ -70,13 +83,13 @@ export class Viewport {
    * hold: the view is following.
    */
   settle(): void {
-    if (this.store.scrollback === 0 || this.held >= this.store.firstActive) this.followingOutput = true
+    if (this.store.scrollback === 0 || Math.max(this.held, this.visibleOldest()) >= this.store.firstActive) this.followingOutput = true
   }
 
   /** The line at the top of the view, fractional while a scroll is part-way between two */
   get top(): number {
     if (this.following) return this.store.firstActive
-    return Math.min(Math.max(this.held, this.store.oldest), this.store.firstActive)
+    return Math.min(Math.max(this.held, this.visibleOldest()), this.store.firstActive)
   }
 
   /** The whole lines the view needs to draw: `[first, count]`, one more than the screen when between two */
@@ -115,19 +128,25 @@ export class Viewport {
 
   /** Shows from the row `position` counted from the oldest line, as the scrollbar measures it */
   scrollToPosition(position: number): void {
-    this.scrollTo(this.stepRows(this.store.oldest, position))
+    this.scrollTo(this.stepRows(this.visibleOldest(), position))
   }
 
   /** Shows from `line`. At or past the screen, the view follows the output again */
   scrollTo(line: number): void {
     if (!Number.isFinite(line)) return
-    let clamped = Math.max(line, this.store.oldest)
+    let clamped = Math.max(line, this.visibleOldest())
     if (clamped >= this.store.firstActive) {
       this.followingOutput = true
       return
     }
     const hidden = this.hiddenIn(Math.floor(clamped))
-    if (hidden) clamped = Math.max(hidden.first, this.store.oldest)
+    if (hidden) {
+      clamped = hidden.first < this.store.oldest ? hidden.last + 1 : hidden.first
+      if (clamped >= this.store.firstActive) {
+        this.followingOutput = true
+        return
+      }
+    }
     this.followingOutput = false
     this.held = clamped
   }
@@ -190,12 +209,13 @@ export class Viewport {
     return this.hiddenBefore[low - 1]! + Math.min(fold.last, limit) - fold.first
   }
 
-  /** The number of drawn rows from line `from` up to `to`, a fold's hidden lines taking none; a fractional `to` counts its line */
-  private rowsBetween(from: number, to: number): number {
+  /** The number of drawn rows from line `from` up to `to`, a fold's hidden lines taking none: negative when `to` is above `from` */
+  rowsBetween(from: number, to: number): number {
+    if (to < from) return -this.rowsBetween(to, from)
     let rows = to - from
     const through = Math.ceil(to) - 1
     if (through >= from && this.folds.length > 0) {
-      rows -= this.hiddenUpTo(through) - this.hiddenUpTo(from - 1)
+      rows -= this.hiddenUpTo(through) - this.hiddenUpTo(Math.floor(from) - 1)
     }
     return rows
   }

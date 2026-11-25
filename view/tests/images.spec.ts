@@ -593,10 +593,11 @@ describe('an image from a broker', () => {
   function attached() {
     const broker = new FakeBroker()
     const source = new BrokerViews(broker).open('s-1')
-    source.attach({ frame: () => {}, ended: () => {} })
+    let ended = 0
+    source.attach({ frame: () => {}, ended: () => { ended += 1 } })
     broker.say({ kind: 'frame', channel: 1, frame: frame({ epoch: 6 }) })
     broker.taken()
-    return { broker, source }
+    return { broker, source, ended: () => ended }
   }
   const part = { kind: 'image', channel: 1, image: 7, generation: 3, width: 2, height: 1, channels: 4, total: 8 } as const
 
@@ -647,66 +648,143 @@ describe('an image from a broker', () => {
   })
 
   it('rejects invalid dimensions, bad channel counts, huge totals, bad offsets, empty chunks, and runaway generation restarts', async () => {
-    const { broker, source } = attached()
-    let req = 0
+    // 1. Zero dimensions (rejected by SessionSource.image validation, connection stays open)
+    {
+      const { broker, source, ended } = attached()
+      const asked = source.image(1)
+      expect(broker.taken()).toEqual([{ kind: 'image', channel: 1, request: 1, image: 1, offset: 0 }])
+      broker.say({ ...part, request: 1, image: 1, width: 0, height: 1, total: 0, offset: 0, bytes: new Uint8Array(0) })
+      expect(await asked).toBeNull()
+      expect(ended(), 'zero-dimension check should not close the connection').toBe(0)
+    }
 
-    // Zero dimensions
-    req += 1
-    let asked = source.image(1)
-    broker.say({ ...part, request: req, width: 0, height: 1, total: 0, offset: 0, bytes: new Uint8Array(0) })
-    expect(await asked).toBeNull()
+    // 2. Invalid channels (5) closes the wire connection in decodeToView; isolated on its own fixture
+    {
+      const { broker, source, ended } = attached()
+      const asked = source.image(2)
+      expect(broker.taken()).toEqual([{ kind: 'image', channel: 1, request: 1, image: 2, offset: 0 }])
+      broker.say({ ...part, request: 1, image: 2, channels: 5, total: 10, offset: 0, bytes: new Uint8Array(10) })
+      expect(await asked).toBeNull()
+      expect(ended(), 'malformed wire channel count closes the connection').toBe(1)
+    }
 
-    // Invalid channels (5)
-    req += 1
-    asked = source.image(2)
-    broker.say({ ...part, request: req, channels: 5, total: 10, offset: 0, bytes: new Uint8Array(10) })
-    expect(await asked).toBeNull()
+    // 3. Dimensions exceeding 64 MiB RGBA cap (rejected by SessionSource.image validation)
+    {
+      const { broker, source, ended } = attached()
+      const asked = source.image(3)
+      expect(broker.taken()).toEqual([{ kind: 'image', channel: 1, request: 1, image: 3, offset: 0 }])
+      broker.say({ ...part, request: 1, image: 3, width: 5000, height: 5000, channels: 4, total: 5000 * 5000 * 4, offset: 0, bytes: Uint8Array.of(1) })
+      expect(await asked).toBeNull()
+      expect(ended()).toBe(0)
+    }
 
-    // Dimensions exceeding 64 MiB RGBA cap
-    req += 1
-    asked = source.image(3)
-    broker.say({ ...part, request: req, width: 5000, height: 5000, channels: 4, total: 5000 * 5000 * 4, offset: 0, bytes: Uint8Array.of(1) })
-    expect(await asked).toBeNull()
+    // 4. Non-zero offset on first chunk (rejected by SessionSource.image validation)
+    {
+      const { broker, source, ended } = attached()
+      const asked = source.image(4)
+      expect(broker.taken()).toEqual([{ kind: 'image', channel: 1, request: 1, image: 4, offset: 0 }])
+      broker.say({ ...part, request: 1, image: 4, offset: 2, bytes: Uint8Array.of(1, 2, 3, 4) })
+      expect(await asked).toBeNull()
+      expect(ended()).toBe(0)
+    }
 
-    // Non-zero offset on first chunk
-    req += 1
-    asked = source.image(4)
-    broker.say({ ...part, request: req, offset: 2, bytes: Uint8Array.of(1, 2, 3, 4) })
-    expect(await asked).toBeNull()
-
-    // Offset past whole.length on second chunk (must return null, not throw RangeError)
-    req += 1
-    asked = source.image(5)
-    broker.say({ ...part, request: req, offset: 0, bytes: Uint8Array.of(1, 2, 3, 4) })
-    await settled()
-    req += 1
-    broker.say({ ...part, request: req, offset: 99, bytes: Uint8Array.of(5, 6, 7, 8) })
-    expect(await asked).toBeNull()
-
-    // Empty chunk before completion returns null instead of a half-zeroed Picture
-    req += 1
-    asked = source.image(6)
-    broker.say({ ...part, request: req, offset: 0, bytes: Uint8Array.of(1, 2, 3, 4) })
-    await settled()
-    req += 1
-    broker.say({ ...part, request: req, offset: 4, bytes: new Uint8Array(0) })
-    expect(await asked).toBeNull()
-
-    // Runaway generation restarts are capped at 4
-    req += 1
-    asked = source.image(7)
-    broker.say({ ...part, generation: 1, request: req, offset: 0, bytes: Uint8Array.of(1, 2, 3, 4) })
-    for (let gen = 2; gen <= 6; gen += 1) {
+    // 5. Offset past whole.length on second chunk (returns null, not RangeError)
+    {
+      const { broker, source, ended } = attached()
+      const asked = source.image(5)
+      expect(broker.taken()).toEqual([{ kind: 'image', channel: 1, request: 1, image: 5, offset: 0 }])
+      broker.say({ ...part, request: 1, image: 5, offset: 0, bytes: Uint8Array.of(1, 2, 3, 4) })
       await settled()
-      req += 1
-      broker.say({ ...part, generation: gen, request: req, offset: 4, bytes: Uint8Array.of(1, 2) })
-      if (gen <= 5) {
+      expect(broker.taken()).toEqual([{ kind: 'image', channel: 1, request: 2, image: 5, offset: 4 }])
+      broker.say({ ...part, request: 2, image: 5, offset: 99, bytes: Uint8Array.of(5, 6, 7, 8) })
+      expect(await asked).toBeNull()
+      expect(ended()).toBe(0)
+    }
+
+    // 6. Empty chunk before completion returns null instead of a half-zeroed Picture
+    {
+      const { broker, source, ended } = attached()
+      const asked = source.image(6)
+      expect(broker.taken()).toEqual([{ kind: 'image', channel: 1, request: 1, image: 6, offset: 0 }])
+      broker.say({ ...part, request: 1, image: 6, offset: 0, bytes: Uint8Array.of(1, 2, 3, 4) })
+      await settled()
+      expect(broker.taken()).toEqual([{ kind: 'image', channel: 1, request: 2, image: 6, offset: 4 }])
+      broker.say({ ...part, request: 2, image: 6, offset: 4, bytes: new Uint8Array(0) })
+      expect(await asked).toBeNull()
+      expect(ended()).toBe(0)
+    }
+
+    // 7. Runaway generation restarts are capped at 4 (5th restart aborts and returns null)
+    {
+      const { broker, source, ended } = attached()
+      const asked = source.image(7)
+      let req = 1
+      expect(broker.taken()).toEqual([{ kind: 'image', channel: 1, request: req, image: 7, offset: 0 }])
+      broker.say({ ...part, generation: 1, request: req, image: 7, offset: 0, bytes: Uint8Array.of(1, 2, 3, 4) })
+      for (let gen = 2; gen <= 6; gen += 1) {
         await settled()
         req += 1
-        broker.say({ ...part, generation: gen, request: req, offset: 0, bytes: Uint8Array.of(1, 2, 3, 4) })
+        expect(broker.taken()).toEqual([{ kind: 'image', channel: 1, request: req, image: 7, offset: 4 }])
+        broker.say({ ...part, generation: gen, request: req, image: 7, offset: 4, bytes: Uint8Array.of(1, 2) })
+        if (gen <= 5) {
+          await settled()
+          req += 1
+          expect(broker.taken()).toEqual([{ kind: 'image', channel: 1, request: req, image: 7, offset: 0 }])
+          broker.say({ ...part, generation: gen, request: req, image: 7, offset: 0, bytes: Uint8Array.of(1, 2, 3, 4) })
+        }
       }
+      expect(await asked).toBeNull()
+      expect(broker.taken(), 'no further restart request should be sent past the cap').toEqual([])
+      expect(ended()).toBe(0)
     }
-    expect(await asked).toBeNull()
+  })
+
+  it('fetches and renders a newer generation that arrived while an earlier generation was still in flight', async () => {
+    const resolvers: Array<(read: Picture | null) => void> = []
+    const view = viewing()
+    view.source.image = (id: number) => {
+      view.source.picturesAsked.push(id)
+      return new Promise((resolve) => { resolvers.push(resolve) })
+    }
+
+    // Request gen 1 via anchored placement; keep it in flight
+    view.source.send(frame({ sequence: 1, images: 0, anchored: anchoring([anchored({ image: 7, generation: 1 })]) }))
+    await settled()
+    expect(view.source.picturesAsked).toEqual([7])
+    expect(resolvers).toHaveLength(1)
+
+    // Gen 2 arrives while gen 1 is still in flight
+    view.source.send(frame({ sequence: 2, images: 0, anchored: anchoring([anchored({ image: 7, generation: 2 })]) }))
+    await settled()
+    expect(view.source.picturesAsked, 'gen 2 waits for gen 1 request to finish').toEqual([7])
+
+    // Gen 1 resolves with gen 1 pixels -> must NOT blacklist gen 2, and must immediately fetch gen 2
+    const pic1 = { ...pixels(4, 4), generation: 1 }
+    const pic2 = { ...pixels(8, 8), generation: 2 }
+    resolvers[0]!(pic1)
+    await settled()
+    expect(view.source.picturesAsked, 'gen 2 was not fetched after gen 1 resolved').toEqual([7, 7])
+    expect(resolvers).toHaveLength(2)
+
+    resolvers[1]!(pic2)
+    await settled()
+    await settled()
+    expect(view.painted().images?.[0]?.picture).toBe(pic2)
+
+    // Same scenario when gen 3 arrives while gen 2 is missing (resolves null): gen 3 is still fetched
+    view.source.send(frame({ sequence: 3, images: 0, anchored: anchoring([anchored({ image: 9, generation: 1 })]) }))
+    await settled()
+    expect(resolvers).toHaveLength(3)
+    view.source.send(frame({ sequence: 4, images: 0, anchored: anchoring([anchored({ image: 9, generation: 2 })]) }))
+    await settled()
+    resolvers[2]!(null)
+    await settled()
+    expect(resolvers, 'gen 2 was blacklisted by gen 1 returning null').toHaveLength(4)
+    const pic9Gen2 = { ...pixels(6, 6), generation: 2 }
+    resolvers[3]!(pic9Gen2)
+    await settled()
+    await settled()
+    expect(view.painted().images?.[0]?.picture).toBe(pic9Gen2)
   })
 
   it('drops pictures when anchored or placeholder rows disappear without images bumping, retries when generation bumps, zeroes fallback canvases, and respects folds in wantPictures', async () => {

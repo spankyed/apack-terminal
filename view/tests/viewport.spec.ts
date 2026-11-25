@@ -173,4 +173,45 @@ describe('folds in the viewport', () => {
     expect(viewport.offset).toBe(0)
     expect(viewport.extent.position).toBe(10)
   })
+
+  it('advances past a fold covering store.oldest so held never lands on a hidden line, and computes signed rowsBetween', () => {
+    // store.oldest = 10, firstActive = 50; fold [5..20] covers oldest (5 < 10 <= 20)
+    const { store, viewport } = scrolledTo(50, 40)
+    expect(store.oldest).toBe(10)
+    viewport.setFolds([{ first: 5, last: 20 }])
+
+    // Scrolling to or below oldest advances past the fold to 21, never landing on hidden line 10..20
+    viewport.scrollTo(0)
+    expect(viewport.top).toBe(21)
+    expect(viewport.hiddenIn(viewport.top)).toBeUndefined()
+    expect(viewport.extent.position).toBe(0)
+
+    viewport.scrollTo(15)
+    expect(viewport.top).toBe(21)
+
+    // scrollToPosition counts from the first non-hidden line at or after oldest
+    viewport.scrollToPosition(1)
+    expect(viewport.top).toBe(22)
+    expect(viewport.extent.position).toBe(1)
+
+    // setFolds while held on a line whose fold starts before oldest also advances past the fold
+    viewport.setFolds([])
+    viewport.scrollTo(12)
+    expect(viewport.top).toBe(12)
+    viewport.setFolds([{ first: 5, last: 20 }])
+    expect(viewport.top).toBe(21)
+
+    // If scrollback trims oldest into a fold that reaches firstActive, viewport settles back to following
+    store.apply(frame({ sequence: 2, firstActive: 50, scrollback: 35 }))
+    viewport.setFolds([{ first: 10, last: 50 }])
+    viewport.scrollTo(15)
+    expect(viewport.following).toBe(true)
+    expect(viewport.top).toBe(50)
+
+    // Signed rowsBetween handles both forward and reverse (to < from) in O(log F)
+    viewport.setFolds([{ first: 10, last: 20 }])
+    expect(viewport.rowsBetween(0, 21)).toBe(11)
+    expect(viewport.rowsBetween(21, 0)).toBe(-11)
+    expect(viewport.rowsBetween(25, 10)).toBe(-5)
+  })
 })

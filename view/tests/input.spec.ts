@@ -378,11 +378,27 @@ describe('composition', () => {
     expect(log).toEqual(['text 日本'])
   })
 
-  it('a non-key insertion of the same character after a prior keydown is not dropped on a later tick', async () => {
+  it('deduplicates input across a microtask boundary after keydown, and clears keyText on the next macrotask tick', async () => {
     const view = mountedView({ mac: false })
+    // Across a microtask boundary (real browser dispatch between keydown and input), dedup still suppresses the duplicate
     view.key('keydown', { code: 'KeyA', key: 'a' })
     await Promise.resolve()
     view.field.value = 'a'
+    view.field.dispatchEvent(new Event('input'))
+    expect(view.source.texts, 'duplicate input after microtask should be suppressed').toEqual([])
+
+    // After a macrotask tick, a non-key insertion of the same character is NOT dropped
+    view.key('keydown', { code: 'KeyA', key: 'a' })
+    await settled()
+    view.field.value = 'a'
+    view.field.dispatchEvent(new Event('input'))
+    expect(view.source.texts, 'non-key insertion on a later macrotask tick should be sent').toEqual(['a'])
+
+    // A subsequent keydown cancels the previous timer so only the newer key's text is deduplicated
+    view.key('keydown', { code: 'KeyA', key: 'a' })
+    view.key('keydown', { code: 'KeyB', key: 'b' })
+    await Promise.resolve()
+    view.field.value = 'b'
     view.field.dispatchEvent(new Event('input'))
     expect(view.source.texts).toEqual(['a'])
   })

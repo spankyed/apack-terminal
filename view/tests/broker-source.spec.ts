@@ -434,10 +434,46 @@ describe('broker lifecycle edge cases', () => {
     await expect(pending3).rejects.toThrow(new Unanswered('attach failed'))
   })
 
-  it('drops TooLarge on tell methods without throwing into DOM event handlers', () => {
+  it('drops TooLarge and RangeError on tell methods without throwing into DOM event handlers', () => {
     const { broker, source } = attached()
     broker.taken()
     expect(() => source.text('x'.repeat(MAX_MESSAGE_BYTES + 1))).not.toThrow()
     expect(broker.taken()).toEqual([])
+
+    // Wire bounds violation (RangeError) from encodeToBroker / stream.send is also dropped by tell()
+    const originalSend = broker.send.bind(broker)
+    broker.send = () => { throw new RangeError('coordinate out of bounds') }
+    expect(() => source.pointer({ action: 'press', button: 0, modifiers: 0, x: -1, y: 0, cellWidth: 8, cellHeight: 16 })).not.toThrow()
+
+    // Non-TooLarge / non-RangeError errors still propagate
+    broker.send = () => { throw new Error('transport failed') }
+    expect(() => source.focus(true)).toThrow('transport failed')
+    broker.send = originalSend
+  })
+
+  it('still releases the channel and notifies listener.ended(reason) when detach send throws in refused()', async () => {
+    const broker = new FakeBroker()
+    const views = new BrokerViews(broker)
+    const source = views.open('s-1')
+    const frames: Frame[] = []
+    const reasons: Array<string | undefined> = []
+    source.attach({ frame: (f) => { frames.push(f) }, ended: (reason) => { reasons.push(reason) } })
+    const pending = source.fetch(0, 1)
+    broker.taken()
+
+    const originalSend = broker.send.bind(broker)
+    broker.send = () => { throw new Error('broken pipe on detach') }
+    expect(() => broker.say({ kind: 'failed', channel: 1, request: 0, message: 'attach refused' })).not.toThrow()
+    expect(reasons).toEqual(['attach refused'])
+    await expect(pending).rejects.toThrow(new Unanswered('attach refused'))
+
+    // Channel 1 was released so late frames on channel 1 are ignored, and re-attaching succeeds on channel 2
+    broker.send = originalSend
+    broker.say({ kind: 'frame', channel: 1, frame: frame({ sequence: 1 }) })
+    expect(frames).toEqual([])
+    source.attach({ frame: (f) => { frames.push(f) }, ended: (reason) => { reasons.push(reason) } })
+    expect(broker.taken()).toEqual([{ kind: 'attach', channel: 2, session: 's-1' }])
+    broker.say({ kind: 'frame', channel: 2, frame: frame({ sequence: 2 }) })
+    expect(frames.map((f) => f.sequence)).toEqual([2])
   })
 })

@@ -258,7 +258,11 @@ class SessionSource implements TerminalSource {
       this.waiting.delete(request)
       waiting.reject(new Unanswered(reason))
     }
-    this.connection.send({ kind: 'detach', channel })
+    try {
+      this.connection.send({ kind: 'detach', channel })
+    } catch {
+      // Failing to send detach on a refused attachment must not skip releasing the channel or telling the view
+    }
     this.connection.release(channel)
     this.listener?.ended(reason)
   }
@@ -287,8 +291,8 @@ class SessionSource implements TerminalSource {
     try {
       this.connection.send(build(this.channel))
     } catch (error) {
-      // Input or acknowledgements that exceed one wire message are dropped rather than crashing DOM handlers
-      if (error instanceof TooLarge) return
+      // Input or acknowledgements that exceed one wire message or violate wire bounds are dropped rather than crashing DOM handlers
+      if (error instanceof TooLarge || error instanceof RangeError) return
       throw error
     }
   }

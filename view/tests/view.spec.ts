@@ -1086,4 +1086,110 @@ describe('view lifecycle, guards, and edge-case regressions', () => {
       window.matchMedia = originalMatchMedia
     }
   })
+
+  it('resubscribes matchMedia when ResizeObserver detects a DPR change before window resize', () => {
+    const originalMatchMedia = window.matchMedia
+    const originalResizeObserver = globalThis.ResizeObserver
+    let observerCallback: (() => void) | null = null
+    const subscriptions: Array<{ query: string; added: number; removed: number; fire: () => void }> = []
+    Object.defineProperty(window, 'devicePixelRatio', { value: 1, configurable: true })
+    window.matchMedia = ((query: string) => {
+      let listener: (() => void) | null = null
+      const entry = {
+        query,
+        added: 0,
+        removed: 0,
+        fire: () => { listener?.() },
+      }
+      subscriptions.push(entry)
+      return {
+        matches: true,
+        addEventListener(_type: string, fn: () => void) { entry.added += 1; listener = fn },
+        removeEventListener(_type: string, fn: () => void) { if (listener === fn) { entry.removed += 1; listener = null } },
+      }
+    }) as unknown as typeof window.matchMedia
+    globalThis.ResizeObserver = class {
+      constructor(cb: () => void) { observerCallback = cb }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    } as unknown as typeof ResizeObserver
+    try {
+      const { canvas } = recordingContext(8)
+      const view = new TerminalView(new FakeSource(), { font: { family: 'monospace', size: 14 }, theme, painter: (f) => new CanvasPainter(f, canvas) })
+      const host = document.createElement('div')
+      document.body.appendChild(host)
+      view.mount(host)
+      expect(subscriptions.map((s) => s.query)).toEqual(['(resolution: 1dppx)'])
+
+      // DPR changes and ResizeObserver fires BEFORE window resize
+      Object.defineProperty(window, 'devicePixelRatio', { value: 2, configurable: true })
+      observerCallback!()
+      expect(subscriptions[0]!.removed, 'previous 1dppx matchMedia listener was not cleaned up').toBe(1)
+      expect(subscriptions.map((s) => s.query)).toEqual(['(resolution: 1dppx)', '(resolution: 2dppx)'])
+
+      // Subsequent window resize sees pixelRatio already updated on this view (its 2dppx listener stays active),
+      // and firing the new 2dppx listener handles future DPR changes cleanly
+      window.dispatchEvent(new Event('resize'))
+      expect(subscriptions[1]!.removed, 'window resize should not tear down the already-updated 2dppx listener').toBe(0)
+
+      Object.defineProperty(window, 'devicePixelRatio', { value: 3, configurable: true })
+      subscriptions[1]!.fire()
+      expect(subscriptions[1]!.removed).toBe(1)
+      expect(subscriptions.at(-1)?.query).toBe('(resolution: 3dppx)')
+
+      view.dispose()
+      expect(subscriptions.at(-1)?.removed).toBe(1)
+    } finally {
+      Object.defineProperty(window, 'devicePixelRatio', { value: 1, configurable: true })
+      window.matchMedia = originalMatchMedia
+      globalThis.ResizeObserver = originalResizeObserver
+    }
+  })
+
+  it('does not re-arm search refresh timer when an in-flight refresh finishes while unmounted or after unmount reset', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const resolvers: Array<(f: import('../src/source.ts').Found) => void> = []
+      const foundEvents: Array<{ current: number; total: number; more: boolean }> = []
+      const source = new FakeSource()
+      source.search = () => new Promise((resolve) => { resolvers.push(resolve) })
+      const view = mountedView({ onFound: (f) => foundEvents.push(f) }, source)
+      source.send(frame({ sequence: 1, rows: [row(0, 'hi')] }))
+
+      const initial = view.view.find('hi')
+      resolvers[0]!({ spans: [{ start: { line: 0, column: 0 }, end: { line: 0, column: 1 } }], more: false })
+      await initial
+
+      // Trigger refresh timer, advance to kick off in-flight runRefresh(), then send another frame to set refreshAgain
+      source.send(frame({ sequence: 2, rows: [row(0, 'hi there')] }))
+      expect(vi.getTimerCount()).toBe(1)
+      vi.advanceTimersByTime(200)
+      expect(resolvers).toHaveLength(2)
+      source.send(frame({ sequence: 3, rows: [row(0, 'hi again')] }))
+
+      // Unmount while refresh is in flight -> resets refreshAgain and sets listening = false
+      view.view.unmount()
+      resolvers[1]!({ spans: [{ start: { line: 0, column: 0 }, end: { line: 0, column: 1 } }, { start: { line: 0, column: 3 }, end: { line: 0, column: 4 } }], more: false })
+      await Promise.resolve()
+      await Promise.resolve()
+      expect(vi.getTimerCount(), 'in-flight refresh must not re-arm timer while unmounted').toBe(0)
+      expect(foundEvents, 'in-flight refresh must not notify onFound while unmounted').toEqual([])
+
+      // Remount, start another in-flight refresh with refreshAgain, unmount + remount before it resolves -> refreshAgain was cleared
+      view.view.mount(view.host)
+      source.send(frame({ sequence: 4, rows: [row(0, 'hi remounted')] }))
+      vi.advanceTimersByTime(200)
+      expect(resolvers).toHaveLength(3)
+      source.send(frame({ sequence: 5, rows: [row(0, 'hi more')] }))
+      view.view.unmount()
+      view.view.mount(view.host)
+      resolvers[2]!({ spans: [{ start: { line: 0, column: 0 }, end: { line: 0, column: 1 } }], more: false })
+      await Promise.resolve()
+      await Promise.resolve()
+      expect(vi.getTimerCount(), 'unmount should have cleared stale refreshAgain flag').toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })

@@ -213,18 +213,27 @@ export class RowStore {
       this.doubted.delete(line)
       this.rows.delete(line)
       this.picturedLines.delete(line)
-      if (this.absent.size < MAX_ABSENT) this.absent.add(line)
+      this.markAbsent(line)
       told.push(line)
     }
     const absentLimit = Math.min(limit, from + MAX_ABSENT + brought.size)
     for (let line = from; line < absentLimit; line += 1) {
       if (brought.has(line) || this.absent.has(line) || this.rows.has(line)) continue
-      if (this.absent.size >= MAX_ABSENT) break
-      this.absent.add(line)
+      this.markAbsent(line)
       told.push(line)
     }
     this.forget(near)
     return told
+  }
+
+  /** Records a history line the owner did not hold, evicting the oldest entry once at `MAX_ABSENT` */
+  private markAbsent(line: number): void {
+    if (this.absent.has(line)) return
+    if (this.absent.size >= MAX_ABSENT) {
+      const first = this.absent.values().next().value
+      if (first !== undefined) this.absent.delete(first)
+    }
+    this.absent.add(line)
   }
 
   /**

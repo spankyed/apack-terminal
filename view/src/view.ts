@@ -251,6 +251,8 @@ export class TerminalView {
   private observer: ResizeObserver | null = null
   /** Stops listening for the display and the page's fonts changing, while mounted */
   private unwatch: (() => void) | null = null
+  /** Stops the current `matchMedia` resolution listener, while mounted */
+  private stopDisplay: (() => void) | null = null
   /** The pixel ratio the painter was last sized for, or `null` before it has been */
   private pixelRatio: number | null = null
   /** How tall the view is on the page, as last measured */
@@ -554,7 +556,7 @@ export class TerminalView {
     const asked = this.finding
     void this.search(this.needle).then((answer) => {
       this.refreshing = false
-      if (this.disposed) return
+      if (this.disposed || !this.listening) return
       // Nothing to say when the person has searched again since, or the source could not answer
       if (answer && asked === this.finding) {
         const found = answer.spans
@@ -685,13 +687,7 @@ export class TerminalView {
 
   /** The number of rows from line `from` up to line `to`, folded lines taking none: negative when `to` is above `from` */
   private rowsBetween(from: number, to: number): number {
-    if (to < from) return -this.rowsBetween(to, from)
-    let rows = to - from
-    for (const fold of this.folds) {
-      const hidden = Math.min(fold.last + 1, to) - Math.max(fold.first + 1, from)
-      if (hidden > 0) rows -= hidden
-    }
-    return rows
+    return this.viewport.rowsBetween(from, to)
   }
 
   /** The header row of a fold, drawn as its label in the place of the line it starts at */
@@ -875,16 +871,24 @@ export class TerminalView {
       // No answer for want of an attachment says nothing about the image: the next attachment asks
       if (!picture && (attachment !== this.attachment || !this.listening)) return
       const wanted = this.wanted.get(image) ?? generation
-      if (!picture || got !== wanted) {
+      if (!picture || got !== generation) {
         entry.refused = this.placed
-        entry.refusedGeneration = wanted
+        entry.refusedGeneration = generation
       }
       this.schedule()
+      if (wanted !== generation && got !== wanted && !this.disposed && this.listening && !this.ended) {
+        this.wantPicture(image, wanted)
+      }
     }, () => {
       entry.asking = false
+      if (this.disposed || this.pictures.get(image) !== entry) return
       if (attachment === this.attachment && this.listening) {
         entry.refused = this.placed
-        entry.refusedGeneration = this.wanted.get(image) ?? generation
+        entry.refusedGeneration = generation
+        const wanted = this.wanted.get(image) ?? generation
+        if (wanted !== generation && !this.ended) {
+          this.wantPicture(image, wanted)
+        }
       }
     })
   }
@@ -1094,6 +1098,7 @@ export class TerminalView {
       clearTimeout(this.refreshTimer)
       this.refreshTimer = undefined
     }
+    this.refreshAgain = false
     // Said while there is still an attachment to say it on: a view off the page does not have the keyboard
     // or a held button, whether or not the page gets round to saying so
     const pressed = this.pressed
@@ -1130,8 +1135,11 @@ export class TerminalView {
    */
   private size(): boolean {
     const before = this.painter.metrics
-    this.pixelRatio = window.devicePixelRatio || 1
+    const nextRatio = window.devicePixelRatio || 1
+    const ratioChanged = nextRatio !== this.pixelRatio
+    this.pixelRatio = nextRatio
     this.painter.resize(this.columns, this.rows, this.pixelRatio, this.gutter)
+    if (ratioChanged && this.listening) this.display()
     const { cellWidth, cellHeight } = this.painter.metrics
     return cellWidth !== before.cellWidth || cellHeight !== before.cellHeight
   }
@@ -1156,38 +1164,47 @@ export class TerminalView {
     if (!faces || faces.some((face) => own.has(named(face.family)))) this.remeasure()
   }
 
+  /**
+   * Subscribes to `matchMedia` for the current display pixel ratio.
+   *
+   * A resolution query matches one ratio, so it is asked again for each ratio the display comes to have.
+   * Under fractional browser zoom, an exact `(resolution: ...)` query may not match due to float rounding,
+   * in which case we fall back to a narrow min/max-resolution range and also re-check on window resize.
+   */
+  private display(): void {
+    this.stopDisplay?.()
+    this.stopDisplay = null
+    if (typeof matchMedia !== 'function') return
+    const ratio = window.devicePixelRatio || 1
+    let query = matchMedia(`(resolution: ${ratio}dppx)`)
+    if (query.matches === false) {
+      const min = Math.max(0.001, ratio - 0.001)
+      const max = ratio + 0.001
+      query = matchMedia(`(min-resolution: ${min}dppx) and (max-resolution: ${max}dppx)`)
+    }
+    const changed = () => {
+      query.removeEventListener?.('change', changed)
+      this.stopDisplay = null
+      const before = this.pixelRatio
+      this.remeasure()
+      if (this.pixelRatio === before && this.listening) this.display()
+    }
+    // A browser whose queries cannot be listened to this way is one whose display changing goes unheard
+    query.addEventListener?.('change', changed)
+    this.stopDisplay = () => {
+      query.removeEventListener?.('change', changed)
+      this.stopDisplay = null
+    }
+  }
+
   /** Listens, while mounted, for what changes the size of a cell without the view being told */
   private watch(): void {
     this.unwatch?.()
     const stop: Array<() => void> = []
-    // A resolution query matches one ratio, so it is asked again for each ratio the display comes to have.
-    // Under fractional browser zoom, an exact `(resolution: ...)` query may not match due to float rounding,
-    // in which case we fall back to a narrow min/max-resolution range and also re-check on window resize.
-    const display = () => {
-      if (typeof matchMedia !== 'function') return
-      const ratio = window.devicePixelRatio || 1
-      let query = matchMedia(`(resolution: ${ratio}dppx)`)
-      if (query.matches === false) {
-        const min = Math.max(0.001, ratio - 0.001)
-        const max = ratio + 0.001
-        query = matchMedia(`(min-resolution: ${min}dppx) and (max-resolution: ${max}dppx)`)
-      }
-      const changed = () => {
-        query.removeEventListener?.('change', changed)
-        display()
-        this.remeasure()
-      }
-      // A browser whose queries cannot be listened to this way is one whose display changing goes unheard
-      query.addEventListener?.('change', changed)
-      stopDisplay = () => query.removeEventListener?.('change', changed)
-    }
-    let stopDisplay = () => {}
-    display()
-    stop.push(() => stopDisplay())
+    this.display()
+    stop.push(() => this.stopDisplay?.())
     const onResize = () => {
       if ((window.devicePixelRatio || 1) === this.pixelRatio) return
-      stopDisplay()
-      display()
       this.remeasure()
     }
     window.addEventListener('resize', onResize)

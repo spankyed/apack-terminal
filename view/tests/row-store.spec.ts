@@ -342,5 +342,20 @@ describe('a fetch answered before a frame named history stale', () => {
     expect(told.length).toBeLessThanOrEqual(16_384)
     expect(performance.now() - absorbStart).toBeLessThan(200)
   })
+
+  it('evicts the oldest absent entries (FIFO) at the cap so newly discovered absent lines are remembered', () => {
+    const store = new RowStore()
+    store.apply(frame({ firstActive: 100_000, scrollback: 100_000, rows: [] }))
+    // Fill absent set to MAX_ABSENT (16_384) with lines 0..16_383
+    store.absorb({ epoch: 1, first: 0, count: 16_384, rows: [] })
+    expect(store.missing(0, 16_384)).toEqual([])
+
+    // Discovering 10 new absent lines at 50_000..50_009 evicts 0..9 and records 50_000..50_009
+    const told = store.absorb({ epoch: 1, first: 50_000, count: 10, rows: [] })
+    expect(told).toEqual([50_000, 50_001, 50_002, 50_003, 50_004, 50_005, 50_006, 50_007, 50_008, 50_009])
+    expect(store.missing(50_000, 10), 'newly absent lines must not stay missing and trigger infinite refetches').toEqual([])
+    expect(store.missing(0, 10), 'oldest absent lines were evicted FIFO').toEqual([[0, 10]])
+    expect(store.missing(10, 10), 'entries after the evicted prefix are still remembered').toEqual([])
+  })
 })
 

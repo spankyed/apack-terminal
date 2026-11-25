@@ -97,7 +97,7 @@ export class Input {
   private held = { start: 0, suffix: 0 }
   /** The text the last key sent, which an input event for the same text would otherwise send a second time */
   private keyText: string | null = null
-  private keyTextToken = 0
+  private keyTextTimer: ReturnType<typeof setTimeout> | null = null
   /** The keys the source was told went down and has not been told came up */
   private readonly down = new Set<string>()
 
@@ -160,9 +160,16 @@ export class Input {
     this.field.removeEventListener('focus', this.focus)
     this.field.removeEventListener('blur', this.blur)
     this.down.clear()
-    this.keyText = null
-    this.keyTextToken += 1
+    this.clearKeyText()
     this.field.remove()
+  }
+
+  private clearKeyText(): void {
+    this.keyText = null
+    if (this.keyTextTimer !== null) {
+      clearTimeout(this.keyTextTimer)
+      this.keyTextTimer = null
+    }
   }
 
   private unshifted(code: string): number {
@@ -214,8 +221,7 @@ export class Input {
       event.preventDefault()
       return
     }
-    this.keyText = null
-    this.keyTextToken += 1
+    this.clearKeyText()
     // While an input method is composing, Enter (and every other key) belongs to the IME to confirm or
     // edit the composition; `read` returns `null` so `compositionend` commits the final text naturally.
     // Copy and paste where the command key is not there to ask with: control and shift together
@@ -238,10 +244,10 @@ export class Input {
     this.down.add(event.code)
     if (key.text !== '') {
       this.keyText = key.text
-      const token = (this.keyTextToken += 1)
-      queueMicrotask(() => {
-        if (this.keyTextToken === token) this.keyText = null
-      })
+      this.keyTextTimer = setTimeout(() => {
+        this.keyTextTimer = null
+        this.keyText = null
+      }, 0)
     }
     this.source.key(key)
     if (!MODIFIER_KEYS.has(event.key)) this.options.typed?.()
@@ -299,7 +305,7 @@ export class Input {
     this.field.value = ''
     // A key has already sent this text, and an input event for it is the same character arriving twice
     const sent = text === this.keyText ? '' : text
-    this.keyText = null
+    this.clearKeyText()
     if (sent === '') return
     this.source.text(sent)
     this.options.typed?.()
