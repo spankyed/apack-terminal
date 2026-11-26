@@ -157,11 +157,15 @@ fn index_segment(seg_id: u64, path: PathBuf) -> Result<Option<SegmentSummary>, W
 /// Reads and verifies a sealed segment's 40-byte footer in $O(1)$, verifying that `file_len`
 /// matches `footer.records_end_offset + SEGMENT_FOOTER_LEN` and contains at least one record.
 pub(crate) fn try_read_footer(path: &Path) -> Result<Option<SegmentFooter>, WalError> {
-    let mut file = File::open(path)?;
-    let meta = file.metadata()?;
-    if !meta.is_file() {
+    let lstat = std::fs::symlink_metadata(path)?;
+    if lstat.file_type().is_symlink() {
+        return Err(WalError::SymlinkRefused);
+    }
+    if !lstat.is_file() {
         return Err(WalError::InvalidFormat("segment is not a regular file"));
     }
+    let mut file = File::open(path)?;
+    let meta = file.metadata()?;
     let len = meta.len();
     let min_sealed_len = (MIN_RECORD_LEN + SEGMENT_FOOTER_LEN) as u64;
     if len < min_sealed_len {

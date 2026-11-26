@@ -901,8 +901,14 @@ fn boundary_helpers_and_bounded_file_reads() {
     fs::write(&exact_path, &exact).unwrap();
     assert_eq!(try_read_footer(&exact_path).unwrap(), Some(ftr));
 
-    // Directory passed to try_read_footer fails with InvalidFormat
+    // Directory passed to try_read_footer fails with InvalidFormat (cross-platform!)
     assert!(matches!(try_read_footer(tmp.path()), Err(WalError::InvalidFormat(_))));
+    #[cfg(unix)]
+    {
+        let sym_seg = tmp.path().join("sym-seg.apks");
+        std::os::unix::fs::symlink(&exact_path, &sym_seg).unwrap();
+        assert!(matches!(try_read_footer(&sym_seg), Err(WalError::SymlinkRefused)));
+    }
 }
 
 #[test]
