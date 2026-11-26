@@ -344,8 +344,10 @@ mod tests {
         bridge.set_paused(true);
         bridge.set_paused(false);
 
-        // Wait until `cmd.exe` prints `READY` so ConPTY has attached stdin before we write `HELLO\r\n`.
+        // Answer ConPTY's initial DSR cursor-position query (`\x1b[6n`) with CPR (`\x1b[1;1R`)
+        // so ConPTY flushes `READY` immediately, then write `HELLO\r\n` once `cmd.exe` is ready.
         let mut collected = Vec::new();
+        let mut answered_dsr = false;
         let deadline = Instant::now() + Duration::from_secs(10);
         while !String::from_utf8_lossy(&collected).contains("READY") {
             assert!(
@@ -354,7 +356,13 @@ mod tests {
                 String::from_utf8_lossy(&collected)
             );
             match bridge.try_recv_output() {
-                Some(ConPtyOutput::Data(bytes)) => collected.extend_from_slice(&bytes),
+                Some(ConPtyOutput::Data(bytes)) => {
+                    collected.extend_from_slice(&bytes);
+                    if !answered_dsr && collected.windows(4).any(|w| w == b"\x1b[6n") {
+                        bridge.write(b"\x1b[1;1R".to_vec()).expect("answer ConPTY DSR");
+                        answered_dsr = true;
+                    }
+                }
                 Some(ConPtyOutput::Eof) => panic!("unexpected ConPTY EOF before READY"),
                 None => std::thread::sleep(Duration::from_millis(10)),
             }

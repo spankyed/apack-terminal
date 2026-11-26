@@ -367,11 +367,16 @@ mod tests {
         assert!(events.iter().any(|e| e.token == tw && e.writable));
         poller.deregister(tw).expect("dereg w1");
 
+        // Synchronous double-wake coalesces to one wake and leaves subsequent poll clean.
         let waker = poller.waker();
+        waker.wake().expect("coalesced wake 1");
+        waker.wake().expect("coalesced wake 2");
+        assert!(poller.poll(&mut events, Some(Duration::from_secs(2))).expect("coalesced woken"));
+        assert!(!poller.poll(&mut events, Some(Duration::from_millis(10))).expect("clean after coalesced"));
+
         let wake_th = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(20));
-            waker.wake().expect("wake 1");
-            waker.wake().expect("wake 2 coalesced");
+            waker.wake().expect("cross-thread wake");
         });
         assert!(poller.poll(&mut events, Some(Duration::from_secs(2))).expect("woken"));
         wake_th.join().expect("join");

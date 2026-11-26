@@ -64,10 +64,10 @@ mod tests {
     fn worker_returns_value_resets_on_progress_and_trips_circuit_breaker_when_stuck() {
         let worker = Worker::default();
 
-        // Progress ticks keep a slow job alive past `quiet`.
-        let val = worker.run(Duration::from_millis(80), |progress| {
+        // Progress ticks keep a slow job alive past `quiet` (3 * 120ms = 360ms > 300ms quiet).
+        let val = worker.run(Duration::from_millis(300), |progress| {
             for _ in 0..3 {
-                std::thread::sleep(Duration::from_millis(40));
+                std::thread::sleep(Duration::from_millis(120));
                 progress();
             }
             42u32
