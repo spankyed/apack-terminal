@@ -120,10 +120,9 @@ impl JobGuard {
                 // bytes; reading the header field via raw pointer preserves full `buffer` provenance
                 // for the flexible `ProcessIdList` tail slice below.
                 let reported = unsafe { std::ptr::addr_of!((*list_ptr).NumberOfProcessIdsInList).read() } as usize;
-                let max_entries = (alloc_bytes - header_bytes) / size_of::<usize>();
-                let count = reported.min(max_entries);
-                // SAFETY: `header_bytes + count * size_of::<usize>() <= alloc_bytes` within
-                // `buffer`, and `header_bytes` (`8`) is aligned to `align_of::<usize>()`.
+                let count = reported.min(capacity);
+                // SAFETY: `header_bytes + count * size_of::<usize>() <= total_bytes <= alloc_bytes`
+                // within `buffer`, and `header_bytes` (`8`) is aligned to `align_of::<usize>()`.
                 let base = unsafe { buffer.as_ptr().cast::<u8>().add(header_bytes).cast::<usize>() };
                 // SAFETY: `QueryInformationJobObject` initialized `count` `usize` entries at `base`
                 // within `buffer`'s live allocation.
@@ -175,14 +174,23 @@ mod tests {
         assert!(!guard.owns(std::process::id()).expect("broker process not in child job"));
 
         // Dropping the JobGuard must terminate the 30-second ping child promptly via
-        // `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (Windows terminates job processes with exit code 0,
-        // so we assert the child exits well before the 30s ping could finish naturally).
+        // `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. Poll with `try_wait` so a broken `Drop` fails
+        // cleanly within 3s instead of hanging for the full 30s ping.
         let drop_started = std::time::Instant::now();
         drop(guard);
-        let _ = child.wait().expect("reap killed child");
-        assert!(
-            drop_started.elapsed() < std::time::Duration::from_secs(5),
-            "child outlived JobGuard drop instead of being killed by KILL_ON_JOB_CLOSE"
-        );
+        let exited = loop {
+            if child.try_wait().expect("try_wait").is_some() {
+                break true;
+            }
+            if drop_started.elapsed() >= std::time::Duration::from_secs(3) {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        if !exited {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("child outlived JobGuard drop instead of being killed by KILL_ON_JOB_CLOSE");
+        }
     }
 }

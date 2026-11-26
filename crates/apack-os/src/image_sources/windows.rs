@@ -22,7 +22,7 @@ const _: () = assert!(VOLUME_NAME_DOS == 0);
 /// post-open kernel final path are regular disk files under a drive letter (`C:\...`).
 pub fn open_file(path: &[u8]) -> Option<File> {
     let text = std::str::from_utf8(path).ok()?;
-    if text.contains('\0') || rules::refused(path) {
+    if rules::refused(path) {
         return None;
     }
     let file = File::open(text).ok()?;

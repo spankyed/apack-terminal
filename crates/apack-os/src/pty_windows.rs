@@ -70,6 +70,10 @@ impl PauseGate {
         self.changed.notify_all();
     }
 
+    fn is_paused(&self) -> bool {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).paused
+    }
+
     /// Blocks while paused (and not draining).
     fn wait_unpaused(&self) {
         let mut st = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -230,6 +234,17 @@ impl ConPtyBridge {
         Ok(())
     }
 
+    /// Queries the current ConPTY dimensions if still open.
+    pub fn get_size(&self) -> Result<Option<portable_pty::PtySize>, OsError> {
+        let guard = self.master.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard
+            .as_ref()
+            .map(|master| {
+                master.get_size().map_err(|err| OsError::io("querying conpty size", io::Error::other(err.to_string())))
+            })
+            .transpose()
+    }
+
     /// Enqueues input bytes for the ConPTY writer thread without blocking.
     pub fn write(&self, data: Vec<u8>) -> Result<(), OsError> {
         self.input.push(data)
@@ -290,12 +305,21 @@ mod tests {
         // Once draining begins, `set_paused(true)` is ignored so reader never stalls before EOF.
         gate.begin_drain();
         gate.set_paused(true);
-        gate.wait_unpaused();
+        let gate_drain = Arc::clone(&gate);
+        let (dtx, drx) = mpsc::channel();
+        std::thread::spawn(move || {
+            gate_drain.wait_unpaused();
+            let _ = dtx.send(());
+        });
+        drx.recv_timeout(Duration::from_millis(500)).expect("draining gate must never block");
     }
 
     #[test]
     fn input_queue_enforces_bounds_fifo_broken_and_close() {
-        let q = InputQueue::new();
+        assert_eq!(READ_CHUNK_BYTES, 65_536);
+        assert_eq!(MAX_INPUT_QUEUE_BYTES, 262_144);
+
+        let q = Arc::new(InputQueue::new());
         q.push(Vec::new()).expect("empty push is a no-op");
         q.push(b"abc".to_vec()).expect("push 1");
         q.push(vec![0u8; MAX_INPUT_QUEUE_BYTES - 3]).expect("fill to exact cap");
@@ -312,9 +336,14 @@ mod tests {
         assert!(matches!(broken_err, OsError::Io { source, .. } if source.kind() == io::ErrorKind::BrokenPipe));
 
         q.close();
-        assert_eq!(q.pop(), None);
         let closed_err = q.push(b"y".to_vec()).expect_err("closed rejects");
         assert!(matches!(closed_err, OsError::Io { source, .. } if source.kind() == io::ErrorKind::BrokenPipe));
+        let q_bg = Arc::clone(&q);
+        let (ptx, prx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = ptx.send(q_bg.pop());
+        });
+        assert_eq!(prx.recv_timeout(Duration::from_millis(500)).expect("closed pop must not block"), None);
     }
 
     #[test]
@@ -341,8 +370,12 @@ mod tests {
         .expect("start bridge");
 
         bridge.resize(GridSize::new(90, 25).expect("grid"), CellPx { width: 8, height: 16 }).expect("resize");
+        let sz = bridge.get_size().expect("get_size").expect("open master");
+        assert_eq!((sz.cols, sz.rows), (90, 25));
         bridge.set_paused(true);
+        assert!(bridge.pause.is_paused());
         bridge.set_paused(false);
+        assert!(!bridge.pause.is_paused());
 
         // Answer ConPTY's initial DSR cursor-position query (`\x1b[6n`) with CPR (`\x1b[1;1R`)
         // so ConPTY flushes `READY` immediately, then write `HELLO\r\n` once `cmd.exe` is ready.
@@ -388,5 +421,22 @@ mod tests {
         let text = String::from_utf8_lossy(&collected);
         assert!(text.contains("APACK_WIN_GOT:HELLO"), "unexpected ConPTY output: {text:?}");
         assert!(wakes.load(Ordering::Relaxed) >= 1);
+
+        // Dropping a live bridge without calling `close_master_async` closes its input queue via `Drop`.
+        let quick = PtySpawnConfig {
+            size: GridSize::new(80, 24).expect("grid"),
+            cell_px: CellPx::default(),
+            shell: Some("cmd.exe".to_owned()),
+            args: vec!["/C".to_owned(), "echo ok".to_owned()],
+            env: vec![],
+            unset: vec![],
+            cwd: None,
+        };
+        let mut quick_spawn = spawn_pty(&quick).expect("spawn quick");
+        let quick_bridge = ConPtyBridge::start(quick_spawn.master, || {}).expect("start quick bridge");
+        let quick_input = Arc::clone(&quick_bridge.input);
+        drop(quick_bridge);
+        assert!(quick_input.push(b"x".to_vec()).is_err(), "Drop must close ConPtyBridge input queue");
+        let _ = quick_spawn.child.wait();
     }
 }
