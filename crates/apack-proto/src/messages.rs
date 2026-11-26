@@ -238,7 +238,14 @@ pub struct FrameUpdate {
     pub epoch: u64,
     /// Current terminal grid dimensions.
     pub size: GridSize,
-    /// Number of scrollback lines above the active viewport.
+    /// Monotonic epoch-local line number of viewport row `0`.
+    ///
+    /// History occupies `[first_active_line - scrollback_lines, first_active_line)` and the active
+    /// viewport occupies `[first_active_line, first_active_line + size.rows)`. When scrollback
+    /// reaches its limit and evicts old lines, `first_active_line` advances without renumbering
+    /// any surviving line or bumping `epoch`.
+    pub first_active_line: u64,
+    /// Number of retained scrollback lines above the active viewport (`<= first_active_line`).
     pub scrollback_lines: u64,
     /// Net viewport scroll shift since the previous frame (`> 0` scrolled up, `< 0` down, `0` none).
     pub scroll_delta: i32,
@@ -261,6 +268,7 @@ impl FrameUpdate {
         w.var_u64(self.seq);
         w.var_u64(self.epoch);
         self.size.encode(w);
+        w.var_u64(self.first_active_line);
         w.var_u64(self.scrollback_lines);
         w.i32(self.scroll_delta);
         self.cursor.encode(w);
@@ -272,11 +280,20 @@ impl FrameUpdate {
     }
 
     fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
+        let seq = r.var_u64()?;
+        let epoch = r.var_u64()?;
+        let size = GridSize::decode(r)?;
+        let first_active_line = r.var_u64()?;
+        let scrollback_lines = r.var_u64()?;
+        if scrollback_lines > first_active_line {
+            return Err(WireError::InvalidValue("FrameUpdate.scrollback_lines > first_active_line"));
+        }
         Ok(Self {
-            seq: r.var_u64()?,
-            epoch: r.var_u64()?,
-            size: GridSize::decode(r)?,
-            scrollback_lines: r.var_u64()?,
+            seq,
+            epoch,
+            size,
+            first_active_line,
+            scrollback_lines,
             scroll_delta: r.i32()?,
             cursor: CursorState::decode(r)?,
             modes: ViewModes::decode(r)?,
@@ -845,7 +862,9 @@ pub enum BrokerMsg {
         size: GridSize,
         /// Current screen epoch.
         epoch: u64,
-        /// Current scrollback depth in lines.
+        /// Monotonic epoch-local line number of viewport row `0`.
+        first_active_line: u64,
+        /// Current retained scrollback depth in lines (`<= first_active_line`).
         scrollback_lines: u64,
         /// Current foreground process (POSIX live sessions only).
         foreground: Option<ForegroundProcess>,
@@ -1079,11 +1098,12 @@ impl BrokerMsg {
             }
             Self::Sought { at_ms } => w.var_u64(*at_ms),
             Self::MetricsReply(m) => m.encode(w),
-            Self::Attached { session, stream_id, size, epoch, scrollback_lines, foreground } => {
+            Self::Attached { session, stream_id, size, epoch, first_active_line, scrollback_lines, foreground } => {
                 session.encode(w);
                 stream_id.encode(w);
                 size.encode(w);
                 w.var_u64(*epoch);
+                w.var_u64(*first_active_line);
                 w.var_u64(*scrollback_lines);
                 w.opt(foreground.as_ref(), |w, f| f.encode(w));
             }
@@ -1175,14 +1195,19 @@ impl BrokerMsg {
             }
             msg_type::SOUGHT => Self::Sought { at_ms: r.var_u64()? },
             msg_type::METRICS_REPLY => Self::MetricsReply(MetricsSnapshot::decode(&mut r)?),
-            msg_type::ATTACHED => Self::Attached {
-                session: SessionId::decode(&mut r)?,
-                stream_id: NonZeroStreamId::decode(&mut r)?,
-                size: GridSize::decode(&mut r)?,
-                epoch: r.var_u64()?,
-                scrollback_lines: r.var_u64()?,
-                foreground: r.opt(ForegroundProcess::decode)?,
-            },
+            msg_type::ATTACHED => {
+                let session = SessionId::decode(&mut r)?;
+                let stream_id = NonZeroStreamId::decode(&mut r)?;
+                let size = GridSize::decode(&mut r)?;
+                let epoch = r.var_u64()?;
+                let first_active_line = r.var_u64()?;
+                let scrollback_lines = r.var_u64()?;
+                if scrollback_lines > first_active_line {
+                    return Err(WireError::InvalidValue("Attached.scrollback_lines > first_active_line"));
+                }
+                let foreground = r.opt(ForegroundProcess::decode)?;
+                Self::Attached { session, stream_id, size, epoch, first_active_line, scrollback_lines, foreground }
+            }
             msg_type::WAITED => Self::Waited { outcome: WaitOutcome::decode(&mut r)? },
             msg_type::FRAME => Self::Frame(Box::new(FrameUpdate::decode(&mut r)?)),
             msg_type::ROWS => Self::Rows {

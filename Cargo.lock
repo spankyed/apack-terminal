@@ -28,6 +28,14 @@ name = "apack-proto"
 version = "0.2.0"
 
 [[package]]
+name = "apack-sim"
+version = "0.2.0"
+dependencies = [
+ "apack-core",
+ "apack-proto",
+]
+
+[[package]]
 name = "apack-terminal"
 version = "0.1.0"
 dependencies = [

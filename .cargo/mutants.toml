@@ -2,12 +2,13 @@
 # which `cargo xtask pre-push` and `.github/workflows/mutants.yml` both do: a whole-repository run is minutes
 # of mutants nobody edited, and a survivor outside the change is not this push's to answer for.
 
-# The tests themselves, and the repository's own tasks. `xtask/` has cases of its own
-# (`xtask/tests/`) and is still not mutated here: the gate's subject is the broker, and mutating a task
-# would report survivors in code whose only caller is a developer typing its name
+# The tests themselves, the deterministic chaos simulator harness (`apack-sim`), and the repository's
+# own tasks (`xtask/`). None of these ship in the broker; mutating the simulator's PRNG/workload
+# driver would test the test harness rather than production broker code.
 exclude_globs = [
     "tests/**",
     "xtask/**",
+    "crates/apack-sim/**",
 ]
 # Each test in its own process under `.config/nextest.toml`'s deadlines, so a mutant that makes the broker
 # stop answering is caught at one rather than hanging the run

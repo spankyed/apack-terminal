@@ -250,6 +250,7 @@ fn all_broker_messages() -> Vec<BrokerMsg> {
             stream_id: stream,
             size: sample_grid(),
             epoch: 2,
+            first_active_line: 600,
             scrollback_lines: 500,
             foreground: Some(fg),
         },
@@ -258,6 +259,7 @@ fn all_broker_messages() -> Vec<BrokerMsg> {
             seq: 11,
             epoch: 2,
             size: sample_grid(),
+            first_active_line: 600,
             scrollback_lines: 500,
             scroll_delta: -3,
             cursor: CursorState { col: 15, row: 4, shape: CursorShape::Underline, blinking: true, hidden: true },
@@ -1298,6 +1300,7 @@ fn enum_variant_and_flag_exhaustiveness() {
                 seq: 1,
                 epoch: 1,
                 size: sample_grid(),
+                first_active_line: 0,
                 scrollback_lines: 0,
                 scroll_delta: 0,
                 cursor: CursorState { col: 0, row: 0, shape, blinking, hidden },
@@ -1324,6 +1327,7 @@ fn enum_variant_and_flag_exhaustiveness() {
     w.var_u64(1);
     sample_grid().encode(&mut w);
     w.var_u64(0);
+    w.var_u64(0);
     w.i32(0);
     w.u16(0);
     w.u16(0);
@@ -1338,6 +1342,7 @@ fn enum_variant_and_flag_exhaustiveness() {
     w.var_u64(1);
     w.var_u64(1);
     sample_grid().encode(&mut w);
+    w.var_u64(0);
     w.var_u64(0);
     w.i32(0);
     w.u16(0);
@@ -1459,4 +1464,49 @@ fn enum_variant_and_flag_exhaustiveness() {
         st.encode(&mut w);
         assert_eq!(BrokerMsg::decode(msg_type::PROGRAM_STATUS, w.as_slice()), Ok(st));
     }
+
+    // FrameUpdate & Attached: scrollback_lines == first_active_line is valid; scrollback_lines > first_active_line is rejected
+    let ok_attached = BrokerMsg::Attached {
+        session: SessionId::new(1).unwrap(),
+        stream_id: NonZeroStreamId::new(1).unwrap(),
+        size: sample_grid(),
+        epoch: 1,
+        first_active_line: 10,
+        scrollback_lines: 10,
+        foreground: None,
+    };
+    let mut w = Writer::new();
+    ok_attached.encode(&mut w);
+    assert_eq!(BrokerMsg::decode(msg_type::ATTACHED, w.as_slice()), Ok(ok_attached));
+
+    let bad_attached = BrokerMsg::Attached {
+        session: SessionId::new(1).unwrap(),
+        stream_id: NonZeroStreamId::new(1).unwrap(),
+        size: sample_grid(),
+        epoch: 1,
+        first_active_line: 10,
+        scrollback_lines: 11,
+        foreground: None,
+    };
+    let mut w = Writer::new();
+    bad_attached.encode(&mut w);
+    assert!(BrokerMsg::decode(msg_type::ATTACHED, w.as_slice()).is_err());
+
+    let bad_frame = BrokerMsg::Frame(Box::new(FrameUpdate {
+        seq: 1,
+        epoch: 1,
+        size: sample_grid(),
+        first_active_line: 10,
+        scrollback_lines: 11,
+        scroll_delta: 0,
+        cursor: CursorState { col: 0, row: 0, shape: CursorShape::Block, blinking: false, hidden: false },
+        modes: ViewModes::default(),
+        palette: None,
+        rows: vec![],
+        images_gen: 0,
+        full_sync: true,
+    }));
+    let mut w = Writer::new();
+    bad_frame.encode(&mut w);
+    assert!(BrokerMsg::decode(msg_type::FRAME, w.as_slice()).is_err());
 }
