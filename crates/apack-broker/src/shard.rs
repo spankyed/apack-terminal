@@ -779,8 +779,6 @@ impl ShardRunner {
             ShardCmd::CancelConnWaiters { conn } => {
                 for sess in self.sessions.values_mut() {
                     sess.machine.cancel_waiters_for_conn(conn);
-                    sess.view_slot_free.retain(|&(c, _)| c != conn);
-                    sess.raw_output_subs.retain(|&(c, _)| c != conn);
                 }
             }
             ShardCmd::StreamMsg { session_id, conn, stream_id, req_id, msg } => {
