@@ -942,6 +942,18 @@ fn image_store_o1_lru_eviction_recovery_placeholder_dirtying_and_hostile_rejecti
     assert!(store.get_chunk(h4, 0, 5).is_some());
     assert!(store.get_chunk(h5, 0, 5).is_some());
 
+    // Pure `get_chunk()`-only LRU promotion (kills `clock += 1` -> `-=` / `*=` in `get_chunk`) & `insert_pixels`!
+    let mut s_chunk = ImageStore::new(10);
+    let ga = s_chunk.insert_encoded(ImageEncoding::Png, vec![41; 5]).unwrap();
+    let gb = s_chunk.insert_encoded(ImageEncoding::Png, vec![42; 5]).unwrap();
+    assert!(s_chunk.get_chunk(ga, 0, 5).is_some());
+    assert!(s_chunk.get_chunk(gb, 0, 5).is_some()); // gb is now strictly newer than ga; with `clock *= 1`, gb keeps stale stamp 2 and gets evicted!
+    let _gc = s_chunk.insert_encoded(ImageEncoding::Png, vec![43; 5]).unwrap();
+    assert!(s_chunk.get_chunk(gb, 0, 5).is_some() && s_chunk.get_chunk(ga, 0, 5).is_none());
+    let mut s_px = ImageStore::new(4096);
+    let px_hash = s_px.insert_pixels(2, 1, 3, &[10, 20, 30, 40, 50, 60]).unwrap();
+    assert!(s_px.get_chunk(px_hash, 0, 1024).is_some());
+
     // Pure `touch()`-only LRU promotion (kills `clock += 1` -> `*= 1` in `touch`) & exact `push_lru` compaction threshold!
     let mut s_touch = ImageStore::new(10);
     let ta = s_touch.insert_encoded(ImageEncoding::Png, vec![11; 5]).unwrap();
