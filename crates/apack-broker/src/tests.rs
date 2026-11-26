@@ -2067,6 +2067,43 @@ fn windows_edge_helpers_and_natural_child_exit() {
     let _ = stalled.read_to_end(&mut discard);
     assert!(discard.len() < all_replies.len());
     srv_reap.shutdown().unwrap();
+
+    // 4c. Small pipelined Metrics + FIN_FRAME where writer_done becomes true and reap_draining_win_conns
+    //     runs BEFORE the client reads: reap must NOT call close_abrupt (DisconnectNamedPipe), so the
+    //     unread reply remains preserved in the pipe buffer!
+    let dir_small = tempdir().unwrap();
+    let ep_small = unique_endpoint(dir_small.path(), "win-drain-small");
+    let mut cfg_small = BrokerConfig::for_socket(&ep_small);
+    cfg_small.shard_count = 1;
+    let mut srv_small = BrokerServer::bind(cfg_small).unwrap().spawn().unwrap();
+    let mut small = apack_os::transport::connect_local_stream(srv_small.socket_path()).unwrap();
+    do_hello(&mut small);
+    let mut one_req = Vec::new();
+    ClientMsg::Metrics
+        .encode_to_frame(apack_proto::types::StreamId::CONTROL, RequestId::from_raw(2), &mut one_req)
+        .unwrap();
+    one_req.extend_from_slice(&apack_proto::FIN_FRAME);
+    small.write_all(&one_req).unwrap();
+    small.flush().unwrap();
+    let wait_small = std::time::Instant::now();
+    while !srv_small.is_finished() && wait_small.elapsed() < Duration::from_millis(1_000) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(srv_small.is_finished(), "broker must finish reaping clean small draining_win conn");
+    let mut small_reply = Vec::new();
+    let _ = small.read_to_end(&mut small_reply);
+    let mut small_dec = apack_proto::frame::FrameDecoder::new();
+    let mut small_rest = small_reply.as_slice();
+    let mut small_frames = 0u32;
+    while !small_rest.is_empty() {
+        let (used, ev) = small_dec.step(small_rest).unwrap();
+        small_rest = &small_rest[used..];
+        if matches!(ev, Some(apack_proto::frame::DecodedFrame::Frame { .. })) {
+            small_frames += 1;
+        }
+    }
+    assert_eq!(small_frames, 1, "reap_draining_win_conns must preserve unread reply when writer_done is true");
+    srv_small.shutdown().unwrap();
 }
 
 struct ChanReader {

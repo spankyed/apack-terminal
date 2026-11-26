@@ -2120,9 +2120,17 @@ mod win_shard_tests {
         let paused_id = SessionId::new(1).unwrap();
         let live_id = SessionId::new(2).unwrap();
         runner.sessions.insert(paused_id, make_session(paused_id, "echo WIN_PAUSED_ONLY", true));
+
+        // While only paused_id is present, drain_windows_ptys must ingest zero bytes and return false.
+        for _ in 0..15 {
+            assert!(!runner.drain_windows_ptys(PTY_READ_QUANTUM_BYTES));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(runner.total_pty_bytes, 0, "paused ConPTY session must not be drained at all");
+
+        // Now add live_id (unpaused) and verify budget=1 exhausts while paused_id stays unread.
         runner.sessions.insert(live_id, make_session(live_id, "echo WIN_LIVE_ONLY && set /p _x=", false));
 
-        // Wait until live_id produces output and exhausts budget=1 while paused_id stays unread.
         let mut saw_exhausted = false;
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
