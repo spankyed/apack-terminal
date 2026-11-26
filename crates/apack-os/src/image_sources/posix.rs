@@ -1,11 +1,11 @@
 //! Sandboxed POSIX file and shared-memory opener for Kitty graphics named sources.
 
-use std::ffi::{CString, OsStr};
-use std::fs::{File, OpenOptions};
+use std::ffi::CString;
+use std::fs::File;
 use std::ops::Range;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::MetadataExt;
 
 use super::{CHUNK_BYTES, Refused};
 
@@ -49,82 +49,188 @@ pub fn clear_nonblock(flags: libc::c_int) -> Option<libc::c_int> {
     (flags != -1).then_some(flags & !libc::O_NONBLOCK)
 }
 
-fn path_reaches_refused(path: &[u8]) -> bool {
+fn is_refused_prefix(resolved: &[Vec<u8>]) -> bool {
+    resolved != [b"dev".as_slice()] && is_refused_components(resolved)
+}
+
+/// Opens `path` read-only by walking components left-to-right via `openat(..., O_NOFOLLOW | O_CLOEXEC)`
+/// and `readlinkat`, eliminating symlink-swap TOCTOU races between path validation and `open()`.
+///
+/// Refuses `/proc`, `/sys`, `/dev` (except `/dev/shm`), symlink loops (`> MAX_SYMLINK_HOPS`),
+/// non-regular files (FIFOs, sockets, devices, directories), and special filesystems.
+pub fn open_file(path: &[u8]) -> Option<File> {
     let owned;
     let combined = if path.starts_with(b"/") {
         path
     } else {
         let Ok(cwd) = std::env::current_dir() else {
-            return true;
+            return None;
         };
         owned = [cwd.as_os_str().as_bytes(), b"/", path].concat();
         &owned
     };
+
     let mut pending: std::collections::VecDeque<Vec<u8>> =
         combined.split(|&byte| byte == b'/').filter(|s| !s.is_empty()).map(ToOwned::to_owned).collect();
+    if pending.is_empty() {
+        return None;
+    }
 
+    let mut dirfd = open_abs_dir(c"/")?;
     let mut resolved: Vec<Vec<u8>> = Vec::new();
     let mut remaining_hops = MAX_SYMLINK_HOPS;
+
     while let Some(segment) = pending.pop_front() {
         if segment == b"." {
             continue;
         }
         if segment == b".." {
             resolved.pop();
+            dirfd = open_dir_at(&dirfd, b"..")?;
             continue;
         }
-        resolved.push(segment);
-        if resolved.as_slice() != [b"dev".as_slice()] && is_refused_components(&resolved) {
-            return true;
+        resolved.push(segment.clone());
+        if is_refused_prefix(&resolved) {
+            return None;
         }
-        let mut joined = Vec::new();
-        for component in &resolved {
-            joined.push(b'/');
-            joined.extend_from_slice(component);
-        }
-        let meta = match std::fs::symlink_metadata(OsStr::from_bytes(&joined)) {
-            Ok(meta) => meta,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return true,
-        };
-        if meta.file_type().is_symlink() {
-            let Some(next_hops) = remaining_hops.checked_sub(1) else {
-                return true;
-            };
-            remaining_hops = next_hops;
-            let Ok(target) = std::fs::read_link(OsStr::from_bytes(&joined)) else {
-                return true;
-            };
-            let target_bytes = target.as_os_str().as_bytes();
-            if target_bytes.starts_with(b"/") {
-                resolved.clear();
-            } else {
-                resolved.pop();
+
+        let is_leaf = pending.is_empty();
+        if is_leaf {
+            match open_leaf_at(&dirfd, &segment) {
+                LeafOpen::Opened(fd) => {
+                    if is_refused_components(&resolved) {
+                        return None;
+                    }
+                    let file = File::from(fd);
+                    let found = file.metadata().ok()?;
+                    if !found.is_file() || on_special_filesystem(device(found.dev()), &special_filesystems()) {
+                        return None;
+                    }
+                    // SAFETY: `file` is an open regular file descriptor; clear `O_NONBLOCK` before returning.
+                    let flags = clear_nonblock(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) })?;
+                    // SAFETY: `file` is an open regular file descriptor and `flags` came from `F_GETFL`.
+                    unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags) };
+                    return Some(file);
+                }
+                LeafOpen::Symlink => {
+                    let target = readlink_at(&dirfd, &segment, super::PATH_BYTES)?;
+                    remaining_hops = remaining_hops.checked_sub(1)?;
+                    if target.starts_with(b"/") {
+                        resolved.clear();
+                        dirfd = open_abs_dir(c"/")?;
+                    } else {
+                        resolved.pop();
+                    }
+                    for part in target.split(|&byte| byte == b'/').filter(|s| !s.is_empty()).rev() {
+                        pending.push_front(part.to_vec());
+                    }
+                }
+                LeafOpen::Failed => return None,
             }
-            for part in target_bytes.split(|&byte| byte == b'/').filter(|s| !s.is_empty()).rev() {
-                pending.push_front(part.to_vec());
+        } else {
+            match open_subdir_at(&dirfd, &segment) {
+                SubdirOpen::Opened(next_dir) => {
+                    dirfd = next_dir;
+                }
+                SubdirOpen::Symlink => {
+                    let target = readlink_at(&dirfd, &segment, super::PATH_BYTES)?;
+                    remaining_hops = remaining_hops.checked_sub(1)?;
+                    if target.starts_with(b"/") {
+                        resolved.clear();
+                        dirfd = open_abs_dir(c"/")?;
+                    } else {
+                        resolved.pop();
+                    }
+                    for part in target.split(|&byte| byte == b'/').filter(|s| !s.is_empty()).rev() {
+                        pending.push_front(part.to_vec());
+                    }
+                }
+                SubdirOpen::Failed => return None,
             }
         }
     }
-    is_refused_components(&resolved)
+    None
 }
 
-/// Opens `path` read-only with `O_NONBLOCK | O_NOCTTY`, refusing symlinks into `/proc`, `/sys`,
-/// `/dev` (except `/dev/shm`), non-regular files (FIFOs/sockets/devices/dirs), and special mounts.
-pub fn open_file(path: &[u8]) -> Option<File> {
-    if path.contains(&0) || path_reaches_refused(path) {
+enum LeafOpen {
+    Opened(OwnedFd),
+    Symlink,
+    Failed,
+}
+
+enum SubdirOpen {
+    Opened(OwnedFd),
+    Symlink,
+    Failed,
+}
+
+const DIR_FLAGS: libc::c_int = libc::O_DIRECTORY | libc::O_CLOEXEC;
+const LEAF_FLAGS: libc::c_int = FILE_FLAGS | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+const SUBDIR_FLAGS: libc::c_int = DIR_FLAGS | libc::O_NOFOLLOW;
+
+fn open_abs_dir(path: &std::ffi::CStr) -> Option<OwnedFd> {
+    // SAFETY: `path` is a valid C string; `open` returns a fresh fd or `-1`.
+    let fd = unsafe { libc::open(path.as_ptr(), DIR_FLAGS) };
+    if fd == -1 {
         return None;
     }
-    let file = OpenOptions::new().read(true).custom_flags(FILE_FLAGS).open(OsStr::from_bytes(path)).ok()?;
-    let found = file.metadata().ok()?;
-    if !found.is_file() || on_special_filesystem(device(found.dev()), &special_filesystems()) {
+    // SAFETY: `fd != -1` is exclusively owned by this call.
+    Some(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn open_dir_at(dirfd: &OwnedFd, name: &[u8]) -> Option<OwnedFd> {
+    let c_name = CString::new(name).ok()?;
+    // SAFETY: `dirfd` is an open directory fd and `c_name` is a valid C string.
+    let fd = unsafe { libc::openat(dirfd.as_raw_fd(), c_name.as_ptr(), DIR_FLAGS) };
+    if fd == -1 {
         return None;
     }
-    // SAFETY: `file` is an open regular file descriptor; we read its flags and clear `O_NONBLOCK`.
-    let flags = clear_nonblock(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) })?;
-    // SAFETY: `file` is an open regular file descriptor and `flags` came from `F_GETFL` above.
-    unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags) };
-    Some(file)
+    // SAFETY: `fd != -1` is exclusively owned by this call.
+    Some(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn open_subdir_at(dirfd: &OwnedFd, name: &[u8]) -> SubdirOpen {
+    let Ok(c_name) = CString::new(name) else {
+        return SubdirOpen::Failed;
+    };
+    // SAFETY: `dirfd` is an open directory fd and `c_name` is a valid C string.
+    let fd = unsafe { libc::openat(dirfd.as_raw_fd(), c_name.as_ptr(), SUBDIR_FLAGS) };
+    if fd != -1 {
+        // SAFETY: `fd != -1` is exclusively owned by this call.
+        return SubdirOpen::Opened(unsafe { OwnedFd::from_raw_fd(fd) });
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ELOOP | libc::ENOTDIR) => SubdirOpen::Symlink,
+        _ => SubdirOpen::Failed,
+    }
+}
+
+fn open_leaf_at(dirfd: &OwnedFd, name: &[u8]) -> LeafOpen {
+    let Ok(c_name) = CString::new(name) else {
+        return LeafOpen::Failed;
+    };
+    // SAFETY: `dirfd` is an open directory fd and `c_name` is a valid C string.
+    let fd = unsafe { libc::openat(dirfd.as_raw_fd(), c_name.as_ptr(), LEAF_FLAGS) };
+    if fd != -1 {
+        // SAFETY: `fd != -1` is exclusively owned by this call.
+        return LeafOpen::Opened(unsafe { OwnedFd::from_raw_fd(fd) });
+    }
+    if std::io::Error::last_os_error().raw_os_error() == Some(libc::ELOOP) {
+        LeafOpen::Symlink
+    } else {
+        LeafOpen::Failed
+    }
+}
+
+fn readlink_at(dirfd: &OwnedFd, name: &[u8], max_len: usize) -> Option<Vec<u8>> {
+    let c_name = CString::new(name).ok()?;
+    let mut buf = vec![0u8; max_len];
+    // SAFETY: `dirfd` is an open directory fd, `c_name` is a valid C string, and `buf` has
+    // capacity `buf.len()`.
+    let n = unsafe { libc::readlinkat(dirfd.as_raw_fd(), c_name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+    let len = usize::try_from(n).ok().filter(|&len| len < buf.len())?;
+    buf.truncate(len);
+    Some(buf)
 }
 
 /// Device `(major, minor)` pair matching `/proc/self/mountinfo`.
@@ -307,6 +413,18 @@ unsafe fn copy_volatile(mut src: *const u8, dst: &mut [u8]) {
     }
 }
 
+struct MappedGuard {
+    ptr: *mut libc::c_void,
+    len: usize,
+}
+
+impl Drop for MappedGuard {
+    fn drop(&mut self) {
+        // SAFETY: `self.ptr` was returned by `mmap` with length `self.len` and is unmapped once.
+        unsafe { libc::munmap(self.ptr, self.len) };
+    }
+}
+
 /// Maps only the page-aligned window covering `range` and copies bytes via volatile reads.
 pub fn read_mapped_range(object: OwnedFd, range: Range<u64>) -> Result<Vec<Vec<u8>>, Refused> {
     read_mapped_range_chunked(object, range, CHUNK_BYTES)
@@ -318,18 +436,22 @@ fn read_mapped_range_chunked(object: OwnedFd, range: Range<u64>, chunk_bytes: us
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     let page = u64::try_from(page).ok().and_then(std::num::NonZeroU64::new).ok_or(invalid)?;
     let window = page_window(range, page).ok_or(invalid)?;
+    if window.len == 0 {
+        return Ok(Vec::new());
+    }
     let offset = libc::off_t::try_from(window.aligned).map_err(|_| invalid)?;
-    // SAFETY: maps only the page-aligned window covering `range` read-only and unmaps before return.
+    // SAFETY: maps only the page-aligned window covering `range` read-only; unmapped by `MappedGuard`.
     let mapped = unsafe {
         libc::mmap(std::ptr::null_mut(), window.mapped, libc::PROT_READ, libc::MAP_SHARED, object.as_raw_fd(), offset)
     };
     if mapped == libc::MAP_FAILED {
         return Err(invalid);
     }
+    let guard = MappedGuard { ptr: mapped, len: window.mapped };
     let step = chunk_bytes.max(1);
     let mut pieces = Vec::new();
     // SAFETY: `window.lead <= window.mapped`, so `base` lies within the live mapping.
-    let base = unsafe { mapped.cast::<u8>().add(window.lead) };
+    let base = unsafe { guard.ptr.cast::<u8>().add(window.lead) };
     for copied in (0..window.len).step_by(step) {
         let count = (window.len - copied).min(step);
         let mut piece = vec![0u8; count];
@@ -337,8 +459,7 @@ fn read_mapped_range_chunked(object: OwnedFd, range: Range<u64>, chunk_bytes: us
         unsafe { copy_volatile(base.add(copied), &mut piece) };
         pieces.push(piece);
     }
-    // SAFETY: `mapped` was returned by `mmap` with length `window.mapped` and is unmapped once.
-    unsafe { libc::munmap(mapped, window.mapped) };
+    drop(guard);
     Ok(pieces)
 }
 
@@ -365,6 +486,28 @@ mod tests {
         assert_ne!(FILE_FLAGS & libc::O_NOCTTY, 0);
         assert_ne!(SHARED_MEMORY_FLAGS & libc::O_NONBLOCK, 0);
         assert_ne!(SHARED_MEMORY_FLAGS & libc::O_CLOEXEC, 0);
+        assert_ne!(DIR_FLAGS & libc::O_DIRECTORY, 0);
+        assert_ne!(DIR_FLAGS & libc::O_CLOEXEC, 0);
+        assert_ne!(LEAF_FLAGS & libc::O_NONBLOCK, 0);
+        assert_ne!(LEAF_FLAGS & libc::O_NOFOLLOW, 0);
+        assert_ne!(LEAF_FLAGS & libc::O_CLOEXEC, 0);
+        assert_ne!(SUBDIR_FLAGS & libc::O_DIRECTORY, 0);
+        assert_ne!(SUBDIR_FLAGS & libc::O_NOFOLLOW, 0);
+        assert_ne!(SUBDIR_FLAGS & libc::O_CLOEXEC, 0);
+
+        // `is_refused_prefix` leaves bare `/dev` open so `/dev/shm/...` can traverse it, while
+        // refusing `/proc`, `/sys`, and any non-shm child of `/dev`.
+        assert!(!is_refused_prefix(&[b"dev".to_vec()]));
+        assert!(!is_refused_prefix(&[b"dev".to_vec(), b"shm".to_vec()]));
+        assert!(is_refused_prefix(&[b"dev".to_vec(), b"fd".to_vec()]));
+        assert!(is_refused_prefix(&[b"proc".to_vec()]));
+        assert!(is_refused_prefix(&[b"sys".to_vec()]));
+
+        // `open_abs_dir` / `open_dir_at` return `None` on missing directories, and `readlink_at`
+        // refuses non-symlinks and targets filling the buffer.
+        assert!(open_abs_dir(c"/nonexistent_apack_v2_dir").is_none());
+        let root_fd = open_abs_dir(c"/").expect("open root");
+        assert!(open_dir_at(&root_fd, b"nonexistent_apack_v2_dir").is_none());
 
         // Device extraction and special mount detection.
         let root_dev = device(std::fs::metadata("/").expect("root meta").dev());
@@ -395,6 +538,10 @@ mod tests {
         let f3 = File::open(&path).expect("open 3");
         let mapped_chunks = read_mapped_range_chunked(OwnedFd::from(f3), 1..8, 3).expect("mapped chunked");
         assert_eq!(mapped_chunks, vec![b"123".to_vec(), b"456".to_vec(), b"7".to_vec()]);
+        let f4 = File::open(&path).expect("open 4");
+        assert_eq!(read_mapped_range(OwnedFd::from(f4), 2..6).expect("read_mapped_range"), vec![b"2345".to_vec()]);
+        let f5 = File::open(&path).expect("open 5");
+        assert_eq!(read_mapped_range(OwnedFd::from(f5), 0..0).expect("empty aligned range"), Vec::<Vec<u8>>::new());
 
         // `/dev/fd/<N>` duplicating an open regular-file fd MUST be refused by `path_reaches_refused`
         // before `open()`, even though its post-open `fstat` device is the regular disk.
@@ -448,59 +595,88 @@ mod tests {
         assert!(on_special_filesystem((0, 6), &mounts));
         assert!(!on_special_filesystem((0, 7), &mounts));
 
-        // Thorough left-to-right symlink and path_reaches_refused checks.
+        // Thorough left-to-right `openat` + `O_NOFOLLOW` symlink and boundary checks.
         let dir = tempfile::tempdir().expect("tempdir");
         let fifo = dir.path().join("pipe.fifo");
         let fifo_c = CString::new(fifo.as_os_str().as_bytes()).expect("cstr");
         // SAFETY: creates a temporary FIFO inside `dir` for this test.
         assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
         assert!(open_file(fifo.as_os_str().as_bytes()).is_none());
+        assert!(open_file(b"").is_none());
+        assert!(open_file(b"/").is_none());
+        assert!(open_file(b"/dev").is_none());
+        assert!(open_file(dir.path().as_os_str().as_bytes()).is_none());
 
+        let real = dir.path().join("ok.bin");
+        std::fs::write(&real, b"hello").expect("write");
+        let keep_fd = File::open(&real).expect("keep regular fd");
+        let dev_fd_n = format!("/dev/fd/{}", keep_fd.as_raw_fd());
+
+        // Symlink to `/dev/fd/<N>` (regular-file fd!) is refused during the openat walk.
         let esc = dir.path().join("esc");
-        std::os::unix::fs::symlink("/dev/fd/0", &esc).expect("symlink");
-        assert!(path_reaches_refused(esc.as_os_str().as_bytes()));
+        std::os::unix::fs::symlink(&dev_fd_n, &esc).expect("symlink");
         assert!(open_file(esc.as_os_str().as_bytes()).is_none());
         assert!(open_file(b"/tmp/bad\0path").is_none());
 
-        // Symlink loop fails closed.
+        // Symlink loop (leaf and directory) fails closed cleanly.
         let loop_a = dir.path().join("loop_a");
         let loop_b = dir.path().join("loop_b");
         std::os::unix::fs::symlink(&loop_b, &loop_a).expect("loop a");
         std::os::unix::fs::symlink(&loop_a, &loop_b).expect("loop b");
-        assert!(path_reaches_refused(loop_a.as_os_str().as_bytes()));
+        assert!(open_file(loop_a.as_os_str().as_bytes()).is_none());
+        assert!(open_file(loop_a.join("child").as_os_str().as_bytes()).is_none());
 
-        // Symlink to /dev/shm followed by `../fd/0` is refused.
+        // Directory symlink to `/dev/shm` followed by `../fd/<N>` is refused.
         let shm_link = dir.path().join("shm_link");
         std::os::unix::fs::symlink("/dev/shm", &shm_link).expect("shm link");
-        let escaped = shm_link.join("../fd/0");
-        assert!(path_reaches_refused(escaped.as_os_str().as_bytes()));
+        let escaped = shm_link.join(format!("../fd/{}", keep_fd.as_raw_fd()));
         assert!(open_file(escaped.as_os_str().as_bytes()).is_none());
 
-        // Direct `/dev/shm/...` and `/dev/./shm/...` allowed; `/dev` and `/dev/fd/../shm/ok` refused.
-        assert!(!path_reaches_refused(b"/dev/shm/picture"));
-        assert!(!path_reaches_refused(b"/dev/./shm/picture"));
-        assert!(path_reaches_refused(b"/dev"));
-        assert!(path_reaches_refused(b"/dev/fd/../shm/ok"));
-        assert!(path_reaches_refused(b"/proc/../tmp/ok"));
-
-        // Relative path climbing to `/dev/fd/0` refused; one level short allowed.
+        // Relative path climbing to `/dev/fd/<N>` is refused; valid relative path works.
         let cwd = std::env::current_dir().expect("cwd");
         let depth = cwd.as_os_str().as_bytes().split(|&b| b == b'/').filter(|s| !s.is_empty()).count();
         assert!(depth >= 1);
-        let to_root = format!("{}dev/fd/0", "../".repeat(depth));
-        let one_short = format!("{}dev/fd/0", "../".repeat(depth - 1));
-        assert!(path_reaches_refused(to_root.as_bytes()));
-        assert!(!path_reaches_refused(one_short.as_bytes()));
-        assert!(!path_reaches_refused(b"nonexistent_apack_v2_rel.bin"));
+        let to_root_fd = format!("{}dev/fd/{}", "../".repeat(depth), keep_fd.as_raw_fd());
+        assert!(open_file(to_root_fd.as_bytes()).is_none());
+        assert!(open_file(b"nonexistent_apack_v2_rel.bin").is_none());
+        // Relative path to `Cargo.toml` inside workspace succeeds.
+        if cwd.join("Cargo.toml").is_file() {
+            assert!(open_file(b"./Cargo.toml").is_some());
+        }
 
-        // Real file opens cleanly and clears O_NONBLOCK; non-NotFound errors (ENOTDIR) fail closed.
-        let real = dir.path().join("ok.bin");
-        std::fs::write(&real, b"hello").expect("write");
-        assert!(path_reaches_refused(real.join("child").as_os_str().as_bytes()));
+        // Non-directory prefix fails closed.
+        assert!(open_file(real.join("child").as_os_str().as_bytes()).is_none());
+
+        // Relative leaf symlink, absolute leaf symlink, directory symlink (relative & absolute),
+        // and `.` / `..` traversal to a regular file all succeed and clear `O_NONBLOCK`.
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).expect("sub dir");
+        let inside = sub.join("inside.bin");
+        std::fs::write(&inside, b"world").expect("write inside");
+
+        let rel_dir_link = dir.path().join("rel_dir");
+        std::os::unix::fs::symlink("sub", &rel_dir_link).expect("rel dir link");
+        assert!(open_file(rel_dir_link.join("./inside.bin").as_os_str().as_bytes()).is_some());
+
+        let abs_dir_link = dir.path().join("abs_dir");
+        std::os::unix::fs::symlink(&sub, &abs_dir_link).expect("abs dir link");
+        assert!(open_file(abs_dir_link.join("inside.bin").as_os_str().as_bytes()).is_some());
+
+        let abs_leaf_link = sub.join("abs_leaf");
+        std::os::unix::fs::symlink(&real, &abs_leaf_link).expect("abs leaf link");
+        assert!(open_file(abs_leaf_link.as_os_str().as_bytes()).is_some());
+
+        let dotdot = sub.join("../ok.bin");
+        assert!(open_file(dotdot.as_os_str().as_bytes()).is_some());
 
         let good_link = dir.path().join("good_link");
         std::os::unix::fs::symlink("ok.bin", &good_link).expect("good link");
-        assert!(!path_reaches_refused(good_link.as_os_str().as_bytes()));
+        // Verify `readlink_at` fails on non-symlinks and on truncated targets (`len >= max_len`).
+        let dir_c = CString::new(dir.path().as_os_str().as_bytes()).expect("dir cstr");
+        let dir_fd = open_abs_dir(&dir_c).expect("open temp dir");
+        assert!(readlink_at(&dir_fd, b"ok.bin", 64).is_none());
+        assert!(readlink_at(&dir_fd, b"good_link", 6).is_none(), "exact-length target truncated");
+        assert_eq!(readlink_at(&dir_fd, b"good_link", 7), Some(b"ok.bin".to_vec()));
         let opened = open_file(good_link.as_os_str().as_bytes()).expect("open regular file");
         // SAFETY: reading flags on freshly opened file descriptor.
         let fl = unsafe { libc::fcntl(opened.as_raw_fd(), libc::F_GETFL) };

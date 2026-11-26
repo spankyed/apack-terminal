@@ -29,7 +29,7 @@ pub struct EpollWaker {
 impl EpollWaker {
     /// Wakes a sleeping [`EpollPoller::poll`] call promptly (coalescing redundant increments).
     pub fn wake(&self) -> io::Result<()> {
-        if self.pending.swap(true, Ordering::AcqRel) {
+        if self.pending.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
         let val: u64 = 1;
@@ -39,7 +39,7 @@ impl EpollWaker {
             let rc = unsafe {
                 libc::write(self.event_fd.as_raw_fd(), std::ptr::from_ref(&val).cast(), std::mem::size_of::<u64>())
             };
-            if rc >= 0 {
+            if rc != -1 {
                 return Ok(());
             }
             let err = io::Error::last_os_error();
@@ -47,7 +47,7 @@ impl EpollWaker {
                 WakeErrAction::Retry => continue,
                 WakeErrAction::AlreadyQueued => return Ok(()),
                 WakeErrAction::Fail => {
-                    self.pending.store(false, Ordering::Release);
+                    self.pending.store(false, Ordering::SeqCst);
                     return Err(err);
                 }
             }
@@ -56,6 +56,10 @@ impl EpollWaker {
 }
 
 /// Linux `epoll` multiplexer with a coalescing `eventfd` waker.
+///
+/// Entries registered or modified to [`Interest::NONE`] are removed from the kernel `epoll`
+/// interest set so paused sessions never busy-spin on unconditional `EPOLLHUP`/`EPOLLERR`
+/// notifications (matching [`crate::pty_poller::PollPoller`] semantics).
 pub struct EpollPoller {
     epoll_fd: OwnedFd,
     event_fd: Arc<OwnedFd>,
@@ -69,18 +73,18 @@ impl EpollPoller {
     pub fn new() -> io::Result<Self> {
         // SAFETY: `epoll_create1(EPOLL_CLOEXEC)` returns a fresh fd or `-1` on error.
         let raw_ep = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-        if raw_ep < 0 {
+        if raw_ep == -1 {
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: `raw_ep >= 0` is exclusively owned by this function.
+        // SAFETY: `raw_ep != -1` is exclusively owned by this function.
         let epoll_fd = unsafe { OwnedFd::from_raw_fd(raw_ep) };
 
         // SAFETY: `eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)` returns a fresh fd or `-1`.
         let raw_ev = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-        if raw_ev < 0 {
+        if raw_ev == -1 {
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: `raw_ev >= 0` is exclusively owned by this function.
+        // SAFETY: `raw_ev != -1` is exclusively owned by this function.
         let event_fd = Arc::new(unsafe { OwnedFd::from_raw_fd(raw_ev) });
 
         let mut ev = libc::epoll_event { events: libc::EPOLLIN as u32, u64: WAKE_SENTINEL };
@@ -111,10 +115,13 @@ impl EpollPoller {
         if self.entries.contains_key(&token) {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, "duplicate poll token"));
         }
-        let mut ev = libc::epoll_event { events: interest_to_epoll(interest), u64: token.0 };
-        // SAFETY: `self.epoll_fd` is valid and `fd` is supplied by caller.
-        if unsafe { libc::epoll_ctl(self.epoll_fd.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &mut ev) } != 0 {
-            return Err(io::Error::last_os_error());
+        let mask = interest_to_epoll(interest);
+        if mask != 0 {
+            let mut ev = libc::epoll_event { events: mask, u64: token.0 };
+            // SAFETY: `self.epoll_fd` is valid and `fd` is supplied by caller.
+            if unsafe { libc::epoll_ctl(self.epoll_fd.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &mut ev) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
         }
         self.entries.insert(token, (fd, interest));
         Ok(())
@@ -126,10 +133,29 @@ impl EpollPoller {
             .entries
             .get_mut(&token)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown poll token"))?;
-        let mut ev = libc::epoll_event { events: interest_to_epoll(interest), u64: token.0 };
-        // SAFETY: `self.epoll_fd` and `entry.0` are currently registered descriptors.
-        if unsafe { libc::epoll_ctl(self.epoll_fd.as_raw_fd(), libc::EPOLL_CTL_MOD, entry.0, &mut ev) } != 0 {
-            return Err(io::Error::last_os_error());
+        let was_armed = interest_to_epoll(entry.1) != 0;
+        let new_mask = interest_to_epoll(interest);
+        let now_armed = new_mask != 0;
+        let fd = entry.0;
+        match (was_armed, now_armed) {
+            (false, false) => {}
+            (false, true) => {
+                let mut ev = libc::epoll_event { events: new_mask, u64: token.0 };
+                // SAFETY: `self.epoll_fd` is valid and `fd` is currently unregistered in epoll.
+                if unsafe { libc::epoll_ctl(self.epoll_fd.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &mut ev) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            (true, false) => {
+                self.epoll_del_ignore_closed(fd)?;
+            }
+            (true, true) => {
+                let mut ev = libc::epoll_event { events: new_mask, u64: token.0 };
+                // SAFETY: `self.epoll_fd` and `fd` are currently registered descriptors.
+                if unsafe { libc::epoll_ctl(self.epoll_fd.as_raw_fd(), libc::EPOLL_CTL_MOD, fd, &mut ev) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
         }
         entry.1 = interest;
         Ok(())
@@ -137,13 +163,19 @@ impl EpollPoller {
 
     /// Removes `token` from the `epoll` interest set.
     pub fn deregister(&mut self, token: PollToken) -> io::Result<()> {
-        let (fd, _) =
+        let (fd, interest) =
             self.entries.remove(&token).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown poll token"))?;
+        if interest_to_epoll(interest) != 0 {
+            self.epoll_del_ignore_closed(fd)?;
+        }
+        Ok(())
+    }
+
+    fn epoll_del_ignore_closed(&self, fd: RawFd) -> io::Result<()> {
         // SAFETY: `self.epoll_fd` is valid; `EPOLL_CTL_DEL` ignores the event pointer on Linux >= 2.6.9.
         let rc = unsafe { libc::epoll_ctl(self.epoll_fd.as_raw_fd(), libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut()) };
         if rc != 0 {
             let err = io::Error::last_os_error();
-            // Kernel automatically removes closed fds from epoll sets, returning ENOENT/EBADF.
             if !matches!(err.raw_os_error(), Some(libc::ENOENT | libc::EBADF)) {
                 return Err(err);
             }
@@ -176,7 +208,7 @@ impl EpollPoller {
                     timeout_ms,
                 )
             };
-            if rc >= 0 {
+            if rc != -1 {
                 break rc as usize;
             }
             let err = io::Error::last_os_error();
@@ -199,12 +231,28 @@ impl EpollPoller {
     }
 
     fn drain_event_fd(&self) {
-        self.wake_pending.store(false, Ordering::Release);
+        // Drain `eventfd` completely BEFORE clearing `wake_pending` so a concurrent `wake()` can
+        // never have its increment swallowed while leaving `wake_pending == true`.
         let mut counter: u64 = 0;
-        // SAFETY: `self.event_fd` is an open non-blocking `eventfd`; reading 8 bytes resets it.
-        let _ = unsafe {
-            libc::read(self.event_fd.as_raw_fd(), std::ptr::from_mut(&mut counter).cast(), std::mem::size_of::<u64>())
-        };
+        loop {
+            // SAFETY: `self.event_fd` is an open non-blocking `eventfd`; reading 8 bytes resets it.
+            let rc = unsafe {
+                libc::read(
+                    self.event_fd.as_raw_fd(),
+                    std::ptr::from_mut(&mut counter).cast(),
+                    std::mem::size_of::<u64>(),
+                )
+            };
+            if rc != -1 {
+                break;
+            }
+            let err = io::Error::last_os_error();
+            if is_interrupted(&err) {
+                continue;
+            }
+            break;
+        }
+        self.wake_pending.store(false, Ordering::SeqCst);
     }
 }
 
@@ -254,15 +302,17 @@ mod tests {
     }
 
     #[test]
-    fn epoll_poller_multiplexes_pipes_pauses_resumes_wakes_and_detects_hangup() {
+    fn epoll_poller_multiplexes_pipes_pauses_without_hup_spin_wakes_and_handles_closed_deregister() {
         let mut poller = EpollPoller::new().expect("create epoll");
         assert!(poller.is_empty());
         assert_eq!(poller.len(), 0);
 
         let (r1, w1) = create_nonblocking_pipe().expect("pipe 1");
         let (r2, w2) = create_nonblocking_pipe().expect("pipe 2");
+        let (r3, w3) = create_nonblocking_pipe().expect("pipe 3");
         let t1 = PollToken(1);
         let t2 = PollToken(2);
+        let t3 = PollToken(3);
 
         // Sentinel token rejected.
         assert_eq!(
@@ -276,8 +326,14 @@ mod tests {
             io::ErrorKind::AlreadyExists
         );
         poller.register(t2, r2.as_raw_fd(), Interest::NONE).expect("reg t2 paused");
-        assert_eq!(poller.len(), 2);
+        poller.register(t3, r3.as_raw_fd(), Interest::READ).expect("reg t3");
+        assert_eq!(poller.len(), 3);
         assert!(!poller.is_empty());
+
+        // Pausing t3 (`READ -> NONE`) and closing w3 must NOT spin on `EPOLLHUP` while paused.
+        poller.modify(t3, Interest::NONE).expect("pause t3");
+        poller.modify(t3, Interest::NONE).expect("re-pause t3 noop");
+        drop(w3);
 
         assert_eq!(
             poller.modify(PollToken(99), Interest::READ).expect_err("not found").kind(),
@@ -287,7 +343,15 @@ mod tests {
 
         let mut events = Vec::new();
         assert!(!poller.poll(&mut events, Some(Duration::from_millis(10))).expect("idle"));
-        assert!(events.is_empty());
+        assert!(events.is_empty(), "paused hung-up fd t3 must not fire EPOLLHUP: {events:?}");
+
+        // Resuming t3 surfaces the pending hangup cleanly.
+        poller.modify(t3, Interest::READ).expect("resume t3");
+        assert!(!poller.poll(&mut events, Some(Duration::from_millis(50))).expect("t3 hangup"));
+        assert!(events.iter().any(|e| e.token == t3 && e.hangup));
+        // Closing r3 before deregister exercises `ENOENT | EBADF` cleanup gracefully.
+        drop(r3);
+        poller.deregister(t3).expect("dereg closed fd");
 
         assert_eq!(write_fd_nonblocking(w1.as_raw_fd(), b"one").expect("w1"), 3);
         assert_eq!(write_fd_nonblocking(w2.as_raw_fd(), b"two").expect("w2"), 3);
@@ -302,6 +366,8 @@ mod tests {
         assert_eq!(&buf[..3], b"one");
 
         poller.modify(t2, Interest::READ).expect("unpause t2");
+        poller.modify(t2, Interest::READ_WRITE).expect("active -> active mod");
+        poller.modify(t2, Interest::READ).expect("back to read");
         assert!(!poller.poll(&mut events, Some(Duration::from_millis(50))).expect("poll t2"));
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].token, t2);
@@ -309,7 +375,7 @@ mod tests {
         assert_eq!(read_fd_nonblocking(r2.as_raw_fd(), &mut buf).expect("r2"), NonBlockingRead::Bytes(3));
         assert_eq!(&buf[..3], b"two");
 
-        let tw = PollToken(3);
+        let tw = PollToken(4);
         poller.register(tw, w1.as_raw_fd(), Interest::WRITE).expect("reg w1");
         assert!(!poller.poll(&mut events, Some(Duration::from_millis(50))).expect("poll w1"));
         assert!(events.iter().any(|e| e.token == tw && e.writable));
@@ -331,7 +397,8 @@ mod tests {
         assert_eq!(read_fd_nonblocking(r1.as_raw_fd(), &mut buf).expect("eof"), NonBlockingRead::Eof);
 
         poller.deregister(t1).expect("dereg t1");
-        poller.deregister(t2).expect("dereg t2");
+        poller.modify(t2, Interest::NONE).expect("pause t2 before dereg");
+        poller.deregister(t2).expect("dereg paused t2");
         assert!(poller.is_empty());
     }
 }

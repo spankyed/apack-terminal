@@ -47,32 +47,35 @@ struct PauseGate {
 #[derive(Default)]
 struct PauseState {
     paused: bool,
-    closed: bool,
+    draining: bool,
 }
 
 impl PauseGate {
     fn set_paused(&self, paused: bool) {
         let mut st = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if st.draining {
+            return;
+        }
         st.paused = paused;
         if !paused {
             self.changed.notify_all();
         }
     }
 
-    fn close(&self) {
+    /// Permanently unpauses the reader so it drains all remaining ConPTY output through true EOF.
+    fn begin_drain(&self) {
         let mut st = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        st.closed = true;
+        st.draining = true;
         st.paused = false;
         self.changed.notify_all();
     }
 
-    /// Blocks while paused; returns `false` if closed.
-    fn wait_unpaused(&self) -> bool {
+    /// Blocks while paused (and not draining).
+    fn wait_unpaused(&self) {
         let mut st = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        while st.paused && !st.closed {
+        while st.paused && !st.draining {
             st = self.changed.wait(st).unwrap_or_else(std::sync::PoisonError::into_inner);
         }
-        !st.closed
     }
 }
 
@@ -183,7 +186,8 @@ impl ConPtyBridge {
             .name("conpty-reader".to_owned())
             .spawn(move || {
                 let mut buf = vec![0u8; READ_CHUNK_BYTES];
-                while reader_pause.wait_unpaused() {
+                loop {
+                    reader_pause.wait_unpaused();
                     match reader.read(&mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
@@ -248,7 +252,7 @@ impl ConPtyBridge {
             return;
         }
         self.input.close();
-        self.pause.close();
+        self.pause.begin_drain();
         let master = self.master.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
         if let Some(master) = master {
             let _ = std::thread::Builder::new().name("conpty-drop".to_owned()).spawn(move || drop(master));
@@ -270,12 +274,56 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn conpty_bridge_runs_command_and_closes_nonblocking() {
+    fn pause_gate_blocks_unblocks_and_drains_permanently() {
+        let gate = Arc::new(PauseGate::default());
+        gate.set_paused(true);
+        let gate_bg = Arc::clone(&gate);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            gate_bg.wait_unpaused();
+            let _ = tx.send(());
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(40)).is_err(), "paused gate must block");
+        gate.set_paused(false);
+        rx.recv_timeout(Duration::from_secs(2)).expect("unpaused gate must wake");
+
+        // Once draining begins, `set_paused(true)` is ignored so reader never stalls before EOF.
+        gate.begin_drain();
+        gate.set_paused(true);
+        gate.wait_unpaused();
+    }
+
+    #[test]
+    fn input_queue_enforces_bounds_fifo_broken_and_close() {
+        let q = InputQueue::new();
+        q.push(Vec::new()).expect("empty push is a no-op");
+        q.push(b"abc".to_vec()).expect("push 1");
+        q.push(vec![0u8; MAX_INPUT_QUEUE_BYTES - 3]).expect("fill to exact cap");
+        let full_err = q.push(vec![1u8]).expect_err("over cap fails");
+        assert!(matches!(full_err, OsError::Io { source, .. } if source.kind() == io::ErrorKind::WouldBlock));
+
+        assert_eq!(q.pop(), Some(b"abc".to_vec()));
+        assert_eq!(q.pop().expect("big chunk").len(), MAX_INPUT_QUEUE_BYTES - 3);
+
+        // Broken queue clears buffered data and rejects further writes with BrokenPipe.
+        q.push(b"pending".to_vec()).expect("push before broken");
+        q.mark_broken();
+        let broken_err = q.push(b"x".to_vec()).expect_err("broken rejects");
+        assert!(matches!(broken_err, OsError::Io { source, .. } if source.kind() == io::ErrorKind::BrokenPipe));
+
+        q.close();
+        assert_eq!(q.pop(), None);
+        let closed_err = q.push(b"y".to_vec()).expect_err("closed rejects");
+        assert!(matches!(closed_err, OsError::Io { source, .. } if source.kind() == io::ErrorKind::BrokenPipe));
+    }
+
+    #[test]
+    fn conpty_bridge_runs_interactive_write_pause_resume_and_drains_on_close() {
         let config = PtySpawnConfig {
             size: GridSize::new(80, 24).expect("grid"),
             cell_px: CellPx { width: 8, height: 16 },
             shell: Some("cmd.exe".to_owned()),
-            args: vec!["/C".to_owned(), "echo APACK_WIN_OK".to_owned()],
+            args: vec!["/C".to_owned(), "set /p line= && echo APACK_WIN_GOT:%line%".to_owned()],
             env: vec![],
             unset: vec![],
             cwd: None,
@@ -289,12 +337,15 @@ mod tests {
         .expect("start bridge");
 
         bridge.resize(GridSize::new(90, 25).expect("grid"), CellPx { width: 8, height: 16 }).expect("resize");
-        bridge.write(Vec::new()).expect("empty write ok");
+        bridge.set_paused(true);
         bridge.set_paused(false);
+        bridge.write(b"HELLO\r\n".to_vec()).expect("write input");
 
         let status = spawned.child.wait().expect("wait child");
         assert!(status.success());
-        // Closing master flushes ConPTY output and terminates the reader stream.
+        // Closing master flushes ConPTY output and terminates the reader stream without losing output.
+        bridge.close_master_async();
+        // Second call is idempotent.
         bridge.close_master_async();
 
         let mut collected = Vec::new();
@@ -308,7 +359,7 @@ mod tests {
             }
         }
         let text = String::from_utf8_lossy(&collected);
-        assert!(text.contains("APACK_WIN_OK"), "unexpected ConPTY output: {text:?}");
+        assert!(text.contains("APACK_WIN_GOT:HELLO"), "unexpected ConPTY output: {text:?}");
         assert!(wakes.load(Ordering::Relaxed) >= 1);
     }
 }

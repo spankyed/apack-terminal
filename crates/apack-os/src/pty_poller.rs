@@ -100,14 +100,14 @@ pub(crate) fn classify_wake_error(err: &io::Error) -> WakeErrAction {
 impl PollWaker {
     /// Wakes a sleeping [`PollPoller::poll`] call promptly (coalescing redundant writes).
     pub fn wake(&self) -> io::Result<()> {
-        if self.pending.swap(true, Ordering::AcqRel) {
+        if self.pending.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
         let byte = [1u8; 1];
         loop {
             // SAFETY: `self.write_end` is an open non-blocking pipe write fd owned by `Arc`.
             let rc = unsafe { libc::write(self.write_end.as_raw_fd(), byte.as_ptr().cast(), 1) };
-            if rc >= 0 {
+            if rc != -1 {
                 return Ok(());
             }
             let err = io::Error::last_os_error();
@@ -115,7 +115,7 @@ impl PollWaker {
                 WakeErrAction::Retry => continue,
                 WakeErrAction::AlreadyQueued => return Ok(()),
                 WakeErrAction::Fail => {
-                    self.pending.store(false, Ordering::Release);
+                    self.pending.store(false, Ordering::SeqCst);
                     return Err(err);
                 }
             }
@@ -250,9 +250,12 @@ impl PollPoller {
     }
 
     fn drain_wake_pipe(&self) {
-        self.wake_pending.store(false, Ordering::Release);
+        // Drain the pipe completely BEFORE clearing `wake_pending` so a concurrent `wake()` cannot
+        // have its byte drained while leaving `wake_pending == true` (which would cause a permanent
+        // lost-wakeup deadlock).
         let mut drain = [0u8; 64];
         while matches!(read_fd_nonblocking(self.wake_read.as_raw_fd(), &mut drain), Ok(NonBlockingRead::Bytes(_))) {}
+        self.wake_pending.store(false, Ordering::SeqCst);
     }
 }
 
@@ -282,7 +285,31 @@ pub fn duration_to_poll_timeout_ms(timeout: Option<Duration>) -> libc::c_int {
 }
 
 /// Creates a `O_NONBLOCK | FD_CLOEXEC` Unix pipe pair `(read_end, write_end)`.
+///
+/// Uses atomic `pipe2(O_NONBLOCK | O_CLOEXEC)` on Linux and portable `pipe` + `fcntl` elsewhere.
 pub(crate) fn create_nonblocking_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: `fds` is a valid 2-element array for `pipe2(2)` to populate atomically with
+        // `O_NONBLOCK | O_CLOEXEC`.
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `pipe2(2)` succeeded and returned two freshly opened exclusive descriptors.
+        let read_end = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        // SAFETY: `pipe2(2)` succeeded and returned two freshly opened exclusive descriptors.
+        let write_end = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        Ok((read_end, write_end))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        create_nonblocking_pipe_posix()
+    }
+}
+
+/// Portable POSIX `pipe` + `FD_CLOEXEC` + `O_NONBLOCK` helper (compiled and tested on all Unix).
+fn create_nonblocking_pipe_posix() -> io::Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0 as RawFd; 2];
     // SAFETY: `fds` is a valid 2-element array for `pipe(2)` to populate.
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
@@ -355,6 +382,16 @@ mod tests {
             decode_poll_revents(tok, libc::POLLNVAL),
             Some(PollEvent { token: tok, readable: true, writable: false, hangup: true })
         );
+
+        // Verify both `create_nonblocking_pipe` and `create_nonblocking_pipe_posix` set CLOEXEC + NONBLOCK.
+        for (r, w) in [create_nonblocking_pipe().expect("pipe"), create_nonblocking_pipe_posix().expect("posix pipe")] {
+            for fd in [r.as_raw_fd(), w.as_raw_fd()] {
+                // SAFETY: `F_GETFD` on open pipe fd.
+                assert_ne!(unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC, 0);
+                // SAFETY: `F_GETFL` on open pipe fd.
+                assert_ne!(unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_NONBLOCK, 0);
+            }
+        }
 
         // Multi-chunk wake pipe drain clears > 64 bytes in a single poll call.
         let mut poller = PollPoller::new().expect("poller");

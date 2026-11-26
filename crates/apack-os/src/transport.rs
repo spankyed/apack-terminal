@@ -151,11 +151,39 @@ pub fn ensure_private_directory(socket: &str) -> Result<(), OsError> {
     }
 }
 
+#[cfg(unix)]
+static UMASK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(unix)]
+struct UmaskGuard {
+    prev: libc::mode_t,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(unix)]
+impl UmaskGuard {
+    fn acquire(mask: libc::mode_t) -> Self {
+        let lock = UMASK_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: `umask` takes a mode mask and returns the previous mask; serialized by `UMASK_LOCK`.
+        let prev = unsafe { libc::umask(mask) };
+        Self { prev, _lock: lock }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UmaskGuard {
+    fn drop(&mut self) {
+        // SAFETY: restores the exact previous umask captured under `UMASK_LOCK` before `_lock` drops.
+        unsafe { libc::umask(self.prev) };
+    }
+}
+
 /// Binds a user-private local listener at `socket`.
 ///
 /// - On Unix: refuses to overwrite any pre-existing non-socket file, narrows process umask to
-///   `0o177` around bind so the socket is owner-only from creation, and overwrites stale socket
-///   files once [`acquire_socket_hold`] has established exclusivity.
+///   `0o177` around bind (serialized via `UMASK_LOCK` and restored via RAII `Drop`) so the socket
+///   is owner-only from creation, and overwrites stale socket files once [`acquire_socket_hold`]
+///   has established exclusivity.
 /// - On Windows: attaches [`crate::security::owner_only_security_descriptor`] so `Everyone` never
 ///   receives pipe access, mapping `AddrInUse` / `PermissionDenied` to [`OsError::AlreadyHeld`].
 pub fn bind_local_listener(socket: &str) -> Result<Listener, OsError> {
@@ -180,15 +208,9 @@ pub fn bind_local_listener(socket: &str) -> Result<Listener, OsError> {
         options.security_descriptor(sd)
     };
 
-    // SAFETY: `umask` takes a mode mask and returns the previous mask; it cannot fail.
     #[cfg(unix)]
-    let prev_umask = unsafe { libc::umask(0o177) };
+    let _umask = UmaskGuard::acquire(0o177);
     let bound = options.create_sync();
-    // SAFETY: restoring the exact previous umask captured above.
-    #[cfg(unix)]
-    unsafe {
-        libc::umask(prev_umask);
-    }
 
     match bound {
         Ok(listener) => Ok(listener),
@@ -301,7 +323,6 @@ pub fn write_vectored_some(writer: &mut impl Write, slices: &[IoSlice<'_>]) -> i
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
 
     #[test]
     fn start_grace_parses_valid_and_falls_back() {
@@ -383,6 +404,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unix_private_dir_hold_bind_peer_and_nonblocking_roundtrip() {
+        use std::io::Read;
         use std::os::fd::AsRawFd;
         use std::os::unix::fs::PermissionsExt;
 
@@ -433,6 +455,17 @@ mod tests {
         let dup_lock_fd = hold.lock.try_clone().expect("dup lock fd");
 
         let listener = bind_local_listener(&sock_str).expect("bind listener");
+        // Verify `UmaskGuard::drop` restored the process umask (not left stuck at 0o177).
+        {
+            let _lock = UMASK_LOCK.lock().expect("umask lock");
+            // SAFETY: probe current umask and restore immediately under `UMASK_LOCK`.
+            let current_umask = unsafe {
+                let cur = libc::umask(0o022);
+                libc::umask(cur);
+                cur
+            };
+            assert_ne!(current_umask, 0o177, "UmaskGuard::drop must restore previous umask");
+        }
         let sock_meta = std::fs::symlink_metadata(&nested).expect("socket meta");
         assert_eq!(sock_meta.permissions().mode() & 0o077, 0, "socket must be owner-only");
         let lfd = listener_raw_fd(&listener);

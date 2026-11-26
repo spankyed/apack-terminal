@@ -495,6 +495,35 @@ mod tests {
         let (_, high_load) = scanner.read(b"Gt=f;\x98L2\xffE=\x1b\\", |_| {});
         assert_eq!(high_load.expect("high-byte load").source(), &Source::File(b"/a".to_vec()));
 
+        // Empty control block `G;...` and trailing-comma `Gt=f,;...` terminate control data at `;`.
+        let mut empty_ctl = Vec::new();
+        scanner.begin();
+        let (n_empty, load_empty) = scanner.read(b"G;AAAA\x1b\\", |b| empty_ctl.extend_from_slice(b));
+        assert!(load_empty.is_none());
+        assert_eq!(empty_ctl, b"G;");
+        assert_eq!(&b"G;AAAA\x1b\\"[n_empty..], b"AAAA\x1b\\");
+
+        scanner.begin();
+        let (_, trailing_comma) = scanner.read(b"Gt=f,;L2E=\x1b\\", |_| {});
+        assert_eq!(trailing_comma.expect("trailing comma load").source(), &Source::File(b"/a".to_vec()));
+
+        // Overlong key (>11 bytes) followed by `=val,t=f;` and multi-char key followed by `=val,next=1;`:
+        // ignored pairs stay ignored across `,` and terminate cleanly at `;` without parsing trailing keys.
+        let mut ign_fwd = Vec::new();
+        scanner.begin();
+        let (n_ign, load_ign) = scanner.read(b"Gabcdefghijkl=123,t=f;AAAA\x1b\\", |b| ign_fwd.extend_from_slice(b));
+        assert!(load_ign.is_none());
+        assert_eq!(ign_fwd, b"G;");
+        assert_eq!(&b"Gabcdefghijkl=123,t=f;AAAA\x1b\\"[n_ign..], b"AAAA\x1b\\");
+
+        // Multi-char key (`ab=1;`) ends control data at `;` in `ValueIgnored` state.
+        let mut multi_fwd = Vec::new();
+        scanner.begin();
+        let (n_multi, load_multi) = scanner.read(b"Gab=1;BBBB\x1b\\", |b| multi_fwd.extend_from_slice(b));
+        assert!(load_multi.is_none());
+        assert_eq!(multi_fwd, b"G;");
+        assert_eq!(&b"Gab=1;BBBB\x1b\\"[n_multi..], b"BBBB\x1b\\");
+
         // CAN (0x18) drops the string.
         scanner.begin();
         let (n, load) = scanner.read(b"Gt=f;L2E=\x18rest", |_| {});

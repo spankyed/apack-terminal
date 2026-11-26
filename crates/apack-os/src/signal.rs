@@ -192,20 +192,33 @@ pub fn inside_tree(leader: u32, pid: u32) -> bool {
 /// On Linux, opens a `pidfd` pinning `pid` to defeat PID-reuse TOCTOU races between ancestry
 /// verification and signal delivery.
 #[cfg(target_os = "linux")]
-pub(crate) fn try_open_pidfd(pid: i32) -> Option<std::os::fd::OwnedFd> {
+pub(crate) fn try_open_pidfd(pid: i32) -> std::io::Result<std::os::fd::OwnedFd> {
     use std::os::fd::FromRawFd;
 
-    if pid < 1 {
-        return None;
-    }
     // SAFETY: `SYS_pidfd_open` takes `(pid_t, unsigned int flags)` and returns either a newly
     // created file descriptor (`>= 0`) with `O_CLOEXEC` set by the kernel, or `-1` on error.
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0u32) };
-    if fd < 0 {
-        return None;
+    if fd == -1 {
+        return Err(std::io::Error::last_os_error());
     }
-    // SAFETY: `fd >= 0` is a fresh file descriptor owned exclusively by this call.
-    Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as std::os::fd::RawFd) })
+    // SAFETY: `fd != -1` is a fresh file descriptor owned exclusively by this call.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as std::os::fd::RawFd) })
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+enum PidfdOpenFailure {
+    FallbackLegacyKill,
+    Return(OsError),
+}
+
+#[cfg(target_os = "linux")]
+fn classify_pidfd_open_error(err: std::io::Error, leader: u32, pid: u32) -> PidfdOpenFailure {
+    match err.raw_os_error() {
+        Some(libc::ENOSYS) => PidfdOpenFailure::FallbackLegacyKill,
+        Some(libc::ESRCH) => PidfdOpenFailure::Return(OsError::OutsideSession { leader, pid }),
+        _ => PidfdOpenFailure::Return(OsError::io("opening pidfd for session process", err)),
+    }
 }
 
 /// On Linux, sends `sig` to the process pinned by `pidfd`.
@@ -226,7 +239,8 @@ pub(crate) fn pidfd_send_signal_raw(pidfd: &std::os::fd::OwnedFd, sig: libc::c_i
 /// - On Windows: returns `Err(OsError::Unsupported)` honestly (process trees are terminated via
 ///   [`crate::tree::TreeGuard`]).
 /// - On Unix: validates [`kill_target`]; for [`SignalScope::Pid`], verifies [`inside_tree`]
-///   (pinning via `pidfd_open` on Linux to defeat PID reuse) before signaling.
+///   (pinning via `pidfd_open` on Linux to defeat PID reuse, falling back to `libc::kill` only
+///   when `pidfd_open` is unsupported with `ENOSYS`) before signaling.
 pub fn deliver_signal(leader: u32, kind: SignalKind, scope: SignalScope) -> Result<(), OsError> {
     #[cfg(not(unix))]
     {
@@ -241,7 +255,13 @@ pub fn deliver_signal(leader: u32, kind: SignalKind, scope: SignalScope) -> Resu
         if let SignalScope::Pid(pid_target) = scope {
             let pid = pid_target.pid() as u32;
             #[cfg(target_os = "linux")]
-            let pinned_pidfd = try_open_pidfd(target.0);
+            let pinned_pidfd = match try_open_pidfd(target.0) {
+                Ok(fd) => Some(fd),
+                Err(err) => match classify_pidfd_open_error(err, leader, pid) {
+                    PidfdOpenFailure::FallbackLegacyKill => None,
+                    PidfdOpenFailure::Return(os_err) => return Err(os_err),
+                },
+            };
 
             if !inside_tree(leader, pid) {
                 return Err(OsError::OutsideSession { leader, pid });
@@ -413,13 +433,14 @@ mod tests {
         use apack_proto::types::{CellPx, GridSize};
         use std::time::Instant;
 
-        // Spawn a PTY session leader that launches a background `sleep 30` and prints its PID,
-        // then waits so the leader stays alive while we call `hang_up_session_descendants`.
+        // Spawn a PTY session leader that starts a background `sleep 30`, prints `BG:<pid>`, and
+        // actively `wait`s on it so `sh` reaps it immediately (avoiding Linux zombie `kill(0)==0`)
+        // and reports `EXITED:<status>`.
         let config = PtySpawnConfig {
             size: GridSize::new(80, 24).expect("grid"),
             cell_px: CellPx::default(),
             shell: Some("/bin/sh".to_owned()),
-            args: vec!["-c".to_owned(), "sleep 30 & echo BG:$!; read dummy".to_owned()],
+            args: vec!["-c".to_owned(), "sleep 30 & bg=$!; echo BG:$bg; wait $bg; echo EXITED:$?".to_owned()],
             env: vec![],
             unset: vec![],
             cwd: None,
@@ -428,49 +449,61 @@ mod tests {
         let mut output = Vec::new();
         let mut buf = [0u8; 256];
         let deadline = Instant::now() + Duration::from_secs(5);
-        let bg_pid: i32 = loop {
+        loop {
             assert!(Instant::now() < deadline, "timed out waiting for BG pid");
             match spawned.master.read_nonblocking(&mut buf).expect("read") {
                 NonBlockingRead::Bytes(n) => {
                     output.extend_from_slice(&buf[..n]);
                     let s = String::from_utf8_lossy(&output);
-                    if let Some(rest) = s.split("BG:").nth(1)
-                        && let Some(line) = rest.lines().next()
-                        && let Ok(pid) = line.trim().parse::<i32>()
-                    {
-                        break pid;
+                    if s.contains("BG:") && s.lines().any(|l| l.trim().starts_with("BG:")) {
+                        break;
                     }
                 }
                 NonBlockingRead::WouldBlock => std::thread::sleep(Duration::from_millis(5)),
-                NonBlockingRead::Eof => panic!("unexpected EOF"),
+                NonBlockingRead::Eof => panic!("unexpected EOF before BG"),
             }
-        };
+        }
 
-        // Call `hang_up_session_descendants` while leader is alive; `sleep 30` must die from SIGHUP.
+        // Send SIGHUP to non-leader descendants while leader is alive; `sleep 30` dies and `sh`
+        // reaps it and prints `EXITED:<non-zero>` then exits cleanly.
         hang_up_session_descendants(&[spawned.pid]);
 
-        let wait_deadline = Instant::now() + Duration::from_secs(3);
-        let bg_gone = loop {
-            // SAFETY: `kill(bg_pid, 0)` is a liveness probe on our own spawned background sleep.
-            let alive = unsafe { libc::kill(bg_pid, 0) } == 0;
-            if !alive {
-                break true;
+        let wait_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                Instant::now() < wait_deadline,
+                "timed out waiting for hang_up_session_descendants to terminate background job: {:?}",
+                String::from_utf8_lossy(&output)
+            );
+            match spawned.master.read_nonblocking(&mut buf).expect("read exit") {
+                NonBlockingRead::Bytes(n) => output.extend_from_slice(&buf[..n]),
+                NonBlockingRead::WouldBlock => std::thread::sleep(Duration::from_millis(5)),
+                NonBlockingRead::Eof => break,
             }
-            if Instant::now() >= wait_deadline {
-                break false;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        let _ = spawned.killer.kill();
-        let _ = spawned.child.wait();
-        assert!(bg_gone, "hang_up_session_descendants did not terminate background job {bg_pid}");
+        }
+        let text = String::from_utf8_lossy(&output);
+        let status = spawned.child.wait().expect("reap leader");
+        assert!(status.success(), "leader shell should finish cleanly after wait: {text:?}");
+        assert!(text.contains("EXITED:") && !text.contains("EXITED:0"), "expected signal exit: {text:?}");
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn pidfd_open_and_zero_signal_on_self() {
-        assert!(try_open_pidfd(0).is_none());
-        assert!(try_open_pidfd(-1).is_none());
+        assert!(try_open_pidfd(0).is_err());
+        assert!(try_open_pidfd(-1).is_err());
+        assert!(matches!(
+            classify_pidfd_open_error(std::io::Error::from_raw_os_error(libc::ENOSYS), 10, 20),
+            PidfdOpenFailure::FallbackLegacyKill
+        ));
+        assert!(matches!(
+            classify_pidfd_open_error(std::io::Error::from_raw_os_error(libc::ESRCH), 10, 20),
+            PidfdOpenFailure::Return(OsError::OutsideSession { leader: 10, pid: 20 })
+        ));
+        assert!(matches!(
+            classify_pidfd_open_error(std::io::Error::from_raw_os_error(libc::EPERM), 10, 20),
+            PidfdOpenFailure::Return(OsError::Io { .. })
+        ));
         let fd = try_open_pidfd(std::process::id() as i32).expect("pidfd_open on self");
         pidfd_send_signal_raw(&fd, 0).expect("pidfd_send_signal(0) liveness probe");
         assert!(pidfd_send_signal_raw(&fd, -1).is_err(), "invalid signal must return Err");

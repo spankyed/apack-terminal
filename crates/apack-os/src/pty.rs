@@ -148,7 +148,7 @@ pub fn spawn_pty(config: &PtySpawnConfig) -> Result<SpawnedPty, OsError> {
         cmd.cwd(dir);
     }
 
-    let mut child = pair
+    let child = pair
         .slave
         .spawn_command(cmd)
         .map_err(|err| OsError::io("spawning shell", io::Error::other(err.to_string())))?;
@@ -159,6 +159,8 @@ pub fn spawn_pty(config: &PtySpawnConfig) -> Result<SpawnedPty, OsError> {
     let tree = TreeGuard::attach(pid);
     let killer = child.clone_killer();
 
+    #[cfg(unix)]
+    let mut child = child;
     #[cfg(unix)]
     let master = {
         let Some(raw_fd) = pair.master.as_raw_fd() else {
@@ -283,7 +285,7 @@ pub fn write_fd_nonblocking(fd: std::os::fd::RawFd, data: &[u8]) -> io::Result<u
     loop {
         // SAFETY: `fd` is valid and `data` is a live byte slice of length `data.len()`.
         let n = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
-        if n >= 0 {
+        if n != -1 {
             return Ok(n as usize);
         }
         let err = io::Error::last_os_error();
@@ -321,7 +323,12 @@ mod tests {
     #[test]
     fn set_fd_nonblocking_and_error_classifiers() {
         use std::os::fd::AsRawFd;
-        let (r, _w) = crate::pty_poller::create_nonblocking_pipe().expect("pipe");
+        let (r, w) = crate::pty_poller::create_nonblocking_pipe().expect("pipe");
+        // 1-byte write kills `n != -1` -> `n != 1` mutant in `write_fd_nonblocking`.
+        assert_eq!(write_fd_nonblocking(w.as_raw_fd(), b"x").expect("1-byte write"), 1);
+        let mut one = [0u8; 1];
+        assert_eq!(read_fd_nonblocking(r.as_raw_fd(), &mut one).expect("1-byte read"), NonBlockingRead::Bytes(1));
+        assert_eq!(&one, b"x");
         // Clear nonblocking, check flag cleared, then re-enable and check flag set.
         set_fd_nonblocking(r.as_raw_fd(), false).expect("clear nonblock");
         // SAFETY: `F_GETFL` on open pipe fd.

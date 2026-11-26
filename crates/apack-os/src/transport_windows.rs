@@ -110,6 +110,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn map_bind_error_classifies_held_vs_other() {
+        assert!(matches!(
+            map_bind_error(io::Error::new(io::ErrorKind::AddrInUse, "in use")),
+            crate::OsError::AlreadyHeld
+        ));
+        assert!(matches!(
+            map_bind_error(io::Error::new(io::ErrorKind::PermissionDenied, "denied")),
+            crate::OsError::AlreadyHeld
+        ));
+        assert!(matches!(
+            map_bind_error(io::Error::new(io::ErrorKind::NotFound, "missing")),
+            crate::OsError::Io { .. }
+        ));
+    }
+
+    #[test]
     fn pipe_owner_check_let_go_and_hang_up() {
         let name = format!(r"\\.\pipe\apack-v2-os-test-{}", std::process::id());
         let listener = ListenerOptions::new()
@@ -161,7 +177,8 @@ mod tests {
         let _ = (&client).read_to_string(&mut got);
         assert_eq!(got, "preserved\n");
 
-        // Second pipe: hang_up disconnects an idle connected pipe and returns false on repeat.
+        // Second pipe: let_go on an idle pipe with no pending I/O cancels nothing (returns false),
+        // and hang_up disconnects a connected idle pipe (returns true) then false on repeat.
         let idle_name = format!(r"\\.\pipe\apack-v2-os-hangup-{}", std::process::id());
         let idle_listener = ListenerOptions::new()
             .name(idle_name.clone().to_fs_name::<GenericFilePath>().expect("name"))
@@ -172,6 +189,7 @@ mod tests {
         });
         let Stream::NamedPipe(idle_server) = idle_listener.accept().expect("accept idle");
         let _idle_client = idle_th.join().expect("join idle");
+        assert!(!let_go(&idle_server, || {}));
         assert!(hang_up(&idle_server));
         assert!(!hang_up(&idle_server));
     }

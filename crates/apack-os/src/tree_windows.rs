@@ -74,18 +74,32 @@ impl JobGuard {
     /// Queries the kernel via `JobObjectBasicProcessIdList` to check whether `pid` is currently
     /// assigned to this Job Object.
     pub fn owns(&self, pid: u32) -> io::Result<bool> {
+        self.owns_with_capacity(pid, INITIAL_PID_CAPACITY)
+    }
+
+    fn owns_with_capacity(&self, pid: u32, initial_capacity: usize) -> io::Result<bool> {
         if pid == 0 {
             return Ok(false);
         }
         let target = pid as usize;
         let header_bytes = offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList);
-        let mut capacity = INITIAL_PID_CAPACITY;
+        let mut capacity = initial_capacity.max(1);
 
         for _ in 0..MAX_QUERY_RETRIES {
-            let total_bytes = header_bytes.saturating_add(capacity.saturating_mul(size_of::<usize>()));
+            let pid_bytes = capacity
+                .checked_mul(size_of::<usize>())
+                .ok_or_else(|| io::Error::other("JobObjectBasicProcessIdList size overflow"))?;
+            let total_bytes = header_bytes
+                .checked_add(pid_bytes)
+                .ok_or_else(|| io::Error::other("JobObjectBasicProcessIdList size overflow"))?;
             let word_count = total_bytes.div_ceil(size_of::<usize>());
+            let alloc_bytes = word_count
+                .checked_mul(size_of::<usize>())
+                .ok_or_else(|| io::Error::other("JobObjectBasicProcessIdList size overflow"))?;
+            let buf_len = u32::try_from(alloc_bytes)
+                .map_err(|_| io::Error::other("JobObjectBasicProcessIdList exceeds u32::MAX"))?;
+
             let mut buffer = vec![0usize; word_count];
-            let buf_len = u32::try_from(word_count.saturating_mul(size_of::<usize>())).unwrap_or(u32::MAX);
             let mut returned: u32 = 0;
 
             // SAFETY: `self.job` is a valid open Job Object handle, `buffer` is `usize`-aligned
@@ -100,14 +114,19 @@ impl JobGuard {
                 )
             };
 
-            // SAFETY: `buffer` is large enough for `JOBOBJECT_BASIC_PROCESS_ID_LIST` and aligned.
-            let list = unsafe { &*buffer.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() };
-
+            let list_ptr = buffer.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>();
             if ok != 0 {
-                let count = (list.NumberOfProcessIdsInList as usize).min(capacity);
-                let base = std::ptr::addr_of!(list.ProcessIdList).cast::<usize>();
-                // SAFETY: `QueryInformationJobObject` succeeded and wrote `count <= capacity`
-                // `usize` PIDs into `buffer` starting at `ProcessIdList`.
+                // SAFETY: `buffer` holds at least `size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>()`
+                // bytes; reading the header field via raw pointer preserves full `buffer` provenance
+                // for the flexible `ProcessIdList` tail slice below.
+                let reported = unsafe { std::ptr::addr_of!((*list_ptr).NumberOfProcessIdsInList).read() } as usize;
+                let max_entries = (alloc_bytes - header_bytes) / size_of::<usize>();
+                let count = reported.min(max_entries);
+                // SAFETY: `header_bytes + count * size_of::<usize>() <= alloc_bytes` within
+                // `buffer`, and `header_bytes` (`8`) is aligned to `align_of::<usize>()`.
+                let base = unsafe { buffer.as_ptr().cast::<u8>().add(header_bytes).cast::<usize>() };
+                // SAFETY: `QueryInformationJobObject` initialized `count` `usize` entries at `base`
+                // within `buffer`'s live allocation.
                 let pids = unsafe { std::slice::from_raw_parts(base, count) };
                 return Ok(pids.contains(&target));
             }
@@ -115,7 +134,8 @@ impl JobGuard {
             // SAFETY: `GetLastError` reads the calling thread's last Win32 error code.
             let err = unsafe { GetLastError() };
             if err == ERROR_MORE_DATA {
-                let needed = list.NumberOfAssignedProcesses as usize;
+                // SAFETY: `buffer` holds the initialized header fields written by `QueryInformationJobObject`.
+                let needed = unsafe { std::ptr::addr_of!((*list_ptr).NumberOfAssignedProcesses).read() } as usize;
                 capacity = needed.max(capacity.saturating_mul(2));
                 continue;
             }
@@ -138,7 +158,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn job_guard_owns_assigned_child_and_kills_on_drop() {
+    fn job_guard_owns_assigned_child_grows_on_more_data_and_kills_on_drop() {
         let mut child = std::process::Command::new("cmd.exe")
             .args(["/C", "ping -n 30 127.0.0.1 >nul"])
             .spawn()
@@ -146,6 +166,10 @@ mod tests {
         let child_pid = child.id();
 
         let guard = JobGuard::attach(child_pid).expect("attach job to child");
+        // Give `cmd.exe` a brief moment to spawn `ping.exe` so the Job Object has >= 2 processes,
+        // exercising the `ERROR_MORE_DATA` growth path when queried with `initial_capacity = 1`.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(guard.owns_with_capacity(child_pid, 1).expect("query with cap 1"));
         assert!(guard.owns(child_pid).expect("query child pid"));
         assert!(!guard.owns(0).expect("pid 0 never owned"));
         assert!(!guard.owns(std::process::id()).expect("broker process not in child job"));
