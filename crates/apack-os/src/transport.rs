@@ -181,9 +181,10 @@ impl Drop for UmaskGuard {
 /// Binds a user-private local listener at `socket`.
 ///
 /// - On Unix: refuses to overwrite any pre-existing non-socket file, narrows process umask to
-///   `0o177` around bind (serialized via `UMASK_LOCK` and restored via RAII `Drop`) so the socket
-///   is owner-only from creation, and overwrites stale socket files once [`acquire_socket_hold`]
-///   has established exclusivity.
+///   `0o077` around bind (serialized via `UMASK_LOCK` and restored via RAII `Drop`) so the socket
+///   is owner-only from creation without stripping owner `+x` from concurrently created directories,
+///   then tightens the socket permissions to `0o600`, overwriting stale socket files once
+///   [`acquire_socket_hold`] has established exclusivity.
 /// - On Windows: attaches [`crate::security::owner_only_security_descriptor`] so `Everyone` never
 ///   receives pipe access, mapping `AddrInUse` / `PermissionDenied` to [`OsError::AlreadyHeld`].
 pub fn bind_local_listener(socket: &str) -> Result<Listener, OsError> {
@@ -209,11 +210,27 @@ pub fn bind_local_listener(socket: &str) -> Result<Listener, OsError> {
     };
 
     #[cfg(unix)]
-    let _umask = UmaskGuard::acquire(0o177);
+    let _umask = UmaskGuard::acquire(0o077);
     let bound = options.create_sync();
 
     match bound {
-        Ok(listener) => Ok(listener),
+        Ok(listener) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+                let meta =
+                    std::fs::symlink_metadata(socket).map_err(|err| OsError::io("inspecting bound socket", err))?;
+                if !meta.file_type().is_socket() {
+                    return Err(OsError::io(
+                        "verifying bound socket type",
+                        io::Error::new(io::ErrorKind::InvalidInput, "bound path is not a Unix socket"),
+                    ));
+                }
+                std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
+                    .map_err(|err| OsError::io("tightening socket permissions", err))?;
+            }
+            Ok(listener)
+        }
         #[cfg(windows)]
         Err(err) => Err(crate::transport_windows::map_bind_error(err)),
         #[cfg(not(windows))]
@@ -455,7 +472,7 @@ mod tests {
         let dup_lock_fd = hold.lock.try_clone().expect("dup lock fd");
 
         let listener = bind_local_listener(&sock_str).expect("bind listener");
-        // Verify `UmaskGuard::drop` restored the process umask (not left stuck at 0o177).
+        // Verify `UmaskGuard::drop` restored the process umask (not left stuck at 0o077).
         {
             let _lock = UMASK_LOCK.lock().expect("umask lock");
             // SAFETY: probe current umask and restore immediately under `UMASK_LOCK`.
@@ -464,10 +481,10 @@ mod tests {
                 libc::umask(cur);
                 cur
             };
-            assert_ne!(current_umask, 0o177, "UmaskGuard::drop must restore previous umask");
+            assert_ne!(current_umask, 0o077, "UmaskGuard::drop must restore previous umask");
         }
         let sock_meta = std::fs::symlink_metadata(&nested).expect("socket meta");
-        assert_eq!(sock_meta.permissions().mode() & 0o077, 0, "socket must be owner-only");
+        assert_eq!(sock_meta.permissions().mode() & 0o777, 0o600, "socket must be 0o600 owner-only");
         let lfd = listener_raw_fd(&listener);
         assert!(lfd > 2, "listener fd must be > 2");
 

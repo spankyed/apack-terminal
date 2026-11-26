@@ -312,6 +312,11 @@ impl BrokerCore {
         self.conns.len()
     }
 
+    /// Returns `true` iff `conn` has completed `Hello` (and mutual HMAC `AuthProof` when required).
+    pub fn is_connection_ready(&self, conn: ConnId) -> bool {
+        matches!(self.conns.get(&conn).map(|c| c.phase), Some(ConnPhase::Ready))
+    }
+
     /// Returns `true` when at least one live or in-grace broker-wide lease is active.
     pub fn has_active_broker_lease(&self) -> bool {
         self.leases.has_active_broker_lease()
@@ -603,6 +608,50 @@ impl BrokerCore {
         }
     }
 
+    /// Returns the [`SessionId`] bound to `(conn, stream_id)`, if that stream is currently attached.
+    pub fn stream_session(&self, conn: ConnId, stream_id: NonZeroStreamId) -> Option<SessionId> {
+        self.conns.get(&conn)?.streams.get(&stream_id).map(|s| s.session)
+    }
+
+    /// Attempts to publish a `FrameUpdate` on `(conn, stream_id)` respecting BDP `FramePacer` and
+    /// per-connection outbound queue bounds, returning `Err(frame)` without cloning if deferred.
+    pub fn try_publish_frame(
+        &mut self,
+        conn: ConnId,
+        stream_id: NonZeroStreamId,
+        mut frame: Box<FrameUpdate>,
+        now: TimestampMs,
+        actions: &mut Vec<BrokerAction>,
+    ) -> Result<(), Box<FrameUpdate>> {
+        let Some(state) = self.conns.get_mut(&conn) else {
+            return Err(frame);
+        };
+        if state.outbound.has_pending_frame(stream_id.as_stream_id()) {
+            return Err(frame);
+        }
+        let Some(stream) = state.streams.get_mut(&stream_id) else {
+            return Err(frame);
+        };
+        let Some(pacer) = stream.frame_pacer.as_mut() else {
+            return Err(frame);
+        };
+        // Assign the real monotonic sequence before measuring encoded bytes so varint length is exact.
+        frame.seq = pacer.peek_next_seq();
+        let msg = BrokerMsg::Frame(frame);
+        let encoded_bytes = estimate_encoded_bytes(&msg);
+        let BrokerMsg::Frame(frame) = msg else {
+            unreachable!();
+        };
+        let frame_u32 = u32::try_from(encoded_bytes).unwrap_or(u32::MAX);
+        if !pacer.can_send(frame_u32) || !state.outbound.can_fit_frame(stream_id.as_stream_id(), encoded_bytes) {
+            return Err(frame);
+        }
+        let _ = state.outbound.push_frame(stream_id.as_stream_id(), frame, encoded_bytes);
+        let _ = pacer.on_send(frame_u32, now);
+        actions.push(BrokerAction::OutboundReady(conn));
+        Ok(())
+    }
+
     /// Attempts to publish a `FrameUpdate` on `(conn, stream_id)` respecting BDP `FramePacer` and
     /// per-connection outbound queue bounds.
     ///
@@ -613,39 +662,11 @@ impl BrokerCore {
         &mut self,
         conn: ConnId,
         stream_id: NonZeroStreamId,
-        mut frame: Box<FrameUpdate>,
+        frame: Box<FrameUpdate>,
         now: TimestampMs,
         actions: &mut Vec<BrokerAction>,
     ) -> bool {
-        let Some(state) = self.conns.get_mut(&conn) else {
-            return false;
-        };
-        if state.outbound.has_pending_frame(stream_id.as_stream_id()) {
-            return false;
-        }
-        let Some(stream) = state.streams.get_mut(&stream_id) else {
-            return false;
-        };
-        let Some(pacer) = stream.frame_pacer.as_mut() else {
-            return false;
-        };
-        // Assign the real monotonic sequence before measuring encoded bytes so varint length is exact.
-        frame.seq = pacer.peek_next_seq();
-        let msg = BrokerMsg::Frame(frame);
-        let encoded_bytes = estimate_encoded_bytes(&msg);
-        let BrokerMsg::Frame(frame) = msg else {
-            unreachable!();
-        };
-        let frame_u32 = u32::try_from(encoded_bytes).unwrap_or(u32::MAX);
-        if !pacer.can_send(frame_u32) {
-            return false;
-        }
-        if state.outbound.push_frame(stream_id.as_stream_id(), frame, encoded_bytes).is_err() {
-            return false;
-        }
-        let _ = pacer.on_send(frame_u32, now);
-        actions.push(BrokerAction::OutboundReady(conn));
-        true
+        self.try_publish_frame(conn, stream_id, frame, now, actions).is_ok()
     }
 
     /// Returns the measured RTT EWMA in milliseconds for a `SUB_VIEW` stream, if available.

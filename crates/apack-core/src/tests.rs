@@ -677,8 +677,10 @@ fn broker_handshake_mutual_auth_timeout_duplicate_conn_and_framing_errors() {
     ));
 
     let proof = compute_client_proof(&secret, &c_nonce, &s_nonce);
+    assert!(!broker.is_connection_ready(conn(2)));
     let auth_frame = encode_client(StreamId::CONTROL, 2, &ClientMsg::AuthProof { hmac: proof });
     broker.feed_bytes(conn(2), &auth_frame, ts(2_020), &mut actions);
+    assert!(broker.is_connection_ready(conn(2)));
     let auth_ok = broker.pop_outbound(conn(2)).unwrap();
     match auth_ok.msg {
         BrokerMsg::AuthOk { server_hmac } => {
@@ -1280,4 +1282,50 @@ fn broker_leases_grace_expiry_multi_stream_backpressure_and_limits() {
         BrokerAction::DispatchToSession { req_id, msg: ClientMsg::Write { .. }, .. }
         if *req_id == RequestId::from_raw(3005)
     )));
+
+    // stream_session + try_publish_frame budget boundary & ownership return without clone!
+    assert_eq!(broker.stream_session(conn(3), nz_stream(1)), Some(sid(1)));
+    assert_eq!(broker.stream_session(conn(3), nz_stream(9_999)), None);
+    let mut small_q = OutboundQueue::new(100);
+    assert!(small_q.can_fit_frame(StreamId::from_raw(1), 100));
+    assert!(!small_q.can_fit_frame(StreamId::from_raw(1), 101));
+    small_q.push_frame(StreamId::from_raw(1), sample_frame(), 60).unwrap();
+    assert!(small_q.can_fit_frame(StreamId::from_raw(1), 100)); // replacing existing 60B frame with 100B fits!
+    assert!(!small_q.can_fit_frame(StreamId::from_raw(2), 41)); // 60 + 41 > 100
+
+    // try_publish_frame returns Err(frame) when queue cap is exceeded
+    let mut tight = BrokerCore::with_queue_cap(AuthConfig::None, 16);
+    tight.register_session(sid(1), false, false);
+    tight.open_connection(conn(1), [0; 32], ts(0)).unwrap();
+    let mut a2 = Vec::new();
+    tight.feed_bytes(
+        conn(1),
+        &encode_client(
+            StreamId::CONTROL,
+            1,
+            &ClientMsg::Hello { protocol_version: PROTOCOL_VERSION, client_nonce: [0; 32], client_name: "t".into() },
+        ),
+        ts(1),
+        &mut a2,
+    );
+    let _ = tight.pop_outbound(conn(1));
+    tight.feed_bytes(
+        conn(1),
+        &encode_client(
+            StreamId::CONTROL,
+            2,
+            &ClientMsg::Attach {
+                session: sid(1),
+                stream_id: nz_stream(1),
+                flags: SubFlags::from_bits(SubFlags::VIEW).unwrap(),
+                initial_viewport: None,
+                initial_output_credit: 0,
+                initial_frame_credit: FrameCredit { max_frames: 4, max_bytes: 65_536 },
+            },
+        ),
+        ts(2),
+        &mut a2,
+    );
+    let returned = tight.try_publish_frame(conn(1), nz_stream(1), sample_frame(), ts(3), &mut a2);
+    assert!(returned.is_err());
 }

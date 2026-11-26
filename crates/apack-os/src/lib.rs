@@ -11,7 +11,7 @@
 //!   `owns(pid)`, and POSIX session/parent tree verification + foreground process inspection).
 //! - [`security`]: Windows named-pipe SDDL generation and owner-only `SecurityDescriptor` helpers.
 //! - [`transport`]: User-private Unix domain sockets (`0o700` dir, `flock` exclusive hold,
-//!   `0o177` bind umask, peer UID verification) and Windows protected named pipes (`GetSecurityInfo`
+//!   `0o077` bind umask + `0o600` socket chmod, peer UID verification) and Windows protected named pipes (`GetSecurityInfo`
 //!   owner verification, `CancelIoEx` hang-up / `assume_flushed` let-go), plus `writev` helpers.
 //! - [`pty`]: Cross-platform PTY spawning (`portable-pty`), non-blocking Unix master fd I/O, and
 //!   bounded-channel Windows ConPTY bridge with non-blocking drop.
