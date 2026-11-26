@@ -4,7 +4,7 @@
 //! blobs keyed by SHA-256 [`BlobHash`] so identical images across sessions share one allocation
 //! and browser views decode them off-main-thread with `createImageBitmap`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 use std::sync::Once;
 
@@ -37,13 +37,15 @@ struct StoredBlob {
     last_used: u64,
 }
 
-/// Broker-wide deduplicated, LRU-evicting image store bounded to a hard byte cap.
+/// Broker-wide deduplicated, $O(1)$-amortized LRU-evicting image store bounded to a hard byte cap.
 #[derive(Debug)]
 pub struct ImageStore {
     cap_bytes: usize,
     used_bytes: usize,
     clock: u64,
     blobs: HashMap<BlobHash, StoredBlob>,
+    /// Lazy recency queue: `(hash, stamp)` entries are valid iff `blobs.get(&hash).last_used == stamp`.
+    lru: VecDeque<(BlobHash, u64)>,
 }
 
 impl Default for ImageStore {
@@ -55,7 +57,7 @@ impl Default for ImageStore {
 impl ImageStore {
     /// Creates an empty `ImageStore` capped at `cap_bytes`.
     pub fn new(cap_bytes: usize) -> Self {
-        Self { cap_bytes, used_bytes: 0, clock: 0, blobs: HashMap::new() }
+        Self { cap_bytes, used_bytes: 0, clock: 0, blobs: HashMap::new(), lru: VecDeque::new() }
     }
 
     /// Current byte footprint stored across all deduplicated blobs.
@@ -73,9 +75,22 @@ impl ImageStore {
         self.blobs.is_empty()
     }
 
+    /// Checks whether `blob` is still resident and refreshes its LRU recency in $O(1)$.
+    pub fn touch(&mut self, blob: BlobHash) -> bool {
+        self.clock += 1;
+        let tick = self.clock;
+        if let Some(existing) = self.blobs.get_mut(&blob) {
+            existing.last_used = tick;
+            self.push_lru(blob, tick);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Inserts an already-encoded blob, deduplicating by SHA-256 hash and evicting LRU entries
-    /// as needed to stay within `cap_bytes`. Returns `None` if `bytes` alone exceeds `cap_bytes`
-    /// or `u32::MAX`.
+    /// in $O(1)$ amortized time to stay within `cap_bytes`. Returns `None` if `bytes` alone exceeds
+    /// `cap_bytes` or `u32::MAX`.
     pub fn insert_encoded(&mut self, encoding: ImageEncoding, bytes: Vec<u8>) -> Option<BlobHash> {
         if bytes.is_empty() || bytes.len() > self.cap_bytes || u32::try_from(bytes.len()).is_err() {
             return None;
@@ -85,22 +100,26 @@ impl ImageStore {
         let tick = self.clock;
         if let Some(existing) = self.blobs.get_mut(&hash) {
             existing.last_used = tick;
+            self.push_lru(hash, tick);
             return Some(hash);
         }
         while self.used_bytes.saturating_add(bytes.len()) > self.cap_bytes {
-            let Some((&victim, _)) = self.blobs.iter().min_by_key(|(_, b)| b.last_used) else {
+            let Some((victim, stamp)) = self.lru.pop_front() else {
                 break;
             };
-            if let Some(removed) = self.blobs.remove(&victim) {
+            if self.blobs.get(&victim).is_some_and(|b| b.last_used == stamp)
+                && let Some(removed) = self.blobs.remove(&victim)
+            {
                 self.used_bytes -= removed.bytes.len();
             }
         }
         self.used_bytes += bytes.len();
         self.blobs.insert(hash, StoredBlob { encoding, bytes, last_used: tick });
+        self.push_lru(hash, tick);
         Some(hash)
     }
 
-    /// Encodes raw pixel bytes (`1`..=`4` channels) as a fast PNG and stores them deduplicated.
+    /// Encodes raw pixel bytes (`3` RGB or `4` RGBA channels) as a fast PNG and stores them deduplicated.
     pub fn insert_pixels(&mut self, width: u32, height: u32, channels: u8, pixels: &[u8]) -> Option<BlobHash> {
         let png_bytes = encode_png_pixels(width, height, channels, pixels)?;
         self.insert_encoded(ImageEncoding::Png, png_bytes)
@@ -116,13 +135,27 @@ impl ImageStore {
         let start = (offset as usize).min(entry.bytes.len());
         let len = (max_bytes as usize).clamp(1, BULK_CHUNK_BYTES);
         let end = start.saturating_add(len).min(entry.bytes.len());
-        Some(BlobChunk {
+        let chunk = BlobChunk {
             blob,
             encoding: entry.encoding,
             total_bytes,
             offset: start as u32,
             data: entry.bytes[start..end].to_vec(),
-        })
+        };
+        self.push_lru(blob, tick);
+        Some(chunk)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lru_len(&self) -> usize {
+        self.lru.len()
+    }
+
+    fn push_lru(&mut self, hash: BlobHash, tick: u64) {
+        self.lru.push_back((hash, tick));
+        if self.lru.len() > self.blobs.len().saturating_mul(4).saturating_add(64) {
+            self.lru.retain(|(h, stamp)| self.blobs.get(h).is_some_and(|b| b.last_used == *stamp));
+        }
     }
 }
 
@@ -203,8 +236,8 @@ fn decode_png_into<'a>(encoded: &[u8], allocate: impl FnOnce(usize) -> Option<&'
     let rgba = allocate(pixels * 4).filter(|buf| buf.len() == pixels * 4)?;
     let frame = reader.next_frame(&mut rgba[..decoded]).ok()?;
     match frame.color_type {
-        png::ColorType::Rgba => {}
-        png::ColorType::GrayscaleAlpha => {
+        png::ColorType::Rgba if frame.buffer_size() == pixels * 4 => {}
+        png::ColorType::GrayscaleAlpha if frame.buffer_size() == pixels * 2 => {
             for pixel in (0..pixels).rev() {
                 let (grey, alpha) = (rgba[pixel * 2], rgba[pixel * 2 + 1]);
                 rgba[pixel * 4..pixel * 4 + 4].copy_from_slice(&[grey, grey, grey, alpha]);

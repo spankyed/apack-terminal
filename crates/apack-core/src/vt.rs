@@ -7,8 +7,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use apack_proto::types::{
-    CellPos, CellPx, CellSpan, CursorShape, CursorState, GridSize, ImagePlacement, KeyInput, PackedRow,
-    PaletteOverrides, PointerInput, ProgressState, ViewModes,
+    BlockedKind, CellPos, CellPx, CellSpan, CursorShape, CursorState, GridSize, ImagePlacement, KeyInput, PackedRow,
+    PaletteOverrides, PointerInput, ProgressState, StatusState, ViewModes,
 };
 
 /// Monotonic generation counters allowing generation-gated metadata queries (zero FFI when unchanged).
@@ -24,7 +24,34 @@ pub struct VtGenerations {
     pub modes: u64,
 }
 
-/// Side-effect events emitted by [`VtEngine::feed`] during PTY byte parsing.
+/// Structured OSC 7501 program-status update emitted directly by [`VtEngine`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProgramStatusUpdate {
+    /// Create or update a program-status record (all fields already decoded by the VT engine).
+    Set {
+        /// Slot identifier (`""` for root status).
+        id: String,
+        /// Reported program state.
+        state: StatusState,
+        /// Optional blocked reason (valid only when `state == StatusState::Blocked`).
+        kind: Option<BlockedKind>,
+        /// Optional progress percentage (`0..=100`).
+        progress: Option<u8>,
+        /// Optional claimed application name.
+        app: Option<String>,
+        /// Optional title (may contain arbitrary characters including `;` and `=`).
+        title: Option<String>,
+        /// Optional message (may contain arbitrary characters including `;` and `=`).
+        message: Option<String>,
+    },
+    /// Clear a program-status record (`id == ""` clears the root slot).
+    Clear {
+        /// Slot identifier to clear.
+        id: String,
+    },
+}
+
+/// Side-effect events emitted by [`VtEngine::feed`] or [`VtEngine::resize`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VtEvent {
     /// Window title changed (OSC 0/2).
@@ -72,9 +99,9 @@ pub enum VtEvent {
         /// Epoch-local absolute cursor line when this mark arrived.
         cursor_line: u64,
     },
-    /// Raw OSC 7501 program-status payload (after `7501;`).
-    Osc7501(String),
-    /// Terminal reply bytes (e.g. DSR/DA/DECRQM) that must be written back to the PTY stdin.
+    /// Structured OSC 7501 program-status update (set or clear).
+    ProgramStatus(ProgramStatusUpdate),
+    /// Terminal reply bytes (e.g. DSR/DA/DECRQM/mode 2048) that must be written back to the PTY stdin.
     DeviceResponse(Vec<u8>),
 }
 
@@ -146,8 +173,9 @@ pub trait VtEngine {
     /// Feeds raw PTY bytes into the emulator, appending side effects to `events`.
     fn feed(&mut self, bytes: &[u8], events: &mut Vec<VtEvent>);
 
-    /// Resizes the terminal grid and cell pixel geometry, incrementing `epoch` if reflow occurred.
-    fn resize(&mut self, size: GridSize, cell_px: CellPx);
+    /// Resizes the terminal grid and cell pixel geometry, incrementing `epoch` if reflow occurred
+    /// and appending any synchronous side effects (e.g. mode 2048 size reports or sync-hold release).
+    fn resize(&mut self, size: GridSize, cell_px: CellPx, events: &mut Vec<VtEvent>);
 
     /// Returns lightweight current screen metadata.
     fn meta(&self) -> VtSnapshotMeta;
@@ -198,8 +226,8 @@ pub trait VtEngine {
     /// Encodes a structured keyboard event into PTY input bytes.
     fn encode_key(&mut self, key: &KeyInput, out: &mut Vec<u8>);
 
-    /// Encodes a structured pointer event into PTY input bytes.
-    fn encode_pointer(&mut self, ev: &PointerInput, out: &mut Vec<u8>);
+    /// Encodes a structured pointer event into PTY input bytes using per-view `held_buttons` bitmask.
+    fn encode_pointer(&mut self, ev: &PointerInput, held_buttons: &mut u8, out: &mut Vec<u8>);
 
     /// Encodes focus gained/lost into PTY bytes if focus reporting is enabled.
     fn encode_focus(&mut self, focused: bool, out: &mut Vec<u8>);

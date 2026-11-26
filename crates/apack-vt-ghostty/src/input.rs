@@ -18,7 +18,6 @@ pub struct InputEncoders {
     key_event: sys::KeyEvent,
     mouse: sys::MouseEncoder,
     mouse_event: sys::MouseEvent,
-    held_buttons: u8,
     mouse_modes: Option<[bool; MOUSE_MODES.len()]>,
     mouse_size: Option<[u32; 4]>,
 }
@@ -34,7 +33,6 @@ impl InputEncoders {
             key_event: std::ptr::null_mut(),
             mouse: std::ptr::null_mut(),
             mouse_event: std::ptr::null_mut(),
-            held_buttons: 0,
             mouse_modes: None,
             mouse_size: None,
         };
@@ -107,12 +105,19 @@ impl InputEncoders {
         }
     }
 
-    /// Encodes a structured pointer/wheel input against `terminal`'s active mouse modes.
+    /// Clears cached terminal mouse-mode & geometry snapshots (called after snapshot restore).
+    pub(crate) fn reset_cache(&mut self) {
+        self.mouse_modes = None;
+        self.mouse_size = None;
+    }
+
+    /// Encodes a structured pointer/wheel input against `terminal`'s active mouse modes using per-view `held_buttons`.
     pub(crate) fn encode_pointer(
         &mut self,
         terminal: sys::Terminal,
         grid: GridSize,
         ev: &PointerInput,
+        held_buttons: &mut u8,
         out: &mut Vec<u8>,
     ) {
         let cell_w = u32::from(ev.cell_px.width).clamp(1, MAX_CELL_PIXELS);
@@ -134,12 +139,12 @@ impl InputEncoders {
         };
         if ev.button < 3 {
             match ev.action {
-                PointerAction::Press => self.held_buttons |= 1 << ev.button,
-                PointerAction::Release => self.held_buttons &= !(1 << ev.button),
+                PointerAction::Press => *held_buttons |= 1 << ev.button,
+                PointerAction::Release => *held_buttons &= !(1 << ev.button),
                 _ => {}
             }
         }
-        let pressed = self.held_buttons != 0;
+        let pressed = *held_buttons != 0;
         let mut modes = [false; MOUSE_MODES.len()];
         for (slot, mode) in modes.iter_mut().zip(MOUSE_MODES) {
             *slot = query_mode(terminal, mode);
@@ -422,6 +427,18 @@ const KEYS: &[(&str, sys::Key::Type)] = &[
     ("NumpadParenLeft", sys::Key::NUMPAD_PAREN_LEFT),
     ("NumpadParenRight", sys::Key::NUMPAD_PAREN_RIGHT),
     ("NumpadSubtract", sys::Key::NUMPAD_SUBTRACT),
+    ("NumpadSeparator", sys::Key::NUMPAD_SEPARATOR),
+    ("NumpadUp", sys::Key::NUMPAD_UP),
+    ("NumpadDown", sys::Key::NUMPAD_DOWN),
+    ("NumpadRight", sys::Key::NUMPAD_RIGHT),
+    ("NumpadLeft", sys::Key::NUMPAD_LEFT),
+    ("NumpadBegin", sys::Key::NUMPAD_BEGIN),
+    ("NumpadHome", sys::Key::NUMPAD_HOME),
+    ("NumpadEnd", sys::Key::NUMPAD_END),
+    ("NumpadInsert", sys::Key::NUMPAD_INSERT),
+    ("NumpadDelete", sys::Key::NUMPAD_DELETE),
+    ("NumpadPageUp", sys::Key::NUMPAD_PAGE_UP),
+    ("NumpadPageDown", sys::Key::NUMPAD_PAGE_DOWN),
     ("Escape", sys::Key::ESCAPE),
     ("F1", sys::Key::F1),
     ("F2", sys::Key::F2),
@@ -448,9 +465,33 @@ const KEYS: &[(&str, sys::Key::Type)] = &[
     ("F23", sys::Key::F23),
     ("F24", sys::Key::F24),
     ("F25", sys::Key::F25),
+    ("Fn", sys::Key::FN),
+    ("FnLock", sys::Key::FN_LOCK),
     ("PrintScreen", sys::Key::PRINT_SCREEN),
     ("ScrollLock", sys::Key::SCROLL_LOCK),
     ("Pause", sys::Key::PAUSE),
+    ("BrowserBack", sys::Key::BROWSER_BACK),
+    ("BrowserFavorites", sys::Key::BROWSER_FAVORITES),
+    ("BrowserForward", sys::Key::BROWSER_FORWARD),
+    ("BrowserHome", sys::Key::BROWSER_HOME),
+    ("BrowserRefresh", sys::Key::BROWSER_REFRESH),
+    ("BrowserSearch", sys::Key::BROWSER_SEARCH),
+    ("BrowserStop", sys::Key::BROWSER_STOP),
+    ("Eject", sys::Key::EJECT),
+    ("LaunchApp1", sys::Key::LAUNCH_APP_1),
+    ("LaunchApp2", sys::Key::LAUNCH_APP_2),
+    ("LaunchMail", sys::Key::LAUNCH_MAIL),
+    ("MediaPlayPause", sys::Key::MEDIA_PLAY_PAUSE),
+    ("MediaSelect", sys::Key::MEDIA_SELECT),
+    ("MediaStop", sys::Key::MEDIA_STOP),
+    ("MediaTrackNext", sys::Key::MEDIA_TRACK_NEXT),
+    ("MediaTrackPrevious", sys::Key::MEDIA_TRACK_PREVIOUS),
+    ("Power", sys::Key::POWER),
+    ("Sleep", sys::Key::SLEEP),
+    ("AudioVolumeDown", sys::Key::AUDIO_VOLUME_DOWN),
+    ("AudioVolumeMute", sys::Key::AUDIO_VOLUME_MUTE),
+    ("AudioVolumeUp", sys::Key::AUDIO_VOLUME_UP),
+    ("WakeUp", sys::Key::WAKE_UP),
     ("Copy", sys::Key::COPY),
     ("Cut", sys::Key::CUT),
     ("Paste", sys::Key::PASTE),

@@ -9,6 +9,5 @@ description = "libghostty-vt implementation of apack-core's VtEngine for apack-t
 apack-core = { path = "../apack-core" }
 apack-proto = { path = "../apack-proto" }
 ghostty-vt-rs-sys = "0.3.0"
-memchr = "2.8.3"
 png = "0.18.1"
 sha2 = "0.10"

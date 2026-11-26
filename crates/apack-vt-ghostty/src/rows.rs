@@ -11,8 +11,11 @@ use ghostty_vt_rs_sys as sys;
 
 use crate::placeholders::{PLACEHOLDER, PlaceholderRun, Said, fit};
 
-/// Maximum UTF-8 bytes of hyperlinks stored in a single `PackedRow` (`1 MiB`).
-pub const ROW_LINK_BYTES: usize = 1 << 20;
+/// Maximum UTF-8 bytes of hyperlinks stored in a single `PackedRow` (`64 KiB`).
+///
+/// Bounded well below `MAX_FRAME_PAYLOAD` (`8 MiB`) so even a 100+ row `full_sync` viewport frame
+/// packed with unique OSC 8 hyperlinks stays strictly encodable on the wire.
+pub const ROW_LINK_BYTES: usize = 64 * 1024;
 
 /// Maximum codepoints extracted for a single grapheme cluster cell.
 const CLUSTER_CODEPOINTS: usize = 16;
@@ -123,6 +126,7 @@ pub(crate) fn extract_row(
     let mut links: Vec<String> = Vec::new();
     let mut link_map: HashMap<String, u16> = HashMap::new();
     let mut link_bytes = 0usize;
+    let mut link_scratch: Vec<u8> = Vec::new();
     let mut placeholders: Vec<PlaceholderRun> = Vec::new();
 
     for col in 0..cols {
@@ -226,7 +230,11 @@ pub(crate) fn extract_row(
             _ => {}
         }
 
-        let link_idx = if linked { read_link_index(&grid_ref, &mut links, &mut link_map, &mut link_bytes) } else { 0 };
+        let link_idx = if linked {
+            read_link_index(&grid_ref, &mut links, &mut link_map, &mut link_bytes, &mut link_scratch)
+        } else {
+            0
+        };
 
         // Blank cell with default style and no hyperlink is omitted completely.
         if text.len() == before {
@@ -323,33 +331,34 @@ fn read_link_index(
     links: &mut Vec<String>,
     map: &mut HashMap<String, u16>,
     total_bytes: &mut usize,
+    scratch: &mut Vec<u8>,
 ) -> u16 {
     let mut short = [0u8; 256];
     let mut written = 0usize;
     // SAFETY: `short` is valid for `short.len()` bytes; `grid_ref` is live.
     let res =
         unsafe { sys::ghostty_grid_ref_hyperlink_uri(grid_ref, short.as_mut_ptr(), short.len(), &raw mut written) };
-    let uri_bytes: Vec<u8> = match res {
-        sys::Result::SUCCESS => short[..written.min(short.len())].to_vec(),
+    let uri_slice: &[u8] = match res {
+        sys::Result::SUCCESS => &short[..written.min(short.len())],
         sys::Result::OUT_OF_SPACE => {
-            let mut long = vec![0u8; written];
-            // SAFETY: `long` has `written` bytes matching the passed length.
+            scratch.resize(written.min(ROW_LINK_BYTES), 0);
+            // SAFETY: `scratch` has `scratch.len()` bytes matching the passed length.
             let res2 = unsafe {
-                sys::ghostty_grid_ref_hyperlink_uri(grid_ref, long.as_mut_ptr(), long.len(), &raw mut written)
+                sys::ghostty_grid_ref_hyperlink_uri(grid_ref, scratch.as_mut_ptr(), scratch.len(), &raw mut written)
             };
             if res2 != sys::Result::SUCCESS {
                 return 0;
             }
-            long.truncate(written.min(long.len()));
-            long
+            &scratch[..written.min(scratch.len())]
         }
         _ => return 0,
     };
-    intern_link(String::from_utf8_lossy(&uri_bytes).into_owned(), links, map, total_bytes, ROW_LINK_BYTES)
+    let uri = String::from_utf8_lossy(uri_slice);
+    intern_link(&uri, links, map, total_bytes, ROW_LINK_BYTES)
 }
 
 pub(crate) fn intern_link(
-    uri: String,
+    uri: &str,
     links: &mut Vec<String>,
     map: &mut HashMap<String, u16>,
     total_bytes: &mut usize,
@@ -358,7 +367,7 @@ pub(crate) fn intern_link(
     if uri.is_empty() {
         return 0;
     }
-    if let Some(&idx) = map.get(&uri) {
+    if let Some(&idx) = map.get(uri) {
         return idx;
     }
     if total_bytes.saturating_add(uri.len()) > max_bytes || links.len() >= 1024 {
@@ -369,7 +378,8 @@ pub(crate) fn intern_link(
     }
     let idx = links.len() as u16;
     *total_bytes += uri.len();
-    map.insert(uri.clone(), idx);
-    links.push(uri);
+    let owned = uri.to_owned();
+    map.insert(owned.clone(), idx);
+    links.push(owned);
     idx
 }

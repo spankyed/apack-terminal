@@ -209,6 +209,7 @@ pub struct SessionMachine<V: VtEngine> {
     viewports: BTreeMap<StreamKey, (ViewportHint, u64)>,
     subscribers: BTreeMap<StreamKey, SubFlags>,
     views: BTreeMap<StreamKey, ViewSubscriber>,
+    held_buttons: BTreeMap<StreamKey, u8>,
     searches: BTreeMap<StreamKey, SearchWatch>,
     manual_pauses: BTreeSet<StreamKey>,
     waiters: Vec<Waiter>,
@@ -257,6 +258,7 @@ impl<V: VtEngine> SessionMachine<V> {
             viewports: BTreeMap::new(),
             subscribers: BTreeMap::new(),
             views: BTreeMap::new(),
+            held_buttons: BTreeMap::new(),
             searches: BTreeMap::new(),
             manual_pauses: BTreeSet::new(),
             waiters: Vec::new(),
@@ -335,6 +337,7 @@ impl<V: VtEngine> SessionMachine<V> {
     pub fn detach_stream(&mut self, key: StreamKey, effects: &mut Vec<SessionEffect>) {
         self.subscribers.remove(&key);
         self.views.remove(&key);
+        self.held_buttons.remove(&key);
         self.searches.remove(&key);
         if self.searches.is_empty()
             && let Some(tid) = self.search_flush_timer.take()
@@ -486,9 +489,9 @@ impl<V: VtEngine> SessionMachine<V> {
                     self.marks.on_osc633(&payload, cursor_line, now, &mut mark_effects);
                     self.apply_mark_effects(mark_effects, effects);
                 }
-                VtEvent::Osc7501(payload) => {
+                VtEvent::ProgramStatus(update) => {
                     let mut status_effects = Vec::new();
-                    self.statuses.ingest(&payload, now, &mut status_effects);
+                    self.statuses.ingest_update(update, now, &mut status_effects);
                     self.apply_status_effects(status_effects, Some(&mut pending_verify), effects);
                 }
                 VtEvent::DeviceResponse(reply) => {
@@ -699,13 +702,17 @@ impl<V: VtEngine> SessionMachine<V> {
                 }
             }
             ClientMsg::Pointer(input) => {
+                let held = self.held_buttons.entry(key).or_insert(0);
                 let mut buf = Vec::new();
-                self.vt.encode_pointer(&input, &mut buf);
+                self.vt.encode_pointer(&input, held, &mut buf);
                 if self.enqueue_pty_bytes(&buf, effects).is_err() {
                     send_stream_error(conn, wire_stream, req_id, ErrorCode::Pty, "PTY write rejected", effects);
                 }
             }
             ClientMsg::Focus { focused } => {
+                if !focused {
+                    self.held_buttons.remove(&key);
+                }
                 let mut buf = Vec::new();
                 self.vt.encode_focus(focused, &mut buf);
                 let _ = self.enqueue_pty_bytes(&buf, effects);
@@ -1076,7 +1083,22 @@ impl<V: VtEngine> SessionMachine<V> {
         let prev_epoch = self.vt.meta().epoch;
         self.current_size = size;
         self.current_cell_px = cell_px;
-        self.vt.resize(size, cell_px);
+        let mut vt_events = Vec::new();
+        self.vt.resize(size, cell_px, &mut vt_events);
+        for ev in vt_events {
+            match ev {
+                VtEvent::SyncOutput(false) => {
+                    if let Some(tid) = self.sync_hold.take() {
+                        self.timers.cancel(tid);
+                    }
+                    self.sync_hold_started = None;
+                }
+                VtEvent::DeviceResponse(reply) => {
+                    let _ = self.enqueue_device_response(&reply, effects);
+                }
+                _ => {}
+            }
+        }
         let new_epoch = self.vt.meta().epoch;
         let _ = self.vt.take_dirty_viewport();
         if new_epoch != prev_epoch {

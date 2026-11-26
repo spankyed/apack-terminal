@@ -1,26 +1,33 @@
 //! [`GhosttyEngine`] implementing [`apack_core::vt::VtEngine`] on unmodified `ghostty-vt-rs-sys`.
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 
-use apack_core::vt::{CompressStep, DirtyViewport, PasteEncode, VtEngine, VtEvent, VtGenerations, VtSnapshotMeta};
+use apack_core::vt::{
+    CompressStep, DirtyViewport, PasteEncode, ProgramStatusUpdate, VtEngine, VtEvent, VtGenerations, VtSnapshotMeta,
+};
+use apack_proto::MAX_STRING_BYTES;
 use apack_proto::types::{
-    BlobHash, CellPos, CellPx, CellSpan, CursorShape, CursorState, GridSize, ImagePlacement, KeyInput, PackedRow,
-    PaletteOverrides, PointerInput, ProgressState, Rgb, ViewModes,
+    BlobHash, BlockedKind, CellPos, CellPx, CellSpan, CursorShape, CursorState, GridSize, ImageEncoding,
+    ImagePlacement, KeyInput, PackedRow, PaletteOverrides, PointerInput, ProgressState, Rgb, StatusState, ViewModes,
 };
 use ghostty_vt_rs_sys as sys;
 
 use crate::error::GhosttyError;
-use crate::image_store::{ImageStore, install_png_decoder};
+use crate::image_store::{ImageStore, encode_png_pixels, install_png_decoder};
 use crate::input::{InputEncoders, encode_focus, encode_paste, query_mode};
-use crate::rows::{VirtualImageInfo, extract_row};
+use crate::placeholders::PLACEHOLDER;
+use crate::rows::{ROW_LINK_BYTES, VirtualImageInfo, extract_row, pack_color, pack_style_flags};
 use crate::{SESSION_IMAGE_STORAGE_BYTES, UNKNOWN_OSC_MAX_BYTES};
 
 const REVERSE_VIDEO_MODE: u16 = 5;
+const CURSOR_BLINK_MODE: u16 = 12;
 const BRACKETED_PASTE_MODE: u16 = 2004;
 const SEARCH_CANDIDATES: usize = 20_000;
+const CONTINUATION_MAX_BYTES: usize = 4096;
+const CLUSTER_CODEPOINTS: usize = 16;
 
 /// Linked `libghostty-vt` compile-time feature flags queried via `ghostty_build_info`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,7 +106,8 @@ impl GhosttyConfig {
     }
 }
 
-/// Heap-allocated callback target pinned at a stable address for `libghostty-vt` C callbacks.
+/// Heap-allocated callback target pinned behind a raw [`NonNull`] pointer (never `Box<T>` with
+/// `noalias`) so C FFI `USERDATA` pointers remain valid under Stacked/Tree Borrows across `&mut self`.
 struct CallbackState {
     events: Vec<VtEvent>,
     cols: u16,
@@ -108,10 +116,39 @@ struct CallbackState {
     first_active_line: u64,
 }
 
+struct CallbackBox(NonNull<CallbackState>);
+
+// SAFETY: `CallbackBox` exclusively owns its heap allocation and is never shared across threads.
+unsafe impl Send for CallbackBox {}
+
+impl CallbackBox {
+    fn new(state: CallbackState) -> Self {
+        Self(NonNull::from(Box::leak(Box::new(state))))
+    }
+
+    fn as_ptr(&self) -> *mut CallbackState {
+        self.0.as_ptr()
+    }
+
+    /// Borrows `CallbackState` mutably for a short scope strictly outside any C FFI call.
+    fn with_mut<R>(&mut self, f: impl FnOnce(&mut CallbackState) -> R) -> R {
+        // SAFETY: `&mut self` guarantees exclusive Rust access and no C callback is executing.
+        f(unsafe { self.0.as_mut() })
+    }
+}
+
+impl Drop for CallbackBox {
+    fn drop(&mut self) {
+        // SAFETY: `GhosttyEngine::drop` frees `self.handle` BEFORE dropping fields, so no C handle
+        // references `self.0` when `CallbackBox::drop` reclaims the allocation.
+        drop(unsafe { Box::from_raw(self.0.as_ptr()) });
+    }
+}
+
 #[derive(Default)]
 struct ImageSyncCache {
     images_gen: u64,
-    /// Maps `(kitty_image_id, kitty_image_gen)` -> `(BlobHash, width, height)`.
+    /// Maps active `(kitty_image_id, kitty_image_gen)` -> `(BlobHash, width, height)`.
     blobs: HashMap<(u32, u64), (BlobHash, u32, u32)>,
     /// Virtual placement grids keyed by `(image_id, placement_id)`.
     virtual_named: HashMap<(u32, u32), (u32, u32)>,
@@ -122,14 +159,13 @@ struct ImageSyncCache {
 /// `libghostty-vt` terminal emulator implementing [`VtEngine`].
 ///
 /// Field safety: `Drop` explicitly frees `active_top`, `render_rows`, `render_state`, and
-/// `handle` before `callbacks` is dropped, guaranteeing C callbacks never see dangling userdata.
+/// `handle` strictly BEFORE Rust drops the `callbacks` [`CallbackBox`] field.
 pub struct GhosttyEngine {
     handle: sys::Terminal,
     render_state: sys::RenderState,
     render_rows: sys::RenderStateRowIterator,
     active_top: sys::TrackedGridRef,
     encoders: InputEncoders,
-    callbacks: Box<CallbackState>,
     image_store: Arc<Mutex<ImageStore>>,
     image_cache: RefCell<ImageSyncCache>,
     size: GridSize,
@@ -150,14 +186,15 @@ pub struct GhosttyEngine {
     full_dirty: bool,
     viewport_hashes: Vec<u64>,
     cursor_defaults: Option<(CursorShape, bool)>,
+    callbacks: CallbackBox,
 }
 
-// SAFETY: `GhosttyEngine` exclusively owns every underlying C handle and its boxed `CallbackState`;
+// SAFETY: `GhosttyEngine` exclusively owns every underlying C handle and its `CallbackBox`;
 // none of them are shared across threads, so moving ownership between threads is sound.
 unsafe impl Send for GhosttyEngine {}
 
 impl GhosttyEngine {
-    /// Creates a new `GhosttyEngine` with hardened defaults (zero file/SHM image reads).
+    /// Creates a new `GhosttyEngine` with hardened defaults (zero file/temp-file/SHM image reads).
     pub fn new(config: GhosttyConfig) -> Result<Self, GhosttyError> {
         install_png_decoder();
 
@@ -218,7 +255,7 @@ impl GhosttyEngine {
             }
         };
 
-        let callbacks = Box::new(CallbackState {
+        let callbacks = CallbackBox::new(CallbackState {
             events: Vec::new(),
             cols: config.size.cols.get(),
             rows: config.size.rows.get(),
@@ -233,7 +270,6 @@ impl GhosttyEngine {
             render_rows,
             active_top,
             encoders,
-            callbacks,
             image_store,
             image_cache: RefCell::new(ImageSyncCache::default()),
             size: config.size,
@@ -254,8 +290,9 @@ impl GhosttyEngine {
             full_dirty: true,
             viewport_hashes: vec![0u64; usize::from(config.size.rows.get())],
             cursor_defaults: None,
+            callbacks,
         };
-        engine.apply_terminal_settings()?;
+        engine.configure_handle(engine.handle, false)?;
         if config.cell_px.width > 0 && config.cell_px.height > 0 {
             // SAFETY: handle is live; notifies core of initial pixel geometry.
             let _ = unsafe {
@@ -275,6 +312,19 @@ impl GhosttyEngine {
     /// Returns a handle to the shared deduplicated [`ImageStore`].
     pub fn image_store(&self) -> &Arc<Mutex<ImageStore>> {
         &self.image_store
+    }
+
+    /// Returns `true` when the VT parser and UTF-8 decoder are cleanly at ground state (no pending continuation).
+    pub fn at_ground(&self) -> bool {
+        let mut written = 0usize;
+        // SAFETY: passing null buffer with length 0 queries continuation byte length cleanly.
+        if unsafe { sys::ghostty_terminal_continuation_buf(self.handle, std::ptr::null_mut(), 0, &raw mut written) }
+            == sys::Result::SUCCESS
+        {
+            written == 0
+        } else {
+            false
+        }
     }
 
     /// Encodes a bounded binary `libghostty-vt` snapshot (at most `max_bytes`) for v2 keyframes.
@@ -308,14 +358,16 @@ impl GhosttyEngine {
         if !cap.cut {
             GhosttyError::check("ghostty_snapshot_encode", res)?;
         }
-        // Truncate cleanly to the last complete record boundary (10-byte header + [tag:u16, len:u32, crc:u32, payload]).
         let end = last_snapshot_record_end(&cap.out);
         cap.out.truncate(end);
         Ok(cap.out)
     }
 
-    /// Restores terminal state from a binary snapshot produced by [`Self::export_snapshot`],
-    /// re-applying all hardened broker settings and bumping `epoch`.
+    /// Atomically restores terminal state from a binary snapshot produced by [`Self::export_snapshot`].
+    ///
+    /// All-or-nothing: validates geometry, decodes all records, re-applies hardened broker settings
+    /// (preserving restored DEC mode 12 cursor blink state), and swaps handles only after every step
+    /// succeeds, leaving `self` completely intact on any error.
     pub fn restore_snapshot(&mut self, snapshot: &[u8]) -> Result<(), GhosttyError> {
         let mut decoder: sys::SnapshotDecoder = std::ptr::null_mut();
         // SAFETY: `decoder` is a valid out-pointer; `snapshot` outlives the decoder below.
@@ -344,15 +396,56 @@ impl GhosttyEngine {
             unsafe { sys::ghostty_snapshot_decoder_free(decoder) };
             return Err(e);
         }
+        if new_handle.is_null() {
+            // SAFETY: freeing decoder on null handle error.
+            unsafe { sys::ghostty_snapshot_decoder_free(decoder) };
+            return Err(GhosttyError { call: "ghostty_snapshot_decoder_ready", code: sys::Result::OUT_OF_MEMORY });
+        }
         // SAFETY: decode all remaining history/image records while both `decoder` and `new_handle` are live.
-        // Bounded by `snapshot.len()` so decoding always terminates deterministically.
+        let mut decode_err: Option<GhosttyError> = None;
         for _ in 0..=snapshot.len() {
-            if unsafe { sys::ghostty_snapshot_decoder_next(decoder) } != sys::Result::SUCCESS {
+            let next_res = unsafe { sys::ghostty_snapshot_decoder_next(decoder) };
+            if next_res == sys::Result::NO_VALUE {
+                break;
+            }
+            if next_res != sys::Result::SUCCESS {
+                decode_err = Some(GhosttyError { call: "ghostty_snapshot_decoder_next", code: next_res });
                 break;
             }
         }
-        // SAFETY: decoder is no longer needed once all records are applied.
+        // SAFETY: decoder is no longer needed once all records are decoded or failed.
         unsafe { sys::ghostty_snapshot_decoder_free(decoder) };
+        if let Some(err) = decode_err {
+            // SAFETY: freeing decoded handle on corrupt-record failure without touching `self`.
+            unsafe { sys::ghostty_terminal_free(new_handle) };
+            return Err(err);
+        }
+
+        let Some(new_size) = read_u16(new_handle, sys::TerminalData::COLS)
+            .zip(read_u16(new_handle, sys::TerminalData::ROWS))
+            .and_then(|(c, r)| GridSize::new(c, r))
+        else {
+            // SAFETY: freeing decoded handle on invalid grid dimensions.
+            unsafe { sys::ghostty_terminal_free(new_handle) };
+            return Err(GhosttyError { call: "restore_snapshot(grid_size)", code: sys::Result::INVALID_VALUE });
+        };
+
+        // Configure `new_handle` BEFORE swapping so any error leaves `self` completely intact!
+        if let Err(e) = self.configure_handle(new_handle, true) {
+            // SAFETY: freeing decoded handle on settings failure.
+            unsafe { sys::ghostty_terminal_free(new_handle) };
+            return Err(e);
+        }
+        // SAFETY: `new_handle` is live; restores pixel cell geometry without changing grid cols/rows.
+        let _ = unsafe {
+            sys::ghostty_terminal_resize(
+                new_handle,
+                new_size.cols.get(),
+                new_size.rows.get(),
+                u32::from(self.cell_px.width),
+                u32::from(self.cell_px.height),
+            )
+        };
 
         let new_mark = match track_active_top(new_handle) {
             Ok(m) => m,
@@ -363,7 +456,7 @@ impl GhosttyEngine {
             }
         };
 
-        // Swap handles safely: free old active_top BEFORE freeing old terminal handle.
+        // Commit swap: free old active_top strictly BEFORE freeing old terminal handle.
         let old_mark = std::mem::replace(&mut self.active_top, new_mark);
         let old_handle = std::mem::replace(&mut self.handle, new_handle);
         // SAFETY: freeing old mark before its owning terminal handle.
@@ -372,33 +465,39 @@ impl GhosttyEngine {
             sys::ghostty_terminal_free(old_handle);
         }
 
-        self.apply_terminal_settings()?;
-        let cols = read_u16(self.handle, sys::TerminalData::COLS).unwrap_or(self.size.cols.get());
-        let rows = read_u16(self.handle, sys::TerminalData::ROWS).unwrap_or(self.size.rows.get());
-        if let Some(gs) = GridSize::new(cols, rows) {
-            self.size = gs;
-            self.callbacks.cols = cols;
-            self.callbacks.rows = rows;
-        }
+        self.size = new_size;
         self.alt_screen = query_alt_screen(self.handle);
         self.scrollback_lines = query_scrollback_rows(self.handle);
         self.first_active_line = if self.alt_screen { 0 } else { self.scrollback_lines };
-        self.callbacks.first_active_line = self.first_active_line;
+        let first_active = self.first_active_line;
+        self.callbacks.with_mut(|cb| {
+            cb.cols = new_size.cols.get();
+            cb.rows = new_size.rows.get();
+            cb.first_active_line = first_active;
+            cb.events.clear();
+        });
         self.epoch += 1;
         self.full_dirty = true;
         self.dirty_rows.clear();
         self.scroll_delta = 0;
-        self.image_cache.borrow_mut().images_gen = 0;
+        self.encoders.reset_cache();
+        {
+            let mut cache = self.image_cache.borrow_mut();
+            cache.images_gen = 0;
+            cache.blobs.clear();
+            cache.virtual_named.clear();
+            cache.virtual_lowest.clear();
+        }
         self.refresh_render_state(true, 0);
         Ok(())
     }
 
-    fn apply_terminal_settings(&mut self) -> Result<(), GhosttyError> {
-        let cb_ptr: *mut CallbackState = &mut *self.callbacks;
-        // SAFETY: `USERDATA` stores `cb_ptr` which stays pinned at this heap address until after
-        // `self.handle` is freed in `Drop`.
+    fn configure_handle(&self, handle: sys::Terminal, preserve_blink: bool) -> Result<(), GhosttyError> {
+        let cb_ptr: *mut CallbackState = self.callbacks.as_ptr();
+        // SAFETY: `USERDATA` stores `cb_ptr` from `CallbackBox` (never `Box<T>` `noalias`), valid
+        // until after `handle` is freed in `Drop`.
         GhosttyError::check("ghostty_terminal_set(USERDATA)", unsafe {
-            sys::ghostty_terminal_set(self.handle, sys::TerminalOption::USERDATA, cb_ptr.cast())
+            sys::ghostty_terminal_set(handle, sys::TerminalOption::USERDATA, cb_ptr.cast())
         })?;
 
         for (opt, func, name) in [
@@ -420,22 +519,24 @@ impl GhosttyEngine {
             (sys::TerminalOption::UNKNOWN_SEQUENCE, cb_unknown_sequence as *const std::ffi::c_void, "UNKNOWN_SEQUENCE"),
         ] {
             // SAFETY: each callback matches the exact `extern "C"` signature for its `TerminalOption`.
-            GhosttyError::check(name, unsafe { sys::ghostty_terminal_set(self.handle, opt, func) })?;
+            GhosttyError::check(name, unsafe { sys::ghostty_terminal_set(handle, opt, func) })?;
         }
 
         let sb_lines = self.scrollback_lines_limit;
         let sb_bytes = usize::MAX;
         let unknown_cap = UNKNOWN_OSC_MAX_BYTES;
+        let clipboard_cap = MAX_STRING_BYTES;
+        let continuation_cap = CONTINUATION_MAX_BYTES;
         let image_limit: u64 = if self.allow_images { SESSION_IMAGE_STORAGE_BYTES } else { 0 };
         let no_files = false;
         let term_name = sys::String::from(self.terminfo_name.as_str());
 
-        // SAFETY: each option pointer matches the documented C type (`size_t*`, `uint64_t*`, `bool*`, `GhosttyString*`).
+        // SAFETY: each option pointer matches the documented C type (`size_t*`, `uint64_t*`, `bool*`, `NULL`, `GhosttyString*`).
         unsafe {
             GhosttyError::check(
                 "SCROLLBACK_MAX_LINES",
                 sys::ghostty_terminal_set(
-                    self.handle,
+                    handle,
                     sys::TerminalOption::SCROLLBACK_MAX_LINES,
                     (&raw const sb_lines).cast(),
                 ),
@@ -443,7 +544,7 @@ impl GhosttyEngine {
             GhosttyError::check(
                 "SCROLLBACK_MAX_BYTES",
                 sys::ghostty_terminal_set(
-                    self.handle,
+                    handle,
                     sys::TerminalOption::SCROLLBACK_MAX_BYTES,
                     (&raw const sb_bytes).cast(),
                 ),
@@ -451,72 +552,73 @@ impl GhosttyEngine {
             GhosttyError::check(
                 "UNKNOWN_MAX_BYTES",
                 sys::ghostty_terminal_set(
-                    self.handle,
+                    handle,
                     sys::TerminalOption::UNKNOWN_MAX_BYTES,
                     (&raw const unknown_cap).cast(),
                 ),
             )?;
             GhosttyError::check(
+                "CLIPBOARD_WRITE_MAX_BYTES",
+                sys::ghostty_terminal_set(
+                    handle,
+                    sys::TerminalOption::CLIPBOARD_WRITE_MAX_BYTES,
+                    (&raw const clipboard_cap).cast(),
+                ),
+            )?;
+            GhosttyError::check(
+                "CONTINUATION_MAX_BYTES",
+                sys::ghostty_terminal_set(
+                    handle,
+                    sys::TerminalOption::CONTINUATION_MAX_BYTES,
+                    (&raw const continuation_cap).cast(),
+                ),
+            )?;
+            GhosttyError::check(
                 "KITTY_IMAGE_STORAGE_LIMIT",
                 sys::ghostty_terminal_set(
-                    self.handle,
+                    handle,
                     sys::TerminalOption::KITTY_IMAGE_STORAGE_LIMIT,
                     (&raw const image_limit).cast(),
                 ),
             )?;
-            // Hostile-PTY security invariant: VT core NEVER opens files or shared memory objects!
+            // Hostile-PTY security invariant: VT core NEVER opens files, temp files, or shared memory!
             GhosttyError::check(
                 "KITTY_IMAGE_MEDIUM_FILE",
                 sys::ghostty_terminal_set(
-                    self.handle,
+                    handle,
                     sys::TerminalOption::KITTY_IMAGE_MEDIUM_FILE,
                     (&raw const no_files).cast(),
                 ),
             )?;
             GhosttyError::check(
+                "KITTY_IMAGE_MEDIUM_TEMP_FILE",
+                sys::ghostty_terminal_set(handle, sys::TerminalOption::KITTY_IMAGE_MEDIUM_TEMP_FILE, std::ptr::null()),
+            )?;
+            GhosttyError::check(
                 "KITTY_IMAGE_MEDIUM_SHARED_MEM",
                 sys::ghostty_terminal_set(
-                    self.handle,
+                    handle,
                     sys::TerminalOption::KITTY_IMAGE_MEDIUM_SHARED_MEM,
                     (&raw const no_files).cast(),
                 ),
             )?;
             GhosttyError::check(
                 "TERMINFO_NAME",
-                sys::ghostty_terminal_set(
-                    self.handle,
-                    sys::TerminalOption::TERMINFO_NAME,
-                    (&raw const term_name).cast(),
-                ),
+                sys::ghostty_terminal_set(handle, sys::TerminalOption::TERMINFO_NAME, (&raw const term_name).cast()),
             )?;
         }
 
         if let Some((shape, blinking)) = self.cursor_defaults {
-            self.apply_cursor_defaults(shape, blinking);
+            let saved_blink = if preserve_blink { Some(query_mode(handle, CURSOR_BLINK_MODE)) } else { None };
+            apply_cursor_defaults(handle, shape, blinking);
+            if let Some(prev_blink) = saved_blink {
+                // Restore DEC mode 12 so re-applying broker defaults never clobbers a restored snapshot's blink state.
+                let seq: &[u8] = if prev_blink { b"\x1b[?12h" } else { b"\x1b[?12l" };
+                // SAFETY: `handle` is live and `seq` is a valid static slice.
+                unsafe { sys::ghostty_terminal_vt_write(handle, seq.as_ptr(), seq.len()) };
+            }
         }
         Ok(())
-    }
-
-    fn apply_cursor_defaults(&self, shape: CursorShape, blinking: bool) {
-        let style = match shape {
-            CursorShape::Block => sys::CursorStyle::BLOCK,
-            CursorShape::Hollow => sys::CursorStyle::BLOCK_HOLLOW,
-            CursorShape::Bar => sys::CursorStyle::BAR,
-            CursorShape::Underline => sys::CursorStyle::UNDERLINE,
-        };
-        // SAFETY: `DEFAULT_CURSOR_STYLE` takes `GhosttyCursorStyle*` and `DEFAULT_CURSOR_BLINK` takes `bool*`.
-        unsafe {
-            let _ = sys::ghostty_terminal_set(
-                self.handle,
-                sys::TerminalOption::DEFAULT_CURSOR_STYLE,
-                (&raw const style).cast(),
-            );
-            let _ = sys::ghostty_terminal_set(
-                self.handle,
-                sys::TerminalOption::DEFAULT_CURSOR_BLINK,
-                (&raw const blinking).cast(),
-            );
-        }
     }
 
     fn update_scroll_and_screen(&mut self, events: &mut Vec<VtEvent>) -> u64 {
@@ -526,7 +628,8 @@ impl GhosttyEngine {
             self.alt_screen = after_alt;
             self.scrollback_lines = after_sb;
             self.first_active_line = if after_alt { 0 } else { after_sb };
-            self.callbacks.first_active_line = self.first_active_line;
+            let first = self.first_active_line;
+            self.callbacks.with_mut(|cb| cb.first_active_line = first);
             self.epoch += 1;
             self.full_dirty = true;
             self.dirty_rows.clear();
@@ -536,21 +639,44 @@ impl GhosttyEngine {
             return 0;
         }
 
-        // Measure exact lines scrolled up since last step using `active_top` TrackedGridRef.
-        let scrolled_up: u64 = match tracked_screen_row(self.active_top) {
-            Some(row) => after_sb.saturating_sub(u64::from(row)),
-            None => {
-                // Active top scrolled off the entire scrollback limit -> force full resync.
+        // Alternate screen has zero scrollback and fixed `first_active_line == 0`.
+        if self.alt_screen {
+            self.scrollback_lines = 0;
+            self.first_active_line = 0;
+            if tracked_screen_row(self.active_top).is_none() {
                 self.full_dirty = true;
-                after_sb.saturating_sub(self.scrollback_lines).max(u64::from(self.size.rows.get()))
+                self.dirty_rows.clear();
+                self.scroll_delta = 0;
+                self.reset_active_top_mark();
             }
+            return 0;
+        }
+
+        // Measure exact lines scrolled up since last step using `active_top` TrackedGridRef.
+        let Some(row) = tracked_screen_row(self.active_top) else {
+            // Active top scrolled off the scrollback limit (or `scrollback_lines == 0`):
+            // bump epoch rather than guessing scroll count and silently renumbering surviving lines!
+            self.scrollback_lines = after_sb;
+            self.first_active_line = after_sb;
+            self.callbacks.with_mut(|cb| cb.first_active_line = after_sb);
+            self.epoch += 1;
+            self.full_dirty = true;
+            self.dirty_rows.clear();
+            self.scroll_delta = 0;
+            self.reset_active_top_mark();
+            events.push(VtEvent::EpochChanged);
+            return 0;
         };
+
+        let scrolled_up = after_sb.saturating_sub(u64::from(row));
         self.scrollback_lines = after_sb;
         let mut applied_scroll = 0u64;
         if scrolled_up != 0 {
             self.first_active_line = self.first_active_line.saturating_add(scrolled_up);
-            self.callbacks.first_active_line = self.first_active_line;
-            if scrolled_up >= u64::from(self.size.rows.get()) {
+            let first = self.first_active_line;
+            self.callbacks.with_mut(|cb| cb.first_active_line = first);
+            let cumulative = u64::try_from(self.scroll_delta).unwrap_or(0).saturating_add(scrolled_up);
+            if self.full_dirty || cumulative >= u64::from(self.size.rows.get()) {
                 self.full_dirty = true;
                 self.dirty_rows.clear();
                 self.scroll_delta = 0;
@@ -606,14 +732,17 @@ impl GhosttyEngine {
         };
         if force_full || (dirty == sys::RenderStateDirty::FULL && (scrolled_up == 0 || self.full_dirty)) {
             self.full_dirty = true;
+            self.dirty_rows.clear();
+            self.scroll_delta = 0;
             self.gens.grid += 1;
             for r in 0..rows_count {
                 self.viewport_hashes[r] = hash_viewport_row(self.handle, r as u32, cols_count);
             }
         } else if dirty == sys::RenderStateDirty::FULL {
             // `libghostty-vt` reports FULL on viewport scroll; preserve scroll-blit delta by
-            // shifting our per-row hashes and marking only newly revealed or modified rows dirty.
-            let shift = (scrolled_up as usize).min(rows_count);
+            // shifting our per-row hashes (including side-table styles/graphemes/links) and marking
+            // only newly revealed or modified rows dirty.
+            let shift = usize::try_from(scrolled_up).unwrap_or(rows_count).min(rows_count);
             self.viewport_hashes.copy_within(shift..rows_count, 0);
             let keep = rows_count - shift;
             for r in 0..rows_count {
@@ -703,19 +832,46 @@ impl GhosttyEngine {
             self.gens.palette += 1;
         }
 
-        self.gens.images = query_images_generation(self.handle);
+        let new_images_gen = query_images_generation(self.handle);
+        if new_images_gen != self.gens.images {
+            self.gens.images = new_images_gen;
+            // When images upload/replace/delete after U+10EEEE placeholders are already on screen,
+            // mark placeholder-bearing viewport rows dirty so `PackedRow.pieces` updates!
+            if !self.full_dirty {
+                for r in 0..rows_count {
+                    if viewport_row_has_placeholder(self.handle, r as u32) {
+                        self.dirty_rows.insert(r as u16);
+                        self.gens.grid += 1;
+                    }
+                }
+            }
+        }
     }
 
     fn sync_images_cache(&self) {
         let cur_gen = query_images_generation(self.handle);
         let mut cache = self.image_cache.borrow_mut();
-        if cache.images_gen == cur_gen {
+        let gen_changed = cache.images_gen != cur_gen;
+        if !gen_changed && cache.blobs.is_empty() {
             return;
         }
+        // Fast path when `cur_gen` unchanged: touch every cached blob in `ImageStore` under one brief
+        // lock; if all are still resident, nothing to re-encode!
+        if !gen_changed {
+            let all_resident = {
+                let mut store = self.image_store.lock().expect("ImageStore mutex poisoned");
+                cache.blobs.values().all(|&(hash, _, _)| store.touch(hash))
+            };
+            if all_resident {
+                return;
+            }
+        }
+
         cache.images_gen = cur_gen;
         cache.virtual_named.clear();
         cache.virtual_lowest.clear();
         let Some(graphics) = query_graphics(self.handle) else {
+            cache.blobs.clear();
             return;
         };
 
@@ -734,6 +890,9 @@ impl GhosttyEngine {
                 (&raw mut iter).cast(),
             )
         };
+
+        let mut active_keys: HashSet<(u32, u64)> = HashSet::new();
+        let mut to_encode: Vec<(u32, u64, u32, u32, u8, Vec<u8>)> = Vec::new();
         if filled == sys::Result::SUCCESS {
             let mut store = self.image_store.lock().expect("ImageStore mutex poisoned");
             // SAFETY: iterating placements while no write mutates `self.handle`.
@@ -750,7 +909,18 @@ impl GhosttyEngine {
                 {
                     continue;
                 }
-                sync_single_image(graphics, image_id, &mut store, &mut cache.blobs);
+                // SAFETY: `graphics` is live for `&self`.
+                let img = unsafe { sys::ghostty_kitty_graphics_image(graphics, image_id) };
+                if !img.is_null() {
+                    let img_gen = query_image_generation(img);
+                    let key = (image_id, img_gen);
+                    if active_keys.insert(key) {
+                        let still_resident = cache.blobs.get(&key).is_some_and(|&(hash, _, _)| store.touch(hash));
+                        if !still_resident && let Some((w, h, ch, px)) = copy_kitty_pixels(img) {
+                            to_encode.push((image_id, img_gen, w, h, ch, px));
+                        }
+                    }
+                }
 
                 let mut is_virtual = false;
                 // SAFETY: `IS_VIRTUAL` writes a `bool`.
@@ -774,9 +944,28 @@ impl GhosttyEngine {
                         .or_insert((pid, grid));
                 }
             }
+            drop(store);
         }
         // SAFETY: freeing iterator once.
         unsafe { sys::ghostty_kitty_graphics_placement_iterator_free(iter) };
+
+        // Evict deleted/replaced image metadata so `cache.blobs` never grows unboundedly.
+        cache.blobs.retain(|k, _| active_keys.contains(k));
+
+        // Encode PNGs completely OUTSIDE the global `ImageStore` mutex so slow compression
+        // never stalls other sessions/shards!
+        if !to_encode.is_empty() {
+            let encoded: Vec<(u32, u64, u32, u32, Vec<u8>)> = to_encode
+                .into_iter()
+                .filter_map(|(id, g, w, h, ch, px)| encode_png_pixels(w, h, ch, &px).map(|png| (id, g, w, h, png)))
+                .collect();
+            let mut store = self.image_store.lock().expect("ImageStore mutex poisoned");
+            for (id, g, w, h, png) in encoded {
+                if let Some(hash) = store.insert_encoded(ImageEncoding::Png, png) {
+                    cache.blobs.insert((id, g), (hash, w, h));
+                }
+            }
+        }
     }
 
     fn resolve_virtual(&self, image_id: u32, placement_id: u32) -> Option<VirtualImageInfo> {
@@ -852,8 +1041,8 @@ impl GhosttyEngine {
 
 impl Drop for GhosttyEngine {
     fn drop(&mut self) {
-        // SAFETY: free every dependent handle strictly BEFORE freeing `self.handle` (and before
-        // `self.callbacks` drops automatically afterwards).
+        // SAFETY: free every dependent C handle strictly BEFORE freeing `self.handle`, which in
+        // turn runs BEFORE Rust drops `self.callbacks` (`CallbackBox`).
         unsafe {
             sys::ghostty_tracked_grid_ref_free(self.active_top);
             sys::ghostty_render_state_row_iterator_free(self.render_rows);
@@ -867,6 +1056,7 @@ impl VtEngine for GhosttyEngine {
     fn feed(&mut self, bytes: &[u8], events: &mut Vec<VtEvent>) {
         let mut rest = bytes;
         let mut total_scrolled = 0u64;
+        let mut raw_events: Vec<VtEvent> = Vec::new();
         while !rest.is_empty() {
             let mut stop =
                 sys::TerminalWriteStop { size: std::mem::size_of::<sys::TerminalWriteStop>(), ..Default::default() };
@@ -892,8 +1082,8 @@ impl VtEngine for GhosttyEngine {
             rest = &rest[consumed..];
 
             // Synchronize scroll / alt-screen epoch BEFORE stamping cursor_line on callbacks from this slice!
-            let mut pending = std::mem::take(&mut self.callbacks.events);
-            total_scrolled = total_scrolled.saturating_add(self.update_scroll_and_screen(events));
+            let mut pending = self.callbacks.with_mut(|cb| std::mem::take(&mut cb.events));
+            total_scrolled = total_scrolled.saturating_add(self.update_scroll_and_screen(&mut raw_events));
             let cur_y = read_u16(self.handle, sys::TerminalData::CURSOR_Y).unwrap_or(0);
             let abs_cursor_line = self.first_active_line.saturating_add(u64::from(cur_y));
             for ev in &mut pending {
@@ -904,24 +1094,27 @@ impl VtEngine for GhosttyEngine {
                     _ => {}
                 }
             }
-            events.extend(pending);
+            raw_events.extend(pending);
         }
+        coalesce_feed_events(raw_events, events);
         if !bytes.is_empty() {
             self.refresh_render_state(false, total_scrolled);
         }
     }
 
-    fn resize(&mut self, size: GridSize, cell_px: CellPx) {
+    fn resize(&mut self, size: GridSize, cell_px: CellPx, events: &mut Vec<VtEvent>) {
         let grid_changed = size != self.size;
         if !grid_changed && cell_px == self.cell_px {
             return;
         }
         self.size = size;
         self.cell_px = cell_px;
-        self.callbacks.cols = size.cols.get();
-        self.callbacks.rows = size.rows.get();
-        self.callbacks.cell_px = cell_px;
-        // SAFETY: `self.handle` is live for `&mut self`.
+        self.callbacks.with_mut(|cb| {
+            cb.cols = size.cols.get();
+            cb.rows = size.rows.get();
+            cb.cell_px = cell_px;
+        });
+        // SAFETY: `self.handle` is live for `&mut self`; may invoke `cb_write_pty` (mode 2048) or `cb_render_hold`.
         let _ = unsafe {
             sys::ghostty_terminal_resize(
                 self.handle,
@@ -931,11 +1124,14 @@ impl VtEngine for GhosttyEngine {
                 u32::from(cell_px.height),
             )
         };
+        let pending = self.callbacks.with_mut(|cb| std::mem::take(&mut cb.events));
+        events.extend(pending);
         if grid_changed {
             self.epoch += 1;
             self.scrollback_lines = query_scrollback_rows(self.handle);
             self.first_active_line = if self.alt_screen { 0 } else { self.scrollback_lines };
-            self.callbacks.first_active_line = self.first_active_line;
+            let first = self.first_active_line;
+            self.callbacks.with_mut(|cb| cb.first_active_line = first);
             self.full_dirty = true;
             self.dirty_rows.clear();
             self.scroll_delta = 0;
@@ -1008,15 +1204,17 @@ impl VtEngine for GhosttyEngine {
         }
     }
 
-    fn word_at(&self, pos: CellPos, _delimiters: &str) -> Option<CellSpan> {
+    fn word_at(&self, pos: CellPos, delimiters: &str) -> Option<CellSpan> {
         let grid_ref = self.screen_grid_ref(pos)?;
+        let boundary_cps: Vec<u32> = delimiters.chars().map(u32::from).collect();
         let opts = sys::TerminalSelectWordOptions {
             size: std::mem::size_of::<sys::TerminalSelectWordOptions>(),
             ref_: grid_ref,
-            ..Default::default()
+            boundary_codepoints: if boundary_cps.is_empty() { std::ptr::null() } else { boundary_cps.as_ptr() },
+            boundary_codepoints_len: boundary_cps.len(),
         };
         let mut sel = sys::Selection::default();
-        // SAFETY: `opts` is sized and `sel` is a valid out-pointer on live `self.handle`.
+        // SAFETY: `opts` is sized, `boundary_cps` outlives the call, and `sel` is a valid out-pointer.
         let res = unsafe { sys::ghostty_terminal_select_word(self.handle, &raw const opts, &raw mut sel) };
         (res == sys::Result::SUCCESS).then(|| self.selection_to_span(&sel)).flatten()
     }
@@ -1085,27 +1283,57 @@ impl VtEngine for GhosttyEngine {
             let Some(screen_y) = self.epoch_to_screen_row(line) else {
                 continue;
             };
+            let point = sys::Point {
+                tag: sys::PointTag::SCREEN,
+                value: sys::PointValue { coordinate: sys::PointCoordinate { x: lo_col, y: screen_y } },
+            };
+            let mut grid_ref = sys::GridRef::default();
+            // SAFETY: resolve row once per line instead of walking scrollback pages per cell.
+            if unsafe { sys::ghostty_terminal_grid_ref(self.handle, point, &raw mut grid_ref) } != sys::Result::SUCCESS
+            {
+                continue;
+            }
             let mut row_text = String::new();
             for col in lo_col..=hi_col {
-                let point = sys::Point {
-                    tag: sys::PointTag::SCREEN,
-                    value: sys::PointValue { coordinate: sys::PointCoordinate { x: col, y: screen_y } },
-                };
-                let mut grid_ref = sys::GridRef::default();
-                // SAFETY: `grid_ref` is a valid out-pointer on live `self.handle`.
-                if unsafe { sys::ghostty_terminal_grid_ref(self.handle, point, &raw mut grid_ref) }
-                    != sys::Result::SUCCESS
-                {
-                    continue;
-                }
+                grid_ref.x = col;
                 let mut cell: sys::Cell = 0;
-                // SAFETY: `grid_ref` was just resolved.
+                // SAFETY: `grid_ref` names a valid column in the resolved row.
                 if unsafe { sys::ghostty_grid_ref_cell(&raw const grid_ref, &raw mut cell) } != sys::Result::SUCCESS {
                     continue;
                 }
+                let mut wide: sys::CellWide::Type = sys::CellWide::NARROW;
+                let mut content: sys::CellContentTag::Type = sys::CellContentTag::CODEPOINT;
                 let mut cp: u32 = 0;
-                // SAFETY: `CODEPOINT` writes a `uint32_t`.
-                let _ = unsafe { sys::ghostty_cell_get(cell, sys::CellData::CODEPOINT, (&raw mut cp).cast()) };
+                // SAFETY: out-pointer types match `libghostty-vt` CellData contract.
+                unsafe {
+                    let _ = sys::ghostty_cell_get(cell, sys::CellData::WIDE, (&raw mut wide).cast());
+                    let _ = sys::ghostty_cell_get(cell, sys::CellData::CONTENT_TAG, (&raw mut content).cast());
+                    let _ = sys::ghostty_cell_get(cell, sys::CellData::CODEPOINT, (&raw mut cp).cast());
+                }
+                if wide == sys::CellWide::SPACER_TAIL || wide == sys::CellWide::SPACER_HEAD {
+                    continue;
+                }
+                if cp == u32::from(PLACEHOLDER) {
+                    row_text.push(' ');
+                    continue;
+                }
+                if content == sys::CellContentTag::CODEPOINT_GRAPHEME {
+                    let mut cps = [0u32; CLUSTER_CODEPOINTS];
+                    let mut written = 0usize;
+                    // SAFETY: `cps` has length `CLUSTER_CODEPOINTS`.
+                    let res = unsafe {
+                        sys::ghostty_grid_ref_graphemes(
+                            &raw const grid_ref,
+                            cps.as_mut_ptr(),
+                            cps.len(),
+                            &raw mut written,
+                        )
+                    };
+                    if res == sys::Result::SUCCESS {
+                        row_text.extend(cps[..written.min(cps.len())].iter().filter_map(|&c| char::from_u32(c)));
+                        continue;
+                    }
+                }
                 row_text.push(char::from_u32(cp).filter(|&c| c != '\0').unwrap_or(' '));
             }
             out.push_str(row_text.trim_end_matches(' '));
@@ -1122,7 +1350,7 @@ impl VtEngine for GhosttyEngine {
         limit: usize,
         out: &mut Vec<CellSpan>,
     ) -> bool {
-        if needle.is_empty() || limit == 0 {
+        if needle.is_empty() || from_line >= to_line || limit == 0 {
             return false;
         }
         let mut search: sys::Search = std::ptr::null_mut();
@@ -1134,7 +1362,10 @@ impl VtEngine for GhosttyEngine {
         let mut raw_matches: Vec<sys::Selection> = Vec::new();
         let wanted = SEARCH_CANDIDATES.max(limit);
         let mut complete = false;
-        let max_passes = (self.scrollback_lines as usize).saturating_add(usize::from(self.size.rows.get())).max(64);
+        let total_rows = usize::try_from(self.scrollback_lines)
+            .unwrap_or(usize::MAX)
+            .saturating_add(usize::from(self.size.rows.get()));
+        let max_passes = total_rows.saturating_mul(16).max(1024);
         // SAFETY: `search` is live; `NEEDLE` copies `text`, `MATCHES` writes up to `cap` selections.
         let res = unsafe {
             let mut r =
@@ -1182,15 +1413,16 @@ impl VtEngine for GhosttyEngine {
 
         let mut formatter: sys::Formatter = std::ptr::null_mut();
         if case_sensitive && !raw_matches.is_empty() {
-            // SAFETY: creating a single reused formatter for exact-case filtering; freed below.
+            // SAFETY: creating a single reused formatter for exact-case filtering; fail-closed on error.
             let _ = unsafe { sys::ghostty_formatter_terminal_new(std::ptr::null(), &raw mut formatter, self.handle) };
-            if !formatter.is_null() {
-                let unwrap = true;
-                // SAFETY: `UNWRAP` takes a `bool*`.
-                let _ = unsafe {
-                    sys::ghostty_formatter_set(formatter, sys::FormatterOption::UNWRAP, (&raw const unwrap).cast())
-                };
+            if formatter.is_null() {
+                return false;
             }
+            let unwrap = true;
+            // SAFETY: `UNWRAP` takes a `bool*`.
+            let _ = unsafe {
+                sys::ghostty_formatter_set(formatter, sys::FormatterOption::UNWRAP, (&raw const unwrap).cast())
+            };
         }
 
         let needle_bytes = needle.as_bytes();
@@ -1309,8 +1541,8 @@ impl VtEngine for GhosttyEngine {
         self.encoders.encode_key(self.handle, key, out);
     }
 
-    fn encode_pointer(&mut self, ev: &PointerInput, out: &mut Vec<u8>) {
-        self.encoders.encode_pointer(self.handle, self.size, ev, out);
+    fn encode_pointer(&mut self, ev: &PointerInput, held_buttons: &mut u8, out: &mut Vec<u8>) {
+        self.encoders.encode_pointer(self.handle, self.size, ev, held_buttons, out);
     }
 
     fn encode_focus(&mut self, focused: bool, out: &mut Vec<u8>) {
@@ -1323,7 +1555,7 @@ impl VtEngine for GhosttyEngine {
 
     fn set_cursor_defaults(&mut self, shape: CursorShape, blinking: bool) {
         self.cursor_defaults = Some((shape, blinking));
-        self.apply_cursor_defaults(shape, blinking);
+        apply_cursor_defaults(self.handle, shape, blinking);
         self.refresh_render_state(false, 0);
     }
 
@@ -1351,10 +1583,57 @@ impl VtEngine for GhosttyEngine {
     }
 }
 
+fn apply_cursor_defaults(handle: sys::Terminal, shape: CursorShape, blinking: bool) {
+    let style = match shape {
+        CursorShape::Block => sys::CursorStyle::BLOCK,
+        CursorShape::Hollow => sys::CursorStyle::BLOCK_HOLLOW,
+        CursorShape::Bar => sys::CursorStyle::BAR,
+        CursorShape::Underline => sys::CursorStyle::UNDERLINE,
+    };
+    // SAFETY: `DEFAULT_CURSOR_STYLE` takes `GhosttyCursorStyle*` and `DEFAULT_CURSOR_BLINK` takes `bool*`.
+    unsafe {
+        let _ = sys::ghostty_terminal_set(handle, sys::TerminalOption::DEFAULT_CURSOR_STYLE, (&raw const style).cast());
+        let _ =
+            sys::ghostty_terminal_set(handle, sys::TerminalOption::DEFAULT_CURSOR_BLINK, (&raw const blinking).cast());
+    }
+}
+
+/// Coalesces flood-prone stateless/latest-wins events (`Bell`, consecutive `Title`/`Progress`)
+/// within a single `feed()` call while strictly preserving ordering of marks, epochs, and replies.
+pub(crate) fn coalesce_feed_events(raw: Vec<VtEvent>, out: &mut Vec<VtEvent>) {
+    let mut saw_bell = false;
+    for ev in raw {
+        match ev {
+            VtEvent::Bell => {
+                if !saw_bell {
+                    saw_bell = true;
+                    out.push(VtEvent::Bell);
+                }
+            }
+            VtEvent::Title(title) => {
+                if let Some(VtEvent::Title(prev)) = out.last_mut() {
+                    *prev = title;
+                } else {
+                    out.push(VtEvent::Title(title));
+                }
+            }
+            VtEvent::Progress { state, percent } => {
+                if let Some(VtEvent::Progress { state: ps, percent: pp }) = out.last_mut() {
+                    *ps = state;
+                    *pp = percent;
+                } else {
+                    out.push(VtEvent::Progress { state, percent });
+                }
+            }
+            other => out.push(other),
+        }
+    }
+}
+
 // --- C callback trampolines ---
 
-// SAFETY: `libghostty-vt` calls this synchronously during `vt_write` with `userdata` set to our
-// pinned `CallbackState` and `data` readable for `len` bytes.
+// SAFETY: `libghostty-vt` calls this synchronously during `vt_write`/`resize` with `userdata` set to
+// our `CallbackBox` pointer and `data` readable for `len` bytes.
 unsafe extern "C" fn cb_write_pty(_term: sys::Terminal, userdata: *mut std::ffi::c_void, data: *const u8, len: usize) {
     if userdata.is_null() || data.is_null() || len == 0 {
         return;
@@ -1364,7 +1643,7 @@ unsafe extern "C" fn cb_write_pty(_term: sys::Terminal, userdata: *mut std::ffi:
     state.events.push(VtEvent::DeviceResponse(bytes.to_vec()));
 }
 
-// SAFETY: `libghostty-vt` calls this synchronously with our pinned `CallbackState` and valid `event`.
+// SAFETY: `libghostty-vt` calls this synchronously with our `CallbackBox` pointer and valid `event`.
 unsafe extern "C" fn cb_semantic_prompt(
     _term: sys::Terminal,
     userdata: *mut std::ffi::c_void,
@@ -1385,7 +1664,8 @@ unsafe extern "C" fn cb_semantic_prompt(
         sys::SemanticPromptKind::GHOSTTY_SEMANTIC_PROMPT_OUTPUT_START => {
             // SAFETY: `ev.command` is owned by `libghostty-vt` for this callback and copied out.
             if let Some(cmd) = unsafe { copy_ghostty_string(&ev.command) } {
-                state.events.push(VtEvent::Osc133 { payload: format!("E;{cmd}"), cursor_line: line });
+                let escaped = escape_osc633_field(&cmd);
+                state.events.push(VtEvent::Osc133 { payload: format!("E;{escaped}"), cursor_line: line });
             }
             state.events.push(VtEvent::Osc133 { payload: String::from("C"), cursor_line: line });
         }
@@ -1397,7 +1677,7 @@ unsafe extern "C" fn cb_semantic_prompt(
     }
 }
 
-// SAFETY: `libghostty-vt` calls this synchronously with our pinned `CallbackState` and valid `out_size`.
+// SAFETY: `libghostty-vt` calls this synchronously with our `CallbackBox` pointer and valid `out_size`.
 unsafe extern "C" fn cb_size(
     _term: sys::Terminal,
     userdata: *mut std::ffi::c_void,
@@ -1418,7 +1698,7 @@ unsafe extern "C" fn cb_size(
     true
 }
 
-// SAFETY: `libghostty-vt` calls this synchronously with our pinned `CallbackState` and live `term`.
+// SAFETY: `libghostty-vt` calls this synchronously with our `CallbackBox` pointer and live `term`.
 unsafe extern "C" fn cb_pwd_changed(term: sys::Terminal, userdata: *mut std::ffi::c_void) {
     if userdata.is_null() {
         return;
@@ -1436,7 +1716,7 @@ unsafe extern "C" fn cb_pwd_changed(term: sys::Terminal, userdata: *mut std::ffi
     }
 }
 
-// SAFETY: `libghostty-vt` calls this synchronously with our pinned `CallbackState` and live `term`.
+// SAFETY: `libghostty-vt` calls this synchronously with our `CallbackBox` pointer and live `term`.
 unsafe extern "C" fn cb_title_changed(term: sys::Terminal, userdata: *mut std::ffi::c_void) {
     if userdata.is_null() {
         return;
@@ -1453,7 +1733,7 @@ unsafe extern "C" fn cb_title_changed(term: sys::Terminal, userdata: *mut std::f
     state.events.push(VtEvent::Title(title.unwrap_or_default()));
 }
 
-// SAFETY: `libghostty-vt` calls this synchronously with our pinned `CallbackState`.
+// SAFETY: `libghostty-vt` calls this synchronously with our `CallbackBox` pointer.
 unsafe extern "C" fn cb_bell(_term: sys::Terminal, userdata: *mut std::ffi::c_void) {
     if userdata.is_null() {
         return;
@@ -1462,7 +1742,7 @@ unsafe extern "C" fn cb_bell(_term: sys::Terminal, userdata: *mut std::ffi::c_vo
     unsafe { &mut *userdata.cast::<CallbackState>() }.events.push(VtEvent::Bell);
 }
 
-// SAFETY: `libghostty-vt` calls this synchronously with our pinned `CallbackState` and valid `write`.
+// SAFETY: `libghostty-vt` calls this synchronously with our `CallbackBox` pointer and valid `write`.
 unsafe extern "C" fn cb_clipboard_write(
     _term: sys::Terminal,
     userdata: *mut std::ffi::c_void,
@@ -1497,7 +1777,7 @@ unsafe extern "C" fn cb_clipboard_write(
     }
 }
 
-// SAFETY: `libghostty-vt` calls this synchronously with our pinned `CallbackState` and valid `note`.
+// SAFETY: `libghostty-vt` calls this synchronously with our `CallbackBox` pointer and valid `note`.
 unsafe extern "C" fn cb_notification(
     _term: sys::Terminal,
     userdata: *mut std::ffi::c_void,
@@ -1514,7 +1794,7 @@ unsafe extern "C" fn cb_notification(
     state.events.push(VtEvent::Notification { title: title.unwrap_or_default(), body: body.unwrap_or_default() });
 }
 
-// SAFETY: `libghostty-vt` calls this synchronously with our pinned `CallbackState` and valid `report`.
+// SAFETY: `libghostty-vt` calls this synchronously with our `CallbackBox` pointer and valid `report`.
 unsafe extern "C" fn cb_progress(
     _term: sys::Terminal,
     userdata: *mut std::ffi::c_void,
@@ -1535,7 +1815,7 @@ unsafe extern "C" fn cb_progress(
     state.events.push(VtEvent::Progress { state: progress_state, percent: u8::try_from(rep.progress).ok() });
 }
 
-// SAFETY: `libghostty-vt` calls this synchronously with our pinned `CallbackState` and valid `report`.
+// SAFETY: `libghostty-vt` calls this synchronously with our `CallbackBox` pointer and valid `report`.
 unsafe extern "C" fn cb_program_status(
     _term: sys::Terminal,
     userdata: *mut std::ffi::c_void,
@@ -1546,53 +1826,42 @@ unsafe extern "C" fn cb_program_status(
     }
     // SAFETY: both pointers are valid for this call.
     let (state, rep) = unsafe { (&mut *userdata.cast::<CallbackState>(), &*report) };
-    let state_str = match rep.state {
-        sys::ProgramStatusState::IDLE => "idle",
-        sys::ProgramStatusState::WORKING => "working",
-        sys::ProgramStatusState::DONE => "done",
-        sys::ProgramStatusState::BLOCKED => "blocked",
-        sys::ProgramStatusState::ERROR => "error",
-        sys::ProgramStatusState::CLEAR => "clear",
+    // SAFETY: string slices are valid for this callback and copied out immediately.
+    let id = unsafe { copy_ghostty_string(&rep.id) }.unwrap_or_default();
+    if rep.state == sys::ProgramStatusState::CLEAR {
+        state.events.push(VtEvent::ProgramStatus(ProgramStatusUpdate::Clear { id }));
+        return;
+    }
+    let status_state = match rep.state {
+        sys::ProgramStatusState::IDLE => StatusState::Idle,
+        sys::ProgramStatusState::WORKING => StatusState::Working,
+        sys::ProgramStatusState::DONE => StatusState::Done,
+        sys::ProgramStatusState::BLOCKED => StatusState::Blocked,
+        sys::ProgramStatusState::ERROR => StatusState::Error,
         _ => return,
     };
-    let mut parts = vec![format!("state={state_str}")];
-    let kind_str = match rep.kind {
-        sys::ProgramStatusKind::PERMISSION => Some("permission"),
-        sys::ProgramStatusKind::QUESTION => Some("question"),
-        sys::ProgramStatusKind::AUTH => Some("auth"),
+    let kind = match rep.kind {
+        sys::ProgramStatusKind::PERMISSION => Some(BlockedKind::Permission),
+        sys::ProgramStatusKind::QUESTION => Some(BlockedKind::Question),
+        sys::ProgramStatusKind::AUTH => Some(BlockedKind::Auth),
         _ => None,
     };
-    if let Some(k) = kind_str {
-        parts.push(format!("kind={k}"));
-    }
-    if let Ok(p) = u8::try_from(rep.progress) {
-        parts.push(format!("progress={p}"));
-    }
-    // SAFETY: string slices are valid for this callback and copied out.
-    let (id, app, title, msg) = unsafe {
-        (
-            copy_ghostty_string(&rep.id),
-            copy_ghostty_string(&rep.app),
-            copy_ghostty_string(&rep.title),
-            copy_ghostty_string(&rep.message),
-        )
-    };
-    if let Some(v) = id {
-        parts.push(format!("id={v}"));
-    }
-    if let Some(v) = app {
-        parts.push(format!("app={v}"));
-    }
-    if let Some(v) = title {
-        parts.push(format!("title={v}"));
-    }
-    if let Some(v) = msg {
-        parts.push(format!("message={v}"));
-    }
-    state.events.push(VtEvent::Osc7501(parts.join(";")));
+    let progress = u8::try_from(rep.progress).ok();
+    // SAFETY: string slices are valid for this callback and copied out immediately.
+    let (app, title, message) =
+        unsafe { (copy_ghostty_string(&rep.app), copy_ghostty_string(&rep.title), copy_ghostty_string(&rep.message)) };
+    state.events.push(VtEvent::ProgramStatus(ProgramStatusUpdate::Set {
+        id,
+        state: status_state,
+        kind,
+        progress,
+        app,
+        title,
+        message,
+    }));
 }
 
-// SAFETY: `libghostty-vt` calls this synchronously with our pinned `CallbackState`.
+// SAFETY: `libghostty-vt` calls this synchronously with our `CallbackBox` pointer.
 unsafe extern "C" fn cb_render_hold(_term: sys::Terminal, userdata: *mut std::ffi::c_void, held: bool) {
     if userdata.is_null() {
         return;
@@ -1601,7 +1870,7 @@ unsafe extern "C" fn cb_render_hold(_term: sys::Terminal, userdata: *mut std::ff
     unsafe { &mut *userdata.cast::<CallbackState>() }.events.push(VtEvent::SyncOutput(held));
 }
 
-// SAFETY: `libghostty-vt` calls this synchronously with our pinned `CallbackState` and valid `seq`.
+// SAFETY: `libghostty-vt` calls this synchronously with our `CallbackBox` pointer and valid `seq`.
 unsafe extern "C" fn cb_unknown_sequence(
     _term: sys::Terminal,
     userdata: *mut std::ffi::c_void,
@@ -1624,13 +1893,46 @@ unsafe extern "C" fn cb_unknown_sequence(
     let raw = unsafe { std::slice::from_raw_parts(osc.content.ptr, osc.content.len) };
     let text = String::from_utf8_lossy(raw);
     if let Some(body) = text.strip_prefix("633;") {
-        // Claims cut short by `UNKNOWN_MAX_BYTES` are dropped; keyed `V;` marks keep their
-        // authenticated prefix (`V;<kind>;<seq>;<key>;...`).
-        if osc.truncated && !body.starts_with("V;") {
+        let Some(payload) = sanitize_osc633_body(body, osc.truncated) else {
             return;
-        }
-        state.events.push(VtEvent::Osc633 { payload: body.to_owned(), cursor_line: state.first_active_line });
+        };
+        state.events.push(VtEvent::Osc633 { payload, cursor_line: state.first_active_line });
     }
+}
+
+/// Drops truncated unvouched claims, and strips the half-truncated CWD field from truncated `V;F;`
+/// records while preserving their authenticated exit code.
+pub(crate) fn sanitize_osc633_body(body: &str, truncated: bool) -> Option<String> {
+    if !truncated {
+        return Some(body.to_owned());
+    }
+    if !body.starts_with("V;") {
+        return None;
+    }
+    if body.starts_with("V;F;") {
+        // Format: V;F;<seq>;<key>;<status>;<cwd> -> keep up to and including the 5th `;` (empty cwd).
+        let mut semis = body.match_indices(';');
+        if let Some((fifth_pos, _)) = semis.nth(4) {
+            return Some(body[..=fifth_pos].to_owned());
+        }
+    }
+    Some(body.to_owned())
+}
+
+/// Escapes `\` / `;` / `\n` / `\r` in an already-decoded command string so `MarksTracker`'s
+/// `OSC 133;E;<cmd>` parser recovers the exact original command verbatim.
+pub(crate) fn escape_osc633_field(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            ';' => out.push_str("\\x3b"),
+            '\n' => out.push_str("\\x0a"),
+            '\r' => out.push_str("\\x0d"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Copies a `libghostty-vt` `GhosttyString` into an owned UTF-8 `String`.
@@ -1649,7 +1951,10 @@ unsafe fn copy_ghostty_string(text: &sys::String) -> Option<String> {
 
 // --- Helper FFI queries ---
 
+/// Hashes all visually observable state of viewport row `row` (wrap/prompt flags, cells, AND
+/// side-table styles, grapheme continuations, and hyperlink URIs guarded by fast row-level flags).
 fn hash_viewport_row(handle: sys::Terminal, row: u32, cols: u16) -> u64 {
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
     let point = sys::Point {
         tag: sys::PointTag::ACTIVE,
         value: sys::PointValue { coordinate: sys::PointCoordinate { x: 0, y: row } },
@@ -1662,26 +1967,129 @@ fn hash_viewport_row(handle: sys::Terminal, row: u32, cols: u16) -> u64 {
     let mut raw_row: sys::Row = 0;
     let mut wrapped = false;
     let mut prompt: sys::RowSemanticPrompt::Type = sys::RowSemanticPrompt::NONE;
-    // SAFETY: `grid_ref` was just populated; `WRAP` writes `bool` and `SEMANTIC_PROMPT` writes `RowSemanticPrompt`.
+    let mut row_styled = false;
+    let mut row_grapheme = false;
+    let mut row_hyperlink = false;
+    // SAFETY: `grid_ref` was just populated; each `RowData` key matches its documented out-pointer type.
     unsafe {
         if sys::ghostty_grid_ref_row(&raw const grid_ref, &raw mut raw_row) == sys::Result::SUCCESS {
             let _ = sys::ghostty_row_get(raw_row, sys::RowData::WRAP, (&raw mut wrapped).cast());
             let _ = sys::ghostty_row_get(raw_row, sys::RowData::SEMANTIC_PROMPT, (&raw mut prompt).cast());
+            let _ = sys::ghostty_row_get(raw_row, sys::RowData::STYLED, (&raw mut row_styled).cast());
+            let _ = sys::ghostty_row_get(raw_row, sys::RowData::GRAPHEME, (&raw mut row_grapheme).cast());
+            let _ = sys::ghostty_row_get(raw_row, sys::RowData::HYPERLINK, (&raw mut row_hyperlink).cast());
         }
     }
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325u64
-        .wrapping_add(u64::from(wrapped))
-        .wrapping_mul(0x0000_0100_0000_01b3)
-        .wrapping_add(u64::from(prompt));
+    let mut h: u64 =
+        0xcbf2_9ce4_8422_2325u64.wrapping_add(u64::from(wrapped)).wrapping_mul(PRIME).wrapping_add(u64::from(prompt));
+    let mut link_scratch: Vec<u8> = Vec::new();
     for col in 0..cols {
         grid_ref.x = col;
         let mut cell: sys::Cell = 0;
         // SAFETY: `grid_ref` names a valid column in the resolved row.
-        if unsafe { sys::ghostty_grid_ref_cell(&raw const grid_ref, &raw mut cell) } == sys::Result::SUCCESS {
-            h = h.wrapping_mul(0x0000_0100_0000_01b3).wrapping_add(cell);
+        if unsafe { sys::ghostty_grid_ref_cell(&raw const grid_ref, &raw mut cell) } != sys::Result::SUCCESS {
+            continue;
+        }
+        h = h.wrapping_mul(PRIME).wrapping_add(cell);
+
+        if row_styled {
+            let mut styled = false;
+            // SAFETY: `HAS_STYLING` writes a `bool`.
+            let _ = unsafe { sys::ghostty_cell_get(cell, sys::CellData::HAS_STYLING, (&raw mut styled).cast()) };
+            if styled {
+                let mut st = sys::Style::default();
+                // SAFETY: `grid_ref` is live and `st` is a valid out-pointer.
+                let _ = unsafe { sys::ghostty_grid_ref_style(&raw const grid_ref, &raw mut st) };
+                h = h
+                    .wrapping_mul(PRIME)
+                    .wrapping_add(u64::from(pack_color(st.fg_color)))
+                    .wrapping_mul(PRIME)
+                    .wrapping_add(u64::from(pack_color(st.bg_color)))
+                    .wrapping_mul(PRIME)
+                    .wrapping_add(u64::from(pack_color(st.underline_color)))
+                    .wrapping_mul(PRIME)
+                    .wrapping_add(u64::from(pack_style_flags(st.flags)));
+            }
+        }
+        if row_grapheme {
+            let mut content: sys::CellContentTag::Type = sys::CellContentTag::CODEPOINT;
+            // SAFETY: `CONTENT_TAG` writes a `GhosttyCellContentTag`.
+            let _ = unsafe { sys::ghostty_cell_get(cell, sys::CellData::CONTENT_TAG, (&raw mut content).cast()) };
+            if content == sys::CellContentTag::CODEPOINT_GRAPHEME {
+                let mut cps = [0u32; CLUSTER_CODEPOINTS];
+                let mut written = 0usize;
+                // SAFETY: `cps` has length `CLUSTER_CODEPOINTS`.
+                if unsafe {
+                    sys::ghostty_grid_ref_graphemes(&raw const grid_ref, cps.as_mut_ptr(), cps.len(), &raw mut written)
+                } == sys::Result::SUCCESS
+                {
+                    for &cp in &cps[..written.min(cps.len())] {
+                        h = h.wrapping_mul(PRIME).wrapping_add(u64::from(cp));
+                    }
+                }
+            }
+        }
+        if row_hyperlink {
+            let mut linked = false;
+            // SAFETY: `HAS_HYPERLINK` writes a `bool`.
+            let _ = unsafe { sys::ghostty_cell_get(cell, sys::CellData::HAS_HYPERLINK, (&raw mut linked).cast()) };
+            if linked {
+                let mut short = [0u8; 256];
+                let mut written = 0usize;
+                // SAFETY: `short` is valid for `short.len()` bytes.
+                let res = unsafe {
+                    sys::ghostty_grid_ref_hyperlink_uri(
+                        &raw const grid_ref,
+                        short.as_mut_ptr(),
+                        short.len(),
+                        &raw mut written,
+                    )
+                };
+                let slice: &[u8] = match res {
+                    sys::Result::SUCCESS => &short[..written.min(short.len())],
+                    sys::Result::OUT_OF_SPACE => {
+                        link_scratch.resize(written.min(ROW_LINK_BYTES), 0);
+                        // SAFETY: `link_scratch` has `link_scratch.len()` bytes.
+                        let r2 = unsafe {
+                            sys::ghostty_grid_ref_hyperlink_uri(
+                                &raw const grid_ref,
+                                link_scratch.as_mut_ptr(),
+                                link_scratch.len(),
+                                &raw mut written,
+                            )
+                        };
+                        if r2 == sys::Result::SUCCESS { &link_scratch[..written.min(link_scratch.len())] } else { &[] }
+                    }
+                    _ => &[],
+                };
+                for &b in slice {
+                    h = h.wrapping_mul(PRIME).wrapping_add(u64::from(b));
+                }
+            }
         }
     }
     h
+}
+
+fn viewport_row_has_placeholder(handle: sys::Terminal, row: u32) -> bool {
+    let point = sys::Point {
+        tag: sys::PointTag::ACTIVE,
+        value: sys::PointValue { coordinate: sys::PointCoordinate { x: 0, y: row } },
+    };
+    let mut grid_ref = sys::GridRef::default();
+    // SAFETY: `grid_ref` is a valid out-pointer on live `handle`.
+    if unsafe { sys::ghostty_terminal_grid_ref(handle, point, &raw mut grid_ref) } != sys::Result::SUCCESS {
+        return false;
+    }
+    let mut raw_row: sys::Row = 0;
+    let mut has = false;
+    // SAFETY: `KITTY_VIRTUAL_PLACEHOLDER` writes a `bool`.
+    unsafe {
+        if sys::ghostty_grid_ref_row(&raw const grid_ref, &raw mut raw_row) == sys::Result::SUCCESS {
+            let _ = sys::ghostty_row_get(raw_row, sys::RowData::KITTY_VIRTUAL_PLACEHOLDER, (&raw mut has).cast());
+        }
+    }
+    has
 }
 
 fn track_active_top(handle: sys::Terminal) -> Result<sys::TrackedGridRef, GhosttyError> {
@@ -1812,21 +2220,7 @@ fn read_placement_u32(
     (res == sys::Result::SUCCESS).then_some(val)
 }
 
-fn sync_single_image(
-    graphics: sys::KittyGraphics,
-    image_id: u32,
-    store: &mut ImageStore,
-    blobs: &mut HashMap<(u32, u64), (BlobHash, u32, u32)>,
-) {
-    // SAFETY: `graphics` is live for this call.
-    let img = unsafe { sys::ghostty_kitty_graphics_image(graphics, image_id) };
-    if img.is_null() {
-        return;
-    }
-    let img_gen = query_image_generation(img);
-    if blobs.contains_key(&(image_id, img_gen)) {
-        return;
-    }
+fn copy_kitty_pixels(img: sys::KittyGraphicsImage) -> Option<(u32, u32, u8, Vec<u8>)> {
     let mut width = 0u32;
     let mut height = 0u32;
     let mut format: sys::KittyImageFormat::Type = sys::KittyImageFormat::RGBA;
@@ -1842,18 +2236,16 @@ fn sync_single_image(
             sys::ghostty_kitty_graphics_image_get(img, sys::KittyGraphicsImageData::PIXELS, (&raw mut pixels).cast());
     }
     if pixels.ptr.is_null() {
-        return;
+        return None;
     }
     let channels = match format {
         sys::KittyImageFormat::RGB => 3,
         sys::KittyImageFormat::RGBA => 4,
-        _ => return,
+        _ => return None,
     };
     // SAFETY: `pixels.ptr` is non-null and readable for `pixels.len` bytes while terminal is immutable.
     let slice = unsafe { std::slice::from_raw_parts(pixels.ptr, pixels.len) };
-    if let Some(hash) = store.insert_pixels(width, height, channels, slice) {
-        blobs.insert((image_id, img_gen), (hash, width, height));
-    }
+    Some((width, height, channels, slice.to_vec()))
 }
 
 fn selection_matches_exact(formatter: sys::Formatter, sel: &sys::Selection, needle: &[u8]) -> bool {
@@ -1878,16 +2270,15 @@ fn selection_matches_exact(formatter: sys::Formatter, sel: &sys::Selection, need
     matched
 }
 
-/// Decodes OSC 7 `file://host/path` percent-escapes or returns bare paths verbatim.
+/// Decodes OSC 7 `file://host/path` percent-escapes, returning bare paths (OSC 9 / OSC 1337) verbatim.
 pub(crate) fn decode_osc7_cwd(raw: &str) -> String {
-    let path = if let Some(rest) = raw.strip_prefix("file://")
+    if let Some(rest) = raw.strip_prefix("file://")
         && let Some(slash) = rest.find('/')
     {
-        &rest[slash..]
+        percent_decode(&rest[slash..])
     } else {
-        raw
-    };
-    percent_decode(path)
+        raw.to_owned()
+    }
 }
 
 fn percent_decode(text: &str) -> String {

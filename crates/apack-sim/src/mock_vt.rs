@@ -206,7 +206,11 @@ impl MockVt {
             "7" => events.push(VtEvent::Cwd(String::from(body))),
             "133" => events.push(VtEvent::Osc133 { payload: String::from(body), cursor_line }),
             "633" => events.push(VtEvent::Osc633 { payload: String::from(body), cursor_line }),
-            "7501" => events.push(VtEvent::Osc7501(String::from(body))),
+            "7501" => {
+                if let Some(update) = apack_core::status::parse_osc7501(body) {
+                    events.push(VtEvent::ProgramStatus(update));
+                }
+            }
             _ => {}
         }
     }
@@ -287,7 +291,7 @@ impl VtEngine for MockVt {
         }
     }
 
-    fn resize(&mut self, size: GridSize, _cell_px: CellPx) {
+    fn resize(&mut self, size: GridSize, _cell_px: CellPx, _events: &mut Vec<VtEvent>) {
         if size == self.size {
             return;
         }
@@ -493,7 +497,7 @@ impl VtEngine for MockVt {
         }
     }
 
-    fn encode_pointer(&mut self, ev: &PointerInput, out: &mut Vec<u8>) {
+    fn encode_pointer(&mut self, ev: &PointerInput, _held_buttons: &mut u8, out: &mut Vec<u8>) {
         if self.modes.mouse {
             out.extend_from_slice(format!("\x1b[<0;{};{}M", ev.x_px, ev.y_px).as_bytes());
         }
