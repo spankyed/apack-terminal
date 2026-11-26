@@ -76,9 +76,7 @@ impl ShardRunner {
                 }
                 self.try_reap_session(session_id);
             }
-            if let Some(sess) = self.sessions.get_mut(&session_id)
-                && sess.machine.pty_write_len() != 0
-            {
+            if let Some(sess) = self.sessions.get_mut(&session_id) {
                 drain_windows_pty_writes(sess);
             }
         }

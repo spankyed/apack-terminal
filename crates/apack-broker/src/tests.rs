@@ -1911,6 +1911,16 @@ fn windows_edge_helpers_and_natural_child_exit() {
     assert!(t1.elapsed() < Duration::from_millis(500));
     assert!(!mb.lock().unwrap().woken);
 
+    // 2b. try_push_win_write handles Ok(true), bounded-channel Full -> Ok(false)+pending, and Disconnected -> Err(())
+    let (wtx, wrx) = std::sync::mpsc::sync_channel::<crate::transport_windows::WinWriteMsg>(1);
+    let mut pending = None;
+    assert_eq!(crate::transport_windows::try_push_win_write(&wtx, &mut pending, vec![1, 2]), Ok(true));
+    assert!(pending.is_none());
+    assert_eq!(crate::transport_windows::try_push_win_write(&wtx, &mut pending, vec![3, 4]), Ok(false));
+    assert_eq!(pending, Some(vec![3, 4]));
+    drop(wrx);
+    assert_eq!(crate::transport_windows::try_push_win_write(&wtx, &mut pending, vec![5]), Err(()));
+
     // 3. Naturally-exiting Windows child is reaped cleanly without kill(), emitting Exited!
     let tmp = tempdir().unwrap();
     let sock = unique_endpoint(tmp.path(), "win-nat-exit");

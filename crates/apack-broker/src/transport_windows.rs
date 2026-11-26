@@ -59,6 +59,24 @@ pub(crate) fn is_graceful_win_close(reason: CloseReason, has_final_error: bool) 
     matches!(reason, CloseReason::ClientFin) || has_final_error
 }
 
+/// Attempts a non-blocking push of encoded frame bytes to a Windows pipe writer channel.
+/// Returns `Ok(true)` if queued, `Ok(false)` if the bounded window is full (parking `bytes` in
+/// `pending` for retry on `WriteReady`), or `Err(())` if the writer thread has disconnected.
+pub(crate) fn try_push_win_write(
+    tx: &mpsc::SyncSender<WinWriteMsg>,
+    pending: &mut Option<Vec<u8>>,
+    bytes: Vec<u8>,
+) -> Result<bool, ()> {
+    match tx.try_send(WinWriteMsg::Bytes(bytes)) {
+        Ok(()) => Ok(true),
+        Err(mpsc::TrySendError::Full(WinWriteMsg::Bytes(buf))) => {
+            *pending = Some(buf);
+            Ok(false)
+        }
+        Err(_) => Err(()),
+    }
+}
+
 /// Waits on the Windows reactor condvar until signalled or `wait_for` elapses.
 pub(crate) fn wait_for_win_wake(win_cond: &(Mutex<bool>, Condvar), wait_for: Duration) {
     let (lock, cv) = win_cond;
@@ -113,6 +131,12 @@ pub(crate) fn spawn_win_conn_io(
     let stream = Arc::new(stream);
     let r_stream = Arc::clone(&stream);
     let w_stream = Arc::clone(&stream);
+    let closed = Arc::new(AtomicBool::new(false));
+    let r_closed = Arc::clone(&closed);
+    let w_closed = Arc::clone(&closed);
+    let reader_done = Arc::new(AtomicBool::new(false));
+    let r_done = Arc::clone(&reader_done);
+    let w_reader_done = Arc::clone(&reader_done);
     let (wtx, wrx) = mpsc::sync_channel::<WinWriteMsg>(WIN_WRITE_WINDOW);
 
     let r_ev_tx = ev_tx.clone();
@@ -120,7 +144,7 @@ pub(crate) fn spawn_win_conn_io(
     let _ = std::thread::Builder::new().name(format!("apack-win-r-{}", conn.get())).spawn(move || {
         let mut buf = vec![0u8; WIN_CONN_READ_BUF_BYTES];
         let mut reader: &Stream = &r_stream;
-        loop {
+        while !r_closed.load(Ordering::Acquire) {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => {
                     let _ = r_ev_tx.send(WinTransportEvent::Closed(conn));
@@ -135,6 +159,7 @@ pub(crate) fn spawn_win_conn_io(
                 }
             }
         }
+        r_done.store(true, Ordering::Release);
     });
 
     let _ = std::thread::Builder::new().name(format!("apack-win-w-{}", conn.get())).spawn(move || {
@@ -155,9 +180,19 @@ pub(crate) fn spawn_win_conn_io(
                 }
             }
         }
-        // Always cancel parked reader I/O and mark `assume_flushed` before dropping `w_stream`
-        // so `interprocess` never blocks in `FlushFileBuffers` on a silent or disconnected peer.
+        // Signal the reader loop to stop, cancel any parked overlapped ReadFile (retrying if the
+        // reader entered ReadFile right after the first CancelIoEx), and mark `assume_flushed`
+        // before dropping `w_stream` so the server pipe handle closes promptly and never hangs in
+        // `FlushFileBuffers`.
+        w_closed.store(true, Ordering::Release);
         let _ = let_go(&w_stream, || {});
+        for _ in 0..64 {
+            if w_reader_done.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            let _ = let_go(&w_stream, || {});
+        }
     });
 
     let close_tx = wtx.clone();
@@ -217,68 +252,58 @@ impl ReactorState {
         }
     }
 
-    pub(crate) fn flush_win_writes(&mut self, conn: ConnId) {
-        // First retry any single chunk that previously hit `TrySendError::Full`.
-        if let Some(pending) = self.conns.get_mut(&conn).and_then(|c| c.win.pending_chunk.take()) {
-            let send_res = self.conns.get(&conn).map(|c| c.win.tx.try_send(WinWriteMsg::Bytes(pending)));
-            match send_res {
-                Some(Ok(())) => {}
-                Some(Err(mpsc::TrySendError::Full(WinWriteMsg::Bytes(buf)))) => {
-                    if let Some(c) = self.conns.get_mut(&conn) {
-                        c.win.pending_chunk = Some(buf);
-                    }
-                    return;
-                }
-                _ => {
-                    self.on_transport_closed(conn);
-                    return;
-                }
+    fn push_win_bytes_or_park(&mut self, conn: ConnId, bytes: Vec<u8>) -> bool {
+        let res = self.conns.get_mut(&conn).map(|c| try_push_win_write(&c.win.tx, &mut c.win.pending_chunk, bytes));
+        match res {
+            Some(Ok(sent)) => sent,
+            _ => {
+                self.on_transport_closed(conn);
+                false
             }
         }
+    }
 
-        while let Some(queued) = self.core.pop_outbound(conn) {
-            let is_frame = matches!(queued.msg, BrokerMsg::Frame(_));
-            if is_frame
-                && let Some(nz) = NonZeroStreamId::new(queued.stream_id.raw())
-                && let Some(session_id) = self.conns.get_mut(&conn).and_then(|c| c.queued_frame_streams.remove(&nz))
-            {
-                self.on_outbound_frame_drained(conn, nz, session_id);
-            }
-            let mut encoded = Vec::with_capacity(queued.encoded_bytes);
-            if queued.msg.encode_to_frame(queued.stream_id, queued.req_id, &mut encoded).is_err() {
-                continue;
-            }
-            let send_res = self.conns.get(&conn).map(|c| c.win.tx.try_send(WinWriteMsg::Bytes(encoded)));
-            match send_res {
-                Some(Ok(())) => {
-                    let ready_stalled = self
-                        .conns
-                        .get(&conn)
-                        .map(|c| ready_stalled_stream_ids(&c.stalled_frames, &c.queued_frame_streams))
-                        .unwrap_or_default();
-                    for stream_id in ready_stalled {
-                        if let Some((sid, frame)) =
-                            self.conns.get_mut(&conn).and_then(|c| c.stalled_frames.remove(&stream_id))
-                        {
-                            self.try_publish_or_stall_frame(
-                                conn,
-                                stream_id,
-                                sid,
-                                frame,
-                                TimestampMs::from_millis(now_unix_ms()),
-                            );
-                        }
-                    }
+    pub(crate) fn flush_win_writes(&mut self, conn: ConnId) {
+        loop {
+            let next = if let Some(pending) = self.conns.get_mut(&conn).and_then(|c| c.win.pending_chunk.take()) {
+                Some(pending)
+            } else if let Some(queued) = self.core.pop_outbound(conn) {
+                let is_frame = matches!(queued.msg, BrokerMsg::Frame(_));
+                if is_frame
+                    && let Some(nz) = NonZeroStreamId::new(queued.stream_id.raw())
+                    && let Some(session_id) = self.conns.get_mut(&conn).and_then(|c| c.queued_frame_streams.remove(&nz))
+                {
+                    self.on_outbound_frame_drained(conn, nz, session_id);
                 }
-                Some(Err(mpsc::TrySendError::Full(WinWriteMsg::Bytes(buf)))) => {
-                    if let Some(c) = self.conns.get_mut(&conn) {
-                        c.win.pending_chunk = Some(buf);
-                    }
-                    return;
+                let mut encoded = Vec::with_capacity(queued.encoded_bytes);
+                if queued.msg.encode_to_frame(queued.stream_id, queued.req_id, &mut encoded).is_err() {
+                    continue;
                 }
-                _ => {
-                    self.on_transport_closed(conn);
-                    return;
+                Some(encoded)
+            } else {
+                None
+            };
+            let Some(bytes) = next else {
+                return;
+            };
+            if !self.push_win_bytes_or_park(conn, bytes) {
+                return;
+            }
+            let ready_stalled = self
+                .conns
+                .get(&conn)
+                .map(|c| ready_stalled_stream_ids(&c.stalled_frames, &c.queued_frame_streams))
+                .unwrap_or_default();
+            for stream_id in ready_stalled {
+                if let Some((sid, frame)) = self.conns.get_mut(&conn).and_then(|c| c.stalled_frames.remove(&stream_id))
+                {
+                    self.try_publish_or_stall_frame(
+                        conn,
+                        stream_id,
+                        sid,
+                        frame,
+                        TimestampMs::from_millis(now_unix_ms()),
+                    );
                 }
             }
         }
