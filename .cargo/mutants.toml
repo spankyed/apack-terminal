@@ -326,6 +326,17 @@ exclude_re = [
     # would make the floor matter is a core that stops for an OSC's end having parsed nothing, which no
     # input produces; the two replacements beside this one are real and are killed.
     "vt/mod.rs:.*replace & with \\| in Terminal::write_until",
+
+    # **v2 `apack-vt-ghostty` equivalents matching the v1 `src/vt/` proofs above:**
+    # 1. Freeing exclusively-owned FFI handles and `CallbackBox` in `Drop` cannot be observed by functional tests (verified by ASAN).
+    "crates/apack-vt-ghostty/src/engine.rs:.*<impl Drop for (GhosttyEngine|CallbackBox)>::drop",
+    "crates/apack-vt-ghostty/src/input.rs:.*<impl Drop for InputEncoders>::drop",
+    # 2. Boundary strictness (`<`/`<=`, `>`/`>=`) in Kitty placeholder aspect-ratio `fit`, where both branches
+    #    compute the exact same floating-point value at the dividing boundary (see `vt/placeholders.rs` above).
+    "crates/apack-vt-ghostty/src/placeholders.rs:.*replace (<|>) with (<=|>=) in fit",
+    # 3. `png` crate rejects animated sub-frame PNGs whose first frame is smaller than the full image, so
+    #    these defense-in-depth guards are always true for accepted inputs (see `vt/images.rs` above).
+    "crates/apack-vt-ghostty/src/image_store.rs:.*replace match guard frame.buffer_size\\(\\) == pixels \\* (4|2) with true in decode_png_into",
 ]
 
 # **What only Windows compiles is not excluded here, and is left out of every other run instead.**

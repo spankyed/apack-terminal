@@ -12,6 +12,7 @@ use apack_proto::types::{BlockedKind, Confirmed, StatusRecord, StatusState};
 
 use crate::time::TimestampMs;
 use crate::truncate_utf8;
+use crate::vt::ProgramStatusUpdate;
 
 /// Maximum UTF-8 byte length accepted for any single OSC 7501 string field.
 const MAX_FIELD_BYTES: usize = 512;
@@ -37,6 +38,64 @@ pub enum StatusEffect {
 pub struct StatusTable {
     revision: u64,
     records: BTreeMap<String, StatusRecord>,
+}
+
+/// Parses an `OSC 7501;<payload>` string into a structured [`ProgramStatusUpdate`].
+///
+/// Malformed payloads or unknown states return `None` safely (total parser).
+pub fn parse_osc7501(payload: &str) -> Option<ProgramStatusUpdate> {
+    let mut id = String::new();
+    let mut state: Option<Option<StatusState>> = None; // Some(None) => Clear
+    let mut kind = None;
+    let mut progress = None;
+    let mut app = None;
+    let mut title = None;
+    let mut message = None;
+
+    for pair in payload.split(';') {
+        let Some((k, v)) = pair.split_once('=') else {
+            continue;
+        };
+        match k {
+            "id" => id = truncate_utf8(v, MAX_FIELD_BYTES),
+            "state" => {
+                state = match v {
+                    "idle" => Some(Some(StatusState::Idle)),
+                    "working" => Some(Some(StatusState::Working)),
+                    "blocked" => Some(Some(StatusState::Blocked)),
+                    "done" => Some(Some(StatusState::Done)),
+                    "error" => Some(Some(StatusState::Error)),
+                    "clear" => Some(None),
+                    _ => None,
+                };
+            }
+            "kind" => {
+                kind = match v {
+                    "permission" => Some(BlockedKind::Permission),
+                    "question" => Some(BlockedKind::Question),
+                    "auth" => Some(BlockedKind::Auth),
+                    _ => None,
+                };
+            }
+            "progress" => {
+                if let Ok(p) = v.parse::<u8>()
+                    && p <= 100
+                {
+                    progress = Some(p);
+                }
+            }
+            "app" => app = Some(truncate_utf8(v, MAX_FIELD_BYTES)),
+            "title" => title = Some(truncate_utf8(v, MAX_FIELD_BYTES)),
+            "message" => message = Some(truncate_utf8(v, MAX_FIELD_BYTES)),
+            _ => {}
+        }
+    }
+
+    let parsed_state = state?;
+    Some(match parsed_state {
+        None => ProgramStatusUpdate::Clear { id },
+        Some(state) => ProgramStatusUpdate::Set { id, state, kind, progress, app, title, message },
+    })
 }
 
 impl StatusTable {
@@ -69,57 +128,30 @@ impl StatusTable {
     ///
     /// Malformed payloads or unknown states are ignored safely (total parser).
     pub fn ingest(&mut self, payload: &str, now: TimestampMs, effects: &mut Vec<StatusEffect>) {
-        let mut id = String::new();
-        let mut state = None;
-        let mut kind = None;
-        let mut progress = None;
-        let mut app = None;
-        let mut title = None;
-        let mut message = None;
-
-        for pair in payload.split(';') {
-            let Some((k, v)) = pair.split_once('=') else {
-                continue;
-            };
-            match k {
-                "id" => id = truncate_utf8(v, MAX_FIELD_BYTES),
-                "state" => {
-                    state = match v {
-                        "idle" => Some(StatusState::Idle),
-                        "working" => Some(StatusState::Working),
-                        "blocked" => Some(StatusState::Blocked),
-                        "done" => Some(StatusState::Done),
-                        "error" => Some(StatusState::Error),
-                        _ => None,
-                    };
-                }
-                "kind" => {
-                    kind = match v {
-                        "permission" => Some(BlockedKind::Permission),
-                        "question" => Some(BlockedKind::Question),
-                        "auth" => Some(BlockedKind::Auth),
-                        _ => None,
-                    };
-                }
-                "progress" => {
-                    if let Ok(p) = v.parse::<u8>()
-                        && p <= 100
-                    {
-                        progress = Some(p);
-                    }
-                }
-                "app" if !v.is_empty() => app = Some(truncate_utf8(v, MAX_FIELD_BYTES)),
-                "title" if !v.is_empty() => title = Some(truncate_utf8(v, MAX_FIELD_BYTES)),
-                "message" if !v.is_empty() => message = Some(truncate_utf8(v, MAX_FIELD_BYTES)),
-                _ => {}
-            }
+        if let Some(update) = parse_osc7501(payload) {
+            self.ingest_update(update, now, effects);
         }
+    }
 
-        let Some(state) = state else {
-            return;
+    /// Ingests an already-parsed [`ProgramStatusUpdate`] directly (immune to delimiter injection).
+    pub fn ingest_update(&mut self, update: ProgramStatusUpdate, now: TimestampMs, effects: &mut Vec<StatusEffect>) {
+        let (id, state, kind, progress, app, title, message) = match update {
+            ProgramStatusUpdate::Clear { id } => {
+                let id = truncate_utf8(&id, MAX_FIELD_BYTES);
+                self.records.remove(&id);
+                return;
+            }
+            ProgramStatusUpdate::Set { id, state, kind, progress, app, title, message } => (
+                truncate_utf8(&id, MAX_FIELD_BYTES),
+                state,
+                // Enforce StatusRecord invariant: `kind` is only valid in `Blocked` state.
+                if state == StatusState::Blocked { kind } else { None },
+                progress.filter(|&p| p <= 100),
+                app.filter(|s| !s.is_empty()).map(|s| truncate_utf8(&s, MAX_FIELD_BYTES)),
+                title.filter(|s| !s.is_empty()).map(|s| truncate_utf8(&s, MAX_FIELD_BYTES)),
+                message.filter(|s| !s.is_empty()).map(|s| truncate_utf8(&s, MAX_FIELD_BYTES)),
+            ),
         };
-        // Enforce StatusRecord invariant: `kind` is only valid in `Blocked` state.
-        let kind = if state == StatusState::Blocked { kind } else { None };
 
         if !self.records.contains_key(&id) && self.records.len() >= MAX_STATUSES {
             // Evict the oldest non-root entry (lowest `changed` revision) so root `""` is never evicted.

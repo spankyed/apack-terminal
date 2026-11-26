@@ -91,6 +91,7 @@ fn mock_vt_one_byte_split_and_queries() {
     assert_eq!(whole.meta().cursor.shape, CursorShape::Bar);
 
     let mut ptr_out = Vec::new();
+    let mut held = 0u8;
     whole.encode_pointer(
         &PointerInput {
             action: PointerAction::Press,
@@ -100,6 +101,7 @@ fn mock_vt_one_byte_split_and_queries() {
             y_px: 2,
             cell_px: CellPx::default(),
         },
+        &mut held,
         &mut ptr_out,
     );
     assert!(ptr_out.is_empty());

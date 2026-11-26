@@ -1,0 +1,13 @@
+[package]
+name = "apack-vt-ghostty"
+version = "0.2.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "libghostty-vt implementation of apack-core's VtEngine for apack-terminal v2"
+
+[dependencies]
+apack-core = { path = "../apack-core" }
+apack-proto = { path = "../apack-proto" }
+ghostty-vt-rs-sys = "0.3.0"
+png = "0.18.1"
+sha2 = "0.10"

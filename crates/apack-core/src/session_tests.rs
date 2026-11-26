@@ -159,12 +159,14 @@ impl VtEngine for StubVt {
         }
     }
 
-    fn resize(&mut self, size: GridSize, _cell_px: CellPx) {
+    fn resize(&mut self, size: GridSize, _cell_px: CellPx, events: &mut Vec<VtEvent>) {
         if size == self.size {
             return;
         }
         self.size = size;
         self.epoch += 1;
+        events.push(VtEvent::SyncOutput(false));
+        events.push(VtEvent::DeviceResponse(b"\x1b[48;10;20t".to_vec()));
         self.rows.resize(usize::from(size.rows.get()), String::new());
         self.dirty.full_dirty = true;
     }
@@ -313,8 +315,12 @@ impl VtEngine for StubVt {
         out.extend_from_slice(key.text.as_bytes());
     }
 
-    fn encode_pointer(&mut self, _ev: &PointerInput, out: &mut Vec<u8>) {
-        out.extend_from_slice(b"M");
+    fn encode_pointer(&mut self, ev: &PointerInput, held_buttons: &mut u8, out: &mut Vec<u8>) {
+        if ev.action == PointerAction::Press && ev.button < 3 {
+            *held_buttons |= 1 << ev.button;
+        }
+        out.push(b'M');
+        out.push(b'0' + *held_buttons);
     }
 
     fn encode_focus(&mut self, focused: bool, out: &mut Vec<u8>) {
@@ -813,7 +819,7 @@ fn session_machine_marks_search_waiters_command_output_and_exit() {
         VtEvent::Cwd("/work".into()),
         VtEvent::DeviceResponse(b"\x1b[1;1R".to_vec()),
         VtEvent::Osc133 { payload: "C".into(), cursor_line: 0 },
-        VtEvent::Osc7501("state=working;app=tool".into()),
+        VtEvent::ProgramStatus(crate::status::parse_osc7501("state=working;app=tool").unwrap()),
     ];
     let mut sess = SessionMachine::new(sid(1), vt, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
     assert_eq!(sess.id(), sid(1));
@@ -977,7 +983,7 @@ fn session_machine_marks_search_waiters_command_output_and_exit() {
     ] {
         sess.handle_stream_msg(k1, RequestId::from_raw(req), msg, &mut fx);
     }
-    assert_eq!(sess.drain_pty_write(32), b"abMI");
+    assert_eq!(sess.drain_pty_write(32), b"abM1I");
     assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Error { code: ErrorCode::StaleEpoch, .. }, .. } if *req_id == RequestId::from_raw(60))));
     assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Rows { .. }, .. } if *req_id == RequestId::from_raw(61))));
     assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Error { code: ErrorCode::StaleEpoch, .. }, .. } if *req_id == RequestId::from_raw(62))));
@@ -1043,8 +1049,10 @@ fn session_machine_marks_search_waiters_command_output_and_exit() {
     s2.cancel_waiters_for_conn(conn(2));
 
     let mut vt3 = StubVt::new(40, 4);
-    vt3.next_events =
-        vec![VtEvent::Osc633 { payload: "D;0".into(), cursor_line: 0 }, VtEvent::Osc7501("state=done".into())];
+    vt3.next_events = vec![
+        VtEvent::Osc633 { payload: "D;0".into(), cursor_line: 0 },
+        VtEvent::ProgramStatus(crate::status::parse_osc7501("state=done").unwrap()),
+    ];
     let mut s3 = SessionMachine::new(sid(3), vt3, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
     s3.attach_stream(k1, SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
     s3.register_wait(conn(1), RequestId::from_raw(90), WaitCondition::Idle, 500, ts(2_000), &mut fx);
@@ -1162,7 +1170,7 @@ fn session_edge_cases_and_boundary_invariants() {
 
     // 4. apply_status_confirmation propagates Confirmed::Matched via ProgramStatus broadcast!
     let mut vt_st = StubVt::new(40, 4);
-    vt_st.next_events = vec![VtEvent::Osc7501("state=blocked;app=claude".into())];
+    vt_st.next_events = vec![VtEvent::ProgramStatus(crate::status::parse_osc7501("state=blocked;app=claude").unwrap())];
     let mut s_st =
         SessionMachine::new(sid(13), vt_st, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
     s_st.attach_stream(k1, SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
@@ -1361,8 +1369,8 @@ fn session_security_hardening_and_audit_fixes() {
         VtEvent::Progress { state: ProgressState::Indeterminate, percent: Some(80) },
         VtEvent::Progress { state: ProgressState::None, percent: Some(50) },
         VtEvent::Progress { state: ProgressState::Running, percent: Some(250) },
-        VtEvent::Osc7501("id=a;state=working;app=one".into()),
-        VtEvent::Osc7501("id=a;state=done;app=two".into()),
+        VtEvent::ProgramStatus(crate::status::parse_osc7501("id=a;state=working;app=one").unwrap()),
+        VtEvent::ProgramStatus(crate::status::parse_osc7501("id=a;state=done;app=two").unwrap()),
         VtEvent::EpochChanged,
     ];
     let mut s_ev =
@@ -1763,4 +1771,111 @@ fn session_security_hardening_and_audit_fixes() {
         CellSpan { start: CellPos { line: 3, col: 10 }, end: CellPos { line: 4, col: 5 } },
         "3:10:4:5",
     );
+}
+
+#[test]
+fn status_clear_per_stream_held_buttons_and_resize_side_effects() {
+    use crate::status::StatusTable;
+    use crate::vt::ProgramStatusUpdate;
+
+    // 1. StatusTable Clear + ingest_update invariant enforcement (progress <= 100, non-empty optional strings)
+    let mut table = StatusTable::new();
+    let mut sfx = Vec::new();
+    table.ingest("state=blocked;kind=permission;progress=50;app=claude", ts(10), &mut sfx);
+    assert!(table.root().is_some());
+    table.ingest("state=clear", ts(20), &mut sfx);
+    assert!(table.root().is_none());
+
+    table.ingest_update(
+        ProgramStatusUpdate::Set {
+            id: "sub".into(),
+            state: StatusState::Working,
+            kind: Some(BlockedKind::Auth), // stripped outside Blocked
+            progress: Some(150),           // rejected > 100
+            app: Some(String::new()),      // empty stripped
+            title: Some("ok;with=sep".into()),
+            message: Some("msg;state=done".into()),
+        },
+        ts(30),
+        &mut sfx,
+    );
+    let sub = table.get("sub").unwrap();
+    assert_eq!(sub.kind, None);
+    assert_eq!(sub.progress, None);
+    assert_eq!(sub.app, None);
+    assert_eq!(sub.title.as_deref(), Some("ok;with=sep"));
+    assert_eq!(sub.message.as_deref(), Some("msg;state=done"));
+    table.ingest_update(ProgramStatusUpdate::Clear { id: "sub".into() }, ts(40), &mut sfx);
+    assert!(table.get("sub").is_none());
+
+    // 2. Per-stream held_buttons isolated across streams and cleared on blur & detach
+    let mut sess = SessionMachine::new(
+        sid(40),
+        StubVt::new(40, 4),
+        ResizePolicy::LatestActive,
+        MarksMode::Claimed,
+        CellPx::default(),
+    );
+    let k1 = (conn(1), NonZeroStreamId::new(1).unwrap());
+    let k2 = (conn(2), NonZeroStreamId::new(1).unwrap());
+    let mut fx = Vec::new();
+    sess.attach_stream(k1, SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, &mut fx);
+    sess.attach_stream(k2, SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, &mut fx);
+
+    let press0 = PointerInput {
+        action: PointerAction::Press,
+        button: 0,
+        modifiers: 0,
+        x_px: 0,
+        y_px: 0,
+        cell_px: CellPx::default(),
+    };
+    let move0 = PointerInput {
+        action: PointerAction::Motion,
+        button: 0,
+        modifiers: 0,
+        x_px: 8,
+        y_px: 0,
+        cell_px: CellPx::default(),
+    };
+    sess.handle_stream_msg(k1, RequestId::from_raw(1), ClientMsg::Pointer(press0), &mut fx);
+    assert_eq!(sess.drain_pty_write(64), b"M1");
+    // Stream k2 still has held_buttons == 0!
+    sess.handle_stream_msg(k2, RequestId::from_raw(2), ClientMsg::Pointer(move0), &mut fx);
+    assert_eq!(sess.drain_pty_write(64), b"M0");
+    // Blur on k1 clears k1's held_buttons!
+    sess.handle_stream_msg(k1, RequestId::from_raw(3), ClientMsg::Focus { focused: false }, &mut fx);
+    let _ = sess.drain_pty_write(64);
+    sess.handle_stream_msg(k1, RequestId::from_raw(4), ClientMsg::Pointer(move0), &mut fx);
+    assert_eq!(sess.drain_pty_write(64), b"M0");
+    // Detach removes held_buttons entry cleanly
+    sess.handle_stream_msg(k1, RequestId::from_raw(5), ClientMsg::Pointer(press0), &mut fx);
+    let _ = sess.drain_pty_write(64);
+    sess.detach_stream(k1, &mut fx);
+    sess.attach_stream(k1, SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, &mut fx);
+    sess.handle_stream_msg(k1, RequestId::from_raw(6), ClientMsg::Pointer(move0), &mut fx);
+    assert_eq!(sess.drain_pty_write(64), b"M0");
+
+    // 3. Resize drains VtEvent::SyncOutput(false) and VtEvent::DeviceResponse immediately!
+    let mut vt_rs = StubVt::new(40, 4);
+    vt_rs.next_events = vec![VtEvent::SyncOutput(true)];
+    let mut s_rs =
+        SessionMachine::new(sid(41), vt_rs, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    s_rs.attach_stream(k1, SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, &mut fx);
+    s_rs.on_pty_output(b"HOLD", ts(100), &mut fx);
+    assert!(s_rs.is_sync_held());
+    fx.clear();
+    s_rs.handle_stream_msg(
+        k1,
+        RequestId::from_raw(7),
+        ClientMsg::ViewportHint(ViewportHint {
+            size: GridSize::new(50, 10).unwrap(),
+            cell_px: CellPx::default(),
+            visible: true,
+            focused: true,
+        }),
+        &mut fx,
+    );
+    assert!(!s_rs.is_sync_held(), "resize emitting SyncOutput(false) must release sync hold");
+    assert_eq!(s_rs.drain_pty_write(64), b"\x1b[48;10;20t");
 }
