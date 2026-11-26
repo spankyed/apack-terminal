@@ -40,6 +40,7 @@ impl BrokerServer {
         let shutdown = Arc::new(AtomicBool::new(false));
         let res = run_control_reactor(self.config, self.listener, shutdown, |_| {})
             .map_err(|err| OsError::io("running control reactor", err));
+        #[allow(clippy::drop_non_drop)]
         drop(self._hold);
         res
     }
@@ -61,6 +62,7 @@ impl BrokerServer {
                 let res = run_control_reactor(config, listener, thread_shutdown, |wake| {
                     let _ = wake_tx.send(wake);
                 });
+                #[allow(clippy::drop_non_drop)]
                 drop(hold);
                 res
             })

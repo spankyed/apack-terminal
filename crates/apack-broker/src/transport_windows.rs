@@ -151,12 +151,13 @@ pub(crate) fn spawn_win_conn_io(
                     wake();
                 }
                 WinWriteMsg::CloseGraceful => {
-                    let _ = writer.flush();
-                    let _ = let_go(&w_stream, || {});
                     break;
                 }
             }
         }
+        // Always cancel parked reader I/O and mark `assume_flushed` before dropping `w_stream`
+        // so `interprocess` never blocks in `FlushFileBuffers` on a silent or disconnected peer.
+        let _ = let_go(&w_stream, || {});
     });
 
     let close_tx = wtx.clone();
@@ -255,14 +256,17 @@ impl ReactorState {
                         .get(&conn)
                         .map(|c| ready_stalled_stream_ids(&c.stalled_frames, &c.queued_frame_streams))
                         .unwrap_or_default();
-                    if !ready_stalled.is_empty() {
-                        let now = TimestampMs::from_millis(now_unix_ms());
-                        for stream_id in ready_stalled {
-                            if let Some((sid, frame)) =
-                                self.conns.get_mut(&conn).and_then(|c| c.stalled_frames.remove(&stream_id))
-                            {
-                                self.try_publish_or_stall_frame(conn, stream_id, sid, frame, now);
-                            }
+                    for stream_id in ready_stalled {
+                        if let Some((sid, frame)) =
+                            self.conns.get_mut(&conn).and_then(|c| c.stalled_frames.remove(&stream_id))
+                        {
+                            self.try_publish_or_stall_frame(
+                                conn,
+                                stream_id,
+                                sid,
+                                frame,
+                                TimestampMs::from_millis(now_unix_ms()),
+                            );
                         }
                     }
                 }

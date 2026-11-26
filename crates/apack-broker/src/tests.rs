@@ -1266,7 +1266,11 @@ fn e2e_interactive_write_resize_pause_raw_output_and_multi_shard() {
         )
         .unwrap();
     client
-        .send_raw(st.as_stream_id(), RequestId::PUSH, &ClientMsg::Write { data: b"ECHO_SECOND_FRAME\n".to_vec() })
+        .send_raw(
+            st.as_stream_id(),
+            RequestId::PUSH,
+            &ClientMsg::Write { data: b"echo ECHO_SECOND_FRAME\r\n".to_vec() },
+        )
         .unwrap();
 
     // Wait for BOTH a second FrameUpdate containing ECHO_SECOND_FRAME and RawOutput containing it!
@@ -1307,12 +1311,20 @@ fn e2e_interactive_write_resize_pause_raw_output_and_multi_shard() {
 
     // Verify viewer_b ALSO still received ECHO_SECOND_FRAME after viewer_drop disconnected!
     let mut vb_saw = false;
-    for _ in 0..32 {
-        if let BrokerMsg::Frame(upd) = viewer_b.recv_frame().unwrap().msg
-            && upd.rows.iter().any(|r| r.text.contains("ECHO_SECOND_FRAME"))
-        {
-            vb_saw = true;
-            break;
+    for _ in 0..64 {
+        if let BrokerMsg::Frame(upd) = viewer_b.recv_frame().unwrap().msg {
+            let matched = upd.rows.iter().any(|r| r.text.contains("ECHO_SECOND_FRAME"));
+            viewer_b
+                .send_raw(
+                    st_b.as_stream_id(),
+                    RequestId::PUSH,
+                    &ClientMsg::FrameAck { seq: upd.seq, credit: FrameCredit { max_frames: 4, max_bytes: 256 * 1024 } },
+                )
+                .unwrap();
+            if matched {
+                vb_saw = true;
+                break;
+            }
         }
     }
     assert!(vb_saw, "disconnecting one viewer must not break another viewer's frame slot");
@@ -1747,20 +1759,55 @@ fn e2e_leases_kept_pinning_tier2_compression_foreground_verify_and_kill_escalati
         c2.attach(
             s_tail,
             st_tail,
-            SubFlags::from_bits(SubFlags::EVENTS).unwrap(),
+            SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(),
             None,
             0,
-            FrameCredit { max_frames: 1, max_bytes: 65_536 },
+            FrameCredit { max_frames: 4, max_bytes: 256 * 1024 },
+        )
+        .unwrap();
+        // Drain initial full-sync frame and grant credit before pausing.
+        let init_tail = loop {
+            if let BrokerMsg::Frame(upd) = c2.recv_frame().unwrap().msg {
+                break upd;
+            }
+        };
+        c2.send_raw(
+            st_tail.as_stream_id(),
+            RequestId::PUSH,
+            &ClientMsg::FrameAck { seq: init_tail.seq, credit: FrameCredit { max_frames: 4, max_bytes: 256 * 1024 } },
         )
         .unwrap();
         c2.send_raw(st_tail.as_stream_id(), RequestId::PUSH, &ClientMsg::Pause).unwrap();
         std::thread::sleep(Duration::from_millis(70));
         c2.kill(s_tail).unwrap();
-        assert_eq!(
-            c2.wait(s_tail, WaitCondition::Text(String::from("TAIL_BEFORE_EXIT_99")), 3_000).unwrap(),
-            WaitOutcome::Met,
-            "killing a paused session must unpause & drain buffered tail bytes cleanly"
-        );
+        let mut saw_tail = false;
+        let mut saw_exited = false;
+        for _ in 0..64 {
+            let f = c2.recv_frame().unwrap();
+            match f.msg {
+                BrokerMsg::Frame(upd) if f.stream_id == st_tail.as_stream_id() => {
+                    if upd.rows.iter().any(|r| r.text.contains("TAIL_BEFORE_EXIT_99")) {
+                        saw_tail = true;
+                    }
+                    c2.send_raw(
+                        st_tail.as_stream_id(),
+                        RequestId::PUSH,
+                        &ClientMsg::FrameAck {
+                            seq: upd.seq,
+                            credit: FrameCredit { max_frames: 4, max_bytes: 256 * 1024 },
+                        },
+                    )
+                    .unwrap();
+                }
+                BrokerMsg::Exited { .. } if f.stream_id == st_tail.as_stream_id() => {
+                    saw_exited = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_tail, "killing a paused session must unpause & drain buffered tail bytes cleanly");
+        assert!(saw_exited, "killed paused session must deliver Exited cleanly without ttydrain deadlock");
 
         // Direct unit check of `drain_unix_pty_nonblocking` on a real Unix PTY master.
         let pty_cfg = apack_os::pty::PtySpawnConfig {
