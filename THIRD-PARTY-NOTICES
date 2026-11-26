@@ -583,6 +583,38 @@ DEALINGS IN THE SOFTWARE.
 
 ================================================================================
 MIT License (MIT), covering:
+  getrandom 0.4.3, by The Rand Project Developers
+
+Copyright (c) 2018-2026 The rust-random Project Developers
+Copyright (c) 2014 The Rust Project Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+
+================================================================================
+MIT License (MIT), covering:
   downcast-rs 1.2.1, by Ashish Myles <marcianx@gmail.com>; Runji Wang <wangrunji0408@163.com>
 
 Copyright (c) 2020 Ashish Myles and contributors
@@ -789,7 +821,7 @@ SOFTWARE.
 
 ================================================================================
 MIT License (MIT), covering:
-  apack-terminal 0.1.0
+  apack-terminal 0.2.0
 
 MIT License
 
@@ -844,10 +876,14 @@ SOFTWARE.
 
 ================================================================================
 MIT License (MIT), covering:
+  apack-broker 0.2.0
+  apack-core 0.2.0
+  apack-os 0.2.0
+  apack-proto 0.2.0
+  apack-vt-ghostty 0.2.0
+  apack-wal 0.2.0
   objc2-core-foundation 0.3.2, from https://github.com/madsmtm/objc2
   objc2-io-kit 0.3.2, from https://github.com/madsmtm/objc2
-  ts-rs-macros 12.0.1, by Moritz Bischof <moritz.bischof1@gmail.com>
-  ts-rs 12.0.1, by Moritz Bischof <moritz.bischof1@gmail.com>
 
 MIT License
 
@@ -1030,9 +1066,7 @@ MIT License (MIT), covering:
   syn 2.0.119, by David Tolnay <dtolnay@gmail.com>
   syn 3.0.9, by David Tolnay <dtolnay@gmail.com>
   thiserror-impl 1.0.69, by David Tolnay <dtolnay@gmail.com>
-  thiserror-impl 2.0.21, by David Tolnay <dtolnay@gmail.com>
   thiserror 1.0.69, by David Tolnay <dtolnay@gmail.com>
-  thiserror 2.0.21, by David Tolnay <dtolnay@gmail.com>
   unicode-ident 1.0.27, by David Tolnay <dtolnay@gmail.com>
   zmij 1.0.23, by David Tolnay <dtolnay@gmail.com>
 
@@ -1114,7 +1148,6 @@ SOFTWARE.
 ================================================================================
 MIT License (MIT), covering:
   memchr 2.8.3, by Andrew Gallant <jamslam@gmail.com>; bluss
-  termcolor 1.4.1, by Andrew Gallant <jamslam@gmail.com>
 
 The MIT License (MIT)
 
@@ -1192,33 +1225,6 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-
-
-================================================================================
-MIT License (MIT), covering:
-  winapi-util 0.1.11, by Andrew Gallant <jamslam@gmail.com>
-
-The MIT License (MIT)
-
-Copyright (c) 2017 Andrew Gallant
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
 
 
 ================================================================================

@@ -1,115 +1,37 @@
-# The broker is the only crate shipped; `xtask` is the repository's own tasks (`cargo xtask <task>`), which
-# are a member rather than a script so they are compiled and type-checked with everything else.
+# The workspace: modular sans-IO v2 crates plus the shipped `apack-terminal` broker binary and
+# repository `xtask` automation (`cargo xtask <task>`).
 [workspace]
-members = ["xtask", "crates/apack-proto", "crates/apack-core", "crates/apack-sim", "crates/apack-vt-ghostty", "crates/apack-os", "crates/apack-wal", "crates/apack-broker"]
+members = [
+    ".",
+    "xtask",
+    "crates/apack-proto",
+    "crates/apack-core",
+    "crates/apack-sim",
+    "crates/apack-vt-ghostty",
+    "crates/apack-os",
+    "crates/apack-wal",
+    "crates/apack-broker",
+]
 exclude = ["fuzz"]
 resolver = "3"
 
 [package]
 name = "apack-terminal"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-# One test program, whose modules are the files under `tests/` (`tests/suite.rs` on why)
-autotests = false
-
-[[test]]
-name = "suite"
-path = "tests/suite.rs"
-
-# P1: the broker's numbers as a client drives it (`benches/broker.rs`). Reports, never fails
-[[bench]]
-name = "broker"
-path = "benches/broker.rs"
-harness = false
-
-# What a view's search costs over a full history (`benches/search.rs`). Reports, never fails
-[[bench]]
-name = "search"
-path = "benches/search.rs"
-harness = false
-
-# What a chosen cursor blink costs a session's output (`benches/blink.rs`). Reports, never fails
-[[bench]]
-name = "blink"
-path = "benches/blink.rs"
-harness = false
-
-# The synchronized-output hold: its cost and the broker's limit on one (`benches/hold.rs`). Reports, never fails
-[[bench]]
-name = "hold"
-path = "benches/hold.rs"
-harness = false
-
-# What a recording's keyframe costs to write out and to put back (`benches/keyframe.rs`). Reports, never fails
-[[bench]]
-name = "keyframe"
-path = "benches/keyframe.rs"
-harness = false
 
 [dependencies]
-interprocess = "2.4.7"
-# Finding the escapes in a program's output (`vt::Terminal::watched`), which is every byte a session parses
-memchr = "2.8.3"
-portable-pty = { git = "https://github.com/wez/wezterm", rev = "8afe0ad30739c5aa106c19e8a75b1dfc83bcfb56" }
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.154"
-ts-rs = "12.0.1"
-# Decodes a PNG a program sends as an image, which the VT core leaves to whoever embeds it (`src/vt/images.rs`)
-png = "0.18.1"
-hmac = "0.12"
-sha2 = "0.10"
-
-# Windows only: Job Objects, which is how a session owns its process tree there (`src/tree.rs`). POSIX needs
-# none — the kernel's SIGHUP to a pty's foreground group does it.
-# POSIX only: the name of the process reading a session's pty. The pid comes from `portable-pty`, whose
-# `process_group_leader` is `#[cfg(unix)]`, so there is nothing to turn into a name on Windows and this
-# would otherwise pull the `windows` crate into that build for a call it cannot make.
-[target.'cfg(unix)'.dependencies]
-sysinfo = { version = "0.40.1", default-features = false, features = ["system"] }
-# POSIX only: the signal numbers a `Signal` request names, and the system's own description of a signal, which
-# is what `portable-pty` hands back for a child that was killed and what naming it again has to be inverted
-# from. Windows has neither, and a `Signal` request is refused there.
-libc = "0.2.191"
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading"] }
-# The SDDL string the pipe's security descriptor is built from, which `interprocess` takes as a `U16CStr`
-widestring = "1.0.2"
-
-# **The VT core.** `libghostty-vt` parses a session's bytes here as the sole terminal emulator: views
-# (`@apackdev/terminal-view`) draw rows published from this core and carry no emulator of their own.
-#
-# **The crate is bindings only and brings no build of its own**: its bindgen output is committed, so nothing
-# runs `libclang`, and it links a static library this repository supplies rather than one the build makes.
-# `GHOSTTY_VT_RS_SYS_BUILD=prebuilt` makes a build from source a refusal rather than a silent attempt
-# needing a Zig this repository does not pin, and with `GHOSTTY_VT_RS_SYS_PREBUILT_DIR` set the build
-# fetches nothing at all.
-#
-# **Where that library comes from is not the same on every target.** On the targets upstream or the crate
-# publish one, `cargo xtask vt-prebuilt` fetches the archive and verifies it against the checksum the crate
-# pins. **For Windows nobody publishes one**, so it is built from the release's signed source and dependency
-# tarballs with Zig 0.17.0 and `--system` — out of band, once, never during a build here. Two things about
-# the crate make that less tidy than it reads, both measured: its source build passes `zig build` a
-# `--global-cache-dir` that Zig 0.17.0 rejects, and `GHOSTTY_VT_RS_SYS_PREBUILT_DIR` asserts a
-# `lib/libghostty-vt.a` that no Windows build produces, Zig installing `ghostty-vt-static.lib` — which is
-# the name the crate's own link directive uses on that target.
-[dependencies.ghostty-vt-rs-sys]
-version = "0.3.0"
+apack-broker = { path = "crates/apack-broker" }
+apack-os = { path = "crates/apack-os" }
+apack-proto = { path = "crates/apack-proto" }
 
 [dev-dependencies]
-insta = "1.49.0"
-proptest = "1.12.0"
+apack-core = { path = "crates/apack-core" }
 tempfile = "3.27.0"
 
-# POSIX only: `tests/broker.rs`'s liveness probe asks with signal 0, which Windows has no equivalent for and
-# answers there by asking the OS's own task list instead.
-[target.'cfg(unix)'.dev-dependencies]
-libc = "0.2.191"
-
-# **The PNG decoder is built optimised in a debug build too**: it is a dependency, so it is compiled once and
-# never mutated, and unoptimised it is two thirds of what the suite's PNG cases spend — CPU a busy machine
-# multiplies against a deadline that is a clock. `fdeflate` and `miniz_oxide` inflate, `crc32fast` checks
+# **The PNG decoder and memchr are built optimised in debug/test builds too**: they are pure
+# dependencies compiled once and never mutated, keeping test & mutation runs fast.
 [profile.dev.package.png]
 opt-level = 3
 [profile.dev.package.fdeflate]
@@ -118,21 +40,14 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.crc32fast]
 opt-level = 3
-# `memchr` finds where a program's output may be held (`screen::hold_piece`), over every byte fed — a named
-# image's encoded source included, which is tens of megabytes
 [profile.dev.package.memchr]
 opt-level = 3
 
-# **The suite is built optimised, a little.** A case's deadline is a clock (`.config/nextest.toml`), so what a
-# case spends in debug code is what a busy machine multiplies against it: unoptimised, the suite spent 33 s of CPU
-# and its heaviest cases about 2 s each; at this level 14 s and 0.15 s (2026-11-17). A one-line change to `src/`
-# rebuilds in about 4 s either way, and assertions and overflow checks are kept. Mutants build with their own
-# profile (below), so what a mutant costs is unchanged.
+# Mild optimisation for test builds so heavy VT/WAL/simulation tests stay fast under nextest deadlines.
 [profile.test]
 opt-level = 1
 
-# What cargo-mutants builds each mutant with (`.cargo/mutants.toml`): a debug build without the debug info,
-# since nothing debugs a mutant and each one is a fresh copy of the build directory
+# Profile used by cargo-mutants (`.cargo/mutants.toml`): no debug info for fast mutant rebuilds.
 [profile.mutants]
 inherits = "dev"
 debug = false

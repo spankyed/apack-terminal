@@ -1,344 +1,35 @@
 # cargo-mutants: what it mutates and how it tests each mutant. A run is scoped to a change (`--in-diff`),
-# which `cargo xtask pre-push` and `.github/workflows/mutants.yml` both do: a whole-repository run is minutes
-# of mutants nobody edited, and a survivor outside the change is not this push's to answer for.
+# which `cargo xtask pre-push` and `.github/workflows/mutants.yml` both do.
 
 # The tests themselves, the deterministic chaos simulator harness (`apack-sim`), and the repository's
-# own tasks (`xtask/`). None of these ship in the broker; mutating the simulator's PRNG/workload
-# driver would test the test harness rather than production broker code.
+# own tasks (`xtask/`). None of these ship in the broker binary.
 exclude_globs = [
     "tests/**",
     "xtask/**",
     "crates/apack-sim/**",
 ]
-# Each test in its own process under `.config/nextest.toml`'s deadlines, so a mutant that makes the broker
-# stop answering is caught at one rather than hanging the run
+# Each test in its own process under `.config/nextest.toml`'s deadlines.
 test_tool = "nextest"
-# **A mutant is caught by the first case that fails, so the run ends there.** Left to itself the runner
-# stops starting cases and waits for the ones already running, which is the suite's longest case for
-# nearly every mutant: a run of 1,505 spent 21 s testing each mutant it caught and 23 s each one it
-# missed. A flag rather than a profile, since a second profile would carry none of the first's overrides
-# (`.config/nextest.toml`)
+# Stop on the first failing test per mutant for fast turnaround.
 additional_cargo_test_args = ["--max-fail=1:immediate"]
-# Under the machine's other load a suite can run several times its baseline
 timeout_multiplier = 3.0
-# Inside target/, which is gitignored and which cargo-mutants doesn't copy
 output = "target"
-# Without debug info (`Cargo.toml`, profile.mutants): each job's copy is a fraction of a debug build's
 profile = "mutants"
 
-# **The one exclusion that is not about an answer: running the mutant is the damage.**
-#
-# `SignalTarget::at` refuses the two numbers that must never reach `kill(2)` — `0`, every process in this
-# broker's own group, and `-1`, every process the user owns. A mutant of a guard is the guard gone, and the
-# suite asks the broker to signal a session, so the mutated broker *executes* the broadcast. That is not a
-# survivor to be killed by a better case: a run on a developer's machine sent `kill(-1, SIGKILL)` and killed
-# every application they had open, and no assertion written afterwards can undo it.
-#
-# The type is what makes the rest of the function safe to mutate: `SignalTarget` has a private field and no
-# `Default`, so a mutation tester cannot construct one and `Ok(Default::default())` — the replacement for
-# `SignalTarget::at` and for `signal_target` themselves — does not compile. Those two are reported unviable,
-# which is why neither is named here. `SignalTarget::number` is not named either, and deliberately: the
-# syscall is handed `target.0` rather than the accessor, so a mutant of it aims nothing, and
-# `tests/signals.rs` reads it and kills all three.
-#
-# What is left to exclude is the comparisons *inside* the constructor, which the pattern below matches
-# because `in <fn>` appears for a mutation of something within a function and not for a replacement of the
-# function itself.
 exclude_re = [
-    "session.rs:.*in SignalTarget::at",
-
-    # **What is hung up when a shell has to be killed is not mutated from the inside.** `hang_up_the_rest`
-    # chooses which processes are sent a hangup; a mutant of the choice sends one to processes that were
-    # not chosen, on the machine running the suite. Replacing the function whole sends nothing, and is
-    # tested: `a_job_in_a_group_of_its_own_ends_with_a_shell_that_had_to_be_killed` fails without it.
-    "session.rs:.*in hang_up_the_rest",
-
-    # **Starting a process is not mutated from the inside either.** `start_broker` runs this binary as a
-    # broker in a session of its own, which is what lets it outlive the proxy that started it — and is also
-    # what would let a mutant of how it is started outlive the run that made it, on a developer's machine,
-    # holding a socket. The function replaced whole starts nothing and is caught (`tests/proxy.rs`: a proxy
-    # with nothing to connect to), so what is excluded is only what is inside it.
-    "proxy.rs:.*in start_broker",
-
-    # **`inside_tree`'s guard is cost and clarity, not an answer.** It refuses a pid below 2, and so does the
-    # walk it skips: `sysinfo` has no process 0, and 1 is init, whose ancestry ends at itself. So for every
-    # pid a session's tree can hold, `<` and `<=`, `<` and `==`, and `||` and `&&` answer the same, and only
-    # the number of reads differs. `leader < 2` is the same claim from the other side: a session records
-    # `child.process_id().unwrap_or_default()`, and no platform `portable-pty` spawns on answers `None`, so
-    # nothing produces a leader of 0 to tell them apart — a case that killed these would have to invent a
-    # session whose leader is init, which the broker cannot be asked for.
-    #
-    # **Exactly the five, by replacement**, because the two beside them are real and are killed: `< with >`
-    # admits no real pid at all, and `== with !=` in the lines below answers for the wrong process.
-    # Excluding the guard wholesale would have taken both with it. The guard holds the function's only `<`
-    # and `||`, so the replacement names it and no line is pinned.
-    "session.rs:.*replace < with (==|<=) in inside_tree",
-    "session.rs:.*replace \\|\\| with && in inside_tree",
-
-    # `sendable`'s ASCII arm gives 1 and so does the `_` fallback, so deleting it changes no answer. It is
-    # there to say that ASCII is one byte, where `_` says "not a lead byte at all" — removing the arm to kill
-    # the mutant would make that comment wrong about every ASCII byte
-    "output.rs:.*delete match arm 0x00..= 0x7F in sendable",
-    # The reader's buffer is how much one `read` may return, not how much a message carries: the coalescer
-    # decides that, on a window and a cap, and a character split across two reads is already a case of its
-    # own. A smaller buffer reads the same bytes in more passes and answers identically
-    "session.rs:.*replace \\* with \\+ in Sessions::spawn",
-    # The two halves of the pipe's access are split so that the one that decides anything is testable: the
-    # SDDL string is built on every platform and `tests/security.rs` reads it back. What is left here is
-    # `#[cfg(windows)]` FFI — reading the token's SID and handing the string to the OS — which nothing off
-    # Windows compiles, and which on Windows needs a second local account connecting to the pipe to observe
-    # at all. No job has one, so this is skipped rather than killed, and the claim is made by hand on the
-    # development VM. A mutant here that mattered would be caught by the pipe failing to open at all
-    # Matched without `in`, because these mutants replace the function rather than something inside it:
-    # `in <fn>` appears only for the latter, so the two patterns this replaced matched nothing at all and
-    # the gate went on reporting them. A pattern that excludes nothing is worse than no pattern, since it
-    # reads as a decision that was taken
-    "security.rs:.*(owner_only|current_user_sid)",
-    # A pipe this user does not own answering "this user's". Making one takes another account — an ordinary one
-    # can name no owner but itself — and no job has one. `owned_by`, which this asks, is killed both ways in
-    # `src/listening/pipe.rs` against `SYSTEM`'s SID; this wrapper's other mutant, `Ok(false)`, is killed by
-    # every proxy case; and the refusal itself was seen with a second account on the development VM
-    # (`docs/architecture/windows-pipe-access.md`)
-    "listening/pipe.rs:.*replace owned_by_this_user -> std::io::Result<bool> with Ok\\(true\\)",
-    # `PROCESS_SET_QUOTA` is 256 and `PROCESS_TERMINATE` is 1 (`windows-sys` 0.61's
-    # `Win32::System::Threading`), so they are distinct single bits and `|` and `^` both ask `OpenProcess`
-    # for 257. There is nothing to distinguish. Its sibling `| with &` asks for 0 and is caught, because a
-    # handle opened with no access cannot be assigned to the job
-    "tree.rs:.*replace \\| with \\^ in Tree::owning",
-    # **Windows reads no shared memory object**, as the core reads none there. A command naming one with
-    # an id or a number is refused by the core before anything is read (`Load::asked`), so its
-    # `shared_memory` is reached only by a transmission with neither — to which the core says nothing,
-    # having no number to say it with. Each bytes it could answer instead — none, an empty piece, a one —
-    # is no image either, and is answered with the same silence
-    "image_sources/windows.rs:.*replace shared_memory -> Result<Vec<Vec<u8>>, super::Refused> with Ok",
-    # **A file is opened with `O_NONBLOCK | O_NOCTTY`**, two distinct single bits, so `|` and `^` are the
-    # same number and there is nothing to tell apart. Its sibling `| with &` asks for neither and is
-    # caught, a FIFO then holding the open until something writes to it
-    "image_sources/posix.rs:.*replace \\| with \\^",
-    # The POSIX arm of `Tree::owning`, which answers `None` because POSIX needs no job: nothing observes a
-    # `Tree` there — the type has no fields off Windows and nothing reads it — so `None` and `Some` are the
-    # same answer, and off Windows the mutant does not even compile, there being no `Default` for `Tree`
-    # (measured: `cargo mutants --no-config --file src/tree.rs --re tree.rs:94` is 1 unviable here). On
-    # Windows that arm is not compiled at all, so the mutation changes nothing and the run reports it
-    # missed, which is what the first Windows mutation of this file found.
-    #
-    # **The line number is pinned on purpose, and it is `check-exclusions` that makes that safe**: the two
-    # `Some(Default::default())` mutants in this file print identically but for the line, so there is
-    # nothing else to match on, and a pattern left behind by an edit above it matches no mutant and fails
-    # that check rather than going quiet.
-    "tree.rs:94:.*with Some\\(Default::default\\(\\)\\)",
-    # Freeing the terminal handle. A mutant of this leaks it, and a leak is not an answer any case here can
-    # read: the suite would pass, the process would exit, and the operating system would reclaim it. Killing
-    # it would mean a leak checker in the suite — which this repository does not have and which would be a
-    # large thing to acquire for one line whose body is a single documented call. What makes the omission
-    # small is that the handle has exactly one owner by construction: `Terminal` has no `Clone`, the pointer
-    # never leaves the type, and `Screen` holds the only one a session has
-    # Matched without `in`, for the reason `security.rs`' entry above records: this mutant replaces the
-    # function rather than something inside it, and `in <fn>` prints only for the latter
-    "vt/mod.rs:.*<impl Drop for Terminal>::drop",
-    # **The same of a snapshot's decoder**, which is made and freed inside one call each time a keyframe is
-    # taken or put back: nothing outside the process can tell one that was not freed from one that was
-    "vt/keyframe.rs:.*<impl Drop for Decoding>::drop",
-
-    # **Which cuts are tried is what a keyframe costs, never what it is.** A snapshot's beginning is taken
-    # in a sixty-fourth, an eighth and then all of the room a keyframe may have, stopping at the first
-    # that holds it; with the middle one some other size the same keyframe is found one cut later, or one
-    # sooner, and it is cut where the same record ends. `benches/keyframe.rs` is where the cost shows
-    "vt/keyframe.rs:.*replace / with % in Terminal::keyframe",
-
-    # **A keyframe given the pixels its cut left behind is decoded before it is kept**, to hold the
-    # reading of the snapshot's framing those pixels were found by: it fails only for a core that frames a
-    # snapshot some other way, which no case here can be. With it answering yes, or yes to either half,
-    # every keyframe this core writes is the same keyframe
-    "vt/keyframe.rs:.*replace Terminal::holds_every_image -> bool with true",
-    "vt/keyframe.rs:.*replace && with \\|\\| in Terminal::holds_every_image",
-
-    # **Whether a cut already holds every image's pixels is what finding them costs.** Counted wrongly as
-    # not holding them, the rest of the snapshot is read for pixels that are not there and the keyframe
-    # is decoded once more, to the same keyframe. Pinned to its line: the two counts beside it are of the
-    # records and the lines a keyframe holds, and are caught
-    "vt/keyframe.rs:392:.*replace \\+= with \\*= in Terminal::cut",
-    # The same for the key and mouse encoders a session keeps, which are four more handles with one owner
-    "vt/input.rs:.*<impl Drop for Encoders>::drop",
-
-    # **Sizes that are how much is moved at a time, not what is moved.** The proxy's buffers are how much one
-    # `read` may hand over, from the broker and from stdin; a smaller one carries the same bytes in more
-    # passes, as the reader's above does
-    "proxy.rs:.*replace \\* with \\+ in (heard|run)",
-
-    # **Flags that are distinct bits, joined.** `|` and `^` differ only where two operands share a bit, and
-    # these share none: a frame's flags are one bit each (`FRAME_CURSOR` … `FRAME_HIDDEN`), a row's are
-    # three, a command's say which of eight fields it has, the bit that says a number goes on is the one
-    # bit its seven others are not, and the modifiers that compose a character are shift and alt
-    "view/wire.rs:.*replace \\| with \\^ in (frame|row_flags|row_head|number|Writer::command)",
-    "vt/input.rs:.*replace \\| with \\^ in consumed",
-
-    # **Freeing what the core allocated, and the collector it fills.** As `Terminal`'s above: a mutant of
-    # one of these leaks, and a leak is not an answer any case here can read. Each has one owner by
-    # construction — a mark is a command's or a publication's, a render state a publication's, and the
-    # collector a screen's, none of them `Clone`
-    "vt/rows.rs:.*<impl Drop for (Mark|Rendering)>::drop",
-    "screen.rs:.*<impl Drop for Collector>::drop",
-
-    # **A deadline compared with the instant it is read against.** The housekeeper leaves alone whatever
-    # is not yet due; `>` and `>=` differ only for a session due at exactly the nanosecond the clock was
-    # read, and both a deadline and that reading are `Instant::now()` taken at different moments. A case
-    # that told them apart would have to make two readings of the clock equal
-    "housekeeping.rs:.*replace > with >= in keep",
-
-    # **Two ways of saying one thing the core says once.** Each asks the core for something and reads both
-    # its result and what it wrote, and the core never gives one answer without the other: a feature it
-    # answers for is present in this build, every one of them (`tests/core_features.rs` refuses a build
-    # where one is not, so there is no build here in which "answered, and absent" exists to tell `&&` from
-    # `||`), and an image storage is written whenever asking for one succeeds. Killing either needs a
-    # second build of the core, made without a feature
-    "vt/mod.rs:.*replace && with \\|\\| in features",
-    "vt/images.rs:.*replace && with \\|\\| in Terminal::graphics",
-
-    # **Values the core's header names and nothing sent to this broker produces.** A stored image is grey,
-    # or grey and alpha, only if a decoder handed the core one — and the decoder here answers red, green,
-    # blue and alpha for every PNG (`rgba_of_png`), as raw pixels a program sends are three or four bytes
-    # each. A cursor is a hollow block only where the embedder chose that as its default style, which this
-    # one does not; no sequence a program writes selects it. The arms are there so that a core which
-    # began storing or reporting them would be read rather than dropped
-    "vt/images.rs:.*delete match arm sys::KittyImageFormat::GRAY(_ALPHA)? in Terminal::image",
-    "vt/rows.rs:.*delete match arm sys::CursorStyle::BLOCK_HOLLOW in Rendering::cursor",
-
-    # **Where each keyframe is, after a recording's oldest part went.** What is kept is at most half the
-    # budget — it starts at the first keyframe in the newer half — and the next drop looks only past the
-    # half of a recording that is by then over its budget, so no offset rewritten here is ever the one a
-    # later drop chooses: that is always a keyframe written since. The offsets are kept true because the
-    # list is also how many keyframes there are, and one that lied about where would be a trap for the
-    # next reader of it. Pinned to the rebase line so `self.written - from + kept` in `drop_oldest`
-    # stays under mutation testing.
-    "recording.rs:1030:.*replace - with / in Recorder::drop_oldest",
-
-    # **The header read stops at the same byte with `<=`.** The loop reads into `head[read..]`, and once
-    # `read` is the whole header that slice is empty, so the extra pass returns `Ok(0)` and breaks: the same
-    # answer one pass later, with nothing read. No input can tell the two apart
-    "recording.rs:.*replace < with <= in check",
-
-    # **Two bits that are never the same bit**, so `|` and `^` build one value: the two flags a socket's
-    # lock is taken with (the `tree.rs` entry above, again)
-    "listening.rs:.*replace \\| with \\^ in hold",
-
-    # **The two bytes of a frame's head no frame can use.** The head is allowed a count of rows at its
-    # longest, five bytes, and a message holds too few rows for the count ever to be more than three. A
-    # head a byte or two short of that allowance still holds every head there can be, which is what these
-    # four make it; the others in the sum make it shorter than a real head, or leave room unused, and
-    # are caught (`the_longest_head_there_is_fits_with_rows_taken_to_the_last_byte`). Pinned to the line
-    # and column, since nothing else tells them from the ones that matter
-    "view/wire.rs:40:14: replace \\+ with (-|\\*)$",
-    "view/wire.rs:(38:5|42:10): replace \\+ with \\*$",
-
-    # **A link the core flags and has no address for.** `read_link` is asked only of a cell the core says
-    # is linked, and the core starts no link with an empty address (`OSC 8 ; ; ST` leaves a cell unlinked),
-    # so a length of nothing on success is the core contradicting itself. The arm is what keeps an empty
-    # address from being sent as a link if it ever did
-    "vt/rows.rs:.*replace match guard written == 0 with false in Terminal::read_link",
-
-    # **Where a read is cut to look for a hold, not what is parsed.** It only adds cuts: every byte is
-    # still fed in order and every hold the scan finds is still settled after its sequence, so what
-    # differs is how many calls into the core one read is. The one thing a case could see is a hold
-    # toggled by a spelling the scan does not know being settled sooner, and a case holding the later
-    # moment would be holding the scan's own blind spot
-    "screen.rs:.*replace hold_piece -> usize with 1",
-
-    # **The rows a capture does not read again.** A row the core says was not written to, on a screen
-    # that has not scrolled, is kept as it is held without being read. Either of these turns that off:
-    # each row is then read and its bytes compared with what is held, which keeps the same rows and sends
-    # the same frames. Only the number of rows read differs, and nothing outside the process counts them.
-    # The first is pinned to its place: the other `==` in `capture` decide what is sent
-    "view/publish.rs:310:30: replace == with != in Publication::capture",
-    "view/publish.rs:.*replace match guard shift == 0 .* with false in Publication::capture",
-
-    # **What a capture asks of a row it is about to keep unread** (the entry above): whether the row still
-    # runs on, and still is or is not the prompt's, since those change with nothing written on it
-    # (`a_row_whose_flags_changed_with_nothing_written_on_it_is_sent_again`). The first answers that there
-    # is no such row, for every row, which is the rows all read again and the same frames sent. The
-    # second answers that every row runs on and none is a prompt's: every row held as anything else is
-    # read again, and one held as exactly that is kept on the core's word alone — and of the ways such a
-    # row's flags change, the one a stream can cause, the shell marking its prompt there, the core does
-    # flag. Not proven for every way; found for none
-    "vt/rows.rs:267:.*replace != with == in Terminal::row_flags",
-    "vt/rows.rs:.*replace Terminal::row_flags -> Result<Option<u8>, Failed> with Ok\\(Some\\(1\\)\\)",
-
-    # **A refusal nothing sent to a broker produces.** An attach is refused for a reason other than there
-    # being no such session only when the core fails a call or a lock is poisoned. It is there so the
-    # rare thing is said rather than mistaken for the common one
-    "main.rs:.*replace match guard refusal.code == ErrorCode::NoSuchSession with true in carry_out_view",
-
-    # **A hold's number, which no deadline ever gets wrong.** Each hold is numbered so that a deadline
-    # ends the hold it was set for and not a later one. The number a deadline asks about is read from a
-    # clock the screen sets as a hold begins, with the screen locked, and is asked of the screen with it
-    # locked again: by then the screen holds that hold or none. With every hold numbered alike the same
-    # holds end at the same moments; the number is what says so on the page
-    "screen.rs:.*replace \\+= with \\*= in Screen::settle_holds",
-
-    # **When a busy screen's lock is tried again, never which hold ends.** A deadline not yet due is kept
-    # by the clock's own check a few lines on, so the first two change only a retry: tried when the next
-    # deadline arrives rather than twenty milliseconds on. The third tries it on every turn — a thread
-    # that spins while a screen is busy, which is a real cost and one only a clock or a reading of the
-    # processor could show, in a suite that reads neither. The hold ends at the first try that finds the
-    # screen free under all three
-    "holds.rs:135:22: replace > with (==|>=) in keep",
-    "holds.rs:.*replace \\+ with - in keep",
-
-    # **Who is on the other end of a pipe or a socket, which takes a second user to ask.** A broker told
-    # its pipe's name is taken is compiled only on Windows, where the suites that start two brokers do not
-    # run; and a peer that is not this user is a connection from another account, which no job here has.
-    # Both are refusals of somebody else, and are made by hand where there is a somebody else
-    "listening.rs:.*replace match guard matches!\\(error.kind\\(\\).* in listen$",
-    "listening.rs:.*replace peer_is_this_user -> io::Result<bool> with Ok\\(true\\)",
-
-    # **A deadline exactly due, which is due either way.** With `>=` a deadline at the instant it is checked
-    # is kept, and waited for with a zero timeout, so it is given up on on the next turn: the same answer,
-    # one turn later and at the same instant. Nothing outside the thread can see the difference
-    "deadlines.rs:.*replace > with >= in keep",
-
-    # **A second way to hang up that only macOS needs.** There a socket whose far end has stopped sending
-    # refuses to be shut both ways and takes being shut for writing; on Linux both succeed, so requiring
-    # both is the same answer. The case that tells them apart
-    # (`a_connection_whose_far_end_has_stopped_sending_is_hung_up_on_and_a_write_to_it_ends`) fails under
-    # this mutant on macOS and cannot on the Linux runner the gate runs on
-    "listening.rs:.*replace \\|\\| with && in hang_up",
-
-    # **What the decoder has already refused.** A frame smaller than its picture is an animation's, and
-    # the decoder rejects one whose first frame is not the whole picture, so neither guard is false for a
-    # file it accepts (`an_animated_png_whose_first_frame_is_part_of_the_picture_is_no_picture` is what
-    # fails if it stops). They stay because what is decoded is whatever a program wrote
-    "vt/images.rs:.*replace match guard frame.buffer_size\\(\\) == pixels \\* (4|2) with true in decode_png_into",
-
-    # **Where two ways of fitting a picture meet, they agree.** `fit` chooses by comparison: whether the
-    # picture is wider than its cells or taller, and whether a run's slice begins in a margin, ends in
-    # one, or lies inside the picture. Each pair of branches gives the same answer at the value that
-    # divides them — a picture exactly the shape of its cells has no margin either way, and a slice that
-    # begins exactly where a margin ends loses nothing of itself to it — so a comparison that takes the
-    # boundary and one that leaves it are one function. Only the strictness is excluded: turning any of
-    # these round (`<` with `>`, `>` with `<`) or into an equality is a different fit, and
-    # `every_row_reads_as_the_core_says_it_shows` fails on each
-    "vt/placeholders.rs:.*replace (<|>) with (<=|>=) in fit",
-    # **`write_until`'s floor on what the core says it parsed is a claim about the core, not an answer.** A
-    # stop for ground can be on no byte at all, where every other stop is on the byte that reached it, so a
-    # stop that is not for ground is held to at least one byte: a core that answered none would have its
-    # caller ask for the same bytes for ever. The core never answers none for those, so `&` and `|` there
-    # give the same count for everything it does answer — with `|` the floor is simply never applied. What
-    # would make the floor matter is a core that stops for an OSC's end having parsed nothing, which no
-    # input produces; the two replacements beside this one are real and are killed.
-    "vt/mod.rs:.*replace & with \\| in Terminal::write_until",
-
-    # **v2 `apack-vt-ghostty` equivalents matching the v1 `src/vt/` proofs above:**
-    # 1. Freeing exclusively-owned FFI handles and `CallbackBox` in `Drop` cannot be observed by functional tests (verified by ASAN).
+    # **`apack-vt-ghostty` proven-equivalent & ASAN-covered Drop exclusions:**
+    # 1. Freeing exclusively-owned FFI handles and `CallbackBox` in `Drop` cannot be observed by
+    #    functional tests (verified by AddressSanitizer in CI).
     "crates/apack-vt-ghostty/src/engine.rs:.*<impl Drop for (GhosttyEngine|CallbackBox)>::drop",
     "crates/apack-vt-ghostty/src/input.rs:.*<impl Drop for InputEncoders>::drop",
-    # 2. Boundary strictness (`<`/`<=`, `>`/`>=`) in Kitty placeholder aspect-ratio `fit`, where both branches
-    #    compute the exact same floating-point value at the dividing boundary (see `vt/placeholders.rs` above).
+    # 2. Boundary strictness (`<`/`<=`, `>`/`>=`) in Kitty placeholder aspect-ratio `fit`, where both
+    #    branches compute the exact same floating-point value at the dividing boundary.
     "crates/apack-vt-ghostty/src/placeholders.rs:.*replace (<|>) with (<=|>=) in fit",
-    # 3. `png` crate rejects animated sub-frame PNGs whose first frame is smaller than the full image, so
-    #    these defense-in-depth guards are always true for accepted inputs (see `vt/images.rs` above).
+    # 3. `png` crate already rejects animated sub-frame PNGs whose first frame is smaller than the full
+    #    image, so these defense-in-depth guards are always true for accepted inputs.
     "crates/apack-vt-ghostty/src/image_store.rs:.*replace match guard frame.buffer_size\\(\\) == pixels \\* (4|2) with true in decode_png_into",
 
-    # **v2 `apack-os` lethal-broadcast safety & proven-equivalent exclusions (exact equivalents of v1):**
+    # **`apack-os` lethal-broadcast safety & proven-equivalent exclusions:**
     # 1. Mutating comparisons inside `KillTarget::at` allows `kill(0)`/`kill(-1)` broadcasts; mutating
     #    process selection inside `signal_session_descendants` sends SIGHUP/SIGKILL to unrelated host processes.
     "crates/apack-os/src/signal.rs:.*in KillTarget::at",
@@ -349,30 +40,15 @@ exclude_re = [
     "crates/apack-os/src/pty_poller.rs:.*replace \\| with \\^ in create_nonblocking_pipe",
     "crates/apack-os/src/tree_windows.rs:.*replace \\| with \\^ in JobGuard::attach",
     # 3. Testing a peer owned by another OS user or pipe access denial to another local account
-    #    requires a second local OS account not present in CI (see v1 `security.rs:96`, `listening.rs:292`, `listening/pipe.rs:102`).
+    #    requires a second local OS account not present in CI.
     "crates/apack-os/src/transport.rs:.*replace verify_peer_is_current_user -> io::Result<bool> with Ok\\(true\\)",
     "crates/apack-os/src/transport_windows.rs:.*replace owned_by_this_user -> io::Result<bool> with Ok\\(true\\)",
     "crates/apack-os/src/security_windows.rs:.*replace owner_only_security_descriptor -> io::Result<SecurityDescriptor> with Ok\\(Default::default\\(\\)\\)",
     # 4. macOS half-closed socket fallback (`Shutdown::Both || Shutdown::Write`) is unobservable on Linux
-    #    where `Shutdown::Both` always succeeds (see v1 `listening.rs:304`).
+    #    where `Shutdown::Both` always succeeds.
     "crates/apack-os/src/transport.rs:.*replace \\|\\| with && in hang_up",
     # 5. Closing an exclusively-owned Win32 token handle or unmapping `MappedGuard` in `Drop` leaks
     #    a kernel resource not observable by functional assertions (verified by ASAN on Linux).
     "crates/apack-os/src/security_windows.rs:.*<impl Drop for TokenHandle>::drop",
     "crates/apack-os/src/image_sources/posix.rs:.*<impl Drop for MappedGuard>::drop",
 ]
-
-# **What only Windows compiles is not excluded here, and is left out of every other run instead.**
-# The files `.cargo/windows-only` lists compile nowhere else, so a suite that does not build them cannot
-# kill their mutants, and a run on a Mac or on Linux would report every one as missed. `cargo xtask
-# pre-push` passes them as `--exclude`, the Linux job of `.github/workflows/mutants.yml` leaves them out of
-# its diff, and its second job, on `windows-latest`, mutates them, so a change to them is answered where
-# the claim is made. Excluding them here would turn that job into a no-op: a file named
-# on the command line is still left out by this file's `exclude_globs`.
-#
-# **A change is not the only way that job runs, and it had to stop being the only way.** `tree.rs` changes
-# rarely, so a gate scoped to a change answers it rarely — and on a pull-request trigger alone, in a
-# repository whose work lands on `master` directly, it had never answered it at all. The workflow takes a
-# push and a dispatch now, and the dispatch mutates a file rather than a change:
-# `gh workflow run mutants.yml -f files=src/tree.rs`. What the code claims about where it is checked is
-# only worth reading if the check has run.

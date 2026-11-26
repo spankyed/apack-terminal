@@ -3,7 +3,7 @@
 //! else runs before a push.
 //!
 //! What it cannot run is CI's alone: the Windows and Linux suites, and the stage of this platform's binary
-//! on each of the others. Everything in `src/tree.rs` and every
+//! on each of the others. Everything in `crates/apack-os/src/tree_windows.rs` and every
 //! ConPTY claim is Windows-only by construction, so a change there is proven by a Windows run or not at all
 //! (`CLAUDE.md`, "A platform claim is made on that platform").
 

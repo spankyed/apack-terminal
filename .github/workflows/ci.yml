@@ -1,16 +1,16 @@
 name: CI
 
 # Every push to master and every pull request runs the checks on Linux and the suite on all three platforms.
-# **All three is the point, not thoroughness**: everything in `src/tree.rs`, ConPTY's missing EOF, its
-# cursor-position request and `\r\n` submitting a line are reachable from no Mac, and every one of them was
-# wrong before it was run on Windows (`CLAUDE.md`, "A platform claim is made on that platform"). A change to
-# documentation alone runs nothing past `changes`, and a newer push to the same pull request cancels the run
-# before it; `master` runs never cancel each other so a docs-only follow-up cannot supersede an unverified code
-# commit. `ci-pass` is the one check a merge waits on. Mutants of a pull request's change run beside this in
-# mutants.yml, which a surviving mutant fails.
+# **All three is the point, not thoroughness**: everything in `crates/apack-os/src/tree_windows.rs`, ConPTY's
+# missing EOF, its cursor-position request and `\r\n` submitting a line are reachable from no Mac, and every one
+# of them was wrong before it was run on Windows (`CLAUDE.md`, "A platform claim is made on that platform"). A
+# change to documentation alone runs nothing past `changes`, and a newer push to the same pull request cancels
+# the run before it; `master` runs never cancel each other so a docs-only follow-up cannot supersede an
+# unverified code commit. `ci-pass` is the one check a merge waits on. Mutants of a pull request's change run
+# beside this in mutants.yml, which a surviving mutant fails.
 on:
   push:
-    branches: [master, v2]
+    branches: [master]
   pull_request:
   workflow_dispatch:
 
@@ -69,7 +69,7 @@ jobs:
       # restores `master`'s, which is the one that matches it best. The same in every workflow that builds
       - uses: Swatinem/rust-cache@v2
         with:
-          save-if: ${{ github.ref == 'refs/heads/master' || github.ref == 'refs/heads/v2' }}
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - run: cargo fetch --locked
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
@@ -127,7 +127,7 @@ jobs:
       # Saved from `master` only, as in `checks`
       - uses: Swatinem/rust-cache@v2
         with:
-          save-if: ${{ github.ref == 'refs/heads/master' || github.ref == 'refs/heads/v2' }}
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.148
@@ -141,7 +141,7 @@ jobs:
 
   # The view (`view/`): its types, its suite and the build a consumer bundles. One platform, since it is
   # TypeScript drawing on a canvas and nothing in it asks the operating system anything. Its suite reads
-  # `node/view-vectors.json` where the broker's suite writes it, so a change to the wire that taught only
+  # `node/wire-vectors-v2.json` where the broker's suite writes it, so a change to the wire that taught only
   # one half fails here or in `platforms`, in the same run
   view:
     name: view (Linux x64)

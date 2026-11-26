@@ -120,5 +120,5 @@ fn the_windows_only_files_are_the_lines_that_name_one() {
 fn the_windows_only_files_listed_are_there() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("the repository");
     let files = xtask::mutants::windows_only_files(root).expect("the list is whole");
-    assert!(files.iter().any(|file| file == "src/tree.rs"), "{files:?}");
+    assert!(files.iter().any(|file| file == "crates/apack-os/src/tree_windows.rs"), "{files:?}");
 }

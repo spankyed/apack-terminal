@@ -1,7 +1,7 @@
 //! The repository's own tasks, run as `cargo xtask <task>`:
 //!
-//! - `generate`: writes the protocol's TypeScript declarations into `node/protocol.d.ts`, derived from `src/protocol.rs`.
-//! - `check-generated`: fails when what `generate` would write differs from what is committed.
+//! - `generate`: regenerates `node/wire-vectors-v2.json` from `apack-proto` and `apack-core`.
+//! - `check-generated`: fails when committed `node/wire-vectors-v2.json` differs from what `generate` writes.
 //! - `notices`: writes the release binaries' third-party notices, `THIRD-PARTY-NOTICES` and
 //!   `COPYRIGHT-rust-library.html`, at the repository's root (`src/notices.rs`).
 //! - `check-notices`: fails when what `notices` would write differs from what is committed.

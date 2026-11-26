@@ -10,82 +10,39 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 
-[dependencies.apack-terminal]
-path = ".."
-
 [dependencies.apack-proto]
 path = "../crates/apack-proto"
+
+[dependencies.apack-core]
+path = "../crates/apack-core"
+
+[dependencies.apack-wal]
+path = "../crates/apack-wal"
+
+[dependencies.apack-vt-ghostty]
+path = "../crates/apack-vt-ghostty"
 
 # Its own workspace, so cargo-fuzz's toolchain and flags stay here and the broker's build does not see them
 [workspace]
 members = ["."]
 
 [[bin]]
-name = "frames"
-path = "fuzz_targets/frames.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "view_wire"
-path = "fuzz_targets/view_wire.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "markers"
-path = "fuzz_targets/markers.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "png"
-path = "fuzz_targets/png.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "recording"
-path = "fuzz_targets/recording.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "status"
-path = "fuzz_targets/status.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "vt_screen"
-path = "fuzz_targets/vt_screen.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "image_sources"
-path = "fuzz_targets/image_sources.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "keyframe"
-path = "fuzz_targets/keyframe.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "v2_wire"
 path = "fuzz_targets/v2_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "v2_wal"
+path = "fuzz_targets/v2_wal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "v2_vt"
+path = "fuzz_targets/v2_vt.rs"
 test = false
 doc = false
 bench = false

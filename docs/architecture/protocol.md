@@ -1,372 +1,106 @@
-# Protocol
+# Protocol — apack-terminal v2
 
-Newline-delimited JSON, both ways, over a Unix socket — or a named pipe on Windows, where the transport
-refuses a filesystem path outright.
+`apack-terminal` v2 uses **one unified, multiplexed binary protocol** (`PROTOCOL_VERSION = 2`) for control
+RPCs, raw output feeds, incremental search watches, differential view frames, input events, and image blob
+transfers.
 
-**Rust is the source of truth and `node/protocol.d.ts` is generated from it**:
+The single source of truth is `crates/apack-proto` (`#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`). The
+TypeScript codec lives in `view/src/wire/`. Both halves are locked together by the golden wire test
+vectors in `node/wire-vectors-v2.json` (`cargo xtask generate` / `cargo xtask check-generated`).
 
-```sh
-cargo xtask generate         # re-derive it
-cargo xtask check-generated  # fail when it has fallen behind
+## Framing
+
+Every frame on the wire has a 12-byte little-endian header followed by `payload_len` bytes:
+
+```text
+ 0       4       6       8               12
+┌───────┬───────┬───────┬───────────────┬──────────────────────┐
+│  len  │ type  │ flags │   stream_id   │       payload        │
+│  u32  │  u16  │  u16  │      u32      │     [u8; len]        │
+└───────┴───────┴───────┴───────────────┴──────────────────────┘
 ```
 
-It is written **inside the npm package**, which is what ships it: a consumer imports these types from
-`@apackdev/terminal` like any dependency's, rather than keeping its own copy and a script to keep that copy
-fresh. The file is committed, so reading it needs no Rust toolchain. `cargo xtask generate` rather than
-`TS_RS_EXPORT_DIR=… cargo test`, because without that variable ts-rs writes to a gitignored `bindings/`,
-which is a second answer to the same question that nobody reads.
+- `len`: payload byte length (`<= MAX_FRAME_PAYLOAD = 16 MiB`; frames exceeding this close the connection with
+  `WireError::FrameTooLarge`).
+- `type`: `u16` message tag distinguishing client (`0x0001..`) and broker (`0x8001..`) messages.
+- `flags`: reserved `u16` (`0`; unknown non-zero flags are rejected).
+- `stream_id`: `0` for connection-level control RPCs and lifecycle events; `>= 1` for multiplexed per-session
+  streams (`AttachView`, `SubscribeOutput`, `SubscribeSearch`, etc.).
+- **Scalar & collection encoding (`crates/apack-proto/src/codec.rs`):**
+  - Unsigned integers use **canonical unsigned LEB128** (`var_u32`, `var_u64`); non-canonical overlong encodings
+    and trailing bytes are rejected on decode.
+  - Strings are UTF-8 length-prefixed (`var_u32` byte count + UTF-8 bytes) with hard per-field decode caps.
+  - Vectors use `vec_bounded` with explicit compile-time maximums before allocation (preventing OOM bombs).
+  - `FrameDecoder` is strictly streaming and chunk-boundary invariant across every 1-byte and arbitrary split.
 
-JSON rather than a length prefix because the first consumer is a Node client and a debuggable frame is worth
-more than a compact one. Nothing in the traffic makes framing the bottleneck. A length prefix is a change
-`src/protocol.rs` can make alone.
+## Handshake & Mutual Authentication
 
-## The handshake is first, or the connection is refused
+Every new connection starts in `Unauthenticated` state under a hard `AUTH_HANDSHAKE_TIMEOUT_MS` (`10 s`)
+deadline and completes a 4-step mutual HMAC-SHA256 handshake (`crates/apack-core/src/auth.rs`):
 
-```json
-{"kind":"hello","protocol":1,"role":"client"}
+```text
+Client                                          Broker
+  │ ─── Hello { protocol: 2, client_nonce, ──▶   │  verifies protocol == 2
+  │             client_name, capabilities }      │  generates server_nonce
+  │ ◀── HelloChallenge { server_nonce,      ───  │  MAC_s = HMAC(key, "apack-v2-srv" || c_nonce || s_nonce)
+  │                      server_mac }            │
+  │   verifies server_mac (constant-time)        │
+  │   MAC_c = HMAC(key, "apack-v2-cli" || ...)   │
+  │ ─── HelloAuth { client_mac }            ──▶  │  verifies client_mac (constant-time)
+  │ ◀── HelloOk { broker_version,           ───  │  transitions connection to Authenticated
+  │               capabilities, max_frame,       │
+  │               word_delimiters }              │
 ```
 
-The broker answers `hello` with its own version, or refuses with `HANDSHAKE`. Nothing can be asked before
-it, and it is said once: a second `hello` on a connection is refused with `HANDSHAKE` and changes nothing,
-the connection's role being what it is counted as and how it is spoken to from the first.
-
-**It is a contract across a pin boundary.** A consumer pins a commit of this repository, so a stale pin has
-to be a clear refusal rather than a message that means something else.
-
-**A greeting can ask the broker to prove it is the caller's own.** A socket's or pipe's name says where a
-caller connected, not to whom, and on Windows any account may create a pipe under a name nobody holds yet. So a
-caller that started its broker with a key (`APACK_TERMINAL_KEY`, which the broker takes out of its environment
-before any session can inherit it) adds a fresh `challenge` to its `hello`, and goes on only if the answer's
-`proof` is HMAC-SHA256 of the challenge under that key, in lowercase hexadecimal:
-
-```json
-{"kind":"hello","protocol":1,"role":"client","challenge":"<random hex>"}
-{"kind":"hello","protocol":1,"history":1000,"proof":"<hmac hex>"}
-```
-
-A broker started without a key answers `proof: null`, as does every broker to a greeting that asks nothing. A
-caller that asked must take `null` as a broker that is not its own: the key is kept where only its user can
-read it, so another account's process has nothing to answer with.
-
-`role` is `client`, `lifetime`, or `view`, and **a caller that omits it is a client** — so a raw caller, a probe or
-anything speaking the older handshake behaves exactly as before. [design.md](design.md) has what each role
-means for a session's lifetime, and [views.md](views.md) covers `view`.
-
-**A client is told what the sessions report for as long as it reads.** The last client to greet is the
-one reported to. What it has not yet read waits in a queue of its own, and a client that has left more
-than 64 MiB unread is hung up on. The sessions are as they were, and a client that connects again and
-greets is reported to from then on. Output never gets a client there, because one that stops reading
-stops the program instead ([design.md](design.md)); what can is everything else, titles and answers
-among it, left unread.
-
-## Requests
-
-| kind | asks for |
-|---|---|
-| `hello` | the handshake, with a protocol version and a role |
-| `done` | the caller has said all it will; drain pending answers and let the connection go |
-| `spawn` | a shell in a new pty: `cols`, `rows`, `shell`, `args`, `env`, `unset`, `cwd`, and optionally `colors`, `output`, `record`, `restore`, `images`, `image_files`, `marks_key` |
-| `write` | bytes the user typed |
-| `resize` | the viewport changed (`cols`, `rows`, and optionally `cell_width`, `cell_height`); one size per session, because a pty has one |
-| `set_cursor_defaults` | set the session's default cursor style and blink mode, and reset the cursor to them |
-| `pause` | stop reading this session's pty, so its process feels the reader stop |
-| `resume` | read it again, and send what arrived while it was not being read |
-| `signal` | a signal to the session's process, its process group, or one process inside its tree |
-| `owns` | whether a pid is inside this session's process tree |
-| `screen` | the screen as the broker has it, with up to `history` lines above the viewport |
-| `facts` | what the shell reported about itself: directory, command line, whether one is running, how the last one ended, how many have finished — and whether the session's marks are vouched for, and how many were refused |
-| `search` | where text appears in the screen and the history above it |
-| `wait` | until idle, until text appears, until the program says it is in one of some states (`status`, below), or until the process ends, with a deadline |
-| `commands` | the commands the session's shell has marked, oldest first |
-| `command_output` | what one of them printed, as text |
-| `keep` | whether the session outlives whoever holds the broker |
-| `sessions` | every session the broker has |
-| `rewind` | a recording, opened as a session with no process |
-| `seek` | show a rewound session's recording as it was at a moment |
-| `kill` | end the session and its process tree; for a rewound session, close it. The process is asked first (a hangup) and killed two seconds later if it is still there, so `exited` always follows |
-
-`output` says whether the session's bytes are sent as `output` at all. A caller that reads a program's
-bytes wants them; a terminal a person looks at is drawn by a view, which is sent rows
-([views.md](views.md)), and its bytes would cross the socket to be thrown away and stall the program on
-their credit. `record` and `restore` are a file to record the session in and whether to begin with what it
-holds; `images` is whether its programs may send any ([design.md](design.md)).
-
-`image_files` is whether an image may be *named* rather than sent: as a file on this machine or a shared
-memory object, which the broker then reads and hands to the terminal as its bytes. It is read only where `images` is on, and it is the caller's
-to say because only the caller knows what a session's output is. A program on this machine could have read
-the file itself; a file shown with `cat`, a log, or the far end of an `ssh` that spells the same request
-is asking this machine to open a path of its choosing. So it is for a session started to run one program
-the caller trusts, and absent — a shell — such an image is refused and the program told so
-([design.md](design.md#known-limits)).
-
-`marks_key` is what vouches for the shell's marks: 32 lowercase hexadecimal characters the caller also
-gives the shell — the broker does not; it spawns what it is handed — and nothing else. A session spawned
-with one records a command, and says one is running, only on the word of a mark carrying it; one spawned
-without believes every marker and reports how a command ended as a claim. Which it is holds for the
-session's whole life. A key that is not one is refused with `MALFORMED` rather than spawned without
-([design.md](design.md#a-sessions-marks-can-be-vouched-for)).
-
-**A `wait` for idle in a keyed session is met by a keyed finish and by nothing else.** A prompt mark is
-what ends a command for a session without a key, and anything can print one.
-
-**A `write` is queued, not written.** What is bound for a program — a `write`, and everything a view
-types, pastes or points at — waits its turn for the program to read it, and the request is answered
-without waiting: a program that has stopped reading holds up its own input and nothing else. Up to 16 MiB
-may wait for one session; a `write` past that is refused with `PTY` rather than dropped or held.
-
-**A rewound session lists the commands since its keyframe.** `commands` on one answers those the shell
-marked between the keyframe the moment shown was replayed from and that moment, with the times they ran.
-
-**A rewound session is its opener's.** It ends when the connection that asked for it closes, as well as
-when it is killed: it is no process, nothing else knows its id, and a client that reconnects asks again.
-
-A connection that greets with `role: "view"` leaves this protocol after the handshake: what it speaks is
-[views.md](views.md).
-
-**A kept session is a reason for the broker to stay.** A session is ended when the holder's connection
-closes, and when the last client leaves a broker nobody holds; one that was asked to be kept is not, and
-the broker exits only when nobody is connected and no session is left.
-
-`args` and `env` are how shell integration is arranged: the markers a terminal reads facts from come from
-code the shell runs at startup, and every shell takes that a different way — bash wants `--init-file` and
-PowerShell `-NoExit`, which are arguments; zsh wants `ZDOTDIR` and fish `XDG_DATA_DIRS`, which are
-environment. **The broker chooses neither**: it spawns what it is handed, because the files those point at
-belong to whoever ships them.
-
-`unset` is the other half of that, and it is what `env` cannot express: a session inherits the broker's
-environment, so adding entries cannot make a name *absent*. A consumer spawning a program rather than the
-user's shell often needs exactly that — a CLI handed a credential the app happens to carry would
-authenticate as the app rather than as whoever the user signed in as. It is applied after `env`, so absence
-is what a caller gets when it asks for both.
-
-## Events
-
-| kind | says |
-|---|---|
-| `hello` | the broker's own protocol version |
-| `spawned` | a session exists and its process is running, with its pid. `recorded` says whether it is being recorded and `restored` whether its screen began as what the recording held — each `false` when it was not asked for, and when it was asked for and not got: a file that is not a recording is left alone, a file another session is recording to has one writer, and a file the session before is still writing the last of is waited for five seconds and no longer |
-| `output` | bytes the process wrote. A feed: unprompted, and nobody asked |
-| `exited` | the process ended: `code` when it exited, `signal` by name when one killed it, never both |
-| `throttled` | a flush waited for credit, with the microseconds it waited. Not a loss |
-| `screen` | the lines a `screen` asked for, the cursor, and whether an alternate-screen app is showing |
-| `owns` | whether that pid is inside the session's tree; the pid is the correlation |
-| `facts` | what the shell said about itself. `outcome` is how the last command to end ended, absent when none has. `finished` moves each time a command it reported starting has ended, so a caller that asks after a quick command has ended still learns one ran. It is compared for a difference only: it wraps, and a shell emitting both marker families moves it twice per command. `vouched` says whether the session was spawned with a key, which is whether `command`, `running`, `outcome` and `finished` come from keyed marks alone; `cwd` is a claim either way. `refused` counts the marks spelled as keyed ones that were not accepted |
-| `search` | where the text was found, with the whole line for context |
-| `waited` | how a wait ended: `MET`, `TIMEOUT` or `EXITED`. Once per wait, however it ended |
-| `title`, `bell`, `clipboard`, `notification`, `progress` | what the program did that is not on its screen. Reported, never acted on |
-| `program_status` | what the session's programs say they are doing (OSC 7501): every record the session holds, as it stands. Below |
-| `command_started`, `command_finished`, `cwd_changed` | what the shell marked, as it happened. `command_finished` carries how it ended (`outcome`), and a keyed session that ends with a command running sends one for it before `exited` |
-| `commands`, `command_output` | the answers to the requests of those names |
-| `kept` | whether the session outlives the broker's holder, answering `keep` |
-| `sessions` | every session there is: its size, whether it is kept and recorded, its title, its shell's claims and what its programs say they are doing |
-| `rewound` | a recording opened as a session, with the moments it runs between |
-| `sought` | the moment a rewound session now shows |
-| `failed` | a request could not be carried out |
-
-## How a command ended is one value, and it says who said so
-
-Wherever a command's end is told — a record in `commands`, `command_finished`, `facts` — it is an
-`outcome`, tagged by `kind`:
-
-| outcome | means |
-|---|---|
-| `{"kind":"running"}` | it has not ended. A record still waiting at its prompt has not begun either, which its `started_ms` says |
-| `{"kind":"exited","code":N}` | it exited with this status, as a mark carrying the session's key reported |
-| `{"kind":"unknown","why":…}` | it is over, in a keyed session, and no keyed mark said how: `no_status` (the shell reported the end and had no status), `superseded` (a later command began while it ran), `session_ended` |
-| `{"kind":"claimed","code":N\|null}` | something printed that it ended, with this status where it gave one. Every command that ended in a session spawned without a key, and none in one spawned with |
-
-**`exited` is the only one that is an exit status.** A reader that wants to know a command succeeded asks
-for `exited` with a code of zero, and nothing a program printed can be handed to it as that. There is no
-bare status field anywhere to read instead.
-
-A record's `cwd` is where the shell was: when the command began, in a session without a key, and when it
-ended, in one with — which is what a keyed finish carries.
-
-Lines in a `screen` are **text, not cells**: a wide character appears once rather than beside the spacer cell
-it occupies, and the padding a row carries to its full width is not there. What it answers is what was
-written, which is what matching against it means.
-
-## What a program says it is doing is kept here, and sent whole
-
-A program can say what it is doing — idle, working, done, blocked on the person, failed — by writing
-OSC 7501, the [Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status), to
-its own terminal. The core reads each report and holds it to that specification. The specification leaves
-keeping the records to the terminal, and `src/status.rs` is the only place they are kept and the only
-place the rules are written:
-
-- one record for each `id`, and a report replaces its record whole;
-- a `clear` takes a record and every record beneath it (`build` takes `build/test`), and all of them
-  when it names none; a full reset is a clear of all;
-- a record that names no `app` is told with its nearest ancestor's;
-- at most 256, letting go of the one changed longest ago;
-- when the program's command ends, or its session does, `idle`, `working` and `blocked` records go and
-  `done` and `error` stay. A command ends where `facts` says it does: at a prompt in a session without a
-  key, and at the keyed finish in one with, where a prompt mark anything can print ends nothing.
-
-**`program_status` carries every record of the session, never a change to them**, at most once for what
-one read of the pty changed. A client replaces what it held. `facts` and each entry of `sessions` carry
-the same set, which is what a client that did not see the events starts from.
-
-| field | says |
-|---|---|
-| `id` | which record. Empty for the program itself |
-| `state` | `idle`, `working`, `blocked`, `done` or `error` |
-| `kind` | what a blocked program needs: `permission`, `question` or `auth`. Absent otherwise, and where it did not say |
-| `progress` | 0 to 100, where it gave a figure |
-| `app`, `title`, `message` | the program's name for a machine to match on, a short label, and one line for a person. Text the program chose: free of control characters, and not markup |
-| `changed` | moved by every report that changed a record of the session. A later change is a larger number, which is what "has the person seen this" is compared on |
-| `since_ms` | when the record entered the state it is in. For showing and ordering; nothing is decided on it |
-| `confirmed` | `matched`, `mismatched` or `unknown`, below |
-
-**A record is a claim, and `confirmed` is what could be checked of it.** Anything in the pty can write a
-report, and one naming another program is as well formed as an honest one: a file printed to the
-terminal can say an agent is asking for permission. So for a read that changed the records, the broker
-reads the foreground process group's leader once and says of each record that read took whether that is
-the program it names: `matched` when the leader was run as the record's `app` — or, being an
-interpreter, was run with a script of that name — `mismatched` when a leader was read and is another
-program, and `unknown` when there is nothing to compare: the record names no program, no leader could
-be read, or the platform has no foreground group, which is Windows. The names a program is run by where
-they differ from the one it reports as are data in `src/status.rs`. Nothing here acts on a record
-whatever it says.
-
-**Recorded bytes report nothing.** A screen rebuilt from a recording holds no record and answers no
-query: what a program said it was doing then is not what anything is doing now.
-
-**A program that asks is answered.** `OSC 7501 ; ?` gets the states and kinds this terminal takes, which
-some programs wait for before they report at all.
-
-A `wait` until `{"kind":"status","states":[…]}` is met while the program's own record — the one with no
-`id` — is in one of those states, and never by a session that reports nothing.
-
-## Flow control has two classes, and a `pause` is the second
-
-Credit bounds how much output may be in flight **for every session at once**, because one socket carries
-them all; a consumer reading its socket more slowly gets that for free and stalls every terminal in the app
-to slow one of them down. `pause` is the other class: one session stops being read because *its* consumer
-asked.
-
-**A paused session's pty is not read, rather than read and held.** The bytes stay in the kernel's buffer, it
-fills, and the process blocks on its own write — so a pause is backpressure reaching the program, and
-nothing accumulates in the broker. Two things follow, and both are the contract rather than a limitation:
-
-- **A read already outstanding still lands.** The reader is parked before a `read`, so the chunk the
-  outstanding one returns arrives after the pause was asked for. `node-pty`'s `pause()` is the same, and it
-  is what a consumer handling a chunk means by pausing.
-- **A paused session's screen stops being fed**, so `screen`, `facts` and a `text` wait describe it as it was
-  when it was paused. An `exit` is unaffected: that is waited for on the child, not read off the pty.
-
-**A pause does not outlive the client that asked for one.** A connection leaving resumes everything, because
-the next client never asked and has no way to find out.
-
-## A signal is for driving one program, and the broker checks the target is its own
-
-`kill` ends a session and its tree, which is the whole of what a terminal needs. `signal` is for a consumer
-driving a particular program and shutting it down the way that program documents — signal the CLI so the
-servers it owns outlive its own shutdown handlers, then its group, then the group harder.
-
-| scope | reaches |
-|---|---|
-| `leader` | the process the broker started for the session |
-| `group` | the process group it leads, which is `kill(-pid)` and no more |
-| `pid` | one process, which must be inside that session's tree |
-
-**`group` is not the whole tree.** A shell with job control puts each background job in a process group of
-its own, so a group signal does not reach one; `kill` is what ends everything, by the mechanism each
-platform gives. What `group` is for is a program the broker started directly and the children it left in
-its own group.
-
-**The pid scope is checked, and that check is why it can be offered at all.** A pid is a number any caller
-can name, so a socket that signals an arbitrary one on request is `kill(2)` for whatever can reach the
-broker. A pid outside the named session's tree is refused with `OUTSIDE_SESSION`.
-
-**POSIX only.** Windows has no signals, and what the job object can express is not this, so it answers
-`UNSUPPORTED` rather than approximating it.
-
-## The question the refusal answers is also a request of its own
-
-`owns` asks whether a pid is inside a session's tree, and it is the same walk the `pid` scope refuses with —
-so what a caller reads and what it would have been refused cannot disagree.
-
-**It exists because a signal is an act.** A caller that wanted the answer rather than the effect had nothing
-to ask, and reaching for the act to learn the answer is the mistake this removes. What needs the answer is a
-claim a caller cannot check itself: a process says *"I am yours, pid N"* over a socket, where the pid is
-whatever it chose to write. The alternative is a consumer walking the parent chain from outside — a second
-implementation of the broker's own invariant, which can disagree with it.
-
-**The pid is the correlation**, as the session is for every other answer: a consumer may have several claims
-to admit at once, and an answer taken for another pid's is one admitted or refused wrongly.
-
-**Windows answers `UNSUPPORTED` for now.** The route there is the job object `tree.rs` already holds —
-`JobObjectBasicProcessIdList` lists what is in it — and a platform claim is made on that platform, so it is
-unwritten rather than guessed. A refusal a caller can see is still the better of the two answers available:
-a parent walk with `/bin/ps` finds no `ps` there, answers *not owned* for everything, and refuses every
-claim without saying why.
-
-## What crosses as output is text, and that is a decision
-
-**The broker forwards decoded text, not bytes.** The terminal here replaces an invalid UTF-8 sequence with
-U+FFFD, and so does anything a consumer would draw the bytes with, so a byte-exact pipe would show the user
-exactly what this does. Nothing in this protocol consumes raw
-bytes either: `screen` answers lines, a search is over text, a marker is a claim. The field is named `text`
-for that reason; it was `data`, which reads as bytes to everyone.
-
-A **UTF-8** sequence split across two reads is a different matter and is not lossy: the coalescer holds an
-incomplete trailing sequence back until it completes (`output::sendable`), so the only thing ever replaced
-is what was never valid. Before that, `é` arriving as `a\xC3` then `\xA9b` was delivered with both halves
-replaced.
-
-**An event is a fragment of a stream, not a unit of anything.** A whole character is the only boundary
-promised — at most three bytes are ever held back, that being the longest tail of an incomplete one — and an
-*escape* sequence is neither covered nor coverable: `\x1b[?1049h` is eight bytes of valid ASCII, and an OSC
-payload has no length at all, so holding a partial one means stalling the feed on a sequence that may never
-terminate, or inventing a cap. That trades a feed every incremental parser already handles for latency and a
-new way to fail, so the contract stays where it is.
-
-What it costs a consumer is one rule: **never match a pattern against a single event.** Both ends that read
-this feed already obey it — a VT parser is a state machine, and the marker scanner carries state across
-chunks — and anything else accumulates first.
-
-**Why not base64 or a binary frame — measured 2026-11-08.** JSON escapes a control byte as `\u001b`, six
-bytes for one, so its cost is `1 + 5 ×` the control-byte fraction, against base64's flat 1.33×. The
-crossover is 6.7% control bytes, and real terminal output sits below it:
-
-| sample | control bytes | JSON | base64 |
-|---|---|---|---|
-| ordinary build output | 1.1% | **1.01×** | 1.33× |
-| `ls --color` | 6.5% | **1.22×** | 1.33× |
-| a full-screen TUI redraw | 2.4% | **1.12×** | 1.33× |
-
-So base64 would make every one of those *larger* and cost the frames their readability, which this protocol
-values. Revisit only with a measurement showing sustained output above that crossover.
-
-## The scrollback is one number, and the handshake answers it
-
-`hello` carries `history`: the guaranteed line depth (`HISTORY_LINES`, 1,000) that the broker keeps and
-caps `screen` text reads at. The broker holds the single grid and scrollback per session — views draw
-rows served from that same buffer (scrolling deeper, up to `VIEW_HISTORY_LINES` = 100,000) rather than
-maintaining a second terminal emulator — so closing and reopening a window never loses scrollback.
-
-Two independent constants is what this replaced: 10,000 in apack's window against `HISTORY_LINES` of 1,000
-here, so closing and reopening a window silently lost nine tenths of the scrollback. Raising the broker's is
-a measured decision about its own memory — the core holds a grid per session — not a number to pick twice.
-
-## Errors are a closed set
-
-`ErrorCode` generates as a TypeScript string union, so a caller switches on a value the compiler knows
-rather than matching a message that is free to be reworded.
-
-| code | means |
-|---|---|
-| `HANDSHAKE` | the first message was not `hello`, its version is not ours, or `hello` was said a second time |
-| `MALFORMED` | a frame did not parse as a request, or a field of one holds what it cannot: a `marks_key` that is not 32 lowercase hexadecimal characters |
-| `NO_SUCH_SESSION` | no session has that id — it never existed, or it has already exited |
-| `PTY` | the pty or the process refused: spawn or resize failed at the OS, or more is already waiting for the program to read than a session holds |
-| `OUTSIDE_SESSION` | a `signal` named a pid that is not in that session's tree |
-| `UNSUPPORTED` | this platform has no such operation — signals, on Windows |
-
-## Correlation
-
-The frames carry no call of their own: **the session is the correlation**, and an answer must not be taken
-for another session's ask. A handshake and a refusal of a frame that named no session are answered to the
-connection that asked, rather than through the feed — otherwise a refusal of one connection's malformed
-frame would land on whichever client was attached.
+Any message other than the expected handshake step, wrong protocol version, bad MAC, or timeout immediately
+closes the connection.
+
+## Message Catalog (`crates/apack-proto/src/messages.rs`)
+
+### Client → Broker (`ClientMsg`)
+
+| Group | Messages | Purpose |
+|---|---|---|
+| Handshake | `Hello`, `HelloAuth`, `Ping` | Protocol negotiation, mutual HMAC auth, RTT probing |
+| Leases | `AcquireLease`, `ReleaseLease`, `RenewLease` | Claim/release/extend broker-wide or per-session reconnect grace leases |
+| Session Lifecycle | `Spawn`, `ListSessions`, `CloseSession`, `Signal`, `Resize`, `Write` | Create/list/terminate sessions, send POSIX signals (`SignalKind`), resize PTY/VT, write raw stdin |
+| Streams & Views | `Attach`, `Detach`, `FrameAck`, `OutputCredit`, `KeyInput`, `MouseInput`, `Paste` | Open/close multiplexed streams (`SUB_VIEW`, `SUB_RAW_OUTPUT`, `SUB_EVENTS`), acknowledge rendered view frames, grant raw output byte credits, send structured input |
+| Queries & Waits | `ReadScreen`, `ReadHistory`, `GetFacts`, `GetCommands`, `GetImages`, `GetImageBlob`, `WordAt`, `SelectText`, `Search`, `SearchWatchStart`, `SearchWatchStop`, `Wait`, `CancelWait` | Authoritative reads, scrollback paging, shell/status facts, content-addressed image blob streaming, word/selection resolution, one-shot & incremental search, event-driven waits |
+| Recordings | `RecordingStatus`, `RecordingFlush`, `RewindOpen`, `RewindSeek`, `RewindClose` | Inspect WAL status, flush barrier, and deterministic recording rewind/seek |
+
+### Broker → Client (`BrokerMsg`)
+
+| Group | Messages | Purpose |
+|---|---|---|
+| Handshake | `HelloChallenge`, `HelloOk`, `Pong`, `Error` | Auth challenge/completion, RTT reply, typed `ErrorCode` replies (`rpc_id`) |
+| Leases | `LeaseAcquired`, `LeaseReleased` | Lease confirmation and expiry/release notice |
+| Lifecycle & Replies | `Spawned`, `SessionList`, `Ok`, `SessionExited` | RPC replies and asynchronous session exit notifications (exit code/signal) |
+| Streaming Data | `ViewFrame`, `RawOutput`, `SessionEvent`, `SearchDelta` | Coalesced differential view frames, credit-bounded raw PTY bytes, async shell/title/CWD/status/bell events, debounced search match updates |
+| Query Replies | `ScreenReply`, `HistoryReply`, `FactsReply`, `CommandsReply`, `ImagesReply`, `ImageBlobChunk`, `WordReply`, `TextReply`, `SearchReply`, `WaitReply`, `RecordingStatusReply`, `RewindReply` | Bounded authoritative query answers |
+
+## Flow Control & Backpressure (`crates/apack-core/src/flow.rs`)
+
+`apack-terminal` v2 strictly separates **conflatable visual state** from **ordered byte/event streams**:
+
+1. **View Frames (Conflatable, Adaptive BDP Window):**
+   - Each attached view stream tracks in-flight frame bytes against an adaptive bandwidth-delay-product
+     window clamped to `[MIN_BDP_FRAME_BYTES = 32 KiB, MAX_BDP_FRAME_BYTES = 1 MiB]` (default `256 KiB`).
+   - When the window is full, the shard marks dirty rows in the view's `ViewProjection` without queueing
+     intermediate frames. The next `FrameAck { frame_seq, paint_us }` frees credit, adjusts the BDP window
+     using observed RTT/paint time, and immediately flushes a single coalesced delta frame carrying all
+     accumulated changes plus `coalesced_frames` accounting.
+2. **Raw Output (`SUB_RAW_OUTPUT`, Ordered Byte Credits):**
+   - Clients explicitly grant byte credits via `OutputCredit { bytes }` (capped at `MAX_RAW_OUTPUT_CREDIT = 4 MiB`).
+   - The broker never transmits raw bytes beyond granted credit; if a consumer stalls, overflow is tracked
+     explicitly rather than growing memory unboundedly.
+3. **Control & Event Outbound Queue:**
+   - Non-conflatable outbound bytes per connection are capped at `MAX_CONTROL_QUEUE_BYTES = 16 MiB`. Exceeding
+     this terminates the stalled connection cleanly so one dead client cannot starve the shard.
+   - Per-session PTY stdin write backlog is capped at `MAX_PTY_WRITE_BYTES = 16 MiB`.
+
+## Error Codes (`ErrorCode`)
+
+Every RPC error returns a closed, typed `ErrorCode` enum (never ad-hoc error strings for control flow):
+`ProtocolVersion`, `AuthFailed`, `InvalidRequest`, `SessionNotFound`, `StreamNotFound`, `LimitExceeded`,
+`Backpressure`, `LeaseConflict`, `NotSupported`, `IoFailed`, `RecordingError`, `Cancelled`, `TimedOut`,
+`Internal`.

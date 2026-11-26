@@ -12,7 +12,7 @@ name: mutants
 #
 # **It runs on a push too, and that is not belt and braces.** This repository's work lands on `master`
 # directly, so a gate that fires only on a pull request had never fired at all — and `.cargo/mutants.toml`
-# says this job is what answers `src/tree.rs`. A claim about where a check is made has to be true of the
+# says this job is what answers `crates/apack-os/src/tree_windows.rs`. A claim about where a check is made has to be true of the
 # record and not only of the design. The Linux half duplicates `cargo xtask pre-push` and is cheap; the
 # Windows half is the one no developer here can run, which is the point of having it.
 #
@@ -22,12 +22,12 @@ name: mutants
 on:
   pull_request:
   push:
-    branches: [master, v2]
+    branches: [master]
   workflow_dispatch:
     inputs:
       files:
         description: The files to mutate on Windows, space separated
-        default: src/tree.rs
+        default: crates/apack-os/src/tree_windows.rs
         required: true
 
 permissions:
@@ -84,7 +84,7 @@ jobs:
       - if: steps.scope.outputs.code == 'true'
         uses: Swatinem/rust-cache@v2
         with:
-          save-if: ${{ github.ref == 'refs/heads/master' || github.ref == 'refs/heads/v2' }}
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - if: steps.scope.outputs.code == 'true'
         uses: taiki-e/install-action@v2
         with:
@@ -202,7 +202,7 @@ jobs:
       - if: steps.scope.outputs.code == 'true'
         uses: Swatinem/rust-cache@v2
         with:
-          save-if: ${{ github.ref == 'refs/heads/master' || github.ref == 'refs/heads/v2' }}
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - if: steps.scope.outputs.code == 'true'
         uses: taiki-e/install-action@v2
         with:

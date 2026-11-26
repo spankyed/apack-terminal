@@ -117,10 +117,13 @@ pub enum CliCommand {
     Version,
 }
 
+/// Usage banner returned when `apack-terminal` is invoked with no subcommand.
+pub const CLI_USAGE: &str = "usage: apack-terminal <serve | proxy | inspect | version> [options]";
+
 /// Parses CLI arguments (excluding `argv[0]`) into a [`CliCommand`].
 pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
     let Some((cmd, rest)) = args.split_first() else {
-        return Ok(CliCommand::Serve { socket: None, shards: None });
+        return Err(String::from(CLI_USAGE));
     };
     match cmd.as_str() {
         "serve" => {

@@ -85,7 +85,8 @@ fn echo_command_spec(text: &str, record_dir: Option<String>, restore_from: Optio
 fn cli_parsing_config_and_helpers() {
     let args = |xs: &[&str]| xs.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
 
-    assert_eq!(parse_cli(&[]).unwrap(), CliCommand::Serve { socket: None, shards: None });
+    assert!(parse_cli(&[]).unwrap_err().contains("usage: apack-terminal"));
+    assert_eq!(parse_cli(&args(&["serve"])).unwrap(), CliCommand::Serve { socket: None, shards: None });
     assert_eq!(
         parse_cli(&args(&["serve", "--socket", "/tmp/a.sock", "--shards", "8"])).unwrap(),
         CliCommand::Serve { socket: Some(String::from("/tmp/a.sock")), shards: Some(8) }

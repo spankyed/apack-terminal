@@ -1,166 +1,118 @@
-# apack-terminal
+# apack-terminal (v2)
 
-A terminal broker: one process that owns ptys and their process trees, parses VT, and answers a protocol —
-so that no terminal session's lifetime is tied to the process that asked for it.
+A sharded, sans-IO terminal broker: one process that owns PTYs and their process trees, runs `libghostty-vt`
+as the single VT authority, records sessions to an immutable segmented WAL, and serves a single multiplexed
+binary protocol — paired with the thin TypeScript renderer `@apackdev/terminal-view`.
 
-Written for [apack](https://github.com/spankyed/apack), whose backend is a separate Node process. A session
-survives that process restarting, and ends when the app that claimed it goes.
+Written for [apack](https://github.com/spankyed/apack), whose backend is a separate Node process. Sessions
+survive backend restarts via broker-wide and per-session leases with reconnect grace windows, and tear down
+deterministically through kernel-enforced ownership when the app exits.
 
-The repository also holds what draws a session in a window: [`view/`](view) is the `@apackdev/terminal-view`
-package, a view over the rows the broker sends, with no terminal core of its own. The broker interprets
-and the view paints, so they are the two halves of one protocol and change in one commit.
-
-| | |
+| Path | What it is |
 |---|---|
-| `src/`, `tests/`, `xtask/` | the broker, in Rust |
-| [`node/`](node) | the `@apackdev/terminal` npm package: the protocol's generated types, the view's vectors, and where the installed broker binary is |
-| [`view/`](view) | the `@apackdev/terminal-view` npm package, in TypeScript ([its README](view/README.md)) |
+| `src/`, `tests/` | the `apack-terminal` v2 CLI binary (`serve`, `proxy`, `inspect`, `version`) and CLI integration tests |
+| `crates/apack-proto/` | zero-`unsafe` `#![no_std]` + `alloc` binary framing, canonical LEB128 codec, and `PROTOCOL_VERSION = 2` wire schema |
+| `crates/apack-core/` | zero-`unsafe` `#![no_std]` + `alloc` sans-IO deterministic broker & session state machine |
+| `crates/apack-sim/` | deterministic discrete-event simulator (`SimWorld`, virtual clock, arbitrary chunking, slow-consumer chaos) |
+| `crates/apack-vt-ghostty/` | `libghostty-vt` adapter implementing `VtEngine`, global content-addressed image store, bounded snapshots |
+| `crates/apack-os/` | OS boundary: PTYs/ConPTY, `SignalTarget` process-tree control, Windows Job Objects, ACL-enforced sockets/pipes |
+| `crates/apack-wal/` | zero-`unsafe` immutable segmented WAL (`meta.apkm`, `seg-*.apks`, `blobs/`), dual-layer `KeyframeV2`, $O(1)$ eviction |
+| `crates/apack-broker/` | sharded I/O reactor (`mio`), per-session reader threads, OS blocking pool, `proxy`, `inspect`, v2 Rust client |
+| `xtask/` | repository tasks (`pre-push`, `generate`, `check-generated`, `check-safety`, `notices`, `check-exclusions`) |
+| [`node/`](node) | the `@apackdev/terminal` npm package: `brokerBinary()` runtime locator and golden `wire-vectors-v2.json` |
+| [`view/`](view) | the `@apackdev/terminal-view` npm package: Canvas 2D + WebGL2 atlas renderer and v2 binary client ([its README](view/README.md)) |
 
-- **Sessions outlive their client.** The connection that opened a session is not what ends it; whoever
-  claimed the broker's lifetime is, and a descriptor closes on process death however the process died.
-- **Owned process trees.** A Job Object on Windows, the kernel's own signal on POSIX — one mechanism per
-  platform rather than cleanup code that has to run.
-- **One authority on the screen.** The broker parses the same bytes it forwards, so a session nobody is
-  drawing still answers a bounded read, a search and a wait.
-- **Shell facts, not guesses.** OSC 633 markers give the working directory, command boundaries and exit
-  status; what a shell did not say is reported as unknown rather than inferred.
-- **Marks that can be vouched for.** A session spawned with a key takes its commands only from marks that
-  carry it, so nothing printed into the terminal — a file, a log, a web response — can report a command
-  as ended or as having succeeded. A status a keyed mark did not give is told as a claim, never as an
-  exit.
-- **Bounded output with real backpressure.** Reads are coalesced, the channel is credit-bounded, and an
-  overload is reported with the microseconds it waited rather than being silent.
+## Core Guarantees
 
-## The protocol
+- **Correct by construction.** Illegal states are unrepresentable at compile time: `SignalTarget` makes
+  `kill(0)`/`kill(-1)` impossible to construct; `VouchedExitCode` separates authenticated `MarksKey` shell
+  facts from untrusted PTY claims; `apack-core` enforces sans-IO purity via `#![no_std]` + `#![forbid(unsafe_code)]`.
+- **Single authority & unidirectional replication.** The broker's `libghostty-vt` core is the sole authority
+  on terminal state (screen, scrollback, modes, cursor, images, markers, commands, program statuses).
+  `@apackdev/terminal-view` interprets zero VT bytes and renders style-run `PackedRow` diffs directly.
+- **Unified multiplexed binary protocol (v2).** One length-prefixed binary wire over Unix sockets, Windows
+  named pipes, or `ssh host apack-terminal proxy` carries control RPCs, raw output feeds, incremental search
+  watches, view frames, input events, and image blobs over independent `stream_id` channels with mutual
+  HMAC-SHA256 authentication.
+- **Explicit backpressure & principled load shedding.** Zero unbounded buffers anywhere. Conflatable view
+  frames use adaptive BDP credit flow control and dirty-row coalescing; non-conflatable control streams use
+  explicit byte credits and bounded queues; overload always reports measured metrics rather than dropping
+  silently.
+- **Owned process trees & crash-only safety.** POSIX sessions/process groups (`setsid` + negative-pgid kill)
+  and Windows Job Objects (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) ensure no orphaned shells survive teardown
+  or crashes.
+- **Immutable segmented WAL & dual-layer restore.** Crash-safe CRC32C-framed segments with $O(1)$ budget
+  eviction and `KeyframeV2` carrying both a version-stable `VisualKeyframe` and an optional ABI-hashed
+  `libghostty-vt` binary checkpoint.
 
-Two, on one socket. A client that opens and ends sessions speaks newline-delimited JSON: Rust is the source
-of truth and `node/protocol.d.ts` is generated from it and shipped by the npm package, so a consumer imports
-the types without building Rust. A view that draws a session speaks length-prefixed binary after the same
-greeting.
+## CLI
 
-```jsonc
-→ {"kind":"hello","protocol":1,"role":"client"}
-← {"kind":"hello","protocol":1,"history":1000,"proof":null}
-→ {"kind":"spawn","cols":80,"rows":24,"shell":null,"args":[],"env":[],"unset":[],"cwd":null}
-← {"kind":"spawned","session":"s-1","pid":4242,"recorded":false,"restored":false}
-→ {"kind":"write","session":"s-1","text":"echo hi\n"}
-← {"kind":"output","session":"s-1","text":"echo hi\r\nhi\r\n"}
-→ {"kind":"facts","session":"s-1"}
-← {"kind":"facts","session":"s-1","cwd":"/home/me","command":"echo hi","running":false,"outcome":{"kind":"claimed","code":0},"finished":1,"vouched":false,"refused":0,"foreground":{"pid":4242,"name":"zsh"},"statuses":[]}
+```sh
+apack-terminal serve [--socket <path>] [--lease-grace-ms <ms>] [--max-sessions <n>]
+apack-terminal proxy [<socket>] [--no-autostart]
+apack-terminal inspect <recording-dir> [--json]
+apack-terminal version
 ```
 
-[protocol.md](docs/architecture/protocol.md) has every message, the roles, and the closed error set.
+With no socket named, the broker binds the user's private runtime path (`$XDG_RUNTIME_DIR/apack-terminal/broker.sock`
+or `~/.apack-terminal/broker.sock` on Unix; `\\.\pipe\apack-terminal-<sid>-default` on Windows). Shared
+directories writable by other users (such as `/tmp`) are refused. Running `apack-terminal` with no arguments
+exits with code `2` and prints usage to stderr.
 
-A window draws a session over a connection of its own, greeting as a `view`: it is sent the rows that
-changed and paints them, interpreting nothing ([views.md](docs/architecture/views.md)). What paints them
-is the `@apackdev/terminal-view` package in [`view/`](view), whose codec (`view/src/broker/wire.ts`) is the
-other half of `src/view/wire.rs`. The two meet in `node/view-vectors.json`: the broker's suite writes every
-kind of message there as bytes and as the value they mean, and the view's suite reads that file where it
-lies, so a change to the wire that taught only one half fails.
-
-`apack-terminal proxy [<socket>]` is a process's stdin and stdout as a connection to the broker on that
-socket, started first if there is none — so `ssh host apack-terminal proxy` is a connection to a broker
-on another machine. With no socket named it is the user's own: `$XDG_RUNTIME_DIR/apack-terminal/broker.sock`
-where the system gives a runtime directory, and `~/.apack-terminal/broker.sock` otherwise. A socket goes
-in a directory that is its user's alone: one other users can write to, `/tmp` among them, is refused.
-
-## Status
-
-Built for apack and not published, so build it from source. Nothing here is a stable API yet: the protocol
-version is 1 and is edited in place until a release has users.
+## Status & Building
 
 ```sh
 git clone https://github.com/spankyed/apack-terminal.git && cd apack-terminal
 cargo build
-cargo test
-npm --prefix view ci && npm --prefix view test    # the view
+cargo nextest run --workspace
+npm --prefix view ci && npm --prefix view test && npm --prefix view run build
+npm --prefix node test
 ```
 
 | | |
 |---|---|
 | Rust | pinned by `rust-toolchain.toml` |
-| Node | 24.12 or later, for the view |
-| Platforms | macOS and Linux: the whole suite. Windows: the whole suite but for the cases about what a Windows pipe or console does not have (socket files, mode bits, a connection closed one way, an ignored hangup), each gated and named in `tests/`; sessions run on the ConPTY the broker carries (`windows/conpty/`). See [Known limits](docs/architecture/design.md#known-limits) |
-| Transport | a Unix socket, or a named pipe on Windows |
-| Crash | a session ends when the broker stops; there is no handoff of a session to another broker |
-| Not in scope | agent status rules, command semantics beyond what a shell reports, storage, a recording or a path link on a remote target, `signal` on Windows |
+| Node | 24.12 or later, for `view/` and `node/` |
+| Platforms | macOS arm64, Linux x64 (glibc ≥ 2.28), Windows x64 (with bundled Microsoft ConPTY in `windows/conpty/`) |
+| Transport | Unix domain socket (owner-only `0o700` dir + `0o600` socket + peer UID check) or Windows named pipe (protected SDDL DACL + owner SID check) |
+| Crash model | Sessions end when the broker stops; durable sessions restore from segmented WAL recordings (`KeyframeV2`) |
 
-Consumed by pinning a release commit (e.g. `npm run deps:pin` in apack). One pin holds the broker and the view,
-which is why they are one repository.
-
-**The broker reaches a consumer as a release build, as npm packages installed by URL.** Every `master` commit is
-built for each platform the app ships and published as the release `bin-<commit>` (`.github/workflows/binaries.yml`):
-each file named `<platform>__<file>` — Node's `<platform>-<arch>`, and on Windows the ConPTY the binary runs its
-sessions on beside it (`windows/conpty/`) — with a `SHA256SUMS`, and the same files packed as npm packages: one
-`@apackdev/terminal-<platform>` per platform, `@apackdev/terminal`, and `@apackdev/terminal-view`. A consumer
-depends on `@apackdev/terminal` by its release URL; its optional dependencies name that release's platform packages
-by URL, so npm installs the one for the platform it is on, and `brokerBinary()` answers where its binary is. So the
-app runs exactly what this repository's CI built, and nothing working on the app needs a Rust toolchain
-([design.md](docs/architecture/design.md#how-a-consumer-gets-the-broker)).
-
-`node/` is that package's source: the protocol's generated types, the view's vectors, and the runtime entry
-(`index.js`). Its manifest names the platform packages at its own version, which a release's tarball replaces with
-URLs (`node/release/pack.mjs`).
-
-**None is published to npm.** The packages are named under the owner's npm scope and publishable, public by
-`publishConfig`; publishing `@apackdev/terminal` would take the three platform packages published first at its
-version. Neither source package is `private`; what keeps either from being published by accident is that only
-the scope's owner can publish to it, and only by running `npm publish`.
-
-**The view reaches a consumer as its release tarball too**, pre-built (`dist/`), or from a local checkout
-built with `npm run build` in `view/`. What it ships is its compiled `dist/`, which is not tracked in git.
-
-**v1 scope.** What v1 is: a broker that owns processes and screens, serves views over a protocol, records
-sessions and restores them from their recordings, keeps sessions the app asked to keep, and reports what a shell
-said of its commands, where the shell vouched for it. What v1 is not is said in the table above. Its decisions
-(scope, platforms, the crash behaviour, the echo flush) are recorded where they were taken, and each limit a
-platform has is stated beside the code it limits, in [Known limits](docs/architecture/design.md#known-limits).
+**Distribution.** Every `master` commit is built for macOS arm64, Linux x64 (manylinux_2_28), and Windows x64
+and published as a GitHub release `bin-<commit>` (`.github/workflows/binaries.yml`) containing raw binaries,
+Windows ConPTY assets, `THIRD-PARTY-NOTICES`, `COPYRIGHT-rust-library.html`, CycloneDX SBOMs, `SHA256SUMS`,
+and pre-packed `.tgz` tarballs for `@apackdev/terminal`, `@apackdev/terminal-<platform>`, and
+`@apackdev/terminal-view`. Consumers pin a release commit by URL and never need a Rust toolchain.
 
 ## Docs
 
-See the [docs map](docs/README.md). The ones most people want:
+See the [docs map](docs/README.md):
 
-- [design.md](docs/architecture/design.md): the two layers, who owns a session, and what the broker won't do
-- [protocol.md](docs/architecture/protocol.md): every message, the handshake, the roles, the errors
-- [views.md](docs/architecture/views.md): how a window draws a session, and the protocol a view speaks
-- [testing.md](docs/architecture/testing.md): what proves it correct, and the command for each check
+- [design.md](docs/architecture/design.md): workspace layers, sharded runtime, process lifetime, WAL, and security boundaries
+- [protocol.md](docs/architecture/protocol.md): v2 binary framing, mutual auth, multiplexed streams, messages, and flow control
+- [views.md](docs/architecture/views.md): differential view replication, Canvas 2D and WebGL2 atlas painters, and `@apackdev/terminal-view`
+- [testing.md](docs/architecture/testing.md): deterministic simulation, mutation gates, ASAN, fuzzing, and cross-platform CI
+- [windows-pipe-access.md](docs/architecture/windows-pipe-access.md): Windows named-pipe SDDL security descriptor and owner verification
 - [background.md](docs/background.md): why the broker exists
 
 ## Develop
 
-Needs Rust, which `rust-toolchain.toml` pins, and Node for the view. `CLAUDE.md` has the repository's rules.
-
 ```sh
-cargo xtask pre-push                         # before a push: every check CI runs, and the change's mutants
-cargo nextest run --workspace                # every suite, each test in its own process
+cargo xtask pre-push                         # every CI check + mutation testing on the diff
+cargo nextest run --workspace                # full Rust test suite (each test in its own process)
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
-cargo xtask generate                         # regenerate the protocol's TypeScript; commit it if it moved
-cargo run -- ~/.apack-terminal/broker.sock   # run one, and talk to it
-npm --prefix view test                       # the view's suite (also: run typecheck, run build)
-npm --prefix node test                       # the broker package's runtime entry and the release's packing
+cargo xtask generate                         # regenerate node/wire-vectors-v2.json
+cargo xtask check-generated                  # verify wire vectors match Rust encoder
+cargo xtask check-safety                     # verify every unsafe site has a SAFETY justification
+cargo xtask check-notices                    # verify THIRD-PARTY-NOTICES and Rust stdlib notices
+cargo xtask check-exclusions                 # verify every .cargo/mutants.toml exclusion is live
+npm --prefix view test                       # view suite (also: run typecheck, run build)
+npm --prefix node test                       # node package & release packing tests
 ```
-
-`cargo xtask pre-push` is the one to run before a push: it is every check
-[CI](.github/workflows/ci.yml) fails a change on, cheapest first, and it refuses a dirty tree because what
-is checked has to be what is pushed. A mutant of the change that survives is killed, or excluded in
-`.cargo/mutants.toml` with the reason. The view's types, suite and build are among its steps, after the
-broker's suites, since the view's suite reads the vectors those hold to the encoder.
 
 ## License
 
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), both npm packages included, each of
-which ships the two texts. The view's input handling draws on
-[coder/ghostty-web](https://github.com/coder/ghostty-web), under MIT, whose notice
-[`view/NOTICE`](view/NOTICE) carries and the view's package ships.
-
-A release binary also holds the code it is built from, each under its own license: the Rust standard library, the
-crates the broker depends on, and libghostty-vt, which is Ghostty's code compiled with Zig together with Highway,
-simdutf, Wuffs and uucode; the Windows release ships Microsoft's ConPTY beside its binary. Redistributing one means
-complying with those licenses too. Each `bin-<commit>` release of a commit that has them carries their texts and
-notices beside each platform's binary: the crates', libghostty-vt's and ConPTY's in `THIRD-PARTY-NOTICES`, and the
-Rust standard library's in `COPYRIGHT-rust-library.html`, with the binary's CycloneDX SBOM, `apack-terminal.cdx.json`,
-listing the crates it is built from, the procedural macros that run while it compiles among them.
-
-Unless you explicitly state otherwise, any contribution you intentionally submit for inclusion in this work,
-as defined in the Apache-2.0 license, is dual-licensed as above, without any additional terms or conditions.
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), both npm packages included. The view's
+input handling draws on [coder/ghostty-web](https://github.com/coder/ghostty-web) under MIT ([`view/NOTICE`](view/NOTICE)).
+Release binaries ship `THIRD-PARTY-NOTICES`, `COPYRIGHT-rust-library.html`, and a CycloneDX SBOM alongside
+each platform artifact.

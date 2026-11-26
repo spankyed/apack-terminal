@@ -1,73 +1,25 @@
-# Each test runs in its own process, so a test that hangs is killed at its deadline and the rest run on. That
-# matters more here than the deadline being tight: nearly every suite waits on a frame the broker sends when
-# something happened, and a regression that loses the signal is a blocking read that never returns rather
-# than a wrong answer. Under `cargo test` one such test holds the whole run.
+# Each test runs in its own process, so a test that hangs is killed at its deadline and the rest run on.
+# Nearly every integration test waits on a frame or OS signal; a regression that loses a wake is a blocking
+# read that never returns rather than a wrong answer. Under `cargo test`, one hung test holds the whole run.
 
 # What CI installs, and the oldest that reads this file as written
 nextest-version = "0.9.148"
 
-# The deadline is for a test that has stopped ending at all, so it is several times the slowest test
-# rather than near it: `cargo nextest run` prints what each one took.
+# Default deadline for any test that stops making progress
 [profile.default]
 slow-timeout = { period = "10s", terminate-after = 2 }
 
-# v2 `apack-broker` tests finish in < 0.5 s; a tight 8 s deadline catches stalled/hung mutants promptly.
+# `apack-broker` and root `apack-terminal` CLI tests finish in < 1 s; an 8 s deadline catches hung mutants promptly.
 [[profile.default.overrides]]
-filter = "package(apack-broker)"
+filter = "package(apack-broker) | package(apack-terminal)"
 slow-timeout = { period = "4s", terminate-after = 2 }
 
-# The one test that waits for a producer to saturate the bounded channel and for the throttle to be reported,
-# reading one event each 20 ms until it is: 3.4 s on an Apple-silicon laptop, and 5–20 s across twenty runs with
-# twenty busy loops on its ten cores (November 2026)
+# Fast pure unit & simulation tests run before tests that spawn real PTYs or broker processes so mutation runs
+# fail as early as possible.
 [[profile.default.overrides]]
-filter = "test(=channel::a_saturating_producer_reports_that_it_was_throttled_rather_than_losing_output)"
-slow-timeout = { period = "30s", terminate-after = 2 }
-
-# Three megabytes pasted into a program that echoes them, read back off the screen: volume too, and on Windows
-# it goes through ConPTY and `findstr`, which took 8.8–18.3 s on CI's Windows runners across ten runs in
-# November 2026 and timed out at 20 s on one; 1.6 s on an Apple-silicon laptop at a load of forty
-[[profile.default.overrides]]
-filter = "test(=view_broker::a_paste_of_megabytes_into_a_program_that_echoes_holds_nothing_up)"
-slow-timeout = { period = "30s", terminate-after = 2 }
-
-# Ten thousand commands through ConPTY on Windows: volume, as the two above. 8.1 s on CI's Windows runner in
-# November 2026, close enough to the default's 20 s that a slow runner would end it
-[[profile.default.overrides]]
-filter = "test(=broker::ten_thousand_commands_from_a_powershell_session_come_back_in_order)"
-slow-timeout = { period = "30s", terminate-after = 2 }
-
-# **ts-rs generates one `export_bindings_*` test per exported type, and every one of them writes the same
-# file.** Under `cargo test` they were threads in one process and the writes interleaved harmlessly often
-# enough; as separate processes they truncate and write `bindings/protocol.d.ts` on top of each other, and one
-# of them reads back a file another had just emptied. It failed on the first full run after this file existed.
-# A group of one thread is the fix rather than a lock in the tests: nothing about these is concurrent on
-# purpose, and `cargo xtask generate` runs them for their side effect alone.
-#
-# **There is one profile on purpose.** A `[profile.ci]` whose only setting was `fail-fast = false` carried
-# none of the overrides above — nextest does not merge a profile's overrides with the default's, which
-# `cargo nextest show-config test-groups --profile ci` says plainly — so every CI job raced here while every
-# local run was fine. `--no-fail-fast` is a flag, and a flag cannot silently lack an override.
-[test-groups]
-protocol-export = { max-threads = 1 }
-
-[[profile.default.overrides]]
-filter = "test(/^protocol::export_bindings_/)"
-test-group = "protocol-export"
-
-# **The three longest cases start first.** Each is seconds of real output by design, so left to the end
-# they are what a whole run waits for after everything else has finished; started first they are over
-# when the rest is. Above the override that puts their modules last, because the first override that
-# matches a case is the one that sets its priority
-[[profile.default.overrides]]
-filter = "test(=channel::a_saturating_producer_reports_that_it_was_throttled_rather_than_losing_output) | test(=broker::a_client_that_stops_reading_stalls_the_program_rather_than_filling_the_broker) | test(=view_broker::a_paste_of_megabytes_into_a_program_that_echoes_holds_nothing_up)"
+filter = "package(apack-proto) | package(apack-core) | package(apack-sim)"
 priority = 50
 
-# **Of the rest, the cases that are a function call run before the ones that are a process.** A case that feeds a
-# parser or reads a row back answers in milliseconds, and is what fails first for most of what can go
-# wrong in this crate; the modules below start the real broker and a shell, and take the suite's whole
-# length between them. Run in the order of their names, those came first — so a run that stops at its
-# first failure, which a mutation run does once a mutant (`.cargo/mutants.toml`), waited through seconds
-# of processes to reach a case that took none.
 [[profile.default.overrides]]
-filter = "test(/^(broker|candidates|channel|coalescing|housekeeping|keeping|proxy|view_broker)::/)"
+filter = "package(apack-broker) | package(apack-terminal)"
 priority = -50
