@@ -98,7 +98,7 @@ impl BrokerHandle {
         &self.socket_path
     }
 
-    #[cfg(all(test, windows))]
+    #[cfg(test)]
     pub(crate) fn is_finished(&self) -> bool {
         self.thread.as_ref().is_none_or(JoinHandle::is_finished)
     }

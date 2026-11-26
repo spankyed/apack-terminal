@@ -2377,7 +2377,7 @@ fn review_regressions_env_grace_pipelined_fin_teardown_spawn_and_seek_cell_px() 
         };
 
         let mut batch = Vec::new();
-        const BURST_N: u32 = 20_000;
+        const BURST_N: u32 = 100_000;
         for i in 0..BURST_N {
             ClientMsg::Metrics
                 .encode_to_frame(apack_proto::types::StreamId::CONTROL, RequestId::from_raw(i + 2), &mut batch)
@@ -2385,7 +2385,7 @@ fn review_regressions_env_grace_pipelined_fin_teardown_spawn_and_seek_cell_px() 
         }
         batch.extend_from_slice(&apack_proto::FIN_FRAME);
 
-        // 6a. Sole client pipelines 20,000 Metrics (~1.1 MiB > Linux & macOS AF_UNIX buffers) + FIN_FRAME.
+        // 6a. Sole client pipelines 100,000 Metrics (~2.2 MiB > Linux & macOS AF_UNIX buffers) + FIN_FRAME.
         //     `has_draining_conns()` MUST keep the broker from auto-exiting while replies drain!
         let dir_solo = tempdir().unwrap();
         let ep_solo = unique_endpoint(dir_solo.path(), "unix-drain-solo");
@@ -2426,11 +2426,13 @@ fn review_regressions_env_grace_pipelined_fin_teardown_spawn_and_seek_cell_px() 
         stalled.write_all(&batch).unwrap();
         stalled.flush().unwrap();
         let reap_wait = std::time::Instant::now();
-        while std::path::Path::new(&ep_reap).exists() && reap_wait.elapsed() < Duration::from_millis(1_500) {
+        while (!srv_reap.is_finished() || std::path::Path::new(&ep_reap).exists())
+            && reap_wait.elapsed() < Duration::from_millis(1_500)
+        {
             std::thread::sleep(Duration::from_millis(25));
         }
         assert!(
-            !std::path::Path::new(&ep_reap).exists(),
+            srv_reap.is_finished() && !std::path::Path::new(&ep_reap).exists(),
             "reap_draining_conns must drop stalled draining_unix peer after 500ms so broker auto-exits"
         );
         let mut discard = Vec::new();

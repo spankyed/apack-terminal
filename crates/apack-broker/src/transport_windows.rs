@@ -18,7 +18,7 @@ use interprocess::local_socket::traits::Listener as _;
 use interprocess::local_socket::{Listener, Stream};
 
 use crate::transport_loop::{
-    ConnState, GRACEFUL_DRAIN_TIMEOUT, MAX_CONNECTIONS, ReactorState, ready_stalled_stream_ids,
+    ConnState, GRACEFUL_DRAIN_TIMEOUT, MAX_CONNECTIONS, ReactorState, drain_deadline_expired, ready_stalled_stream_ids,
 };
 use crate::{fill_random, now_unix_ms};
 
@@ -372,13 +372,17 @@ impl ReactorState {
 
     pub(crate) fn reap_draining_win_conns(&mut self) {
         let now = Instant::now();
-        let expired: Vec<ConnId> =
-            self.draining_win
-                .iter()
-                .filter_map(|(&conn, d)| {
-                    if d.win.writer_done.load(Ordering::Acquire) || now >= d.deadline { Some(conn) } else { None }
-                })
-                .collect();
+        let expired: Vec<ConnId> = self
+            .draining_win
+            .iter()
+            .filter_map(|(&conn, d)| {
+                if d.win.writer_done.load(Ordering::Acquire) || drain_deadline_expired(now, d.deadline) {
+                    Some(conn)
+                } else {
+                    None
+                }
+            })
+            .collect();
         for conn in expired {
             if let Some(d) = self.draining_win.remove(&conn)
                 && !d.win.writer_done.load(Ordering::Acquire)

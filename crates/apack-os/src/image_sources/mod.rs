@@ -176,7 +176,7 @@ impl Load {
     }
 
     fn source_limit(&self) -> u64 {
-        if self.action == b'q' { QUERY_SOURCE_BYTES } else { SOURCE_BYTES }
+        SOURCE_BYTES
     }
 
     /// Returns `true` when a regular file of length `file_len` fits within this command's limit.

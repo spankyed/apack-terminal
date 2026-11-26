@@ -2025,7 +2025,7 @@ mod win_shard_tests {
     use crate::shard_windows::{clamp_win_write_timeout, drain_conpty_quantum, maybe_wait_win_mailbox};
     use apack_os::pty::{PtySpawnConfig, spawn_pty};
     use apack_os::pty_windows::ConPtyBridge;
-    use apack_proto::types::{CellPos, CellSpan, GridSize, ResizePolicy};
+    use apack_proto::types::{CellPos, CellPx, CellSpan, GridSize, ResizePolicy};
 
     #[test]
     fn win_shard_helpers_and_drain_windows_ptys_cover_pause_quantum_and_eof() {

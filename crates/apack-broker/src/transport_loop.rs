@@ -158,6 +158,7 @@ pub(crate) fn all_sessions_drained(sessions_empty: bool, pending_spawns: usize) 
     sessions_empty && pending_spawns == 0
 }
 
+#[cfg(any(unix, test))]
 pub(crate) fn should_graceful_drain_unix(reason: CloseReason, drained_len: usize, has_final: bool) -> bool {
     matches!(reason, CloseReason::ClientFin) || drained_len != 0 || has_final
 }
