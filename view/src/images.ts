@@ -37,7 +37,9 @@ async function defaultDecodeBlob(
   }
   const pngBytes = new Uint8Array(blob.bytes.length)
   pngBytes.set(blob.bytes)
-  const bitmap = await createImageBitmap(new Blob([pngBytes], { type: 'image/png' }))
+  const bitmap = await createImageBitmap(new Blob([pngBytes], { type: 'image/png' }), {
+    premultiplyAlpha: 'premultiply',
+  })
   return { source: bitmap, width: bitmap.width, height: bitmap.height }
 }
 
