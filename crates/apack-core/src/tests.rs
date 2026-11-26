@@ -49,6 +49,7 @@ fn sample_frame() -> Box<FrameUpdate> {
         seq: 0,
         epoch: 1,
         size: GridSize::new(80, 24).unwrap(),
+        first_active_line: 0,
         scrollback_lines: 0,
         scroll_delta: 0,
         cursor: CursorState { col: 0, row: 0, shape: CursorShape::Block, blinking: false, hidden: false },

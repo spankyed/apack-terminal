@@ -278,6 +278,7 @@ fn session_machine_direct_rpcs_and_wait_outcomes() {
         seq: 1,
         epoch: 1,
         size: GridSize::new(10, 3).unwrap(),
+        first_active_line: 5,
         scrollback_lines: 5,
         scroll_delta: 0,
         cursor: sess.vt().meta().cursor,
@@ -291,6 +292,7 @@ fn session_machine_direct_rpcs_and_wait_outcomes() {
         seq: 2,
         epoch: 1,
         size: GridSize::new(10, 3).unwrap(),
+        first_active_line: 5,
         scrollback_lines: 4,
         scroll_delta: -1,
         cursor: sess.vt().meta().cursor,
@@ -301,4 +303,18 @@ fn session_machine_direct_rpcs_and_wait_outcomes() {
         full_sync: false,
     });
     assert_eq!(vm.last_seq, 2);
+
+    // Extreme u64::MAX span must clamp safely without hanging/OOM
+    assert_eq!(
+        sess.vt()
+            .text_of(CellSpan { start: CellPos { line: 0, col: 0 }, end: CellPos { line: u64::MAX, col: u16::MAX } }),
+        "\n\n\n\n\n\n\n"
+    );
+    assert_eq!(
+        sess.vt().text_of_rect(CellSpan {
+            start: CellPos { line: 0, col: 0 },
+            end: CellPos { line: u64::MAX, col: u16::MAX },
+        }),
+        "\n\n\n\n\n\n\n"
+    );
 }

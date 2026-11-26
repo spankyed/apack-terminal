@@ -11,6 +11,7 @@ use apack_proto::MAX_STATUSES;
 use apack_proto::types::{BlockedKind, Confirmed, StatusRecord, StatusState};
 
 use crate::time::TimestampMs;
+use crate::truncate_utf8;
 
 /// Maximum UTF-8 byte length accepted for any single OSC 7501 string field.
 const MAX_FIELD_BYTES: usize = 512;
@@ -174,17 +175,4 @@ impl StatusTable {
             effects.push(StatusEffect::Updated(rec.clone()));
         }
     }
-}
-
-fn truncate_utf8(s: &str, max_bytes: usize) -> String {
-    if s.len() <= max_bytes {
-        return String::from(s);
-    }
-    let end = s
-        .char_indices()
-        .map(|(idx, ch)| idx + ch.len_utf8())
-        .take_while(|&end_idx| end_idx <= max_bytes)
-        .last()
-        .unwrap_or(0);
-    String::from(&s[..end])
 }

@@ -5,7 +5,7 @@ use apack_proto::types::{
     PasteOutcome, PointerAction, PointerInput, ProgressState, RequestId, ResizePolicy, SessionId, StatusState,
     SubFlags, UnknownReason, ViewModes, ViewportHint, VouchedExitCode, WaitCondition, WaitOutcome,
 };
-use apack_proto::{MAX_COMMANDS, MAX_STATUSES};
+use apack_proto::{BULK_CHUNK_BYTES, MAX_COMMANDS, MAX_SEARCH_MATCHES, MAX_STATUSES};
 
 use crate::lease::ConnId;
 use crate::marks::{MarkEffect, MarksMode, MarksTracker};
@@ -13,7 +13,7 @@ use crate::session::{SessionEffect, SessionMachine};
 use crate::status::StatusTable;
 use crate::time::TimestampMs;
 use crate::vt::{CompressStep, DirtyViewport, PasteEncode, VtEngine, VtEvent, VtGenerations, VtSnapshotMeta};
-use crate::{SEARCH_COALESCE_MS, SYNC_HOLD_MAX_MS};
+use crate::{MAX_WAITERS_PER_SESSION, SEARCH_COALESCE_MS, SYNC_HOLD_MAX_MS};
 
 fn ts(ms: u64) -> TimestampMs {
     TimestampMs::from_millis(ms)
@@ -39,6 +39,7 @@ fn sample_key() -> MarksKey {
 struct StubVt {
     size: GridSize,
     epoch: u64,
+    first_active_line: u64,
     scrollback: u64,
     rows: Vec<String>,
     cursor: CursorState,
@@ -53,6 +54,7 @@ impl StubVt {
         Self {
             size: GridSize::new(cols, rows).unwrap(),
             epoch: 1,
+            first_active_line: 0,
             scrollback: 0,
             rows: vec![String::new(); usize::from(rows)],
             cursor: CursorState { col: 0, row: 0, shape: CursorShape::Block, blinking: false, hidden: false },
@@ -70,12 +72,21 @@ impl VtEngine for StubVt {
         let text = core::str::from_utf8(bytes).unwrap_or("");
         match text {
             "SCROLL" => {
+                self.first_active_line += 1;
                 self.scrollback += 1;
                 self.rows.remove(0);
                 self.rows.push(String::from("new-line"));
                 self.dirty.scroll_delta += 1;
                 self.dirty.dirty_rows.push(self.size.rows.get() - 1);
                 self.gens.grid += 1;
+            }
+            "EVICT_SB" => {
+                self.first_active_line += 1;
+                // scrollback stays capped -> oldest_line advances by 1!
+                self.gens.grid += 1;
+            }
+            "CLEAR_SB" => {
+                self.scrollback = 0;
             }
             "SCROLL_DOWN" => {
                 self.rows.pop();
@@ -116,7 +127,7 @@ impl VtEngine for StubVt {
             }
             "CURSOR_HOME" => {
                 self.cursor.row = 0;
-                events.push(VtEvent::Osc133("D;0".into()));
+                events.push(VtEvent::Osc133 { payload: "D;0".into(), cursor_line: self.first_active_line });
             }
             "MODES" => {
                 self.modes.mouse = !self.modes.mouse;
@@ -133,6 +144,10 @@ impl VtEngine for StubVt {
                 self.modes.alt_screen = !self.modes.alt_screen;
                 self.gens.modes += 1;
                 self.dirty.full_dirty = true;
+            }
+            "SYNC_REARM" => {
+                events.push(VtEvent::SyncOutput(false));
+                events.push(VtEvent::SyncOutput(true));
             }
             "NOOP" => {}
             _ if !text.is_empty() => {
@@ -158,6 +173,7 @@ impl VtEngine for StubVt {
         VtSnapshotMeta {
             epoch: self.epoch,
             size: self.size,
+            first_active_line: self.first_active_line,
             scrollback_lines: self.scrollback,
             cursor: self.cursor,
             modes: self.modes,
@@ -195,7 +211,7 @@ impl VtEngine for StubVt {
                 }]
             };
             out.push(PackedRow {
-                line: self.scrollback + u64::from(r),
+                line: self.first_active_line + u64::from(r),
                 flags: 0,
                 text: t.clone(),
                 runs,
@@ -209,8 +225,8 @@ impl VtEngine for StubVt {
     fn extract_history_rows(&self, from_line: u64, count: u32, out: &mut Vec<PackedRow>) {
         for i in 0..u64::from(count) {
             let line = from_line + i;
-            if line >= self.scrollback && (line - self.scrollback) < self.rows.len() as u64 {
-                self.extract_viewport_rows(&[(line - self.scrollback) as u16], out);
+            if line >= self.first_active_line && (line - self.first_active_line) < self.rows.len() as u64 {
+                self.extract_viewport_rows(&[(line - self.first_active_line) as u16], out);
             }
         }
     }
@@ -240,9 +256,39 @@ impl VtEngine for StubVt {
         limit: usize,
         out: &mut Vec<CellSpan>,
     ) -> bool {
+        if needle == "__OOB_SPAN__" && from_line < to_line {
+            // One span below from_line, one span at end_line == to_line, and one valid span inside [from_line, to_line)
+            if from_line > 0 {
+                out.push(CellSpan {
+                    start: CellPos { line: from_line - 1, col: 0 },
+                    end: CellPos { line: from_line, col: 0 },
+                });
+            }
+            out.push(CellSpan { start: CellPos { line: from_line, col: 0 }, end: CellPos { line: to_line, col: 0 } });
+            out.push(CellSpan { start: CellPos { line: from_line, col: 0 }, end: CellPos { line: from_line, col: 1 } });
+            return false;
+        }
+        if needle == "__EXACT_LIMIT__" && from_line < to_line {
+            for _ in 0..MAX_SEARCH_MATCHES {
+                out.push(CellSpan {
+                    start: CellPos { line: from_line, col: 0 },
+                    end: CellPos { line: from_line, col: 0 },
+                });
+            }
+            return false;
+        }
+        if needle == "__OVER_LIMIT__" && from_line < to_line {
+            for _ in 0..=MAX_SEARCH_MATCHES {
+                out.push(CellSpan {
+                    start: CellPos { line: from_line, col: 0 },
+                    end: CellPos { line: from_line, col: 0 },
+                });
+            }
+            return false;
+        }
         for line in from_line..to_line {
-            if line >= self.scrollback {
-                let idx = (line - self.scrollback) as usize;
+            if line >= self.first_active_line {
+                let idx = (line - self.first_active_line) as usize;
                 if let Some(text) = self.rows.get(idx)
                     && let Some(pos) = text.find(needle)
                 {
@@ -304,68 +350,93 @@ fn marks_tracker_keyed_immunity_supersede_exit_ring_and_unescape() {
     let mut fx = Vec::new();
     assert!(!keyed.is_idle());
     assert_eq!(keyed.last_cwd(), None);
+    assert_eq!(keyed.refused(), 0);
 
-    // Unvouched marks and bad keys are completely ignored in Keyed mode
+    let k = key.as_str();
+    // Unvouched marks, OSC 7 CWD, bad keys, leading-zero/zero/sign seqs are ignored/refused in Keyed mode
     keyed.on_osc133("A", 0, ts(1), &mut fx);
     keyed.on_osc633("C", 1, ts(2), &mut fx);
     keyed.on_osc633("D;0", 2, ts(3), &mut fx);
-    keyed.on_osc633("V;ffffffffffffffffffffffffffffffff;D;0", 2, ts(4), &mut fx);
-    keyed.on_osc633("V;short;D;0", 2, ts(5), &mut fx);
+    keyed.on_cwd("/untrusted-osc7");
+    assert_eq!(keyed.last_cwd(), None);
+
+    keyed.on_osc633("V;S;1;ffffffffffffffffffffffffffffffff;cmd", 2, ts(4), &mut fx);
+    keyed.on_osc633("V;S;1;short;cmd", 2, ts(5), &mut fx);
+    keyed.on_osc633(&format!("V;S;0;{k};cmd"), 2, ts(6), &mut fx);
+    keyed.on_osc633(&format!("V;S;01;{k};cmd"), 2, ts(7), &mut fx);
+    keyed.on_osc633(&format!("V;S;+1;{k};cmd"), 2, ts(8), &mut fx);
+    keyed.on_osc633(&format!("V;A;1;{k};extra"), 2, ts(9), &mut fx);
+    keyed.on_osc633(&format!("V;X;1;{k};unknown"), 2, ts(9), &mut fx);
     assert!(fx.is_empty());
     assert!(keyed.commands().is_empty());
     assert!(!keyed.is_idle());
+    assert_eq!(keyed.refused(), 7);
 
-    let k = key.as_str();
-    keyed.on_osc633(&format!("V;{k};A"), 10, ts(10), &mut fx);
+    // Valid vouched prompt arrival (seq=1) + replay rejection (seq=1 again!)
+    keyed.on_osc633(&format!("V;A;1;{k}"), 10, ts(10), &mut fx);
     assert!(keyed.is_idle());
     assert_eq!(fx, vec![MarkEffect::PromptArrived]);
     fx.clear();
+    keyed.on_osc633(&format!("V;A;1;{k}"), 10, ts(11), &mut fx);
+    assert!(fx.is_empty());
+    assert_eq!(keyed.refused(), 8);
 
-    // Test lowercase hex (\x3b = ';', \x3f = '?'), uppercase hex (\x3F = '?', \x4A = 'J'), invalid hex (\x3g, \xg3), \\, and trailing backslash
-    keyed.on_osc633(&format!("V;{k};P;Cwd=/tmp/a\\x3bb\\x3fc\\x3Fd\\x4Ae\\x3g\\xg3\\\\f\\"), 10, ts(11), &mut fx);
-    assert_eq!(keyed.last_cwd(), Some("/tmp/a;b?c?dJe\\x3g\\xg3\\f\\"));
-    assert_eq!(fx, vec![MarkEffect::CwdChanged("/tmp/a;b?c?dJe\\x3g\\xg3\\f\\".into())]);
-    fx.clear();
-
-    keyed.on_osc633(&format!("V;{k};E;echo\\x20\\x61\\x42"), 10, ts(12), &mut fx);
-    keyed.on_osc633(&format!("V;{k};C"), 11, ts(13), &mut fx);
+    // Valid vouched Start (seq=2) with unescaping + replay rejection (seq=2 again!) + mismatched Finish (seq=99)
+    keyed.on_osc633(&format!("V;S;2;{k};echo\\x20\\x61\\x42"), 11, ts(13), &mut fx);
     assert!(!keyed.is_idle());
     assert!(matches!(
         &fx[0],
-        MarkEffect::CommandStarted(r) if r.id == 1 && r.command.as_deref() == Some("echo aB") && r.prompt_line == Some(10)
+        MarkEffect::CommandStarted(r) if r.id == 2 && r.command.as_deref() == Some("echo aB") && r.prompt_line == Some(10)
     ));
+    assert_eq!(keyed.find_command(2).and_then(|c| c.command.as_deref()), Some("echo aB"));
+    assert!(keyed.find_command(999).is_none());
     fx.clear();
+    keyed.on_osc633(&format!("V;S;2;{k};replay"), 12, ts(14), &mut fx);
+    keyed.on_osc633(&format!("V;F;99;{k};0;/tmp"), 12, ts(15), &mut fx);
+    keyed.on_osc633(&format!("V;F;2;{k};+0;/tmp"), 12, ts(16), &mut fx);
+    keyed.on_osc633(&format!("V;F;2;{k};0"), 12, ts(17), &mut fx); // missing cwd semicolon
+    assert!(fx.is_empty());
+    assert_eq!(keyed.refused(), 12);
 
-    keyed.on_osc633(&format!("V;{k};D;42"), 15, ts(20), &mut fx);
+    // Valid vouched Finish (seq=2) with exit code -7 & unescaped CWD (all hex + invalid hex + \\ + trailing \)
+    keyed.on_osc633(&format!("V;F;2;{k};-7;/tmp/a\\x3bb\\x3fc\\x3Fd\\x4Ae\\x3g\\xg3\\\\f\\"), 15, ts(20), &mut fx);
     assert!(keyed.is_idle());
+    assert_eq!(keyed.last_cwd(), Some("/tmp/a;b?c?dJe\\x3g\\xg3\\f\\"));
+    assert_eq!(fx[0], MarkEffect::CwdChanged("/tmp/a;b?c?dJe\\x3g\\xg3\\f\\".into()));
     assert!(matches!(
-        &fx[0],
-        MarkEffect::CommandFinished(r) if r.outcome == CommandOutcome::Exited(VouchedExitCode::from_vouched(42)) && r.end_line == Some(15)
+        &fx[1],
+        MarkEffect::CommandFinished(r) if r.outcome == CommandOutcome::Exited(VouchedExitCode::from_vouched(-7)) && r.end_line == Some(15)
     ));
-    assert_eq!(fx[1], MarkEffect::PromptArrived);
+    assert_eq!(fx[2], MarkEffect::PromptArrived);
 
-    // Command 2: verify monotonic IDs (1, 2, 3) and NoStatus
+    // Finish without active command is refused
     fx.clear();
-    keyed.on_osc633(&format!("V;{k};C"), 16, ts(21), &mut fx);
-    assert!(matches!(&fx[0], MarkEffect::CommandStarted(r) if r.id == 2));
+    keyed.on_osc633(&format!("V;F;2;{k};0;/tmp"), 15, ts(20), &mut fx);
+    assert!(fx.is_empty());
+    assert_eq!(keyed.refused(), 13);
+
+    // Command 3: NoStatus (empty status field, empty cwd)
     fx.clear();
-    keyed.on_osc633(&format!("V;{k};D"), 17, ts(22), &mut fx);
+    keyed.on_osc633(&format!("V;S;3;{k};ls"), 16, ts(21), &mut fx);
+    assert!(matches!(&fx[0], MarkEffect::CommandStarted(r) if r.id == 3));
+    fx.clear();
+    keyed.on_osc633(&format!("V;F;3;{k};;"), 17, ts(22), &mut fx);
     assert!(matches!(
         &fx[0],
         MarkEffect::CommandFinished(r) if r.outcome == CommandOutcome::Unknown(UnknownReason::NoStatus)
     ));
 
-    // Command 3 -> Superseded by Command 4 -> SessionEnded
+    // Command 4 -> Superseded by Command 5 -> SessionEnded
     fx.clear();
-    keyed.on_osc633(&format!("V;{k};C"), 18, ts(23), &mut fx);
-    assert!(matches!(&fx[0], MarkEffect::CommandStarted(r) if r.id == 3));
+    keyed.on_osc633(&format!("V;S;4;{k};sleep"), 18, ts(23), &mut fx);
+    assert!(matches!(&fx[0], MarkEffect::CommandStarted(r) if r.id == 4));
     fx.clear();
-    keyed.on_osc633(&format!("V;{k};C"), 19, ts(24), &mut fx);
+    keyed.on_osc633(&format!("V;S;5;{k};pwd"), 19, ts(24), &mut fx);
     assert!(matches!(
         &fx[0],
         MarkEffect::CommandFinished(r) if r.outcome == CommandOutcome::Unknown(UnknownReason::Superseded)
     ));
-    assert!(matches!(&fx[1], MarkEffect::CommandStarted(r) if r.id == 4));
+    assert!(matches!(&fx[1], MarkEffect::CommandStarted(r) if r.id == 5));
     fx.clear();
     keyed.on_epoch_change();
     assert!(
@@ -377,8 +448,27 @@ fn marks_tracker_keyed_immunity_supersede_exit_ring_and_unescape() {
         MarkEffect::CommandFinished(r) if r.outcome == CommandOutcome::Unknown(UnknownReason::SessionEnded)
     ));
 
-    // Claimed mode + MAX_COMMANDS ring cap
+    // Claimed mode: V;... is refused (never read as claim), OSC 7 updates cwd, E/P/A/C/D & MAX_COMMANDS ring cap
     let mut claimed = MarksTracker::new(MarksMode::Claimed);
+    fx.clear();
+    claimed.on_osc633(&format!("V;S;1;{k};nope"), 0, ts(1), &mut fx);
+    assert!(fx.is_empty());
+    assert_eq!(claimed.refused(), 1);
+    claimed.on_cwd("/from-osc7");
+    assert_eq!(claimed.last_cwd(), Some("/from-osc7"));
+    claimed.on_osc633("P;Cwd=/from-633", 0, ts(2), &mut fx);
+    assert_eq!(claimed.last_cwd(), Some("/from-633"));
+    claimed.on_osc633("E;echo hi", 0, ts(3), &mut fx);
+    claimed.on_osc633("A", 0, ts(4), &mut fx);
+    assert!(claimed.is_idle());
+    fx.clear();
+    claimed.on_osc133("C", 1, ts(5), &mut fx);
+    assert!(matches!(&fx[0], MarkEffect::CommandStarted(r) if r.id == 1 && r.command.as_deref() == Some("echo hi")));
+    // Empty E; leaves pending_command None, and monotonic id advances 1 -> 2
+    claimed.on_osc633("E;", 1, ts(5), &mut fx);
+    fx.clear();
+    claimed.on_osc133("C", 2, ts(6), &mut fx); // supersede in Claimed mode
+    assert!(matches!(&fx[1], MarkEffect::CommandStarted(r) if r.id == 2 && r.command.is_none()));
     for i in 0..=(MAX_COMMANDS as u64 + 2) {
         fx.clear();
         claimed.on_osc133("C", i, ts(i), &mut fx);
@@ -722,7 +812,7 @@ fn session_machine_marks_search_waiters_command_output_and_exit() {
         VtEvent::Progress { state: ProgressState::Running, percent: Some(40) },
         VtEvent::Cwd("/work".into()),
         VtEvent::DeviceResponse(b"\x1b[1;1R".to_vec()),
-        VtEvent::Osc133("C".into()),
+        VtEvent::Osc133 { payload: "C".into(), cursor_line: 0 },
         VtEvent::Osc7501("state=working;app=tool".into()),
     ];
     let mut sess = SessionMachine::new(sid(1), vt, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
@@ -953,7 +1043,8 @@ fn session_machine_marks_search_waiters_command_output_and_exit() {
     s2.cancel_waiters_for_conn(conn(2));
 
     let mut vt3 = StubVt::new(40, 4);
-    vt3.next_events = vec![VtEvent::Osc633("D;0".into()), VtEvent::Osc7501("state=done".into())];
+    vt3.next_events =
+        vec![VtEvent::Osc633 { payload: "D;0".into(), cursor_line: 0 }, VtEvent::Osc7501("state=done".into())];
     let mut s3 = SessionMachine::new(sid(3), vt3, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
     s3.attach_stream(k1, SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
     s3.register_wait(conn(1), RequestId::from_raw(90), WaitCondition::Idle, 500, ts(2_000), &mut fx);
@@ -1111,11 +1202,15 @@ fn session_edge_cases_and_boundary_invariants() {
     assert_eq!(s_srch.next_deadline(), Some(ts(20 + SEARCH_COALESCE_MS)));
 
     // 6. apply_resize: cell_px-only change (new_epoch == prev_epoch) must NOT clear mark line anchors!
-    //    Whereas grid-size change (new_epoch != prev_epoch) MUST clear mark line anchors!
+    //    Whereas grid-size change (new_epoch != prev_epoch) MUST clear mark line anchors AND immediately flush searches!
     let mut vt_rs = StubVt::new(40, 4);
-    vt_rs.next_events = vec![VtEvent::Osc133("C".into()), VtEvent::Osc133("D;0".into())];
+    vt_rs.next_events = vec![
+        VtEvent::Osc133 { payload: "C".into(), cursor_line: 0 },
+        VtEvent::Osc133 { payload: "D;0".into(), cursor_line: 0 },
+    ];
     let mut s_rs =
         SessionMachine::new(sid(15), vt_rs, ResizePolicy::ExplicitOverride, MarksMode::Claimed, CellPx::default());
+    s_rs.attach_stream(k1, SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
     s_rs.on_pty_output(b"NOOP", ts(10), &mut fx);
     // Single-line command output (start_line == end_line == 0): kills start_line > end_line -> >= and ==!
     // Also send a subsequent normal NOOP chunk (epoch unchanged) to prove marks are NOT wiped (kills epoch_changed != -> ==)!
@@ -1123,6 +1218,15 @@ fn session_edge_cases_and_boundary_invariants() {
     fx.clear();
     s_rs.handle_stream_msg(k1, RequestId::from_raw(1), ClientMsg::CommandOutput { command_id: 1 }, &mut fx);
     assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::CommandOutputReply { text: Some(t) }, .. } if *req_id == RequestId::from_raw(1) && t == "0:0:0:39")));
+
+    // Active search watch flushes immediately on epoch-bumping resize!
+    s_rs.handle_stream_msg(
+        k1,
+        RequestId::from_raw(10),
+        ClientMsg::SetSearch { query: "foo".into(), case_sensitive: true },
+        &mut fx,
+    );
+    s_rs.on_pty_output(b"DIRTY_ROW2", ts(12), &mut fx); // schedules SearchFlush timer
 
     // CellPx-only resize keeps same epoch -> mark anchors survive!
     s_rs.handle_stream_msg(
@@ -1135,23 +1239,27 @@ fn session_edge_cases_and_boundary_invariants() {
     s_rs.handle_stream_msg(k1, RequestId::from_raw(3), ClientMsg::CommandOutput { command_id: 1 }, &mut fx);
     assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::CommandOutputReply { text: Some(_) }, .. } if *req_id == RequestId::from_raw(3))));
 
-    // Grid resize bumps epoch -> mark anchors cleared!
+    // Grid resize bumps epoch -> mark anchors cleared, SearchMatches flushed immediately, pending timer cancelled!
+    fx.clear();
     s_rs.handle_stream_msg(
         k1,
         RequestId::from_raw(4),
         ClientMsg::ExplicitResize { size: GridSize::new(50, 5).unwrap(), cell_px: CellPx { width: 12, height: 24 } },
         &mut fx,
     );
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::SearchMatches { .. }, .. })));
+    assert_eq!(s_rs.next_deadline(), None);
     fx.clear();
     s_rs.handle_stream_msg(k1, RequestId::from_raw(5), ClientMsg::CommandOutput { command_id: 1 }, &mut fx);
     assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::CommandOutputReply { text: None }, .. } if *req_id == RequestId::from_raw(5))));
 
-    // 7. CommandOutput where start_line (2) > end_line (0) while end_line < total_lines (4) must return None (kills || -> &&)!
+    // 7. CommandOutput where start_line (2) > end_line (0) while end_line < total_lines (4) must return None!
     let mut vt_cmd = StubVt::new(40, 4);
     vt_cmd.cursor.row = 2;
-    vt_cmd.next_events = vec![VtEvent::Osc133("C".into())];
+    vt_cmd.next_events = vec![VtEvent::Osc133 { payload: "C".into(), cursor_line: 2 }];
     let mut s_cmd =
         SessionMachine::new(sid(16), vt_cmd, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    s_cmd.attach_stream(k1, SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
     s_cmd.on_pty_output(b"NOOP", ts(10), &mut fx);
     s_cmd.on_pty_output(b"CURSOR_HOME", ts(11), &mut fx);
     fx.clear();
@@ -1160,11 +1268,499 @@ fn session_edge_cases_and_boundary_invariants() {
 
     // 8. Non-prompt mark (Osc133("C")) must NOT wake WaitCondition::Idle; PromptArrived (Osc133("A")) DOES wake it.
     let mut vt_cmd2 = StubVt::new(40, 4);
-    vt_cmd2.next_events = vec![VtEvent::Osc133("C".into())];
+    vt_cmd2.next_events = vec![VtEvent::Osc133 { payload: "C".into(), cursor_line: 0 }];
     let mut s_idle =
         SessionMachine::new(sid(17), vt_cmd2, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
     fx.clear();
     s_idle.register_wait(conn(1), RequestId::from_raw(1), WaitCondition::Idle, 500, ts(10), &mut fx);
     s_idle.on_pty_output(b"NOOP", ts(20), &mut fx);
     assert!(!fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Waited { .. }, .. })));
+}
+
+#[test]
+fn session_security_hardening_and_audit_fixes() {
+    let mut fx = Vec::new();
+    let k1 = (conn(1), nz_stream(1));
+    let k2 = (conn(2), nz_stream(1));
+
+    // 1. Opposing-sign scrolls coalesced before publish degrade to full_sync; scrollback clear triggers publish
+    let mut vt = StubVt::new(40, 4);
+    vt.dirty.full_dirty = false;
+    let mut sess = SessionMachine::new(sid(20), vt, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    sess.attach_stream(k1, SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
+    assert!(sess.try_publish_view(k1, |_| true));
+    sess.on_pty_output(b"SCROLL_ONLY", ts(1), &mut fx);
+    sess.on_pty_output(b"SCROLL_DOWN_ONLY", ts(2), &mut fx);
+    let mut full = false;
+    assert!(sess.try_publish_view(k1, |f| {
+        full = f.full_sync;
+        true
+    }));
+    assert!(full);
+
+    // Scrollback eviction + scrollback clear both trigger frame updates even without dirty viewport rows
+    sess.on_pty_output(b"SCROLL", ts(3), &mut fx);
+    assert!(sess.try_publish_view(k1, |_| true));
+    sess.on_pty_output(b"EVICT_SB", ts(4), &mut fx);
+    assert!(sess.try_publish_view(k1, |f| {
+        assert_eq!(f.first_active_line, 2);
+        assert_eq!(f.scrollback_lines, 1);
+        true
+    }));
+    sess.on_pty_output(b"CLEAR_SB", ts(5), &mut fx);
+    assert!(sess.try_publish_view(k1, |f| {
+        assert_eq!(f.scrollback_lines, 0);
+        true
+    }));
+
+    // 2. Unattached stream rejected (NoSuchStream) and non-VIEW ViewportHint rejected (Malformed)
+    fx.clear();
+    sess.handle_stream_msg(k2, RequestId::from_raw(1), ClientMsg::Commands, &mut fx);
+    assert!(
+        fx.iter().any(|e| matches!(
+            e,
+            SessionEffect::Send { msg: BrokerMsg::Error { code: ErrorCode::NoSuchStream, .. }, .. }
+        ))
+    );
+
+    sess.attach_stream(k2, SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
+    fx.clear();
+    sess.handle_stream_msg(
+        k2,
+        RequestId::from_raw(2),
+        ClientMsg::ViewportHint(ViewportHint {
+            size: GridSize::new(30, 10).unwrap(),
+            cell_px: CellPx::default(),
+            visible: true,
+            focused: true,
+        }),
+        &mut fx,
+    );
+    assert!(
+        fx.iter()
+            .any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Error { code: ErrorCode::Malformed, .. }, .. }))
+    );
+
+    // 3. Pause / Resume reference counting + automatic unpause on detach_stream
+    fx.clear();
+    sess.handle_stream_msg(k1, RequestId::from_raw(10), ClientMsg::Pause, &mut fx);
+    assert!(fx.contains(&SessionEffect::SetPtyPaused(true)));
+    fx.clear();
+    sess.handle_stream_msg(k2, RequestId::from_raw(11), ClientMsg::Pause, &mut fx);
+    assert!(!fx.contains(&SessionEffect::SetPtyPaused(true))); // already paused
+    fx.clear();
+    sess.handle_stream_msg(k1, RequestId::from_raw(12), ClientMsg::Resume, &mut fx);
+    assert!(!fx.contains(&SessionEffect::SetPtyPaused(false))); // k2 still holds pause
+    fx.clear();
+    sess.detach_stream(k2, &mut fx);
+    assert!(fx.contains(&SessionEffect::SetPtyPaused(false))); // last pauser detached -> unpaused!
+
+    // 4. Progress normalization, VerifyForeground batch coalescing, and EpochChanged in stream order
+    let mut vt_ev = StubVt::new(40, 4);
+    vt_ev.next_events = vec![
+        VtEvent::Progress { state: ProgressState::Indeterminate, percent: Some(80) },
+        VtEvent::Progress { state: ProgressState::None, percent: Some(50) },
+        VtEvent::Progress { state: ProgressState::Running, percent: Some(250) },
+        VtEvent::Osc7501("id=a;state=working;app=one".into()),
+        VtEvent::Osc7501("id=a;state=done;app=two".into()),
+        VtEvent::EpochChanged,
+    ];
+    let mut s_ev =
+        SessionMachine::new(sid(21), vt_ev, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    s_ev.attach_stream(k1, SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
+    fx.clear();
+    s_ev.on_pty_output(b"NOOP", ts(10), &mut fx);
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        SessionEffect::Send { msg: BrokerMsg::Progress { state: ProgressState::Indeterminate, percent: None }, .. }
+    )));
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        SessionEffect::Send { msg: BrokerMsg::Progress { state: ProgressState::None, percent: None }, .. }
+    )));
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        SessionEffect::Send { msg: BrokerMsg::Progress { state: ProgressState::Running, percent: Some(100) }, .. }
+    )));
+    let verify_count = fx.iter().filter(|e| matches!(e, SessionEffect::VerifyForeground { .. })).count();
+    assert_eq!(verify_count, 1);
+    assert!(
+        fx.iter()
+            .any(|e| matches!(e, SessionEffect::VerifyForeground { id, changed: 2, app } if id == "a" && app == "two"))
+    );
+
+    // 5. DEC 2026 anti-starvation: 2026l + 2026h before any frame flushes CANNOT extend SYNC_HOLD_MAX_MS!
+    //    And on_process_exit releases sync hold & clears pty_write_queue & rejects future writes!
+    let mut vt_sync = StubVt::new(40, 4);
+    vt_sync.next_events = vec![VtEvent::SyncOutput(true)];
+    let mut s_sync = SessionMachine::with_pty_write_cap(
+        sid(22),
+        vt_sync,
+        ResizePolicy::LatestActive,
+        MarksMode::Claimed,
+        CellPx::default(),
+        10,
+    );
+    s_sync.attach_stream(k1, SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
+    s_sync.on_pty_output(b"x", ts(1_000), &mut fx);
+    assert_eq!(s_sync.next_deadline(), Some(ts(1_000 + SYNC_HOLD_MAX_MS)));
+    // Attempt starvation at t=1900 by toggling 2026l + 2026h without publishing a frame
+    s_sync.on_pty_output(b"SYNC_REARM", ts(1_900), &mut fx);
+    assert_eq!(s_sync.next_deadline(), Some(ts(1_000 + SYNC_HOLD_MAX_MS))); // NOT pushed to 2900!
+    // After expiry at t=2000, trying to re-arm at t=2050 BEFORE publishing still does NOT hold!
+    s_sync.poll_timers(ts(2_000), &mut fx);
+    assert!(!s_sync.is_sync_held());
+    s_sync.on_pty_output(b"SYNC_REARM", ts(2_050), &mut fx);
+    assert!(!s_sync.is_sync_held());
+    assert!(s_sync.try_publish_view(k1, |_| true)); // publishing resets anti-starvation window!
+    s_sync.on_pty_output(b"SYNC_REARM", ts(2_100), &mut fx);
+    assert!(s_sync.is_sync_held());
+
+    // DSR sub-quota leaves half the queue free for interactive user input!
+    s_sync.handle_stream_msg(k1, RequestId::from_raw(1), ClientMsg::Write { data: b"1234".to_vec() }, &mut fx);
+    assert_eq!(s_sync.pty_write_len(), 4);
+    // Queue cap is 10, DSR cap is 5; DSR of 6 bytes (> 5) is dropped, while user write of 8 bytes (<= 10) succeeds!
+    let mut vt_dsr = StubVt::new(40, 4);
+    vt_dsr.next_events = vec![VtEvent::DeviceResponse(b"123456".to_vec())];
+    let mut s_dsr = SessionMachine::with_pty_write_cap(
+        sid(23),
+        vt_dsr,
+        ResizePolicy::LatestActive,
+        MarksMode::Claimed,
+        CellPx::default(),
+        10,
+    );
+    s_dsr.attach_stream(k1, SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
+    s_dsr.on_pty_output(b"NOOP", ts(1), &mut fx);
+    assert_eq!(s_dsr.pty_write_len(), 0); // 6 > 10/2 rejected!
+    s_dsr.handle_stream_msg(k1, RequestId::from_raw(1), ClientMsg::Write { data: b"12345678".to_vec() }, &mut fx);
+    assert_eq!(s_dsr.pty_write_len(), 8); // user input still works!
+
+    // on_process_exit releases sync hold, clears pty_write_queue, and rejects subsequent PTY writes
+    fx.clear();
+    s_sync.on_process_exit(Some(0), None, ts(2_200), &mut fx);
+    assert!(!s_sync.is_sync_held());
+    assert_eq!(s_sync.pty_write_len(), 0);
+    assert!(fx.contains(&SessionEffect::ViewsDirty));
+    fx.clear();
+    s_sync.handle_stream_msg(k1, RequestId::from_raw(2), ClientMsg::Write { data: b"hi".to_vec() }, &mut fx);
+    assert!(
+        fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Error { code: ErrorCode::Pty, .. }, .. }))
+    );
+
+    // 6. MAX_WAITERS_PER_SESSION cap returns ResourceLimit
+    let mut s_lim = SessionMachine::new(
+        sid(24),
+        StubVt::new(40, 4),
+        ResizePolicy::LatestActive,
+        MarksMode::Claimed,
+        CellPx::default(),
+    );
+    for i in 0..MAX_WAITERS_PER_SESSION {
+        s_lim.register_wait(conn(1), RequestId::from_raw(i as u32 + 1), WaitCondition::Exit, 500, ts(1), &mut fx);
+    }
+    fx.clear();
+    s_lim.register_wait(conn(1), RequestId::from_raw(999), WaitCondition::Exit, 500, ts(1), &mut fx);
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        SessionEffect::Send { msg: BrokerMsg::Error { code: ErrorCode::ResourceLimit, .. }, .. }
+    )));
+
+    // 7. SearchWatch eviction delta, OOB span clamp on TextOf/TextOfRect, GetImageBlob max_bytes clamp,
+    //    and SearchFlush timer cancelled when last search cleared or detached!
+    let mut vt_s = StubVt::new(40, 4);
+    vt_s.dirty.full_dirty = false;
+    let mut s_s = SessionMachine::new(sid(25), vt_s, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    s_s.attach_stream(k1, SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
+    s_s.handle_stream_msg(
+        k1,
+        RequestId::from_raw(1),
+        ClientMsg::SetSearch { query: "row".into(), case_sensitive: true },
+        &mut fx,
+    );
+    // Evicting scrollback advances oldest_line -> schedules SearchFlush and emits eviction SearchDelta [0, 1)
+    s_s.on_pty_output(b"SCROLL", ts(10), &mut fx);
+    s_s.on_pty_output(b"EVICT_SB", ts(11), &mut fx);
+    fx.clear();
+    s_s.poll_timers(ts(10 + SEARCH_COALESCE_MS), &mut fx);
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::SearchDelta { from_line: 0, to_line: 1, added, .. }, .. } if added.is_empty())));
+
+    // Clearing search cancels pending SearchFlush timer
+    s_s.on_pty_output(b"DIRTY_ROW2", ts(300), &mut fx);
+    assert!(s_s.next_deadline().is_some());
+    s_s.handle_stream_msg(
+        k1,
+        RequestId::from_raw(2),
+        ClientMsg::SetSearch { query: String::new(), case_sensitive: true },
+        &mut fx,
+    );
+    assert_eq!(s_s.next_deadline(), None);
+
+    // TextOf / TextOfRect with inverted/OOB spans return empty string; GetImageBlob clamps max_bytes
+    let ep = s_s.vt().meta().epoch;
+    fx.clear();
+    s_s.handle_stream_msg(
+        k1,
+        RequestId::from_raw(3),
+        ClientMsg::TextOf {
+            epoch: ep,
+            span: CellSpan { start: CellPos { line: 999, col: 0 }, end: CellPos { line: 1000, col: 0 } },
+        },
+        &mut fx,
+    );
+    s_s.handle_stream_msg(
+        k1,
+        RequestId::from_raw(4),
+        ClientMsg::TextOfRect {
+            epoch: ep,
+            span: CellSpan { start: CellPos { line: 0, col: 0 }, end: CellPos { line: 0, col: 0 } },
+        },
+        &mut fx,
+    );
+    s_s.handle_stream_msg(
+        k1,
+        RequestId::from_raw(5),
+        ClientMsg::GetImageBlob { blob: BlobHash([2; 32]), offset: 0, max_bytes: u32::MAX },
+        &mut fx,
+    );
+    s_s.handle_stream_msg(
+        k1,
+        RequestId::from_raw(6),
+        ClientMsg::GetImageBlob { blob: BlobHash([2; 32]), offset: 0, max_bytes: 0 },
+        &mut fx,
+    );
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::TextReply { text }, .. } if *req_id == RequestId::from_raw(3) && text.is_empty())));
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::TextReply { text }, .. } if *req_id == RequestId::from_raw(4) && text.is_empty())));
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::FetchImageBlob { req_id, max_bytes, .. } if *req_id == RequestId::from_raw(5) && *max_bytes == BULK_CHUNK_BYTES as u32)));
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::FetchImageBlob { req_id, max_bytes, .. } if *req_id == RequestId::from_raw(6) && *max_bytes == 1)));
+
+    // Detach cancels pending SearchFlush timer when last search watch leaves
+    s_s.handle_stream_msg(
+        k1,
+        RequestId::from_raw(7),
+        ClientMsg::SetSearch { query: "row".into(), case_sensitive: true },
+        &mut fx,
+    );
+    s_s.on_pty_output(b"DIRTY_ROW2", ts(400), &mut fx);
+    assert!(s_s.next_deadline().is_some());
+    s_s.detach_stream(k1, &mut fx);
+    assert_eq!(s_s.next_deadline(), None);
+    assert!(!fx.contains(&SessionEffect::SetPtyPaused(false))); // non-paused detach must NOT emit SetPtyPaused(false)!
+
+    // 8. Additional exact boundary checks killing remaining mutants:
+    //    - Stream-ordered VtEvent::EpochChanged preserves post-event command anchor (kills !saw_epoch_event)
+    let mut vt_ep = StubVt::new(40, 4);
+    vt_ep.next_events = vec![
+        VtEvent::Osc133 { payload: "C".into(), cursor_line: 0 },
+        VtEvent::EpochChanged,
+        VtEvent::Osc133 { payload: "C".into(), cursor_line: 1 },
+        VtEvent::Osc133 { payload: "D;0".into(), cursor_line: 1 },
+    ];
+    let mut s_ep =
+        SessionMachine::new(sid(26), vt_ep, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    s_ep.attach_stream(k1, SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
+    s_ep.on_pty_output(b"ALT", ts(1), &mut fx);
+    fx.clear();
+    s_ep.handle_stream_msg(k1, RequestId::from_raw(1), ClientMsg::CommandOutput { command_id: 1 }, &mut fx);
+    s_ep.handle_stream_msg(k1, RequestId::from_raw(2), ClientMsg::CommandOutput { command_id: 2 }, &mut fx);
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::CommandOutputReply { text: None }, .. } if *req_id == RequestId::from_raw(1))));
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::CommandOutputReply { text: Some(t) }, .. } if *req_id == RequestId::from_raw(2) && t == "1:0:1:39")));
+
+    //    - SYNC_REARM at exact deadline (now == deadline) must NOT hold!
+    let mut vt_sd = StubVt::new(40, 4);
+    vt_sd.next_events = vec![VtEvent::SyncOutput(true)];
+    let mut s_sd =
+        SessionMachine::new(sid(27), vt_sd, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    s_sd.attach_stream(k1, SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, &mut fx);
+    s_sd.on_pty_output(b"NOOP", ts(100), &mut fx);
+    s_sd.poll_timers(ts(100 + SYNC_HOLD_MAX_MS), &mut fx);
+    s_sd.on_pty_output(b"SYNC_REARM", ts(100 + SYNC_HOLD_MAX_MS), &mut fx);
+    assert!(!s_sd.is_sync_held());
+
+    //    - enqueue_device_response exact boundary (next == dsr_cap succeeds) & rejected when !alive!
+    let mut vt_dr = StubVt::new(40, 4);
+    vt_dr.next_events = vec![VtEvent::DeviceResponse(b"12345".to_vec())];
+    let mut s_dr = SessionMachine::with_pty_write_cap(
+        sid(28),
+        vt_dr,
+        ResizePolicy::LatestActive,
+        MarksMode::Claimed,
+        CellPx::default(),
+        10,
+    );
+    s_dr.on_pty_output(b"NOOP", ts(1), &mut fx);
+    assert_eq!(s_dr.pty_write_len(), 5); // exact dsr_cap = 10/2 = 5 succeeds!
+    s_dr.on_process_exit(Some(0), None, ts(2), &mut fx);
+    assert_eq!(s_dr.pty_write_len(), 0);
+    // Feed DeviceResponse after process exit -> must be ignored!
+    let mut vt_dr2 = StubVt::new(40, 4);
+    vt_dr2.next_events = vec![VtEvent::DeviceResponse(b"ok".to_vec())];
+    let mut s_dr2 =
+        SessionMachine::new(sid(29), vt_dr2, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    s_dr2.on_process_exit(Some(0), None, ts(1), &mut fx);
+    s_dr2.on_pty_output(b"NOOP", ts(2), &mut fx);
+    assert_eq!(s_dr2.pty_write_len(), 0);
+
+    //    - CLEAR_SB alone (no dirty rows, oldest_line advances 0 -> 1) schedules SearchFlush!
+    //    - Normal DIRTY_ROW2 flush emits EXACTLY 1 SearchDelta (no spurious [oldest, oldest) delta!)
+    //    - Dirty range fully evicted before flush (clamped_from == clamped_to) emits NO second SearchDelta!
+    //    - __OOB_SPAN__, __EXACT_LIMIT__, __OVER_LIMIT__ test SearchDelta filtering and MAX_SEARCH_MATCHES cap!
+    let mut vt_sf = StubVt::new(40, 4);
+    vt_sf.dirty.full_dirty = false;
+    let mut s_sf =
+        SessionMachine::new(sid(30), vt_sf, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    s_sf.attach_stream(k1, SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
+    s_sf.on_pty_output(b"SCROLL", ts(1), &mut fx); // first_active_line=1, scrollback=1, oldest=0
+    s_sf.handle_stream_msg(
+        k1,
+        RequestId::from_raw(1),
+        ClientMsg::SetSearch { query: "__OOB_SPAN__".into(), case_sensitive: true },
+        &mut fx,
+    );
+    assert_eq!(s_sf.next_deadline(), None);
+    // CLEAR_SB sets scrollback=0 -> oldest advances 0 -> 1 with NO dirty rows -> schedules SearchFlush!
+    s_sf.on_pty_output(b"CLEAR_SB", ts(10), &mut fx);
+    assert_eq!(s_sf.next_deadline(), Some(ts(10 + SEARCH_COALESCE_MS)));
+    fx.clear();
+    s_sf.poll_timers(ts(10 + SEARCH_COALESCE_MS), &mut fx);
+    assert_eq!(
+        fx.iter().filter(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::SearchDelta { .. }, .. })).count(),
+        1
+    );
+
+    // DIRTY_ROW2 on __OOB_SPAN__: retains ONLY the 1 valid span (drops start < from and end == to), emits 1 delta!
+    s_sf.on_pty_output(b"DIRTY_ROW2", ts(300), &mut fx);
+    fx.clear();
+    s_sf.poll_timers(ts(300 + SEARCH_COALESCE_MS), &mut fx);
+    let deltas: Vec<_> = fx
+        .iter()
+        .filter_map(|e| match e {
+            SessionEffect::Send { msg: BrokerMsg::SearchDelta { added, truncated, .. }, .. } => {
+                Some((added.len(), *truncated))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(deltas, vec![(1, false)]);
+
+    // __EXACT_LIMIT__ (len == MAX_SEARCH_MATCHES -> truncated == false) vs __OVER_LIMIT__ (len > MAX -> truncated == true)
+    s_sf.handle_stream_msg(
+        k1,
+        RequestId::from_raw(2),
+        ClientMsg::SetSearch { query: "__EXACT_LIMIT__".into(), case_sensitive: true },
+        &mut fx,
+    );
+    s_sf.on_pty_output(b"DIRTY_ROW2", ts(600), &mut fx);
+    fx.clear();
+    s_sf.poll_timers(ts(600 + SEARCH_COALESCE_MS), &mut fx);
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::SearchDelta { added, truncated: false, .. }, .. } if added.len() == MAX_SEARCH_MATCHES)));
+
+    s_sf.handle_stream_msg(
+        k1,
+        RequestId::from_raw(3),
+        ClientMsg::SetSearch { query: "__OVER_LIMIT__".into(), case_sensitive: true },
+        &mut fx,
+    );
+    s_sf.on_pty_output(b"DIRTY_ROW2", ts(900), &mut fx);
+    fx.clear();
+    s_sf.poll_timers(ts(900 + SEARCH_COALESCE_MS), &mut fx);
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::SearchDelta { added, truncated: true, .. }, .. } if added.len() == MAX_SEARCH_MATCHES)));
+
+    // Dirty row 0 evicted before SearchFlush -> clamped_from == clamped_to -> only eviction delta emitted, no empty dirty delta!
+    s_sf.on_pty_output(b"DIRTY_ROW0", ts(1200), &mut fx); // dirty_range = [1, 2)
+    s_sf.on_pty_output(b"EVICT_SB", ts(1201), &mut fx); // first_active=2, scrollback=0, oldest=2!
+    // Wait: EVICT_SB sets first_active=2 > 1 so dirty_range expands to [2, 6); instead use a fresh watch where only CLEAR_SB evicts:
+    let mut vt_cl = StubVt::new(40, 4);
+    vt_cl.dirty.full_dirty = false;
+    let mut s_cl =
+        SessionMachine::new(sid(31), vt_cl, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    s_cl.attach_stream(k1, SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
+    s_cl.handle_stream_msg(
+        k1,
+        RequestId::from_raw(1),
+        ClientMsg::SetSearch { query: "row".into(), case_sensitive: true },
+        &mut fx,
+    );
+    s_cl.on_pty_output(b"DIRTY_ROW0", ts(1), &mut fx); // dirty_range = [0, 1)
+    s_cl.on_pty_output(b"SCROLL", ts(2), &mut fx); // first_active=1, scrollback=1, oldest=0
+    // Flush first, then mark row 0 dirty at line 1, then advance oldest past line 1 via CLEAR_SB after another scroll:
+    s_cl.poll_timers(ts(200), &mut fx);
+    s_cl.on_pty_output(b"DIRTY_ROW0", ts(300), &mut fx); // dirty_range = [1, 2)
+    // Make oldest jump to 2 without expanding dirty_range past 2: first_active=1, scrollback=1 -> SCROLL -> first_active=2, scrollback=2 -> wait, let's test clamp_span & extract_command_output < oldest directly!
+    s_cl.on_pty_output(b"SCROLL", ts(301), &mut fx); // first_active=2, scrollback=2
+    s_cl.on_pty_output(b"CLEAR_SB", ts(302), &mut fx); // oldest=2, max_line=5, cols=40 (max_col=39)!
+
+    // Command started at line 0 before scrollback eviction -> start_line < oldest (0 < 2) -> None!
+    // Command started at line 3 -> start_line > oldest (3 > 2) -> Some!
+    let mut vt_co = StubVt::new(40, 4);
+    vt_co.next_events = vec![
+        VtEvent::Osc133 { payload: "C".into(), cursor_line: 0 },
+        VtEvent::Osc133 { payload: "D;0".into(), cursor_line: 0 },
+        VtEvent::Osc133 { payload: "C".into(), cursor_line: 3 },
+        VtEvent::Osc133 { payload: "D;0".into(), cursor_line: 3 },
+    ];
+    let mut s_co =
+        SessionMachine::new(sid(32), vt_co, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    s_co.attach_stream(k1, SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
+    s_co.on_pty_output(b"SCROLL", ts(1), &mut fx);
+    s_co.on_pty_output(b"SCROLL", ts(2), &mut fx);
+    s_co.on_pty_output(b"CLEAR_SB", ts(3), &mut fx); // oldest = 2, total_lines = 6
+    fx.clear();
+    s_co.handle_stream_msg(k1, RequestId::from_raw(1), ClientMsg::CommandOutput { command_id: 1 }, &mut fx);
+    s_co.handle_stream_msg(k1, RequestId::from_raw(2), ClientMsg::CommandOutput { command_id: 2 }, &mut fx);
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::CommandOutputReply { text: None }, .. } if *req_id == RequestId::from_raw(1))));
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::CommandOutputReply { text: Some(t) }, .. } if *req_id == RequestId::from_raw(2) && t == "3:0:3:39")));
+
+    // 9. Exhaustive clamp_span boundary table (oldest = 2, max_line = 5, max_col = 39)
+    let ep_cl = s_cl.vt().meta().epoch;
+    let check_text_of = |s: &mut SessionMachine<StubVt>, span: CellSpan, expected: &str| {
+        let mut local_fx = Vec::new();
+        s.handle_stream_msg(k1, RequestId::from_raw(1), ClientMsg::TextOf { epoch: ep_cl, span }, &mut local_fx);
+        let got = local_fx
+            .into_iter()
+            .find_map(|e| match e {
+                SessionEffect::Send { msg: BrokerMsg::TextReply { text }, .. } => Some(text),
+                _ => None,
+            })
+            .expect("TextReply");
+        assert_eq!(got, expected, "clamp_span mismatch for {span:?}");
+    };
+    // end.line < oldest (0 < 2, strictly less than oldest and != oldest) -> ""
+    check_text_of(&mut s_cl, CellSpan { start: CellPos { line: 0, col: 0 }, end: CellPos { line: 0, col: 5 } }, "");
+    // end.line == oldest (2 == 2) -> valid!
+    check_text_of(
+        &mut s_cl,
+        CellSpan { start: CellPos { line: 2, col: 0 }, end: CellPos { line: 2, col: 0 } },
+        "2:0:2:0",
+    );
+    // start.line > max_line (7 > 5) -> ""
+    check_text_of(&mut s_cl, CellSpan { start: CellPos { line: 7, col: 0 }, end: CellPos { line: 8, col: 0 } }, "");
+    // start.line == max_line (5 == 5) -> valid!
+    check_text_of(
+        &mut s_cl,
+        CellSpan { start: CellPos { line: 5, col: 2 }, end: CellPos { line: 5, col: 5 } },
+        "5:2:5:5",
+    );
+    // Straddling both oldest and max_line: start_col -> 0, end_col -> max_col (39)
+    check_text_of(
+        &mut s_cl,
+        CellSpan { start: CellPos { line: 0, col: 10 }, end: CellPos { line: 10, col: 10 } },
+        "2:0:5:39",
+    );
+    // Col > max_col clamped to 39
+    check_text_of(
+        &mut s_cl,
+        CellSpan { start: CellPos { line: 3, col: 99 }, end: CellPos { line: 3, col: 99 } },
+        "3:39:3:39",
+    );
+    // Inverted multi-line span (4..3) -> ""
+    check_text_of(&mut s_cl, CellSpan { start: CellPos { line: 4, col: 0 }, end: CellPos { line: 3, col: 5 } }, "");
+    // Inverted single-line span (3:10..3:5) -> ""
+    check_text_of(&mut s_cl, CellSpan { start: CellPos { line: 3, col: 10 }, end: CellPos { line: 3, col: 5 } }, "");
+    // Multi-line non-inverted span where start.col > end.col (3:10..4:5) -> valid!
+    check_text_of(
+        &mut s_cl,
+        CellSpan { start: CellPos { line: 3, col: 10 }, end: CellPos { line: 4, col: 5 } },
+        "3:10:4:5",
+    );
 }

@@ -56,10 +56,22 @@ pub enum VtEvent {
     Cwd(String),
     /// DEC mode 2026 synchronized output toggled (`true` = begin hold, `false` = end hold).
     SyncOutput(bool),
-    /// Raw OSC 133 payload (after `133;`).
-    Osc133(String),
-    /// Raw OSC 633 payload (after `633;`).
-    Osc633(String),
+    /// Screen epoch changed mid-stream (e.g. alternate-screen switch or hard reset).
+    EpochChanged,
+    /// Raw OSC 133 payload (after `133;`), with the absolute epoch cursor line at the exact point of arrival.
+    Osc133 {
+        /// Raw OSC 133 payload after `133;`.
+        payload: String,
+        /// Epoch-local absolute cursor line when this mark arrived.
+        cursor_line: u64,
+    },
+    /// Raw OSC 633 payload (after `633;`), with the absolute epoch cursor line at the exact point of arrival.
+    Osc633 {
+        /// Raw OSC 633 payload after `633;`.
+        payload: String,
+        /// Epoch-local absolute cursor line when this mark arrived.
+        cursor_line: u64,
+    },
     /// Raw OSC 7501 program-status payload (after `7501;`).
     Osc7501(String),
     /// Terminal reply bytes (e.g. DSR/DA/DECRQM) that must be written back to the PTY stdin.
@@ -73,7 +85,12 @@ pub struct VtSnapshotMeta {
     pub epoch: u64,
     /// Active viewport grid dimensions.
     pub size: GridSize,
-    /// Number of scrollback lines above the active viewport.
+    /// Monotonic epoch-local line number of viewport row `0`.
+    ///
+    /// Retained history occupies `[first_active_line - scrollback_lines, first_active_line)` and the
+    /// active viewport occupies `[first_active_line, first_active_line + size.rows)`.
+    pub first_active_line: u64,
+    /// Number of retained scrollback lines above the active viewport (`<= first_active_line`).
     pub scrollback_lines: u64,
     /// Current cursor position, shape, blink, and visibility.
     pub cursor: CursorState,
@@ -81,6 +98,18 @@ pub struct VtSnapshotMeta {
     pub modes: ViewModes,
     /// Current image-placement generation counter.
     pub images_gen: u64,
+}
+
+impl VtSnapshotMeta {
+    /// Earliest retained absolute epoch line number (`first_active_line - scrollback_lines`).
+    pub const fn oldest_line(&self) -> u64 {
+        self.first_active_line.saturating_sub(self.scrollback_lines)
+    }
+
+    /// Exclusive upper bound on valid absolute epoch line numbers (`first_active_line + rows`).
+    pub const fn total_lines(&self) -> u64 {
+        self.first_active_line.saturating_add(self.size.rows.get() as u64)
+    }
 }
 
 /// Viewport dirty summary drained from [`VtEngine::take_dirty_viewport`].

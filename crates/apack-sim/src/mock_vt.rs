@@ -27,6 +27,7 @@ pub struct MockVt {
     size: GridSize,
     scrollback_limit: usize,
     epoch: u64,
+    first_active_line: u64,
     scrollback: Vec<String>,
     viewport: Vec<String>,
     cursor: CursorState,
@@ -49,6 +50,7 @@ impl MockVt {
             size,
             scrollback_limit,
             epoch: 1,
+            first_active_line: 0,
             scrollback: Vec::new(),
             viewport: vec![String::new(); rows],
             cursor: CursorState { col: 0, row: 0, shape: CursorShape::Block, blinking: false, hidden: false },
@@ -64,19 +66,26 @@ impl MockVt {
         }
     }
 
-    /// Returns the plain text of absolute line `abs_line` (scrollback followed by viewport).
+    /// Returns the plain text of epoch-local absolute line `abs_line` (retained scrollback or viewport).
     pub fn line_text(&self, abs_line: u64) -> Option<&str> {
-        let sb = self.scrollback.len() as u64;
-        if abs_line < sb {
-            self.scrollback.get(abs_line as usize).map(String::as_str)
-        } else {
-            self.viewport.get((abs_line - sb) as usize).map(String::as_str)
+        let sb_len = self.scrollback.len() as u64;
+        let oldest = self.first_active_line.saturating_sub(sb_len);
+        if abs_line < oldest {
+            return None;
         }
+        if abs_line < self.first_active_line {
+            self.scrollback.get((abs_line - oldest) as usize).map(String::as_str)
+        } else {
+            self.viewport.get((abs_line - self.first_active_line) as usize).map(String::as_str)
+        }
+    }
+
+    fn cursor_abs_line(&self) -> u64 {
+        self.first_active_line.saturating_add(u64::from(self.cursor.row))
     }
 
     fn put_char(&mut self, ch: char) {
         let cols = usize::from(self.size.cols.get());
-        let row_idx = usize::from(self.cursor.row);
         if usize::from(self.cursor.col) >= cols {
             self.newline();
         }
@@ -96,7 +105,6 @@ impl MockVt {
         } else {
             self.cursor.col = cols as u16;
         }
-        let _ = row_idx;
     }
 
     fn newline(&mut self) {
@@ -106,12 +114,15 @@ impl MockVt {
             self.cursor.row += 1;
         } else {
             let evicted = self.viewport.remove(0);
-            if !self.modes.alt_screen && self.scrollback_limit > 0 {
-                if self.scrollback.len() == self.scrollback_limit {
-                    self.scrollback.remove(0);
-                    self.compressed_lines = self.compressed_lines.saturating_sub(1);
+            if !self.modes.alt_screen {
+                self.first_active_line = self.first_active_line.saturating_add(1);
+                if self.scrollback_limit > 0 {
+                    if self.scrollback.len() == self.scrollback_limit {
+                        self.scrollback.remove(0);
+                        self.compressed_lines = self.compressed_lines.saturating_sub(1);
+                    }
+                    self.scrollback.push(evicted);
                 }
-                self.scrollback.push(evicted);
             }
             self.viewport.push(String::new());
             self.scroll_delta = self.scroll_delta.saturating_add(1);
@@ -128,27 +139,50 @@ impl MockVt {
         }
     }
 
+    fn scroll_down_one(&mut self) {
+        let rows = self.size.rows.get();
+        self.viewport.pop();
+        self.viewport.insert(0, String::new());
+        self.scroll_delta = self.scroll_delta.saturating_sub(1);
+        let mut shifted = BTreeSet::new();
+        for &r in &self.dirty_rows {
+            if r + 1 < rows {
+                shifted.insert(r + 1);
+            }
+        }
+        shifted.insert(0);
+        self.dirty_rows = shifted;
+        self.gens.grid += 1;
+    }
+
     fn handle_csi(&mut self, params: &[u8], final_byte: u8, events: &mut Vec<VtEvent>) {
         match (params, final_byte) {
             (b"?2026", b'h') => events.push(VtEvent::SyncOutput(true)),
             (b"?2026", b'l') => events.push(VtEvent::SyncOutput(false)),
+            (b"", b'T') | (b"1", b'T') => self.scroll_down_one(),
             (b"?1049", b'h') if !self.modes.alt_screen => {
                 self.modes.alt_screen = true;
                 self.epoch += 1;
+                self.first_active_line = 0;
+                self.scrollback.clear();
                 self.gens.modes += 1;
                 self.viewport.fill_with(String::new);
                 self.cursor.col = 0;
                 self.cursor.row = 0;
                 self.full_dirty = true;
+                events.push(VtEvent::EpochChanged);
             }
             (b"?1049", b'l') if self.modes.alt_screen => {
                 self.modes.alt_screen = false;
                 self.epoch += 1;
+                self.first_active_line = 0;
+                self.scrollback.clear();
                 self.gens.modes += 1;
                 self.viewport.fill_with(String::new);
                 self.cursor.col = 0;
                 self.cursor.row = 0;
                 self.full_dirty = true;
+                events.push(VtEvent::EpochChanged);
             }
             (b"6", b'n') => {
                 let r = self.cursor.row + 1;
@@ -166,11 +200,12 @@ impl MockVt {
         let Some((code, body)) = text.split_once(';') else {
             return;
         };
+        let cursor_line = self.cursor_abs_line();
         match code {
             "0" | "2" => events.push(VtEvent::Title(String::from(body))),
             "7" => events.push(VtEvent::Cwd(String::from(body))),
-            "133" => events.push(VtEvent::Osc133(String::from(body))),
-            "633" => events.push(VtEvent::Osc633(String::from(body))),
+            "133" => events.push(VtEvent::Osc133 { payload: String::from(body), cursor_line }),
+            "633" => events.push(VtEvent::Osc633 { payload: String::from(body), cursor_line }),
             "7501" => events.push(VtEvent::Osc7501(String::from(body))),
             _ => {}
         }
@@ -258,6 +293,7 @@ impl VtEngine for MockVt {
         }
         self.size = size;
         self.epoch += 1;
+        self.first_active_line = self.scrollback.len() as u64;
         let rows = usize::from(size.rows.get());
         self.viewport.resize(rows, String::new());
         self.cursor.row = self.cursor.row.min(size.rows.get() - 1);
@@ -272,6 +308,7 @@ impl VtEngine for MockVt {
         VtSnapshotMeta {
             epoch: self.epoch,
             size: self.size,
+            first_active_line: self.first_active_line,
             scrollback_lines: self.scrollback.len() as u64,
             cursor: self.cursor,
             modes: self.modes,
@@ -300,10 +337,9 @@ impl VtEngine for MockVt {
     }
 
     fn extract_viewport_rows(&self, rows: &[u16], out: &mut Vec<PackedRow>) {
-        let sb = self.scrollback.len() as u64;
         for &r in rows {
             if let Some(text) = self.viewport.get(usize::from(r)) {
-                out.push(self.pack_row(sb + u64::from(r), text));
+                out.push(self.pack_row(self.first_active_line.saturating_add(u64::from(r)), text));
             }
         }
     }
@@ -350,9 +386,19 @@ impl VtEngine for MockVt {
     }
 
     fn text_of(&self, span: CellSpan) -> String {
+        let meta = self.meta();
+        let oldest = meta.oldest_line();
+        let Some(max_line) = meta.total_lines().checked_sub(1) else {
+            return String::new();
+        };
+        if span.end.line < oldest || span.start.line > max_line {
+            return String::new();
+        }
+        let start_line = span.start.line.max(oldest);
+        let end_line = span.end.line.min(max_line);
         let mut out = String::new();
-        for line in span.start.line..=span.end.line {
-            if line > span.start.line {
+        for line in start_line..=end_line {
+            if line > start_line {
                 out.push('\n');
             }
             if let Some(text) = self.line_text(line) {
@@ -374,11 +420,21 @@ impl VtEngine for MockVt {
     }
 
     fn text_of_rect(&self, span: CellSpan) -> String {
+        let meta = self.meta();
+        let oldest = meta.oldest_line();
+        let Some(max_line) = meta.total_lines().checked_sub(1) else {
+            return String::new();
+        };
+        if span.end.line < oldest || span.start.line > max_line {
+            return String::new();
+        }
+        let start_line = span.start.line.max(oldest);
+        let end_line = span.end.line.min(max_line);
         let lo = usize::from(span.start.col.min(span.end.col));
         let hi = usize::from(span.start.col.max(span.end.col));
         let mut out = String::new();
-        for line in span.start.line..=span.end.line {
-            if line > span.start.line {
+        for line in start_line..=end_line {
+            if line > start_line {
                 out.push('\n');
             }
             if let Some(text) = self.line_text(line) {

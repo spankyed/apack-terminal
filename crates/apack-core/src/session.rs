@@ -11,18 +11,22 @@ use alloc::vec::Vec;
 
 use apack_proto::messages::{BrokerMsg, ClientMsg, FrameUpdate};
 use apack_proto::types::{
-    CellPx, CursorState, ErrorCode, GridSize, NonZeroStreamId, PackedRow, PasteOutcome, RequestId, ResizePolicy,
-    SessionId, StreamId, SubFlags, ViewModes, ViewportHint, WaitCondition, WaitOutcome,
+    CellPos, CellPx, CellSpan, CursorState, ErrorCode, GridSize, NonZeroStreamId, PackedRow, PasteOutcome,
+    ProgressState, RequestId, ResizePolicy, SessionId, StreamId, SubFlags, ViewModes, ViewportHint, WaitCondition,
+    WaitOutcome,
 };
-use apack_proto::{MAX_ROWS_PER_FETCH, MAX_SEARCH_MATCHES};
+use apack_proto::{BULK_CHUNK_BYTES, MAX_ROWS_PER_FETCH, MAX_SEARCH_MATCHES, MAX_STRING_BYTES};
 
 use crate::flow::OutboundPriority;
 use crate::lease::ConnId;
 use crate::marks::{MarkEffect, MarksMode, MarksTracker};
 use crate::status::{StatusEffect, StatusTable};
 use crate::time::{TimerId, TimerWheel, TimestampMs};
-use crate::vt::{DirtyViewport, PasteEncode, VtEngine, VtEvent};
-use crate::{DEFAULT_WORD_DELIMITERS, MAX_PTY_WRITE_BYTES, SEARCH_COALESCE_MS, SYNC_HOLD_MAX_MS};
+use crate::vt::{DirtyViewport, PasteEncode, VtEngine, VtEvent, VtSnapshotMeta};
+use crate::{
+    DEFAULT_WORD_DELIMITERS, MAX_EVENT_STRING_BYTES, MAX_IMAGE_PLACEMENTS, MAX_PTY_WRITE_BYTES,
+    MAX_WAITERS_PER_SESSION, SEARCH_COALESCE_MS, SYNC_HOLD_MAX_MS, truncate_utf8,
+};
 
 /// Identifies one attached multiplexed stream across connections.
 pub type StreamKey = (ConnId, NonZeroStreamId);
@@ -78,6 +82,8 @@ pub enum SessionEffect {
         /// Maximum chunk bytes requested.
         max_bytes: u32,
     },
+    /// Toggle manual PTY read pause requested via stream `Pause`/`Resume`.
+    SetPtyPaused(bool),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +96,8 @@ enum SessionTimer {
 #[derive(Debug)]
 struct ViewSubscriber {
     last_epoch: Option<u64>,
+    last_first_active_line: u64,
+    last_scrollback_lines: u64,
     last_palette_gen: u64,
     last_images_gen: u64,
     last_cursor: Option<CursorState>,
@@ -103,6 +111,8 @@ impl ViewSubscriber {
     fn new() -> Self {
         Self {
             last_epoch: None,
+            last_first_active_line: 0,
+            last_scrollback_lines: 0,
             last_palette_gen: 0,
             last_images_gen: 0,
             last_cursor: None,
@@ -121,6 +131,17 @@ impl ViewSubscriber {
             return;
         }
         if self.needs_full_sync {
+            return;
+        }
+        // Opposing-sign scrolls coalesced before publish can cancel out `scroll_delta` while
+        // losing track of blank rows exposed at both edges; degrade safely to `full_sync`.
+        if self.scroll_delta != 0
+            && dirty.scroll_delta != 0
+            && self.scroll_delta.signum() != dirty.scroll_delta.signum()
+        {
+            self.needs_full_sync = true;
+            self.dirty_rows.clear();
+            self.scroll_delta = 0;
             return;
         }
         let next_scroll = self.scroll_delta.saturating_add(dirty.scroll_delta);
@@ -154,6 +175,7 @@ struct SearchWatch {
     query: String,
     case_sensitive: bool,
     epoch: u64,
+    last_oldest_line: u64,
     needs_full_refresh: bool,
     dirty_range: Option<(u64, u64)>,
 }
@@ -181,12 +203,14 @@ pub struct SessionMachine<V: VtEngine> {
     statuses: StatusTable,
     timers: TimerWheel<SessionTimer>,
     sync_hold: Option<TimerId>,
+    sync_hold_started: Option<TimestampMs>,
     search_flush_timer: Option<TimerId>,
     viewport_seq: u64,
     viewports: BTreeMap<StreamKey, (ViewportHint, u64)>,
     subscribers: BTreeMap<StreamKey, SubFlags>,
     views: BTreeMap<StreamKey, ViewSubscriber>,
     searches: BTreeMap<StreamKey, SearchWatch>,
+    manual_pauses: BTreeSet<StreamKey>,
     waiters: Vec<Waiter>,
     pty_write_queue: VecDeque<u8>,
     max_pty_write_bytes: usize,
@@ -227,12 +251,14 @@ impl<V: VtEngine> SessionMachine<V> {
             statuses: StatusTable::new(),
             timers: TimerWheel::new(),
             sync_hold: None,
+            sync_hold_started: None,
             search_flush_timer: None,
             viewport_seq: 0,
             viewports: BTreeMap::new(),
             subscribers: BTreeMap::new(),
             views: BTreeMap::new(),
             searches: BTreeMap::new(),
+            manual_pauses: BTreeSet::new(),
             waiters: Vec::new(),
             pty_write_queue: VecDeque::new(),
             max_pty_write_bytes,
@@ -305,11 +331,19 @@ impl<V: VtEngine> SessionMachine<V> {
         }
     }
 
-    /// Detaches a stream, cleaning up its view state, viewport hint, and active search watch.
+    /// Detaches a stream, cleaning up its view state, viewport hint, manual pause, and active search watch.
     pub fn detach_stream(&mut self, key: StreamKey, effects: &mut Vec<SessionEffect>) {
         self.subscribers.remove(&key);
         self.views.remove(&key);
         self.searches.remove(&key);
+        if self.searches.is_empty()
+            && let Some(tid) = self.search_flush_timer.take()
+        {
+            self.timers.cancel(tid);
+        }
+        if self.manual_pauses.remove(&key) && self.manual_pauses.is_empty() {
+            effects.push(SessionEffect::SetPtyPaused(false));
+        }
         if self.viewports.remove(&key).is_some() {
             self.recompute_viewport_geometry(effects);
         }
@@ -358,6 +392,17 @@ impl<V: VtEngine> SessionMachine<V> {
             });
             return;
         }
+        if self.waiters.len() >= MAX_WAITERS_PER_SESSION {
+            send_stream_error(
+                conn,
+                StreamId::CONTROL,
+                req_id,
+                ErrorCode::ResourceLimit,
+                "too many concurrent waiters on session",
+                effects,
+            );
+            return;
+        }
         let deadline = now.saturating_add(u64::from(timeout_ms));
         let timer = self.timers.schedule(deadline, SessionTimer::WaitTimeout);
         self.waiters.push(Waiter { conn, req_id, condition, timer });
@@ -376,20 +421,19 @@ impl<V: VtEngine> SessionMachine<V> {
         let after_meta = self.vt.meta();
         let dirty = self.vt.take_dirty_viewport();
         let epoch_changed = after_meta.epoch != before_meta.epoch;
-        if epoch_changed {
-            self.marks.on_epoch_change();
-        }
 
         // Propagate viewport dirty bitsets to every attached SUB_VIEW subscriber.
         for view in self.views.values_mut() {
             view.apply_dirty(after_meta.epoch, after_meta.size.rows.get(), &dirty);
         }
 
-        // Process VT side-effect events.
-        let cursor_abs_line = after_meta.scrollback_lines.saturating_add(u64::from(after_meta.cursor.row));
+        // Process VT side-effect events in stream order, coalescing VerifyForeground per status ID.
+        let mut saw_epoch_event = false;
+        let mut pending_verify: BTreeMap<String, (u64, String)> = BTreeMap::new();
         for ev in vt_events {
             match ev {
-                VtEvent::Title(title) => {
+                VtEvent::Title(raw) => {
+                    let title = truncate_utf8(&raw, MAX_EVENT_STRING_BYTES);
                     self.title = title.clone();
                     self.broadcast_event(BrokerMsg::Title { title }, effects);
                 }
@@ -397,20 +441,29 @@ impl<V: VtEngine> SessionMachine<V> {
                     self.broadcast_event(BrokerMsg::Bell, effects);
                 }
                 VtEvent::Clipboard { selection, data } => {
+                    let selection = truncate_utf8(&selection, MAX_EVENT_STRING_BYTES);
+                    let data = truncate_utf8(&data, MAX_STRING_BYTES);
                     self.broadcast_event(BrokerMsg::Clipboard { selection, data }, effects);
                 }
                 VtEvent::Notification { title, body } => {
+                    let title = truncate_utf8(&title, MAX_EVENT_STRING_BYTES);
+                    let body = truncate_utf8(&body, MAX_EVENT_STRING_BYTES);
                     self.broadcast_event(BrokerMsg::Notification { title, body }, effects);
                 }
                 VtEvent::Progress { state, percent } => {
+                    let percent = normalize_progress(state, percent);
                     self.broadcast_event(BrokerMsg::Progress { state, percent }, effects);
                 }
-                VtEvent::Cwd(cwd) => {
+                VtEvent::Cwd(raw) => {
+                    let cwd = truncate_utf8(&raw, MAX_EVENT_STRING_BYTES);
+                    self.marks.on_cwd(&cwd);
                     self.broadcast_event(BrokerMsg::CwdChanged { cwd }, effects);
                 }
                 VtEvent::SyncOutput(true) => {
-                    if self.sync_hold.is_none() {
-                        let timer = self.timers.schedule(now.saturating_add(SYNC_HOLD_MAX_MS), SessionTimer::SyncHold);
+                    let start = *self.sync_hold_started.get_or_insert(now);
+                    let deadline = start.saturating_add(SYNC_HOLD_MAX_MS);
+                    if self.sync_hold.is_none() && now < deadline {
+                        let timer = self.timers.schedule(deadline, SessionTimer::SyncHold);
                         self.sync_hold = Some(timer);
                     }
                 }
@@ -419,45 +472,62 @@ impl<V: VtEngine> SessionMachine<V> {
                         self.timers.cancel(timer);
                     }
                 }
-                VtEvent::Osc133(payload) => {
+                VtEvent::EpochChanged => {
+                    saw_epoch_event = true;
+                    self.marks.on_epoch_change();
+                }
+                VtEvent::Osc133 { payload, cursor_line } => {
                     let mut mark_effects = Vec::new();
-                    self.marks.on_osc133(&payload, cursor_abs_line, now, &mut mark_effects);
+                    self.marks.on_osc133(&payload, cursor_line, now, &mut mark_effects);
                     self.apply_mark_effects(mark_effects, effects);
                 }
-                VtEvent::Osc633(payload) => {
+                VtEvent::Osc633 { payload, cursor_line } => {
                     let mut mark_effects = Vec::new();
-                    self.marks.on_osc633(&payload, cursor_abs_line, now, &mut mark_effects);
+                    self.marks.on_osc633(&payload, cursor_line, now, &mut mark_effects);
                     self.apply_mark_effects(mark_effects, effects);
                 }
                 VtEvent::Osc7501(payload) => {
                     let mut status_effects = Vec::new();
                     self.statuses.ingest(&payload, now, &mut status_effects);
-                    self.apply_status_effects(status_effects, effects);
+                    self.apply_status_effects(status_effects, Some(&mut pending_verify), effects);
                 }
                 VtEvent::DeviceResponse(reply) => {
-                    let _ = self.enqueue_pty_bytes(&reply, effects);
+                    let _ = self.enqueue_device_response(&reply, effects);
                 }
             }
         }
+        if epoch_changed && !saw_epoch_event {
+            self.marks.on_epoch_change();
+        }
+        for (id, (changed, app)) in pending_verify {
+            effects.push(SessionEffect::VerifyForeground { id, changed, app });
+        }
 
         // Compute the absolute dirty line range for incremental SearchWatch & WaitCondition::Text.
-        let total_lines = after_meta.scrollback_lines.saturating_add(u64::from(after_meta.size.rows.get()));
-        let dirty_abs_range = compute_dirty_abs_range(&before_meta, &after_meta, &dirty, total_lines);
+        let oldest_line = after_meta.oldest_line();
+        let total_lines = after_meta.total_lines();
+        let dirty_abs_range = compute_dirty_abs_range(&before_meta, &after_meta, &dirty);
 
         if !self.searches.is_empty() {
             let mut need_timer = false;
             for watch in self.searches.values_mut() {
                 if watch.epoch != after_meta.epoch {
                     watch.epoch = after_meta.epoch;
+                    watch.last_oldest_line = oldest_line;
                     watch.needs_full_refresh = true;
                     watch.dirty_range = None;
                     need_timer = true;
-                } else if let Some((from, to)) = dirty_abs_range {
-                    watch.dirty_range = Some(match watch.dirty_range {
-                        None => (from, to),
-                        Some((a, b)) => (a.min(from), b.max(to)),
-                    });
-                    need_timer = true;
+                } else {
+                    if oldest_line > watch.last_oldest_line {
+                        need_timer = true;
+                    }
+                    if let Some((from, to)) = dirty_abs_range {
+                        watch.dirty_range = Some(match watch.dirty_range {
+                            None => (from, to),
+                            Some((a, b)) => (a.min(from), b.max(to)),
+                        });
+                        need_timer = true;
+                    }
                 }
             }
             if need_timer && self.search_flush_timer.is_none() {
@@ -467,7 +537,7 @@ impl<V: VtEngine> SessionMachine<V> {
         }
 
         // Evaluate reactive WaitCondition::Text waiters over only the newly dirty range (or full on epoch change).
-        let text_scan = if epoch_changed { Some((0, total_lines)) } else { dirty_abs_range };
+        let text_scan = if epoch_changed { Some((oldest_line, total_lines)) } else { dirty_abs_range };
         if let Some((from, to)) = text_scan {
             self.check_text_waiters(from, to, effects);
         }
@@ -485,11 +555,11 @@ impl<V: VtEngine> SessionMachine<V> {
     ) {
         let mut status_effects = Vec::new();
         self.statuses.apply_confirmation(id, changed, confirmed, &mut status_effects);
-        self.apply_status_effects(status_effects, effects);
+        self.apply_status_effects(status_effects, None, effects);
     }
 
-    /// Handles session process termination: finalizes running command, notifies `EVENTS` subscribers,
-    /// and resolves every pending waiter immediately.
+    /// Handles session process termination: releases any sync hold, clears pending stdin bytes,
+    /// finalizes running command, notifies `EVENTS` subscribers, and resolves every pending waiter.
     pub fn on_process_exit(
         &mut self,
         exit_code: Option<i32>,
@@ -501,6 +571,12 @@ impl<V: VtEngine> SessionMachine<V> {
             return;
         }
         self.alive = false;
+        self.pty_write_queue.clear();
+        if let Some(tid) = self.sync_hold.take() {
+            self.timers.cancel(tid);
+        }
+        self.sync_hold_started = None;
+
         let mut mark_effects = Vec::new();
         self.marks.on_session_exit(now, &mut mark_effects);
         self.apply_mark_effects(mark_effects, effects);
@@ -521,6 +597,7 @@ impl<V: VtEngine> SessionMachine<V> {
                 msg: BrokerMsg::Waited { outcome },
             });
         }
+        self.notify_views_dirty(effects);
     }
 
     /// Fires all expired session timers (`SyncHold`, `SearchFlush`, `WaitTimeout`) at `now`.
@@ -567,8 +644,23 @@ impl<V: VtEngine> SessionMachine<V> {
     ) {
         let (conn, stream_id) = key;
         let wire_stream = stream_id.as_stream_id();
+        let Some(&flags) = self.subscribers.get(&key) else {
+            send_stream_error(conn, wire_stream, req_id, ErrorCode::NoSuchStream, "stream not attached", effects);
+            return;
+        };
         match msg {
             ClientMsg::ViewportHint(hint) => {
+                if !flags.contains(SubFlags::VIEW) {
+                    send_stream_error(
+                        conn,
+                        wire_stream,
+                        req_id,
+                        ErrorCode::Malformed,
+                        "ViewportHint requires SUB_VIEW",
+                        effects,
+                    );
+                    return;
+                }
                 self.viewport_seq += 1;
                 self.viewports.insert(key, (hint, self.viewport_seq));
                 self.recompute_viewport_geometry(effects);
@@ -598,19 +690,19 @@ impl<V: VtEngine> SessionMachine<V> {
                 let mut buf = Vec::new();
                 self.vt.encode_key(&input, &mut buf);
                 if self.enqueue_pty_bytes(&buf, effects).is_err() {
-                    send_stream_error(conn, wire_stream, req_id, ErrorCode::Pty, "PTY write queue full", effects);
+                    send_stream_error(conn, wire_stream, req_id, ErrorCode::Pty, "PTY write rejected", effects);
                 }
             }
             ClientMsg::Text { text } => {
                 if self.enqueue_pty_bytes(text.as_bytes(), effects).is_err() {
-                    send_stream_error(conn, wire_stream, req_id, ErrorCode::Pty, "PTY write queue full", effects);
+                    send_stream_error(conn, wire_stream, req_id, ErrorCode::Pty, "PTY write rejected", effects);
                 }
             }
             ClientMsg::Pointer(input) => {
                 let mut buf = Vec::new();
                 self.vt.encode_pointer(&input, &mut buf);
                 if self.enqueue_pty_bytes(&buf, effects).is_err() {
-                    send_stream_error(conn, wire_stream, req_id, ErrorCode::Pty, "PTY write queue full", effects);
+                    send_stream_error(conn, wire_stream, req_id, ErrorCode::Pty, "PTY write rejected", effects);
                 }
             }
             ClientMsg::Focus { focused } => {
@@ -630,7 +722,7 @@ impl<V: VtEngine> SessionMachine<V> {
                 }
                 PasteEncode::Bytes(bytes) => {
                     if self.enqueue_pty_bytes(&bytes, effects).is_err() {
-                        send_stream_error(conn, wire_stream, req_id, ErrorCode::Pty, "PTY write queue full", effects);
+                        send_stream_error(conn, wire_stream, req_id, ErrorCode::Pty, "PTY write rejected", effects);
                     } else {
                         effects.push(SessionEffect::Send {
                             conn,
@@ -644,8 +736,34 @@ impl<V: VtEngine> SessionMachine<V> {
             },
             ClientMsg::Write { data } => {
                 if self.enqueue_pty_bytes(&data, effects).is_err() {
-                    send_stream_error(conn, wire_stream, req_id, ErrorCode::Pty, "PTY write queue full", effects);
+                    send_stream_error(conn, wire_stream, req_id, ErrorCode::Pty, "PTY write rejected", effects);
                 }
+            }
+            ClientMsg::Pause => {
+                let was_paused = !self.manual_pauses.is_empty();
+                self.manual_pauses.insert(key);
+                if !was_paused {
+                    effects.push(SessionEffect::SetPtyPaused(true));
+                }
+                effects.push(SessionEffect::Send {
+                    conn,
+                    stream_id: wire_stream,
+                    req_id,
+                    priority: OutboundPriority::Control,
+                    msg: BrokerMsg::Ok,
+                });
+            }
+            ClientMsg::Resume => {
+                if self.manual_pauses.remove(&key) && self.manual_pauses.is_empty() {
+                    effects.push(SessionEffect::SetPtyPaused(false));
+                }
+                effects.push(SessionEffect::Send {
+                    conn,
+                    stream_id: wire_stream,
+                    req_id,
+                    priority: OutboundPriority::Control,
+                    msg: BrokerMsg::Ok,
+                });
             }
             ClientMsg::FetchRows { epoch, from_line, count } => {
                 let cur_epoch = self.vt.meta().epoch;
@@ -692,11 +810,15 @@ impl<V: VtEngine> SessionMachine<V> {
                 });
             }
             ClientMsg::TextOf { epoch, span } => {
-                if epoch != self.vt.meta().epoch {
+                let meta = self.vt.meta();
+                if epoch != meta.epoch {
                     send_stream_error(conn, wire_stream, req_id, ErrorCode::StaleEpoch, "stale epoch", effects);
                     return;
                 }
-                let text = self.vt.text_of(span);
+                let text = match clamp_span(span, &meta) {
+                    Some(clamped) => truncate_utf8(&self.vt.text_of(clamped), MAX_STRING_BYTES),
+                    None => String::new(),
+                };
                 effects.push(SessionEffect::Send {
                     conn,
                     stream_id: wire_stream,
@@ -706,11 +828,15 @@ impl<V: VtEngine> SessionMachine<V> {
                 });
             }
             ClientMsg::TextOfRect { epoch, span } => {
-                if epoch != self.vt.meta().epoch {
+                let meta = self.vt.meta();
+                if epoch != meta.epoch {
                     send_stream_error(conn, wire_stream, req_id, ErrorCode::StaleEpoch, "stale epoch", effects);
                     return;
                 }
-                let text = self.vt.text_of_rect(span);
+                let text = match clamp_span(span, &meta) {
+                    Some(clamped) => truncate_utf8(&self.vt.text_of_rect(clamped), MAX_STRING_BYTES),
+                    None => String::new(),
+                };
                 effects.push(SessionEffect::Send {
                     conn,
                     stream_id: wire_stream,
@@ -723,6 +849,11 @@ impl<V: VtEngine> SessionMachine<V> {
                 let meta = self.vt.meta();
                 if query.is_empty() {
                     self.searches.remove(&key);
+                    if self.searches.is_empty()
+                        && let Some(tid) = self.search_flush_timer.take()
+                    {
+                        self.timers.cancel(tid);
+                    }
                     effects.push(SessionEffect::Send {
                         conn,
                         stream_id: wire_stream,
@@ -732,16 +863,19 @@ impl<V: VtEngine> SessionMachine<V> {
                     });
                     return;
                 }
-                let total_lines = meta.scrollback_lines.saturating_add(u64::from(meta.size.rows.get()));
+                let oldest = meta.oldest_line();
+                let total_lines = meta.total_lines();
                 let mut matches = Vec::new();
                 let truncated =
-                    self.vt.search_lines(0, total_lines, &query, case_sensitive, MAX_SEARCH_MATCHES, &mut matches);
+                    self.vt.search_lines(oldest, total_lines, &query, case_sensitive, MAX_SEARCH_MATCHES, &mut matches);
+                matches.truncate(MAX_SEARCH_MATCHES);
                 self.searches.insert(
                     key,
                     SearchWatch {
                         query,
                         case_sensitive,
                         epoch: meta.epoch,
+                        last_oldest_line: oldest,
                         needs_full_refresh: false,
                         dirty_range: None,
                     },
@@ -775,7 +909,8 @@ impl<V: VtEngine> SessionMachine<V> {
             }
             ClientMsg::Images => {
                 let meta = self.vt.meta();
-                let placements = self.vt.images();
+                let mut placements = self.vt.images();
+                placements.truncate(MAX_IMAGE_PLACEMENTS);
                 effects.push(SessionEffect::Send {
                     conn,
                     stream_id: wire_stream,
@@ -785,6 +920,7 @@ impl<V: VtEngine> SessionMachine<V> {
                 });
             }
             ClientMsg::GetImageBlob { blob, offset, max_bytes } => {
+                let max_bytes = max_bytes.clamp(1, BULK_CHUNK_BYTES as u32);
                 effects.push(SessionEffect::FetchImageBlob { conn, stream_id, req_id, blob, offset, max_bytes });
             }
             _ => {}
@@ -810,6 +946,8 @@ impl<V: VtEngine> SessionMachine<V> {
         let nothing_changed = !full_sync
             && sub.dirty_rows.is_empty()
             && sub.scroll_delta == 0
+            && sub.last_first_active_line == meta.first_active_line
+            && sub.last_scrollback_lines == meta.scrollback_lines
             && sub.last_cursor == Some(meta.cursor)
             && sub.last_modes == Some(meta.modes)
             && !palette_changed
@@ -827,6 +965,7 @@ impl<V: VtEngine> SessionMachine<V> {
             seq: 0,
             epoch: meta.epoch,
             size: meta.size,
+            first_active_line: meta.first_active_line,
             scrollback_lines: meta.scrollback_lines,
             scroll_delta: if full_sync { 0 } else { sub.scroll_delta },
             cursor: meta.cursor,
@@ -844,6 +983,8 @@ impl<V: VtEngine> SessionMachine<V> {
         // Commit only after `publish` accepted the frame!
         if let Some(sub) = self.views.get_mut(&key) {
             sub.last_epoch = Some(meta.epoch);
+            sub.last_first_active_line = meta.first_active_line;
+            sub.last_scrollback_lines = meta.scrollback_lines;
             sub.last_palette_gen = gens.palette;
             sub.last_images_gen = meta.images_gen;
             sub.last_cursor = Some(meta.cursor);
@@ -852,6 +993,8 @@ impl<V: VtEngine> SessionMachine<V> {
             sub.dirty_rows.clear();
             sub.scroll_delta = 0;
         }
+        // A view actually flushed outside a sync hold -> reset anti-starvation clock for future holds.
+        self.sync_hold_started = None;
         true
     }
 
@@ -867,11 +1010,28 @@ impl<V: VtEngine> SessionMachine<V> {
     }
 
     fn enqueue_pty_bytes(&mut self, bytes: &[u8], effects: &mut Vec<SessionEffect>) -> Result<(), ()> {
+        if !self.alive {
+            return Err(());
+        }
         if bytes.is_empty() {
             return Ok(());
         }
         let next = self.pty_write_queue.len().checked_add(bytes.len()).ok_or(())?;
         if next > self.max_pty_write_bytes {
+            return Err(());
+        }
+        self.pty_write_queue.extend(bytes);
+        effects.push(SessionEffect::PtyWriteReady);
+        Ok(())
+    }
+
+    fn enqueue_device_response(&mut self, bytes: &[u8], effects: &mut Vec<SessionEffect>) -> Result<(), ()> {
+        if !self.alive || bytes.is_empty() {
+            return Ok(());
+        }
+        let dsr_cap = self.max_pty_write_bytes / 2;
+        let next = self.pty_write_queue.len().checked_add(bytes.len()).ok_or(())?;
+        if next > dsr_cap {
             return Err(());
         }
         self.pty_write_queue.extend(bytes);
@@ -921,10 +1081,16 @@ impl<V: VtEngine> SessionMachine<V> {
         let _ = self.vt.take_dirty_viewport();
         if new_epoch != prev_epoch {
             self.marks.on_epoch_change();
-            for watch in self.searches.values_mut() {
-                watch.epoch = new_epoch;
-                watch.needs_full_refresh = true;
-                watch.dirty_range = None;
+            if !self.searches.is_empty() {
+                if let Some(tid) = self.search_flush_timer.take() {
+                    self.timers.cancel(tid);
+                }
+                for watch in self.searches.values_mut() {
+                    watch.epoch = new_epoch;
+                    watch.needs_full_refresh = true;
+                    watch.dirty_range = None;
+                }
+                self.flush_searches(effects);
             }
         }
         for view in self.views.values_mut() {
@@ -959,7 +1125,12 @@ impl<V: VtEngine> SessionMachine<V> {
         }
     }
 
-    fn apply_status_effects(&mut self, status_effects: Vec<StatusEffect>, effects: &mut Vec<SessionEffect>) {
+    fn apply_status_effects(
+        &mut self,
+        status_effects: Vec<StatusEffect>,
+        mut coalesce_verify: Option<&mut BTreeMap<String, (u64, String)>>,
+        effects: &mut Vec<SessionEffect>,
+    ) {
         let mut root_state = None;
         for se in status_effects {
             match se {
@@ -970,7 +1141,11 @@ impl<V: VtEngine> SessionMachine<V> {
                     self.broadcast_event(BrokerMsg::ProgramStatus(Box::new(rec)), effects);
                 }
                 StatusEffect::VerifyForeground { id, changed, app } => {
-                    effects.push(SessionEffect::VerifyForeground { id, changed, app });
+                    if let Some(map) = coalesce_verify.as_mut() {
+                        map.insert(id, (changed, app));
+                    } else {
+                        effects.push(SessionEffect::VerifyForeground { id, changed, app });
+                    }
                 }
             }
         }
@@ -981,21 +1156,24 @@ impl<V: VtEngine> SessionMachine<V> {
 
     fn flush_searches(&mut self, effects: &mut Vec<SessionEffect>) {
         let meta = self.vt.meta();
-        let total_lines = meta.scrollback_lines.saturating_add(u64::from(meta.size.rows.get()));
+        let oldest = meta.oldest_line();
+        let total_lines = meta.total_lines();
         for (&(conn, stream_id), watch) in &mut self.searches {
             if watch.needs_full_refresh || watch.epoch != meta.epoch {
                 watch.epoch = meta.epoch;
+                watch.last_oldest_line = oldest;
                 watch.needs_full_refresh = false;
                 watch.dirty_range = None;
                 let mut matches = Vec::new();
                 let truncated = self.vt.search_lines(
-                    0,
+                    oldest,
                     total_lines,
                     &watch.query,
                     watch.case_sensitive,
                     MAX_SEARCH_MATCHES,
                     &mut matches,
                 );
+                matches.truncate(MAX_SEARCH_MATCHES);
                 effects.push(SessionEffect::Send {
                     conn,
                     stream_id: stream_id.as_stream_id(),
@@ -1003,11 +1181,30 @@ impl<V: VtEngine> SessionMachine<V> {
                     priority: OutboundPriority::Bulk,
                     msg: BrokerMsg::SearchMatches { epoch: meta.epoch, matches, truncated },
                 });
-            } else if let Some((from, to)) = watch.dirty_range.take() {
-                let clamped_to = to.min(total_lines);
-                let clamped_from = from.min(clamped_to);
+                continue;
+            }
+            if oldest > watch.last_oldest_line {
+                let evicted_from = watch.last_oldest_line;
+                watch.last_oldest_line = oldest;
+                effects.push(SessionEffect::Send {
+                    conn,
+                    stream_id: stream_id.as_stream_id(),
+                    req_id: RequestId::PUSH,
+                    priority: OutboundPriority::Event,
+                    msg: BrokerMsg::SearchDelta {
+                        epoch: meta.epoch,
+                        from_line: evicted_from,
+                        to_line: oldest,
+                        added: Vec::new(),
+                        truncated: false,
+                    },
+                });
+            }
+            if let Some((from, to)) = watch.dirty_range.take() {
+                let clamped_from = from.max(oldest).min(total_lines);
+                let clamped_to = to.max(clamped_from).min(total_lines);
                 let mut added = Vec::new();
-                let truncated = self.vt.search_lines(
+                let mut truncated = self.vt.search_lines(
                     clamped_from,
                     clamped_to,
                     &watch.query,
@@ -1015,6 +1212,12 @@ impl<V: VtEngine> SessionMachine<V> {
                     MAX_SEARCH_MATCHES,
                     &mut added,
                 );
+                // Enforce apack-proto SearchDelta wire invariant strictly.
+                added.retain(|s| s.start.line >= clamped_from && s.end.line < clamped_to);
+                if added.len() > MAX_SEARCH_MATCHES {
+                    added.truncate(MAX_SEARCH_MATCHES);
+                    truncated = true;
+                }
                 effects.push(SessionEffect::Send {
                     conn,
                     stream_id: stream_id.as_stream_id(),
@@ -1037,9 +1240,8 @@ impl<V: VtEngine> SessionMachine<V> {
             WaitCondition::Idle => self.marks.is_idle(),
             WaitCondition::Text(needle) => {
                 let meta = self.vt.meta();
-                let total = meta.scrollback_lines.saturating_add(u64::from(meta.size.rows.get()));
                 let mut found = Vec::new();
-                let _ = self.vt.search_lines(0, total, needle, true, 1, &mut found);
+                let _ = self.vt.search_lines(meta.oldest_line(), meta.total_lines(), needle, true, 1, &mut found);
                 !found.is_empty()
             }
             WaitCondition::Status(states) => self.statuses.root().is_some_and(|r| states.contains(&r.state)),
@@ -1094,19 +1296,20 @@ impl<V: VtEngine> SessionMachine<V> {
     }
 
     fn extract_command_output(&self, command_id: u64) -> Option<String> {
-        let cmd = self.marks.commands().into_iter().find(|c| c.id == command_id)?;
+        let cmd = self.marks.find_command(command_id)?;
         let start_line = cmd.output_line?;
         let meta = self.vt.meta();
-        let total_lines = meta.scrollback_lines.saturating_add(u64::from(meta.size.rows.get()));
+        let oldest = meta.oldest_line();
+        let total_lines = meta.total_lines();
         let end_line = cmd.end_line.unwrap_or_else(|| total_lines.saturating_sub(1));
-        if start_line > end_line || end_line >= total_lines {
+        if start_line < oldest || start_line > end_line || end_line >= total_lines {
             return None;
         }
-        let span = apack_proto::types::CellSpan {
-            start: apack_proto::types::CellPos { line: start_line, col: 0 },
-            end: apack_proto::types::CellPos { line: end_line, col: meta.size.cols.get() - 1 },
+        let span = CellSpan {
+            start: CellPos { line: start_line, col: 0 },
+            end: CellPos { line: end_line, col: meta.size.cols.get() - 1 },
         };
-        Some(self.vt.text_of(span))
+        Some(truncate_utf8(&self.vt.text_of(span), MAX_STRING_BYTES))
     }
 
     fn broadcast_event(&self, msg: BrokerMsg, effects: &mut Vec<SessionEffect>) {
@@ -1124,22 +1327,58 @@ impl<V: VtEngine> SessionMachine<V> {
     }
 }
 
-fn compute_dirty_abs_range(
-    before: &crate::vt::VtSnapshotMeta,
-    after: &crate::vt::VtSnapshotMeta,
-    dirty: &DirtyViewport,
-    total_lines: u64,
-) -> Option<(u64, u64)> {
-    if dirty.full_dirty {
-        return Some((0, total_lines));
+fn normalize_progress(state: ProgressState, percent: Option<u8>) -> Option<u8> {
+    match state {
+        ProgressState::None | ProgressState::Indeterminate => None,
+        ProgressState::Running | ProgressState::Error | ProgressState::Paused => percent.map(|p| p.min(100)),
     }
-    let mut range: Option<(u64, u64)> = if after.scrollback_lines > before.scrollback_lines {
-        Some((before.scrollback_lines, total_lines))
-    } else {
-        None
-    };
+}
+
+fn clamp_span(span: CellSpan, meta: &VtSnapshotMeta) -> Option<CellSpan> {
+    let oldest = meta.oldest_line();
+    let max_line = meta.total_lines().checked_sub(1)?;
+    let max_col = meta.size.cols.get() - 1;
+    let start_line = span.start.line.max(oldest);
+    let end_line = span.end.line.min(max_line);
+    let start_col = if start_line == span.start.line { span.start.col.min(max_col) } else { 0 };
+    let end_col = if end_line == span.end.line { span.end.col.min(max_col) } else { max_col };
+    if start_line > end_line || (start_line == end_line && start_col > end_col) {
+        return None;
+    }
+    Some(CellSpan {
+        start: CellPos { line: start_line, col: start_col },
+        end: CellPos { line: end_line, col: end_col },
+    })
+}
+
+fn compute_dirty_abs_range(
+    before: &VtSnapshotMeta,
+    after: &VtSnapshotMeta,
+    dirty: &DirtyViewport,
+) -> Option<(u64, u64)> {
+    let oldest = after.oldest_line();
+    let total_lines = after.total_lines();
+    if dirty.full_dirty {
+        return Some((oldest, total_lines));
+    }
+    let mut range: Option<(u64, u64)> = None;
+    if after.first_active_line > before.first_active_line {
+        let from = before.first_active_line.max(oldest);
+        range = Some((from, total_lines));
+    }
+    if dirty.scroll_delta != 0 {
+        let from = after.first_active_line;
+        range = Some(match range {
+            None => (from, total_lines),
+            Some((lo, hi)) => (lo.min(from), hi.max(total_lines)),
+        });
+    }
+    let rows = after.size.rows.get();
     for &r in &dirty.dirty_rows {
-        let abs = after.scrollback_lines.saturating_add(u64::from(r));
+        if r >= rows {
+            continue;
+        }
+        let abs = after.first_active_line.saturating_add(u64::from(r));
         let end = abs.saturating_add(1);
         range = Some(match range {
             None => (abs, end),

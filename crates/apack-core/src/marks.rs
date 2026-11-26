@@ -1,8 +1,9 @@
 //! Typestate shell marker tracker distinguishing vouched (`MarksKey`) vs claimed shell facts.
 //!
 //! Hostile PTY output can emit arbitrary `OSC 133` / `OSC 633` sequences. In [`MarksMode::Keyed`],
-//! only marks carrying the session's secret [`MarksKey`] (verified in constant time) can ever
-//! produce [`CommandOutcome::Exited`] ([`VouchedExitCode`]) or transition a keyed session to idle.
+//! only marks carrying the session's secret [`MarksKey`] (verified in constant time) AND a strictly
+//! monotonic command sequence number can ever produce [`CommandOutcome::Exited`] ([`VouchedExitCode`])
+//! or transition a keyed session to idle.
 
 use alloc::collections::VecDeque;
 use alloc::string::String;
@@ -13,13 +14,14 @@ use apack_proto::types::{CommandOutcome, CommandRecord, MarksKey, UnknownReason,
 
 use crate::auth::ct_eq_32;
 use crate::time::TimestampMs;
+use crate::{MAX_EVENT_STRING_BYTES, truncate_utf8};
 
 /// Shell integration trust model for a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarksMode {
     /// Unkeyed session: all `OSC 133` / `OSC 633` marks are untrusted [`CommandOutcome::Claimed`].
     Claimed,
-    /// Keyed session: only marks verified against [`MarksKey`] can produce [`CommandOutcome::Exited`].
+    /// Keyed session: only marks verified against [`MarksKey`] + monotonic sequence produce [`CommandOutcome::Exited`].
     Keyed(MarksKey),
 }
 
@@ -32,7 +34,7 @@ pub enum MarkEffect {
     CommandFinished(CommandRecord),
     /// Shell returned to an idle prompt (in keyed mode, emitted ONLY on vouched marks).
     PromptArrived,
-    /// Shell reported a working directory update (`OSC 633;P;Cwd=...`).
+    /// Shell reported a working directory update (`OSC 633;P;Cwd=...` or vouched `633;V;F`).
     CwdChanged(String),
 }
 
@@ -41,6 +43,8 @@ pub enum MarkEffect {
 pub struct MarksTracker {
     mode: MarksMode,
     next_id: u64,
+    last_seq: u64,
+    refused: u64,
     commands: VecDeque<CommandRecord>,
     active_index: Option<usize>,
     pending_prompt_line: Option<u64>,
@@ -55,6 +59,8 @@ impl MarksTracker {
         Self {
             mode,
             next_id: 1,
+            last_seq: 0,
+            refused: 0,
             commands: VecDeque::new(),
             active_index: None,
             pending_prompt_line: None,
@@ -69,14 +75,31 @@ impl MarksTracker {
         self.at_prompt && self.active_index.is_none()
     }
 
+    /// Returns how many `OSC 633;V;...` marks were refused (bad key, bad/replayed sequence, or wrong mode).
+    pub fn refused(&self) -> u64 {
+        self.refused
+    }
+
     /// Returns a snapshot of the bounded command ring (`<= MAX_COMMANDS`).
     pub fn commands(&self) -> Vec<CommandRecord> {
         self.commands.iter().cloned().collect()
     }
 
+    /// Finds a command record by ID without cloning the ring.
+    pub fn find_command(&self, id: u64) -> Option<&CommandRecord> {
+        self.commands.iter().find(|c| c.id == id)
+    }
+
     /// Returns the last working directory reported via shell integration, if any.
     pub fn last_cwd(&self) -> Option<&str> {
         self.last_cwd.as_deref()
+    }
+
+    /// Records a working directory reported via OSC 7 (honoured in [`MarksMode::Claimed`] only).
+    pub fn on_cwd(&mut self, cwd: &str) {
+        if matches!(self.mode, MarksMode::Claimed) && !cwd.is_empty() {
+            self.last_cwd = Some(truncate_utf8(cwd, MAX_EVENT_STRING_BYTES));
+        }
     }
 
     /// Invalidates line coordinates across all stored commands when the screen epoch changes (reflow/alt-screen).
@@ -91,29 +114,25 @@ impl MarksTracker {
 
     /// Feeds an `OSC 133;<payload>` sequence (always unvouched).
     pub fn on_osc133(&mut self, payload: &str, cursor_line: u64, now: TimestampMs, effects: &mut Vec<MarkEffect>) {
-        self.handle_mark(payload, false, cursor_line, now, effects);
+        self.handle_claimed_mark(payload, cursor_line, now, effects);
     }
 
     /// Feeds an `OSC 633;<payload>` sequence.
     ///
-    /// Supported vouched prefix in [`MarksMode::Keyed`]: `V;<32-hex-key>;<rest>` where `<rest>` is
-    /// `A`, `C`, `D[;<code>]`, `E;<command>`, or `P;Cwd=<path>`.
+    /// Supported vouched forms in [`MarksMode::Keyed`]:
+    /// - `V;A;<seq>;<32-hex-key>` — prompt start (`seq > last_seq`)
+    /// - `V;S;<seq>;<32-hex-key>;<command>` — command start (`seq > last_seq`)
+    /// - `V;F;<seq>;<32-hex-key>;<status>;<cwd>` — command finish (`seq == active.id`)
+    ///
+    /// A `V;...` mark that fails validation increments [`Self::refused`] and is NEVER read as a claim.
     pub fn on_osc633(&mut self, payload: &str, cursor_line: u64, now: TimestampMs, effects: &mut Vec<MarkEffect>) {
         if let Some(after_v) = payload.strip_prefix("V;") {
-            if let Some((candidate, rest)) = after_v.split_once(';') {
-                let vouched = match self.mode {
-                    MarksMode::Keyed(expected) => {
-                        candidate.len() == 32 && ct_eq_32(expected.as_bytes(), &to_32(candidate.as_bytes()))
-                    }
-                    MarksMode::Claimed => false,
-                };
-                if vouched {
-                    self.handle_mark(rest, true, cursor_line, now, effects);
-                }
+            if !self.handle_vouched_mark(after_v, cursor_line, now, effects) {
+                self.refused += 1;
             }
             return;
         }
-        self.handle_mark(payload, false, cursor_line, now, effects);
+        self.handle_claimed_mark(payload, cursor_line, now, effects);
     }
 
     /// Finalizes any currently running command when the session process exits.
@@ -132,17 +151,132 @@ impl MarksTracker {
         }
     }
 
-    fn handle_mark(
+    fn handle_vouched_mark(
+        &mut self,
+        fields: &str,
+        cursor_line: u64,
+        now: TimestampMs,
+        effects: &mut Vec<MarkEffect>,
+    ) -> bool {
+        let MarksMode::Keyed(expected) = self.mode else {
+            return false;
+        };
+        let mut parts = fields.splitn(4, ';');
+        let (Some(kind), Some(seq_str), Some(carried)) = (parts.next(), parts.next(), parts.next()) else {
+            return false;
+        };
+        if carried.len() != 32 || !ct_eq_32(expected.as_bytes(), &to_32(carried.as_bytes())) {
+            return false;
+        }
+        let Some(seq) = parse_counted(seq_str) else {
+            return false;
+        };
+        let rest = parts.next();
+
+        match kind {
+            "A" => {
+                if rest.is_some() || seq <= self.last_seq {
+                    return false;
+                }
+                self.last_seq = seq;
+                self.pending_prompt_line = Some(cursor_line);
+                if self.active_index.is_none() {
+                    self.at_prompt = true;
+                    effects.push(MarkEffect::PromptArrived);
+                }
+                true
+            }
+            "S" => {
+                let Some(raw_cmd) = rest else {
+                    return false;
+                };
+                if seq <= self.last_seq {
+                    return false;
+                }
+                self.last_seq = seq;
+                if let Some(prev_idx) = self.active_index.take()
+                    && let Some(prev) = self.commands.get_mut(prev_idx)
+                {
+                    prev.finished_ms = Some(now.as_millis());
+                    prev.end_line = Some(cursor_line);
+                    prev.outcome = CommandOutcome::Unknown(UnknownReason::Superseded);
+                    effects.push(MarkEffect::CommandFinished(prev.clone()));
+                }
+                self.at_prompt = false;
+                let decoded = truncate_utf8(&unescape_osc633(raw_cmd), MAX_EVENT_STRING_BYTES);
+                let command = (!decoded.is_empty()).then_some(decoded);
+                let record = CommandRecord {
+                    id: seq,
+                    command,
+                    cwd: self.last_cwd.clone(),
+                    started_ms: Some(now.as_millis()),
+                    finished_ms: None,
+                    outcome: CommandOutcome::Running,
+                    prompt_line: self.pending_prompt_line.take(),
+                    output_line: Some(cursor_line),
+                    end_line: None,
+                };
+                self.push_command(record.clone());
+                effects.push(MarkEffect::CommandStarted(record));
+                true
+            }
+            "F" => {
+                let Some(rest_str) = rest else {
+                    return false;
+                };
+                let Some((status_str, raw_cwd)) = rest_str.split_once(';') else {
+                    return false;
+                };
+                let Some(idx) = self.active_index else {
+                    return false;
+                };
+                if self.commands.get(idx).map(|c| c.id) != Some(seq) {
+                    return false;
+                }
+                let outcome = if status_str.is_empty() {
+                    CommandOutcome::Unknown(UnknownReason::NoStatus)
+                } else {
+                    let Some(code) = parse_exit_status(status_str) else {
+                        return false;
+                    };
+                    CommandOutcome::Exited(VouchedExitCode::from_vouched(code))
+                };
+
+                self.active_index = None;
+                let new_cwd = if raw_cwd.is_empty() {
+                    None
+                } else {
+                    let decoded = truncate_utf8(&unescape_osc633(raw_cwd), MAX_EVENT_STRING_BYTES);
+                    (!decoded.is_empty()).then_some(decoded)
+                };
+                if let Some(cwd) = new_cwd.clone() {
+                    self.last_cwd = Some(cwd.clone());
+                    effects.push(MarkEffect::CwdChanged(cwd));
+                }
+                if let Some(cmd) = self.commands.get_mut(idx) {
+                    cmd.finished_ms = Some(now.as_millis());
+                    cmd.end_line = Some(cursor_line);
+                    cmd.outcome = outcome;
+                    effects.push(MarkEffect::CommandFinished(cmd.clone()));
+                }
+                self.at_prompt = true;
+                effects.push(MarkEffect::PromptArrived);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_claimed_mark(
         &mut self,
         payload: &str,
-        vouched: bool,
         cursor_line: u64,
         now: TimestampMs,
         effects: &mut Vec<MarkEffect>,
     ) {
         // In keyed mode, completely ignore unvouched control marks so hostile PTY output cannot
         // spoof prompts, command boundaries, or exit codes.
-        if matches!(self.mode, MarksMode::Keyed(_)) && !vouched {
+        if matches!(self.mode, MarksMode::Keyed(_)) {
             return;
         }
 
@@ -152,7 +286,6 @@ impl MarksTracker {
         };
         match kind {
             "A" => {
-                // Prompt start
                 self.pending_prompt_line = Some(cursor_line);
                 if self.active_index.is_none() {
                     self.at_prompt = true;
@@ -160,19 +293,17 @@ impl MarksTracker {
                 }
             }
             "E" => {
-                // Command line text (`E;<cmd>[;<nonce>]`)
                 if let Some(cmd_text) = parts.next() {
-                    let trimmed = unescape_osc633(cmd_text);
+                    let trimmed = truncate_utf8(&unescape_osc633(cmd_text), MAX_EVENT_STRING_BYTES);
                     if !trimmed.is_empty() {
                         self.pending_command = Some(trimmed);
                     }
                 }
             }
             "P" => {
-                // Property (`P;Cwd=<path>`)
                 for prop in parts {
                     if let Some(cwd) = prop.strip_prefix("Cwd=") {
-                        let decoded = unescape_osc633(cwd);
+                        let decoded = truncate_utf8(&unescape_osc633(cwd), MAX_EVENT_STRING_BYTES);
                         if !decoded.is_empty() {
                             self.last_cwd = Some(decoded.clone());
                             effects.push(MarkEffect::CwdChanged(decoded));
@@ -181,16 +312,12 @@ impl MarksTracker {
                 }
             }
             "C" => {
-                // Command execution started: supersede any still-running command first.
                 if let Some(prev_idx) = self.active_index.take()
                     && let Some(prev) = self.commands.get_mut(prev_idx)
                 {
                     prev.finished_ms = Some(now.as_millis());
                     prev.end_line = Some(cursor_line);
-                    prev.outcome = match self.mode {
-                        MarksMode::Keyed(_) => CommandOutcome::Unknown(UnknownReason::Superseded),
-                        MarksMode::Claimed => CommandOutcome::Claimed(None),
-                    };
+                    prev.outcome = CommandOutcome::Claimed(None);
                     effects.push(MarkEffect::CommandFinished(prev.clone()));
                 }
                 self.at_prompt = false;
@@ -207,29 +334,17 @@ impl MarksTracker {
                     output_line: Some(cursor_line),
                     end_line: None,
                 };
-                if self.commands.len() == MAX_COMMANDS {
-                    self.commands.pop_front();
-                }
-                self.commands.push_back(record.clone());
-                self.active_index = Some(self.commands.len() - 1);
+                self.push_command(record.clone());
                 effects.push(MarkEffect::CommandStarted(record));
             }
             "D" => {
-                // Command finished (`D` or `D;<exit_code>`)
-                let parsed_code = parts.next().and_then(|s| s.parse::<i32>().ok());
-                let outcome = match self.mode {
-                    MarksMode::Keyed(_) => match parsed_code {
-                        Some(code) => CommandOutcome::Exited(VouchedExitCode::from_vouched(code)),
-                        None => CommandOutcome::Unknown(UnknownReason::NoStatus),
-                    },
-                    MarksMode::Claimed => CommandOutcome::Claimed(parsed_code),
-                };
+                let parsed_code = parts.next().and_then(parse_exit_status);
                 if let Some(idx) = self.active_index.take()
                     && let Some(cmd) = self.commands.get_mut(idx)
                 {
                     cmd.finished_ms = Some(now.as_millis());
                     cmd.end_line = Some(cursor_line);
-                    cmd.outcome = outcome;
+                    cmd.outcome = CommandOutcome::Claimed(parsed_code);
                     effects.push(MarkEffect::CommandFinished(cmd.clone()));
                 }
                 self.at_prompt = true;
@@ -238,6 +353,32 @@ impl MarksTracker {
             _ => {}
         }
     }
+
+    fn push_command(&mut self, record: CommandRecord) {
+        if self.commands.len() == MAX_COMMANDS {
+            self.commands.pop_front();
+        }
+        self.commands.push_back(record);
+        self.active_index = Some(self.commands.len() - 1);
+    }
+}
+
+/// Strictly positive canonical decimal sequence number (no leading zero, no sign).
+fn parse_counted(text: &str) -> Option<u64> {
+    let bytes = text.as_bytes();
+    if bytes.is_empty() || bytes[0] == b'0' || !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+/// Strict decimal exit status (optional leading `-`, ASCII digits only).
+fn parse_exit_status(text: &str) -> Option<i32> {
+    let digits = text.strip_prefix('-').unwrap_or(text);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
 }
 
 fn to_32(bytes: &[u8]) -> [u8; 32] {
