@@ -210,20 +210,15 @@ where
                     return Ok(());
                 }
                 Ok(n) => {
-                    let (current, buffering) = {
+                    let current = {
                         let mut guard = writer_link.lock().unwrap_or_else(|e| e.into_inner());
-                        let buffering = should_buffer_replay(writer_saw.load(Ordering::Acquire), guard.reconnected);
-                        if buffering {
+                        if should_buffer_replay(writer_saw.load(Ordering::Acquire), guard.reconnected) {
                             guard.replay.push(&buf[..n]);
                         }
-                        (Arc::clone(&guard.stream), buffering)
+                        Arc::clone(&guard.stream)
                     };
                     let mut tx: &Stream = &current;
-                    if let Err(err) = tx.write_all(&buf[..n])
-                        && !buffering
-                    {
-                        return Err(err);
-                    }
+                    let _ = tx.write_all(&buf[..n]);
                 }
                 Err(err) => return Err(err),
             }

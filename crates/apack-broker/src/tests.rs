@@ -642,24 +642,28 @@ fn e2e_dumb_single_channel_proxy_splices_live_client() {
     drop(gclient);
     run_thread.join().unwrap().unwrap();
 
-    // connect_or_autostart_with: autostart=false fails without spawning, autostart=true retries until server binds,
-    // and autostart=true times out cleanly if spawner never binds.
+    // connect_or_autostart_with: autostart=false fails without spawning, autostart=true retries
+    // across an async broker startup delay until server binds, and times out cleanly if spawner never binds.
     let auto_ok_sock = unique_endpoint(tmp.path(), "e2e-auto-ok");
     let mut spawned_count = 0usize;
-    let mut bg_holder: Option<crate::BrokerHandle> = None;
+    let (bg_tx, bg_rx) = std::sync::mpsc::sync_channel::<crate::BrokerHandle>(1);
     let stream_auto = connect_or_autostart_with(&auto_ok_sock, true, Duration::from_secs(2), |path| {
         spawned_count += 1;
-        let mut scfg = BrokerConfig::for_socket(path);
-        scfg.shard_count = 1;
-        bg_holder = Some(BrokerServer::bind(scfg).unwrap().spawn().unwrap());
+        let p = path.to_owned();
+        let tx = bg_tx.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            let mut scfg = BrokerConfig::for_socket(&p);
+            scfg.shard_count = 1;
+            let _ = tx.send(BrokerServer::bind(scfg).unwrap().spawn().unwrap());
+        });
         Ok(())
     })
     .unwrap();
     assert_eq!(spawned_count, 1);
     drop(stream_auto);
-    if let Some(mut h) = bg_holder {
-        h.shutdown().unwrap();
-    }
+    let mut bg_handle = bg_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    bg_handle.shutdown().unwrap();
 
     let auto_timeout_sock = unique_endpoint(tmp.path(), "e2e-auto-timeout");
     let mut noauto_spawns = 0usize;

@@ -32,9 +32,9 @@ use apack_os::pty::{PtySpawnConfig, spawn_pty};
 use apack_os::pty_poller::{Interest, PollEvent, PollToken, PtyPoller, PtyWaker};
 #[cfg(windows)]
 use apack_os::pty_windows::ConPtyBridge;
-use apack_os::signal::{deliver_signal, signal_name_from_description};
 #[cfg(unix)]
-use apack_os::signal::{hang_up_session_descendants, kill_session_descendants};
+use apack_os::signal::hang_up_session_descendants;
+use apack_os::signal::{deliver_signal, kill_session_descendants, signal_name_from_description};
 use apack_os::tree::TreeGuard;
 use apack_proto::messages::{BrokerMsg, ClientMsg, FrameUpdate, SessionSummary, SpawnSpec};
 use apack_proto::types::{
