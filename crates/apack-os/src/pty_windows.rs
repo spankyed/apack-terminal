@@ -70,6 +70,7 @@ impl PauseGate {
         self.changed.notify_all();
     }
 
+    #[cfg(test)]
     fn is_paused(&self) -> bool {
         self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).paused
     }
