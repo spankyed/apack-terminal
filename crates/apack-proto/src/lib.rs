@@ -12,7 +12,10 @@
 //! non-FIN frame has `body_len == 10 + payload_len` (`10..=10 + MAX_FRAME_PAYLOAD`), so empty-payload
 //! messages never collide with `FIN`.
 
+#![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
+
+extern crate alloc;
 
 pub mod codec;
 pub mod frame;
@@ -34,8 +37,14 @@ pub const MAX_FRAME_PAYLOAD: usize = 8_388_608;
 /// Chunk size used to fair-queue bulk payloads (`ImageBlob`, `FetchRows`) across multiplexed streams (64 KiB).
 pub const BULK_CHUNK_BYTES: usize = 65_536;
 
-/// Universal 4-byte end-of-input sentinel frame (`payload_len == 0`).
+/// Universal 4-byte end-of-input sentinel frame (`body_len == 0`).
 pub const FIN_FRAME: [u8; 4] = [0, 0, 0, 0];
+
+/// Maximum terminal grid columns accepted by the protocol.
+pub const MAX_GRID_COLS: u16 = 1_000;
+
+/// Maximum terminal grid rows accepted by the protocol.
+pub const MAX_GRID_ROWS: u16 = 1_000;
 
 /// Maximum rows returned in a single `FetchRows` response.
 pub const MAX_ROWS_PER_FETCH: u32 = 2_000;

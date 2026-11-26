@@ -1,9 +1,11 @@
 //! Correct-by-construction domain types shared across the broker core and wire protocol.
 
-use std::num::{NonZeroI32, NonZeroU16, NonZeroU64};
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::num::{NonZeroI32, NonZeroU16, NonZeroU32, NonZeroU64};
 
-use crate::MAX_LEASE_GRACE_MS;
 use crate::codec::{Reader, WireError, Writer};
+use crate::{MAX_GRID_COLS, MAX_GRID_ROWS, MAX_LEASE_GRACE_MS};
 
 /// Non-zero session identifier assigned by the broker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -53,6 +55,36 @@ impl StreamId {
     }
 }
 
+/// Non-zero multiplexed stream identifier (`>= 1`), making [`StreamId::CONTROL`] unrepresentable
+/// in session-bound messages (`Attach`, `Detach`, `Attached`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NonZeroStreamId(NonZeroU32);
+
+impl NonZeroStreamId {
+    /// Creates a `NonZeroStreamId`, returning `None` for `0` (`StreamId::CONTROL`).
+    pub fn new(raw: u32) -> Option<Self> {
+        NonZeroU32::new(raw).map(Self)
+    }
+
+    /// Returns the raw non-zero `u32`.
+    pub const fn raw(self) -> u32 {
+        self.0.get()
+    }
+
+    /// Widens into a [`StreamId`].
+    pub const fn as_stream_id(self) -> StreamId {
+        StreamId(self.0.get())
+    }
+
+    pub(crate) fn encode(self, w: &mut Writer) {
+        w.u32(self.0.get());
+    }
+
+    pub(crate) fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
+        Self::new(r.u32()?).ok_or(WireError::InvalidValue("stream id must be non-zero"))
+    }
+}
+
 /// Per-connection request correlation identifier (`0` marks unsolicited push events).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RequestId(u32);
@@ -85,9 +117,9 @@ impl RequestId {
 pub struct SignalTarget(NonZeroI32);
 
 impl SignalTarget {
-    /// Constructs a `SignalTarget` iff `pid > 0`.
+    /// Constructs a `SignalTarget` iff `pid >= 1`.
     pub fn new(pid: i32) -> Option<Self> {
-        if pid <= 0 {
+        if pid < 1 {
             return None;
         }
         NonZeroI32::new(pid).map(Self)
@@ -211,7 +243,7 @@ impl MarksKey {
     /// Returns the key as a `&str`.
     pub fn as_str(&self) -> &str {
         // Every byte was validated as ASCII hex in `parse`.
-        std::str::from_utf8(&self.0).expect("MarksKey is valid ASCII hex")
+        core::str::from_utf8(&self.0).expect("MarksKey is valid ASCII hex")
     }
 
     pub(crate) fn encode(&self, w: &mut Writer) {
@@ -224,8 +256,8 @@ impl MarksKey {
     }
 }
 
-impl std::fmt::Debug for MarksKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for MarksKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("MarksKey([REDACTED])")
     }
 }
@@ -377,8 +409,11 @@ pub struct GridSize {
 }
 
 impl GridSize {
-    /// Constructs a `GridSize`, returning `None` if either dimension is zero.
+    /// Constructs a `GridSize`, returning `None` if either dimension is zero or exceeds protocol bounds.
     pub fn new(cols: u16, rows: u16) -> Option<Self> {
+        if cols > MAX_GRID_COLS || rows > MAX_GRID_ROWS {
+            return None;
+        }
         Some(Self { cols: NonZeroU16::new(cols)?, rows: NonZeroU16::new(rows)? })
     }
 
@@ -390,7 +425,7 @@ impl GridSize {
     pub(crate) fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
         let cols = r.u16()?;
         let rows = r.u16()?;
-        Self::new(cols, rows).ok_or(WireError::InvalidValue("grid dimensions must be non-zero"))
+        Self::new(cols, rows).ok_or(WireError::InvalidValue("grid dimensions out of range"))
     }
 }
 
@@ -430,9 +465,15 @@ impl SubFlags {
     /// Mask of all defined bits.
     pub const ALL_MASK: u8 = 0x0F;
 
-    /// Constructs `SubFlags`, rejecting unknown reserved bits.
+    /// Constructs `SubFlags`, rejecting unknown reserved bits and `BACKPRESSURE_PTY` without `RAW_OUTPUT`.
     pub fn from_bits(bits: u8) -> Option<Self> {
-        if bits & !Self::ALL_MASK != 0 { None } else { Some(Self(bits)) }
+        if bits > Self::ALL_MASK {
+            return None;
+        }
+        if bits & Self::BACKPRESSURE_PTY != 0 && bits & Self::RAW_OUTPUT == 0 {
+            return None;
+        }
+        Some(Self(bits))
     }
 
     /// Returns raw flag bits.
@@ -454,16 +495,60 @@ impl SubFlags {
     }
 }
 
-/// Lifetime ownership lease held by a connection.
+/// Validated non-zero lease reconnect grace duration in milliseconds (`1..=MAX_LEASE_GRACE_MS`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LeaseGraceMs(NonZeroU32);
+
+impl LeaseGraceMs {
+    /// Constructs a `LeaseGraceMs` iff `1 <= ms <= MAX_LEASE_GRACE_MS`.
+    pub fn new(ms: u32) -> Option<Self> {
+        if ms > MAX_LEASE_GRACE_MS {
+            return None;
+        }
+        NonZeroU32::new(ms).map(Self)
+    }
+
+    /// Returns the grace duration in milliseconds.
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+/// Opaque 32-byte bearer token used to resume an in-grace remote broker lease.
+///
+/// Redacts itself in [`core::fmt::Debug`] so bearer secrets cannot leak into diagnostic logs.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResumeToken([u8; 32]);
+
+impl ResumeToken {
+    /// Wraps a 32-byte reconnect token.
+    pub const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the raw 32-byte token.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl core::fmt::Debug for ResumeToken {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("ResumeToken([REDACTED])")
+    }
+}
+
+/// Lifetime ownership lease held by a connection — invalid combinations are unrepresentable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseKind {
-    /// Holds all non-kept broker sessions alive. `grace_ms == 0` tears down immediately on EOF;
-    /// `grace_ms > 0` (capped at [`MAX_LEASE_GRACE_MS`]) allows a remote reconnect with `resume_token`.
-    Broker {
-        /// Milliseconds to hold the lease after disconnect before teardown (`0..=300_000`).
-        grace_ms: u32,
-        /// 32-byte opaque reconnect token (required when `grace_ms > 0`).
-        resume_token: Option<[u8; 32]>,
+    /// Holds all non-kept broker sessions alive; tears down immediately on connection EOF (local default).
+    BrokerImmediate,
+    /// Holds all non-kept broker sessions alive with opt-in reconnect grace (e.g. remote SSH).
+    BrokerGrace {
+        /// Milliseconds to hold the lease after disconnect before teardown (`1..=MAX_LEASE_GRACE_MS`).
+        grace_ms: LeaseGraceMs,
+        /// 32-byte opaque reconnect bearer token.
+        resume_token: ResumeToken,
     },
     /// Pins one specific session (e.g., `Rewind` or ephemeral tool) to this connection.
     Session(SessionId),
@@ -472,13 +557,14 @@ pub enum LeaseKind {
 impl LeaseKind {
     pub(crate) fn encode(&self, w: &mut Writer) {
         match *self {
-            Self::Broker { grace_ms, resume_token } => {
-                w.u8(0);
-                w.var_u32(grace_ms);
-                w.opt(resume_token.as_ref(), |w, t| w.raw(t));
+            Self::BrokerImmediate => w.u8(0),
+            Self::BrokerGrace { grace_ms, resume_token } => {
+                w.u8(1);
+                w.var_u32(grace_ms.get());
+                w.raw(resume_token.as_bytes());
             }
             Self::Session(id) => {
-                w.u8(1);
+                w.u8(2);
                 id.encode(w);
             }
         }
@@ -486,18 +572,14 @@ impl LeaseKind {
 
     pub(crate) fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
         match r.u8()? {
-            0 => {
-                let grace_ms = r.var_u32()?;
-                if grace_ms > MAX_LEASE_GRACE_MS {
-                    return Err(WireError::LimitExceeded("lease grace_ms"));
-                }
-                let resume_token = r.opt(|r| r.fixed::<32>())?;
-                if grace_ms > 0 && resume_token.is_none() {
-                    return Err(WireError::InvalidValue("grace_ms > 0 requires resume_token"));
-                }
-                Ok(Self::Broker { grace_ms, resume_token })
+            0 => Ok(Self::BrokerImmediate),
+            1 => {
+                let raw_ms = r.var_u32()?;
+                let grace_ms = LeaseGraceMs::new(raw_ms).ok_or(WireError::LimitExceeded("lease grace_ms"))?;
+                let resume_token = ResumeToken::new(r.fixed::<32>()?);
+                Ok(Self::BrokerGrace { grace_ms, resume_token })
             }
-            1 => Ok(Self::Session(SessionId::decode(r)?)),
+            2 => Ok(Self::Session(SessionId::decode(r)?)),
             other => Err(WireError::InvalidTag { kind: "LeaseKind", tag: u16::from(other) }),
         }
     }
@@ -812,8 +894,21 @@ impl ImagePiece {
         let blob = BlobHash::decode(r)?;
         let col_start = r.u16()?;
         let col_len = r.u16()?;
+        if col_len == 0 || col_start.checked_add(col_len).is_none() {
+            return Err(WireError::InvalidValue("invalid ImagePiece column span"));
+        }
         let src_rect = [r.var_u32()?, r.var_u32()?, r.var_u32()?, r.var_u32()?];
+        if src_rect[2] == 0
+            || src_rect[3] == 0
+            || src_rect[0].checked_add(src_rect[2]).is_none()
+            || src_rect[1].checked_add(src_rect[3]).is_none()
+        {
+            return Err(WireError::InvalidValue("invalid ImagePiece src_rect"));
+        }
         let dst_px = [r.var_u32()?, r.var_u32()?];
+        if dst_px[0] == 0 || dst_px[1] == 0 {
+            return Err(WireError::InvalidValue("invalid ImagePiece dst_px"));
+        }
         Ok(Self { blob, col_start, col_len, src_rect, dst_px })
     }
 }
@@ -851,6 +946,9 @@ impl PackedRun {
     pub(crate) fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
         let col_start = r.u16()?;
         let col_len = r.u16()?;
+        if col_len == 0 || col_start.checked_add(col_len).is_none() {
+            return Err(WireError::InvalidValue("invalid PackedRun column span"));
+        }
         let byte_offset = r.var_u32()?;
         let byte_len = r.var_u32()?;
         let style_idx = r.u16()?;
@@ -877,6 +975,33 @@ pub struct PackedStyle {
 }
 
 impl PackedStyle {
+    /// Bold attribute bit.
+    pub const FLAG_BOLD: u32 = 0x0001;
+    /// Italic attribute bit.
+    pub const FLAG_ITALIC: u32 = 0x0002;
+    /// 3-bit underline style field (bits 2..=4, values `0..=5`: none, single, double, curly, dotted, dashed).
+    pub const FLAG_UNDERLINE_MASK: u32 = 0x001C;
+    /// Maximum valid shifted underline value (`5 << 2 = 0x14`).
+    pub const FLAG_UNDERLINE_MAX: u32 = 0x0014;
+    /// Strikethrough attribute bit.
+    pub const FLAG_STRIKETHROUGH: u32 = 0x0020;
+    /// Blink attribute bit.
+    pub const FLAG_BLINK: u32 = 0x0040;
+    /// Inverse video attribute bit.
+    pub const FLAG_INVERSE: u32 = 0x0080;
+    /// Invisible text attribute bit.
+    pub const FLAG_INVISIBLE: u32 = 0x0100;
+    /// Faint/dim attribute bit.
+    pub const FLAG_FAINT: u32 = 0x0200;
+    /// Mask of all defined style attribute bits.
+    pub const ALL_FLAGS_MASK: u32 = 0x03FF;
+
+    /// Returns `true` iff `color` is a valid packed colour (`0` default, `1..=256` palette+1,
+    /// or `0x01_00_00_00..=0x01_FF_FF_FF` RGB).
+    pub const fn is_valid_color(color: u32) -> bool {
+        color <= 256 || (color >= 0x01_00_00_00 && color <= 0x01_FF_FF_FF)
+    }
+
     pub(crate) fn encode(&self, w: &mut Writer) {
         w.u32(self.fg);
         w.u32(self.bg);
@@ -885,7 +1010,17 @@ impl PackedStyle {
     }
 
     pub(crate) fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
-        Ok(Self { fg: r.u32()?, bg: r.u32()?, underline_color: r.u32()?, flags: r.u32()? })
+        let fg = r.u32()?;
+        let bg = r.u32()?;
+        let underline_color = r.u32()?;
+        let flags = r.u32()?;
+        if !Self::is_valid_color(fg) || !Self::is_valid_color(bg) || !Self::is_valid_color(underline_color) {
+            return Err(WireError::InvalidValue("invalid PackedStyle colour encoding"));
+        }
+        if flags & !Self::ALL_FLAGS_MASK != 0 || (flags & Self::FLAG_UNDERLINE_MASK) > Self::FLAG_UNDERLINE_MAX {
+            return Err(WireError::InvalidValue("invalid PackedStyle flags"));
+        }
+        Ok(Self { fg, bg, underline_color, flags })
     }
 }
 
@@ -918,6 +1053,16 @@ impl PackedRow {
     /// Row contains Kitty Unicode placeholder cells.
     pub const FLAG_HAS_PLACEHOLDER: u8 = 0x08;
 
+    /// Safely resolves `style_idx`, returning [`PackedStyle::default`] for index `0` even when `styles` is omitted.
+    pub fn style(&self, idx: u16) -> PackedStyle {
+        self.styles.get(usize::from(idx)).copied().unwrap_or_default()
+    }
+
+    /// Safely resolves `link_idx`, returning `""` for index `0` even when `links` is omitted.
+    pub fn link(&self, idx: u16) -> &str {
+        self.links.get(usize::from(idx)).map(String::as_str).unwrap_or("")
+    }
+
     pub(crate) fn encode(&self, w: &mut Writer) {
         w.var_u64(self.line);
         w.u8(self.flags);
@@ -937,8 +1082,17 @@ impl PackedRow {
         let text = r.str()?;
         let runs = r.vec_bounded(4096, "packed runs", PackedRun::decode)?;
         let styles = r.vec_bounded(4096, "packed styles", PackedStyle::decode)?;
+        if styles.first().is_some_and(|s| *s != PackedStyle::default()) {
+            return Err(WireError::InvalidValue("styles[0] must be default style"));
+        }
         let links = r.vec_bounded(1024, "packed links", Reader::str)?;
+        if links.first().is_some_and(|l| !l.is_empty()) {
+            return Err(WireError::InvalidValue("links[0] must be empty"));
+        }
         let pieces = r.vec_bounded(1024, "image pieces", ImagePiece::decode)?;
+        if !pieces.is_empty() && (flags & Self::FLAG_HAS_PLACEHOLDER == 0) {
+            return Err(WireError::InvalidValue("pieces require FLAG_HAS_PLACEHOLDER"));
+        }
         // Validate every run's byte range and table indices up front (parse, don't validate later!).
         for run in &runs {
             let start = run.byte_offset as usize;
@@ -1225,6 +1379,9 @@ impl StatusRecord {
         let id = r.str()?;
         let state = StatusState::decode(r)?;
         let kind = r.opt(BlockedKind::decode)?;
+        if state != StatusState::Blocked && kind.is_some() {
+            return Err(WireError::InvalidValue("status kind requires Blocked state"));
+        }
         let progress = r.opt(|r| {
             let p = r.u8()?;
             if p > 100 { Err(WireError::InvalidValue("progress must be 0..=100")) } else { Ok(p) }
@@ -1335,8 +1492,14 @@ impl KeyInput {
         let code = r.str()?;
         let action = KeyAction::decode(r)?;
         let modifiers = r.u8()?;
+        if modifiers > 0x3F {
+            return Err(WireError::InvalidValue("unknown KeyInput modifier bits"));
+        }
         let text = r.str()?;
         let unshifted_codepoint = r.var_u32()?;
+        if unshifted_codepoint != 0 && char::from_u32(unshifted_codepoint).is_none() {
+            return Err(WireError::InvalidValue("invalid Unicode scalar codepoint"));
+        }
         let composed = r.bool()?;
         Ok(Self { code, action, modifiers, text, unshifted_codepoint, composed })
     }
@@ -1409,14 +1572,16 @@ impl PointerInput {
     }
 
     pub(crate) fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
-        Ok(Self {
-            action: PointerAction::decode(r)?,
-            button: r.u8()?,
-            modifiers: r.u8()?,
-            x_px: r.var_u32()?,
-            y_px: r.var_u32()?,
-            cell_px: CellPx::decode(r)?,
-        })
+        let action = PointerAction::decode(r)?;
+        let button = r.u8()?;
+        if button > 2 && button != 255 {
+            return Err(WireError::InvalidValue("invalid PointerInput button"));
+        }
+        let modifiers = r.u8()?;
+        if modifiers > 0x3F {
+            return Err(WireError::InvalidValue("unknown PointerInput modifier bits"));
+        }
+        Ok(Self { action, button, modifiers, x_px: r.var_u32()?, y_px: r.var_u32()?, cell_px: CellPx::decode(r)? })
     }
 }
 
@@ -1476,8 +1641,20 @@ impl WaitCondition {
     pub(crate) fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
         match r.u8()? {
             0 => Ok(Self::Idle),
-            1 => Ok(Self::Text(r.str()?)),
-            2 => Ok(Self::Status(r.vec_bounded(8, "wait states", StatusState::decode)?)),
+            1 => {
+                let needle = r.str()?;
+                if needle.is_empty() {
+                    return Err(WireError::InvalidValue("wait text needle must be non-empty"));
+                }
+                Ok(Self::Text(needle))
+            }
+            2 => {
+                let states = r.vec_bounded(8, "wait states", StatusState::decode)?;
+                if states.is_empty() {
+                    return Err(WireError::InvalidValue("wait status list must be non-empty"));
+                }
+                Ok(Self::Status(states))
+            }
             3 => Ok(Self::Exit),
             other => Err(WireError::InvalidTag { kind: "WaitCondition", tag: u16::from(other) }),
         }

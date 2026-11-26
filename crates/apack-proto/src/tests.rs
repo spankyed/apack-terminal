@@ -10,14 +10,14 @@ use crate::messages::{
 use crate::types::{
     BlobHash, BlockedKind, CellPos, CellPx, CellSpan, CommandOutcome, CommandRecord, Confirmed, CursorShape,
     CursorState, ErrorCode, ForegroundProcess, FrameCredit, GridSize, ImageEncoding, ImagePiece, ImagePlacement,
-    KeyAction, KeyInput, LeaseKind, MarksKey, MetricsSnapshot, PackedRow, PackedRun, PackedStyle, PaletteOverrides,
-    PasteOutcome, PointerAction, PointerInput, ProgressState, RequestId, ResizePolicy, Rgb, SessionId, SignalKind,
-    SignalScope, SignalTarget, StatusRecord, StatusState, StreamId, SubFlags, UnknownReason, ViewModes, ViewportHint,
-    VouchedExitCode, WaitCondition, WaitOutcome,
+    KeyAction, KeyInput, LeaseGraceMs, LeaseKind, MarksKey, MetricsSnapshot, NonZeroStreamId, PackedRow, PackedRun,
+    PackedStyle, PaletteOverrides, PasteOutcome, PointerAction, PointerInput, ProgressState, RequestId, ResizePolicy,
+    ResumeToken, Rgb, SessionId, SignalKind, SignalScope, SignalTarget, StatusRecord, StatusState, StreamId, SubFlags,
+    UnknownReason, ViewModes, ViewportHint, VouchedExitCode, WaitCondition, WaitOutcome,
 };
 use crate::{
-    BULK_CHUNK_BYTES, FIN_FRAME, FRAME_HEADER_LEN, MAX_BLOB_BYTES, MAX_FRAME_PAYLOAD, MAX_LEASE_GRACE_MS,
-    MAX_ROWS_PER_FETCH, MAX_STRING_BYTES, MAX_VEC_ITEMS, PROTOCOL_VERSION,
+    BULK_CHUNK_BYTES, FIN_FRAME, FRAME_HEADER_LEN, MAX_BLOB_BYTES, MAX_FRAME_PAYLOAD, MAX_GRID_COLS, MAX_GRID_ROWS,
+    MAX_LEASE_GRACE_MS, MAX_ROWS_PER_FETCH, MAX_STRING_BYTES, MAX_VEC_ITEMS, PROTOCOL_VERSION,
 };
 
 fn sample_key() -> MarksKey {
@@ -30,6 +30,10 @@ fn sample_grid() -> GridSize {
 
 fn sample_sid(n: u64) -> SessionId {
     SessionId::new(n).expect("non-zero sid")
+}
+
+fn sample_nz_stream(n: u32) -> NonZeroStreamId {
+    NonZeroStreamId::new(n).expect("non-zero stream id")
 }
 
 fn sample_pid(n: i32) -> SignalTarget {
@@ -98,7 +102,7 @@ fn sample_status(state: StatusState, kind: Option<BlockedKind>, confirmed: Confi
 
 fn all_client_messages() -> Vec<ClientMsg> {
     let sid = sample_sid(7);
-    let stream = StreamId::from_raw(3);
+    let stream = sample_nz_stream(3);
     let hint =
         ViewportHint { size: sample_grid(), cell_px: CellPx { width: 9, height: 18 }, visible: true, focused: true };
     let credit = FrameCredit { max_frames: 2, max_bytes: 256 * 1024 };
@@ -111,7 +115,12 @@ fn all_client_messages() -> Vec<ClientMsg> {
             client_name: "view-v2".to_owned(),
         },
         ClientMsg::AuthProof { hmac: [0xCD; 32] },
-        ClientMsg::AcquireLease { kind: LeaseKind::Broker { grace_ms: 30_000, resume_token: Some([0x11; 32]) } },
+        ClientMsg::AcquireLease {
+            kind: LeaseKind::BrokerGrace {
+                grace_ms: LeaseGraceMs::new(30_000).unwrap(),
+                resume_token: ResumeToken::new([0x11; 32]),
+            },
+        },
         ClientMsg::ReleaseLease { lease_id: 55 },
         ClientMsg::Spawn(Box::new(SpawnSpec {
             argv: vec!["/bin/zsh".to_owned(), "-l".to_owned()],
@@ -191,8 +200,9 @@ fn all_client_messages() -> Vec<ClientMsg> {
 
 fn all_broker_messages() -> Vec<BrokerMsg> {
     let sid = sample_sid(7);
-    let stream = StreamId::from_raw(3);
+    let stream = sample_nz_stream(3);
     let span = CellSpan { start: CellPos { line: 2, col: 0 }, end: CellPos { line: 2, col: 8 } };
+    let delta_span = CellSpan { start: CellPos { line: 10, col: 0 }, end: CellPos { line: 19, col: 4 } };
     let fg = ForegroundProcess { pid: sample_pid(900), name: Some("vim".to_owned()) };
 
     vec![
@@ -267,7 +277,7 @@ fn all_broker_messages() -> Vec<BrokerMsg> {
         BrokerMsg::SpanReply { span: Some(span) },
         BrokerMsg::TextReply { text: "selected".to_owned() },
         BrokerMsg::SearchMatches { epoch: 2, matches: vec![span], truncated: true },
-        BrokerMsg::SearchDelta { epoch: 2, from_line: 10, to_line: 20, added: vec![span], truncated: false },
+        BrokerMsg::SearchDelta { epoch: 2, from_line: 10, to_line: 20, added: vec![delta_span], truncated: false },
         BrokerMsg::CommandsReply {
             commands: vec![
                 sample_command(CommandOutcome::Running),
@@ -392,6 +402,11 @@ fn frame_decoder_splits_multi_frames_fin_and_bounds() {
     // Extra trailing bytes after FIN should be ignored once closed
     wire.extend_from_slice(&[1, 2, 3]);
 
+    // Empty input slice does nothing
+    let mut empty_dec = FrameDecoder::new();
+    assert_eq!(empty_dec.step(&[]), Ok((0, None)));
+    assert!(!empty_dec.is_closed());
+
     for chunk_size in [1, 2, 3, 5, 7, 14, 100] {
         let mut dec = FrameDecoder::new();
         let mut frames = Vec::new();
@@ -408,18 +423,21 @@ fn frame_decoder_splits_multi_frames_fin_and_bounds() {
         }
         assert!(dec.is_closed());
         assert_eq!(frames.len(), 3);
-        assert_eq!(
-            frames[0],
-            DecodedFrame::Frame {
-                header: FrameHeader {
+        if let DecodedFrame::Frame { header, payload } = &frames[0] {
+            assert_eq!(
+                *header,
+                FrameHeader {
                     stream_id: StreamId::CONTROL,
                     msg_type: msg_type::LIST_SESSIONS,
                     req_id: RequestId::from_raw(1),
                     payload_len: 0,
-                },
-                payload: Vec::new(),
-            }
-        );
+                }
+            );
+            assert!(payload.is_empty());
+            assert_eq!(payload.capacity(), 0);
+        } else {
+            panic!("expected empty-payload frame");
+        }
         assert_eq!(
             frames[1],
             DecodedFrame::Frame {
@@ -446,11 +464,12 @@ fn frame_decoder_splits_multi_frames_fin_and_bounds() {
         Err(WireError::FrameTooLarge((MAX_FRAME_PAYLOAD + 1) as u32))
     );
 
-    // body_len in 1..10 is rejected and closes the decoder
+    // body_len in 1..10 is rejected, closes the decoder, and subsequent bytes are ignored
     for bad_len in [1u32, 9] {
         let mut dec = FrameDecoder::new();
         assert_eq!(dec.step(&bad_len.to_le_bytes()), Err(WireError::InvalidValue("frame shorter than header")));
         assert!(dec.is_closed());
+        assert_eq!(dec.step(&[1, 2, 3]), Ok((3, None)));
     }
 
     // body_len == MAX_BODY_LEN is accepted as in-progress; +1 is rejected
@@ -519,7 +538,9 @@ fn codec_primitives_varints_bounds_and_display() {
     assert_eq!(r.remaining(), 0);
     assert_eq!(r.finish(), Ok(()));
 
-    // Varint overflow boundaries
+    // Canonical varint enforcement & overflow boundaries
+    assert_eq!(Reader::new(&[0x80, 0x00]).var_u32(), Err(WireError::InvalidValue("non-canonical varint")));
+    assert_eq!(Reader::new(&[0x80, 0x00]).var_u64(), Err(WireError::InvalidValue("non-canonical varint")));
     assert_eq!(Reader::new(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]).var_u32(), Ok(u32::MAX));
     assert_eq!(Reader::new(&[0xFF, 0xFF, 0xFF, 0xFF, 0x10]).var_u32(), Err(WireError::VarintOverflow));
     assert_eq!(Reader::new(&[0x80, 0x80, 0x80, 0x80, 0x80]).var_u32(), Err(WireError::VarintOverflow));
@@ -560,7 +581,6 @@ fn codec_primitives_varints_bounds_and_display() {
         Reader::new(w_vec.as_slice()).vec_bounded(MAX_VEC_ITEMS + 100, "items", Reader::u8),
         Err(WireError::LimitExceeded("items"))
     );
-    // Hostile count within MAX_VEC_ITEMS with 0 bytes left hits UnexpectedEof cleanly
     let mut w_hostile = Writer::new();
     w_hostile.var_u32(MAX_VEC_ITEMS as u32);
     assert_eq!(
@@ -591,33 +611,38 @@ fn domain_invariants_reject_illegal_values() {
     assert_eq!(SessionId::new(9).unwrap().get(), 9);
     assert_eq!(ClientMsg::decode(msg_type::KILL, &[0]), Err(WireError::InvalidValue("zero session id")));
 
-    // StreamId & RequestId helpers
+    // StreamId, NonZeroStreamId, RequestId helpers
     assert!(StreamId::CONTROL.is_control());
     assert!(!StreamId::from_raw(1).is_control());
+    assert!(NonZeroStreamId::new(0).is_none());
+    let nz = NonZeroStreamId::new(5).unwrap();
+    assert_eq!(nz.raw(), 5);
+    assert_eq!(nz.as_stream_id(), StreamId::from_raw(5));
     assert!(RequestId::PUSH.is_push());
     assert!(!RequestId::from_raw(1).is_push());
 
-    // Attach / Detach / Attached forbid StreamId::CONTROL (0)
+    // Attach / Detach / Attached reject stream_id == 0 on wire
     let mut w = Writer::new();
     sample_sid(1).encode(&mut w);
     w.u32(0);
     assert_eq!(
         ClientMsg::decode(msg_type::ATTACH, w.as_slice()),
-        Err(WireError::InvalidValue("attach stream_id must be non-zero"))
+        Err(WireError::InvalidValue("stream id must be non-zero"))
     );
     assert_eq!(
         ClientMsg::decode(msg_type::DETACH, &0u32.to_le_bytes()),
-        Err(WireError::InvalidValue("detach stream_id must be non-zero"))
+        Err(WireError::InvalidValue("stream id must be non-zero"))
     );
     assert_eq!(
         BrokerMsg::decode(msg_type::ATTACHED, w.as_slice()),
-        Err(WireError::InvalidValue("attached stream_id must be non-zero"))
+        Err(WireError::InvalidValue("stream id must be non-zero"))
     );
 
-    // SignalTarget forbids <= 0
+    // SignalTarget forbids < 1; test 1 and 42 explicitly
     assert!(SignalTarget::new(0).is_none());
     assert!(SignalTarget::new(-1).is_none());
     assert!(SignalTarget::new(i32::MIN).is_none());
+    assert_eq!(SignalTarget::new(1).unwrap().pid(), 1);
     assert_eq!(SignalTarget::new(42).unwrap().pid(), 42);
     let mut w = Writer::new();
     sample_sid(1).encode(&mut w);
@@ -627,7 +652,7 @@ fn domain_invariants_reject_illegal_values() {
         Err(WireError::InvalidValue("signal target pid must be > 0"))
     );
 
-    // MarksKey parsing + redacted Debug
+    // MarksKey parsing, wire decode rejection, and redacted Debug
     assert!(MarksKey::parse(b"short").is_none());
     assert!(MarksKey::parse(b"0123456789ABCDEF0123456789abcdef").is_none());
     assert!(MarksKey::parse(b"0123456789abcdef0123456789abcdeg").is_none());
@@ -635,29 +660,57 @@ fn domain_invariants_reject_illegal_values() {
     assert_eq!(key.as_str(), "0123456789abcdef0123456789abcdef");
     assert_eq!(key.as_bytes(), b"0123456789abcdef0123456789abcdef");
     assert_eq!(format!("{key:?}"), "MarksKey([REDACTED])");
+    let mut w = Writer::new();
+    w.var_u32(0); // argv
+    w.u8(0); // cwd
+    w.var_u32(0); // env
+    sample_grid().encode(&mut w);
+    CellPx::default().encode(&mut w);
+    w.var_u32(0); // scrollback
+    w.u8(1); // marks_key = Some
+    w.raw(&[b'Z'; 32]); // invalid uppercase non-hex
+    assert_eq!(
+        ClientMsg::decode(msg_type::SPAWN, w.as_slice()),
+        Err(WireError::InvalidValue("marks key must be 32 lowercase hex chars"))
+    );
 
-    // GridSize forbids 0 cols or 0 rows
+    // GridSize bounds (1..=MAX_GRID_COLS, 1..=MAX_GRID_ROWS)
     assert!(GridSize::new(0, 10).is_none());
     assert!(GridSize::new(10, 0).is_none());
+    assert!(GridSize::new(MAX_GRID_COLS + 1, 1).is_none());
+    assert!(GridSize::new(1, MAX_GRID_ROWS + 1).is_none());
+    assert!(GridSize::new(1, 1).is_some());
+    assert!(GridSize::new(MAX_GRID_COLS, MAX_GRID_ROWS).is_some());
     let mut w = Writer::new();
-    w.u16(0);
+    w.u16(MAX_GRID_COLS + 1);
     w.u16(24);
     assert_eq!(
         ClientMsg::decode(msg_type::EXPLICIT_RESIZE, w.as_slice()),
-        Err(WireError::InvalidValue("grid dimensions must be non-zero"))
+        Err(WireError::InvalidValue("grid dimensions out of range"))
     );
 
-    // SubFlags
+    // SubFlags (reserved bits and BACKPRESSURE_PTY without RAW_OUTPUT)
     assert_eq!(SubFlags::VIEW, 0x01);
     assert_eq!(SubFlags::EVENTS, 0x02);
     assert_eq!(SubFlags::RAW_OUTPUT, 0x04);
     assert_eq!(SubFlags::BACKPRESSURE_PTY, 0x08);
     assert_eq!(SubFlags::ALL_MASK, 0x0F);
+    assert!(SubFlags::from_bits(0x00).is_some());
     assert!(SubFlags::from_bits(0x10).is_none());
+    assert!(SubFlags::from_bits(SubFlags::BACKPRESSURE_PTY).is_none());
+    assert!(SubFlags::from_bits(SubFlags::BACKPRESSURE_PTY | SubFlags::RAW_OUTPUT).is_some());
     let flags = SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap();
     assert_eq!(flags.bits(), 0x03);
     assert!(flags.contains(SubFlags::VIEW));
     assert!(!flags.contains(SubFlags::RAW_OUTPUT));
+    let mut w = Writer::new();
+    sample_sid(1).encode(&mut w);
+    sample_nz_stream(1).encode(&mut w);
+    w.u8(0x10);
+    assert_eq!(
+        ClientMsg::decode(msg_type::ATTACH, w.as_slice()),
+        Err(WireError::InvalidValue("unknown SubFlags bits"))
+    );
 
     // PackedRow flag constants
     assert_eq!(PackedRow::FLAG_WRAPPED, 0x01);
@@ -665,42 +718,36 @@ fn domain_invariants_reject_illegal_values() {
     assert_eq!(PackedRow::FLAG_HAS_BLINK, 0x04);
     assert_eq!(PackedRow::FLAG_HAS_PLACEHOLDER, 0x08);
 
-    // LeaseKind invariants
-    let ok_zero = ClientMsg::AcquireLease { kind: LeaseKind::Broker { grace_ms: 0, resume_token: None } };
-    let mut w = Writer::new();
-    ok_zero.encode(&mut w);
-    assert_eq!(ClientMsg::decode(msg_type::ACQUIRE_LEASE, w.as_slice()), Ok(ok_zero));
+    // LeaseGraceMs, ResumeToken (redacted), and LeaseKind invariants
+    assert!(LeaseGraceMs::new(0).is_none());
+    assert_eq!(LeaseGraceMs::new(1).unwrap().get(), 1);
+    assert_eq!(LeaseGraceMs::new(MAX_LEASE_GRACE_MS).unwrap().get(), MAX_LEASE_GRACE_MS);
+    assert!(LeaseGraceMs::new(MAX_LEASE_GRACE_MS + 1).is_none());
+    let tok = ResumeToken::new([0x5A; 32]);
+    assert_eq!(tok.as_bytes(), &[0x5A; 32]);
+    assert_eq!(format!("{tok:?}"), "ResumeToken([REDACTED])");
 
-    let ok_max = ClientMsg::AcquireLease {
-        kind: LeaseKind::Broker { grace_ms: MAX_LEASE_GRACE_MS, resume_token: Some([1; 32]) },
-    };
-    let mut w = Writer::new();
-    ok_max.encode(&mut w);
-    assert_eq!(ClientMsg::decode(msg_type::ACQUIRE_LEASE, w.as_slice()), Ok(ok_max));
+    for kind in [
+        LeaseKind::BrokerImmediate,
+        LeaseKind::BrokerGrace { grace_ms: LeaseGraceMs::new(MAX_LEASE_GRACE_MS).unwrap(), resume_token: tok },
+        LeaseKind::Session(sample_sid(4)),
+    ] {
+        let msg = ClientMsg::AcquireLease { kind };
+        let mut w = Writer::new();
+        msg.encode(&mut w);
+        assert_eq!(ClientMsg::decode(msg_type::ACQUIRE_LEASE, w.as_slice()), Ok(msg));
+    }
 
-    let ok_sess = ClientMsg::AcquireLease { kind: LeaseKind::Session(sample_sid(4)) };
-    let mut w = Writer::new();
-    ok_sess.encode(&mut w);
-    assert_eq!(ClientMsg::decode(msg_type::ACQUIRE_LEASE, w.as_slice()), Ok(ok_sess));
-
-    // grace_ms > MAX_LEASE_GRACE_MS rejected
-    let mut w = Writer::new();
-    w.u8(0);
-    w.var_u32(MAX_LEASE_GRACE_MS + 1);
-    assert_eq!(
-        ClientMsg::decode(msg_type::ACQUIRE_LEASE, w.as_slice()),
-        Err(WireError::LimitExceeded("lease grace_ms"))
-    );
-    // grace_ms > 0 without resume_token rejected
-    let mut w = Writer::new();
-    w.u8(0);
-    w.var_u32(1);
-    w.u8(0);
-    assert_eq!(
-        ClientMsg::decode(msg_type::ACQUIRE_LEASE, w.as_slice()),
-        Err(WireError::InvalidValue("grace_ms > 0 requires resume_token"))
-    );
-    // Invalid LeaseKind tag
+    for bad_grace in [0u32, MAX_LEASE_GRACE_MS + 1] {
+        let mut w = Writer::new();
+        w.u8(1);
+        w.var_u32(bad_grace);
+        w.raw(&[0; 32]);
+        assert_eq!(
+            ClientMsg::decode(msg_type::ACQUIRE_LEASE, w.as_slice()),
+            Err(WireError::LimitExceeded("lease grace_ms"))
+        );
+    }
     assert_eq!(
         ClientMsg::decode(msg_type::ACQUIRE_LEASE, &[9]),
         Err(WireError::InvalidTag { kind: "LeaseKind", tag: 9 })
@@ -722,6 +769,64 @@ fn domain_invariants_reject_illegal_values() {
     ok_fetch.encode(&mut w);
     assert_eq!(ClientMsg::decode(msg_type::FETCH_ROWS, w.as_slice()), Ok(ok_fetch));
 
+    // GetImageBlob max_bytes == 0 rejected
+    let mut w = Writer::new();
+    sample_blob(1).encode(&mut w);
+    w.var_u32(0);
+    w.var_u32(0);
+    assert_eq!(
+        ClientMsg::decode(msg_type::GET_IMAGE_BLOB, w.as_slice()),
+        Err(WireError::InvalidValue("get_image_blob max_bytes must be non-zero"))
+    );
+
+    // ImageBlobChunk bounds and overflow checks
+    let ok_chunk = BrokerMsg::ImageBlobChunk {
+        blob: sample_blob(1),
+        encoding: ImageEncoding::Png,
+        total_bytes: BULK_CHUNK_BYTES as u32,
+        offset: 0,
+        data: vec![0xAA; BULK_CHUNK_BYTES],
+    };
+    let mut w = Writer::new();
+    ok_chunk.encode(&mut w);
+    assert_eq!(BrokerMsg::decode(msg_type::IMAGE_BLOB_CHUNK, w.as_slice()), Ok(ok_chunk));
+
+    // Chunk larger than BULK_CHUNK_BYTES rejected
+    let mut w = Writer::new();
+    sample_blob(1).encode(&mut w);
+    ImageEncoding::Png.encode(&mut w);
+    w.var_u32((BULK_CHUNK_BYTES + 1) as u32);
+    w.var_u32(0);
+    w.var_u32((BULK_CHUNK_BYTES + 1) as u32);
+    assert_eq!(
+        BrokerMsg::decode(msg_type::IMAGE_BLOB_CHUNK, w.as_slice()),
+        Err(WireError::LimitExceeded("image blob chunk"))
+    );
+
+    // offset + data.len() > total_bytes rejected
+    let mut w = Writer::new();
+    sample_blob(1).encode(&mut w);
+    ImageEncoding::Png.encode(&mut w);
+    w.var_u32(10);
+    w.var_u32(8);
+    w.bytes(&[1, 2, 3]);
+    assert_eq!(
+        BrokerMsg::decode(msg_type::IMAGE_BLOB_CHUNK, w.as_slice()),
+        Err(WireError::InvalidValue("image blob chunk exceeds total_bytes"))
+    );
+
+    // offset + data.len() u32 overflow rejected
+    let mut w = Writer::new();
+    sample_blob(1).encode(&mut w);
+    ImageEncoding::Png.encode(&mut w);
+    w.var_u32(u32::MAX);
+    w.var_u32(u32::MAX);
+    w.bytes(&[1]);
+    assert_eq!(
+        BrokerMsg::decode(msg_type::IMAGE_BLOB_CHUNK, w.as_slice()),
+        Err(WireError::InvalidValue("image blob chunk offset overflow"))
+    );
+
     // CellSpan end < start rejected; start == end accepted
     let mut w = Writer::new();
     w.var_u64(1);
@@ -739,7 +844,7 @@ fn domain_invariants_reject_illegal_values() {
     eq_msg.encode(&mut w);
     assert_eq!(ClientMsg::decode(msg_type::TEXT_OF, w.as_slice()), Ok(eq_msg));
 
-    // SearchDelta to_line < from_line rejected; equal accepted
+    // SearchDelta invariants
     let mut w = Writer::new();
     w.var_u64(1);
     w.var_u64(10);
@@ -753,7 +858,22 @@ fn domain_invariants_reject_illegal_values() {
     ok_delta.encode(&mut w);
     assert_eq!(BrokerMsg::decode(msg_type::SEARCH_DELTA, w.as_slice()), Ok(ok_delta));
 
-    // Progress > 100 rejected; 100 accepted
+    // SearchDelta span below from_line or at/above to_line rejected
+    for bad_span in [
+        CellSpan { start: CellPos { line: 9, col: 0 }, end: CellPos { line: 10, col: 1 } },
+        CellSpan { start: CellPos { line: 10, col: 0 }, end: CellPos { line: 20, col: 0 } },
+    ] {
+        let bad_delta =
+            BrokerMsg::SearchDelta { epoch: 1, from_line: 10, to_line: 20, added: vec![bad_span], truncated: false };
+        let mut w = Writer::new();
+        bad_delta.encode(&mut w);
+        assert_eq!(
+            BrokerMsg::decode(msg_type::SEARCH_DELTA, w.as_slice()),
+            Err(WireError::InvalidValue("search delta span outside [from_line, to_line)"))
+        );
+    }
+
+    // Progress > 100 and invalid state/percent combinations rejected
     let mut w = Writer::new();
     w.u8(1);
     w.u8(1);
@@ -762,12 +882,20 @@ fn domain_invariants_reject_illegal_values() {
         BrokerMsg::decode(msg_type::PROGRESS, w.as_slice()),
         Err(WireError::InvalidValue("progress percent > 100"))
     );
+    for state in [ProgressState::None, ProgressState::Indeterminate] {
+        let mut w = Writer::new();
+        BrokerMsg::Progress { state, percent: Some(50) }.encode(&mut w);
+        assert_eq!(
+            BrokerMsg::decode(msg_type::PROGRESS, w.as_slice()),
+            Err(WireError::InvalidValue("progress percent invalid for state"))
+        );
+    }
     let ok_prog = BrokerMsg::Progress { state: ProgressState::Running, percent: Some(100) };
     let mut w = Writer::new();
     ok_prog.encode(&mut w);
     assert_eq!(BrokerMsg::decode(msg_type::PROGRESS, w.as_slice()), Ok(ok_prog));
 
-    // StatusRecord progress > 100 rejected; 100 accepted
+    // StatusRecord progress > 100 and non-Blocked kind rejected
     let mut bad_status = sample_status(StatusState::Working, None, Confirmed::Unknown);
     bad_status.progress = Some(101);
     let mut w = Writer::new();
@@ -775,6 +903,13 @@ fn domain_invariants_reject_illegal_values() {
     assert_eq!(
         BrokerMsg::decode(msg_type::PROGRAM_STATUS, w.as_slice()),
         Err(WireError::InvalidValue("progress must be 0..=100"))
+    );
+    let bad_kind = sample_status(StatusState::Working, Some(BlockedKind::Auth), Confirmed::Unknown);
+    let mut w = Writer::new();
+    BrokerMsg::ProgramStatus(Box::new(bad_kind)).encode(&mut w);
+    assert_eq!(
+        BrokerMsg::decode(msg_type::PROGRAM_STATUS, w.as_slice()),
+        Err(WireError::InvalidValue("status kind requires Blocked state"))
     );
     let mut ok_status = sample_status(StatusState::Working, None, Confirmed::Unknown);
     ok_status.progress = Some(100);
@@ -784,10 +919,113 @@ fn domain_invariants_reject_illegal_values() {
         BrokerMsg::decode(msg_type::PROGRAM_STATUS, w.as_slice()),
         Ok(BrokerMsg::ProgramStatus(Box::new(ok_status)))
     );
+
+    // KeyInput modifiers and Unicode scalar validation
+    let mut w = Writer::new();
+    ClientMsg::Key(KeyInput {
+        code: "KeyA".to_owned(),
+        action: KeyAction::Press,
+        modifiers: 0x40,
+        text: String::new(),
+        unshifted_codepoint: 0,
+        composed: false,
+    })
+    .encode(&mut w);
+    assert_eq!(
+        ClientMsg::decode(msg_type::KEY, w.as_slice()),
+        Err(WireError::InvalidValue("unknown KeyInput modifier bits"))
+    );
+    let mut w = Writer::new();
+    ClientMsg::Key(KeyInput {
+        code: "KeyA".to_owned(),
+        action: KeyAction::Press,
+        modifiers: 0x3F,
+        text: String::new(),
+        unshifted_codepoint: 0xD800,
+        composed: false,
+    })
+    .encode(&mut w);
+    assert_eq!(
+        ClientMsg::decode(msg_type::KEY, w.as_slice()),
+        Err(WireError::InvalidValue("invalid Unicode scalar codepoint"))
+    );
+
+    // PointerInput button and modifiers validation
+    for ok_btn in [0u8, 1, 2, 255] {
+        let msg = ClientMsg::Pointer(PointerInput {
+            action: PointerAction::Press,
+            button: ok_btn,
+            modifiers: 0x3F,
+            x_px: 0,
+            y_px: 0,
+            cell_px: CellPx::default(),
+        });
+        let mut w = Writer::new();
+        msg.encode(&mut w);
+        assert_eq!(ClientMsg::decode(msg_type::POINTER, w.as_slice()), Ok(msg));
+    }
+    let mut w = Writer::new();
+    ClientMsg::Pointer(PointerInput {
+        action: PointerAction::Press,
+        button: 3,
+        modifiers: 0,
+        x_px: 0,
+        y_px: 0,
+        cell_px: CellPx::default(),
+    })
+    .encode(&mut w);
+    assert_eq!(
+        ClientMsg::decode(msg_type::POINTER, w.as_slice()),
+        Err(WireError::InvalidValue("invalid PointerInput button"))
+    );
+    let mut w = Writer::new();
+    ClientMsg::Pointer(PointerInput {
+        action: PointerAction::Press,
+        button: 0,
+        modifiers: 0x40,
+        x_px: 0,
+        y_px: 0,
+        cell_px: CellPx::default(),
+    })
+    .encode(&mut w);
+    assert_eq!(
+        ClientMsg::decode(msg_type::POINTER, w.as_slice()),
+        Err(WireError::InvalidValue("unknown PointerInput modifier bits"))
+    );
+
+    // WaitCondition rejects empty Text and empty Status
+    let mut w = Writer::new();
+    ClientMsg::Wait { session: sample_sid(1), condition: WaitCondition::Text(String::new()), timeout_ms: 1 }
+        .encode(&mut w);
+    assert_eq!(
+        ClientMsg::decode(msg_type::WAIT, w.as_slice()),
+        Err(WireError::InvalidValue("wait text needle must be non-empty"))
+    );
+    let mut w = Writer::new();
+    ClientMsg::Wait { session: sample_sid(1), condition: WaitCondition::Status(vec![]), timeout_ms: 1 }.encode(&mut w);
+    assert_eq!(
+        ClientMsg::decode(msg_type::WAIT, w.as_slice()),
+        Err(WireError::InvalidValue("wait status list must be non-empty"))
+    );
 }
 
 #[test]
-fn packed_row_rejects_corrupt_runs_and_flags() {
+fn packed_row_style_piece_and_run_invariants() {
+    // Valid PackedStyle colour & flag boundaries
+    assert!(PackedStyle::is_valid_color(0));
+    assert!(PackedStyle::is_valid_color(256));
+    assert!(!PackedStyle::is_valid_color(257));
+    assert!(!PackedStyle::is_valid_color(0x00_FF_FF_FF));
+    assert!(PackedStyle::is_valid_color(0x01_00_00_00));
+    assert!(PackedStyle::is_valid_color(0x01_FF_FF_FF));
+    assert!(!PackedStyle::is_valid_color(0x02_00_00_00));
+
+    let row = sample_row();
+    assert_eq!(row.style(0), PackedStyle::default());
+    assert_eq!(row.style(1), row.styles[1]);
+    assert_eq!(row.link(0), "");
+    assert_eq!(row.link(1), "https://example.com");
+
     // Valid empty-style-table row using style_idx=0 and link_idx=0
     let plain = PackedRow {
         line: 0,
@@ -806,12 +1044,109 @@ fn packed_row_rejects_corrupt_runs_and_flags() {
         links: vec![],
         pieces: vec![],
     };
+    assert_eq!(plain.style(0), PackedStyle::default());
+    assert_eq!(plain.link(0), "");
     let ok_msg = BrokerMsg::Rows { epoch: 1, rows: vec![plain.clone()] };
     let mut w = Writer::new();
     ok_msg.encode(&mut w);
     assert_eq!(BrokerMsg::decode(msg_type::ROWS, w.as_slice()), Ok(ok_msg));
 
-    // Unknown row flag bit
+    // Valid max PackedStyle flags (0x03F7: underline=5 + all other bits)
+    let mut max_style_row = plain.clone();
+    max_style_row.styles = vec![
+        PackedStyle::default(),
+        PackedStyle { fg: 256, bg: 0x01_00_00_00, underline_color: 0x01_FF_FF_FF, flags: 0x03F7 },
+    ];
+    max_style_row.runs[0].style_idx = 1;
+    let ok_max_style = BrokerMsg::Rows { epoch: 1, rows: vec![max_style_row] };
+    let mut w = Writer::new();
+    ok_max_style.encode(&mut w);
+    assert_eq!(BrokerMsg::decode(msg_type::ROWS, w.as_slice()), Ok(ok_max_style));
+
+    // Invalid PackedStyle colors & flags
+    for bad_style in [
+        PackedStyle { fg: 257, ..PackedStyle::default() },
+        PackedStyle { bg: 0x02_00_00_00, ..PackedStyle::default() },
+        PackedStyle { underline_color: 300, ..PackedStyle::default() },
+    ] {
+        let mut r = plain.clone();
+        r.styles = vec![PackedStyle::default(), bad_style];
+        let mut w = Writer::new();
+        BrokerMsg::Rows { epoch: 1, rows: vec![r] }.encode(&mut w);
+        assert_eq!(
+            BrokerMsg::decode(msg_type::ROWS, w.as_slice()),
+            Err(WireError::InvalidValue("invalid PackedStyle colour encoding"))
+        );
+    }
+    for bad_flags in [0x0400, 0x0018] {
+        let mut r = plain.clone();
+        r.styles = vec![PackedStyle::default(), PackedStyle { flags: bad_flags, ..PackedStyle::default() }];
+        let mut w = Writer::new();
+        BrokerMsg::Rows { epoch: 1, rows: vec![r] }.encode(&mut w);
+        assert_eq!(
+            BrokerMsg::decode(msg_type::ROWS, w.as_slice()),
+            Err(WireError::InvalidValue("invalid PackedStyle flags"))
+        );
+    }
+
+    // Non-default styles[0] and non-empty links[0] rejected
+    let mut bad_s0 = plain.clone();
+    bad_s0.styles = vec![PackedStyle { fg: 1, ..PackedStyle::default() }];
+    let mut w = Writer::new();
+    BrokerMsg::Rows { epoch: 1, rows: vec![bad_s0] }.encode(&mut w);
+    assert_eq!(
+        BrokerMsg::decode(msg_type::ROWS, w.as_slice()),
+        Err(WireError::InvalidValue("styles[0] must be default style"))
+    );
+    let mut bad_l0 = plain.clone();
+    bad_l0.links = vec!["https://not-empty".to_owned()];
+    let mut w = Writer::new();
+    BrokerMsg::Rows { epoch: 1, rows: vec![bad_l0] }.encode(&mut w);
+    assert_eq!(BrokerMsg::decode(msg_type::ROWS, w.as_slice()), Err(WireError::InvalidValue("links[0] must be empty")));
+
+    // Non-empty pieces without FLAG_HAS_PLACEHOLDER rejected
+    let mut bad_piece_flag = sample_row();
+    bad_piece_flag.flags &= !PackedRow::FLAG_HAS_PLACEHOLDER;
+    let mut w = Writer::new();
+    BrokerMsg::Rows { epoch: 1, rows: vec![bad_piece_flag] }.encode(&mut w);
+    assert_eq!(
+        BrokerMsg::decode(msg_type::ROWS, w.as_slice()),
+        Err(WireError::InvalidValue("pieces require FLAG_HAS_PLACEHOLDER"))
+    );
+
+    // Invalid ImagePiece geometry
+    let valid_piece = sample_row().pieces[0];
+    for (bad_piece, expected) in [
+        (ImagePiece { col_len: 0, ..valid_piece }, "invalid ImagePiece column span"),
+        (ImagePiece { col_start: u16::MAX, col_len: 1, ..valid_piece }, "invalid ImagePiece column span"),
+        (ImagePiece { src_rect: [0, 0, 0, 1], ..valid_piece }, "invalid ImagePiece src_rect"),
+        (ImagePiece { src_rect: [0, 0, 1, 0], ..valid_piece }, "invalid ImagePiece src_rect"),
+        (ImagePiece { src_rect: [u32::MAX, 0, 1, 1], ..valid_piece }, "invalid ImagePiece src_rect"),
+        (ImagePiece { src_rect: [0, u32::MAX, 1, 1], ..valid_piece }, "invalid ImagePiece src_rect"),
+        (ImagePiece { dst_px: [0, 10], ..valid_piece }, "invalid ImagePiece dst_px"),
+        (ImagePiece { dst_px: [10, 0], ..valid_piece }, "invalid ImagePiece dst_px"),
+    ] {
+        let mut r = sample_row();
+        r.pieces = vec![bad_piece];
+        let mut w = Writer::new();
+        BrokerMsg::Rows { epoch: 1, rows: vec![r] }.encode(&mut w);
+        assert_eq!(BrokerMsg::decode(msg_type::ROWS, w.as_slice()), Err(WireError::InvalidValue(expected)));
+    }
+
+    // Invalid PackedRun column span
+    for (col_start, col_len) in [(0, 0), (u16::MAX, 1)] {
+        let mut bad = plain.clone();
+        bad.runs[0].col_start = col_start;
+        bad.runs[0].col_len = col_len;
+        let mut w = Writer::new();
+        BrokerMsg::Rows { epoch: 1, rows: vec![bad] }.encode(&mut w);
+        assert_eq!(
+            BrokerMsg::decode(msg_type::ROWS, w.as_slice()),
+            Err(WireError::InvalidValue("invalid PackedRun column span"))
+        );
+    }
+
+    // Unknown row flag bit & run flag bit
     let mut bad = plain.clone();
     bad.flags = 0x10;
     let mut w = Writer::new();
@@ -821,7 +1156,6 @@ fn packed_row_rejects_corrupt_runs_and_flags() {
         Err(WireError::InvalidValue("unknown PackedRow flag bits"))
     );
 
-    // Unknown run flag bit
     let mut bad = plain.clone();
     bad.runs[0].flags = 2;
     let mut w = Writer::new();
@@ -831,7 +1165,7 @@ fn packed_row_rejects_corrupt_runs_and_flags() {
         Err(WireError::InvalidValue("unknown PackedRun flag bits"))
     );
 
-    // Out-of-bounds byte_len
+    // Out-of-bounds byte_len and mid-UTF-8 start/end boundaries
     let mut bad = plain.clone();
     bad.runs[0].byte_len = 3;
     let mut w = Writer::new();
@@ -841,31 +1175,22 @@ fn packed_row_rejects_corrupt_runs_and_flags() {
         Err(WireError::InvalidValue("run byte range out of bounds or mid-UTF-8"))
     );
 
-    // Mid-UTF-8 start and end boundaries
-    let mut bad_utf8 = plain.clone();
-    bad_utf8.text = "é".to_owned(); // 2 bytes
-    bad_utf8.runs[0].byte_offset = 0;
-    bad_utf8.runs[0].byte_len = 1;
-    let mut w = Writer::new();
-    BrokerMsg::Rows { epoch: 1, rows: vec![bad_utf8] }.encode(&mut w);
-    assert_eq!(
-        BrokerMsg::decode(msg_type::ROWS, w.as_slice()),
-        Err(WireError::InvalidValue("run byte range out of bounds or mid-UTF-8"))
-    );
+    for (byte_offset, byte_len) in [(0, 1), (1, 1)] {
+        let mut bad_utf8 = plain.clone();
+        bad_utf8.text = "é".to_owned();
+        bad_utf8.runs[0].byte_offset = byte_offset;
+        bad_utf8.runs[0].byte_len = byte_len;
+        let mut w = Writer::new();
+        BrokerMsg::Rows { epoch: 1, rows: vec![bad_utf8] }.encode(&mut w);
+        assert_eq!(
+            BrokerMsg::decode(msg_type::ROWS, w.as_slice()),
+            Err(WireError::InvalidValue("run byte range out of bounds or mid-UTF-8"))
+        );
+    }
 
-    let mut bad_utf8_start = plain.clone();
-    bad_utf8_start.text = "é".to_owned();
-    bad_utf8_start.runs[0].byte_offset = 1;
-    bad_utf8_start.runs[0].byte_len = 1;
-    let mut w = Writer::new();
-    BrokerMsg::Rows { epoch: 1, rows: vec![bad_utf8_start] }.encode(&mut w);
-    assert_eq!(
-        BrokerMsg::decode(msg_type::ROWS, w.as_slice()),
-        Err(WireError::InvalidValue("run byte range out of bounds or mid-UTF-8"))
-    );
-
-    // Out-of-bounds style_idx and link_idx
+    // Exact boundary style_idx == styles.len() (1 == 1) and link_idx == links.len() (1 == 1)
     let mut bad_style = plain.clone();
+    bad_style.styles = vec![PackedStyle::default()];
     bad_style.runs[0].style_idx = 1;
     let mut w = Writer::new();
     BrokerMsg::Rows { epoch: 1, rows: vec![bad_style] }.encode(&mut w);
@@ -875,6 +1200,7 @@ fn packed_row_rejects_corrupt_runs_and_flags() {
     );
 
     let mut bad_link = plain;
+    bad_link.links = vec![String::new()];
     bad_link.runs[0].link_idx = 1;
     let mut w = Writer::new();
     BrokerMsg::Rows { epoch: 1, rows: vec![bad_link] }.encode(&mut w);
@@ -886,7 +1212,6 @@ fn packed_row_rejects_corrupt_runs_and_flags() {
 
 #[test]
 fn enum_variant_and_flag_exhaustiveness() {
-    // SignalKind & SignalScope
     for kind in [
         SignalKind::Hup,
         SignalKind::Int,
@@ -921,7 +1246,6 @@ fn enum_variant_and_flag_exhaustiveness() {
         Err(WireError::InvalidTag { kind: "SignalScope", tag: 99 })
     );
 
-    // ErrorCode
     for code in [
         ErrorCode::Handshake,
         ErrorCode::Unauthorized,
@@ -948,7 +1272,6 @@ fn enum_variant_and_flag_exhaustiveness() {
         Err(WireError::InvalidTag { kind: "ErrorCode", tag: 999 })
     );
 
-    // ResizePolicy, CursorShape, ImageEncoding, KeyAction, PointerAction, PasteOutcome, WaitCondition, WaitOutcome
     for policy in [ResizePolicy::LatestActive, ResizePolicy::MinFit, ResizePolicy::ExplicitOverride] {
         let msg = ClientMsg::Spawn(Box::new(SpawnSpec {
             argv: vec![],
@@ -1005,7 +1328,7 @@ fn enum_variant_and_flag_exhaustiveness() {
     w.u16(0);
     w.u16(0);
     w.u8(0);
-    w.u8(0x04); // bad CursorState flags
+    w.u8(0x04);
     assert_eq!(
         BrokerMsg::decode(msg_type::FRAME, w.as_slice()),
         Err(WireError::InvalidValue("unknown CursorState flag bits"))
@@ -1021,7 +1344,7 @@ fn enum_variant_and_flag_exhaustiveness() {
     w.u16(0);
     w.u8(0);
     w.u8(0);
-    w.u8(0x10); // bad ViewModes flags
+    w.u8(0x10);
     assert_eq!(
         BrokerMsg::decode(msg_type::FRAME, w.as_slice()),
         Err(WireError::InvalidValue("unknown ViewModes flag bits"))

@@ -1,18 +1,23 @@
 //! Unified v2 wire messages for control, view, event, and raw-output streams.
 //!
-//! Every message has an explicit `u16` wire discriminant in [`MsgType`] and a total, bounds-checked
+//! Every message has an explicit `u16` wire discriminant in [`msg_type`] and a total, bounds-checked
 //! binary encoder/decoder. Both [`ClientMsg::decode`] and [`BrokerMsg::decode`] reject trailing
 //! bytes so wire drift is caught immediately.
+
+use alloc::boxed::Box;
+use alloc::string::String;
+use alloc::vec::Vec;
 
 use crate::codec::{Reader, WireError, Writer};
 use crate::frame::{DecodedFrame, FrameHeader, encode_frame};
 use crate::types::{
     BlobHash, CellPos, CellPx, CellSpan, CommandRecord, CursorShape, CursorState, ErrorCode, ForegroundProcess,
-    FrameCredit, GridSize, ImageEncoding, ImagePlacement, KeyInput, LeaseKind, MarksKey, MetricsSnapshot, PackedRow,
-    PaletteOverrides, PasteOutcome, PointerInput, ProgressState, RequestId, ResizePolicy, SessionId, SignalKind,
-    SignalScope, SignalTarget, StatusRecord, StreamId, SubFlags, ViewModes, ViewportHint, WaitCondition, WaitOutcome,
+    FrameCredit, GridSize, ImageEncoding, ImagePlacement, KeyInput, LeaseKind, MarksKey, MetricsSnapshot,
+    NonZeroStreamId, PackedRow, PaletteOverrides, PasteOutcome, PointerInput, ProgressState, RequestId, ResizePolicy,
+    SessionId, SignalKind, SignalScope, SignalTarget, StatusRecord, StreamId, SubFlags, ViewModes, ViewportHint,
+    WaitCondition, WaitOutcome,
 };
-use crate::{MAX_COMMANDS, MAX_ROWS_PER_FETCH, MAX_SEARCH_MATCHES};
+use crate::{BULK_CHUNK_BYTES, MAX_COMMANDS, MAX_ROWS_PER_FETCH, MAX_SEARCH_MATCHES};
 
 /// Explicit `u16` wire discriminants shared between Rust and TypeScript codecs.
 #[allow(missing_docs)]
@@ -356,7 +361,7 @@ pub enum ClientMsg {
         /// Target session.
         session: SessionId,
         /// Client-chosen non-zero stream ID for this connection.
-        stream_id: StreamId,
+        stream_id: NonZeroStreamId,
         /// Subscription capability bitmask (`VIEW`, `EVENTS`, `RAW_OUTPUT`, `BACKPRESSURE_PTY`).
         flags: SubFlags,
         /// Optional initial viewport hint for `SUB_VIEW` streams.
@@ -369,7 +374,7 @@ pub enum ClientMsg {
     /// Detach a previously attached stream.
     Detach {
         /// Non-zero stream ID to detach.
-        stream_id: StreamId,
+        stream_id: NonZeroStreamId,
     },
     /// Toggle whether a session survives lease release.
     Keep {
@@ -597,13 +602,13 @@ impl ClientMsg {
                 initial_frame_credit,
             } => {
                 session.encode(w);
-                w.u32(stream_id.raw());
+                stream_id.encode(w);
                 flags.encode(w);
                 w.opt(initial_viewport.as_ref(), |w, h| h.encode(w));
                 w.var_u32(*initial_output_credit);
                 initial_frame_credit.encode(w);
             }
-            Self::Detach { stream_id } => w.u32(stream_id.raw()),
+            Self::Detach { stream_id } => stream_id.encode(w),
             Self::Keep { session, kept } => {
                 session.encode(w);
                 w.bool(*kept);
@@ -688,28 +693,15 @@ impl ClientMsg {
             msg_type::REWIND => Self::Rewind { record_dir: r.str()?, at_ms: r.opt(Reader::var_u64)? },
             msg_type::SEEK => Self::Seek { session: SessionId::decode(&mut r)?, at_ms: r.var_u64()? },
             msg_type::METRICS => Self::Metrics,
-            msg_type::ATTACH => {
-                let session = SessionId::decode(&mut r)?;
-                let stream_id = StreamId::from_raw(r.u32()?);
-                if stream_id.is_control() {
-                    return Err(WireError::InvalidValue("attach stream_id must be non-zero"));
-                }
-                Self::Attach {
-                    session,
-                    stream_id,
-                    flags: SubFlags::decode(&mut r)?,
-                    initial_viewport: r.opt(ViewportHint::decode)?,
-                    initial_output_credit: r.var_u32()?,
-                    initial_frame_credit: FrameCredit::decode(&mut r)?,
-                }
-            }
-            msg_type::DETACH => {
-                let stream_id = StreamId::from_raw(r.u32()?);
-                if stream_id.is_control() {
-                    return Err(WireError::InvalidValue("detach stream_id must be non-zero"));
-                }
-                Self::Detach { stream_id }
-            }
+            msg_type::ATTACH => Self::Attach {
+                session: SessionId::decode(&mut r)?,
+                stream_id: NonZeroStreamId::decode(&mut r)?,
+                flags: SubFlags::decode(&mut r)?,
+                initial_viewport: r.opt(ViewportHint::decode)?,
+                initial_output_credit: r.var_u32()?,
+                initial_frame_credit: FrameCredit::decode(&mut r)?,
+            },
+            msg_type::DETACH => Self::Detach { stream_id: NonZeroStreamId::decode(&mut r)? },
             msg_type::KEEP => Self::Keep { session: SessionId::decode(&mut r)?, kept: r.bool()? },
             msg_type::WAIT => Self::Wait {
                 session: SessionId::decode(&mut r)?,
@@ -751,7 +743,13 @@ impl ClientMsg {
             msg_type::COMMAND_OUTPUT => Self::CommandOutput { command_id: r.var_u64()? },
             msg_type::IMAGES => Self::Images,
             msg_type::GET_IMAGE_BLOB => {
-                Self::GetImageBlob { blob: BlobHash::decode(&mut r)?, offset: r.var_u32()?, max_bytes: r.var_u32()? }
+                let blob = BlobHash::decode(&mut r)?;
+                let offset = r.var_u32()?;
+                let max_bytes = r.var_u32()?;
+                if max_bytes == 0 {
+                    return Err(WireError::InvalidValue("get_image_blob max_bytes must be non-zero"));
+                }
+                Self::GetImageBlob { blob, offset, max_bytes }
             }
             other => return Err(WireError::InvalidTag { kind: "ClientMsg", tag: other }),
         };
@@ -842,7 +840,7 @@ pub enum BrokerMsg {
         /// Attached session ID.
         session: SessionId,
         /// Bound non-zero stream ID.
-        stream_id: StreamId,
+        stream_id: NonZeroStreamId,
         /// Current terminal grid size.
         size: GridSize,
         /// Current screen epoch.
@@ -1083,7 +1081,7 @@ impl BrokerMsg {
             Self::MetricsReply(m) => m.encode(w),
             Self::Attached { session, stream_id, size, epoch, scrollback_lines, foreground } => {
                 session.encode(w);
-                w.u32(stream_id.raw());
+                stream_id.encode(w);
                 size.encode(w);
                 w.var_u64(*epoch);
                 w.var_u64(*scrollback_lines);
@@ -1177,21 +1175,14 @@ impl BrokerMsg {
             }
             msg_type::SOUGHT => Self::Sought { at_ms: r.var_u64()? },
             msg_type::METRICS_REPLY => Self::MetricsReply(MetricsSnapshot::decode(&mut r)?),
-            msg_type::ATTACHED => {
-                let session = SessionId::decode(&mut r)?;
-                let stream_id = StreamId::from_raw(r.u32()?);
-                if stream_id.is_control() {
-                    return Err(WireError::InvalidValue("attached stream_id must be non-zero"));
-                }
-                Self::Attached {
-                    session,
-                    stream_id,
-                    size: GridSize::decode(&mut r)?,
-                    epoch: r.var_u64()?,
-                    scrollback_lines: r.var_u64()?,
-                    foreground: r.opt(ForegroundProcess::decode)?,
-                }
-            }
+            msg_type::ATTACHED => Self::Attached {
+                session: SessionId::decode(&mut r)?,
+                stream_id: NonZeroStreamId::decode(&mut r)?,
+                size: GridSize::decode(&mut r)?,
+                epoch: r.var_u64()?,
+                scrollback_lines: r.var_u64()?,
+                foreground: r.opt(ForegroundProcess::decode)?,
+            },
             msg_type::WAITED => Self::Waited { outcome: WaitOutcome::decode(&mut r)? },
             msg_type::FRAME => Self::Frame(Box::new(FrameUpdate::decode(&mut r)?)),
             msg_type::ROWS => Self::Rows {
@@ -1213,13 +1204,13 @@ impl BrokerMsg {
                 if to_line < from_line {
                     return Err(WireError::InvalidValue("search delta to_line < from_line"));
                 }
-                Self::SearchDelta {
-                    epoch,
-                    from_line,
-                    to_line,
-                    added: r.vec_bounded(MAX_SEARCH_MATCHES, "search delta", CellSpan::decode)?,
-                    truncated: r.bool()?,
+                let added = r.vec_bounded(MAX_SEARCH_MATCHES, "search delta", CellSpan::decode)?;
+                for span in &added {
+                    if span.start.line < from_line || span.end.line >= to_line {
+                        return Err(WireError::InvalidValue("search delta span outside [from_line, to_line)"));
+                    }
                 }
+                Self::SearchDelta { epoch, from_line, to_line, added, truncated: r.bool()? }
             }
             msg_type::COMMANDS_REPLY => {
                 Self::CommandsReply { commands: r.vec_bounded(MAX_COMMANDS, "commands", CommandRecord::decode)? }
@@ -1229,13 +1220,20 @@ impl BrokerMsg {
                 images_gen: r.var_u64()?,
                 placements: r.vec_bounded(4096, "image placements", ImagePlacement::decode)?,
             },
-            msg_type::IMAGE_BLOB_CHUNK => Self::ImageBlobChunk {
-                blob: BlobHash::decode(&mut r)?,
-                encoding: ImageEncoding::decode(&mut r)?,
-                total_bytes: r.var_u32()?,
-                offset: r.var_u32()?,
-                data: r.bytes()?,
-            },
+            msg_type::IMAGE_BLOB_CHUNK => {
+                let blob = BlobHash::decode(&mut r)?;
+                let encoding = ImageEncoding::decode(&mut r)?;
+                let total_bytes = r.var_u32()?;
+                let offset = r.var_u32()?;
+                let data = r.bytes_bounded(BULK_CHUNK_BYTES, "image blob chunk")?.to_vec();
+                let end = offset
+                    .checked_add(data.len() as u32)
+                    .ok_or(WireError::InvalidValue("image blob chunk offset overflow"))?;
+                if end > total_bytes {
+                    return Err(WireError::InvalidValue("image blob chunk exceeds total_bytes"));
+                }
+                Self::ImageBlobChunk { blob, encoding, total_bytes, offset, data }
+            }
             msg_type::TITLE => Self::Title { title: r.str()? },
             msg_type::BELL => Self::Bell,
             msg_type::CLIPBOARD => Self::Clipboard { selection: r.str()?, data: r.str()? },
@@ -1246,6 +1244,9 @@ impl BrokerMsg {
                     let p = r.u8()?;
                     if p > 100 { Err(WireError::InvalidValue("progress percent > 100")) } else { Ok(p) }
                 })?;
+                if percent.is_some() && matches!(state, ProgressState::None | ProgressState::Indeterminate) {
+                    return Err(WireError::InvalidValue("progress percent invalid for state"));
+                }
                 Self::Progress { state, percent }
             }
             msg_type::PROGRAM_STATUS => Self::ProgramStatus(Box::new(StatusRecord::decode(&mut r)?)),

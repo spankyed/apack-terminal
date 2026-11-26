@@ -10,7 +10,7 @@ name: CI
 # mutants.yml, which a surviving mutant fails.
 on:
   push:
-    branches: [master]
+    branches: [master, v2]
   pull_request:
   workflow_dispatch:
 

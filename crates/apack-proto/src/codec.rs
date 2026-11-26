@@ -1,6 +1,9 @@
 //! Total, overflow-safe, allocation-bounded binary reader and writer primitives.
 
-use std::fmt;
+use alloc::borrow::ToOwned;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::fmt;
 
 use crate::{MAX_BLOB_BYTES, MAX_STRING_BYTES, MAX_VEC_ITEMS};
 
@@ -45,7 +48,7 @@ impl fmt::Display for WireError {
     }
 }
 
-impl std::error::Error for WireError {}
+impl core::error::Error for WireError {}
 
 /// Append-only binary wire encoder writing into an owned `Vec<u8>`.
 #[derive(Debug, Default)]
@@ -249,12 +252,15 @@ impl<'a> Reader<'a> {
         Ok(u64::from_le_bytes(self.fixed::<8>()?))
     }
 
-    /// Reads an unsigned LEB128 `u32`, rejecting non-canonical overflow past 32 bits.
+    /// Reads a canonical unsigned LEB128 `u32`, rejecting overflow past 32 bits and overlong encodings.
     pub fn var_u32(&mut self) -> Result<u32, WireError> {
         let mut value = 0u32;
         let mut shift = 0u32;
         for _ in 0..5 {
             let byte = self.u8()?;
+            if shift > 0 && byte == 0 {
+                return Err(WireError::InvalidValue("non-canonical varint"));
+            }
             let low = u32::from(byte & 0x7F);
             if shift == 28 && low > 0x0F {
                 return Err(WireError::VarintOverflow);
@@ -268,12 +274,15 @@ impl<'a> Reader<'a> {
         Err(WireError::VarintOverflow)
     }
 
-    /// Reads an unsigned LEB128 `u64`, rejecting overflow past 64 bits.
+    /// Reads a canonical unsigned LEB128 `u64`, rejecting overflow past 64 bits and overlong encodings.
     pub fn var_u64(&mut self) -> Result<u64, WireError> {
         let mut value = 0u64;
         let mut shift = 0u32;
         for _ in 0..10 {
             let byte = self.u8()?;
+            if shift > 0 && byte == 0 {
+                return Err(WireError::InvalidValue("non-canonical varint"));
+            }
             let low = u64::from(byte & 0x7F);
             if shift == 63 && low > 0x01 {
                 return Err(WireError::VarintOverflow);
@@ -304,7 +313,7 @@ impl<'a> Reader<'a> {
     /// Reads a length-prefixed UTF-8 string capped at [`MAX_STRING_BYTES`].
     pub fn str(&mut self) -> Result<String, WireError> {
         let raw = self.bytes_bounded(MAX_STRING_BYTES, "string")?;
-        std::str::from_utf8(raw).map(str::to_owned).map_err(|_| WireError::InvalidUtf8)
+        core::str::from_utf8(raw).map(ToOwned::to_owned).map_err(|_| WireError::InvalidUtf8)
     }
 
     /// Reads an optional value encoded with a strict `0`/`1` presence tag.

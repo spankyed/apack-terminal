@@ -10,6 +10,8 @@
 //! never collide with `[0, 0, 0, 0]` `FIN`. The outer 4-byte length prefix is identical across
 //! transports and zero-sniff proxies.
 
+use alloc::vec::Vec;
+
 use crate::codec::WireError;
 use crate::types::{RequestId, StreamId};
 use crate::{FIN_FRAME, FRAME_HEADER_LEN, MAX_FRAME_PAYLOAD};
@@ -33,7 +35,7 @@ pub struct FrameHeader {
     pub payload_len: u32,
 }
 
-/// Output of [`FrameDecoder::next_frame`].
+/// Output of [`FrameDecoder::step`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodedFrame {
     /// Clean universal end-of-input sentinel (`[0, 0, 0, 0]`).
@@ -92,10 +94,21 @@ pub fn encode_fin(out: &mut Vec<u8>) {
 enum State {
     /// Accumulating the 4-byte outer `body_len`.
     Length { buf: [u8; 4], have: usize },
-    /// Accumulating `body_len` bytes (`INNER_HEADER_LEN..=MAX_BODY_LEN`).
-    Body { expected: usize, buf: Vec<u8> },
+    /// Accumulating the 10-byte inner header (`stream_id`, `msg_type`, `req_id`) on the stack.
+    InnerHeader { payload_len: u32, buf: [u8; INNER_HEADER_LEN], have: usize },
+    /// Accumulating the frame payload directly into the final `Vec<u8>` (zero extra copy).
+    Payload { header: FrameHeader, buf: Vec<u8> },
     /// Saw `FIN` or a fatal framing error; no further frames can be decoded.
     Closed,
+}
+
+/// Copies as many bytes as needed to fill `dst[*have..]` from `input[*offset..]`.
+fn fill_fixed(dst: &mut [u8], have: &mut usize, input: &[u8], offset: &mut usize) -> bool {
+    let take = (dst.len() - *have).min(input.len() - *offset);
+    dst[*have..*have + take].copy_from_slice(&input[*offset..*offset + take]);
+    *have += take;
+    *offset += take;
+    *have == dst.len()
 }
 
 /// Total, streaming, memory-bounded binary frame decoder invariant across arbitrary chunk splits.
@@ -128,11 +141,7 @@ impl FrameDecoder {
             match &mut self.state {
                 State::Closed => return Ok((input.len(), None)),
                 State::Length { buf, have } => {
-                    let take = (4 - *have).min(input.len());
-                    buf[*have..*have + take].copy_from_slice(&input[..take]);
-                    *have += take;
-                    offset += take;
-                    if *have == 4 {
+                    if fill_fixed(buf, have, input, &mut offset) {
                         let body_len = u32::from_le_bytes(*buf);
                         if body_len == 0 {
                             self.state = State::Closed;
@@ -150,31 +159,38 @@ impl FrameDecoder {
                             self.state = State::Closed;
                             return Err(WireError::FrameTooLarge(body_len - INNER_HEADER_LEN as u32));
                         }
-                        // Start with an empty buffer so a huge declared length on a tiny stalled
-                        // chunk allocates nothing until body bytes actually arrive.
-                        self.state = State::Body { expected, buf: Vec::new() };
+                        let payload_len = body_len - INNER_HEADER_LEN as u32;
+                        self.state = State::InnerHeader { payload_len, buf: [0; INNER_HEADER_LEN], have: 0 };
                     }
                 }
-                State::Body { expected, buf } => {
-                    let need = *expected - buf.len();
+                State::InnerHeader { payload_len, buf, have } => {
+                    if fill_fixed(buf, have, input, &mut offset) {
+                        let header = FrameHeader {
+                            stream_id: StreamId::from_raw(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])),
+                            msg_type: u16::from_le_bytes([buf[4], buf[5]]),
+                            req_id: RequestId::from_raw(u32::from_le_bytes([buf[6], buf[7], buf[8], buf[9]])),
+                            payload_len: *payload_len,
+                        };
+                        if header.payload_len == 0 {
+                            self.state = State::Length { buf: [0; 4], have: 0 };
+                            return Ok((offset, Some(DecodedFrame::Frame { header, payload: Vec::new() })));
+                        }
+                        // Start with an empty buffer so a huge declared length on a stalled chunk
+                        // allocates zero bytes until payload bytes actually arrive.
+                        self.state = State::Payload { header, buf: Vec::new() };
+                    }
+                }
+                State::Payload { header, buf } => {
+                    let expected = header.payload_len as usize;
+                    let need = expected - buf.len();
                     let take = need.min(input.len() - offset);
                     buf.extend_from_slice(&input[offset..offset + take]);
                     offset += take;
-                    if buf.len() == *expected {
-                        let body = std::mem::take(buf);
+                    if buf.len() == expected {
+                        let header = *header;
+                        let payload = core::mem::take(buf);
                         self.state = State::Length { buf: [0; 4], have: 0 };
-                        let stream_id = StreamId::from_raw(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
-                        let msg_type = u16::from_le_bytes([body[4], body[5]]);
-                        let req_id = RequestId::from_raw(u32::from_le_bytes([body[6], body[7], body[8], body[9]]));
-                        let payload = body[INNER_HEADER_LEN..].to_vec();
-                        let payload_len = payload.len() as u32;
-                        return Ok((
-                            offset,
-                            Some(DecodedFrame::Frame {
-                                header: FrameHeader { stream_id, msg_type, req_id, payload_len },
-                                payload,
-                            }),
-                        ));
+                        return Ok((offset, Some(DecodedFrame::Frame { header, payload })));
                     }
                 }
             }
