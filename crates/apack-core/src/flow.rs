@@ -12,6 +12,7 @@ use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::num::NonZeroUsize;
 
 use apack_proto::BULK_CHUNK_BYTES;
 use apack_proto::messages::{BrokerMsg, FrameUpdate};
@@ -272,7 +273,7 @@ impl RawOutputFlow {
             let mut offset = 0usize;
             if self.pending_utf8.is_empty() {
                 while offset < decoded.len() && self.credit_bytes > 0 {
-                    let take = self.take_chunk_len(&decoded[offset..]);
+                    let take = self.take_chunk_len(&decoded[offset..]).get();
                     delta.emit_chunks.push(String::from(&decoded[offset..offset + take]));
                     offset += take;
                 }
@@ -288,7 +289,7 @@ impl RawOutputFlow {
         } else {
             let mut offset = 0usize;
             while offset < decoded.len() && self.credit_bytes > 0 {
-                let take = self.take_chunk_len(&decoded[offset..]);
+                let take = self.take_chunk_len(&decoded[offset..]).get();
                 delta.emit_chunks.push(String::from(&decoded[offset..offset + take]));
                 offset += take;
             }
@@ -301,13 +302,13 @@ impl RawOutputFlow {
     fn drain_pending_chunks(&mut self, out: &mut Vec<String>) {
         while !self.pending_utf8.is_empty() && self.credit_bytes > 0 {
             let text = core::str::from_utf8(&self.pending_utf8).expect("pending_utf8 always holds valid UTF-8");
-            let take = take_chunk_len(&mut self.credit_bytes, &mut self.credit_debt, self.max_chunk_bytes, text);
+            let take = take_chunk_len(&mut self.credit_bytes, &mut self.credit_debt, self.max_chunk_bytes, text).get();
             out.push(String::from(&text[..take]));
             self.pending_utf8.drain(..take);
         }
     }
 
-    fn take_chunk_len(&mut self, text: &str) -> usize {
+    fn take_chunk_len(&mut self, text: &str) -> NonZeroUsize {
         take_chunk_len(&mut self.credit_bytes, &mut self.credit_debt, self.max_chunk_bytes, text)
     }
 }
@@ -315,18 +316,18 @@ impl RawOutputFlow {
 /// Consumes at least one complete UTF-8 scalar (up to `min(credit_bytes, max_chunk_bytes)`),
 /// recording at most `3` bytes of `credit_debt` when `1 <= credit_bytes < first_char.len_utf8()`.
 ///
+/// Returning [`NonZeroUsize`] makes a zero-progress infinite loop unrepresentable.
 /// Caller guarantees `!text.is_empty()` and `*credit_bytes > 0`.
-fn take_chunk_len(credit_bytes: &mut u32, credit_debt: &mut u8, max_chunk_bytes: usize, text: &str) -> usize {
+fn take_chunk_len(credit_bytes: &mut u32, credit_debt: &mut u8, max_chunk_bytes: usize, text: &str) -> NonZeroUsize {
     let limit = (*credit_bytes as usize).min(max_chunk_bytes);
-    let take = floor_char_boundary(text, limit);
-    if take > 0 {
-        *credit_bytes -= take as u32;
+    if let Some(take) = NonZeroUsize::new(floor_char_boundary(text, limit)) {
+        *credit_bytes -= take.get() as u32;
         return take;
     }
     let ch_len = text.chars().next().expect("non-empty text").len_utf8();
     *credit_debt = (ch_len - *credit_bytes as usize) as u8;
     *credit_bytes = 0;
-    ch_len
+    NonZeroUsize::new(ch_len).expect("UTF-8 char len is 1..=4")
 }
 
 /// Decodes valid UTF-8 from `input`, replacing malformed interior sequences with U+FFFD and storing
