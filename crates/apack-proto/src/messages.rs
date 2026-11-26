@@ -984,9 +984,9 @@ pub enum BrokerMsg {
         /// Valid UTF-8 output text.
         text: String,
     },
-    /// Reports cumulative microseconds spent throttled waiting on output credit (`SUB_RAW_OUTPUT`).
+    /// Reports microseconds spent throttled waiting on output credit during a pause episode (`SUB_RAW_OUTPUT`).
     Throttled {
-        /// Microseconds waited.
+        /// Microseconds waited during the completed backpressure episode.
         waited_us: u64,
     },
     /// Explicit accounting of shed raw output bytes in best-effort mode (`SUB_RAW_OUTPUT`).

@@ -1,0 +1,19 @@
+[package]
+name = "apack-core"
+version = "0.2.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Sans-IO broker state machine, unified timer wheel, auth, leases, and flow control for apack-terminal v2."
+
+[dependencies]
+apack-proto = { path = "../apack-proto" }
+hmac = { version = "0.12", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+disallowed_types = "deny"
+disallowed_methods = "deny"
