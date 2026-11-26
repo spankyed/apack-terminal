@@ -658,7 +658,8 @@ impl ShardRunner {
                 timeout = timeout.min(shard_session_wait_timeout(
                     sess.machine.next_deadline(),
                     now_ms,
-                    sess.terminating_since.is_some() || sess.is_pty_paused(),
+                    sess.terminating_since.is_some(),
+                    sess.is_pty_paused(),
                     pty_eof,
                     sess.compressed_idle,
                     sess.last_activity.elapsed(),
@@ -1839,10 +1840,12 @@ pub(crate) fn maybe_compress_idle(
 }
 
 /// Computes the next shard wait timeout contribution for a single session.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn shard_session_wait_timeout(
     next_deadline: Option<TimestampMs>,
     now: TimestampMs,
     terminating: bool,
+    pty_paused: bool,
     pty_eof: bool,
     compressed_idle: bool,
     idle_elapsed: Duration,
@@ -1852,7 +1855,7 @@ pub(crate) fn shard_session_wait_timeout(
     if let Some(dl) = next_deadline {
         timeout = timeout.min(Duration::from_millis(dl.saturating_sub(now)));
     }
-    if terminating || pty_eof {
+    if terminating || pty_paused || pty_eof {
         timeout = timeout.min(TERMINATE_POLL_INTERVAL);
     } else if !compressed_idle {
         if idle_elapsed >= idle_compress_after {

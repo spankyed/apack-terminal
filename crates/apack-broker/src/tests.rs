@@ -871,23 +871,54 @@ fn timeout_and_idle_compression_helpers_unit() {
     assert_eq!(resolve_scrollback_lines(500), 500);
 
     assert_eq!(
-        shard_session_wait_timeout(None, now, true, false, false, Duration::ZERO, Duration::from_secs(2)),
+        shard_session_wait_timeout(None, now, true, false, false, false, Duration::ZERO, Duration::from_secs(2)),
         Duration::from_millis(20)
     );
     assert_eq!(
-        shard_session_wait_timeout(None, now, false, true, false, Duration::ZERO, Duration::from_secs(2)),
+        shard_session_wait_timeout(None, now, false, true, false, false, Duration::ZERO, Duration::from_secs(2)),
         Duration::from_millis(20)
     );
     assert_eq!(
-        shard_session_wait_timeout(None, now, false, false, true, Duration::from_secs(5), Duration::from_secs(2)),
+        shard_session_wait_timeout(None, now, false, false, true, false, Duration::ZERO, Duration::from_secs(2)),
+        Duration::from_millis(20)
+    );
+    assert_eq!(
+        shard_session_wait_timeout(
+            None,
+            now,
+            false,
+            false,
+            false,
+            true,
+            Duration::from_secs(5),
+            Duration::from_secs(2)
+        ),
         Duration::from_secs(5)
     );
     assert_eq!(
-        shard_session_wait_timeout(None, now, false, false, false, Duration::from_millis(500), Duration::from_secs(2)),
+        shard_session_wait_timeout(
+            None,
+            now,
+            false,
+            false,
+            false,
+            false,
+            Duration::from_millis(500),
+            Duration::from_secs(2)
+        ),
         Duration::from_millis(1_500)
     );
     assert_eq!(
-        shard_session_wait_timeout(None, now, false, false, false, Duration::from_secs(2), Duration::from_secs(2)),
+        shard_session_wait_timeout(
+            None,
+            now,
+            false,
+            false,
+            false,
+            false,
+            Duration::from_secs(2),
+            Duration::from_secs(2)
+        ),
         Duration::from_millis(5)
     );
     assert_eq!(
@@ -895,6 +926,7 @@ fn timeout_and_idle_compression_helpers_unit() {
             Some(apack_core::time::TimestampMs::from_millis(1_010)),
             now,
             true,
+            false,
             false,
             false,
             Duration::ZERO,

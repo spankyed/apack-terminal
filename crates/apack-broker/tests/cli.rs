@@ -5,6 +5,7 @@ use apack_broker::client::BrokerClient;
 use apack_broker::config::BrokerConfig;
 use apack_broker::runtime::BrokerServer;
 use apack_core::auth::AuthConfig;
+#[cfg(unix)]
 use tempfile::tempdir;
 
 #[test]
@@ -22,6 +23,7 @@ fn cli_binary_version_invalid_serve_inspect_and_proxy() {
     assert_eq!(bad.status.code(), Some(2));
 
     // Subprocess `inspect --json` and `proxy --no-autostart` against a live BrokerServer!
+    #[cfg(unix)]
     let tmp = tempdir().unwrap();
     #[cfg(unix)]
     let sock = tmp.path().join("cli-e2e.sock").to_string_lossy().into_owned();
