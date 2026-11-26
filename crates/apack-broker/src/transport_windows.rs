@@ -53,6 +53,12 @@ pub(crate) struct WinConnHandle {
     pub(crate) close_abrupt: Arc<dyn Fn() + Send + Sync>,
 }
 
+/// Returns `true` when a newly accepted Windows named-pipe connection satisfies shutdown and
+/// connection-capacity checks.
+pub(crate) fn can_accept_win_conn(shutting_down: bool, active_conns: usize) -> bool {
+    !shutting_down && active_conns < MAX_CONNECTIONS
+}
+
 /// Returns `true` when closing a Windows named-pipe connection should flush gracefully (`let_go`)
 /// rather than abruptly cancelling I/O (`hang_up`).
 pub(crate) fn is_graceful_win_close(reason: CloseReason, has_final_error: bool) -> bool {
@@ -215,7 +221,7 @@ impl ReactorState {
     pub(crate) fn handle_win_transport_event(&mut self, ev: WinTransportEvent) {
         match ev {
             WinTransportEvent::Accepted(stream) => {
-                if self.shutting_down || self.conns.len() >= MAX_CONNECTIONS {
+                if !can_accept_win_conn(self.shutting_down, self.conns.len()) {
                     let _ = hang_up(&stream);
                     return;
                 }

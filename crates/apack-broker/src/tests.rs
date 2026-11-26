@@ -448,7 +448,14 @@ fn e2e_remote_lease_grace_resume_and_recording_rewind_seek_restore() {
     };
 
     // Reconnect within grace using ResumeToken -> seamlessly resumes without losing session!
+    // Wait briefly for the broker reactor to process `c1`'s transport EOF before resuming.
     let mut c2 = BrokerClient::connect(handle.socket_path(), &AuthConfig::None, "ssh-2").unwrap();
+    for _ in 0..50 {
+        if c2.metrics().unwrap().connections == 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let (_, resumed) = c2.acquire_lease(LeaseKind::BrokerGrace { grace_ms: grace, resume_token: token }).unwrap();
     assert!(resumed, "reconnecting with matching ResumeToken must resume in-grace lease");
     assert_eq!(c2.list_sessions().unwrap().len(), 1);
@@ -1896,7 +1903,10 @@ fn e2e_leases_kept_pinning_tier2_compression_foreground_verify_and_kill_escalati
 fn windows_edge_helpers_and_natural_child_exit() {
     use std::sync::{Arc, Condvar, Mutex};
 
-    // 1. is_graceful_win_close + wait_for_win_wake resets *woken = false and returns immediately
+    // 1. is_graceful_win_close + can_accept_win_conn + wait_for_win_wake resets *woken = false and returns immediately
+    assert!(crate::transport_windows::can_accept_win_conn(false, 0));
+    assert!(!crate::transport_windows::can_accept_win_conn(true, 0));
+    assert!(!crate::transport_windows::can_accept_win_conn(false, crate::transport_loop::MAX_CONNECTIONS));
     assert!(crate::transport_windows::is_graceful_win_close(apack_core::broker::CloseReason::ClientFin, false));
     assert!(crate::transport_windows::is_graceful_win_close(apack_core::broker::CloseReason::SlowReader, true));
     assert!(!crate::transport_windows::is_graceful_win_close(apack_core::broker::CloseReason::SlowReader, false));
