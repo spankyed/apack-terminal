@@ -21,6 +21,17 @@ export {
 export { css, fontOf, measure, type Font, type Metrics, type Painter, type Scene } from './painter.ts'
 export { CanvasPainter } from './canvas-painter.ts'
 export {
+  DrawMode,
+  INSTANCE_FLOATS,
+  ShelfPacker,
+  WebGL2AtlasPainter,
+  WebGL2UnavailableError,
+  createPainter,
+  type AtlasEntry,
+  type CreatePainterOptions,
+  type WebGL2PainterOptions,
+} from './webgl-painter.ts'
+export {
   BLINK_MS,
   MATCH_HIGHLIGHTS,
   MIRROR_DEBOUNCE_MS,
