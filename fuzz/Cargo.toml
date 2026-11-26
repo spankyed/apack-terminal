@@ -13,6 +13,9 @@ libfuzzer-sys = "0.4"
 [dependencies.apack-terminal]
 path = ".."
 
+[dependencies.apack-proto]
+path = "../crates/apack-proto"
+
 # Its own workspace, so cargo-fuzz's toolchain and flags stay here and the broker's build does not see them
 [workspace]
 members = ["."]
@@ -76,6 +79,13 @@ bench = false
 [[bin]]
 name = "keyframe"
 path = "fuzz_targets/keyframe.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "v2_wire"
+path = "fuzz_targets/v2_wire.rs"
 test = false
 doc = false
 bench = false

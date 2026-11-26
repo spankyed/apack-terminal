@@ -15,6 +15,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "apack-proto"
+version = "0.2.0"
+
+[[package]]
 name = "apack-terminal"
 version = "0.1.0"
 dependencies = [
@@ -38,6 +42,7 @@ dependencies = [
 name = "apack-terminal-fuzz"
 version = "0.0.0"
 dependencies = [
+ "apack-proto",
  "apack-terminal",
  "libfuzzer-sys",
 ]

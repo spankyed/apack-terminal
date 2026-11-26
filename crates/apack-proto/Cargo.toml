@@ -1,0 +1,14 @@
+[package]
+name = "apack-proto"
+version = "0.2.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Sans-IO binary wire protocol and domain types for apack-terminal v2."
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+disallowed_types = "deny"
+disallowed_methods = "deny"

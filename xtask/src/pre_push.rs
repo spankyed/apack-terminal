@@ -135,7 +135,7 @@ fn mutants_of_the_change(root: &Path, base: &str) -> Result<(), String> {
     // is otherwise read as a run that failed. A change that only deletes Rust is the case: it touches Rust and
     // leaves nothing to mutate
     let listed = Command::new("cargo")
-        .args(["mutants", "--list", "--in-diff", CHANGE_DIFF])
+        .args(["mutants", "--workspace", "--list", "--in-diff", CHANGE_DIFF])
         .args(windows_only.iter().flat_map(|file| ["--exclude", file.as_str()]))
         .current_dir(root)
         .output()
@@ -152,7 +152,7 @@ fn mutants_of_the_change(root: &Path, base: &str) -> Result<(), String> {
         return Ok(());
     }
     let status = Command::new("cargo")
-        .args(["mutants", "--in-diff", CHANGE_DIFF])
+        .args(["mutants", "--workspace", "--in-diff", CHANGE_DIFF])
         .args(windows_only.iter().flat_map(|file| ["--exclude", file.as_str()]))
         .current_dir(root)
         .status()
