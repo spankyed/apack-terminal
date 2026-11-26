@@ -33,17 +33,21 @@ interface MockDrawCall {
   readonly texture: unknown
 }
 
-function mockWebGL2Canvas(options: { readonly maxTextureSize?: number } = {}) {
+function mockWebGL2Canvas(options: { readonly maxTextureSize?: number; readonly throwOnImageUpload?: boolean } = {}) {
   const uniforms = new Map<string, number | readonly number[]>()
   const drawCalls: MockDrawCall[] = []
+  const premultiplyAtUpload: number[] = []
   let texSubUploads = 0
   let deletedTextures = 0
   let deletedBuffers = 0
   let deletedVaos = 0
   let deletedPrograms = 0
+  let loseContextCalls = 0
+  let unpackPremultiply = 0
   let boundTexture: unknown = null
   let lastUploadedBuffer = new Float32Array(0)
   let contextLostFlag = false
+  let failCreateProgram = false
   let nextId = 1
 
   const gl = {
@@ -75,13 +79,15 @@ function mockWebGL2Canvas(options: { readonly maxTextureSize?: number } = {}) {
 
     isContextLost: () => contextLostFlag,
     getParameter: (param: number) => (param === 0x0d33 ? (options.maxTextureSize ?? 2048) : 0),
+    getExtension: (name: string) =>
+      name === 'WEBGL_lose_context' ? { loseContext: () => { loseContextCalls += 1 } } : null,
     createShader: () => ({ id: nextId++ }),
     shaderSource: () => {},
     compileShader: () => {},
     getShaderParameter: () => true,
     getShaderInfoLog: () => '',
     deleteShader: () => {},
-    createProgram: () => ({ id: nextId++ }),
+    createProgram: () => (failCreateProgram ? null : { id: nextId++ }),
     attachShader: () => {},
     linkProgram: () => {},
     getProgramParameter: () => true,
@@ -112,9 +118,19 @@ function mockWebGL2Canvas(options: { readonly maxTextureSize?: number } = {}) {
     activeTexture: () => {},
     bindTexture: (_target: number, tex: unknown) => { boundTexture = tex },
     texParameteri: () => {},
-    pixelStorei: () => {},
-    texImage2D: () => {},
-    texSubImage2D: () => { texSubUploads += 1 },
+    pixelStorei: (pname: number, param: number) => {
+      if (pname === 0x9241) unpackPremultiply = param
+    },
+    texImage2D: (...args: unknown[]) => {
+      if (args.length === 6) {
+        if (options.throwOnImageUpload) throw new Error('InvalidStateError: closed ImageBitmap')
+        premultiplyAtUpload.push(unpackPremultiply)
+      }
+    },
+    texSubImage2D: () => {
+      texSubUploads += 1
+      premultiplyAtUpload.push(unpackPremultiply)
+    },
     enable: () => {},
     blendFunc: () => {},
     viewport: () => {},
@@ -140,21 +156,31 @@ function mockWebGL2Canvas(options: { readonly maxTextureSize?: number } = {}) {
     gl,
     uniforms,
     drawCalls,
+    premultiplyAtUpload,
     setContextLost: (lost: boolean) => { contextLostFlag = lost },
-    stats: () => ({ texSubUploads, deletedTextures, deletedBuffers, deletedVaos, deletedPrograms }),
+    setFailCreateProgram: (fail: boolean) => { failCreateProgram = fail },
+    stats: () => ({ texSubUploads, deletedTextures, deletedBuffers, deletedVaos, deletedPrograms, loseContextCalls }),
   }
 }
 
-function makeScratchCanvas(coloredEmoji = false) {
+function makeScratchCanvas(pixelMode: 'white' | 'chromatic' | 'grayscaleEmoji' = 'white') {
   const rec = recordingContext(10)
+  let getImageDataCalls = 0
   const ctx = rec.canvas.getContext('2d') as unknown as Record<string, unknown>
   ctx.clearRect = () => {}
   ctx.getImageData = (_x: number, _y: number, w: number, h: number) => {
+    getImageDataCalls += 1
     const data = new Uint8ClampedArray(Math.max(1, w * h * 4))
-    if (coloredEmoji) {
+    if (pixelMode === 'chromatic') {
       data[0] = 255
       data[1] = 80
       data[2] = 0
+      data[3] = 255
+    } else if (pixelMode === 'grayscaleEmoji') {
+      // Dark gray/black emoji like 🐼 or ⚫ (r===g===b < 245)
+      data[0] = 40
+      data[1] = 40
+      data[2] = 40
       data[3] = 255
     } else {
       data[0] = 255
@@ -164,21 +190,22 @@ function makeScratchCanvas(coloredEmoji = false) {
     }
     return { data, width: w, height: h }
   }
-  return rec.canvas
+  return { canvas: rec.canvas, getImageDataCalls: () => getImageDataCalls }
 }
 
 describe('ShelfPacker', () => {
-  it('packs rectangles onto shelves with 1px padding and returns null when full', () => {
+  it('packs rectangles with 1px padding and rejects oversized rectangles cleanly', () => {
     const packer = new ShelfPacker(64)
+    // Oversized rectangle (needs 64 + 2 = 66 > 64) must return null, never clamp OOB!
+    expect(packer.allocate(64, 20)).toBeNull()
+    expect(packer.allocate(20, 64)).toBeNull()
+
     const a = packer.allocate(20, 20)
     const b = packer.allocate(20, 20)
-    // Each padded slot is 22px wide -> 2 fit on row 0 (44px), 3rd wraps to row 1 (y=23)
     const c = packer.allocate(20, 20)
     expect(a).toEqual({ x: 1, y: 1 })
     expect(b).toEqual({ x: 23, y: 1 })
     expect(c).toEqual({ x: 1, y: 23 })
-
-    // Fill remaining space until overflow
     expect(packer.allocate(20, 20)).toEqual({ x: 23, y: 23 })
     expect(packer.allocate(20, 20)).toBeNull()
 
@@ -188,11 +215,12 @@ describe('ShelfPacker', () => {
 })
 
 describe('WebGL2AtlasPainter & createPainter', () => {
-  it('batches backgrounds, glyphs, curly underlines, and cursor into 2 instanced draw calls with fractional scroll uniform', () => {
+  it('batches backgrounds, ASCII glyphs (0 getImageData), shader-driven curly/dotted lines, and cursor in 2 draw calls', () => {
     const mock = mockWebGL2Canvas()
+    const scratch = makeScratchCanvas('white')
     const painter = new WebGL2AtlasPainter(
       { family: 'monospace', size: 14 },
-      { canvas: mock.canvas, pixelRatio: 1, scratchCanvas: () => makeScratchCanvas(false) },
+      { canvas: mock.canvas, pixelRatio: 1, scratchCanvas: () => scratch.canvas },
     )
     painter.resize(20, 4, 1, 6)
 
@@ -201,9 +229,13 @@ describe('WebGL2AtlasPainter & createPainter', () => {
         line: 0,
         styles: [
           {},
-          { bg: packedRgb(0x334455), flags: (3 << 2) /* curly underline */ },
+          { bg: packedRgb(0x334455), flags: (3 << 2) /* curly */ },
+          { flags: (4 << 2) /* dotted */ },
         ],
-        runs: [{ colStart: 0, colLen: 5, text: 'hello', styleIdx: 1 }],
+        runs: [
+          { colStart: 0, colLen: 5, text: 'hello', styleIdx: 1 },
+          { colStart: 5, colLen: 10, text: '0123456789', styleIdx: 2 },
+        ],
       }),
       theme,
     )
@@ -216,42 +248,33 @@ describe('WebGL2AtlasPainter & createPainter', () => {
     }
     painter.paint(scene)
 
-    // Pass 1 (gutter mark + row background) + Pass 2 (5 glyphs + curly wave + block cursor + cursor text) = 2 draw calls!
+    // 2 draw calls total: Pass 1 (gutter+bg) + Pass 2 (glyphs + 1 curly + 1 dotted + cursor + cursor glyph)
     expect(painter.drawCallsLastFrame).toBe(2)
     expect(mock.drawCalls).toHaveLength(2)
-
-    // Fractional scroll uniform: 0.25 * cellHeight(20) = 5.0px
+    // ZERO getImageData calls for pure ASCII!
+    expect(scratch.getImageDataCalls()).toBe(0)
+    // All atlas uploads used UNPACK_PREMULTIPLY_ALPHA_WEBGL = 1
+    expect(mock.premultiplyAtUpload.every((v) => v === 1)).toBe(true)
     expect(mock.uniforms.get('uOffsetPx')).toBe(5)
+    expect(mock.uniforms.get('uPixelRatio')).toBe(1)
     expect(mock.uniforms.get('uViewportPx')).toEqual([206, 80])
 
-    // Pass 1: 2 solid rects (1 gutter mark + 1 background run)
-    const pass1 = mock.drawCalls[0]!
-    expect(pass1.count).toBe(2)
-    expect(pass1.instances[12]).toBe(DrawMode.SOLID)
-
-    // Pass 2: 5 ASCII glyphs ('h','e','l','l','o') + 1 curly underline + 1 cursor rect + 1 cursor glyph = 8 instances
+    // Pass 2: 15 glyphs + 1 curly + 1 dotted (1 quad, NOT per-dot!) + 1 cursor + 1 cursor glyph = 19 instances
     const pass2 = mock.drawCalls[1]!
-    expect(pass2.count).toBe(8)
+    expect(pass2.count).toBe(19)
     const modes: number[] = []
     for (let i = 0; i < pass2.count; i += 1) modes.push(pass2.instances[i * INSTANCE_FLOATS + 12]!)
-    expect(modes).toEqual([
-      DrawMode.MONO_GLYPH,
-      DrawMode.MONO_GLYPH,
-      DrawMode.MONO_GLYPH,
-      DrawMode.MONO_GLYPH,
-      DrawMode.MONO_GLYPH,
+    expect(modes.slice(15)).toEqual([
       DrawMode.CURLY_WAVE,
+      DrawMode.DASHED_LINE,
       DrawMode.SOLID,
       DrawMode.MONO_GLYPH,
     ])
 
-    // Unique glyphs cached in atlas: 'h', 'e', 'l', 'o' = 4 uploads (repeated 'l' and cursor 'e' hit cache!)
-    expect(painter.atlasEntryCount).toBe(4)
-    expect(mock.stats().texSubUploads).toBe(4)
-
     // Repainting same scene uploads ZERO new glyphs
+    const uploadsBefore = mock.stats().texSubUploads
     painter.paint(scene)
-    expect(mock.stats().texSubUploads).toBe(4)
+    expect(mock.stats().texSubUploads).toBe(uploadsBefore)
 
     painter.dispose()
     const st = mock.stats()
@@ -259,69 +282,140 @@ describe('WebGL2AtlasPainter & createPainter', () => {
     expect(st.deletedBuffers).toBe(2)
     expect(st.deletedVaos).toBe(1)
     expect(st.deletedPrograms).toBe(1)
+    expect(st.loseContextCalls).toBe(1)
+    expect(scratch.canvas.width).toBe(0)
+    expect(scratch.canvas.height).toBe(0)
   })
 
-  it('auto-resets and repacks the glyph atlas cleanly when full', () => {
+  it('auto-resets atlas when stale entries overflow, and avoids thrashing on an already-empty atlas', () => {
     const mock = mockWebGL2Canvas()
-    // Tiny 64x64 atlas with 10x20 cells (12x22 padded) holds 5 cols * 2 rows = 10 glyphs max
+    const scratch = makeScratchCanvas('white')
+    // 64x64 atlas with padded slots (~18x28) holds ~6 glyphs max
     const painter = new WebGL2AtlasPainter(
       { family: 'monospace', size: 14 },
-      { canvas: mock.canvas, pixelRatio: 1, atlasSize: 64, scratchCanvas: () => makeScratchCanvas(false) },
+      { canvas: mock.canvas, pixelRatio: 1, atlasSize: 64, scratchCanvas: () => scratch.canvas },
     )
     painter.resize(20, 2, 1)
 
-    // Frame 1 fills 9 glyphs ('a'..'i') -> fits with 0 resets
-    painter.paint({ theme, rows: [drawRow(row(0, 'abcdefghi'), theme), null], offset: 0 })
+    // Frame 1 with 3 glyphs fits with 0 resets
+    painter.paint({ theme, rows: [drawRow(row(0, 'abc'), theme), null], offset: 0 })
     expect(painter.atlasResets).toBe(0)
-    expect(painter.atlasEntryCount).toBe(9)
+    expect(painter.atlasEntryCount).toBe(3)
 
-    // Frame 2 introduces 5 brand-new glyphs ('1'..'5') -> triggers 1 automatic atlas reset & repacks only '1'..'5'!
+    // Frame 2 with 5 new glyphs overflows stale entries -> 1 reset & repacks!
     painter.paint({ theme, rows: [drawRow(row(0, '12345'), theme), null], offset: 0 })
     expect(painter.atlasResets).toBe(1)
-    expect(painter.atlasEntryCount).toBe(5)
+
+    // Fresh painter on a huge overflowing single frame does NOT trigger a redundant reset on empty atlas
+    const mock2 = mockWebGL2Canvas()
+    const painter2 = new WebGL2AtlasPainter(
+      { family: 'monospace', size: 14 },
+      { canvas: mock2.canvas, pixelRatio: 1, atlasSize: 64, scratchCanvas: () => makeScratchCanvas('white').canvas },
+    )
+    painter2.resize(30, 2, 1)
+    painter2.paint({ theme, rows: [drawRow(row(0, 'abcdefghijklmnopqrstuvwxyz'), theme), null], offset: 0 })
+    expect(painter2.atlasResets).toBe(0)
+
     painter.dispose()
+    painter2.dispose()
   })
 
-  it('detects color emoji via COLOR_TEX mode and renders image placements above and below text', () => {
+  it('detects grayscale color emoji, batches same-texture Kitty slices, evicts image textures LRU, and draws cursor above above:true images', () => {
     const mock = mockWebGL2Canvas()
+    const scratch = makeScratchCanvas('grayscaleEmoji')
+    // Cap image texture cache to 2048 bytes (each 16x16 RGBA canvas = 1024 bytes => holds at most 2)
     const painter = new WebGL2AtlasPainter(
       { family: 'monospace', size: 14 },
-      { canvas: mock.canvas, pixelRatio: 1, scratchCanvas: () => makeScratchCanvas(true) },
+      {
+        canvas: mock.canvas,
+        pixelRatio: 1,
+        maxImageTextureBytes: 2048,
+        scratchCanvas: () => scratch.canvas,
+      },
     )
     painter.resize(10, 2, 1)
 
-    const pic = document.createElement('canvas')
-    pic.width = 40
-    pic.height = 20
+    const mkPic = () => {
+      const c = document.createElement('canvas')
+      c.width = 16
+      c.height = 16
+      return c
+    }
+    const p1 = mkPic()
+    const p2 = mkPic()
+    const p3 = mkPic()
 
     const r0 = drawRow(
       packRow({
         line: 0,
         styles: [{}, { flags: PackedStyleFlag.BOLD }],
-        runs: [{ colStart: 0, colLen: 2, text: '🔥', flags: RunFlag.PER_CELL, styleIdx: 1 }],
+        runs: [{ colStart: 0, colLen: 2, text: '🐼', flags: RunFlag.PER_CELL, styleIdx: 1 }],
       }),
       theme,
     )
+
+    // Two consecutive under-text slices of p1 MUST batch into 1 draw call; cursor draws AFTER above-text p2!
+    painter.paint({
+      theme,
+      rows: [r0, null],
+      offset: 0,
+      cursor: { column: 0, row: 0, cells: 1, shape: 'bar' },
+      images: [
+        { picture: p1, x: 0, y: 0, width: 16, height: 10, source: { x: 0, y: 0, width: 16, height: 8 }, above: false },
+        { picture: p1, x: 0, y: 10, width: 16, height: 10, source: { x: 0, y: 8, width: 16, height: 8 }, above: false },
+        { picture: p2, x: 20, y: 0, width: 16, height: 16, source: { x: 0, y: 0, width: 16, height: 16 }, above: true },
+      ],
+    })
+
+    // Draw calls: [0] 2 batched p1 slices, [1] grayscale emoji 🐼 (COLOR_TEX), [2] above p2, [3] cursor on top!
+    expect(painter.drawCallsLastFrame).toBe(4)
+    expect(mock.drawCalls[0]!.count).toBe(2)
+    expect(mock.drawCalls[1]!.instances[12]).toBe(DrawMode.COLOR_TEX)
+    expect(mock.drawCalls[3]!.instances[12]).toBe(DrawMode.SOLID) // cursor drawn AFTER above:true image!
+
+    // Adding p3 evicts oldest texture (p1) via gl.deleteTexture to stay <= 2048 bytes
     painter.paint({
       theme,
       rows: [r0, null],
       offset: 0,
       images: [
-        { picture: pic, x: 0, y: 0, width: 20, height: 20, source: { x: 0, y: 0, width: 40, height: 20 }, above: false },
-        { picture: pic, x: 20, y: 0, width: 20, height: 20, source: { x: 0, y: 0, width: 40, height: 20 }, above: true },
+        { picture: p3, x: 0, y: 0, width: 16, height: 16, source: { x: 0, y: 0, width: 16, height: 16 }, above: false },
       ],
     })
+    expect(painter.imageTextureCount).toBe(2)
+    expect(painter.imageTextureBytes).toBeLessThanOrEqual(2048)
+    expect(mock.stats().deletedTextures).toBe(1)
 
-    // Under-text image + glyph pass + above-text image = 3 draw calls
-    expect(painter.drawCallsLastFrame).toBe(3)
-    // Color emoji rendered with DrawMode.COLOR_TEX
-    expect(mock.drawCalls[1]!.instances[12]).toBe(DrawMode.COLOR_TEX)
-    // Image texture reused across both placements and freed on dispose
     painter.dispose()
-    expect(mock.stats().deletedTextures).toBe(2) // 1 atlas + 1 image texture
   })
 
-  it('handles webglcontextlost / webglcontextrestored cleanly and fires whenCleared', () => {
+  it('survives texImage2D exceptions without leaking texture or aborting text rendering', () => {
+    const mock = mockWebGL2Canvas({ throwOnImageUpload: true })
+    const painter = new WebGL2AtlasPainter(
+      { family: 'monospace', size: 14 },
+      { canvas: mock.canvas, pixelRatio: 1, scratchCanvas: () => makeScratchCanvas('white').canvas },
+    )
+    painter.resize(10, 2, 1)
+    const pic = document.createElement('canvas')
+    pic.width = 16
+    pic.height = 16
+
+    painter.paint({
+      theme,
+      rows: [drawRow(row(0, 'safe'), theme), null],
+      offset: 0,
+      images: [
+        { picture: pic, x: 0, y: 0, width: 16, height: 16, source: { x: 0, y: 0, width: 16, height: 16 }, above: false },
+      ],
+    })
+    // Failed image texture was deleted immediately and Pass 2 text ('safe') still drew!
+    expect(mock.stats().deletedTextures).toBe(1)
+    expect(painter.drawCallsLastFrame).toBe(1)
+    expect(mock.drawCalls[0]!.count).toBe(4)
+    painter.dispose()
+  })
+
+  it('handles webglcontextlost, failed restore retry, and successful webglcontextrestored cleanly', () => {
     const mock = mockWebGL2Canvas()
     let lostNotified = 0
     let clearedNotified = 0
@@ -330,7 +424,7 @@ describe('WebGL2AtlasPainter & createPainter', () => {
       {
         canvas: mock.canvas,
         pixelRatio: 1,
-        scratchCanvas: () => makeScratchCanvas(false),
+        scratchCanvas: () => makeScratchCanvas('white').canvas,
         onContextLost: () => { lostNotified += 1 },
       },
     )
@@ -344,13 +438,15 @@ describe('WebGL2AtlasPainter & createPainter', () => {
     expect(painter.isContextLost).toBe(true)
     expect(lostNotified).toBe(1)
 
-    // Painting while context is lost is a safe no-op
-    mock.drawCalls.length = 0
-    painter.paint({ theme, rows: [drawRow(row(0, 'hi'), theme), null], offset: 0 })
-    expect(mock.drawCalls).toHaveLength(0)
-
-    // Context restored rebuilds GPU state and triggers whenCleared repaint callback
+    // Simulate failed restore (driver loses context mid-init): stays contextLost, does NOT throw uncaught
+    mock.setFailCreateProgram(true)
     mock.setContextLost(false)
+    mock.canvas.dispatchEvent(new Event('webglcontextrestored'))
+    expect(painter.isContextLost).toBe(true)
+    expect(clearedNotified).toBe(0)
+
+    // Subsequent successful restore recovers and fires whenCleared
+    mock.setFailCreateProgram(false)
     mock.canvas.dispatchEvent(new Event('webglcontextrestored'))
     expect(painter.isContextLost).toBe(false)
     expect(clearedNotified).toBe(1)
@@ -367,14 +463,12 @@ describe('WebGL2AtlasPainter & createPainter', () => {
       WebGL2UnavailableError,
     )
 
-    // createPainter falls back cleanly to CanvasPainter when webgl2 returns null
     const origCreate = document.createElement.bind(document)
     const fallbackRec = recordingContext(10)
     let created = 0
     const spyCreate = ((tag: string) => {
       if (tag === 'canvas') {
         created += 1
-        // 1st canvas: no webgl2; 2nd canvas: 2D context for CanvasPainter fallback
         return created === 1 ? noWebGLCanvas : fallbackRec.canvas
       }
       return origCreate(tag)

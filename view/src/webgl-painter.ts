@@ -3,20 +3,22 @@
  * interface as `CanvasPainter`.
  *
  * Architecture:
- * - **Dynamic shelf-packed 2D glyph atlas (`RGBA8` texture):** rasterizes unique `(face, cells, text)`
- *   glyphs on a small offscreen 2D canvas with 1px transparent padding and uploads via `texSubImage2D`.
- *   Monochrome glyphs are rasterized in white so one atlas slot serves all foreground colours; color
- *   emoji are detected on rasterization and sampled with true RGBA. When full, the atlas clears and
- *   repacks automatically in-frame.
+ * - **Dynamic shelf-packed 2D glyph atlas (`RGBA8`, premultiplied alpha):** rasterizes unique
+ *   `(face, cells, text)` glyphs on a small offscreen 2D canvas with overhang bearing margins and
+ *   1px transparent padding, uploading via WebGL2 9-arg `texSubImage2D(..., w, h, scratch)` (zero
+ *   `getImageData` for ASCII; single scan for non-ASCII detecting both chromatic and grayscale color
+ *   emoji). When full, clears and repacks automatically in-frame.
  * - **Single `Float32Array` instanced draw buffer (`drawArraysInstanced`):** packs backgrounds,
- *   gutter marks, glyphs, underlines (including GPU-rendered anti-aliased curly waves), and cursor
- *   into a single reusable growable `Float32Array` (13 floats/instance = 52 bytes), drawing an
- *   entire terminal frame in 1–2 WebGL draw calls with zero per-frame JS allocations.
- * - **Fractional scroll uniform (`uOffsetPx`):** smooth sub-row trackpad scrolling shifts all
- *   instances directly in the vertex shader without rebuilding geometry.
- * - **Context loss resilience:** listens to `webglcontextlost` (preventing default so the browser
- *   restores it) and `webglcontextrestored` (rebuilding GPU state, clearing the atlas, and triggering
- *   `whenCleared` so `TerminalView` immediately repaints).
+ *   gutter marks, glyphs, straight/dotted/dashed/curly decorations (all shader-driven: 1 quad per
+ *   run!), and cursor into a reusable growable `Float32Array` (13 floats/instance = 52 bytes),
+ *   drawing a normal frame in 1–2 WebGL draw calls with zero per-frame JS allocations.
+ * - **Fractional scroll uniform (`uOffsetPx`):** smooth sub-row trackpad scrolling directly in the
+ *   vertex shader at exact 1:1 device-pixel scale.
+ * - **Bounded GPU image texture LRU (`maxImageTextureBytes = 64 MiB`):** batches consecutive
+ *   same-texture Kitty placeholder slices, evicts LRU textures with `gl.deleteTexture`, and guards
+ *   against closed/tainted image sources.
+ * - **Context loss resilience:** listens to `webglcontextlost` / `webglcontextrestored`, cleans up
+ *   partial GPU state on errors, and releases contexts cleanly via `WEBGL_lose_context` on dispose.
  */
 import { CanvasPainter } from './canvas-painter.ts'
 import type { GlyphRun, LineKind } from './draw.ts'
@@ -28,8 +30,11 @@ const ATLAS_PAD = 1
 /** Default glyph atlas dimension in device pixels (clamped to `GL_MAX_TEXTURE_SIZE`). */
 const DEFAULT_ATLAS_SIZE = 2048
 
-/** Minimum supported atlas dimension (for unit tests exercising overflow/repack). */
+/** Minimum supported atlas dimension (also used in unit tests exercising overflow/repack). */
 const MIN_ATLAS_SIZE = 64
+
+/** Default GPU VRAM cap for cached image placement textures (64 MiB). */
+const DEFAULT_MAX_IMAGE_TEX_BYTES = 64 * 1024 * 1024
 
 /** Floats per instance: `aDest(4) + aUv(4) + aColor(4) + aMode(1) = 13`. */
 export const INSTANCE_FLOATS = 13
@@ -41,6 +46,7 @@ export const DrawMode = {
   MONO_GLYPH: 1,
   COLOR_TEX: 2,
   CURLY_WAVE: 3,
+  DASHED_LINE: 4,
 } as const
 
 /** Error thrown when `WebGL2AtlasPainter` cannot acquire a WebGL2 context. */
@@ -56,6 +62,8 @@ export interface WebGL2PainterOptions {
   readonly pixelRatio?: number
   /** Glyph atlas texture size in pixels (square, clamped to `[64, MAX_TEXTURE_SIZE]`). Default `2048`. */
   readonly atlasSize?: number
+  /** Maximum GPU bytes retained across cached image placement textures (default `64 MiB`). */
+  readonly maxImageTextureBytes?: number
   /** Optional custom offscreen 2D canvas factory (used for glyph rasterization & font metrics). */
   readonly scratchCanvas?: () => HTMLCanvasElement
   /** Optional callback fired when WebGL2 context is lost. */
@@ -80,8 +88,8 @@ export function createPainter(font: Font, options: CreatePainterOptions = {}): P
       return new WebGL2AtlasPainter(font, { ...options, canvas: glCanvas, pixelRatio: ratio })
     } catch (err) {
       if (!(err instanceof WebGL2UnavailableError)) throw err
-      // HTML Canvas spec forbids requesting '2d' on a canvas where 'webgl2' was attempted if locked;
-      // always allocate a clean canvas for the 2D fallback.
+      // HTML Canvas spec forbids requesting '2d' on a canvas whose 'webgl2' slot was locked;
+      // always allocate a fresh canvas for the 2D fallback.
       return new CanvasPainter(font, document.createElement('canvas'), ratio)
     }
   }
@@ -93,6 +101,9 @@ export interface AtlasEntry {
   readonly y: number
   readonly w: number
   readonly h: number
+  /** Left/top overhang padding in device pixels subtracted from draw position. */
+  readonly bearingX: number
+  readonly bearingY: number
   readonly u0: number
   readonly v0: number
   readonly u1: number
@@ -108,7 +119,6 @@ interface Shelf {
 
 /**
  * Pure shelf-packing allocator for a square `size × size` 2D glyph atlas texture.
- * Separated for direct unit testing and deterministic overflow/repack behavior.
  */
 export class ShelfPacker {
   private readonly shelves: Shelf[] = []
@@ -121,13 +131,12 @@ export class ShelfPacker {
     this.nextY = 0
   }
 
-  /** Allocates a `(w, h)` rectangle (including `ATLAS_PAD` border), or returns `null` if full. */
+  /** Allocates a `(w, h)` rectangle (including `ATLAS_PAD` border on all sides), or `null` if it doesn't fit. */
   allocate(w: number, h: number): { readonly x: number; readonly y: number } | null {
-    const pw = Math.min(this.size, Math.max(1, Math.ceil(w)) + ATLAS_PAD * 2)
-    const ph = Math.min(this.size, Math.max(1, Math.ceil(h)) + ATLAS_PAD * 2)
+    const pw = Math.max(1, Math.ceil(w)) + ATLAS_PAD * 2
+    const ph = Math.max(1, Math.ceil(h)) + ATLAS_PAD * 2
     if (pw > this.size || ph > this.size) return null
 
-    // First-fit shelf whose height accommodates `ph` with minimal waste (<= 2x height)
     for (const shelf of this.shelves) {
       if (ph <= shelf.height && shelf.height <= ph * 2 && shelf.cursorX + pw <= this.size) {
         const x = shelf.cursorX + ATLAS_PAD
@@ -162,6 +171,7 @@ out vec2 vLocal;
 out vec4 vColor;
 out float vMode;
 out vec2 vDestSize;
+out vec4 vParams;
 
 void main() {
   vec2 posPx = vec2(aDest.x, aDest.y - uOffsetPx) + aCorner * aDest.zw;
@@ -172,6 +182,7 @@ void main() {
   vColor = aColor;
   vMode = aMode;
   vDestSize = aDest.zw;
+  vParams = aUv;
 }
 `
 
@@ -180,12 +191,14 @@ precision highp float;
 
 uniform sampler2D uAtlas;
 uniform float uCellWidth;
+uniform float uPixelRatio;
 
 in vec2 vUv;
 in vec2 vLocal;
 in vec4 vColor;
 in float vMode;
 in vec2 vDestSize;
+in vec4 vParams;
 
 out vec4 outColor;
 
@@ -200,21 +213,32 @@ void main() {
     if (a <= 0.001) discard;
     outColor = vec4(vColor.rgb * a, a);
   } else if (vMode < 2.5) {
-    // Mode 2: Full-color RGBA texture (color emoji or image placement)
+    // Mode 2: Full-color premultiplied RGBA texture (color emoji or image placement)
     vec4 tex = texture(uAtlas, vUv);
     float a = tex.a * vColor.a;
     if (a <= 0.001) discard;
     outColor = vec4(tex.rgb * vColor.a, a);
-  } else {
-    // Mode 3: Anti-aliased curly underline wave (1 cycle per cellWidth)
+  } else if (vMode < 3.5) {
+    // Mode 3: Anti-aliased curly underline wave (vParams.x = amplitudePx, vParams.y = strokeHalfPx)
     float xPx = vLocal.x * vDestSize.x;
-    float phase = (xPx / max(1.0, uCellWidth)) * 6.2831853;
-    float waveY = 0.5 + 0.32 * sin(phase);
-    float dist = abs(vLocal.y - waveY) * max(1.0, vDestSize.y);
-    float cov = clamp(1.0 - max(0.0, dist - 0.5), 0.0, 1.0);
+    float yPx = vLocal.y * vDestSize.y;
+    float freq = 6.2831853 / max(1.0, uCellWidth);
+    float phase = xPx * freq;
+    float ampPx = vParams.x;
+    float halfStroke = vParams.y;
+    float centerY = vDestSize.y * 0.5 + ampPx * sin(phase);
+    float slope = ampPx * freq * cos(phase);
+    float perpDist = abs(yPx - centerY) / sqrt(1.0 + slope * slope);
+    float aa = 1.0 / max(1.0, uPixelRatio);
+    float cov = 1.0 - smoothstep(halfStroke - aa * 0.5, halfStroke + aa * 0.5, perpDist);
     float a = cov * vColor.a;
     if (a <= 0.001) discard;
     outColor = vec4(vColor.rgb * a, a);
+  } else {
+    // Mode 4: Dotted / dashed underline (vParams.x = dashPx, vParams.y = periodPx)
+    float xPx = vLocal.x * vDestSize.x;
+    if (mod(xPx, max(1.0, vParams.y)) >= vParams.x) discard;
+    outColor = vec4(vColor.rgb * vColor.a, vColor.a);
   }
 }
 `
@@ -232,6 +256,7 @@ interface ImageTextureEntry {
   readonly texture: WebGLTexture
   readonly width: number
   readonly height: number
+  readonly byteSize: number
 }
 
 export class WebGL2AtlasPainter implements Painter {
@@ -241,7 +266,7 @@ export class WebGL2AtlasPainter implements Painter {
   private readonly gl: WebGL2RenderingContext
   private readonly scratch: HTMLCanvasElement
   private readonly scratchCtx: CanvasRenderingContext2D
-  private readonly requestedAtlasSize: number
+  private readonly maxImageTexBytes: number
   private readonly onContextLostCallback: (() => void) | undefined
 
   private font: Font
@@ -265,10 +290,11 @@ export class WebGL2AtlasPainter implements Painter {
   private uOffsetPx: WebGLUniformLocation | null = null
   private uAtlas: WebGLUniformLocation | null = null
   private uCellWidth: WebGLUniformLocation | null = null
+  private uPixelRatio: WebGLUniformLocation | null = null
 
-  // Cached image textures (released on dispose or context loss)
-  private imageTextures = new WeakMap<CanvasImageSource, ImageTextureEntry>()
-  private readonly ownedImageTextures = new Set<WebGLTexture>()
+  // Bounded LRU cache of image placement textures (deleted via gl.deleteTexture on eviction)
+  private readonly imageTextures = new Map<CanvasImageSource, ImageTextureEntry>()
+  private imageTexBytes = 0
 
   // Reusable growable instanced CPU scratch buffer (zero per-frame allocations)
   private instances = new Float32Array(4096 * INSTANCE_FLOATS)
@@ -299,6 +325,7 @@ export class WebGL2AtlasPainter implements Painter {
     const scratch = options.scratchCanvas ? options.scratchCanvas() : document.createElement('canvas')
     const scratchCtx = scratch.getContext('2d', { willReadFrequently: true })
     if (!scratchCtx) {
+      gl.getExtension?.('WEBGL_lose_context')?.loseContext()
       throw new WebGL2UnavailableError('Offscreen 2D rasterization context unavailable')
     }
 
@@ -311,14 +338,25 @@ export class WebGL2AtlasPainter implements Painter {
     this.font = font
     this.faces = facesOf(font)
     this.metrics = measure(scratchCtx, font, this.pixelRatio)
-    this.requestedAtlasSize = options.atlasSize ?? DEFAULT_ATLAS_SIZE
+    this.maxImageTexBytes = Math.max(
+      1024,
+      Number.isFinite(options.maxImageTextureBytes) ? options.maxImageTextureBytes! : DEFAULT_MAX_IMAGE_TEX_BYTES,
+    )
     this.onContextLostCallback = options.onContextLost
 
-    const maxTex = Number(gl.getParameter(gl.MAX_TEXTURE_SIZE)) || DEFAULT_ATLAS_SIZE
-    this.atlasSize = Math.max(MIN_ATLAS_SIZE, Math.min(this.requestedAtlasSize, maxTex))
+    const requested = Number.isFinite(options.atlasSize) ? options.atlasSize! : DEFAULT_ATLAS_SIZE
+    const maxTexRaw = Number(gl.getParameter(gl.MAX_TEXTURE_SIZE))
+    const maxTex = Number.isFinite(maxTexRaw) && maxTexRaw > 0 ? maxTexRaw : DEFAULT_ATLAS_SIZE
+    this.atlasSize = Math.max(MIN_ATLAS_SIZE, Math.min(Math.floor(requested), maxTex))
     this.packer = new ShelfPacker(this.atlasSize)
 
-    this.initGpu()
+    try {
+      this.initGpu()
+    } catch (err) {
+      this.releaseGpuObjects()
+      gl.getExtension?.('WEBGL_lose_context')?.loseContext()
+      throw err
+    }
 
     canvas.addEventListener('webglcontextlost', this.handleContextLost)
     canvas.addEventListener('webglcontextrestored', this.handleContextRestored)
@@ -332,11 +370,20 @@ export class WebGL2AtlasPainter implements Painter {
     return this.atlasEntries.size
   }
 
+  get imageTextureCount(): number {
+    return this.imageTextures.size
+  }
+
+  get imageTextureBytes(): number {
+    return this.imageTexBytes
+  }
+
   whenCleared(repaint: () => void): void {
     this.repaint = repaint
   }
 
   resize(columns: number, rows: number, pixelRatio: number, gutter = 0): void {
+    if (this.disposed) return
     const ratio = Number.isFinite(pixelRatio) && pixelRatio > 0 ? pixelRatio : 1
     const ratioChanged = ratio !== this.pixelRatio
     const prevW = this.metrics.cellWidth
@@ -365,11 +412,21 @@ export class WebGL2AtlasPainter implements Painter {
   }
 
   setFont(font: Font): void {
+    if (this.disposed) return
     this.font = font
     this.faces = facesOf(font)
     this.metrics = measure(this.scratchCtx, font, this.pixelRatio)
     this.resetAtlas()
-    this.resize(this.columns, this.rows, this.pixelRatio, this.gutter)
+    // Recompute canvas CSS/device dimensions with the already-measured font metrics
+    const width = this.columns * this.metrics.cellWidth + this.gutter
+    const height = this.rows * this.metrics.cellHeight
+    this.canvas.width = Math.max(1, Math.round(width * this.pixelRatio))
+    this.canvas.height = Math.max(1, Math.round(height * this.pixelRatio))
+    this.canvas.style.width = `${width}px`
+    this.canvas.style.height = `${height}px`
+    if (!this.contextLost) {
+      this.gl.viewport(0, 0, this.canvas.width, this.canvas.height)
+    }
   }
 
   paint(scene: Scene): void {
@@ -379,8 +436,9 @@ export class WebGL2AtlasPainter implements Painter {
 
     const gl = this.gl
     const { cellWidth, cellHeight } = this.metrics
-    const viewportW = Math.max(1, this.columns * cellWidth + this.gutter)
-    const viewportH = Math.max(1, this.rows * cellHeight)
+    // Derive CSS viewport from actual device buffer dimensions so 1 CSS px maps 1:1 to pixelRatio device px
+    const viewportW = Math.max(1, this.canvas.width / this.pixelRatio)
+    const viewportH = Math.max(1, this.canvas.height / this.pixelRatio)
 
     gl.viewport(0, 0, this.canvas.width, this.canvas.height)
     const [bgR, bgG, bgB] = rgbFloats(scene.theme.background)
@@ -392,11 +450,9 @@ export class WebGL2AtlasPainter implements Painter {
     gl.uniform2f(this.uViewportPx, viewportW, viewportH)
     gl.uniform1f(this.uOffsetPx, scene.offset * cellHeight)
     gl.uniform1f(this.uCellWidth, cellWidth)
+    gl.uniform1f(this.uPixelRatio, this.pixelRatio)
     gl.uniform1i(this.uAtlas, 0)
 
-    // Pre-populate glyph atlas for all visible glyphs (+ block cursor char). If an overflow reset
-    // triggers mid-frame, we restart glyph preparation once cleanly so every glyph in this frame
-    // shares the same valid atlas generation!
     this.ensureSceneGlyphs(scene)
 
     // --- Pass 1: Backgrounds + gutter marks ---
@@ -425,7 +481,10 @@ export class WebGL2AtlasPainter implements Painter {
     // --- Pass 1b: Images drawn under text (`above === false`) ---
     this.drawImages(scene, false)
 
-    // --- Pass 2: Glyphs + text decorations + cursor (single batched draw call!) ---
+    const hasAboveImages =
+      scene.images?.some((img) => img.above && img.source.width > 0 && img.source.height > 0) ?? false
+
+    // --- Pass 2: Glyphs + text decorations (+ cursor when no above-text images exist) ---
     this.instanceCount = 0
     for (let rowIdx = 0; rowIdx < scene.rows.length; rowIdx += 1) {
       const row = scene.rows[rowIdx]
@@ -438,15 +497,24 @@ export class WebGL2AtlasPainter implements Painter {
         this.emitDecoration(line.kind, this.gutter + line.column * cellWidth, y, line.cells * cellWidth, line.color)
       }
     }
-    if (scene.cursor) {
+    if (scene.cursor && !hasAboveImages) {
       this.emitCursor(scene)
     }
     if (this.instanceCount > 0) {
       this.flushBatch(this.atlasTex)
     }
 
-    // --- Pass 3: Images drawn above text (`above === true`) ---
-    this.drawImages(scene, true)
+    // --- Pass 3: Images drawn above text (`above === true`) + cursor on top (matching CanvasPainter z-order) ---
+    if (hasAboveImages) {
+      this.drawImages(scene, true)
+      if (scene.cursor) {
+        this.instanceCount = 0
+        this.emitCursor(scene)
+        if (this.instanceCount > 0) {
+          this.flushBatch(this.atlasTex)
+        }
+      }
+    }
 
     gl.bindVertexArray(null)
   }
@@ -457,9 +525,15 @@ export class WebGL2AtlasPainter implements Painter {
     this.canvas.removeEventListener('webglcontextlost', this.handleContextLost)
     this.canvas.removeEventListener('webglcontextrestored', this.handleContextRestored)
     this.repaint = null
+    const wasLost = this.contextLost
     this.releaseGpuObjects()
+    if (!wasLost) {
+      this.gl.getExtension?.('WEBGL_lose_context')?.loseContext()
+    }
     this.atlasEntries.clear()
     this.packer.reset()
+    this.scratch.width = 0
+    this.scratch.height = 0
     this.canvas.width = 0
     this.canvas.height = 0
     this.canvas.remove()
@@ -476,15 +550,22 @@ export class WebGL2AtlasPainter implements Painter {
     this.atlasTex = null
     this.atlasEntries.clear()
     this.packer.reset()
-    this.imageTextures = new WeakMap()
-    this.ownedImageTextures.clear()
+    this.imageTextures.clear()
+    this.imageTexBytes = 0
     this.onContextLostCallback?.()
   }
 
   private readonly handleContextRestored = () => {
     if (this.disposed) return
+    try {
+      this.initGpu()
+    } catch {
+      // Context lost again or driver refused rebuild; remain in contextLost state safely
+      this.releaseGpuObjects()
+      this.contextLost = true
+      return
+    }
     this.contextLost = false
-    this.initGpu()
     if (this.columns > 0 && this.rows > 0) {
       this.gl.viewport(0, 0, this.canvas.width, this.canvas.height)
     }
@@ -493,74 +574,80 @@ export class WebGL2AtlasPainter implements Painter {
 
   private initGpu(): void {
     const gl = this.gl
-    const vs = compileShader(gl, gl.VERTEX_SHADER, VERTEX_SHADER_SRC)
-    const fs = compileShader(gl, gl.FRAGMENT_SHADER, FRAGMENT_SHADER_SRC)
-    const program = gl.createProgram()
-    if (!program) throw new WebGL2UnavailableError('Failed to create WebGL2 program')
-    gl.attachShader(program, vs)
-    gl.attachShader(program, fs)
-    gl.linkProgram(program)
-    const linked = gl.getProgramParameter(program, gl.LINK_STATUS)
-    gl.deleteShader(vs)
-    gl.deleteShader(fs)
-    if (!linked) {
-      const log = gl.getProgramInfoLog(program) ?? 'link error'
-      gl.deleteProgram(program)
-      throw new WebGL2UnavailableError(`WebGL2 program link failed: ${log}`)
+    let vs: WebGLShader | null = null
+    let fs: WebGLShader | null = null
+    try {
+      vs = compileShader(gl, gl.VERTEX_SHADER, VERTEX_SHADER_SRC)
+      fs = compileShader(gl, gl.FRAGMENT_SHADER, FRAGMENT_SHADER_SRC)
+      const program = gl.createProgram()
+      if (!program) throw new WebGL2UnavailableError('Failed to create WebGL2 program')
+      this.program = program
+      gl.attachShader(program, vs)
+      gl.attachShader(program, fs)
+      gl.linkProgram(program)
+      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        const log = gl.getProgramInfoLog(program) ?? 'link error'
+        throw new WebGL2UnavailableError(`WebGL2 program link failed: ${log}`)
+      }
+      this.uViewportPx = gl.getUniformLocation(program, 'uViewportPx')
+      this.uOffsetPx = gl.getUniformLocation(program, 'uOffsetPx')
+      this.uAtlas = gl.getUniformLocation(program, 'uAtlas')
+      this.uCellWidth = gl.getUniformLocation(program, 'uCellWidth')
+      this.uPixelRatio = gl.getUniformLocation(program, 'uPixelRatio')
+
+      const vao = gl.createVertexArray()
+      const quadBuf = gl.createBuffer()
+      const instanceBuf = gl.createBuffer()
+      this.vao = vao
+      this.quadBuf = quadBuf
+      this.instanceBuf = instanceBuf
+      this.instanceBufCapacityFloats = 0
+      if (!vao || !quadBuf || !instanceBuf) {
+        throw new WebGL2UnavailableError('Failed to allocate WebGL2 VAO/buffers')
+      }
+
+      gl.bindVertexArray(vao)
+
+      gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf)
+      gl.bufferData(gl.ARRAY_BUFFER, UNIT_QUAD, gl.STATIC_DRAW)
+      gl.enableVertexAttribArray(0)
+      gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0)
+
+      gl.bindBuffer(gl.ARRAY_BUFFER, instanceBuf)
+      gl.enableVertexAttribArray(1)
+      gl.vertexAttribPointer(1, 4, gl.FLOAT, false, INSTANCE_STRIDE_BYTES, 0)
+      gl.vertexAttribDivisor(1, 1)
+
+      gl.enableVertexAttribArray(2)
+      gl.vertexAttribPointer(2, 4, gl.FLOAT, false, INSTANCE_STRIDE_BYTES, 16)
+      gl.vertexAttribDivisor(2, 1)
+
+      gl.enableVertexAttribArray(3)
+      gl.vertexAttribPointer(3, 4, gl.FLOAT, false, INSTANCE_STRIDE_BYTES, 32)
+      gl.vertexAttribDivisor(3, 1)
+
+      gl.enableVertexAttribArray(4)
+      gl.vertexAttribPointer(4, 1, gl.FLOAT, false, INSTANCE_STRIDE_BYTES, 48)
+      gl.vertexAttribDivisor(4, 1)
+
+      gl.bindVertexArray(null)
+
+      const atlasTex = gl.createTexture()
+      if (!atlasTex) throw new WebGL2UnavailableError('Failed to create WebGL2 atlas texture')
+      this.atlasTex = atlasTex
+      // Keep UNPACK_PREMULTIPLY_ALPHA_WEBGL = 1 globally for both atlas (color emoji) and image uploads
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, 1)
+      this.allocateAtlasTexture()
+
+      gl.enable(gl.BLEND)
+      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
+    } catch (err) {
+      this.releaseGpuObjects()
+      throw err
+    } finally {
+      if (vs) gl.deleteShader(vs)
+      if (fs) gl.deleteShader(fs)
     }
-    this.program = program
-    this.uViewportPx = gl.getUniformLocation(program, 'uViewportPx')
-    this.uOffsetPx = gl.getUniformLocation(program, 'uOffsetPx')
-    this.uAtlas = gl.getUniformLocation(program, 'uAtlas')
-    this.uCellWidth = gl.getUniformLocation(program, 'uCellWidth')
-
-    const vao = gl.createVertexArray()
-    const quadBuf = gl.createBuffer()
-    const instanceBuf = gl.createBuffer()
-    if (!vao || !quadBuf || !instanceBuf) {
-      throw new WebGL2UnavailableError('Failed to allocate WebGL2 VAO/buffers')
-    }
-    this.vao = vao
-    this.quadBuf = quadBuf
-    this.instanceBuf = instanceBuf
-    this.instanceBufCapacityFloats = 0
-
-    gl.bindVertexArray(vao)
-
-    // Attribute 0: unit quad corners (per-vertex)
-    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf)
-    gl.bufferData(gl.ARRAY_BUFFER, UNIT_QUAD, gl.STATIC_DRAW)
-    gl.enableVertexAttribArray(0)
-    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0)
-
-    // Attributes 1..4: instanced payload (per-instance, divisor 1)
-    gl.bindBuffer(gl.ARRAY_BUFFER, instanceBuf)
-    gl.enableVertexAttribArray(1)
-    gl.vertexAttribPointer(1, 4, gl.FLOAT, false, INSTANCE_STRIDE_BYTES, 0)
-    gl.vertexAttribDivisor(1, 1)
-
-    gl.enableVertexAttribArray(2)
-    gl.vertexAttribPointer(2, 4, gl.FLOAT, false, INSTANCE_STRIDE_BYTES, 16)
-    gl.vertexAttribDivisor(2, 1)
-
-    gl.enableVertexAttribArray(3)
-    gl.vertexAttribPointer(3, 4, gl.FLOAT, false, INSTANCE_STRIDE_BYTES, 32)
-    gl.vertexAttribDivisor(3, 1)
-
-    gl.enableVertexAttribArray(4)
-    gl.vertexAttribPointer(4, 1, gl.FLOAT, false, INSTANCE_STRIDE_BYTES, 48)
-    gl.vertexAttribDivisor(4, 1)
-
-    gl.bindVertexArray(null)
-
-    // Create empty RGBA8 glyph atlas texture
-    const atlasTex = gl.createTexture()
-    if (!atlasTex) throw new WebGL2UnavailableError('Failed to create WebGL2 atlas texture')
-    this.atlasTex = atlasTex
-    this.allocateAtlasTexture()
-
-    gl.enable(gl.BLEND)
-    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
   }
 
   private allocateAtlasTexture(): void {
@@ -572,7 +659,7 @@ export class WebGL2AtlasPainter implements Painter {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
-    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, 0)
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, 1)
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, this.atlasSize, this.atlasSize, 0, gl.RGBA, gl.UNSIGNED_BYTE, null)
   }
 
@@ -587,9 +674,9 @@ export class WebGL2AtlasPainter implements Painter {
 
   private releaseGpuObjects(): void {
     const gl = this.gl
-    for (const tex of this.ownedImageTextures) gl.deleteTexture(tex)
-    this.ownedImageTextures.clear()
-    this.imageTextures = new WeakMap()
+    for (const entry of this.imageTextures.values()) gl.deleteTexture(entry.texture)
+    this.imageTextures.clear()
+    this.imageTexBytes = 0
     if (this.atlasTex) gl.deleteTexture(this.atlasTex)
     if (this.quadBuf) gl.deleteBuffer(this.quadBuf)
     if (this.instanceBuf) gl.deleteBuffer(this.instanceBuf)
@@ -598,12 +685,15 @@ export class WebGL2AtlasPainter implements Painter {
     this.atlasTex = null
     this.quadBuf = null
     this.instanceBuf = null
+    this.instanceBufCapacityFloats = 0
     this.vao = null
     this.program = null
   }
 
   private ensureSceneGlyphs(scene: Scene): void {
+    const hadPriorEntries = this.atlasEntries.size > 0
     let overflowed = false
+
     const ensureChar = (text: string, cells: number, bold: boolean, italic: boolean): boolean => {
       if (text === ' ' || text === '') return true
       const key = glyphKey(text, cells, bold, italic)
@@ -634,8 +724,8 @@ export class WebGL2AtlasPainter implements Painter {
     }
 
     walk()
-    if (overflowed) {
-      // Atlas filled up mid-frame: clear once and repack only glyphs visible in this scene.
+    if (overflowed && hadPriorEntries) {
+      // Atlas filled up with stale glyphs from prior frames: clear once and repack only this frame's glyphs.
       this.resetAtlas()
       overflowed = false
       walk()
@@ -654,9 +744,14 @@ export class WebGL2AtlasPainter implements Painter {
 
     const cellPxW = Math.max(1, Math.ceil(cells * metrics.cellWidth * pixelRatio))
     const cellPxH = Math.max(1, Math.ceil(metrics.cellHeight * pixelRatio))
+    // Small bearing padding so italic/bold overhangs and tall accents aren't clipped to the cell box
+    const padX = Math.max(1, Math.ceil(0.25 * metrics.cellWidth * pixelRatio))
+    const padY = Math.max(1, Math.ceil(0.15 * metrics.cellHeight * pixelRatio))
     const maxSlot = Math.max(1, atlasSize - ATLAS_PAD * 2)
-    const w = Math.min(cellPxW, maxSlot)
-    const h = Math.min(cellPxH, maxSlot)
+    const bearingX = cellPxW + padX * 2 <= maxSlot ? padX : 0
+    const bearingY = cellPxH + padY * 2 <= maxSlot ? padY : 0
+    const w = Math.min(cellPxW + bearingX * 2, maxSlot)
+    const h = Math.min(cellPxH + bearingY * 2, maxSlot)
 
     const pos = this.packer.allocate(w, h)
     if (!pos) return false
@@ -672,16 +767,16 @@ export class WebGL2AtlasPainter implements Painter {
     scratchCtx.font = this.faces[faceIdx]!
     scratchCtx.textBaseline = 'alphabetic'
     scratchCtx.fillStyle = '#ffffff'
-    scratchCtx.fillText(text, 0, metrics.baseline)
+    scratchCtx.fillText(text, bearingX / pixelRatio, metrics.baseline + bearingY / pixelRatio)
 
-    // Detect color emoji only for non-ASCII glyphs (zero getImageData overhead for ASCII!)
+    // Detect color emoji (both chromatic and dark/grayscale like 🐼/⚫) ONLY for non-ASCII clusters
     let colored = false
     if (text.length > 1 || text.charCodeAt(0) >= 0x80) {
       const img = scratchCtx.getImageData?.(0, 0, w, h)
       if (img) {
         const d = img.data
         for (let i = 0; i < d.length; i += 4) {
-          if (d[i + 3]! > 16 && (d[i]! !== d[i + 1]! || d[i + 1]! !== d[i + 2]!)) {
+          if (d[i + 3]! > 16 && (d[i]! !== d[i + 1]! || d[i + 1]! !== d[i + 2]! || d[i]! < 245)) {
             colored = true
             break
           }
@@ -689,25 +784,19 @@ export class WebGL2AtlasPainter implements Painter {
       }
     }
 
+    // WebGL2 9-arg texSubImage2D natively copies top-left `w × h` from `scratch` canvas AND applies
+    // `UNPACK_PREMULTIPLY_ALPHA_WEBGL = 1` with zero `getImageData` readback!
     gl.activeTexture(gl.TEXTURE0)
     gl.bindTexture(gl.TEXTURE_2D, atlasTex)
-    // Copy exact `w × h` rasterized sub-region (if scratch is larger, pass ImageData or sized canvas)
-    if (scratch.width === w && scratch.height === h) {
-      gl.texSubImage2D(gl.TEXTURE_2D, 0, pos.x, pos.y, gl.RGBA, gl.UNSIGNED_BYTE, scratch)
-    } else {
-      const imgData = scratchCtx.getImageData?.(0, 0, w, h)
-      if (imgData) {
-        gl.texSubImage2D(gl.TEXTURE_2D, 0, pos.x, pos.y, w, h, gl.RGBA, gl.UNSIGNED_BYTE, imgData.data)
-      } else {
-        gl.texSubImage2D(gl.TEXTURE_2D, 0, pos.x, pos.y, gl.RGBA, gl.UNSIGNED_BYTE, scratch)
-      }
-    }
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, pos.x, pos.y, w, h, gl.RGBA, gl.UNSIGNED_BYTE, scratch)
 
     this.atlasEntries.set(key, {
       x: pos.x,
       y: pos.y,
       w,
       h,
+      bearingX,
+      bearingY,
       u0: pos.x / atlasSize,
       v0: pos.y / atlasSize,
       u1: (pos.x + w) / atlasSize,
@@ -726,27 +815,13 @@ export class WebGL2AtlasPainter implements Painter {
         if (ch === ' ') continue
         const entry = this.atlasEntries.get(glyphKey(ch, 1, run.bold, run.italic))
         if (!entry) continue
-        this.pushGlyph(
-          this.gutter + (run.column + k) * cellWidth,
-          y,
-          entry.w / this.pixelRatio,
-          entry.h / this.pixelRatio,
-          entry,
-          r, g, b, run.alpha,
-        )
+        this.pushGlyph(this.gutter + (run.column + k) * cellWidth, y, entry, r, g, b, run.alpha)
       }
       return
     }
     const entry = this.atlasEntries.get(glyphKey(run.text, run.cells, run.bold, run.italic))
     if (!entry) return
-    this.pushGlyph(
-      this.gutter + run.column * cellWidth,
-      y,
-      entry.w / this.pixelRatio,
-      entry.h / this.pixelRatio,
-      entry,
-      r, g, b, run.alpha,
-    )
+    this.pushGlyph(this.gutter + run.column * cellWidth, y, entry, r, g, b, run.alpha)
   }
 
   private emitDecoration(kind: LineKind, x: number, y: number, width: number, color: number): void {
@@ -768,24 +843,19 @@ export class WebGL2AtlasPainter implements Painter {
       case 'overline':
         this.pushSolid(x, y, width, thickness, r, g, b, 1)
         break
-      case 'dotted': {
-        const step = thickness * 3
-        for (let dx = 0; dx < width; dx += step) {
-          this.pushSolid(x + dx, under, Math.min(thickness, width - dx), thickness, r, g, b, 1)
-        }
+      case 'dotted':
+        // Single shader-driven quad per run (zero per-dot instance explosion!)
+        this.pushInstance(x, under, width, thickness, thickness, thickness * 3, 0, 0, r, g, b, 1, DrawMode.DASHED_LINE)
         break
-      }
-      case 'dashed': {
-        const dash = thickness * 4
-        const step = thickness * 6
-        for (let dx = 0; dx < width; dx += step) {
-          this.pushSolid(x + dx, under, Math.min(dash, width - dx), thickness, r, g, b, 1)
-        }
+      case 'dashed':
+        this.pushInstance(x, under, width, thickness, thickness * 4, thickness * 6, 0, 0, r, g, b, 1, DrawMode.DASHED_LINE)
         break
-      }
       case 'curly': {
-        const h = Math.max(3, thickness * 4)
-        this.pushInstance(x, under - h * 0.4, width, h, 0, 0, 1, 1, r, g, b, 1, DrawMode.CURLY_WAVE)
+        const ampPx = thickness * 1.35
+        const halfStroke = thickness * 0.5
+        const aaMargin = 1.5 / Math.max(1, this.pixelRatio)
+        const h = (ampPx + halfStroke + aaMargin) * 2
+        this.pushInstance(x, under - h * 0.5, width, h, ampPx, halfStroke, 0, 0, r, g, b, 1, DrawMode.CURLY_WAVE)
         break
       }
     }
@@ -821,7 +891,7 @@ export class WebGL2AtlasPainter implements Painter {
           )
           if (entry) {
             const [tr, tg, tb] = rgbFloats(scene.theme.cursorText)
-            this.pushGlyph(x, y, entry.w / this.pixelRatio, entry.h / this.pixelRatio, entry, tr, tg, tb, 1)
+            this.pushGlyph(x, y, entry, tr, tg, tb, 1)
           }
         }
         break
@@ -831,15 +901,24 @@ export class WebGL2AtlasPainter implements Painter {
   private drawImages(scene: Scene, above: boolean): void {
     const list = scene.images
     if (!list || list.length === 0) return
+
+    // Batch consecutive slices sharing the same WebGLTexture (e.g., Kitty placeholder rows) into 1 draw call
+    let currentTex: WebGLTexture | null = null
+    this.instanceCount = 0
+
     for (const img of list) {
       if (img.above !== above || img.source.width <= 0 || img.source.height <= 0) continue
       const texEntry = this.ensureImageTexture(img.picture)
       if (!texEntry || texEntry.width <= 0 || texEntry.height <= 0) continue
+      if (currentTex !== null && currentTex !== texEntry.texture && this.instanceCount > 0) {
+        this.flushBatch(currentTex)
+        this.instanceCount = 0
+      }
+      currentTex = texEntry.texture
       const u0 = img.source.x / texEntry.width
       const v0 = img.source.y / texEntry.height
       const u1 = (img.source.x + img.source.width) / texEntry.width
       const v1 = (img.source.y + img.source.height) / texEntry.height
-      this.instanceCount = 0
       this.pushInstance(
         this.gutter + img.x,
         img.y,
@@ -849,34 +928,62 @@ export class WebGL2AtlasPainter implements Painter {
         1, 1, 1, 1,
         DrawMode.COLOR_TEX,
       )
-      this.flushBatch(texEntry.texture)
+    }
+
+    if (currentTex !== null && this.instanceCount > 0) {
+      this.flushBatch(currentTex)
+      this.instanceCount = 0
     }
   }
 
   private ensureImageTexture(picture: CanvasImageSource): ImageTextureEntry | null {
+    const dims = sourceDimensions(picture)
     const cached = this.imageTextures.get(picture)
-    if (cached) return cached
+    if (cached) {
+      if (dims.width <= 0 || dims.height <= 0) {
+        // Source bitmap was closed externally; delete GPU texture immediately
+        this.gl.deleteTexture(cached.texture)
+        this.imageTextures.delete(picture)
+        this.imageTexBytes -= cached.byteSize
+        return null
+      }
+      // Refresh LRU recency
+      this.imageTextures.delete(picture)
+      this.imageTextures.set(picture, cached)
+      return cached
+    }
     if (typeof SVGImageElement !== 'undefined' && picture instanceof SVGImageElement) return null
+    if (dims.width <= 0 || dims.height <= 0) return null
+
     const gl = this.gl
     const tex = gl.createTexture()
     if (!tex) return null
-    const dims = sourceDimensions(picture)
-    if (dims.width <= 0 || dims.height <= 0) {
+    try {
+      gl.activeTexture(gl.TEXTURE0)
+      gl.bindTexture(gl.TEXTURE_2D, tex)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, 1)
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, picture as TexImageSource)
+    } catch {
       gl.deleteTexture(tex)
       return null
     }
-    gl.activeTexture(gl.TEXTURE0)
-    gl.bindTexture(gl.TEXTURE_2D, tex)
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
-    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, 1)
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, picture as TexImageSource)
-    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, 0)
-    const entry: ImageTextureEntry = { texture: tex, width: dims.width, height: dims.height }
+
+    const byteSize = Math.max(4, dims.width * dims.height * 4)
+    const entry: ImageTextureEntry = { texture: tex, width: dims.width, height: dims.height, byteSize }
     this.imageTextures.set(picture, entry)
-    this.ownedImageTextures.add(tex)
+    this.imageTexBytes += byteSize
+    while (this.imageTexBytes > this.maxImageTexBytes && this.imageTextures.size > 1) {
+      const oldestKey = this.imageTextures.keys().next().value
+      if (oldestKey === undefined) break
+      const oldest = this.imageTextures.get(oldestKey)!
+      this.imageTextures.delete(oldestKey)
+      this.imageTexBytes -= oldest.byteSize
+      gl.deleteTexture(oldest.texture)
+    }
     return entry
   }
 
@@ -887,8 +994,6 @@ export class WebGL2AtlasPainter implements Painter {
   private pushGlyph(
     x: number,
     y: number,
-    w: number,
-    h: number,
     entry: AtlasEntry,
     r: number,
     g: number,
@@ -896,7 +1001,10 @@ export class WebGL2AtlasPainter implements Painter {
     a: number,
   ): void {
     this.pushInstance(
-      x, y, w, h,
+      x - entry.bearingX / this.pixelRatio,
+      y - entry.bearingY / this.pixelRatio,
+      entry.w / this.pixelRatio,
+      entry.h / this.pixelRatio,
       entry.u0, entry.v0, entry.u1, entry.v1,
       r, g, b, a,
       entry.colored ? DrawMode.COLOR_TEX : DrawMode.MONO_GLYPH,
