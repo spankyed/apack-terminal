@@ -258,43 +258,41 @@ impl ReactorState {
         }
     }
 
-    fn push_win_bytes_or_park(&mut self, conn: ConnId, bytes: Vec<u8>) -> bool {
+    pub(crate) fn flush_win_writes(&mut self, conn: ConnId) {
+        while self.push_next_win_frame(conn) {}
+    }
+
+    fn push_next_win_frame(&mut self, conn: ConnId) -> bool {
+        let next = if let Some(pending) = self.conns.get_mut(&conn).and_then(|c| c.win.pending_chunk.take()) {
+            Some(pending)
+        } else if let Some(queued) = self.core.pop_outbound(conn) {
+            let is_frame = matches!(queued.msg, BrokerMsg::Frame(_));
+            if is_frame
+                && let Some(nz) = NonZeroStreamId::new(queued.stream_id.raw())
+                && let Some(session_id) = self.conns.get_mut(&conn).and_then(|c| c.queued_frame_streams.remove(&nz))
+            {
+                self.on_outbound_frame_drained(conn, nz, session_id);
+            }
+            let mut encoded = Vec::with_capacity(queued.encoded_bytes);
+            if queued.msg.encode_to_frame(queued.stream_id, queued.req_id, &mut encoded).is_err() {
+                return true;
+            }
+            Some(encoded)
+        } else {
+            None
+        };
+        let Some(bytes) = next else {
+            return false;
+        };
         let res = self.conns.get_mut(&conn).map(|c| try_push_win_write(&c.win.tx, &mut c.win.pending_chunk, bytes));
-        match res {
+        let sent = match res {
             Some(Ok(sent)) => sent,
             _ => {
                 self.on_transport_closed(conn);
                 false
             }
-        }
-    }
-
-    pub(crate) fn flush_win_writes(&mut self, conn: ConnId) {
-        loop {
-            let next = if let Some(pending) = self.conns.get_mut(&conn).and_then(|c| c.win.pending_chunk.take()) {
-                Some(pending)
-            } else if let Some(queued) = self.core.pop_outbound(conn) {
-                let is_frame = matches!(queued.msg, BrokerMsg::Frame(_));
-                if is_frame
-                    && let Some(nz) = NonZeroStreamId::new(queued.stream_id.raw())
-                    && let Some(session_id) = self.conns.get_mut(&conn).and_then(|c| c.queued_frame_streams.remove(&nz))
-                {
-                    self.on_outbound_frame_drained(conn, nz, session_id);
-                }
-                let mut encoded = Vec::with_capacity(queued.encoded_bytes);
-                if queued.msg.encode_to_frame(queued.stream_id, queued.req_id, &mut encoded).is_err() {
-                    continue;
-                }
-                Some(encoded)
-            } else {
-                None
-            };
-            let Some(bytes) = next else {
-                return;
-            };
-            if !self.push_win_bytes_or_park(conn, bytes) {
-                return;
-            }
+        };
+        if sent {
             let ready_stalled = self
                 .conns
                 .get(&conn)
@@ -313,5 +311,6 @@ impl ReactorState {
                 }
             }
         }
+        sent
     }
 }

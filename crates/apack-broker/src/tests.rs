@@ -1295,7 +1295,14 @@ fn e2e_interactive_write_resize_pause_raw_output_and_multi_shard() {
             .unwrap();
         viewer_drop.send_fin().unwrap();
     }
-    std::thread::sleep(Duration::from_millis(25));
+    // Wait until reactor has closed `viewer_drop` AND the shard has processed `CancelConnWaiters`.
+    for _ in 0..50 {
+        if client.metrics().unwrap().connections == 2 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = client.list_sessions().unwrap();
 
     // Explicit Resize + interactive Write -> second view frame (without prior FrameAck!) + RawOutput!
     client
