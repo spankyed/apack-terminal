@@ -13,7 +13,7 @@ use apack_proto::codec::Writer;
 use apack_proto::frame::{DecodedFrame, FrameDecoder};
 use apack_proto::messages::{BrokerMsg, ClientMsg, FrameUpdate, SpawnSpec};
 use apack_proto::types::{
-    ErrorCode, FrameCredit, MetricsSnapshot, NonZeroStreamId, RequestId, SessionId, SignalKind, SignalScope,
+    ErrorCode, FrameCredit, LeaseKind, MetricsSnapshot, NonZeroStreamId, RequestId, SessionId, SignalKind, SignalScope,
     SignalTarget, StreamId, SubFlags, ViewportHint, WaitCondition,
 };
 use apack_proto::{FRAME_HEADER_LEN, PROTOCOL_VERSION};
@@ -26,6 +26,10 @@ use crate::{
     AUTH_HANDSHAKE_TIMEOUT_MS, BROKER_CAPABILITIES, DEFAULT_WORD_DELIMITERS, MAX_CONTROL_QUEUE_BYTES,
     MAX_STREAMS_PER_CONN,
 };
+
+/// Error returned by [`BrokerCore::open_connection`] if `conn` is already registered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DuplicateConnId;
 
 /// Why `BrokerCore` instructed the transport reactor to close a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,7 +46,7 @@ pub enum CloseReason {
     HandshakeTimeout,
     /// Mutual HMAC-SHA256 authentication failed.
     Unauthorized,
-    /// Connection's non-conflatable outbound queue hit its hard byte cap.
+    /// Connection's outbound queue hit its hard byte cap.
     SlowReader,
 }
 
@@ -210,7 +214,7 @@ pub enum BrokerAction {
         /// `true` to pause PTY reads, `false` to resume.
         paused: bool,
     },
-    /// Last broker-wide lease ended (or its grace timer expired): tear down all non-kept sessions.
+    /// Last broker-wide lease ended (or its grace timer expired): tear down all non-kept, non-pinned sessions.
     TeardownNonKeptSessions,
     /// Last `LeaseKind::Session` pinning `session` ended.
     SessionUnpinned(SessionId),
@@ -278,12 +282,12 @@ pub struct BrokerCore {
 }
 
 impl BrokerCore {
-    /// Creates a new `BrokerCore` with the default `16 MiB` per-connection ordered queue cap.
+    /// Creates a new `BrokerCore` with the default `16 MiB` per-connection total outbound queue cap.
     pub fn new(auth: AuthConfig) -> Self {
         Self::with_queue_cap(auth, MAX_CONTROL_QUEUE_BYTES)
     }
 
-    /// Creates a new `BrokerCore` with a custom per-connection ordered queue byte cap (useful in tests/sim).
+    /// Creates a new `BrokerCore` with a custom per-connection outbound queue byte cap (useful in tests/sim).
     pub fn with_queue_cap(auth: AuthConfig, max_queue_bytes: usize) -> Self {
         Self {
             auth,
@@ -308,6 +312,16 @@ impl BrokerCore {
         self.conns.len()
     }
 
+    /// Returns `true` when at least one live or in-grace broker-wide lease is active.
+    pub fn has_active_broker_lease(&self) -> bool {
+        self.leases.has_active_broker_lease()
+    }
+
+    /// Returns `true` when `session` is currently pinned by at least one `LeaseKind::Session`.
+    pub fn is_session_pinned(&self, session: SessionId) -> bool {
+        self.leases.is_session_pinned(session)
+    }
+
     /// Registers a live or rewound session in the broker's session table.
     pub fn register_session(&mut self, session: SessionId, rewound: bool, kept: bool) {
         self.sessions.insert(session, SessionRecord { rewound, kept, pty_paused: false });
@@ -325,7 +339,8 @@ impl BrokerCore {
         self.sessions.get(&session).is_some_and(|rec| rec.kept)
     }
 
-    /// Removes a session and closes every stream currently attached to it with `BrokerMsg::StreamClosed`.
+    /// Removes a session, cleans up its session leases, drops unsent frames, and enqueues
+    /// `BrokerMsg::StreamClosed` behind any queued `Exited` / final `Output` on every attached stream.
     pub fn unregister_session(
         &mut self,
         session: SessionId,
@@ -334,6 +349,7 @@ impl BrokerCore {
         actions: &mut Vec<BrokerAction>,
     ) {
         self.sessions.remove(&session);
+        self.leases.remove_session_leases(session);
         let mut to_close: Vec<(ConnId, NonZeroStreamId)> = Vec::new();
         for (&conn_id, conn) in &self.conns {
             for (&stream_id, st) in &conn.streams {
@@ -345,14 +361,17 @@ impl BrokerCore {
         for (conn_id, stream_id) in to_close {
             if let Some(conn) = self.conns.get_mut(&conn_id) {
                 conn.streams.remove(&stream_id);
-                conn.outbound.remove_stream(stream_id.as_stream_id());
+                // Preserve already-queued `Exited` events and final `Output` chunks; drop only unsent frames.
+                conn.outbound.remove_stream_frames(stream_id.as_stream_id());
             }
             let msg = BrokerMsg::StreamClosed { reason: String::from(reason) };
+            // Enqueued at `RawOutput` priority so it drains strictly after `Exited` (Event) and
+            // FIFO behind any already-queued final `Output` chunks for this stream.
             self.enqueue_message(
                 conn_id,
                 stream_id.as_stream_id(),
                 RequestId::PUSH,
-                OutboundPriority::Control,
+                OutboundPriority::RawOutput,
                 msg,
                 now,
                 actions,
@@ -371,16 +390,16 @@ impl BrokerCore {
         let mut rewound_sessions = 0u32;
         for rec in self.sessions.values() {
             if rec.rewound {
-                rewound_sessions += 1;
+                rewound_sessions = rewound_sessions.saturating_add(1);
             } else {
-                live_sessions += 1;
+                live_sessions = live_sessions.saturating_add(1);
             }
         }
         MetricsSnapshot {
             live_sessions,
             rewound_sessions,
-            connections: self.conns.len() as u32,
-            active_timers: self.timers.len() as u32,
+            connections: u32::try_from(self.conns.len()).unwrap_or(u32::MAX),
+            active_timers: u32::try_from(self.timers.len()).unwrap_or(u32::MAX),
             scrollback_bytes: self.shard_telemetry.scrollback_bytes,
             image_store_bytes: self.shard_telemetry.image_store_bytes,
             total_pty_bytes: self.shard_telemetry.total_pty_bytes,
@@ -389,7 +408,17 @@ impl BrokerCore {
     }
 
     /// Registers a newly accepted transport connection and schedules its handshake deadline.
-    pub fn open_connection(&mut self, conn: ConnId, server_nonce: [u8; 32], now: TimestampMs) {
+    ///
+    /// Returns `Err(DuplicateConnId)` if `conn` is already open.
+    pub fn open_connection(
+        &mut self,
+        conn: ConnId,
+        server_nonce: [u8; 32],
+        now: TimestampMs,
+    ) -> Result<(), DuplicateConnId> {
+        if self.conns.contains_key(&conn) {
+            return Err(DuplicateConnId);
+        }
         let deadline = now.saturating_add(AUTH_HANDSHAKE_TIMEOUT_MS);
         let timeout = self.timers.schedule(deadline, BrokerTimer::HandshakeTimeout(conn));
         self.conns.insert(
@@ -401,6 +430,7 @@ impl BrokerCore {
                 streams: BTreeMap::new(),
             },
         );
+        Ok(())
     }
 
     /// Feeds raw inbound bytes from `conn` into its streaming [`FrameDecoder`] and processes complete frames.
@@ -416,8 +446,7 @@ impl BrokerCore {
                 Ok((consumed, None)) => {
                     bytes = &bytes[consumed..];
                 }
-                Ok((consumed, Some(DecodedFrame::Fin))) => {
-                    let _ = consumed;
+                Ok((_, Some(DecodedFrame::Fin))) => {
                     self.close_connection(conn, CloseReason::ClientFin, now, actions);
                     return;
                 }
@@ -513,11 +542,16 @@ impl BrokerCore {
     pub fn poll_timers(&mut self, now: TimestampMs, actions: &mut Vec<BrokerAction>) {
         let mut expired = Vec::new();
         self.timers.poll_expired(now, &mut expired);
-        for (_, timer) in expired {
+        for (timer_id, timer) in expired {
             match timer {
                 BrokerTimer::HandshakeTimeout(conn) => {
-                    let still_handshaking = self.conns.get(&conn).is_some_and(|c| !matches!(c.phase, ConnPhase::Ready));
-                    if still_handshaking {
+                    let matches_timer = self.conns.get(&conn).is_some_and(|c| match c.phase {
+                        ConnPhase::AwaitingHello { timeout, .. } | ConnPhase::AwaitingAuth { timeout, .. } => {
+                            timeout == timer_id
+                        }
+                        ConnPhase::Ready => false,
+                    });
+                    if matches_timer {
                         self.fail_and_close(
                             conn,
                             StreamId::CONTROL,
@@ -531,7 +565,7 @@ impl BrokerCore {
                     }
                 }
                 BrokerTimer::LeaseGrace(lease_id) => {
-                    let changes = self.leases.on_grace_expired(lease_id);
+                    let changes = self.leases.on_grace_expired(lease_id, timer_id);
                     if changes.teardown_non_kept {
                         actions.push(BrokerAction::TeardownNonKeptSessions);
                     }
@@ -569,38 +603,47 @@ impl BrokerCore {
         }
     }
 
-    /// Attempts to publish a conflatable `FrameUpdate` on `(conn, stream_id)` respecting BDP `FramePacer`.
+    /// Attempts to publish a `FrameUpdate` on `(conn, stream_id)` respecting BDP `FramePacer` and
+    /// per-connection outbound queue bounds.
     ///
-    /// Returns `true` if the frame was accepted and queued; returns `false` if the stream is out of
-    /// credit or paused (`max_frames == 0`), leaving the caller's dirty bitset untouched.
+    /// Returns `false` if a frame is already queued in `OutboundQueue` for `stream_id` (preventing
+    /// silent drop of an unsent differential frame and phantom in-flight BDP accounting), if `FramePacer`
+    /// is out of credit/paused, or if the connection's total queue budget would be exceeded.
     pub fn publish_frame(
         &mut self,
         conn: ConnId,
         stream_id: NonZeroStreamId,
-        frame: Box<FrameUpdate>,
+        mut frame: Box<FrameUpdate>,
         now: TimestampMs,
         actions: &mut Vec<BrokerAction>,
     ) -> bool {
-        let msg = BrokerMsg::Frame(frame);
-        let encoded_bytes = estimate_encoded_bytes(&msg);
-        let BrokerMsg::Frame(mut frame) = msg else {
-            unreachable!();
-        };
         let Some(state) = self.conns.get_mut(&conn) else {
             return false;
         };
+        if state.outbound.has_pending_frame(stream_id.as_stream_id()) {
+            return false;
+        }
         let Some(stream) = state.streams.get_mut(&stream_id) else {
             return false;
         };
         let Some(pacer) = stream.frame_pacer.as_mut() else {
             return false;
         };
+        // Assign the real monotonic sequence before measuring encoded bytes so varint length is exact.
+        frame.seq = pacer.peek_next_seq();
+        let msg = BrokerMsg::Frame(frame);
+        let encoded_bytes = estimate_encoded_bytes(&msg);
+        let BrokerMsg::Frame(frame) = msg else {
+            unreachable!();
+        };
         let frame_u32 = u32::try_from(encoded_bytes).unwrap_or(u32::MAX);
         if !pacer.can_send(frame_u32) {
             return false;
         }
-        frame.seq = pacer.on_send(frame_u32, now);
-        state.outbound.push_frame(stream_id.as_stream_id(), frame, encoded_bytes);
+        if state.outbound.push_frame(stream_id.as_stream_id(), frame, encoded_bytes).is_err() {
+            return false;
+        }
+        let _ = pacer.on_send(frame_u32, now);
         actions.push(BrokerAction::OutboundReady(conn));
         true
     }
@@ -638,7 +681,7 @@ impl BrokerCore {
                 };
                 flow.ingest(raw, now)
             };
-            if let Some(text) = delta.emit_text {
+            for text in delta.emit_chunks {
                 self.enqueue_message(
                     cid,
                     sid.as_stream_id(),
@@ -827,34 +870,61 @@ impl BrokerCore {
                     actions,
                 );
             }
-            ClientMsg::AcquireLease { kind } => match self.leases.acquire(conn, kind) {
-                Ok(outcome) => {
-                    if let Some(timer) = outcome.cancelled_timer {
-                        self.timers.cancel(timer);
-                    }
-                    self.enqueue_message(
-                        conn,
-                        StreamId::CONTROL,
-                        req_id,
-                        OutboundPriority::Control,
-                        BrokerMsg::LeaseAck { lease_id: outcome.lease_id.get(), resumed: outcome.resumed },
-                        now,
-                        actions,
-                    );
-                }
-                Err(LeaseError::TokenInUse) => {
+            ClientMsg::AcquireLease { kind } => {
+                if let LeaseKind::Session(sid) = kind
+                    && !self.sessions.contains_key(&sid)
+                {
                     self.send_error(
                         conn,
                         StreamId::CONTROL,
                         req_id,
-                        ErrorCode::Busy,
-                        "resume token already active on another connection",
+                        ErrorCode::NoSuchSession,
+                        "no such session",
                         now,
                         actions,
                     );
+                    return;
                 }
-                Err(LeaseError::NotOwned) => {}
-            },
+                match self.leases.acquire(conn, kind) {
+                    Ok(outcome) => {
+                        if let Some(timer) = outcome.cancelled_timer {
+                            self.timers.cancel(timer);
+                        }
+                        self.enqueue_message(
+                            conn,
+                            StreamId::CONTROL,
+                            req_id,
+                            OutboundPriority::Control,
+                            BrokerMsg::LeaseAck { lease_id: outcome.lease_id.get(), resumed: outcome.resumed },
+                            now,
+                            actions,
+                        );
+                    }
+                    Err(LeaseError::TokenInUse) => {
+                        self.send_error(
+                            conn,
+                            StreamId::CONTROL,
+                            req_id,
+                            ErrorCode::Busy,
+                            "resume token already active on another connection",
+                            now,
+                            actions,
+                        );
+                    }
+                    Err(LeaseError::LimitExceeded) => {
+                        self.send_error(
+                            conn,
+                            StreamId::CONTROL,
+                            req_id,
+                            ErrorCode::ResourceLimit,
+                            "connection lease limit reached",
+                            now,
+                            actions,
+                        );
+                    }
+                    Err(LeaseError::NotOwned) => {}
+                }
+            }
             ClientMsg::ReleaseLease { lease_id } => {
                 let Some(lid) = LeaseId::new(lease_id) else {
                     self.send_error(
@@ -1208,7 +1278,7 @@ impl BrokerCore {
                     .and_then(|st| st.raw_output.as_mut())
                     .map(|flow| flow.grant_credit(bytes, now));
                 if let Some(delta) = delta {
-                    if let Some(text) = delta.emit_text {
+                    for text in delta.emit_chunks {
                         self.enqueue_message(
                             conn,
                             stream_id.as_stream_id(),

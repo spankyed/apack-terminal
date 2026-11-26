@@ -41,6 +41,9 @@ pub const MAX_STREAMS_PER_CONN: usize = 1_024;
 /// Maximum concurrent in-grace disconnected broker leases retained at once.
 pub const MAX_IN_GRACE_LEASES: usize = 64;
 
+/// Maximum concurrent per-session leases held by a single connection.
+pub const MAX_SESSION_LEASES_PER_CONN: usize = 64;
+
 /// Default word-selection delimiter characters advertised in `HelloOk`.
 pub const DEFAULT_WORD_DELIMITERS: &str = " \t\n\r`'\"()[]{}<>|;:,";
 

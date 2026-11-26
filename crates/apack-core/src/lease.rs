@@ -14,9 +14,9 @@ use core::num::NonZeroU64;
 
 use apack_proto::types::{LeaseGraceMs, LeaseKind, ResumeToken, SessionId};
 
-use crate::MAX_IN_GRACE_LEASES;
 use crate::auth::ct_eq_32;
 use crate::time::{TimerId, TimestampMs};
+use crate::{MAX_IN_GRACE_LEASES, MAX_SESSION_LEASES_PER_CONN};
 
 /// Non-zero connection identifier assigned by the transport reactor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -57,6 +57,8 @@ pub enum LeaseError {
     NotOwned,
     /// Another live connection already holds a lease with the exact same `ResumeToken`.
     TokenInUse,
+    /// Connection already holds a broker-wide lease or reached [`MAX_SESSION_LEASES_PER_CONN`].
+    LimitExceeded,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -93,11 +95,12 @@ pub struct LeaseChanges {
     pub unpinned_sessions: Vec<SessionId>,
 }
 
-/// Tracks all live and in-grace broker and session leases.
+/// Tracks all live and in-grace broker and session leases with per-connection resource bounds.
 #[derive(Debug)]
 pub struct LeaseTable {
     next_id: u64,
     leases: BTreeMap<LeaseId, LeaseEntry>,
+    in_grace_count: usize,
 }
 
 impl Default for LeaseTable {
@@ -109,17 +112,17 @@ impl Default for LeaseTable {
 impl LeaseTable {
     /// Creates an empty lease table.
     pub fn new() -> Self {
-        Self { next_id: 1, leases: BTreeMap::new() }
+        Self { next_id: 1, leases: BTreeMap::new(), in_grace_count: 0 }
     }
 
     /// Returns `true` when at least one broker lease is currently held or in reconnect grace.
     pub fn has_active_broker_lease(&self) -> bool {
-        self.leases.values().any(|e| matches!(e.kind, LeaseKind::BrokerImmediate | LeaseKind::BrokerGrace { .. }))
+        self.leases.values().any(|e| is_broker_lease(e.kind))
     }
 
     /// Returns the number of currently disconnected leases waiting in reconnect grace.
     pub fn in_grace_count(&self) -> usize {
-        self.leases.values().filter(|e| matches!(e.state, LeaseState::InGrace { .. })).count()
+        self.in_grace_count
     }
 
     /// Returns `true` if `session` is currently pinned by at least one live `LeaseKind::Session`.
@@ -128,7 +131,29 @@ impl LeaseTable {
     }
 
     /// Acquires a new lease or resumes an in-grace `BrokerGrace` lease matching `resume_token`.
+    ///
+    /// Enforces at most one broker-wide lease and at most [`MAX_SESSION_LEASES_PER_CONN`] session
+    /// leases per connection so a single client cannot exhaust global grace slots or memory.
     pub fn acquire(&mut self, conn: ConnId, kind: LeaseKind) -> Result<AcquireOutcome, LeaseError> {
+        if is_broker_lease(kind) {
+            let conn_has_broker = self
+                .leases
+                .values()
+                .any(|e| matches!(e.state, LeaseState::Held(owner) if owner == conn) && is_broker_lease(e.kind));
+            if conn_has_broker {
+                return Err(LeaseError::LimitExceeded);
+            }
+        } else {
+            let conn_sessions = self
+                .leases
+                .values()
+                .filter(|e| matches!(e.state, LeaseState::Held(owner) if owner == conn) && !is_broker_lease(e.kind))
+                .count();
+            if conn_sessions >= MAX_SESSION_LEASES_PER_CONN {
+                return Err(LeaseError::LimitExceeded);
+            }
+        }
+
         if let LeaseKind::BrokerGrace { grace_ms, resume_token } = kind
             && let Some((existing_id, existing_state)) = self.find_by_token(&resume_token)
         {
@@ -138,6 +163,7 @@ impl LeaseTable {
                     let entry = self.leases.get_mut(&existing_id).expect("found entry");
                     entry.kind = LeaseKind::BrokerGrace { grace_ms, resume_token };
                     entry.state = LeaseState::Held(conn);
+                    self.in_grace_count -= 1;
                     Ok(AcquireOutcome { lease_id: existing_id, resumed: true, cancelled_timer: Some(timer) })
                 }
             };
@@ -171,6 +197,11 @@ impl LeaseTable {
         Ok(changes)
     }
 
+    /// Removes all per-session leases pinning `session` when `session` exits or is unregistered.
+    pub fn remove_session_leases(&mut self, session: SessionId) {
+        self.leases.retain(|_, e| !matches!(e.kind, LeaseKind::Session(s) if s == session));
+    }
+
     /// Handles connection EOF: drops immediate and session leases, and moves `BrokerGrace` leases
     /// into reconnect grace (up to [`MAX_IN_GRACE_LEASES`]).
     ///
@@ -199,12 +230,13 @@ impl LeaseTable {
                     self.leases.remove(&id);
                 }
                 LeaseKind::BrokerGrace { grace_ms, .. } => {
-                    if self.in_grace_count() < MAX_IN_GRACE_LEASES {
+                    if self.in_grace_count < MAX_IN_GRACE_LEASES {
                         let deadline = grace_deadline(now, grace_ms);
                         let timer = schedule_timer(id, deadline);
                         if let Some(entry) = self.leases.get_mut(&id) {
                             entry.state = LeaseState::InGrace { timer };
                         }
+                        self.in_grace_count += 1;
                         changes.schedule_grace.push((id, deadline));
                     } else {
                         // Hard cap reached: err on the side of teardown rather than leaking state.
@@ -229,12 +261,16 @@ impl LeaseTable {
         changes
     }
 
-    /// Expires a disconnected grace lease when its timer fires.
-    pub fn on_grace_expired(&mut self, lease_id: LeaseId) -> LeaseChanges {
+    /// Expires a disconnected grace lease iff its recorded `TimerId` matches `timer_id`.
+    pub fn on_grace_expired(&mut self, lease_id: LeaseId, timer_id: TimerId) -> LeaseChanges {
         let had_broker = self.has_active_broker_lease();
-        let expired = matches!(self.leases.get(&lease_id), Some(e) if matches!(e.state, LeaseState::InGrace { .. }));
+        let expired = matches!(
+            self.leases.get(&lease_id),
+            Some(e) if matches!(e.state, LeaseState::InGrace { timer } if timer == timer_id)
+        );
         if expired {
             self.leases.remove(&lease_id);
+            self.in_grace_count -= 1;
         }
         let mut changes = LeaseChanges::default();
         if had_broker && !self.has_active_broker_lease() {
@@ -254,6 +290,10 @@ impl LeaseTable {
         }
         matched
     }
+}
+
+const fn is_broker_lease(kind: LeaseKind) -> bool {
+    matches!(kind, LeaseKind::BrokerImmediate | LeaseKind::BrokerGrace { .. })
 }
 
 fn grace_deadline(now: TimestampMs, grace_ms: LeaseGraceMs) -> TimestampMs {

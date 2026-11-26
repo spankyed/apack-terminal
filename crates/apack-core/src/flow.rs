@@ -2,16 +2,18 @@
 //!
 //! - **Class A ([`FramePacer`]):** Byte-bounded BDP pacing (`max_frames` + `max_bytes` + RTT EWMA)
 //!   for conflatable `SUB_VIEW` frames.
-//! - **Class B ([`RawOutputFlow`]):** Per-stream `4 MiB` byte credit, UTF-8 boundary preservation,
-//!   and explicit `BACKPRESSURE_PTY` pause vs best-effort `OutputDropped` accounting.
+//! - **Class B ([`RawOutputFlow`]):** Per-stream `4 MiB` byte credit, `64 KiB` WFQ output chunking,
+//!   UTF-8 boundary preservation with bounded `0..=3` byte debt for forward progress, and explicit
+//!   `BACKPRESSURE_PTY` pause vs best-effort `OutputDropped` accounting.
 //! - **Class C ([`OutboundQueue`]):** 5-tier priority scheduler (`Control > Frame > Event > Bulk WFQ > RawOutput WFQ`)
-//!   with hard `16 MiB` memory cap on ordered queues.
+//!   with a hard `16 MiB` total byte cap per connection across all tiers.
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use apack_proto::BULK_CHUNK_BYTES;
 use apack_proto::messages::{BrokerMsg, FrameUpdate};
 use apack_proto::types::{FrameCredit, RequestId, StreamId};
 
@@ -21,7 +23,7 @@ use crate::{MAX_BDP_FRAME_BYTES, MAX_CONTROL_QUEUE_BYTES, MAX_RAW_OUTPUT_CREDIT,
 /// Error returned when a client violates a flow-control contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlowError {
-    /// `FrameAck.seq` was zero, regressed below the last ack, or exceeded the last sent sequence.
+    /// `FrameAck.seq` regressed below the last ack, exceeded the last sent sequence, or was zero after frames were sent.
     InvalidAckSeq,
 }
 
@@ -36,7 +38,7 @@ struct InFlightFrame {
     sent_at: TimestampMs,
 }
 
-/// Class A: Byte-bounded BDP pacer for conflatable view frames on a single `SUB_VIEW` stream.
+/// Class A: Byte-bounded BDP pacer for view frames on a single `SUB_VIEW` stream.
 #[derive(Debug)]
 pub struct FramePacer {
     credit: FrameCredit,
@@ -63,6 +65,11 @@ impl FramePacer {
     /// Returns the effective clamped byte budget for in-flight frames.
     pub fn effective_max_bytes(&self) -> u32 {
         self.credit.max_bytes.clamp(MIN_BDP_FRAME_BYTES, MAX_BDP_FRAME_BYTES)
+    }
+
+    /// Returns the sequence number that will be assigned to the next sent frame.
+    pub fn peek_next_seq(&self) -> u64 {
+        self.next_seq
     }
 
     /// Returns the current RTT EWMA in milliseconds, if at least one frame has been acked.
@@ -112,9 +119,12 @@ impl FramePacer {
     }
 
     /// Applies a client `FrameAck`, updating in-flight accounting, RTT EWMA, and credit window.
+    ///
+    /// `seq == 0` is permitted iff no frames have been sent yet (`last_sent == 0`), allowing a
+    /// hidden view attached with `max_frames == 0` to un-pause by granting credit.
     pub fn on_ack(&mut self, seq: u64, credit: FrameCredit, now: TimestampMs) -> Result<(), FlowError> {
         let last_sent = self.next_seq - 1;
-        if seq == 0 || seq > last_sent || seq < self.last_acked_seq {
+        if (seq == 0 && last_sent > 0) || seq > last_sent || seq < self.last_acked_seq {
             return Err(FlowError::InvalidAckSeq);
         }
         let mut acked_sent_at = None;
@@ -144,11 +154,11 @@ impl FramePacer {
 /// Result of feeding PTY output bytes or replenishing credit on a [`RawOutputFlow`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RawOutputDelta {
-    /// Valid UTF-8 chunk ready to emit in `BrokerMsg::Output`.
-    pub emit_text: Option<String>,
+    /// Valid UTF-8 chunks (`<= BULK_CHUNK_BYTES` each) ready to emit in `BrokerMsg::Output`.
+    pub emit_chunks: Vec<String>,
     /// Microseconds spent throttled if backpressure just released (`BrokerMsg::Throttled`).
     pub throttled_us: Option<u64>,
-    /// Explicitly accounted shed bytes in best-effort mode (`BrokerMsg::OutputDropped`).
+    /// Explicitly accounted shed bytes in best-effort mode or on pending overflow (`BrokerMsg::OutputDropped`).
     pub dropped_bytes: u64,
     /// Current desired PTY pause state for this stream (`true` when backpressure is engaged).
     pub pty_paused: bool,
@@ -158,7 +168,9 @@ pub struct RawOutputDelta {
 #[derive(Debug)]
 pub struct RawOutputFlow {
     credit_bytes: u32,
+    credit_debt: u8,
     max_pending_bytes: usize,
+    max_chunk_bytes: usize,
     backpressure_pty: bool,
     utf8_tail: [u8; 3],
     utf8_tail_len: usize,
@@ -170,14 +182,21 @@ pub struct RawOutputFlow {
 impl RawOutputFlow {
     /// Creates a new per-stream raw-output controller, clamping initial credit to [`MAX_RAW_OUTPUT_CREDIT`].
     pub fn new(initial_credit: u32, backpressure_pty: bool) -> Self {
-        Self::with_max_pending(initial_credit, backpressure_pty, MAX_RAW_OUTPUT_CREDIT as usize)
+        Self::with_limits(initial_credit, backpressure_pty, MAX_RAW_OUTPUT_CREDIT as usize, BULK_CHUNK_BYTES)
     }
 
-    /// Creates a raw-output controller with a custom bounded pending buffer cap (used in tests/sim).
-    pub fn with_max_pending(initial_credit: u32, backpressure_pty: bool, max_pending_bytes: usize) -> Self {
+    /// Creates a raw-output controller with custom bounded pending and chunk caps (used in tests/sim).
+    pub fn with_limits(
+        initial_credit: u32,
+        backpressure_pty: bool,
+        max_pending_bytes: usize,
+        max_chunk_bytes: usize,
+    ) -> Self {
         Self {
             credit_bytes: initial_credit.min(MAX_RAW_OUTPUT_CREDIT),
+            credit_debt: 0,
             max_pending_bytes: max_pending_bytes.min(MAX_RAW_OUTPUT_CREDIT as usize),
+            max_chunk_bytes: max_chunk_bytes.clamp(4, BULK_CHUNK_BYTES),
             backpressure_pty,
             utf8_tail: [0; 3],
             utf8_tail_len: 0,
@@ -192,6 +211,11 @@ impl RawOutputFlow {
         self.credit_bytes
     }
 
+    /// Outstanding UTF-8 multi-byte credit debt (`0..=3`) paid down from the next `OutputCredit`.
+    pub fn credit_debt(&self) -> u8 {
+        self.credit_debt
+    }
+
     /// Returns `true` when this stream is requesting PTY backpressure pause.
     pub fn is_pty_paused(&self) -> bool {
         self.backpressure_pty && self.throttled_since.is_some()
@@ -202,10 +226,15 @@ impl RawOutputFlow {
         self.total_throttled_us
     }
 
-    /// Replenishes byte credit and drains any buffered UTF-8 output held during backpressure.
+    /// Replenishes byte credit (paying down any `0..=3` UTF-8 boundary debt first) and drains buffered output.
     pub fn grant_credit(&mut self, bytes: u32, now: TimestampMs) -> RawOutputDelta {
-        self.credit_bytes = self.credit_bytes.saturating_add(bytes).min(MAX_RAW_OUTPUT_CREDIT);
-        let mut delta = RawOutputDelta { emit_text: self.drain_pending(), ..RawOutputDelta::default() };
+        let paid = bytes.min(u32::from(self.credit_debt));
+        self.credit_debt -= paid as u8;
+        let rem = bytes - paid;
+        self.credit_bytes = self.credit_bytes.saturating_add(rem).min(MAX_RAW_OUTPUT_CREDIT);
+
+        let mut delta = RawOutputDelta::default();
+        self.drain_pending_chunks(&mut delta.emit_chunks);
         if self.credit_bytes > 0
             && self.pending_utf8.is_empty()
             && let Some(since) = self.throttled_since.take()
@@ -238,38 +267,66 @@ impl RawOutputFlow {
         }
 
         if self.backpressure_pty {
+            // Drain directly against available credit first when pending is empty so available credit
+            // is never prematurely truncated by `max_pending_bytes`.
+            let mut offset = 0usize;
+            if self.pending_utf8.is_empty() {
+                while offset < decoded.len() && self.credit_bytes > 0 {
+                    let take = self.take_chunk_len(&decoded[offset..]);
+                    delta.emit_chunks.push(String::from(&decoded[offset..offset + take]));
+                    offset += take;
+                }
+            }
+            let rest = &decoded[offset..];
             let room = self.max_pending_bytes.saturating_sub(self.pending_utf8.len());
-            let keep = floor_char_boundary(&decoded, room);
-            self.pending_utf8.extend_from_slice(&decoded.as_bytes()[..keep]);
-            delta.dropped_bytes = (decoded.len() - keep) as u64;
-            delta.emit_text = self.drain_pending();
+            let keep = floor_char_boundary(rest, room);
+            self.pending_utf8.extend_from_slice(&rest.as_bytes()[..keep]);
+            delta.dropped_bytes = (rest.len() - keep) as u64;
             if (!self.pending_utf8.is_empty() || self.credit_bytes == 0) && self.throttled_since.is_none() {
                 self.throttled_since = Some(now);
             }
         } else {
-            let budget = self.credit_bytes as usize;
-            let take = floor_char_boundary(&decoded, budget);
-            if take > 0 {
-                self.credit_bytes -= take as u32;
-                delta.emit_text = Some(String::from(&decoded[..take]));
+            let mut offset = 0usize;
+            while offset < decoded.len() && self.credit_bytes > 0 {
+                let take = self.take_chunk_len(&decoded[offset..]);
+                delta.emit_chunks.push(String::from(&decoded[offset..offset + take]));
+                offset += take;
             }
-            delta.dropped_bytes = (decoded.len() - take) as u64;
+            delta.dropped_bytes = (decoded.len() - offset) as u64;
         }
         delta.pty_paused = self.is_pty_paused();
         delta
     }
 
-    fn drain_pending(&mut self) -> Option<String> {
-        let text = core::str::from_utf8(&self.pending_utf8).expect("pending_utf8 always holds valid UTF-8");
-        let take = floor_char_boundary(text, self.credit_bytes as usize);
-        if take == 0 {
-            return None;
+    fn drain_pending_chunks(&mut self, out: &mut Vec<String>) {
+        while !self.pending_utf8.is_empty() && self.credit_bytes > 0 {
+            let text = core::str::from_utf8(&self.pending_utf8).expect("pending_utf8 always holds valid UTF-8");
+            let take = take_chunk_len(&mut self.credit_bytes, &mut self.credit_debt, self.max_chunk_bytes, text);
+            out.push(String::from(&text[..take]));
+            self.pending_utf8.drain(..take);
         }
-        let emitted = String::from(&text[..take]);
-        self.pending_utf8.drain(..take);
-        self.credit_bytes -= take as u32;
-        Some(emitted)
     }
+
+    fn take_chunk_len(&mut self, text: &str) -> usize {
+        take_chunk_len(&mut self.credit_bytes, &mut self.credit_debt, self.max_chunk_bytes, text)
+    }
+}
+
+/// Consumes at least one complete UTF-8 scalar (up to `min(credit_bytes, max_chunk_bytes)`),
+/// recording at most `3` bytes of `credit_debt` when `1 <= credit_bytes < first_char.len_utf8()`.
+///
+/// Caller guarantees `!text.is_empty()` and `*credit_bytes > 0`.
+fn take_chunk_len(credit_bytes: &mut u32, credit_debt: &mut u8, max_chunk_bytes: usize, text: &str) -> usize {
+    let limit = (*credit_bytes as usize).min(max_chunk_bytes);
+    let take = floor_char_boundary(text, limit);
+    if take > 0 {
+        *credit_bytes -= take as u32;
+        return take;
+    }
+    let ch_len = text.chars().next().expect("non-empty text").len_utf8();
+    *credit_debt = (ch_len - *credit_bytes as usize) as u8;
+    *credit_bytes = 0;
+    ch_len
 }
 
 /// Decodes valid UTF-8 from `input`, replacing malformed interior sequences with U+FFFD and storing
@@ -324,7 +381,7 @@ pub enum OutboundPriority {
     Event,
     /// Priority 3: Fair-queued 64 KiB bulk payloads (`ImageBlobChunk`, `Rows`, `SearchMatches`, `CommandsReply`).
     Bulk,
-    /// Priority 4: Fair-queued `SUB_RAW_OUTPUT` chunks (`Output`, `Throttled`, `OutputDropped`).
+    /// Priority 4: Fair-queued `SUB_RAW_OUTPUT` chunks (`Output`, `Throttled`, `OutputDropped`, exit `StreamClosed`).
     RawOutput,
 }
 
@@ -337,7 +394,7 @@ pub struct QueuedMessage {
     pub req_id: RequestId,
     /// Message to send.
     pub msg: BrokerMsg,
-    /// Estimated encoded byte size accounted against queue limits.
+    /// Encoded byte size accounted against queue limits.
     pub encoded_bytes: usize,
 }
 
@@ -385,11 +442,12 @@ impl WfqQueues {
     }
 }
 
-/// Class C: 5-tier strict-priority + WFQ outbound queue enforcing a hard byte cap per connection.
+/// Class C: 5-tier strict-priority + WFQ outbound queue enforcing a hard total byte cap per connection.
 #[derive(Debug)]
 pub struct OutboundQueue {
-    max_ordered_bytes: usize,
+    max_total_bytes: usize,
     ordered_bytes: usize,
+    frame_bytes: usize,
     p0_control: VecDeque<QueuedMessage>,
     p1_frame_order: VecDeque<StreamId>,
     p1_frames: BTreeMap<StreamId, QueuedMessage>,
@@ -405,11 +463,12 @@ impl Default for OutboundQueue {
 }
 
 impl OutboundQueue {
-    /// Creates an outbound queue capped at `max_ordered_bytes` for ordered traffic.
-    pub fn new(max_ordered_bytes: usize) -> Self {
+    /// Creates an outbound queue capped at `max_total_bytes` across ordered and frame tiers.
+    pub fn new(max_total_bytes: usize) -> Self {
         Self {
-            max_ordered_bytes,
+            max_total_bytes,
             ordered_bytes: 0,
+            frame_bytes: 0,
             p0_control: VecDeque::new(),
             p1_frame_order: VecDeque::new(),
             p1_frames: BTreeMap::new(),
@@ -424,9 +483,24 @@ impl OutboundQueue {
         self.ordered_bytes
     }
 
-    /// Returns the number of conflated pending view frames (at most 1 per stream).
+    /// Returns bytes currently buffered in pending Priority 1 frames.
+    pub fn frame_bytes(&self) -> usize {
+        self.frame_bytes
+    }
+
+    /// Returns total bytes buffered across all tiers (`ordered_bytes + frame_bytes`).
+    pub fn total_bytes(&self) -> usize {
+        self.ordered_bytes + self.frame_bytes
+    }
+
+    /// Returns the number of pending view frames (at most 1 per stream).
     pub fn pending_frames(&self) -> usize {
         self.p1_frames.len()
+    }
+
+    /// Returns `true` if `stream_id` already has an unsent frame waiting in Priority 1.
+    pub fn has_pending_frame(&self, stream_id: StreamId) -> bool {
+        self.p1_frames.contains_key(&stream_id)
     }
 
     /// Returns `true` when no messages are queued in any tier.
@@ -438,14 +512,24 @@ impl OutboundQueue {
             && self.p4_raw.by_stream.is_empty()
     }
 
-    /// Enqueues or supersedes a conflatable Priority 1 view frame for `stream_id`.
-    ///
-    /// If an unsent frame is already queued for `stream_id`, it is replaced in place (zero queue growth).
-    pub fn push_frame(&mut self, stream_id: StreamId, frame: Box<FrameUpdate>, encoded_bytes: usize) {
+    /// Enqueues a Priority 1 view frame for `stream_id`, enforcing the total per-connection byte cap.
+    pub fn push_frame(
+        &mut self,
+        stream_id: StreamId,
+        frame: Box<FrameUpdate>,
+        encoded_bytes: usize,
+    ) -> Result<(), QueueOverflow> {
+        let prev_bytes = self.p1_frames.get(&stream_id).map_or(0, |m| m.encoded_bytes);
+        let next_total = (self.total_bytes() - prev_bytes).checked_add(encoded_bytes).ok_or(QueueOverflow)?;
+        if next_total > self.max_total_bytes {
+            return Err(QueueOverflow);
+        }
+        self.frame_bytes = self.frame_bytes - prev_bytes + encoded_bytes;
         let item = QueuedMessage { stream_id, req_id: RequestId::PUSH, msg: BrokerMsg::Frame(frame), encoded_bytes };
         if self.p1_frames.insert(stream_id, item).is_none() {
             self.p1_frame_order.push_back(stream_id);
         }
+        Ok(())
     }
 
     /// Enqueues a non-conflatable ordered message, returning [`QueueOverflow`] if the hard byte cap would be exceeded.
@@ -457,11 +541,11 @@ impl OutboundQueue {
         msg: BrokerMsg,
         encoded_bytes: usize,
     ) -> Result<(), QueueOverflow> {
-        let next_bytes = self.ordered_bytes.checked_add(encoded_bytes).ok_or(QueueOverflow)?;
-        if next_bytes > self.max_ordered_bytes {
+        let next_total = self.total_bytes().checked_add(encoded_bytes).ok_or(QueueOverflow)?;
+        if next_total > self.max_total_bytes {
             return Err(QueueOverflow);
         }
-        self.ordered_bytes = next_bytes;
+        self.ordered_bytes += encoded_bytes;
         let item = QueuedMessage { stream_id, req_id, msg, encoded_bytes };
         match priority {
             OutboundPriority::Control => self.p0_control.push_back(item),
@@ -480,6 +564,7 @@ impl OutboundQueue {
         }
         while let Some(sid) = self.p1_frame_order.pop_front() {
             if let Some(item) = self.p1_frames.remove(&sid) {
+                self.frame_bytes -= item.encoded_bytes;
                 return Some(item);
             }
         }
@@ -498,11 +583,17 @@ impl OutboundQueue {
         None
     }
 
-    /// Removes all pending frames, events, bulk chunks, and raw output queued for a detached stream.
-    pub fn remove_stream(&mut self, stream_id: StreamId) {
-        if self.p1_frames.remove(&stream_id).is_some() {
+    /// Removes only pending Priority 1 frames for `stream_id` (preserving queued `Exited` / final `Output`).
+    pub fn remove_stream_frames(&mut self, stream_id: StreamId) {
+        if let Some(item) = self.p1_frames.remove(&stream_id) {
+            self.frame_bytes -= item.encoded_bytes;
             self.p1_frame_order.retain(|s| *s != stream_id);
         }
+    }
+
+    /// Removes all pending frames, events, bulk chunks, and raw output queued for a detached stream.
+    pub fn remove_stream(&mut self, stream_id: StreamId) {
+        self.remove_stream_frames(stream_id);
         let mut freed = 0usize;
         self.p2_events.retain(|item| {
             if item.stream_id == stream_id {
