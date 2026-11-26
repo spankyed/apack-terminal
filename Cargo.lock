@@ -94,6 +94,7 @@ name = "apack-wal"
 version = "0.2.0"
 dependencies = [
  "apack-proto",
+ "libc",
  "miniz_oxide 0.9.1",
  "sha2 0.10.9",
  "tempfile",

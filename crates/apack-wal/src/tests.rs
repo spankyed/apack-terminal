@@ -1081,13 +1081,14 @@ fn remaining_edge_cases_and_helper_invariants() {
     let mut w = WalWriter::open_or_create(&same_ms_dir, [14; 16], 100, WalConfig::default(), registry.clone()).unwrap();
     w.start_segment_with_keyframe(100, &sample_keyframe(None, None, None)).unwrap();
     w.start_segment_with_keyframe(100, &sample_keyframe(None, None, None)).unwrap();
-    // evict_to_budget when evicted_segments == 0 must NOT sweep blobs
+    // evict_to_budget sweeps orphaned blobs/tmp files even when evicted_segments == 0 so cleared
+    // images never leak disk space until budget exhaustion.
     fs::create_dir_all(same_ms_dir.join("blobs")).unwrap();
-    fs::write(same_ms_dir.join("blobs").join(".tmp-keep-me"), b"x").unwrap();
+    fs::write(same_ms_dir.join("blobs").join(".tmp-orphan"), b"x").unwrap();
     let ev0 = w.evict_to_budget().unwrap();
     assert_eq!(ev0.evicted_segments, 0);
-    assert_eq!(ev0.swept_blobs, 0);
-    assert!(same_ms_dir.join("blobs").join(".tmp-keep-me").exists());
+    assert_eq!(ev0.swept_blobs, 1);
+    assert!(!same_ms_dir.join("blobs").join(".tmp-orphan").exists());
     drop(w);
 
     let r = WalReader::open(&same_ms_dir, &registry).unwrap();
@@ -1123,4 +1124,165 @@ fn remaining_edge_cases_and_helper_invariants() {
     sh.flush_barrier_timeout(Duration::from_secs(2)).unwrap();
     assert!(!sh.take_rollover_needed());
     sh.shutdown().unwrap();
+}
+
+#[test]
+fn evict_credits_freed_blob_bytes_before_cascading_segments() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path().join("blob-credit");
+    let registry = RecordingRegistry::new();
+    let cfg = WalConfig { budget_bytes: 20_000, segment_target_bytes: 1_000_000, ..WalConfig::default() };
+    let mut w = WalWriter::open_or_create(&dir, [21; 16], 100, cfg, registry.clone()).unwrap();
+
+    // Segment 1 references a large 16 KiB image blob.
+    let big_blob = vec![0xAB; 16_384];
+    let hash = w.write_blob(ImageEncoding::Png, &big_blob).unwrap();
+    let kf1 = sample_keyframe(Some(hash), None, None);
+    w.start_segment_with_keyframe(100, &kf1).unwrap();
+
+    // Segment 2 has no blobs (~small keyframe), plus 4 KiB of output so seg1+seg2+seg3+blob > 20_000
+    // while seg2+seg3 alone << 20_000.
+    w.start_segment_with_keyframe(200, &sample_keyframe(None, None, None)).unwrap();
+    w.record_output(210, &vec![b'a'; 4_000], true).unwrap();
+    let ev = w.start_segment_with_keyframe(300, &sample_keyframe(None, None, None)).unwrap();
+    // Evicting seg1 sweeps the 16 KiB blob immediately and credits it to `total`, so seg2 MUST survive!
+    assert_eq!(ev.evicted_segments, 1);
+    assert_eq!(ev.swept_blobs, 1);
+    assert_eq!(w.segment_count(), 2, "seg2 must not be cascade-evicted once seg1's blob is freed");
+    drop(w);
+
+    let r = WalReader::open(&dir, &registry).unwrap();
+    assert_eq!(r.segments().len(), 2);
+}
+
+#[test]
+fn corrupt_record0_payload_len_returns_ok_none_and_overlapping_segments_rejected() {
+    let tmp = tempdir().unwrap();
+    // 1. Sealed file whose record-0 header claims payload_len > MAX_RECORD_PAYLOAD must return Ok(None).
+    let huge_rec0 = tmp.path().join("huge-rec0.apks");
+    let mut bytes = Vec::new();
+    encode_framed_record(100, &WalRecord::Keyframe(Box::new(sample_keyframe(None, None, None))), &mut bytes).unwrap();
+    // Bytes 0..4 are u32 LE payload_len in RECORD_HEADER_LEN.
+    let huge_len = ((MAX_RECORD_PAYLOAD as u32) + 1).to_le_bytes();
+    bytes[0..4].copy_from_slice(&huge_len);
+    let end = bytes.len() as u64;
+    bytes.extend_from_slice(
+        &SegmentFooter { first_ms: 100, last_ms: 100, records_end_offset: end, record_count: 1 }.encode(),
+    );
+    fs::write(&huge_rec0, &bytes).unwrap();
+    assert_eq!(read_sealed_header_and_footer(&huge_rec0).unwrap(), None);
+
+    // 2. Two sealed segments where seg2.first_ms < seg1.last_ms must be rejected by WalReader::open.
+    let overlap_dir = tmp.path().join("overlap");
+    let registry = RecordingRegistry::new();
+    let mut w = WalWriter::open_or_create(&overlap_dir, [22; 16], 100, WalConfig::default(), registry.clone()).unwrap();
+    w.start_segment_with_keyframe(100, &sample_keyframe(None, None, None)).unwrap();
+    w.record_output(500, b"later", true).unwrap();
+    w.seal_active().unwrap();
+    drop(w);
+    // Forge a second sealed segment with first_ms = 200 (< seg1.last_ms = 500).
+    let mut seg2 = Vec::new();
+    encode_framed_record(200, &WalRecord::Keyframe(Box::new(sample_keyframe(None, None, None))), &mut seg2).unwrap();
+    let end2 = seg2.len() as u64;
+    seg2.extend_from_slice(
+        &SegmentFooter { first_ms: 200, last_ms: 250, records_end_offset: end2, record_count: 1 }.encode(),
+    );
+    fs::write(overlap_dir.join(segment_filename(2)), &seg2).unwrap();
+    match WalReader::open(&overlap_dir, &registry) {
+        Err(WalError::CorruptSegment(_)) => {}
+        Err(other) => panic!("expected CorruptSegment, got {other:?}"),
+        Ok(_) => panic!("expected CorruptSegment, got Ok"),
+    }
+}
+
+#[test]
+fn wal_handle_coalesces_small_outputs_and_never_drops_seal() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path().join("coalesce-seal");
+    let registry = RecordingRegistry::new();
+    let w = WalWriter::open_or_create(&dir, [23; 16], 100, WalConfig::default(), registry.clone()).unwrap();
+    let h = WalWorker::spawn(w);
+    assert!(h.start_segment(100, sample_keyframe(None, None, None)));
+    // Exercise empty ground-notification path and control_queued decrement across > MAX_CONTROL_QUEUE_LEN resizes.
+    assert!(h.write_output(100, Vec::new(), true));
+    let sz = GridSize::new(80, 24).unwrap();
+    let px = CellPx { width: 8, height: 16 };
+    for i in 0..=MAX_CONTROL_QUEUE_LEN {
+        if i % 256 == 0 {
+            h.flush_barrier_timeout(Duration::from_secs(5)).unwrap();
+        }
+        assert!(h.write_resize(100 + i as u64, sz, px), "control_queued must decrement as worker drains");
+    }
+    for i in 0..2_000u64 {
+        assert!(h.write_output(100 + i, b"x".to_vec(), true));
+    }
+    assert!(h.seal(), "seal must never be dropped behind coalesced output items");
+    h.flush_barrier_timeout(Duration::from_secs(5)).unwrap();
+    h.shutdown().unwrap();
+
+    let r = WalReader::open(&dir, &registry).unwrap();
+    assert_eq!(r.segments().len(), 1);
+    assert!(r.segments()[0].sealed);
+}
+
+#[test]
+fn review_mutants_wal_hard_cap_coalesce_control_slot_and_fifo_rejection() {
+    use crate::writer::{try_coalesce_output, try_reserve_control_slot};
+
+    // 1. try_reserve_control_slot exact boundaries
+    let mut cq = MAX_CONTROL_QUEUE_LEN - 1;
+    assert!(!try_reserve_control_slot(true, &mut cq));
+    assert_eq!(cq, MAX_CONTROL_QUEUE_LEN - 1);
+    assert!(try_reserve_control_slot(false, &mut cq));
+    assert_eq!(cq, MAX_CONTROL_QUEUE_LEN);
+    assert!(!try_reserve_control_slot(false, &mut cq));
+    assert_eq!(cq, MAX_CONTROL_QUEUE_LEN);
+
+    // 2. try_coalesce_output exact boundaries (ground mismatch & max_payload boundary)
+    let mut prev = b"ab".to_vec();
+    assert!(!try_coalesce_output(&mut prev, true, b"cd", false, 10));
+    assert_eq!(prev, b"ab");
+    assert!(try_coalesce_output(&mut prev, true, b"cd", true, 4), "exact max_payload must coalesce");
+    assert_eq!(prev, b"abcd");
+    assert!(!try_coalesce_output(&mut prev, true, b"e", true, 4), "max_payload + 1 must not coalesce");
+    assert_eq!(prev, b"abcd");
+
+    // 3. record_output_capped exact hard cap boundary + Gap emission + tight gap-room check
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path().join("hard-cap");
+    let registry = RecordingRegistry::new();
+    let cfg = WalConfig { segment_target_bytes: 1_000_000, budget_bytes: 10_000_000, ..WalConfig::default() };
+    let mut w = WalWriter::open_or_create(&dir, [24; 16], 100, cfg, registry.clone()).unwrap();
+    w.start_segment_with_keyframe(100, &sample_keyframe(None, None, None)).unwrap();
+    let base_size = w.active_segment_size().unwrap();
+    let chunk_len = 16usize;
+    let framed_len = (RECORD_HEADER_LEN + chunk_len + crate::RECORD_TRAILER_LEN) as u64;
+    // Choose max_file_bytes so hard_data_cap == base_size + framed_len (exact boundary admits chunk!)
+    let exact_max = base_size + framed_len + (SEGMENT_FOOTER_LEN as u64) + 1024;
+    assert_eq!(w.record_output_capped(110, &vec![b'a'; chunk_len], true, exact_max).unwrap(), RolloverHint::Continue);
+    assert_eq!(w.active_segment_size().unwrap(), base_size + framed_len);
+    // Next 1-byte chunk exceeds hard_data_cap -> emits Gap and returns NeedKeyframe!
+    assert_eq!(w.record_output_capped(120, b"z", true, exact_max).unwrap(), RolloverHint::NeedKeyframe);
+    let after_gap = w.active_segment_size().unwrap();
+    assert!(after_gap > base_size + framed_len, "Gap record must be appended when room remains");
+    assert!(after_gap + (SEGMENT_FOOTER_LEN as u64) <= exact_max);
+    // When cur_size + 64 > max_file_bytes - SEGMENT_FOOTER_LEN, no Gap record is appended (stays <= max_file_bytes)
+    let tight_max = after_gap + (SEGMENT_FOOTER_LEN as u64) + 63;
+    assert_eq!(w.record_output_capped(130, b"w", true, tight_max).unwrap(), RolloverHint::NeedKeyframe);
+    assert_eq!(w.active_segment_size().unwrap(), after_gap);
+    drop(w);
+
+    // 4. On Unix, open_regular_read_only refuses a FIFO (O_NONBLOCK avoids blocking) and symlinks (ELOOP).
+    #[cfg(unix)]
+    {
+        let fifo_path = tmp.path().join("named.fifo");
+        let status = std::process::Command::new("mkfifo").arg(&fifo_path).status().unwrap();
+        assert!(status.success());
+        let err = read_regular_file_bounded(&fifo_path, 1024, "fifo").unwrap_err();
+        assert!(matches!(err, WalError::InvalidFormat(_)), "FIFO must fail with InvalidFormat, got {err:?}");
+        let sym_path = tmp.path().join("sym.file");
+        std::os::unix::fs::symlink(&fifo_path, &sym_path).unwrap();
+        let sym_err = read_regular_file_bounded(&sym_path, 1024, "sym").unwrap_err();
+        assert!(matches!(sym_err, WalError::SymlinkRefused), "symlink must fail with SymlinkRefused, got {sym_err:?}");
+    }
 }

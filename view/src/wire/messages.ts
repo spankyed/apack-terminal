@@ -7,6 +7,7 @@ import {
   MAX_COMMANDS,
   MAX_ROWS_PER_FETCH,
   MAX_SEARCH_MATCHES,
+  MAX_SEARCH_NEEDLE_BYTES,
   WireError,
   WireReader,
   WireWriter,
@@ -192,6 +193,7 @@ export const MsgType = {
   COMMAND_FINISHED: 0x0317,
   CWD_CHANGED: 0x0318,
   EXITED: 0x0319,
+  PROGRAM_STATUS_CLEARED: 0x031a,
   OUTPUT: 0x0320,
   THROTTLED: 0x0321,
   OUTPUT_DROPPED: 0x0322,
@@ -351,6 +353,7 @@ export type BrokerMsg =
   | { readonly kind: 'notification'; readonly title: string; readonly body: string }
   | { readonly kind: 'progress'; readonly state: ProgressState; readonly percent: number | null }
   | { readonly kind: 'programStatus'; readonly record: StatusRecord }
+  | { readonly kind: 'programStatusCleared'; readonly id: string }
   | { readonly kind: 'commandStarted'; readonly record: CommandRecord }
   | { readonly kind: 'commandFinished'; readonly record: CommandRecord }
   | { readonly kind: 'cwdChanged'; readonly cwd: string }
@@ -771,7 +774,7 @@ export function decodeClientMsg(msgType: number, payload: Uint8Array): ClientMsg
       msg = { kind: 'textOfRect', epoch: r.varU64(), span: decodeCellSpan(r) }
       break
     case MsgType.SET_SEARCH:
-      msg = { kind: 'setSearch', query: r.str(), caseSensitive: r.bool() }
+      msg = { kind: 'setSearch', query: r.strBounded(MAX_SEARCH_NEEDLE_BYTES, 'search query'), caseSensitive: r.bool() }
       break
     case MsgType.COMMANDS:
       msg = { kind: 'commands' }
@@ -829,6 +832,7 @@ export function brokerMsgType(msg: BrokerMsg): number {
     case 'notification': return MsgType.NOTIFICATION
     case 'progress': return MsgType.PROGRESS
     case 'programStatus': return MsgType.PROGRAM_STATUS
+    case 'programStatusCleared': return MsgType.PROGRAM_STATUS_CLEARED
     case 'commandStarted': return MsgType.COMMAND_STARTED
     case 'commandFinished': return MsgType.COMMAND_FINISHED
     case 'cwdChanged': return MsgType.CWD_CHANGED
@@ -961,6 +965,9 @@ export function encodeBrokerPayload(msg: BrokerMsg): Uint8Array {
       break
     case 'programStatus':
       encodeStatusRecord(w, msg.record)
+      break
+    case 'programStatusCleared':
+      w.str(msg.id)
       break
     case 'commandStarted':
     case 'commandFinished':
@@ -1143,6 +1150,9 @@ export function decodeBrokerMsg(msgType: number, payload: Uint8Array): BrokerMsg
     }
     case MsgType.PROGRAM_STATUS:
       msg = { kind: 'programStatus', record: decodeStatusRecord(r) }
+      break
+    case MsgType.PROGRAM_STATUS_CLEARED:
+      msg = { kind: 'programStatusCleared', id: r.str() }
       break
     case MsgType.COMMAND_STARTED:
       msg = { kind: 'commandStarted', record: decodeCommandRecord(r) }

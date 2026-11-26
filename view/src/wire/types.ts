@@ -6,6 +6,7 @@ import {
   MAX_GRID_COLS,
   MAX_GRID_ROWS,
   MAX_LEASE_GRACE_MS,
+  MAX_SEARCH_NEEDLE_BYTES,
   WireError,
   decodeUtf8Strict,
   encodeUtf8,
@@ -1091,7 +1092,7 @@ export function decodeWaitCondition(r: WireReader): WaitCondition {
   const tag = r.u8()
   if (tag === 0) return { kind: 'idle' }
   if (tag === 1) {
-    const needle = r.str()
+    const needle = r.strBounded(MAX_SEARCH_NEEDLE_BYTES, 'wait text needle')
     if (needle.length === 0) throw new WireError('InvalidValue', 'wait text needle must be non-empty')
     return { kind: 'text', needle }
   }

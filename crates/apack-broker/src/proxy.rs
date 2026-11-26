@@ -76,7 +76,12 @@ impl ReplayBuffer {
 /// broker is listening, spawns a detached `apack-terminal serve --socket <socket_path>` and retries.
 pub fn connect_or_autostart(socket_path: &str, autostart: bool) -> io::Result<Stream> {
     connect_or_autostart_with(socket_path, autostart, AUTOSTART_TIMEOUT, |path| {
-        let _child = spawn_detached_broker(path)?;
+        let mut child = spawn_detached_broker(path)?;
+        // Reap the detached broker handle on a tiny background thread so losing autostart racers
+        // do not remain as `<defunct>` zombies while this proxy stays alive.
+        let _ = thread::Builder::new().name(String::from("apack-proxy-reaper")).spawn(move || {
+            let _ = child.wait();
+        });
         Ok(())
     })
 }
@@ -93,7 +98,7 @@ where
 {
     match connect_verified(socket_path) {
         Ok(stream) => return Ok(stream),
-        Err(err) if !autostart => return Err(err),
+        Err(err) if !autostart || err.kind() == io::ErrorKind::PermissionDenied => return Err(err),
         Err(_) => {}
     }
 
@@ -104,7 +109,7 @@ where
         match connect_verified(socket_path) {
             Ok(stream) => return Ok(stream),
             Err(err) => {
-                if started.elapsed() >= timeout {
+                if err.kind() == io::ErrorKind::PermissionDenied || started.elapsed() >= timeout {
                     return Err(err);
                 }
                 thread::sleep(backoff);
@@ -259,6 +264,12 @@ where
         let stream2 = Arc::new(connect()?);
         let already_eof = {
             let mut guard = link.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.replay.is_overflowed() {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "proxy replay buffer overflowed while reconnecting",
+                ));
+            }
             if let Some(bytes) = guard.replay.replay_slice() {
                 let mut tx2: &Stream = &stream2;
                 tx2.write_all(bytes)?;

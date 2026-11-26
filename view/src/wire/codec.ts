@@ -17,6 +17,7 @@ export const MAX_ROWS_PER_FETCH = 2_000
 export const MAX_COMMANDS = 256
 export const MAX_STATUSES = 256
 export const MAX_SEARCH_MATCHES = 2_000
+export const MAX_SEARCH_NEEDLE_BYTES = 4_096
 export const MAX_LEASE_GRACE_MS = 300_000
 export const DEFAULT_SSH_GRACE_MS = 30_000
 export const MAX_STRING_BYTES = 1_048_576
@@ -319,7 +320,11 @@ export class WireReader {
   }
 
   str(): string {
-    const raw = this.strBytes()
+    return this.strBounded(MAX_STRING_BYTES, 'string bytes')
+  }
+
+  strBounded(maxLen: number, label: string): string {
+    const raw = this.bytesBounded(maxLen, label)
     try {
       return textDecoder.decode(raw)
     } catch {

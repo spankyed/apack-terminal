@@ -161,6 +161,7 @@ impl WalWriter {
         let mut next_segment_id = 1u64;
         let mut last_at_ms = 0u64;
 
+        let canonical = claim.canonical_dir().to_path_buf();
         let total = discovered.len();
         for (idx, (seg_id, path)) in discovered.into_iter().enumerate() {
             next_segment_id =
@@ -185,14 +186,35 @@ impl WalWriter {
             let bytes = read_regular_file_bounded(&path, MAX_SEGMENT_FILE_BYTES, "WAL segment file")?;
             let scan = scan_segment(&bytes);
             let Some(first) = scan.records.first() else {
-                // Record 0 was torn/empty or not a KeyframeV2: unlink unusable segment cleanly.
-                let _ = fs::remove_file(&path);
+                // Record 0 was torn/empty or not a KeyframeV2: unlink only if no reader holds a pin.
+                let _ = registry.try_unlink_if_unpinned(&canonical, seg_id, || {
+                    let _ = fs::remove_file(&path);
+                    Ok(())
+                });
                 continue;
             };
             let WalRecord::Keyframe(kf) = &first.record else {
-                let _ = fs::remove_file(&path);
+                let _ = registry.try_unlink_if_unpinned(&canonical, seg_id, || {
+                    let _ = fs::remove_file(&path);
+                    Ok(())
+                });
                 continue;
             };
+
+            let seg_last_ms = scan.records.last().map_or(first.at_ms, |r| r.at_ms);
+            last_at_ms = last_at_ms.max(seg_last_ms);
+            let record_count = u32::try_from(scan.records.len()).unwrap_or(u32::MAX);
+
+            // Never truncate or mutate a segment while a concurrent WalReader holds a pin on it.
+            if registry.is_pinned(&canonical, seg_id) {
+                closed.push(ClosedSegment {
+                    id: seg_id,
+                    path,
+                    size_bytes: bytes.len() as u64,
+                    referenced_blobs: kf.referenced_blobs(),
+                });
+                continue;
+            }
 
             let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
             if scan.had_torn_tail {
@@ -200,9 +222,6 @@ impl WalWriter {
                 file.sync_data()?;
             }
             file.seek(SeekFrom::End(0))?;
-            let seg_last_ms = scan.records.last().map_or(first.at_ms, |r| r.at_ms);
-            last_at_ms = last_at_ms.max(seg_last_ms);
-            let record_count = u32::try_from(scan.records.len()).unwrap_or(u32::MAX);
 
             if !is_last {
                 // Earlier unsealed segment: seal it now so `closed` holds only properly sealed segments.
@@ -272,6 +291,11 @@ impl WalWriter {
         self.active.as_ref().map(|a| a.id)
     }
 
+    #[cfg(test)]
+    pub(crate) fn active_segment_size(&self) -> Option<u64> {
+        self.active.as_ref().map(|a| a.size_bytes)
+    }
+
     /// Returns the number of retained segments (closed + active).
     pub fn segment_count(&self) -> usize {
         self.closed.len() + usize::from(self.active.is_some())
@@ -339,20 +363,26 @@ impl WalWriter {
         self.non_ground_run = 0;
         self.non_ground_dropped = 0;
 
-        let mut report = self.evict_to_budget()?;
-        // Always sweep unreferenced blobs on rollover so images cleared within a single segment are reclaimed.
-        if report.evicted_segments == 0 {
-            let live = self.collect_live_blobs();
-            report.swept_blobs = sweep_unreferenced(&self.dir, &live)?;
-        }
-        Ok(report)
+        // `evict_to_budget` sweeps unreferenced blobs both before checking budget and after evicting
+        // any image-bearing segment, so images cleared within a single segment are always reclaimed.
+        self.evict_to_budget()
     }
 
     /// Appends raw PTY output bytes to the active segment, enforcing the non-ground escape run cap.
     ///
     /// Returns [`RolloverHint::NeedKeyframe`] when the active segment has reached
-    /// `segment_target_bytes` and `vt_at_ground` is `true`.
+    /// `segment_target_bytes` and `vt_at_ground` is `true`, or when the hard segment size cap is hit.
     pub fn record_output(&mut self, at_ms: u64, bytes: &[u8], vt_at_ground: bool) -> Result<RolloverHint, WalError> {
+        self.record_output_capped(at_ms, bytes, vt_at_ground, crate::MAX_SEGMENT_FILE_BYTES)
+    }
+
+    pub(crate) fn record_output_capped(
+        &mut self,
+        at_ms: u64,
+        bytes: &[u8],
+        vt_at_ground: bool,
+        max_file_bytes: u64,
+    ) -> Result<RolloverHint, WalError> {
         if self.active.is_none() {
             return Err(WalError::CorruptSegment("no active segment"));
         }
@@ -376,9 +406,34 @@ impl WalWriter {
             }
         }
 
+        // Hard ceiling leaving room for a final Gap record and 40-byte SegmentFooter so an active
+        // segment can NEVER exceed `max_file_bytes` and brick subsequent reopen/reads.
+        let footer_reserve = crate::SEGMENT_FOOTER_LEN as u64;
+        let hard_data_cap = max_file_bytes.saturating_sub(footer_reserve).saturating_sub(1024);
         if !bytes.is_empty() {
+            let mut hit_hard_cap = false;
+            let mut shed_bytes = 0u64;
             for chunk in bytes.chunks(MAX_RECORD_PAYLOAD) {
+                let framed_len = (crate::RECORD_HEADER_LEN
+                    .saturating_add(chunk.len())
+                    .saturating_add(crate::RECORD_TRAILER_LEN)) as u64;
+                let cur_size = self.active.as_ref().map_or(0, |a| a.size_bytes);
+                if cur_size.saturating_add(framed_len) > hard_data_cap {
+                    hit_hard_cap = true;
+                    shed_bytes = shed_bytes.saturating_add(chunk.len() as u64);
+                    continue;
+                }
                 self.append_record_unchecked(at_ms, &WalRecord::Output(chunk.to_vec()))?;
+            }
+            if hit_hard_cap {
+                let cur_size = self.active.as_ref().map_or(0, |a| a.size_bytes);
+                if cur_size.saturating_add(64) <= max_file_bytes.saturating_sub(footer_reserve) {
+                    self.append_record_unchecked(
+                        at_ms,
+                        &WalRecord::Gap { dropped_bytes: shed_bytes, reason: GapReason::BacklogOverflow },
+                    )?;
+                }
+                return Ok(RolloverHint::NeedKeyframe);
             }
         }
 
@@ -441,8 +496,11 @@ impl WalWriter {
             record_count: active.record_count,
         };
         let encoded_footer = footer.encode();
-        active.file.write_all(&encoded_footer)?;
-        active.file.sync_data()?;
+        if let Err(err) = active.file.write_all(&encoded_footer).and_then(|()| active.file.sync_data()) {
+            let _ = active.file.set_len(active.size_bytes);
+            let _ = active.file.seek(SeekFrom::Start(active.size_bytes));
+            return Err(WalError::Io(err));
+        }
         let _ = sync_dir(&self.dir);
 
         let sealed = self.active.take().expect("checked Some above");
@@ -456,10 +514,14 @@ impl WalWriter {
     }
 
     /// Evicts oldest unpinned closed segments until aggregate segment + blob bytes fit within
-    /// `config.budget_bytes`, then sweeps unreferenced image blobs in `blobs/`.
+    /// `config.budget_bytes`, sweeping unreferenced blobs before and during eviction so freeing a
+    /// large image blob immediately credits the budget without cascading through unrelated segments.
     pub fn evict_to_budget(&mut self) -> Result<EvictionReport, WalError> {
         let mut report = EvictionReport::default();
         let canonical = self.claim.canonical_dir().to_path_buf();
+        // Sweep any already-unreferenced blobs first before counting toward budget.
+        let initial_live = self.collect_live_blobs();
+        report.swept_blobs = report.swept_blobs.saturating_add(sweep_unreferenced(&self.dir, &initial_live)?);
         let blob_bytes = blobs_total_bytes(&self.dir)?;
         let mut total = self.total_segment_bytes().saturating_add(blob_bytes);
 
@@ -471,6 +533,7 @@ impl WalWriter {
                 kept.push(seg);
                 continue;
             }
+            let had_blobs = !seg.referenced_blobs.is_empty();
             let unlink_res = self.registry.try_unlink_if_unpinned(&canonical, seg.id, || {
                 if let Err(err) = fs::remove_file(&seg.path)
                     && err.kind() != std::io::ErrorKind::NotFound
@@ -483,6 +546,29 @@ impl WalWriter {
                 Ok(true) => {
                     total = total.saturating_sub(seg.size_bytes);
                     report.evicted_segments += 1;
+                    if had_blobs {
+                        // Immediately sweep blobs freed by this segment and credit them to `total`
+                        // before deciding whether additional closed segments must be evicted.
+                        let mut live = HashSet::new();
+                        for s in &kept {
+                            live.extend(s.referenced_blobs.iter().copied());
+                        }
+                        for s in iter.as_slice() {
+                            live.extend(s.referenced_blobs.iter().copied());
+                        }
+                        if let Some(active) = &self.active {
+                            live.extend(active.referenced_blobs.iter().copied());
+                        }
+                        live.extend(self.pending_blobs.iter().copied());
+                        report.swept_blobs = report.swept_blobs.saturating_add(sweep_unreferenced(&self.dir, &live)?);
+                        let rem_seg_bytes: u64 = kept
+                            .iter()
+                            .chain(iter.as_slice().iter())
+                            .map(|s| s.size_bytes)
+                            .sum::<u64>()
+                            .saturating_add(self.active.as_ref().map_or(0, |a| a.size_bytes));
+                        total = rem_seg_bytes.saturating_add(blobs_total_bytes(&self.dir)?);
+                    }
                 }
                 Ok(false) => {
                     report.skipped_pinned += 1;
@@ -497,11 +583,6 @@ impl WalWriter {
             }
         }
         self.closed = kept;
-
-        if report.evicted_segments > 0 {
-            let live = self.collect_live_blobs();
-            report.swept_blobs = sweep_unreferenced(&self.dir, &live)?;
-        }
 
         Ok(report)
     }
@@ -530,8 +611,12 @@ impl WalWriter {
         };
         self.encode_buf.clear();
         encode_framed_record(at_ms, record, &mut self.encode_buf)?;
-        // Write the complete framed record in one contiguous `write_all` call (no 8 KiB partial splits).
-        active.file.write_all(&self.encode_buf)?;
+        // Write the complete framed record in one contiguous `write_all` call; roll back length/cursor on failure.
+        if let Err(err) = active.file.write_all(&self.encode_buf) {
+            let _ = active.file.set_len(active.size_bytes);
+            let _ = active.file.seek(SeekFrom::Start(active.size_bytes));
+            return Err(WalError::Io(err));
+        }
         active.size_bytes = active.size_bytes.saturating_add(self.encode_buf.len() as u64);
         active.last_ms = active.last_ms.max(at_ms);
         active.record_count = active.record_count.saturating_add(1);
@@ -553,6 +638,7 @@ enum WorkerCmd {
 struct QueueState {
     queue: VecDeque<(usize, WorkerCmd)>,
     queued_bytes: usize,
+    control_queued: usize,
     closed: bool,
 }
 
@@ -564,7 +650,7 @@ impl WalWorker {
     pub fn spawn(writer: WalWriter) -> WalHandle {
         let max_backlog = writer.config().max_backlog_bytes;
         let shared = Arc::new((
-            Mutex::new(QueueState { queue: VecDeque::new(), queued_bytes: 0, closed: false }),
+            Mutex::new(QueueState { queue: VecDeque::new(), queued_bytes: 0, control_queued: 0, closed: false }),
             Condvar::new(),
         ));
         let failed = Arc::new(AtomicBool::new(false));
@@ -588,6 +674,28 @@ pub(crate) const fn should_worker_wait(queue_empty: bool, closed: bool) -> bool 
     queue_empty && !closed
 }
 
+pub(crate) fn try_reserve_control_slot(closed: bool, control_queued: &mut usize) -> bool {
+    if closed || *control_queued >= MAX_CONTROL_QUEUE_LEN {
+        return false;
+    }
+    *control_queued += 1;
+    true
+}
+
+pub(crate) fn try_coalesce_output(
+    prev_bytes: &mut Vec<u8>,
+    prev_ground: bool,
+    next_bytes: &[u8],
+    next_ground: bool,
+    max_payload: usize,
+) -> bool {
+    if prev_ground != next_ground || prev_bytes.len().saturating_add(next_bytes.len()) > max_payload {
+        return false;
+    }
+    prev_bytes.extend_from_slice(next_bytes);
+    true
+}
+
 fn run_worker_loop(
     mut writer: WalWriter,
     shared: Arc<(Mutex<QueueState>, Condvar)>,
@@ -607,6 +715,11 @@ fn run_worker_loop(
                 break;
             };
             state.queued_bytes = state.queued_bytes.saturating_sub(cost);
+            if matches!(cmd, WorkerCmd::StartSegment { .. } | WorkerCmd::Resize { .. } | WorkerCmd::Marks { .. })
+                || matches!(&cmd, WorkerCmd::Output { bytes, .. } if bytes.is_empty())
+            {
+                state.control_queued = state.control_queued.saturating_sub(1);
+            }
             cmd
         };
 
@@ -712,6 +825,22 @@ impl WalHandle {
         if state.closed {
             return false;
         }
+        if cost == 0 {
+            // Coalesce repeated empty ground notifications so zero-byte writes cannot grow the queue unboundedly.
+            if matches!(
+                state.queue.back(),
+                Some((_, WorkerCmd::Output { bytes: prev, vt_at_ground: prev_g, .. }))
+                    if prev.is_empty() && *prev_g == vt_at_ground
+            ) {
+                return true;
+            }
+            if !try_reserve_control_slot(state.closed, &mut state.control_queued) {
+                return false;
+            }
+            state.queue.push_back((0, WorkerCmd::Output { at_ms, bytes, vt_at_ground }));
+            cv.notify_one();
+            return true;
+        }
         if !try_reserve_backlog(&mut state.queued_bytes, cost, self.max_backlog) {
             if let Some((_, WorkerCmd::BacklogGap { at_ms: gap_ms, dropped_bytes })) = state.queue.back_mut() {
                 *dropped_bytes = dropped_bytes.saturating_add(cost as u64);
@@ -721,6 +850,16 @@ impl WalHandle {
             }
             cv.notify_one();
             return false;
+        }
+        // Coalesce adjacent output chunks with matching ground state up to `MAX_RECORD_PAYLOAD`.
+        if let Some((prev_cost, WorkerCmd::Output { at_ms: prev_ms, bytes: prev_bytes, vt_at_ground: prev_g })) =
+            state.queue.back_mut()
+            && try_coalesce_output(prev_bytes, *prev_g, &bytes, vt_at_ground, MAX_RECORD_PAYLOAD)
+        {
+            *prev_cost = prev_cost.saturating_add(cost);
+            *prev_ms = (*prev_ms).max(at_ms);
+            cv.notify_one();
+            return true;
         }
         state.queue.push_back((cost, WorkerCmd::Output { at_ms, bytes, vt_at_ground }));
         cv.notify_one();
@@ -754,9 +893,19 @@ impl WalHandle {
         true
     }
 
-    /// Enqueues an explicit active-segment seal.
+    /// Enqueues an explicit active-segment seal (never starved by output queue length).
     pub fn seal(&self) -> bool {
-        self.push_control(WorkerCmd::Seal)
+        if self.is_failed() {
+            return false;
+        }
+        let (lock, cv) = &*self.shared;
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closed {
+            return false;
+        }
+        state.queue.push_back((0, WorkerCmd::Seal));
+        cv.notify_one();
+        true
     }
 
     /// Blocks until every previously enqueued command has been applied and flushed to OS buffers.
@@ -817,7 +966,7 @@ impl WalHandle {
         }
         let (lock, cv) = &*self.shared;
         let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
-        if state.queue.len() >= MAX_CONTROL_QUEUE_LEN {
+        if !try_reserve_control_slot(state.closed, &mut state.control_queued) {
             return false;
         }
         state.queue.push_back((0, cmd));

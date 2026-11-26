@@ -78,35 +78,42 @@ describe('CanvasPainter v2', () => {
   it('uses O(1) drawImage scroll-blit fast path on uniform scroll shifts and repaints only newly exposed edge rows', () => {
     const rec = recordingContext(10)
     const painter = new CanvasPainter({ family: 'monospace', size: 14 }, rec.canvas, 1)
-    painter.resize(10, 6, 1)
+    painter.resize(10, 8, 1)
 
-    const rows = Array.from({ length: 7 }, (_, i) => drawRow(row(i, `line-${i}`), theme))
-    const scene1: Scene = { theme, rows: rows.slice(0, 6), offset: 0, scrollPosition: 0 }
+    const rows = Array.from({ length: 9 }, (_, i) => drawRow(row(i, `line-${i}`), theme))
+    const scene1: Scene = { theme, epoch: 1, rows: rows.slice(0, 8), offset: 0, scrollPosition: 0 }
     painter.paint(scene1)
     rec.drawn.length = 0
 
     // Scroll down by 1 row (scrollPosition: 0 -> 1)
-    const scene2: Scene = { theme, rows: rows.slice(1, 7), offset: 0, scrollPosition: 1 }
+    const scene2: Scene = { theme, epoch: 1, rows: rows.slice(1, 9), offset: 0, scrollPosition: 1 }
     painter.paint(scene2)
 
-    // Must blit self canvas once with srcY=20, dstY=0, height=100 (6*20 - 20)
+    // Must blit self canvas once with srcY=20, dstY=0, height=140 (8*20 - 20)
     const blits = rec.drawn.filter((d) => d.kind === 'image' && d.picture === rec.canvas)
     expect(blits).toHaveLength(1)
-    expect(blits[0]!.source).toEqual([0, 20, 100, 100])
+    expect(blits[0]!.source).toEqual([0, 20, 100, 140])
     expect(blits[0]!.y).toBe(0)
-    expect(blits[0]!.height).toBe(100)
+    expect(blits[0]!.height).toBe(140)
 
-    // Top unchanged lines (line-1, line-2) must NOT be redrawn!
+    // Newly exposed bottom row (line-8) and top clip-edge row (line-1, clearing scrolled-off descenders)
+    // are repainted, while interior blitted lines (line-3, line-4) must NOT be redrawn!
     const redrawnTexts = rec.drawn.filter((d) => d.kind === 'text').map((d) => d.text)
-    expect(redrawnTexts).toContain('line-6')
-    expect(redrawnTexts).not.toContain('line-1')
-    expect(redrawnTexts).not.toContain('line-2')
+    expect(redrawnTexts).toContain('line-8')
+    expect(redrawnTexts).toContain('line-1')
+    expect(redrawnTexts).not.toContain('line-3')
+    expect(redrawnTexts).not.toContain('line-4')
+
+    // Epoch change invalidates scroll-blit and forces full repaint instead of blitting stale pixels
+    rec.drawn.length = 0
+    painter.paint({ theme, epoch: 2, rows: rows.slice(2, 9).concat([drawRow(row(9, 'line-9'), theme)]), offset: 0, scrollPosition: 2 })
+    expect(rec.drawn.filter((d) => d.kind === 'image' && d.picture === rec.canvas)).toHaveLength(0)
 
     // Fractional scroll shift (+0.5 row = 10px) where a middle row mutated MUST repaint the dirty row!
     rec.drawn.length = 0
-    const mutatedMid = [...rows.slice(1, 7), drawRow(row(7, 'line-7'), theme)]
-    mutatedMid[2] = drawRow(row(3, 'mid-updated'), theme)
-    painter.paint({ theme, rows: mutatedMid, offset: 0.5, scrollPosition: 1.5 })
+    const mutatedMid = [...rows.slice(2, 9), drawRow(row(9, 'line-9'), theme), drawRow(row(10, 'line-10'), theme)]
+    mutatedMid[3] = drawRow(row(5, 'mid-updated'), theme)
+    painter.paint({ theme, epoch: 2, rows: mutatedMid, offset: 0.5, scrollPosition: 2.5 })
     const fracTexts = rec.drawn.filter((d) => d.kind === 'text').map((d) => d.text)
     expect(fracTexts).toContain('mid-updated')
     painter.dispose()

@@ -106,9 +106,15 @@ impl MarksTracker {
     }
 
     /// Records a working directory reported via OSC 7 (honoured in [`MarksMode::Claimed`] only).
-    pub fn on_cwd(&mut self, cwd: &str) {
+    ///
+    /// Returns `Some(accepted_cwd)` iff the update was accepted (unkeyed mode and non-empty).
+    pub fn on_cwd(&mut self, cwd: &str) -> Option<String> {
         if matches!(self.mode, MarksMode::Claimed) && !cwd.is_empty() {
-            self.last_cwd = Some(truncate_utf8(cwd, MAX_EVENT_STRING_BYTES));
+            let accepted = truncate_utf8(cwd, MAX_EVENT_STRING_BYTES);
+            self.last_cwd = Some(accepted.clone());
+            Some(accepted)
+        } else {
+            None
         }
     }
 

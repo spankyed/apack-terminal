@@ -27,6 +27,9 @@ use crate::{
     MAX_STREAMS_PER_CONN,
 };
 
+/// Maximum wire-encoded size of any single protocol frame (14-byte header + 8 MiB payload).
+pub(crate) const MAX_WIRE_FRAME_BYTES: usize = apack_proto::FRAME_HEADER_LEN + apack_proto::MAX_FRAME_PAYLOAD;
+
 /// Error returned by [`BrokerCore::open_connection`] if `conn` is already registered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DuplicateConnId;
@@ -55,7 +58,7 @@ pub enum CloseReason {
 pub enum BrokerAction {
     /// One or more frames are queued in `conn`'s [`OutboundQueue`] ready for `writev`.
     OutboundReady(ConnId),
-    /// Close the connection's socket/pipe (writing `final_error` best-effort beforehand if present).
+    /// Close the connection's socket/pipe (flushing `drained` and `final_error` beforehand if present).
     CloseConn {
         /// Connection to close.
         conn: ConnId,
@@ -63,6 +66,8 @@ pub enum BrokerAction {
         reason: CloseReason,
         /// Optional final error frame to send best-effort before closing the transport.
         final_error: Option<(StreamId, RequestId, BrokerMsg)>,
+        /// Already-queued ordered replies drained on graceful `ClientFin`.
+        drained: Vec<QueuedMessage>,
     },
     /// Spawn a new live session on a session shard.
     SpawnSession {
@@ -258,6 +263,8 @@ struct ConnState {
     decoder: FrameDecoder,
     outbound: OutboundQueue,
     streams: BTreeMap<NonZeroStreamId, AttachedStream>,
+    /// Stream IDs whose `StreamClosed` marker is still queued in `outbound` and not yet popped.
+    closing_streams: BTreeSet<NonZeroStreamId>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -366,6 +373,7 @@ impl BrokerCore {
         for (conn_id, stream_id) in to_close {
             if let Some(conn) = self.conns.get_mut(&conn_id) {
                 conn.streams.remove(&stream_id);
+                conn.closing_streams.insert(stream_id);
                 // Preserve already-queued `Exited` events and final `Output` chunks; drop only unsent frames.
                 conn.outbound.remove_stream_frames(stream_id.as_stream_id());
             }
@@ -433,6 +441,7 @@ impl BrokerCore {
                 decoder: FrameDecoder::new(),
                 outbound: OutboundQueue::new(self.max_queue_bytes),
                 streams: BTreeMap::new(),
+                closing_streams: BTreeSet::new(),
             },
         );
         Ok(())
@@ -512,7 +521,7 @@ impl BrokerCore {
         now: TimestampMs,
         actions: &mut Vec<BrokerAction>,
     ) {
-        let Some(state) = self.conns.remove(&conn) else {
+        let Some(mut state) = self.conns.remove(&conn) else {
             return;
         };
         match state.phase {
@@ -520,6 +529,17 @@ impl BrokerCore {
                 self.timers.cancel(timeout);
             }
             ConnPhase::Ready => {}
+        }
+
+        let mut drained = Vec::new();
+        if reason == CloseReason::ClientFin {
+            // Preserve already-queued ordered replies (e.g. pipelined RPC + FIN_FRAME in one read),
+            // dropping conflatable view frames since the peer is closing.
+            while let Some(msg) = state.outbound.pop_next() {
+                if !matches!(msg.msg, BrokerMsg::Frame(_)) {
+                    drained.push(msg);
+                }
+            }
         }
 
         let mut affected_sessions = BTreeSet::new();
@@ -540,7 +560,7 @@ impl BrokerCore {
         if changes.teardown_non_kept {
             actions.push(BrokerAction::TeardownNonKeptSessions);
         }
-        actions.push(BrokerAction::CloseConn { conn, reason, final_error });
+        actions.push(BrokerAction::CloseConn { conn, reason, final_error, drained });
     }
 
     /// Fires all timers due at or before `now` in deterministic `(deadline, id)` order.
@@ -581,7 +601,14 @@ impl BrokerCore {
 
     /// Pops the highest-priority pending outbound message for `conn`.
     pub fn pop_outbound(&mut self, conn: ConnId) -> Option<QueuedMessage> {
-        self.conns.get_mut(&conn)?.outbound.pop_next()
+        let state = self.conns.get_mut(&conn)?;
+        let popped = state.outbound.pop_next()?;
+        if matches!(popped.msg, BrokerMsg::StreamClosed { .. })
+            && let Some(nz) = NonZeroStreamId::new(popped.stream_id.raw())
+        {
+            state.closing_streams.remove(&nz);
+        }
+        Some(popped)
     }
 
     /// Enqueues a reply or event on `conn`, closing the connection as a slow reader on queue overflow.
@@ -592,11 +619,21 @@ impl BrokerCore {
         stream_id: StreamId,
         req_id: RequestId,
         priority: OutboundPriority,
-        msg: BrokerMsg,
+        mut msg: BrokerMsg,
         now: TimestampMs,
         actions: &mut Vec<BrokerAction>,
     ) {
-        let encoded_bytes = estimate_encoded_bytes(&msg);
+        let mut encoded_bytes = estimate_encoded_bytes(&msg);
+        if encoded_bytes > MAX_WIRE_FRAME_BYTES {
+            if req_id == RequestId::PUSH {
+                return;
+            }
+            msg = BrokerMsg::Error {
+                code: ErrorCode::ResourceLimit,
+                message: String::from("response exceeds maximum frame payload"),
+            };
+            encoded_bytes = estimate_encoded_bytes(&msg);
+        }
         let overflowed = match self.conns.get_mut(&conn) {
             Some(state) => state.outbound.push_ordered(priority, stream_id, req_id, msg, encoded_bytes).is_err(),
             None => return,
@@ -643,7 +680,10 @@ impl BrokerCore {
             unreachable!();
         };
         let frame_u32 = u32::try_from(encoded_bytes).unwrap_or(u32::MAX);
-        if !pacer.can_send(frame_u32) || !state.outbound.can_fit_frame(stream_id.as_stream_id(), encoded_bytes) {
+        if encoded_bytes > MAX_WIRE_FRAME_BYTES
+            || !pacer.can_send(frame_u32)
+            || !state.outbound.can_fit_frame(stream_id.as_stream_id(), encoded_bytes)
+        {
             return Err(frame);
         }
         let _ = state.outbound.push_frame(stream_id.as_stream_id(), frame, encoded_bytes);
@@ -1114,6 +1154,18 @@ impl BrokerCore {
                     );
                     return;
                 }
+                if state.closing_streams.contains(&stream_id) {
+                    self.send_error(
+                        conn,
+                        StreamId::CONTROL,
+                        req_id,
+                        ErrorCode::Busy,
+                        "stream id still draining close events",
+                        now,
+                        actions,
+                    );
+                    return;
+                }
                 if state.streams.len() >= MAX_STREAMS_PER_CONN {
                     self.send_error(
                         conn,
@@ -1174,13 +1226,25 @@ impl BrokerCore {
                 );
             }
             ClientMsg::Keep { session, kept } => {
-                if !self.sessions.contains_key(&session) {
+                let Some(rec) = self.sessions.get(&session).copied() else {
                     self.send_error(
                         conn,
                         StreamId::CONTROL,
                         req_id,
                         ErrorCode::NoSuchSession,
                         "no such session",
+                        now,
+                        actions,
+                    );
+                    return;
+                };
+                if rec.rewound {
+                    self.send_error(
+                        conn,
+                        StreamId::CONTROL,
+                        req_id,
+                        ErrorCode::Malformed,
+                        "cannot keep a read-only rewound session",
                         now,
                         actions,
                     );

@@ -97,7 +97,14 @@ impl ClientViewModel {
         assert!(frame.seq > self.last_seq, "frame seq regressed: {} <= {}", frame.seq, self.last_seq);
         self.last_seq = frame.seq;
         let height = usize::from(frame.size.rows.get());
-        if frame.full_sync || frame.epoch != self.epoch || frame.size != self.size {
+        if frame.epoch != self.epoch || frame.size != self.size {
+            assert!(
+                frame.full_sync,
+                "broker must set full_sync=true on epoch ({} -> {}) or size ({:?} -> {:?}) change",
+                self.epoch, frame.epoch, self.size, frame.size
+            );
+        }
+        if frame.full_sync {
             self.epoch = frame.epoch;
             self.size = frame.size;
             self.rows = vec![String::new(); height];

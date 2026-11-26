@@ -320,8 +320,9 @@ export function drawRow(
       continue
     }
 
-    // Narrow non-BMP codepoints (surrogate pairs, `slice.length !== colLen`): emit 1 codepoint per column
-    if (slice.length !== colLen) {
+    // Narrow non-BMP codepoints (surrogate pairs, `slice.length !== colLen`): emit 1 codepoint per column.
+    // Guard `slice.length > 0` so blank style-only runs (e.g. colored background spaces) stay on the fast path.
+    if (slice.length > 0 && slice.length !== colLen) {
       const cps = Array.from(slice)
       for (let k = 0; k < cps.length && k < colLen; k += 1) {
         const c = colStart + k

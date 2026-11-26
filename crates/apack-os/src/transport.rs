@@ -84,8 +84,15 @@ pub fn acquire_socket_hold(socket: &str) -> Result<SocketHold, OsError> {
             .create(true)
             .truncate(false)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&lock_path)
             .map_err(|err| OsError::io("opening socket lock file", err))?;
+        if !lock.metadata().map_err(|err| OsError::io("inspecting socket lock file", err))?.is_file() {
+            return Err(OsError::io(
+                "inspecting socket lock file",
+                io::Error::new(io::ErrorKind::InvalidInput, "socket lock path is not a regular file"),
+            ));
+        }
 
         // SAFETY: `lock` is an open file descriptor owned by this function.
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
@@ -244,8 +251,8 @@ pub fn connect_local_stream(socket: &str) -> io::Result<Stream> {
     Stream::connect(name)
 }
 
-/// Verifies via kernel credentials (`SO_PEERCRED`/`getpeereid` on Unix, `GetSecurityInfo` pipe
-/// owner SID on Windows) that the peer endpoint belongs to the current user.
+/// Verifies (client-side) via kernel credentials (`SO_PEERCRED`/`getpeereid` on Unix,
+/// `GetSecurityInfo` pipe owner SID on Windows) that the broker endpoint belongs to the current user.
 pub fn verify_peer_is_current_user(stream: &Stream) -> io::Result<bool> {
     #[cfg(windows)]
     {
@@ -260,6 +267,181 @@ pub fn verify_peer_is_current_user(stream: &Stream) -> io::Result<bool> {
         Ok(stream.peer_creds()?.euid() == Some(user))
     }
 }
+
+/// Verifies (server-side) via kernel credentials (`SO_PEERCRED`/`getpeereid` on Unix,
+/// `GetNamedPipeClientProcessId` + client token user SID on Windows) that an accepted client
+/// belongs to the current user.
+pub fn verify_client_is_current_user(stream: &Stream) -> io::Result<bool> {
+    #[cfg(windows)]
+    {
+        let Stream::NamedPipe(pipe) = stream;
+        crate::transport_windows::client_is_this_user(pipe)
+    }
+    #[cfg(unix)]
+    {
+        verify_peer_is_current_user(stream)
+    }
+}
+
+#[cfg(windows)]
+pub use crate::transport_windows::{ShutdownSignalGuard, install_shutdown_signals};
+
+#[cfg(unix)]
+mod unix_signals {
+    use std::io;
+    use std::os::fd::RawFd;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+
+    pub(crate) const INVALID_FD: RawFd = -1;
+    static SIGNAL_PIPE_WR: AtomicI32 = AtomicI32::new(INVALID_FD);
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum SignalReadAction {
+        Wake,
+        Retry,
+        Stop,
+    }
+
+    pub(crate) fn classify_signal_read(n: isize, err_kind: io::ErrorKind) -> SignalReadAction {
+        if n > 0 {
+            SignalReadAction::Wake
+        } else if n < 0 && err_kind == io::ErrorKind::Interrupted {
+            SignalReadAction::Retry
+        } else {
+            SignalReadAction::Stop
+        }
+    }
+
+    extern "C" fn handle_shutdown_signal(_sig: libc::c_int) {
+        let fd = SIGNAL_PIPE_WR.load(Ordering::Relaxed);
+        if fd >= 0 {
+            let byte: u8 = 1;
+            // SAFETY: `write(2)` of 1 byte to a non-blocking pipe fd is POSIX async-signal-safe.
+            let _ = unsafe { libc::write(fd, (&raw const byte).cast(), 1) };
+        }
+    }
+
+    /// Guard keeping Unix `SIGINT`/`SIGTERM` graceful shutdown handling active until dropped.
+    pub struct ShutdownSignalGuard {
+        prev_int: libc::sigaction,
+        prev_term: libc::sigaction,
+        wr_fd: RawFd,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl ShutdownSignalGuard {
+        #[cfg(test)]
+        pub(crate) fn write_fd(&self) -> RawFd {
+            self.wr_fd
+        }
+    }
+
+    impl Drop for ShutdownSignalGuard {
+        fn drop(&mut self) {
+            // SAFETY: restoring previous signal dispositions saved in `install_shutdown_signals`.
+            unsafe {
+                libc::sigaction(libc::SIGINT, &self.prev_int, std::ptr::null_mut());
+                libc::sigaction(libc::SIGTERM, &self.prev_term, std::ptr::null_mut());
+            }
+            SIGNAL_PIPE_WR.store(INVALID_FD, Ordering::Release);
+            // SAFETY: closing the write end unblocks the reader thread cleanly with EOF.
+            unsafe {
+                libc::close(self.wr_fd);
+            }
+            if let Some(handle) = self.worker.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    /// Installs async-signal-safe `SIGINT` and `SIGTERM` handlers that set `flag` and invoke `wake`.
+    pub fn install_shutdown_signals(
+        flag: Arc<AtomicBool>,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) -> io::Result<ShutdownSignalGuard> {
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: `fds` is a valid 2-element array for `pipe(2)`.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let (rd_fd, wr_fd) = (fds[0], fds[1]);
+        for fd in [rd_fd, wr_fd] {
+            // SAFETY: setting `FD_CLOEXEC` on freshly created pipe descriptors.
+            unsafe {
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+        }
+        // SAFETY: setting `O_NONBLOCK` on write end so signal handler `write(2)` never blocks.
+        unsafe {
+            let fl = libc::fcntl(wr_fd, libc::F_GETFL);
+            libc::fcntl(wr_fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+        }
+
+        if SIGNAL_PIPE_WR.compare_exchange(INVALID_FD, wr_fd, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            // SAFETY: closing unused pipe fds on duplicate registration.
+            unsafe {
+                libc::close(rd_fd);
+                libc::close(wr_fd);
+            }
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "shutdown signal handler already installed"));
+        }
+
+        // SAFETY: zero-initialized `libc::sigaction` is valid before setting `sa_sigaction`/`sa_mask`/`sa_flags`.
+        let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+        sa.sa_sigaction = handle_shutdown_signal as *const () as usize;
+        sa.sa_flags = libc::SA_RESTART;
+        // SAFETY: `sigemptyset` initializes `sa.sa_mask`.
+        unsafe {
+            libc::sigemptyset(&raw mut sa.sa_mask);
+        }
+        // SAFETY: out-buffer populated by `sigaction`.
+        let mut prev_int: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: out-buffer populated by `sigaction`.
+        let mut prev_term: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: installing async-signal-safe handlers for `SIGINT` and `SIGTERM`.
+        let installed = unsafe {
+            libc::sigaction(libc::SIGINT, &sa, &mut prev_int) == 0
+                && libc::sigaction(libc::SIGTERM, &sa, &mut prev_term) == 0
+        };
+        if !installed {
+            let err = io::Error::last_os_error();
+            SIGNAL_PIPE_WR.store(INVALID_FD, Ordering::Release);
+            // SAFETY: closing pipe fds after `sigaction` failure.
+            unsafe {
+                libc::close(rd_fd);
+                libc::close(wr_fd);
+            }
+            return Err(err);
+        }
+
+        let worker = std::thread::Builder::new().name("apack-signals".to_owned()).spawn(move || {
+            let mut buf = [0u8; 16];
+            loop {
+                // SAFETY: `rd_fd` is owned exclusively by this thread and `buf` is valid for 16 bytes.
+                let n = unsafe { libc::read(rd_fd, buf.as_mut_ptr().cast(), buf.len()) };
+                let kind = io::Error::last_os_error().kind();
+                match classify_signal_read(n, kind) {
+                    SignalReadAction::Wake => {
+                        flag.store(true, Ordering::Release);
+                        wake();
+                    }
+                    SignalReadAction::Retry => continue,
+                    SignalReadAction::Stop => break,
+                }
+            }
+            // SAFETY: closing owned read end before thread exits.
+            unsafe {
+                libc::close(rd_fd);
+            }
+        })?;
+
+        Ok(ShutdownSignalGuard { prev_int, prev_term, wr_fd, worker: Some(worker) })
+    }
+}
+
+#[cfg(unix)]
+pub use unix_signals::{ShutdownSignalGuard, install_shutdown_signals};
 
 /// Abruptly shuts down a stream in both directions, unblocking parked reads/writes.
 ///
@@ -505,6 +687,7 @@ mod tests {
 
         assert!(verify_peer_is_current_user(&server).expect("peer check server"));
         assert!(verify_peer_is_current_user(&client).expect("peer check client"));
+        assert!(verify_client_is_current_user(&server).expect("client check server"));
         let sfd = stream_raw_fd(&server);
         assert!(sfd > 2, "stream fd must be > 2");
         let cfd = stream_raw_fd(&client);
@@ -534,5 +717,76 @@ mod tests {
         drop(hold);
         let _reacquired = acquire_socket_hold(&sock_str).expect("reacquire after explicit LOCK_UN");
         let _ = dup_lock_fd.as_raw_fd();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_shutdown_signals_guard_catches_sigterm_sigint_and_reinstalls_after_drop() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        // Pure read-outcome classifier covers Wake / Retry (EINTR) / Stop (EOF & fatal) without stalling.
+        const { assert!(unix_signals::INVALID_FD < 0) };
+        assert_eq!(unix_signals::classify_signal_read(1, io::ErrorKind::Other), unix_signals::SignalReadAction::Wake);
+        assert_eq!(
+            unix_signals::classify_signal_read(0, io::ErrorKind::Interrupted),
+            unix_signals::SignalReadAction::Stop
+        );
+        assert_eq!(
+            unix_signals::classify_signal_read(-1, io::ErrorKind::Interrupted),
+            unix_signals::SignalReadAction::Retry
+        );
+        assert_eq!(unix_signals::classify_signal_read(-1, io::ErrorKind::Other), unix_signals::SignalReadAction::Stop);
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let wakes_cb = Arc::clone(&wakes);
+        let guard = install_shutdown_signals(Arc::clone(&flag), move || {
+            wakes_cb.fetch_add(1, Ordering::AcqRel);
+        })
+        .expect("install shutdown signals");
+
+        // Verify pipe write fd carries both FD_CLOEXEC and O_NONBLOCK.
+        let wr = guard.write_fd();
+        // SAFETY: querying flags on open owned pipe descriptor.
+        assert_ne!(unsafe { libc::fcntl(wr, libc::F_GETFD) } & libc::FD_CLOEXEC, 0);
+        // SAFETY: querying status flags on open owned pipe descriptor.
+        assert_ne!(unsafe { libc::fcntl(wr, libc::F_GETFL) } & libc::O_NONBLOCK, 0);
+
+        // Duplicate install while guard is active fails with AlreadyExists.
+        let dup = install_shutdown_signals(Arc::new(AtomicBool::new(false)), || {});
+        assert_eq!(dup.err().map(|e| e.kind()), Some(io::ErrorKind::AlreadyExists));
+
+        // Raising SIGTERM flips flag and fires wake.
+        // SAFETY: sending SIGTERM to self while our async-signal-safe handler is installed.
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+        let start = std::time::Instant::now();
+        while (!flag.load(Ordering::Acquire) || wakes.load(Ordering::Acquire) < 1)
+            && start.elapsed() < Duration::from_secs(2)
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(flag.load(Ordering::Acquire), "SIGTERM must set shutdown flag");
+        let after_term = wakes.load(Ordering::Acquire);
+        assert!(after_term >= 1);
+
+        // Raising SIGINT also wakes cleanly.
+        flag.store(false, Ordering::Release);
+        // SAFETY: sending SIGINT to self while our async-signal-safe handler is installed.
+        assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
+        let start2 = std::time::Instant::now();
+        while (!flag.load(Ordering::Acquire) || wakes.load(Ordering::Acquire) <= after_term)
+            && start2.elapsed() < Duration::from_secs(2)
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(flag.load(Ordering::Acquire), "SIGINT must set shutdown flag");
+        assert!(wakes.load(Ordering::Acquire) > after_term);
+
+        // Dropping guard restores handlers and releases the global slot so reinstall succeeds.
+        drop(guard);
+        let guard2 = install_shutdown_signals(Arc::new(AtomicBool::new(false)), || {})
+            .expect("reinstall after drop must succeed");
+        drop(guard2);
     }
 }

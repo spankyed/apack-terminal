@@ -4,10 +4,14 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Maximum silence before an unprogressing filesystem read is abandoned.
 pub const QUIET: Duration = Duration::from_secs(5);
+
+/// Multiplier deriving the hard total wall-clock deadline from `quiet` (`6 * 5s = 30s`),
+/// preventing a slow-drip FUSE mount from pinning the worker indefinitely.
+const TOTAL_DEADLINE_FACTOR: u32 = 6;
 
 /// Per-session single-flight named-source reader with stuck-mount circuit breaker.
 #[derive(Debug, Default)]
@@ -46,8 +50,13 @@ impl Worker {
             let _ = tell.send(Some(answer));
         });
         started.ok()?;
+        let hard_deadline = Instant::now() + quiet.saturating_mul(TOTAL_DEADLINE_FACTOR);
         loop {
-            match told.recv_timeout(quiet) {
+            let remaining = hard_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            match told.recv_timeout(quiet.min(remaining)) {
                 Ok(Some(answer)) => return Some(answer),
                 Ok(None) => {}
                 Err(_) => return None,
@@ -95,5 +104,20 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         };
         assert_eq!(recovered, 7);
+
+        // Slow-drip producer that keeps ticking before `quiet` still hits the hard total deadline (`6 * quiet`).
+        let (drip_stop_tx, drip_stop_rx) = mpsc::channel::<()>();
+        let drip = worker.run(Duration::from_millis(20), move |progress| {
+            for _ in 0..40 {
+                if drip_stop_rx.try_recv().is_ok() {
+                    return 0u32;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+                progress();
+            }
+            1u32
+        });
+        let _ = drip_stop_tx.send(());
+        assert_eq!(drip, None, "slow-drip worker must time out at hard total deadline");
     }
 }

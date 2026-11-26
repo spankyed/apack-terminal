@@ -36,12 +36,18 @@ pub fn owner_only_security_descriptor() -> io::Result<SecurityDescriptor> {
 
 /// Reads the current process token's user SID string (`S-1-5-...`).
 pub fn current_user_sid() -> io::Result<U16CString> {
+    // SAFETY: `GetCurrentProcess` returns a valid pseudo-handle requiring no close.
+    user_sid_for_process(unsafe { GetCurrentProcess() })
+}
+
+/// Reads the user SID string (`S-1-5-...`) from the primary token of `process`.
+pub(crate) fn user_sid_for_process(process: HANDLE) -> io::Result<U16CString> {
     // SAFETY: Every Win32 call is checked before reading output buffers, `buffer` is `u64`-aligned
     // to satisfy `TOKEN_USER`, and both the token handle and `ConvertSidToStringSidW` string are
     // freed on all paths.
     unsafe {
         let mut raw_token: HANDLE = std::ptr::null_mut();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token) == 0 {
+        if OpenProcessToken(process, TOKEN_QUERY, &mut raw_token) == 0 {
             return Err(io::Error::last_os_error());
         }
         let token = TokenHandle(raw_token);

@@ -185,6 +185,7 @@ export class CanvasPainter implements Painter {
     const shown = this.shown
     if (!shown) return false
     if (shown.theme !== scene.theme) return false
+    if (shown.epoch !== scene.epoch) return false
     if (scene.scrollPosition === undefined || shown.scrollPosition === undefined) return false
     if ((scene.images?.length ?? 0) > 0 || (shown.images?.length ?? 0) > 0) return false
     if ((scene.marks?.length ?? 0) > 0 || (shown.marks?.length ?? 0) > 0) return false
@@ -269,6 +270,12 @@ export class CanvasPainter implements Painter {
     const expanded = new Uint8Array(count)
     for (let i = 0; i < count; i += 1) {
       if (dirty[i] || dirty[i - 1] || dirty[i + 1]) expanded[i] = 1
+    }
+    // Also clean the opposite clip-edge row itself (without expanding into its interior neighbor)
+    // so any ascender/descender overhang copied from the scrolled-off row is cleanly cleared.
+    if (count > 0) {
+      if (deltaRows > 0) expanded[0] = 1
+      else expanded[count - 1] = 1
     }
 
     const bands = collectBands(expanded)

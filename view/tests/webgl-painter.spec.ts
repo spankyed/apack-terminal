@@ -37,6 +37,7 @@ function mockWebGL2Canvas(options: { readonly maxTextureSize?: number; readonly 
   const uniforms = new Map<string, number | readonly number[]>()
   const drawCalls: MockDrawCall[] = []
   const premultiplyAtUpload: number[] = []
+  let texImage2dCalls = 0
   let texSubUploads = 0
   let deletedTextures = 0
   let deletedBuffers = 0
@@ -122,6 +123,7 @@ function mockWebGL2Canvas(options: { readonly maxTextureSize?: number; readonly 
       if (pname === 0x9241) unpackPremultiply = param
     },
     texImage2D: (...args: unknown[]) => {
+      texImage2dCalls += 1
       if (args.length === 6) {
         if (options.throwOnImageUpload) throw new Error('InvalidStateError: closed ImageBitmap')
         premultiplyAtUpload.push(unpackPremultiply)
@@ -159,7 +161,7 @@ function mockWebGL2Canvas(options: { readonly maxTextureSize?: number; readonly 
     premultiplyAtUpload,
     setContextLost: (lost: boolean) => { contextLostFlag = lost },
     setFailCreateProgram: (fail: boolean) => { failCreateProgram = fail },
-    stats: () => ({ texSubUploads, deletedTextures, deletedBuffers, deletedVaos, deletedPrograms, loseContextCalls }),
+    stats: () => ({ texImage2dCalls, texSubUploads, deletedTextures, deletedBuffers, deletedVaos, deletedPrograms, loseContextCalls }),
   }
 }
 
@@ -306,7 +308,8 @@ describe('WebGL2AtlasPainter & createPainter', () => {
     painter.paint({ theme, rows: [drawRow(row(0, '12345'), theme), null], offset: 0 })
     expect(painter.atlasResets).toBe(1)
 
-    // Fresh painter on a huge overflowing single frame does NOT trigger a redundant reset on empty atlas
+    // Single frame exceeding atlas capacity flushes + resets in batches so ZERO glyphs are dropped,
+    // without thrashing per-glyph (26 glyphs in a 6-slot atlas => ~4 resets, not 20!).
     const mock2 = mockWebGL2Canvas()
     const painter2 = new WebGL2AtlasPainter(
       { family: 'monospace', size: 14 },
@@ -314,7 +317,9 @@ describe('WebGL2AtlasPainter & createPainter', () => {
     )
     painter2.resize(30, 2, 1)
     painter2.paint({ theme, rows: [drawRow(row(0, 'abcdefghijklmnopqrstuvwxyz'), theme), null], offset: 0 })
-    expect(painter2.atlasResets).toBe(0)
+    expect(painter2.atlasResets).toBeGreaterThanOrEqual(3)
+    expect(painter2.atlasResets).toBeLessThanOrEqual(6)
+    expect(mock2.drawCalls.length).toBeGreaterThanOrEqual(painter2.atlasResets + 1)
 
     painter.dispose()
     painter2.dispose()
@@ -445,14 +450,17 @@ describe('WebGL2AtlasPainter & createPainter', () => {
     expect(painter.isContextLost).toBe(true)
     expect(clearedNotified).toBe(0)
 
-    // Subsequent successful restore recovers and fires whenCleared
+    // Subsequent successful restore recovers, allocates atlas texture immediately, and fires whenCleared
     mock.setFailCreateProgram(false)
+    const texUploadsBefore = mock.stats().texImage2dCalls
     mock.canvas.dispatchEvent(new Event('webglcontextrestored'))
     expect(painter.isContextLost).toBe(false)
     expect(clearedNotified).toBe(1)
+    expect(mock.stats().texImage2dCalls).toBeGreaterThan(texUploadsBefore)
 
     painter.paint({ theme, rows: [drawRow(row(0, 'hi'), theme), null], offset: 0 })
     expect(mock.drawCalls.length).toBeGreaterThan(0)
+    expect(painter.atlasEntryCount).toBe(2)
     painter.dispose()
   })
 

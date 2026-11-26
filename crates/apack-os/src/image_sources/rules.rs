@@ -5,13 +5,15 @@ fn separator(byte: u8) -> bool {
     matches!(byte, b'\\' | b'/')
 }
 
-/// Returns `true` for UNC paths (`\\server\share`), device paths (`\\.\`, `\\?\`, `\??\`), or any
-/// path containing a reserved Windows device component (`CON`, `PRN`, `AUX`, `NUL`, `COM0`..`COM9`,
-/// `LPT0`..`LPT9`, superscript variants, `CONIN$`, `CONOUT$`).
+/// Returns `true` for UNC paths (`\\server\share`), device paths (`\\.\`, `\\?\`, `\??\`),
+/// drive-relative paths (`C:CON`, `C:foo`), or any path containing a reserved Windows device
+/// component (`CON`, `PRN`, `AUX`, `NUL`, `COM0`..`COM9`, `LPT0`..`LPT9`, superscript variants,
+/// `CONIN$`, `CONOUT$`).
 pub fn refused(path: &[u8]) -> bool {
     match path {
         [first, second, ..] if separator(*first) && separator(*second) => true,
         [first, b'?', b'?', fourth, ..] if separator(*first) && separator(*fourth) => true,
+        [drive, b':', rest @ ..] if drive.is_ascii_alphabetic() && !rest.first().is_some_and(|b| separator(*b)) => true,
         _ => path.split(|byte| separator(*byte)).any(names_a_device),
     }
 }
@@ -59,6 +61,10 @@ mod tests {
         assert!(refused("C:\\tmp\\COM\u{00b2}.png".as_bytes()));
         assert!(refused(br"C:\tmp\CONIN$"));
         assert!(refused(br"C:\tmp\conout$.png"));
+        assert!(refused(b"C:CON"));
+        assert!(refused(b"C:NUL"));
+        assert!(refused(b"c:com1"));
+        assert!(refused(b"C:relative.png"));
 
         assert!(!refused(br"C:\Users\alice\image.png"));
         assert!(!refused(br"C:\Users\alice\console.png"));

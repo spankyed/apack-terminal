@@ -332,15 +332,21 @@ export class TerminalClient {
   }
 
   private allocReqId(): number {
-    const id = this.nextReqId
-    this.nextReqId = id === 0xffff_ffff ? 1 : id + 1
-    return id
+    for (let tries = 0; tries < 65_536; tries += 1) {
+      const id = this.nextReqId
+      this.nextReqId = id === 0xffff_ffff ? 1 : id + 1
+      if (!this.pending.has(id)) return id
+    }
+    throw new WireError('LimitExceeded', 'too many concurrent in-flight requests')
   }
 
   private allocStreamId(): number {
-    const id = this.nextStreamId
-    this.nextStreamId = id === 0xffff_ffff ? 1 : id + 1
-    return id
+    for (let tries = 0; tries < 65_536; tries += 1) {
+      const id = this.nextStreamId
+      this.nextStreamId = id === 0xffff_ffff ? 1 : id + 1
+      if (!this.streams.has(id)) return id
+    }
+    throw new WireError('LimitExceeded', 'too many concurrent attached streams')
   }
 
   /** Sends a fire-and-forget frame (`reqId = 0`). */
@@ -413,6 +419,7 @@ export class TerminalClient {
     }
     if (msg.kind === 'error') {
       this.handleClosed(`${msg.code}: ${msg.message}`)
+      this.stream.close()
     }
   }
 
@@ -582,6 +589,7 @@ export class BrokerSessionSource implements TerminalSource {
   private lastFrameAtMs: number | null = null
   private ewmaIntervalMs = 16
   private visible: boolean
+  private everGrantedCredit: boolean
   private disposed = false
 
   constructor(
@@ -594,6 +602,7 @@ export class BrokerSessionSource implements TerminalSource {
     private readonly nowMs: () => number,
   ) {
     this.visible = visible
+    this.everGrantedCredit = visible && maxFrames > 0
   }
 
   get wordDelimiters(): string {
@@ -613,12 +622,20 @@ export class BrokerSessionSource implements TerminalSource {
     return { maxFrames: desiredFrames, maxBytes: this.maxBytes }
   }
 
+  private markClosed(reason: string): void {
+    if (this.disposed) return
+    this.disposed = true
+    const currentSinks = [...this.sinks]
+    this.sinks.clear()
+    this.manualAckSinks.clear()
+    this.bufferedFrames.length = 0
+    for (const sink of currentSinks) sink.onEvent?.({ kind: 'streamClosed', reason })
+  }
+
   handler(): AttachedStream {
     return {
       onMessage: (msg) => this.handleStreamMessage(msg),
-      onClosed: (reason) => {
-        for (const sink of this.sinks) sink.onEvent?.({ kind: 'streamClosed', reason })
-      },
+      onClosed: (reason) => this.markClosed(reason),
     }
   }
 
@@ -669,17 +686,18 @@ export class BrokerSessionSource implements TerminalSource {
       case 'notification':
       case 'progress':
       case 'programStatus':
+      case 'programStatusCleared':
       case 'commandStarted':
       case 'commandFinished':
       case 'cwdChanged':
       case 'exited':
-      case 'streamClosed':
         for (const sink of this.sinks) sink.onEvent?.(msg as SessionEvent)
         break
+      case 'streamClosed':
+        this.markClosed(msg.reason)
+        break
       case 'error':
-        for (const sink of this.sinks) {
-          sink.onEvent?.({ kind: 'streamClosed', reason: `${msg.code}: ${msg.message}` })
-        }
+        this.markClosed(`${msg.code}: ${msg.message}`)
         break
       default:
         break
@@ -710,10 +728,12 @@ export class BrokerSessionSource implements TerminalSource {
     if (this.disposed) return
     const nextSeq = Math.max(this.lastAckedSeq, seq)
     this.lastAckedSeq = nextSeq
+    const credit = this.currentCredit()
+    if (credit.maxFrames > 0) this.everGrantedCredit = true
     this.client.sendPush(this.streamId, {
       kind: 'frameAck',
       seq: nextSeq,
-      credit: this.currentCredit(),
+      credit,
     })
   }
 
@@ -722,9 +742,11 @@ export class BrokerSessionSource implements TerminalSource {
     const visibilityChanged = this.visible !== hint.visible
     this.visible = hint.visible
     this.client.sendPush(this.streamId, { kind: 'viewportHint', hint })
-    // Only send an out-of-band FrameAck once at least one frame has been observed so we never
-    // race frame 1 with `seq = 0` (`FlowError::InvalidAckSeq`).
-    if (visibilityChanged && this.lastSeq > 0) {
+    // Send an out-of-band FrameAck when visibility changes if either:
+    // - at least one frame has been observed (`lastSeq > 0`), or
+    // - we attached hidden (`!everGrantedCredit`, so the broker cannot have sent frame 1 yet)
+    //   and just became visible for the first time, granting initial credit safely with `seq = 0`.
+    if (visibilityChanged && (this.lastSeq > 0 || (hint.visible && !this.everGrantedCredit))) {
       this.ackFrame(this.lastSeq)
     }
   }
@@ -886,26 +908,33 @@ export class BrokerSessionSource implements TerminalSource {
     }
 
     let cursor = 0
+    let aborted = false
     const worker = async (): Promise<void> => {
-      while (cursor < offsets.length) {
-        const off = offsets[cursor++]!
-        const expectedLen = Math.min(BULK_CHUNK_BYTES, total - off)
-        const chunk = await this.requestImageChunk(blob, off, expectedLen)
-        if (
-          !ctEq32(chunk.blob, blob)
-          || chunk.encoding !== encoding
-          || chunk.totalBytes !== total
-          || chunk.offset !== off
-        ) {
-          throw new WireError('InvalidValue', 'inconsistent image blob chunk metadata')
+      try {
+        while (!aborted && cursor < offsets.length) {
+          const off = offsets[cursor++]!
+          const expectedLen = Math.min(BULK_CHUNK_BYTES, total - off)
+          const chunk = await this.requestImageChunk(blob, off, expectedLen)
+          if (aborted) return
+          if (
+            !ctEq32(chunk.blob, blob)
+            || chunk.encoding !== encoding
+            || chunk.totalBytes !== total
+            || chunk.offset !== off
+          ) {
+            throw new WireError('InvalidValue', 'inconsistent image blob chunk metadata')
+          }
+          if (chunk.data.length !== expectedLen) {
+            throw new WireError(
+              'UnexpectedEof',
+              `short image blob chunk at ${off}: got ${chunk.data.length}, expected ${expectedLen}`,
+            )
+          }
+          out.set(chunk.data, off)
         }
-        if (chunk.data.length !== expectedLen) {
-          throw new WireError(
-            'UnexpectedEof',
-            `short image blob chunk at ${off}: got ${chunk.data.length}, expected ${expectedLen}`,
-          )
-        }
-        out.set(chunk.data, off)
+      } catch (err) {
+        aborted = true
+        throw err
       }
     }
 
@@ -936,6 +965,7 @@ export class BrokerSessionSource implements TerminalSource {
     if (this.disposed) return
     this.disposed = true
     this.sinks.clear()
+    this.manualAckSinks.clear()
     this.bufferedFrames.length = 0
     this.client.detachStream(this.streamId)
   }

@@ -131,6 +131,7 @@ export type SessionEvent =
   | { readonly kind: 'notification'; readonly title: string; readonly body: string }
   | { readonly kind: 'progress'; readonly state: ProgressState; readonly percent: number | null }
   | { readonly kind: 'programStatus'; readonly record: StatusRecord }
+  | { readonly kind: 'programStatusCleared'; readonly id: string }
   | { readonly kind: 'commandStarted'; readonly record: CommandRecord }
   | { readonly kind: 'commandFinished'; readonly record: CommandRecord }
   | { readonly kind: 'cwdChanged'; readonly cwd: string }

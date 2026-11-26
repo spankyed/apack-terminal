@@ -11,19 +11,23 @@ use crate::shard::{LivePty, LiveSession, PTY_READ_QUANTUM_BYTES, ShardMailboxSta
 const WIN_PTY_WRITE_CHUNK_BYTES: usize = 65_536;
 
 /// Drains up to `budget` bytes of ready ConPTY output from `bridge`, invoking `on_bytes` for each
-/// chunk. Returns `true` if `ConPtyOutput::Eof` was observed.
-pub(crate) fn drain_conpty_quantum(bridge: &ConPtyBridge, mut budget: usize, mut on_bytes: impl FnMut(&[u8])) -> bool {
+/// chunk. Returns `(hit_eof, exhausted_quantum)`.
+pub(crate) fn drain_conpty_quantum(
+    bridge: &ConPtyBridge,
+    mut budget: usize,
+    mut on_bytes: impl FnMut(&[u8]),
+) -> (bool, bool) {
     while budget != 0 {
         match bridge.try_recv_output() {
             Some(ConPtyOutput::Data(bytes)) => {
                 budget = budget.saturating_sub(bytes.len());
                 on_bytes(&bytes);
             }
-            Some(ConPtyOutput::Eof) => return true,
-            None => break,
+            Some(ConPtyOutput::Eof) => return (true, false),
+            None => return (false, false),
         }
     }
-    false
+    (false, true)
 }
 
 /// Sleeps on `cond` until either `mailbox` becomes non-empty, `woken` was signalled (eliminating
@@ -35,6 +39,23 @@ pub(crate) fn wait_for_win_mailbox(mailbox: &Mutex<ShardMailboxState>, cond: &Co
         state = guard;
     }
     state.woken = false;
+}
+
+/// Clamps shard wait timeout when a Windows ConPTY session has pending input bytes to flush.
+pub(crate) fn clamp_win_write_timeout(timeout: Duration, pending_write_bytes: usize) -> Duration {
+    if pending_write_bytes != 0 { timeout.min(Duration::from_millis(10)) } else { timeout }
+}
+
+/// Waits on the Windows shard mailbox unless a ConPTY session exhausted its per-turn output quantum.
+pub(crate) fn maybe_wait_win_mailbox(
+    exhausted_quantum: bool,
+    mailbox: &Mutex<ShardMailboxState>,
+    cond: &Condvar,
+    timeout: Duration,
+) {
+    if !exhausted_quantum {
+        wait_for_win_mailbox(mailbox, cond, timeout);
+    }
 }
 
 /// Writes pending PTY input bytes into a Windows `ConPtyBridge` without dropping on `WouldBlock`.
@@ -55,16 +76,24 @@ pub(crate) fn drain_windows_pty_writes(sess: &mut LiveSession) {
 }
 
 impl ShardRunner {
-    pub(crate) fn drain_windows_ptys(&mut self) {
+    /// Drains ready Windows ConPTY output (respecting `is_pty_paused`) and pending input writes.
+    /// Returns `true` when at least one unpaused session exhausted its per-turn read quantum,
+    /// signalling the shard loop to immediately spin another turn without sleeping.
+    pub(crate) fn drain_windows_ptys(&mut self) -> bool {
         let ids: Vec<SessionId> = self.sessions.keys().copied().collect();
+        let mut any_exhausted = false;
         for session_id in ids {
             let mut chunks = Vec::new();
-            let hit_eof = match self.sessions.get(&session_id).and_then(|s| s.pty.as_ref()) {
-                Some(LivePty::Windows { bridge, eof: false }) => {
-                    drain_conpty_quantum(bridge, PTY_READ_QUANTUM_BYTES, |bytes| chunks.push(bytes.to_vec()))
-                }
-                _ => false,
+            let (hit_eof, exhausted) = match self.sessions.get(&session_id) {
+                Some(sess) if !sess.is_pty_paused() => match sess.pty.as_ref() {
+                    Some(LivePty::Windows { bridge, eof: false }) => {
+                        drain_conpty_quantum(bridge, PTY_READ_QUANTUM_BYTES, |bytes| chunks.push(bytes.to_vec()))
+                    }
+                    _ => (false, false),
+                },
+                _ => (false, false),
             };
+            any_exhausted |= exhausted;
             for chunk in chunks {
                 self.ingest_pty_bytes(session_id, &chunk);
             }
@@ -80,5 +109,6 @@ impl ShardRunner {
                 drain_windows_pty_writes(sess);
             }
         }
+        any_exhausted
     }
 }

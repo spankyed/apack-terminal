@@ -25,6 +25,9 @@ use crate::{SESSION_IMAGE_STORAGE_BYTES, UNKNOWN_OSC_MAX_BYTES};
 const REVERSE_VIDEO_MODE: u16 = 5;
 const CURSOR_BLINK_MODE: u16 = 12;
 const BRACKETED_PASTE_MODE: u16 = 2004;
+/// Hard cap on `ghostty_search_get(MATCHES)` allocation (~3 MiB) to prevent OOM on dense single-page bursts.
+const MAX_SEARCH_ALLOC: usize = 65_536;
+
 const SEARCH_CANDIDATES: usize = 20_000;
 const CONTINUATION_MAX_BYTES: usize = 4096;
 const CLUSTER_CODEPOINTS: usize = 16;
@@ -181,6 +184,9 @@ pub struct GhosttyEngine {
     modes: ViewModes,
     palette: PaletteOverrides,
     gens: VtGenerations,
+    /// Last raw `libghostty-vt` Kitty graphics generation observed on `self.handle` (used to drive
+    /// monotonic `self.gens.images` even across `restore_snapshot` handle swaps).
+    raw_images_gen: u64,
     dirty_rows: BTreeSet<u16>,
     scroll_delta: i32,
     full_dirty: bool,
@@ -285,6 +291,7 @@ impl GhosttyEngine {
             modes: ViewModes::default(),
             palette: PaletteOverrides::default(),
             gens: VtGenerations::default(),
+            raw_images_gen: 0,
             dirty_rows: BTreeSet::new(),
             scroll_delta: 0,
             full_dirty: true,
@@ -316,18 +323,13 @@ impl GhosttyEngine {
 
     /// Returns `true` when the VT parser and UTF-8 decoder are cleanly at ground state (no pending continuation).
     pub fn at_ground(&self) -> bool {
-        let mut written = 0usize;
-        // SAFETY: passing null buffer with length 0 queries continuation byte length cleanly.
-        if unsafe { sys::ghostty_terminal_continuation_buf(self.handle, std::ptr::null_mut(), 0, &raw mut written) }
-            == sys::Result::SUCCESS
-        {
-            written == 0
-        } else {
-            false
-        }
+        handle_at_ground(self.handle)
     }
 
     /// Encodes a bounded binary `libghostty-vt` snapshot (at most `max_bytes`) for v2 keyframes.
+    ///
+    /// Fails with `OUT_OF_SPACE` if the snapshot exceeds `max_bytes` (never returns a truncated,
+    /// unrestorable snapshot missing its `FINISH` record).
     pub fn export_snapshot(&self, max_bytes: usize) -> Result<Vec<u8>, GhosttyError> {
         struct CapBuf {
             out: Vec<u8>,
@@ -355,11 +357,10 @@ impl GhosttyEngine {
         let writer = sys::Writer { write: Some(write_cb), userdata: (&raw mut cap).cast() };
         // SAFETY: `handle` is live for `&self` and `cap` outlives the synchronous encode call.
         let res = unsafe { sys::ghostty_snapshot_encode(self.handle, writer) };
-        if !cap.cut {
-            GhosttyError::check("ghostty_snapshot_encode", res)?;
+        if cap.cut {
+            return Err(GhosttyError { call: "export_snapshot", code: sys::Result::OUT_OF_SPACE });
         }
-        let end = last_snapshot_record_end(&cap.out);
-        cap.out.truncate(end);
+        GhosttyError::check("ghostty_snapshot_encode", res)?;
         Ok(cap.out)
     }
 
@@ -375,14 +376,24 @@ impl GhosttyEngine {
             sys::ghostty_snapshot_decoder_new_buf(std::ptr::null(), &raw mut decoder, snapshot.as_ptr(), snapshot.len())
         })?;
         let image_limit: u64 = if self.allow_images { SESSION_IMAGE_STORAGE_BYTES } else { 0 };
-        // SAFETY: `KITTY_IMAGE_STORAGE_LIMIT` takes a `uint64_t*`.
-        let set_res = unsafe {
-            sys::ghostty_snapshot_decoder_set(
-                decoder,
-                sys::SnapshotDecoderOption::KITTY_IMAGE_STORAGE_LIMIT,
-                (&raw const image_limit).cast(),
-            )
-        };
+        let continuation_cap: usize = CONTINUATION_MAX_BYTES;
+        let retain_continuation = true;
+        let compress_history = true;
+        let opts: [(sys::SnapshotDecoderOption::Type, *const core::ffi::c_void); 4] = [
+            (sys::SnapshotDecoderOption::KITTY_IMAGE_STORAGE_LIMIT, (&raw const image_limit).cast()),
+            (sys::SnapshotDecoderOption::MAX_CONTINUATION_BYTES, (&raw const continuation_cap).cast()),
+            (sys::SnapshotDecoderOption::RETAIN_CONTINUATION, (&raw const retain_continuation).cast()),
+            (sys::SnapshotDecoderOption::COMPRESS_HISTORY, (&raw const compress_history).cast()),
+        ];
+        // SAFETY: option pointer types match `libghostty-vt` `SnapshotDecoderOption` contracts.
+        let mut set_res = sys::Result::SUCCESS;
+        for (opt, ptr) in opts {
+            // SAFETY: `decoder` is live and `ptr` points to the exact option type.
+            set_res = unsafe { sys::ghostty_snapshot_decoder_set(decoder, opt, ptr) };
+            if set_res != sys::Result::SUCCESS {
+                break;
+            }
+        }
         if let Err(e) = GhosttyError::check("ghostty_snapshot_decoder_set", set_res) {
             // SAFETY: freeing decoder on setup failure.
             unsafe { sys::ghostty_snapshot_decoder_free(decoder) };
@@ -488,6 +499,8 @@ impl GhosttyEngine {
             cache.virtual_named.clear();
             cache.virtual_lowest.clear();
         }
+        self.raw_images_gen = query_images_generation(self.handle);
+        self.gens.images = self.gens.images.saturating_add(1);
         self.refresh_render_state(true, 0);
         Ok(())
     }
@@ -609,13 +622,21 @@ impl GhosttyEngine {
         }
 
         if let Some((shape, blinking)) = self.cursor_defaults {
-            let saved_blink = if preserve_blink { Some(query_mode(handle, CURSOR_BLINK_MODE)) } else { None };
-            apply_cursor_defaults(handle, shape, blinking);
-            if let Some(prev_blink) = saved_blink {
-                // Restore DEC mode 12 so re-applying broker defaults never clobbers a restored snapshot's blink state.
-                let seq: &[u8] = if prev_blink { b"\x1b[?12h" } else { b"\x1b[?12l" };
-                // SAFETY: `handle` is live and `seq` is a valid static slice.
-                unsafe { sys::ghostty_terminal_vt_write(handle, seq.as_ptr(), seq.len()) };
+            if preserve_blink {
+                let prev_blink = query_mode(handle, CURSOR_BLINK_MODE);
+                if !handle_at_ground(handle) {
+                    // Never inject raw escape bytes into a mid-sequence continuation; preserve the
+                    // restored blink state via cursor defaults directly when not at ground.
+                    apply_cursor_defaults(handle, shape, prev_blink);
+                } else {
+                    apply_cursor_defaults(handle, shape, blinking);
+                    // Restore DEC mode 12 cleanly now that we know `handle` is at ground.
+                    let seq: &[u8] = if prev_blink { b"\x1b[?12h" } else { b"\x1b[?12l" };
+                    // SAFETY: `handle` is live and at ground; `seq` is a valid static slice.
+                    unsafe { sys::ghostty_terminal_vt_write(handle, seq.as_ptr(), seq.len()) };
+                }
+            } else {
+                apply_cursor_defaults(handle, shape, blinking);
             }
         }
         Ok(())
@@ -696,6 +717,46 @@ impl GhosttyEngine {
         }
         self.reset_active_top_mark();
         applied_scroll
+    }
+
+    fn format_span_raw(&self, span: CellSpan) -> String {
+        let (Some(start_ref), Some(end_ref)) = (self.screen_grid_ref(span.start), self.screen_grid_ref(span.end))
+        else {
+            return String::new();
+        };
+        let sel = sys::Selection { start: start_ref, end: end_ref, rectangle: false };
+        let mut formatter: sys::Formatter = std::ptr::null_mut();
+        // SAFETY: `formatter` is a valid out-pointer and `self.handle` outlives it.
+        if unsafe { sys::ghostty_formatter_terminal_new(std::ptr::null(), &raw mut formatter, self.handle) }
+            != sys::Result::SUCCESS
+        {
+            return String::new();
+        }
+        let unwrap = true;
+        let mut ptr: *mut u8 = std::ptr::null_mut();
+        let mut len: usize = 0;
+        // SAFETY: `SELECTION` takes `GhosttySelection*`, `UNWRAP` takes `bool*`; buffer freed below.
+        let res = unsafe {
+            let mut r = sys::ghostty_formatter_set(formatter, sys::FormatterOption::SELECTION, (&raw const sel).cast());
+            if r == sys::Result::SUCCESS {
+                r = sys::ghostty_formatter_set(formatter, sys::FormatterOption::UNWRAP, (&raw const unwrap).cast());
+            }
+            if r == sys::Result::SUCCESS {
+                r = sys::ghostty_formatter_format_alloc(formatter, std::ptr::null(), &raw mut ptr, &raw mut len);
+            }
+            r
+        };
+        let out = match NonNull::new(ptr).filter(|_| res == sys::Result::SUCCESS) {
+            // SAFETY: `ptr` is non-null and initialized for `len` bytes by `ghostty_formatter_format_alloc`.
+            Some(nn) => String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(nn.as_ptr(), len) }).into_owned(),
+            None => String::new(),
+        };
+        // SAFETY: freeing allocated buffer and formatter handle once.
+        unsafe {
+            sys::ghostty_free(std::ptr::null(), ptr, len);
+            sys::ghostty_formatter_free(formatter);
+        }
+        out
     }
 
     fn reset_active_top_mark(&mut self) {
@@ -833,8 +894,9 @@ impl GhosttyEngine {
         }
 
         let new_images_gen = query_images_generation(self.handle);
-        if new_images_gen != self.gens.images {
-            self.gens.images = new_images_gen;
+        if new_images_gen != self.raw_images_gen {
+            self.raw_images_gen = new_images_gen;
+            self.gens.images = self.gens.images.saturating_add(1);
             // When images upload/replace/delete after U+10EEEE placeholders are already on screen,
             // mark placeholder-bearing viewport rows dirty so `PackedRow.pieces` updates!
             if !self.full_dirty {
@@ -1137,6 +1199,21 @@ impl VtEngine for GhosttyEngine {
             self.scroll_delta = 0;
             self.reset_active_top_mark();
             self.refresh_render_state(true, 0);
+        } else {
+            // Cell pixel geometry changed without grid reflow: recompute placeholder pieces and
+            // anchored image cell spans by dirtying placeholder rows and bumping `gens.images`.
+            let rows_count = usize::from(self.size.rows.get());
+            let mut any_placeholder = false;
+            for r in 0..rows_count {
+                if viewport_row_has_placeholder(self.handle, r as u32) {
+                    self.dirty_rows.insert(r as u16);
+                    self.gens.grid += 1;
+                    any_placeholder = true;
+                }
+            }
+            if any_placeholder || self.raw_images_gen != 0 {
+                self.gens.images = self.gens.images.saturating_add(1);
+            }
         }
     }
 
@@ -1232,51 +1309,21 @@ impl VtEngine for GhosttyEngine {
         (res == sys::Result::SUCCESS).then(|| self.selection_to_span(&sel)).flatten()
     }
 
-    fn text_of(&self, span: CellSpan) -> String {
-        let (Some(start_ref), Some(end_ref)) = (self.screen_grid_ref(span.start), self.screen_grid_ref(span.end))
-        else {
-            return String::new();
-        };
-        let sel = sys::Selection { start: start_ref, end: end_ref, rectangle: false };
-        let mut formatter: sys::Formatter = std::ptr::null_mut();
-        // SAFETY: `formatter` is a valid out-pointer and `self.handle` outlives it.
-        if unsafe { sys::ghostty_formatter_terminal_new(std::ptr::null(), &raw mut formatter, self.handle) }
-            != sys::Result::SUCCESS
-        {
-            return String::new();
-        }
-        let unwrap = true;
-        let mut ptr: *mut u8 = std::ptr::null_mut();
-        let mut len: usize = 0;
-        // SAFETY: `SELECTION` takes `GhosttySelection*`, `UNWRAP` takes `bool*`; buffer freed below.
-        let res = unsafe {
-            let mut r = sys::ghostty_formatter_set(formatter, sys::FormatterOption::SELECTION, (&raw const sel).cast());
-            if r == sys::Result::SUCCESS {
-                r = sys::ghostty_formatter_set(formatter, sys::FormatterOption::UNWRAP, (&raw const unwrap).cast());
-            }
-            if r == sys::Result::SUCCESS {
-                r = sys::ghostty_formatter_format_alloc(formatter, std::ptr::null(), &raw mut ptr, &raw mut len);
-            }
-            r
-        };
-        let out = match NonNull::new(ptr).filter(|_| res == sys::Result::SUCCESS) {
-            // SAFETY: `ptr` is non-null and initialized for `len` bytes by `ghostty_formatter_format_alloc`.
-            Some(nn) => String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(nn.as_ptr(), len) }).into_owned(),
-            None => String::new(),
-        };
-        // SAFETY: freeing allocated buffer and formatter handle once.
-        unsafe {
-            sys::ghostty_free(std::ptr::null(), ptr, len);
-            sys::ghostty_formatter_free(formatter);
-        }
-        out
+    fn text_of(&self, span: CellSpan, max_bytes: usize) -> String {
+        self.text_of_batched(span, max_bytes, 256)
     }
 
-    fn text_of_rect(&self, span: CellSpan) -> String {
+    fn text_of_rect(&self, span: CellSpan, max_bytes: usize) -> String {
+        if max_bytes == 0 {
+            return String::new();
+        }
         let lo_col = span.start.col.min(span.end.col);
         let hi_col = span.start.col.max(span.end.col).min(self.size.cols.get().saturating_sub(1));
         let mut out = String::new();
         for (i, line) in (span.start.line..=span.end.line).enumerate() {
+            if out.len() >= max_bytes {
+                break;
+            }
             if i > 0 {
                 out.push('\n');
             }
@@ -1318,25 +1365,24 @@ impl VtEngine for GhosttyEngine {
                     continue;
                 }
                 if content == sys::CellContentTag::CODEPOINT_GRAPHEME {
-                    let mut cps = [0u32; CLUSTER_CODEPOINTS];
-                    let mut written = 0usize;
-                    // SAFETY: `cps` has length `CLUSTER_CODEPOINTS`.
-                    let res = unsafe {
-                        sys::ghostty_grid_ref_graphemes(
-                            &raw const grid_ref,
-                            cps.as_mut_ptr(),
-                            cps.len(),
-                            &raw mut written,
-                        )
-                    };
-                    if res == sys::Result::SUCCESS {
-                        row_text.extend(cps[..written.min(cps.len())].iter().filter_map(|&c| char::from_u32(c)));
+                    let mut cluster = Vec::new();
+                    if read_grapheme_codepoints(&grid_ref, &mut cluster) {
+                        row_text.extend(cluster.iter().filter_map(|&c| char::from_u32(c)));
                         continue;
                     }
                 }
                 row_text.push(char::from_u32(cp).filter(|&c| c != '\0').unwrap_or(' '));
             }
-            out.push_str(row_text.trim_end_matches(' '));
+            let trimmed = row_text.trim_end_matches(' ');
+            let remaining = max_bytes.saturating_sub(out.len());
+            if trimmed.len() <= remaining {
+                out.push_str(trimmed);
+            } else {
+                let mut part = trimmed.to_owned();
+                part.truncate(part.floor_char_boundary(remaining));
+                out.push_str(&part);
+                break;
+            }
         }
         out
     }
@@ -1350,106 +1396,16 @@ impl VtEngine for GhosttyEngine {
         limit: usize,
         out: &mut Vec<CellSpan>,
     ) -> bool {
-        if needle.is_empty() || from_line >= to_line || limit == 0 {
-            return false;
-        }
-        let mut search: sys::Search = std::ptr::null_mut();
-        // SAFETY: `search` is a valid out-pointer; freed unconditionally below.
-        if unsafe { sys::ghostty_search_new(std::ptr::null(), &raw mut search, self.handle) } != sys::Result::SUCCESS {
-            return false;
-        }
-        let text = sys::String::from(needle);
-        let mut raw_matches: Vec<sys::Selection> = Vec::new();
-        let wanted = SEARCH_CANDIDATES.max(limit);
-        let mut complete = false;
-        let total_rows = usize::try_from(self.scrollback_lines)
-            .unwrap_or(usize::MAX)
-            .saturating_add(usize::from(self.size.rows.get()));
-        let max_passes = total_rows.saturating_mul(16).max(1024);
-        // SAFETY: `search` is live; `NEEDLE` copies `text`, `MATCHES` writes up to `cap` selections.
-        let res = unsafe {
-            let mut r =
-                sys::ghostty_search_set(search, sys::SearchOption::GHOSTTY_SEARCH_OPT_NEEDLE, (&raw const text).cast());
-            let mut total: usize = 0;
-            let mut needs_feed = true;
-            for _ in 0..max_passes {
-                if r != sys::Result::SUCCESS {
-                    break;
-                }
-                if needs_feed {
-                    r = sys::ghostty_search_feed(search);
-                    if r != sys::Result::SUCCESS {
-                        break;
-                    }
-                }
-                let mut status: sys::SearchStatus::Type = sys::SearchStatus::RUNNING;
-                r = sys::ghostty_search_tick(search, &raw mut status);
-                if r != sys::Result::SUCCESS {
-                    break;
-                }
-                r = sys::ghostty_search_get(search, sys::SearchData::TOTAL_MATCHES, (&raw mut total).cast());
-                if status == sys::SearchStatus::COMPLETE {
-                    complete = true;
-                    break;
-                }
-                if total >= wanted {
-                    break;
-                }
-                needs_feed = status != sys::SearchStatus::RUNNING;
-            }
-            if r == sys::Result::SUCCESS {
-                raw_matches.resize(total, sys::Selection::default());
-                let mut buf = sys::SelectionBuffer { ptr: raw_matches.as_mut_ptr(), cap: raw_matches.len(), len: 0 };
-                r = sys::ghostty_search_get(search, sys::SearchData::MATCHES, (&raw mut buf).cast());
-                raw_matches.truncate(if r == sys::Result::SUCCESS { buf.len.min(raw_matches.len()) } else { 0 });
-            }
-            r
-        };
-        // SAFETY: freeing search handle once.
-        unsafe { sys::ghostty_search_free(search) };
-        if res != sys::Result::SUCCESS {
-            return false;
-        }
-
-        let mut formatter: sys::Formatter = std::ptr::null_mut();
-        if case_sensitive && !raw_matches.is_empty() {
-            // SAFETY: creating a single reused formatter for exact-case filtering; fail-closed on error.
-            let _ = unsafe { sys::ghostty_formatter_terminal_new(std::ptr::null(), &raw mut formatter, self.handle) };
-            if formatter.is_null() {
-                return false;
-            }
-            let unwrap = true;
-            // SAFETY: `UNWRAP` takes a `bool*`.
-            let _ = unsafe {
-                sys::ghostty_formatter_set(formatter, sys::FormatterOption::UNWRAP, (&raw const unwrap).cast())
-            };
-        }
-
-        let needle_bytes = needle.as_bytes();
-        let mut filtered: Vec<CellSpan> = Vec::new();
-        for sel in &raw_matches {
-            let Some(span) = self.selection_to_span(sel) else {
-                continue;
-            };
-            if span.start.line < from_line || span.end.line >= to_line {
-                continue;
-            }
-            if !formatter.is_null() && !selection_matches_exact(formatter, sel, needle_bytes) {
-                continue;
-            }
-            filtered.push(span);
-        }
-        // SAFETY: `ghostty_formatter_free` accepts a null pointer.
-        unsafe { sys::ghostty_formatter_free(formatter) };
-
-        filtered.sort_by_key(|s| (s.start.line, s.start.col, s.end.line, s.end.col));
-        let mut truncated = !complete;
-        if filtered.len() > limit {
-            filtered.truncate(limit);
-            truncated = true;
-        }
-        out.extend(filtered);
-        truncated
+        self.search_lines_bounded(
+            from_line,
+            to_line,
+            needle,
+            case_sensitive,
+            limit,
+            SEARCH_CANDIDATES,
+            MAX_SEARCH_ALLOC,
+            out,
+        )
     }
 
     fn images(&self) -> Vec<ImagePlacement> {
@@ -2016,14 +1972,9 @@ fn hash_viewport_row(handle: sys::Terminal, row: u32, cols: u16) -> u64 {
             // SAFETY: `CONTENT_TAG` writes a `GhosttyCellContentTag`.
             let _ = unsafe { sys::ghostty_cell_get(cell, sys::CellData::CONTENT_TAG, (&raw mut content).cast()) };
             if content == sys::CellContentTag::CODEPOINT_GRAPHEME {
-                let mut cps = [0u32; CLUSTER_CODEPOINTS];
-                let mut written = 0usize;
-                // SAFETY: `cps` has length `CLUSTER_CODEPOINTS`.
-                if unsafe {
-                    sys::ghostty_grid_ref_graphemes(&raw const grid_ref, cps.as_mut_ptr(), cps.len(), &raw mut written)
-                } == sys::Result::SUCCESS
-                {
-                    for &cp in &cps[..written.min(cps.len())] {
+                let mut cluster = Vec::new();
+                if read_grapheme_codepoints(&grid_ref, &mut cluster) {
+                    for &cp in &cluster {
                         h = h.wrapping_mul(PRIME).wrapping_add(u64::from(cp));
                     }
                 }
@@ -2314,7 +2265,209 @@ const fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
+/// Maximum grapheme cluster codepoints read on retry when a cluster exceeds `CLUSTER_CODEPOINTS`.
+const MAX_CLUSTER_CODEPOINTS: usize = 256;
+
+/// Returns `true` when `handle`'s VT parser and UTF-8 decoder have no pending continuation bytes.
+fn handle_at_ground(handle: sys::Terminal) -> bool {
+    let mut written = 0usize;
+    // SAFETY: passing null buffer with length 0 queries continuation byte length cleanly.
+    if unsafe { sys::ghostty_terminal_continuation_buf(handle, std::ptr::null_mut(), 0, &raw mut written) }
+        == sys::Result::SUCCESS
+    {
+        written == 0
+    } else {
+        false
+    }
+}
+
+/// Reads grapheme cluster codepoints from `grid_ref` into `out`, retrying on `OUT_OF_SPACE` up to
+/// [`MAX_CLUSTER_CODEPOINTS`] so clusters with `> 16` codepoints are never silently dropped.
+pub(crate) fn read_grapheme_codepoints(grid_ref: &sys::GridRef, out: &mut Vec<u32>) -> bool {
+    out.clear();
+    let mut stack = [0u32; CLUSTER_CODEPOINTS];
+    let mut written = 0usize;
+    // SAFETY: `stack` has length `CLUSTER_CODEPOINTS` matching the passed capacity.
+    let res = unsafe { sys::ghostty_grid_ref_graphemes(grid_ref, stack.as_mut_ptr(), stack.len(), &raw mut written) };
+    if res == sys::Result::SUCCESS {
+        out.extend_from_slice(&stack[..written.min(stack.len())]);
+        return true;
+    }
+    if res == sys::Result::OUT_OF_SPACE {
+        let cap = written.clamp(stack.len(), MAX_CLUSTER_CODEPOINTS);
+        let mut heap = vec![0u32; cap];
+        let mut retry_written = 0usize;
+        // SAFETY: `heap` has length `cap` matching the passed capacity.
+        let retry =
+            unsafe { sys::ghostty_grid_ref_graphemes(grid_ref, heap.as_mut_ptr(), heap.len(), &raw mut retry_written) };
+        if retry == sys::Result::SUCCESS {
+            out.extend_from_slice(&heap[..retry_written.min(heap.len())]);
+            return true;
+        }
+    }
+    false
+}
+
+impl GhosttyEngine {
+    pub(crate) fn text_of_batched(&self, span: CellSpan, max_bytes: usize, batch_lines: u64) -> String {
+        let step = batch_lines.max(1);
+        let max_col = self.size.cols.get().saturating_sub(1);
+        let mut out = String::new();
+        let mut cur_line = span.start.line;
+        while cur_line <= span.end.line && out.len() < max_bytes {
+            let mut batch_end = cur_line.saturating_add(step.saturating_sub(1)).min(span.end.line);
+            if let Some(logical) = self.line_at(batch_end) {
+                batch_end = logical.end.line.min(span.end.line);
+            }
+            let sub = CellSpan {
+                start: CellPos { line: cur_line, col: if cur_line == span.start.line { span.start.col } else { 0 } },
+                end: CellPos { line: batch_end, col: if batch_end == span.end.line { span.end.col } else { max_col } },
+            };
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            let chunk = self.format_span_raw(sub);
+            let remaining = max_bytes.saturating_sub(out.len());
+            let take = chunk.floor_char_boundary(remaining);
+            out.push_str(&chunk[..take]);
+            if take != chunk.len() {
+                break;
+            }
+            let Some(next) = batch_end.checked_add(1) else {
+                break;
+            };
+            cur_line = next;
+        }
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn search_lines_bounded(
+        &self,
+        from_line: u64,
+        to_line: u64,
+        needle: &str,
+        case_sensitive: bool,
+        limit: usize,
+        wanted: usize,
+        max_alloc: usize,
+        out: &mut Vec<CellSpan>,
+    ) -> bool {
+        if needle.is_empty() || from_line >= to_line || limit == 0 {
+            return false;
+        }
+        let mut search: sys::Search = std::ptr::null_mut();
+        // SAFETY: `search` is a valid out-pointer; freed unconditionally below.
+        if unsafe { sys::ghostty_search_new(std::ptr::null(), &raw mut search, self.handle) } != sys::Result::SUCCESS {
+            return false;
+        }
+        let text = sys::String::from(needle);
+        let mut raw_matches: Vec<sys::Selection> = Vec::new();
+        let mut complete = false;
+        let mut alloc_exceeded = false;
+        let total_rows = usize::try_from(self.scrollback_lines)
+            .unwrap_or(usize::MAX)
+            .saturating_add(usize::from(self.size.rows.get()));
+        let max_passes = total_rows.saturating_mul(16).max(1024);
+        // SAFETY: `search` is live; `NEEDLE` copies `text`, `MATCHES` writes up to `cap` selections.
+        let res = unsafe {
+            let mut r =
+                sys::ghostty_search_set(search, sys::SearchOption::GHOSTTY_SEARCH_OPT_NEEDLE, (&raw const text).cast());
+            let mut total: usize = 0;
+            let mut needs_feed = true;
+            for _ in 0..max_passes {
+                if r != sys::Result::SUCCESS {
+                    break;
+                }
+                if needs_feed {
+                    r = sys::ghostty_search_feed(search);
+                    if r != sys::Result::SUCCESS {
+                        break;
+                    }
+                }
+                let mut status: sys::SearchStatus::Type = sys::SearchStatus::RUNNING;
+                r = sys::ghostty_search_tick(search, &raw mut status);
+                if r != sys::Result::SUCCESS {
+                    break;
+                }
+                r = sys::ghostty_search_get(search, sys::SearchData::TOTAL_MATCHES, (&raw mut total).cast());
+                if status == sys::SearchStatus::COMPLETE {
+                    complete = true;
+                    break;
+                }
+                if total >= wanted {
+                    break;
+                }
+                needs_feed = status != sys::SearchStatus::RUNNING;
+            }
+            if r == sys::Result::SUCCESS {
+                if total > max_alloc {
+                    // `ghostty_search_get(MATCHES)` requires `cap >= total`; refuse unbounded allocation
+                    // and explicitly signal truncation instead of silently returning `false`.
+                    alloc_exceeded = true;
+                } else if total != 0 {
+                    raw_matches.resize(total, sys::Selection::default());
+                    let mut buf =
+                        sys::SelectionBuffer { ptr: raw_matches.as_mut_ptr(), cap: raw_matches.len(), len: 0 };
+                    r = sys::ghostty_search_get(search, sys::SearchData::MATCHES, (&raw mut buf).cast());
+                    raw_matches.truncate(if r == sys::Result::SUCCESS { buf.len.min(raw_matches.len()) } else { 0 });
+                }
+            }
+            r
+        };
+        // SAFETY: freeing search handle once.
+        unsafe { sys::ghostty_search_free(search) };
+        if res != sys::Result::SUCCESS {
+            return false;
+        }
+        if alloc_exceeded {
+            return true;
+        }
+
+        let mut formatter: sys::Formatter = std::ptr::null_mut();
+        if case_sensitive && !raw_matches.is_empty() {
+            // SAFETY: creating a single reused formatter for exact-case filtering; fail-closed on error.
+            let _ = unsafe { sys::ghostty_formatter_terminal_new(std::ptr::null(), &raw mut formatter, self.handle) };
+            if formatter.is_null() {
+                return false;
+            }
+            let unwrap = true;
+            // SAFETY: `UNWRAP` takes a `bool*`.
+            let _ = unsafe {
+                sys::ghostty_formatter_set(formatter, sys::FormatterOption::UNWRAP, (&raw const unwrap).cast())
+            };
+        }
+
+        let needle_bytes = needle.as_bytes();
+        let mut filtered: Vec<CellSpan> = Vec::new();
+        for sel in &raw_matches {
+            let Some(span) = self.selection_to_span(sel) else {
+                continue;
+            };
+            if span.start.line < from_line || span.end.line >= to_line {
+                continue;
+            }
+            if !formatter.is_null() && !selection_matches_exact(formatter, sel, needle_bytes) {
+                continue;
+            }
+            filtered.push(span);
+        }
+        // SAFETY: `ghostty_formatter_free` accepts a null pointer.
+        unsafe { sys::ghostty_formatter_free(formatter) };
+
+        filtered.sort_by_key(|s| (s.start.line, s.start.col, s.end.line, s.end.col));
+        let mut truncated = !complete;
+        if filtered.len() > limit {
+            filtered.truncate(limit);
+            truncated = true;
+        }
+        out.extend(filtered);
+        truncated
+    }
+}
+
 /// Computes the byte offset of the end of the last complete record in a `libghostty-vt` snapshot.
+#[cfg(test)]
 pub(crate) fn last_snapshot_record_end(snapshot: &[u8]) -> usize {
     const RECORD_HEAD: usize = 10;
     let mut at = 10.min(snapshot.len());

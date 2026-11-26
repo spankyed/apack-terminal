@@ -19,6 +19,8 @@ export interface Metrics {
 /** Everything one frame of drawing needs */
 export interface Scene {
   readonly theme: Theme
+  /** Monotonic broker epoch of the rows in this scene (invalidates scroll-blit caches on reset). */
+  readonly epoch?: number
   /** The rows to draw, top to bottom. `null` is a line the view does not hold yet: it is drawn blank */
   readonly rows: ReadonlyArray<RowDrawing | null>
   /** How far the grid is shifted up, as a fraction of a row: the view is between two lines */

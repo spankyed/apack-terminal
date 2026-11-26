@@ -6,7 +6,10 @@ use std::thread::{self, JoinHandle};
 
 use apack_os::OsError;
 use apack_os::signal::init_signal_descriptions;
-use apack_os::transport::{SocketHold, acquire_socket_hold, bind_local_listener, ensure_private_directory};
+use apack_os::transport::{
+    ShutdownSignalGuard, SocketHold, acquire_socket_hold, bind_local_listener, ensure_private_directory,
+    install_shutdown_signals,
+};
 use interprocess::local_socket::Listener;
 
 use crate::config::BrokerConfig;
@@ -38,8 +41,13 @@ impl BrokerServer {
     /// Runs the broker reactor loop on the calling thread until shutdown or idle exit.
     pub fn run(self) -> Result<(), OsError> {
         let shutdown = Arc::new(AtomicBool::new(false));
-        let res = run_control_reactor(self.config, self.listener, shutdown, |_| {})
-            .map_err(|err| OsError::io("running control reactor", err));
+        let sig_shutdown = Arc::clone(&shutdown);
+        let mut sig_guard: Option<ShutdownSignalGuard> = None;
+        let res = run_control_reactor(self.config, self.listener, shutdown, |wake| {
+            sig_guard = install_shutdown_signals(sig_shutdown, move || wake.wake()).ok();
+        })
+        .map_err(|err| OsError::io("running control reactor", err));
+        drop(sig_guard);
         #[allow(clippy::drop_non_drop)]
         drop(self._hold);
         res

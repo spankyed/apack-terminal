@@ -4,12 +4,14 @@
 
 #![cfg(windows)]
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::AsRawHandle;
 
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_NAME_NORMALIZED, FILE_TYPE_DISK, GetFileType, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED, FILE_TYPE_DISK, GetFileType,
+    GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
 };
 
 use super::rules;
@@ -25,13 +27,19 @@ pub fn open_file(path: &[u8]) -> Option<File> {
     if rules::refused(path) {
         return None;
     }
-    let file = File::open(text).ok()?;
+    // Open without following NTFS reparse points so a hostile symlink/junction pointing to an
+    // external UNC share or named pipe is refused before any SMB connection or pipe open occurs.
+    let file = OpenOptions::new().read(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(text).ok()?;
+    let meta = file.metadata().ok()?;
+    if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        return None;
+    }
     let handle = file.as_raw_handle() as HANDLE;
     // SAFETY: `handle` belongs to `file` which stays open for this call.
     if unsafe { GetFileType(handle) } != FILE_TYPE_DISK {
         return None;
     }
-    if !file.metadata().ok()?.is_file() {
+    if !meta.is_file() {
         return None;
     }
     let opened = final_path(handle)?;

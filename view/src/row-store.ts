@@ -149,12 +149,31 @@ export class RowStore {
     }
 
     const changed: number[] = []
-    if (frame.fullSync && !reset) {
-      // Drop any active-screen rows that were replaced by a blank row not listed in `frame.rows`
-      for (let line = this.firstActive; line < this.end; line += 1) {
-        if (this.row(line) !== undefined) {
-          this.deleteLine(line)
-          changed.push(line)
+    if (!reset) {
+      if (frame.fullSync) {
+        // Drop any active-screen rows that were replaced by a blank row not listed in `frame.rows`,
+        // AND drop rows that scrolled off the previous active screen during skipped/coalesced frames.
+        const clearStart = Math.min(prevFirstActive, this.firstActive)
+        for (let line = clearStart; line < this.end; line += 1) {
+          if (this.row(line) !== undefined) {
+            this.deleteLine(line)
+            changed.push(line)
+          }
+        }
+        // If `firstActive` moved backward within the same epoch (e.g. reflow/shrink), doubt older
+        // cached history so scrolled views re-fetch authoritative lines instead of stale wraps.
+        if (this.firstActive < prevFirstActive) {
+          for (let line = this.oldest; line < this.firstActive; line += 1) {
+            if (this.row(line) !== undefined) this.doubted.add(line)
+          }
+        }
+      } else if (this.firstActive > prevFirstActive && frame.scrollDelta > 0) {
+        // Rows that just scrolled off the active screen into scrollback may have been mutated
+        // (e.g. spinner/progress overwrite) right before scrolling; mark them doubted so scrolling
+        // back re-verifies them against broker history without causing blank flashes while live.
+        const scrolledEnd = Math.min(prevEnd, this.firstActive)
+        for (let line = prevFirstActive; line < scrolledEnd; line += 1) {
+          if (this.row(line) !== undefined) this.doubted.add(line)
         }
       }
     }
@@ -209,9 +228,15 @@ export class RowStore {
     const start = Math.max(this.oldest, fromLine)
     const stop = Math.min(this.firstActive, fromLine + count)
     for (let line = start; line < stop; line += 1) {
-      if (!seen.has(line) && this.row(line) === undefined) {
-        if (this.absent.size >= MAX_ABSENT) this.absent.clear()
-        this.absent.add(line)
+      if (!seen.has(line)) {
+        if (this.doubted.has(line)) {
+          this.deleteLine(line)
+          absorbed.push(line)
+        }
+        if (this.row(line) === undefined) {
+          if (this.absent.size >= MAX_ABSENT) this.absent.clear()
+          this.absent.add(line)
+        }
       }
     }
 

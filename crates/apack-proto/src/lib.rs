@@ -67,6 +67,9 @@ pub const DEFAULT_SSH_GRACE_MS: u32 = 30_000;
 /// Maximum length in bytes of any single decoded string field (1 MiB).
 pub const MAX_STRING_BYTES: usize = 1_048_576;
 
+/// Maximum length in bytes of a search query or `WaitCondition::Text` needle (4 KiB).
+pub const MAX_SEARCH_NEEDLE_BYTES: usize = 4_096;
+
 /// Maximum number of elements in any single decoded wire sequence.
 pub const MAX_VEC_ITEMS: usize = 65_536;
 

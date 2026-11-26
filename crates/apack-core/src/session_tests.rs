@@ -47,6 +47,8 @@ struct StubVt {
     gens: VtGenerations,
     next_events: Vec<VtEvent>,
     dirty: DirtyViewport,
+    wrapped_logical: Option<(u64, u64)>,
+    last_search_range: core::cell::Cell<(u64, u64)>,
 }
 
 impl StubVt {
@@ -62,6 +64,8 @@ impl StubVt {
             gens: VtGenerations::default(),
             next_events: Vec::new(),
             dirty: DirtyViewport { scroll_delta: 0, dirty_rows: Vec::new(), full_dirty: true },
+            wrapped_logical: None,
+            last_search_range: core::cell::Cell::new((0, 0)),
         }
     }
 }
@@ -238,14 +242,20 @@ impl VtEngine for StubVt {
     }
 
     fn line_at(&self, line: u64) -> Option<CellSpan> {
+        if let Some((start, end)) = self.wrapped_logical
+            && line >= start
+            && line <= end
+        {
+            return Some(CellSpan { start: CellPos { line: start, col: 0 }, end: CellPos { line: end, col: 3 } });
+        }
         Some(CellSpan { start: CellPos { line, col: 0 }, end: CellPos { line, col: 3 } })
     }
 
-    fn text_of(&self, span: CellSpan) -> String {
+    fn text_of(&self, span: CellSpan, _max_bytes: usize) -> String {
         format!("{}:{}:{}:{}", span.start.line, span.start.col, span.end.line, span.end.col)
     }
 
-    fn text_of_rect(&self, span: CellSpan) -> String {
+    fn text_of_rect(&self, span: CellSpan, _max_bytes: usize) -> String {
         format!("rect:{}:{}", span.start.col, span.end.col)
     }
 
@@ -258,6 +268,7 @@ impl VtEngine for StubVt {
         limit: usize,
         out: &mut Vec<CellSpan>,
     ) -> bool {
+        self.last_search_range.set((from_line, to_line));
         if needle == "__OOB_SPAN__" && from_line < to_line {
             // One span below from_line, one span at end_line == to_line, and one valid span inside [from_line, to_line)
             if from_line > 0 {
@@ -1945,4 +1956,90 @@ fn session_machine_runtime_accessors_and_nonblocking_pty_peek_consume() {
     sess.sync_vt_geometry(new_px);
     assert_eq!(sess.current_size(), new_sz);
     assert_eq!(sess.current_cell_px(), new_px);
+}
+
+#[test]
+fn review_mutants_rows_budget_clamp_rect_and_logical_line_expansion() {
+    use crate::session::{clamp_rect_span, estimate_packed_row_bytes, truncate_rows_to_budget};
+
+    // 1. estimate_packed_row_bytes & truncate_rows_to_budget exact boundaries
+    let r0 = PackedRow {
+        line: 0,
+        flags: 0,
+        text: "hello-world".into(),
+        runs: Vec::new(),
+        styles: Vec::new(),
+        links: Vec::new(),
+        pieces: Vec::new(),
+    };
+    let sz0 = estimate_packed_row_bytes(&r0);
+    assert!(sz0 > 10);
+    // Keep at least 1 row even when row 0 > budget; keep 2 rows when exact == budget; drop 3rd when +1 > budget
+    let mut rows = vec![r0.clone(), r0.clone(), r0.clone()];
+    truncate_rows_to_budget(&mut rows, 1);
+    assert_eq!(rows.len(), 1);
+    let mut rows2 = vec![r0.clone(), r0.clone(), r0.clone()];
+    truncate_rows_to_budget(&mut rows2, 32 + sz0 * 2);
+    assert_eq!(rows2.len(), 2);
+    let mut rows3 = vec![r0.clone(), r0.clone(), r0.clone()];
+    truncate_rows_to_budget(&mut rows3, 32 + sz0 * 2 - 1);
+    assert_eq!(rows3.len(), 1);
+
+    // 2. clamp_rect_span boundaries (cols=10 => max_col=9, total_lines=4 => max_line=3)
+    let meta = VtSnapshotMeta {
+        epoch: 1,
+        size: GridSize::new(10, 4).unwrap(),
+        first_active_line: 0,
+        scrollback_lines: 0,
+        cursor: CursorState { col: 0, row: 0, shape: CursorShape::Block, blinking: false, hidden: false },
+        modes: ViewModes::default(),
+        images_gen: 0,
+    };
+    // Exact max_col boundary (9) is valid; max_col + 1 (10) returns None
+    let at_edge =
+        clamp_rect_span(CellSpan { start: CellPos { line: 1, col: 9 }, end: CellPos { line: 2, col: 9 } }, &meta);
+    assert_eq!(at_edge, Some(CellSpan { start: CellPos { line: 1, col: 9 }, end: CellPos { line: 2, col: 9 } }));
+    let past_edge =
+        clamp_rect_span(CellSpan { start: CellPos { line: 1, col: 10 }, end: CellPos { line: 2, col: 12 } }, &meta);
+    assert_eq!(past_edge, None);
+    // Reversed columns normalized and clamped to max_col; reversed lines -> None
+    let swapped =
+        clamp_rect_span(CellSpan { start: CellPos { line: 1, col: 15 }, end: CellPos { line: 1, col: 3 } }, &meta);
+    assert_eq!(swapped, Some(CellSpan { start: CellPos { line: 1, col: 3 }, end: CellPos { line: 1, col: 9 } }));
+    assert_eq!(
+        clamp_rect_span(CellSpan { start: CellPos { line: 3, col: 0 }, end: CellPos { line: 1, col: 5 } }, &meta),
+        None
+    );
+
+    // 3. Soft-wrapped logical line expansion in SearchDelta & text waiters
+    let mut vt = StubVt::new(10, 4);
+    vt.wrapped_logical = Some((1, 2));
+    let mut s = SessionMachine::new(sid(40), vt, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    let k1 = (ConnId::new(1).unwrap(), NonZeroStreamId::new(1).unwrap());
+    let mut fx = Vec::new();
+    s.attach_stream(k1, SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, &mut fx);
+    s.handle_stream_msg(
+        k1,
+        RequestId::from_raw(1),
+        ClientMsg::SetSearch { query: "foo".into(), case_sensitive: false },
+        &mut fx,
+    );
+    // Dirtying only row 1 must expand the search delta range to [1, 3) (covering wrapped row 2)!
+    s.vt_mut().cursor.row = 1;
+    s.vt_mut().dirty = DirtyViewport { scroll_delta: 0, dirty_rows: vec![1], full_dirty: false };
+    s.on_pty_output(b"NOOP", ts(10), &mut fx);
+    fx.clear();
+    s.poll_timers(ts(200), &mut fx);
+    assert_eq!(s.vt().last_search_range.get(), (1, 3));
+    // Dirtying only row 2 must expand backward to [1, 3) as well!
+    s.vt_mut().cursor.row = 2;
+    s.vt_mut().dirty = DirtyViewport { scroll_delta: 0, dirty_rows: vec![2], full_dirty: false };
+    s.on_pty_output(b"NOOP", ts(300), &mut fx);
+    fx.clear();
+    s.poll_timers(ts(500), &mut fx);
+    assert_eq!(s.vt().last_search_range.get(), (1, 3));
+    // Empty range (lo == hi) must return (lo, lo) untouched without underflowing `hi - 1`
+    assert_eq!(s.expand_to_logical_lines(2, 2, 0, 4), (2, 2));
+    assert_eq!(s.expand_to_logical_lines(1, 2, 0, 4), (1, 3));
+    assert_eq!(s.expand_to_logical_lines(2, 3, 0, 4), (1, 3));
 }

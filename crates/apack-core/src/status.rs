@@ -22,6 +22,11 @@ const MAX_FIELD_BYTES: usize = 512;
 pub enum StatusEffect {
     /// Status record was created or updated.
     Updated(StatusRecord),
+    /// Existing status record was cleared via `state=clear`.
+    Cleared {
+        /// Status record ID (`""` for root).
+        id: String,
+    },
     /// Request the OS Blocking Pool to verify whether the foreground process matches `app`.
     VerifyForeground {
         /// Status record ID (`""` for root).
@@ -138,7 +143,9 @@ impl StatusTable {
         let (id, state, kind, progress, app, title, message) = match update {
             ProgramStatusUpdate::Clear { id } => {
                 let id = truncate_utf8(&id, MAX_FIELD_BYTES);
-                self.records.remove(&id);
+                if self.records.remove(&id).is_some() {
+                    effects.push(StatusEffect::Cleared { id });
+                }
                 return;
             }
             ProgramStatusUpdate::Set { id, state, kind, progress, app, title, message } => (

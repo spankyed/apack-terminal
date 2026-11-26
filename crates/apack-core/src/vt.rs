@@ -201,11 +201,11 @@ pub trait VtEngine {
     /// Resolves wrapped logical line boundaries containing `line`.
     fn line_at(&self, line: u64) -> Option<CellSpan>;
 
-    /// Extracts plain UTF-8 text across an inclusive cell span.
-    fn text_of(&self, span: CellSpan) -> String;
+    /// Extracts plain UTF-8 text across an inclusive cell span, stopping at `max_bytes`.
+    fn text_of(&self, span: CellSpan, max_bytes: usize) -> String;
 
-    /// Extracts rectangular block UTF-8 text across an inclusive cell span.
-    fn text_of_rect(&self, span: CellSpan) -> String;
+    /// Extracts rectangular block UTF-8 text across an inclusive cell span, stopping at `max_bytes`.
+    fn text_of_rect(&self, span: CellSpan, max_bytes: usize) -> String;
 
     /// Searches epoch lines `[from_line, to_line)` for `needle`, appending up to `limit` spans.
     ///

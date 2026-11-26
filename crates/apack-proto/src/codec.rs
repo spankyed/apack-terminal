@@ -310,10 +310,15 @@ impl<'a> Reader<'a> {
         Ok(self.bytes_bounded(MAX_BLOB_BYTES, "bytes")?.to_vec())
     }
 
+    /// Reads a length-prefixed UTF-8 string capped at `max_len` (and [`MAX_STRING_BYTES`]).
+    pub fn str_bounded(&mut self, max_len: usize, what: &'static str) -> Result<String, WireError> {
+        let raw = self.bytes_bounded(max_len.min(MAX_STRING_BYTES), what)?;
+        core::str::from_utf8(raw).map(ToOwned::to_owned).map_err(|_| WireError::InvalidUtf8)
+    }
+
     /// Reads a length-prefixed UTF-8 string capped at [`MAX_STRING_BYTES`].
     pub fn str(&mut self) -> Result<String, WireError> {
-        let raw = self.bytes_bounded(MAX_STRING_BYTES, "string")?;
-        core::str::from_utf8(raw).map(ToOwned::to_owned).map_err(|_| WireError::InvalidUtf8)
+        self.str_bounded(MAX_STRING_BYTES, "string")
     }
 
     /// Reads an optional value encoded with a strict `0`/`1` presence tag.

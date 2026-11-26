@@ -198,7 +198,7 @@ fn packed_row_individual_styles_bg_tags_links_graphemes_wrapping_and_wire_roundt
     assert!(rows[3].flags & PackedRow::FLAG_PROMPT != 0);
     assert!(rows[3].flags & PackedRow::FLAG_WRAPPED != 0);
     assert_eq!(rows[4].flags & PackedRow::FLAG_WRAPPED, 0);
-    let unwrapped = vt.text_of(CellSpan { start: CellPos { line: 3, col: 0 }, end: CellPos { line: 4, col: 4 } });
+    let unwrapped = vt.text_of(CellSpan { start: CellPos { line: 3, col: 0 }, end: CellPos { line: 4, col: 4 } }, 4096);
     assert_eq!(unwrapped, "W".repeat(45));
 
     // Wire round-trip validation of all emitted PackedRows
@@ -445,16 +445,17 @@ fn scrollback_eviction_compression_word_delimiters_rect_wide_grapheme_and_search
 
     // word_at honours custom `delimiters` (" " selects "foo/bar"; " /" selects "foo")!
     let w_space = vt.word_at(CellPos { line: oldest, col: 11 }, " ").unwrap();
-    assert_eq!(vt.text_of(w_space), "foo/bar");
+    assert_eq!(vt.text_of(w_space, 4096), "foo/bar");
     let w_slash = vt.word_at(CellPos { line: oldest, col: 11 }, " /").unwrap();
-    assert_eq!(vt.text_of(w_slash), "foo");
+    assert_eq!(vt.text_of(w_slash, 4096), "foo");
     let line_span = vt.line_at(oldest).unwrap();
-    assert!(vt.text_of(line_span).contains("foo/bar"));
+    assert!(vt.text_of(line_span, 4096).contains("foo/bar"));
 
     // text_of_rect: handles wide CJK (no spurious spacer!), combining graphemes, Kitty placeholder -> ' ', and col clamping
     let mut rvt = GhosttyEngine::new(GhosttyConfig::new(grid(20, 4))).unwrap();
     rvt.feed(format!("中文e\u{0301}{}Z\r\nline2\r\n", PLACEHOLDER).as_bytes(), &mut ev);
-    let rect = rvt.text_of_rect(CellSpan { start: CellPos { line: 0, col: 0 }, end: CellPos { line: 1, col: 99 } });
+    let rect =
+        rvt.text_of_rect(CellSpan { start: CellPos { line: 0, col: 0 }, end: CellPos { line: 1, col: 99 } }, 4096);
     assert_eq!(rect, "中文e\u{0301} Z\nline2");
 
     // Search edge cases: empty needle, empty range, zero limit
@@ -1150,11 +1151,11 @@ fn snapshot_export_mid_sequence_at_ground_corrupt_rejection_and_blink_preservati
     assert_eq!(last_snapshot_record_end(&synth), 10);
     assert_eq!(last_snapshot_record_end(&snap[..5]), 5);
 
-    let tight = src.export_snapshot(snap.len() / 2).unwrap();
-    assert!(tight.len() <= snap.len() / 2);
-    assert_eq!(last_snapshot_record_end(&tight), tight.len());
+    // Exceeding `max_bytes` must fail with `OUT_OF_SPACE` rather than returning an unrestorable truncated snapshot.
+    assert!(src.export_snapshot(snap.len() / 2).is_err());
 
-    // Destination has `cursor_defaults = (Bar, false)` -> restoring MUST preserve `src`'s blinking=true!
+    // Destination has `cursor_defaults = (Bar, false)` -> restoring MUST preserve `src`'s blinking=true
+    // WITHOUT corrupting the in-flight `\x1b[38;2;` CSI continuation!
     let mut dst_cfg = GhosttyConfig::new(grid(10, 2));
     dst_cfg.cell_px = CellPx { width: 8, height: 16 };
     let mut dst = GhosttyEngine::new(dst_cfg).unwrap();
@@ -1168,16 +1169,26 @@ fn snapshot_export_mid_sequence_at_ground_corrupt_rejection_and_blink_preservati
     assert_eq!(dst.meta().epoch, 1);
     assert_eq!(dst.meta().size, grid(10, 2));
 
-    // Valid restore succeeds twice (epoch 1 -> 2 -> 3), decodes all scrollback pages, preserves blink=true & cell_px!
+    // Valid restore succeeds twice (epoch 1 -> 2 -> 3), preserves blink=true, continuation tracking, & cell_px!
     dst.restore_snapshot(&snap).unwrap();
     assert_eq!(dst.meta().epoch, 2);
     assert_eq!(dst.meta().size, grid(80, 4));
     assert!(dst.meta().cursor.blinking, "restore_snapshot must preserve restored DEC mode 12 blink state");
     assert!(dst.meta().scrollback_lines >= 1_490);
+    assert!(!dst.at_ground(), "restored mid-CSI terminal must retain continuation tracking");
+    // Re-exporting mid-sequence right after restore must succeed because RETAIN_CONTINUATION was configured!
+    assert!(dst.export_snapshot(1024 * 1024).is_ok());
     ev.clear();
-    // Finish the mid-CSI sequence from `snap` (`0m`) then query cell pixel size via CSI 16t!
+    // Finish the mid-CSI sequence from `snap` (`0;0;0m`) then query cell pixel size via CSI 16t!
     dst.feed(b"0;0;0m\x1b[16t", &mut ev);
+    assert!(dst.at_ground());
     assert!(ev.iter().any(|e| matches!(e, VtEvent::DeviceResponse(b) if b == b"\x1b[6;16;8t")));
+    let mut active = Vec::new();
+    dst.extract_viewport_rows(&[0, 1, 2, 3], &mut active);
+    assert!(
+        active.iter().all(|r| !r.text.contains("0;0;0m")),
+        "mid-CSI continuation must not be broken by injected DEC mode 12 bytes: {active:?}"
+    );
     let mut hist = Vec::new();
     dst.extract_history_rows(0, 2, &mut hist);
     assert!(hist[0].text.starts_with("snap-line-0000"));
@@ -1207,4 +1218,107 @@ fn snapshot_export_mid_sequence_at_ground_corrupt_rejection_and_blink_preservati
     m_dst.restore_snapshot(&m_snap).unwrap();
     m_dst.encode_pointer(&drag, &mut held, &mut pout);
     assert_eq!(pout, b"\x1b[<32;4;2M");
+}
+
+#[test]
+fn review_mutants_batched_text_cell_px_resize_placeholder_bg_long_grapheme_and_search_truncation() {
+    let mut ev = Vec::new();
+    // 1. text_of_batched across soft-wrapped logical lines, multi-byte UTF-8, and max_bytes boundaries
+    let mut vt = GhosttyEngine::new(GhosttyConfig::new(grid(6, 10))).unwrap();
+    // Line 0: "hi"; Lines 1-2: soft-wrapped 10-char line "abcdefghij"; Line 3: "éé"; Line 4: "world"
+    vt.feed(b"hi\r\nabcdefghij\r\n\xc3\xa9\xc3\xa9\r\nworld", &mut ev);
+    let full = CellSpan { start: CellPos { line: 0, col: 0 }, end: CellPos { line: 4, col: 3 } };
+    assert_eq!(vt.text_of_batched(full, 0, 2), "");
+    assert_eq!(
+        vt.text_of_batched(CellSpan { start: CellPos { line: 3, col: 0 }, end: CellPos { line: 1, col: 0 } }, 64, 2),
+        ""
+    );
+    // With batch_lines=2: batch 1 starts at line 0 and initially ends at line 1 (mid soft-wrap!),
+    // so `line_at(1)` MUST expand batch_end to 2 so "abcdefghij" is NOT split by a spurious '\n'!
+    let expected = vt.text_of_batched(full, 1024, 256);
+    assert_eq!(expected, "hi\nabcdefghij\n\u{00e9}\u{00e9}\nworl");
+    assert_eq!(vt.text_of_batched(full, 1024, 2), expected);
+    // Exact length of batch 1 ("hi\nabcdefghij" = 13 bytes): must stop without appending trailing '\n'!
+    assert_eq!(vt.text_of_batched(full, 13, 2), "hi\nabcdefghij");
+    // Exact byte cap mid-2-byte UTF-8 char
+    let t_trunc = vt.text_of_batched(full, 15, 2);
+    assert!(t_trunc.len() <= 15);
+    assert_eq!(t_trunc, &expected[..expected.floor_char_boundary(15)]);
+    // text_of_rect respects max_bytes cleanly
+    let rect = vt.text_of_rect(CellSpan { start: CellPos { line: 0, col: 0 }, end: CellPos { line: 2, col: 4 } }, 4);
+    assert!(rect.len() <= 4);
+    assert_eq!(rect, "hi\na");
+
+    // 2. >16-codepoint grapheme cluster exercises read_grapheme_codepoints OUT_OF_SPACE heap retry!
+    let mut g_vt = GhosttyEngine::new(GhosttyConfig::new(grid(20, 4))).unwrap();
+    let mut cluster = String::from("a");
+    for _ in 0..20 {
+        cluster.push('\u{0301}');
+    }
+    g_vt.feed(cluster.as_bytes(), &mut ev);
+    let mut g_rows = Vec::new();
+    g_vt.extract_viewport_rows(&[0], &mut g_rows);
+    assert!(
+        g_rows[0].text.chars().count() >= 18,
+        "long grapheme cluster (>16 codepoints) must survive OUT_OF_SPACE retry, got {} chars",
+        g_rows[0].text.chars().count()
+    );
+
+    // 3. U+10EEEE placeholder (both bare CODEPOINT and CODEPOINT_GRAPHEME with combining diacritic)
+    //    preserves non-default RGB bg while stripping fg/flags, AND cell_px-only resize bumps
+    //    both `gens.grid` and `gens.images` cleanly!
+    let mut p_vt = GhosttyEngine::new(GhosttyConfig::new(grid(20, 4))).unwrap();
+    // 3a. Terminal with ZERO images: cell_px-only resize must NOT bump images_gen!
+    let no_img_gen = p_vt.generations().images;
+    p_vt.resize(grid(20, 4), CellPx { width: 9, height: 18 }, &mut ev);
+    assert_eq!(p_vt.generations().images, no_img_gen);
+    // 3b. Direct (non-placeholder) Kitty placement: cell_px-only resize still bumps images_gen!
+    let px_b64 = base64_encode(&[255, 0, 0, 255]);
+    p_vt.feed(format!("\x1b_Ga=T,f=32,s=1,v=1,i=2,c=2,r=1,q=2;{px_b64}\x1b\\").as_bytes(), &mut ev);
+    let direct_gen = p_vt.generations().images;
+    p_vt.resize(grid(20, 4), CellPx { width: 10, height: 20 }, &mut ev);
+    assert!(p_vt.generations().images > direct_gen, "direct Kitty placement must bump images_gen on cell_px resize");
+    // 3c. Unicode placeholder (bare on row 0, grapheme with combining U+0305 on row 1)
+    p_vt.feed(format!("\x1b_Ga=T,f=32,s=1,v=1,i=1,U=1,c=2,r=1,q=2;{px_b64}\x1b\\").as_bytes(), &mut ev);
+    p_vt.feed(
+        "\r\n\x1b[1;38;5;1;48;2;10;20;30m\u{10EEEE}\x1b[0m\r\n\x1b[1;38;5;1;48;2;40;50;60m\u{10EEEE}\u{0305}\x1b[0m"
+            .as_bytes(),
+        &mut ev,
+    );
+    let _ = p_vt.take_dirty_viewport();
+    let mut p_rows = Vec::new();
+    p_vt.extract_viewport_rows(&[1, 2], &mut p_rows);
+    let bg1 = 0x01_00_00_00 | (10 << 16) | (20 << 8) | 30;
+    let bg2 = 0x01_00_00_00 | (40 << 16) | (50 << 8) | 60;
+    assert!(p_rows[0].styles.iter().any(|s| s.bg == bg1 && s.fg == 0 && s.flags == 0));
+    assert!(p_rows[1].styles.iter().any(|s| s.bg == bg2 && s.fg == 0 && s.flags == 0));
+    let gen_before = p_vt.generations();
+    p_vt.resize(grid(20, 4), CellPx { width: 12, height: 24 }, &mut ev);
+    let gen_after = p_vt.generations();
+    assert!(gen_after.images > gen_before.images, "cell_px-only resize must bump images_gen");
+    assert_eq!(gen_after.grid, gen_before.grid + 2, "each placeholder row must increment gens.grid by 1");
+    let dirty = p_vt.take_dirty_viewport();
+    assert!(dirty.dirty_rows.contains(&1) && dirty.dirty_rows.contains(&2));
+
+    // 4. set_cursor_defaults toggles blinking cleanly at ground
+    let mut c_vt = GhosttyEngine::new(GhosttyConfig::new(grid(10, 4))).unwrap();
+    c_vt.set_cursor_defaults(CursorShape::Bar, true);
+    assert!(c_vt.meta().cursor.blinking);
+    c_vt.set_cursor_defaults(CursorShape::Bar, false);
+    assert!(!c_vt.meta().cursor.blinking);
+
+    // 5. search_lines_bounded enforces max_alloc without OOM (signalling truncated=true) and
+    //    returns all matches when total <= max_alloc!
+    let mut s_vt = GhosttyEngine::new(GhosttyConfig::new(grid(40, 10))).unwrap();
+    for _ in 0..5 {
+        s_vt.feed(b"xxxxxxxxxx\r\n", &mut ev);
+    }
+    let mut found = Vec::new();
+    // 50 matches, max_alloc = 50 -> exact boundary succeeds with 50 matches and truncated = false!
+    assert!(!s_vt.search_lines_bounded(0, s_vt.meta().total_lines(), "x", false, 100, 100, 50, &mut found));
+    assert_eq!(found.len(), 50);
+    // 50 matches, max_alloc = 49 -> refuses unbounded allocation and reports truncated = true!
+    found.clear();
+    assert!(s_vt.search_lines_bounded(0, s_vt.meta().total_lines(), "x", false, 100, 100, 49, &mut found));
+    assert!(found.is_empty());
 }

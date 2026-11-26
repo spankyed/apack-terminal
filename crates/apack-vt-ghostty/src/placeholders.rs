@@ -168,12 +168,16 @@ pub fn fit(run: &PlaceholderRun, grid: (u32, u32), picture: (u32, u32), cell: (u
 
     let whole = |v: f64| v.max(0.0).round() as u32;
     let dst_px = [whole(width), whole(height)];
-    let src_w = whole(source_width);
-    let src_h = whole(source_height);
+    let src_x = whole(source_x).min(picture.0);
+    let src_y = whole(source_y).min(picture.1);
+    let src_x2 = whole(source_x + source_width).min(picture.0);
+    let src_y2 = whole(source_y + source_height).min(picture.1);
+    let src_w = src_x2.saturating_sub(src_x);
+    let src_h = src_y2.saturating_sub(src_y);
     if dst_px[0].min(dst_px[1]).min(src_w).min(src_h) == 0 {
         return None;
     }
-    Some(Fit { src_rect: [whole(source_x), whole(source_y), src_w, src_h], dst_px })
+    Some(Fit { src_rect: [src_x, src_y, src_w, src_h], dst_px })
 }
 
 /// Decodes a packed `PackedStyle` colour back into the 24-bit Kitty placeholder number.

@@ -157,6 +157,8 @@ impl InputQueue {
     fn close(&self) {
         let mut st = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         st.closed = true;
+        st.chunks.clear();
+        st.buffered_bytes = 0;
         self.changed.notify_all();
     }
 }
@@ -171,9 +173,9 @@ pub struct ConPtyBridge {
 }
 
 impl ConPtyBridge {
-    /// Wraps a spawned [`PtyMaster`] in bounded reader/writer threads, invoking `on_output_ready`
-    /// whenever a new [`ConPtyOutput`] item is pushed into the output channel.
-    pub fn start(master: PtyMaster, on_output_ready: impl Fn() + Send + 'static) -> Result<Self, OsError> {
+    /// Wraps a spawned [`PtyMaster`] in bounded reader/writer threads, invoking `on_ready`
+    /// whenever a new [`ConPtyOutput`] item is pushed or input queue space frees up.
+    pub fn start(master: PtyMaster, on_ready: impl Fn() + Send + Sync + 'static) -> Result<Self, OsError> {
         let raw_master = master.master;
         let mut reader = raw_master
             .try_clone_reader()
@@ -185,8 +187,10 @@ impl ConPtyBridge {
         let (output_tx, output_rx) = mpsc::sync_channel::<ConPtyOutput>(OUTPUT_CHANNEL_DEPTH);
         let pause = Arc::new(PauseGate::default());
         let input = Arc::new(InputQueue::new());
+        let wake = Arc::new(on_ready);
 
         let reader_pause = Arc::clone(&pause);
+        let reader_wake = Arc::clone(&wake);
         std::thread::Builder::new()
             .name("conpty-reader".to_owned())
             .spawn(move || {
@@ -199,20 +203,22 @@ impl ConPtyBridge {
                             if output_tx.send(ConPtyOutput::Data(buf[..n].to_vec())).is_err() {
                                 return;
                             }
-                            on_output_ready();
+                            reader_wake();
                         }
                     }
                 }
                 let _ = output_tx.send(ConPtyOutput::Eof);
-                on_output_ready();
+                reader_wake();
             })
             .map_err(|err| OsError::io("spawning conpty reader thread", err))?;
 
         let writer_input = Arc::clone(&input);
+        let writer_wake = Arc::clone(&wake);
         std::thread::Builder::new()
             .name("conpty-writer".to_owned())
             .spawn(move || {
                 while let Some(chunk) = writer_input.pop() {
+                    writer_wake();
                     if writer.write_all(&chunk).is_err() {
                         writer_input.mark_broken();
                         break;

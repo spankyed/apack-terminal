@@ -229,6 +229,7 @@ export class TerminalView {
   private moreMatches = false
   private currentMatch = -1
   private finding = 0
+  private searchPending = false
   private matchVersion = 0
   private hoverVersion = 0
 
@@ -370,18 +371,21 @@ export class TerminalView {
   setVisible(visible: boolean): void {
     if (this.visible === visible) return
     this.visible = visible
+    if (!visible && this.scheduled !== null) {
+      cancelAnimationFrame(this.scheduled)
+      this.scheduled = null
+    }
+    // Send the updated `ViewportHint` FIRST so the source flips `visible` before any FrameAck
+    // (advertising `maxFrames = 0` when hiding instead of granting visible credit).
+    this.pushViewportHint()
     if (!visible) {
-      if (this.scheduled !== null) {
-        cancelAnimationFrame(this.scheduled)
-        this.scheduled = null
-      }
       if (this.unacknowledgedSeq !== null && !this.ended) {
         this.source.ackFrame?.(this.unacknowledgedSeq)
         this.unacknowledgedSeq = null
       }
+    } else {
+      this.schedule()
     }
-    this.pushViewportHint()
-    if (visible) this.schedule()
   }
 
   setTheme(theme: Theme): void {
@@ -440,6 +444,7 @@ export class TerminalView {
     this.needle = needle
     this.matchCase = options.matchCase ?? false
     if (needle === '') {
+      this.searchPending = false
       this.matches = []
       this.moreMatches = false
       this.currentMatch = -1
@@ -449,12 +454,23 @@ export class TerminalView {
       void this.source.setSearch('', this.matchCase).catch(() => {})
       return 0
     }
+    this.searchPending = true
     try {
       const snapshot = await this.source.setSearch(needle, this.matchCase)
       if (this.disposed || asked !== this.finding) return this.matches.length
+      this.searchPending = false
       this.applySearchSnapshot(snapshot, true)
       return this.matches.length
     } catch {
+      if (!this.disposed && asked === this.finding) {
+        this.searchPending = false
+        this.matches = []
+        this.moreMatches = false
+        this.currentMatch = -1
+        this.matchVersion += 1
+        this.options.onFound?.(this.found)
+        this.schedule()
+      }
       return 0
     }
   }
@@ -505,7 +521,7 @@ export class TerminalView {
   }
 
   private applySearchDelta(patch: SearchPatch): void {
-    if (this.needle === '') return
+    if (this.needle === '' || this.searchPending) return
     if (this.store.epoch >= 0 && patch.epoch !== this.store.epoch) return
     const prev = this.matches[this.currentMatch]
     const kept = this.matches.filter(
@@ -928,7 +944,7 @@ export class TerminalView {
     this.lastHintSent = null
     this.cachedBox = null
     this.thumbRelease?.()
-    this.input.clearKeyText()
+    this.input.reset()
     const pressed = this.pressed
     this.pressed = null
     if (pressed?.reporting) {
@@ -1169,6 +1185,7 @@ export class TerminalView {
     this.fetchCommands()
     this.wantPicturesInView()
     this.blinkAgain()
+    this.schedule()
   }
 
   private pause(): void {
@@ -1709,9 +1726,10 @@ export class TerminalView {
       const cursor = this.cursorIn(frame, lines)
       const scene: Scene = {
         theme: this.theme,
+        epoch: this.store.epoch,
         rows,
         offset: this.viewport.offset,
-        scrollPosition: this.viewport.extent.position,
+        scrollPosition: this.viewport.rowsBetween(0, this.viewport.top),
         cursor,
         marks: this.marksIn(first, lines),
         images: this.imagesIn(first, span, lines),

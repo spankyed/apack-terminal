@@ -719,6 +719,12 @@ fn build_broker_vectors() -> Vec<BrokerVector> {
             })),
         },
         BrokerVector {
+            name: "program_status_cleared",
+            stream_id: s3,
+            req_id: push,
+            msg: BrokerMsg::ProgramStatusCleared { id: String::from("agent-1") },
+        },
+        BrokerVector {
             name: "command_started",
             stream_id: s3,
             req_id: push,

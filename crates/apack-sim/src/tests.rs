@@ -33,15 +33,16 @@ fn mock_vt_one_byte_split_and_queries() {
     // Word/line/text/rect/search queries
     let w = whole.word_at(CellPos { line: 0, col: 7 }, " ").unwrap();
     assert_eq!(w, CellSpan { start: CellPos { line: 0, col: 6 }, end: CellPos { line: 0, col: 10 } });
-    assert_eq!(whole.text_of(w), "world");
+    assert_eq!(whole.text_of(w, usize::MAX), "world");
     assert_eq!(whole.word_at(CellPos { line: 0, col: 5 }, " ").unwrap().start.col, 5);
     assert!(whole.word_at(CellPos { line: 99, col: 0 }, " ").is_none());
 
     let l = whole.line_at(1).unwrap();
-    assert_eq!(whole.text_of(l), "foo bar baz");
+    assert_eq!(whole.text_of(l, usize::MAX), "foo bar baz");
     assert!(whole.line_at(99).is_none());
 
-    let rect = whole.text_of_rect(CellSpan { start: CellPos { line: 0, col: 0 }, end: CellPos { line: 1, col: 2 } });
+    let rect = whole
+        .text_of_rect(CellSpan { start: CellPos { line: 0, col: 0 }, end: CellPos { line: 1, col: 2 } }, usize::MAX);
     assert_eq!(rect, "hel\nfoo");
 
     let mut found = Vec::new();
@@ -308,15 +309,17 @@ fn session_machine_direct_rpcs_and_wait_outcomes() {
 
     // Extreme u64::MAX span must clamp safely without hanging/OOM
     assert_eq!(
-        sess.vt()
-            .text_of(CellSpan { start: CellPos { line: 0, col: 0 }, end: CellPos { line: u64::MAX, col: u16::MAX } }),
+        sess.vt().text_of(
+            CellSpan { start: CellPos { line: 0, col: 0 }, end: CellPos { line: u64::MAX, col: u16::MAX } },
+            usize::MAX,
+        ),
         "\n\n\n\n\n\n\n"
     );
     assert_eq!(
-        sess.vt().text_of_rect(CellSpan {
-            start: CellPos { line: 0, col: 0 },
-            end: CellPos { line: u64::MAX, col: u16::MAX },
-        }),
+        sess.vt().text_of_rect(
+            CellSpan { start: CellPos { line: 0, col: 0 }, end: CellPos { line: u64::MAX, col: u16::MAX } },
+            usize::MAX,
+        ),
         "\n\n\n\n\n\n\n"
     );
 }

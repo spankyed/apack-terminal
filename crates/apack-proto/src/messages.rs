@@ -102,6 +102,7 @@ pub mod msg_type {
     pub const COMMAND_FINISHED: u16 = 0x0317;
     pub const CWD_CHANGED: u16 = 0x0318;
     pub const EXITED: u16 = 0x0319;
+    pub const PROGRAM_STATUS_CLEARED: u16 = 0x031A;
     pub const OUTPUT: u16 = 0x0320;
     pub const THROTTLED: u16 = 0x0321;
     pub const OUTPUT_DROPPED: u16 = 0x0322;
@@ -755,7 +756,10 @@ impl ClientMsg {
             msg_type::LINE_AT => Self::LineAt { epoch: r.var_u64()?, line: r.var_u64()? },
             msg_type::TEXT_OF => Self::TextOf { epoch: r.var_u64()?, span: CellSpan::decode(&mut r)? },
             msg_type::TEXT_OF_RECT => Self::TextOfRect { epoch: r.var_u64()?, span: CellSpan::decode(&mut r)? },
-            msg_type::SET_SEARCH => Self::SetSearch { query: r.str()?, case_sensitive: r.bool()? },
+            msg_type::SET_SEARCH => Self::SetSearch {
+                query: r.str_bounded(crate::MAX_SEARCH_NEEDLE_BYTES, "search query")?,
+                case_sensitive: r.bool()?,
+            },
             msg_type::COMMANDS => Self::Commands,
             msg_type::COMMAND_OUTPUT => Self::CommandOutput { command_id: r.var_u64()? },
             msg_type::IMAGES => Self::Images,
@@ -982,6 +986,11 @@ pub enum BrokerMsg {
     },
     /// OSC 7501 program status record updated.
     ProgramStatus(Box<StatusRecord>),
+    /// OSC 7501 program status record cleared (`state=clear`).
+    ProgramStatusCleared {
+        /// Status record ID (`""` for root).
+        id: String,
+    },
     /// Shell command started (OSC 133/633).
     CommandStarted(Box<CommandRecord>),
     /// Shell command finished (OSC 133/633).
@@ -1054,6 +1063,7 @@ impl BrokerMsg {
             Self::Notification { .. } => msg_type::NOTIFICATION,
             Self::Progress { .. } => msg_type::PROGRESS,
             Self::ProgramStatus(_) => msg_type::PROGRAM_STATUS,
+            Self::ProgramStatusCleared { .. } => msg_type::PROGRAM_STATUS_CLEARED,
             Self::CommandStarted(_) => msg_type::COMMAND_STARTED,
             Self::CommandFinished(_) => msg_type::COMMAND_FINISHED,
             Self::CwdChanged { .. } => msg_type::CWD_CHANGED,
@@ -1155,6 +1165,7 @@ impl BrokerMsg {
                 w.opt(percent.as_ref(), |w, p| w.u8(*p));
             }
             Self::ProgramStatus(record) => record.encode(w),
+            Self::ProgramStatusCleared { id } => w.str(id),
             Self::CommandStarted(record) | Self::CommandFinished(record) => record.encode(w),
             Self::CwdChanged { cwd } => w.str(cwd),
             Self::Exited { exit_code, signal } => {
@@ -1275,6 +1286,7 @@ impl BrokerMsg {
                 Self::Progress { state, percent }
             }
             msg_type::PROGRAM_STATUS => Self::ProgramStatus(Box::new(StatusRecord::decode(&mut r)?)),
+            msg_type::PROGRAM_STATUS_CLEARED => Self::ProgramStatusCleared { id: r.str()? },
             msg_type::COMMAND_STARTED => Self::CommandStarted(Box::new(CommandRecord::decode(&mut r)?)),
             msg_type::COMMAND_FINISHED => Self::CommandFinished(Box::new(CommandRecord::decode(&mut r)?)),
             msg_type::CWD_CHANGED => Self::CwdChanged { cwd: r.str()? },

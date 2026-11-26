@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
 use std::io;
 #[cfg(unix)]
-use std::io::{IoSlice, Read, Write};
+use std::io::{IoSlice, Read};
 #[cfg(windows)]
 use std::sync::Condvar;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,12 +45,17 @@ use crate::fill_random;
 use crate::shard::{ReactorEvent, ShardCmd, ShardHandle, ShardShared, spawn_shard};
 #[cfg(windows)]
 use crate::transport_windows::{
-    WinConnHandle, WinTransportEvent, WinWriteMsg, is_graceful_win_close, spawn_win_accept_thread, wait_for_win_wake,
+    DrainingWinConn, MAX_WIN_EVENTS_PER_TURN, WIN_EVENT_CHANNEL_CAP, WinConnHandle, WinTransportEvent,
+    spawn_win_accept_thread, wait_for_win_wake,
 };
 use crate::{engine_abi_hash, now_unix_ms};
 
 /// Hard cap on simultaneous client connections accepted by the broker.
 pub(crate) const MAX_CONNECTIONS: usize = 1024;
+
+/// Maximum wall-clock duration a closing connection may remain in the non-blocking tail drain
+/// set while flushing final replies before being forcibly closed.
+pub(crate) const GRACEFUL_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[cfg(unix)]
 const LISTENER_TOKEN: PollToken = PollToken(0);
@@ -139,7 +144,7 @@ pub(crate) fn compute_shutdown_deadline(now: Instant, kill_escalate_after: Durat
     now + kill_escalate_after + Duration::from_secs(5)
 }
 
-/// Returns `true` once explicit shutdown has drained all sessions or exceeded its hard deadline.
+/// Returns `true` once explicit shutdown has drained all sessions & in-flight spawns, or exceeded its deadline.
 pub(crate) fn reactor_should_exit(
     shutting_down: bool,
     sessions_empty: bool,
@@ -147,6 +152,22 @@ pub(crate) fn reactor_should_exit(
     deadline: Option<Instant>,
 ) -> bool {
     shutting_down && (sessions_empty || deadline.is_some_and(|dl| now >= dl))
+}
+
+pub(crate) fn all_sessions_drained(sessions_empty: bool, pending_spawns: usize) -> bool {
+    sessions_empty && pending_spawns == 0
+}
+
+pub(crate) fn should_graceful_drain_unix(reason: CloseReason, drained_len: usize, has_final: bool) -> bool {
+    matches!(reason, CloseReason::ClientFin) || drained_len != 0 || has_final
+}
+
+pub(crate) fn should_fast_poll(shutting_down: bool, has_draining: bool) -> bool {
+    shutting_down || has_draining
+}
+
+pub(crate) fn drain_deadline_expired(now: Instant, deadline: Instant) -> bool {
+    now >= deadline
 }
 
 /// Returns `true` when a newly accepted Unix socket satisfies shutdown, capacity, peer, and mode checks.
@@ -180,6 +201,40 @@ pub(crate) struct PendingList {
     pub(crate) req_id: RequestId,
     pub(crate) remaining_shards: usize,
     pub(crate) collected: Vec<SessionSummary>,
+}
+
+#[cfg(unix)]
+struct DrainingUnixConn {
+    stream: Stream,
+    write_queue: VecDeque<(Vec<u8>, usize)>,
+    deadline: Instant,
+}
+
+#[cfg(unix)]
+enum DrainProgress {
+    Done,
+    WouldBlock,
+    Closed,
+}
+
+#[cfg(unix)]
+fn drain_unix_queue_nonblocking(stream: &mut Stream, queue: &mut VecDeque<(Vec<u8>, usize)>) -> DrainProgress {
+    loop {
+        if queue.is_empty() {
+            return DrainProgress::Done;
+        }
+        let slices: Vec<IoSlice<'_>> =
+            queue.iter().take(MAX_WRITEV_IOVS).map(|(buf, off)| IoSlice::new(&buf[*off..])).collect();
+        match write_vectored_some(stream, &slices) {
+            Ok(0) => return DrainProgress::Closed,
+            Ok(written) => advance_write_queue(queue, written),
+            Err(err) => match classify_nonblocking_err(&err) {
+                NonBlockErr::WouldBlock => return DrainProgress::WouldBlock,
+                NonBlockErr::Interrupted => continue,
+                NonBlockErr::Fatal => return DrainProgress::Closed,
+            },
+        }
+    }
 }
 
 /// Per-connection stalled view frames awaiting `FramePacer` credit or outbound queue clearance
@@ -274,7 +329,7 @@ pub(crate) fn run_control_reactor(
     }
 
     #[cfg(windows)]
-    let (win_ev_tx, win_ev_rx) = mpsc::channel::<WinTransportEvent>();
+    let (win_ev_tx, win_ev_rx) = mpsc::sync_channel::<WinTransportEvent>(WIN_EVENT_CHANNEL_CAP);
     #[cfg(windows)]
     let listener = Arc::new(listener);
     #[cfg(windows)]
@@ -290,6 +345,7 @@ pub(crate) fn run_control_reactor(
         shards,
         image_store,
         conns: HashMap::new(),
+        flushing_conns: HashSet::new(),
         next_conn_id: 1,
         next_session_id: 1,
         next_list_id: 1,
@@ -311,11 +367,15 @@ pub(crate) fn run_control_reactor(
         #[cfg(unix)]
         token_to_conn: HashMap::new(),
         #[cfg(unix)]
+        draining_unix: HashMap::new(),
+        #[cfg(unix)]
         read_buf: vec![0u8; CONN_READ_BUF_BYTES],
         #[cfg(windows)]
         win_ev_tx,
         #[cfg(windows)]
         win_wake: wake_fn,
+        #[cfg(windows)]
+        draining_win: HashMap::new(),
     };
 
     #[cfg(unix)]
@@ -331,13 +391,27 @@ pub(crate) fn run_control_reactor(
             state.handle_shard_event(ev);
         }
 
-        // 2. Drain Windows transport events (if Windows).
+        // 2. Drain bounded Windows transport events (if Windows).
         #[cfg(windows)]
-        while let Ok(ev) = win_ev_rx.try_recv() {
-            state.handle_win_transport_event(ev);
+        let mut hit_win_event_cap = false;
+        #[cfg(windows)]
+        {
+            for _ in 0..MAX_WIN_EVENTS_PER_TURN {
+                match win_ev_rx.try_recv() {
+                    Ok(ev) => state.handle_win_transport_event(ev),
+                    Err(_) => break,
+                }
+            }
+            // If more transport events remain queued, spin immediately on the next turn without
+            // sleeping while still letting shard events and timers run first.
+            if let Ok(ev) = win_ev_rx.try_recv() {
+                state.handle_win_transport_event(ev);
+                hit_win_event_cap = true;
+            }
         }
 
-        // 3. Fire due BrokerCore timers (handshake timeouts, remote lease grace timers).
+        // 3. Fire due BrokerCore timers and reap expired draining connections.
+        state.reap_draining_conns();
         let now = TimestampMs::from_millis(now_unix_ms());
         let mut actions = Vec::new();
         state.core.poll_timers(now, &mut actions);
@@ -349,9 +423,10 @@ pub(crate) fn run_control_reactor(
         }
 
         // 5. Auto-exit when all clients disconnected, no broker lease holds us, and no sessions
-        //    or in-flight spawns remain.
+        //    or in-flight spawns remain (wait for draining final replies to finish first).
         if state.ever_connected
             && state.core.connection_count() == 0
+            && !state.has_draining_conns()
             && !state.core.has_active_broker_lease()
             && state.session_shard.is_empty()
             && state.pending_spawns == 0
@@ -363,13 +438,18 @@ pub(crate) fn run_control_reactor(
             break;
         }
 
-        let wait_for = reactor_wait_timeout(
+        #[cfg_attr(unix, allow(unused_mut))]
+        let mut wait_for = reactor_wait_timeout(
             state.core.next_deadline(),
             now,
             state.ever_connected,
             state.start_grace.saturating_sub(state.started_at.elapsed()),
-            state.shutting_down,
+            should_fast_poll(state.shutting_down, state.has_draining_conns()),
         );
+        #[cfg(windows)]
+        if hit_win_event_cap {
+            wait_for = Duration::ZERO;
+        }
 
         #[cfg(unix)]
         {
@@ -411,6 +491,7 @@ pub(crate) struct ReactorState {
     shards: Vec<ShardHandle>,
     image_store: Arc<Mutex<ImageStore>>,
     pub(crate) conns: HashMap<ConnId, ConnState>,
+    pub(crate) flushing_conns: HashSet<ConnId>,
     next_conn_id: u64,
     next_session_id: u64,
     next_list_id: u64,
@@ -432,16 +513,56 @@ pub(crate) struct ReactorState {
     #[cfg(unix)]
     token_to_conn: HashMap<PollToken, ConnId>,
     #[cfg(unix)]
+    draining_unix: HashMap<PollToken, DrainingUnixConn>,
+    #[cfg(unix)]
     read_buf: Vec<u8>,
     #[cfg(windows)]
-    pub(crate) win_ev_tx: mpsc::Sender<WinTransportEvent>,
+    pub(crate) win_ev_tx: mpsc::SyncSender<WinTransportEvent>,
     #[cfg(windows)]
     pub(crate) win_wake: Arc<dyn Fn() + Send + Sync>,
+    #[cfg(windows)]
+    pub(crate) draining_win: HashMap<ConnId, DrainingWinConn>,
 }
 
 impl ReactorState {
     fn should_exit(&self) -> bool {
-        reactor_should_exit(self.shutting_down, self.session_shard.is_empty(), Instant::now(), self.shutdown_deadline)
+        reactor_should_exit(
+            self.shutting_down,
+            all_sessions_drained(self.session_shard.is_empty(), self.pending_spawns),
+            Instant::now(),
+            self.shutdown_deadline,
+        )
+    }
+
+    fn has_draining_conns(&self) -> bool {
+        #[cfg(unix)]
+        {
+            !self.draining_unix.is_empty()
+        }
+        #[cfg(windows)]
+        {
+            self.has_draining_win()
+        }
+    }
+
+    fn reap_draining_conns(&mut self) {
+        #[cfg(unix)]
+        {
+            let now = Instant::now();
+            let expired: Vec<PollToken> = self
+                .draining_unix
+                .iter()
+                .filter_map(|(&tok, d)| if drain_deadline_expired(now, d.deadline) { Some(tok) } else { None })
+                .collect();
+            for tok in expired {
+                if let Some(d) = self.draining_unix.remove(&tok) {
+                    let _ = self.poller.deregister(tok);
+                    let _ = hang_up(&d.stream);
+                }
+            }
+        }
+        #[cfg(windows)]
+        self.reap_draining_win_conns();
     }
 
     fn begin_shutdown(&mut self) {
@@ -452,6 +573,16 @@ impl ReactorState {
         #[cfg(unix)]
         {
             let _ = self.poller.deregister(LISTENER_TOKEN);
+            for (tok, d) in self.draining_unix.drain() {
+                let _ = self.poller.deregister(tok);
+                let _ = hang_up(&d.stream);
+            }
+        }
+        #[cfg(windows)]
+        {
+            for (_, d) in self.draining_win.drain() {
+                (d.win.close_abrupt)();
+            }
         }
         // Terminate ALL sessions (kept and non-kept alike) so explicit shutdown never deadlocks.
         for shard in &self.shards {
@@ -460,7 +591,7 @@ impl ReactorState {
         // Close all open client connections cleanly.
         let cids: Vec<ConnId> = self.conns.keys().copied().collect();
         for cid in cids {
-            self.close_conn_transport(cid, false);
+            self.close_conn_transport(cid);
         }
     }
 
@@ -502,6 +633,10 @@ impl ReactorState {
                 self.accept_unix_connections();
                 continue;
             }
+            if self.draining_unix.contains_key(&ev.token) {
+                self.poll_draining_unix(ev.token);
+                continue;
+            }
             let Some(&conn) = self.token_to_conn.get(&ev.token) else {
                 continue;
             };
@@ -511,6 +646,21 @@ impl ReactorState {
             if ev.readable || ev.hangup {
                 self.read_unix_conn(conn);
             }
+        }
+    }
+
+    #[cfg(unix)]
+    fn poll_draining_unix(&mut self, token: PollToken) {
+        let done = match self.draining_unix.get_mut(&token) {
+            Some(d) => match drain_unix_queue_nonblocking(&mut d.stream, &mut d.write_queue) {
+                DrainProgress::Done | DrainProgress::Closed => true,
+                DrainProgress::WouldBlock => drain_deadline_expired(Instant::now(), d.deadline),
+            },
+            None => false,
+        };
+        if done && let Some(d) = self.draining_unix.remove(&token) {
+            let _ = self.poller.deregister(token);
+            drop(d.stream);
         }
     }
 
@@ -604,6 +754,15 @@ impl ReactorState {
 
     #[cfg(unix)]
     fn flush_unix_writes(&mut self, conn: ConnId) {
+        if !self.flushing_conns.insert(conn) {
+            return;
+        }
+        self.flush_unix_writes_inner(conn);
+        self.flushing_conns.remove(&conn);
+    }
+
+    #[cfg(unix)]
+    fn flush_unix_writes_inner(&mut self, conn: ConnId) {
         loop {
             // Pull outbound messages up to a bounded watermark so excess data stays in `BrokerCore`
             // where 5-tier priority + WFQ and the 16 MiB `SlowReader` limit are enforced.
@@ -613,19 +772,25 @@ impl ReactorState {
                     break;
                 };
                 let is_frame = matches!(queued.msg, BrokerMsg::Frame(_));
-                if is_frame
+                let drained_frame = if is_frame
                     && let Some(nz) = NonZeroStreamId::new(queued.stream_id.raw())
                     && let Some(session_id) = self.conns.get_mut(&conn).and_then(|c| c.queued_frame_streams.remove(&nz))
                 {
-                    self.on_outbound_frame_drained(conn, nz, session_id);
-                }
+                    Some((nz, session_id))
+                } else {
+                    None
+                };
                 let mut encoded = Vec::with_capacity(queued.encoded_bytes);
-                if queued.msg.encode_to_frame(queued.stream_id, queued.req_id, &mut encoded).is_err() {
-                    continue;
-                }
-                if let Some(c) = self.conns.get_mut(&conn) {
+                if queued.msg.encode_to_frame(queued.stream_id, queued.req_id, &mut encoded).is_ok()
+                    && let Some(c) = self.conns.get_mut(&conn)
+                {
                     c.write_queue_bytes = c.write_queue_bytes.saturating_add(encoded.len());
                     c.write_queue.push_back((encoded, 0));
+                }
+                // Release the frame slot and retry stalled frames STRICTLY AFTER pushing `encoded`
+                // onto `c.write_queue` so subsequent frames can never overtake this one.
+                if let Some((nz, session_id)) = drained_frame {
+                    self.on_outbound_frame_drained(conn, nz, session_id);
                 }
                 let ready_stalled = self
                     .conns
@@ -736,7 +901,7 @@ impl ReactorState {
     }
 
     pub(crate) fn on_transport_closed(&mut self, conn: ConnId) {
-        self.close_conn_transport(conn, false);
+        self.close_conn_transport(conn);
         let now = TimestampMs::from_millis(now_unix_ms());
         let mut actions = Vec::new();
         self.core.close_connection(conn, CloseReason::TransportClosed, now, &mut actions);
@@ -748,24 +913,19 @@ impl ReactorState {
         self.execute_actions(actions, now);
     }
 
-    fn close_conn_transport(&mut self, conn: ConnId, graceful: bool) {
+    fn close_conn_transport(&mut self, conn: ConnId) {
         let Some(c) = self.conns.remove(&conn) else {
             return;
         };
         #[cfg(unix)]
         {
-            let _ = graceful;
             let _ = self.poller.deregister(c.token);
             self.token_to_conn.remove(&c.token);
             let _ = hang_up(&c.stream);
         }
         #[cfg(windows)]
         {
-            if graceful {
-                (c.win.close_graceful)();
-            } else {
-                (c.win.close_abrupt)();
-            }
+            (c.win.close_abrupt)();
         }
     }
 
@@ -837,36 +997,48 @@ impl ReactorState {
                 BrokerAction::OutboundReady(conn) => {
                     self.flush_writes(conn);
                 }
-                BrokerAction::CloseConn { conn, reason, final_error } => {
-                    let has_final = final_error.is_some();
-                    if let Some((stream_id, req_id, msg)) = final_error {
-                        let mut encoded = Vec::new();
-                        if msg.encode_to_frame(stream_id, req_id, &mut encoded).is_ok() {
-                            #[cfg(unix)]
-                            {
-                                // Flush pending frames first; only write final_error directly if
-                                // write_queue is empty so we never splice mid-frame!
-                                self.flush_unix_writes(conn);
-                                if let Some(c) = self.conns.get_mut(&conn)
-                                    && c.write_queue.is_empty()
-                                {
-                                    let _ = c.stream.write_all(&encoded);
-                                }
+                BrokerAction::CloseConn { conn, reason, final_error, drained } => {
+                    #[cfg(unix)]
+                    if let Some(mut c) = self.conns.remove(&conn) {
+                        self.token_to_conn.remove(&c.token);
+                        let want_graceful = should_graceful_drain_unix(reason, drained.len(), final_error.is_some());
+                        for queued in drained {
+                            let mut encoded = Vec::with_capacity(queued.encoded_bytes);
+                            if queued.msg.encode_to_frame(queued.stream_id, queued.req_id, &mut encoded).is_ok() {
+                                c.write_queue.push_back((encoded, 0));
                             }
-                            #[cfg(windows)]
-                            if let Some(c) = self.conns.get(&conn) {
-                                let _ = c.win.tx.try_send(WinWriteMsg::Bytes(encoded));
+                        }
+                        if let Some((stream_id, req_id, msg)) = final_error {
+                            let mut encoded = Vec::new();
+                            if msg.encode_to_frame(stream_id, req_id, &mut encoded).is_ok() {
+                                c.write_queue.push_back((encoded, 0));
                             }
+                        }
+                        if want_graceful {
+                            if matches!(
+                                drain_unix_queue_nonblocking(&mut c.stream, &mut c.write_queue),
+                                DrainProgress::WouldBlock
+                            ) {
+                                let _ = self.poller.modify(c.token, Interest::WRITE);
+                                self.draining_unix.insert(
+                                    c.token,
+                                    DrainingUnixConn {
+                                        stream: c.stream,
+                                        write_queue: c.write_queue,
+                                        deadline: Instant::now() + GRACEFUL_DRAIN_TIMEOUT,
+                                    },
+                                );
+                            } else {
+                                let _ = self.poller.deregister(c.token);
+                                drop(c.stream);
+                            }
+                        } else {
+                            let _ = self.poller.deregister(c.token);
+                            let _ = hang_up(&c.stream);
                         }
                     }
                     #[cfg(windows)]
-                    let graceful = is_graceful_win_close(reason, has_final);
-                    #[cfg(not(windows))]
-                    let graceful = {
-                        let _ = has_final;
-                        false
-                    };
-                    self.close_conn_transport(conn, graceful);
+                    self.begin_win_close(conn, reason, drained, final_error);
                     let mut close_actions = Vec::new();
                     self.core.close_connection(conn, reason, now, &mut close_actions);
                     for shard in &self.shards {
@@ -971,13 +1143,14 @@ impl ReactorState {
                         });
                     }
                 }
-                BrokerAction::FrameCreditUpdated { conn, stream_id, session, .. } => {
-                    // Retry any stalled frame for `(conn, stream_id)`; otherwise notify shard slot is free.
+                BrokerAction::FrameCreditUpdated { conn, stream_id, .. } => {
+                    // Retry any stalled frame parked on the reactor for `(conn, stream_id)`.
+                    // Never mint a `ViewSlotFree` token here: the shard's 1-slot token is
+                    // released strictly when an outbound frame drains in `on_outbound_frame_drained`
+                    // (or on initial `Attach`), preventing duplicate in-flight frames!
                     let stalled = self.conns.get_mut(&conn).and_then(|c| c.stalled_frames.remove(&stream_id));
                     if let Some((sid, frame)) = stalled {
                         self.try_publish_or_stall_frame(conn, stream_id, sid, frame, now);
-                    } else if let Some(&shard_idx) = self.session_shard.get(&session) {
-                        self.shards[shard_idx].send(ShardCmd::ViewSlotFree { session_id: session, conn, stream_id });
                     }
                 }
                 BrokerAction::SetPtyPaused { session, paused } => {

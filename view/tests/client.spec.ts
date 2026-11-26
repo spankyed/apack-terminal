@@ -257,6 +257,47 @@ describe('TerminalClient & BrokerSessionSource', () => {
       expect(lastAck.msg.credit.maxFrames).toBe(0)
     }
 
+    // Attaching hidden (`visible: false`, so initialFrameCredit.maxFrames === 0) and later becoming
+    // visible BEFORE frame 1 arrives must immediately grant credit via FrameAck(seq=0, maxFrames>0)!
+    const hiddenSource = await client.attachSession(30, {
+      flags: SubFlags.VIEW | SubFlags.EVENTS,
+      initialViewport: {
+        size: { cols: 80, rows: 24 },
+        cellPx: { width: 10, height: 20 },
+        visible: false,
+        focused: false,
+      },
+    })
+    const hiddenEvents: string[] = []
+    hiddenSource.subscribe({
+      onFrame: () => {},
+      onSearchMatches: () => {},
+      onSearchDelta: () => {},
+      onEvent: (ev) => hiddenEvents.push(ev.kind),
+    })
+    const acksBeforeReveal = pipe.sentToBroker.filter(
+      (m) => m.streamId === hiddenSource.streamId && m.msg.kind === 'frameAck',
+    ).length
+    hiddenSource.sendViewportHint({
+      size: { cols: 80, rows: 24 },
+      cellPx: { width: 10, height: 20 },
+      visible: true,
+      focused: true,
+    })
+    const revealAcks = pipe.sentToBroker.filter(
+      (m) => m.streamId === hiddenSource.streamId && m.msg.kind === 'frameAck',
+    )
+    expect(revealAcks.length).toBe(acksBeforeReveal + 1)
+    const revealAck = revealAcks.at(-1)!
+    if (revealAck.msg.kind === 'frameAck') {
+      expect(revealAck.msg.seq).toBe(0)
+      expect(revealAck.msg.credit.maxFrames).toBeGreaterThan(0)
+    }
+    // programStatusCleared forwards cleanly as a SessionEvent
+    pipe.pushBroker(hiddenSource.streamId, PUSH_REQ_ID, { kind: 'programStatusCleared', id: 'agent-1' })
+    expect(hiddenEvents).toContain('programStatusCleared')
+    hiddenSource.dispose()
+
     // Pipelined 64 KiB image blob reassembly
     const blob = await s1.getImageBlob(blobHash)
     expect(blob.encoding).toBe('png')

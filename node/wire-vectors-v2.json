@@ -82,6 +82,7 @@
     { "name": "notification", "streamId": 3, "msgType": 787, "reqId": 0, "hex": "1500000003000000130300000000054275696c6404446f6e65" },
     { "name": "progress", "streamId": 3, "msgType": 788, "reqId": 0, "hex": "0d00000003000000140300000000010143" },
     { "name": "program_status", "streamId": 3, "msgType": 789, "reqId": 0, "hex": "340000000300000015030000000000020100013201056167656e740107417070726f7665010a52756e2074657374733f03f4d395ffbc3100" },
+    { "name": "program_status_cleared", "streamId": 3, "msgType": 794, "reqId": 0, "hex": "12000000030000001a0300000000076167656e742d31" },
     { "name": "command_started", "streamId": 3, "msgType": 790, "reqId": 0, "hex": "37000000030000001603000000000c010a636172676f207465737401052f7265706f0180d095ffbc3101c4e395ffbc310100000000010a010b012a" },
     { "name": "command_finished", "streamId": 3, "msgType": 791, "reqId": 0, "hex": "37000000030000001703000000000c010a636172676f207465737401052f7265706f0180d095ffbc3101c4e395ffbc310100000000010a010b012a" },
     { "name": "cwd_changed", "streamId": 3, "msgType": 792, "reqId": 0, "hex": "1400000003000000180300000000092f7265706f2f737263" },

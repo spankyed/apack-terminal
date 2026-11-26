@@ -640,6 +640,7 @@ fn broker_handshake_mutual_auth_timeout_duplicate_conn_and_framing_errors() {
             conn: c,
             reason: CloseReason::HandshakeTimeout,
             final_error: Some((_, _, BrokerMsg::Error { code: ErrorCode::Handshake, .. })),
+            ..
         }) if *c == conn(1)
     ));
 
@@ -1328,4 +1329,177 @@ fn broker_leases_grace_expiry_multi_stream_backpressure_and_limits() {
     );
     let returned = tight.try_publish_frame(conn(1), nz_stream(1), sample_frame(), ts(3), &mut a2);
     assert!(returned.is_err());
+}
+
+#[test]
+fn broker_fin_drain_filters_frames_and_oversized_messages_enforced() {
+    use crate::broker::MAX_WIRE_FRAME_BYTES;
+
+    let mut broker = BrokerCore::with_queue_cap(AuthConfig::None, 32 * 1024 * 1024);
+    broker.register_session(sid(1), false, false);
+    let mut actions = Vec::new();
+    broker.open_connection(conn(1), [1; 32], ts(0)).unwrap();
+    broker.feed_bytes(
+        conn(1),
+        &encode_client(
+            StreamId::CONTROL,
+            1,
+            &ClientMsg::Hello { protocol_version: PROTOCOL_VERSION, client_nonce: [0; 32], client_name: "c".into() },
+        ),
+        ts(1),
+        &mut actions,
+    );
+    let _ = broker.pop_outbound(conn(1));
+    broker.feed_bytes(
+        conn(1),
+        &encode_client(
+            StreamId::CONTROL,
+            2,
+            &ClientMsg::Attach {
+                session: sid(1),
+                stream_id: nz_stream(1),
+                flags: SubFlags::from_bits(SubFlags::VIEW).unwrap(),
+                initial_viewport: None,
+                initial_output_credit: 0,
+                initial_frame_credit: FrameCredit { max_frames: 4, max_bytes: 16 * 1024 * 1024 },
+            },
+        ),
+        ts(2),
+        &mut actions,
+    );
+    // 1. Oversized correlated enqueue_message -> ErrorCode::ResourceLimit; oversized PUSH -> dropped;
+    //    exact MAX_WIRE_FRAME_BYTES -> allowed!
+    let make_blob_msg = |data_len: usize| BrokerMsg::ImageBlobChunk {
+        blob: apack_proto::types::BlobHash([0; 32]),
+        encoding: apack_proto::types::ImageEncoding::Png,
+        total_bytes: data_len as u32,
+        offset: 0,
+        data: vec![0u8; data_len],
+    };
+    // Measure exact overhead of ImageBlobChunk so we construct exact MAX_WIRE_FRAME_BYTES and +1.
+    let probe_len = 8_000_000usize;
+    let probe = make_blob_msg(probe_len);
+    let mut w = apack_proto::codec::Writer::new();
+    probe.encode(&mut w);
+    let overhead = apack_proto::FRAME_HEADER_LEN + w.as_slice().len() - probe_len;
+    let exact_data = MAX_WIRE_FRAME_BYTES - overhead;
+
+    actions.clear();
+    broker.enqueue_message(
+        conn(1),
+        StreamId::CONTROL,
+        RequestId::from_raw(10),
+        OutboundPriority::Bulk,
+        make_blob_msg(exact_data),
+        ts(3),
+        &mut actions,
+    );
+    let exact_pop = broker.pop_outbound(conn(1)).expect("exact boundary must enqueue");
+    assert_eq!(exact_pop.req_id, RequestId::from_raw(10));
+    assert!(matches!(exact_pop.msg, BrokerMsg::ImageBlobChunk { .. }));
+
+    // exact_data + 1 correlated -> ResourceLimit error
+    actions.clear();
+    broker.enqueue_message(
+        conn(1),
+        StreamId::CONTROL,
+        RequestId::from_raw(11),
+        OutboundPriority::Bulk,
+        make_blob_msg(exact_data + 1),
+        ts(4),
+        &mut actions,
+    );
+    let over_pop = broker.pop_outbound(conn(1)).expect("correlated oversized converts to ResourceLimit");
+    assert_eq!(over_pop.req_id, RequestId::from_raw(11));
+    assert!(matches!(over_pop.msg, BrokerMsg::Error { code: ErrorCode::ResourceLimit, .. }));
+
+    // exact_data + 1 unsolicited PUSH -> dropped cleanly
+    actions.clear();
+    broker.enqueue_message(
+        conn(1),
+        StreamId::CONTROL,
+        RequestId::PUSH,
+        OutboundPriority::Bulk,
+        make_blob_msg(exact_data + 1),
+        ts(5),
+        &mut actions,
+    );
+    assert!(broker.pop_outbound(conn(1)).is_none(), "unsolicited oversized push must be dropped");
+
+    // 2. try_publish_frame rejects > MAX_WIRE_FRAME_BYTES and admits exact MAX_WIRE_FRAME_BYTES
+    let mut huge_frame = sample_frame();
+    huge_frame.rows.push(apack_proto::types::PackedRow {
+        line: 0,
+        flags: 0,
+        text: "x".repeat(apack_proto::MAX_FRAME_PAYLOAD),
+        runs: Vec::new(),
+        styles: Vec::new(),
+        links: Vec::new(),
+        pieces: Vec::new(),
+    });
+    assert!(broker.try_publish_frame(conn(1), nz_stream(1), huge_frame, ts(6), &mut actions).is_err());
+
+    // Construct a frame whose encoded_bytes == MAX_WIRE_FRAME_BYTES
+    let mut probe_f = sample_frame();
+    probe_f.seq = 1;
+    let base_text = 8_000_000usize;
+    probe_f.rows.push(apack_proto::types::PackedRow {
+        line: 0,
+        flags: 0,
+        text: "a".repeat(base_text),
+        runs: Vec::new(),
+        styles: Vec::new(),
+        links: Vec::new(),
+        pieces: Vec::new(),
+    });
+    let mut wf = apack_proto::codec::Writer::new();
+    BrokerMsg::Frame(probe_f.clone()).encode(&mut wf);
+    let f_overhead = apack_proto::FRAME_HEADER_LEN + wf.as_slice().len() - base_text;
+    let exact_text = MAX_WIRE_FRAME_BYTES - f_overhead;
+    probe_f.rows[0].text = "a".repeat(exact_text);
+    assert!(broker.try_publish_frame(conn(1), nz_stream(1), probe_f, ts(7), &mut actions).is_ok());
+
+    // 3. ClientFin drains queued ordered replies while dropping queued Frame!
+    broker.enqueue_message(
+        conn(1),
+        StreamId::CONTROL,
+        RequestId::from_raw(12),
+        OutboundPriority::Control,
+        BrokerMsg::Ok,
+        ts(8),
+        &mut actions,
+    );
+    actions.clear();
+    broker.close_connection(conn(1), CloseReason::ClientFin, ts(9), &mut actions);
+    let drained = actions
+        .iter()
+        .find_map(|a| match a {
+            BrokerAction::CloseConn { reason: CloseReason::ClientFin, drained, .. } => Some(drained),
+            _ => None,
+        })
+        .expect("CloseConn for ClientFin");
+    assert_eq!(drained.len(), 1, "ClientFin must drain ordered Ok and drop conflatable Frame");
+    assert!(matches!(drained[0].msg, BrokerMsg::Ok));
+
+    // 4. Non-ClientFin close (SlowReader) must NOT drain queued replies!
+    broker.open_connection(conn(2), [2; 32], ts(10)).unwrap();
+    broker.enqueue_message(
+        conn(2),
+        StreamId::CONTROL,
+        RequestId::from_raw(13),
+        OutboundPriority::Control,
+        BrokerMsg::Ok,
+        ts(11),
+        &mut actions,
+    );
+    actions.clear();
+    broker.close_connection(conn(2), CloseReason::SlowReader, ts(12), &mut actions);
+    let slow_drained = actions
+        .iter()
+        .find_map(|a| match a {
+            BrokerAction::CloseConn { reason: CloseReason::SlowReader, drained, .. } => Some(drained),
+            _ => None,
+        })
+        .expect("CloseConn for SlowReader");
+    assert!(slow_drained.is_empty(), "SlowReader must not drain queued replies");
 }

@@ -389,20 +389,23 @@ impl VtEngine for MockVt {
         Some(CellSpan { start: CellPos { line, col: 0 }, end: CellPos { line, col: end_col } })
     }
 
-    fn text_of(&self, span: CellSpan) -> String {
+    fn text_of(&self, span: CellSpan, max_bytes: usize) -> String {
         let meta = self.meta();
         let oldest = meta.oldest_line();
         let Some(max_line) = meta.total_lines().checked_sub(1) else {
             return String::new();
         };
-        if span.end.line < oldest || span.start.line > max_line {
+        if span.end.line < oldest || span.start.line > max_line || max_bytes == 0 {
             return String::new();
         }
         let start_line = span.start.line.max(oldest);
         let end_line = span.end.line.min(max_line);
         let mut out = String::new();
-        for line in start_line..=end_line {
+        'lines: for line in start_line..=end_line {
             if line > start_line {
+                if out.len() + 1 > max_bytes {
+                    break;
+                }
                 out.push('\n');
             }
             if let Some(text) = self.line_text(line) {
@@ -415,6 +418,9 @@ impl VtEngine for MockVt {
                 };
                 if lo < chars.len() && lo <= hi {
                     for &c in &chars[lo..=hi] {
+                        if out.len() + c.len_utf8() > max_bytes {
+                            break 'lines;
+                        }
                         out.push(c);
                     }
                 }
@@ -423,13 +429,13 @@ impl VtEngine for MockVt {
         out
     }
 
-    fn text_of_rect(&self, span: CellSpan) -> String {
+    fn text_of_rect(&self, span: CellSpan, max_bytes: usize) -> String {
         let meta = self.meta();
         let oldest = meta.oldest_line();
         let Some(max_line) = meta.total_lines().checked_sub(1) else {
             return String::new();
         };
-        if span.end.line < oldest || span.start.line > max_line {
+        if span.end.line < oldest || span.start.line > max_line || max_bytes == 0 {
             return String::new();
         }
         let start_line = span.start.line.max(oldest);
@@ -437,8 +443,11 @@ impl VtEngine for MockVt {
         let lo = usize::from(span.start.col.min(span.end.col));
         let hi = usize::from(span.start.col.max(span.end.col));
         let mut out = String::new();
-        for line in start_line..=end_line {
+        'lines: for line in start_line..=end_line {
             if line > start_line {
+                if out.len() + 1 > max_bytes {
+                    break;
+                }
                 out.push('\n');
             }
             if let Some(text) = self.line_text(line) {
@@ -446,6 +455,9 @@ impl VtEngine for MockVt {
                 if lo < chars.len() {
                     let end = hi.min(chars.len() - 1);
                     for &c in &chars[lo..=end] {
+                        if out.len() + c.len_utf8() > max_bytes {
+                            break 'lines;
+                        }
                         out.push(c);
                     }
                 }
@@ -463,12 +475,13 @@ impl VtEngine for MockVt {
         limit: usize,
         out: &mut Vec<CellSpan>,
     ) -> bool {
-        if needle.is_empty() || from_line >= to_line {
+        let clamped_from = from_line.max(self.meta().oldest_line());
+        if needle.is_empty() || clamped_from >= to_line {
             return false;
         }
         let needle_cmp = if case_sensitive { String::from(needle) } else { needle.to_lowercase() };
         let needle_chars = needle_cmp.chars().count();
-        for line in from_line..to_line {
+        for line in clamped_from..to_line {
             let Some(raw) = self.line_text(line) else {
                 break;
             };

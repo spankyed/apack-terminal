@@ -1664,7 +1664,7 @@ impl WaitCondition {
         match r.u8()? {
             0 => Ok(Self::Idle),
             1 => {
-                let needle = r.str()?;
+                let needle = r.str_bounded(crate::MAX_SEARCH_NEEDLE_BYTES, "wait text needle")?;
                 if needle.is_empty() {
                     return Err(WireError::InvalidValue("wait text needle must be non-empty"));
                 }

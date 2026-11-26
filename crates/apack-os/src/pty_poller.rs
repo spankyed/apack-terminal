@@ -218,8 +218,10 @@ impl PollPoller {
             self.scratch_tokens.push(token);
         }
 
-        let timeout_ms = duration_to_poll_timeout_ms(timeout);
+        let deadline = timeout.map(|d| std::time::Instant::now() + d);
         loop {
+            let remaining = deadline.map(|dl| dl.saturating_duration_since(std::time::Instant::now()));
+            let timeout_ms = duration_to_poll_timeout_ms(remaining);
             // SAFETY: `scratch_fds` is a contiguous initialized array of `libc::pollfd` with
             // length `scratch_fds.len()`.
             let rc = unsafe {

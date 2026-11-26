@@ -26,13 +26,16 @@ pub const MAX_TREE_DEPTH: usize = 64;
 pub struct KillTarget(i32);
 
 impl KillTarget {
-    /// Constructs a [`KillTarget`], refusing broadcast targets (`0`, `-1`) and `i32::MIN`.
+    /// Constructs a [`KillTarget`], refusing broadcast targets (`0`, `-1`), init (`1`), and `i32::MIN`.
     pub fn at(target: i32) -> Result<Self, OsError> {
         if target == 0 {
             return Err(OsError::InvalidTarget("pid 0 targets every process in this broker's own group".to_owned()));
         }
         if target == -1 {
             return Err(OsError::InvalidTarget("pid -1 targets every process the user owns".to_owned()));
+        }
+        if target == 1 {
+            return Err(OsError::InvalidTarget("pid 1 is init and is not a signalable session process".to_owned()));
         }
         if target == i32::MIN {
             return Err(OsError::InvalidTarget("i32::MIN is not a valid signal target".to_owned()));

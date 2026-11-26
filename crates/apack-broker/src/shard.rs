@@ -49,7 +49,7 @@ use apack_wal::{
 
 use crate::config::AUTH_KEY_ENV;
 #[cfg(windows)]
-use crate::shard_windows::{drain_windows_pty_writes, wait_for_win_mailbox};
+use crate::shard_windows::{clamp_win_write_timeout, drain_windows_pty_writes, maybe_wait_win_mailbox};
 use crate::{fill_random, now_unix_ms};
 
 /// Per-session PTY read cap per shard turn (`256 KiB`) preventing one flood from starving siblings.
@@ -532,6 +532,7 @@ pub fn spawn_shard(
             write_scratch: Vec::new(),
             total_pty_bytes: 0,
             running: true,
+            tearing_down_all: false,
         };
         runner.run();
     })?;
@@ -541,7 +542,7 @@ pub fn spawn_shard(
 
 pub(crate) enum LivePty {
     #[cfg(unix)]
-    Unix { master: PtyMaster, token: PollToken, eof: bool },
+    Unix { master: PtyMaster, token: PollToken, eof: bool, write_broken: bool },
     #[cfg(windows)]
     Windows { bridge: ConPtyBridge, eof: bool },
 }
@@ -557,6 +558,7 @@ pub(crate) struct LiveSession {
     rewound: bool,
     created_ms: u64,
     wal: Option<WalHandle>,
+    pending_wal_rollover: bool,
     rewind_reader: Option<WalReader>,
     rewind_at_ms: u64,
     last_activity: Instant,
@@ -572,7 +574,7 @@ pub(crate) struct LiveSession {
 }
 
 impl LiveSession {
-    fn is_pty_paused(&self) -> bool {
+    pub(crate) fn is_pty_paused(&self) -> bool {
         self.paused_by_stream || self.paused_by_raw_flow
     }
 
@@ -623,6 +625,7 @@ pub(crate) struct ShardRunner {
     write_scratch: Vec<u8>,
     total_pty_bytes: u64,
     running: bool,
+    tearing_down_all: bool,
 }
 
 impl ShardRunner {
@@ -639,7 +642,7 @@ impl ShardRunner {
 
             // Tier 1: Drain ready PTY output (round-robin, 256 KiB quantum per session) + PTY writes.
             #[cfg(windows)]
-            self.drain_windows_ptys();
+            let win_exhausted_quantum = self.drain_windows_ptys();
 
             // Tier 2: Session timers, child reap / kill escalation, cooperative idle compression.
             let now_ms = TimestampMs::from_millis(now_unix_ms());
@@ -665,6 +668,10 @@ impl ShardRunner {
                     sess.last_activity.elapsed(),
                     self.shared.idle_compress_after,
                 ));
+                #[cfg(windows)]
+                {
+                    timeout = clamp_win_write_timeout(timeout, sess.machine.pty_write_len());
+                }
             }
 
             // Wait until next PTY readiness, mailbox wakeup, or earliest deadline.
@@ -681,7 +688,7 @@ impl ShardRunner {
             }
 
             #[cfg(windows)]
-            wait_for_win_mailbox(&self.mailbox, &self.cond, timeout);
+            maybe_wait_win_mailbox(win_exhausted_quantum, &self.mailbox, &self.cond, timeout);
         }
 
         // Shutdown: tear down every remaining session cleanly, seal WALs, and stop fg worker.
@@ -820,6 +827,7 @@ impl ShardRunner {
                 }
             }
             ShardCmd::TeardownAll => {
+                self.tearing_down_all = true;
                 let victims: Vec<SessionId> = self.sessions.keys().copied().collect();
                 for id in victims {
                     self.initiate_session_termination(id);
@@ -847,6 +855,11 @@ impl ShardRunner {
     }
 
     fn handle_spawn(&mut self, session_id: SessionId, conn: ConnId, req_id: RequestId, spec: SpawnSpec) {
+        if self.tearing_down_all {
+            self.emit(ReactorEvent::SpawnOrRewindFailed);
+            self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Busy, "broker is shutting down");
+            return;
+        }
         if spec.image_files {
             self.emit(ReactorEvent::SpawnOrRewindFailed);
             self.send_error(
@@ -979,7 +992,7 @@ impl ShardRunner {
                 return;
             }
             self.token_to_session.insert(token, session_id);
-            LivePty::Unix { master: spawned.master, token, eof: false }
+            LivePty::Unix { master: spawned.master, token, eof: false, write_broken: false }
         };
 
         #[cfg(windows)]
@@ -1016,6 +1029,7 @@ impl ShardRunner {
                 rewound: false,
                 created_ms,
                 wal,
+                pending_wal_rollover: false,
                 rewind_reader: None,
                 rewind_at_ms: 0,
                 last_activity: Instant::now(),
@@ -1053,6 +1067,11 @@ impl ShardRunner {
         record_dir: &str,
         at_ms: Option<u64>,
     ) {
+        if self.tearing_down_all {
+            self.emit(ReactorEvent::SpawnOrRewindFailed);
+            self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Busy, "broker is shutting down");
+            return;
+        }
         let reader = match WalReader::open(record_dir, &self.shared.wal_registry) {
             Ok(r) => r,
             Err(err) => {
@@ -1095,13 +1114,13 @@ impl ShardRunner {
             }
         };
 
-        apply_seek_slice(&mut engine, &slice, &self.shared.engine_abi_hash);
+        let effective_cell_px = apply_seek_slice(&mut engine, &slice, &self.shared.engine_abi_hash);
         let machine = SessionMachine::new(
             session_id,
             engine,
             ResizePolicy::ExplicitOverride,
             MarksMode::Claimed,
-            slice.keyframe.visual.cell_px,
+            effective_cell_px,
         );
         let actual_offset_ms = target_ms.saturating_sub(first_ms);
 
@@ -1118,6 +1137,7 @@ impl ShardRunner {
                 rewound: true,
                 created_ms: reader.meta().created_ms,
                 wal: None,
+                pending_wal_rollover: false,
                 rewind_reader: Some(reader),
                 rewind_at_ms: actual_offset_ms,
                 last_activity: Instant::now(),
@@ -1190,9 +1210,9 @@ impl ShardRunner {
                 return;
             }
         };
-        apply_seek_slice(&mut fresh_engine, &slice, &self.shared.engine_abi_hash);
+        let effective_cell_px = apply_seek_slice(&mut fresh_engine, &slice, &self.shared.engine_abi_hash);
         *sess.machine.vt_mut() = fresh_engine;
-        sess.machine.sync_vt_geometry(slice.keyframe.visual.cell_px);
+        sess.machine.sync_vt_geometry(effective_cell_px);
         sess.machine.mark_all_views_full_sync();
         let actual_offset_ms = target_ms.saturating_sub(first_ms);
         sess.rewind_at_ms = actual_offset_ms;
@@ -1491,7 +1511,6 @@ impl ShardRunner {
         self.total_pty_bytes = self.total_pty_bytes.saturating_add(bytes.len() as u64);
         let now_ms = now_unix_ms();
         let mut effects = Vec::new();
-        let mut need_rollover = false;
         let mut has_raw_subs = false;
 
         if let Some(sess) = self.sessions.get_mut(&session_id) {
@@ -1502,13 +1521,15 @@ impl ShardRunner {
             let at_ground = sess.machine.vt().at_ground();
             if let Some(wal) = &sess.wal {
                 let _ = wal.write_output(now_ms, bytes.to_vec(), at_ground);
-                if at_ground && wal.take_rollover_needed() {
-                    need_rollover = true;
+                if wal.take_rollover_needed() {
+                    sess.pending_wal_rollover = true;
                 }
-            }
-            if need_rollover && let Some(wal) = &sess.wal {
-                let kf = capture_keyframe(&sess.machine, &self.shared.engine_abi_hash);
-                let _ = wal.start_segment(now_ms, kf);
+                if at_ground && sess.pending_wal_rollover {
+                    let kf = capture_keyframe(&sess.machine, &self.shared.engine_abi_hash);
+                    if wal.start_segment(now_ms, kf) {
+                        sess.pending_wal_rollover = false;
+                    }
+                }
             }
         }
         if has_raw_subs {
@@ -1523,19 +1544,31 @@ impl ShardRunner {
         };
         #[cfg(unix)]
         {
+            let mut hit_write_err = false;
             while sess.machine.pty_write_len() != 0 {
                 sess.machine.peek_pty_write(PTY_WRITE_CHUNK_BYTES, &mut self.write_scratch);
                 let written = match &sess.pty {
-                    Some(LivePty::Unix { master, eof: false, .. }) => master.write_nonblocking(&self.write_scratch),
+                    Some(LivePty::Unix { master, eof: false, write_broken: false, .. }) => {
+                        master.write_nonblocking(&self.write_scratch)
+                    }
                     _ => break,
                 };
                 match written {
                     Ok(0) => break, // EAGAIN -> arm writable interest below
                     Ok(n) => sess.machine.consume_pty_write(n),
-                    Err(_) => break,
+                    Err(_) => {
+                        if let Some(LivePty::Unix { write_broken, .. }) = sess.pty.as_mut() {
+                            *write_broken = true;
+                        }
+                        hit_write_err = true;
+                        break;
+                    }
                 }
             }
             self.sync_pty_interest(session_id);
+            if hit_write_err {
+                self.try_reap_session(session_id);
+            }
         }
         #[cfg(windows)]
         drain_windows_pty_writes(sess);
@@ -1547,9 +1580,8 @@ impl ShardRunner {
             let Some(sess) = self.sessions.get(&session_id) else {
                 return;
             };
-            if let Some(LivePty::Unix { token, eof: false, .. }) = &sess.pty {
-                let interest =
-                    Interest { readable: !sess.is_pty_paused(), writable: sess.machine.pty_write_len() != 0 };
+            if let Some(LivePty::Unix { token, eof: false, write_broken, .. }) = &sess.pty {
+                let interest = unix_pty_interest(sess.is_pty_paused(), *write_broken, sess.machine.pty_write_len());
                 let _ = self.poller.modify(*token, interest);
             }
         }
@@ -1715,6 +1747,12 @@ impl ShardRunner {
             if let Some(mut killer) = sess.killer.take() {
                 let _ = killer.kill();
             }
+            // Drop the master PTY fd BEFORE `child.wait()` so macOS/BSD kernel `ttydrain()`
+            // releases any child waiting for unread master bytes instead of wedging `wait()`.
+            sess.pty = None;
+            if let Some(mut child) = sess.child.take() {
+                let _ = child.wait();
+            }
             if let Some(wal) = sess.wal.take() {
                 let _ = wal.seal();
                 let _ = wal.shutdown();
@@ -1820,6 +1858,12 @@ pub(crate) fn drain_unix_pty_nonblocking(
     }
 }
 
+/// Computes Unix PTY `Interest` flags from pause state, broken-write latch, and queued input length.
+#[cfg(unix)]
+pub(crate) const fn unix_pty_interest(paused: bool, write_broken: bool, pending_writes: usize) -> Interest {
+    Interest { readable: !paused, writable: !write_broken && pending_writes != 0 }
+}
+
 /// Resolves `SpawnSpec::scrollback_limit` (`0` selects [`DEFAULT_SCROLLBACK_LINES`]).
 pub(crate) fn resolve_scrollback_lines(limit: u32) -> usize {
     if limit == 0 { DEFAULT_SCROLLBACK_LINES } else { limit as usize }
@@ -1916,9 +1960,14 @@ fn restore_engine_from_dir(
     Ok(())
 }
 
-pub(crate) fn apply_seek_slice(engine: &mut GhosttyEngine, slice: &apack_wal::SeekSlice, abi_hash: &[u8; 32]) {
+pub(crate) fn apply_seek_slice(
+    engine: &mut GhosttyEngine,
+    slice: &apack_wal::SeekSlice,
+    abi_hash: &[u8; 32],
+) -> apack_proto::types::CellPx {
     let mut events = Vec::new();
     let mut restored_lossless = false;
+    let mut effective_cell_px = slice.keyframe.visual.cell_px;
     if let Some(snap) = slice.keyframe.engine_snapshot_if_compatible(abi_hash)
         && engine.restore_snapshot(snap).is_ok()
     {
@@ -1941,10 +1990,14 @@ pub(crate) fn apply_seek_slice(engine: &mut GhosttyEngine, slice: &apack_wal::Se
         events.clear();
         match &timed.record {
             WalRecord::Output(bytes) => engine.feed(bytes, &mut events),
-            WalRecord::Resize { size, cell_px } => engine.resize(*size, *cell_px, &mut events),
+            WalRecord::Resize { size, cell_px } => {
+                effective_cell_px = *cell_px;
+                engine.resize(*size, *cell_px, &mut events);
+            }
             WalRecord::Keyframe(_) | WalRecord::Marks { .. } | WalRecord::Gap { .. } => {}
         }
     }
+    effective_cell_px
 }
 
 pub(crate) fn parse_exit_status(status: &portable_pty::ExitStatus) -> (Option<i32>, Option<String>) {

@@ -176,8 +176,13 @@ Recordings live in an owner-private directory (`0o700` on Unix, symlink-refused)
   and mode `0o700` (world/group-writable directories like `/tmp` are refused). Socket permissions are `0o600`,
   and both broker and client verify peer UID via `SO_PEERCRED` / `getpeereid`.
 - **Windows named pipes (`crates/apack-os/src/security.rs`, `security_windows.rs`, `transport_windows.rs`):**
-  Protected SDDL DACL (`O:{sid}D:P(A;;GA;;;{sid})(A;;GA;;;SY)`) plus client-side owner SID verification
-  (`owned_by_this_user`) before sending a byte ([windows-pipe-access.md](windows-pipe-access.md)).
+  Protected SDDL DACL (`O:{sid}D:P(A;;GA;;;{sid})(A;;GA;;;SY)`), server-side client PID SID verification
+  (`verify_client_is_current_user` via `GetNamedPipeClientProcessId` → `OpenProcess` → `GetTokenInformation`),
+  and client-side pipe owner SID verification (`owned_by_this_user`) before sending a byte ([windows-pipe-access.md](windows-pipe-access.md)).
+- **Graceful process shutdown (`crates/apack-os/src/transport.rs`, `crates/apack-broker/src/runtime.rs`):**
+  `BrokerServer::run` installs async-signal-safe `SIGINT`/`SIGTERM` handlers (self-pipe on Unix) and a
+  Windows `SetConsoleCtrlHandler` hook so operator termination triggers graceful `TeardownAll`, seals active
+  WAL segments, and removes the broker socket cleanly.
 - **Optional mutual HMAC-SHA256 authentication (`apack-core/src/auth.rs`, `apack-broker/src/config.rs`):**
   Local transport defaults to `AuthConfig::None` (relying on OS peer UID / pipe owner verification); setting
   `APACK_TERMINAL_AUTH_KEY` derives a 32-byte `AuthSecret` via SHA-256 and enforces the `Hello -> HelloOk -> AuthProof -> AuthOk`

@@ -132,4 +132,56 @@ describe('page-chunked RowStore', () => {
     // Furthest history pages evicted
     expect(store.row(firstActive - PAGE_LINES * 2)).toBeUndefined()
   })
+
+  it('invalidates scrolled-off active rows on fullSync and doubts them on incremental scroll', () => {
+    const store = new RowStore()
+    store.apply(
+      frame({
+        seq: 1,
+        epoch: 1,
+        firstActiveLine: 10,
+        scrollbackLines: 10,
+        size: { cols: 20, rows: 4 },
+        rows: [row(10, 'spinner-1'), row(11, 'spinner-2'), row(12, 'c'), row(13, 'd')],
+      }),
+    )
+
+    // Incremental scroll shifts lines 10..12 into history: kept visible (no blank flash) but doubted!
+    store.apply(
+      frame({
+        seq: 2,
+        epoch: 1,
+        firstActiveLine: 12,
+        scrollbackLines: 12,
+        scrollDelta: 2,
+        size: { cols: 20, rows: 4 },
+        fullSync: false,
+        rows: [row(14, 'e'), row(15, 'f')],
+      }),
+    )
+    expect(store.row(10)?.text).toBe('spinner-1')
+    expect(store.missing(10, 2)).toEqual([{ from: 10, count: 2 }])
+
+    // Absorbing authoritative history refreshes line 10 and clears line 11 when omitted (blank)
+    store.absorb(1, 10, 2, [row(10, 'done-1')])
+    expect(store.row(10)?.text).toBe('done-1')
+    expect(store.row(11)).toBeUndefined()
+    expect(store.missing(10, 2)).toEqual([])
+
+    // fullSync that jumps firstActive forward drops scrolled-off former-active rows immediately
+    store.apply(
+      frame({
+        seq: 3,
+        epoch: 1,
+        firstActiveLine: 15,
+        scrollbackLines: 15,
+        size: { cols: 20, rows: 4 },
+        fullSync: true,
+        rows: [row(15, 'fresh-15')],
+      }),
+    )
+    expect(store.row(12)).toBeUndefined()
+    expect(store.row(14)).toBeUndefined()
+    expect(store.row(15)?.text).toBe('fresh-15')
+  })
 })

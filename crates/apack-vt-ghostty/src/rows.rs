@@ -17,9 +17,6 @@ use crate::placeholders::{PLACEHOLDER, PlaceholderRun, Said, fit};
 /// packed with unique OSC 8 hyperlinks stays strictly encodable on the wire.
 pub const ROW_LINK_BYTES: usize = 64 * 1024;
 
-/// Maximum codepoints extracted for a single grapheme cluster cell.
-const CLUSTER_CODEPOINTS: usize = 16;
-
 /// Resolved Kitty virtual placement metadata for converting placeholder runs into [`ImagePiece`]s.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VirtualImageInfo {
@@ -173,22 +170,24 @@ pub(crate) fn extract_row(
             sys::CellContentTag::CODEPOINT if codepoint == u32::from(PLACEHOLDER) => {
                 push_placeholder(&mut placeholders, col, Said::of(&style, []));
                 row_flags |= PackedRow::FLAG_HAS_PLACEHOLDER;
+                // Placeholder cells encode image/placement IDs in fg/underline_color; strip them
+                // so no bogus colored/underlined/inverted space run is painted over the image.
+                style = PackedStyle { bg: style.bg, ..PackedStyle::default() };
             }
             sys::CellContentTag::CODEPOINT_GRAPHEME if codepoint == u32::from(PLACEHOLDER) => {
-                let mut cps = [0u32; CLUSTER_CODEPOINTS];
-                let mut written = 0usize;
-                // SAFETY: `cps` has length `CLUSTER_CODEPOINTS` matching the passed count.
-                let res = unsafe {
-                    sys::ghostty_grid_ref_graphemes(&raw const grid_ref, cps.as_mut_ptr(), cps.len(), &raw mut written)
+                let mut cps = Vec::new();
+                let marks: &[u32] = if crate::engine::read_grapheme_codepoints(&grid_ref, &mut cps) {
+                    &cps[1.min(cps.len())..]
+                } else {
+                    &[]
                 };
-                let marks =
-                    if res == sys::Result::SUCCESS { &cps[1.min(written)..written.min(cps.len())] } else { &[] };
                 push_placeholder(
                     &mut placeholders,
                     col,
                     Said::of(&style, marks.iter().filter_map(|&m| char::from_u32(m))),
                 );
                 row_flags |= PackedRow::FLAG_HAS_PLACEHOLDER;
+                style = PackedStyle { bg: style.bg, ..PackedStyle::default() };
             }
             sys::CellContentTag::CODEPOINT => {
                 if let Some(ch) = char::from_u32(codepoint).filter(|&c| c != '\0') {
@@ -197,14 +196,9 @@ pub(crate) fn extract_row(
             }
             sys::CellContentTag::CODEPOINT_GRAPHEME => {
                 is_grapheme = true;
-                let mut cps = [0u32; CLUSTER_CODEPOINTS];
-                let mut written = 0usize;
-                // SAFETY: `cps` has length `CLUSTER_CODEPOINTS` matching the passed count.
-                let res = unsafe {
-                    sys::ghostty_grid_ref_graphemes(&raw const grid_ref, cps.as_mut_ptr(), cps.len(), &raw mut written)
-                };
-                if res == sys::Result::SUCCESS {
-                    text.extend(cps[..written.min(cps.len())].iter().filter_map(|&c| char::from_u32(c)));
+                let mut cps = Vec::new();
+                if crate::engine::read_grapheme_codepoints(&grid_ref, &mut cps) {
+                    text.extend(cps.iter().filter_map(|&c| char::from_u32(c)));
                 } else if let Some(ch) = char::from_u32(codepoint) {
                     text.push(ch);
                 }

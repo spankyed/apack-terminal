@@ -347,18 +347,23 @@ export class Input {
     this.options.copy()
   }
 
-  private readonly focus = () => this.options.focused(true)
-  private readonly blur = () => {
-    // Keys let go while something else has the keyboard are never heard of again
+  /** Clears all transient keyboard/IME state (used on blur and unmount so remounting starts clean). */
+  reset(): void {
     this.down.clear()
     this.clearKeyText()
     if (this.composing) {
       this.composing = false
       this.field.style.opacity = '0'
       this.field.style.width = '1px'
-      this.field.value = ''
-      this.held = { start: 0, suffix: 0 }
     }
+    this.field.value = ''
+    this.held = { start: 0, suffix: 0 }
+  }
+
+  private readonly focus = () => this.options.focused(true)
+  private readonly blur = () => {
+    // Keys let go while something else has the keyboard are never heard of again
+    this.reset()
     this.options.focused(false)
   }
 }

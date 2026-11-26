@@ -86,24 +86,42 @@ pub(crate) fn verify_real_dir(dir: &Path) -> Result<(), WalError> {
     Ok(())
 }
 
-/// Opens `path` as a regular non-symlink file and reads up to `max_bytes` using a bounded handle.
-///
-/// Refuses symlinks, FIFOs/devices/directories, and files exceeding `max_bytes` BEFORE allocating.
-pub(crate) fn read_regular_file_bounded(path: &Path, max_bytes: u64, what: &'static str) -> Result<Vec<u8>, WalError> {
-    let lstat = fs::symlink_metadata(path)?;
-    if lstat.file_type().is_symlink() {
-        return Err(WalError::SymlinkRefused);
+/// Opens `path` read-only without following symlinks or blocking on FIFOs (`O_NOFOLLOW | O_NONBLOCK`
+/// on Unix), verifying that the opened descriptor is a regular file.
+pub(crate) fn open_regular_read_only(path: &Path, what: &'static str) -> Result<(File, fs::Metadata), WalError> {
+    #[cfg(not(unix))]
+    {
+        let lstat = fs::symlink_metadata(path)?;
+        if lstat.file_type().is_symlink() {
+            return Err(WalError::SymlinkRefused);
+        }
     }
-    if !lstat.is_file() {
-        return Err(WalError::InvalidFormat(what));
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    check_file_size(lstat.len(), max_bytes, what)?;
-
-    let file = File::open(path)?;
+    let file = opts.open(path).map_err(|err| {
+        #[cfg(unix)]
+        if err.raw_os_error() == Some(libc::ELOOP) {
+            return WalError::SymlinkRefused;
+        }
+        WalError::Io(err)
+    })?;
     let fstat = file.metadata()?;
     if !fstat.is_file() {
         return Err(WalError::InvalidFormat(what));
     }
+    Ok((file, fstat))
+}
+
+/// Opens `path` as a regular non-symlink file and reads up to `max_bytes` using a bounded handle.
+///
+/// Refuses symlinks, FIFOs/devices/directories, and files exceeding `max_bytes` BEFORE allocating.
+pub(crate) fn read_regular_file_bounded(path: &Path, max_bytes: u64, what: &'static str) -> Result<Vec<u8>, WalError> {
+    let (file, fstat) = open_regular_read_only(path, what)?;
     check_file_size(fstat.len(), max_bytes, what)?;
 
     let cap = usize::try_from(fstat.len().min(max_bytes)).unwrap_or(0);

@@ -27,8 +27,9 @@ pub use worker::{QUIET, Worker};
 use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
 
-/// Maximum bytes read from a named file or shared-memory image source (400 MiB).
-pub const SOURCE_BYTES: u64 = 400 << 20;
+/// Maximum bytes read from a named file or shared-memory image source (64 MiB, aligned with
+/// `apack-vt-ghostty`'s per-session `SESSION_IMAGE_STORAGE_BYTES` cap).
+pub const SOURCE_BYTES: u64 = 64 << 20;
 
 /// Maximum bytes read for a query (`a=q`), matching `apack-vt-ghostty`'s 64 MiB single-image cap.
 pub const QUERY_SOURCE_BYTES: u64 = 64 << 20;
@@ -421,7 +422,7 @@ mod tests {
 
     #[test]
     fn constants_and_read_piece_error_handling() {
-        assert_eq!(SOURCE_BYTES, 400 * 1024 * 1024);
+        assert_eq!(SOURCE_BYTES, 64 * 1024 * 1024);
         assert_eq!(QUERY_SOURCE_BYTES, 64 * 1024 * 1024);
         assert_eq!(CHUNK_BYTES, 3 * 1024 * 1024);
         assert_eq!(READ_BYTES, 1024 * 1024);

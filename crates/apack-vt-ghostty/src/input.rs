@@ -243,8 +243,10 @@ pub(crate) fn encode_focus(terminal: sys::Terminal, focused: bool, out: &mut Vec
 pub(crate) fn encode_paste(terminal: sys::Terminal, text: &str, allow_unsafe: bool) -> PasteEncode {
     let bracketed = query_mode(terminal, BRACKETED_PASTE_MODE);
     let bytes = text.as_bytes();
+    const PASTE_END_C1: &[u8] = b"\xc2\x9b201~";
     let dangerous = if bracketed {
         bytes.windows(PASTE_END.len()).any(|w| w == PASTE_END)
+            || bytes.windows(PASTE_END_C1.len()).any(|w| w == PASTE_END_C1)
     } else {
         bytes.iter().any(|&b| b == b'\n' || b == b'\r')
     };

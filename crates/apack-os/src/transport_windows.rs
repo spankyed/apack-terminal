@@ -7,12 +7,16 @@
 
 use std::io;
 use std::os::windows::io::{AsHandle, AsRawHandle};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
-use windows_sys::Win32::Foundation::{HANDLE, HLOCAL, LocalFree};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
 use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, GetSecurityInfo, SE_KERNEL_OBJECT};
 use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
+use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 use windows_sys::Win32::System::IO::CancelIoEx;
-use windows_sys::Win32::System::Pipes::DisconnectNamedPipe;
+use windows_sys::Win32::System::Pipes::{DisconnectNamedPipe, GetNamedPipeClientProcessId};
+use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
 /// Maps Windows named-pipe bind errors indicating an existing instance to [`crate::OsError::AlreadyHeld`].
 pub fn map_bind_error(err: io::Error) -> crate::OsError {
@@ -57,9 +61,95 @@ pub fn default_pipe_name() -> Option<String> {
     Some(format!(r"\\.\pipe\apack-terminal-{}", sid.to_string_lossy()))
 }
 
-/// Verifies that `pipe` is owned by the current user's SID.
+/// Verifies (client-side) that `pipe` is owned by the current user's SID.
 pub fn owned_by_this_user(pipe: &impl AsHandle) -> io::Result<bool> {
     owned_by(pipe, &crate::security::current_user_sid()?)
+}
+
+/// Verifies (server-side) that the connected named-pipe client process runs as the current user's SID.
+///
+/// Unlike [`owned_by_this_user`] (which reads the pipe object's own owner SID), this inspects the
+/// connecting client's PID via `GetNamedPipeClientProcessId` and compares its process token user SID
+/// against the current user's SID.
+pub fn client_is_this_user(pipe: &impl AsHandle) -> io::Result<bool> {
+    let expected = crate::security::current_user_sid()?;
+    let handle = pipe.as_handle().as_raw_handle() as HANDLE;
+    let mut client_pid: u32 = 0;
+    // SAFETY: `handle` is borrowed from a live server-side named pipe; `client_pid` is a valid out-pointer.
+    if unsafe { GetNamedPipeClientProcessId(handle, &mut client_pid) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if client_pid == 0 {
+        return Ok(false);
+    }
+    // SAFETY: opens the client process for query-only token inspection and closes the handle before returning.
+    let proc = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, client_pid) };
+    if proc.is_null() {
+        return Ok(false);
+    }
+    let client_sid = crate::security_windows::user_sid_for_process(proc);
+    // SAFETY: `proc` is a valid non-null handle opened by `OpenProcess` above.
+    unsafe { CloseHandle(proc) };
+    Ok(client_sid.is_ok_and(|sid| sid == expected))
+}
+
+struct CtrlHook {
+    flag: Arc<AtomicBool>,
+    wake: Arc<dyn Fn() + Send + Sync>,
+}
+
+static CTRL_HOOK: Mutex<Option<CtrlHook>> = Mutex::new(None);
+
+// SAFETY: Windows calls this handler on a dedicated OS control thread (not an async POSIX signal
+// context); locking a short non-reentrant mutex to set an atomic flag and wake the reactor is safe.
+unsafe extern "system" fn console_ctrl_handler(_ctrl_type: u32) -> i32 {
+    if let Ok(guard) = CTRL_HOOK.lock()
+        && let Some(hook) = guard.as_ref()
+    {
+        hook.flag.store(true, Ordering::Release);
+        (hook.wake)();
+        return 1;
+    }
+    0
+}
+
+/// Guard keeping a Windows `SetConsoleCtrlHandler` registration active until dropped.
+pub struct ShutdownSignalGuard {
+    registered: bool,
+}
+
+impl Drop for ShutdownSignalGuard {
+    fn drop(&mut self) {
+        if self.registered {
+            if let Ok(mut guard) = CTRL_HOOK.lock() {
+                *guard = None;
+            }
+            // SAFETY: removes the exact handler registered in `install_shutdown_signals`.
+            unsafe {
+                SetConsoleCtrlHandler(Some(console_ctrl_handler), 0);
+            }
+        }
+    }
+}
+
+/// Installs a Windows console control handler (`Ctrl+C`, `Ctrl+Break`, close, shutdown) that sets
+/// `flag` and calls `wake` so the broker shuts down cleanly.
+pub fn install_shutdown_signals(
+    flag: Arc<AtomicBool>,
+    wake: impl Fn() + Send + Sync + 'static,
+) -> io::Result<ShutdownSignalGuard> {
+    if let Ok(mut guard) = CTRL_HOOK.lock() {
+        *guard = Some(CtrlHook { flag, wake: Arc::new(wake) });
+    }
+    // SAFETY: registers a valid `extern "system"` console control callback.
+    let ok = unsafe { SetConsoleCtrlHandler(Some(console_ctrl_handler), 1) } != 0;
+    if !ok {
+        if let Ok(mut guard) = CTRL_HOOK.lock() {
+            *guard = None;
+        }
+        return Err(io::Error::last_os_error());
+    }
+    Ok(ShutdownSignalGuard { registered: true })
 }
 
 fn owned_by(pipe: &impl AsHandle, sid: &widestring::U16CStr) -> io::Result<bool> {

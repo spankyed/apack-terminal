@@ -177,6 +177,7 @@ struct SearchWatch {
     epoch: u64,
     last_oldest_line: u64,
     needs_full_refresh: bool,
+    was_truncated: bool,
     dirty_range: Option<(u64, u64)>,
 }
 
@@ -402,6 +403,12 @@ impl<V: VtEngine> SessionMachine<V> {
     pub fn detach_stream(&mut self, key: StreamKey, effects: &mut Vec<SessionEffect>) {
         self.subscribers.remove(&key);
         self.views.remove(&key);
+        if self.views.is_empty() {
+            if let Some(tid) = self.sync_hold.take() {
+                self.timers.cancel(tid);
+            }
+            self.sync_hold_started = None;
+        }
         self.held_buttons.remove(&key);
         self.searches.remove(&key);
         if self.searches.is_empty()
@@ -523,16 +530,18 @@ impl<V: VtEngine> SessionMachine<V> {
                     self.broadcast_event(BrokerMsg::Progress { state, percent }, effects);
                 }
                 VtEvent::Cwd(raw) => {
-                    let cwd = truncate_utf8(&raw, MAX_EVENT_STRING_BYTES);
-                    self.marks.on_cwd(&cwd);
-                    self.broadcast_event(BrokerMsg::CwdChanged { cwd }, effects);
+                    if let Some(cwd) = self.marks.on_cwd(&raw) {
+                        self.broadcast_event(BrokerMsg::CwdChanged { cwd }, effects);
+                    }
                 }
                 VtEvent::SyncOutput(true) => {
-                    let start = *self.sync_hold_started.get_or_insert(now);
-                    let deadline = start.saturating_add(SYNC_HOLD_MAX_MS);
-                    if self.sync_hold.is_none() && now < deadline {
-                        let timer = self.timers.schedule(deadline, SessionTimer::SyncHold);
-                        self.sync_hold = Some(timer);
+                    if !self.views.is_empty() {
+                        let start = *self.sync_hold_started.get_or_insert(now);
+                        let deadline = start.saturating_add(SYNC_HOLD_MAX_MS);
+                        if self.sync_hold.is_none() && now < deadline {
+                            let timer = self.timers.schedule(deadline, SessionTimer::SyncHold);
+                            self.sync_hold = Some(timer);
+                        }
                     }
                 }
                 VtEvent::SyncOutput(false) => {
@@ -587,13 +596,20 @@ impl<V: VtEngine> SessionMachine<V> {
                     need_timer = true;
                 } else {
                     if oldest_line > watch.last_oldest_line {
+                        if watch.was_truncated {
+                            watch.needs_full_refresh = true;
+                        }
                         need_timer = true;
                     }
                     if let Some((from, to)) = dirty_abs_range {
-                        watch.dirty_range = Some(match watch.dirty_range {
-                            None => (from, to),
-                            Some((a, b)) => (a.min(from), b.max(to)),
-                        });
+                        if watch.was_truncated {
+                            watch.needs_full_refresh = true;
+                        } else {
+                            watch.dirty_range = Some(match watch.dirty_range {
+                                None => (from, to),
+                                Some((a, b)) => (a.min(from), b.max(to)),
+                            });
+                        }
                         need_timer = true;
                     }
                 }
@@ -604,8 +620,12 @@ impl<V: VtEngine> SessionMachine<V> {
             }
         }
 
-        // Evaluate reactive WaitCondition::Text waiters over only the newly dirty range (or full on epoch change).
-        let text_scan = if epoch_changed { Some((oldest_line, total_lines)) } else { dirty_abs_range };
+        // Evaluate reactive WaitCondition::Text waiters over the enclosing logical lines (or full on epoch change).
+        let text_scan = if epoch_changed {
+            Some((oldest_line, total_lines))
+        } else {
+            dirty_abs_range.map(|(from, to)| self.expand_to_logical_lines(from, to, oldest_line, total_lines))
+        };
         if let Some((from, to)) = text_scan {
             self.check_text_waiters(from, to, effects);
         }
@@ -845,6 +865,9 @@ impl<V: VtEngine> SessionMachine<V> {
                 }
                 let mut rows = Vec::new();
                 self.vt.extract_history_rows(from_line, count.min(MAX_ROWS_PER_FETCH), &mut rows);
+                // Enforce the wire frame payload cap so heavily styled/hyperlinked rows never
+                // exceed `MAX_FRAME_PAYLOAD` when serialized into `BrokerMsg::Rows`.
+                truncate_rows_to_budget(&mut rows, apack_proto::MAX_FRAME_PAYLOAD.saturating_sub(4_096));
                 effects.push(SessionEffect::Send {
                     conn,
                     stream_id: wire_stream,
@@ -888,7 +911,7 @@ impl<V: VtEngine> SessionMachine<V> {
                     return;
                 }
                 let text = match clamp_span(span, &meta) {
-                    Some(clamped) => truncate_utf8(&self.vt.text_of(clamped), MAX_STRING_BYTES),
+                    Some(clamped) => truncate_utf8(&self.vt.text_of(clamped, MAX_STRING_BYTES), MAX_STRING_BYTES),
                     None => String::new(),
                 };
                 effects.push(SessionEffect::Send {
@@ -905,8 +928,8 @@ impl<V: VtEngine> SessionMachine<V> {
                     send_stream_error(conn, wire_stream, req_id, ErrorCode::StaleEpoch, "stale epoch", effects);
                     return;
                 }
-                let text = match clamp_span(span, &meta) {
-                    Some(clamped) => truncate_utf8(&self.vt.text_of_rect(clamped), MAX_STRING_BYTES),
+                let text = match clamp_rect_span(span, &meta) {
+                    Some(clamped) => truncate_utf8(&self.vt.text_of_rect(clamped, MAX_STRING_BYTES), MAX_STRING_BYTES),
                     None => String::new(),
                 };
                 effects.push(SessionEffect::Send {
@@ -949,6 +972,7 @@ impl<V: VtEngine> SessionMachine<V> {
                         epoch: meta.epoch,
                         last_oldest_line: oldest,
                         needs_full_refresh: false,
+                        was_truncated: truncated,
                         dirty_range: None,
                     },
                 );
@@ -1025,6 +1049,7 @@ impl<V: VtEngine> SessionMachine<V> {
             && !palette_changed
             && sub.last_images_gen == meta.images_gen;
         if nothing_changed {
+            self.sync_hold_started = None;
             return false;
         }
 
@@ -1225,7 +1250,18 @@ impl<V: VtEngine> SessionMachine<V> {
                     if rec.id.is_empty() {
                         root_state = Some(rec.state);
                     }
+                    if rec.app.is_none()
+                        && let Some(map) = coalesce_verify.as_mut()
+                    {
+                        map.remove(&rec.id);
+                    }
                     self.broadcast_event(BrokerMsg::ProgramStatus(Box::new(rec)), effects);
+                }
+                StatusEffect::Cleared { id } => {
+                    if let Some(map) = coalesce_verify.as_mut() {
+                        map.remove(&id);
+                    }
+                    self.broadcast_event(BrokerMsg::ProgramStatusCleared { id }, effects);
                 }
                 StatusEffect::VerifyForeground { id, changed, app } => {
                     if let Some(map) = coalesce_verify.as_mut() {
@@ -1241,10 +1277,34 @@ impl<V: VtEngine> SessionMachine<V> {
         }
     }
 
+    pub(crate) fn expand_to_logical_lines(&self, from: u64, to: u64, oldest: u64, total_lines: u64) -> (u64, u64) {
+        let mut lo = from.max(oldest).min(total_lines);
+        let mut hi = to.max(lo).min(total_lines);
+        if lo < hi {
+            if let Some(span) = self.vt.line_at(lo) {
+                lo = lo.min(span.start.line).max(oldest);
+            }
+            if let Some(span) = self.vt.line_at(hi - 1) {
+                hi = hi.max(span.end.line.saturating_add(1)).min(total_lines);
+            }
+        }
+        (lo, hi)
+    }
+
     fn flush_searches(&mut self, effects: &mut Vec<SessionEffect>) {
         let meta = self.vt.meta();
         let oldest = meta.oldest_line();
         let total_lines = meta.total_lines();
+        let mut expanded_ranges: Vec<(StreamKey, u64, u64)> = Vec::new();
+        for (&key, watch) in &self.searches {
+            if !watch.needs_full_refresh
+                && watch.epoch == meta.epoch
+                && let Some((from, to)) = watch.dirty_range
+            {
+                let (lo, hi) = self.expand_to_logical_lines(from, to, oldest, total_lines);
+                expanded_ranges.push((key, lo, hi));
+            }
+        }
         for (&(conn, stream_id), watch) in &mut self.searches {
             if watch.needs_full_refresh || watch.epoch != meta.epoch {
                 watch.epoch = meta.epoch;
@@ -1261,6 +1321,7 @@ impl<V: VtEngine> SessionMachine<V> {
                     &mut matches,
                 );
                 matches.truncate(MAX_SEARCH_MATCHES);
+                watch.was_truncated = truncated;
                 effects.push(SessionEffect::Send {
                     conn,
                     stream_id: stream_id.as_stream_id(),
@@ -1277,7 +1338,7 @@ impl<V: VtEngine> SessionMachine<V> {
                     conn,
                     stream_id: stream_id.as_stream_id(),
                     req_id: RequestId::PUSH,
-                    priority: OutboundPriority::Event,
+                    priority: OutboundPriority::Bulk,
                     msg: BrokerMsg::SearchDelta {
                         epoch: meta.epoch,
                         from_line: evicted_from,
@@ -1287,9 +1348,11 @@ impl<V: VtEngine> SessionMachine<V> {
                     },
                 });
             }
-            if let Some((from, to)) = watch.dirty_range.take() {
-                let clamped_from = from.max(oldest).min(total_lines);
-                let clamped_to = to.max(clamped_from).min(total_lines);
+            if watch.dirty_range.take().is_some() {
+                let (clamped_from, clamped_to) = expanded_ranges
+                    .iter()
+                    .find(|(k, _, _)| *k == (conn, stream_id))
+                    .map_or((oldest, oldest), |&(_, lo, hi)| (lo, hi));
                 let mut added = Vec::new();
                 let mut truncated = self.vt.search_lines(
                     clamped_from,
@@ -1305,11 +1368,14 @@ impl<V: VtEngine> SessionMachine<V> {
                     added.truncate(MAX_SEARCH_MATCHES);
                     truncated = true;
                 }
+                if truncated {
+                    watch.was_truncated = true;
+                }
                 effects.push(SessionEffect::Send {
                     conn,
                     stream_id: stream_id.as_stream_id(),
                     req_id: RequestId::PUSH,
-                    priority: OutboundPriority::Event,
+                    priority: OutboundPriority::Bulk,
                     msg: BrokerMsg::SearchDelta {
                         epoch: meta.epoch,
                         from_line: clamped_from,
@@ -1396,7 +1462,7 @@ impl<V: VtEngine> SessionMachine<V> {
             start: CellPos { line: start_line, col: 0 },
             end: CellPos { line: end_line, col: meta.size.cols.get() - 1 },
         };
-        Some(truncate_utf8(&self.vt.text_of(span), MAX_STRING_BYTES))
+        Some(truncate_utf8(&self.vt.text_of(span, MAX_STRING_BYTES), MAX_STRING_BYTES))
     }
 
     fn broadcast_event(&self, msg: BrokerMsg, effects: &mut Vec<SessionEffect>) {
@@ -1419,6 +1485,40 @@ fn normalize_progress(state: ProgressState, percent: Option<u8>) -> Option<u8> {
         ProgressState::None | ProgressState::Indeterminate => None,
         ProgressState::Running | ProgressState::Error | ProgressState::Paused => percent.map(|p| p.min(100)),
     }
+}
+
+pub(crate) fn clamp_rect_span(span: CellSpan, meta: &VtSnapshotMeta) -> Option<CellSpan> {
+    let oldest = meta.oldest_line();
+    let max_line = meta.total_lines().checked_sub(1)?;
+    let max_col = meta.size.cols.get() - 1;
+    let start_line = span.start.line.max(oldest);
+    let end_line = span.end.line.min(max_line);
+    let lo_col = span.start.col.min(span.end.col);
+    let hi_col = span.start.col.max(span.end.col).min(max_col);
+    if start_line > end_line || lo_col > max_col {
+        return None;
+    }
+    Some(CellSpan { start: CellPos { line: start_line, col: lo_col }, end: CellPos { line: end_line, col: hi_col } })
+}
+
+pub(crate) fn estimate_packed_row_bytes(row: &PackedRow) -> usize {
+    let mut w = apack_proto::codec::Writer::new();
+    row.encode(&mut w);
+    w.as_slice().len()
+}
+
+pub(crate) fn truncate_rows_to_budget(rows: &mut Vec<PackedRow>, max_rows_bytes: usize) {
+    let mut used_bytes = 32usize;
+    let mut keep_count = 0usize;
+    for row in rows.iter() {
+        let row_bytes = estimate_packed_row_bytes(row);
+        if keep_count > 0 && used_bytes.saturating_add(row_bytes) > max_rows_bytes {
+            break;
+        }
+        used_bytes = used_bytes.saturating_add(row_bytes);
+        keep_count += 1;
+    }
+    rows.truncate(keep_count);
 }
 
 fn clamp_span(span: CellSpan, meta: &VtSnapshotMeta) -> Option<CellSpan> {

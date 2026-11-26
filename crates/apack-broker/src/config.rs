@@ -70,7 +70,9 @@ impl BrokerConfig {
 
     /// Applies optional `start_grace` and `auth_key` string overrides.
     pub fn apply_env_overrides(mut self, grace: Option<&str>, auth_key: Option<&str>) -> Self {
-        self.start_grace = start_grace(grace);
+        if let Some(raw) = grace {
+            self.start_grace = start_grace(Some(raw));
+        }
         if let Some(secret) = auth_key
             && !secret.is_empty()
         {

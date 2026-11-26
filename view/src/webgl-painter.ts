@@ -557,6 +557,8 @@ export class WebGL2AtlasPainter implements Painter {
 
   private readonly handleContextRestored = () => {
     if (this.disposed) return
+    // Clear `contextLost` BEFORE `initGpu()` so `resetAtlas()` allocates `atlasTex` immediately.
+    this.contextLost = false
     try {
       this.initGpu()
     } catch {
@@ -565,7 +567,6 @@ export class WebGL2AtlasPainter implements Painter {
       this.contextLost = true
       return
     }
-    this.contextLost = false
     if (this.columns > 0 && this.rows > 0) {
       this.gl.viewport(0, 0, this.canvas.width, this.canvas.height)
     }
@@ -769,14 +770,21 @@ export class WebGL2AtlasPainter implements Painter {
     scratchCtx.fillStyle = '#ffffff'
     scratchCtx.fillText(text, bearingX / pixelRatio, metrics.baseline + bearingY / pixelRatio)
 
-    // Detect color emoji (both chromatic and dark/grayscale like 🐼/⚫) ONLY for non-ASCII clusters
+    // Detect color emoji (both chromatic and dark/grayscale like 🐼/⚫) ONLY for non-ASCII clusters,
+    // ignoring thin subpixel-antialiased fringes on monochrome non-ASCII text (CJK, box-drawing, accents).
     let colored = false
     if (text.length > 1 || text.charCodeAt(0) >= 0x80) {
       const img = scratchCtx.getImageData?.(0, 0, w, h)
       if (img) {
         const d = img.data
         for (let i = 0; i < d.length; i += 4) {
-          if (d[i + 3]! > 16 && (d[i]! !== d[i + 1]! || d[i + 1]! !== d[i + 2]! || d[i]! < 245)) {
+          const a = d[i + 3]!
+          if (a < 64) continue
+          const r = d[i]!
+          const g = d[i + 1]!
+          const b = d[i + 2]!
+          const chroma = Math.max(r, g, b) - Math.min(r, g, b)
+          if (chroma > 24 || (a >= 200 && r < 220)) {
             colored = true
             break
           }
@@ -806,6 +814,25 @@ export class WebGL2AtlasPainter implements Painter {
     return true
   }
 
+  private resolveGlyphForEmit(text: string, cells: number, bold: boolean, italic: boolean): AtlasEntry | undefined {
+    const key = glyphKey(text, cells, bold, italic)
+    const existing = this.atlasEntries.get(key)
+    if (existing) return existing
+    if (!this.atlasTex) return undefined
+    // First try packing into the current atlas (handles subsequent glyphs after a mid-pass reset
+    // without thrashing); only flush + reset when the atlas is genuinely full.
+    if (this.rasterizeAndUpload(key, text, cells, bold, italic)) {
+      return this.atlasEntries.get(key)
+    }
+    if (this.instanceCount > 0) {
+      this.flushBatch(this.atlasTex)
+      this.instanceCount = 0
+    }
+    this.resetAtlas()
+    this.rasterizeAndUpload(key, text, cells, bold, italic)
+    return this.atlasEntries.get(key)
+  }
+
   private emitGlyphRun(run: GlyphRun, y: number): void {
     const { cellWidth } = this.metrics
     const [r, g, b] = rgbFloats(run.color)
@@ -813,13 +840,13 @@ export class WebGL2AtlasPainter implements Painter {
       for (let k = 0; k < run.text.length; k += 1) {
         const ch = run.text[k]!
         if (ch === ' ') continue
-        const entry = this.atlasEntries.get(glyphKey(ch, 1, run.bold, run.italic))
+        const entry = this.resolveGlyphForEmit(ch, 1, run.bold, run.italic)
         if (!entry) continue
         this.pushGlyph(this.gutter + (run.column + k) * cellWidth, y, entry, r, g, b, run.alpha)
       }
       return
     }
-    const entry = this.atlasEntries.get(glyphKey(run.text, run.cells, run.bold, run.italic))
+    const entry = this.resolveGlyphForEmit(run.text, run.cells, run.bold, run.italic)
     if (!entry) return
     this.pushGlyph(this.gutter + run.column * cellWidth, y, entry, r, g, b, run.alpha)
   }
@@ -886,9 +913,7 @@ export class WebGL2AtlasPainter implements Painter {
       case 'block':
         this.pushSolid(x, y, w, cellHeight, r, g, b, 1)
         if (cursor.text) {
-          const entry = this.atlasEntries.get(
-            glyphKey(cursor.text.text, cursor.cells, cursor.text.bold, cursor.text.italic),
-          )
+          const entry = this.resolveGlyphForEmit(cursor.text.text, cursor.cells, cursor.text.bold, cursor.text.italic)
           if (entry) {
             const [tr, tg, tb] = rgbFloats(scene.theme.cursorText)
             this.pushGlyph(x, y, entry, tr, tg, tb, 1)
@@ -902,18 +927,28 @@ export class WebGL2AtlasPainter implements Painter {
     const list = scene.images
     if (!list || list.length === 0) return
 
-    // Batch consecutive slices sharing the same WebGLTexture (e.g., Kitty placeholder rows) into 1 draw call
+    // Batch consecutive slices sharing the same picture/WebGLTexture into 1 draw call.
+    // Flush BEFORE calling `ensureImageTexture` on a new picture so LRU eviction inside
+    // `ensureImageTexture` can never delete `currentTex` while its quads are still queued.
+    let currentPicture: CanvasImageSource | null = null
     let currentTex: WebGLTexture | null = null
     this.instanceCount = 0
 
     for (const img of list) {
       if (img.above !== above || img.source.width <= 0 || img.source.height <= 0) continue
+      if (img.picture !== currentPicture && currentTex !== null && this.instanceCount > 0) {
+        this.flushBatch(currentTex)
+        this.instanceCount = 0
+        currentTex = null
+        currentPicture = null
+      }
       const texEntry = this.ensureImageTexture(img.picture)
       if (!texEntry || texEntry.width <= 0 || texEntry.height <= 0) continue
       if (currentTex !== null && currentTex !== texEntry.texture && this.instanceCount > 0) {
         this.flushBatch(currentTex)
         this.instanceCount = 0
       }
+      currentPicture = img.picture
       currentTex = texEntry.texture
       const u0 = img.source.x / texEntry.width
       const v0 = img.source.y / texEntry.height

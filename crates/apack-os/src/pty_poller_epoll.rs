@@ -115,6 +115,9 @@ impl EpollPoller {
         if self.entries.contains_key(&token) {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, "duplicate poll token"));
         }
+        if self.entries.values().any(|&(existing_fd, _)| existing_fd == fd) {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "duplicate poll file descriptor"));
+        }
         let mask = interest_to_epoll(interest);
         if mask != 0 {
             let mut ev = libc::epoll_event { events: mask, u64: token.0 };
@@ -186,8 +189,10 @@ impl EpollPoller {
     /// descriptors to `out`. Returns `true` if woken by [`EpollWaker::wake`].
     pub fn poll(&mut self, out: &mut Vec<PollEvent>, timeout: Option<Duration>) -> io::Result<bool> {
         out.clear();
-        let timeout_ms = duration_to_poll_timeout_ms(timeout);
+        let deadline = timeout.map(|d| std::time::Instant::now() + d);
         let ready = loop {
+            let remaining = deadline.map(|dl| dl.saturating_duration_since(std::time::Instant::now()));
+            let timeout_ms = duration_to_poll_timeout_ms(remaining);
             // SAFETY: `self.scratch` is an initialized buffer of `EPOLL_BATCH` `epoll_event`s.
             let rc = unsafe {
                 libc::epoll_wait(

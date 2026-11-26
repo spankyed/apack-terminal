@@ -80,7 +80,7 @@ bad HMAC, or timeout closes the connection.
 |---|---|---|
 | Control Replies (`0x0200..=0x020C`) | `HelloOk`, `AuthOk`, `Error`, `Ok`, `LeaseAck`, `Spawned`, `OwnsReply`, `SessionsList`, `Rewound`, `Sought`, `MetricsReply`, `Attached`, `Waited` | Handshake/auth completion, typed `ErrorCode` replies, lease/session/rewind/metrics/wait RPC replies |
 | Per-Session Replies (`0x0300..=0x030A`) | `Frame`, `Rows`, `Pasted`, `SpanReply`, `TextReply`, `SearchMatches`, `SearchDelta`, `CommandsReply`, `CommandOutputReply`, `ImagesReply`, `ImageBlobChunk` | Differential `FrameUpdate` pushes, scrollback rows, paste outcome, word/line/text queries, incremental search matches/deltas, shell commands & output, Kitty image placements & chunks |
-| Per-Session Push Events (`0x0310..=0x0323`) | `Title`, `Bell`, `Clipboard`, `Notification`, `Progress`, `ProgramStatus`, `CommandStarted`, `CommandFinished`, `CwdChanged`, `Exited`, `Output`, `Throttled`, `OutputDropped`, `StreamClosed` | Terminal metadata/events, vouched/claimed shell lifecycle, OSC 7501 status updates, credit-bounded raw PTY `Output`, explicit backpressure notices (`Throttled`, `OutputDropped`), stream close |
+| Per-Session Push Events (`0x0310..=0x0323`) | `Title`, `Bell`, `Clipboard`, `Notification`, `Progress`, `ProgramStatus`, `ProgramStatusCleared`, `CommandStarted`, `CommandFinished`, `CwdChanged`, `Exited`, `Output`, `Throttled`, `OutputDropped`, `StreamClosed` | Terminal metadata/events, vouched/claimed shell lifecycle, OSC 7501 status updates & clears, credit-bounded raw PTY `Output`, explicit backpressure notices (`Throttled`, `OutputDropped`), stream close |
 
 ## Flow Control & Backpressure (`crates/apack-core/src/flow.rs`)
 
