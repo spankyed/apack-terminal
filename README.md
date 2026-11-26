@@ -15,28 +15,29 @@ deterministically through kernel-enforced ownership when the app exits.
 | `crates/apack-core/` | zero-`unsafe` `#![no_std]` + `alloc` sans-IO deterministic broker & session state machine |
 | `crates/apack-sim/` | deterministic discrete-event simulator (`SimWorld`, virtual clock, arbitrary chunking, slow-consumer chaos) |
 | `crates/apack-vt-ghostty/` | `libghostty-vt` adapter implementing `VtEngine`, global content-addressed image store, bounded snapshots |
-| `crates/apack-os/` | OS boundary: PTYs/ConPTY, `SignalTarget` process-tree control, Windows Job Objects, ACL-enforced sockets/pipes |
+| `crates/apack-os/` | OS boundary: PTYs/ConPTY, `KillTarget` process-tree control, Windows Job Objects, `PtyPoller`, ACL-enforced sockets/pipes |
 | `crates/apack-wal/` | zero-`unsafe` immutable segmented WAL (`meta.apkm`, `seg-*.apks`, `blobs/`), dual-layer `KeyframeV2`, $O(1)$ eviction |
-| `crates/apack-broker/` | sharded I/O reactor (`mio`), per-session reader threads, OS blocking pool, `proxy`, `inspect`, v2 Rust client |
-| `xtask/` | repository tasks (`pre-push`, `generate`, `check-generated`, `check-safety`, `notices`, `check-exclusions`) |
+| `crates/apack-broker/` | sharded I/O runtime (`K = min(cores, 8)` shards, `PtyPoller` on Unix / `ConPtyBridge` on Windows), `proxy`, `inspect`, v2 Rust client |
+| `xtask/` | repository tasks (`pre-push`, `generate`, `check-generated`, `check-safety`, `notices`, `check-exclusions`, `vt-prebuilt`) |
 | [`node/`](node) | the `@apackdev/terminal` npm package: `brokerBinary()` runtime locator and golden `wire-vectors-v2.json` |
 | [`view/`](view) | the `@apackdev/terminal-view` npm package: Canvas 2D + WebGL2 atlas renderer and v2 binary client ([its README](view/README.md)) |
 
 ## Core Guarantees
 
-- **Correct by construction.** Illegal states are unrepresentable at compile time: `SignalTarget` makes
-  `kill(0)`/`kill(-1)` impossible to construct; `VouchedExitCode` separates authenticated `MarksKey` shell
-  facts from untrusted PTY claims; `apack-core` enforces sans-IO purity via `#![no_std]` + `#![forbid(unsafe_code)]`.
+- **Correct by construction.** Illegal states are unrepresentable at compile time: `SignalTarget` (`NonZeroI32`
+  positive PID) and `KillTarget` (private validated PID/pgid) make `kill(0)`/`kill(-1)` impossible to
+  construct; `VouchedExitCode` separates authenticated `MarksKey` shell facts from untrusted PTY claims;
+  `apack-core` enforces sans-IO purity via `#![no_std]` + `#![forbid(unsafe_code)]`.
 - **Single authority & unidirectional replication.** The broker's `libghostty-vt` core is the sole authority
-  on terminal state (screen, scrollback, modes, cursor, images, markers, commands, program statuses).
+  on terminal state (screen, scrollback, modes, cursor, Kitty images, markers, commands, program statuses).
   `@apackdev/terminal-view` interprets zero VT bytes and renders style-run `PackedRow` diffs directly.
 - **Unified multiplexed binary protocol (v2).** One length-prefixed binary wire over Unix sockets, Windows
   named pipes, or `ssh host apack-terminal proxy` carries control RPCs, raw output feeds, incremental search
-  watches, view frames, input events, and image blobs over independent `stream_id` channels with mutual
-  HMAC-SHA256 authentication.
+  watches, view frames, input events, and image blobs over independent `stream_id` channels with optional
+  mutual HMAC-SHA256 authentication (`APACK_TERMINAL_AUTH_KEY`).
 - **Explicit backpressure & principled load shedding.** Zero unbounded buffers anywhere. Conflatable view
-  frames use adaptive BDP credit flow control and dirty-row coalescing; non-conflatable control streams use
-  explicit byte credits and bounded queues; overload always reports measured metrics rather than dropping
+  frames use adaptive BDP `FrameCredit` flow control and dirty-row coalescing; non-conflatable control streams
+  use explicit byte credits and bounded queues; overload always reports measured metrics rather than dropping
   silently.
 - **Owned process trees & crash-only safety.** POSIX sessions/process groups (`setsid` + negative-pgid kill)
   and Windows Job Objects (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) ensure no orphaned shells survive teardown
@@ -48,16 +49,16 @@ deterministically through kernel-enforced ownership when the app exits.
 ## CLI
 
 ```sh
-apack-terminal serve [--socket <path>] [--lease-grace-ms <ms>] [--max-sessions <n>]
-apack-terminal proxy [<socket>] [--no-autostart]
-apack-terminal inspect <recording-dir> [--json]
+apack-terminal serve [--socket <path>] [--shards <1..=8>]
+apack-terminal proxy [--socket <path>] [--no-autostart]
+apack-terminal inspect [--socket <path>] [--json]
 apack-terminal version
 ```
 
-With no socket named, the broker binds the user's private runtime path (`$XDG_RUNTIME_DIR/apack-terminal/broker.sock`
-or `~/.apack-terminal/broker.sock` on Unix; `\\.\pipe\apack-terminal-<sid>-default` on Windows). Shared
-directories writable by other users (such as `/tmp`) are refused. Running `apack-terminal` with no arguments
-exits with code `2` and prints usage to stderr.
+With no `--socket` named, the broker binds the user's private runtime path (`$XDG_RUNTIME_DIR/apack-terminal/broker.sock`
+or `~/.apack-terminal/broker.sock` on Unix; `\\.\pipe\apack-terminal-<SID>` on Windows). Shared directories
+writable by other users (such as `/tmp`) are refused. Running `apack-terminal` with no arguments exits with
+code `2` and prints usage to stderr.
 
 ## Status & Building
 

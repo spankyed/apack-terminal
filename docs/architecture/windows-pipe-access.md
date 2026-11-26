@@ -6,13 +6,13 @@ a pipe gets grants read access to Everyone**, the anonymous logon included. What
 byte the user's shells print and every key they type into them, so the default is wrong here in a way that
 fails nothing and shows nothing.
 
-So the listener is created with a descriptor of its own (`crates/apack-os/src/security_windows.rs`), and a descriptor that cannot be
+So the listener is created with a descriptor of its own (`crates/apack-os/src/security.rs`, `security_windows.rs`), and a descriptor that cannot be
 built refuses the listen rather than falling back — falling back would mean serving terminal output to every
 local account because something about the token could not be read.
 
 ## What the code asks for
 
-`sddl_for_user_sid(sid)` is the whole of the decision, as SDDL:
+`windows_pipe_sddl(sid)` is the whole of the decision, as SDDL:
 
 ```
 O:{sid}D:P(A;;GA;;;{sid})(A;;GA;;;SY)
@@ -20,7 +20,7 @@ O:{sid}D:P(A;;GA;;;{sid})(A;;GA;;;SY)
 
 The owner is the account that started the broker; the DACL is protected, so nothing is inherited into it;
 that account and `SYSTEM` may do everything. **Everyone else is denied by absence**, which is what makes the
-`P` load-bearing, and `crates/apack-os` unit tests verify the SDDL builder on every platform — the broadest ACE in
+`P` load-bearing, and `crates/apack-os` unit tests verify `windows_pipe_sddl` on every platform — the broadest ACE in
 Windows should not be one edit away on the one platform most developers here cannot run.
 
 ## What the object actually holds
@@ -48,7 +48,7 @@ show: `interprocess`'s `security_descriptor` is taken on trust until something r
 does, and nothing but the starting account and `SYSTEM` is granted anything.
 
 **The group was dropped because of this reading, and the same reading taken again proves the drop changed
-nothing.** With `G:` gone from `access_for`, a rebuilt broker's pipe reports the same owner, the same two
+nothing.** With `G:` gone from `windows_pipe_sddl`, a rebuilt broker's pipe reports the same owner, the same two
 ACEs and the same `…-513` group — so the group on the object was never ours to set. Nothing referenced it
 either: no ACE names it, and the pipe is inherited into by nothing. A descriptor should not say things the
 object will not hold.
@@ -64,7 +64,7 @@ administrator) tried the pipe of a broker the first account had started, through
 account may create a pipe under a name nobody holds yet — with a descriptor that lets this user in. A client
 connecting by name then reaches the other account's process, and the DACL on *our* pipe has nothing to say about
 it. So a client or proxy asks whose the pipe it reached is before it carries a byte (`crates/apack-os/src/transport_windows.rs`,
-`verify_pipe_owner`), as it asks the kernel for the peer's uid on POSIX (`crates/apack-os/src/transport_posix.rs`).
+`owned_by_this_user`), as it asks the kernel for the peer's uid on POSIX (`crates/apack-os/src/transport.rs`).
 An owner is the creator or a SID the creator holds, so an ordinary account cannot make a pipe that answers with
 ours. In the same run the second account created such a pipe, open to Everyone, and the first account's proxy was
 pointed at it: the proxy refused and the other account's pipe received 0 bytes. Reading that owner is verified

@@ -15,16 +15,11 @@ pub fn windows_pipe_sddl(sid: &str) -> String {
 
 /// Builds a Windows `SecurityDescriptor` granting access solely to the current user and `SYSTEM`.
 #[cfg(windows)]
-pub fn owner_only_security_descriptor()
--> std::io::Result<interprocess::os::windows::security_descriptor::SecurityDescriptor> {
-    crate::security_windows::owner_only_security_descriptor()
-}
+pub use crate::security_windows::owner_only_security_descriptor;
 
 /// Returns the current process token's user SID string (`S-1-5-...`).
 #[cfg(windows)]
-pub(crate) fn current_user_sid() -> std::io::Result<widestring::U16CString> {
-    crate::security_windows::current_user_sid()
-}
+pub(crate) use crate::security_windows::current_user_sid;
 
 #[cfg(test)]
 mod tests {

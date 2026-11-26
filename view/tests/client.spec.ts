@@ -14,6 +14,7 @@ import {
   decodeClientMsg,
   encodeBrokerFrame,
   packRow,
+  sha256,
   type BrokerMsg,
   type ByteStream,
   type ClientMsg,
@@ -167,10 +168,10 @@ describe('TerminalClient & BrokerSessionSource', () => {
   it('multiplexes multiple sessions, paces BDP FrameCredit, pauses when hidden, and pipelines 64 KiB image blobs', async () => {
     const pipe = new MockBrokerPipe()
     let now = 100
-    const blobHash = new Uint8Array(32).fill(0xab)
     // 140 KiB blob => 3 chunks (64 KiB + 64 KiB + 12 KiB)
     const blobBytes = new Uint8Array(65_536 * 2 + 12_345)
     for (let i = 0; i < blobBytes.length; i += 1) blobBytes[i] = (i * 17) & 0xff
+    const blobHash = sha256(blobBytes)
 
     pipe.onClientFrame = (streamId, reqId, msg) => {
       if (msg.kind === 'hello') {
@@ -304,7 +305,7 @@ describe('TerminalClient & BrokerSessionSource', () => {
     // 2. Hostile 0-byte initial chunk for totalBytes = 64 MiB fails fast without OOM/hang
     const imgPipe = new MockBrokerPipe()
     const wantedBlob = new Uint8Array(32).fill(0x42)
-    let mode: 'zero' | 'wrongHash' = 'zero'
+    let mode: 'zero' | 'wrongHash' | 'corruptBody' = 'zero'
     imgPipe.onClientFrame = (streamId, reqId, msg) => {
       if (msg.kind === 'hello') {
         imgPipe.pushBroker(streamId, reqId, {
@@ -342,6 +343,8 @@ describe('TerminalClient & BrokerSessionSource', () => {
     await expect(session.getImageBlob(wantedBlob)).rejects.toThrow(/short initial image blob chunk/i)
     mode = 'wrongHash'
     await expect(session.getImageBlob(wantedBlob)).rejects.toThrow(/hash mismatch/i)
+    mode = 'corruptBody'
+    await expect(session.getImageBlob(wantedBlob)).rejects.toThrow(/SHA-256 mismatch/i)
 
     session.dispose()
     await expect(session.commands()).rejects.toBeInstanceOf(DisconnectedError)

@@ -1,4 +1,4 @@
-//! Live broker inspection (`apack-broker inspect [--json]`).
+//! Live broker inspection (`apack-terminal inspect [--socket <path>] [--json]`).
 
 use apack_core::auth::AuthConfig;
 use apack_proto::messages::SessionSummary;

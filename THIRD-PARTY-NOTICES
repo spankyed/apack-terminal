@@ -876,12 +876,6 @@ SOFTWARE.
 
 ================================================================================
 MIT License (MIT), covering:
-  apack-broker 0.2.0
-  apack-core 0.2.0
-  apack-os 0.2.0
-  apack-proto 0.2.0
-  apack-vt-ghostty 0.2.0
-  apack-wal 0.2.0
   objc2-core-foundation 0.3.2, from https://github.com/madsmtm/objc2
   objc2-io-kit 0.3.2, from https://github.com/madsmtm/objc2
 

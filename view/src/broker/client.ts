@@ -11,7 +11,7 @@
  * - Pipelined `64 KiB` `GetImageBlob` chunk assembly (`window = 8` chunks in flight)
  */
 import { BULK_CHUNK_BYTES, PROTOCOL_VERSION, WireError } from '../wire/codec.ts'
-import { computeClientProof, ctEq32, randomNonce32, verifyServerProof } from '../wire/auth.ts'
+import { computeClientProof, ctEq32, randomNonce32, sha256, verifyServerProof } from '../wire/auth.ts'
 import { FrameDecoder, encodeFin, type FrameHeader } from '../wire/frame.ts'
 import {
   decodeBrokerMsg,
@@ -856,7 +856,11 @@ export class BrokerSessionSource implements TerminalSource {
       throw new WireError('InvalidValue', `unexpected initial image chunk offset ${first.offset}`)
     }
     if (total === 0) {
-      return { blob, encoding, bytes: new Uint8Array(0) }
+      const empty = new Uint8Array(0)
+      if (!ctEq32(sha256(empty), blob)) {
+        throw new WireError('InvalidValue', 'image blob SHA-256 mismatch')
+      }
+      return { blob, encoding, bytes: empty }
     }
     const expectedFirst = Math.min(BULK_CHUNK_BYTES, total)
     if (first.data.length !== expectedFirst) {
@@ -866,7 +870,11 @@ export class BrokerSessionSource implements TerminalSource {
       )
     }
     if (first.data.length === total) {
-      return { blob, encoding, bytes: first.data.slice() }
+      const single = first.data.slice()
+      if (!ctEq32(sha256(single), blob)) {
+        throw new WireError('InvalidValue', 'image blob SHA-256 mismatch')
+      }
+      return { blob, encoding, bytes: single }
     }
 
     const out = new Uint8Array(total)
@@ -905,6 +913,9 @@ export class BrokerSessionSource implements TerminalSource {
     const concurrency = Math.min(IMAGE_PIPELINE_WINDOW, offsets.length)
     for (let i = 0; i < concurrency; i += 1) workers.push(worker())
     await Promise.all(workers)
+    if (!ctEq32(sha256(out), blob)) {
+      throw new WireError('InvalidValue', 'image blob SHA-256 mismatch')
+    }
     return { blob, encoding, bytes: out }
   }
 

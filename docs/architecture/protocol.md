@@ -5,102 +5,104 @@ RPCs, raw output feeds, incremental search watches, differential view frames, in
 transfers.
 
 The single source of truth is `crates/apack-proto` (`#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`). The
-TypeScript codec lives in `view/src/wire/`. Both halves are locked together by the golden wire test
-vectors in `node/wire-vectors-v2.json` (`cargo xtask generate` / `cargo xtask check-generated`).
+TypeScript codec lives in `view/src/wire/`. Both halves are locked together by the golden wire test vectors
+in `node/wire-vectors-v2.json` (`cargo xtask generate` / `cargo xtask check-generated`).
 
-## Framing
+## Framing (`crates/apack-proto/src/frame.rs`)
 
-Every frame on the wire has a 12-byte little-endian header followed by `payload_len` bytes:
+Every regular frame on the wire has a 14-byte little-endian header followed by `payload` (`body_len - 10` bytes):
 
 ```text
- 0       4       6       8               12
-┌───────┬───────┬───────┬───────────────┬──────────────────────┐
-│  len  │ type  │ flags │   stream_id   │       payload        │
-│  u32  │  u16  │  u16  │      u32      │     [u8; len]        │
-└───────┴───────┴───────┴───────────────┴──────────────────────┘
+ 0           4           8         10          14
+┌───────────┬───────────┬─────────┬───────────┬──────────────────────────┐
+│ body_len  │ stream_id │ msg_type│  req_id   │         payload          │
+│  u32 LE   │  u32 LE   │ u16 LE  │  u32 LE   │   [u8; body_len - 10]    │
+└───────────┴───────────┴─────────┴───────────┴──────────────────────────┘
 ```
 
-- `len`: payload byte length (`<= MAX_FRAME_PAYLOAD = 16 MiB`; frames exceeding this close the connection with
-  `WireError::FrameTooLarge`).
-- `type`: `u16` message tag distinguishing client (`0x0001..`) and broker (`0x8001..`) messages.
-- `flags`: reserved `u16` (`0`; unknown non-zero flags are rejected).
-- `stream_id`: `0` for connection-level control RPCs and lifecycle events; `>= 1` for multiplexed per-session
-  streams (`AttachView`, `SubscribeOutput`, `SubscribeSearch`, etc.).
+- `FIN_FRAME = [0, 0, 0, 0]` (`body_len == 0`): universal 4-byte clean EOF sentinel across Unix sockets,
+  Windows named pipes, and SSH `proxy` links.
+- `body_len`: byte length of `[stream_id..]` (`10 <= body_len <= MAX_FRAME_PAYLOAD + 10`, where
+  `MAX_FRAME_PAYLOAD = 8 MiB = 8_388_608`; values in `1..10` or above the cap fail decoding cleanly).
+- `stream_id`: `0` (`CONTROL_STREAM_ID`) for connection-level control RPCs; `>= 1` (`NonZeroStreamId`) for
+  multiplexed per-session streams.
+- `msg_type`: explicit `u16` wire tag (`crates/apack-proto/src/messages.rs::msg_type`):
+  - `0x0001..=0x0010`: Client → Broker control (`stream_id == 0`)
+  - `0x0100..=0x0116`: Client → Broker per-session (`stream_id >= 1`)
+  - `0x0200..=0x020C`: Broker → Client control replies
+  - `0x0300..=0x0323`: Broker → Client per-session replies and push events (`req_id == 0` / `PUSH_REQ_ID` for pushes)
+- `req_id`: client-assigned `u32` request correlation ID (`0` for unsolicited pushes / fire-and-forget messages).
 - **Scalar & collection encoding (`crates/apack-proto/src/codec.rs`):**
-  - Unsigned integers use **canonical unsigned LEB128** (`var_u32`, `var_u64`); non-canonical overlong encodings
-    and trailing bytes are rejected on decode.
-  - Strings are UTF-8 length-prefixed (`var_u32` byte count + UTF-8 bytes) with hard per-field decode caps.
+  - Unsigned integers use **canonical unsigned LEB128** (`var_u32`, `var_u64`); non-canonical overlong
+    encodings and trailing bytes in any decoded message payload are rejected.
+  - Strings are UTF-8 length-prefixed with hard per-field decode caps.
   - Vectors use `vec_bounded` with explicit compile-time maximums before allocation (preventing OOM bombs).
   - `FrameDecoder` is strictly streaming and chunk-boundary invariant across every 1-byte and arbitrary split.
 
-## Handshake & Mutual Authentication
+## Handshake & Mutual Authentication (`crates/apack-core/src/auth.rs`)
 
-Every new connection starts in `Unauthenticated` state under a hard `AUTH_HANDSHAKE_TIMEOUT_MS` (`10 s`)
-deadline and completes a 4-step mutual HMAC-SHA256 handshake (`crates/apack-core/src/auth.rs`):
+Every new connection starts unauthenticated under a hard `AUTH_HANDSHAKE_TIMEOUT_MS` (`10 s`) deadline:
 
 ```text
 Client                                          Broker
-  │ ─── Hello { protocol: 2, client_nonce, ──▶   │  verifies protocol == 2
-  │             client_name, capabilities }      │  generates server_nonce
-  │ ◀── HelloChallenge { server_nonce,      ───  │  MAC_s = HMAC(key, "apack-v2-srv" || c_nonce || s_nonce)
-  │                      server_mac }            │
-  │   verifies server_mac (constant-time)        │
-  │   MAC_c = HMAC(key, "apack-v2-cli" || ...)   │
-  │ ─── HelloAuth { client_mac }            ──▶  │  verifies client_mac (constant-time)
-  │ ◀── HelloOk { broker_version,           ───  │  transitions connection to Authenticated
-  │               capabilities, max_frame,       │
-  │               word_delimiters }              │
+  │ ─── Hello { protocol_version: 2,        ──▶  │  verifies protocol_version == 2
+  │             client_nonce: [u8; 32] }         │  generates server_nonce: [u8; 32]
+  │ ◀── HelloOk { protocol_version: 2,      ───  │  sets auth_required (true if APACK_TERMINAL_AUTH_KEY set)
+  │               auth_required, server_nonce,   │
+  │               word_delimiters, capabilities }│
+  │                                              │
+  │   [if auth_required == true:]                │
+  │   client_hmac = HMAC-SHA256(secret,          │
+  │     "apack-v2-client" || c_nonce || s_nonce) │
+  │ ─── AuthProof { hmac: client_hmac }     ──▶  │  verifies client_hmac (constant-time)
+  │                                              │  server_hmac = HMAC-SHA256(secret,
+  │                                              │    "apack-v2-server" || s_nonce || c_nonce)
+  │ ◀── AuthOk { server_hmac }              ───  │  transitions connection to Authenticated
+  │   verifies server_hmac (constant-time)       │
 ```
 
-Any message other than the expected handshake step, wrong protocol version, bad MAC, or timeout immediately
-closes the connection.
+If a client was configured with `authSecret` and the server replies `auth_required == false`, the client
+rejects the connection immediately (downgrade protection). Any wrong protocol version, out-of-order message,
+bad HMAC, or timeout closes the connection.
 
 ## Message Catalog (`crates/apack-proto/src/messages.rs`)
 
 ### Client → Broker (`ClientMsg`)
 
-| Group | Messages | Purpose |
+| Scope | Messages (`msg_type`) | Purpose |
 |---|---|---|
-| Handshake | `Hello`, `HelloAuth`, `Ping` | Protocol negotiation, mutual HMAC auth, RTT probing |
-| Leases | `AcquireLease`, `ReleaseLease`, `RenewLease` | Claim/release/extend broker-wide or per-session reconnect grace leases |
-| Session Lifecycle | `Spawn`, `ListSessions`, `CloseSession`, `Signal`, `Resize`, `Write` | Create/list/terminate sessions, send POSIX signals (`SignalKind`), resize PTY/VT, write raw stdin |
-| Streams & Views | `Attach`, `Detach`, `FrameAck`, `OutputCredit`, `KeyInput`, `MouseInput`, `Paste` | Open/close multiplexed streams (`SUB_VIEW`, `SUB_RAW_OUTPUT`, `SUB_EVENTS`), acknowledge rendered view frames, grant raw output byte credits, send structured input |
-| Queries & Waits | `ReadScreen`, `ReadHistory`, `GetFacts`, `GetCommands`, `GetImages`, `GetImageBlob`, `WordAt`, `SelectText`, `Search`, `SearchWatchStart`, `SearchWatchStop`, `Wait`, `CancelWait` | Authoritative reads, scrollback paging, shell/status facts, content-addressed image blob streaming, word/selection resolution, one-shot & incremental search, event-driven waits |
-| Recordings | `RecordingStatus`, `RecordingFlush`, `RewindOpen`, `RewindSeek`, `RewindClose` | Inspect WAL status, flush barrier, and deterministic recording rewind/seek |
+| Control (`0x0001..=0x0010`) | `Hello`, `AuthProof`, `AcquireLease`, `ReleaseLease`, `Spawn`, `Kill`, `Signal`, `Owns`, `ListSessions`, `Rewind`, `Seek`, `Metrics`, `Attach`, `Detach`, `Keep`, `Wait` | Handshake/auth, leases (`BrokerImmediate`, `BrokerGrace`, `Session`), session spawn/kill/signal/ownership/list/keep, WAL `Rewind`/`Seek`, telemetry `Metrics`, stream `Attach`/`Detach`, event-driven `Wait` |
+| Per-Session Stream (`0x0100..=0x0116`) | `FrameAck`, `ViewportHint`, `ExplicitResize`, `SetCursorDefaults`, `Key`, `Text`, `Pointer`, `Focus`, `Paste`, `Write`, `Pause`, `Resume`, `OutputCredit`, `FetchRows`, `WordAt`, `LineAt`, `TextOf`, `TextOfRect`, `SetSearch`, `Commands`, `CommandOutput`, `Images`, `GetImageBlob` | Adaptive BDP view pacing, resize arbitration, structured input/paste/raw write, PTY pause/resume, raw output byte credits, scrollback `FetchRows`, authoritative word/line/text selection, incremental `SetSearch`, shell command history & output, Kitty image placements & `64 KiB` chunked blob reads |
 
 ### Broker → Client (`BrokerMsg`)
 
-| Group | Messages | Purpose |
+| Scope | Messages (`msg_type`) | Purpose |
 |---|---|---|
-| Handshake | `HelloChallenge`, `HelloOk`, `Pong`, `Error` | Auth challenge/completion, RTT reply, typed `ErrorCode` replies (`rpc_id`) |
-| Leases | `LeaseAcquired`, `LeaseReleased` | Lease confirmation and expiry/release notice |
-| Lifecycle & Replies | `Spawned`, `SessionList`, `Ok`, `SessionExited` | RPC replies and asynchronous session exit notifications (exit code/signal) |
-| Streaming Data | `ViewFrame`, `RawOutput`, `SessionEvent`, `SearchDelta` | Coalesced differential view frames, credit-bounded raw PTY bytes, async shell/title/CWD/status/bell events, debounced search match updates |
-| Query Replies | `ScreenReply`, `HistoryReply`, `FactsReply`, `CommandsReply`, `ImagesReply`, `ImageBlobChunk`, `WordReply`, `TextReply`, `SearchReply`, `WaitReply`, `RecordingStatusReply`, `RewindReply` | Bounded authoritative query answers |
+| Control Replies (`0x0200..=0x020C`) | `HelloOk`, `AuthOk`, `Error`, `Ok`, `LeaseAck`, `Spawned`, `OwnsReply`, `SessionsList`, `Rewound`, `Sought`, `MetricsReply`, `Attached`, `Waited` | Handshake/auth completion, typed `ErrorCode` replies, lease/session/rewind/metrics/wait RPC replies |
+| Per-Session Replies (`0x0300..=0x030A`) | `Frame`, `Rows`, `Pasted`, `SpanReply`, `TextReply`, `SearchMatches`, `SearchDelta`, `CommandsReply`, `CommandOutputReply`, `ImagesReply`, `ImageBlobChunk` | Differential `FrameUpdate` pushes, scrollback rows, paste outcome, word/line/text queries, incremental search matches/deltas, shell commands & output, Kitty image placements & chunks |
+| Per-Session Push Events (`0x0310..=0x0323`) | `Title`, `Bell`, `Clipboard`, `Notification`, `Progress`, `ProgramStatus`, `CommandStarted`, `CommandFinished`, `CwdChanged`, `Exited`, `Output`, `Throttled`, `OutputDropped`, `StreamClosed` | Terminal metadata/events, vouched/claimed shell lifecycle, OSC 7501 status updates, credit-bounded raw PTY `Output`, explicit backpressure notices (`Throttled`, `OutputDropped`), stream close |
 
 ## Flow Control & Backpressure (`crates/apack-core/src/flow.rs`)
 
 `apack-terminal` v2 strictly separates **conflatable visual state** from **ordered byte/event streams**:
 
-1. **View Frames (Conflatable, Adaptive BDP Window):**
-   - Each attached view stream tracks in-flight frame bytes against an adaptive bandwidth-delay-product
-     window clamped to `[MIN_BDP_FRAME_BYTES = 32 KiB, MAX_BDP_FRAME_BYTES = 1 MiB]` (default `256 KiB`).
-   - When the window is full, the shard marks dirty rows in the view's `ViewProjection` without queueing
-     intermediate frames. The next `FrameAck { frame_seq, paint_us }` frees credit, adjusts the BDP window
-     using observed RTT/paint time, and immediately flushes a single coalesced delta frame carrying all
-     accumulated changes plus `coalesced_frames` accounting.
-2. **Raw Output (`SUB_RAW_OUTPUT`, Ordered Byte Credits):**
-   - Clients explicitly grant byte credits via `OutputCredit { bytes }` (capped at `MAX_RAW_OUTPUT_CREDIT = 4 MiB`).
-   - The broker never transmits raw bytes beyond granted credit; if a consumer stalls, overflow is tracked
-     explicitly rather than growing memory unboundedly.
-3. **Control & Event Outbound Queue:**
-   - Non-conflatable outbound bytes per connection are capped at `MAX_CONTROL_QUEUE_BYTES = 16 MiB`. Exceeding
-     this terminates the stalled connection cleanly so one dead client cannot starve the shard.
+1. **View Frames (`SubFlags::VIEW`, Conflatable Adaptive BDP Credits):**
+   - Each view stream grants `FrameCredit { max_frames: u16, max_bytes: u32 }` inside `FrameAck { seq, credit }`.
+   - The broker clamps byte budgets to `[MIN_BDP_FRAME_BYTES = 32 KiB, MAX_BDP_FRAME_BYTES = 1 MiB]` (default
+     `256 KiB`) and emits no frames when `max_frames == 0` (e.g. hidden tab).
+   - While credit is exhausted, dirty rows accumulate in the session's dirty bitmap with zero queued
+     intermediate frames; the next `FrameAck` immediately flushes one coalesced `Frame(FrameUpdate)`.
+2. **Raw Output (`SubFlags::RAW_OUTPUT`, Ordered Byte Credits):**
+   - Clients grant byte credits via `OutputCredit { bytes }` (capped at `MAX_RAW_OUTPUT_CREDIT = 4 MiB`).
+   - Overload is explicitly surfaced via `Throttled` / `OutputDropped` rather than silently discarding bytes
+     or unbounded buffering.
+3. **Outbound & Stdin Caps:**
+   - Non-conflatable outbound bytes per connection are capped at `MAX_CONTROL_QUEUE_BYTES = 16 MiB`.
    - Per-session PTY stdin write backlog is capped at `MAX_PTY_WRITE_BYTES = 16 MiB`.
 
-## Error Codes (`ErrorCode`)
+## Error Codes (`crates/apack-proto/src/types.rs::ErrorCode`)
 
-Every RPC error returns a closed, typed `ErrorCode` enum (never ad-hoc error strings for control flow):
-`ProtocolVersion`, `AuthFailed`, `InvalidRequest`, `SessionNotFound`, `StreamNotFound`, `LimitExceeded`,
-`Backpressure`, `LeaseConflict`, `NotSupported`, `IoFailed`, `RecordingError`, `Cancelled`, `TimedOut`,
-`Internal`.
+Every RPC error returns one of 11 closed `ErrorCode` variants:
+`Handshake` (`1`), `Unauthorized` (`2`), `Malformed` (`3`), `NoSuchSession` (`4`), `NoSuchStream` (`5`),
+`StaleEpoch` (`6`), `Pty` (`7`), `OutsideSession` (`8`), `Unsupported` (`9`), `ResourceLimit` (`10`),
+`Busy` (`11`).

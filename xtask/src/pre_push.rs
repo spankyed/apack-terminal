@@ -118,10 +118,10 @@ fn mutants_of_the_change(root: &Path, base: &str) -> Result<(), String> {
 
     // **A timeout is a kill, so this fails on a survivor and not on one.** cargo-mutants exits 2 for a
     // mutant the suite passed and 3 for one that made it stop ending — and the second is nextest's deadline
-    // catching it, which is what `.config/nextest.toml` is for: the credit-accounting mutants in
-    // `output.rs` hang the writer every time, by design. Treating any non-zero exit as failure made this
-    // refuse a change whose every mutant was accounted for (15 caught, 3 timed out, none missed), which is
-    // how it was found. `.github/workflows/mutants.yml` tolerates the same code for the same reason.
+    // catching it, which is what `.config/nextest.toml` is for: codec and credit-accounting mutants hang by
+    // design. Treating any non-zero exit as failure made this refuse a change whose every mutant was
+    // accounted for (15 caught, 3 timed out, none missed), which is how it was found.
+    // `.github/workflows/mutants.yml` tolerates the same code for the same reason.
     // What a pass that was ended left in the system's temporary directory, which nothing else removes
     let cleared = crate::leftovers::clear_in(root, &std::env::temp_dir())?;
     if cleared > 0 {
@@ -129,14 +129,17 @@ fn mutants_of_the_change(root: &Path, base: &str) -> Result<(), String> {
     }
     let started = Instant::now();
     println!("pre-push: mutants of the change");
-    // What only Windows compiles is not mutated here, where nothing builds it (`.cargo/windows-only`)
-    let windows_only = crate::mutants::windows_only_files(root)?;
+    // What only Windows (or Linux-only epoll) compiles is not mutated on platforms that do not compile it.
+    let mut platform_excludes = crate::mutants::windows_only_files(root)?;
+    if cfg!(not(target_os = "linux")) {
+        platform_excludes.push("crates/apack-os/src/pty_poller_epoll.rs".to_owned());
+    }
     // **Asked first whether the change has any**, because a run with none writes no list, and a missing list
     // is otherwise read as a run that failed. A change that only deletes Rust is the case: it touches Rust and
     // leaves nothing to mutate
     let listed = Command::new("cargo")
         .args(["mutants", "--workspace", "--list", "--in-diff", CHANGE_DIFF])
-        .args(windows_only.iter().flat_map(|file| ["--exclude", file.as_str()]))
+        .args(platform_excludes.iter().flat_map(|file| ["--exclude", file.as_str()]))
         .current_dir(root)
         .output()
         .map_err(|e| format!("pre-push: listing the change's mutants didn't start: {e}"))?;
@@ -153,7 +156,7 @@ fn mutants_of_the_change(root: &Path, base: &str) -> Result<(), String> {
     }
     let status = Command::new("cargo")
         .args(["mutants", "--workspace", "--in-diff", CHANGE_DIFF])
-        .args(windows_only.iter().flat_map(|file| ["--exclude", file.as_str()]))
+        .args(platform_excludes.iter().flat_map(|file| ["--exclude", file.as_str()]))
         .current_dir(root)
         .status()
         .map_err(|e| format!("pre-push: mutants of the change didn't start: {e}"))?;

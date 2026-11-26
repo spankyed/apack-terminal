@@ -26,7 +26,10 @@ pub const DEFAULT_IDLE_COMPRESS: Duration = Duration::from_secs(2);
 pub const DEFAULT_KILL_ESCALATE: Duration = Duration::from_secs(2);
 
 /// Environment variable supplying the optional mutual-HMAC authentication secret.
-pub const AUTH_KEY_ENV: &str = "APACK_TERMINAL_KEY";
+///
+/// Kept distinct from [`apack_os::pty::MARKS_KEY_ENV`] (`APACK_TERMINAL_KEY`) so stripping
+/// the broker auth secret from spawned shells never clobbers caller-supplied vouched marks keys.
+pub const AUTH_KEY_ENV: &str = "APACK_TERMINAL_AUTH_KEY";
 
 /// Runtime configuration for [`crate::BrokerServer`].
 #[derive(Debug, Clone)]
@@ -76,7 +79,7 @@ impl BrokerConfig {
         self
     }
 
-    /// Loads `start_grace` and optional `APACK_TERMINAL_KEY` from process environment variables.
+    /// Loads `start_grace` and optional `APACK_TERMINAL_AUTH_KEY` from process environment variables.
     pub fn with_env_overrides(self) -> Self {
         let grace_env = std::env::var(START_GRACE_ENV).ok();
         let key_env = std::env::var(AUTH_KEY_ENV).ok();
@@ -89,7 +92,7 @@ pub fn clamp_shard_count(requested: usize) -> usize {
     requested.clamp(1, MAX_DEFAULT_SHARDS)
 }
 
-/// Parsed top-level CLI subcommand for `apack-broker`.
+/// Parsed top-level CLI subcommand for `apack-terminal`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliCommand {
     /// Run the broker daemon listening on a local socket/pipe.

@@ -2,9 +2,8 @@
 //!
 //! **The point is that the build does not do this.** `ghostty-vt-rs-sys`' own `build.rs` will download and
 //! check the same archive on a first build, which is mechanically what happens here — the difference is
-//! *when*, and it is the whole of the decision this feature rests on (`goal-one-vt-core.md`, D4): a build
-//! that reaches the network fails differently on a machine that has none, and cannot be reproduced. So the
-//! fetch happens here, once, and the build is handed the result through
+//! *when*: a build that reaches the network fails differently on a machine that has none, and cannot be
+//! reproduced. So the fetch happens here, once, and the build is handed the result through
 //! `GHOSTTY_VT_RS_SYS_PREBUILT_DIR` with `GHOSTTY_VT_RS_SYS_BUILD=prebuilt` beside it, which makes a
 //! build-from-source a refusal rather than a silent attempt that would need a Zig this repository does not
 //! pin.
@@ -145,7 +144,7 @@ fn pinned(source: &Path, triple: &str) -> Result<(String, String), String> {
             format!(
                 "no prebuilt libghostty-vt for {triple} at ghostty {}. The published targets are Apple, \
                  Linux (gnu and musl) and wasm32; Windows has no prebuilt from anyone and has to be built \
-                 from the signed source and dependency tarballs (goal-one-vt-core.md, D4)",
+                 from source with Zig",
                 &commit[..12]
             )
         })?;

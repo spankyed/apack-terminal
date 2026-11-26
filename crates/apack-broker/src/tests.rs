@@ -21,10 +21,12 @@ use apack_vt_ghostty::{GhosttyConfig, GhosttyEngine};
 use tempfile::tempdir;
 
 use crate::client::{BrokerClient, ClientError};
-use crate::config::{BrokerConfig, CliCommand, clamp_shard_count, derive_auth_secret, parse_cli, resolve_socket_path};
+use crate::config::{
+    AUTH_KEY_ENV, BrokerConfig, CliCommand, clamp_shard_count, derive_auth_secret, parse_cli, resolve_socket_path,
+};
 use crate::inspect::{build_report, collect_report, format_report};
 use crate::proxy::{
-    PROXY_REPLAY_CAP, ReplayBuffer, connect_or_autostart, connect_or_autostart_with, run_proxy_over,
+    PROXY_REPLAY_CAP, ReplayBuffer, connect_or_autostart, connect_or_autostart_with, run_proxy_over, run_stdio_proxy,
     should_buffer_replay, should_reconnect_proxy,
 };
 use crate::runtime::BrokerServer;
@@ -2034,4 +2036,56 @@ impl Write for ChanDuplex {
     fn flush(&mut self) -> io::Result<()> {
         self.writer.flush()
     }
+}
+
+#[test]
+fn stdio_proxy_fails_on_missing_socket_without_autostart() {
+    let dir = tempdir().unwrap();
+    let missing = unique_endpoint(dir.path(), "no-such-broker");
+    assert!(run_stdio_proxy(&missing, false).is_err());
+}
+
+#[test]
+fn connected_client_stays_alive_past_start_grace_and_marks_env_is_distinct_from_auth_env() {
+    assert_ne!(AUTH_KEY_ENV, apack_os::pty::MARKS_KEY_ENV);
+
+    let dir = tempdir().unwrap();
+    let endpoint = unique_endpoint(dir.path(), "start-grace-live");
+    let mut cfg = BrokerConfig::for_socket(&endpoint);
+    cfg.start_grace = Duration::from_millis(60);
+    let mut server = BrokerServer::bind(cfg).unwrap().spawn().unwrap();
+
+    let mut client = BrokerClient::connect(&endpoint, &AuthConfig::None, "grace-test").unwrap();
+    // Stay connected well past `start_grace` so `!state.ever_connected` is strictly exercised.
+    std::thread::sleep(Duration::from_millis(120));
+    let sessions = client.list_sessions().unwrap();
+    assert!(sessions.is_empty());
+
+    // Spawn a session with an explicit `APACK_TERMINAL_KEY` in `spec.env` and verify the broker
+    // does not strip it when stripping `AUTH_KEY_ENV`.
+    #[cfg(unix)]
+    let argv =
+        vec![String::from("/bin/sh"), String::from("-c"), String::from("printf 'MK=%s\\r\\n' \"$APACK_TERMINAL_KEY\"")];
+    #[cfg(windows)]
+    let argv = vec![String::from("cmd.exe"), String::from("/C"), String::from("echo MK=%APACK_TERMINAL_KEY%")];
+    let spec = SpawnSpec {
+        argv,
+        cwd: None,
+        env: vec![(String::from(apack_os::pty::MARKS_KEY_ENV), String::from("vouched-secret-value"))],
+        size: GridSize::new(80, 24).unwrap(),
+        cell_px: CellPx { width: 8, height: 16 },
+        scrollback_limit: 100,
+        marks_key: None,
+        resize_policy: ResizePolicy::LatestActive,
+        record_dir: None,
+        restore_from: None,
+        image_files: false,
+        kept: false,
+    };
+    let (session_id, _) = client.spawn(spec).unwrap();
+    let outcome = client.wait(session_id, WaitCondition::Text(String::from("MK=vouched-secret-value")), 5_000).unwrap();
+    assert_eq!(outcome, WaitOutcome::Met, "expected marks env preserved, got {outcome:?}");
+
+    drop(client);
+    server.shutdown().unwrap();
 }

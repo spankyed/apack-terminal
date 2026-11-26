@@ -89,9 +89,9 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-mutants@27.1.0,cargo-nextest@0.9.148
-      # Exit 3 is a timeout, which is the suite's deadline catching a mutant rather than a survivor — the
-      # credit-accounting mutants in `output.rs` hang the writer by design. It is also what a run with a
-      # timeout *and* a survivor exits with, so the survivors are read from the list rather than the code.
+      # Exit 3 is a timeout, which is the suite's deadline catching a mutant rather than a survivor — codec
+      # and flow-control mutants hang by design. It is also what a run with a timeout *and* a survivor exits
+      # with, so the survivors are read from the list rather than the code.
       # Two at a time: a runner has four cores, and the suite under one mutant uses more than one
       - if: steps.scope.outputs.code == 'true'
         env:
@@ -159,13 +159,12 @@ jobs:
             exit 0
           fi
           base="$(bash .github/base.sh)"
-          # **The files whose mutants only Windows can answer**, which is what this job is for. A file like
-          # `src/session.rs` holds Windows arms and POSIX code together, and `#[cfg(unix)]` code is not
-          # compiled here — so a mutation of it changes nothing, the suite passes, and the mutant is
-          # reported missed. A job scoped to the whole change is red whenever POSIX-only code moves, and
-          # says nothing about Windows either way.
+          # **The files whose mutants only Windows can answer**, which is what this job is for. A mixed file
+          # holds Windows arms and POSIX code together, and `#[cfg(unix)]` code is not compiled here — so a
+          # mutation of it changes nothing, the suite passes, and the mutant is reported missed. A job scoped
+          # to the whole change is red whenever POSIX-only code moves, and says nothing about Windows either way.
           #
-          # A mixed file's Windows arms are answered by a dispatch (`-f files=src/session.rs`): nothing here
+          # A mixed file's Windows arms are answered by a dispatch (`-f files=crates/apack-os/src/pty.rs`): nothing here
           # can tell a Windows mutant from a POSIX one inside one file, and a developer naming the file is
           # the claim being made deliberately rather than by a grep.
           # `base` is git arguments (`--merge-base HEAD^1` on a pull request), so it is split here as the Linux

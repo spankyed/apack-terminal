@@ -73,9 +73,12 @@ impl ReplayBuffer {
 }
 
 /// Connects to `socket_path`, verifying current-user ownership; if `autostart` is true and no
-/// broker is listening, spawns a detached `apack-broker serve --socket <socket_path>` and retries.
+/// broker is listening, spawns a detached `apack-terminal serve --socket <socket_path>` and retries.
 pub fn connect_or_autostart(socket_path: &str, autostart: bool) -> io::Result<Stream> {
-    connect_or_autostart_with(socket_path, autostart, AUTOSTART_TIMEOUT, spawn_detached_broker)
+    connect_or_autostart_with(socket_path, autostart, AUTOSTART_TIMEOUT, |path| {
+        let _child = spawn_detached_broker(path)?;
+        Ok(())
+    })
 }
 
 /// Testable core of [`connect_or_autostart`] accepting a custom timeout and spawner closure.
@@ -121,7 +124,7 @@ fn connect_verified(socket_path: &str) -> io::Result<Stream> {
     Ok(stream)
 }
 
-fn spawn_detached_broker(socket_path: &str) -> io::Result<()> {
+fn spawn_detached_broker(socket_path: &str) -> io::Result<std::process::Child> {
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
     cmd.arg("serve").arg("--socket").arg(socket_path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
@@ -138,8 +141,7 @@ fn spawn_detached_broker(socket_path: &str) -> io::Result<()> {
         const WINDOWS_DETACHED_FLAGS: u32 = 0x0800_0208;
         cmd.creation_flags(WINDOWS_DETACHED_FLAGS);
     }
-    let _child = cmd.spawn()?;
-    Ok(())
+    cmd.spawn()
 }
 
 /// Runs the dumb single-channel stdio proxy connected to `socket_path`.

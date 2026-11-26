@@ -1,6 +1,6 @@
 //! Golden v2 wire & mutual-HMAC test vectors shared with `@apackdev/terminal-view`.
 //!
-//! Run `UPDATE_VECTORS=1 cargo test -p apack-core --test wire_vectors_v2` to regenerate
+//! Run `UPDATE_VECTORS=1 cargo test -p apack-broker --test wire_vectors_v2` to regenerate
 //! `node/wire-vectors-v2.json`; normal test runs verify that the committed vectors match
 //! `apack-proto` and `apack-core::auth` byte-for-byte.
 
