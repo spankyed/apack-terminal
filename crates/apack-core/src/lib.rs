@@ -12,13 +12,28 @@ pub mod auth;
 pub mod broker;
 pub mod flow;
 pub mod lease;
+pub mod marks;
+pub mod session;
+pub mod status;
 pub mod time;
+pub mod vt;
 
+#[cfg(test)]
+mod session_tests;
 #[cfg(test)]
 mod tests;
 
 /// Hard cap on non-conflatable outbound bytes queued for a single connection (16 MiB).
 pub const MAX_CONTROL_QUEUE_BYTES: usize = 16_777_216;
+
+/// Hard cap on queued outbound bytes waiting to be written to a session's PTY stdin (16 MiB).
+pub const MAX_PTY_WRITE_BYTES: usize = 16_777_216;
+
+/// Hard upper bound on a DEC 2026 synchronized-output hold (1 second).
+pub const SYNC_HOLD_MAX_MS: u64 = 1_000;
+
+/// Coalescing window for incremental server-side `SearchWatch` delta pushes (150 ms).
+pub const SEARCH_COALESCE_MS: u64 = 150;
 
 /// Hard cap on per-stream `SUB_RAW_OUTPUT` byte credit (4 MiB).
 pub const MAX_RAW_OUTPUT_CREDIT: u32 = 4_194_304;
