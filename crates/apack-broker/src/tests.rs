@@ -1739,7 +1739,9 @@ fn e2e_leases_kept_pinning_tier2_compression_foreground_verify_and_kill_escalati
             argv: vec![
                 String::from("/bin/sh"),
                 String::from("-c"),
-                String::from("trap 'sleep 0.04; exit 7' HUP; printf 'HUP_TRAP_READY\\r\\n'; sleep 30 & wait"),
+                String::from(
+                    "trap 'sleep 0.04; exit 7' HUP; printf 'HUP_TRAP_READY\\r\\n'; while true; do sleep 30 & wait $!; done",
+                ),
             ],
             cwd: None,
             env: Vec::new(),
