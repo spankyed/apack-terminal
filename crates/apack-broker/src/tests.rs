@@ -2414,7 +2414,7 @@ fn review_regressions_env_grace_pipelined_fin_teardown_spawn_and_seek_cell_px() 
         };
 
         let mut batch = Vec::new();
-        const BURST_N: u32 = 100_000;
+        const BURST_N: u32 = 35_000;
         for i in 0..BURST_N {
             ClientMsg::Metrics
                 .encode_to_frame(apack_proto::types::StreamId::CONTROL, RequestId::from_raw(i + 2), &mut batch)
@@ -2422,7 +2422,7 @@ fn review_regressions_env_grace_pipelined_fin_teardown_spawn_and_seek_cell_px() 
         }
         batch.extend_from_slice(&apack_proto::FIN_FRAME);
 
-        // 6a. Sole client pipelines 100,000 Metrics (~2.2 MiB > Linux & macOS AF_UNIX buffers) + FIN_FRAME.
+        // 6a. Sole client pipelines 35,000 Metrics (~770 KiB > Linux & macOS AF_UNIX buffers) + FIN_FRAME.
         //     `has_draining_conns()` MUST keep the broker from auto-exiting while replies drain!
         let dir_solo = tempdir().unwrap();
         let ep_solo = unique_endpoint(dir_solo.path(), "unix-drain-solo");
@@ -2433,8 +2433,10 @@ fn review_regressions_env_grace_pipelined_fin_teardown_spawn_and_seek_cell_px() 
         do_hello(&mut burst);
         burst.write_all(&batch).unwrap();
         burst.flush().unwrap();
-        // Wait 60ms so the reactor processes FIN and would auto-exit if `has_draining_conns` were false!
-        std::thread::sleep(Duration::from_millis(60));
+        // Wait 200ms (>> unoptimized parse time of 35k frames, << 500ms GRACEFUL_DRAIN_TIMEOUT) so
+        // the reactor processes FIN and would auto-exit if `has_draining_conns` were false!
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!srv_solo.is_finished(), "broker must not auto-exit while draining_unix still holds unsent replies");
         let mut all_replies = Vec::new();
         burst.read_to_end(&mut all_replies).unwrap();
         let mut dec = apack_proto::frame::FrameDecoder::new();

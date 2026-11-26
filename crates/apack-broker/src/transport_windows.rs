@@ -173,8 +173,10 @@ pub(crate) fn spawn_win_conn_io(
         while !r_closed.load(Ordering::Acquire) {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => {
-                    let _ = r_ev_tx.send(WinTransportEvent::Closed(conn));
-                    r_wake();
+                    if !r_closed.load(Ordering::Acquire) {
+                        let _ = r_ev_tx.send(WinTransportEvent::Closed(conn));
+                        r_wake();
+                    }
                     break;
                 }
                 Ok(n) => {
