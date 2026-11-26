@@ -44,6 +44,7 @@ async function defaultDecodeBlob(
 export class ImageCache {
   private readonly entries = new Map<string, DecodedImage>()
   private readonly inflight = new Map<string, Promise<DecodedImage | null>>()
+  private readonly inflightCallbacks = new Map<string, Set<() => void>>()
   private readonly maxBytes: number
   private readonly decode: NonNullable<ImageCacheOptions['decode']>
   private usedBytes = 0
@@ -81,9 +82,13 @@ export class ImageCache {
 
     const existing = this.inflight.get(key)
     if (existing) {
-      if (onReady) void existing.then((img) => { if (img && !this.disposed) onReady() })
+      if (onReady) this.inflightCallbacks.get(key)?.add(onReady)
       return existing
     }
+
+    const callbacks = new Set<() => void>()
+    if (onReady) callbacks.add(onReady)
+    this.inflightCallbacks.set(key, callbacks)
 
     const promise = (async (): Promise<DecodedImage | null> => {
       try {
@@ -103,12 +108,17 @@ export class ImageCache {
           byteSize,
         }
         this.insert(entry)
-        onReady?.()
+        const waiting = this.inflightCallbacks.get(key)
+        this.inflightCallbacks.delete(key)
+        if (waiting) {
+          for (const cb of waiting) cb()
+        }
         return entry
       } catch {
         return null
       } finally {
         this.inflight.delete(key)
+        this.inflightCallbacks.delete(key)
       }
     })()
 
@@ -142,12 +152,13 @@ export class ImageCache {
     }
     this.entries.clear()
     this.inflight.clear()
+    this.inflightCallbacks.clear()
     this.usedBytes = 0
   }
 }
 
 function closeIfBitmap(source: CanvasImageSource): void {
-  if (typeof ImageBitmap !== 'undefined' && source instanceof ImageBitmap) {
+  if (typeof source === 'object' && source !== null && 'close' in source && typeof source.close === 'function') {
     source.close()
   }
 }

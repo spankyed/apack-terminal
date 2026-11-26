@@ -62,8 +62,12 @@ describe('ImageCache and TerminalView image placements', () => {
     expect(cache.get(b1)).toBeDefined()
     expect(cache.get(b3)).toBeDefined()
     expect(cache.get(b2)).toBeUndefined()
+    // Evicted bitmap must be closed!
+    expect(bitmaps[1]!.closed).toBe(true)
     cache.dispose()
     expect(cache.size).toBe(0)
+    expect(bitmaps[0]!.closed).toBe(true)
+    expect(bitmaps[2]!.closed).toBe(true)
   })
 
   it('fetches placements on imagesGen bump and renders both placements and placeholder pieces in z-order', async () => {
@@ -76,8 +80,9 @@ describe('ImageCache and TerminalView image placements', () => {
     }
     source.imagesGen = 1
     source.imagePlacements = [
-      { blob: fgBlob, line: 1, col: 2, pixelSize: [40, 20], cellSpan: [4, 1], zIndex: 5 },
-      { blob: bgBlob, line: 0, col: 0, pixelSize: [20, 20], cellSpan: [2, 1], zIndex: -2 },
+      // Large natural pixelSize (2000x1500) placed in 4x1 cells -> drawn at 4*10=40 by 1*20=20 CSS px!
+      { blob: fgBlob, line: 1, col: 2, pixelSize: [2000, 1500], cellSpan: [4, 1], zIndex: 5 },
+      { blob: bgBlob, line: 0, col: 0, pixelSize: [800, 600], cellSpan: [2, 1], zIndex: -2 },
     ]
 
     const pics = new Map<string, CanvasImageSource>()
@@ -118,6 +123,8 @@ describe('ImageCache and TerminalView image placements', () => {
     expect(scene.images![1]!.above).toBe(false)
     expect(scene.images![2]!.picture).toBe(pics.get(blobHashToHex(fgBlob)))
     expect(scene.images![2]!.above).toBe(true)
+    expect(scene.images![2]!.width).toBe(40)
+    expect(scene.images![2]!.height).toBe(20)
 
     view.dispose()
     cache.dispose()

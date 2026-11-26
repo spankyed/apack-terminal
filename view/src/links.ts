@@ -108,21 +108,17 @@ function rowCells(row: PackedRow): CellInfo[] {
     const slice = text.slice(u16Off, u16Off + u16Len)
 
     if ((runFlags & RunFlag.PER_CELL) !== 0) {
-      const chars = Array.from(slice)
-      if (chars.length <= 1) {
-        out.push({ col: colStart, width: colLen, text: slice, linkIdx })
-      } else {
-        const per = Math.max(1, Math.floor(colLen / chars.length))
-        let col = colStart
-        for (let k = 0; k < chars.length; k += 1) {
-          const w = k + 1 === chars.length ? Math.max(1, colStart + colLen - col) : per
-          out.push({ col, width: w, text: chars[k]!, linkIdx })
-          col += w
-        }
+      // Ghostty emits one PER_CELL run per cell (wide char or multi-codepoint grapheme cluster).
+      out.push({ col: colStart, width: colLen, text: slice, linkIdx })
+    } else if (slice.length === colLen) {
+      for (let k = 0; k < colLen; k += 1) {
+        out.push({ col: colStart + k, width: 1, text: slice[k]!, linkIdx })
       }
     } else {
-      for (let k = 0; k < slice.length && k < colLen; k += 1) {
-        out.push({ col: colStart + k, width: 1, text: slice[k]!, linkIdx })
+      // Narrow non-BMP codepoints (e.g. Nerd Font PUA-A/B surrogate pairs): 1 codepoint per column.
+      const cps = Array.from(slice)
+      for (let k = 0; k < cps.length && k < colLen; k += 1) {
+        out.push({ col: colStart + k, width: 1, text: cps[k]!, linkIdx })
       }
     }
   }
@@ -134,7 +130,7 @@ function isWrapped(row: PackedRow): boolean {
 }
 
 function targetOf(row: PackedRow, linkIdx: number): string | undefined {
-  return linkIdx === 0 ? undefined : row.links[linkIdx - 1]
+  return linkIdx === 0 ? undefined : row.links[linkIdx]
 }
 
 function runIndexAt(row: PackedRow, column: number): number {

@@ -794,6 +794,7 @@ export function decodePackedRow(r: WireReader): PackedRow {
 
   const runCount = r.varU32()
   if (runCount > 4096) throw new WireError('LimitExceeded', 'wire limit exceeded: packed runs')
+  if (runCount * 11 > r.remaining) throw new WireError('UnexpectedEof', 'truncated packed runs')
   const runs = new Uint32Array(runCount * 4)
   for (let i = 0; i < runCount; i += 1) {
     const colStart = r.u16()
@@ -837,6 +838,7 @@ export function decodePackedRow(r: WireReader): PackedRow {
 
   const styleCount = r.varU32()
   if (styleCount > 4096) throw new WireError('LimitExceeded', 'wire limit exceeded: packed styles')
+  if (styleCount * 16 > r.remaining) throw new WireError('UnexpectedEof', 'truncated packed styles')
   const styles = new Uint32Array(styleCount * 4)
   for (let i = 0; i < styleCount; i += 1) {
     const fg = r.u32()

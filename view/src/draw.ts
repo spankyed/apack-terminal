@@ -314,25 +314,25 @@ export function drawRow(
     const perCell = (runFlags & RunFlag.PER_CELL) !== 0
 
     if (perCell) {
-      const chars = Array.from(slice)
-      if (chars.length <= 1) {
-        const isSel = hasSelection && colStart < selected!.to && colStart + colLen > selected!.from
-        emitSegment(slice, colStart, colLen, false, styleFg, styleBg, styleUl, flags, isSel)
-      } else {
-        const per = Math.max(1, Math.floor(colLen / chars.length))
-        let col = colStart
-        for (let k = 0; k < chars.length; k += 1) {
-          const w = k + 1 === chars.length ? Math.max(1, colStart + colLen - col) : per
-          const isSel = hasSelection && col < selected!.to && col + w > selected!.from
-          emitSegment(chars[k]!, col, w, false, styleFg, styleBg, styleUl, flags, isSel)
-          col += w
-        }
+      // Ghostty emits one PER_CELL run per cell (wide glyph or multi-codepoint grapheme cluster).
+      const isSel = hasSelection && colStart < selected!.to && colStart + colLen > selected!.from
+      emitSegment(slice, colStart, colLen, false, styleFg, styleBg, styleUl, flags, isSel)
+      continue
+    }
+
+    // Narrow non-BMP codepoints (surrogate pairs, `slice.length !== colLen`): emit 1 codepoint per column
+    if (slice.length !== colLen) {
+      const cps = Array.from(slice)
+      for (let k = 0; k < cps.length && k < colLen; k += 1) {
+        const c = colStart + k
+        const isSel = hasSelection && c < selected!.to && c + 1 > selected!.from
+        emitSegment(cps[k]!, c, 1, false, styleFg, styleBg, styleUl, flags, isSel)
       }
       continue
     }
 
-    // 1-cell-per-code-unit fast path (ASCII or 1-cell BMP run)
-    const batchable = slice.length === colLen && isPrintableAscii(slice)
+    // 1-cell-per-UTF-16-code-unit fast path (ASCII or 1-cell BMP run)
+    const batchable = isPrintableAscii(slice)
     const runEnd = colStart + colLen
 
     // Collect any interior split points caused by selection edges or WCAG highlight boundaries

@@ -11,8 +11,8 @@
  * - Pipelined `64 KiB` `GetImageBlob` chunk assembly (`window = 8` chunks in flight)
  */
 import { BULK_CHUNK_BYTES, PROTOCOL_VERSION, WireError } from '../wire/codec.ts'
-import { computeClientProof, randomNonce32, verifyServerProof } from '../wire/auth.ts'
-import { FrameDecoder, encodeFin } from '../wire/frame.ts'
+import { computeClientProof, ctEq32, randomNonce32, verifyServerProof } from '../wire/auth.ts'
+import { FrameDecoder, encodeFin, type FrameHeader } from '../wire/frame.ts'
 import {
   decodeBrokerMsg,
   encodeClientFrame,
@@ -165,19 +165,33 @@ export class TerminalClient {
 
     const decoder = new FrameDecoder()
     let instance: TerminalClient | null = null
-    const handshakeQueue: BrokerMsg[] = []
-    let handshakeWaiter: ((msg: BrokerMsg) => void) | null = null
+    type HandshakeItem =
+      | { readonly kind: 'msg'; readonly header: FrameHeader; readonly msg: BrokerMsg }
+      | { readonly kind: 'fin' }
+    const handshakeQueue: HandshakeItem[] = []
+    let handshakeWaiter: ((item: HandshakeItem) => void) | null = null
     let handshakeReject: ((err: Error) => void) | null = null
-    let closedEarly = false
+    let earlyError: Error | null = null
 
     const failEarly = (err: Error) => {
-      if (closedEarly) return
-      closedEarly = true
+      if (earlyError !== null) return
+      earlyError = err
       if (handshakeReject) {
         const rej = handshakeReject
         handshakeWaiter = null
         handshakeReject = null
         rej(err)
+      }
+    }
+
+    const pushHandshakeItem = (item: HandshakeItem) => {
+      if (handshakeWaiter) {
+        const w = handshakeWaiter
+        handshakeWaiter = null
+        handshakeReject = null
+        w(item)
+      } else {
+        handshakeQueue.push(item)
       }
     }
 
@@ -190,18 +204,11 @@ export class TerminalClient {
         const frames = decoder.push(chunk)
         for (const f of frames) {
           if (f.kind === 'fin') {
-            failEarly(new DisconnectedError('broker sent FIN during handshake'))
+            pushHandshakeItem({ kind: 'fin' })
             return
           }
           const msg = decodeBrokerMsg(f.header.msgType, f.payload)
-          if (handshakeWaiter) {
-            const w = handshakeWaiter
-            handshakeWaiter = null
-            handshakeReject = null
-            w(msg)
-          } else {
-            handshakeQueue.push(msg)
-          }
+          pushHandshakeItem({ kind: 'msg', header: f.header, msg })
         }
       } catch (err) {
         failEarly(err instanceof Error ? err : new Error(String(err)))
@@ -217,12 +224,36 @@ export class TerminalClient {
       }
     })
 
-    const nextHandshakeMsg = (): Promise<BrokerMsg> => {
+    const nextHandshakeMsg = (expectedReqId: number): Promise<BrokerMsg> => {
+      const consume = (item: HandshakeItem): BrokerMsg => {
+        if (item.kind === 'fin') {
+          throw new DisconnectedError('broker sent FIN during handshake')
+        }
+        if (item.header.streamId !== CONTROL_STREAM_ID || item.header.reqId !== expectedReqId) {
+          throw new WireError(
+            'InvalidValue',
+            `unexpected handshake header (stream=${item.header.streamId}, req=${item.header.reqId})`,
+          )
+        }
+        return item.msg
+      }
       const queued = handshakeQueue.shift()
-      if (queued) return Promise.resolve(queued)
-      if (closedEarly) return Promise.reject(new DisconnectedError('transport closed during handshake'))
+      if (queued) {
+        try {
+          return Promise.resolve(consume(queued))
+        } catch (err) {
+          return Promise.reject(err)
+        }
+      }
+      if (earlyError !== null) return Promise.reject(earlyError)
       return new Promise((resolve, reject) => {
-        handshakeWaiter = resolve
+        handshakeWaiter = (item) => {
+          try {
+            resolve(consume(item))
+          } catch (err) {
+            reject(err instanceof Error ? err : new Error(String(err)))
+          }
+        }
         handshakeReject = reject
       })
     }
@@ -237,7 +268,7 @@ export class TerminalClient {
           clientName,
         }),
       )
-      const first = await nextHandshakeMsg()
+      const first = await nextHandshakeMsg(1)
       if (first.kind === 'error') throw new BrokerError(first.code, first.message)
       if (first.kind !== 'helloOk') {
         throw new WireError('InvalidTag', `expected helloOk, got ${first.kind}`)
@@ -255,7 +286,7 @@ export class TerminalClient {
         }
         const proof = computeClientProof(authSecret, clientNonce, first.serverNonce)
         stream.write(encodeClientFrame(CONTROL_STREAM_ID, 2, { kind: 'authProof', hmac: proof }))
-        const second = await nextHandshakeMsg()
+        const second = await nextHandshakeMsg(2)
         if (second.kind === 'error') throw new BrokerError(second.code, second.message)
         if (second.kind !== 'authOk') {
           throw new WireError('InvalidTag', `expected authOk, got ${second.kind}`)
@@ -264,6 +295,8 @@ export class TerminalClient {
           throw new BrokerError('unauthorized', 'broker failed mutual HMAC verification')
         }
       }
+
+      if (earlyError !== null) throw earlyError
 
       const client = new TerminalClient(
         stream,
@@ -276,10 +309,14 @@ export class TerminalClient {
       )
       client.nextReqId = 3
       instance = client
-      // Deliver any frames that arrived in the same read chunk right after HelloOk/AuthOk
-      while (handshakeQueue.length > 0) {
+      // Deliver any frames/FIN that arrived in the same read chunk right after HelloOk/AuthOk
+      while (handshakeQueue.length > 0 && !client.closed) {
         const extra = handshakeQueue.shift()!
-        client.dispatchFrame(CONTROL_STREAM_ID, PUSH_REQ_ID, extra)
+        if (extra.kind === 'fin') {
+          client.handleClosed('broker sent FIN')
+          break
+        }
+        client.dispatchFrame(extra.header.streamId, extra.header.reqId, extra.msg)
       }
       return client
     } catch (err) {
@@ -349,6 +386,11 @@ export class TerminalClient {
     if (reqId !== PUSH_REQ_ID) {
       const entry = this.pending.get(reqId)
       if (entry) {
+        if (entry.streamId !== streamId) {
+          this.handleClosed(`protocol error: reply reqId ${reqId} arrived on stream ${streamId}, expected ${entry.streamId}`)
+          this.stream.close()
+          return
+        }
         this.pending.delete(reqId)
         if (msg.kind === 'error') {
           entry.reject(new BrokerError(msg.code, msg.message))
@@ -525,6 +567,8 @@ export class TerminalClient {
   }
 }
 
+const MAX_BUFFERED_FRAMES = 8
+
 /**
  * One multiplexed session attachment implementing `TerminalSource` with byte-bounded BDP
  * `FrameCredit` pacing and pipelined `64 KiB` `GetImageBlob` chunk assembly.
@@ -534,6 +578,7 @@ export class BrokerSessionSource implements TerminalSource {
   private readonly manualAckSinks = new Set<SourceSink>()
   private readonly bufferedFrames: FrameUpdate[] = []
   private lastSeq = 0
+  private lastAckedSeq = 0
   private lastFrameAtMs: number | null = null
   private ewmaIntervalMs = 16
   private visible: boolean
@@ -588,16 +633,17 @@ export class BrokerSessionSource implements TerminalSource {
         this.lastFrameAtMs = now
         this.lastSeq = msg.frame.seq
         if (this.sinks.size === 0) {
-          // Conflate buffered full/delta frames if subscribe() has not run yet
+          // Conflate & cap buffered frames while unsubscribed; hold ack until a sink subscribes
           if (msg.frame.fullSync) this.bufferedFrames.length = 0
+          if (this.bufferedFrames.length >= MAX_BUFFERED_FRAMES) this.bufferedFrames.shift()
           this.bufferedFrames.push(msg.frame)
         } else {
           for (const sink of this.sinks) sink.onFrame(msg.frame)
-        }
-        // When a view subscribes with `manualAck`, it calls `ackFrame(seq)` after painting so
-        // frame credit paces cleanly to actual render speed. Otherwise auto-ack immediately.
-        if (this.manualAckSinks.size === 0) {
-          this.ackFrame(msg.frame.seq)
+          // When a view subscribes with `manualAck`, it calls `ackFrame(seq)` after painting so
+          // frame credit paces cleanly to actual render speed. Otherwise auto-ack immediately.
+          if (this.manualAckSinks.size === 0) {
+            this.ackFrame(msg.frame.seq)
+          }
         }
         break
       }
@@ -630,29 +676,43 @@ export class BrokerSessionSource implements TerminalSource {
       case 'streamClosed':
         for (const sink of this.sinks) sink.onEvent?.(msg as SessionEvent)
         break
+      case 'error':
+        for (const sink of this.sinks) {
+          sink.onEvent?.({ kind: 'streamClosed', reason: `${msg.code}: ${msg.message}` })
+        }
+        break
       default:
         break
     }
   }
 
   subscribe(sink: SourceSink, options?: { readonly manualAck?: boolean }): () => void {
+    if (this.disposed) return () => {}
     this.sinks.add(sink)
     if (options?.manualAck) this.manualAckSinks.add(sink)
     if (this.bufferedFrames.length > 0) {
       const frames = this.bufferedFrames.splice(0, this.bufferedFrames.length)
       for (const f of frames) sink.onFrame(f)
+      if (this.manualAckSinks.size === 0 && this.lastSeq > this.lastAckedSeq) {
+        this.ackFrame(this.lastSeq)
+      }
     }
     return () => {
       this.sinks.delete(sink)
-      this.manualAckSinks.delete(sink)
+      const wasManual = this.manualAckSinks.delete(sink)
+      if (wasManual && this.manualAckSinks.size === 0 && this.lastSeq > this.lastAckedSeq) {
+        this.ackFrame(this.lastSeq)
+      }
     }
   }
 
   ackFrame(seq: number): void {
     if (this.disposed) return
+    const nextSeq = Math.max(this.lastAckedSeq, seq)
+    this.lastAckedSeq = nextSeq
     this.client.sendPush(this.streamId, {
       kind: 'frameAck',
-      seq,
+      seq: nextSeq,
       credit: this.currentCredit(),
     })
   }
@@ -662,89 +722,106 @@ export class BrokerSessionSource implements TerminalSource {
     const visibilityChanged = this.visible !== hint.visible
     this.visible = hint.visible
     this.client.sendPush(this.streamId, { kind: 'viewportHint', hint })
-    if (visibilityChanged) {
-      this.client.sendPush(this.streamId, {
-        kind: 'frameAck',
-        seq: this.lastSeq,
-        credit: this.currentCredit(),
-      })
+    // Only send an out-of-band FrameAck once at least one frame has been observed so we never
+    // race frame 1 with `seq = 0` (`FlowError::InvalidAckSeq`).
+    if (visibilityChanged && this.lastSeq > 0) {
+      this.ackFrame(this.lastSeq)
     }
   }
 
+  private ensureActive(): void {
+    if (this.disposed) throw new DisconnectedError('stream disposed')
+  }
+
   async explicitResize(size: GridSize, cellPx: CellPx): Promise<void> {
+    this.ensureActive()
     const reply = await this.client.request(this.streamId, { kind: 'explicitResize', size, cellPx })
     if (reply.kind !== 'ok') throw new WireError('InvalidTag', `expected ok, got ${reply.kind}`)
   }
 
   setCursorDefaults(shape: CursorShape, blinking: boolean): void {
+    if (this.disposed) return
     this.client.sendPush(this.streamId, { kind: 'setCursorDefaults', shape, blinking })
   }
 
   sendKey(input: KeyInput): void {
+    if (this.disposed) return
     this.client.sendPush(this.streamId, { kind: 'key', input })
   }
 
   sendText(text: string): void {
+    if (this.disposed) return
     this.client.sendPush(this.streamId, { kind: 'text', text })
   }
 
   sendPointer(input: PointerInput): void {
+    if (this.disposed) return
     this.client.sendPush(this.streamId, { kind: 'pointer', input })
   }
 
   sendFocus(focused: boolean): void {
+    if (this.disposed) return
     this.client.sendPush(this.streamId, { kind: 'focus', focused })
   }
 
   async paste(text: string, allowUnsafe = false): Promise<PasteOutcome> {
+    this.ensureActive()
     const reply = await this.client.request(this.streamId, { kind: 'paste', text, allowUnsafe })
     if (reply.kind !== 'pasted') throw new WireError('InvalidTag', `expected pasted, got ${reply.kind}`)
     return reply.outcome
   }
 
   async fetchRows(epoch: number, fromLine: number, count: number): Promise<readonly PackedRow[]> {
+    this.ensureActive()
     const reply = await this.client.request(this.streamId, { kind: 'fetchRows', epoch, fromLine, count })
     if (reply.kind !== 'rows') throw new WireError('InvalidTag', `expected rows, got ${reply.kind}`)
     return reply.rows
   }
 
   async wordAt(epoch: number, pos: CellPos): Promise<CellSpan | null> {
+    this.ensureActive()
     const reply = await this.client.request(this.streamId, { kind: 'wordAt', epoch, pos })
     if (reply.kind !== 'spanReply') throw new WireError('InvalidTag', `expected spanReply, got ${reply.kind}`)
     return reply.span
   }
 
   async lineAt(epoch: number, line: number): Promise<CellSpan | null> {
+    this.ensureActive()
     const reply = await this.client.request(this.streamId, { kind: 'lineAt', epoch, line })
     if (reply.kind !== 'spanReply') throw new WireError('InvalidTag', `expected spanReply, got ${reply.kind}`)
     return reply.span
   }
 
   async textOf(epoch: number, span: CellSpan): Promise<string> {
+    this.ensureActive()
     const reply = await this.client.request(this.streamId, { kind: 'textOf', epoch, span })
     if (reply.kind !== 'textReply') throw new WireError('InvalidTag', `expected textReply, got ${reply.kind}`)
     return reply.text
   }
 
   async textOfRect(epoch: number, span: CellSpan): Promise<string> {
+    this.ensureActive()
     const reply = await this.client.request(this.streamId, { kind: 'textOfRect', epoch, span })
     if (reply.kind !== 'textReply') throw new WireError('InvalidTag', `expected textReply, got ${reply.kind}`)
     return reply.text
   }
 
   async setSearch(query: string, caseSensitive: boolean): Promise<{ readonly epoch: number; readonly matches: readonly CellSpan[]; readonly truncated: boolean }> {
+    this.ensureActive()
     const reply = await this.client.request(this.streamId, { kind: 'setSearch', query, caseSensitive })
     if (reply.kind !== 'searchMatches') throw new WireError('InvalidTag', `expected searchMatches, got ${reply.kind}`)
     return { epoch: reply.epoch, matches: reply.matches, truncated: reply.truncated }
   }
 
   async commands(): Promise<readonly CommandRecord[]> {
+    this.ensureActive()
     const reply = await this.client.request(this.streamId, { kind: 'commands' })
     if (reply.kind !== 'commandsReply') throw new WireError('InvalidTag', `expected commandsReply, got ${reply.kind}`)
     return reply.commands
   }
 
   async commandOutput(commandId: number): Promise<string | null> {
+    this.ensureActive()
     const reply = await this.client.request(this.streamId, { kind: 'commandOutput', commandId })
     if (reply.kind !== 'commandOutputReply') {
       throw new WireError('InvalidTag', `expected commandOutputReply, got ${reply.kind}`)
@@ -753,6 +830,7 @@ export class BrokerSessionSource implements TerminalSource {
   }
 
   async images(): Promise<{ readonly imagesGen: number; readonly placements: readonly ImagePlacement[] }> {
+    this.ensureActive()
     const reply = await this.client.request(this.streamId, { kind: 'images' })
     if (reply.kind !== 'imagesReply') throw new WireError('InvalidTag', `expected imagesReply, got ${reply.kind}`)
     return { imagesGen: reply.imagesGen, placements: reply.placements }
@@ -763,7 +841,12 @@ export class BrokerSessionSource implements TerminalSource {
    * flight simultaneously so high-RTT SSH links stream images in 1–2 RTTs!).
    */
   async getImageBlob(blob: Uint8Array): Promise<ImageBlobData> {
+    this.ensureActive()
+    if (blob.length !== 32) throw new WireError('InvalidValue', 'image blob hash must be 32 bytes')
     const first = await this.requestImageChunk(blob, 0, BULK_CHUNK_BYTES)
+    if (!ctEq32(first.blob, blob)) {
+      throw new WireError('InvalidValue', 'image blob chunk hash mismatch')
+    }
     const total = first.totalBytes
     if (total > MAX_IMAGE_BLOB_BYTES) {
       throw new WireError('LimitExceeded', `image blob ${total} bytes exceeds safety cap`)
@@ -772,15 +855,25 @@ export class BrokerSessionSource implements TerminalSource {
     if (first.offset !== 0) {
       throw new WireError('InvalidValue', `unexpected initial image chunk offset ${first.offset}`)
     }
-    const out = new Uint8Array(total)
-    out.set(first.data, 0)
-    if (first.data.length >= total) {
-      return { blob, encoding, bytes: out }
+    if (total === 0) {
+      return { blob, encoding, bytes: new Uint8Array(0) }
+    }
+    const expectedFirst = Math.min(BULK_CHUNK_BYTES, total)
+    if (first.data.length !== expectedFirst) {
+      throw new WireError(
+        'UnexpectedEof',
+        `short initial image blob chunk: got ${first.data.length}, expected ${expectedFirst}`,
+      )
+    }
+    if (first.data.length === total) {
+      return { blob, encoding, bytes: first.data.slice() }
     }
 
-    const chunkSize = Math.max(1, Math.min(BULK_CHUNK_BYTES, first.data.length))
+    const out = new Uint8Array(total)
+    out.set(first.data, 0)
+
     const offsets: number[] = []
-    for (let off = first.data.length; off < total; off += chunkSize) {
+    for (let off = first.data.length; off < total; off += BULK_CHUNK_BYTES) {
       offsets.push(off)
     }
 
@@ -788,13 +881,21 @@ export class BrokerSessionSource implements TerminalSource {
     const worker = async (): Promise<void> => {
       while (cursor < offsets.length) {
         const off = offsets[cursor++]!
-        const expectedLen = Math.min(chunkSize, total - off)
+        const expectedLen = Math.min(BULK_CHUNK_BYTES, total - off)
         const chunk = await this.requestImageChunk(blob, off, expectedLen)
-        if (chunk.encoding !== encoding || chunk.totalBytes !== total || chunk.offset !== off) {
+        if (
+          !ctEq32(chunk.blob, blob)
+          || chunk.encoding !== encoding
+          || chunk.totalBytes !== total
+          || chunk.offset !== off
+        ) {
           throw new WireError('InvalidValue', 'inconsistent image blob chunk metadata')
         }
-        if (chunk.data.length === 0) {
-          throw new WireError('UnexpectedEof', 'empty image blob chunk before totalBytes')
+        if (chunk.data.length !== expectedLen) {
+          throw new WireError(
+            'UnexpectedEof',
+            `short image blob chunk at ${off}: got ${chunk.data.length}, expected ${expectedLen}`,
+          )
         }
         out.set(chunk.data, off)
       }

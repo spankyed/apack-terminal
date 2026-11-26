@@ -276,4 +276,75 @@ describe('TerminalClient & BrokerSessionSource', () => {
     pipe.pushFin()
     await expect(pending).rejects.toBeInstanceOf(DisconnectedError)
   })
+
+  it('rejects 0-byte/short/mismatched-hash image chunks, FIN piggybacked on HelloOk, and post-dispose calls', async () => {
+    // 1. FIN arriving in same chunk right after HelloOk marks returned client closed
+    const finPipe = new MockBrokerPipe()
+    finPipe.onClientFrame = (streamId, reqId, msg) => {
+      if (msg.kind === 'hello') {
+        const helloOk = encodeBrokerFrame(streamId, reqId, {
+          kind: 'helloOk',
+          protocolVersion: PROTOCOL_VERSION,
+          authRequired: false,
+          serverNonce: new Uint8Array(32),
+          wordDelimiters: ' ',
+          capabilities: 0,
+        })
+        const combined = new Uint8Array(helloOk.length + FIN_FRAME.length)
+        combined.set(helloOk, 0)
+        combined.set(FIN_FRAME, helloOk.length)
+        // Push both in one read chunk
+        finPipe.stream.onData(() => {}) // no-op
+        ;(finPipe as unknown as { dataHandlers: Set<(c: Uint8Array) => void> }).dataHandlers.forEach((cb) => cb(combined))
+      }
+    }
+    const cFin = await TerminalClient.connect(finPipe.stream)
+    expect(cFin.isClosed).toBe(true)
+
+    // 2. Hostile 0-byte initial chunk for totalBytes = 64 MiB fails fast without OOM/hang
+    const imgPipe = new MockBrokerPipe()
+    const wantedBlob = new Uint8Array(32).fill(0x42)
+    let mode: 'zero' | 'wrongHash' = 'zero'
+    imgPipe.onClientFrame = (streamId, reqId, msg) => {
+      if (msg.kind === 'hello') {
+        imgPipe.pushBroker(streamId, reqId, {
+          kind: 'helloOk',
+          protocolVersion: PROTOCOL_VERSION,
+          authRequired: false,
+          serverNonce: new Uint8Array(32),
+          wordDelimiters: ' ',
+          capabilities: 0,
+        })
+      } else if (msg.kind === 'attach') {
+        imgPipe.pushBroker(CONTROL_STREAM_ID, reqId, {
+          kind: 'attached',
+          session: msg.session,
+          streamId: msg.streamId,
+          epoch: 1,
+          size: { cols: 80, rows: 24 },
+          firstActiveLine: 0,
+          scrollbackLines: 0,
+          foreground: null,
+        })
+      } else if (msg.kind === 'getImageBlob') {
+        imgPipe.pushBroker(streamId, reqId, {
+          kind: 'imageBlobChunk',
+          blob: mode === 'wrongHash' ? new Uint8Array(32).fill(0x99) : msg.blob,
+          encoding: 'png',
+          totalBytes: mode === 'zero' ? 64 * 1024 * 1024 : 4,
+          offset: 0,
+          data: mode === 'zero' ? new Uint8Array(0) : new Uint8Array([1, 2, 3, 4]),
+        })
+      }
+    }
+    const client = await TerminalClient.connect(imgPipe.stream)
+    const session = await client.attachSession(1)
+    await expect(session.getImageBlob(wantedBlob)).rejects.toThrow(/short initial image blob chunk/i)
+    mode = 'wrongHash'
+    await expect(session.getImageBlob(wantedBlob)).rejects.toThrow(/hash mismatch/i)
+
+    session.dispose()
+    await expect(session.commands()).rejects.toBeInstanceOf(DisconnectedError)
+    client.close()
+  })
 })

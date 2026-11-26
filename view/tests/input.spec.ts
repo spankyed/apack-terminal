@@ -76,6 +76,15 @@ describe('Input & keyboard handling', () => {
     expect(source.texts).toEqual(['🎉'])
     field.dispatchEvent(new Event('compositionend'))
     expect(source.texts).toEqual(['🎉', '日本語'])
+
+    // Blur mid-composition resets composing state so subsequent keys are never stuck
+    field.dispatchEvent(new Event('compositionstart'))
+    field.value = 'stuck'
+    field.dispatchEvent(new Event('blur'))
+    expect(field.value).toBe('')
+    expect(field.style.opacity).toBe('0')
+    key('keydown', { code: 'KeyB', key: 'b' })
+    expect(source.keys.at(-1)?.code).toBe('KeyB')
   })
 
   it('confirms unsafe pastes before resending with allowUnsafe=true and reports paste errors', async () => {

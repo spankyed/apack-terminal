@@ -89,6 +89,11 @@ describe('pointer, selection, wheel, links, and layout caching', () => {
     point('pointerdown', 3, 1, { button: 0, at: 2000 })
     point('pointermove', 4, 1, { button: 0, at: 2050 })
     point('pointerup', 4, 1, { button: 0, at: 2100 })
+    // Side buttons (Back=3 / Forward=4) must NOT be sent as invalid PointerInput
+    point('pointerdown', 3, 1, { button: 3, at: 2200 })
+    point('pointerup', 3, 1, { button: 3, at: 2250 })
+    point('pointerdown', 3, 1, { button: 4, at: 2300 })
+    point('pointerup', 3, 1, { button: 4, at: 2350 })
     expect(source.pointers.map((p) => [p.action, p.button, p.xPx, p.yPx])).toEqual([
       ['press', 0, 35, 30],
       ['motion', 0, 45, 30],

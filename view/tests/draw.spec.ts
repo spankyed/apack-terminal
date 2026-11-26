@@ -83,14 +83,24 @@ describe('drawRow & sessionTheme (v2 PackedRow)', () => {
     expect(hidden.glyphs.map((g) => g.text)).toEqual(['AB', 'CD'])
   })
 
-  it('handles wide PER_CELL glyphs and expands selection rectangle to cover touched wide characters', () => {
+  it('handles wide PER_CELL grapheme clusters without splitting and narrow non-BMP runs without breaking surrogate pairs', () => {
     const r = packRow({
       line: 0,
       styles: [{}],
-      runs: [{ colStart: 0, colLen: 2, text: '日', flags: RunFlag.PER_CELL }],
+      runs: [
+        { colStart: 0, colLen: 2, text: '👨‍👩‍👧‍👦', flags: RunFlag.PER_CELL },
+        { colStart: 2, colLen: 1, text: 'e\u0301', flags: RunFlag.PER_CELL },
+        { colStart: 3, colLen: 2, text: '𝕏𝕐', flags: 0 },
+      ],
     })
     const drawn = drawRow(r, theme, { from: 1, to: 2 })
-    expect(drawn.glyphs[0]).toMatchObject({ text: '日', column: 0, cells: 2, batchable: false })
+    // Family emoji stays ONE 2-cell glyph, combining accent stays ONE 1-cell glyph, and 𝕏/𝕐 stay intact surrogate pairs!
+    expect(drawn.glyphs.map((g) => [g.text, g.column, g.cells, g.batchable])).toEqual([
+      ['👨‍👩‍👧‍👦', 0, 2, false],
+      ['e\u0301', 2, 1, false],
+      ['𝕏', 3, 1, false],
+      ['𝕐', 4, 1, false],
+    ])
     expect(drawn.backgrounds).toEqual([{ column: 0, cells: 2, color: theme.selectionBackground }])
   })
 

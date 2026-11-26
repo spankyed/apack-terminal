@@ -29,6 +29,7 @@ import {
 } from './source.ts'
 import { Viewport } from './viewport.ts'
 import { cellsOfCodePoint } from './width.ts'
+import { MAX_GRID_COLS, MAX_GRID_ROWS } from './wire/codec.ts'
 
 /**
  * A run of lines a host folds away. The first line stays on screen as a header, which stands for
@@ -369,6 +370,16 @@ export class TerminalView {
   setVisible(visible: boolean): void {
     if (this.visible === visible) return
     this.visible = visible
+    if (!visible) {
+      if (this.scheduled !== null) {
+        cancelAnimationFrame(this.scheduled)
+        this.scheduled = null
+      }
+      if (this.unacknowledgedSeq !== null && !this.ended) {
+        this.source.ackFrame?.(this.unacknowledgedSeq)
+        this.unacknowledgedSeq = null
+      }
+    }
     this.pushViewportHint()
     if (visible) this.schedule()
   }
@@ -460,6 +471,7 @@ export class TerminalView {
   }
 
   private applySearchSnapshot(snapshot: SearchSnapshot, resetCurrent: boolean): void {
+    if (this.needle === '') return
     if (this.store.epoch >= 0 && snapshot.epoch !== this.store.epoch) return
     const prev = this.matches[this.currentMatch]
     const sorted = sortMatchesNewestFirst(snapshot.matches)
@@ -708,19 +720,20 @@ export class TerminalView {
     this.wantPictures(first, lines[lines.length - 1]! - first + 1)
   }
 
+  private readonly schedulePaint = () => this.schedule()
+
   private wantPictures(first: number, count: number): void {
     if (this.ended || !this.listening || count <= 0) return
-    const onReady = () => this.schedule()
     for (const placement of this.placements) {
       const pRows = Math.max(1, placement.cellSpan[1])
       if (placement.line + pRows <= first - count || placement.line >= first + count * 2) continue
-      void this.imageCache.ensure(this.source, placement.blob, onReady)
+      void this.imageCache.ensure(this.source, placement.blob, this.schedulePaint)
     }
     for (let line = first - count; line < first + count * 2; line += 1) {
       const pieces = this.store.row(line)?.pieces
       if (!pieces) continue
       for (const piece of pieces) {
-        void this.imageCache.ensure(this.source, piece.blob, onReady)
+        void this.imageCache.ensure(this.source, piece.blob, this.schedulePaint)
       }
     }
   }
@@ -759,8 +772,8 @@ export class TerminalView {
 
     // 2. Anchored placements from `source.images()`
     for (const placement of this.placements) {
-      const pCols = Math.max(1, placement.cellSpan[0])
-      const pRows = Math.max(1, placement.cellSpan[1])
+      const [spanCols, spanRows] = placement.cellSpan
+      const pRows = Math.max(1, spanRows)
       if (placement.line + pRows <= first || placement.line >= first + span) continue
       if (this.hiddenIn(placement.line)) continue
       const decoded = this.imageCache.get(placement.blob)
@@ -770,8 +783,8 @@ export class TerminalView {
         picture: decoded.source,
         x: placement.col * cellWidth,
         y: this.rowsBetween(first, placement.line) * cellHeight,
-        width: pxW > 0 ? pxW : pCols * cellWidth,
-        height: pxH > 0 ? pxH : pRows * cellHeight,
+        width: spanCols > 0 ? spanCols * cellWidth : pxW,
+        height: spanRows > 0 ? spanRows * cellHeight : pxH,
         source: { x: 0, y: 0, width: decoded.width, height: decoded.height },
         above: placement.zIndex >= 0,
         z: placement.zIndex,
@@ -942,8 +955,8 @@ export class TerminalView {
     if (host.clientWidth <= 0 || host.clientHeight <= 0) return
     const { cellWidth, cellHeight } = this.painter.metrics
     if (cellWidth <= 0 || cellHeight <= 0) return
-    const columns = Math.max(1, Math.floor((host.clientWidth - this.gutter) / cellWidth))
-    const rows = Math.max(1, Math.floor(host.clientHeight / cellHeight))
+    const columns = Math.min(MAX_GRID_COLS, Math.max(1, Math.floor((host.clientWidth - this.gutter) / cellWidth)))
+    const rows = Math.min(MAX_GRID_ROWS, Math.max(1, Math.floor(host.clientHeight / cellHeight)))
     const last = this.lastFit
     if (
       last
@@ -1159,10 +1172,13 @@ export class TerminalView {
   }
 
   private pause(): void {
+    if (this.unacknowledgedSeq !== null && !this.ended) {
+      this.source.ackFrame?.(this.unacknowledgedSeq)
+    }
+    this.unacknowledgedSeq = null
     this.unsubscribe?.()
     this.unsubscribe = null
     this.listening = false
-    this.unacknowledgedSeq = null
     this.mirrorTimer.cancel()
     if (this.scheduled !== null) cancelAnimationFrame(this.scheduled)
     this.scheduled = null
@@ -1254,14 +1270,14 @@ export class TerminalView {
       this.setCommands([])
       this.placements = []
       this.imagesGenSeen = -1
-      const hadSearch = this.needle !== '' || this.matches.length > 0 || this.moreMatches
-      this.needle = ''
+      const hadMatches = this.matches.length > 0 || this.moreMatches
+      // Keep `this.needle` across epoch resets: the broker preserves the active SearchWatch and
+      // immediately pushes a fresh `SearchMatches` for the new epoch.
       this.matches = []
       this.moreMatches = false
       this.currentMatch = -1
-      this.finding += 1
       this.matchVersion += 1
-      if (hadSearch) this.options.onFound?.(this.found)
+      if (hadMatches) this.options.onFound?.(this.found)
       this.fetchCommands()
     } else {
       for (const line of changed) this.drawings.delete(line)
@@ -1476,7 +1492,8 @@ export class TerminalView {
     this.focus()
     event.preventDefault()
     const at = this.positionOf(event)
-    const reporting = this.frame?.modes.mouse === true && !event.shiftKey && this.viewport.following
+    const validButton = event.button >= 0 && event.button <= 2
+    const reporting = validButton && this.frame?.modes.mouse === true && !event.shiftKey && this.viewport.following
     this.pressed = { button: event.button, reporting, at, moved: false, block: event.altKey }
     this.element.setPointerCapture?.(event.pointerId)
     if (reporting) {
@@ -1883,21 +1900,19 @@ function cellAtColumn(
     const slice = text.slice(u16Off, u16Off + u16Len)
 
     if ((runFlags & RunFlag.PER_CELL) !== 0) {
-      const chars = Array.from(slice)
-      if (chars.length <= 1) return { col: start, width: len, text: slice, flags }
-      const per = Math.max(1, Math.floor(len / chars.length))
-      let cur = start
-      for (let k = 0; k < chars.length; k += 1) {
-        const w = k + 1 === chars.length ? Math.max(1, start + len - cur) : per
-        if (col >= cur && col < cur + w) return { col: cur, width: w, text: chars[k]!, flags }
-        cur += w
-      }
-      return null
+      return { col: start, width: len, text: slice, flags }
     }
 
     const offset = col - start
-    if (offset >= 0 && offset < slice.length) {
-      return { col, width: 1, text: slice[offset]!, flags }
+    if (slice.length === len) {
+      if (offset >= 0 && offset < slice.length) {
+        return { col, width: 1, text: slice[offset]!, flags }
+      }
+      return null
+    }
+    const cps = Array.from(slice)
+    if (offset >= 0 && offset < cps.length) {
+      return { col, width: 1, text: cps[offset]!, flags }
     }
     return null
   }

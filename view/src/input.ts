@@ -352,6 +352,13 @@ export class Input {
     // Keys let go while something else has the keyboard are never heard of again
     this.down.clear()
     this.clearKeyText()
+    if (this.composing) {
+      this.composing = false
+      this.field.style.opacity = '0'
+      this.field.style.width = '1px'
+      this.field.value = ''
+      this.held = { start: 0, suffix: 0 }
+    }
     this.options.focused(false)
   }
 }

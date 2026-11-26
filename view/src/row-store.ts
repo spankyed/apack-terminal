@@ -124,19 +124,25 @@ export class RowStore {
     const prevEnd = this.end
     const prevFirstActive = this.firstActive
 
+    const imagesBumped = !reset && frame.imagesGen !== this.imagesGen
     if (reset) {
       this.clearAll()
       this.epoch = frame.epoch
       this.imagesGen = frame.imagesGen
-    } else if (frame.imagesGen !== this.imagesGen) {
+    } else if (imagesBumped) {
       this.imagesGen = frame.imagesGen
-      this.doubtPictured()
     }
 
     this.firstActive = Math.max(0, frame.firstActiveLine)
     this.screenRows = Math.max(0, frame.size.rows)
     this.columns = Math.max(0, frame.size.cols)
     this.scrollback = Math.max(0, Math.min(frame.scrollbackLines, this.firstActive))
+
+    // Doubt pictured history rows AFTER updating `firstActive` so active rows that just scrolled
+    // into history on the same frame `imagesGen` changed are properly doubted too.
+    if (imagesBumped) {
+      this.doubtPictured()
+    }
 
     if (reset || this.oldest !== prevOldest || this.firstActive < prevFirstActive) {
       this.absent.clear()
@@ -189,7 +195,12 @@ export class RowStore {
       if (row.line < this.oldest || row.line >= this.end) continue
       // Never overwrite live screen rows or newer doubted placeholder rows with stale history
       if (row.line >= this.firstActive && this.row(row.line) !== undefined) continue
-      if (staleImages && (row.flags & RowFlag.HAS_PLACEHOLDER) !== 0) continue
+      if (staleImages && (row.flags & RowFlag.HAS_PLACEHOLDER) !== 0) {
+        // Never mark a stale-image placeholder line as `absent`; mark it doubted so it refetches.
+        seen.add(row.line)
+        if (row.line < this.firstActive) this.doubted.add(row.line)
+        continue
+      }
       this.setRow(row)
       seen.add(row.line)
       absorbed.push(row.line)

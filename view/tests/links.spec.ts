@@ -37,11 +37,11 @@ describe('links (OSC 8 declared & URL/custom detectors on PackedRow)', () => {
     })
   })
 
-  it('prefers declared OSC 8 hyperlinks, joins wrapped linkRuns, and blocks unsafe schemes', () => {
+  it('prefers declared OSC 8 hyperlinks (1-based into links[] with links[0]=""), joins wrapped linkRuns, and blocks unsafe schemes', () => {
     const r0 = packRow({
       line: 0,
       flags: RowFlag.WRAPPED,
-      links: ['https://docs.example.dev'],
+      links: ['', 'https://docs.example.dev', 'https://other.example.dev'],
       runs: [
         { colStart: 0, colLen: 5, text: 'click' },
         { colStart: 5, colLen: 5, text: ' here', linkIdx: 1 },
@@ -49,8 +49,11 @@ describe('links (OSC 8 declared & URL/custom detectors on PackedRow)', () => {
     })
     const r1 = packRow({
       line: 1,
-      links: ['https://docs.example.dev'],
-      runs: [{ colStart: 0, colLen: 4, text: 'more', linkIdx: 1 }],
+      links: ['', 'https://docs.example.dev', 'https://other.example.dev'],
+      runs: [
+        { colStart: 0, colLen: 4, text: 'more', linkIdx: 1 },
+        { colStart: 5, colLen: 4, text: 'next', linkIdx: 2 },
+      ],
     })
     const rows = new Map([
       [0, r0],
@@ -68,11 +71,18 @@ describe('links (OSC 8 declared & URL/custom detectors on PackedRow)', () => {
       { line: 0, from: 5, to: 10 },
       { line: 1, from: 0, to: 4 },
     ])
+    // Second distinct OSC 8 link on same row resolves to links[2]
+    expect(linkAt(r1, 6, [urls], (l) => rows.get(l))).toEqual({
+      target: 'https://other.example.dev',
+      kind: 'declared',
+      from: 5,
+      to: 9,
+    })
 
     // Unsafe javascript: / data: / vbscript: schemes (even with control chars) are rejected
     const bad = packRow({
       line: 2,
-      links: ['  java\tscript:alert(1)'],
+      links: ['', '  java\tscript:alert(1)'],
       runs: [{ colStart: 0, colLen: 4, text: 'evil', linkIdx: 1 }],
     })
     expect(linkAt(bad, 1, [urls])).toBeNull()

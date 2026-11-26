@@ -64,8 +64,8 @@ type DecoderState =
   | {
       readonly kind: 'payload'
       readonly header: FrameHeader
-      /** Grows lazily as chunks arrive so a huge declared length on a stalled chunk allocates 0 bytes */
-      readonly chunks: Uint8Array[]
+      /** Single exponentially-grown buffer (0 bytes allocated until payload bytes arrive; no chunk amplification) */
+      buf: Uint8Array | null
       have: number
     }
   | { readonly kind: 'closed' }
@@ -147,7 +147,7 @@ export class FrameDecoder {
             this.state = { kind: 'length', buf: new Uint8Array(4), have: 0 }
             return { consumed: offset, frame: { kind: 'frame', header, payload: new Uint8Array(0) } }
           }
-          this.state = { kind: 'payload', header, chunks: [], have: 0 }
+          this.state = { kind: 'payload', header, buf: null, have: 0 }
         }
         continue
       }
@@ -155,21 +155,32 @@ export class FrameDecoder {
       const expected = st.header.payloadLen
       const need = expected - st.have
       const take = Math.min(need, input.length - offset)
-      st.chunks.push(input.slice(offset, offset + take))
-      st.have += take
+      if (st.buf === null && take === expected) {
+        // Fast path: full payload arrived in one chunk
+        const payload = input.slice(offset, offset + take)
+        offset += take
+        const header = st.header
+        this.state = { kind: 'length', buf: new Uint8Array(4), have: 0 }
+        return { consumed: offset, frame: { kind: 'frame', header, payload } }
+      }
+      const nextHave = st.have + take
+      if (st.buf === null) {
+        const initialCap = Math.min(expected, Math.max(256, nextHave))
+        st.buf = new Uint8Array(initialCap)
+      } else if (nextHave > st.buf.length) {
+        let nextCap = st.buf.length
+        while (nextCap < nextHave) {
+          nextCap = Math.min(expected, nextCap * 2)
+        }
+        const grown = new Uint8Array(nextCap)
+        grown.set(st.buf.subarray(0, st.have), 0)
+        st.buf = grown
+      }
+      st.buf.set(input.subarray(offset, offset + take), st.have)
+      st.have = nextHave
       offset += take
       if (st.have === expected) {
-        let payload: Uint8Array
-        if (st.chunks.length === 1) {
-          payload = st.chunks[0]!
-        } else {
-          payload = new Uint8Array(expected)
-          let pos = 0
-          for (const chunk of st.chunks) {
-            payload.set(chunk, pos)
-            pos += chunk.length
-          }
-        }
+        const payload = st.buf.length === expected ? st.buf : st.buf.subarray(0, expected)
         const header = st.header
         this.state = { kind: 'length', buf: new Uint8Array(4), have: 0 }
         return { consumed: offset, frame: { kind: 'frame', header, payload } }

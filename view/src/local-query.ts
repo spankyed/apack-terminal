@@ -31,27 +31,42 @@ function cellsOfRow(row: PackedRow): RowCell[] {
     const slice = text.slice(u16Off, u16Off + u16Len)
 
     if ((runFlags & RunFlag.PER_CELL) !== 0) {
-      // Split into Unicode codepoints (or single grapheme cluster if colLen matches one cell/wide pair)
-      const chars = Array.from(slice)
-      if (chars.length === 1) {
-        out.push({ col: colStart, width: colLen, text: slice })
-      } else if (chars.length > 1) {
-        const per = Math.max(1, Math.floor(colLen / chars.length))
-        let col = colStart
-        for (let k = 0; k < chars.length; k += 1) {
-          const w = k + 1 === chars.length ? Math.max(1, colStart + colLen - col) : per
-          out.push({ col, width: w, text: chars[k]! })
-          col += w
-        }
+      // Ghostty emits one PER_CELL run per cell (wide glyph or multi-codepoint grapheme cluster).
+      out.push({ col: colStart, width: colLen, text: slice })
+    } else if (slice.length === colLen) {
+      // Pure 1-cell ASCII/BMP run: 1 UTF-16 code unit per column
+      for (let k = 0; k < colLen; k += 1) {
+        out.push({ col: colStart + k, width: 1, text: slice[k]!, })
       }
     } else {
-      // Pure 1-cell ASCII/BMP run: 1 UTF-16 code unit per column
-      for (let k = 0; k < slice.length && k < colLen; k += 1) {
-        out.push({ col: colStart + k, width: 1, text: slice[k]! })
+      // Narrow non-BMP codepoints (surrogate pairs): 1 codepoint per column
+      const cps = Array.from(slice)
+      for (let k = 0; k < cps.length && k < colLen; k += 1) {
+        out.push({ col: colStart + k, width: 1, text: cps[k]! })
       }
     }
   }
   return out
+}
+
+const EMPTY_ROW: PackedRow = {
+  line: 0,
+  flags: 0,
+  text: '',
+  runs: new Uint32Array(0),
+  styles: new Uint32Array(0),
+  links: [''],
+}
+
+/**
+ * Returns the cached row for `line`, treating omitted blank active-screen lines (`>= firstActive`)
+ * as empty non-wrapped rows so `fullSync` blank active lines never force a broker RPC fallback.
+ */
+function resolveLocalRow(store: RowStore, line: number): PackedRow | undefined {
+  const found = store.row(line)
+  if (found !== undefined) return found
+  if (line >= store.firstActive && line < store.end) return EMPTY_ROW
+  return undefined
 }
 
 /**
@@ -61,11 +76,11 @@ function cellsOfRow(row: PackedRow): RowCell[] {
  */
 export function localLineAt(store: RowStore, line: number): CellSpan | null {
   if (line < store.oldest || line >= store.end || store.columns <= 0) return null
-  if (store.row(line) === undefined) return null
+  if (resolveLocalRow(store, line) === undefined) return null
 
   let startLine = line
   while (startLine > store.oldest) {
-    const prev = store.row(startLine - 1)
+    const prev = resolveLocalRow(store, startLine - 1)
     if (prev === undefined) return null
     if ((prev.flags & RowFlag.WRAPPED) === 0) break
     startLine -= 1
@@ -73,11 +88,11 @@ export function localLineAt(store: RowStore, line: number): CellSpan | null {
 
   let endLine = line
   while (endLine + 1 < store.end) {
-    const cur = store.row(endLine)
+    const cur = resolveLocalRow(store, endLine)
     if (cur === undefined) return null
     if ((cur.flags & RowFlag.WRAPPED) === 0) break
     endLine += 1
-    if (store.row(endLine) === undefined) return null
+    if (resolveLocalRow(store, endLine) === undefined) return null
   }
 
   return {
@@ -133,17 +148,19 @@ export function localWordAt(store: RowStore, pos: CellPos, wordDelimiters: strin
 
   if (targetIdx < 0 || targetIdx >= flat.length) return null
 
-  const classify = (ch: string): 'space' | 'delim' | 'word' => {
+  const classify = (ch: string): string => {
     if (ch === ' ' || ch === '\t' || ch === '') return 'space'
-    if (delims.has(ch)) return 'delim'
+    if (delims.has(ch)) return `delim:${ch}`
     return 'word'
   }
 
   const targetClass = classify(flat[targetIdx]!.text)
   let lo = targetIdx
-  while (lo > 0 && classify(flat[lo - 1]!.text) === targetClass) lo -= 1
   let hi = targetIdx
-  while (hi + 1 < flat.length && classify(flat[hi + 1]!.text) === targetClass) hi += 1
+  if (targetClass === 'word' || targetClass === 'space') {
+    while (lo > 0 && classify(flat[lo - 1]!.text) === targetClass) lo -= 1
+    while (hi + 1 < flat.length && classify(flat[hi + 1]!.text) === targetClass) hi += 1
+  }
 
   const first = flat[lo]!
   const last = flat[hi]!
@@ -167,9 +184,6 @@ function sliceRowText(row: PackedRow, fromCol: number, toColInclusive: number, t
     out += c.text
     col = c.col + c.width
   }
-  if (!trimTrailingSpaces && col <= toColInclusive) {
-    out += ' '.repeat(toColInclusive - col + 1)
-  }
   return trimTrailingSpaces ? out.replace(/[ ]+$/, '') : out
 }
 
@@ -183,7 +197,7 @@ export function localTextOf(store: RowStore, span: CellSpan): string | null {
   const parts: string[] = []
   const maxCol = Math.max(0, store.columns - 1)
   for (let line = span.start.line; line <= span.end.line; line += 1) {
-    const row = store.row(line)
+    const row = resolveLocalRow(store, line)
     if (row === undefined) return null
     const fromCol = line === span.start.line ? span.start.col : 0
     const toCol = line === span.end.line ? span.end.col : maxCol
@@ -206,7 +220,7 @@ export function localTextOfRect(store: RowStore, span: CellSpan): string | null 
   const right = Math.max(span.start.col, span.end.col)
   const lines: string[] = []
   for (let line = span.start.line; line <= span.end.line; line += 1) {
-    const row = store.row(line)
+    const row = resolveLocalRow(store, line)
     if (row === undefined) return null
     lines.push(sliceRowText(row, left, right, true))
   }

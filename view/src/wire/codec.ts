@@ -268,6 +268,9 @@ export class WireReader {
       if (i === 4 && byte > 0x0f) {
         throw new WireError('VarintOverflow', 'LEB128 u32 varint overflow')
       }
+      if (i > 0 && byte === 0) {
+        throw new WireError('InvalidValue', 'non-canonical LEB128 u32 varint')
+      }
       acc = (acc + ((byte & 0x7f) * 2 ** (i * 7))) >>> 0
       if ((byte & 0x80) === 0) return acc
     }
@@ -280,6 +283,9 @@ export class WireReader {
       const byte = this.u8()
       if (i === 9 && byte > 0x01) {
         throw new WireError('VarintOverflow', 'LEB128 u64 varint overflow')
+      }
+      if (i > 0 && byte === 0) {
+        throw new WireError('InvalidValue', 'non-canonical LEB128 u64 varint')
       }
       acc |= BigInt(byte & 0x7f) << BigInt(i * 7)
       if ((byte & 0x80) === 0) return acc

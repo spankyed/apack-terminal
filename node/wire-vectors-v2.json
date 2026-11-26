@@ -102,6 +102,7 @@
     { "name": "frame_scrollback_exceeds_first_active", "direction": "broker", "hex": "2100000001000000000300000000010150001800050a000000000000000000000000000001", "reason": "scrollback_lines > first_active_line must be rejected" },
     { "name": "row_pieces_without_placeholder_flag", "direction": "broker", "hex": "3e0000000100000001030100000001010000016100000001111111111111111111111111111111111111111111111111111111111111111100000100000008080808", "reason": "non-empty pieces without FLAG_HAS_PLACEHOLDER must be rejected" },
     { "name": "search_delta_inverted_range", "direction": "broker", "hex": "0f0000000100000006030000000001140a0000", "reason": "to_line < from_line must be rejected" },
-    { "name": "image_blob_chunk_overflow", "direction": "broker", "hex": "31000000010000000a0301000000abababababababababababababababababababababababababababababababab00040203010203", "reason": "offset + len > total_bytes must be rejected" }
+    { "name": "image_blob_chunk_overflow", "direction": "broker", "hex": "31000000010000000a0301000000abababababababababababababababababababababababababababababababab00040203010203", "reason": "offset + len > total_bytes must be rejected" },
+    { "name": "non_canonical_varint", "direction": "broker", "hex": "0c000000000000000902010000008000", "reason": "overlong LEB128 varint must be rejected" }
   ]
 }

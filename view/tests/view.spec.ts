@@ -91,6 +91,23 @@ describe('TerminalView v2 core lifecycle', () => {
     // Row 0 still highlighted
     expect(scene.rows[0]!.backgrounds.length).toBeGreaterThan(0)
 
+    // Epoch reset preserves active SearchWatch needle so broker's new-epoch SearchMatches + SearchDelta work!
+    source.send(frame({ seq: 2, epoch: 2, size: { cols: 20, rows: 4 }, rows: [row(0, 'foo resized')] }))
+    source.pushSearchMatches({
+      epoch: 2,
+      matches: [{ start: { line: 0, col: 0 }, end: { line: 0, col: 2 } }],
+      truncated: false,
+    })
+    expect(view.found).toEqual({ current: 1, total: 1, more: false })
+    source.pushSearchDelta({
+      epoch: 2,
+      fromLine: 1,
+      toLine: 2,
+      added: [{ start: { line: 1, col: 0 }, end: { line: 1, col: 2 } }],
+      truncated: false,
+    })
+    expect(view.found.total).toBe(2)
+
     // Clearing search sends empty query once
     await view.find('')
     expect(view.found).toEqual({ current: 0, total: 0, more: false })

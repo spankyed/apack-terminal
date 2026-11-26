@@ -230,17 +230,20 @@ export class CanvasPainter implements Painter {
       for (let i = 0; i < stop; i += 1) dirty[i] = 1
     }
 
-    // For integer row shifts, also detect any individual row in the blitted band whose drawing identity
-    // or cursor changed (e.g., cursor moved off a scrolled row or a row mutated while scrolling).
+    // Detect any row in the blitted band whose drawing identity changed relative to the shifted
+    // `shown.rows` (for BOTH integer and fractional smooth scrolls so newly fetched history rows,
+    // search highlights, selections, or blinking text never leave stale blitted pixels!).
+    const rowShift = Math.floor(scene.scrollPosition) - Math.floor(shown.scrollPosition)
+    for (let i = 0; i < count; i += 1) {
+      const oldIdx = i + rowShift
+      if (oldIdx < 0 || oldIdx >= shown.rows.length || scene.rows[i] !== shown.rows[oldIdx]) {
+        dirty[i] = 1
+      }
+    }
+
     const intShift = Math.round(deltaRows)
     const isIntegerShift = Math.abs(deltaRows - intShift) < 1e-6 && scene.offset === 0 && shown.offset === 0
     if (isIntegerShift) {
-      for (let i = 0; i < count; i += 1) {
-        const oldIdx = i + intShift
-        if (oldIdx < 0 || oldIdx >= shown.rows.length || scene.rows[i] !== shown.rows[oldIdx]) {
-          dirty[i] = 1
-        }
-      }
       if (shown.cursor) {
         const landed = shown.cursor.row - intShift
         if (landed >= 0 && landed < count) dirty[landed] = 1
@@ -249,7 +252,6 @@ export class CanvasPainter implements Painter {
         dirty[scene.cursor.row] = 1
       }
     } else {
-      // Fractional shift: repaint cursor rows unconditionally if present
       if (shown.cursor) {
         const landed = Math.floor(shown.cursor.row - deltaRows)
         for (let r = landed - 1; r <= landed + 1; r += 1) {
@@ -263,7 +265,13 @@ export class CanvasPainter implements Painter {
       }
     }
 
-    const bands = collectBands(dirty)
+    // Expand dirty rows by +-1 for vertical glyph overhang consistency with `changed()`
+    const expanded = new Uint8Array(count)
+    for (let i = 0; i < count; i += 1) {
+      if (dirty[i] || dirty[i - 1] || dirty[i + 1]) expanded[i] = 1
+    }
+
+    const bands = collectBands(expanded)
     for (const [first, end] of bands) {
       this.paintBand(scene, first, end)
     }

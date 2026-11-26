@@ -101,6 +101,14 @@ describe('CanvasPainter v2', () => {
     expect(redrawnTexts).toContain('line-6')
     expect(redrawnTexts).not.toContain('line-1')
     expect(redrawnTexts).not.toContain('line-2')
+
+    // Fractional scroll shift (+0.5 row = 10px) where a middle row mutated MUST repaint the dirty row!
+    rec.drawn.length = 0
+    const mutatedMid = [...rows.slice(1, 7), drawRow(row(7, 'line-7'), theme)]
+    mutatedMid[2] = drawRow(row(3, 'mid-updated'), theme)
+    painter.paint({ theme, rows: mutatedMid, offset: 0.5, scrollPosition: 1.5 })
+    const fracTexts = rec.drawn.filter((d) => d.kind === 'text').map((d) => d.text)
+    expect(fracTexts).toContain('mid-updated')
     painter.dispose()
   })
 

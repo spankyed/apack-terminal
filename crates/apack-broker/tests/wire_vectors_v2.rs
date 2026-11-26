@@ -928,6 +928,16 @@ fn build_malformed_vectors() -> Vec<MalformedVector> {
         reason: "offset + len > total_bytes must be rejected",
     });
 
+    // 12. Non-canonical LEB128 varint (overlong zero `[0x80, 0x00]` on Sought.at_ms)
+    buf.clear();
+    encode_frame(StreamId::CONTROL, msg_type::SOUGHT, RequestId::from_raw(1), &[0x80, 0x00], &mut buf).unwrap();
+    out.push(MalformedVector {
+        name: "non_canonical_varint",
+        direction: "broker",
+        hex: to_hex(&buf),
+        reason: "overlong LEB128 varint must be rejected",
+    });
+
     out
 }
 
@@ -1067,8 +1077,9 @@ fn golden_wire_vectors_v2_match_committed_file() {
     let committed = std::fs::read_to_string(&path).expect(
         "node/wire-vectors-v2.json missing; run UPDATE_VECTORS=1 cargo test -p apack-broker --test wire_vectors_v2",
     );
+    let committed_norm = committed.replace("\r\n", "\n");
     assert_eq!(
-        committed, generated,
+        committed_norm, generated,
         "node/wire-vectors-v2.json drifted from apack-proto; regenerate with UPDATE_VECTORS=1 cargo test -p apack-broker --test wire_vectors_v2"
     );
 }

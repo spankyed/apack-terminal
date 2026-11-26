@@ -2,10 +2,12 @@ import { describe, expect, it } from 'vitest'
 import {
   DEFAULT_WORD_DELIMITERS,
   RowStore,
+  RunFlag,
   localLineAt,
   localTextOf,
   localTextOfRect,
   localWordAt,
+  packRow,
 } from '../src/index.ts'
 import { frame, row } from './_support.ts'
 
@@ -114,5 +116,40 @@ describe('0 ms local selection & text queries over cached RowStore', () => {
     )
     expect(localTextOf(sparse, { start: { line: 3, col: 0 }, end: { line: 6, col: 2 } })).toBeNull()
     expect(localTextOfRect(sparse, { start: { line: 3, col: 0 }, end: { line: 6, col: 2 } })).toBeNull()
+  })
+
+  it('handles omitted blank active rows, PER_CELL grapheme clusters, narrow non-BMP runs, and single-delimiter selection', () => {
+    const store = new RowStore()
+    store.apply(
+      frame({
+        firstActiveLine: 0,
+        scrollbackLines: 0,
+        size: { cols: 12, rows: 4 },
+        fullSync: true,
+        rows: [
+          row(0, 'foo()/bar'),
+          // line 1 intentionally omitted (blank active screen row after fullSync)
+          packRow({
+            line: 2,
+            runs: [
+              { colStart: 0, colLen: 2, text: '👨‍👩‍👧‍👦', flags: RunFlag.PER_CELL },
+              { colStart: 2, colLen: 1, text: '𝕏', flags: 0 },
+              { colStart: 3, colLen: 3, text: ' ok', flags: 0 },
+            ],
+          }),
+          row(3, 'end'),
+        ],
+      }),
+    )
+
+    // Omitted blank active row resolves synchronously as empty line
+    expect(localLineAt(store, 1)).toEqual({ start: { line: 1, col: 0 }, end: { line: 1, col: 11 } })
+    expect(localTextOf(store, { start: { line: 0, col: 0 }, end: { line: 3, col: 2 } })).toBe('foo()/bar\n\n👨‍👩‍👧‍👦𝕏 ok\nend')
+
+    // Distinct delimiters '(' and ')' do not merge together
+    expect(localWordAt(store, { line: 0, col: 3 }, DEFAULT_WORD_DELIMITERS)).toEqual({
+      start: { line: 0, col: 3 },
+      end: { line: 0, col: 3 },
+    })
   })
 })
