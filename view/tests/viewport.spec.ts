@@ -4,10 +4,9 @@ import { RowStore } from '../src/row-store.ts'
 import { Viewport } from '../src/viewport.ts'
 import { frame } from './_support.ts'
 
-/** A store whose screen starts at `firstActive` with that much history, and a viewport over it */
-function scrolledTo(firstActive: number, scrollback = firstActive) {
+function scrolledTo(firstActiveLine: number, scrollbackLines = firstActiveLine) {
   const store = new RowStore()
-  store.apply(frame({ firstActive, scrollback }))
+  store.apply(frame({ firstActiveLine, scrollbackLines }))
   return { store, viewport: new Viewport(store) }
 }
 
@@ -17,7 +16,7 @@ describe('a view that is following', () => {
     expect(viewport.following).toBe(true)
     expect(viewport.visible).toEqual([100, 4])
 
-    store.apply(frame({ sequence: 2, firstActive: 130, scrollback: 130 }))
+    store.apply(frame({ seq: 2, firstActiveLine: 130, scrollbackLines: 130 }))
     expect(viewport.top, 'new output did not move a following view').toBe(130)
   })
 })
@@ -29,8 +28,7 @@ describe('a view scrolled back', () => {
     expect(viewport.following).toBe(false)
     expect(viewport.top).toBe(88)
 
-    // A thousand more lines are written
-    store.apply(frame({ sequence: 2, firstActive: 1100, scrollback: 1100 }))
+    store.apply(frame({ seq: 2, firstActiveLine: 1100, scrollbackLines: 1100 }))
 
     expect(viewport.top, 'output moved a view that was scrolled back').toBe(88)
     expect(viewport.following).toBe(false)
@@ -40,8 +38,7 @@ describe('a view scrolled back', () => {
     const { store, viewport } = scrolledTo(100)
     viewport.scrollTo(10)
 
-    // The owner keeps only fifty lines of history now
-    store.apply(frame({ sequence: 2, firstActive: 200, scrollback: 50 }))
+    store.apply(frame({ seq: 2, firstActiveLine: 200, scrollbackLines: 50 }))
 
     expect(viewport.top).toBe(150)
   })
@@ -77,8 +74,12 @@ describe('a screen with no history', () => {
     const { store, viewport } = scrolledTo(100)
     viewport.scrollBy(-10)
 
-    // A full-screen program takes over, which has no scrollback
-    store.apply(frame({ sequence: 2, firstActive: 100, scrollback: 0, modes: { alternateScreen: true, mouse: false } }))
+    store.apply(frame({
+      seq: 2,
+      firstActiveLine: 100,
+      scrollbackLines: 0,
+      modes: { altScreen: true, mouse: false, reverseVideo: false, bracketedPaste: false },
+    }))
     viewport.settle()
 
     expect(viewport.following).toBe(true)
@@ -89,13 +90,11 @@ describe('a screen with no history', () => {
     const { store, viewport } = scrolledTo(100)
     viewport.scrollBy(-10)
 
-    // The history is cleared while the view is scrolled back in it
-    store.apply(frame({ sequence: 2, firstActive: 100, scrollback: 0 }))
+    store.apply(frame({ seq: 2, firstActiveLine: 100, scrollbackLines: 0 }))
     viewport.settle()
     expect(viewport.following).toBe(true)
 
-    // And then one line scrolls off the screen
-    store.apply(frame({ sequence: 3, firstActive: 101, scrollback: 1 }))
+    store.apply(frame({ seq: 3, firstActiveLine: 101, scrollbackLines: 1 }))
     viewport.settle()
 
     expect(viewport.following, 'a view with nothing to hold stopped following at the first new line').toBe(true)
@@ -118,8 +117,7 @@ describe('line numbers changing under a view', () => {
     viewport.scrollTo(80)
 
     const after = viewport.acrossReset()
-    // A resize reflowed the history: everything is renumbered
-    store.apply(frame({ sequence: 2, epoch: 2, firstActive: 240, scrollback: 240 }))
+    store.apply(frame({ seq: 2, epoch: 2, firstActiveLine: 240, scrollbackLines: 240 }))
     after()
 
     expect(viewport.top, 'the view kept a number that now names another line').toBe(220)
@@ -128,7 +126,7 @@ describe('line numbers changing under a view', () => {
   it('leaves a following view following', () => {
     const { store, viewport } = scrolledTo(100)
     const after = viewport.acrossReset()
-    store.apply(frame({ sequence: 2, epoch: 2, firstActive: 240, scrollback: 240 }))
+    store.apply(frame({ seq: 2, epoch: 2, firstActiveLine: 240, scrollbackLines: 240 }))
     after()
 
     expect(viewport.following).toBe(true)
@@ -138,7 +136,6 @@ describe('line numbers changing under a view', () => {
 describe('folds in the viewport', () => {
   it('steps across thousands of folds and huge offsets in logarithmic time and guards non-finite inputs', () => {
     const { viewport } = scrolledTo(1_000_000, 1_000_000)
-    // 1000 folds, each hiding 100 lines: [1000*i, 1000*i + 100]
     const folds = Array.from({ length: 1000 }, (_, i) => ({ first: i * 1000, last: i * 1000 + 100 }))
     viewport.setFolds(folds)
 
@@ -148,15 +145,12 @@ describe('folds in the viewport', () => {
     expect(viewport.hiddenIn(500_050)).toEqual({ first: 500_000, last: 500_100 })
 
     const start = performance.now()
-    // Stepping forward 900_000 drawn rows from 0 crosses all 1000 folds (100_000 hidden lines) -> line 1_000_000
     expect(viewport.stepRows(0, 900_000)).toBe(1_000_000)
     expect(viewport.stepRows(1_000_000, -900_000)).toBe(0)
-    // Fractional stepping back across a fold header lands at the header + fraction
     expect(viewport.stepRows(101, -0.25)).toBeCloseTo(0.75)
     expect(viewport.stepRows(0.75, 0.5)).toBeCloseTo(101.25)
     expect(performance.now() - start).toBeLessThan(100)
 
-    // Non-finite inputs do not corrupt viewport state (hidden lines still snap to header)
     expect(viewport.stepRows(500, Number.NaN)).toBe(500)
     expect(viewport.stepRows(500, Number.POSITIVE_INFINITY)).toBe(500)
     expect(viewport.stepRows(10, Number.NaN)).toBe(0)
@@ -175,12 +169,10 @@ describe('folds in the viewport', () => {
   })
 
   it('advances past a fold covering store.oldest so held never lands on a hidden line, and computes signed rowsBetween', () => {
-    // store.oldest = 10, firstActive = 50; fold [5..20] covers oldest (5 < 10 <= 20)
     const { store, viewport } = scrolledTo(50, 40)
     expect(store.oldest).toBe(10)
     viewport.setFolds([{ first: 5, last: 20 }])
 
-    // Scrolling to or below oldest advances past the fold to 21, never landing on hidden line 10..20
     viewport.scrollTo(0)
     expect(viewport.top).toBe(21)
     expect(viewport.hiddenIn(viewport.top)).toBeUndefined()
@@ -189,26 +181,22 @@ describe('folds in the viewport', () => {
     viewport.scrollTo(15)
     expect(viewport.top).toBe(21)
 
-    // scrollToPosition counts from the first non-hidden line at or after oldest
     viewport.scrollToPosition(1)
     expect(viewport.top).toBe(22)
     expect(viewport.extent.position).toBe(1)
 
-    // setFolds while held on a line whose fold starts before oldest also advances past the fold
     viewport.setFolds([])
     viewport.scrollTo(12)
     expect(viewport.top).toBe(12)
     viewport.setFolds([{ first: 5, last: 20 }])
     expect(viewport.top).toBe(21)
 
-    // If scrollback trims oldest into a fold that reaches firstActive, viewport settles back to following
-    store.apply(frame({ sequence: 2, firstActive: 50, scrollback: 35 }))
+    store.apply(frame({ seq: 2, firstActiveLine: 50, scrollbackLines: 35 }))
     viewport.setFolds([{ first: 10, last: 50 }])
     viewport.scrollTo(15)
     expect(viewport.following).toBe(true)
     expect(viewport.top).toBe(50)
 
-    // Signed rowsBetween handles both forward and reverse (to < from) in O(log F)
     viewport.setFolds([{ first: 10, last: 20 }])
     expect(viewport.rowsBetween(0, 21)).toBe(11)
     expect(viewport.rowsBetween(21, 0)).toBe(-11)

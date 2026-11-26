@@ -1,35 +1,64 @@
 import { CanvasPainter } from './canvas-painter.ts'
 import { Timer, systemClock, type Clock } from './clock.ts'
-import { blinks, drawRow, sessionTheme, type RowDrawing, type SelectedCells, type Theme } from './draw.ts'
+import { blinks, drawRow, rowPlainText, sessionTheme, type RowDrawing, type SelectedCells, type Theme } from './draw.ts'
+import { ImageCache, type ImageCacheOptions } from './images.ts'
 import { Input, modifiersOf } from './input.ts'
 import { linkAt, linkRuns, urls, type Detector, type Link, type LinkRun } from './links.ts'
 import { fontOf, type Font, type Painter, type Scene } from './painter.ts'
-import { RowStore } from './row-store.ts'
+import { PAGE_LINES, RowStore } from './row-store.ts'
 import { Selection, type Granularity } from './selection.ts'
-import { Modifier, PLAIN, StyleFlag, TooLarge, type Anchored, type Command, type Frame, type Picture, type Placements, type PointerInput, type CursorShape, type Found, type Position, type Row, type SessionColors, type Span, type TerminalSource } from './source.ts'
+import {
+  Modifier,
+  PackedStyleFlag,
+  RunFlag,
+  packRow,
+  type CellPos,
+  type CellSpan,
+  type CommandRecord,
+  type CursorShape,
+  type FrameUpdate,
+  type ImagePlacement,
+  type PackedRow,
+  type PaletteOverrides,
+  type PointerInput,
+  type SearchPatch,
+  type SearchSnapshot,
+  type SessionEvent,
+  type TerminalSource,
+  type ViewportHint,
+} from './source.ts'
 import { Viewport } from './viewport.ts'
 import { cellsOfCodePoint } from './width.ts'
+import { MAX_GRID_COLS, MAX_GRID_ROWS } from './wire/codec.ts'
 
 /**
- * A run of lines a host folds away. The first line stays on screen as a header, which stands for the lines after it up
- * to `last`: those are neither drawn nor pointed at, and what is copied from the fold is still all of its text.
+ * A run of lines a host folds away. The first line stays on screen as a header, which stands for
+ * the lines after it up to `last`: those are neither drawn nor pointed at, and what is copied
+ * from the fold is still all of its text.
  */
 export interface Fold {
   readonly first: number
   readonly last: number
-  /** What the header says the fold holds, after the count of lines. Left out, the header says only the count */
+  /** What the header says the fold holds, after the count of lines. Left out, the header says only the count. */
   readonly label?: string
 }
 
-/** How long the cursor is shown, and then hidden, while it blinks */
+/** How long the cursor is shown, and then hidden, while it blinks (ms). */
 export const BLINK_MS = 530
 
-/**
- * Whether a row has blinking text, asked once per row it is. A row is replaced when it changes, so a row
- * held is answered from memory and nothing rescans every cell of a screen on every frame.
- */
-const blinkingRows = new WeakMap<Row, boolean>()
-function blinksIn(row: Row): boolean {
+/** Maximum search matches retained & highlighted in the view. */
+export const MATCH_HIGHLIGHTS = 1000
+
+/** Debounce interval (ms) for coalescing updates to the hidden `[data-terminal-text]` DOM mirror. */
+export const MIRROR_DEBOUNCE_MS = 200
+
+const DRAG_LINES_PER_SECOND = 15
+const CLICK_AGAIN_MS = 500
+const CLICK_AGAIN_PIXELS = 4
+const THUMB_MIN = 20
+
+const blinkingRows = new WeakMap<PackedRow, boolean>()
+function blinksIn(row: PackedRow): boolean {
   let answer = blinkingRows.get(row)
   if (answer === undefined) {
     answer = blinks(row)
@@ -39,327 +68,208 @@ function blinksIn(row: Row): boolean {
 }
 
 /**
- * How many lines of history are asked for at once, in pages that start on a multiple of it. A view scrolling
- * a line at a time crosses into a new page once in this many lines, and asks once.
- */
-export const PAGE_LINES = 256
-/** Matches a search highlights and steps through: the rest are counted as more, as "1000+" */
-export const MATCH_HIGHLIGHTS = 1000
-/** At most one refresh of the matches in this long: what changed while it waits is the next one's to find */
-const MATCH_REFRESH_MS = 200
-/** What a search of nothing finds, and what one that could not be answered is taken as */
-const NOTHING_FOUND: Found = { spans: [], more: false }
-
-/** How fast a selection dragged past an edge scrolls: lines a second, for each row the pointer is past it */
-const DRAG_LINES_PER_SECOND = 15
-
-/** How soon after a press, in milliseconds, and how near it, in pixels, another is the same click again */
-const CLICK_AGAIN_MS = 500
-const CLICK_AGAIN_PIXELS = 4
-
-/** The shortest the scrollbar's thumb is drawn, in pixels, however much history it stands for */
-const THUMB_MIN = 20
-
-/**
- * What hovering a link shows of where it opens, as the pointer's title: `osc8` for a link a program declared
- * with a hyperlink sequence, `all` for any link (text that looks like a URL, or what a detector found), and
- * `off` for none. The pointer is a pointer over every link either way.
+ * What hovering a link shows of where it opens, as the pointer's title: `osc8` for a link a
+ * program declared with a hyperlink sequence, `all` for any link, and `off` for none.
  */
 export type LinkPreview = 'off' | 'osc8' | 'all'
 
 export interface ViewOptions {
-  /** The typeface a view starts in; `setFont` changes it */
+  /** The typeface a view starts in; `setFont` changes it. */
   readonly font: Font
-  /** The colours a view starts in; `setTheme` changes them */
+  /** The colours a view starts in; `setTheme` changes them. */
   readonly theme: Theme
-  /**
-   * Turns an image's pixels into something the painter draws. The default makes a bitmap; a painter that
-   * draws another way gives its own, and so does a page with no canvas to make one on.
-   */
-  readonly picture?: (read: Picture) => Promise<CanvasImageSource | null>
-  /**
-   * Makes the painter. Left out, a view draws on a 2D canvas; a host that has a GPU painter passes it, and
-   * a case passes one that records.
-   */
+  /** Optional custom `ImageCache` or decode/cap options (e.g. for tests or zstdRgba decoders). */
+  readonly imageCache?: ImageCache
+  readonly imageCacheOptions?: ImageCacheOptions
+  /** Custom painter factory. Defaults to `CanvasPainter`. */
   readonly painter?: (font: Font) => Painter
-  /**
-   * The view measured how many cells fit where it is mounted. The grid a session runs at is the owner's to
-   * decide — several views may be showing it — so this is a report, and the view goes on drawing the grid
-   * its frames describe.
-   */
+  /** Reports measured cell fit whenever container dimensions or font metrics change. */
   readonly onFit?: (fit: { columns: number; rows: number; cellWidth: number; cellHeight: number }) => void
-  /** Whether the view is following the output changed, which a host draws a "jump to bottom" control from */
+  /** Fires whenever whether the view is following live output changes. */
   readonly onFollowingChange?: (following: boolean) => void
-  /**
-   * No more frames will come: the session ended, or — with `reason`, in the source's words — it is there
-   * and could not be shown.
-   */
+  /** Fires when the session exits or the stream closes. */
   readonly onEnded?: (reason?: string) => void
-  /**
-   * A key the host wants for itself. Answering `true` keeps it from the program. Asked before anything
-   * else, for every key.
-   */
+  /** Optional raw event callback for title, bell, clipboard, notification, progress, status, cwd, etc. */
+  readonly onEvent?: (event: SessionEvent) => void
+  /** Host keyboard shortcut interceptor. Returning `true` consumes the key. */
   readonly onKey?: (event: KeyboardEvent) => boolean
-  /**
-   * A paste holds what could run a command. Answer whether the person, shown the text, said to paste it
-   * anyway. Left out, such a paste is dropped.
-   */
+  /** Confirmation callback when the broker flags a paste as `'unsafe'`. */
   readonly confirmPaste?: (text: string) => Promise<boolean>
-  /** A paste the person made was too large for the source to carry, and none of it was sent */
-  readonly onPasteRefused?: (error: TooLarge) => void
-  /**
-   * Whether typing, composed text and a paste bring a view that is scrolled back down to the screen, where
-   * what was typed appears. Left out, they do.
-   */
+  /** Fires if a paste RPC fails (e.g. oversized payload). */
+  readonly onPasteError?: (error: unknown) => void
+  /** Whether typing/pasting jumps a scrolled-back view back to the live screen. Default `true`. */
   readonly followOnInput?: boolean
-  /**
-   * The shape the cursor is drawn in while the view does not have the keyboard. Left out, a hollow block.
-   */
+  /** Cursor shape when unfocused. Default `'hollow'`. */
   readonly cursorInactive?: CursorShape
-  /**
-   * Whether a Mac's option key is alt rather than the key that composes characters: a key held with it is
-   * then sent as what the key types without it. Left out, option composes, as it does everywhere else on
-   * a Mac.
-   */
+  /** Whether Option acts as Alt on macOS. Default `false`. */
   readonly optionIsAlt?: boolean
-  /** The person opened a link: clicked it with the platform's modifier held */
+  /** Fires when the user Cmd/Ctrl-clicks a link. */
   readonly onLink?: (link: Link, event: MouseEvent) => void
-  /** Which links show where they open when the pointer is over them (`LinkPreview`). Left out, `osc8` */
+  /** Which links display a tooltip preview on hover. Default `'osc8'`. */
   readonly linkPreview?: LinkPreview
-  /** What else on a row can be opened, beyond URLs and what a program declared */
+  /** Additional custom link detectors beyond `urls`. */
   readonly detectors?: readonly Detector[]
-  /** Whether anything is selected changed, which a host draws its copy control from */
+  /** Fires whenever selection presence flips between empty and non-empty. */
   readonly onSelectionChange?: (selected: boolean) => void
-  /**
-   * What a search has found changed with the session's output, with no one having searched or stepped: the
-   * count a host shows is `found` as of its last `find` or `findNext` until it is told so here
-   */
+  /** Fires when live incremental `SearchWatch` updates change match count or current index. */
   readonly onFound?: (found: { current: number; total: number; more: boolean }) => void
-  /** Text was copied. Left out, it is written to the clipboard the page has */
+  /** Custom copy handler. Defaults to writing to `navigator.clipboard`. */
   readonly onCopy?: (text: string) => void
-  /** The commands the shell has reported, each time the view hears them: a host draws its command list from this */
-  readonly onCommands?: (commands: readonly Command[]) => void
-  /**
-   * Copies a selection as the pointer is let go, as iTerm2 and Ghostty can, so the text is on the clipboard without a
-   * key. Off unless set, as macOS Terminal has it: a selection overwriting what was copied is a surprise to most people.
-   * `setCopyOnSelect` changes it while the view is up.
-   */
+  /** Fires whenever the session's command list updates. */
+  readonly onCommands?: (commands: readonly CommandRecord[]) => void
+  /** Automatically copy selections on pointer release. Default `false`. */
   readonly copyOnSelect?: boolean
-  /** Whether this is a Mac, where the command key is the app's. Left out, asked of the browser */
+  /** Override macOS modifier heuristics. Defaults to `navigator.platform` detection. */
   readonly mac?: boolean
-  /**
-   * A strip this many pixels wide left of the first column, where each command the shell ran is marked
-   * beside its prompt, coloured by how it ended. Left out, there is none and nothing is marked.
-   */
+  /** Gutter width in CSS px for command prompt status marks. Default `0` (disabled). */
   readonly gutter?: number
-  /**
-   * Timer source for cursor/text blink, search refresh, and input dedupe timers. Matches `@apackdev/clock`,
-   * `@apackdev/link`, and `@apackdev/state` structurally so a host can share one timer queue across open
-   * views (dispose views before closing a shared clock). Left out, uses `setTimeout`/`clearTimeout`.
-   */
+  /** Structural timer source (compatible with `@apackdev/clock`). Defaults to `systemClock`. */
   readonly clock?: Clock
 }
 
-interface Kept {
-  readonly row: Row
-  readonly selected: string
+interface KeptDrawing {
+  readonly row: PackedRow
+  readonly selVer: number
+  readonly matchVer: number
+  readonly hoverVer: number
+  readonly blinkedOff: boolean
   readonly drawing: RowDrawing
 }
 
-/** A button that is down: what it is doing, and where it went down */
 interface Pressed {
   readonly button: number
   readonly reporting: boolean
-  readonly at: Position
+  readonly at: CellPos
   moved: boolean
-  /** Whether Alt (Option on a Mac) was held when the press began: a drag over cells then selects a rectangle */
   readonly block: boolean
 }
 
-/** A point on the page, as a pointer event gives one */
 interface Point {
   readonly clientX: number
   readonly clientY: number
 }
 
-/** The images placed relative to another, each with the line it is on, and the cell they are measured in */
-interface AnchoredOnLines {
-  readonly cellWidth: number
-  readonly cellHeight: number
-  readonly list: ReadonlyArray<Anchored & { readonly line: number }>
+interface CachedBox {
+  readonly left: number
+  readonly top: number
+  readonly scaleX: number
+  readonly scaleY: number
 }
 
-/**
- * A picture a view holds for an image, or is asking for. `generation` is the one `picture` is of, and
- * `refused` the placements that were current when an answer was not the pixels they name.
- */
-interface HeldPicture {
-  generation: number
-  picture: CanvasImageSource | null
-  asking: boolean
-  refused: Placements | null
-  refusedGeneration: number
-}
-
-/** A command, by the line it is on */
 interface CommandLine {
   readonly line: number
-  readonly command: Command
+  readonly command: CommandRecord
 }
 
 /**
- * A terminal, drawn.
+ * Clean-room v2 `@apackdev/terminal-view`.
  *
- * **It draws when something changed and at no other time.** A frame arrives, the user scrolls, a
- * selection moves, the cursor blinks: each asks for one paint on the next animation frame, and with
- * nothing asking there is no loop running. A frame is acknowledged once it has been painted, which is what
- * lets the source send the next — so a view that is slow to draw is sent fewer frames rather than more
- * than it can use, and a view that is not mounted is sent none and draws nothing.
+ * Key architectural properties:
+ * - Zero VT interpretation: renders authoritative `PackedRow`s from `FrameUpdate`s.
+ * - Declarative `ViewportHint` resize & visibility (`setVisible(false)` pauses broker frames).
+ * - Zero search polling: driven entirely by push `SearchMatches` / `SearchDelta` from `SearchWatch`.
+ * - 0 ms synchronous local `wordAt` / `lineAt` / `textOf` / `textOfRect` via `RowStore` + `local-query.ts`.
+ * - Zero `getBoundingClientRect()` on `pointermove` (cached via `ResizeObserver` / resize / scroll / pointerdown).
+ * - Numeric dirty-checked `RowDrawing` cache (zero per-row string key allocations).
+ * - Lazy `Clock`-coalesced `[data-terminal-text]` DOM mirror (`MIRROR_DEBOUNCE_MS = 200` + `flushMirror()`).
+ * - Bounded LRU `ImageCache` with off-main-thread `createImageBitmap` decoding.
  */
 export class TerminalView {
   readonly element: HTMLDivElement
   readonly store = new RowStore()
   readonly viewport = new Viewport(this.store)
+  readonly selection: Selection
 
   private readonly painter: Painter
+  private readonly imageCache: ImageCache
+  private readonly ownsImageCache: boolean
   private font: Font
-  /**
-   * The colours the view is drawn in: the host's theme, under the colours the session's program set for
-   * itself and the reverse video it may have the screen in (`sessionTheme`). Made again when any of the
-   * three changes, and the same object until then, which is how a painter knows the colours are the same.
-   */
   private theme: Theme
   private hostTheme: Theme
-  /** What the source last said the program's own colours are, and whether it has the screen reversed */
-  private colors: SessionColors | null = null
+  private paletteOverrides: PaletteOverrides | null = null
   private reverseVideo = false
-  /**
-   * The drawings of the rows in view and a screenful either side, each kept while its row looks the same.
-   * A painter knows a row is unchanged by its drawing being the same object as last time.
-   */
-  private readonly drawings = new Map<number, Kept>()
-  /** The pages of history asked for and not yet answered. Of this epoch only */
+
+  private readonly drawings = new Map<number, KeptDrawing>()
   private readonly asking = new Set<number>()
-  private frame: Frame | null = null
+  private frame: FrameUpdate | null = null
   private columns = 0
   private rows = 0
-  /** The frame to acknowledge once it is on the screen */
-  private unacknowledged: number | null = null
-  private detach: (() => void) | null = null
-  /**
-   * Whether the view is taking frames, from before it asks for them: a source may hand over the first
-   * inside the asking. Counts the attachments, so an answer can tell it was asked for in one that is over.
-   */
+  private unacknowledgedSeq: number | null = null
+  private unsubscribe: (() => void) | null = null
   private listening = false
-  private attachment = 0
-  /** The session is over: nothing more is asked of its source */
+  private visible = true
   private ended = false
   private scheduled: number | null = null
   private observer: ResizeObserver | null = null
-  /** Stops listening for the display and the page's fonts changing, while mounted */
   private unwatch: (() => void) | null = null
-  /** Stops the current `matchMedia` resolution listener, while mounted */
   private stopDisplay: (() => void) | null = null
-  /** The pixel ratio the painter was last sized for, or `null` before it has been */
   private pixelRatio: number | null = null
-  /** How tall the view is on the page, as last measured */
   private height = 0
+  private cachedBox: CachedBox | null = null
+
   private readonly blink: Timer
   private cursorShown = true
-  /** The clock blinking text goes by, while any is in view, and which half of a blink it is in */
   private readonly textBlink: Timer
   private textBlinking = false
   private textShown = true
+  private readonly mirrorTimer: Timer
+  private mirrorDirty = false
+  private lastLayoutLines: number[] = []
+
   private focused = false
   private wasFollowing = true
   private disposed = false
   private wasSelected = false
-  /** The frame the page was last told is drawn */
-  private drawn = -1
-  /**
-   * What is being searched for, where it was found, newest first, and which of those the person is on.
-   * `finding` counts the searches a person asked for, so an answer to one that was overtaken says nothing.
-   */
+  private drawnSeq = -1
+
+  // Incremental SearchWatch state (zero polling timers!)
   private needle = ''
-  private matches: readonly Span[] = []
-  /**
-   * Whether there are, or may be, matches beyond the ones held: more than `MATCH_HIGHLIGHTS` were found, or the
-   * source says its search did not reach the oldest line
-   */
-  private moreMatches = false
   private matchCase = false
-  private readonly refreshTimer: Timer
+  private matches: CellSpan[] = []
+  private moreMatches = false
   private currentMatch = -1
   private finding = 0
-  /** A search made again because rows changed is on its way, and whether rows changed again since */
-  private refreshing = false
-  private refreshAgain = false
+  private matchVersion = 0
+  private hoverVersion = 0
+
   private readonly gutter: number
-  /** The commands the shell has reported, and the frame's count that said to ask for them */
-  private commandList: readonly Command[] = []
-  private folds: readonly Fold[] = []
-  private foldRows = new Map<string, Row>()
-  private foldDrawings = new Map<Row, RowDrawing>()
-  private lastFit: { columns: number; rows: number; cellWidth: number; cellHeight: number } | null = null
-  private commandsSeen = -1
-  /** Those of them that begin on a line, and those with a prompt on one: each in the order of its lines */
+  private commandList: CommandRecord[] = []
   private commandStarts: readonly CommandLine[] = []
   private commandPrompts: readonly CommandLine[] = []
-  /** Where the session's images are, as last told, and the generation of the frame that prompted asking */
-  private placed: Placements = { cellWidth: 0, cellHeight: 0, placements: [] }
-  private imagesSeen = -1
-  /**
-   * The images placed relative to another, as the last frame to tell them did, each on the line it is on:
-   * a frame counts a row from its own first line, and a view keeps what it is told across frames that
-   * only moved the screen
-   */
-  private anchored: AnchoredOnLines = { cellWidth: 0, cellHeight: 0, list: [] }
-  /** The last frame's count of the images, whether or not asking where they are was answered */
-  private imagesTold = -1
-  private readonly pictures = new Map<number, HeldPicture>()
-  /** The generation of each image last asked for, which is the one an answer is held to */
-  private readonly wanted = new Map<number, number>()
+  private folds: readonly Fold[] = []
+  private readonly foldRows = new Map<string, PackedRow>()
+  private readonly foldDrawings = new Map<PackedRow, RowDrawing>()
+  private lastFit: { columns: number; rows: number; cellWidth: number; cellHeight: number } | null = null
+  private lastHintSent: ViewportHint | null = null
+
+  // v2 content-addressed image placements
+  private placements: readonly ImagePlacement[] = []
+  private imagesGenSeen = -1
+
   private readonly mac: boolean
   private readonly detectors: readonly Detector[]
   private readonly input: Input
-  /** The rows on screen as text, for whatever reads a page rather than looks at it */
   private readonly mirror: HTMLDivElement
-  private readonly mirrored: Array<Row | null | undefined> = []
+  private readonly mirrored: Array<PackedRow | null | undefined> = []
   private readonly thumb: HTMLDivElement
-  /** The thumb as last drawn, so the page is told only what changed: its height, its top, whether it shows */
   private thumbDrawn = { height: 0, top: 0, shown: false }
-  /** Ends a drag of the thumb that is under way */
   private thumbRelease: (() => void) | null = null
-  /** The link the pointer is over, the line it is on, and the cells it covers on each line it runs across */
   private hovered: { line: number; link: Link; runs: LinkRun[] } | null = null
-  /** The cell the pointer was over when that was last worked out, and the row that was on its line then */
-  private hoverAt: { line: number; column: number; row: Row | undefined } | null = null
+  private hoverAt: { line: number; col: number; row: PackedRow | undefined } | null = null
   private pressed: Pressed | null = null
-  /**
-   * The last press: when, where on the page, with which button, and how many presses it was the last of.
-   * A pointer event does not say how many times it was clicked — only the mouse events a view prevents
-   * do — so a view counts.
-   */
   private lastPress: { time: number; clientX: number; clientY: number; button: number; count: number } | null = null
-  /** The cell a program was last told the pointer is over, and with which button: it is told of each once */
-  private reported: { column: number; row: number; button: number } | null = null
-  /** A selection is being dragged past the top or bottom edge: where the pointer is, and the frame that scrolls */
+  private reported: { col: number; row: number; button: number } | null = null
   private dragScroll: { point: Point; frame: number; at: number | null } | null = null
-  /** Fractions of a wheel notch not yet sent to a program that takes whole ones */
   private wheelOwed = 0
-  /** Whether a selection is copied as the pointer is let go: the option at construction, then `setCopyOnSelect` */
   private copyOnSelect: boolean
-  /** The cursor's shape without the keyboard and the link previews: the options at construction, then their setters */
   private cursorInactive: CursorShape
   private linkPreview: LinkPreview
-  /** What is selected. It asks the source what a word or a line is and draws nothing itself */
-  readonly selection: Selection
 
   constructor(private readonly source: TerminalSource, private readonly options: ViewOptions) {
     const clock = options.clock ?? systemClock
     this.blink = new Timer(clock)
     this.textBlink = new Timer(clock)
-    this.refreshTimer = new Timer(clock)
+    this.mirrorTimer = new Timer(clock)
     this.mac = options.mac ?? /Mac|iPhone|iPad/.test(navigator.platform)
     this.gutter = options.gutter ?? 0
     this.copyOnSelect = options.copyOnSelect ?? false
@@ -369,6 +279,15 @@ export class TerminalView {
     this.theme = options.theme
     this.hostTheme = options.theme
     this.detectors = [urls, ...(options.detectors ?? [])]
+
+    if (options.imageCache) {
+      this.imageCache = options.imageCache
+      this.ownsImageCache = false
+    } else {
+      this.imageCache = new ImageCache(options.imageCacheOptions)
+      this.ownsImageCache = true
+    }
+
     this.element = document.createElement('div')
     this.element.style.cssText = 'position:relative;width:100%;height:100%;overflow:hidden;cursor:text'
     this.painter = (options.painter ?? ((font) => new CanvasPainter(font)))(options.font)
@@ -376,21 +295,22 @@ export class TerminalView {
     this.painter.whenCleared?.(() => this.schedule())
     this.element.appendChild(this.painter.canvas)
 
-    this.selection = new Selection(source, () => this.columns, () => {
+    this.selection = new Selection(source, this.store, () => {
       const selected = this.selection.span !== null
       if (selected !== this.wasSelected) {
         this.wasSelected = selected
         this.options.onSelectionChange?.(selected)
       }
       this.schedule()
-    }, () => ({ oldest: this.store.oldest, end: this.store.end }), (line) => this.store.row(line) ?? null)
+    })
+
     this.input = new Input(source, {
       mac: this.mac,
       optionIsAlt: options.optionIsAlt,
       intercept: (event) => this.shortcut(event) || (options.onKey?.(event) ?? false),
       paste: (text) => {
         void this.paste(text).catch((error: unknown) => {
-          if (error instanceof TooLarge) this.options.onPasteRefused?.(error)
+          this.options.onPasteError?.(error)
         })
       },
       copy: () => { void this.copy() },
@@ -405,13 +325,11 @@ export class TerminalView {
     this.mirror.setAttribute('role', 'document')
     this.mirror.setAttribute('aria-label', 'Terminal')
     this.mirror.dataset.terminalText = ''
-    // Read, not seen: the canvas is what is looked at
     this.mirror.style.cssText = 'position:absolute;left:0;top:0;width:1px;height:1px;overflow:hidden;'
       + 'clip-path:inset(50%);white-space:pre;pointer-events:none;user-select:none'
     this.element.appendChild(this.mirror)
 
     this.thumb = document.createElement('div')
-    // Not there to be pressed while it is not there to be seen
     this.thumb.style.cssText = 'position:absolute;right:2px;width:6px;border-radius:3px;top:0;height:0;'
       + 'background:currentColor;opacity:0;pointer-events:none;transition:opacity 120ms;cursor:default;z-index:2'
     this.element.appendChild(this.thumb)
@@ -428,41 +346,51 @@ export class TerminalView {
     this.thumb.addEventListener('pointerdown', this.thumbDown)
   }
 
-  /** Changes whether a selection is copied as the pointer is let go (`copyOnSelect`) */
   setCopyOnSelect(on: boolean): void {
     this.copyOnSelect = on
   }
 
-  /**
-   * Changes the shape the cursor is drawn in while the view does not have the keyboard (`cursorInactive`). The
-   * view is not remade: its scroll position and selection stay, and the next paint draws the new shape.
-   */
   setCursorInactive(style: CursorShape): void {
     this.cursorInactive = style
     this.schedule()
   }
 
-  /** Changes which links show where they open (`linkPreview`), and the link under the pointer shows it at once */
   setLinkPreview(mode: LinkPreview): void {
     this.linkPreview = mode
-    if (this.hovered) this.element.title = this.previews(this.hovered.link) ? sanitizeTitle(this.hovered.link.target) : ''
+    if (this.hovered) {
+      this.element.title = this.previews(this.hovered.link) ? sanitizeTitle(this.hovered.link.target) : ''
+    }
   }
 
   /**
-   * Draws in other colours from here on: every row a view holds is drawn again, and none is asked for.
-   * A colour the session's program set for itself stays the program's, over the new theme as over the old.
-   *
-   * The theme is taken as it is when given: a host that changes one it gave gives it again.
+   * Controls whether this view is visible (e.g. active tab vs background tab). Setting `visible: false`
+   * sends a declarative `ViewportHint` that pauses broker frame delivery (`maxFrames = 0`) without
+   * dropping the session attachment.
    */
+  setVisible(visible: boolean): void {
+    if (this.visible === visible) return
+    this.visible = visible
+    if (!visible) {
+      if (this.scheduled !== null) {
+        cancelAnimationFrame(this.scheduled)
+        this.scheduled = null
+      }
+      if (this.unacknowledgedSeq !== null && !this.ended) {
+        this.source.ackFrame?.(this.unacknowledgedSeq)
+        this.unacknowledgedSeq = null
+      }
+    }
+    this.pushViewportHint()
+    if (visible) this.schedule()
+  }
+
   setTheme(theme: Theme): void {
-    // A copy, so that the same object given again with other colours in it is other colours
     this.hostTheme = { ...theme, palette: [...theme.palette] }
     this.recolour()
   }
 
-  /** The theme, the program's colours or the reverse video changed: everything is drawn again in what they make */
   private recolour(): void {
-    const theme = sessionTheme(this.hostTheme, this.colors, this.reverseVideo)
+    const theme = sessionTheme(this.hostTheme, this.paletteOverrides, this.reverseVideo)
     if (theme === this.theme) return
     this.theme = theme
     this.themed()
@@ -471,7 +399,6 @@ export class TerminalView {
     this.schedule()
   }
 
-  /** Draws in another typeface from here on, and reports what fits now that a cell is another size */
   setFont(font: Font): void {
     const before = this.painter.metrics
     this.font = font
@@ -482,134 +409,132 @@ export class TerminalView {
     this.schedule()
   }
 
-  /** What of the page around the canvas is in the theme's colours and the view's font */
   private themed(): void {
     const { background, foreground } = this.theme
     this.element.style.background = hex(background)
     this.thumb.style.color = hex(foreground)
-    this.input.appearance({ font: fontOf(this.font, false, false), color: hex(foreground), background: hex(background) })
+    this.input.appearance({
+      font: fontOf(this.font, false, false),
+      color: hex(foreground),
+      background: hex(background),
+    })
   }
 
-  /**
-   * Selects everything the terminal holds, history included. Copying it asks the source for all of that as
-   * one text, and a source carries only so much in one answer — a broker about eight megabytes — past
-   * which `copy` answers `false` and nothing is copied.
-   */
   selectAll(): void {
     if (!this.frame || this.rows <= 0 || this.columns <= 0) return
     const endLine = this.store.firstActive + this.rows - 1
     if (endLine < this.store.oldest) return
     this.selection.select({
-      start: { line: this.store.oldest, column: 0 },
-      end: { line: endLine, column: Math.max(0, this.columns - 1) },
+      start: { line: this.store.oldest, col: 0 },
+      end: { line: endLine, col: Math.max(0, this.columns - 1) },
     })
   }
 
   /**
-   * Finds every place `needle` appears, in the screen and all of its history, and goes to the newest.
-   * Answers how many there are — of as many as the source looks for, which for a broker is the newest two
-   * thousand. An empty needle clears the search.
-   *
-   * What is found is kept true to the screen: when rows change, the search is made again — one at a time,
-   * and once more after it if rows changed while it was on its way — and the person stays on the match
-   * they were on.
+   * Installs or clears (`needle === ''`) an incremental server-side `SearchWatch`.
+   * Zero client-side polling: subsequent terminal mutations push `SearchDelta` patches automatically.
    */
   async find(needle: string, options: { matchCase?: boolean } = {}): Promise<number> {
     if (this.disposed) return 0
-    this.refreshTimer.cancel()
-    this.refreshAgain = false
     const asked = (this.finding += 1)
     this.needle = needle
     this.matchCase = options.matchCase ?? false
-    const found = (await this.search(needle)) ?? NOTHING_FOUND
-    // A search that was overtaken by a later one — or completed after disposal — has nothing to say
-    if (this.disposed || asked !== this.finding) return this.matches.length
-    this.setMatches(found)
-    this.currentMatch = this.matches.length > 0 ? 0 : -1
-    this.drawings.clear()
-    this.showMatch()
-    return this.matches.length
-  }
-
-  /** Holds what a search found, up to `MATCH_HIGHLIGHTS` of it, and whether that is all there is */
-  private setMatches(found: Found): void {
-    this.matches = found.spans.slice(0, MATCH_HIGHLIGHTS)
-    this.moreMatches = found.more || found.spans.length > MATCH_HIGHLIGHTS
-  }
-
-  /** Where the source finds `needle`, or `null` when it could not say */
-  private async search(needle: string): Promise<Found | null> {
-    if (needle === '') return NOTHING_FOUND
+    if (needle === '') {
+      this.matches = []
+      this.moreMatches = false
+      this.currentMatch = -1
+      this.matchVersion += 1
+      this.options.onFound?.(this.found)
+      this.schedule()
+      void this.source.setSearch('', this.matchCase).catch(() => {})
+      return 0
+    }
     try {
-      return await this.source.search(needle, this.matchCase)
+      const snapshot = await this.source.setSearch(needle, this.matchCase)
+      if (this.disposed || asked !== this.finding) return this.matches.length
+      this.applySearchSnapshot(snapshot, true)
+      return this.matches.length
     } catch {
-      return null
+      return 0
     }
   }
 
-  /**
-   * Rows changed under a search: what it found may no longer be where it was, or there at all. At most one
-   * refresh per `MATCH_REFRESH_MS`, so a stream of output costs one search a window, and the last change is
-   * found once it is quiet.
-   */
-  private refreshMatches(): void {
-    if (this.needle === '' || this.refreshTimer.active) return
-    this.refreshTimer.arm(MATCH_REFRESH_MS, () => {
-      this.runRefresh()
-    })
-  }
-
-  private runRefresh(): void {
-    if (this.needle === '') return
-    if (this.refreshing) {
-      this.refreshAgain = true
-      return
-    }
-    this.refreshing = true
-    this.refreshAgain = false
-    const asked = this.finding
-    void this.search(this.needle).then((answer) => {
-      this.refreshing = false
-      if (this.disposed || !this.listening) return
-      // Nothing to say when the person has searched again since, or the source could not answer
-      if (answer && asked === this.finding) {
-        const held = answer.spans.slice(0, MATCH_HIGHLIGHTS)
-        const on = this.matches[this.currentMatch]
-        const still = on ? held.findIndex((match) => match.start.line === on.start.line && match.start.column === on.start.column) : -1
-        // On the match they were on; failing that the nearest there is, which for a search that had found
-        // nothing is the newest
-        const current = held.length === 0 ? -1 : still !== -1 ? still : Math.max(0, Math.min(this.currentMatch, held.length - 1))
-        const same = current === this.currentMatch && held.length === this.matches.length && held.every((match, index) => sameSpan(match, this.matches[index]!))
-        const before = this.found
-        this.setMatches(answer)
-        this.currentMatch = current
-        const now = this.found
-        if (now.current !== before.current || now.total !== before.total || now.more !== before.more) this.options.onFound?.(now)
-        // A row's drawing is kept by what matches are on it, so only the rows whose matches moved are
-        // drawn again — and with none moved, nothing is
-        if (!same) this.schedule()
-      }
-      if (this.refreshAgain) this.refreshMatches()
-    })
-  }
-
-  /**
-   * Which match the person is on, counting from one at the newest, how many are held, and whether there are or
-   * may be more: past the `MATCH_HIGHLIGHTS` held, or further back than the source's search looked
-   */
   get found(): { current: number; total: number; more: boolean } {
     return { current: this.currentMatch + 1, total: this.matches.length, more: this.moreMatches }
   }
 
-  /** Goes to the next match: an older one for `1`, a newer one for `-1`, round to the other end past the last */
   findNext(direction: -1 | 1 = 1): void {
     if (this.matches.length === 0) return
     this.currentMatch = (this.currentMatch + direction + this.matches.length) % this.matches.length
-    this.drawings.clear()
+    this.matchVersion += 1
     this.showMatch()
   }
 
-  /** Brings the match the person is on into view, in the middle where there is room */
+  private applySearchSnapshot(snapshot: SearchSnapshot, resetCurrent: boolean): void {
+    if (this.needle === '') return
+    if (this.store.epoch >= 0 && snapshot.epoch !== this.store.epoch) return
+    const prev = this.matches[this.currentMatch]
+    const sorted = sortMatchesNewestFirst(snapshot.matches)
+    const held = sorted.slice(0, MATCH_HIGHLIGHTS)
+    const more = snapshot.truncated || sorted.length > MATCH_HIGHLIGHTS
+    let current: number
+    if (held.length === 0) {
+      current = -1
+    } else if (resetCurrent) {
+      current = 0
+    } else {
+      const still = prev
+        ? held.findIndex((m) => m.start.line === prev.start.line && m.start.col === prev.start.col)
+        : -1
+      current = still !== -1 ? still : Math.max(0, Math.min(this.currentMatch, held.length - 1))
+    }
+    const before = this.found
+    this.matches = held
+    this.moreMatches = more
+    this.currentMatch = current
+    this.matchVersion += 1
+    const after = this.found
+    if (resetCurrent) {
+      this.showMatch()
+    } else {
+      this.schedule()
+    }
+    if (after.current !== before.current || after.total !== before.total || after.more !== before.more) {
+      this.options.onFound?.(after)
+    }
+  }
+
+  private applySearchDelta(patch: SearchPatch): void {
+    if (this.needle === '') return
+    if (this.store.epoch >= 0 && patch.epoch !== this.store.epoch) return
+    const prev = this.matches[this.currentMatch]
+    const kept = this.matches.filter(
+      (m) => m.end.line < patch.fromLine || m.start.line >= patch.toLine,
+    )
+    const merged = sortMatchesNewestFirst([...kept, ...patch.added])
+    const held = merged.slice(0, MATCH_HIGHLIGHTS)
+    const more = patch.truncated || merged.length > MATCH_HIGHLIGHTS
+    let current: number
+    if (held.length === 0) {
+      current = -1
+    } else {
+      const still = prev
+        ? held.findIndex((m) => m.start.line === prev.start.line && m.start.col === prev.start.col)
+        : -1
+      current = still !== -1 ? still : Math.max(0, Math.min(this.currentMatch, held.length - 1))
+    }
+    const before = this.found
+    this.matches = held
+    this.moreMatches = more
+    this.currentMatch = current
+    this.matchVersion += 1
+    const after = this.found
+    if (after.current !== before.current || after.total !== before.total || after.more !== before.more) {
+      this.options.onFound?.(after)
+    }
+    this.schedule()
+  }
+
   private showMatch(): void {
     const match = this.matches[this.currentMatch]
     if (match) {
@@ -622,14 +547,8 @@ export class TerminalView {
     this.schedule()
   }
 
-  /**
-   * The cells of `line` that matches cover, each with whether it is the match the person is on. Matches
-   * are newest first and do not overlap, so the ones on a line are side by side among them and are found
-   * by halving.
-   */
   private matchesOn(line: number): Array<{ from: number; to: number; current: boolean }> {
     const matches = this.matches
-    // The first that starts on this line or above it: every one before it starts below
     let low = 0
     let high = matches.length
     while (low < high) {
@@ -642,25 +561,20 @@ export class TerminalView {
       const match = matches[index]!
       if (match.end.line < line) break
       on.push({
-        from: line === match.start.line ? match.start.column : 0,
-        to: line === match.end.line ? match.end.column + 1 : this.columns,
+        from: line === match.start.line ? match.start.col : 0,
+        to: line === match.end.line ? match.end.col + 1 : this.columns,
         current: index === this.currentMatch,
       })
     }
     return on
   }
 
-  /** The commands the shell has reported, as the view last heard them */
-  get commands(): readonly Command[] {
+  get commands(): readonly CommandRecord[] {
     return this.commandList
   }
 
-  /**
-   * Folds the lines a host names. Each fold is one header row in the lines it starts at, and its other lines are not drawn:
-   * a host draws its command blocks from this. Folds may not overlap.
-   */
   setFolds(folds: readonly Fold[]): void {
-    const sorted = folds.filter((fold) => fold.last > fold.first).sort((one, other) => one.first - other.first)
+    const sorted = folds.filter((fold) => fold.last > fold.first).sort((a, b) => a.first - b.first)
     for (let index = 1; index < sorted.length; index += 1) {
       if (sorted[index]!.first <= sorted[index - 1]!.last) throw new RangeError('folds overlap')
     }
@@ -673,15 +587,10 @@ export class TerminalView {
     this.schedule()
   }
 
-  /** The fold a line is hidden in: a header is not, and neither is a line outside every fold */
   private hiddenIn(line: number): Fold | undefined {
     return this.viewport.hiddenIn(line)
   }
 
-  /**
-   * The rows the view draws, top down: the absolute line each is, a fold's header standing for the line it starts at. The
-   * window is as many rows as the screen, which is more lines than that where folds hide some.
-   */
   private layout(): { first: number; lines: number[] } {
     const [top, count] = this.viewport.visible
     const hidden = this.hiddenIn(top)
@@ -699,43 +608,36 @@ export class TerminalView {
     return { first, lines }
   }
 
-  /** The number of rows from line `from` up to line `to`, folded lines taking none: negative when `to` is above `from` */
   private rowsBetween(from: number, to: number): number {
     return this.viewport.rowsBetween(from, to)
   }
 
-  /** The header row of a fold, drawn as its label in the place of the line it starts at */
-  private foldRow(fold: Fold): Row {
-    const text = `▸ ${fold.label ?? `${fold.last - fold.first} lines folded`}`
-    const key = `${fold.first}:${fold.last}:${text}`
+  private foldRow(fold: Fold): PackedRow {
+    const label = `▸ ${fold.label ?? `${fold.last - fold.first} lines folded`}`
+    const key = `${fold.first}:${fold.last}:${label}`
     const known = this.foldRows.get(key)
     if (known) return known
-    const characters = [...text]
-    // Each character starts where the cells before it end, so a wide label lines up with what is after it
-    const widths = characters.map((character) => cellsOfCodePoint(character.codePointAt(0) ?? 0))
-    const starts: number[] = []
-    let next = 0
-    for (const cells of widths) {
-      starts.push(next)
-      next += cells
+    const chars = Array.from(label)
+    const runs: Array<{ colStart: number; colLen: number; text: string; flags: number }> = []
+    let col = 0
+    for (const ch of chars) {
+      const cp = ch.codePointAt(0) ?? 0
+      const w = Math.max(1, cellsOfCodePoint(cp))
+      const isAscii = ch.length === 1 && cp >= 0x20 && cp <= 0x7e && w === 1
+      const last = runs.at(-1)
+      if (isAscii && last && last.flags === 0 && last.colStart + last.colLen === col) {
+        last.text += ch
+        last.colLen += 1
+      } else {
+        runs.push({ colStart: col, colLen: w, text: ch, flags: isAscii ? 0 : RunFlag.PER_CELL })
+      }
+      col += w
     }
-    const row: Row = {
-      line: fold.first,
-      wrapped: false,
-      prompt: false,
-      text: characters,
-      column: Uint16Array.from(starts),
-      width: Uint8Array.from(widths),
-      style: new Uint16Array(characters.length),
-      link: new Uint16Array(characters.length),
-      styles: [PLAIN],
-      links: [''],
-    }
+    const row = packRow({ line: fold.first, runs })
     this.foldRows.set(key, row)
     return row
   }
 
-  /** Cached drawing for a fold header, so unchanged fold headers keep identity for dirty-band painting */
   private foldDrawing(fold: Fold): RowDrawing {
     const row = this.foldRow(fold)
     let drawing = this.foldDrawings.get(row)
@@ -746,57 +648,65 @@ export class TerminalView {
     return drawing
   }
 
-  private setCommands(commands: readonly Command[]): void {
-    this.commandList = commands
-    this.options.onCommands?.(commands)
+  private setCommands(commands: readonly CommandRecord[]): void {
+    this.commandList = [...commands]
+    this.rebuildCommandIndex()
+    this.options.onCommands?.(this.commandList)
+  }
+
+  private upsertCommand(record: CommandRecord): void {
+    const idx = this.commandList.findIndex((c) => c.id === record.id)
+    if (idx === -1) this.commandList.push(record)
+    else this.commandList[idx] = record
+    this.rebuildCommandIndex()
+    this.options.onCommands?.(this.commandList)
+    this.schedule()
+  }
+
+  private rebuildCommandIndex(): void {
     const starts: CommandLine[] = []
     const prompts: CommandLine[] = []
-    for (const command of commands) {
-      const begins = command.prompt ?? command.output
+    for (const command of this.commandList) {
+      const begins = command.promptLine ?? command.outputLine
       if (begins !== null) starts.push({ line: begins, command })
-      if (command.prompt !== null) prompts.push({ line: command.prompt, command })
+      if (command.promptLine !== null) prompts.push({ line: command.promptLine, command })
     }
+    starts.sort((a, b) => a.line - b.line)
+    prompts.sort((a, b) => a.line - b.line)
     this.commandStarts = starts
     this.commandPrompts = prompts
   }
 
-  /**
-   * The command whose prompt, line or output is on `line`: the last one that began at or before it.
-   * `null` above the first command, and for a shell that marks none.
-   */
-  commandAt(line: number): Command | null {
+  commandAt(line: number): CommandRecord | null {
     return this.commandStarts[firstAfter(this.commandStarts, line) - 1]?.command ?? null
   }
 
-  /** The cells a command's output covers, or `null` where it printed nothing or its rows are gone */
-  outputOf(command: Command): Span | null {
-    if (command.output === null || !this.frame) return null
-    // To where it ended; while it runs, and where its end was never marked, to the bottom of the screen
-    const last = command.end !== null ? command.end - 1 : this.store.firstActive + this.rows - 1
-    if (last < command.output) return null
-    return { start: { line: command.output, column: 0 }, end: { line: last, column: Math.max(0, this.columns - 1) } }
+  outputOf(command: CommandRecord): CellSpan | null {
+    if (command.outputLine === null || !this.frame) return null
+    const last = command.endLine !== null ? command.endLine - 1 : this.store.firstActive + this.rows - 1
+    if (last < command.outputLine) return null
+    return {
+      start: { line: command.outputLine, col: 0 },
+      end: { line: last, col: Math.max(0, this.columns - 1) },
+    }
   }
 
-  /** Selects what a command printed. Answers whether there was anything to select */
-  selectOutput(command: Command): boolean {
+  selectOutput(command: CommandRecord): boolean {
     const span = this.outputOf(command)
     if (span) this.selection.select(span)
     return span !== null
   }
 
-  /**
-   * Scrolls to the prompt of the command before or after what is at the top of the view. From the
-   * oldest, back stays there; from the newest, forward returns to the screen and follows it.
-   */
   scrollToCommand(direction: -1 | 1): void {
     const top = Math.floor(this.viewport.top)
     const prompts = this.commandPrompts
-    const target = direction === -1 ? prompts[firstAfter(prompts, top - 1) - 1] : prompts[firstAfter(prompts, top)]
+    const target = direction === -1
+      ? prompts[firstAfter(prompts, top - 1) - 1]
+      : prompts[firstAfter(prompts, top)]
     if (target !== undefined) this.scrollTo(target.line)
     else if (direction === 1) this.follow()
   }
 
-  /** The keys that are the view's own: moving between commands */
   private shortcut(event: KeyboardEvent): boolean {
     const held = this.mac ? event.metaKey && !event.ctrlKey : event.ctrlKey && event.shiftKey
     if (!held || event.altKey || (event.code !== 'ArrowUp' && event.code !== 'ArrowDown')) return false
@@ -804,174 +714,86 @@ export class TerminalView {
     return true
   }
 
-  /**
-   * Lets go of the pictures of images nothing shows any more: none places it, and no row held shows part
-   * of it. Known once placements are told, which is whenever the images change.
-   */
-  private dropPictures(): void {
-    if (this.pictures.size === 0) return
-    const shown = this.store.pictured()
-    for (const placement of this.placed.placements) shown.add(placement.image)
-    for (const { image } of this.anchored.list) shown.add(image)
-    for (const [image, held] of this.pictures) {
-      if (shown.has(image)) continue
-      release(held.picture)
-      this.pictures.delete(image)
-      this.wanted.delete(image)
-    }
-  }
-
-  /** Asks for pictures covering the lines currently laid out in view (accounting for folds) */
   private wantPicturesInView(): void {
     const { first, lines } = this.layout()
     if (lines.length === 0) return
     this.wantPictures(first, lines[lines.length - 1]! - first + 1)
   }
 
-  /**
-   * Asks for the pixels of the images in view, or within a screenful of it, that this view does not hold
-   * at the generation shown: the ones placed there, by themselves or relative to another, and the ones
-   * the rows there show part of. One far up the history costs nothing until it is scrolled to.
-   */
+  private readonly schedulePaint = () => this.schedule()
+
   private wantPictures(first: number, count: number): void {
     if (this.ended || !this.listening || count <= 0) return
-    for (const placement of [...this.placed.placements, ...this.anchored.list]) {
-      if (placement.line + placement.rows <= first - count || placement.line >= first + count * 2) continue
-      this.wantPicture(placement.image, placement.generation)
+    for (const placement of this.placements) {
+      const pRows = Math.max(1, placement.cellSpan[1])
+      if (placement.line + pRows <= first - count || placement.line >= first + count * 2) continue
+      void this.imageCache.ensure(this.source, placement.blob, this.schedulePaint)
     }
-    // Once an image, at the newest generation any row there shows it at. A row brought before an image
-    // was sent again still names the generation before, until it is brought again: asked for by that,
-    // the pixels would be fetched for it and found to be the newer ones, at every paint
-    const shown = new Map<number, number>()
     for (let line = first - count; line < first + count * 2; line += 1) {
-      for (const piece of this.store.row(line)?.images?.pieces ?? []) {
-        shown.set(piece.image, Math.max(shown.get(piece.image) ?? 0, piece.generation))
+      const pieces = this.store.row(line)?.pieces
+      if (!pieces) continue
+      for (const piece of pieces) {
+        void this.imageCache.ensure(this.source, piece.blob, this.schedulePaint)
       }
     }
-    for (const [image, generation] of shown) this.wantPicture(image, generation)
   }
 
-  /**
-   * Asks for one image's pixels, once.
-   *
-   * **An answer that is not what was asked for is not asked for again until the placements are told or the
-   * requested generation moves on.** The image is gone, or could not be made into a picture, or was replaced
-   * since — and asking again gets the same answer, on every paint, until something has changed.
-   */
-  private wantPicture(image: number, generation: number): void {
-    this.wanted.set(image, generation)
-    let held = this.pictures.get(image)
-    if (!held) {
-      held = { generation: -1, picture: null, asking: false, refused: null, refusedGeneration: -1 }
-      this.pictures.set(image, held)
-    }
-    if (held.generation === generation || held.asking || (held.refused === this.placed && held.refusedGeneration === generation)) return
-    const entry = held
-    entry.asking = true
-    const attachment = this.attachment
-    const made = this.source.image(image).then(async (read) => ({
-      picture: read ? await (this.options.picture ?? pictureOf)(read) : null,
-      generation: read?.generation ?? -1,
-    }))
-    void made.then(({ picture, generation: got }) => {
-      entry.asking = false
-      // Let go of while its pixels were on their way: a picture nothing holds is closed, not leaked
-      if (this.disposed || this.pictures.get(image) !== entry) return release(picture)
-      if (picture) {
-        release(entry.picture)
-        entry.picture = picture
-        entry.generation = got
-      }
-      // No answer for want of an attachment says nothing about the image: the next attachment asks
-      if (!picture && (attachment !== this.attachment || !this.listening)) return
-      const wanted = this.wanted.get(image) ?? generation
-      if (!picture || got !== generation) {
-        entry.refused = this.placed
-        entry.refusedGeneration = generation
-      }
-      this.schedule()
-      if (wanted !== generation && got !== wanted && !this.disposed && this.listening && !this.ended) {
-        this.wantPicture(image, wanted)
-      }
-    }, () => {
-      entry.asking = false
-      if (this.disposed || this.pictures.get(image) !== entry) return
-      if (attachment === this.attachment && this.listening) {
-        entry.refused = this.placed
-        entry.refusedGeneration = generation
-        const wanted = this.wanted.get(image) ?? generation
-        if (wanted !== generation && !this.ended) {
-          this.wantPicture(image, wanted)
-        }
-      }
-    })
-  }
-
-  /**
-   * The images with any part in view, lowest first, in the pixels this view draws a cell in: the ones
-   * placed there, by themselves or relative to another, and the parts of images the rows there show
-   * through placeholder cells.
-   */
   private imagesIn(first: number, span: number, lines: number[]): NonNullable<Scene['images']> {
     const { cellWidth, cellHeight } = this.painter.metrics
-    // What the terminal measured an image in, against what this view draws: the same, where it was not told
-    // A piece is under the text and over whatever else is: the core draws one at a z of minus one
-    const images: Array<NonNullable<Scene['images']>[number] & { z: number }> =
-      this.piecesIn(first, lines).map((piece) => ({ ...piece, z: -1 }))
-    // Each list in the cell it was measured in, which the two are told apart from each other
-    for (const told of [{ ...this.placed, list: this.placed.placements }, this.anchored]) {
-      const scaleX = told.cellWidth > 0 ? cellWidth / told.cellWidth : 1
-      const scaleY = told.cellHeight > 0 ? cellHeight / told.cellHeight : 1
-      for (const placement of told.list) {
-        if (placement.line + placement.rows <= first || placement.line >= first + span) continue
-        if (this.hiddenIn(placement.line)) continue
-        const picture = this.pictures.get(placement.image)?.picture
-        if (!picture) continue
-        images.push({
-          picture,
-          x: placement.column * cellWidth + placement.offsetX * scaleX,
-          y: this.rowsBetween(first, placement.line) * cellHeight + placement.offsetY * scaleY,
-          width: placement.width * scaleX,
-          height: placement.height * scaleY,
-          source: { x: placement.sourceX, y: placement.sourceY, width: placement.sourceWidth, height: placement.sourceHeight },
-          above: placement.z >= 0,
-          z: placement.z,
-        })
-      }
-    }
-    return images.sort((one, other) => one.z - other.z)
-  }
+    const images: Array<NonNullable<Scene['images']>[number] & { z: number }> = []
 
-  /** The parts of images the rows in view show, each where its cells are, under the text */
-  private piecesIn(first: number, lines: number[]): NonNullable<Scene['images']> {
-    const { cellWidth, cellHeight } = this.painter.metrics
-    const shown: Array<NonNullable<Scene['images']>[number]> = []
+    // 1. Placeholder pieces on visible rows (drawn under text at z = -1)
     for (const line of lines) {
-      const images = this.store.row(line)?.images
-      // A fold's line is drawn as the fold, not as the row that begins what it hides
-      if (images === undefined || this.folds.some((fold) => fold.first === line)) continue
-      // What the terminal measured a piece in, against what this view draws
-      const scaleX = images.cellWidth > 0 ? cellWidth / images.cellWidth : 1
-      const scaleY = images.cellHeight > 0 ? cellHeight / images.cellHeight : 1
+      const row = this.store.row(line)
+      if (!row?.pieces || this.folds.some((fold) => fold.first === line)) continue
       const top = this.rowsBetween(first, line) * cellHeight
-      for (const piece of images.pieces) {
-        const picture = this.pictures.get(piece.image)?.picture
-        if (!picture) continue
-        shown.push({
-          picture,
-          x: piece.column * cellWidth + piece.offsetX * scaleX,
-          y: top + piece.offsetY * scaleY,
-          width: piece.width * scaleX,
-          height: piece.height * scaleY,
-          source: { x: piece.sourceX, y: piece.sourceY, width: piece.sourceWidth, height: piece.sourceHeight },
+      for (const piece of row.pieces) {
+        const decoded = this.imageCache.get(piece.blob)
+        if (!decoded) continue
+        const [sx, sy, sw, sh] = piece.srcRect
+        const [dstW, dstH] = piece.dstPx
+        images.push({
+          picture: decoded.source,
+          x: piece.colStart * cellWidth,
+          y: top,
+          width: dstW > 0 ? dstW : piece.colLen * cellWidth,
+          height: dstH > 0 ? dstH : cellHeight,
+          source: {
+            x: sx,
+            y: sy,
+            width: sw > 0 ? sw : decoded.width,
+            height: sh > 0 ? sh : decoded.height,
+          },
           above: false,
+          z: -1,
         })
       }
     }
-    return shown
+
+    // 2. Anchored placements from `source.images()`
+    for (const placement of this.placements) {
+      const [spanCols, spanRows] = placement.cellSpan
+      const pRows = Math.max(1, spanRows)
+      if (placement.line + pRows <= first || placement.line >= first + span) continue
+      if (this.hiddenIn(placement.line)) continue
+      const decoded = this.imageCache.get(placement.blob)
+      if (!decoded) continue
+      const [pxW, pxH] = placement.pixelSize
+      images.push({
+        picture: decoded.source,
+        x: placement.col * cellWidth,
+        y: this.rowsBetween(first, placement.line) * cellHeight,
+        width: spanCols > 0 ? spanCols * cellWidth : pxW,
+        height: spanRows > 0 ? spanRows * cellHeight : pxH,
+        source: { x: 0, y: 0, width: decoded.width, height: decoded.height },
+        above: placement.zIndex >= 0,
+        z: placement.zIndex,
+      })
+    }
+
+    return images.sort((a, b) => a.z - b.z)
   }
 
-  /** A mark for each command whose prompt is in view, coloured by how the command ended */
   private marksIn(first: number, lines: number[]): NonNullable<Scene['marks']> {
     if (this.gutter === 0 || lines.length === 0) return []
     const prompts = this.commandPrompts
@@ -980,75 +802,78 @@ export class TerminalView {
     for (let index = firstAfter(prompts, first - 1); index < prompts.length && prompts[index]!.line <= last; index += 1) {
       const { line, command } = prompts[index]!
       if (this.hiddenIn(line)) continue
-      marks.push({ row: this.rowsBetween(first, line), color: this.theme.palette[markColor(command)] ?? this.theme.foreground })
+      marks.push({
+        row: this.rowsBetween(first, line),
+        color: this.theme.palette[markColor(command)] ?? this.theme.foreground,
+      })
     }
     return marks
   }
 
-  /** Asks the program to clear its screen, the way the keyboard does: control and L */
   clear(): void {
-    this.source.key({ action: 'press', code: 'KeyL', modifiers: Modifier.control, text: '', unshifted: 108, composed: false })
+    this.source.sendKey({
+      action: 'press',
+      code: 'KeyL',
+      modifiers: Modifier.ctrl,
+      text: '',
+      unshiftedCodepoint: 108,
+      composed: false,
+    })
   }
 
-  /** Gives the view the keyboard */
   focus(): void {
     this.input.field.focus({ preventScroll: true })
   }
 
-  /** Copies what one command printed, answering whether there was any to copy: a command whose output has left the history has none */
-  async copyCommand(command: Command): Promise<boolean> {
+  async copyCommand(command: CommandRecord): Promise<boolean> {
     return this.selectOutput(command) ? this.copy() : false
   }
 
-  /**
-   * Types `text` into the program as text a keyboard typed: what a program at a prompt would be sent by someone at the
-   * keyboard, with no paste and so no confirmation. A view scrolled back follows the screen down to it, as a key does.
-   */
   typeText(text: string): void {
-    this.source.text(text)
+    this.source.sendText(text)
     this.typed()
   }
 
-  /**
-   * Pastes text into the program. Text that could run a command — a line ending where the program takes
-   * them as typed — goes only if the host's `confirmPaste` says the person agreed.
-   *
-   * Rejects with `TooLarge` for text the source cannot carry, of which none was sent. A paste into a
-   * session that has ended goes nowhere, and says nothing.
-   */
   async paste(text: string): Promise<void> {
     if (this.disposed) return
-    try {
-      let outcome = await this.source.paste(text)
+    let outcome = await this.source.paste(text, false)
+    if (this.disposed) return
+    if (outcome === 'unsafe' && (await this.options.confirmPaste?.(text))) {
       if (this.disposed) return
-      if (outcome === 'unsafe' && (await this.options.confirmPaste?.(text))) {
-        if (this.disposed) return
-        outcome = await this.source.paste(text, { allowUnsafe: true })
-      }
-      if (!this.disposed && outcome === 'pasted') this.typed()
-    } catch (error) {
-      if (error instanceof TooLarge) throw error
-      // The session ended while the paste was on its way: there is nothing to paste into
+      outcome = await this.source.paste(text, true)
     }
+    if (!this.disposed && outcome === 'pasted') this.typed()
   }
 
   /**
-   * Copies what is selected, as a program wrote it. Answers whether it was copied.
-   *
-   * **The clipboard is written inside the gesture that asked.** The text is the source's to give, which
-   * takes a round trip, and a browser lets a page write the clipboard only while it is handling what the
-   * person did. So the clipboard is handed the text as a promise there and then, where the browser takes
-   * one, rather than being written once the text has come.
+   * Copies selected text. Resolves synchronously in 0 ms when all selected rows are cached in
+   * `RowStore`, falling back to async broker RPC + Promise `ClipboardItem` only for uncached lines.
    */
   async copy(): Promise<boolean> {
     if (!this.selection.span) return false
+    const sync = this.selection.syncText()
+    if (sync !== null) {
+      if (sync === '') return false
+      if (this.options.onCopy) {
+        this.options.onCopy(sync)
+        return true
+      }
+      const clipboard = navigator.clipboard
+      if (!clipboard) return false
+      try {
+        await clipboard.writeText(sync)
+        return true
+      } catch {
+        return false
+      }
+    }
+
     const text = this.selection.text()
     if (this.options.onCopy) {
       const copied = await text.catch(() => '')
       if (copied !== '') this.options.onCopy(copied)
       return copied !== ''
     }
-    // Looked at whoever else does or does not: a text nobody waits for must not fail unheard
     text.catch(() => {})
     const clipboard = navigator.clipboard
     if (!clipboard) return false
@@ -1071,59 +896,58 @@ export class TerminalView {
     }
   }
 
-  /** Puts the view in `host` and starts its frames */
   mount(host: HTMLElement): void {
     if (this.disposed) return
-    // Mounted where it already is, there is nothing to do; mounted somewhere else, it is moved
     if (this.observer) {
       if (this.element.parentElement === host) return
       this.unmount()
     }
     host.appendChild(this.element)
     this.observer = new ResizeObserver(() => {
+      this.refreshBox()
       if ((window.devicePixelRatio || 1) !== this.pixelRatio) this.size()
       this.fit()
       this.schedule()
     })
     this.observer.observe(host)
     this.watch()
-    // The display may not be the one the painter last measured a cell on, or any it has measured one on
     const sized = (window.devicePixelRatio || 1) !== this.pixelRatio
     if (sized) this.size()
+    this.refreshBox()
     this.fit()
     this.resume()
-    // Sizing a canvas clears it, so what the view holds is drawn again without waiting for a frame
     if (sized) this.schedule()
   }
 
-  /**
-   * Takes the view off the page and stops its frames. What it holds is kept, and what it was showing stays
-   * on its canvas: mounted again, the first frames say what the screen is and which history may have
-   * changed meanwhile, and the rest is as it was.
-   */
   unmount(): void {
     this.observer?.disconnect()
     this.observer = null
     this.unwatch?.()
     this.unwatch = null
     this.lastFit = null
+    this.lastHintSent = null
+    this.cachedBox = null
     this.thumbRelease?.()
     this.input.clearKeyText()
-    // Said while there is still an attachment to say it on: a view off the page does not have the keyboard
-    // or a held button, whether or not the page gets round to saying so
     const pressed = this.pressed
     this.pressed = null
     if (pressed?.reporting) {
       this.reported = null
       const { cellWidth, cellHeight } = this.painter.metrics
-      this.source.pointer({ action: 'release', button: pressed.button, modifiers: 0, x: 0, y: 0, cellWidth, cellHeight })
+      this.source.sendPointer({
+        action: 'release',
+        button: pressed.button,
+        modifiers: 0,
+        xPx: 0,
+        yPx: 0,
+        cellPx: { width: Math.max(1, Math.round(cellWidth)), height: Math.max(1, Math.round(cellHeight)) },
+      })
     }
     this.setFocused(false)
     this.pause()
     this.element.remove()
   }
 
-  /** Measures how many cells fit, and reports it */
   fit(): void {
     const host = this.element.parentElement
     if (!host) return
@@ -1131,18 +955,55 @@ export class TerminalView {
     if (host.clientWidth <= 0 || host.clientHeight <= 0) return
     const { cellWidth, cellHeight } = this.painter.metrics
     if (cellWidth <= 0 || cellHeight <= 0) return
-    const columns = Math.max(1, Math.floor((host.clientWidth - this.gutter) / cellWidth))
-    const rows = Math.max(1, Math.floor(host.clientHeight / cellHeight))
+    const columns = Math.min(MAX_GRID_COLS, Math.max(1, Math.floor((host.clientWidth - this.gutter) / cellWidth)))
+    const rows = Math.min(MAX_GRID_ROWS, Math.max(1, Math.floor(host.clientHeight / cellHeight)))
     const last = this.lastFit
-    if (last && last.columns === columns && last.rows === rows && last.cellWidth === cellWidth && last.cellHeight === cellHeight) return
+    if (
+      last
+      && last.columns === columns
+      && last.rows === rows
+      && last.cellWidth === cellWidth
+      && last.cellHeight === cellHeight
+    ) {
+      return
+    }
     this.lastFit = { columns, rows, cellWidth, cellHeight }
     this.options.onFit?.({ columns, rows, cellWidth, cellHeight })
+    this.pushViewportHint()
   }
 
-  /**
-   * Sizes the painter for the grid there is on the display there is, which is when a cell is measured.
-   * Answers whether a cell is now another size, which is when what fits has changed.
-   */
+  private pushViewportHint(): void {
+    if (!this.listening || this.disposed) return
+    const fit = this.lastFit
+    const cols = fit?.columns ?? this.columns
+    const rows = fit?.rows ?? this.rows
+    if (cols <= 0 || rows <= 0) return
+    const { cellWidth, cellHeight } = this.painter.metrics
+    const hint: ViewportHint = {
+      size: { cols, rows },
+      cellPx: {
+        width: Math.max(1, Math.round(cellWidth)),
+        height: Math.max(1, Math.round(cellHeight)),
+      },
+      visible: this.visible,
+      focused: this.focused,
+    }
+    const prev = this.lastHintSent
+    if (
+      prev
+      && prev.size.cols === hint.size.cols
+      && prev.size.rows === hint.size.rows
+      && prev.cellPx.width === hint.cellPx.width
+      && prev.cellPx.height === hint.cellPx.height
+      && prev.visible === hint.visible
+      && prev.focused === hint.focused
+    ) {
+      return
+    }
+    this.lastHintSent = hint
+    this.source.sendViewportHint(hint)
+  }
+
   private size(): boolean {
     const before = this.painter.metrics
     const nextRatio = window.devicePixelRatio || 1
@@ -1154,19 +1015,12 @@ export class TerminalView {
     return cellWidth !== before.cellWidth || cellHeight !== before.cellHeight
   }
 
-  /**
-   * A cell may be another size: the window moved to a display with other pixels, the page was zoomed, or
-   * a font the view draws in finished loading after it had been measured as its fallback.
-   */
   private readonly remeasure = () => {
     if (this.size()) this.fit()
+    this.refreshBox()
     this.schedule()
   }
 
-  /**
-   * Fonts finished loading on the page. A cell is measured again when one of them is a family the view
-   * draws in; an event that does not say which faces loaded is taken to be about one that is.
-   */
   private readonly fontsLoaded = (event: Event) => {
     const faces = (event as Event & { fontfaces?: readonly FontFace[] }).fontfaces
     const named = (family: string) => family.trim().replace(/^["']|["']$/g, '').toLowerCase()
@@ -1174,13 +1028,6 @@ export class TerminalView {
     if (!faces || faces.some((face) => own.has(named(face.family)))) this.remeasure()
   }
 
-  /**
-   * Subscribes to `matchMedia` for the current display pixel ratio.
-   *
-   * A resolution query matches one ratio, so it is asked again for each ratio the display comes to have.
-   * Under fractional browser zoom, an exact `(resolution: ...)` query may not match due to float rounding,
-   * in which case we fall back to a narrow min/max-resolution range and also re-check on window resize.
-   */
   private display(): void {
     this.stopDisplay?.()
     this.stopDisplay = null
@@ -1199,7 +1046,6 @@ export class TerminalView {
       this.remeasure()
       if (this.pixelRatio === before && this.listening) this.display()
     }
-    // A browser whose queries cannot be listened to this way is one whose display changing goes unheard
     query.addEventListener?.('change', changed)
     this.stopDisplay = () => {
       query.removeEventListener?.('change', changed)
@@ -1207,18 +1053,23 @@ export class TerminalView {
     }
   }
 
-  /** Listens, while mounted, for what changes the size of a cell without the view being told */
   private watch(): void {
     this.unwatch?.()
     const stop: Array<() => void> = []
     this.display()
     stop.push(() => this.stopDisplay?.())
     const onResize = () => {
+      this.refreshBox()
       if ((window.devicePixelRatio || 1) === this.pixelRatio) return
       this.remeasure()
     }
+    const onScroll = () => {
+      this.refreshBox()
+    }
     window.addEventListener('resize', onResize)
+    window.addEventListener('scroll', onScroll, { passive: true, capture: true })
     stop.push(() => window.removeEventListener('resize', onResize))
+    stop.push(() => window.removeEventListener('scroll', onScroll, true))
     const fonts = document.fonts
     if (fonts && typeof fonts.addEventListener === 'function') {
       fonts.addEventListener('loadingdone', this.fontsLoaded)
@@ -1227,22 +1078,20 @@ export class TerminalView {
     this.unwatch = () => { for (const one of stop) one() }
   }
 
-  /** The view has, or has lost, the keyboard: an unfocused terminal shows a hollow cursor that does not blink */
   setFocused(focused: boolean): void {
     if (focused === this.focused) return
     this.focused = focused
     this.blinkAgain()
-    this.source.focus(focused)
+    this.source.sendFocus(focused)
+    this.pushViewportHint()
     this.schedule()
   }
 
-  /** Moves by drawn rows, negative for back: a fold's hidden lines are not counted */
   scrollBy(rows: number): void {
     this.viewport.scrollBy(rows)
     this.scrolled()
   }
 
-  /** Shows from a row of the history counted from its oldest line, as the scrollbar counts them */
   private scrollToPosition(position: number): void {
     this.viewport.scrollToPosition(position)
     this.scrolled()
@@ -1253,15 +1102,32 @@ export class TerminalView {
     this.scrolled()
   }
 
-  /** Shows the screen again and follows it */
   follow(): void {
     this.viewport.follow()
     this.scrolled()
   }
 
-  /** Something outside the rows changed what a row looks like — a selection moved */
   redraw(): void {
     this.schedule()
+  }
+
+  /** Synchronously flushes any pending lazy DOM mirror updates (useful for a11y/tests). */
+  flushMirror(): void {
+    this.mirrorTimer.cancel()
+    this.mirrorDirty = false
+    const lines = this.lastLayoutLines
+    const count = lines.length
+    while (this.mirror.childElementCount < count) this.mirror.appendChild(document.createElement('div'))
+    while (this.mirror.childElementCount > count) this.mirror.lastElementChild!.remove()
+    this.mirrored.length = count
+    for (let index = 0; index < count; index += 1) {
+      const line = lines[index]!
+      const fold = this.folds.find((known) => known.first === line)
+      const row = fold ? this.foldRow(fold) : (this.store.row(line) ?? null)
+      if (this.mirrored[index] === row) continue
+      this.mirrored[index] = row
+      this.mirror.children[index]!.textContent = row ? rowPlainText(row) : ''
+    }
   }
 
   dispose(): void {
@@ -1280,45 +1146,40 @@ export class TerminalView {
     this.thumbRelease?.()
     this.pressed = null
     this.stopDragScroll()
-    for (const held of this.pictures.values()) release(held.picture)
-    this.pictures.clear()
+    if (this.ownsImageCache) this.imageCache.dispose()
     this.input.dispose()
     this.painter.dispose()
   }
 
   private resume(): void {
-    if (this.detach || this.disposed) return
-    // An attachment that could not be made is over and its session is not: this one asks again. And what
-    // was held is left as it is: the attachment's first frames say what of it is not to be trusted, by
-    // naming history as stale or by being in another epoch
+    if (this.unsubscribe || this.disposed) return
     this.ended = false
     this.listening = true
-    this.attachment += 1
-    this.detach = this.source.attach({
-      frame: (frame) => this.take(frame),
-      ended: (reason) => {
-        this.ended = true
-        this.options.onEnded?.(reason)
+    this.unsubscribe = this.source.subscribe(
+      {
+        onFrame: (frame) => this.take(frame),
+        onSearchMatches: (snapshot) => this.applySearchSnapshot(snapshot, false),
+        onSearchDelta: (patch) => this.applySearchDelta(patch),
+        onEvent: (event) => this.handleEvent(event),
       },
-    })
-    // A program is told who has the keyboard by the attachment that has it
-    if (this.focused) this.source.focus(true)
-    // What an attachment before was asked for and could not answer is asked of this one
+      { manualAck: true },
+    )
+    this.pushViewportHint()
+    if (this.focused) this.source.sendFocus(true)
+    this.fetchCommands()
     this.wantPicturesInView()
     this.blinkAgain()
   }
 
-  /**
-   * Stops everything that goes on by itself: the frames, the paint that was asked for, the blink, and the
-   * scrolling of a drag that was past an edge.
-   */
   private pause(): void {
-    this.detach?.()
-    this.detach = null
+    if (this.unacknowledgedSeq !== null && !this.ended) {
+      this.source.ackFrame?.(this.unacknowledgedSeq)
+    }
+    this.unacknowledgedSeq = null
+    this.unsubscribe?.()
+    this.unsubscribe = null
     this.listening = false
-    this.unacknowledged = null
-    this.refreshTimer.cancel()
-    this.refreshAgain = false
+    this.mirrorTimer.cancel()
     if (this.scheduled !== null) cancelAnimationFrame(this.scheduled)
     this.scheduled = null
     this.stopDragScroll()
@@ -1326,15 +1187,37 @@ export class TerminalView {
     this.blinkText(false)
   }
 
-  /**
-   * Starts or stops the clock blinking text goes by. It runs only while text that blinks is in view and
-   * the view is taking frames, and whatever it stopped at, text is shown once it has: a view that is
-   * not blinking is one in which nothing is hidden.
-   *
-   * **A clock of its own, not the cursor's.** The cursor's starts over at every keystroke and every
-   * frame, so that a cursor that just moved is seen; text that started over that often would never
-   * reach the half it is hidden for under a program that keeps printing.
-   */
+  private handleEvent(event: SessionEvent): void {
+    if (this.disposed) return
+    switch (event.kind) {
+      case 'commandStarted':
+      case 'commandFinished':
+        this.upsertCommand(event.record)
+        break
+      case 'exited':
+        this.ended = true
+        this.options.onEnded?.(event.signal ?? (event.exitCode !== null ? `exited (${event.exitCode})` : undefined))
+        break
+      case 'streamClosed':
+        this.ended = true
+        this.options.onEnded?.(event.reason)
+        break
+      default:
+        break
+    }
+    this.options.onEvent?.(event)
+  }
+
+  private fetchCommands(): void {
+    if (this.disposed || this.ended) return
+    const epoch = this.store.epoch
+    void this.source.commands().then((commands) => {
+      if (this.disposed || (epoch >= 0 && epoch !== this.store.epoch)) return
+      this.setCommands(commands)
+      this.schedule()
+    }, () => {})
+  }
+
   private blinkText(inView: boolean): void {
     if (inView && this.listening) {
       this.textBlinking = true
@@ -1354,20 +1237,18 @@ export class TerminalView {
       if (!this.textBlinking || !this.listening || this.disposed) return
       this.textShown = !this.textShown
       this.schedule()
-      if (this.textBlinking && this.listening && !this.disposed && !this.textBlink.active) this.scheduleTextBlink()
+      if (this.textBlinking && this.listening && !this.disposed && !this.textBlink.active) {
+        this.scheduleTextBlink()
+      }
     })
   }
 
-  private take(frame: Frame): void {
+  private take(frame: FrameUpdate): void {
     const moved = frame.epoch !== this.store.epoch
     const after = moved ? this.viewport.acrossReset() : undefined
-    // What is kept longest is what the viewer is at: the screen, or the line a scrolled view holds
-    const near = moved || this.viewport.following ? frame.firstActive : this.viewport.top
-    // The images changed: history that shows part of one is asked for again. Before the frame is taken,
-    // so a row it brings is the row as it now is and is not asked for twice
-    if (this.imagesTold !== -1 && frame.images !== this.imagesTold) this.store.doubtPictured()
-    this.imagesTold = frame.images
+    const near = moved || this.viewport.following ? frame.firstActiveLine : this.viewport.top
     const { reset, changed } = this.store.apply(frame, near)
+
     if (reset) {
       this.folds = []
       this.viewport.setFolds([])
@@ -1376,105 +1257,71 @@ export class TerminalView {
     }
     after?.()
     this.viewport.settle()
+
     if (reset) {
       this.drawings.clear()
       this.asking.clear()
-      // Every line number changed, so what was selected and hovered names lines that are gone
       this.selection.reset()
       this.hovered = null
       this.hoverAt = null
+      this.hoverVersion += 1
       this.element.style.cursor = 'text'
       this.element.title = ''
-      // And the lines its commands were on: asked for again, in this epoch
       this.setCommands([])
-      this.commandsSeen = -1
-      // And the lines its images were on. Their pixels are the same pictures wherever they are now
-      this.placed = { ...this.placed, placements: [] }
-      this.anchored = { ...this.anchored, list: [] }
-      this.imagesSeen = -1
-      this.refreshTimer.cancel()
-      this.refreshAgain = false
-      const hadSearch = this.needle !== '' || this.matches.length > 0 || this.moreMatches
-      this.needle = ''
-      this.setMatches(NOTHING_FOUND)
+      this.placements = []
+      this.imagesGenSeen = -1
+      const hadMatches = this.matches.length > 0 || this.moreMatches
+      // Keep `this.needle` across epoch resets: the broker preserves the active SearchWatch and
+      // immediately pushes a fresh `SearchMatches` for the new epoch.
+      this.matches = []
+      this.moreMatches = false
       this.currentMatch = -1
-      this.finding += 1
-      if (hadSearch) this.options.onFound?.(this.found)
+      this.matchVersion += 1
+      if (hadMatches) this.options.onFound?.(this.found)
+      this.fetchCommands()
     } else {
       for (const line of changed) this.drawings.delete(line)
-      if (changed.length > 0) this.refreshMatches()
     }
-    if (frame.commands !== this.commandsSeen) {
-      const seen = (this.commandsSeen = frame.commands)
+
+    if (frame.imagesGen !== this.imagesGenSeen) {
+      const targetGen = (this.imagesGenSeen = frame.imagesGen)
       const epoch = frame.epoch
-      void this.source.commands().then((commands) => {
-        if (this.disposed || epoch !== this.store.epoch || seen !== this.commandsSeen) return
-        this.setCommands(commands)
-        this.schedule()
-      }, () => {
-        // Not heard, so not seen: the next frame asks again
-        if (epoch === this.store.epoch && this.commandsSeen === seen) this.commandsSeen = -1
-      })
-    }
-    // Told after a reset has let the old ones go, so a frame that begins a numbering and tells them keeps them
-    if (frame.anchored !== undefined) {
-      const { cellWidth, cellHeight, list } = frame.anchored
-      this.anchored = { cellWidth, cellHeight, list: list.map((one) => ({ ...one, line: frame.firstActive + one.row })) }
-      this.wantPicturesInView()
-    }
-    if (!reset && frame.images === this.imagesSeen) {
-      this.dropPictures()
-    }
-    if (frame.images !== this.imagesSeen) {
-      const seen = (this.imagesSeen = frame.images)
-      const epoch = frame.epoch
-      void this.source.images().then((placed) => {
-        if (this.disposed || epoch !== this.store.epoch || seen !== this.imagesSeen) return
-        this.placed = placed
-        this.dropPictures()
-        // Asked for as soon as they are known to be in view, rather than by the paint that would show them
+      void this.source.images().then((reply) => {
+        if (this.disposed || epoch !== this.store.epoch || targetGen !== this.imagesGenSeen) return
+        this.placements = reply.placements
         this.wantPicturesInView()
         this.schedule()
       }, () => {
-        if (epoch === this.store.epoch && this.imagesSeen === seen) this.imagesSeen = -1
+        if (epoch === this.store.epoch && this.imagesGenSeen === targetGen) this.imagesGenSeen = -1
       })
     }
-    // The program's colours as a frame tells them are all of them: what it leaves out is the theme's again.
-    // A frame that does not tell them leaves them as they were — across a new numbering too, since an
-    // attachment's first frame always tells them
-    if (frame.colors !== undefined || frame.reverseVideo !== this.reverseVideo) {
-      if (frame.colors !== undefined) this.colors = frame.colors
-      this.reverseVideo = frame.reverseVideo
+
+    if (frame.palette !== null || frame.modes.reverseVideo !== this.reverseVideo) {
+      if (frame.palette !== null) this.paletteOverrides = frame.palette
+      this.reverseVideo = frame.modes.reverseVideo
       this.recolour()
     }
+
     this.frame = frame
-    this.unacknowledged = frame.sequence
-    if (frame.columns !== this.columns || frame.screenRows !== this.rows) {
-      this.columns = frame.columns
-      this.rows = frame.screenRows
+    this.unacknowledgedSeq = frame.seq
+
+    if (frame.size.cols !== this.columns || frame.size.rows !== this.rows) {
+      this.columns = frame.size.cols
+      this.rows = frame.size.rows
       if (this.size()) this.fit()
+      this.refreshBox()
     }
-    // Output shows the cursor where it now is, at the start of a blink
+
     this.blinkAgain()
     this.followingMayHaveChanged()
     this.schedule()
   }
 
-  /**
-   * Whether the cursor blinks now, which is the source's to say: a frame's cursor is the one to draw. What a
-   * person chose and what a program asked for are settled where the session's output is parsed, the one
-   * place that can tell a program asking for a cursor from one that only showed it again
-   */
   private cursorBlinks(): boolean {
     const cursor = this.frame?.cursor
-    return cursor !== null && cursor !== undefined && !cursor.hidden && cursor.blinking
+    return cursor !== undefined && !cursor.hidden && cursor.blinking
   }
 
-  /**
-   * Shows the cursor and starts its blink over, which is what anything typed and anything printed does:
-   * a cursor that has just moved is one a person is looking for. It blinks only while the view has the
-   * keyboard and is taking frames.
-   */
   private blinkAgain(): void {
     this.blink.cancel()
     if (!this.cursorShown) {
@@ -1490,11 +1337,12 @@ export class TerminalView {
       if (!this.focused || !this.listening || this.disposed || !this.cursorBlinks()) return
       this.cursorShown = !this.cursorShown
       this.schedule()
-      if (this.focused && this.listening && !this.disposed && this.cursorBlinks() && !this.blink.active) this.scheduleBlink()
+      if (this.focused && this.listening && !this.disposed && this.cursorBlinks() && !this.blink.active) {
+        this.scheduleBlink()
+      }
     })
   }
 
-  /** The person typed, composed or pasted something the program was sent */
   private typed(): void {
     if ((this.options.followOnInput ?? true) && !this.viewport.following) this.follow()
     this.blinkAgain()
@@ -1512,54 +1360,63 @@ export class TerminalView {
     this.options.onFollowingChange?.(following)
   }
 
-  /**
-   * The wheel scrolls history where there is some. A program that asked for the mouse is sent the wheel
-   * instead, while the view is showing the screen it draws on, and a full-screen program that did not is
-   * sent arrow keys, which is what makes `less` and `man` scroll under a wheel in every terminal.
-   */
   private readonly wheel = (event: WheelEvent) => {
     const frame = this.frame
-    // With control held the wheel is the browser's: a pinch arrives as one, and zooms the page
     if (!frame || event.ctrlKey) return
     const { cellHeight } = this.painter.metrics
-    // A wheel reports pixels, lines or pages; a trackpad reports pixels, which is what makes the view move
-    // by fractions of a row
-    const lines = event.deltaMode === 1 ? event.deltaY : event.deltaMode === 2 ? event.deltaY * this.rows : event.deltaY / cellHeight
+    const lines =
+      event.deltaMode === 1
+        ? event.deltaY
+        : event.deltaMode === 2
+          ? event.deltaY * this.rows
+          : event.deltaY / cellHeight
     const toProgram = frame.modes.mouse && !event.shiftKey && this.viewport.following
-    if (!toProgram && !frame.modes.alternateScreen) {
+    if (!toProgram && !frame.modes.altScreen) {
       if (this.store.scrollback === 0) return
       event.preventDefault()
       this.scrollBy(lines)
       return
     }
     event.preventDefault()
-    // A program is told about whole notches, so fractions are kept until they add up to one — of one
-    // direction: what was owed the other way is not paid back out of this one
     if (this.wheelOwed !== 0 && Math.sign(lines) !== Math.sign(this.wheelOwed)) this.wheelOwed = 0
     this.wheelOwed += lines
     const notches = Math.trunc(this.wheelOwed)
     this.wheelOwed -= notches
     for (let sent = 0; sent < Math.min(Math.abs(notches), 20); sent += 1) {
-      if (toProgram) this.source.pointer(this.pointerInput(event, notches < 0 ? 'wheelUp' : 'wheelDown', -1))
-      else this.source.key({ action: 'press', code: notches < 0 ? 'ArrowUp' : 'ArrowDown', modifiers: 0, text: '', unshifted: 0, composed: false })
+      if (toProgram) {
+        this.source.sendPointer(this.pointerInput(event, notches < 0 ? 'wheelUp' : 'wheelDown', 255))
+      } else {
+        this.source.sendKey({
+          action: 'press',
+          code: notches < 0 ? 'ArrowUp' : 'ArrowDown',
+          modifiers: 0,
+          text: '',
+          unshiftedCodepoint: 0,
+          composed: false,
+        })
+      }
     }
   }
 
-  /**
-   * Where a point on the page is, in the canvas's own pixels from the grid's corner. A transform on the
-   * page — a scaled panel, a zoomed canvas — makes the box the canvas occupies another size than the
-   * canvas, and a pointer is reported in the box's.
-   */
-  private pointIn(point: Point): { x: number; y: number } {
+  /** Refreshes cached canvas bounding box (called on mount, ResizeObserver, scroll, resize, pointerdown — never pointermove). */
+  private refreshBox(): CachedBox {
     const canvas = this.painter.canvas
     const box = canvas.getBoundingClientRect()
     const scaleX = canvas.offsetWidth > 0 && box.width > 0 ? box.width / canvas.offsetWidth : 1
     const scaleY = canvas.offsetHeight > 0 && box.height > 0 ? box.height / canvas.offsetHeight : 1
-    return { x: (point.clientX - box.left) / scaleX - this.gutter, y: (point.clientY - box.top) / scaleY }
+    this.cachedBox = { left: box.left, top: box.top, scaleX, scaleY }
+    return this.cachedBox
   }
 
-  /** The cell a point is over, as a line and a column: the nearest there is, for a point outside them all */
-  private positionOf(point: Point): Position {
+  private pointIn(point: Point): { x: number; y: number } {
+    const box = this.cachedBox ?? this.refreshBox()
+    return {
+      x: (point.clientX - box.left) / box.scaleX - this.gutter,
+      y: (point.clientY - box.top) / box.scaleY,
+    }
+  }
+
+  private positionOf(point: Point): CellPos {
     const { cellWidth, cellHeight } = this.painter.metrics
     const { x, y } = this.pointIn(point)
     const { lines } = this.layout()
@@ -1567,11 +1424,10 @@ export class TerminalView {
     const line = lines.length > 0 ? lines[Math.max(0, Math.min(row, lines.length - 1))]! : this.store.firstActive
     return {
       line,
-      column: Math.max(0, Math.min(Math.floor(x / cellWidth), Math.max(0, this.columns - 1))),
+      col: Math.max(0, Math.min(Math.floor(x / cellWidth), Math.max(0, this.columns - 1))),
     }
   }
 
-  /** How far a point is past the top edge of the rows, below zero, or past the bottom, above it: in rows */
   private beyond(point: Point): number {
     const { cellHeight } = this.painter.metrics
     const { y } = this.pointIn(point)
@@ -1585,60 +1441,69 @@ export class TerminalView {
     const maxX = this.columns * cellWidth
     const maxY = this.rows * cellHeight
     return {
-      action, button, modifiers: modifiersOf(event),
-      x: Math.max(0, Math.min(x, maxX)),
-      y: Math.max(0, Math.min(y, maxY)),
-      cellWidth, cellHeight,
+      action,
+      button,
+      modifiers: modifiersOf(event),
+      xPx: Math.round(Math.max(0, Math.min(x, maxX))),
+      yPx: Math.round(Math.max(0, Math.min(y, maxY))),
+      cellPx: {
+        width: Math.max(1, Math.round(cellWidth)),
+        height: Math.max(1, Math.round(cellHeight)),
+      },
     }
   }
 
-  /**
-   * Tells a program where the pointer is, once for each cell it comes to: a program draws by cells, and a
-   * pointer crosses one in many more events than that.
-   */
   private reportMove(event: MouseEvent, button: number): void {
-    const input = this.pointerInput(event, 'move', button)
-    const column = Math.floor(input.x / input.cellWidth)
-    const row = Math.floor(input.y / input.cellHeight)
+    const input = this.pointerInput(event, 'motion', button)
+    const col = Math.floor(input.xPx / input.cellPx.width)
+    const row = Math.floor(input.yPx / input.cellPx.height)
     const last = this.reported
-    if (last && last.column === column && last.row === row && last.button === button) return
-    this.reported = { column, row, button }
-    this.source.pointer(input)
+    if (last && last.col === col && last.row === row && last.button === button) return
+    this.reported = { col, row, button }
+    this.source.sendPointer(input)
   }
 
-  /**
-   * How many presses this one is the last of: one, two or three, and then one again. Another press is the
-   * same click again when it is the same button, soon after the last and where the last was — by the
-   * event's own clock, which is the page's and not the wall's.
-   */
   private clicks(event: PointerEvent): number {
     const last = this.lastPress
-    const again = last !== null && last.button === event.button && event.timeStamp - last.time <= CLICK_AGAIN_MS
-      && Math.abs(event.clientX - last.clientX) <= CLICK_AGAIN_PIXELS && Math.abs(event.clientY - last.clientY) <= CLICK_AGAIN_PIXELS
+    const again =
+      last !== null
+      && last.button === event.button
+      && event.timeStamp - last.time <= CLICK_AGAIN_MS
+      && Math.abs(event.clientX - last.clientX) <= CLICK_AGAIN_PIXELS
+      && Math.abs(event.clientY - last.clientY) <= CLICK_AGAIN_PIXELS
     const count = again && last.count < 3 ? last.count + 1 : 1
-    this.lastPress = { time: event.timeStamp, clientX: event.clientX, clientY: event.clientY, button: event.button, count }
+    this.lastPress = {
+      time: event.timeStamp,
+      clientX: event.clientX,
+      clientY: event.clientY,
+      button: event.button,
+      count,
+    }
     return count
   }
 
-  /** `0` left, `1` middle, `2` right, as a source numbers them — which is how the page does too */
   private readonly pointerDown = (event: PointerEvent) => {
     if (event.target === this.thumb) return
     if (this.pressed) {
       event.preventDefault()
       return
     }
+    this.refreshBox()
     this.focus()
-    // Keeps the focus this just gave from going to whatever the page would otherwise focus on a click
     event.preventDefault()
     const at = this.positionOf(event)
-    // A program that asked for the mouse owns it, where the screen is showing; shift takes it back
-    const reporting = this.frame?.modes.mouse === true && !event.shiftKey && this.viewport.following
+    const validButton = event.button >= 0 && event.button <= 2
+    const reporting = validButton && this.frame?.modes.mouse === true && !event.shiftKey && this.viewport.following
     this.pressed = { button: event.button, reporting, at, moved: false, block: event.altKey }
     this.element.setPointerCapture?.(event.pointerId)
     if (reporting) {
       const input = this.pointerInput(event, 'press', event.button)
-      this.reported = { column: Math.floor(input.x / input.cellWidth), row: Math.floor(input.y / input.cellHeight), button: event.button }
-      this.source.pointer(input)
+      this.reported = {
+        col: Math.floor(input.xPx / input.cellPx.width),
+        row: Math.floor(input.yPx / input.cellPx.height),
+        button: event.button,
+      }
+      this.source.sendPointer(input)
       return
     }
     if (event.button !== 0) return
@@ -1658,11 +1523,12 @@ export class TerminalView {
       this.reportMove(event, pressed.button)
       return
     }
-    if (!pressed && this.frame?.modes.mouse && !event.shiftKey && this.viewport.following) this.reportMove(event, -1)
+    if (!pressed && this.frame?.modes.mouse && !event.shiftKey && this.viewport.following) {
+      this.reportMove(event, 255)
+    }
     const at = this.positionOf(event)
     if (pressed?.button === 0) {
-      // The first move off the cell that was pressed is where a selection starts: a click selects nothing
-      if (!pressed.moved && (at.line !== pressed.at.line || at.column !== pressed.at.column)) {
+      if (!pressed.moved && (at.line !== pressed.at.line || at.col !== pressed.at.col)) {
         pressed.moved = true
         if (!this.selection.span) this.selection.begin(pressed.at, 'cell', pressed.block ? 'block' : 'linear')
       }
@@ -1678,9 +1544,7 @@ export class TerminalView {
   private readonly pointerUp = (event: PointerEvent) => {
     const pressed = this.released(event)
     if (!pressed || pressed.reporting) return
-    // A selection the person made — dragged out, or a word or line on a double or triple click — is copied where asked
     if (pressed.button === 0 && this.copyOnSelect && this.selection.span) void this.copy()
-    // A click that did not drag, with the platform's modifier held, opens what it is on
     const opening = this.mac ? event.metaKey : event.ctrlKey
     if (pressed.button === 0 && !pressed.moved && opening) {
       const link = this.linkOn(this.positionOf(event))
@@ -1688,18 +1552,10 @@ export class TerminalView {
     }
   }
 
-  /**
-   * The pointer was taken away with a button down — the system cancelled it for a gesture of its own, or
-   * something else took its capture — and no `pointerup` will say so.
-   */
   private readonly pointerLost = (event: PointerEvent) => {
     this.released(event)
   }
 
-  /**
-   * The button that was down no longer is, however that came about. A program that was sent its press is
-   * sent its release — it would otherwise go on dragging for ever — and nothing goes on scrolling.
-   */
   private released(event: PointerEvent): Pressed | null {
     const pressed = this.pressed
     if (!pressed) return null
@@ -1709,15 +1565,11 @@ export class TerminalView {
     if (this.element.hasPointerCapture?.(event.pointerId)) this.element.releasePointerCapture(event.pointerId)
     if (pressed.reporting) {
       this.reported = null
-      this.source.pointer(this.pointerInput(event, 'release', pressed.button))
+      this.source.sendPointer(this.pointerInput(event, 'release', pressed.button))
     }
     return pressed
   }
 
-  /**
-   * A selection being dragged has its pointer at `point`. Past the top or bottom edge, the view scrolls
-   * that way for as long as the pointer is held there, faster the further past it is.
-   */
   private dragScrollTo(point: Point): void {
     if (this.beyond(point) === 0) return this.stopDragScroll()
     const kept = { clientX: point.clientX, clientY: point.clientY }
@@ -1728,14 +1580,11 @@ export class TerminalView {
   private readonly dragScrollStep = (time: number) => {
     const drag = this.dragScroll
     if (!drag) return
-    // The first step has no step before it to measure from, and is taken to be one frame long; a step
-    // after a long gap — a tab that was hidden — is not a jump of everything that gap would have scrolled
     const elapsed = drag.at === null ? 16 : Math.min(Math.max(time - drag.at, 0), 100)
     drag.at = time
     const top = this.viewport.top
     this.scrollBy((this.beyond(drag.point) * elapsed * DRAG_LINES_PER_SECOND) / 1000)
     this.selection.extendTo(this.positionOf(drag.point))
-    // With nowhere further to scroll there is nothing to go on doing until the pointer moves again
     if (elapsed > 0 && this.viewport.top === top) {
       this.dragScroll = null
       return
@@ -1750,47 +1599,45 @@ export class TerminalView {
 
   private readonly pointerLeave = () => this.hover(null)
 
-  /**
-   * A program that owns the mouse is sent the right button, where the screen it draws on is showing;
-   * otherwise the page's menu is the host's to show.
-   */
   private readonly contextMenu = (event: MouseEvent) => {
     if (this.frame?.modes.mouse && !event.shiftKey && this.viewport.following) event.preventDefault()
   }
 
-  private linkOn(at: Position): Link | null {
+  private linkOn(at: CellPos): Link | null {
     const row = this.store.row(at.line)
-    return row ? linkAt(row, at.column, this.detectors, (line) => this.store.row(line)) : null
+    return row ? linkAt(row, at.col, this.detectors, (line) => this.store.row(line)) : null
   }
 
-  /** Marks the link under the pointer, which is how a person finds out a piece of text opens something */
-  private hover(at: Position | null): void {
-    // Over the same cell of the same row as when it was last worked out, the answer is the same
-    const over = at ? { line: at.line, column: at.column, row: this.store.row(at.line) } : null
+  private hover(at: CellPos | null): void {
+    const over = at ? { line: at.line, col: at.col, row: this.store.row(at.line) } : null
     const last = this.hoverAt
     this.hoverAt = over
-    if (over && last && over.line === last.line && over.column === last.column && over.row === last.row) return
+    if (over && last && over.line === last.line && over.col === last.col && over.row === last.row) return
     const link = at ? this.linkOn(at) : null
     const before = this.hovered
-    const same = before !== null && link !== null && at !== null && before.line === at.line && before.link.from === link.from && before.link.to === link.to
+    const same =
+      before !== null
+      && link !== null
+      && at !== null
+      && before.line === at.line
+      && before.link.from === link.from
+      && before.link.to === link.to
     if (same || (!before && !link)) return
     const row = at ? this.store.row(at.line) : undefined
-    this.hovered = link && at && row ? { line: at.line, link, runs: linkRuns(link, row, at.column, (line) => this.store.row(line)) } : null
+    this.hovered =
+      link && at && row
+        ? { line: at.line, link, runs: linkRuns(link, row, at.col, (line) => this.store.row(line)) }
+        : null
+    this.hoverVersion += 1
     this.element.style.cursor = link ? 'pointer' : 'text'
     this.element.title = link && this.previews(link) ? sanitizeTitle(link.target) : ''
     this.schedule()
   }
 
-  /** Whether hovering a link shows where it opens, by the `linkPreview` the host chose */
   private previews(link: Link): boolean {
     return this.linkPreview === 'all' || (this.linkPreview === 'osc8' && link.kind === 'declared')
   }
 
-  /**
-   * The scrollbar's thumb for where the view is: how tall, and how far down. It stands for the screenful in
-   * view within everything there is, never shorter than can be grabbed and never past the end of its
-   * track — so the top of its travel is the oldest line and the bottom is the screen.
-   */
   private thumbAt(): { height: number; top: number; travel: number } | null {
     const { total, position, shown } = this.viewport.extent
     if (total <= shown || this.height <= 0) return null
@@ -1799,7 +1646,6 @@ export class TerminalView {
     return { height, top: (position / (total - shown)) * travel, travel }
   }
 
-  /** Dragging the scrollbar's thumb moves through history in proportion */
   private readonly thumbDown = (event: PointerEvent) => {
     event.preventDefault()
     event.stopPropagation()
@@ -1822,9 +1668,8 @@ export class TerminalView {
     this.thumbRelease = up
   }
 
-  /** Asks for one paint on the next animation frame. A view that is taking no frames is not on the page, and draws nothing */
   private schedule(): void {
-    if (this.scheduled !== null || this.disposed || !this.frame || !this.listening) return
+    if (this.scheduled !== null || this.disposed || !this.frame || !this.listening || !this.visible) return
     this.scheduled = requestAnimationFrame(() => {
       this.scheduled = null
       this.paint()
@@ -1836,9 +1681,8 @@ export class TerminalView {
     if (!frame) return
     try {
       const { first, lines } = this.layout()
-      // The absolute lines the window covers, folded ones included: what is asked of the source and what is held
       const span = lines.length > 0 ? lines[lines.length - 1]! - first + 1 : 0
-      // Decided before anything is drawn, so a blink that has just stopped draws its text shown, once
+
       let blinking = false
       for (const line of lines) {
         const row = this.store.row(line)
@@ -1848,11 +1692,12 @@ export class TerminalView {
         }
       }
       this.blinkText(blinking)
+
       const rows: Array<RowDrawing | null> = lines.map((line) => {
         const fold = this.folds.find((known) => known.first === line)
         return fold ? this.foldDrawing(fold) : this.drawingOf(line)
       })
-      // What a scroll of a screenful either way would show stays drawn; the rest is not held on to
+
       if (span > 0) {
         for (const line of this.drawings.keys()) {
           if (line < first - span || line >= first + span * 2) this.drawings.delete(line)
@@ -1863,40 +1708,44 @@ export class TerminalView {
 
       const cursor = this.cursorIn(frame, lines)
       const scene: Scene = {
-        theme: this.theme, rows, offset: this.viewport.offset, cursor,
-        marks: this.marksIn(first, lines), images: this.imagesIn(first, span, lines),
+        theme: this.theme,
+        rows,
+        offset: this.viewport.offset,
+        scrollPosition: this.viewport.extent.position,
+        cursor,
+        marks: this.marksIn(first, lines),
+        images: this.imagesIn(first, span, lines),
       }
       this.painter.paint(scene)
       this.afterPaint(frame, first, lines)
     } finally {
-      // Whatever became of the paint, the frame has been taken: one that is never acknowledged is the
-      // last the source sends
-      if (this.unacknowledged !== null && !this.ended) this.source.acknowledge(this.unacknowledged)
-      this.unacknowledged = null
+      if (this.unacknowledgedSeq !== null && !this.ended) {
+        this.source.ackFrame?.(this.unacknowledgedSeq)
+      }
+      this.unacknowledgedSeq = null
     }
   }
 
-  /**
-   * What follows a paint and is not paint: the text a page reader reads, the scrollbar, where an input
-   * method's window goes, and the mark that says how far has been drawn.
-   */
-  private afterPaint(frame: Frame, first: number, lines: number[]): void {
-    const count = lines.length
-    // One element a row, touched only when its row is a different one from what it last showed
-    while (this.mirror.childElementCount < count) this.mirror.appendChild(document.createElement('div'))
-    while (this.mirror.childElementCount > count) this.mirror.lastElementChild!.remove()
-    this.mirrored.length = count
-    for (let index = 0; index < count; index += 1) {
-      const line = lines[index]!
-      const fold = this.folds.find((known) => known.first === line)
-      const row = fold ? this.foldRow(fold) : (this.store.row(line) ?? null)
-      if (this.mirrored[index] === row) continue
-      this.mirrored[index] = row
-      this.mirror.children[index]!.textContent = row ? textOf(row) : ''
+  private afterPaint(frame: FrameUpdate, first: number, lines: number[]): void {
+    this.lastLayoutLines = lines
+    // Populate DOM mirror synchronously on initial empty paint, then coalesce at 200 ms via Clock
+    if (this.mirror.childElementCount === 0 && lines.length > 0) {
+      this.flushMirror()
+    } else {
+      this.mirrorDirty = true
+      if (!this.mirrorTimer.active) {
+        this.mirrorTimer.arm(MIRROR_DEBOUNCE_MS, () => {
+          if (this.mirrorDirty && !this.disposed) this.flushMirror()
+        })
+      }
     }
 
     const thumb = this.thumbAt()
-    const next = { height: thumb?.height ?? 0, top: thumb?.top ?? 0, shown: thumb !== null && !this.viewport.following }
+    const next = {
+      height: thumb?.height ?? 0,
+      top: thumb?.top ?? 0,
+      shown: thumb !== null && !this.viewport.following,
+    }
     const last = this.thumbDrawn
     if (next.height !== last.height) this.thumb.style.height = `${next.height}px`
     if (next.top !== last.top) this.thumb.style.top = `${next.top}px`
@@ -1907,148 +1756,178 @@ export class TerminalView {
     this.thumbDrawn = next
 
     const { cellWidth, cellHeight } = this.painter.metrics
-    // Where the cursor is, drawn or not: a program that hides it still puts it where typing goes
-    if (frame.cursor) {
-      // A cursor on a line a fold hides is drawn at the fold's header, so the input is placed where the header is
-      const cursorLine = frame.firstActive + frame.cursor.row
-      const row = this.rowsBetween(first, this.hiddenIn(cursorLine)?.first ?? cursorLine)
-      this.input.moveTo(this.gutter + frame.cursor.column * cellWidth, Math.max(0, row - this.viewport.offset) * cellHeight, cellHeight)
-    }
-    // How far a page looking for output to be on screen can count on: this frame, and these lines
-    if (frame.sequence !== this.drawn) {
-      this.drawn = frame.sequence
-      this.element.dataset.terminalDrawn = String(frame.sequence)
+    const cursorLine = frame.firstActiveLine + frame.cursor.row
+    const row = this.rowsBetween(first, this.hiddenIn(cursorLine)?.first ?? cursorLine)
+    this.input.moveTo(
+      this.gutter + frame.cursor.col * cellWidth,
+      Math.max(0, row - this.viewport.offset) * cellHeight,
+      cellHeight,
+    )
+
+    if (frame.seq !== this.drawnSeq) {
+      this.drawnSeq = frame.seq
+      this.element.dataset.terminalDrawn = String(frame.seq)
     }
   }
 
   private drawingOf(line: number): RowDrawing | null {
     const row = this.store.row(line)
     if (!row) return null
+    const selVer = this.selection.version
+    const matchVer = this.matchVersion
+    const hoverVer = this.hoverVersion
+    const blinkedOff = !this.textShown && blinksIn(row)
+
+    const kept = this.drawings.get(line)
+    if (
+      kept
+      && kept.row === row
+      && kept.selVer === selVer
+      && kept.matchVer === matchVer
+      && kept.hoverVer === hoverVer
+      && kept.blinkedOff === blinkedOff
+    ) {
+      return kept.drawing
+    }
+
     const selected: SelectedCells | undefined = this.selection.on(line)
     const hovered = this.hovered?.runs.filter((run) => run.line === line) ?? []
     const matched = this.matches.length > 0 ? this.matchesOn(line) : []
-    // Which half of a blink it is, for a row that has text to hide in one of them
-    const blinkedOff = !this.textShown && blinksIn(row)
-    const key = `${selected ? `${selected.from}-${selected.to}` : ''}|${hovered.map((run) => `${run.from}-${run.to}`).join(',')}`
-      + `|${matched.map((match) => `${match.from}-${match.to}${match.current ? '!' : ''}`).join(',')}|${blinkedOff ? 'off' : ''}`
-    const kept = this.drawings.get(line)
-    if (kept && kept.row === row && kept.selected === key) return kept.drawing
     const { matchBackground = 0x623315, currentMatchBackground = 0x9e6a03 } = this.theme
-    const found = matched.map((match) => ({ from: match.from, to: match.to, color: match.current ? currentMatchBackground : matchBackground }))
+    const found = matched.map((m) => ({
+      from: m.from,
+      to: m.to,
+      color: m.current ? currentMatchBackground : matchBackground,
+    }))
     let drawing = drawRow(row, this.theme, selected, blinkedOff, found)
-    // A link under the pointer is underlined, whatever it looked like before
     if (hovered.length > 0) {
       drawing = {
         ...drawing,
-        lines: [...drawing.lines, ...hovered.map((run) => ({ kind: 'single' as const, column: run.from, cells: run.to - run.from, color: this.theme.foreground }))],
+        lines: [
+          ...drawing.lines,
+          ...hovered.map((run) => ({
+            kind: 'single' as const,
+            column: run.from,
+            cells: run.to - run.from,
+            color: this.theme.foreground,
+          })),
+        ],
       }
     }
-    this.drawings.set(line, { row, selected: key, drawing })
+    this.drawings.set(line, { row, selVer, matchVer, hoverVer, blinkedOff, drawing })
     return drawing
   }
 
-  /**
-   * Asks for the history in view, and within a screenful of it, that is not held.
-   *
-   * **By the page, once a page.** What is asked for is the part of a whole page that is missing, not the
-   * few lines that just came into view: scrolling a line at a time then asks once in `PAGE_LINES` lines
-   * rather than once a line, and a page that is on its way is not asked for again however the view moves
-   * meanwhile.
-   */
   private ask(first: number, count: number): void {
     if (this.ended) return
-    for (const [from, length] of this.store.missing(first - count, count * 3)) {
-      for (let page = Math.floor(from / PAGE_LINES); page * PAGE_LINES < from + length; page += 1) this.askPage(page)
+    for (const span of this.store.missing(first - count, count * 3)) {
+      for (let page = Math.floor(span.from / PAGE_LINES); page * PAGE_LINES < span.from + span.count; page += 1) {
+        this.askPage(page)
+      }
     }
   }
 
-  /**
-   * Asks for what a page lacks, from its first missing line to its last.
-   *
-   * **The answer says how far it got.** A line it covers and has no row for is one the owner does not
-   * hold, which the store remembers, so it is not asked for again. A line past what it covers was not
-   * answered — an answer holds what one message can — and is still missing, so the paint the answer
-   * prompts asks for the rest. An answer that told nothing prompts no paint, and so no asking in a circle.
-   */
   private askPage(page: number): void {
-    if (this.asking.has(page)) return
+    if (this.asking.has(page) || this.store.epoch < 0) return
     const runs = this.store.missing(page * PAGE_LINES, PAGE_LINES)
     const last = runs.at(-1)
     if (!last) return
-    const from = runs[0]![0]
-    const to = last[0] + last[1]
+    const from = runs[0]!.from
+    const to = last.from + last.count
     this.asking.add(page)
     const epoch = this.store.epoch
-    const asked = this.store.imagesChanged
-    const askedStale = this.store.staleFrames
-    void this.source.fetch(from, to - from).then((fetched) => {
-      // After a reflow the page is one of other lines, which this answer says nothing about — and the
-      // page of that number being asked for may be the new one
+    const atImagesChanged = this.store.imagesChanged
+    void this.source.fetchRows(epoch, from, to - from).then((fetched) => {
       if (this.disposed || epoch !== this.store.epoch) return
       this.asking.delete(page)
-      const told = this.store.absorb(fetched, this.viewport.top, asked, askedStale)
-      if (this.imagesSeen !== -1) this.dropPictures()
-      for (const line of told) this.drawings.delete(line)
-      if (told.length > 0 || askedStale !== this.store.staleFrames) this.schedule()
+      const absorbed = this.store.absorb(epoch, from, to - from, fetched, this.viewport.top, atImagesChanged)
+      for (const line of absorbed) this.drawings.delete(line)
+      if (absorbed.length > 0) this.schedule()
     }, () => {
-      // No answer: the lines were numbered again while it was asked, or the session is over. Whatever
-      // paints next asks in the numbering there is then
       if (epoch === this.store.epoch) this.asking.delete(page)
     })
   }
 
-  private cursorIn(frame: Frame, lines: number[]): Scene['cursor'] {
+  private cursorIn(frame: FrameUpdate, lines: number[]): Scene['cursor'] {
     const cursor = frame.cursor
-    if (!cursor || cursor.hidden || !this.cursorShown) return undefined
-    const line = frame.firstActive + cursor.row
+    if (cursor.hidden || !this.cursorShown) return undefined
+    const line = frame.firstActiveLine + cursor.row
     const index = lines.indexOf(line)
     if (index === -1) return undefined
     const fold = this.folds.find((known) => known.first === line)
     const row = fold ? this.foldRow(fold) : this.store.row(line)
-    let at = -1
-    if (row) {
-      for (let i = 0; i < row.column.length; i += 1) {
-        const start = row.column[i]!
-        if (cursor.column >= start && cursor.column < start + row.width[i]!) {
-          at = i
-          break
-        }
-        if (start > cursor.column) break
-      }
-    }
-    const style = row && at !== -1 ? (row.styles[row.style[at]!] ?? PLAIN) : undefined
-    const flags = style?.flags ?? 0
-    const visible = !(flags & StyleFlag.invisible) && !(!this.textShown && (flags & StyleFlag.blink))
+    const cell = row ? cellAtColumn(row, cursor.col) : null
+    const visible =
+      cell !== null
+      && (cell.flags & PackedStyleFlag.INVISIBLE) === 0
+      && !(!this.textShown && (cell.flags & PackedStyleFlag.BLINK) !== 0)
     return {
-      column: row && at !== -1 ? row.column[at]! : cursor.column,
+      column: cell ? cell.col : cursor.col,
       row: index,
-      cells: row && at !== -1 ? row.width[at]! : 1,
+      cells: cell ? cell.width : 1,
       shape: this.focused ? cursor.shape : this.cursorInactive,
-      text: row && at !== -1 && visible
-        ? { text: row.text[at]!, bold: (flags & StyleFlag.bold) !== 0, italic: (flags & StyleFlag.italic) !== 0 }
-        : undefined,
+      text:
+        cell && visible && cell.text !== ' ' && cell.text !== ''
+          ? {
+              text: cell.text,
+              bold: (cell.flags & PackedStyleFlag.BOLD) !== 0,
+              italic: (cell.flags & PackedStyleFlag.ITALIC) !== 0,
+            }
+          : undefined,
     }
   }
 }
 
-const sameSpan = (one: Span, other: Span): boolean =>
-  one.start.line === other.start.line && one.start.column === other.start.column && one.end.line === other.end.line && one.end.column === other.end.column
+function cellAtColumn(
+  row: PackedRow,
+  col: number,
+): { readonly col: number; readonly width: number; readonly text: string; readonly flags: number } | null {
+  const { runs, styles, text } = row
+  for (let i = 0; i < runs.length; i += 4) {
+    const colWord = runs[i]!
+    const start = colWord & 0xffff
+    const len = colWord >>> 16
+    if (col < start) break
+    if (col >= start + len) continue
+    const txtWord = runs[i + 1]!
+    const metaWord = runs[i + 2]!
+    const runFlags = runs[i + 3]!
+    const u16Off = txtWord & 0xffff
+    const u16Len = txtWord >>> 16
+    const styleIdx = metaWord & 0xffff
+    const styleBase = styleIdx * 4
+    const flags = styleBase + 3 < styles.length ? styles[styleBase + 3]! : 0
+    const slice = text.slice(u16Off, u16Off + u16Len)
 
-/** `0xRRGGBB` as the page writes a colour */
+    if ((runFlags & RunFlag.PER_CELL) !== 0) {
+      return { col: start, width: len, text: slice, flags }
+    }
+
+    const offset = col - start
+    if (slice.length === len) {
+      if (offset >= 0 && offset < slice.length) {
+        return { col, width: 1, text: slice[offset]!, flags }
+      }
+      return null
+    }
+    const cps = Array.from(slice)
+    if (offset >= 0 && offset < cps.length) {
+      return { col, width: 1, text: cps[offset]!, flags }
+    }
+    return null
+  }
+  return null
+}
+
+function sortMatchesNewestFirst(spans: readonly CellSpan[]): CellSpan[] {
+  return [...spans].sort((a, b) => b.start.line - a.start.line || b.start.col - a.start.col)
+}
+
 function hex(color: number): string {
   return `#${color.toString(16).padStart(6, '0')}`
 }
 
-/**
- * Which of the theme's sixteen colours marks a command: grey (8) for one still to run, blue (4) for one running, green (2)
- * for one that exited with zero, red (1) for one that exited with anything else, and yellow (3) for one whose status is
- * only claimed. A command whose end nothing reported is grey.
- *
- * **A claim is drawn as a claim, whatever its code.** What separates a vouched status from a claimed one is the
- * command's `outcome` kind, which is what a program reads; the code of a claim is not evidence of anything, so a claim
- * of zero is yellow, the same as a claim of failure.
- */
-function markColor(command: Command): number {
+function markColor(command: CommandRecord): number {
   if (command.startedMs === null) return 8
   const { outcome } = command
   switch (outcome.kind) {
@@ -2059,7 +1938,6 @@ function markColor(command: Command): number {
   }
 }
 
-/** The index of the first of `items`, which are in the order of their lines, that is on a line after `line` */
 function firstAfter(items: ReadonlyArray<{ readonly line: number }>, line: number): number {
   let low = 0
   let high = items.length
@@ -2071,47 +1949,7 @@ function firstAfter(items: ReadonlyArray<{ readonly line: number }>, line: numbe
   return low
 }
 
-/** Strips C0/C1 control characters and Unicode bidi override/isolate controls from link preview tooltips */
 const UNSAFE_TITLE_CHARS = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g
 function sanitizeTitle(text: string): string {
   return text.replace(UNSAFE_TITLE_CHARS, '')
-}
-
-/** Gives back what a picture holds, where it holds anything: a bitmap keeps its pixels until it is closed */
-function release(picture: CanvasImageSource | null): void {
-  if (!picture) return
-  if ('close' in picture && typeof picture.close === 'function') {
-    picture.close()
-  } else if (typeof HTMLCanvasElement !== 'undefined' && picture instanceof HTMLCanvasElement) {
-    picture.width = 0
-    picture.height = 0
-  }
-}
-
-/** A row as the text on it, with the blank cells between its characters as spaces */
-function textOf(row: Row): string {
-  let text = ''
-  let column = 0
-  for (let index = 0; index < row.text.length; index += 1) {
-    const start = row.column[index]!
-    if (start > column) text += ' '.repeat(start - column)
-    text += row.text[index]!
-    column = start + row.width[index]!
-  }
-  return text
-}
-
-/**
- * Pixels as something a canvas draws. A bitmap where the browser makes them — decoded off the thread that
- * paints, and drawn from the GPU — and a canvas holding the pixels where it does not.
- */
-async function pictureOf(read: Picture): Promise<CanvasImageSource | null> {
-  if (read.width <= 0 || read.height <= 0 || read.pixels.length < read.width * read.height * 4) return null
-  const data = new ImageData(read.pixels as Uint8ClampedArray<ArrayBuffer>, read.width, read.height)
-  if (typeof createImageBitmap === 'function') return createImageBitmap(data)
-  const canvas = document.createElement('canvas')
-  canvas.width = read.width
-  canvas.height = read.height
-  canvas.getContext('2d')?.putImageData(data, 0, 0)
-  return canvas
 }

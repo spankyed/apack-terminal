@@ -1,11 +1,11 @@
 /**
  * What on a row can be opened.
  *
- * Two kinds of thing are a link. A program can say so itself, with a hyperlink sequence, and that arrives
- * on the row; and text can simply look like one — a URL, or whatever else a host knows how to open, which
- * a host teaches a view with a `Detector`.
+ * Two kinds of thing are a link: an explicit OSC 8 hyperlink declared by the program (`row.links` +
+ * `linkIdx` in `PackedRow.runs`), or text matched by a `Detector` (such as `urls`) across wrapped
+ * rows.
  */
-import type { Row } from './source.ts'
+import { RowFlag, RunFlag, type PackedRow } from './source.ts'
 
 /** A run of cells on one row that opens something */
 export interface Link {
@@ -85,39 +85,125 @@ export const urls: Detector = {
 /** How many rows of a wrapped line are read on each side of the one asked about */
 const JOINED_ROWS = 16
 
-/**
- * The link at a cell of a row, if there is one.
- *
- * `rowAt` gives the rows above and below, by line. Text a program wrote as one line and the terminal
- * wrapped is read as that one line, so a URL cut by the edge is found whole from any row of it; `from` and
- * `to` are still the cells of it on the row asked about. Left out, a row is read on its own.
- */
-export function linkAt(row: Row, column: number, detectors: readonly Detector[], rowAt?: (line: number) => Row | undefined): Link | null {
-  const at = glyphAt(row, column)
-  if (at === -1) return null
+interface CellInfo {
+  readonly col: number
+  readonly width: number
+  readonly text: string
+  readonly linkIdx: number
+}
 
-  // What a program declared wins: it said what this text opens
-  const declared = row.link[at]!
-  const target = row.links[declared]
-  if (declared !== 0 && target !== undefined && target !== '') {
+function rowCells(row: PackedRow): CellInfo[] {
+  const out: CellInfo[] = []
+  const { runs, text } = row
+  for (let i = 0; i < runs.length; i += 4) {
+    const colWord = runs[i]!
+    const txtWord = runs[i + 1]!
+    const metaWord = runs[i + 2]!
+    const runFlags = runs[i + 3]!
+    const colStart = colWord & 0xffff
+    const colLen = colWord >>> 16
+    const u16Off = txtWord & 0xffff
+    const u16Len = txtWord >>> 16
+    const linkIdx = metaWord >>> 16
+    const slice = text.slice(u16Off, u16Off + u16Len)
+
+    if ((runFlags & RunFlag.PER_CELL) !== 0) {
+      // Ghostty emits one PER_CELL run per cell (wide char or multi-codepoint grapheme cluster).
+      out.push({ col: colStart, width: colLen, text: slice, linkIdx })
+    } else if (slice.length === colLen) {
+      for (let k = 0; k < colLen; k += 1) {
+        out.push({ col: colStart + k, width: 1, text: slice[k]!, linkIdx })
+      }
+    } else {
+      // Narrow non-BMP codepoints (e.g. Nerd Font PUA-A/B surrogate pairs): 1 codepoint per column.
+      const cps = Array.from(slice)
+      for (let k = 0; k < cps.length && k < colLen; k += 1) {
+        out.push({ col: colStart + k, width: 1, text: cps[k]!, linkIdx })
+      }
+    }
+  }
+  return out
+}
+
+function isWrapped(row: PackedRow): boolean {
+  return (row.flags & RowFlag.WRAPPED) !== 0
+}
+
+function targetOf(row: PackedRow, linkIdx: number): string | undefined {
+  return linkIdx === 0 ? undefined : row.links[linkIdx]
+}
+
+function runIndexAt(row: PackedRow, column: number): number {
+  const { runs } = row
+  for (let i = 0; i < runs.length; i += 4) {
+    const colWord = runs[i]!
+    const start = colWord & 0xffff
+    const len = colWord >>> 16
+    if (column >= start && column < start + len) return i
+    if (start > column) break
+  }
+  return -1
+}
+
+function runTarget(row: PackedRow, runByteIndex: number): string | undefined {
+  const linkIdx = row.runs[runByteIndex + 2]! >>> 16
+  return targetOf(row, linkIdx)
+}
+
+function runsContiguous(row: PackedRow, leftIdx: number, rightIdx: number): boolean {
+  const leftCol = row.runs[leftIdx]!
+  const rightCol = row.runs[rightIdx]!
+  return (leftCol & 0xffff) + (leftCol >>> 16) === (rightCol & 0xffff)
+}
+
+/**
+ * The link at a cell of a `PackedRow`, if there is one.
+ *
+ * `rowAt` gives the rows above and below, by line, so wrapped URLs are detected whole across rows.
+ */
+export function linkAt(
+  row: PackedRow,
+  column: number,
+  detectors: readonly Detector[],
+  rowAt?: (line: number) => PackedRow | undefined,
+): Link | null {
+  const rIdx = runIndexAt(row, column)
+  if (rIdx === -1) return null
+
+  // 1. Declared OSC 8 link takes precedence
+  const target = runTarget(row, rIdx)
+  if (target !== undefined && target !== '') {
     if (!isSafeTarget(target)) return null
-    let first = at
-    let last = at
-    while (first > 0 && targetAt(row, first - 1) === target && contiguous(row, first - 1, first)) first -= 1
-    while (last + 1 < row.text.length && targetAt(row, last + 1) === target && contiguous(row, last, last + 1)) last += 1
-    return { target, kind: 'declared', from: row.column[first]!, to: row.column[last]! + row.width[last]! }
+    let first = rIdx
+    let last = rIdx
+    while (first >= 4 && runTarget(row, first - 4) === target && runsContiguous(row, first - 4, first)) {
+      first -= 4
+    }
+    while (last + 4 < row.runs.length && runTarget(row, last + 4) === target && runsContiguous(row, last, last + 4)) {
+      last += 4
+    }
+    const firstWord = row.runs[first]!
+    const lastWord = row.runs[last]!
+    return {
+      target,
+      kind: 'declared',
+      from: firstWord & 0xffff,
+      to: (lastWord & 0xffff) + (lastWord >>> 16),
+    }
   }
 
-  // Otherwise, text that looks like one. The rows the line wrapped onto, as far as they are held
-  const joined: Row[] = [row]
+  if (detectors.length === 0) return null
+
+  // 2. Join wrapped logical line across up to JOINED_ROWS on each side
+  const joined: PackedRow[] = [row]
   if (rowAt) {
     for (let line = row.line - 1; joined.length <= JOINED_ROWS; line -= 1) {
       const above = rowAt(line)
-      if (!above?.wrapped) break
+      if (!above || !isWrapped(above)) break
       joined.unshift(above)
     }
     const before = joined.length - 1
-    for (let below = row; below.wrapped && joined.length <= before + JOINED_ROWS; ) {
+    for (let below = row; isWrapped(below) && joined.length <= before + JOINED_ROWS; ) {
       const next = rowAt(below.line + 1)
       if (!next) break
       joined.push(next)
@@ -125,19 +211,32 @@ export function linkAt(row: Row, column: number, detectors: readonly Detector[],
     }
   }
 
-  // The line is read as a string, with each offset mapped back to the character it came from: a character
-  // can be several code units and can cover two cells. `starts` is of the row asked about only
   let text = ''
-  const starts: number[] = []
-  for (const part of joined) {
-    for (let index = 0; index < part.text.length; index += 1) {
-      const gap = index > 0 ? part.column[index]! - (part.column[index - 1]! + part.width[index - 1]!) : part.column[index]!
-      text += ' '.repeat(Math.max(0, gap))
-      if (part === row) starts.push(text.length)
-      text += part.text[index]!
+  const targetCells = rowCells(row)
+  let targetCellIdx = -1
+  for (let i = 0; i < targetCells.length; i += 1) {
+    const c = targetCells[i]!
+    if (column >= c.col && column < c.col + c.width) {
+      targetCellIdx = i
+      break
     }
   }
-  const offset = starts[at]!
+  if (targetCellIdx === -1) return null
+
+  const starts: number[] = []
+  for (const part of joined) {
+    const cells = part === row ? targetCells : rowCells(part)
+    let col = 0
+    for (let i = 0; i < cells.length; i += 1) {
+      const c = cells[i]!
+      if (c.col > col) text += ' '.repeat(c.col - col)
+      if (part === row) starts.push(text.length)
+      text += c.text
+      col = c.col + c.width
+    }
+  }
+
+  const offset = starts[targetCellIdx]!
   for (const detector of detectors) {
     for (const match of detector.find(text)) {
       if (offset < match.start || offset >= match.end) continue
@@ -148,8 +247,8 @@ export function linkAt(row: Row, column: number, detectors: readonly Detector[],
       return {
         target: match.target ?? text.slice(match.start, match.end),
         kind: detector.kind,
-        from: row.column[first]!,
-        to: row.column[last]! + row.width[last]!,
+        from: targetCells[first]!.col,
+        to: targetCells[last]!.col + targetCells[last]!.width,
       }
     }
   }
@@ -163,80 +262,71 @@ export interface LinkRun {
   readonly to: number
 }
 
+function linkRunOf(row: PackedRow, firstIdx: number, lastIdx: number): LinkRun {
+  const firstWord = row.runs[firstIdx]!
+  const lastWord = row.runs[lastIdx]!
+  return {
+    line: row.line,
+    from: firstWord & 0xffff,
+    to: (lastWord & 0xffff) + (lastWord >>> 16),
+  }
+}
+
 /**
- * Every run of cells the link at `column` of `row` covers, from the first row it wraps over to the last.
- *
- * A declared link is the same URI on consecutive cells, and each row holds its own table of links, so a
- * link that wraps is two runs with one URI between them: the run at the end of a row that wrapped onto the
- * next, and the run at the start of that next row. The URI is what joins them, since the row has no other
- * name for a link. A link a detector found is one run, `linkAt` gives its cells on this row.
+ * Every run of cells the link at `column` of `row` covers, across wrapped rows when declared via OSC 8.
  */
-export function linkRuns(link: Link, row: Row, column: number, rowAt: (line: number) => Row | undefined): LinkRun[] {
+export function linkRuns(
+  link: Link,
+  row: PackedRow,
+  column: number,
+  rowAt: (line: number) => PackedRow | undefined,
+): LinkRun[] {
   const own: LinkRun = { line: row.line, from: link.from, to: link.to }
   if (link.kind !== 'declared') return [own]
-  const at = glyphAt(row, column)
+  const at = runIndexAt(row, column)
   if (at === -1) return [own]
+
   const target = link.target
   let first = at
   let last = at
-  while (first > 0 && targetAt(row, first - 1) === target && contiguous(row, first - 1, first)) first -= 1
-  while (last + 1 < row.text.length && targetAt(row, last + 1) === target && contiguous(row, last, last + 1)) last += 1
+  while (first >= 4 && runTarget(row, first - 4) === target && runsContiguous(row, first - 4, first)) {
+    first -= 4
+  }
+  while (last + 4 < row.runs.length && runTarget(row, last + 4) === target && runsContiguous(row, last, last + 4)) {
+    last += 4
+  }
 
-  // Upward, while the run reaches the start of its row and the row above wrapped onto it
   const above: LinkRun[] = []
   let top = row
   let start = first
-  while (start === 0 && top.column[0] === 0) {
+  while (start === 0 && top.runs.length > 0 && (top.runs[0]! & 0xffff) === 0) {
     const previous = rowAt(top.line - 1)
-    if (!previous?.wrapped || previous.text.length === 0) break
-    const end = previous.text.length - 1
-    if (targetAt(previous, end) !== target) break
+    if (!previous || !isWrapped(previous) || previous.runs.length === 0) break
+    const end = previous.runs.length - 4
+    if (runTarget(previous, end) !== target) break
     let begin = end
-    while (begin > 0 && targetAt(previous, begin - 1) === target && contiguous(previous, begin - 1, begin)) begin -= 1
-    above.unshift(runOf(previous, begin, end))
+    while (begin >= 4 && runTarget(previous, begin - 4) === target && runsContiguous(previous, begin - 4, begin)) {
+      begin -= 4
+    }
+    above.unshift(linkRunOf(previous, begin, end))
     top = previous
     start = begin
   }
 
-  // Downward, while the run reaches the end of its row and the row reaches onto the next
   const below: LinkRun[] = []
   let bottom = row
   let stop = last
-  while (stop === bottom.text.length - 1 && bottom.wrapped) {
+  while (stop === bottom.runs.length - 4 && isWrapped(bottom)) {
     const next = rowAt(bottom.line + 1)
-    if (!next || next.text.length === 0 || next.column[0] !== 0 || targetAt(next, 0) !== target) break
+    if (!next || next.runs.length === 0 || (next.runs[0]! & 0xffff) !== 0 || runTarget(next, 0) !== target) break
     let end = 0
-    while (end + 1 < next.text.length && targetAt(next, end + 1) === target && contiguous(next, end, end + 1)) end += 1
-    below.push(runOf(next, 0, end))
+    while (end + 4 < next.runs.length && runTarget(next, end + 4) === target && runsContiguous(next, end, end + 4)) {
+      end += 4
+    }
+    below.push(linkRunOf(next, 0, end))
     bottom = next
     stop = end
   }
 
-  return [...above, runOf(row, first, last), ...below]
-}
-
-/** Whether two consecutive characters on a row touch with no blank-cell gap between them */
-function contiguous(row: Row, left: number, right: number): boolean {
-  return row.column[left]! + row.width[left]! === row.column[right]!
-}
-
-/** The URI a character of a row declared, or `undefined` where it declared none */
-function targetAt(row: Row, index: number): string | undefined {
-  const declared = row.link[index]!
-  return declared === 0 ? undefined : row.links[declared]
-}
-
-/** The cells from character `first` to character `last` of a row, inclusive */
-function runOf(row: Row, first: number, last: number): LinkRun {
-  return { line: row.line, from: row.column[first]!, to: row.column[last]! + row.width[last]! }
-}
-
-/** The index of the character covering a cell, or `-1` where the cell is blank */
-function glyphAt(row: Row, column: number): number {
-  for (let index = 0; index < row.text.length; index += 1) {
-    const start = row.column[index]!
-    if (column >= start && column < start + row.width[index]!) return index
-    if (start > column) break
-  }
-  return -1
+  return [...above, linkRunOf(row, first, last), ...below]
 }

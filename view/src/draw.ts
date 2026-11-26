@@ -1,5 +1,14 @@
-import { PLAIN, StyleFlag, paletteIndex, underlineOf, type Color, type Row, type SessionColors, type Underline } from './source.ts'
 import { ensureContrast } from './contrast.ts'
+import {
+  PackedStyleFlag,
+  RowFlag,
+  RunFlag,
+  resolvePackedColor,
+  underlineOfStyleFlags,
+  type PackedRow,
+  type PaletteOverrides,
+  type UnderlineKind,
+} from './source.ts'
 
 /**
  * The colours a view supplies: the defaults a program did not override, the palette its numbered colours
@@ -27,33 +36,42 @@ export interface Theme {
 }
 
 /**
- * A theme as a session is drawn in it: the host's, with the colours the program set for itself in place
- * of the theme's own, and with the two defaults changed places while the program has the screen in
- * reverse video.
- *
- * **Only the defaults change places.** A character with a colour of its own keeps it, as it does in every
- * terminal: reverse video is about the screen a program did not colour.
+ * A theme as a session is drawn in it: the host's, with any OSC 10/11/12/4 palette overrides the
+ * program set for itself, and with the two defaults swapped while DECSCNM reverse video is active.
  */
-export function sessionTheme(theme: Theme, colors: SessionColors | null, reverseVideo: boolean): Theme {
-  if (!reverseVideo && (!colors || (colors.foreground === null && colors.background === null && colors.cursor === null && colors.palette.length === 0))) return theme
+export function sessionTheme(
+  theme: Theme,
+  overrides: PaletteOverrides | null,
+  reverseVideo: boolean,
+): Theme {
+  if (
+    !reverseVideo
+    && (!overrides
+      || (overrides.fg === null
+        && overrides.bg === null
+        && overrides.cursor === null
+        && overrides.palette.length === 0))
+  ) {
+    return theme
+  }
   let palette = theme.palette
-  if (colors && colors.palette.length > 0) {
+  if (overrides && overrides.palette.length > 0) {
     const changed = [...theme.palette]
-    for (const entry of colors.palette) changed[entry.index] = entry.rgb
+    for (const entry of overrides.palette) changed[entry.index] = entry.rgb
     palette = changed
   }
-  const foreground = colors?.foreground ?? theme.foreground
-  const background = colors?.background ?? theme.background
+  const foreground = overrides?.fg ?? theme.foreground
+  const background = overrides?.bg ?? theme.background
   return {
     ...theme,
     palette,
     foreground: reverseVideo ? background : foreground,
     background: reverseVideo ? foreground : background,
-    cursor: colors?.cursor ?? theme.cursor,
+    cursor: overrides?.cursor ?? theme.cursor,
   }
 }
 
-export type LineKind = Exclude<Underline, 'none'> | 'strikethrough' | 'overline'
+export type LineKind = Exclude<UnderlineKind, 'none'> | 'strikethrough' | 'overline'
 
 /** A background painted over cells after the row's own, such as where a search found its text */
 export interface Highlight {
@@ -62,32 +80,44 @@ export interface Highlight {
   readonly color: number
 }
 
+/** A run of text (either a batchable printable ASCII span or a single non-ASCII / wide cluster). */
+export interface GlyphRun {
+  readonly text: string
+  readonly column: number
+  readonly cells: number
+  readonly color: number
+  /** `0.5` for faint text, otherwise `1` */
+  readonly alpha: number
+  readonly bold: boolean
+  readonly italic: boolean
+  /**
+   * True when every character in `text` is printable ASCII (`0x20..=0x7E`) occupying 1 cell each,
+   * so `CanvasPainter` can draw the whole span in a single `fillText` call once its font-advance
+   * probe passes.
+   */
+  readonly batchable: boolean
+}
+
 /**
  * One row as things to draw, in cells: a painter multiplies by the size of a cell.
  *
- * **In cells so that it can be kept.** A row's drawing depends on the row, the theme and what is selected
- * on it — not on where it is on the screen — so a painter builds this once per row that changed and reuses
- * it while the view scrolls.
+ * Built directly from v2 `PackedRow` flat typed arrays with zero per-cell intermediate objects.
  */
 export interface RowDrawing {
   /** Runs of cells with a background of their own; cells with the default are not listed */
   readonly backgrounds: ReadonlyArray<{ column: number; cells: number; color: number }>
-  readonly glyphs: ReadonlyArray<{
-    text: string
-    column: number
-    cells: number
-    color: number
-    /** `0.5` for faint text, otherwise `1` */
-    alpha: number
-    bold: boolean
-    italic: boolean
-  }>
+  readonly glyphs: ReadonlyArray<GlyphRun>
   readonly lines: ReadonlyArray<{ kind: LineKind; column: number; cells: number; color: number }>
 }
 
-/** Whether any of a row's text blinks, which is whether drawing it depends on which half of a blink it is */
-export function blinks(row: Row): boolean {
-  return row.style.some((style) => ((row.styles[style] ?? PLAIN).flags & StyleFlag.blink) !== 0)
+/** Whether any style referenced on `row` has the blink flag (O(1) flag fast-path + O(styles) fallback). */
+export function blinks(row: PackedRow): boolean {
+  if ((row.flags & RowFlag.HAS_BLINK) !== 0) return true
+  const { styles } = row
+  for (let i = 3; i < styles.length; i += 4) {
+    if ((styles[i]! & PackedStyleFlag.BLINK) !== 0) return true
+  }
+  return false
 }
 
 /** The cells of one row that are selected: from `from` up to but not including `to` */
@@ -96,61 +126,100 @@ export interface SelectedCells {
   readonly to: number
 }
 
-/** A colour as the theme has it: a numbered one looked up, any other as it is */
-function colorIn(theme: Theme, color: Color): number | null {
-  if (color === null) return null
-  const index = paletteIndex(color)
-  return index === null ? color : (theme.palette[index] ?? theme.foreground)
+/** Extracts plain visible text of a `PackedRow` with spaces filling blank gaps (for DOM mirror / a11y). */
+export function rowPlainText(row: PackedRow): string {
+  const { runs, text } = row
+  let out = ''
+  let col = 0
+  for (let i = 0; i < runs.length; i += 4) {
+    const colWord = runs[i]!
+    const txtWord = runs[i + 1]!
+    const colStart = colWord & 0xffff
+    const colLen = colWord >>> 16
+    const u16Off = txtWord & 0xffff
+    const u16Len = txtWord >>> 16
+    if (colStart > col) out += ' '.repeat(colStart - col)
+    out += text.slice(u16Off, u16Off + u16Len)
+    col = colStart + colLen
+  }
+  return out
+}
+
+function isPrintableAscii(text: string): boolean {
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text.charCodeAt(i)
+    if (ch < 0x20 || ch > 0x7e) return false
+  }
+  return true
+}
+
+function isAllSpaces(text: string): boolean {
+  for (let i = 0; i < text.length; i += 1) {
+    if (text.charCodeAt(i) !== 0x20) return false
+  }
+  return true
+}
+
+interface OrderedHighlight {
+  readonly from: number
+  readonly to: number
+  readonly color: number
+  readonly order: number
 }
 
 /**
- * What to draw for `row`.
- *
- * The rules a terminal's styles follow, in the order they apply: inverse swaps the two colours, defaults
- * included; a selection then replaces the background and, if the theme says so, the text; invisible text
- * keeps its background and draws no character; faint text is drawn at half strength. Text that blinks is
- * invisible text for the half of a blink it is off, which `blinkedOff` says this is.
- *
- * **A selection is one rectangle over the cells it covers, whatever is in them.** A row lists the characters
- * a program wrote and not the blank cells between or after them, so a background made from characters
- * would have a hole wherever nothing was written. The rectangle is the selection's own; the characters
- * under it give up their backgrounds and take its text colour.
+ * Converts a v2 `PackedRow` into a painter-ready `RowDrawing`, preserving run-batched printable
+ * ASCII spans wherever style, selection, and WCAG highlight backgrounds are uniform.
  */
-export function drawRow(row: Row, theme: Theme, selected?: SelectedCells, blinkedOff = false, found: readonly Highlight[] = []): RowDrawing {
+export function drawRow(
+  row: PackedRow,
+  theme: Theme,
+  selected?: SelectedCells,
+  blinkedOff = false,
+  found: readonly Highlight[] = [],
+): RowDrawing {
   const backgrounds: Array<{ column: number; cells: number; color: number }> = []
-  const glyphs: Array<RowDrawing['glyphs'][number]> = []
+  const glyphs: GlyphRun[] = []
   const lines: Array<{ kind: LineKind; column: number; cells: number; color: number }> = []
 
-  /** Extends the last run when this one continues it, which is what keeps a coloured line one rectangle */
-  const extend = <T extends { column: number; cells: number }>(runs: T[], next: T, same: (last: T) => boolean) => {
-    const last = runs.at(-1)
+  const extend = <T extends { column: number; cells: number }>(
+    list: T[],
+    next: T,
+    same: (last: T) => boolean,
+  ) => {
+    const last = list.at(-1)
     if (last && last.column + last.cells === next.column && same(last)) last.cells += next.cells
-    else runs.push(next)
+    else list.push(next)
   }
 
-  // The cells the selection's rectangle covers: what was asked for, widened to the whole of any character
-  // it only partly reaches. Empty ranges (`to <= from`) select nothing, even when inside a wide character
   const hasSelection = selected !== undefined && selected.to > selected.from
   let selectedFrom = hasSelection ? selected.from : 0
   let selectedTo = hasSelection ? selected.to : 0
 
-  // Sort highlights ascending by `from` for an O(G + H) two-pointer scan while keeping original `order`
-  // so that if highlights ever overlap, the last one in `found` still wins (matching paint order below)
-  const orderedHighlights: Array<{ from: number; to: number; color: number; order: number }> =
-    found.length === 0 ? [] : orderedByColumn(found)
-  let highlightCursor = 0
+  const orderedHighlights: OrderedHighlight[] = found.length === 0 ? [] : orderedByColumn(found)
+  const useContrast = theme.minimumContrast !== undefined && theme.minimumContrast > 1
 
-  for (let index = 0; index < row.text.length; index += 1) {
-    const text = row.text[index]!
-    const column = row.column[index]!
-    const cells = row.width[index]!
-    const style = row.styles[row.style[index]!] ?? PLAIN
-    const flags = style.flags
+  const emitSegment = (
+    segText: string,
+    column: number,
+    cells: number,
+    batchable: boolean,
+    styleFg: number,
+    styleBg: number | null,
+    styleUnderlineColor: number | null,
+    flags: number,
+    isSelected: boolean,
+  ): void => {
+    if (cells <= 0) return
 
-    let fg = colorIn(theme, style.fg) ?? theme.foreground
-    let bg = colorIn(theme, style.bg)
-    if (flags & StyleFlag.inverse) [fg, bg] = [bg ?? theme.background, fg]
-    const isSelected = hasSelection && column < selected.to && column + cells > selected.from
+    let fg = styleFg
+    let bg = styleBg
+    if ((flags & PackedStyleFlag.INVERSE) !== 0) {
+      const nextFg = bg ?? theme.background
+      bg = fg
+      fg = nextFg
+    }
+
     if (isSelected) {
       fg = theme.selectionForeground ?? fg
       selectedFrom = Math.min(selectedFrom, column)
@@ -159,64 +228,179 @@ export function drawRow(row: Row, theme: Theme, selected?: SelectedCells, blinke
       extend(backgrounds, { column, cells, color: bg }, (last) => last.color === bg)
     }
 
-    const visible = !(flags & StyleFlag.invisible) && !(blinkedOff && flags & StyleFlag.blink)
-    if (!visible) continue
+    const visible =
+      (flags & PackedStyleFlag.INVISIBLE) === 0
+      && !(blinkedOff && (flags & PackedStyleFlag.BLINK) !== 0)
+    if (!visible) return
 
-    if (theme.minimumContrast !== undefined) {
-      // What the character sits on is the selection's when it is selected, and the cell's own otherwise
+    if (useContrast) {
       let behind = isSelected ? theme.selectionBackground : (bg ?? theme.background)
-      // Highlights are painted later, so the last one a character is under is the colour it is drawn on
-      while (highlightCursor < orderedHighlights.length && orderedHighlights[highlightCursor]!.to <= column) {
-        highlightCursor += 1
-      }
       let bestOrder = -1
-      for (let h = highlightCursor; h < orderedHighlights.length && orderedHighlights[h]!.from < column + cells; h += 1) {
-        const highlight = orderedHighlights[h]!
-        if (highlight.to > column && highlight.order > bestOrder) {
-          bestOrder = highlight.order
-          behind = highlight.color
+      for (let h = 0; h < orderedHighlights.length; h += 1) {
+        const hl = orderedHighlights[h]!
+        if (hl.from >= column + cells) break
+        if (hl.to > column && hl.order > bestOrder) {
+          bestOrder = hl.order
+          behind = hl.color
         }
       }
-      fg = ensureContrast(fg, behind, theme.minimumContrast)
+      fg = ensureContrast(fg, behind, theme.minimumContrast!)
     }
 
-    if (text !== ' ' && text !== '') {
-      glyphs.push({
-        text,
-        column,
-        cells,
-        color: fg,
-        alpha: flags & StyleFlag.faint ? 0.5 : 1,
-        bold: (flags & StyleFlag.bold) !== 0,
-        italic: (flags & StyleFlag.italic) !== 0,
-      })
+    if (segText.length > 0 && !isAllSpaces(segText)) {
+      const alpha = (flags & PackedStyleFlag.FAINT) !== 0 ? 0.5 : 1
+      const bold = (flags & PackedStyleFlag.BOLD) !== 0
+      const italic = (flags & PackedStyleFlag.ITALIC) !== 0
+      const last = glyphs.at(-1)
+      if (
+        batchable
+        && last !== undefined
+        && last.batchable
+        && last.column + last.cells === column
+        && last.color === fg
+        && last.alpha === alpha
+        && last.bold === bold
+        && last.italic === italic
+      ) {
+        glyphs[glyphs.length - 1] = {
+          text: last.text + segText,
+          column: last.column,
+          cells: last.cells + cells,
+          color: fg,
+          alpha,
+          bold,
+          italic,
+          batchable: true,
+        }
+      } else {
+        glyphs.push({ text: segText, column, cells, color: fg, alpha, bold, italic, batchable })
+      }
     }
 
-    const underline = underlineOf(style)
+    const underline = underlineOfStyleFlags(flags)
     if (underline !== 'none') {
-      const color = colorIn(theme, style.underlineColor) ?? fg
+      const color = styleUnderlineColor ?? fg
       extend(lines, { kind: underline, column, cells, color }, (last) => last.kind === underline && last.color === color)
     }
-    if (flags & StyleFlag.strikethrough) {
+    if ((flags & PackedStyleFlag.STRIKETHROUGH) !== 0) {
       extend(lines, { kind: 'strikethrough', column, cells, color: fg }, (last) => last.kind === 'strikethrough' && last.color === fg)
     }
-    if (flags & StyleFlag.overline) {
-      extend(lines, { kind: 'overline', column, cells, color: fg }, (last) => last.kind === 'overline' && last.color === fg)
+  }
+
+  const { runs, styles, text } = row
+  for (let i = 0; i < runs.length; i += 4) {
+    const colWord = runs[i]!
+    const txtWord = runs[i + 1]!
+    const metaWord = runs[i + 2]!
+    const runFlags = runs[i + 3]!
+
+    const colStart = colWord & 0xffff
+    const colLen = colWord >>> 16
+    const u16Off = txtWord & 0xffff
+    const u16Len = txtWord >>> 16
+    const styleIdx = metaWord & 0xffff
+
+    const styleBase = styleIdx * 4
+    const fgRaw = styleBase < styles.length ? styles[styleBase]! : 0
+    const bgRaw = styleBase + 1 < styles.length ? styles[styleBase + 1]! : 0
+    const ulRaw = styleBase + 2 < styles.length ? styles[styleBase + 2]! : 0
+    const flags = styleBase + 3 < styles.length ? styles[styleBase + 3]! : 0
+
+    const styleFg = resolvePackedColor(fgRaw, theme.palette, theme.foreground) ?? theme.foreground
+    const styleBg = resolvePackedColor(bgRaw, theme.palette, null)
+    const styleUl = resolvePackedColor(ulRaw, theme.palette, null)
+
+    const slice = text.slice(u16Off, u16Off + u16Len)
+    const perCell = (runFlags & RunFlag.PER_CELL) !== 0
+
+    if (perCell) {
+      // Ghostty emits one PER_CELL run per cell (wide glyph or multi-codepoint grapheme cluster).
+      const isSel = hasSelection && colStart < selected!.to && colStart + colLen > selected!.from
+      emitSegment(slice, colStart, colLen, false, styleFg, styleBg, styleUl, flags, isSel)
+      continue
+    }
+
+    // Narrow non-BMP codepoints (surrogate pairs, `slice.length !== colLen`): emit 1 codepoint per column
+    if (slice.length !== colLen) {
+      const cps = Array.from(slice)
+      for (let k = 0; k < cps.length && k < colLen; k += 1) {
+        const c = colStart + k
+        const isSel = hasSelection && c < selected!.to && c + 1 > selected!.from
+        emitSegment(cps[k]!, c, 1, false, styleFg, styleBg, styleUl, flags, isSel)
+      }
+      continue
+    }
+
+    // 1-cell-per-UTF-16-code-unit fast path (ASCII or 1-cell BMP run)
+    const batchable = isPrintableAscii(slice)
+    const runEnd = colStart + colLen
+
+    // Collect any interior split points caused by selection edges or WCAG highlight boundaries
+    const splits: number[] = []
+    if (hasSelection) {
+      if (selected!.from > colStart && selected!.from < runEnd) splits.push(selected!.from)
+      if (selected!.to > colStart && selected!.to < runEnd) splits.push(selected!.to)
+    }
+    if (useContrast && orderedHighlights.length > 0) {
+      for (const hl of orderedHighlights) {
+        if (hl.from >= runEnd) break
+        if (hl.to <= colStart) continue
+        if (hl.from > colStart && hl.from < runEnd) splits.push(hl.from)
+        if (hl.to > colStart && hl.to < runEnd) splits.push(hl.to)
+      }
+    }
+
+    if (splits.length === 0) {
+      const isSel = hasSelection && colStart < selected!.to && runEnd > selected!.from
+      if (batchable || slice.length === 0) {
+        emitSegment(slice, colStart, colLen, batchable, styleFg, styleBg, styleUl, flags, isSel)
+      } else {
+        for (let k = 0; k < slice.length && k < colLen; k += 1) {
+          emitSegment(slice[k]!, colStart + k, 1, false, styleFg, styleBg, styleUl, flags, isSel)
+        }
+      }
+    } else {
+      splits.sort((a, b) => a - b)
+      let cursor = colStart
+      for (let s = 0; s <= splits.length; s += 1) {
+        const edge = s < splits.length ? splits[s]! : runEnd
+        if (edge <= cursor) continue
+        const segOff = cursor - colStart
+        const segLen = edge - cursor
+        const segText = slice.slice(segOff, segOff + segLen)
+        const isSel = hasSelection && cursor < selected!.to && edge > selected!.from
+        if (batchable || segText.length === 0) {
+          emitSegment(segText, cursor, segLen, batchable, styleFg, styleBg, styleUl, flags, isSel)
+        } else {
+          for (let k = 0; k < segText.length && k < segLen; k += 1) {
+            emitSegment(segText[k]!, cursor + k, 1, false, styleFg, styleBg, styleUl, flags, isSel)
+          }
+        }
+        cursor = edge
+      }
     }
   }
 
   if (selectedTo > selectedFrom) {
-    // Among the others in the order of its cells, which is the order they are all in
     const after = backgrounds.findIndex((run) => run.column >= selectedTo)
-    backgrounds.splice(after === -1 ? backgrounds.length : after, 0, { column: selectedFrom, cells: selectedTo - selectedFrom, color: theme.selectionBackground })
+    backgrounds.splice(after === -1 ? backgrounds.length : after, 0, {
+      column: selectedFrom,
+      cells: selectedTo - selectedFrom,
+      color: theme.selectionBackground,
+    })
   }
-  for (const highlight of found) backgrounds.push({ column: highlight.from, cells: highlight.to - highlight.from, color: highlight.color })
+  for (const highlight of found) {
+    backgrounds.push({
+      column: highlight.from,
+      cells: highlight.to - highlight.from,
+      color: highlight.color,
+    })
+  }
 
   return { backgrounds, glyphs, lines }
 }
 
-/** Returns `found` ordered ascending by `from`, preserving each item's original index in O(H) for ascending/descending inputs */
-function orderedByColumn(found: readonly Highlight[]): Array<{ from: number; to: number; color: number; order: number }> {
+function orderedByColumn(found: readonly Highlight[]): OrderedHighlight[] {
   const n = found.length
   let ascending = true
   let descending = true
@@ -226,7 +410,7 @@ function orderedByColumn(found: readonly Highlight[]): Array<{ from: number; to:
     if (curr < prev) ascending = false
     if (curr > prev) descending = false
   }
-  const result = new Array<{ from: number; to: number; color: number; order: number }>(n)
+  const result = new Array<OrderedHighlight>(n)
   if (ascending) {
     for (let i = 0; i < n; i += 1) {
       const h = found[i]!

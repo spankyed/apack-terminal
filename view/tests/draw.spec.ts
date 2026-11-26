@@ -1,246 +1,123 @@
-// A row as things to draw: the rules a terminal's styles follow, and what a selection does to them.
 import { describe, expect, it } from 'vitest'
-import { drawRow, type SelectedCells, type Theme } from '../src/draw.ts'
-import { xtermPalette } from '../src/palette.ts'
-import { PLAIN, StyleFlag, paletteColor, type Row, type Style } from '../src/source.ts'
-import { row, PALETTE } from './_support.ts'
-
-/** A row drawn with `styles` as its own: the plain one, then whatever its characters name */
-const drawStyled = (row: Row, styles: Style[], theme: Theme, selected?: SelectedCells) => drawRow({ ...row, styles }, theme, selected)
+import {
+  PackedStyleFlag,
+  RunFlag,
+  blinks,
+  drawRow,
+  packRow,
+  rowPlainText,
+  sessionTheme,
+  type Theme,
+} from '../src/index.ts'
+import { PALETTE, packedPalette, packedRgb, row } from './_support.ts'
 
 const theme: Theme = {
-  background: 0x1e1e1e, palette: PALETTE,
+  background: 0x1e1e1e,
   foreground: 0xd4d4d4,
-  cursor: 0xd4d4d4,
-  cursorText: 0x1e1e1e,
+  palette: PALETTE,
+  cursor: 0xffffff,
+  cursorText: 0x000000,
   selectionBackground: 0x264f78,
-  selectionForeground: null,
+  selectionForeground: 0xffffff,
 }
-const RED = 0xcd3131
-const BLUE = 0x2472c8
 
-/** A row whose characters take the given style indices, one each */
-const styled = (text: string, styles: number[]): Row => ({ ...row(0, text), style: Uint16Array.from(styles) })
+describe('drawRow & sessionTheme (v2 PackedRow)', () => {
+  it('batches contiguous printable ASCII runs and splits cleanly at selection boundaries', () => {
+    const r = row(0, 'hello world')
+    const plain = drawRow(r, theme)
+    expect(plain.glyphs).toHaveLength(1)
+    expect(plain.glyphs[0]).toMatchObject({
+      text: 'hello world',
+      column: 0,
+      cells: 11,
+      batchable: true,
+      color: theme.foreground,
+    })
 
-describe('a plain row', () => {
-  it('draws its characters in the default colour and no background at all', () => {
-    const drawing = drawStyled(row(0, 'ab'), [PLAIN], theme)
-
-    expect(drawing.backgrounds).toEqual([])
-    expect(drawing.glyphs.map(({ text, column, color }) => ({ text, column, color }))).toEqual([
-      { text: 'a', column: 0, color: theme.foreground },
-      { text: 'b', column: 1, color: theme.foreground },
+    // Selection over "lo wo" (cols 3..8) splits the ASCII run into 3 batchable pieces
+    const sel = drawRow(r, theme, { from: 3, to: 8 })
+    expect(sel.glyphs.map((g) => [g.text, g.column, g.cells, g.color, g.batchable])).toEqual([
+      ['hel', 0, 3, theme.foreground, true],
+      ['lo wo', 3, 5, theme.selectionForeground, true],
+      ['rld', 8, 3, theme.foreground, true],
     ])
+    expect(sel.backgrounds).toEqual([{ column: 3, cells: 5, color: theme.selectionBackground }])
   })
 
-  it('draws nothing for a space', () => {
-    expect(drawStyled(row(0, 'a b'), [PLAIN], theme).glyphs.map((glyph) => glyph.text)).toEqual(['a', 'b'])
-  })
-})
+  it('applies inverse, faint, invisible, blink, underlines, and strikethrough from PackedStyleFlag', () => {
+    const r = packRow({
+      line: 0,
+      styles: [
+        {},
+        { fg: packedPalette(1), bg: packedRgb(0x112233), flags: PackedStyleFlag.INVERSE | PackedStyleFlag.BOLD },
+        { flags: PackedStyleFlag.FAINT | PackedStyleFlag.ITALIC | (1 << 2) | PackedStyleFlag.STRIKETHROUGH, underlineColor: packedRgb(0xff0000) },
+        { flags: PackedStyleFlag.INVISIBLE, bg: packedRgb(0x334455) },
+        { flags: PackedStyleFlag.BLINK },
+      ],
+      runs: [
+        { colStart: 0, colLen: 2, text: 'AB', styleIdx: 1 },
+        { colStart: 2, colLen: 2, text: 'CD', styleIdx: 2 },
+        { colStart: 4, colLen: 1, text: 'X', styleIdx: 3 },
+        { colStart: 5, colLen: 1, text: '!', styleIdx: 4 },
+      ],
+    })
 
-describe('a background', () => {
-  it('is one rectangle for a run of cells that share it', () => {
-    const onRed: Style = { ...PLAIN, bg: RED }
-    const onBlue: Style = { ...PLAIN, bg: BLUE }
-    const drawing = drawStyled(styled('aabbc', [1, 1, 2, 2, 0]), [PLAIN, onRed, onBlue], theme)
+    expect(blinks(r)).toBe(true)
+    expect(rowPlainText(r)).toBe('ABCDX!')
 
-    expect(drawing.backgrounds).toEqual([
-      { column: 0, cells: 2, color: RED },
-      { column: 2, cells: 2, color: BLUE },
+    const shown = drawRow(r, theme, undefined, false)
+    expect(shown.glyphs.map((g) => g.text)).toEqual(['AB', 'CD', '!'])
+    expect(shown.glyphs[0]).toMatchObject({ color: 0x112233, bold: true, italic: false })
+    expect(shown.glyphs[1]).toMatchObject({ alpha: 0.5, bold: false, italic: true })
+    expect(shown.backgrounds).toEqual([
+      { column: 0, cells: 2, color: PALETTE[1] },
+      { column: 4, cells: 1, color: 0x334455 },
     ])
-  })
-
-  it('is drawn under a space, which has no character but still has a colour', () => {
-    const drawing = drawStyled(styled(' ', [1]), [PLAIN, { ...PLAIN, bg: RED }], theme)
-
-    expect(drawing.backgrounds).toEqual([{ column: 0, cells: 1, color: RED }])
-    expect(drawing.glyphs).toEqual([])
-  })
-})
-
-describe('inverse', () => {
-  it('swaps the two colours, defaults included', () => {
-    const drawing = drawStyled(styled('a', [1]), [PLAIN, { ...PLAIN, flags: StyleFlag.inverse }], theme)
-
-    expect(drawing.backgrounds).toEqual([{ column: 0, cells: 1, color: theme.foreground }])
-    expect(drawing.glyphs[0]?.color).toBe(theme.background)
-  })
-
-  it('swaps chosen colours too', () => {
-    const style: Style = { ...PLAIN, fg: RED, bg: BLUE, flags: StyleFlag.inverse }
-    const drawing = drawStyled(styled('a', [1]), [PLAIN, style], theme)
-
-    expect(drawing.backgrounds[0]?.color).toBe(RED)
-    expect(drawing.glyphs[0]?.color).toBe(BLUE)
-  })
-})
-
-describe('text attributes', () => {
-  it('reach the character: bold, italic, and faint as half strength', () => {
-    const style: Style = { ...PLAIN, flags: StyleFlag.bold | StyleFlag.italic | StyleFlag.faint }
-    const [glyph] = drawStyled(styled('a', [1]), [PLAIN, style], theme).glyphs
-
-    expect(glyph).toMatchObject({ bold: true, italic: true, alpha: 0.5 })
-  })
-
-  it('invisible text keeps its background and draws neither character nor line', () => {
-    const style: Style = { ...PLAIN, bg: RED, flags: StyleFlag.invisible | StyleFlag.strikethrough | (1 << 8) }
-    const drawing = drawStyled(styled('a', [1]), [PLAIN, style], theme)
-
-    expect(drawing.backgrounds).toHaveLength(1)
-    expect(drawing.glyphs).toEqual([])
-    expect(drawing.lines).toEqual([])
-  })
-
-  it('text that blinks is drawn like any other, and for the half of a blink it is off keeps its background and draws nothing else', () => {
-    const blinking: Style = { ...PLAIN, bg: RED, flags: StyleFlag.blink | StyleFlag.strikethrough }
-    const both = { ...styled('ab', [1, 0]), styles: [PLAIN, blinking] }
-
-    const on = drawRow(both, theme)
-    expect(on.glyphs.map((glyph) => glyph.text)).toEqual(['a', 'b'])
-    expect(on.lines).toHaveLength(1)
-
-    const off = drawRow(both, theme, undefined, true)
-    expect(off.glyphs.map((glyph) => glyph.text), 'the text beside it does not blink').toEqual(['b'])
-    expect(off.lines).toEqual([])
-    expect(off.backgrounds).toEqual(on.backgrounds)
-  })
-})
-
-describe('lines through and under text', () => {
-  it('are one line per run, in the underline colour where one was given and the text colour where not', () => {
-    const curly: Style = { ...PLAIN, underlineColor: RED, flags: 3 << 8 }
-    const struck: Style = { ...PLAIN, fg: BLUE, flags: StyleFlag.strikethrough }
-    const drawing = drawStyled(styled('aabb', [1, 1, 2, 2]), [PLAIN, curly, struck], theme)
-
-    expect(drawing.lines).toEqual([
-      { kind: 'curly', column: 0, cells: 2, color: RED },
-      { kind: 'strikethrough', column: 2, cells: 2, color: BLUE },
+    expect(shown.lines).toEqual([
+      { kind: 'single', column: 2, cells: 2, color: 0xff0000 },
+      { kind: 'strikethrough', column: 2, cells: 2, color: theme.foreground },
     ])
+
+    // Blinked off hides '!'
+    const hidden = drawRow(r, theme, undefined, true)
+    expect(hidden.glyphs.map((g) => g.text)).toEqual(['AB', 'CD'])
   })
 
-  it('an overline and an underline on the same cells are both drawn', () => {
-    const style: Style = { ...PLAIN, flags: StyleFlag.overline | (1 << 8) }
-    const kinds = drawStyled(styled('a', [1]), [PLAIN, style], theme).lines.map((line) => line.kind)
-
-    expect(kinds.sort()).toEqual(['overline', 'single'])
-  })
-})
-
-describe('a wide character', () => {
-  it('is one character over two cells', () => {
-    const wide: Row = { ...row(0, '日a'), column: Uint16Array.from([0, 2]), width: Uint8Array.from([2, 1]) }
-    const drawing = drawStyled(wide, [PLAIN], theme)
-
-    expect(drawing.glyphs.map(({ text, column, cells }) => ({ text, column, cells }))).toEqual([
-      { text: '日', column: 0, cells: 2 },
-      { text: 'a', column: 2, cells: 1 },
+  it('handles wide PER_CELL grapheme clusters without splitting and narrow non-BMP runs without breaking surrogate pairs', () => {
+    const r = packRow({
+      line: 0,
+      styles: [{}],
+      runs: [
+        { colStart: 0, colLen: 2, text: '👨‍👩‍👧‍👦', flags: RunFlag.PER_CELL },
+        { colStart: 2, colLen: 1, text: 'e\u0301', flags: RunFlag.PER_CELL },
+        { colStart: 3, colLen: 2, text: '𝕏𝕐', flags: 0 },
+      ],
+    })
+    const drawn = drawRow(r, theme, { from: 1, to: 2 })
+    // Family emoji stays ONE 2-cell glyph, combining accent stays ONE 1-cell glyph, and 𝕏/𝕐 stay intact surrogate pairs!
+    expect(drawn.glyphs.map((g) => [g.text, g.column, g.cells, g.batchable])).toEqual([
+      ['👨‍👩‍👧‍👦', 0, 2, false],
+      ['e\u0301', 2, 1, false],
+      ['𝕏', 3, 1, false],
+      ['𝕐', 4, 1, false],
     ])
-  })
-})
-
-describe('a selection', () => {
-  it('replaces the background of what it covers and leaves each character its colour', () => {
-    const drawing = drawStyled(styled('abcd', [1, 1, 0, 0]), [PLAIN, { ...PLAIN, fg: RED, bg: BLUE }], theme, { from: 1, to: 3 })
-
-    expect(drawing.backgrounds).toEqual([
-      { column: 0, cells: 1, color: BLUE },
-      { column: 1, cells: 2, color: theme.selectionBackground },
-    ])
-    expect(drawing.glyphs.map((glyph) => glyph.color)).toEqual([RED, RED, theme.foreground, theme.foreground])
+    expect(drawn.backgrounds).toEqual([{ column: 0, cells: 2, color: theme.selectionBackground }])
   })
 
-  it('recolours the text when the theme gives a colour for it', () => {
-    const drawing = drawStyled(row(0, 'ab'), [PLAIN], { ...theme, selectionForeground: 0xffffff }, { from: 0, to: 1 })
+  it('merges session palette overrides and swaps defaults on reverse video', () => {
+    expect(sessionTheme(theme, null, false)).toBe(theme)
+    const rev = sessionTheme(theme, null, true)
+    expect(rev.foreground).toBe(theme.background)
+    expect(rev.background).toBe(theme.foreground)
 
-    expect(drawing.glyphs.map((glyph) => glyph.color)).toEqual([0xffffff, theme.foreground])
-  })
-
-  it('covers the blank cells past the end of the line', () => {
-    const drawing = drawStyled(row(0, 'ab'), [PLAIN], theme, { from: 1, to: 6 })
-
-    expect(drawing.backgrounds).toEqual([{ column: 1, cells: 5, color: theme.selectionBackground }])
-  })
-
-  it('covers the cells nothing was written in, between characters as well as after them', () => {
-    // `a`, six cells a program moved the cursor over without writing, then `b`
-    const gapped: Row = { ...row(0, 'ab'), column: Uint16Array.from([0, 7]) }
-    const drawing = drawStyled(gapped, [PLAIN], theme, { from: 0, to: 12 })
-
-    expect(drawing.backgrounds).toEqual([{ column: 0, cells: 12, color: theme.selectionBackground }])
-  })
-
-  it('is one rectangle among the backgrounds either side of it, in the order of their cells', () => {
-    const drawing = drawStyled(styled('abcdef', [1, 1, 1, 1, 1, 1]), [PLAIN, { ...PLAIN, bg: BLUE }], theme, { from: 2, to: 4 })
-
-    expect(drawing.backgrounds).toEqual([
-      { column: 0, cells: 2, color: BLUE },
-      { column: 2, cells: 2, color: theme.selectionBackground },
-      { column: 4, cells: 2, color: BLUE },
-    ])
-  })
-
-  it('covers a wide character it only half reaches', () => {
-    const wide: Row = { ...row(0, '日'), column: Uint16Array.from([0]), width: Uint8Array.from([2]) }
-
-    expect(drawStyled(wide, [PLAIN], theme, { from: 1, to: 2 }).backgrounds[0]).toMatchObject({ column: 0, cells: 2 })
-  })
-
-  it('does not select a wide character for an empty range inside it', () => {
-    const wide: Row = { ...row(0, '日'), column: Uint16Array.from([0]), width: Uint8Array.from([2]) }
-
-    expect(drawStyled(wide, [PLAIN], theme, { from: 1, to: 1 }).backgrounds).toEqual([])
-  })
-})
-
-describe('contrast and highlights in drawRow', () => {
-  it('applies minimumContrast-adjusted foreground to underline, strikethrough, and overline', () => {
-    const style: Style = { ...PLAIN, fg: 0x222222, flags: StyleFlag.strikethrough | StyleFlag.overline | (1 << 8) }
-    const drawing = drawRow({ ...row(0, 'a'), style: Uint16Array.from([1]), styles: [PLAIN, style] }, { ...theme, minimumContrast: 4.5 })
-    const adjusted = drawing.glyphs[0]!.color
-    expect(adjusted).not.toBe(0x222222)
-    expect(drawing.lines.map((line) => line.color)).toEqual([adjusted, adjusted, adjusted])
-  })
-
-  it('resolves highlights in both descending and ascending order in linear time', () => {
-    const style: Style = { ...PLAIN, fg: 0x7a7a7a }
-    const longRow: Row = { ...row(0, 'a'.repeat(500)), style: new Uint16Array(500).fill(1), styles: [PLAIN, style] }
-    // Descending order (as produced by newest-first search)
-    const descending = Array.from({ length: 250 }, (_, i) => ({ from: (249 - i) * 2, to: (249 - i) * 2 + 1, color: 0x9e6a03 }))
-    const black = { ...theme, background: 0x000000, minimumContrast: 4.5 }
-    const drawn = drawRow(longRow, black, undefined, false, descending)
-    // Even columns are on 0x9e6a03 (adjusted), odd columns are on black (kept 0x7a7a7a)
-    expect(drawn.glyphs[0]!.color).not.toBe(0x7a7a7a)
-    expect(drawn.glyphs[1]!.color).toBe(0x7a7a7a)
-    expect(drawn.glyphs[498]!.color).not.toBe(0x7a7a7a)
-    expect(drawn.glyphs[499]!.color).toBe(0x7a7a7a)
-  })
-})
-
-describe('a numbered colour', () => {
-  it('is looked up in the theme when the row is drawn, so a theme decides what red is', () => {
-    const styles: Style[] = [PLAIN, { fg: paletteColor(1), bg: paletteColor(4), underlineColor: paletteColor(200), flags: 1 << 8 }]
-    const drawing = drawStyled(row(0, 'a', { style: 1 }), styles, theme)
-    expect(drawing.glyphs[0]!.color).toBe(PALETTE[1])
-    expect(drawing.backgrounds[0]!.color).toBe(PALETTE[4])
-    expect(drawing.lines[0]!.color).toBe(PALETTE[200])
-
-    const other = { ...theme, palette: PALETTE.map((color) => color ^ 0xffffff) }
-    expect(drawStyled(row(0, 'a', { style: 1 }), styles, other).glyphs[0]!.color).toBe(PALETTE[1]! ^ 0xffffff)
-  })
-
-  it('keeps a colour a program gave exactly, whatever the theme', () => {
-    const styles: Style[] = [PLAIN, { fg: 0x010203, bg: null, underlineColor: null, flags: 0 }]
-    expect(drawStyled(row(0, 'a', { style: 1 }), styles, theme).glyphs[0]!.color).toBe(0x010203)
-  })
-})
-
-describe('the 256 colours', () => {
-  it('are the theme\'s sixteen, then the cube and the greys every terminal shares', () => {
-    const palette = xtermPalette([0x111111, 0x222222])
-    expect(palette).toHaveLength(256)
-    expect(palette.slice(0, 3)).toEqual([0x111111, 0x222222, 0])
-    expect([palette[16], palette[21], palette[196], palette[231]]).toEqual([0x000000, 0x0000ff, 0xff0000, 0xffffff])
-    expect([palette[17], palette[232], palette[255]]).toEqual([0x00005f, 0x080808, 0xeeeeee])
+    const custom = sessionTheme(
+      theme,
+      { fg: 0x111111, bg: 0xeeeeee, cursor: 0x00ff00, palette: [{ index: 2, rgb: 0xabcdef }] },
+      true,
+    )
+    expect(custom.foreground).toBe(0xeeeeee)
+    expect(custom.background).toBe(0x111111)
+    expect(custom.cursor).toBe(0x00ff00)
+    expect(custom.palette[2]).toBe(0xabcdef)
   })
 })

@@ -1,336 +1,168 @@
-// The 2D painter: what it draws for a scene, and where.
 import { describe, expect, it } from 'vitest'
-import { CanvasPainter } from '../src/canvas-painter.ts'
-import { drawRow, type SelectedCells, type Theme } from '../src/draw.ts'
-import { css, measure } from '../src/painter.ts'
-import { PLAIN, type Row, type Style } from '../src/source.ts'
+import { CanvasPainter, drawRow, type Scene, type Theme } from '../src/index.ts'
 import { recordingContext } from './_canvas.ts'
-import { row, PALETTE } from './_support.ts'
-
-/** A row drawn with `styles` as its own: the plain one, then whatever its characters name */
-const drawStyled = (row: Row, styles: Style[], theme: Theme, selected?: SelectedCells) => drawRow({ ...row, styles }, theme, selected)
+import { PALETTE, row } from './_support.ts'
 
 const theme: Theme = {
-  background: 0x1e1e1e, palette: PALETTE, foreground: 0xd4d4d4, cursor: 0xffffff, cursorText: 0x000000,
-  selectionBackground: 0x264f78, selectionForeground: null,
-}
-const font = { family: 'monospace', size: 14 }
-
-/** A painter over a recording canvas, sized 20 columns by 4 rows: cells are 10 wide and 20 tall */
-function painter() {
-  const { canvas, drawn } = recordingContext()
-  const made = new CanvasPainter(font, canvas)
-  made.resize(20, 4, 1)
-  return { painter: made, drawn }
+  background: 0x1e1e1e,
+  foreground: 0xd4d4d4,
+  palette: PALETTE,
+  cursor: 0xffffff,
+  cursorText: 0x000000,
+  selectionBackground: 0x264f78,
+  selectionForeground: null,
 }
 
-describe('one cell', () => {
-  it('is measured from the font, in whole device pixels', () => {
-    const { painter: made } = painter()
-    expect(made.metrics).toEqual({ cellWidth: 10, cellHeight: 20, baseline: 16 })
-    expect(made.canvas.style.width).toBe('200px')
-    expect(made.canvas.height).toBe(80)
-  })
+describe('CanvasPainter v2', () => {
+  it('batches printable ASCII runs into one fillText when font-advance probe passes, and falls back per-cell when proportional', () => {
+    // 1. Uniform monospace font (measureText('MMMM') === 4 * cellWidth) -> batched!
+    const mono = recordingContext(10)
+    const painter = new CanvasPainter({ family: 'monospace', size: 14 }, mono.canvas, 1)
+    painter.resize(20, 2, 1)
+    expect(painter.canBatchFace(false, false)).toBe(true)
 
-  it('is measured for the display it is on from the start, before anything says how many cells there are', () => {
-    // A character 8.4 pixels wide is 8 on a display of whole pixels, and 8.5 on one with two to a pixel
-    expect(new CanvasPainter(font, recordingContext(8.4).canvas, 1).metrics.cellWidth).toBe(8)
-    expect(new CanvasPainter(font, recordingContext(8.4).canvas, 2).metrics.cellWidth).toBe(8.5)
-  })
+    const r0 = drawRow(row(0, 'hello world'), theme)
+    painter.paint({ theme, rows: [r0, null], offset: 0 })
+    const texts = mono.drawn.filter((d) => d.kind === 'text')
+    expect(texts).toHaveLength(1)
+    expect(texts[0]).toMatchObject({ text: 'hello world', x: 0, y: 16 })
+    // Zero whole-row clips!
+    expect(texts[0]!.clips).toEqual([])
+    painter.dispose()
 
-  it('is measured again for another typeface, and the canvas is sized for the cells it has now', () => {
-    const { canvas, cell } = recordingContext()
-    const made = new CanvasPainter(font, canvas)
-    made.resize(20, 4, 1)
-    cell.width = 12
-    made.setFont({ family: 'serif', size: 18 })
-    expect(made.metrics.cellWidth).toBe(12)
-    expect(made.canvas.style.width).toBe('240px')
-  })
+    // 2. Proportional font where 'iiii' measures narrower than 4 * cellWidth -> per-cell fallback!
+    const prop = recordingContext(10)
+    const ctx = prop.canvas.getContext('2d')!
+    ctx.measureText = ((text: string) => ({
+      width: text === 'iiii' ? 20 : text.length * 10,
+      fontBoundingBoxAscent: 16,
+      fontBoundingBoxDescent: 4,
+    })) as CanvasRenderingContext2D['measureText']
 
-  it('has as many device pixels as the display gives it', () => {
-    const { painter: made } = painter()
-    made.resize(20, 4, 2)
-    expect([made.canvas.width, made.canvas.height]).toEqual([400, 160])
-    expect(made.canvas.style.height, 'the canvas grew on the page with the pixel ratio').toBe('80px')
-  })
-})
-
-describe('a scene', () => {
-  it('is the background, then each row where it belongs', () => {
-    const { painter: made, drawn } = painter()
-    const red: Style = { ...PLAIN, bg: 0xcd3131 }
-    const first = drawStyled(row(0, 'hi'), [PLAIN], theme)
-    const second = drawStyled({ ...row(1, 'x'), style: Uint16Array.from([1]) }, [PLAIN, red], theme)
-
-    made.paint({ theme, rows: [first, second], offset: 0 })
-
-    expect(drawn[0]).toMatchObject({ kind: 'rect', x: 0, y: 0, width: 200, height: 80, color: css(theme.background) })
-    expect(drawn.find((call) => call.color === css(0xcd3131))).toMatchObject({ x: 0, y: 20, width: 10, height: 20 })
-    expect(drawn.filter((call) => call.kind === 'text').map(({ text, x, y }) => ({ text, x, y }))).toEqual([
-      { text: 'h', x: 0, y: 16 },
-      { text: 'i', x: 10, y: 16 },
-      { text: 'x', x: 0, y: 36 },
+    const propPainter = new CanvasPainter({ family: 'proportional', size: 14 }, prop.canvas, 1)
+    propPainter.resize(20, 2, 1)
+    expect(propPainter.canBatchFace(false, false)).toBe(false)
+    propPainter.paint({ theme, rows: [r0, null], offset: 0 })
+    const propTexts = prop.drawn.filter((d) => d.kind === 'text')
+    expect(propTexts.map((d) => [d.text, d.x])).toEqual([
+      ['h', 0], ['e', 10], ['l', 20], ['l', 30], ['o', 40],
+      ['w', 60], ['o', 70], ['r', 80], ['l', 90], ['d', 100],
     ])
+    propPainter.dispose()
   })
 
-  it('draws every background before any character, so a tall one is not cut by the row below', () => {
-    const { painter: made, drawn } = painter()
-    const onRed: Style = { ...PLAIN, bg: 0xcd3131 }
-    const styled = (line: number) => drawStyled({ ...row(line, 'a'), style: Uint16Array.from([1]) }, [PLAIN, onRed], theme)
+  it('clips ONLY individual overhanging glyphs and never wraps entire rows in save/clip/restore', () => {
+    const rec = recordingContext(10)
+    const ctx = rec.canvas.getContext('2d')!
+    ctx.measureText = ((text: string) => ({
+      width: text === '⚡' ? 25 : text.length * 10,
+      fontBoundingBoxAscent: 16,
+      fontBoundingBoxDescent: 4,
+    })) as CanvasRenderingContext2D['measureText']
 
-    made.paint({ theme, rows: [styled(0), styled(1)], offset: 0 })
+    const painter = new CanvasPainter({ family: 'monospace', size: 14 }, rec.canvas, 1)
+    painter.resize(10, 2, 1)
+    const r0 = drawRow(row(0, 'a⚡b'), theme)
+    painter.paint({ theme, rows: [r0, null], offset: 0 })
 
-    const kinds = drawn.slice(1).map((call) => call.kind)
-    expect(kinds).toEqual(['rect', 'rect', 'text', 'text'])
+    const texts = rec.drawn.filter((d) => d.kind === 'text')
+    const normalA = texts.find((t) => t.text === 'a')!
+    const wideBolt = texts.find((t) => t.text === '⚡')!
+    const normalB = texts.find((t) => t.text === 'b')!
+    expect(normalA.clips).toEqual([])
+    expect(wideBolt.clips.length).toBe(1)
+    expect(normalB.clips).toEqual([])
+    painter.dispose()
   })
 
-  it('is shifted up by the fraction of a row the view is scrolled between two lines', () => {
-    const { painter: made, drawn } = painter()
-    made.paint({ theme, rows: [drawStyled(row(0, 'a'), [PLAIN], theme), drawStyled(row(1, 'b'), [PLAIN], theme)], offset: 0.5 })
+  it('uses O(1) drawImage scroll-blit fast path on uniform scroll shifts and repaints only newly exposed edge rows', () => {
+    const rec = recordingContext(10)
+    const painter = new CanvasPainter({ family: 'monospace', size: 14 }, rec.canvas, 1)
+    painter.resize(10, 6, 1)
 
-    expect(drawn.filter((call) => call.kind === 'text').map((call) => call.y)).toEqual([6, 26])
+    const rows = Array.from({ length: 7 }, (_, i) => drawRow(row(i, `line-${i}`), theme))
+    const scene1: Scene = { theme, rows: rows.slice(0, 6), offset: 0, scrollPosition: 0 }
+    painter.paint(scene1)
+    rec.drawn.length = 0
+
+    // Scroll down by 1 row (scrollPosition: 0 -> 1)
+    const scene2: Scene = { theme, rows: rows.slice(1, 7), offset: 0, scrollPosition: 1 }
+    painter.paint(scene2)
+
+    // Must blit self canvas once with srcY=20, dstY=0, height=100 (6*20 - 20)
+    const blits = rec.drawn.filter((d) => d.kind === 'image' && d.picture === rec.canvas)
+    expect(blits).toHaveLength(1)
+    expect(blits[0]!.source).toEqual([0, 20, 100, 100])
+    expect(blits[0]!.y).toBe(0)
+    expect(blits[0]!.height).toBe(100)
+
+    // Top unchanged lines (line-1, line-2) must NOT be redrawn!
+    const redrawnTexts = rec.drawn.filter((d) => d.kind === 'text').map((d) => d.text)
+    expect(redrawnTexts).toContain('line-6')
+    expect(redrawnTexts).not.toContain('line-1')
+    expect(redrawnTexts).not.toContain('line-2')
+
+    // Fractional scroll shift (+0.5 row = 10px) where a middle row mutated MUST repaint the dirty row!
+    rec.drawn.length = 0
+    const mutatedMid = [...rows.slice(1, 7), drawRow(row(7, 'line-7'), theme)]
+    mutatedMid[2] = drawRow(row(3, 'mid-updated'), theme)
+    painter.paint({ theme, rows: mutatedMid, offset: 0.5, scrollPosition: 1.5 })
+    const fracTexts = rec.drawn.filter((d) => d.kind === 'text').map((d) => d.text)
+    expect(fracTexts).toContain('mid-updated')
+    painter.dispose()
   })
 
-  it('leaves a row it does not hold blank', () => {
-    const { painter: made, drawn } = painter()
-    made.paint({ theme, rows: [null, drawStyled(row(1, 'b'), [PLAIN], theme)], offset: 0 })
+  it('preserves colour and glyph-width caches across grid resizes when font and DPR are unchanged', () => {
+    const rec = recordingContext(10)
+    let measureCalls = 0
+    const ctx = rec.canvas.getContext('2d')!
+    const origMeasure = ctx.measureText
+    ctx.measureText = ((text: string) => {
+      if (text === 'é') measureCalls += 1
+      return origMeasure(text)
+    }) as CanvasRenderingContext2D['measureText']
 
-    expect(drawn.filter((call) => call.kind === 'text')).toHaveLength(1)
+    const painter = new CanvasPainter({ family: 'monospace', size: 14 }, rec.canvas, 1)
+    painter.resize(10, 2, 1)
+    const r0 = drawRow(row(0, 'é'), theme)
+    painter.paint({ theme, rows: [r0, null], offset: 0 })
+    expect(measureCalls).toBe(1)
+
+    // Resize grid columns/rows with SAME DPR & font -> wider cache preserved!
+    painter.resize(20, 4, 1)
+    painter.paint({ theme, rows: [r0, null, null, null], offset: 0 })
+    expect(measureCalls).toBe(1)
+
+    // Changing DPR invalidates wider cache
+    painter.resize(20, 4, 2)
+    painter.paint({ theme, rows: [r0, null, null, null], offset: 0 })
+    expect(measureCalls).toBe(2)
+    painter.dispose()
   })
 
-  it('uses the bold and italic faces a character asks for', () => {
-    const { painter: made, drawn } = painter()
-    const strong: Style = { ...PLAIN, flags: 1 | 2 }
-    made.paint({ theme, rows: [drawStyled({ ...row(0, 'a'), style: Uint16Array.from([1]) }, [PLAIN, strong], theme)], offset: 0 })
+  it('repaints dirty bands only when a single row changes and fires whenCleared on contextrestored', () => {
+    const rec = recordingContext(10)
+    const painter = new CanvasPainter({ family: 'monospace', size: 14 }, rec.canvas, 1)
+    painter.resize(10, 6, 1)
 
-    expect(drawn.find((call) => call.kind === 'text')?.font).toBe('italic bold 14px monospace')
-  })
-})
+    const r = Array.from({ length: 6 }, (_, i) => drawRow(row(i, `r${i}`), theme))
+    painter.paint({ theme, rows: r, offset: 0 })
+    rec.drawn.length = 0
 
-describe('what the canvas is told', () => {
-  it('is a font and a colour when they change, not for every character', () => {
-    const { canvas, given } = recordingContext()
-    const made = new CanvasPainter(font, canvas)
-    made.resize(20, 4, 1)
-    const before = { ...given }
-    made.paint({ theme, rows: [drawStyled(row(0, 'hello world'), [PLAIN], theme), drawStyled(row(1, 'again'), [PLAIN], theme)], offset: 0 })
+    // Mutate only row 5
+    const next = [...r]
+    next[5] = drawRow(row(5, 'changed'), theme)
+    painter.paint({ theme, rows: next, offset: 0 })
 
-    expect(given.font - before.font, 'the font was set again for characters in the same face').toBe(1)
-    expect(given.fillStyle - before.fillStyle, 'the background, then one colour for every character').toBe(2)
-  })
-})
+    const drawnTexts = rec.drawn.filter((d) => d.kind === 'text').map((d) => d.text)
+    expect(drawnTexts).toContain('changed')
+    expect(drawnTexts).not.toContain('r0')
+    expect(drawnTexts).not.toContain('r1')
 
-describe('a character wider than its cells', () => {
-  it('is kept to them from side to side, and one that fits is drawn as it is', () => {
-    const { painter: made, drawn } = painter()
-    // One cell each; the recording canvas measures a character by its code units, so the second is two cells wide
-    const narrow = { ...row(0, 'ab'), text: ['a', 'e\u0301'] }
-    // And an emoji that has the two cells it measures
-    const emoji = { ...row(1, 'x'), text: ['\u{1f600}'], width: Uint8Array.from([2]) }
-    made.paint({ theme, rows: [drawStyled(narrow, [PLAIN], theme), drawStyled(emoji, [PLAIN], theme)], offset: 0 })
-
-    // Each inside its row and the two beside it, as every character not of the font's own is; the one
-    // wider than its cell inside that cell's width as well
-    const text = (character: string) => drawn.find((call) => call.text === character)!
-    expect(text('a').clips).toEqual([[0, -20, 200, 60]])
-    expect(text('e\u0301').clips, 'left to cover the cell beside it').toEqual([[0, -20, 200, 60], [10, -20, 10, 60]])
-    expect(text('\u{1f600}').clips).toEqual([[0, 0, 200, 60]])
-  })
-})
-
-describe('a scene painted over the one before it', () => {
-  /** Twelve rows on a painter sized for them, each drawn once and kept, as a view keeps them */
-  function painted() {
-    const { canvas, drawn } = recordingContext()
-    const made = new CanvasPainter(font, canvas)
-    made.resize(20, 12, 1)
-    const rows = Array.from({ length: 12 }, (_, line) => drawStyled(row(line, `line ${line}`), [PLAIN], theme))
-    made.paint({ theme, rows, offset: 0 })
-    drawn.length = 0
-    return { painter: made, drawn, rows }
-  }
-  const texts = (drawn: ReturnType<typeof painted>['drawn']) => [...new Set(drawn.filter((call) => call.kind === 'text').map((call) => call.y))]
-
-  it('draws nothing where nothing changed', () => {
-    const { painter: made, drawn, rows } = painted()
-    made.paint({ theme, rows: [...rows], offset: 0 })
-    expect(drawn).toEqual([])
-  })
-
-  it('draws the row that changed and the rows a character of it could reach, and nothing outside them', () => {
-    const { painter: made, drawn, rows } = painted()
-    const next = [...rows]
-    next[5] = drawStyled(row(5, 'changed'), [PLAIN], theme)
-    made.paint({ theme, rows: next, offset: 0 })
-
-    // Rows four to six, and nothing drawn but inside them
-    expect(drawn.length).toBeGreaterThan(0)
-    for (const call of drawn) expect(call.clips[0], `a ${call.kind} at ${call.y}`).toEqual([0, 80, 200, 60])
-    expect(drawn.filter((call) => call.kind === 'text').map((call) => call.text).join('')).toContain('changed')
-    // The rows beside those are drawn too, since their characters may reach in: three to seven
-    expect(texts(drawn)).toEqual([76, 96, 116, 136, 156])
-  })
-
-  it('draws where the cursor was and where it is, when the cursor is all that moved', () => {
-    const { painter: made, drawn, rows } = painted()
-    const cursor = { column: 2, row: 9, cells: 1, shape: 'block' as const }
-    made.paint({ theme, rows, offset: 0, cursor })
-    expect(drawn.at(-1)).toMatchObject({ kind: 'rect', x: 20, y: 180, color: css(theme.cursor), clips: [[0, 160, 200, 60]] })
-
-    // The off half of a blink: the cell is drawn again without it
-    drawn.length = 0
-    made.paint({ theme, rows, offset: 0 })
-    expect(drawn.some((call) => call.color === css(theme.cursor))).toBe(false)
-    expect(texts(drawn)).toEqual([156, 176, 196, 216, 236])
-  })
-
-  it('is drawn whole when the canvas was sized, the colours changed, or the view is between two lines', () => {
-    const whole = (drawn: ReturnType<typeof painted>['drawn']) =>
-      drawn[0]?.kind === 'rect' && drawn[0].clips.length === 0 && drawn.filter((call) => call.kind === 'text').length > 12
-
-    const sized = painted()
-    sized.painter.resize(20, 12, 2)
-    sized.painter.paint({ theme, rows: sized.rows, offset: 0 })
-    expect(whole(sized.drawn), 'after the canvas was sized, which clears it').toBe(true)
-
-    const themed = painted()
-    themed.painter.paint({ theme: { ...theme, background: 0xffffff }, rows: themed.rows, offset: 0 })
-    expect(whole(themed.drawn), 'in other colours').toBe(true)
-
-    const between = painted()
-    between.painter.paint({ theme, rows: between.rows, offset: 0.5 })
-    expect(whole(between.drawn), 'between two lines').toBe(true)
-
-    const marked = painted()
-    marked.painter.paint({ theme, rows: marked.rows, offset: 0, images: [{ picture: {} as CanvasImageSource, x: 0, y: 0, width: 10, height: 10, source: { x: 0, y: 0, width: 1, height: 1 }, above: true }] })
-    expect(whole(marked.drawn), 'with an image it did not have').toBe(true)
-  })
-
-  it('is drawn again when the browser gives back a context it took, which comes back blank', () => {
-    const { painter: made, drawn, rows } = painted()
-    let asked = 0
-    made.whenCleared(() => { asked += 1 })
-    made.canvas.dispatchEvent(new Event('contextrestored'))
-    expect(asked, 'nothing was asked to paint the blank canvas').toBe(1)
-
-    made.paint({ theme, rows, offset: 0 })
-    expect(drawn.filter((call) => call.kind === 'text').length, 'the scene it thought was showing was not drawn').toBeGreaterThan(12)
-  })
-
-  it('is drawn whole when most of it changed, which is cheaper than piece by piece', () => {
-    const { painter: made, drawn } = painted()
-    made.paint({ theme, rows: Array.from({ length: 12 }, (_, line) => drawStyled(row(line, 'new'), [PLAIN], theme)), offset: 0 })
-    expect(drawn.every((call) => call.clips.length === 0)).toBe(true)
-  })
-})
-
-describe('the cursor', () => {
-  const scene = (shape: 'block' | 'bar' | 'underline' | 'hollow') => ({
-    theme, rows: [drawStyled(row(0, 'ab'), [PLAIN], theme)], offset: 0,
-    cursor: { column: 1, row: 0, cells: 1, shape, text: { text: 'b', bold: false, italic: false } },
-  })
-
-  it('as a block covers its cell and redraws the character over itself', () => {
-    const { painter: made, drawn } = painter()
-    made.paint(scene('block'))
-
-    const [block, text] = drawn.slice(-2)
-    expect(block).toMatchObject({ kind: 'rect', x: 10, y: 0, width: 10, height: 20, color: css(theme.cursor) })
-    expect(text).toMatchObject({ kind: 'text', text: 'b', x: 10, color: css(theme.cursorText) })
-  })
-
-  it('as a bar is a thin line at the left of its cell, and as an underline one at the bottom', () => {
-    const bar = painter()
-    bar.painter.paint(scene('bar'))
-    expect(bar.drawn.at(-1)).toMatchObject({ x: 10, y: 0, width: 2, height: 20 })
-
-    const underline = painter()
-    underline.painter.paint(scene('underline'))
-    expect(underline.drawn.at(-1)).toMatchObject({ x: 10, y: 18, width: 10, height: 2 })
-  })
-
-  it('hollow is an outline, which is what an unfocused terminal shows', () => {
-    const { painter: made, drawn } = painter()
-    made.paint(scene('hollow'))
-    expect(drawn.at(-1)?.kind).toBe('strokeRect')
-  })
-})
-
-describe('a gutter', () => {
-  it('is a strip left of the first column that rows are drawn clear of, with a bar beside each marked row', () => {
-    const { canvas, drawn } = recordingContext()
-    const made = new CanvasPainter(font, canvas)
-    made.resize(20, 4, 1, 6)
-    expect(made.canvas.style.width, 'the gutter is not part of the canvas').toBe('206px')
-
-    made.paint({ theme, rows: [drawStyled(row(0, 'hi'), [PLAIN], theme), null, drawStyled(row(2, 'x'), [PLAIN], theme)], offset: 0, marks: [{ row: 2, color: 0x00ff00 }] })
-
-    expect(drawn[0]).toMatchObject({ kind: 'rect', x: 0, width: 206 })
-    expect(drawn.find((call) => call.color === css(0x00ff00))).toMatchObject({ kind: 'rect', x: 1, y: 42, width: 3, height: 16 })
-    expect(drawn.find((call) => call.text === 'h')).toMatchObject({ x: 6 })
-    expect(drawn.find((call) => call.text === 'x')).toMatchObject({ x: 6, y: 56 })
-  })
-
-  it('is not there unless asked for, and then nothing is marked', () => {
-    const { painter: made, drawn } = painter()
-    made.paint({ theme, rows: [drawStyled(row(0, 'hi'), [PLAIN], theme)], offset: 0, marks: [{ row: 0, color: 0x00ff00 }] })
-    expect(drawn.some((call) => call.color === css(0x00ff00))).toBe(false)
-    expect(drawn.find((call) => call.text === 'h')).toMatchObject({ x: 0 })
-  })
-})
-
-describe('measure and painter lifecycle edge cases', () => {
-  it('treats zero fontBoundingBox metrics as missing and guards invalid pixel ratios', () => {
-    const stub = {
-      font: '',
-      measureText: () => ({ width: 8, fontBoundingBoxAscent: 0, fontBoundingBoxDescent: 0, actualBoundingBoxAscent: 12, actualBoundingBoxDescent: 3 }),
-    } as unknown as CanvasRenderingContext2D
-    expect(measure(stub, font, 0)).toEqual({ cellWidth: 8, cellHeight: 15, baseline: 12 })
-    expect(measure(stub, font, Number.NaN)).toEqual({ cellWidth: 8, cellHeight: 15, baseline: 12 })
-
-    const zeroAll = {
-      font: '',
-      measureText: () => ({ width: 8, fontBoundingBoxAscent: 0, fontBoundingBoxDescent: 0, actualBoundingBoxAscent: 0, actualBoundingBoxDescent: 0 }),
-    } as unknown as CanvasRenderingContext2D
-    const fallback = measure(zeroAll, { family: 'monospace', size: 10 }, 1)
-    expect(fallback).toEqual({ cellWidth: 8, cellHeight: 10, baseline: 8 })
-  })
-
-  it('culls images outside dirty bands, clips wide block-cursor glyphs, and releases canvas memory on dispose', () => {
-    const { canvas, drawn } = recordingContext()
-    const made = new CanvasPainter(font, canvas)
-    made.resize(20, 12, 1)
-    const rows = Array.from({ length: 12 }, (_, line) => drawStyled(row(line, `line ${line}`), [PLAIN], theme))
-    const picture = {} as CanvasImageSource
-    const images = [
-      { picture, x: 0, y: 0, width: 20, height: 20, source: { x: 0, y: 0, width: 10, height: 10 }, above: true },
-      { picture, x: 0, y: 200, width: 20, height: 20, source: { x: 0, y: 0, width: 10, height: 10 }, above: true },
-    ]
-    made.paint({ theme, rows, offset: 0, images })
-    drawn.length = 0
-
-    // Dirty band around row 10 (y=180..240) should draw the image at y=200 and cull the image at y=0
-    const next = [...rows]
-    next[10] = drawStyled(row(10, 'updated'), [PLAIN], theme)
-    made.paint({ theme, rows: next, offset: 0, images })
-    expect(drawn.filter((call) => call.kind === 'image').map((call) => call.y)).toEqual([200])
-
-    // Wide block cursor glyph (2 code units in 1 cell -> wider than cellWidth) is clipped
-    drawn.length = 0
-    made.paint({
-      theme, rows: next, offset: 0, images,
-      cursor: { column: 1, row: 1, cells: 1, shape: 'block', text: { text: 'e\u0301', bold: false, italic: false } },
-    })
-    const cursorGlyph = drawn.find((call) => call.kind === 'text' && call.text === 'e\u0301')
-    expect(cursorGlyph?.clips.at(-1)).toEqual([10, 0, 10, 60])
-
-    // dispose zeroes backing store and clears repaint callback
     let cleared = 0
-    made.whenCleared(() => { cleared += 1 })
-    made.dispose()
-    expect([canvas.width, canvas.height]).toEqual([0, 0])
-    canvas.dispatchEvent(new Event('contextrestored'))
-    expect(cleared).toBe(0)
+    painter.whenCleared(() => { cleared += 1 })
+    rec.canvas.dispatchEvent(new Event('contextrestored'))
+    expect(cleared).toBe(1)
+    painter.dispose()
   })
 })

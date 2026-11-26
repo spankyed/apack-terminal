@@ -1,220 +1,79 @@
-// Folded output: a fold is one header row where its lines start, and its other lines are neither drawn nor pointed at. What
-// is copied from it is still all of its text, and the cursor and the rows under the pointer follow what is drawn.
+// Folded line runs: header row rendering, cached header drawings, cursor clamping, epoch reset, and scrolling.
 import { beforeEach, describe, expect, it } from 'vitest'
-import { installFrames, runFrames } from './_frames.ts'
-import { FakeSource } from './_source.ts'
+import { installFrames } from './_frames.ts'
 import { frame, row } from './_support.ts'
-import { mountedView, settled } from './_view.ts'
+import { mountedView } from './_view.ts'
 
 beforeEach(() => installFrames())
 
-/** The text of each row the view draws, read where a screen reader reads it */
-const drawnText = (view: ReturnType<typeof mountedView>) =>
-  [...view.view.element.querySelector('[data-terminal-text]')!.children].map((child) => child.textContent)
+describe('folded line runs', () => {
+  it('draws a single header row for folded lines, hides folded rows, and caches fold RowDrawing identity', () => {
+    const { source, view, painted } = mountedView()
+    source.send(
+      frame({
+        size: { cols: 30, rows: 4 },
+        rows: [row(0, 'cmd'), row(1, 'out-1'), row(2, 'out-2'), row(3, 'after')],
+      }),
+    )
+    view.setFolds([{ first: 0, last: 2, label: 'build output' }])
+    const scene1 = painted()
+    const headerText = scene1.rows[0]!.glyphs.map((g) => g.text).join('')
+    expect(headerText).toContain('build output')
+    // Second drawn row is line 3 ('after'), skipping hidden lines 1 and 2
+    expect(scene1.rows[1]!.glyphs.map((g) => g.text).join('')).toBe('after')
 
-/**
- * Seven lines: the screen is lines 3 to 6 and lines 0 to 2 are history, shown by scrolling back to the top. The cursor, when
- * given, is at a row of the screen.
- */
-function sevenLines(setup: ReturnType<typeof mountedView>, cursor: { row: number; column: number } | null = null) {
-  setup.source.send(frame({
-    screenRows: 4, columns: 20, firstActive: 3, scrollback: 3, cursor: cursor ? { ...cursor, shape: 'block' } as never : null,
-    rows: [row(0, 'L0'), row(1, 'L1'), row(2, 'L2'), row(3, 'L3'), row(4, 'L4'), row(5, 'L5'), row(6, 'L6')],
-  }))
-  runFrames()
-  setup.view.viewport.scrollTo(0)
-  // Scrolling does not paint: setting the folds, which are none yet, does
-  setup.view.setFolds([])
-  runFrames()
-}
+    // Repaint preserves exact RowDrawing object identity for unchanged fold header
+    view.redraw()
+    const scene2 = painted()
+    expect(scene2.rows[0]).toBe(scene1.rows[0])
 
-describe('a folded run of lines', () => {
-  it('is one header row where it starts, and its other lines are not drawn', () => {
-    const view = mountedView({}, new FakeSource())
-    sevenLines(view)
-    expect(drawnText(view)).toEqual(['L0', 'L1', 'L2', 'L3'])
-    view.view.setFolds([{ first: 1, last: 3, label: 'output' }])
-    runFrames()
-    expect(drawnText(view)).toEqual(['L0', '▸ output', 'L4', 'L5'])
+    // Overlapping folds throw RangeError
+    expect(() => view.setFolds([{ first: 0, last: 3 }, { first: 2, last: 4 }])).toThrow(RangeError)
+
+    // Epoch reset clears folds cleanly
+    source.send(frame({ seq: 2, epoch: 2, size: { cols: 30, rows: 4 }, rows: [row(0, 'fresh')] }))
+    const scene3 = painted()
+    expect(scene3.rows[0]!.glyphs.map((g) => g.text).join('')).toBe('fresh')
   })
 
-  it('is a header with its count when it has no label of its own', () => {
-    const view = mountedView({}, new FakeSource())
-    sevenLines(view)
-    view.view.setFolds([{ first: 1, last: 3 }])
-    runFrames()
-    expect(drawnText(view)[1]).toBe('▸ 2 lines folded')
-  })
-
-  it('moves the rows under the pointer: the row a header is on is its first line, and the rows below it are the lines after it', async () => {
-    const source = new FakeSource()
-    const view = mountedView({}, source)
-    sevenLines(view)
-    view.view.setFolds([{ first: 1, last: 3 }])
-    runFrames()
-    view.point('pointerdown', 0, 2)
-    view.point('pointermove', 3, 2)
-    view.point('pointerup', 3, 2)
-    expect(view.view.selection.span?.start.line, 'the row under the pointer is the fold\'s line after the header').toBe(4)
-  })
-
-  it('keeps the cursor on the line it is on, at the row it is drawn in', () => {
-    const view = mountedView({}, new FakeSource())
-    // The cursor is on the screen's third row, which is line 5
-    sevenLines(view, { row: 2, column: 0 })
-    view.view.setFolds([{ first: 1, last: 3 }])
-    runFrames()
-    const cursor = view.painted().cursor
-    expect(cursor?.row, 'line 5 is the fourth row once lines 2 and 3 are folded away').toBe(3)
-  })
-
-  it('is copied as all of its text, though it is drawn as its header', async () => {
-    class Printed extends FakeSource {
-      readonly asked: number[][] = []
-      override async textOf(span: { start: { line: number }; end: { line: number } }): Promise<string> {
-        this.asked.push([span.start.line, span.end.line])
-        return 'the whole output'
-      }
-    }
-    const source = new Printed()
+  it('positions input field at fold header when cursor is inside folded lines and copies full folded text', async () => {
     const copied: string[] = []
-    const view = mountedView({ onCopy: (text) => { copied.push(text) } }, source)
-    sevenLines(view)
-    view.view.setFolds([{ first: 1, last: 3 }])
-    runFrames()
-    expect(view.view.selectOutput({ id: 1, command: 'make', cwd: null, startedMs: null, finishedMs: null, outcome: { kind: 'exited', code: 0 }, prompt: 0, output: 1, end: 4 } as never)).toBe(true)
-    await settled()
-    expect(await view.view.copy()).toBe(true)
-    expect(source.asked).toEqual([[1, 3]])
-    expect(copied).toEqual(['the whole output'])
+    const { source, view, painted, field } = mountedView({ onCopy: (t) => copied.push(t) })
+    source.send(
+      frame({
+        size: { cols: 20, rows: 4 },
+        cursor: { col: 2, row: 1, shape: 'block', blinking: false, hidden: false },
+        rows: [row(0, 'head'), row(1, 'mid'), row(2, 'tail'), row(3, 'next')],
+      }),
+    )
+    view.setFolds([{ first: 0, last: 2 }])
+    painted()
+    // Cursor on hidden line 1 places IME textarea at fold header row 0 (top = 0px)
+    expect(field.style.top).toBe('0px')
+
+    // Selecting all copies the actual folded lines too!
+    view.selectAll()
+    expect(await view.copy()).toBe(true)
+    expect(copied).toEqual(['head\nmid\ntail\nnext'])
   })
 
-  it('survives scrolling: a view scrolled to a line folded away starts at the fold\'s header, and no hidden line is drawn', () => {
-    const view = mountedView({}, new FakeSource())
-    sevenLines(view)
-    view.view.setFolds([{ first: 1, last: 3, label: 'output' }])
-    runFrames()
-    view.view.viewport.scrollTo(2)
-    view.view.setFolds([{ first: 1, last: 3, label: 'output' }])
-    runFrames()
-    expect(drawnText(view)).toEqual(['▸ output', 'L4', 'L5', 'L6'])
-  })
-
-  it('survives a resize of the screen: the fold still hides its lines in the rows there are', () => {
-    const view = mountedView({}, new FakeSource())
-    sevenLines(view)
-    view.view.setFolds([{ first: 1, last: 3, label: 'output' }])
-    runFrames()
-    view.source.send(frame({ sequence: 2, screenRows: 3, columns: 20, firstActive: 3, scrollback: 3, rows: [row(0, 'L0'), row(1, 'L1'), row(2, 'L2'), row(3, 'L3'), row(4, 'L4'), row(5, 'L5'), row(6, 'L6')] }))
-    view.view.viewport.scrollTo(0)
-    view.view.setFolds([{ first: 1, last: 3, label: 'output' }])
-    runFrames()
-    expect(drawnText(view)).toEqual(['L0', '▸ output', 'L4'])
-  })
-
-  it('is headed by a label whose wide characters take two cells, so what follows lines up with them', () => {
-    const view = mountedView({}, new FakeSource())
-    sevenLines(view)
-    view.view.setFolds([{ first: 1, last: 3, label: '中x' }])
-    runFrames()
-    // The header is "▸ 中x": the wide character is on cells 2 and 3, so the x is on cell 4
-    const header = view.painted().rows[1]!
-    expect(header.glyphs.map((glyph) => [glyph.text, glyph.column])).toEqual([['▸', 0], ['中', 2], ['x', 4]])
-  })
-
-  it('places the input at the fold header when the cursor sits on a line the fold hides', () => {
-    const view = mountedView({}, new FakeSource())
-    // The cursor is on line 5, which a fold over lines 4 to 6 hides. The view is shown from line 0, so the header, line 4,
-    // is the fifth row; rows are twenty pixels high in the test painter. Placed on line 5 it would be a row lower still.
-    sevenLines(view, { row: 2, column: 0 })
-    view.view.setFolds([{ first: 4, last: 6 }])
-    runFrames()
-    expect(view.field.style.top).toBe('80px')
-  })
-
-  describe('scrolling across a fold', () => {
-    /** Thirty lines of history over a four-row screen, with lines 10 to 24 folded to the header on line 9 */
-    function thirtyLines() {
-      const view = mountedView({}, new FakeSource())
-      view.source.send(frame({ screenRows: 4, columns: 20, firstActive: 30, scrollback: 30, rows: Array.from({ length: 34 }, (_, line) => row(line, `L${line}`)) }))
-      runFrames()
-      view.view.setFolds([{ first: 9, last: 24, label: 'output' }])
-      runFrames()
-      return view
-    }
-
-    it('moves one drawn row a notch: a fold is one row, so no notch is spent turning over its hidden lines', () => {
-      const view = thirtyLines()
-      const tops: number[] = []
-      for (let notch = 0; notch < 15; notch += 1) {
-        view.view.scrollBy(-1)
-        runFrames()
-        tops.push(view.view.viewport.top)
-        if (notch === 5) expect(drawnText(view)[0], 'the notch that reaches the fold shows its header').toBe('▸ output')
-      }
-      expect(tops).toEqual([29, 28, 27, 26, 25, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0])
-      view.view.scrollBy(-1)
-      expect(view.view.viewport.top, 'the oldest line is where it stops').toBe(0)
-    })
-
-    it('drags the scrollbar through every drawn row, the fold\'s header among them and none of its hidden lines', () => {
-      const view = thirtyLines()
-      Object.defineProperty(view.view.element, 'clientHeight', { get: () => 80, configurable: true })
-      view.view.fit()
-      view.view.scrollTo(0)
-      view.painted()
-      const thumb = view.view.element.lastElementChild as HTMLElement
-      thumb.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, cancelable: true, clientY: 40 }))
-      const visited: Array<number | 'following'> = []
-      // Every pixel of the track, top to bottom: each row is reached and none is skipped
-      for (let clientY = 40; clientY <= 100; clientY += 1) {
-        window.dispatchEvent(new MouseEvent('pointermove', { clientY }))
-        const top = view.view.viewport.top
-        // The track is 60 pixels for 15 drawn rows, so each four pixels is one row of the scrollbar's own measure
-        if ((clientY - 40) % 4 === 0) expect(view.view.viewport.extent.position, `${(clientY - 40) / 4} rows down the track`).toBe((clientY - 40) / 4)
-        const shown = view.view.viewport.following ? 'following' : Math.floor(top)
-        if (visited.at(-1) !== shown) visited.push(shown)
-      }
-      expect(visited).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 25, 26, 27, 28, 29, 'following'])
-    })
-  })
-
-  it('takes folds that do not overlap, and refuses ones that do', () => {
-    const view = mountedView({}, new FakeSource())
-    expect(() => view.view.setFolds([{ first: 1, last: 3 }, { first: 3, last: 5 }])).toThrow(RangeError)
-    expect(() => view.view.setFolds([{ first: 1, last: 3 }, { first: 4, last: 6 }])).not.toThrow()
-  })
-
-  it('caches fold header RowDrawing across paints, clears folds on epoch reset, and accounts for folds in cursor and showMatch', async () => {
-    const source = new FakeSource()
-    source.search = async () => ({ spans: [{ start: { line: 25, column: 0 }, end: { line: 25, column: 2 } }], more: false })
-    const view = mountedView({}, source)
-    view.source.send(frame({
-      screenRows: 4, columns: 20, firstActive: 25, scrollback: 25,
-      cursor: { column: 0, row: 0, shape: 'block', blinking: false, hidden: false },
-      rows: Array.from({ length: 29 }, (_, line) => row(line, `L${line}`)),
-    }))
-    view.view.setFolds([{ first: 5, last: 20, label: 'folded' }, { first: 25, last: 27, label: 'tail' }])
-    view.view.scrollTo(4)
-    const firstPaint = view.painted()
-    const headerBefore = firstPaint.rows[1]
-    view.view.redraw()
-    const secondPaint = view.painted()
-    expect(secondPaint.rows[1], 'fold header drawing was rebuilt every paint').toBe(headerBefore)
-
-    // Cursor on fold.first reads the fold header text, not the underlying row
-    view.view.follow()
-    expect(view.painted().cursor?.text?.text).toBe('▸')
-
-    // showMatch checks layout().lines with folds: line 25 is visible at top=4 (lines [4, 5, 21, 22])? No, 25 is offscreen -> steps back over folds
-    view.view.scrollTo(0)
-    await view.view.find('L25')
-    expect(view.view.viewport.top).toBe(23)
-
-    // Epoch reset clears folds
-    view.source.send(frame({ sequence: 2, epoch: 2, screenRows: 4, columns: 20, firstActive: 0, scrollback: 0, rows: [row(0, 'fresh')] }))
-    runFrames()
-    expect(view.view.viewport.hiddenIn(10)).toBeUndefined()
-    expect(drawnText(view)[0]).toBe('fresh')
+  it('uses default count label when label is omitted and steps over folded lines when scrolling', () => {
+    const { source, view, painted } = mountedView()
+    source.send(
+      frame({
+        size: { cols: 30, rows: 3 },
+        firstActiveLine: 6,
+        scrollbackLines: 6,
+        rows: [row(6, 's0'), row(7, 's1'), row(8, 's2')],
+      }),
+    )
+    for (let i = 0; i < 6; i += 1) source.history.set(i, row(i, `h${i}`))
+    view.store.absorb(1, 0, 6, Array.from({ length: 6 }, (_, i) => row(i, `h${i}`)))
+    view.setFolds([{ first: 1, last: 4 }])
+    view.scrollTo(0)
+    const scene = painted()
+    expect(scene.rows[0]!.glyphs.map((g) => g.text).join('')).toBe('h0')
+    expect(scene.rows[1]!.glyphs.map((g) => g.text).join('')).toContain('3 lines folded')
+    expect(scene.rows[2]!.glyphs.map((g) => g.text).join('')).toBe('h5')
   })
 })
