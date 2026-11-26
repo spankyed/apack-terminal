@@ -323,7 +323,11 @@ mod tests {
             size: GridSize::new(80, 24).expect("grid"),
             cell_px: CellPx { width: 8, height: 16 },
             shell: Some("cmd.exe".to_owned()),
-            args: vec!["/V:ON".to_owned(), "/C".to_owned(), "set /p line= && echo APACK_WIN_GOT:!line!".to_owned()],
+            args: vec![
+                "/V:ON".to_owned(),
+                "/C".to_owned(),
+                "echo READY && set /p line= && echo APACK_WIN_GOT:!line!".to_owned(),
+            ],
             env: vec![],
             unset: vec![],
             cwd: None,
@@ -339,6 +343,23 @@ mod tests {
         bridge.resize(GridSize::new(90, 25).expect("grid"), CellPx { width: 8, height: 16 }).expect("resize");
         bridge.set_paused(true);
         bridge.set_paused(false);
+
+        // Wait until `cmd.exe` prints `READY` so ConPTY has attached stdin before we write `HELLO\r\n`.
+        let mut collected = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !String::from_utf8_lossy(&collected).contains("READY") {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for READY: {:?}",
+                String::from_utf8_lossy(&collected)
+            );
+            match bridge.try_recv_output() {
+                Some(ConPtyOutput::Data(bytes)) => collected.extend_from_slice(&bytes),
+                Some(ConPtyOutput::Eof) => panic!("unexpected ConPTY EOF before READY"),
+                None => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+
         bridge.write(b"HELLO\r\n".to_vec()).expect("write input");
 
         let status = spawned.child.wait().expect("wait child");
@@ -348,8 +369,6 @@ mod tests {
         // Second call is idempotent.
         bridge.close_master_async();
 
-        let mut collected = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             assert!(Instant::now() < deadline, "timed out waiting for ConPTY EOF");
             match bridge.try_recv_output() {

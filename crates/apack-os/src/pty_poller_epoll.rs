@@ -39,7 +39,7 @@ impl EpollWaker {
             let rc = unsafe {
                 libc::write(self.event_fd.as_raw_fd(), std::ptr::from_ref(&val).cast(), std::mem::size_of::<u64>())
             };
-            if rc != -1 {
+            if rc == std::mem::size_of::<u64>() as isize {
                 return Ok(());
             }
             let err = io::Error::last_os_error();
@@ -220,27 +220,10 @@ impl EpollPoller {
     }
 
     fn drain_event_fd(&self) {
-        // Drain `eventfd` completely BEFORE clearing `wake_pending` so a concurrent `wake()` can
-        // never have its increment swallowed while leaving `wake_pending == true`.
-        let mut counter: u64 = 0;
-        loop {
-            // SAFETY: `self.event_fd` is an open non-blocking `eventfd`; reading 8 bytes resets it.
-            let rc = unsafe {
-                libc::read(
-                    self.event_fd.as_raw_fd(),
-                    std::ptr::from_mut(&mut counter).cast(),
-                    std::mem::size_of::<u64>(),
-                )
-            };
-            if rc != -1 {
-                break;
-            }
-            let err = io::Error::last_os_error();
-            if is_interrupted(&err) {
-                continue;
-            }
-            break;
-        }
+        // Drain `eventfd` completely (retrying `EINTR` via `read_fd_nonblocking`) BEFORE clearing
+        // `wake_pending` so a concurrent `wake()` can never be lost while leaving `wake_pending == true`.
+        let mut buf = [0u8; std::mem::size_of::<u64>()];
+        let _ = crate::pty::read_fd_nonblocking(self.event_fd.as_raw_fd(), &mut buf);
         self.wake_pending.store(false, Ordering::SeqCst);
     }
 }
@@ -346,13 +329,15 @@ mod tests {
         assert!(!poller.poll(&mut events, Some(Duration::from_millis(10))).expect("idle"));
         assert!(events.is_empty(), "paused hung-up fd t3 must not fire EPOLLHUP: {events:?}");
 
-        // Resuming t3 surfaces the pending hangup cleanly.
+        // Resuming t3 surfaces the pending hangup cleanly, then deregister before dropping `r3`.
         poller.modify(t3, Interest::READ).expect("resume t3");
         assert!(!poller.poll(&mut events, Some(Duration::from_millis(50))).expect("t3 hangup"));
         assert!(events.iter().any(|e| e.token == t3 && e.hangup));
-        // Closing r3 before deregister exercises `ENOENT | EBADF` cleanup gracefully.
+        poller.deregister(t3).expect("dereg t3");
+        // Deleting an open fd that is not in `epoll_fd` returns `ENOENT`, which `epoll_del_ignore_closed`
+        // suppresses without any cross-thread fd-number reuse race.
+        epoll_del_ignore_closed(poller.epoll_fd.as_raw_fd(), r3.as_raw_fd()).expect("ignore ENOENT on unregistered fd");
         drop(r3);
-        poller.deregister(t3).expect("dereg closed fd");
 
         assert_eq!(write_fd_nonblocking(w1.as_raw_fd(), b"one").expect("w1"), 3);
         assert_eq!(write_fd_nonblocking(w2.as_raw_fd(), b"two").expect("w2"), 3);

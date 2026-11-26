@@ -309,6 +309,7 @@ pub(crate) fn create_nonblocking_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
 }
 
 /// Portable POSIX `pipe` + `FD_CLOEXEC` + `O_NONBLOCK` helper (compiled and tested on all Unix).
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 fn create_nonblocking_pipe_posix() -> io::Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0 as RawFd; 2];
     // SAFETY: `fds` is a valid 2-element array for `pipe(2)` to populate.
