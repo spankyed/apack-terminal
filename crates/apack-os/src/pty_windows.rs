@@ -345,6 +345,16 @@ mod tests {
         q.close();
         let closed_err = q.push(b"y".to_vec()).expect_err("closed rejects");
         assert!(matches!(closed_err, OsError::Io { source, .. } if source.kind() == io::ErrorKind::BrokenPipe));
+
+        // Closing a live queue with queued bytes releases buffered memory immediately.
+        let q2 = InputQueue::new();
+        q2.push(b"drop-on-close".to_vec()).expect("push before close");
+        q2.close();
+        {
+            let st = q2.state.lock().unwrap();
+            assert!(st.chunks.is_empty());
+            assert_eq!(st.buffered_bytes, 0);
+        }
         let q_bg = Arc::clone(&q);
         let (ptx, prx) = mpsc::channel();
         std::thread::spawn(move || {

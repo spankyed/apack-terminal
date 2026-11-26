@@ -1972,6 +1972,101 @@ fn windows_edge_helpers_and_natural_child_exit() {
     client.send_fin().unwrap();
     drop(client);
     handle.shutdown().unwrap();
+
+    // 4. Windows non-blocking draining_win: clean sole-client pipelined Metrics + FIN_FRAME
+    //    delivers all replies and auto-exits promptly (< 350ms, proving writer_done short-circuits
+    //    GRACEFUL_DRAIN_TIMEOUT), while a stalled sole peer is reaped after 500ms!
+    let do_hello = |s: &mut interprocess::local_socket::Stream| {
+        let mut hello = Vec::new();
+        ClientMsg::Hello {
+            protocol_version: apack_proto::PROTOCOL_VERSION,
+            client_nonce: [7u8; 32],
+            client_name: String::from("win-drain"),
+        }
+        .encode_to_frame(apack_proto::types::StreamId::CONTROL, RequestId::from_raw(1), &mut hello)
+        .unwrap();
+        s.write_all(&hello).unwrap();
+        s.flush().unwrap();
+        let mut dec = apack_proto::frame::FrameDecoder::new();
+        let mut buf = [0u8; 4096];
+        'wait_ok: loop {
+            let n = s.read(&mut buf).unwrap();
+            assert!(n > 0);
+            let mut rest = &buf[..n];
+            while !rest.is_empty() {
+                let (used, ev) = dec.step(rest).unwrap();
+                rest = &rest[used..];
+                if ev.is_some() {
+                    break 'wait_ok;
+                }
+            }
+        }
+    };
+
+    let mut batch = Vec::new();
+    const WIN_BURST_N: u32 = 1_500;
+    for i in 0..WIN_BURST_N {
+        ClientMsg::Metrics
+            .encode_to_frame(apack_proto::types::StreamId::CONTROL, RequestId::from_raw(i + 2), &mut batch)
+            .unwrap();
+    }
+    batch.extend_from_slice(&apack_proto::FIN_FRAME);
+
+    // 4a. Sole client pipelines 1,500 Metrics (>> WIN_WRITE_WINDOW) + FIN_FRAME.
+    let dir_solo = tempdir().unwrap();
+    let ep_solo = unique_endpoint(dir_solo.path(), "win-drain-solo");
+    let mut cfg_solo = BrokerConfig::for_socket(&ep_solo);
+    cfg_solo.shard_count = 1;
+    let mut srv_solo = BrokerServer::bind(cfg_solo).unwrap().spawn().unwrap();
+    let mut burst = apack_os::transport::connect_local_stream(srv_solo.socket_path()).unwrap();
+    do_hello(&mut burst);
+    let t_fin = std::time::Instant::now();
+    burst.write_all(&batch).unwrap();
+    burst.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    let mut all_replies = Vec::new();
+    let _ = burst.read_to_end(&mut all_replies);
+    let mut dec = apack_proto::frame::FrameDecoder::new();
+    let mut rest = all_replies.as_slice();
+    let mut got_replies = 0u32;
+    while !rest.is_empty() {
+        let (used, ev) = dec.step(rest).unwrap();
+        rest = &rest[used..];
+        if matches!(ev, Some(apack_proto::frame::DecodedFrame::Frame { .. })) {
+            got_replies += 1;
+        }
+    }
+    assert_eq!(got_replies, WIN_BURST_N, "draining_win must keep broker alive and deliver all replies");
+    while !srv_solo.is_finished() && t_fin.elapsed() < Duration::from_millis(1_000) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        srv_solo.is_finished() && t_fin.elapsed() < Duration::from_millis(450),
+        "broker must auto-exit promptly once writer_done is true (before 500ms timeout): elapsed={:?}",
+        t_fin.elapsed()
+    );
+    srv_solo.shutdown().unwrap();
+
+    // 4b. Sole stalled peer pipelines WIN_BURST_N Metrics + FIN_FRAME and never reads ->
+    //     reap_draining_win_conns must forcibly close_abrupt after 500ms so broker auto-exits!
+    let dir_reap = tempdir().unwrap();
+    let ep_reap = unique_endpoint(dir_reap.path(), "win-drain-reap");
+    let mut cfg_reap = BrokerConfig::for_socket(&ep_reap);
+    cfg_reap.shard_count = 1;
+    let mut srv_reap = BrokerServer::bind(cfg_reap).unwrap().spawn().unwrap();
+    let mut stalled = apack_os::transport::connect_local_stream(srv_reap.socket_path()).unwrap();
+    do_hello(&mut stalled);
+    stalled.write_all(&batch).unwrap();
+    stalled.flush().unwrap();
+    let reap_wait = std::time::Instant::now();
+    while !srv_reap.is_finished() && reap_wait.elapsed() < Duration::from_millis(2_000) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(srv_reap.is_finished(), "reap_draining_win_conns must drop stalled peer after 500ms so broker auto-exits");
+    let mut discard = Vec::new();
+    let _ = stalled.read_to_end(&mut discard);
+    assert!(discard.len() < all_replies.len());
+    srv_reap.shutdown().unwrap();
 }
 
 struct ChanReader {
@@ -2282,7 +2377,7 @@ fn review_regressions_env_grace_pipelined_fin_teardown_spawn_and_seek_cell_px() 
         };
 
         let mut batch = Vec::new();
-        const BURST_N: u32 = 3_000;
+        const BURST_N: u32 = 20_000;
         for i in 0..BURST_N {
             ClientMsg::Metrics
                 .encode_to_frame(apack_proto::types::StreamId::CONTROL, RequestId::from_raw(i + 2), &mut batch)
@@ -2290,7 +2385,7 @@ fn review_regressions_env_grace_pipelined_fin_teardown_spawn_and_seek_cell_px() 
         }
         batch.extend_from_slice(&apack_proto::FIN_FRAME);
 
-        // 6a. Sole client pipelines 3,000 Metrics (~150 KiB+ > AF_UNIX send buffer) + FIN_FRAME.
+        // 6a. Sole client pipelines 20,000 Metrics (~1.1 MiB > Linux & macOS AF_UNIX buffers) + FIN_FRAME.
         //     `has_draining_conns()` MUST keep the broker from auto-exiting while replies drain!
         let dir_solo = tempdir().unwrap();
         let ep_solo = unique_endpoint(dir_solo.path(), "unix-drain-solo");

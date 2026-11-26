@@ -642,7 +642,7 @@ impl ShardRunner {
 
             // Tier 1: Drain ready PTY output (round-robin, 256 KiB quantum per session) + PTY writes.
             #[cfg(windows)]
-            let win_exhausted_quantum = self.drain_windows_ptys();
+            let win_exhausted_quantum = self.drain_windows_ptys(PTY_READ_QUANTUM_BYTES);
 
             // Tier 2: Session timers, child reap / kill escalation, cooperative idle compression.
             let now_ms = TimestampMs::from_millis(now_unix_ms());
@@ -2017,4 +2017,171 @@ pub(crate) fn argv_matches_app(argv: &[String], app: &str) -> bool {
         let base = Path::new(arg).file_name().and_then(|s| s.to_str()).unwrap_or(arg.as_str());
         base.eq_ignore_ascii_case(needle)
     })
+}
+
+#[cfg(all(test, windows))]
+mod win_shard_tests {
+    use super::*;
+    use crate::shard_windows::{clamp_win_write_timeout, drain_conpty_quantum, maybe_wait_win_mailbox};
+    use apack_os::pty::{PtySpawnConfig, spawn_pty};
+    use apack_os::pty_windows::ConPtyBridge;
+    use apack_proto::types::{CellPos, CellSpan, GridSize, ResizePolicy};
+
+    #[test]
+    fn win_shard_helpers_and_drain_windows_ptys_cover_pause_quantum_and_eof() {
+        // 1. clamp_win_write_timeout
+        assert_eq!(clamp_win_write_timeout(Duration::from_secs(1), 0), Duration::from_secs(1));
+        assert_eq!(clamp_win_write_timeout(Duration::from_secs(1), 4), Duration::from_millis(10));
+        assert_eq!(clamp_win_write_timeout(Duration::from_millis(3), 4), Duration::from_millis(3));
+
+        // 2. maybe_wait_win_mailbox skips wait when exhausted_quantum == true, waits when false
+        let mb = Arc::new(Mutex::new(ShardMailboxState { queue: VecDeque::new(), woken: false }));
+        let cv = Arc::new(Condvar::new());
+        let t_skip = Instant::now();
+        maybe_wait_win_mailbox(true, &mb, &cv, Duration::from_secs(2));
+        assert!(t_skip.elapsed() < Duration::from_millis(200));
+
+        let t_wait = Instant::now();
+        maybe_wait_win_mailbox(false, &mb, &cv, Duration::from_millis(40));
+        assert!(t_wait.elapsed() >= Duration::from_millis(20));
+
+        // 3. ShardRunner::drain_windows_ptys with 0 sessions returns false
+        let (rtx, _rrx) = mpsc::channel();
+        let mut runner = ShardRunner {
+            shard_idx: 0,
+            shared: ShardShared {
+                image_store: Arc::new(Mutex::new(ImageStore::default())),
+                wal_registry: RecordingRegistry::new(),
+                wal_config: WalConfig::default(),
+                idle_compress_after: Duration::from_secs(60),
+                kill_escalate_after: Duration::from_secs(1),
+                engine_abi_hash: [0u8; 32],
+            },
+            reactor_tx: rtx,
+            wake_reactor: Arc::new(|| {}),
+            mailbox: Arc::clone(&mb),
+            load: Arc::new(AtomicUsize::new(0)),
+            telemetry: Arc::new(ShardTelemetryAtomics::default()),
+            self_wake: ShardWake::Cond(Arc::clone(&mb), Arc::clone(&cv)),
+            fg_tx: None,
+            fg_worker: None,
+            fg_inflight: HashSet::new(),
+            sessions: HashMap::new(),
+            cond: Arc::clone(&cv),
+            total_pty_bytes: 0,
+            running: true,
+            tearing_down_all: false,
+        };
+        assert!(!runner.drain_windows_ptys(1));
+
+        // 4. Two real ConPTY sessions: paused_id stays paused while live_id exhausts budget=1.
+        let make_session = |sid: SessionId, marker: &str, paused: bool| {
+            let cfg = PtySpawnConfig {
+                size: GridSize::new(80, 24).unwrap(),
+                cell_px: CellPx { width: 8, height: 16 },
+                shell: Some(String::from("cmd.exe")),
+                args: vec![String::from("/C"), format!("echo {marker}")],
+                env: Vec::new(),
+                unset: Vec::new(),
+                cwd: None,
+            };
+            let spawned = spawn_pty(&cfg).expect("spawn conpty");
+            let bridge = ConPtyBridge::start(spawned.master, || {}).expect("start bridge");
+            let mut vt_cfg = GhosttyConfig::new(cfg.size);
+            vt_cfg.cell_px = cfg.cell_px;
+            vt_cfg.scrollback_lines = 100;
+            let engine = GhosttyEngine::new(vt_cfg).expect("ghostty");
+            let machine = SessionMachine::new(sid, engine, ResizePolicy::LatestActive, MarksMode::Claimed, cfg.cell_px);
+            LiveSession {
+                machine,
+                pty: Some(LivePty::Windows { bridge, eof: false }),
+                child: Some(spawned.child),
+                killer: Some(spawned.killer),
+                tree: spawned.tree,
+                pid: None,
+                kept: false,
+                rewound: false,
+                created_ms: 0,
+                wal: None,
+                pending_wal_rollover: false,
+                rewind_reader: None,
+                rewind_at_ms: 0,
+                last_activity: Instant::now(),
+                compressed_idle: false,
+                paused_by_stream: paused,
+                paused_by_raw_flow: false,
+                terminating_since: None,
+                escalated_sigkill: false,
+                view_slot_free: HashSet::new(),
+                raw_output_subs: HashSet::new(),
+            }
+        };
+
+        let paused_id = SessionId::new(1).unwrap();
+        let live_id = SessionId::new(2).unwrap();
+        runner.sessions.insert(paused_id, make_session(paused_id, "WIN_PAUSED_ONLY", true));
+        runner.sessions.insert(live_id, make_session(live_id, "WIN_LIVE_ONLY", false));
+
+        // Wait until live_id produces output and exhausts budget=1 while paused_id stays unread.
+        let mut saw_exhausted = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if runner.drain_windows_ptys(1) {
+                saw_exhausted = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(saw_exhausted, "unpaused ConPTY session must exhaust budget=1");
+        let full_span = CellSpan { start: CellPos { line: 0, col: 0 }, end: CellPos { line: 23, col: 79 } };
+        let paused_text = runner.sessions[&paused_id].machine.vt().text_of(full_span, 4096);
+        assert!(!paused_text.contains("WIN_PAUSED_ONLY"), "paused ConPTY must not be drained: {paused_text:?}");
+
+        // Unpause paused_id and drain until its marker appears, plus test drain_conpty_quantum EOF.
+        runner.sessions.get_mut(&paused_id).unwrap().paused_by_stream = false;
+        let mut saw_paused_after = false;
+        let deadline2 = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline2 {
+            let _ = runner.drain_windows_ptys(PTY_READ_QUANTUM_BYTES);
+            if runner.sessions[&paused_id].machine.vt().text_of(full_span, 4096).contains("WIN_PAUSED_ONLY") {
+                saw_paused_after = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(saw_paused_after, "unpaused ConPTY must drain its output");
+
+        // Direct drain_conpty_quantum check for (false, false) empty and (true, false) EOF.
+        let quick_cfg = PtySpawnConfig {
+            size: GridSize::new(80, 24).unwrap(),
+            cell_px: CellPx::default(),
+            shell: Some(String::from("cmd.exe")),
+            args: vec![String::from("/C"), String::from("echo QEOF")],
+            env: Vec::new(),
+            unset: Vec::new(),
+            cwd: None,
+        };
+        let mut quick = spawn_pty(&quick_cfg).expect("spawn quick");
+        let bridge = ConPtyBridge::start(quick.master, || {}).expect("bridge");
+        let _ = quick.child.wait();
+        bridge.close_master_async();
+        let mut saw_eof = false;
+        let deadline3 = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline3 {
+            let (eof, exhausted) = drain_conpty_quantum(&bridge, PTY_READ_QUANTUM_BYTES, |_| {});
+            if eof {
+                assert!(!exhausted);
+                saw_eof = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(saw_eof, "drain_conpty_quantum must report (true, false) on EOF");
+        assert_eq!(drain_conpty_quantum(&bridge, PTY_READ_QUANTUM_BYTES, |_| {}), (false, false));
+
+        // Clean up test sessions.
+        for sid in [paused_id, live_id] {
+            runner.force_drop_session(sid);
+        }
+    }
 }

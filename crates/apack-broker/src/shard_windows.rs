@@ -6,7 +6,7 @@ use std::time::Duration;
 use apack_os::pty_windows::{ConPtyBridge, ConPtyOutput};
 use apack_proto::types::SessionId;
 
-use crate::shard::{LivePty, LiveSession, PTY_READ_QUANTUM_BYTES, ShardMailboxState, ShardRunner};
+use crate::shard::{LivePty, LiveSession, ShardMailboxState, ShardRunner};
 
 const WIN_PTY_WRITE_CHUNK_BYTES: usize = 65_536;
 
@@ -79,7 +79,7 @@ impl ShardRunner {
     /// Drains ready Windows ConPTY output (respecting `is_pty_paused`) and pending input writes.
     /// Returns `true` when at least one unpaused session exhausted its per-turn read quantum,
     /// signalling the shard loop to immediately spin another turn without sleeping.
-    pub(crate) fn drain_windows_ptys(&mut self) -> bool {
+    pub(crate) fn drain_windows_ptys(&mut self, budget: usize) -> bool {
         let ids: Vec<SessionId> = self.sessions.keys().copied().collect();
         let mut any_exhausted = false;
         for session_id in ids {
@@ -87,7 +87,7 @@ impl ShardRunner {
             let (hit_eof, exhausted) = match self.sessions.get(&session_id) {
                 Some(sess) if !sess.is_pty_paused() => match sess.pty.as_ref() {
                     Some(LivePty::Windows { bridge, eof: false }) => {
-                        drain_conpty_quantum(bridge, PTY_READ_QUANTUM_BYTES, |bytes| chunks.push(bytes.to_vec()))
+                        drain_conpty_quantum(bridge, budget, |bytes| chunks.push(bytes.to_vec()))
                     }
                     _ => (false, false),
                 },

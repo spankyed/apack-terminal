@@ -223,6 +223,7 @@ pub(crate) fn spawn_win_conn_io(
             let _ = let_go(&w_stream, || {});
         }
         w_writer_done.store(true, Ordering::Release);
+        wake();
     }) {
         closed.store(true, Ordering::Release);
         let _ = hang_up(&stream);
@@ -304,14 +305,14 @@ impl ReactorState {
         let Some(c) = self.conns.remove(&conn) else {
             return;
         };
-        let has_tail = !drained.is_empty() || final_error.is_some();
-        let graceful = is_graceful_win_close(reason, has_tail);
+        let graceful = is_graceful_win_close(reason, final_error.is_some());
         if !graceful {
             (c.win.close_abrupt)();
             return;
         }
+        let mut win = c.win;
         let mut tail_chunks = VecDeque::new();
-        if let Some(pending) = c.win.pending_chunk {
+        if let Some(pending) = win.pending_chunk.take() {
             tail_chunks.push_back(pending);
         }
         for queued in drained {
@@ -326,8 +327,6 @@ impl ReactorState {
                 tail_chunks.push_back(encoded);
             }
         }
-        let mut win = c.win;
-        win.pending_chunk = None;
         self.draining_win.insert(
             conn,
             DrainingWinConn { win, tail_chunks, close_sent: false, deadline: Instant::now() + GRACEFUL_DRAIN_TIMEOUT },

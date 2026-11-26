@@ -114,20 +114,16 @@ unsafe extern "system" fn console_ctrl_handler(_ctrl_type: u32) -> i32 {
 }
 
 /// Guard keeping a Windows `SetConsoleCtrlHandler` registration active until dropped.
-pub struct ShutdownSignalGuard {
-    registered: bool,
-}
+pub struct ShutdownSignalGuard(());
 
 impl Drop for ShutdownSignalGuard {
     fn drop(&mut self) {
-        if self.registered {
-            if let Ok(mut guard) = CTRL_HOOK.lock() {
-                *guard = None;
-            }
-            // SAFETY: removes the exact handler registered in `install_shutdown_signals`.
-            unsafe {
-                SetConsoleCtrlHandler(Some(console_ctrl_handler), 0);
-            }
+        if let Ok(mut guard) = CTRL_HOOK.lock() {
+            *guard = None;
+        }
+        // SAFETY: removes the exact handler registered in `install_shutdown_signals`.
+        unsafe {
+            SetConsoleCtrlHandler(Some(console_ctrl_handler), 0);
         }
     }
 }
@@ -149,7 +145,7 @@ pub fn install_shutdown_signals(
         }
         return Err(io::Error::last_os_error());
     }
-    Ok(ShutdownSignalGuard { registered: true })
+    Ok(ShutdownSignalGuard(()))
 }
 
 fn owned_by(pipe: &impl AsHandle, sid: &widestring::U16CStr) -> io::Result<bool> {
@@ -232,6 +228,8 @@ mod tests {
         let Stream::NamedPipe(client) = client_th.join().expect("join");
 
         assert!(owned_by_this_user(&client).expect("owner check"));
+        let Stream::NamedPipe(server_pipe) = &*server;
+        assert!(client_is_this_user(server_pipe).expect("client user check"));
         let system = widestring::U16CString::from_str("S-1-5-18").expect("system sid");
         assert!(!owned_by(&client, &system).expect("not SYSTEM"));
 
@@ -282,5 +280,23 @@ mod tests {
         assert!(!let_go(&idle_server, || {}));
         assert!(hang_up(&idle_server));
         assert!(!hang_up(&idle_server));
+    }
+
+    #[test]
+    fn shutdown_signal_guard_registers_invokes_and_unregisters() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let woke = Arc::new(AtomicBool::new(false));
+        let woke_cb = Arc::clone(&woke);
+        let guard = install_shutdown_signals(Arc::clone(&flag), move || {
+            woke_cb.store(true, Ordering::Release);
+        })
+        .expect("install console ctrl handler");
+        // SAFETY: invoking the registered callback directly simulates an OS console control event.
+        assert_eq!(unsafe { console_ctrl_handler(0) }, 1);
+        assert!(flag.load(Ordering::Acquire));
+        assert!(woke.load(Ordering::Acquire));
+        drop(guard);
+        // SAFETY: after dropping the guard, CTRL_HOOK is cleared and the callback returns 0.
+        assert_eq!(unsafe { console_ctrl_handler(0) }, 0);
     }
 }

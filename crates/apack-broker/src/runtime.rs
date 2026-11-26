@@ -98,6 +98,11 @@ impl BrokerHandle {
         &self.socket_path
     }
 
+    #[cfg(all(test, windows))]
+    pub(crate) fn is_finished(&self) -> bool {
+        self.thread.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
     /// Signals clean shutdown and waits for the reactor and all shards to exit.
     pub fn shutdown(&mut self) -> std::io::Result<()> {
         self.shutdown.store(true, Ordering::Release);
