@@ -1,5 +1,5 @@
 //! Binary on-disk format for `meta.apkm`, framed WAL records, dual-layer `KeyframeV2`, and
-//! 32-byte sealed segment footers.
+//! 40-byte sealed segment footers.
 //!
 //! All framing is little-endian, bounds-checked, and protected by trailing Castagnoli CRC32C
 //! checksums.
@@ -33,11 +33,15 @@ pub const RECORD_HEADER_LEN: usize = 16;
 /// Trailing CRC32C length appended to every framed record.
 pub const RECORD_TRAILER_LEN: usize = 4;
 
+/// Minimum encoded byte length of a single valid framed record (`header + trailer`).
+pub const MIN_RECORD_LEN: usize = RECORD_HEADER_LEN + RECORD_TRAILER_LEN;
+
 /// Magic bytes at offset `0` of a sealed segment footer (byte `0` is `b'A'`, disjoint from record kinds `1..=5`).
 pub const SEGMENT_FOOTER_MAGIC: [u8; 8] = *b"APKFTR2\0";
 
-/// Exact byte length of a sealed segment footer (`magic[8] + first_ms[8] + last_ms[8] + record_count[4] + crc32c[4]`).
-pub const SEGMENT_FOOTER_LEN: usize = 32;
+/// Exact byte length of a sealed segment footer
+/// (`magic[8] + first_ms[8] + last_ms[8] + records_end_offset[8] + record_count[4] + crc32c[4]`).
+pub const SEGMENT_FOOTER_LEN: usize = 40;
 
 /// Maximum on-disk payload bytes of a single WAL record (`16 MiB`).
 pub const MAX_RECORD_PAYLOAD: usize = 16 << 20;
@@ -127,31 +131,37 @@ impl RecordingMeta {
     }
 }
 
-/// 32-byte immutable footer appended when sealing a segment file for $O(1)$ `Rewind` open.
+/// 40-byte immutable footer appended when sealing a segment file for $O(1)$ `Rewind` open.
+///
+/// Commits `records_end_offset` (the exact byte offset at which the footer begins) so untrusted
+/// PTY output embedded inside a record can never spoof a valid footer at EOF.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentFooter {
     /// Timestamp of record 0 in the segment.
     pub first_ms: u64,
     /// Timestamp of the last record in the segment (`>= first_ms`).
     pub last_ms: u64,
+    /// Exact byte offset where framed records end and this footer starts (`>= MIN_RECORD_LEN`).
+    pub records_end_offset: u64,
     /// Number of valid records in the segment (`>= 1`).
     pub record_count: u32,
 }
 
 impl SegmentFooter {
-    /// Encodes the footer into its exact 32-byte CRC32C-protected representation.
+    /// Encodes the footer into its exact 40-byte CRC32C-protected representation.
     pub fn encode(&self) -> [u8; SEGMENT_FOOTER_LEN] {
         let mut out = [0u8; SEGMENT_FOOTER_LEN];
         out[0..8].copy_from_slice(&SEGMENT_FOOTER_MAGIC);
         out[8..16].copy_from_slice(&self.first_ms.to_le_bytes());
         out[16..24].copy_from_slice(&self.last_ms.to_le_bytes());
-        out[24..28].copy_from_slice(&self.record_count.to_le_bytes());
-        let checksum = crc32c(&out[0..28]);
-        out[28..32].copy_from_slice(&checksum.to_le_bytes());
+        out[24..32].copy_from_slice(&self.records_end_offset.to_le_bytes());
+        out[32..36].copy_from_slice(&self.record_count.to_le_bytes());
+        let checksum = crc32c(&out[0..36]);
+        out[36..40].copy_from_slice(&checksum.to_le_bytes());
         out
     }
 
-    /// Decodes and verifies a 32-byte segment footer.
+    /// Decodes and verifies a 40-byte segment footer.
     pub fn decode(bytes: &[u8]) -> Result<Self, WalError> {
         if bytes.len() != SEGMENT_FOOTER_LEN {
             return Err(WalError::InvalidFormat("segment footer length"));
@@ -159,17 +169,18 @@ impl SegmentFooter {
         if bytes[0..8] != SEGMENT_FOOTER_MAGIC {
             return Err(WalError::InvalidFormat("segment footer magic"));
         }
-        let expected_crc = u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
-        if crc32c(&bytes[0..28]) != expected_crc {
+        let expected_crc = u32::from_le_bytes([bytes[36], bytes[37], bytes[38], bytes[39]]);
+        if crc32c(&bytes[0..36]) != expected_crc {
             return Err(WalError::ChecksumMismatch("segment footer"));
         }
         let first_ms = u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes"));
         let last_ms = u64::from_le_bytes(bytes[16..24].try_into().expect("8 bytes"));
-        let record_count = u32::from_le_bytes(bytes[24..28].try_into().expect("4 bytes"));
-        if last_ms < first_ms || record_count == 0 {
+        let records_end_offset = u64::from_le_bytes(bytes[24..32].try_into().expect("8 bytes"));
+        let record_count = u32::from_le_bytes(bytes[32..36].try_into().expect("4 bytes"));
+        if last_ms < first_ms || record_count == 0 || records_end_offset < MIN_RECORD_LEN as u64 {
             return Err(WalError::CorruptSegment("invalid footer bounds"));
         }
-        Ok(Self { first_ms, last_ms, record_count })
+        Ok(Self { first_ms, last_ms, records_end_offset, record_count })
     }
 }
 
@@ -205,6 +216,14 @@ pub struct VisualKeyframe {
 }
 
 impl VisualKeyframe {
+    fn validate_bounds(&self) -> Result<(), WalError> {
+        check_payload_limit(self.primary_rows.len(), MAX_VISUAL_PRIMARY_ROWS, "visual primary_rows")?;
+        check_payload_limit(self.alt_rows.len(), MAX_VISUAL_ALT_ROWS, "visual alt_rows")?;
+        check_payload_limit(self.images.len(), MAX_VISUAL_IMAGES, "visual images")?;
+        check_payload_limit(self.commands.len(), MAX_COMMANDS, "visual commands")?;
+        Ok(())
+    }
+
     fn encode(&self, w: &mut Writer) {
         self.size.encode(w);
         self.cell_px.encode(w);
@@ -308,6 +327,15 @@ impl KeyframeV2 {
         blobs
     }
 
+    /// Validates all decode-side count and size bounds before serialization.
+    pub(crate) fn validate_bounds(&self) -> Result<(), WalError> {
+        self.visual.validate_bounds()?;
+        if let Some(engine) = &self.engine {
+            check_payload_limit(engine.snapshot_bytes.len(), MAX_ENGINE_SNAPSHOT_BYTES, "engine checkpoint")?;
+        }
+        Ok(())
+    }
+
     fn encode_uncompressed(&self) -> Vec<u8> {
         let mut w = Writer::new();
         self.visual.encode(&mut w);
@@ -346,10 +374,7 @@ impl GapReason {
             1 => Ok(Self::NonGroundCap),
             2 => Ok(Self::BacklogOverflow),
             3 => Ok(Self::DiskError),
-            other => Err(WalError::Wire(apack_proto::codec::WireError::InvalidTag {
-                kind: "GapReason",
-                tag: u16::from(other),
-            })),
+            other => Err(WalError::Wire(WireError::InvalidTag { kind: "GapReason", tag: u16::from(other) })),
         }
     }
 }
@@ -404,6 +429,7 @@ pub(crate) fn check_payload_limit(len: usize, max: usize, what: &'static str) ->
 pub fn encode_framed_record(at_ms: u64, record: &WalRecord, out: &mut Vec<u8>) -> Result<(), WalError> {
     let (kind, flags, payload): (u8, u8, Vec<u8>) = match record {
         WalRecord::Keyframe(kf) => {
+            kf.validate_bounds()?;
             let raw = kf.encode_uncompressed();
             check_payload_limit(raw.len(), MAX_KEYFRAME_UNCOMPRESSED, "keyframe uncompressed bytes")?;
             let compressed = compress_to_vec_zlib(&raw, ZLIB_COMPRESSION_LEVEL);
@@ -451,41 +477,55 @@ pub fn encode_framed_record(at_ms: u64, record: &WalRecord, out: &mut Vec<u8>) -
 /// Outcome of scanning raw segment bytes from offset `0`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentScan {
-    /// All valid records decoded before footer or torn tail.
+    /// All valid records decoded before footer or torn tail (record 0 is guaranteed `Keyframe`).
     pub records: Vec<TimedRecord>,
     /// Byte offset of the end of the last valid record (truncation point on crash recovery).
     pub valid_records_end: usize,
-    /// Present iff a valid 32-byte [`SegmentFooter`] terminated the file cleanly.
+    /// Present iff a valid 40-byte [`SegmentFooter`] terminated the file cleanly and matched all records.
     pub footer: Option<SegmentFooter>,
-    /// `true` iff trailing bytes after `valid_records_end` were truncated or failed CRC32C.
+    /// `true` iff trailing bytes after `valid_records_end` were truncated, corrupt, or invalid.
     pub had_torn_tail: bool,
 }
 
-/// Scans a raw segment byte buffer sequentially, validating every record's CRC32C and payload.
+/// Scans a raw segment byte buffer sequentially, validating every record's CRC32C, payload,
+/// monotonic timestamps, single-keyframe-at-index-0 invariant, and optional trailing footer.
 ///
-/// Stops cleanly at a valid trailing [`SegmentFooter`], or sets `had_torn_tail = true` and stops
-/// at `valid_records_end` if the tail was torn mid-write or corrupted.
+/// Rejects any second `KeyframeV2` after record 0 (neutralizing multi-keyframe zlib amplification
+/// bombs) and stops cleanly at `valid_records_end` if a torn tail or corruption is encountered.
 pub fn scan_segment(bytes: &[u8]) -> SegmentScan {
-    let mut records = Vec::new();
+    let mut records: Vec<TimedRecord> = Vec::new();
     let mut rest = bytes;
     let mut footer = None;
     let mut had_torn_tail = false;
 
     while !rest.is_empty() {
+        let valid_so_far = bytes.len() - rest.len();
         if rest.len() == SEGMENT_FOOTER_LEN && rest[0..8] == SEGMENT_FOOTER_MAGIC {
-            if let Ok(parsed_footer) = SegmentFooter::decode(rest) {
-                if usize::try_from(parsed_footer.record_count).ok() == Some(records.len()) {
-                    footer = Some(parsed_footer);
-                } else {
-                    had_torn_tail = true;
-                }
+            if let Ok(parsed_footer) = SegmentFooter::decode(rest)
+                && let (Some(first), Some(last)) = (records.first(), records.last())
+                && usize::try_from(parsed_footer.record_count).ok() == Some(records.len())
+                && parsed_footer.records_end_offset == valid_so_far as u64
+                && parsed_footer.first_ms == first.at_ms
+                && parsed_footer.last_ms == last.at_ms
+            {
+                footer = Some(parsed_footer);
             } else {
                 had_torn_tail = true;
             }
             break;
         }
-        match decode_one_record(rest) {
+        // Only record 0 may be a KeyframeV2 (rejects multi-keyframe zlib amplification bombs BEFORE inflating!).
+        let allow_keyframe = records.is_empty();
+        match decode_one_record_checked(rest, allow_keyframe) {
             Ok((timed, consumed)) => {
+                if records.is_empty() && !matches!(timed.record, WalRecord::Keyframe(_)) {
+                    had_torn_tail = true;
+                    break;
+                }
+                if records.last().is_some_and(|prev| timed.at_ms < prev.at_ms) {
+                    had_torn_tail = true;
+                    break;
+                }
                 records.push(timed);
                 rest = &rest[consumed..];
             }
@@ -502,10 +542,17 @@ pub fn scan_segment(bytes: &[u8]) -> SegmentScan {
 
 /// Decodes one framed record from the beginning of `bytes`, returning `(record, bytes_consumed)`.
 pub fn decode_one_record(bytes: &[u8]) -> Result<(TimedRecord, usize), WalError> {
-    if bytes.len() < RECORD_HEADER_LEN + RECORD_TRAILER_LEN {
+    decode_one_record_checked(bytes, true)
+}
+
+fn decode_one_record_checked(bytes: &[u8], allow_keyframe: bool) -> Result<(TimedRecord, usize), WalError> {
+    if bytes.len() < MIN_RECORD_LEN {
         return Err(WalError::InvalidFormat("truncated record header"));
     }
     let kind = bytes[0];
+    if kind == KIND_KEYFRAME_V2 && !allow_keyframe {
+        return Err(WalError::CorruptSegment("unexpected keyframe after record 0"));
+    }
     let flags = bytes[1];
     let reserved = u16::from_le_bytes([bytes[2], bytes[3]]);
     if reserved != 0 {

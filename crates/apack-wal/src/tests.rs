@@ -4,6 +4,7 @@ use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 
+use apack_proto::MAX_COMMANDS;
 use apack_proto::codec::WireError;
 use apack_proto::types::{
     BlobHash, CellPx, CommandOutcome, CommandRecord, CursorShape, CursorState, GridSize, ImageEncoding, ImagePiece,
@@ -12,7 +13,8 @@ use apack_proto::types::{
 use tempfile::tempdir;
 
 use crate::blobs::{
-    blob_filename, check_blob_size, hash_blob, parse_blob_filename, read_blob, sweep_unreferenced, write_blob,
+    blob_filename, blobs_total_bytes, check_file_size, hash_blob, parse_blob_filename, read_blob,
+    read_regular_file_bounded, sweep_unreferenced, sync_dir, verify_existing_blob_hash, write_blob,
 };
 use crate::crc32c::{crc32c, crc32c_append};
 use crate::directory::{
@@ -20,15 +22,18 @@ use crate::directory::{
     segment_filename,
 };
 use crate::format::{
-    EngineCheckpoint, FORMAT_VERSION, GapReason, KeyframeV2, MAX_RECORD_PAYLOAD, META_LEN, META_MAGIC,
+    EngineCheckpoint, FORMAT_VERSION, GapReason, KeyframeV2, MAX_RECORD_PAYLOAD, META_LEN, META_MAGIC, MIN_RECORD_LEN,
     RECORD_FLAG_ZLIB, RECORD_HEADER_LEN, RecordingMeta, SEGMENT_FOOTER_LEN, SEGMENT_FOOTER_MAGIC, SegmentFooter,
     VisualKeyframe, WalRecord, check_payload_limit, decode_one_record, encode_framed_record, scan_segment,
 };
-use crate::reader::{WalReader, index_segment_allow_vanished, try_read_footer};
-use crate::writer::{RolloverHint, WalConfig, WalWorker, WalWriter, should_worker_wait, try_reserve_backlog};
+use crate::reader::{WalReader, read_sealed_header_and_footer, try_read_footer};
+use crate::writer::{
+    MAX_CONTROL_QUEUE_LEN, RolloverHint, WalConfig, WalWorker, WalWriter, should_worker_wait, try_reserve_backlog,
+    try_reserve_blob_backlog,
+};
 use crate::{
     DEFAULT_BUDGET_BYTES, DEFAULT_MAX_BACKLOG_BYTES, DEFAULT_MAX_NON_GROUND_BYTES, DEFAULT_SEGMENT_TARGET_BYTES,
-    MAX_BLOB_FILE_BYTES, MIN_SEGMENT_TARGET_BYTES, WalError,
+    MAX_BLOB_FILE_BYTES, MAX_SEGMENT_FILE_BYTES, MIN_SEGMENT_TARGET_BYTES, WalError,
 };
 
 fn sample_marks_key() -> MarksKey {
@@ -121,27 +126,22 @@ fn recording_meta_roundtrip_and_corruption_rejection() {
     assert_eq!(&encoded[0..8], &META_MAGIC);
     assert_eq!(RecordingMeta::decode(&encoded).unwrap(), meta);
 
-    // Wrong length
     assert!(matches!(RecordingMeta::decode(&encoded[..META_LEN - 1]), Err(WalError::InvalidFormat(_))));
 
-    // Wrong magic
     let mut bad_magic = encoded;
     bad_magic[0] ^= 0x01;
     assert!(matches!(RecordingMeta::decode(&bad_magic), Err(WalError::InvalidFormat(_))));
 
-    // Bit flip in body caught by CRC32C
     let mut bad_crc = encoded;
     bad_crc[15] ^= 0x80;
     assert!(matches!(RecordingMeta::decode(&bad_crc), Err(WalError::ChecksumMismatch(_))));
 
-    // Unsupported version (re-signed with valid CRC)
     let mut bad_ver = encoded;
     bad_ver[8..10].copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
     let crc = crc32c(&bad_ver[0..36]);
     bad_ver[36..40].copy_from_slice(&crc.to_le_bytes());
     assert!(matches!(RecordingMeta::decode(&bad_ver), Err(WalError::InvalidFormat(_))));
 
-    // Non-zero reserved flags (re-signed with valid CRC)
     let mut bad_flags = encoded;
     bad_flags[10..12].copy_from_slice(&1u16.to_le_bytes());
     let crc = crc32c(&bad_flags[0..36]);
@@ -151,7 +151,7 @@ fn recording_meta_roundtrip_and_corruption_rejection() {
 
 #[test]
 fn segment_footer_roundtrip_and_validation() {
-    let footer = SegmentFooter { first_ms: 100, last_ms: 500, record_count: 12 };
+    let footer = SegmentFooter { first_ms: 100, last_ms: 500, records_end_offset: 128, record_count: 12 };
     let encoded = footer.encode();
     assert_eq!(encoded.len(), SEGMENT_FOOTER_LEN);
     assert_eq!(&encoded[0..8], &SEGMENT_FOOTER_MAGIC);
@@ -167,13 +167,23 @@ fn segment_footer_roundtrip_and_validation() {
     bad_crc[20] ^= 0x01;
     assert!(matches!(SegmentFooter::decode(&bad_crc), Err(WalError::ChecksumMismatch(_))));
 
-    // Inverted timestamps rejected even with valid CRC
-    let inv = SegmentFooter { first_ms: 500, last_ms: 499, record_count: 1 }.encode();
+    // Inverted timestamps rejected
+    let inv = SegmentFooter { first_ms: 500, last_ms: 499, records_end_offset: 64, record_count: 1 }.encode();
     assert!(matches!(SegmentFooter::decode(&inv), Err(WalError::CorruptSegment(_))));
 
-    // Zero record count rejected even with valid CRC
-    let zero = SegmentFooter { first_ms: 100, last_ms: 100, record_count: 0 }.encode();
+    // Zero record count rejected
+    let zero = SegmentFooter { first_ms: 100, last_ms: 100, records_end_offset: 64, record_count: 0 }.encode();
     assert!(matches!(SegmentFooter::decode(&zero), Err(WalError::CorruptSegment(_))));
+
+    // records_end_offset < MIN_RECORD_LEN rejected
+    let tiny =
+        SegmentFooter { first_ms: 100, last_ms: 100, records_end_offset: (MIN_RECORD_LEN - 1) as u64, record_count: 1 }
+            .encode();
+    assert!(matches!(SegmentFooter::decode(&tiny), Err(WalError::CorruptSegment(_))));
+
+    // Exact MIN_RECORD_LEN and equal timestamps accepted
+    let exact = SegmentFooter { first_ms: 42, last_ms: 42, records_end_offset: MIN_RECORD_LEN as u64, record_count: 1 };
+    assert_eq!(SegmentFooter::decode(&exact.encode()).unwrap(), exact);
 }
 
 #[test]
@@ -206,7 +216,13 @@ fn all_wal_record_variants_roundtrip_and_abi_fallback() {
     for (at_ms, rec) in &records {
         encode_framed_record(*at_ms, rec, &mut stream).unwrap();
     }
-    let footer = SegmentFooter { first_ms: 1000, last_ms: 1035, record_count: records.len() as u32 };
+    let records_end = stream.len() as u64;
+    let footer = SegmentFooter {
+        first_ms: 1000,
+        last_ms: 1035,
+        records_end_offset: records_end,
+        record_count: records.len() as u32,
+    };
     stream.extend_from_slice(&footer.encode());
 
     let scan = scan_segment(&stream);
@@ -229,20 +245,17 @@ fn all_wal_record_variants_roundtrip_and_abi_fallback() {
 }
 
 #[test]
-fn decode_record_rejects_corrupt_headers_flags_lengths_and_crc() {
+fn decode_and_scan_reject_bombs_corrupt_headers_and_non_monotonic_records() {
     let mut buf = Vec::new();
     encode_framed_record(10, &WalRecord::Output(b"abc".to_vec()), &mut buf).unwrap();
 
-    // Too short
     assert!(matches!(decode_one_record(&buf[..RECORD_HEADER_LEN]), Err(WalError::InvalidFormat(_))));
-    // Truncated payload
     assert!(matches!(decode_one_record(&buf[..buf.len() - 1]), Err(WalError::InvalidFormat(_))));
-    // Corrupted CRC
+
     let mut bad_crc = buf.clone();
     *bad_crc.last_mut().unwrap() ^= 0xFF;
     assert!(matches!(decode_one_record(&bad_crc), Err(WalError::ChecksumMismatch(_))));
 
-    // Helper to build an arbitrarily framed header + payload with valid CRC.
     let frame = |kind: u8, flags: u8, reserved: u16, payload: &[u8]| -> Vec<u8> {
         let mut out = Vec::new();
         out.push(kind);
@@ -269,11 +282,47 @@ fn decode_record_rejects_corrupt_headers_flags_lengths_and_crc() {
     ));
     assert!(matches!(decode_one_record(&frame(5, 0, 0, &[0, 99])), Err(WalError::Wire(_))));
 
-    // Oversized payload_len rejected before indexing
     let mut oversized = [0u8; RECORD_HEADER_LEN + 4];
     oversized[0] = 2;
     oversized[12..16].copy_from_slice(&((MAX_RECORD_PAYLOAD as u32) + 1).to_le_bytes());
     assert!(matches!(decode_one_record(&oversized), Err(WalError::LimitExceeded(_))));
+
+    // encode_framed_record validates VisualKeyframe bounds BEFORE writing (> MAX_COMMANDS refused)
+    let mut bad_kf = sample_keyframe(None, None, None);
+    let template_cmd = bad_kf.visual.commands[0].clone();
+    bad_kf.visual.commands = vec![template_cmd; MAX_COMMANDS + 1];
+    assert!(matches!(
+        encode_framed_record(100, &WalRecord::Keyframe(Box::new(bad_kf)), &mut Vec::new()),
+        Err(WalError::LimitExceeded(_))
+    ));
+
+    // scan_segment rejects non-Keyframe at record 0
+    let mut non_kf_stream = Vec::new();
+    encode_framed_record(100, &WalRecord::Output(b"oops".to_vec()), &mut non_kf_stream).unwrap();
+    let non_kf_scan = scan_segment(&non_kf_stream);
+    assert!(non_kf_scan.had_torn_tail);
+    assert!(non_kf_scan.records.is_empty());
+
+    // scan_segment rejects a second KeyframeV2 at record 1 (anti-zlib-amplification-bomb invariant!)
+    let kf = sample_keyframe(None, None, None);
+    let mut double_kf = Vec::new();
+    encode_framed_record(100, &WalRecord::Keyframe(Box::new(kf.clone())), &mut double_kf).unwrap();
+    let after_first = double_kf.len();
+    encode_framed_record(110, &WalRecord::Keyframe(Box::new(kf.clone())), &mut double_kf).unwrap();
+    let bomb_scan = scan_segment(&double_kf);
+    assert!(bomb_scan.had_torn_tail);
+    assert_eq!(bomb_scan.records.len(), 1);
+    assert_eq!(bomb_scan.valid_records_end, after_first);
+
+    // scan_segment rejects backwards timestamp on record 1
+    let mut backwards = Vec::new();
+    encode_framed_record(200, &WalRecord::Keyframe(Box::new(kf)), &mut backwards).unwrap();
+    let first_end = backwards.len();
+    encode_framed_record(199, &WalRecord::Output(b"back".to_vec()), &mut backwards).unwrap();
+    let back_scan = scan_segment(&backwards);
+    assert!(back_scan.had_torn_tail);
+    assert_eq!(back_scan.records.len(), 1);
+    assert_eq!(back_scan.valid_records_end, first_end);
 }
 
 #[test]
@@ -288,11 +337,10 @@ fn blobs_write_dedup_read_verify_and_gc_sweep() {
 
     let h2 = write_blob(dir, ImageEncoding::ZstdRgba, b"fake-zst-payload-2").unwrap();
     assert_eq!(read_blob(dir, h2, ImageEncoding::ZstdRgba).unwrap(), b"fake-zst-payload-2");
+    assert_eq!(blobs_total_bytes(dir).unwrap(), (b"fake-png-payload-1".len() + b"fake-zst-payload-2".len()) as u64);
 
-    // Empty blob rejected
     assert!(matches!(write_blob(dir, ImageEncoding::Png, b""), Err(WalError::InvalidFormat(_))));
 
-    // Filename roundtrip & invalid parses
     let name = blob_filename(h1, ImageEncoding::Png);
     assert_eq!(parse_blob_filename(&name), Some((h1, ImageEncoding::Png)));
     assert_eq!(parse_blob_filename("short.png"), None);
@@ -305,6 +353,12 @@ fn blobs_write_dedup_read_verify_and_gc_sweep() {
     fs::write(&path_h2, b"tampered-payload!!").unwrap();
     assert!(matches!(read_blob(dir, h2, ImageEncoding::ZstdRgba), Err(WalError::CorruptBlob)));
 
+    // Truncated existing blob is overwritten cleanly on rewrite
+    fs::write(&path_h2, b"short").unwrap();
+    let rewritten = write_blob(dir, ImageEncoding::ZstdRgba, b"fake-zst-payload-2").unwrap();
+    assert_eq!(rewritten, h2);
+    assert_eq!(read_blob(dir, h2, ImageEncoding::ZstdRgba).unwrap(), b"fake-zst-payload-2");
+
     // Leftover temp file + unreferenced blob swept, live blob kept.
     fs::write(dir.join("blobs").join(".tmp-999-1"), b"junk").unwrap();
     let live: HashSet<BlobHash> = [h1].into_iter().collect();
@@ -316,33 +370,45 @@ fn blobs_write_dedup_read_verify_and_gc_sweep() {
 }
 
 #[test]
-fn directory_guards_refuse_foreign_dirs_symlinks_and_double_writers() {
+fn directory_guards_refuse_foreign_dirs_symlinks_non_canonical_ids_and_recover_meta_tmp() {
     let tmp = tempdir().unwrap();
 
-    // Non-empty directory without meta.apkm refused!
+    // Non-empty directory without meta.apkm refused
     let foreign = tmp.path().join("foreign");
     fs::create_dir(&foreign).unwrap();
     fs::write(foreign.join("important.txt"), b"do not touch").unwrap();
     assert!(matches!(prepare_recording_dir(&foreign), Err(WalError::ForeignDirectory)));
 
-    // Regular file at recording path refused!
+    // Directory containing ONLY leftover `.meta.tmp-*` crash staging files recovers cleanly!
+    let crash_meta_dir = tmp.path().join("crash-meta");
+    fs::create_dir(&crash_meta_dir).unwrap();
+    fs::write(crash_meta_dir.join(".meta.tmp-1234-1"), b"half-written").unwrap();
+    assert_eq!(prepare_recording_dir(&crash_meta_dir).unwrap(), None);
+    assert!(!crash_meta_dir.join(".meta.tmp-1234-1").exists());
+
+    // Regular file at recording path refused
     let reg_file = tmp.path().join("not-a-dir");
     fs::write(&reg_file, b"file").unwrap();
     assert!(matches!(prepare_recording_dir(&reg_file), Err(WalError::ForeignDirectory)));
 
-    // Segment filename parsing
+    // Segment filename parsing enforces canonical format and rejects u64::MAX
     assert_eq!(segment_filename(1), "seg-000001.apks");
     assert_eq!(parse_segment_id("seg-000001.apks"), Some(1));
     assert_eq!(parse_segment_id("seg-1234567.apks"), Some(1_234_567));
+    assert_eq!(parse_segment_id("seg-0000001.apks"), None);
     assert_eq!(parse_segment_id("seg-000000.apks"), None);
     assert_eq!(parse_segment_id("seg-00001.apks"), None);
     assert_eq!(parse_segment_id("seg-00000a.apks"), None);
     assert_eq!(parse_segment_id("other-000001.apks"), None);
+    assert_eq!(parse_segment_id(&format!("seg-{}.apks", u64::MAX)), None);
 
-    // Single-writer claim exclusivity + Drop release
+    // Single-writer claim exclusivity + cross-platform read_meta & discover_segments
     let rec_dir = tmp.path().join("rec");
     let registry = RecordingRegistry::new();
     let writer = WalWriter::open_or_create(&rec_dir, [1; 16], 500, WalConfig::default(), registry.clone()).unwrap();
+    assert!(rec_dir.join(META_FILENAME).exists());
+    assert_eq!(read_meta(&rec_dir).unwrap().created_ms, 500);
+    assert!(discover_segments(&rec_dir).unwrap().is_empty());
     assert!(registry.is_claimed(&rec_dir));
     assert!(matches!(
         WalWriter::open_or_create(&rec_dir, [1; 16], 500, WalConfig::default(), registry.clone()),
@@ -351,13 +417,20 @@ fn directory_guards_refuse_foreign_dirs_symlinks_and_double_writers() {
     drop(writer);
     assert!(!registry.is_claimed(&rec_dir));
 
-    // Symlink refusal on Unix
+    // Directory named like a segment file is rejected by discover_segments (non-regular file)
+    let bad_seg_dir = tmp.path().join("dir-as-seg");
+    fs::create_dir(&bad_seg_dir).unwrap();
+    fs::create_dir(bad_seg_dir.join("seg-000001.apks")).unwrap();
+    assert!(matches!(discover_segments(&bad_seg_dir), Err(WalError::InvalidFormat(_))));
+
+    // Symlink refusal on Unix across root, meta, segments, and blobs/
     #[cfg(unix)]
     {
         use std::os::unix::fs::symlink;
         let link_dir = tmp.path().join("sym-rec");
         symlink(&rec_dir, &link_dir).unwrap();
         assert!(matches!(prepare_recording_dir(&link_dir), Err(WalError::SymlinkRefused)));
+        assert!(matches!(WalReader::open(&link_dir, &registry), Err(WalError::SymlinkRefused)));
 
         let meta_link_dir = tmp.path().join("meta-link");
         fs::create_dir(&meta_link_dir).unwrap();
@@ -368,38 +441,47 @@ fn directory_guards_refuse_foreign_dirs_symlinks_and_double_writers() {
         fs::create_dir(&seg_link_dir).unwrap();
         symlink(&reg_file, seg_link_dir.join("seg-000001.apks")).unwrap();
         assert!(matches!(discover_segments(&seg_link_dir), Err(WalError::SymlinkRefused)));
+
+        let victim_dir = tmp.path().join("victim");
+        fs::create_dir(&victim_dir).unwrap();
+        let victim_hash = hash_blob(b"do-not-delete");
+        let victim_file = victim_dir.join(blob_filename(victim_hash, ImageEncoding::Png));
+        fs::write(&victim_file, b"do-not-delete").unwrap();
+
+        let sym_blobs_root = tmp.path().join("sym-blobs-root");
+        fs::create_dir(&sym_blobs_root).unwrap();
+        symlink(&victim_dir, sym_blobs_root.join("blobs")).unwrap();
+        assert!(matches!(sweep_unreferenced(&sym_blobs_root, &HashSet::new()), Err(WalError::SymlinkRefused)));
+        assert!(matches!(read_blob(&sym_blobs_root, victim_hash, ImageEncoding::Png), Err(WalError::SymlinkRefused)));
+        assert!(matches!(blobs_total_bytes(&sym_blobs_root), Err(WalError::SymlinkRefused)));
+        assert!(victim_file.exists(), "symlinked blobs/ must never be swept");
     }
 }
 
 #[test]
-fn torn_tail_crash_recovery_at_every_byte_offset() {
+fn torn_tail_crash_recovery_at_every_byte_offset_and_earlier_unsealed_repair() {
     let tmp = tempdir().unwrap();
     let rec_dir = tmp.path().join("crash-rec");
     let registry = RecordingRegistry::new();
     let kf = sample_keyframe(None, None, None);
 
-    // Produce a clean 2-record unsealed segment and capture its exact raw bytes.
     let mut writer = WalWriter::open_or_create(&rec_dir, [2; 16], 100, WalConfig::default(), registry.clone()).unwrap();
     writer.start_segment_with_keyframe(100, &kf).unwrap();
     writer.record_output(110, b"first-clean-output", true).unwrap();
-    writer.flush().unwrap();
     let clean_len = fs::metadata(rec_dir.join("seg-000001.apks")).unwrap().len() as usize;
 
     writer.record_output(120, b"torn-second-record-payload", true).unwrap();
-    writer.flush().unwrap();
     let full_bytes = fs::read(rec_dir.join("seg-000001.apks")).unwrap();
     drop(writer);
     assert!(full_bytes.len() > clean_len);
 
-    // Truncate inside the second record at EVERY single byte offset and confirm open_or_create
-    // truncates cleanly back to `clean_len` and preserves record 0 + record 1!
+    // Truncate inside record 2 at every byte offset and confirm exact recovery.
     for cut in (clean_len + 1)..full_bytes.len() {
         fs::write(rec_dir.join("seg-000001.apks"), &full_bytes[..cut]).unwrap();
         let mut resumed =
             WalWriter::open_or_create(&rec_dir, [2; 16], 100, WalConfig::default(), registry.clone()).unwrap();
         assert_eq!(fs::metadata(rec_dir.join("seg-000001.apks")).unwrap().len() as usize, clean_len);
         resumed.record_output(130, b"recovered-ok", true).unwrap();
-        resumed.flush().unwrap();
         drop(resumed);
 
         let reader = WalReader::open(&rec_dir, &registry).unwrap();
@@ -409,15 +491,31 @@ fn torn_tail_crash_recovery_at_every_byte_offset() {
         assert_eq!(latest.tail_records[1].record, WalRecord::Output(b"recovered-ok".to_vec()));
     }
 
-    // Corrupting record 0 entirely causes recovery to remove the unusable segment cleanly.
-    fs::write(rec_dir.join("seg-000001.apks"), &full_bytes[..10]).unwrap();
+    // Earlier unsealed segment + corrupt earlier segment are repaired/removed cleanly on reopen!
+    fs::write(rec_dir.join("seg-000001.apks"), &full_bytes[..clean_len]).unwrap(); // unsealed earlier
+    fs::write(rec_dir.join("seg-000002.apks"), b"corrupt-earlier-seg").unwrap(); // corrupt earlier
+    fs::write(rec_dir.join("seg-000003.apks"), &full_bytes[..clean_len]).unwrap(); // active tail
     let resumed = WalWriter::open_or_create(&rec_dir, [2; 16], 100, WalConfig::default(), registry.clone()).unwrap();
-    assert_eq!(resumed.active_segment_id(), None);
-    assert!(!rec_dir.join("seg-000001.apks").exists());
+    assert!(!rec_dir.join("seg-000002.apks").exists(), "corrupt earlier segment removed");
+    assert_eq!(resumed.segment_count(), 2);
+    assert_eq!(
+        resumed.total_segment_bytes(),
+        (clean_len + SEGMENT_FOOTER_LEN + clean_len) as u64,
+        "repaired sealed segment size must include footer length"
+    );
+    assert!(try_read_footer(&rec_dir.join("seg-000001.apks")).unwrap().is_some(), "earlier unsealed segment sealed");
+    drop(resumed);
+
+    // Corrupting record 0 entirely removes the unusable segment cleanly.
+    fs::remove_file(rec_dir.join("seg-000001.apks")).unwrap();
+    fs::write(rec_dir.join("seg-000003.apks"), &full_bytes[..10]).unwrap();
+    let resumed2 = WalWriter::open_or_create(&rec_dir, [2; 16], 100, WalConfig::default(), registry.clone()).unwrap();
+    assert_eq!(resumed2.active_segment_id(), None);
+    assert!(!rec_dir.join("seg-000003.apks").exists());
 }
 
 #[test]
-fn rollover_budget_eviction_pin_protection_and_blob_gc() {
+fn rollover_budget_eviction_pin_protection_live_blob_safety_and_gc() {
     let tmp = tempdir().unwrap();
     let rec_dir = tmp.path().join("budget-rec");
     let registry = RecordingRegistry::new();
@@ -436,46 +534,61 @@ fn rollover_budget_eviction_pin_protection_and_blob_gc() {
     let blob2 = writer.write_blob(ImageEncoding::Png, b"image-blob-seg-2").unwrap();
     let blob3 = writer.write_blob(ImageEncoding::Png, b"image-blob-seg-3").unwrap();
 
-    // Segment 1 (referencing blob1)
+    // Segment 1 (referencing blob1; note blob2/blob3 were staged before seg-1, so rollover clears pending_blobs!)
     writer.start_segment_with_keyframe(1_000, &sample_keyframe(Some(blob1), None, None)).unwrap();
+    assert!(
+        !rec_dir.join("blobs").join(blob_filename(blob2, ImageEncoding::Png)).exists(),
+        "unreferenced blob2 swept on rollover"
+    );
+    assert!(
+        !rec_dir.join("blobs").join(blob_filename(blob3, ImageEncoding::Png)).exists(),
+        "unreferenced blob3 swept on rollover"
+    );
+
+    // Re-stage blob2 mid-segment and confirm it stays pinned while seg-1 is active!
+    let blob2 = writer.write_blob(ImageEncoding::Png, b"image-blob-seg-2").unwrap();
     let hint = writer.record_output(1_100, &vec![b'A'; 4_500], true).unwrap();
     assert_eq!(hint, RolloverHint::NeedKeyframe);
 
-    // Segment 2 (referencing blob2) — total ~9.5 KiB > 9 KiB -> would evict seg-1 if unpinned!
     // Pin seg-1 by opening a WalReader BEFORE rolling over!
-    writer.flush().unwrap();
     let reader_pinning_seg1 = WalReader::open(&rec_dir, &registry).unwrap();
     assert_eq!(reader_pinning_seg1.segments().len(), 1);
     assert_eq!(reader_pinning_seg1.segments()[0].id, 1);
 
     let ev1 = writer.start_segment_with_keyframe(2_000, &sample_keyframe(Some(blob2), None, None)).unwrap();
     assert_eq!(ev1.evicted_segments, 0);
-    assert!(ev1.skipped_pinned >= 1 || writer.total_segment_bytes() <= cfg.budget_bytes);
     writer.record_output(2_100, &vec![b'B'; 4_500], true).unwrap();
 
-    // Segment 3 (referencing blob3) — seg-1 is STILL pinned, so seg-2 gets evicted instead!
+    // Stage blob3 right before rolling to seg-3 -> seg-1 stays pinned, seg-2 evicted, blob2 swept, blob1+blob3 kept!
+    let blob3 = writer.write_blob(ImageEncoding::Png, b"image-blob-seg-3").unwrap();
     let ev2 = writer.start_segment_with_keyframe(3_000, &sample_keyframe(Some(blob3), None, None)).unwrap();
     assert!(rec_dir.join("seg-000001.apks").exists(), "pinned seg-1 must not be unlinked");
     assert_eq!(ev2.skipped_pinned, 1);
     assert_eq!(ev2.evicted_segments, 1);
     assert!(!rec_dir.join("seg-000002.apks").exists(), "unpinned seg-2 evicted");
-    assert!(!rec_dir.join("blobs").join(blob_filename(blob2, ImageEncoding::Png)).exists(), "blob2 swept");
+    // Note: blob2 was also written during seg-1 so seg-1's referenced_blobs includes it until seg-1 is evicted.
     assert!(rec_dir.join("blobs").join(blob_filename(blob1, ImageEncoding::Png)).exists(), "blob1 kept for seg-1");
     assert!(rec_dir.join("blobs").join(blob_filename(blob3, ImageEncoding::Png)).exists(), "blob3 kept for seg-3");
 
-    // Drop reader -> unpins seg-1 -> next eviction cleans seg-1 and sweeps blob1!
+    // Mid-segment live blob written during seg-3 is NOT deleted when seg-1 is evicted!
+    let live_mid = writer.write_blob(ImageEncoding::Png, b"mid-segment-live-blob").unwrap();
     drop(reader_pinning_seg1);
     writer.record_output(3_100, &vec![b'C'; 4_500], true).unwrap();
     let ev3 = writer.evict_to_budget().unwrap();
     assert_eq!(ev3.evicted_segments, 1);
-    assert_eq!(ev3.swept_blobs, 1);
+    assert_eq!(ev3.swept_blobs, 2); // blob1 + blob2 swept once seg-1 is gone!
     assert!(!rec_dir.join("seg-000001.apks").exists());
     assert!(!rec_dir.join("blobs").join(blob_filename(blob1, ImageEncoding::Png)).exists());
+    assert!(!rec_dir.join("blobs").join(blob_filename(blob2, ImageEncoding::Png)).exists());
     assert!(rec_dir.join("blobs").join(blob_filename(blob3, ImageEncoding::Png)).exists());
+    assert!(
+        rec_dir.join("blobs").join(blob_filename(live_mid, ImageEncoding::Png)).exists(),
+        "live mid-segment blob must survive eviction sweep!"
+    );
 }
 
 #[test]
-fn seek_binary_search_reads_single_segment_and_respects_monotonic_timestamps() {
+fn seek_binary_search_sealed_integrity_and_monotonic_segment_validation() {
     let tmp = tempdir().unwrap();
     let rec_dir = tmp.path().join("seek-rec");
     let registry = RecordingRegistry::new();
@@ -490,10 +603,10 @@ fn seek_binary_search_reads_single_segment_and_respects_monotonic_timestamps() {
         assert!(r.records_for_moment(100).unwrap().is_none());
     }
 
-    // Segment 1: t = 1000..1200 (with out-of-order clock rollback clamped to 1100)
+    // Segment 1: t = 1000..1200 (clock rollback clamped to 1100)
     writer.start_segment_with_keyframe(1_000, &sample_keyframe(None, None, None)).unwrap();
     writer.record_output(1_100, b"s1-a", true).unwrap();
-    writer.record_output(900, b"s1-rollback-clamped", true).unwrap(); // clamped to 1100!
+    writer.record_output(900, b"s1-rollback-clamped", true).unwrap();
     writer.record_output(1_200, b"s1-b", true).unwrap();
 
     // Segment 2: t = 2000..2200
@@ -505,7 +618,7 @@ fn seek_binary_search_reads_single_segment_and_respects_monotonic_timestamps() {
     // Segment 3 (unsealed active tail): t = 3000..3100
     writer.start_segment_with_keyframe(3_000, &sample_keyframe(None, None, None)).unwrap();
     writer.record_output(3_100, b"s3-active", true).unwrap();
-    writer.flush().unwrap();
+    drop(writer);
 
     let reader = WalReader::open(&rec_dir, &registry).unwrap();
     assert_eq!(reader.segments().len(), 3);
@@ -514,58 +627,76 @@ fn seek_binary_search_reads_single_segment_and_respects_monotonic_timestamps() {
     assert!(!reader.segments()[2].sealed);
     assert_eq!(reader.span(), Some((1_000, 3_100)));
 
-    // Seek before start -> segment 1 keyframe only
+    // Verify fast sealed header+footer reader works on seg-1
+    let (hdr_rec, hdr_ftr, _) = read_sealed_header_and_footer(&rec_dir.join("seg-000001.apks")).unwrap().unwrap();
+    assert_eq!(hdr_rec.at_ms, 1_000);
+    assert_eq!(hdr_ftr.last_ms, 1_200);
+
     let before = reader.records_for_moment(500).unwrap().unwrap();
     assert_eq!(before.segment_id, 1);
     assert!(before.tail_records.is_empty());
 
-    // Seek at 1100 -> includes rollback-clamped record, excludes 1200
     let mid1 = reader.records_for_moment(1_100).unwrap().unwrap();
     assert_eq!(mid1.segment_id, 1);
     assert_eq!(mid1.tail_records.len(), 2);
     assert_eq!(mid1.tail_records[1].at_ms, 1_100);
 
-    // Seek inside segment 2 at 2150 -> s2-a + resize, excludes s2-b
     let mid2 = reader.records_for_moment(2_150).unwrap().unwrap();
     assert_eq!(mid2.segment_id, 2);
     assert_eq!(mid2.tail_records.len(), 2);
 
-    // Seek at 9999 -> segment 3 with active record
     let end = reader.records_for_moment(9_999).unwrap().unwrap();
     assert_eq!(end.segment_id, 3);
     assert_eq!(end.tail_records.len(), 1);
 
-    // Restore (`latest_segment_records`) returns segment 3
     let latest = reader.latest_segment_records().unwrap().unwrap();
     assert_eq!(latest.segment_id, 3);
     assert_eq!(latest.tail_records.len(), 1);
+
+    // Flip a byte inside sealed seg-2's body (footer intact): load_segment_slice must fail with CorruptSegment!
+    let seg2_path = rec_dir.join("seg-000002.apks");
+    let mut seg2_bytes = fs::read(&seg2_path).unwrap();
+    let mid_byte = seg2_bytes.len() - SEGMENT_FOOTER_LEN - 10;
+    seg2_bytes[mid_byte] ^= 0x55;
+    fs::write(&seg2_path, &seg2_bytes).unwrap();
+    assert!(matches!(reader.records_for_moment(2_150), Err(WalError::CorruptSegment(_))));
+    drop(reader);
+
+    // Non-monotonic segment timestamps across segments rejected by WalReader::open!
+    let mut seg4 = Vec::new();
+    encode_framed_record(500, &WalRecord::Keyframe(Box::new(sample_keyframe(None, None, None))), &mut seg4).unwrap();
+    fs::write(rec_dir.join("seg-000004.apks"), &seg4).unwrap();
+    assert!(matches!(WalReader::open(&rec_dir, &registry), Err(WalError::CorruptSegment(_))));
 }
 
 #[test]
-fn non_ground_run_cap_emits_explicit_gap_marker() {
+fn non_ground_run_cap_emits_explicit_gap_marker_and_no_active_does_not_advance_clock() {
     let tmp = tempdir().unwrap();
     let rec_dir = tmp.path().join("nonground-rec");
     let registry = RecordingRegistry::new();
     let cfg = WalConfig { max_non_ground_bytes: 100, ..WalConfig::default() };
 
     let mut writer = WalWriter::open_or_create(&rec_dir, [5; 16], 100, cfg, registry.clone()).unwrap();
-    // Calling record_output before starting a segment fails clearly.
-    assert!(matches!(writer.record_output(100, b"hi", true), Err(WalError::CorruptSegment(_))));
+    // Errors before starting a segment must NOT advance monotonic last_at_ms!
+    assert!(matches!(writer.record_output(9_999, b"hi", true), Err(WalError::CorruptSegment(_))));
+    assert!(matches!(
+        writer.record_resize(9_999, GridSize::new(80, 24).unwrap(), CellPx::default()),
+        Err(WalError::CorruptSegment(_))
+    ));
+    assert!(matches!(writer.record_marks(9_999, None, 0), Err(WalError::CorruptSegment(_))));
+    assert!(matches!(writer.record_gap(9_999, 1, GapReason::DiskError), Err(WalError::CorruptSegment(_))));
 
     writer.start_segment_with_keyframe(100, &sample_keyframe(None, None, None)).unwrap();
-    // 80 bytes non-ground: still under 100 cap -> written
     writer.record_output(110, &[b'x'; 80], false).unwrap();
-    // 50 bytes non-ground: pushes run to 130 > 100 -> paused/dropped (50 bytes)
     writer.record_output(120, &[b'y'; 50], false).unwrap();
-    // 70 more bytes non-ground: dropped (total 120 bytes)
     writer.record_output(130, &[b'z'; 70], false).unwrap();
-    // Ground resumes -> flushes Gap(120, NonGroundCap) then writes "back"
     writer.record_output(140, b"back", true).unwrap();
     writer.seal_active().unwrap();
     drop(writer);
 
     let reader = WalReader::open(&rec_dir, &registry).unwrap();
     let latest = reader.latest_segment_records().unwrap().unwrap();
+    assert_eq!(latest.keyframe_at_ms, 100, "earlier errors must not have advanced clock to 9999");
     assert_eq!(latest.tail_records.len(), 3);
     assert_eq!(latest.tail_records[0].record, WalRecord::Output(vec![b'x'; 80]));
     assert_eq!(latest.tail_records[1].record, WalRecord::Gap { dropped_bytes: 120, reason: GapReason::NonGroundCap });
@@ -573,61 +704,94 @@ fn non_ground_run_cap_emits_explicit_gap_marker() {
 }
 
 #[test]
-fn async_worker_writes_flushes_and_sheds_backlog_with_gap() {
+fn async_worker_preserves_gap_order_reports_rollover_and_sheds_backlog() {
     let tmp = tempdir().unwrap();
     let rec_dir = tmp.path().join("worker-rec");
     let registry = RecordingRegistry::new();
-    let cfg = WalConfig { max_backlog_bytes: 128, ..WalConfig::default() };
+    let cfg =
+        WalConfig { segment_target_bytes: MIN_SEGMENT_TARGET_BYTES, max_backlog_bytes: 5_000, ..WalConfig::default() };
 
     let writer = WalWriter::open_or_create(&rec_dir, [6; 16], 1_000, cfg, registry.clone()).unwrap();
     let handle = WalWorker::spawn(writer);
     assert!(!handle.is_failed());
+    assert!(!handle.take_rollover_needed());
+
+    // Zero timeout returns Timeout (distinct from WorkerClosed), Duration::MAX never panics!
+    assert!(matches!(handle.flush_barrier_timeout(Duration::ZERO), Err(WalError::Timeout)));
 
     let blob_data = b"worker-png-bytes".to_vec();
     let blob_hash = hash_blob(&blob_data);
     assert!(handle.write_blob(ImageEncoding::Png, blob_data.clone()));
     assert!(handle.start_segment(1_000, sample_keyframe(Some(blob_hash), None, None)));
-    assert!(handle.write_output(1_010, b"hello-worker".to_vec(), true));
+    assert!(handle.write_output(1_010, b"before-gap".to_vec(), true));
     assert!(handle.write_resize(1_020, GridSize::new(90, 30).unwrap(), CellPx { width: 8, height: 16 }));
     assert!(handle.write_marks(1_030, Some(sample_marks_key()), 4));
 
-    // Oversized output > max_backlog_bytes (128) is shed non-blockingly and emits Gap(BacklogOverflow)
-    // before the next accepted command!
-    assert!(!handle.write_output(1_040, vec![b'!'; 512], true));
-    assert!(!handle.write_blob(ImageEncoding::Png, vec![b'!'; 512]));
-    assert!(handle.write_output(1_050, b"after-shed".to_vec(), true));
-    assert!(handle.seal());
+    // Oversized output > max_backlog_bytes (5000) is shed in chronological order (after t=1030, never before!)
+    assert!(!handle.write_output(1_040, vec![b'!'; 6_000], true));
+    assert!(!handle.write_output(1_045, vec![b'?'; 6_000], true)); // coalesces into same tail BacklogGap!
+    assert!(handle.write_output(1_050, vec![b'R'; 4_500], true)); // triggers RolloverHint::NeedKeyframe!
+    handle.flush_barrier_timeout(Duration::MAX).unwrap();
+    assert!(handle.take_rollover_needed(), "worker must surface RolloverHint::NeedKeyframe");
+    assert!(!handle.take_rollover_needed(), "take_rollover_needed clears atomically");
 
-    handle.flush_barrier().unwrap();
+    assert!(handle.seal());
     handle.shutdown().unwrap();
 
     let reader = WalReader::open(&rec_dir, &registry).unwrap();
     assert_eq!(reader.read_blob(blob_hash, ImageEncoding::Png).unwrap(), blob_data);
     let latest = reader.latest_segment_records().unwrap().unwrap();
-    assert!(
-        latest
-            .tail_records
-            .iter()
-            .any(|r| matches!(r.record, WalRecord::Gap { dropped_bytes: 512, reason: GapReason::BacklogOverflow }))
+    // Exact chronological order: Output(1010), Resize(1020), Marks(1030), Gap(1045, 12000), Output(1050)
+    assert_eq!(latest.tail_records.len(), 5);
+    assert_eq!(latest.tail_records[0].at_ms, 1_010);
+    assert_eq!(latest.tail_records[1].at_ms, 1_020);
+    assert_eq!(latest.tail_records[2].at_ms, 1_030);
+    assert_eq!(
+        latest.tail_records[3].record,
+        WalRecord::Gap { dropped_bytes: 12_000, reason: GapReason::BacklogOverflow }
     );
-    assert!(latest.tail_records.iter().any(|r| r.record == WalRecord::Output(b"after-shed".to_vec())));
+    assert_eq!(latest.tail_records[4].at_ms, 1_050);
 }
 
 #[test]
-fn corrupted_footer_falls_back_cleanly_in_scan_segment() {
+fn corrupted_footer_and_spoofed_pty_footer_rejected() {
     let mut stream = Vec::new();
     let kf = sample_keyframe(None, None, None);
     encode_framed_record(100, &WalRecord::Keyframe(Box::new(kf)), &mut stream).unwrap();
     let valid_end = stream.len();
 
     // Footer claiming wrong record_count (99 instead of 1) -> treated as torn tail.
-    let bad_count_footer = SegmentFooter { first_ms: 100, last_ms: 100, record_count: 99 }.encode();
-    stream.extend_from_slice(&bad_count_footer);
-    let scan = scan_segment(&stream);
-    assert!(scan.had_torn_tail);
-    assert_eq!(scan.footer, None);
-    assert_eq!(scan.valid_records_end, valid_end);
-    assert_eq!(scan.records.len(), 1);
+    let bad_count_footer =
+        SegmentFooter { first_ms: 100, last_ms: 100, records_end_offset: valid_end as u64, record_count: 99 }.encode();
+    let mut s1 = stream.clone();
+    s1.extend_from_slice(&bad_count_footer);
+    let scan1 = scan_segment(&s1);
+    assert!(scan1.had_torn_tail);
+    assert_eq!(scan1.footer, None);
+    assert_eq!(scan1.valid_records_end, valid_end);
+    assert_eq!(scan1.records.len(), 1);
+
+    // Footer claiming wrong records_end_offset -> treated as torn tail AND rejected by try_read_footer!
+    let bad_off_footer =
+        SegmentFooter { first_ms: 100, last_ms: 100, records_end_offset: (valid_end + 1) as u64, record_count: 1 }
+            .encode();
+    let mut s2 = stream.clone();
+    s2.extend_from_slice(&bad_off_footer);
+    assert!(scan_segment(&s2).had_torn_tail);
+
+    let tmp = tempdir().unwrap();
+    let spoof_path = tmp.path().join("spoof.apks");
+    fs::write(&spoof_path, &s2).unwrap();
+    assert_eq!(try_read_footer(&spoof_path).unwrap(), None);
+
+    // 40-byte file with zero records rejected by try_read_footer!
+    let zero_rec_path = tmp.path().join("only-footer.apks");
+    fs::write(
+        &zero_rec_path,
+        SegmentFooter { first_ms: 1, last_ms: 1, records_end_offset: 20, record_count: 1 }.encode(),
+    )
+    .unwrap();
+    assert_eq!(try_read_footer(&zero_rec_path).unwrap(), None);
 }
 
 #[test]
@@ -660,7 +824,6 @@ fn corrupted_sealed_segment_trailing_garbage_is_detected_on_open() {
     writer.seal_active().unwrap();
     drop(writer);
 
-    // Append garbage after the sealed footer so try_read_footer returns None and fallback scan runs.
     let seg_path = rec_dir.join("seg-000001.apks");
     append_bytes(&seg_path, b"trailing-garbage-bytes");
     let reader = WalReader::open(&rec_dir, &registry).unwrap();
@@ -683,6 +846,8 @@ fn constants_and_error_display_and_registry_debug_are_exact() {
     assert_eq!(DEFAULT_MAX_BACKLOG_BYTES, 16 * 1024 * 1024);
     assert_eq!(DEFAULT_MAX_NON_GROUND_BYTES, 4 * 1024 * 1024);
     assert_eq!(MAX_BLOB_FILE_BYTES, 64 * 1024 * 1024);
+    assert_eq!(MAX_SEGMENT_FILE_BYTES, 64 * 1024 * 1024);
+    assert_eq!(MAX_CONTROL_QUEUE_LEN, 1_024);
 
     let errors: Vec<WalError> = vec![
         WalError::Io(std::io::Error::other("disk")),
@@ -697,6 +862,7 @@ fn constants_and_error_display_and_registry_debug_are_exact() {
         WalError::CorruptBlob,
         WalError::CorruptSegment("seg"),
         WalError::WorkerClosed,
+        WalError::Timeout,
     ];
     for err in errors {
         assert!(!err.to_string().is_empty());
@@ -707,60 +873,57 @@ fn constants_and_error_display_and_registry_debug_are_exact() {
 }
 
 #[test]
-fn boundary_helpers_and_footer_edge_cases() {
-    // Blob size helper exact boundary
-    assert!(check_blob_size(99, 100).is_ok());
-    assert!(check_blob_size(100, 100).is_ok());
-    assert!(matches!(check_blob_size(101, 100), Err(WalError::LimitExceeded(_))));
+fn boundary_helpers_and_bounded_file_reads() {
+    assert!(check_file_size(99, 100, "x").is_ok());
+    assert!(check_file_size(100, 100, "x").is_ok());
+    assert!(matches!(check_file_size(101, 100, "x"), Err(WalError::LimitExceeded(_))));
 
-    // Payload limit helper exact boundary
     assert!(check_payload_limit(99, 100, "x").is_ok());
     assert!(check_payload_limit(100, 100, "x").is_ok());
     assert!(matches!(check_payload_limit(101, 100, "x"), Err(WalError::LimitExceeded(_))));
 
-    // Single-record footer with equal first_ms == last_ms is valid!
-    let same_ts = SegmentFooter { first_ms: 42, last_ms: 42, record_count: 1 };
-    let encoded = same_ts.encode();
-    assert_eq!(SegmentFooter::decode(&encoded).unwrap(), same_ts);
-
-    // try_read_footer exact boundary: 31 bytes -> None, 32 bytes -> Some
     let tmp = tempdir().unwrap();
+    let f = tmp.path().join("ten.bin");
+    fs::write(&f, b"0123456789").unwrap();
+    assert_eq!(read_regular_file_bounded(&f, 10, "ten").unwrap(), b"0123456789");
+    assert!(matches!(read_regular_file_bounded(&f, 9, "ten"), Err(WalError::LimitExceeded(_))));
+    assert!(matches!(read_regular_file_bounded(tmp.path(), 100, "dir"), Err(WalError::InvalidFormat(_))));
+
+    // Exact minimum sealed length (MIN_RECORD_LEN + SEGMENT_FOOTER_LEN = 60 bytes) accepted; 59 rejected!
+    let mut exact = vec![0u8; MIN_RECORD_LEN];
+    let ftr = SegmentFooter { first_ms: 42, last_ms: 42, records_end_offset: MIN_RECORD_LEN as u64, record_count: 1 };
+    exact.extend_from_slice(&ftr.encode());
     let short_path = tmp.path().join("short.apks");
-    fs::write(&short_path, &encoded[..SEGMENT_FOOTER_LEN - 1]).unwrap();
+    fs::write(&short_path, &exact[1..]).unwrap();
     assert_eq!(try_read_footer(&short_path).unwrap(), None);
 
     let exact_path = tmp.path().join("exact.apks");
-    fs::write(&exact_path, encoded).unwrap();
-    assert_eq!(try_read_footer(&exact_path).unwrap(), Some(same_ts));
+    fs::write(&exact_path, &exact).unwrap();
+    assert_eq!(try_read_footer(&exact_path).unwrap(), Some(ftr));
 
-    // index_segment_allow_vanished: missing file -> Ok(None), directory -> Err(Io)
-    assert_eq!(index_segment_allow_vanished(1, tmp.path().join("missing.apks")).unwrap(), None);
-    let sub_dir = tmp.path().join("a-dir");
-    fs::create_dir(&sub_dir).unwrap();
-    assert!(matches!(index_segment_allow_vanished(2, sub_dir), Err(WalError::Io(_))));
+    // Directory passed to try_read_footer fails with InvalidFormat
+    assert!(matches!(try_read_footer(tmp.path()), Err(WalError::InvalidFormat(_))));
 }
 
 #[test]
 fn directory_and_blobs_io_error_paths_and_multi_reader_pin_refcount() {
     let tmp = tempdir().unwrap();
 
-    // sweep_unreferenced when blobs/ does not exist -> Ok(0)
     assert_eq!(sweep_unreferenced(tmp.path(), &HashSet::new()).unwrap(), 0);
+    assert_eq!(blobs_total_bytes(tmp.path()).unwrap(), 0);
 
-    // When `blobs` is a regular file: write_blob -> InvalidFormat, sweep_unreferenced -> Io error
     let file_blobs_root = tmp.path().join("file-blobs");
     fs::create_dir(&file_blobs_root).unwrap();
     fs::write(file_blobs_root.join("blobs"), b"not-a-dir").unwrap();
     assert!(matches!(write_blob(&file_blobs_root, ImageEncoding::Png, b"x"), Err(WalError::InvalidFormat(_))));
-    assert!(matches!(sweep_unreferenced(&file_blobs_root, &HashSet::new()), Err(WalError::Io(_))));
+    assert!(matches!(sweep_unreferenced(&file_blobs_root, &HashSet::new()), Err(WalError::InvalidFormat(_))));
+    assert!(matches!(blobs_total_bytes(&file_blobs_root), Err(WalError::InvalidFormat(_))));
 
-    // When parent is a regular file: symlink_metadata returns non-NotFound -> Err(Io)
     let blocking_file = tmp.path().join("blocker");
     fs::write(&blocking_file, b"x").unwrap();
     assert!(matches!(prepare_recording_dir(&blocking_file.join("child")), Err(WalError::Io(_))));
-    assert!(matches!(write_blob(&blocking_file, ImageEncoding::Png, b"x"), Err(WalError::Io(_))));
+    assert!(matches!(write_blob(&blocking_file, ImageEncoding::Png, b"x"), Err(WalError::InvalidFormat(_))));
 
-    // Two concurrent readers pin the same segment: dropping one keeps pin active until second drops!
     let rec_dir = tmp.path().join("refcount");
     let registry = RecordingRegistry::new();
     let mut writer = WalWriter::open_or_create(&rec_dir, [9; 16], 100, WalConfig::default(), registry.clone()).unwrap();
@@ -772,18 +935,16 @@ fn directory_and_blobs_io_error_paths_and_multi_reader_pin_refcount() {
     assert_eq!(writer.segment_count(), 1);
     writer.start_segment_with_keyframe(200, &sample_keyframe(None, None, None)).unwrap();
     assert_eq!(writer.segment_count(), 2);
-    writer.flush().unwrap();
 
     let canonical = fs::canonicalize(&rec_dir).unwrap();
     let r1 = WalReader::open(&rec_dir, &registry).unwrap();
     let r2 = WalReader::open(&rec_dir, &registry).unwrap();
     assert!(registry.is_pinned(&canonical, 1));
     drop(r1);
-    assert!(registry.is_pinned(&canonical, 1), "second reader still pins seg 1");
+    assert!(registry.is_pinned(&canonical, 1));
     drop(r2);
-    assert!(!registry.is_pinned(&canonical, 1), "pin released once all readers drop");
+    assert!(!registry.is_pinned(&canonical, 1));
 
-    // Verify record_marks persisted in segment 1
     let r3 = WalReader::open(&rec_dir, &registry).unwrap();
     let s1 = r3.records_for_moment(110).unwrap().unwrap();
     assert_eq!(s1.tail_records.len(), 1);
@@ -804,14 +965,10 @@ fn non_ground_exact_boundary_rollover_gate_and_budget_exact_boundary() {
     let mut writer = WalWriter::open_or_create(&rec_dir, [10; 16], 100, cfg, registry.clone()).unwrap();
     writer.start_segment_with_keyframe(100, &sample_keyframe(None, None, None)).unwrap();
 
-    // Writing >= segment_target_bytes while NOT at ground (`vt_at_ground = false`) must NOT request
-    // rollover AND exact `max_non_ground_bytes` (5000) must NOT drop bytes!
     let hint = writer.record_output(110, &vec![b'a'; 5_000], false).unwrap();
     assert_eq!(hint, RolloverHint::Continue);
-    // One more non-ground byte triggers drop (1 byte).
     let hint2 = writer.record_output(115, b"z", false).unwrap();
     assert_eq!(hint2, RolloverHint::Continue);
-    // Returning to ground flushes Gap(1) and triggers NeedKeyframe since size >= 4096.
     let hint3 = writer.record_output(120, b"ok", true).unwrap();
     assert_eq!(hint3, RolloverHint::NeedKeyframe);
     writer.seal_active().unwrap();
@@ -819,14 +976,12 @@ fn non_ground_exact_boundary_rollover_gate_and_budget_exact_boundary() {
     let exact_total = writer.total_segment_bytes();
     drop(writer);
 
-    // Reopen with budget_bytes == exact_total: evict_to_budget must NOT evict seg 1!
     let exact_cfg = WalConfig { budget_bytes: exact_total, ..cfg };
     let mut w2 = WalWriter::open_or_create(&rec_dir, [10; 16], 100, exact_cfg, registry.clone()).unwrap();
     let ev = w2.evict_to_budget().unwrap();
     assert_eq!(ev.evicted_segments, 0);
     assert!(rec_dir.join("seg-000001.apks").exists());
 
-    // Delete seg-000001 externally and force budget smaller: NotFound during eviction is ignored cleanly!
     fs::remove_file(rec_dir.join("seg-000001.apks")).unwrap();
     w2.start_segment_with_keyframe(300, &sample_keyframe(None, None, None)).unwrap();
     assert_eq!(w2.segment_count(), 1);
@@ -834,34 +989,22 @@ fn non_ground_exact_boundary_rollover_gate_and_budget_exact_boundary() {
 
 #[test]
 fn should_worker_wait_truth_table() {
-    for queue_empty in [false, true] {
-        for has_active in [false, true] {
-            for pending_drop in [0u64, 1, 50] {
-                for closed in [false, true] {
-                    let expected = queue_empty && !(has_active && pending_drop > 0) && !closed;
-                    assert_eq!(
-                        should_worker_wait(queue_empty, has_active, pending_drop, closed),
-                        expected,
-                        "mismatch for ({queue_empty}, {has_active}, {pending_drop}, {closed})"
-                    );
-                }
-            }
-        }
-    }
+    assert!(should_worker_wait(true, false));
+    assert!(!should_worker_wait(true, true));
+    assert!(!should_worker_wait(false, false));
+    assert!(!should_worker_wait(false, true));
 }
 
 #[test]
 fn worker_backlog_accounting_failure_propagation_and_drop_cleanup() {
     let tmp = tempdir().unwrap();
 
-    // 1. Backlog exact boundary & cumulative queued_bytes accounting + verifying resize/marks/seal persisted
     let rec1 = tmp.path().join("worker-bounds");
     let registry = RecordingRegistry::new();
     let cfg = WalConfig { max_backlog_bytes: 100, ..WalConfig::default() };
     let writer1 = WalWriter::open_or_create(&rec1, [11; 16], 100, cfg, registry.clone()).unwrap();
     let h1 = WalWorker::spawn(writer1);
     assert!(h1.start_segment(100, sample_keyframe(None, None, None)));
-    // Exact boundary: 100 bytes succeeds
     assert!(h1.write_output(110, vec![b'x'; 100], true));
     h1.flush_barrier_timeout(Duration::from_secs(2)).unwrap();
     assert!(h1.write_blob(ImageEncoding::Png, vec![b'p'; 100]));
@@ -870,7 +1013,6 @@ fn worker_backlog_accounting_failure_propagation_and_drop_cleanup() {
     assert!(h1.seal());
     h1.flush_barrier_timeout(Duration::from_secs(2)).unwrap();
 
-    // Drop h1 directly (without shutdown) -> releases writer claim!
     drop(h1);
     assert!(!registry.is_claimed(&rec1), "Drop for WalHandle must stop thread and release WriterClaim");
 
@@ -881,7 +1023,7 @@ fn worker_backlog_accounting_failure_propagation_and_drop_cleanup() {
     assert!(slice.tail_records.iter().any(|r| matches!(r.record, WalRecord::Resize { .. })));
     assert!(slice.tail_records.iter().any(|r| matches!(r.record, WalRecord::Marks { last_seq: 5, .. })));
 
-    // 2. Worker sticky failure propagation: writing output with no active segment triggers CorruptSegment!
+    // Worker sticky failure propagation
     let rec2 = tmp.path().join("worker-fail");
     let writer2 = WalWriter::open_or_create(&rec2, [12; 16], 100, WalConfig::default(), registry.clone()).unwrap();
     let h2 = WalWorker::spawn(writer2);
@@ -897,7 +1039,7 @@ fn worker_backlog_accounting_failure_propagation_and_drop_cleanup() {
     assert!(h2.shutdown().is_err());
     assert!(!registry.is_claimed(&rec2));
 
-    // 3. Deterministic backlog reservation boundary check (exact limit, cumulative, overflow)
+    // Deterministic backlog reservation boundary checks (normal + empty-queue single large blob)
     let mut queued = 0usize;
     assert!(try_reserve_backlog(&mut queued, 60, 100));
     assert_eq!(queued, 60);
@@ -905,4 +1047,74 @@ fn worker_backlog_accounting_failure_propagation_and_drop_cleanup() {
     assert_eq!(queued, 100);
     assert!(!try_reserve_backlog(&mut queued, 1, 100));
     assert_eq!(queued, 100);
+
+    let mut blob_q = 0usize;
+    assert!(try_reserve_blob_backlog(&mut blob_q, 512, 128), "empty queue admits single blob > max_backlog");
+    assert_eq!(blob_q, 512);
+    assert!(!try_reserve_blob_backlog(&mut blob_q, 10, 128), "non-empty queue enforces max_backlog");
+    assert_eq!(blob_q, 512);
+}
+
+#[test]
+fn remaining_edge_cases_and_helper_invariants() {
+    let tmp = tempdir().unwrap();
+
+    // verify_existing_blob_hash true and false
+    let h = hash_blob(b"abc");
+    assert!(verify_existing_blob_hash(b"abc", h));
+    assert!(!verify_existing_blob_hash(b"abd", h));
+
+    // sync_dir succeeds on existing dir; on Unix fails on nonexistent path
+    assert!(sync_dir(tmp.path()).is_ok());
+    #[cfg(unix)]
+    assert!(sync_dir(&tmp.path().join("does-not-exist")).is_err());
+
+    // Two adjacent segments with identical `first_ms` are valid in WalReader::open
+    let same_ms_dir = tmp.path().join("same-ms");
+    let registry = RecordingRegistry::new();
+    let mut w = WalWriter::open_or_create(&same_ms_dir, [14; 16], 100, WalConfig::default(), registry.clone()).unwrap();
+    w.start_segment_with_keyframe(100, &sample_keyframe(None, None, None)).unwrap();
+    w.start_segment_with_keyframe(100, &sample_keyframe(None, None, None)).unwrap();
+    // evict_to_budget when evicted_segments == 0 must NOT sweep blobs
+    fs::create_dir_all(same_ms_dir.join("blobs")).unwrap();
+    fs::write(same_ms_dir.join("blobs").join(".tmp-keep-me"), b"x").unwrap();
+    let ev0 = w.evict_to_budget().unwrap();
+    assert_eq!(ev0.evicted_segments, 0);
+    assert_eq!(ev0.swept_blobs, 0);
+    assert!(same_ms_dir.join("blobs").join(".tmp-keep-me").exists());
+    drop(w);
+
+    let r = WalReader::open(&same_ms_dir, &registry).unwrap();
+    assert_eq!(r.segments().len(), 2);
+
+    // read_sealed_header_and_footer rejects non-keyframe record 0 and mismatched footer.first_ms
+    let non_kf_path = tmp.path().join("non-kf-sealed.apks");
+    let mut non_kf = Vec::new();
+    encode_framed_record(100, &WalRecord::Output(b"not-a-kf".to_vec()), &mut non_kf).unwrap();
+    let end1 = non_kf.len() as u64;
+    non_kf.extend_from_slice(
+        &SegmentFooter { first_ms: 100, last_ms: 100, records_end_offset: end1, record_count: 1 }.encode(),
+    );
+    fs::write(&non_kf_path, &non_kf).unwrap();
+    assert_eq!(read_sealed_header_and_footer(&non_kf_path).unwrap(), None);
+
+    let bad_ts_path = tmp.path().join("bad-ts-sealed.apks");
+    let mut bad_ts = Vec::new();
+    encode_framed_record(100, &WalRecord::Keyframe(Box::new(sample_keyframe(None, None, None))), &mut bad_ts).unwrap();
+    let end2 = bad_ts.len() as u64;
+    bad_ts.extend_from_slice(
+        &SegmentFooter { first_ms: 200, last_ms: 200, records_end_offset: end2, record_count: 1 }.encode(),
+    );
+    fs::write(&bad_ts_path, &bad_ts).unwrap();
+    assert_eq!(read_sealed_header_and_footer(&bad_ts_path).unwrap(), None);
+
+    // Small output on WalWorker must NOT set rollover_needed
+    let small_dir = tmp.path().join("small-worker");
+    let sw = WalWriter::open_or_create(&small_dir, [15; 16], 100, WalConfig::default(), registry).unwrap();
+    let sh = WalWorker::spawn(sw);
+    assert!(sh.start_segment(100, sample_keyframe(None, None, None)));
+    assert!(sh.write_output(110, b"tiny".to_vec(), true));
+    sh.flush_barrier_timeout(Duration::from_secs(2)).unwrap();
+    assert!(!sh.take_rollover_needed());
+    sh.shutdown().unwrap();
 }

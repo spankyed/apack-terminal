@@ -7,20 +7,22 @@
 //! <recording-dir>/
 //! ├── meta.apkm                # 40B CRC32C-verified metadata header
 //! ├── blobs/<sha256>.png|zst   # Immutable content-addressed image blobs
-//! ├── seg-000001.apks          # Sealed immutable segment (KEYFRAME_V2 + records + 32B footer)
+//! ├── seg-000001.apks          # Sealed immutable segment (KEYFRAME_V2 + records + 40B footer)
 //! └── seg-000002.apks          # Active append-only tail segment
 //! ```
 //!
 //! Operational guarantees:
 //! - **$O(1)$ budget eviction:** unlinks oldest unpinned closed segments and sweeps unreferenced
 //!   blobs — zero full-file copies and zero Windows rename sharing violations.
-//! - **Crash-only safety:** `sync_data()` on segment seal; on resume, scans only the active tail
-//!   segment and truncates any torn tail at the last valid CRC32C boundary via `set_len()`.
+//! - **Crash-only safety:** `sync_data()` + directory sync on segment seal; on resume, closed
+//!   segments read only record 0 + their 40-byte footer while only an unsealed active tail segment
+//!   is scanned and truncated at the last valid CRC32C boundary via `set_len()`.
 //! - **Dual-layer `KeyframeV2`:** always carries a broker-owned, version-stable [`VisualKeyframe`]
 //!   plus an optional ABI-hashed [`EngineCheckpoint`] (`libghostty-vt` snapshot) for lossless
 //!   restore across matching builds with automatic visual fallback on VT upgrades.
-//! - **Bounded non-ground & backlog handling:** never drops bytes silently — emits explicit
-//!   [`WalRecord::Gap`] records whenever non-ground streams or slow disks hit configured caps.
+//! - **Bounded non-ground & backlog handling:** never drops bytes silently — emits explicit,
+//!   chronologically ordered [`WalRecord::Gap`] records whenever non-ground streams or slow disks
+//!   hit configured caps.
 
 #![forbid(unsafe_code)]
 
@@ -55,7 +57,7 @@ pub const DEFAULT_SEGMENT_TARGET_BYTES: u64 = 2 << 20;
 /// Minimum allowed segment target size (`4 KiB`).
 pub const MIN_SEGMENT_TARGET_BYTES: u64 = 4 * 1024;
 
-/// Default total on-disk segment budget (`32 MiB`).
+/// Default total on-disk segment + blob budget (`32 MiB`).
 pub const DEFAULT_BUDGET_BYTES: u64 = 32 << 20;
 
 /// Default asynchronous disk worker backlog cap (`16 MiB`).
@@ -66,6 +68,9 @@ pub const DEFAULT_MAX_NON_GROUND_BYTES: u64 = 4 << 20;
 
 /// Maximum size of a single content-addressed blob file (`64 MiB`).
 pub const MAX_BLOB_FILE_BYTES: u64 = 64 << 20;
+
+/// Hard maximum size of a single segment file read into memory (`64 MiB`).
+pub const MAX_SEGMENT_FILE_BYTES: u64 = 64 << 20;
 
 /// Errors returned by WAL directory, blob, writer, or reader operations.
 #[derive(Debug)]
@@ -82,9 +87,9 @@ pub enum WalError {
     SymlinkRefused,
     /// Another active writer in this process already owns the recording directory.
     AlreadyClaimed,
-    /// Unsupported format magic or version.
+    /// Unsupported format magic, non-regular file, or version mismatch.
     InvalidFormat(&'static str),
-    /// Payload or decompressed keyframe exceeded a hard memory bound.
+    /// Payload, segment file, or decompressed keyframe exceeded a hard memory bound.
     LimitExceeded(&'static str),
     /// Zlib decompression failure inside a compressed record.
     DecompressFailed,
@@ -92,8 +97,10 @@ pub enum WalError {
     CorruptBlob,
     /// Segment or recording violates structural invariant (e.g., record 0 is not a keyframe).
     CorruptSegment(&'static str),
-    /// Background WAL worker shut down or previous disk write failed.
+    /// Background WAL worker shut down or exited before answering.
     WorkerClosed,
+    /// Caller's flush barrier deadline elapsed while the worker was still running.
+    Timeout,
 }
 
 impl fmt::Display for WalError {
@@ -111,6 +118,7 @@ impl fmt::Display for WalError {
             Self::CorruptBlob => write!(f, "WAL blob SHA-256 verification failed"),
             Self::CorruptSegment(what) => write!(f, "corrupt WAL segment: {what}"),
             Self::WorkerClosed => write!(f, "WAL background worker closed"),
+            Self::Timeout => write!(f, "WAL flush barrier timed out"),
         }
     }
 }

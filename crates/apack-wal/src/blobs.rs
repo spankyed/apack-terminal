@@ -1,11 +1,12 @@
 //! Content-addressed immutable image blob store (`<recording-dir>/blobs/<sha256-hex>.<png|zst>`).
 //!
-//! Blobs are written atomically via temp file + rename with owner-only (`0o600`) permissions on
-//! Unix, verified by SHA-256 on read, and garbage-collected whenever closed segments are evicted.
+//! Blobs are written atomically via temp file + `sync_data()` + rename + parent directory sync with
+//! owner-only (`0o600`) permissions on Unix, verified by SHA-256 via bounded regular-file reads,
+//! and garbage-collected whenever closed segments are evicted or new segments roll over.
 
 use std::collections::HashSet;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -62,11 +63,54 @@ pub fn parse_blob_filename(name: &str) -> Option<(BlobHash, ImageEncoding)> {
     Some((BlobHash(out), encoding))
 }
 
-pub(crate) fn check_blob_size(len: u64, max_bytes: u64) -> Result<(), WalError> {
+pub(crate) fn check_file_size(len: u64, max_bytes: u64, what: &'static str) -> Result<(), WalError> {
     if len > max_bytes {
-        return Err(WalError::LimitExceeded("image blob file size"));
+        return Err(WalError::LimitExceeded(what));
     }
     Ok(())
+}
+
+pub(crate) fn verify_existing_blob_hash(bytes: &[u8], expected: BlobHash) -> bool {
+    hash_blob(bytes) == expected
+}
+
+/// Validates that `dir` is a real directory (not a symlink or file).
+pub(crate) fn verify_real_dir(dir: &Path) -> Result<(), WalError> {
+    let meta = fs::symlink_metadata(dir)?;
+    if meta.file_type().is_symlink() {
+        return Err(WalError::SymlinkRefused);
+    }
+    if !meta.is_dir() {
+        return Err(WalError::InvalidFormat("path is not a directory"));
+    }
+    Ok(())
+}
+
+/// Opens `path` as a regular non-symlink file and reads up to `max_bytes` using a bounded handle.
+///
+/// Refuses symlinks, FIFOs/devices/directories, and files exceeding `max_bytes` BEFORE allocating.
+pub(crate) fn read_regular_file_bounded(path: &Path, max_bytes: u64, what: &'static str) -> Result<Vec<u8>, WalError> {
+    let lstat = fs::symlink_metadata(path)?;
+    if lstat.file_type().is_symlink() {
+        return Err(WalError::SymlinkRefused);
+    }
+    if !lstat.is_file() {
+        return Err(WalError::InvalidFormat(what));
+    }
+    check_file_size(lstat.len(), max_bytes, what)?;
+
+    let file = File::open(path)?;
+    let fstat = file.metadata()?;
+    if !fstat.is_file() {
+        return Err(WalError::InvalidFormat(what));
+    }
+    check_file_size(fstat.len(), max_bytes, what)?;
+
+    let cap = usize::try_from(fstat.len().min(max_bytes)).unwrap_or(0);
+    let mut out = Vec::with_capacity(cap);
+    file.take(max_bytes.saturating_add(1)).read_to_end(&mut out)?;
+    check_file_size(out.len() as u64, max_bytes, what)?;
+    Ok(out)
 }
 
 fn hex_nibble(v: u8) -> char {
@@ -87,20 +131,31 @@ fn decode_hex_nibble(b: u8) -> Option<u8> {
 
 /// Persists an immutable content-addressed image blob under `<recording_dir>/blobs/`.
 ///
-/// Deduplicates in $O(1)$ if the blob already exists on disk; otherwise writes atomically via a
-/// unique temp file + `sync_data()` + rename.
+/// Validates both `<recording_dir>` and `blobs/` against symlinks, deduplicates in $O(1)$ if a
+/// verified regular file already exists, and otherwise writes atomically via temp file +
+/// `sync_data()` + rename + parent directory sync.
 pub fn write_blob(recording_dir: &Path, encoding: ImageEncoding, bytes: &[u8]) -> Result<BlobHash, WalError> {
     if bytes.is_empty() {
         return Err(WalError::InvalidFormat("empty image blob"));
     }
-    check_blob_size(bytes.len() as u64, MAX_BLOB_FILE_BYTES)?;
+    check_file_size(bytes.len() as u64, MAX_BLOB_FILE_BYTES, "image blob file size")?;
+    verify_real_dir(recording_dir)?;
+
     let hash = hash_blob(bytes);
     let blobs_dir = recording_dir.join("blobs");
     ensure_blobs_dir(&blobs_dir)?;
 
     let final_path = blobs_dir.join(blob_filename(hash, encoding));
-    if final_path.exists() {
-        return Ok(hash);
+    if let Ok(meta) = fs::symlink_metadata(&final_path) {
+        if meta.file_type().is_symlink() {
+            return Err(WalError::SymlinkRefused);
+        }
+        if !meta.is_file() {
+            return Err(WalError::InvalidFormat("blob target is not a regular file"));
+        }
+        if meta.len() == bytes.len() as u64 {
+            return Ok(hash);
+        }
     }
 
     let tmp_name = format!(".tmp-{}-{}", std::process::id(), TMP_COUNTER.fetch_add(1, Ordering::Relaxed));
@@ -117,41 +172,73 @@ pub fn write_blob(recording_dir: &Path, encoding: ImageEncoding, bytes: &[u8]) -
     }
     if let Err(err) = fs::rename(&tmp_path, &final_path) {
         let _ = fs::remove_file(&tmp_path);
-        // Concurrent identical blob write on Windows can race rename; treat existing valid file as success.
-        if final_path.exists() {
+        // Concurrent identical blob write on Windows can race rename; accept only a verified regular file.
+        if let Ok(existing) = read_regular_file_bounded(&final_path, MAX_BLOB_FILE_BYTES, "image blob file size")
+            && verify_existing_blob_hash(&existing, hash)
+        {
             return Ok(hash);
         }
         return Err(WalError::Io(err));
     }
+    let _ = sync_dir(&blobs_dir);
     Ok(hash)
 }
 
 /// Reads a content-addressed blob from `<recording_dir>/blobs/` and verifies its SHA-256 hash.
 pub fn read_blob(recording_dir: &Path, hash: BlobHash, encoding: ImageEncoding) -> Result<Vec<u8>, WalError> {
-    let path = recording_dir.join("blobs").join(blob_filename(hash, encoding));
-    let meta = fs::symlink_metadata(&path)?;
-    if meta.file_type().is_symlink() {
-        return Err(WalError::SymlinkRefused);
-    }
-    check_blob_size(meta.len(), MAX_BLOB_FILE_BYTES)?;
-    let bytes = fs::read(&path)?;
-    if hash_blob(&bytes) != hash {
+    verify_real_dir(recording_dir)?;
+    let blobs_dir = recording_dir.join("blobs");
+    verify_real_dir(&blobs_dir)?;
+    let path = blobs_dir.join(blob_filename(hash, encoding));
+    let bytes = read_regular_file_bounded(&path, MAX_BLOB_FILE_BYTES, "image blob file size")?;
+    if !verify_existing_blob_hash(&bytes, hash) {
         return Err(WalError::CorruptBlob);
     }
     Ok(bytes)
 }
 
-/// Sweeps `<recording_dir>/blobs/`, deleting any blob whose hash is absent from `live` (plus any
-/// leftover `.tmp-*` staging files). Returns the number of files deleted.
-pub fn sweep_unreferenced(recording_dir: &Path, live: &HashSet<BlobHash>) -> Result<usize, WalError> {
+fn existing_blobs_dir(recording_dir: &Path) -> Result<Option<std::path::PathBuf>, WalError> {
+    verify_real_dir(recording_dir)?;
     let blobs_dir = recording_dir.join("blobs");
-    let entries = match fs::read_dir(&blobs_dir) {
-        Ok(rd) => rd,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
-        Err(err) => return Err(WalError::Io(err)),
+    match fs::symlink_metadata(&blobs_dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(WalError::SymlinkRefused);
+            }
+            if !meta.is_dir() {
+                return Err(WalError::InvalidFormat("blobs path is not a directory"));
+            }
+            Ok(Some(blobs_dir))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+/// Computes total on-disk bytes occupied by canonical files inside `<recording_dir>/blobs/`.
+pub(crate) fn blobs_total_bytes(recording_dir: &Path) -> Result<u64, WalError> {
+    let Some(blobs_dir) = existing_blobs_dir(recording_dir)? else {
+        return Ok(0);
+    };
+    let mut total = 0u64;
+    for entry in fs::read_dir(&blobs_dir)? {
+        let entry = entry?;
+        if let Ok(meta) = entry.metadata()
+            && meta.is_file()
+        {
+            total = total.saturating_add(meta.len());
+        }
+    }
+    Ok(total)
+}
+
+/// Sweeps `<recording_dir>/blobs/`, deleting any blob whose hash is absent from `live` (plus any
+/// leftover `.tmp-*` staging files). Refuses symlinked `<recording_dir>` or `blobs/`.
+pub fn sweep_unreferenced(recording_dir: &Path, live: &HashSet<BlobHash>) -> Result<usize, WalError> {
+    let Some(blobs_dir) = existing_blobs_dir(recording_dir)? else {
+        return Ok(0);
     };
     let mut removed = 0usize;
-    for entry in entries {
+    for entry in fs::read_dir(&blobs_dir)? {
         let entry = entry?;
         let name = entry.file_name();
         let Some(name_str) = name.to_str() else {
@@ -199,7 +286,7 @@ pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
     }
 }
 
-pub(crate) fn create_private_file(path: &Path) -> io::Result<fs::File> {
+pub(crate) fn create_private_file(path: &Path) -> io::Result<File> {
     let mut opts = OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -208,4 +295,17 @@ pub(crate) fn create_private_file(path: &Path) -> io::Result<fs::File> {
         opts.mode(0o600);
     }
     opts.open(path)
+}
+
+/// Parent directory sync on POSIX after atomic renames or file creation.
+pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
 }
