@@ -1,7 +1,7 @@
 # The broker is the only crate shipped; `xtask` is the repository's own tasks (`cargo xtask <task>`), which
 # are a member rather than a script so they are compiled and type-checked with everything else.
 [workspace]
-members = ["xtask", "crates/apack-proto", "crates/apack-core", "crates/apack-sim"]
+members = ["xtask", "crates/apack-proto", "crates/apack-core", "crates/apack-sim", "crates/apack-vt-ghostty"]
 exclude = ["fuzz"]
 resolver = "3"
 
