@@ -677,8 +677,10 @@ fn broker_handshake_mutual_auth_timeout_duplicate_conn_and_framing_errors() {
     ));
 
     let proof = compute_client_proof(&secret, &c_nonce, &s_nonce);
+    assert!(!broker.is_connection_ready(conn(2)));
     let auth_frame = encode_client(StreamId::CONTROL, 2, &ClientMsg::AuthProof { hmac: proof });
     broker.feed_bytes(conn(2), &auth_frame, ts(2_020), &mut actions);
+    assert!(broker.is_connection_ready(conn(2)));
     let auth_ok = broker.pop_outbound(conn(2)).unwrap();
     match auth_ok.msg {
         BrokerMsg::AuthOk { server_hmac } => {

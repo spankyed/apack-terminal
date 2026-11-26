@@ -75,6 +75,16 @@ impl MarksTracker {
         self.at_prompt && self.active_index.is_none()
     }
 
+    /// Returns the shell marker trust mode (`Claimed` or `Keyed`).
+    pub fn mode(&self) -> MarksMode {
+        self.mode
+    }
+
+    /// Returns the last accepted monotonic vouched sequence number.
+    pub fn last_seq(&self) -> u64 {
+        self.last_seq
+    }
+
     /// Returns how many `OSC 633;V;...` marks were refused (bad key, bad/replayed sequence, or wrong mode).
     pub fn refused(&self) -> u64 {
         self.refused

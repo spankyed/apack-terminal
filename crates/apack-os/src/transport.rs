@@ -181,9 +181,10 @@ impl Drop for UmaskGuard {
 /// Binds a user-private local listener at `socket`.
 ///
 /// - On Unix: refuses to overwrite any pre-existing non-socket file, narrows process umask to
-///   `0o177` around bind (serialized via `UMASK_LOCK` and restored via RAII `Drop`) so the socket
-///   is owner-only from creation, and overwrites stale socket files once [`acquire_socket_hold`]
-///   has established exclusivity.
+///   `0o077` around bind (serialized via `UMASK_LOCK` and restored via RAII `Drop`) so the socket
+///   is owner-only from creation without stripping owner `+x` from concurrently created directories,
+///   then tightens the socket permissions to `0o600`, overwriting stale socket files once
+///   [`acquire_socket_hold`] has established exclusivity.
 /// - On Windows: attaches [`crate::security::owner_only_security_descriptor`] so `Everyone` never
 ///   receives pipe access, mapping `AddrInUse` / `PermissionDenied` to [`OsError::AlreadyHeld`].
 pub fn bind_local_listener(socket: &str) -> Result<Listener, OsError> {
@@ -209,11 +210,18 @@ pub fn bind_local_listener(socket: &str) -> Result<Listener, OsError> {
     };
 
     #[cfg(unix)]
-    let _umask = UmaskGuard::acquire(0o177);
+    let _umask = UmaskGuard::acquire(0o077);
     let bound = options.create_sync();
 
     match bound {
-        Ok(listener) => Ok(listener),
+        Ok(listener) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600));
+            }
+            Ok(listener)
+        }
         #[cfg(windows)]
         Err(err) => Err(crate::transport_windows::map_bind_error(err)),
         #[cfg(not(windows))]

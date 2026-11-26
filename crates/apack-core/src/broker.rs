@@ -312,6 +312,11 @@ impl BrokerCore {
         self.conns.len()
     }
 
+    /// Returns `true` iff `conn` has completed `Hello` (and mutual HMAC `AuthProof` when required).
+    pub fn is_connection_ready(&self, conn: ConnId) -> bool {
+        matches!(self.conns.get(&conn).map(|c| c.phase), Some(ConnPhase::Ready))
+    }
+
     /// Returns `true` when at least one live or in-grace broker-wide lease is active.
     pub fn has_active_broker_lease(&self) -> bool {
         self.leases.has_active_broker_lease()

@@ -11,6 +11,11 @@ nextest-version = "0.9.148"
 [profile.default]
 slow-timeout = { period = "10s", terminate-after = 2 }
 
+# v2 `apack-broker` tests finish in < 0.5 s; a tight 8 s deadline catches stalled/hung mutants promptly.
+[[profile.default.overrides]]
+filter = "package(apack-broker)"
+slow-timeout = { period = "4s", terminate-after = 2 }
+
 # The one test that waits for a producer to saturate the bounded channel and for the throttle to be reported,
 # reading one event each 20 ms until it is: 3.4 s on an Apple-silicon laptop, and 5–20 s across twenty runs with
 # twenty busy loops on its ten cores (November 2026)

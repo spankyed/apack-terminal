@@ -1879,3 +1879,61 @@ fn status_clear_per_stream_held_buttons_and_resize_side_effects() {
     assert!(!s_rs.is_sync_held(), "resize emitting SyncOutput(false) must release sync hold");
     assert_eq!(s_rs.drain_pty_write(64), b"\x1b[48;10;20t");
 }
+
+#[test]
+fn session_machine_runtime_accessors_and_nonblocking_pty_peek_consume() {
+    let key = MarksKey::parse(b"0123456789abcdef0123456789abcdef").unwrap();
+    let cell_px = CellPx { width: 9, height: 18 };
+    let mut sess =
+        SessionMachine::new(sid(50), StubVt::new(40, 4), ResizePolicy::LatestActive, MarksMode::Keyed(key), cell_px);
+    assert_eq!(sess.current_cell_px(), cell_px);
+    assert_eq!(sess.marks_key(), Some(key));
+    assert_eq!(sess.marks_last_seq(), 0);
+    assert_eq!(sess.marks_refused(), 0);
+    assert_eq!(sess.cwd(), None);
+    assert!(sess.commands().is_empty());
+
+    // Claimed session returns None for marks_key
+    let claimed =
+        SessionMachine::new(sid(51), StubVt::new(40, 4), ResizePolicy::LatestActive, MarksMode::Claimed, cell_px);
+    assert_eq!(claimed.marks_key(), None);
+
+    // Feed a vouched start + finish + a forged mark via vt_mut
+    let mut fx = Vec::new();
+    sess.vt_mut().next_events = vec![
+        VtEvent::Osc633 { payload: format!("V;S;1;{};echo hi", key.as_str()), cursor_line: 0 },
+        VtEvent::Osc633 { payload: format!("V;F;1;{};0;/home/me", key.as_str()), cursor_line: 1 },
+        VtEvent::Osc633 { payload: String::from("V;S;2;ffffffffffffffffffffffffffffffff;bad"), cursor_line: 1 },
+    ];
+    sess.on_pty_output(b"run", ts(10), &mut fx);
+    assert_eq!(sess.marks_last_seq(), 1);
+    assert_eq!(sess.marks_refused(), 1);
+    assert_eq!(sess.cwd(), Some("/home/me"));
+    assert_eq!(sess.commands().len(), 1);
+
+    // mark_all_views_full_sync forces a clean subscriber to emit a full_sync frame
+    let k1 = (conn(1), nz_stream(1));
+    sess.attach_stream(k1, SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, &mut fx);
+    assert!(sess.try_publish_view(k1, |_| true));
+    assert!(!sess.try_publish_view(k1, |_| true));
+    sess.mark_all_views_full_sync();
+    let mut got_full = false;
+    assert!(sess.try_publish_view(k1, |f| {
+        got_full = f.full_sync;
+        true
+    }));
+    assert!(got_full);
+
+    // peek_pty_write + consume_pty_write handle partial writes and VecDeque wraparound cleanly
+    sess.handle_stream_msg(k1, RequestId::from_raw(1), ClientMsg::Write { data: b"abcdefgh".to_vec() }, &mut fx);
+    let mut buf = Vec::new();
+    sess.peek_pty_write(3, &mut buf);
+    assert_eq!(buf, b"abc");
+    sess.consume_pty_write(3);
+    // Push more to exercise VecDeque wraparound across head + tail slices
+    sess.handle_stream_msg(k1, RequestId::from_raw(2), ClientMsg::Write { data: b"ijkl".to_vec() }, &mut fx);
+    sess.peek_pty_write(20, &mut buf);
+    assert_eq!(buf, b"defghijkl");
+    sess.consume_pty_write(9);
+    assert_eq!(sess.pty_write_len(), 0);
+}

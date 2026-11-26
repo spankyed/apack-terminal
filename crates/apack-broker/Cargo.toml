@@ -1,0 +1,21 @@
+[package]
+name = "apack-broker"
+version = "0.2.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+apack-proto = { path = "../apack-proto" }
+apack-core = { path = "../apack-core" }
+apack-vt-ghostty = { path = "../apack-vt-ghostty" }
+apack-os = { path = "../apack-os" }
+apack-wal = { path = "../apack-wal" }
+getrandom = "0.4"
+interprocess = "2.4.7"
+portable-pty = { git = "https://github.com/wez/wezterm", rev = "8afe0ad30739c5aa106c19e8a75b1dfc83bcfb56" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3.27.0"

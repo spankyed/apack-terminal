@@ -277,6 +277,11 @@ impl<V: VtEngine> SessionMachine<V> {
         &self.vt
     }
 
+    /// Mutably borrows the underlying VT engine (e.g. for cooperative compression or WAL restore).
+    pub fn vt_mut(&mut self) -> &mut V {
+        &mut self.vt
+    }
+
     /// Returns `true` while the session process has not exited.
     pub fn is_alive(&self) -> bool {
         self.alive
@@ -292,9 +297,51 @@ impl<V: VtEngine> SessionMachine<V> {
         &self.title
     }
 
+    /// Returns the last working directory reported by shell integration or OSC 7.
+    pub fn cwd(&self) -> Option<&str> {
+        self.marks.last_cwd()
+    }
+
+    /// Returns the active shell marker vouching key, if in keyed mode.
+    pub fn marks_key(&self) -> Option<apack_proto::types::MarksKey> {
+        match self.marks.mode() {
+            MarksMode::Keyed(k) => Some(k),
+            MarksMode::Claimed => None,
+        }
+    }
+
+    /// Returns the last accepted monotonic vouched mark sequence number.
+    pub fn marks_last_seq(&self) -> u64 {
+        self.marks.last_seq()
+    }
+
+    /// Returns the count of refused forged or replayed vouched marks.
+    pub fn marks_refused(&self) -> u64 {
+        self.marks.refused()
+    }
+
+    /// Returns a snapshot of the bounded shell command history ring.
+    pub fn commands(&self) -> Vec<apack_proto::types::CommandRecord> {
+        self.marks.commands()
+    }
+
     /// Returns the current arbitrated grid size.
     pub fn current_size(&self) -> GridSize {
         self.current_size
+    }
+
+    /// Returns the current arbitrated cell pixel dimensions.
+    pub fn current_cell_px(&self) -> CellPx {
+        self.current_cell_px
+    }
+
+    /// Marks every attached `SUB_VIEW` subscriber as needing a fresh full-sync frame (e.g. after `Seek`).
+    pub fn mark_all_views_full_sync(&mut self) {
+        for view in self.views.values_mut() {
+            view.needs_full_sync = true;
+            view.dirty_rows.clear();
+            view.scroll_delta = 0;
+        }
     }
 
     /// Returns the earliest pending timer deadline for this session (DEC 2026 hold, search flush, or wait timeout).
@@ -305,6 +352,18 @@ impl<V: VtEngine> SessionMachine<V> {
     /// Returns queued bytes waiting to be written to the PTY stdin.
     pub fn pty_write_len(&self) -> usize {
         self.pty_write_queue.len()
+    }
+
+    /// Copies up to `max_bytes` from the front of the PTY stdin queue without removing them.
+    pub fn peek_pty_write(&self, max_bytes: usize, out: &mut Vec<u8>) {
+        out.clear();
+        out.extend(self.pty_write_queue.iter().take(max_bytes).copied());
+    }
+
+    /// Removes `count` bytes from the front of the PTY stdin queue after a successful non-blocking write.
+    pub fn consume_pty_write(&mut self, count: usize) {
+        let drop_n = count.min(self.pty_write_queue.len());
+        self.pty_write_queue.drain(..drop_n);
     }
 
     /// Drains up to `max_bytes` from the bounded PTY stdin write queue.
