@@ -246,11 +246,13 @@ impl MarksKey {
         core::str::from_utf8(&self.0).expect("MarksKey is valid ASCII hex")
     }
 
-    pub(crate) fn encode(&self, w: &mut Writer) {
+    /// Encodes the 32-byte key into `w`.
+    pub fn encode(&self, w: &mut Writer) {
         w.raw(&self.0);
     }
 
-    pub(crate) fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
+    /// Decodes and validates a 32-byte lowercase hex key from `r`.
+    pub fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
         let bytes = r.fixed::<32>()?;
         Self::parse(&bytes).ok_or(WireError::InvalidValue("marks key must be 32 lowercase hex chars"))
     }
@@ -417,12 +419,14 @@ impl GridSize {
         Some(Self { cols: NonZeroU16::new(cols)?, rows: NonZeroU16::new(rows)? })
     }
 
-    pub(crate) fn encode(self, w: &mut Writer) {
+    /// Encodes the grid dimensions into `w`.
+    pub fn encode(self, w: &mut Writer) {
         w.u16(self.cols.get());
         w.u16(self.rows.get());
     }
 
-    pub(crate) fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
+    /// Decodes and validates non-zero bounded grid dimensions from `r`.
+    pub fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
         let cols = r.u16()?;
         let rows = r.u16()?;
         Self::new(cols, rows).ok_or(WireError::InvalidValue("grid dimensions out of range"))
@@ -439,12 +443,14 @@ pub struct CellPx {
 }
 
 impl CellPx {
-    pub(crate) fn encode(self, w: &mut Writer) {
+    /// Encodes the pixel dimensions into `w`.
+    pub fn encode(self, w: &mut Writer) {
         w.u16(self.width);
         w.u16(self.height);
     }
 
-    pub(crate) fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
+    /// Decodes pixel dimensions from `r`.
+    pub fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
         Ok(Self { width: r.u16()?, height: r.u16()? })
     }
 }
@@ -705,7 +711,8 @@ pub struct CursorState {
 }
 
 impl CursorState {
-    pub(crate) fn encode(self, w: &mut Writer) {
+    /// Encodes the cursor state into `w`.
+    pub fn encode(self, w: &mut Writer) {
         w.u16(self.col);
         w.u16(self.row);
         self.shape.encode(w);
@@ -719,7 +726,8 @@ impl CursorState {
         w.u8(flags);
     }
 
-    pub(crate) fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
+    /// Decodes and validates a cursor state from `r`.
+    pub fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
         let col = r.u16()?;
         let row = r.u16()?;
         let shape = CursorShape::decode(r)?;
@@ -759,7 +767,8 @@ pub struct PaletteOverrides {
 }
 
 impl PaletteOverrides {
-    pub(crate) fn encode(&self, w: &mut Writer) {
+    /// Encodes palette overrides into `w`.
+    pub fn encode(&self, w: &mut Writer) {
         w.opt(self.fg.as_ref(), |w, c| c.encode(w));
         w.opt(self.bg.as_ref(), |w, c| c.encode(w));
         w.opt(self.cursor.as_ref(), |w, c| c.encode(w));
@@ -769,7 +778,8 @@ impl PaletteOverrides {
         });
     }
 
-    pub(crate) fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
+    /// Decodes palette overrides from `r`.
+    pub fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
         Ok(Self {
             fg: r.opt(Rgb::decode)?,
             bg: r.opt(Rgb::decode)?,
@@ -793,7 +803,8 @@ pub struct ViewModes {
 }
 
 impl ViewModes {
-    pub(crate) fn encode(self, w: &mut Writer) {
+    /// Encodes view modes into `w`.
+    pub fn encode(self, w: &mut Writer) {
         let mut bits = 0u8;
         if self.alt_screen {
             bits += 1;
@@ -810,7 +821,8 @@ impl ViewModes {
         w.u8(bits);
     }
 
-    pub(crate) fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
+    /// Decodes view modes from `r`.
+    pub fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
         let bits = r.u8()?;
         if bits > 0x0F {
             return Err(WireError::InvalidValue("unknown ViewModes flag bits"));
@@ -829,11 +841,13 @@ impl ViewModes {
 pub struct BlobHash(pub [u8; 32]);
 
 impl BlobHash {
-    pub(crate) fn encode(self, w: &mut Writer) {
+    /// Encodes the 32-byte hash into `w`.
+    pub fn encode(self, w: &mut Writer) {
         w.raw(&self.0);
     }
 
-    pub(crate) fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
+    /// Decodes a 32-byte hash from `r`.
+    pub fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
         Ok(Self(r.fixed::<32>()?))
     }
 }
@@ -849,11 +863,13 @@ pub enum ImageEncoding {
 }
 
 impl ImageEncoding {
-    pub(crate) fn encode(self, w: &mut Writer) {
+    /// Encodes the encoding tag into `w`.
+    pub fn encode(self, w: &mut Writer) {
         w.u8(self as u8);
     }
 
-    pub(crate) fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
+    /// Decodes an image encoding tag from `r`.
+    pub fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
         match r.u8()? {
             0 => Ok(Self::Png),
             1 => Ok(Self::ZstdRgba),
@@ -1063,7 +1079,8 @@ impl PackedRow {
         self.links.get(usize::from(idx)).map(String::as_str).unwrap_or("")
     }
 
-    pub(crate) fn encode(&self, w: &mut Writer) {
+    /// Encodes the packed row into `w`.
+    pub fn encode(&self, w: &mut Writer) {
         w.var_u64(self.line);
         w.u8(self.flags);
         w.str(&self.text);
@@ -1073,7 +1090,8 @@ impl PackedRow {
         w.slice(&self.pieces, |w, p| p.encode(w));
     }
 
-    pub(crate) fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
+    /// Decodes and validates a packed row from `r`.
+    pub fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
         let line = r.var_u64()?;
         let flags = r.u8()?;
         if flags > 0x0F {
@@ -1175,7 +1193,8 @@ pub struct ImagePlacement {
 }
 
 impl ImagePlacement {
-    pub(crate) fn encode(&self, w: &mut Writer) {
+    /// Encodes the image placement into `w`.
+    pub fn encode(&self, w: &mut Writer) {
         self.blob.encode(w);
         w.var_u64(self.line);
         w.i32(self.col);
@@ -1186,7 +1205,8 @@ impl ImagePlacement {
         w.i32(self.z_index);
     }
 
-    pub(crate) fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
+    /// Decodes an image placement from `r`.
+    pub fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
         Ok(Self {
             blob: BlobHash::decode(r)?,
             line: r.var_u64()?,
@@ -1222,7 +1242,8 @@ pub struct CommandRecord {
 }
 
 impl CommandRecord {
-    pub(crate) fn encode(&self, w: &mut Writer) {
+    /// Encodes the command record into `w`.
+    pub fn encode(&self, w: &mut Writer) {
         w.var_u64(self.id);
         w.opt(self.command.as_ref(), |w, s| w.str(s));
         w.opt(self.cwd.as_ref(), |w, s| w.str(s));
@@ -1234,7 +1255,8 @@ impl CommandRecord {
         w.opt(self.end_line.as_ref(), |w, l| w.var_u64(*l));
     }
 
-    pub(crate) fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
+    /// Decodes a command record from `r`.
+    pub fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
         Ok(Self {
             id: r.var_u64()?,
             command: r.opt(Reader::str)?,
