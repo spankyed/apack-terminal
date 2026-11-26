@@ -337,6 +337,19 @@ exclude_re = [
     # 3. `png` crate rejects animated sub-frame PNGs whose first frame is smaller than the full image, so
     #    these defense-in-depth guards are always true for accepted inputs (see `vt/images.rs` above).
     "crates/apack-vt-ghostty/src/image_store.rs:.*replace match guard frame.buffer_size\\(\\) == pixels \\* (4|2) with true in decode_png_into",
+
+    # **v2 `apack-os` lethal-broadcast safety & proven-equivalent exclusions (exact equivalents of v1):**
+    # 1. Mutating comparisons inside `KillTarget::at` allows `kill(0)`/`kill(-1)` broadcasts; mutating
+    #    process selection inside `hang_up_session_descendants` sends SIGHUP to unrelated host processes.
+    "crates/apack-os/src/signal.rs:.*in KillTarget::at",
+    "crates/apack-os/src/signal.rs:.*in hang_up_session_descendants",
+    # 2. Disjoint single-bit POSIX flags (`LOCK_EX | LOCK_NB`, `O_NONBLOCK | O_NOCTTY`,
+    #    `O_NONBLOCK | O_CLOEXEC`) produce identical bitmasks under `|` and `^` (see v1 `listening.rs` & `posix.rs`).
+    "crates/apack-os/src/transport.rs:.*replace \\| with \\^ in acquire_socket_hold",
+    "crates/apack-os/src/image_sources/posix.rs:.*replace \\| with \\^",
+    # 3. Testing a peer owned by another OS user requires a second local OS account not present in CI
+    #    (see v1 `listening.rs:292`).
+    "crates/apack-os/src/transport.rs:.*replace verify_peer_is_current_user -> io::Result<bool> with Ok\\(true\\)",
 ]
 
 # **What only Windows compiles is not excluded here, and is left out of every other run instead.**

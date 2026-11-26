@@ -24,6 +24,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "apack-os"
+version = "0.1.0"
+dependencies = [
+ "apack-proto",
+ "interprocess",
+ "libc",
+ "portable-pty",
+ "sysinfo",
+ "tempfile",
+ "widestring",
+ "windows-sys",
+]
+
+[[package]]
 name = "apack-proto"
 version = "0.2.0"
 

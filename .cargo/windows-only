@@ -8,3 +8,8 @@
 src/listening/pipe.rs
 src/tree.rs
 src/vt/image_sources/windows.rs
+crates/apack-os/src/image_sources/windows.rs
+crates/apack-os/src/pty_windows.rs
+crates/apack-os/src/security_windows.rs
+crates/apack-os/src/transport_windows.rs
+crates/apack-os/src/tree_windows.rs
