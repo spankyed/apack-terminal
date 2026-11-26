@@ -4,9 +4,9 @@
 //! - Zero framing inspection or message parsing.
 //! - Retains up to [`PROXY_REPLAY_CAP`] (`1 MiB`) of client bytes written before the first byte
 //!   arrives from the broker; if an idle broker exited right as the proxy connected, reconnects
-//!   once (auto-starting a detached broker if requested) and replays the buffered bytes.
+//!   once (auto-starting a detached broker if requested) and atomically replays all buffered bytes.
 //! - Writes the universal 4-byte [`apack_proto::FIN_FRAME`] (`[0, 0, 0, 0]`) on `stdin` EOF across
-//!   every OS (Unix and Windows) before draining remaining broker output to `stdout`.
+//!   every OS (Unix and Windows) without aborting the broker-to-stdout read half.
 
 use std::io::{self, Read, Write};
 use std::process::{Command, Stdio};
@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use apack_os::transport::{connect_local_stream, let_go, verify_peer_is_current_user};
+use apack_os::transport::{connect_local_stream, verify_peer_is_current_user};
 use apack_proto::FIN_FRAME;
 use interprocess::local_socket::Stream;
 
@@ -53,6 +53,11 @@ impl ReplayBuffer {
             return;
         }
         self.bytes.extend_from_slice(chunk);
+    }
+
+    /// Returns `true` if the buffer exceeded its cap and can no longer safely replay.
+    pub fn is_overflowed(&self) -> bool {
+        self.overflowed
     }
 
     /// Returns the buffered replay bytes if still within cap and non-empty.
@@ -120,6 +125,19 @@ fn spawn_detached_broker(socket_path: &str) -> io::Result<()> {
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
     cmd.arg("serve").arg("--socket").arg(socket_path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Detach into its own process group so SSH/proxy SIGHUP does not kill the broker.
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS (0x0000_0008) | CREATE_NEW_PROCESS_GROUP (0x0000_0200) | CREATE_NO_WINDOW (0x0800_0000)
+        const WINDOWS_DETACHED_FLAGS: u32 = 0x0800_0208;
+        cmd.creation_flags(WINDOWS_DETACHED_FLAGS);
+    }
     let _child = cmd.spawn()?;
     Ok(())
 }
@@ -131,8 +149,32 @@ pub fn run_stdio_proxy(socket_path: &str, autostart: bool) -> io::Result<()> {
     run_proxy_over(stdin, stdout, || connect_or_autostart(socket_path, autostart))
 }
 
+/// Returns whether the proxy writer thread should still buffer client bytes for a pre-response
+/// reconnect replay (and tolerate broken-pipe on the initial broker link).
+pub(crate) fn should_buffer_replay(saw_broker_byte: bool, reconnected: bool) -> bool {
+    !saw_broker_byte && !reconnected
+}
+
+/// Returns whether the proxy should attempt its single pre-first-response reconnect after `stream1`
+/// hits EOF.
+pub(crate) fn should_reconnect_proxy(
+    first_read_eof: bool,
+    overflowed: bool,
+    stdin_eof: bool,
+    has_replay: bool,
+) -> bool {
+    first_read_eof && !overflowed && (!stdin_eof || has_replay)
+}
+
+struct ActiveLink {
+    stream: Arc<Stream>,
+    replay: ReplayBuffer,
+    stdin_eof: bool,
+    reconnected: bool,
+}
+
 /// Runs the zero-sniff single-channel byte proxy over arbitrary `stdin`/`stdout` streams, using
-/// `connect` to establish the broker link (and retrying once with replay if the broker exits
+/// `connect` to establish the broker link (and retrying once with atomic replay if the broker exits
 /// before emitting its first byte).
 pub fn run_proxy_over<R, W, F>(mut input: R, mut output: W, mut connect: F) -> io::Result<()>
 where
@@ -141,47 +183,46 @@ where
     F: FnMut() -> io::Result<Stream>,
 {
     let stream1 = Arc::new(connect()?);
-    let active_tx = Arc::new(Mutex::new(Arc::clone(&stream1)));
-    let replay = Arc::new(Mutex::new(ReplayBuffer::new(PROXY_REPLAY_CAP)));
+    let link = Arc::new(Mutex::new(ActiveLink {
+        stream: Arc::clone(&stream1),
+        replay: ReplayBuffer::new(PROXY_REPLAY_CAP),
+        stdin_eof: false,
+        reconnected: false,
+    }));
     let saw_broker_byte = Arc::new(AtomicBool::new(false));
-    let stdin_eof = Arc::new(AtomicBool::new(false));
 
-    let writer_tx = Arc::clone(&active_tx);
-    let writer_replay = Arc::clone(&replay);
+    let writer_link = Arc::clone(&link);
     let writer_saw = Arc::clone(&saw_broker_byte);
-    let writer_eof = Arc::clone(&stdin_eof);
 
     let to_broker = thread::spawn(move || -> io::Result<()> {
         let mut buf = [0u8; PROXY_BUF_BYTES];
         loop {
-            match input.read(&mut buf) {
+            match crate::read_retry_eintr(&mut input, &mut buf) {
                 Ok(0) => {
                     let current = {
-                        let guard = writer_tx.lock().unwrap_or_else(|e| e.into_inner());
-                        writer_eof.store(true, Ordering::Release);
-                        Arc::clone(&guard)
+                        let mut guard = writer_link.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.stdin_eof = true;
+                        Arc::clone(&guard.stream)
                     };
                     let mut tx: &Stream = &current;
                     let _ = tx.write_all(&FIN_FRAME);
                     let _ = tx.flush();
-                    let _ = let_go(&current, || {});
                     return Ok(());
                 }
                 Ok(n) => {
-                    let current = {
-                        let guard = writer_tx.lock().unwrap_or_else(|e| e.into_inner());
-                        if !writer_saw.load(Ordering::Acquire) {
-                            writer_replay.lock().unwrap_or_else(|e| e.into_inner()).push(&buf[..n]);
+                    let (current, buffering) = {
+                        let mut guard = writer_link.lock().unwrap_or_else(|e| e.into_inner());
+                        let buffering = should_buffer_replay(writer_saw.load(Ordering::Acquire), guard.reconnected);
+                        if buffering {
+                            guard.replay.push(&buf[..n]);
                         }
-                        Arc::clone(&guard)
+                        (Arc::clone(&guard.stream), buffering)
                     };
                     let mut tx: &Stream = &current;
-                    if let Err(err) = tx.write_all(&buf[..n]) {
-                        // If the first broker closed before responding, the main thread may swap
-                        // `active_tx` to a fresh broker connection and replay buffered bytes.
-                        if writer_saw.load(Ordering::Acquire) {
-                            return Err(err);
-                        }
+                    if let Err(err) = tx.write_all(&buf[..n])
+                        && !buffering
+                    {
+                        return Err(err);
                     }
                 }
                 Err(err) => return Err(err),
@@ -193,48 +234,55 @@ where
     let mut out_buf = [0u8; PROXY_BUF_BYTES];
     let mut broker_rx: &Stream = &stream1;
     let first_read_eof = loop {
-        match broker_rx.read(&mut out_buf) {
+        match crate::read_retry_eintr(&mut broker_rx, &mut out_buf) {
             Ok(0) | Err(_) => break !saw_broker_byte.load(Ordering::Acquire),
             Ok(n) => {
                 saw_broker_byte.store(true, Ordering::Release);
-                replay.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                link.lock().unwrap_or_else(|e| e.into_inner()).replay.clear();
                 output.write_all(&out_buf[..n])?;
                 output.flush()?;
             }
         }
     };
 
-    // If the broker closed before sending a single byte AND we buffered pre-response client bytes,
-    // reconnect once WITHOUT blocking on `to_broker`, swap `active_tx`, replay, and keep forwarding!
-    let replay_bytes = if first_read_eof {
-        replay.lock().unwrap_or_else(|e| e.into_inner()).replay_slice().map(ToOwned::to_owned)
-    } else {
-        None
+    // If the broker closed before sending a single byte AND replay hasn't overflowed, reconnect
+    // FIRST, then lock `link` atomically to replay ALL bytes buffered so far (including any that
+    // arrived while `connect()` was running) and swap `stream` seamlessly!
+    let should_reconnect = {
+        let guard = link.lock().unwrap_or_else(|e| e.into_inner());
+        should_reconnect_proxy(
+            first_read_eof,
+            guard.replay.is_overflowed(),
+            guard.stdin_eof,
+            guard.replay.replay_slice().is_some(),
+        )
     };
 
-    if let Some(bytes) = replay_bytes {
+    if should_reconnect {
         let stream2 = Arc::new(connect()?);
         let already_eof = {
-            let mut guard = active_tx.lock().unwrap_or_else(|e| e.into_inner());
-            let mut tx2: &Stream = &stream2;
-            tx2.write_all(&bytes)?;
-            tx2.flush()?;
-            *guard = Arc::clone(&stream2);
-            stdin_eof.load(Ordering::Acquire)
+            let mut guard = link.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(bytes) = guard.replay.replay_slice() {
+                let mut tx2: &Stream = &stream2;
+                tx2.write_all(bytes)?;
+                tx2.flush()?;
+            }
+            guard.replay.clear();
+            guard.stream = Arc::clone(&stream2);
+            guard.reconnected = true;
+            guard.stdin_eof
         };
         if already_eof {
             let mut tx2: &Stream = &stream2;
             let _ = tx2.write_all(&FIN_FRAME);
             let _ = tx2.flush();
-            let _ = let_go(&stream2, || {});
         }
         let mut rx2: &Stream = &stream2;
         loop {
-            match rx2.read(&mut out_buf) {
+            match crate::read_retry_eintr(&mut rx2, &mut out_buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     saw_broker_byte.store(true, Ordering::Release);
-                    replay.lock().unwrap_or_else(|e| e.into_inner()).clear();
                     output.write_all(&out_buf[..n])?;
                     output.flush()?;
                 }
@@ -242,6 +290,11 @@ where
         }
     }
 
-    let _ = to_broker.join();
+    let _ = output.flush();
+    // Only join `to_broker` if stdin already hit EOF; if the broker closed first (e.g., auth error
+    // over SSH), return immediately so stdout closes without deadlocking in blocking stdin.read().
+    if link.lock().unwrap_or_else(|e| e.into_inner()).stdin_eof {
+        let _ = to_broker.join();
+    }
     Ok(())
 }

@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 #[cfg(windows)]
@@ -22,16 +23,26 @@ use tempfile::tempdir;
 use crate::client::{BrokerClient, ClientError};
 use crate::config::{BrokerConfig, CliCommand, clamp_shard_count, derive_auth_secret, parse_cli, resolve_socket_path};
 use crate::inspect::{build_report, collect_report, format_report};
-use crate::proxy::{PROXY_REPLAY_CAP, ReplayBuffer, connect_or_autostart, connect_or_autostart_with, run_proxy_over};
+use crate::proxy::{
+    PROXY_REPLAY_CAP, ReplayBuffer, connect_or_autostart, connect_or_autostart_with, run_proxy_over,
+    should_buffer_replay, should_reconnect_proxy,
+};
 use crate::runtime::BrokerServer;
+#[cfg(unix)]
+use crate::shard::drain_unix_pty_nonblocking;
 use crate::shard::{
     ReactorEvent, ShardCmd, ShardShared, apply_seek_slice, argv_matches_app, capture_keyframe, maybe_compress_idle,
     parse_exit_status, resolve_scrollback_lines, shard_session_wait_timeout, spawn_shard,
 };
 #[cfg(unix)]
-use crate::transport_loop::{NonBlockErr, advance_write_queue, classify_nonblocking_err};
-use crate::transport_loop::{pick_least_loaded_shard, reactor_wait_timeout};
-use crate::{abi_hash_for_features, engine_abi_hash, fill_random, now_unix_ms};
+use crate::transport_loop::{
+    NonBlockErr, advance_write_queue, can_accept_unix_conn, classify_nonblocking_err, write_queue_can_pull,
+};
+use crate::transport_loop::{
+    PendingList, compute_shutdown_deadline, pick_least_loaded_shard, prune_pending_lists_for_conn, reactor_should_exit,
+    reactor_wait_timeout, ready_stalled_stream_ids,
+};
+use crate::{abi_hash_for_features, engine_abi_hash, fill_random, now_unix_ms, read_retry_eintr};
 
 #[cfg(windows)]
 static PIPE_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -146,15 +157,38 @@ fn cli_parsing_config_and_helpers() {
 
     // ReplayBuffer cap & overflow
     let mut rb = ReplayBuffer::new(10);
+    assert!(!rb.is_overflowed());
     assert_eq!(rb.replay_slice(), None);
     rb.push(b"hello");
     assert_eq!(rb.replay_slice(), Some(&b"hello"[..]));
     rb.push(b"12345");
     assert_eq!(rb.replay_slice(), Some(&b"hello12345"[..]));
     rb.push(b"!");
+    assert!(rb.is_overflowed());
     assert_eq!(rb.replay_slice(), None);
     rb.push(b"x");
     assert_eq!(rb.replay_slice(), None);
+
+    // read_retry_eintr retries Interrupted and returns both Ok and non-Interrupted Err
+    struct FlakyReader(u8);
+    impl Read for FlakyReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.0 += 1;
+            match self.0 {
+                1 => Err(io::Error::from(io::ErrorKind::Interrupted)),
+                2 => {
+                    buf[..3].copy_from_slice(b"abc");
+                    Ok(3)
+                }
+                _ => Err(io::Error::from(io::ErrorKind::BrokenPipe)),
+            }
+        }
+    }
+    let mut fr = FlakyReader(0);
+    let mut rbuf = [0u8; 8];
+    assert_eq!(read_retry_eintr(&mut fr, &mut rbuf).unwrap(), 3);
+    assert_eq!(&rbuf[..3], b"abc");
+    assert_eq!(read_retry_eintr(&mut fr, &mut rbuf).unwrap_err().kind(), io::ErrorKind::BrokenPipe);
 
     let mut rb2 = ReplayBuffer::new(PROXY_REPLAY_CAP);
     rb2.push(b"abc");
@@ -301,7 +335,19 @@ fn e2e_spawn_view_frames_queries_owns_metrics_inspect_and_kill() {
     let metrics = client.metrics().unwrap();
     assert_eq!(metrics.live_sessions, 1);
     assert!(metrics.connections >= 1);
-    assert!(metrics.total_pty_bytes > 0, "shard telemetry must report parsed PTY bytes");
+    assert!(metrics.total_pty_bytes >= 20, "shard telemetry must report real parsed PTY bytes");
+
+    // Two concurrent ListSessions requests back-to-back must get distinct broker list_ids & both replies!
+    let list_req1 = client.alloc_req_id();
+    let list_req2 = client.alloc_req_id();
+    client.send_raw(apack_proto::types::StreamId::CONTROL, list_req1, &ClientMsg::ListSessions).unwrap();
+    client.send_raw(apack_proto::types::StreamId::CONTROL, list_req2, &ClientMsg::ListSessions).unwrap();
+    assert!(
+        matches!(client.wait_reply(list_req1).unwrap(), BrokerMsg::SessionsList { sessions } if sessions.len() == 1)
+    );
+    assert!(
+        matches!(client.wait_reply(list_req2).unwrap(), BrokerMsg::SessionsList { sessions } if sessions.len() == 1)
+    );
 
     let report = collect_report(handle.socket_path(), &AuthConfig::None).unwrap();
     assert_eq!(report.sessions.len(), 1);
@@ -462,23 +508,29 @@ fn e2e_remote_lease_grace_resume_and_recording_rewind_seek_restore() {
     let _ = rew_epoch;
     c2.kill(rew_sid).unwrap();
 
-    // 3. Restore from the recording into a brand-new live session!
-    let (restored_sid, _) =
-        c2.spawn(echo_command_spec("LIVE_AFTER_RESTORE", None, Some(rec_dir.to_string_lossy().into_owned()))).unwrap();
+    // 3. Restore from the recording into a brand-new live session with a DIFFERENT size (100x30 != 80x24)
+    //    so restore aligns VT geometry to the live PTY!
+    let mut restore_spec = echo_command_spec("LIVE_AFTER_RESTORE", None, Some(rec_dir.to_string_lossy().into_owned()));
+    restore_spec.size = GridSize::new(100, 30).unwrap();
+    let (restored_sid, _) = c2.spawn(restore_spec).unwrap();
     assert_eq!(
         c2.wait(restored_sid, WaitCondition::Text(String::from("LIVE_AFTER_RESTORE")), 10_000).unwrap(),
         WaitOutcome::Met
     );
     let res_stream = NonZeroStreamId::new(3).unwrap();
-    c2.attach(
-        restored_sid,
-        res_stream,
-        SubFlags::from_bits(SubFlags::VIEW).unwrap(),
-        None,
-        0,
-        FrameCredit { max_frames: 4, max_bytes: 256 * 1024 },
-    )
-    .unwrap();
+    let res_att = c2
+        .attach(
+            restored_sid,
+            res_stream,
+            SubFlags::from_bits(SubFlags::VIEW).unwrap(),
+            None,
+            0,
+            FrameCredit { max_frames: 4, max_bytes: 256 * 1024 },
+        )
+        .unwrap();
+    if let BrokerMsg::Attached { size, .. } = res_att {
+        assert_eq!(size, GridSize::new(100, 30).unwrap(), "restored session must resize VT to match SpawnSpec.size");
+    }
     let res_search = c2
         .stream_request(
             res_stream,
@@ -770,34 +822,32 @@ fn client_mock_transport_fin_req_id_and_multi_frame() {
     c2.send_fin().unwrap();
     let fin_bytes = rx.recv().unwrap();
     assert_eq!(fin_bytes, FIN_FRAME);
+
+    // Auth downgrade check: client configured with AuthConfig::Required MUST reject auth_required=false!
+    let mut noauth_wire = Vec::new();
+    BrokerMsg::HelloOk {
+        protocol_version: PROTOCOL_VERSION,
+        auth_required: false,
+        server_nonce: [0x33; 32],
+        word_delimiters: String::from(" "),
+        capabilities: 0,
+    }
+    .encode_to_frame(apack_proto::types::StreamId::CONTROL, RequestId::from_raw(1), &mut noauth_wire)
+    .unwrap();
+    let mock_downgrade = MockDuplex { incoming: io::Cursor::new(noauth_wire), outgoing: Vec::new() };
+    let required = AuthConfig::Required(derive_auth_secret(b"client-requires-auth"));
+    assert!(
+        matches!(
+            BrokerClient::handshake(mock_downgrade, &required, "downgrade-check"),
+            Err(ClientError::AuthFailed(_))
+        ),
+        "client with AuthConfig::Required must reject server advertising auth_required=false"
+    );
 }
 
-#[cfg(unix)]
 #[test]
-fn transport_unix_helpers_unit() {
-    assert_eq!(classify_nonblocking_err(&io::Error::from(io::ErrorKind::WouldBlock)), NonBlockErr::WouldBlock);
-    assert_eq!(classify_nonblocking_err(&io::Error::from(io::ErrorKind::Interrupted)), NonBlockErr::Interrupted);
-    assert_eq!(classify_nonblocking_err(&io::Error::from(io::ErrorKind::BrokenPipe)), NonBlockErr::Fatal);
-
-    let mut q = VecDeque::new();
-    q.push_back((vec![1, 2, 3, 4, 5], 0));
-    q.push_back((vec![6, 7, 8, 9], 0));
-    // Partial advance within first buffer (off -> 2, rem = 3)
-    advance_write_queue(&mut q, 2);
-    assert_eq!(q.len(), 2);
-    assert_eq!(q.front().unwrap().1, 2);
-    // Advance 5 bytes: consumes rem=3 of first buffer (5 - 3 = 2 != 5 / 3 = 1!) + 2 of second buffer
-    advance_write_queue(&mut q, 5);
-    assert_eq!(q.len(), 1);
-    assert_eq!(q.front().unwrap().1, 2);
-    // Exact drain of remaining 2 bytes
-    advance_write_queue(&mut q, 2);
-    assert!(q.is_empty());
-    // Extra advance on empty queue is a clean no-op
-    advance_write_queue(&mut q, 5);
-    assert!(q.is_empty());
-
-    // Pure timeout helpers for Reactor and Shard + cooperative idle compression helper!
+fn timeout_and_idle_compression_helpers_unit() {
+    // Pure timeout helpers for Reactor and Shard + cooperative idle compression helper (cross-platform!).
     let now = apack_core::time::TimestampMs::from_millis(1_000);
     assert_eq!(reactor_wait_timeout(None, now, true, Duration::from_millis(50), false), Duration::from_secs(1));
     assert_eq!(reactor_wait_timeout(None, now, false, Duration::from_millis(50), false), Duration::from_millis(50));
@@ -874,6 +924,104 @@ fn transport_unix_helpers_unit() {
         apack_core::vt::CompressStep::Done
     });
     assert_eq!(calls, 2);
+
+    // Pure proxy replay/reconnect decision helpers
+    assert!(should_buffer_replay(false, false));
+    assert!(!should_buffer_replay(true, false));
+    assert!(!should_buffer_replay(false, true));
+    assert!(!should_buffer_replay(true, true));
+
+    assert!(should_reconnect_proxy(true, false, false, false));
+    assert!(should_reconnect_proxy(true, false, true, true));
+    assert!(!should_reconnect_proxy(true, false, true, false));
+    assert!(!should_reconnect_proxy(true, true, false, true));
+    assert!(!should_reconnect_proxy(false, false, false, true));
+
+    // Pure shutdown deadline, should_exit, pending_lists prune, and stalled-frame selector helpers
+    let t0 = std::time::Instant::now();
+    let dl = compute_shutdown_deadline(t0, Duration::from_secs(2));
+    assert_eq!(dl.duration_since(t0), Duration::from_secs(7));
+    assert!(!reactor_should_exit(false, true, t0, Some(t0)));
+    assert!(reactor_should_exit(true, true, t0, Some(dl)));
+    assert!(!reactor_should_exit(true, false, t0, Some(dl)));
+    assert!(reactor_should_exit(true, false, dl, Some(dl)));
+
+    let c1 = apack_core::lease::ConnId::new(1).unwrap();
+    let c2 = apack_core::lease::ConnId::new(2).unwrap();
+    let mut plist = std::collections::HashMap::new();
+    plist
+        .insert(1u64, PendingList { conn: c1, req_id: RequestId::from_raw(1), remaining_shards: 1, collected: vec![] });
+    plist
+        .insert(2u64, PendingList { conn: c2, req_id: RequestId::from_raw(2), remaining_shards: 1, collected: vec![] });
+    prune_pending_lists_for_conn(&mut plist, c1);
+    assert!(!plist.contains_key(&1));
+    assert!(plist.contains_key(&2));
+
+    let s1 = NonZeroStreamId::new(1).unwrap();
+    let s2 = NonZeroStreamId::new(2).unwrap();
+    let mut stalled = std::collections::HashMap::new();
+    let dummy_frame = Box::new(apack_proto::messages::FrameUpdate {
+        seq: 1,
+        epoch: 1,
+        size: GridSize::new(80, 24).unwrap(),
+        first_active_line: 0,
+        scrollback_lines: 0,
+        scroll_delta: 0,
+        cursor: apack_proto::types::CursorState {
+            col: 0,
+            row: 0,
+            shape: apack_proto::types::CursorShape::Block,
+            blinking: false,
+            hidden: false,
+        },
+        modes: apack_proto::types::ViewModes::default(),
+        palette: None,
+        rows: Vec::new(),
+        images_gen: 0,
+        full_sync: true,
+    });
+    stalled.insert(s1, (SessionId::new(1).unwrap(), dummy_frame.clone()));
+    stalled.insert(s2, (SessionId::new(1).unwrap(), dummy_frame));
+    let mut queued = std::collections::HashMap::new();
+    queued.insert(s1, SessionId::new(1).unwrap());
+    assert_eq!(ready_stalled_stream_ids(&stalled, &queued), vec![s2]);
+}
+
+#[cfg(unix)]
+#[test]
+fn transport_unix_helpers_unit() {
+    assert_eq!(classify_nonblocking_err(&io::Error::from(io::ErrorKind::WouldBlock)), NonBlockErr::WouldBlock);
+    assert_eq!(classify_nonblocking_err(&io::Error::from(io::ErrorKind::Interrupted)), NonBlockErr::Interrupted);
+    assert_eq!(classify_nonblocking_err(&io::Error::from(io::ErrorKind::BrokenPipe)), NonBlockErr::Fatal);
+
+    let mut q = VecDeque::new();
+    q.push_back((vec![1, 2, 3, 4, 5], 0));
+    q.push_back((vec![6, 7, 8, 9], 0));
+    // Partial advance within first buffer (off -> 2, rem = 3)
+    advance_write_queue(&mut q, 2);
+    assert_eq!(q.len(), 2);
+    assert_eq!(q.front().unwrap().1, 2);
+    // Advance 5 bytes: consumes rem=3 of first buffer (5 - 3 = 2 != 5 / 3 = 1!) + 2 of second buffer
+    advance_write_queue(&mut q, 5);
+    assert_eq!(q.len(), 1);
+    assert_eq!(q.front().unwrap().1, 2);
+    // Exact drain of remaining 2 bytes
+    advance_write_queue(&mut q, 2);
+    assert!(q.is_empty());
+    // Extra advance on empty queue is a clean no-op
+    advance_write_queue(&mut q, 5);
+    assert!(q.is_empty());
+
+    // Unix connection accept & write_queue watermark boundary helpers
+    assert!(can_accept_unix_conn(false, 0, true, true));
+    assert!(!can_accept_unix_conn(true, 0, true, true));
+    assert!(!can_accept_unix_conn(false, crate::transport_loop::MAX_CONNECTIONS, true, true));
+    assert!(!can_accept_unix_conn(false, 0, false, true));
+    assert!(!can_accept_unix_conn(false, 0, true, false));
+
+    assert!(write_queue_can_pull(31, 131_071));
+    assert!(!write_queue_can_pull(32, 0));
+    assert!(!write_queue_can_pull(0, 131_072));
 }
 
 #[test]
@@ -924,6 +1072,7 @@ fn shard_direct_handle_load_shutdown_drop_and_no_such_session() {
     }
     assert_eq!(s0.session_load(), 2);
     assert_eq!(s1.session_load(), 0);
+    assert_eq!(s1.telemetry(), (0, 0));
     let shards = [s0, s1];
     assert_eq!(pick_least_loaded_shard(&shards), 1);
     let [mut s0, s1] = shards;
@@ -1120,9 +1269,9 @@ fn e2e_interactive_write_resize_pause_raw_output_and_multi_shard() {
         .send_raw(st.as_stream_id(), RequestId::PUSH, &ClientMsg::Write { data: b"ECHO_SECOND_FRAME\n".to_vec() })
         .unwrap();
 
-    // Wait for BOTH a second FrameUpdate containing ECHO_SECOND_FRAME and RawOutput bytes!
+    // Wait for BOTH a second FrameUpdate containing ECHO_SECOND_FRAME and RawOutput containing it!
     let mut saw_frame2 = false;
-    let mut saw_raw = false;
+    let mut raw_buf = String::new();
     for _ in 0..64 {
         let f = client.recv_frame().unwrap();
         match f.msg {
@@ -1141,17 +1290,20 @@ fn e2e_interactive_write_resize_pause_raw_output_and_multi_shard() {
                     )
                     .unwrap();
             }
-            BrokerMsg::Output { text } if !text.is_empty() => {
-                saw_raw = true;
+            BrokerMsg::Output { text } => {
+                raw_buf.push_str(&text);
             }
             _ => {}
         }
-        if saw_frame2 && saw_raw {
+        if saw_frame2 && raw_buf.contains("ECHO_SECOND_FRAME") {
             break;
         }
     }
     assert!(saw_frame2, "must receive second pipelined FrameUpdate before FrameAck");
-    assert!(saw_raw, "must receive Output bytes on SUB_RAW_OUTPUT stream");
+    assert!(
+        raw_buf.contains("ECHO_SECOND_FRAME"),
+        "must receive post-disconnect Output bytes on SUB_RAW_OUTPUT stream"
+    );
 
     // Verify viewer_b ALSO still received ECHO_SECOND_FRAME after viewer_drop disconnected!
     let mut vb_saw = false;
@@ -1326,7 +1478,6 @@ fn e2e_interactive_write_resize_pause_raw_output_and_multi_shard() {
 fn e2e_leases_kept_pinning_tier2_compression_foreground_verify_and_kill_escalation() {
     let tmp = tempdir().unwrap();
     let sock = unique_endpoint(tmp.path(), "e2e-tier2");
-    let rec_dir = tmp.path().join("wal-roll");
     let force_rec_dir = tmp.path().join("wal-force");
 
     let mut cfg = BrokerConfig::for_socket(&sock);
@@ -1347,7 +1498,32 @@ fn e2e_leases_kept_pinning_tier2_compression_foreground_verify_and_kill_escalati
     spec_kept.kept = true;
     let (s_kept, _) = holder.spawn(spec_kept).unwrap();
     let (s_pinned, _) = holder.spawn(echo_command_spec("PINNED_ALIVE", None, None)).unwrap();
-    let (s_ephem, _) = holder.spawn(echo_command_spec("EPHEM_ALIVE", None, None)).unwrap();
+    #[cfg(unix)]
+    let spec_ephem = SpawnSpec {
+        argv: vec![
+            String::from("/bin/sh"),
+            String::from("-c"),
+            String::from("trap 'exit 0' HUP; printf 'EPHEM_ALIVE\\r\\n'; sleep 30 & wait"),
+        ],
+        cwd: None,
+        env: Vec::new(),
+        size: GridSize::new(80, 24).unwrap(),
+        cell_px: CellPx { width: 8, height: 16 },
+        scrollback_limit: 500,
+        marks_key: None,
+        resize_policy: ResizePolicy::LatestActive,
+        record_dir: None,
+        restore_from: None,
+        image_files: false,
+        kept: false,
+    };
+    #[cfg(windows)]
+    let spec_ephem = echo_command_spec("EPHEM_ALIVE", None, None);
+    let (s_ephem, _) = holder.spawn(spec_ephem).unwrap();
+    assert_eq!(
+        holder.wait(s_ephem, WaitCondition::Text(String::from("EPHEM_ALIVE")), 5_000).unwrap(),
+        WaitOutcome::Met
+    );
 
     let mut c2 = BrokerClient::connect(handle.socket_path(), &AuthConfig::None, "pinner").unwrap();
     let (sess_lease, _) = c2.acquire_lease(LeaseKind::Session(s_pinned)).unwrap();
@@ -1355,7 +1531,7 @@ fn e2e_leases_kept_pinning_tier2_compression_foreground_verify_and_kill_escalati
     // SessionUnpinned must NOT kill s_ephem because broker_lease_active == true!
     let (ephem_lease, _) = c2.acquire_lease(LeaseKind::Session(s_ephem)).unwrap();
     c2.release_lease(ephem_lease).unwrap();
-    std::thread::sleep(Duration::from_millis(30));
+    std::thread::sleep(Duration::from_millis(60));
     let still_alive: Vec<SessionId> = c2.list_sessions().unwrap().into_iter().map(|s| s.id).collect();
     assert!(still_alive.contains(&s_ephem), "unpinning a session while broker lease is active must NOT kill it");
 
@@ -1386,13 +1562,19 @@ fn e2e_leases_kept_pinning_tier2_compression_foreground_verify_and_kill_escalati
     assert!(after_pin_drop.contains(&s_kept));
     assert!(!after_pin_drop.contains(&s_pinned));
 
-    // Re-acquire broker lease for remaining tests
+    // Re-acquire broker lease for remaining tests; leave `s_kept` ALIVE through `handle.shutdown()`
+    // below to prove explicit broker shutdown terminates kept sessions cleanly without deadlocking!
     let (_bl2, _) = c2.acquire_lease(LeaseKind::BrokerImmediate).unwrap();
-    c2.kill(s_kept).unwrap();
 
-    // 2. WAL rollover (> 2048 bytes output) + idle compression (25 ms) + Unix foreground verify + SIGKILL escalation!
+    // `SpawnSpec { image_files: true }` must be rejected cleanly (and not leak `pending_spawns`)!
+    let mut bad_img_spec = echo_command_spec("NO_IMG", None, None);
+    bad_img_spec.image_files = true;
+    assert!(matches!(c2.spawn(bad_img_spec), Err(ClientError::Broker { code: ErrorCode::Malformed, .. })));
+
+    // 2. WAL rollover (> 64 KiB output) + idle compression (25 ms) + Unix foreground verify + SIGKILL escalation!
     #[cfg(unix)]
     {
+        let rec_dir = tmp.path().join("wal-roll");
         // Emit > 80 KiB output (exceeding MIN_SEGMENT_TARGET_BYTES = 64 KiB for deterministic WAL
         // rollover + scrollback lines for idle compression), then wait for stdin before OSC 7501!
         let script = concat!(
@@ -1461,15 +1643,16 @@ fn e2e_leases_kept_pinning_tier2_compression_foreground_verify_and_kill_escalati
         let metrics = c2.metrics().unwrap();
         assert!(metrics.scrollback_bytes > 0);
 
-        // Kill s_roll (which traps SIGHUP) -> Tier 2 escalates to SIGKILL after 60 ms and reaps!
+        // Kill s_roll (which traps SIGHUP) -> Tier 2 escalates to SIGKILL after 200 ms and reaps!
         c2.kill(s_roll).unwrap();
         for _ in 0..100 {
-            if c2.list_sessions().unwrap().is_empty() {
+            let ids: Vec<SessionId> = c2.list_sessions().unwrap().into_iter().map(|s| s.id).collect();
+            if !ids.contains(&s_roll) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(c2.list_sessions().unwrap().is_empty());
+        assert!(!c2.list_sessions().unwrap().iter().any(|s| s.id == s_roll));
 
         // Verify WAL rolled over into >= 2 segments and Rewind rejects Signal with Malformed!
         let reg_check = apack_wal::RecordingRegistry::new();
@@ -1537,6 +1720,70 @@ fn e2e_leases_kept_pinning_tier2_compression_foreground_verify_and_kill_escalati
             (Some(7), None),
             "kill() must deliver graceful SIGHUP and wait kill_escalate_after before SIGKILL"
         );
+
+        // Verify `kill()` on a Paused session with buffered output unpauses reads so macOS/BSD
+        // `ttydrain()` does not wedge the exiting child, AND unit-test `drain_unix_pty_nonblocking`!
+        let tail_spec = SpawnSpec {
+            argv: vec![
+                String::from("/bin/sh"),
+                String::from("-c"),
+                String::from("printf 'TAIL_ARMED\\r\\n'; sleep 0.04; printf 'TAIL_BEFORE_EXIT_99\\r\\n'; sleep 30"),
+            ],
+            cwd: None,
+            env: Vec::new(),
+            size: GridSize::new(80, 10).unwrap(),
+            cell_px: CellPx { width: 8, height: 16 },
+            scrollback_limit: 50,
+            marks_key: None,
+            resize_policy: ResizePolicy::LatestActive,
+            record_dir: None,
+            restore_from: None,
+            image_files: false,
+            kept: false,
+        };
+        let (s_tail, _) = c2.spawn(tail_spec).unwrap();
+        assert_eq!(c2.wait(s_tail, WaitCondition::Text(String::from("TAIL_ARMED")), 3_000).unwrap(), WaitOutcome::Met);
+        let st_tail = NonZeroStreamId::new(3).unwrap();
+        c2.attach(
+            s_tail,
+            st_tail,
+            SubFlags::from_bits(SubFlags::EVENTS).unwrap(),
+            None,
+            0,
+            FrameCredit { max_frames: 1, max_bytes: 65_536 },
+        )
+        .unwrap();
+        c2.send_raw(st_tail.as_stream_id(), RequestId::PUSH, &ClientMsg::Pause).unwrap();
+        std::thread::sleep(Duration::from_millis(70));
+        c2.kill(s_tail).unwrap();
+        assert_eq!(
+            c2.wait(s_tail, WaitCondition::Text(String::from("TAIL_BEFORE_EXIT_99")), 3_000).unwrap(),
+            WaitOutcome::Met,
+            "killing a paused session must unpause & drain buffered tail bytes cleanly"
+        );
+
+        // Direct unit check of `drain_unix_pty_nonblocking` on a real Unix PTY master.
+        let pty_cfg = apack_os::pty::PtySpawnConfig {
+            size: GridSize::new(80, 10).unwrap(),
+            cell_px: CellPx { width: 8, height: 16 },
+            shell: Some(String::from("/bin/sh")),
+            args: vec![String::from("-c"), String::from("printf 'DIRECT_DRAIN_OK'")],
+            env: Vec::new(),
+            unset: Vec::new(),
+            cwd: None,
+        };
+        let mut spawned = apack_os::pty::spawn_pty(&pty_cfg).unwrap();
+        let mut drained = Vec::new();
+        let mut scratch = [0u8; 256];
+        for _ in 0..50 {
+            drain_unix_pty_nonblocking(&spawned.master, &mut scratch, 256, |chunk| drained.extend_from_slice(chunk));
+            if String::from_utf8_lossy(&drained).contains("DIRECT_DRAIN_OK") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(String::from_utf8_lossy(&drained).contains("DIRECT_DRAIN_OK"));
+        let _ = spawned.child.wait();
     }
 
     // 3. Force-drop live recorded session on shutdown() -> seals WAL and kills child cleanly!
@@ -1556,6 +1803,57 @@ fn e2e_leases_kept_pinning_tier2_compression_foreground_verify_and_kill_escalati
     let reader = apack_wal::WalReader::open(&force_rec_dir, &reg).unwrap();
     assert!(reader.span().is_some());
     assert!(reader.segments()[0].sealed, "force_drop_session must seal active WAL on shutdown");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_edge_helpers_and_natural_child_exit() {
+    use std::sync::{Arc, Condvar, Mutex};
+
+    // 1. is_graceful_win_close + wait_for_win_wake resets *woken = false and returns immediately
+    assert!(crate::transport_windows::is_graceful_win_close(apack_core::broker::CloseReason::ClientFin, false));
+    assert!(crate::transport_windows::is_graceful_win_close(apack_core::broker::CloseReason::SlowReader, true));
+    assert!(!crate::transport_windows::is_graceful_win_close(apack_core::broker::CloseReason::SlowReader, false));
+    let cond = Arc::new((Mutex::new(true), Condvar::new()));
+    let t0 = std::time::Instant::now();
+    crate::transport_windows::wait_for_win_wake(&cond, Duration::from_secs(2));
+    assert!(t0.elapsed() < Duration::from_millis(500));
+    assert!(!*cond.0.lock().unwrap());
+
+    // 2. wait_for_win_mailbox returns immediately when `woken == true` and clears `woken`
+    let mb = Mutex::new(crate::shard::ShardMailboxState { queue: std::collections::VecDeque::new(), woken: true });
+    let cv = Condvar::new();
+    let t1 = std::time::Instant::now();
+    crate::shard_windows::wait_for_win_mailbox(&mb, &cv, Duration::from_secs(2));
+    assert!(t1.elapsed() < Duration::from_millis(500));
+    assert!(!mb.lock().unwrap().woken);
+
+    // 3. Naturally-exiting Windows child is reaped cleanly without kill(), emitting Exited!
+    let tmp = tempdir().unwrap();
+    let sock = unique_endpoint(tmp.path(), "win-nat-exit");
+    let mut cfg = BrokerConfig::for_socket(&sock);
+    cfg.shard_count = 1;
+    let mut handle = BrokerServer::bind(cfg).unwrap().spawn().unwrap();
+    let mut client = BrokerClient::connect(handle.socket_path(), &AuthConfig::None, "win-exit").unwrap();
+    let spec = SpawnSpec {
+        argv: vec![String::from("cmd.exe"), String::from("/C"), String::from("echo WIN_NATURAL_EXIT")],
+        cwd: None,
+        env: Vec::new(),
+        size: GridSize::new(80, 24).unwrap(),
+        cell_px: CellPx { width: 8, height: 16 },
+        scrollback_limit: 200,
+        marks_key: None,
+        resize_policy: ResizePolicy::LatestActive,
+        record_dir: None,
+        restore_from: None,
+        image_files: false,
+        kept: false,
+    };
+    let (sid, _) = client.spawn(spec).unwrap();
+    assert_eq!(client.wait(sid, WaitCondition::Exit, 5_000).unwrap(), WaitOutcome::Met);
+    client.send_fin().unwrap();
+    drop(client);
+    handle.shutdown().unwrap();
 }
 
 struct ChanReader {

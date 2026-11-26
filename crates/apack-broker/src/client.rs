@@ -80,6 +80,9 @@ pub struct ReceivedFrame {
     pub msg: BrokerMsg,
 }
 
+/// Hard cap on buffered unsolicited push frames inside [`BrokerClient::pending`].
+const MAX_PENDING_FRAMES: usize = 4096;
+
 /// Blocking v2 client wrapping any bidirectional transport (local socket/pipe or stdio proxy).
 pub struct BrokerClient<T> {
     transport: T,
@@ -153,6 +156,10 @@ impl<T: Read + Write> BrokerClient<T> {
                 }
                 _ => return Err(ClientError::UnexpectedReply("expected AuthOk")),
             }
+        } else if auth.is_required() {
+            return Err(ClientError::AuthFailed(String::from(
+                "client requires mutual authentication but server advertised auth_required=false",
+            )));
         }
 
         Ok(client)
@@ -365,10 +372,16 @@ impl<T: Read + Write> BrokerClient<T> {
 
     /// Waits for a reply matching `req_id`, buffering unsolicited push frames in `self.pending`.
     pub fn wait_reply(&mut self, req_id: RequestId) -> Result<BrokerMsg, ClientError> {
+        if let Some(pos) = self.pending.iter().position(|f| f.req_id == req_id) {
+            return Ok(self.pending.remove(pos).expect("position in bounds").msg);
+        }
         loop {
             let frame = self.read_one_from_wire()?;
             if frame.req_id == req_id {
                 return Ok(frame.msg);
+            }
+            if self.pending.len() >= MAX_PENDING_FRAMES {
+                return Err(ClientError::UnexpectedReply("too many buffered unsolicited frames"));
             }
             self.pending.push_back(frame);
         }
@@ -390,7 +403,7 @@ impl<T: Read + Write> BrokerClient<T> {
                     };
                 }
             }
-            let n = self.transport.read(&mut scratch)?;
+            let n = crate::read_retry_eintr(&mut self.transport, &mut scratch)?;
             if n == 0 {
                 return Err(ClientError::Closed);
             }

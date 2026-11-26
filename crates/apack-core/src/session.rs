@@ -335,6 +335,12 @@ impl<V: VtEngine> SessionMachine<V> {
         self.current_cell_px
     }
 
+    /// Synchronizes cached grid/cell geometry after external VT replacement (e.g. `Seek` / restore).
+    pub fn sync_vt_geometry(&mut self, cell_px: CellPx) {
+        self.current_size = self.vt.meta().size;
+        self.current_cell_px = cell_px;
+    }
+
     /// Marks every attached `SUB_VIEW` subscriber as needing a fresh full-sync frame (e.g. after `Seek`).
     pub fn mark_all_views_full_sync(&mut self) {
         for view in self.views.values_mut() {

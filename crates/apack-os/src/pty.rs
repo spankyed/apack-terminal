@@ -74,6 +74,13 @@ impl PtyMaster {
         foreground_process(self.master.as_ref())
     }
 
+    /// Queries the foreground process group leader PID via `tcgetpgrp` (fast, non-blocking; Unix only).
+    #[cfg(unix)]
+    pub fn foreground_pgid(&self) -> Option<u32> {
+        let pid = self.master.process_group_leader()?;
+        u32::try_from(pid).ok()
+    }
+
     /// Queries the foreground process group leader `argv` for status vouching (Unix only).
     pub fn foreground_argv(&self) -> Option<Vec<String>> {
         foreground_argv(self.master.as_ref())
@@ -399,6 +406,7 @@ mod tests {
 
         let fg = spawned.master.foreground_process().expect("foreground process while shell waits");
         assert_eq!(fg.pid.pid() as u32, spawned.pid);
+        assert_eq!(spawned.master.foreground_pgid(), Some(spawned.pid));
         assert!(fg.name.is_some());
         let argv = spawned.master.foreground_argv().expect("foreground argv while shell waits");
         assert!(argv.iter().any(|arg| arg.contains("sh")), "unexpected argv: {argv:?}");

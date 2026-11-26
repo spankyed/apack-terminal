@@ -217,8 +217,17 @@ pub fn bind_local_listener(socket: &str) -> Result<Listener, OsError> {
         Ok(listener) => {
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600));
+                use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+                let meta =
+                    std::fs::symlink_metadata(socket).map_err(|err| OsError::io("inspecting bound socket", err))?;
+                if !meta.file_type().is_socket() {
+                    return Err(OsError::io(
+                        "verifying bound socket type",
+                        io::Error::new(io::ErrorKind::InvalidInput, "bound path is not a Unix socket"),
+                    ));
+                }
+                std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
+                    .map_err(|err| OsError::io("tightening socket permissions", err))?;
             }
             Ok(listener)
         }
@@ -463,7 +472,7 @@ mod tests {
         let dup_lock_fd = hold.lock.try_clone().expect("dup lock fd");
 
         let listener = bind_local_listener(&sock_str).expect("bind listener");
-        // Verify `UmaskGuard::drop` restored the process umask (not left stuck at 0o177).
+        // Verify `UmaskGuard::drop` restored the process umask (not left stuck at 0o077).
         {
             let _lock = UMASK_LOCK.lock().expect("umask lock");
             // SAFETY: probe current umask and restore immediately under `UMASK_LOCK`.
@@ -472,10 +481,10 @@ mod tests {
                 libc::umask(cur);
                 cur
             };
-            assert_ne!(current_umask, 0o177, "UmaskGuard::drop must restore previous umask");
+            assert_ne!(current_umask, 0o077, "UmaskGuard::drop must restore previous umask");
         }
         let sock_meta = std::fs::symlink_metadata(&nested).expect("socket meta");
-        assert_eq!(sock_meta.permissions().mode() & 0o077, 0, "socket must be owner-only");
+        assert_eq!(sock_meta.permissions().mode() & 0o777, 0o600, "socket must be 0o600 owner-only");
         let lfd = listener_raw_fd(&listener);
         assert!(lfd > 2, "listener fd must be > 2");
 

@@ -79,6 +79,30 @@ pub fn foreground_process(master: &(dyn MasterPty + Send)) -> Option<ForegroundP
     }
 }
 
+/// Reads the command-line `argv` of a single PID via `sysinfo` (Unix only; safe to call off-shard).
+pub fn argv_for_pid(pid: u32) -> Option<Vec<String>> {
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        None
+    }
+    #[cfg(unix)]
+    {
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+        let of = Pid::from_u32(pid);
+        let mut system = System::new().ok()?;
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[of]),
+            true,
+            ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+        );
+        let argv: Vec<String> =
+            system.process(of)?.cmd().iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
+        (!argv.is_empty()).then_some(argv)
+    }
+}
+
 /// Reads the command-line `argv` of the foreground process group leader of a PTY master.
 ///
 /// Used by the broker to vouch for `OSC 7501` program status claims against the actual foreground
@@ -91,19 +115,8 @@ pub fn foreground_argv(master: &(dyn MasterPty + Send)) -> Option<Vec<String>> {
     }
     #[cfg(unix)]
     {
-        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
-
         let pid: i32 = master.process_group_leader()?;
-        let of = Pid::from_u32(u32::try_from(pid).ok()?);
-        let mut system = System::new().ok()?;
-        system.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&[of]),
-            true,
-            ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
-        );
-        let argv: Vec<String> =
-            system.process(of)?.cmd().iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
-        (!argv.is_empty()).then_some(argv)
+        argv_for_pid(u32::try_from(pid).ok()?)
     }
 }
 

@@ -288,9 +288,21 @@ pub fn deliver_signal(leader: u32, kind: SignalKind, scope: SignalScope) -> Resu
 /// groups (which the kernel does not automatically SIGHUP on leader exit) are discovered via
 /// `session_id` before reparenting.
 pub fn hang_up_session_descendants(leaders: &[u32]) {
+    signal_session_descendants(leaders, SignalKind::Hup);
+}
+
+/// Sends `SIGKILL` to every non-leader process belonging to any POSIX session led by `leaders`.
+///
+/// Must be called **while the session leaders are still alive** so `SIGHUP`-ignoring background
+/// jobs in separate process groups are terminated before reparenting.
+pub fn kill_session_descendants(leaders: &[u32]) {
+    signal_session_descendants(leaders, SignalKind::Kill);
+}
+
+fn signal_session_descendants(leaders: &[u32], kind: SignalKind) {
     #[cfg(not(unix))]
     {
-        let _ = leaders;
+        let _ = (leaders, kind);
     }
     #[cfg(unix)]
     {
@@ -315,7 +327,7 @@ pub fn hang_up_session_descendants(leaders: &[u32]) {
             .collect();
         for (leader, pid) in others {
             if let Some(target) = i32::try_from(pid).ok().and_then(SignalTarget::new) {
-                let _ = deliver_signal(leader, SignalKind::Hup, SignalScope::Pid(target));
+                let _ = deliver_signal(leader, kind, SignalScope::Pid(target));
             }
         }
     }
@@ -485,6 +497,50 @@ mod tests {
         let status = spawned.child.wait().expect("reap leader");
         assert!(status.success(), "leader shell should finish cleanly after wait: {text:?}");
         assert!(text.contains("EXITED:") && !text.contains("EXITED:0"), "expected signal exit: {text:?}");
+
+        // Also test kill_session_descendants on a SIGHUP-ignoring background job in its own group!
+        let cfg_k = PtySpawnConfig {
+            size: GridSize::new(80, 24).expect("80x24"),
+            cell_px: CellPx::default(),
+            shell: Some(String::from("/bin/sh")),
+            args: vec![
+                String::from("-c"),
+                String::from("set -m; (trap '' HUP; sleep 30) & bg=$!; echo BG:$bg; wait $bg; echo EXITED:$?"),
+            ],
+            env: vec![],
+            unset: vec![],
+            cwd: None,
+        };
+        let mut spawned_k = spawn_pty(&cfg_k).expect("spawn sh for kill_session_descendants");
+        let mut out_k = Vec::new();
+        let deadline_k = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(Instant::now() < deadline_k, "timed out waiting for BG pid");
+            match spawned_k.master.read_nonblocking(&mut buf).expect("read bg") {
+                NonBlockingRead::Bytes(n) => {
+                    out_k.extend_from_slice(&buf[..n]);
+                    let s = String::from_utf8_lossy(&out_k);
+                    if s.contains("BG:") && s.lines().any(|l| l.trim().starts_with("BG:")) {
+                        break;
+                    }
+                }
+                NonBlockingRead::WouldBlock => std::thread::sleep(Duration::from_millis(5)),
+                NonBlockingRead::Eof => panic!("unexpected EOF before BG"),
+            }
+        }
+        kill_session_descendants(&[spawned_k.pid]);
+        let wait_dl_k = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(Instant::now() < wait_dl_k, "timed out waiting for kill_session_descendants");
+            match spawned_k.master.read_nonblocking(&mut buf).expect("read exit") {
+                NonBlockingRead::Bytes(n) => out_k.extend_from_slice(&buf[..n]),
+                NonBlockingRead::WouldBlock => std::thread::sleep(Duration::from_millis(5)),
+                NonBlockingRead::Eof => break,
+            }
+        }
+        let text_k = String::from_utf8_lossy(&out_k);
+        assert!(spawned_k.child.wait().expect("reap leader").success());
+        assert!(text_k.contains("EXITED:") && !text_k.contains("EXITED:0"), "expected SIGKILL exit: {text_k:?}");
     }
 
     #[cfg(target_os = "linux")]

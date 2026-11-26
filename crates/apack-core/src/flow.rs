@@ -513,6 +513,12 @@ impl OutboundQueue {
             && self.p4_raw.by_stream.is_empty()
     }
 
+    /// Returns `true` if inserting/replacing a frame of `encoded_bytes` on `stream_id` fits in the budget.
+    pub fn can_fit_frame(&self, stream_id: StreamId, encoded_bytes: usize) -> bool {
+        let prev_bytes = self.p1_frames.get(&stream_id).map_or(0, |m| m.encoded_bytes);
+        (self.total_bytes() - prev_bytes).checked_add(encoded_bytes).is_some_and(|n| n <= self.max_total_bytes)
+    }
+
     /// Enqueues a Priority 1 view frame for `stream_id`, enforcing the total per-connection byte cap.
     pub fn push_frame(
         &mut self,

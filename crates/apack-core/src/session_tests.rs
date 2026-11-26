@@ -1936,4 +1936,13 @@ fn session_machine_runtime_accessors_and_nonblocking_pty_peek_consume() {
     assert_eq!(buf, b"defghijkl");
     sess.consume_pty_write(9);
     assert_eq!(sess.pty_write_len(), 0);
+
+    // sync_vt_geometry updates cached current_size & current_cell_px after external VT replacement
+    let new_sz = GridSize::new(100, 30).unwrap();
+    let new_px = CellPx { width: 10, height: 20 };
+    let mut evs = Vec::new();
+    sess.vt_mut().resize(new_sz, new_px, &mut evs);
+    sess.sync_vt_geometry(new_px);
+    assert_eq!(sess.current_size(), new_sz);
+    assert_eq!(sess.current_cell_px(), new_px);
 }

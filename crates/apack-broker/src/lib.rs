@@ -34,6 +34,16 @@ pub fn now_unix_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
+/// Reads from `reader` into `buf`, retrying on `EINTR` (`io::ErrorKind::Interrupted`).
+pub(crate) fn read_retry_eintr(reader: &mut impl std::io::Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    loop {
+        match reader.read(buf) {
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            other => return other,
+        }
+    }
+}
+
 /// Fills `buf` with cryptographically secure random bytes from the OS CSPRNG.
 pub fn fill_random(buf: &mut [u8]) -> Result<(), String> {
     getrandom::fill(buf).map_err(|err| format!("OS CSPRNG failure: {err}"))

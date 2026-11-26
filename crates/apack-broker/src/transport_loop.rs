@@ -3,16 +3,16 @@
 //! - On **Unix**, one [`apack_os::pty_poller::PtyPoller`] multiplexes the non-blocking local socket
 //!   listener AND every accepted client connection fd (`writev` scatter-gather writes, zero
 //!   per-connection threads!).
-//! - On **Windows**, a thin accept thread and per-connection blocking reader/writer threads bridge
+//! - On **Windows**, a thin accept thread and per-connection bounded reader/writer threads bridge
 //!   named-pipe `Stream`s into the exact same single-threaded `BrokerCore` loop (keeping the
 //!   `FILE_FLAG_FIRST_PIPE_INSTANCE` listener alive during shutdown).
 
 #[cfg(unix)]
 use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
+use std::io;
 #[cfg(unix)]
-use std::io::IoSlice;
-use std::io::{self, Read, Write};
+use std::io::{IoSlice, Read, Write};
 #[cfg(windows)]
 use std::sync::Condvar;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,12 +40,17 @@ use interprocess::local_socket::Stream;
 use interprocess::local_socket::traits::Listener as _;
 
 use crate::config::BrokerConfig;
+#[cfg(unix)]
+use crate::fill_random;
 use crate::shard::{ReactorEvent, ShardCmd, ShardHandle, ShardShared, spawn_shard};
 #[cfg(windows)]
 use crate::transport_windows::{
-    WinConnHandle, WinTransportEvent, WinWriteMsg, spawn_win_accept_thread, wait_for_win_wake,
+    WinConnHandle, WinTransportEvent, WinWriteMsg, is_graceful_win_close, spawn_win_accept_thread, wait_for_win_wake,
 };
-use crate::{engine_abi_hash, fill_random, now_unix_ms};
+use crate::{engine_abi_hash, now_unix_ms};
+
+/// Hard cap on simultaneous client connections accepted by the broker.
+pub(crate) const MAX_CONNECTIONS: usize = 1024;
 
 #[cfg(unix)]
 const LISTENER_TOKEN: PollToken = PollToken(0);
@@ -60,6 +65,11 @@ const CONN_READ_BUF_BYTES: usize = 65_536;
 /// Maximum pending outbound frame chunks buffered for `writev` per connection.
 #[cfg(unix)]
 const MAX_WRITEV_IOVS: usize = 32;
+
+/// High-water mark (`128 KiB`) on per-connection Unix `write_queue` bytes so backpressure stays
+/// inside `BrokerCore`'s 5-tier priority/WFQ `16 MiB` `OutboundQueue`.
+#[cfg(unix)]
+const WRITE_QUEUE_HIGH_WATER: usize = 131_072;
 
 /// Classification of a non-blocking Unix socket I/O error.
 #[cfg(unix)]
@@ -124,10 +134,52 @@ pub(crate) fn reactor_wait_timeout(
     timeout
 }
 
-/// In-flight `ListSessions` aggregation across all $K$ shards.
-struct PendingList {
-    remaining_shards: usize,
-    collected: Vec<SessionSummary>,
+/// Computes the hard shutdown drain deadline (`now + kill_escalate_after + 5s`).
+pub(crate) fn compute_shutdown_deadline(now: Instant, kill_escalate_after: Duration) -> Instant {
+    now + kill_escalate_after + Duration::from_secs(5)
+}
+
+/// Returns `true` once explicit shutdown has drained all sessions or exceeded its hard deadline.
+pub(crate) fn reactor_should_exit(
+    shutting_down: bool,
+    sessions_empty: bool,
+    now: Instant,
+    deadline: Option<Instant>,
+) -> bool {
+    shutting_down && (sessions_empty || deadline.is_some_and(|dl| now >= dl))
+}
+
+/// Returns `true` when a newly accepted Unix socket satisfies shutdown, capacity, peer, and mode checks.
+#[cfg(unix)]
+pub(crate) fn can_accept_unix_conn(shutting_down: bool, active_conns: usize, peer_ok: bool, nonblock_ok: bool) -> bool {
+    !shutting_down && active_conns < MAX_CONNECTIONS && peer_ok && nonblock_ok
+}
+
+/// Returns `true` when the per-connection Unix `writev` queue is below its chunk and byte watermarks.
+#[cfg(unix)]
+pub(crate) fn write_queue_can_pull(chunks: usize, bytes: usize) -> bool {
+    chunks < MAX_WRITEV_IOVS && bytes < WRITE_QUEUE_HIGH_WATER
+}
+
+/// Removes all pending `ListSessions` entries belonging to `conn`.
+pub(crate) fn prune_pending_lists_for_conn(pending_lists: &mut HashMap<u64, PendingList>, conn: ConnId) {
+    pending_lists.retain(|_, pending| pending.conn != conn);
+}
+
+/// Selects stalled view streams whose outbound queue slot is currently free.
+pub(crate) fn ready_stalled_stream_ids(
+    stalled: &HashMap<NonZeroStreamId, (SessionId, Box<FrameUpdate>)>,
+    queued: &HashMap<NonZeroStreamId, SessionId>,
+) -> Vec<NonZeroStreamId> {
+    stalled.keys().copied().filter(|sid| !queued.contains_key(sid)).collect()
+}
+
+/// In-flight `ListSessions` aggregation across all $K$ shards keyed by broker-allocated `list_id`.
+pub(crate) struct PendingList {
+    pub(crate) conn: ConnId,
+    pub(crate) req_id: RequestId,
+    pub(crate) remaining_shards: usize,
+    pub(crate) collected: Vec<SessionSummary>,
 }
 
 /// Per-connection stalled view frames awaiting `FramePacer` credit or outbound queue clearance
@@ -139,6 +191,8 @@ pub(crate) struct ConnState {
     token: PollToken,
     #[cfg(unix)]
     write_queue: VecDeque<(Vec<u8>, usize)>,
+    #[cfg(unix)]
+    write_queue_bytes: usize,
     #[cfg(windows)]
     pub(crate) win: WinConnHandle,
     pub(crate) stalled_frames: HashMap<NonZeroStreamId, (SessionId, Box<FrameUpdate>)>,
@@ -238,15 +292,17 @@ pub(crate) fn run_control_reactor(
         conns: HashMap::new(),
         next_conn_id: 1,
         next_session_id: 1,
+        next_list_id: 1,
         session_shard: HashMap::new(),
         session_kept: HashMap::new(),
+        pending_spawns: 0,
         pending_lists: HashMap::new(),
-        shard_scrollback: vec![0u64; shard_count],
-        shard_pty_bytes: vec![0u64; shard_count],
         ever_connected: false,
         started_at: Instant::now(),
         start_grace: config.start_grace,
+        kill_escalate_after: config.kill_escalate_after,
         shutting_down: false,
+        shutdown_deadline: None,
         shutdown_flag,
         #[cfg(unix)]
         listener,
@@ -292,11 +348,13 @@ pub(crate) fn run_control_reactor(
             state.begin_shutdown();
         }
 
-        // 5. Auto-exit when all clients disconnected, no broker lease holds us, and no sessions remain.
+        // 5. Auto-exit when all clients disconnected, no broker lease holds us, and no sessions
+        //    or in-flight spawns remain.
         if state.ever_connected
             && state.core.connection_count() == 0
             && !state.core.has_active_broker_lease()
             && state.session_shard.is_empty()
+            && state.pending_spawns == 0
         {
             state.begin_shutdown();
         }
@@ -351,15 +409,17 @@ pub(crate) struct ReactorState {
     pub(crate) conns: HashMap<ConnId, ConnState>,
     next_conn_id: u64,
     next_session_id: u64,
+    next_list_id: u64,
     session_shard: HashMap<SessionId, usize>,
     session_kept: HashMap<SessionId, bool>,
-    pending_lists: HashMap<(ConnId, RequestId), PendingList>,
-    shard_scrollback: Vec<u64>,
-    shard_pty_bytes: Vec<u64>,
+    pending_spawns: usize,
+    pending_lists: HashMap<u64, PendingList>,
     pub(crate) ever_connected: bool,
     started_at: Instant,
     start_grace: Duration,
-    shutting_down: bool,
+    kill_escalate_after: Duration,
+    pub(crate) shutting_down: bool,
+    shutdown_deadline: Option<Instant>,
     shutdown_flag: Arc<AtomicBool>,
     #[cfg(unix)]
     listener: Listener,
@@ -377,19 +437,26 @@ pub(crate) struct ReactorState {
 
 impl ReactorState {
     fn should_exit(&self) -> bool {
-        self.shutting_down && self.session_shard.is_empty()
+        reactor_should_exit(self.shutting_down, self.session_shard.is_empty(), Instant::now(), self.shutdown_deadline)
     }
 
     fn begin_shutdown(&mut self) {
         self.shutting_down = true;
+        self.shutdown_deadline
+            .get_or_insert_with(|| compute_shutdown_deadline(Instant::now(), self.kill_escalate_after));
         self.shutdown_flag.store(true, Ordering::Release);
+        #[cfg(unix)]
+        {
+            let _ = self.poller.deregister(LISTENER_TOKEN);
+        }
+        // Terminate ALL sessions (kept and non-kept alike) so explicit shutdown never deadlocks.
         for shard in &self.shards {
-            shard.send(ShardCmd::TeardownNonKept { pinned: HashSet::new() });
+            shard.send(ShardCmd::TeardownAll);
         }
         // Close all open client connections cleanly.
         let cids: Vec<ConnId> = self.conns.keys().copied().collect();
         for cid in cids {
-            self.close_conn_transport(cid);
+            self.close_conn_transport(cid, false);
         }
     }
 
@@ -403,6 +470,25 @@ impl ReactorState {
         let id = self.next_session_id;
         self.next_session_id = self.next_session_id.saturating_add(1).max(1);
         SessionId::new(id).expect("non-zero session id")
+    }
+
+    fn alloc_list_id(&mut self) -> u64 {
+        let id = self.next_list_id;
+        self.next_list_id = self.next_list_id.wrapping_add(1).max(1);
+        id
+    }
+
+    /// Reads lock-free per-shard telemetry atomics into `BrokerCore` before serving client requests.
+    pub(crate) fn sync_shard_telemetry(&mut self) {
+        let mut scrollback_bytes = 0u64;
+        let mut total_pty_bytes = 0u64;
+        for shard in &self.shards {
+            let (sb, pty) = shard.telemetry();
+            scrollback_bytes = scrollback_bytes.saturating_add(sb);
+            total_pty_bytes = total_pty_bytes.saturating_add(pty);
+        }
+        let image_store_bytes = self.image_store.lock().unwrap_or_else(|e| e.into_inner()).used_bytes() as u64;
+        self.core.update_shard_telemetry(ShardTelemetry { scrollback_bytes, image_store_bytes, total_pty_bytes });
     }
 
     #[cfg(unix)]
@@ -429,11 +515,14 @@ impl ReactorState {
         loop {
             match self.listener.accept() {
                 Ok(stream) => {
-                    if !matches!(verify_peer_is_current_user(&stream), Ok(true)) {
+                    let peer_ok = matches!(verify_peer_is_current_user(&stream), Ok(true));
+                    let nonblock_ok = peer_ok && set_stream_nonblocking(&stream, true).is_ok();
+                    if !can_accept_unix_conn(self.shutting_down, self.conns.len(), peer_ok, nonblock_ok) {
                         let _ = hang_up(&stream);
                         continue;
                     }
-                    if set_stream_nonblocking(&stream, true).is_err() {
+                    let mut nonce = [0u8; 32];
+                    if fill_random(&mut nonce).is_err() {
                         let _ = hang_up(&stream);
                         continue;
                     }
@@ -443,8 +532,6 @@ impl ReactorState {
                         let _ = hang_up(&stream);
                         continue;
                     }
-                    let mut nonce = [0u8; 32];
-                    let _ = fill_random(&mut nonce);
                     let now = TimestampMs::from_millis(now_unix_ms());
                     let _ = self.core.open_connection(conn, nonce, now);
                     self.token_to_conn.insert(token, conn);
@@ -454,6 +541,7 @@ impl ReactorState {
                             stream,
                             token,
                             write_queue: VecDeque::new(),
+                            write_queue_bytes: 0,
                             stalled_frames: HashMap::new(),
                             queued_frame_streams: HashMap::new(),
                         },
@@ -485,6 +573,7 @@ impl ReactorState {
                 }
                 Ok(n) => {
                     budget = budget.saturating_sub(n);
+                    self.sync_shard_telemetry();
                     let now = TimestampMs::from_millis(now_unix_ms());
                     let mut actions = Vec::new();
                     self.core.feed_bytes(conn, &self.read_buf[..n], now, &mut actions);
@@ -512,21 +601,44 @@ impl ReactorState {
     #[cfg(unix)]
     fn flush_unix_writes(&mut self, conn: ConnId) {
         loop {
-            // Pull outbound messages from BrokerCore (bounded by `max_queue_bytes`) into the writev queue.
-            while let Some(queued) = self.core.pop_outbound(conn) {
+            // Pull outbound messages up to a bounded watermark so excess data stays in `BrokerCore`
+            // where 5-tier priority + WFQ and the 16 MiB `SlowReader` limit are enforced.
+            while self.conns.get(&conn).is_some_and(|c| write_queue_can_pull(c.write_queue.len(), c.write_queue_bytes))
+            {
+                let Some(queued) = self.core.pop_outbound(conn) else {
+                    break;
+                };
+                let is_frame = matches!(queued.msg, BrokerMsg::Frame(_));
+                if is_frame
+                    && let Some(nz) = NonZeroStreamId::new(queued.stream_id.raw())
+                    && let Some(session_id) = self.conns.get_mut(&conn).and_then(|c| c.queued_frame_streams.remove(&nz))
+                {
+                    self.on_outbound_frame_drained(conn, nz, session_id);
+                }
                 let mut encoded = Vec::with_capacity(queued.encoded_bytes);
                 if queued.msg.encode_to_frame(queued.stream_id, queued.req_id, &mut encoded).is_err() {
                     continue;
                 }
                 if let Some(c) = self.conns.get_mut(&conn) {
-                    // If this popped a view Frame, free its reactor-queued slot and notify/retry!
-                    if let Some(nz) = NonZeroStreamId::new(queued.stream_id.raw())
-                        && let Some(session_id) = c.queued_frame_streams.remove(&nz)
+                    c.write_queue_bytes = c.write_queue_bytes.saturating_add(encoded.len());
+                    c.write_queue.push_back((encoded, 0));
+                }
+                let ready_stalled = self
+                    .conns
+                    .get(&conn)
+                    .map(|c| ready_stalled_stream_ids(&c.stalled_frames, &c.queued_frame_streams))
+                    .unwrap_or_default();
+                for stream_id in ready_stalled {
+                    if let Some((sid, frame)) =
+                        self.conns.get_mut(&conn).and_then(|c| c.stalled_frames.remove(&stream_id))
                     {
-                        self.on_outbound_frame_drained(conn, nz, session_id);
-                    }
-                    if let Some(c) = self.conns.get_mut(&conn) {
-                        c.write_queue.push_back((encoded, 0));
+                        self.try_publish_or_stall_frame(
+                            conn,
+                            stream_id,
+                            sid,
+                            frame,
+                            TimestampMs::from_millis(now_unix_ms()),
+                        );
                     }
                 }
             }
@@ -547,7 +659,10 @@ impl ReactorState {
                     self.on_transport_closed(conn);
                     return;
                 }
-                Ok(written) => advance_write_queue(&mut c.write_queue, written),
+                Ok(written) => {
+                    c.write_queue_bytes = c.write_queue_bytes.saturating_sub(written);
+                    advance_write_queue(&mut c.write_queue, written);
+                }
                 Err(err) => match classify_nonblocking_err(&err) {
                     NonBlockErr::WouldBlock => {
                         let _ = self.poller.modify(c.token, Interest::READ_WRITE);
@@ -586,7 +701,7 @@ impl ReactorState {
         }
     }
 
-    fn try_publish_or_stall_frame(
+    pub(crate) fn try_publish_or_stall_frame(
         &mut self,
         conn: ConnId,
         stream_id: NonZeroStreamId,
@@ -594,23 +709,30 @@ impl ReactorState {
         frame: Box<FrameUpdate>,
         now: TimestampMs,
     ) {
-        if !self.conns.contains_key(&conn) {
+        // Verify `(conn, stream_id)` is still attached to the exact same `session` (prevents
+        // stale cross-session frame injection after Detach + Re-Attach reuse of `stream_id`).
+        if self.core.stream_session(conn, stream_id) != Some(session) {
             return;
         }
         let mut actions = Vec::new();
-        if self.core.publish_frame(conn, stream_id, frame.clone(), now, &mut actions) {
-            if let Some(c) = self.conns.get_mut(&conn) {
-                c.queued_frame_streams.insert(stream_id, session);
+        match self.core.try_publish_frame(conn, stream_id, frame, now, &mut actions) {
+            Ok(()) => {
+                if let Some(c) = self.conns.get_mut(&conn) {
+                    c.queued_frame_streams.insert(stream_id, session);
+                }
+                self.execute_actions(actions, now);
             }
-            self.execute_actions(actions, now);
-        } else if let Some(c) = self.conns.get_mut(&conn) {
-            // Park this single frame until FrameAck or outbound drain frees credit; shard stays busy.
-            c.stalled_frames.insert(stream_id, (session, frame));
+            Err(frame) => {
+                if let Some(c) = self.conns.get_mut(&conn) {
+                    // Park this single frame until FrameAck or outbound drain frees space/credit.
+                    c.stalled_frames.insert(stream_id, (session, frame));
+                }
+            }
         }
     }
 
     pub(crate) fn on_transport_closed(&mut self, conn: ConnId) {
-        self.close_conn_transport(conn);
+        self.close_conn_transport(conn, false);
         let now = TimestampMs::from_millis(now_unix_ms());
         let mut actions = Vec::new();
         self.core.close_connection(conn, CloseReason::TransportClosed, now, &mut actions);
@@ -618,22 +740,28 @@ impl ReactorState {
         for shard in &self.shards {
             shard.send(ShardCmd::CancelConnWaiters { conn });
         }
+        prune_pending_lists_for_conn(&mut self.pending_lists, conn);
         self.execute_actions(actions, now);
     }
 
-    fn close_conn_transport(&mut self, conn: ConnId) {
+    fn close_conn_transport(&mut self, conn: ConnId, graceful: bool) {
         let Some(c) = self.conns.remove(&conn) else {
             return;
         };
         #[cfg(unix)]
         {
+            let _ = graceful;
             let _ = self.poller.deregister(c.token);
             self.token_to_conn.remove(&c.token);
             let _ = hang_up(&c.stream);
         }
         #[cfg(windows)]
         {
-            (c.win.hangup)();
+            if graceful {
+                (c.win.close_graceful)();
+            } else {
+                (c.win.close_abrupt)();
+            }
         }
     }
 
@@ -654,9 +782,13 @@ impl ReactorState {
                 self.execute_actions(actions, now);
             }
             ReactorEvent::SessionRegistered { session, shard_idx, rewound, kept } => {
+                self.pending_spawns = self.pending_spawns.saturating_sub(1);
                 self.session_shard.insert(session, shard_idx);
                 self.session_kept.insert(session, kept);
                 self.core.register_session(session, rewound, kept);
+            }
+            ReactorEvent::SpawnOrRewindFailed => {
+                self.pending_spawns = self.pending_spawns.saturating_sub(1);
             }
             ReactorEvent::SessionKeptUpdated { session, kept } => {
                 self.session_kept.insert(session, kept);
@@ -669,22 +801,21 @@ impl ReactorState {
                 self.core.unregister_session(session, "session ended", now, &mut actions);
                 self.execute_actions(actions, now);
             }
-            ReactorEvent::SessionListPart { conn, req_id, sessions } => {
-                let key = (conn, req_id);
-                let ready = if let Some(pending) = self.pending_lists.get_mut(&key) {
+            ReactorEvent::SessionListPart { list_id, sessions } => {
+                let ready = if let Some(pending) = self.pending_lists.get_mut(&list_id) {
                     pending.collected.extend(sessions);
                     pending.remaining_shards = pending.remaining_shards.saturating_sub(1);
                     pending.remaining_shards == 0
                 } else {
                     false
                 };
-                if ready && let Some(mut pending) = self.pending_lists.remove(&key) {
+                if ready && let Some(mut pending) = self.pending_lists.remove(&list_id) {
                     pending.collected.sort_by_key(|s| s.id);
                     let mut actions = Vec::new();
                     self.core.enqueue_message(
-                        conn,
+                        pending.conn,
                         StreamId::CONTROL,
-                        req_id,
+                        pending.req_id,
                         OutboundPriority::Control,
                         BrokerMsg::SessionsList { sessions: pending.collected },
                         now,
@@ -692,20 +823,6 @@ impl ReactorState {
                     );
                     self.execute_actions(actions, now);
                 }
-            }
-            ReactorEvent::Telemetry { shard_idx, scrollback_bytes, total_pty_bytes } => {
-                if let Some(slot) = self.shard_scrollback.get_mut(shard_idx) {
-                    *slot = scrollback_bytes;
-                }
-                if let Some(slot) = self.shard_pty_bytes.get_mut(shard_idx) {
-                    *slot = total_pty_bytes;
-                }
-                let img_bytes = self.image_store.lock().unwrap_or_else(|e| e.into_inner()).used_bytes() as u64;
-                self.core.update_shard_telemetry(ShardTelemetry {
-                    scrollback_bytes: self.shard_scrollback.iter().sum(),
-                    image_store_bytes: img_bytes,
-                    total_pty_bytes: self.shard_pty_bytes.iter().sum(),
-                });
             }
         }
     }
@@ -716,13 +833,21 @@ impl ReactorState {
                 BrokerAction::OutboundReady(conn) => {
                     self.flush_writes(conn);
                 }
-                BrokerAction::CloseConn { conn, final_error, .. } => {
+                BrokerAction::CloseConn { conn, reason, final_error } => {
+                    let has_final = final_error.is_some();
                     if let Some((stream_id, req_id, msg)) = final_error {
                         let mut encoded = Vec::new();
                         if msg.encode_to_frame(stream_id, req_id, &mut encoded).is_ok() {
                             #[cfg(unix)]
-                            if let Some(c) = self.conns.get_mut(&conn) {
-                                let _ = c.stream.write_all(&encoded);
+                            {
+                                // Flush pending frames first; only write final_error directly if
+                                // write_queue is empty so we never splice mid-frame!
+                                self.flush_unix_writes(conn);
+                                if let Some(c) = self.conns.get_mut(&conn)
+                                    && c.write_queue.is_empty()
+                                {
+                                    let _ = c.stream.write_all(&encoded);
+                                }
                             }
                             #[cfg(windows)]
                             if let Some(c) = self.conns.get(&conn) {
@@ -730,11 +855,26 @@ impl ReactorState {
                             }
                         }
                     }
-                    self.on_transport_closed(conn);
+                    #[cfg(windows)]
+                    let graceful = is_graceful_win_close(reason, has_final);
+                    #[cfg(not(windows))]
+                    let graceful = {
+                        let _ = has_final;
+                        false
+                    };
+                    self.close_conn_transport(conn, graceful);
+                    let mut close_actions = Vec::new();
+                    self.core.close_connection(conn, reason, now, &mut close_actions);
+                    for shard in &self.shards {
+                        shard.send(ShardCmd::CancelConnWaiters { conn });
+                    }
+                    prune_pending_lists_for_conn(&mut self.pending_lists, conn);
+                    self.execute_actions(close_actions, now);
                 }
                 BrokerAction::SpawnSession { conn, req_id, spec } => {
                     let session_id = self.alloc_session_id();
                     let shard_idx = pick_least_loaded_shard(&self.shards);
+                    self.pending_spawns = self.pending_spawns.saturating_add(1);
                     self.shards[shard_idx].send(ShardCmd::Spawn { session_id, conn, req_id, spec });
                 }
                 BrokerAction::KillSession { conn, req_id, session } => {
@@ -759,17 +899,19 @@ impl ReactorState {
                     }
                 }
                 BrokerAction::ListSessions { conn, req_id } => {
+                    let list_id = self.alloc_list_id();
                     self.pending_lists.insert(
-                        (conn, req_id),
-                        PendingList { remaining_shards: self.shards.len(), collected: Vec::new() },
+                        list_id,
+                        PendingList { conn, req_id, remaining_shards: self.shards.len(), collected: Vec::new() },
                     );
                     for shard in &self.shards {
-                        shard.send(ShardCmd::ListSessions { conn, req_id });
+                        shard.send(ShardCmd::ListSessions { list_id });
                     }
                 }
                 BrokerAction::RewindRecording { conn, req_id, record_dir, at_ms } => {
                     let session_id = self.alloc_session_id();
                     let shard_idx = pick_least_loaded_shard(&self.shards);
+                    self.pending_spawns = self.pending_spawns.saturating_add(1);
                     self.shards[shard_idx].send(ShardCmd::Rewind { session_id, conn, req_id, record_dir, at_ms });
                 }
                 BrokerAction::SeekRecording { conn, req_id, session, at_ms } => {

@@ -7,24 +7,30 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use apack_core::broker::CloseReason;
 use apack_core::lease::ConnId;
 use apack_core::time::TimestampMs;
-use apack_os::transport::{hang_up, verify_peer_is_current_user};
+use apack_os::transport::{hang_up, let_go, verify_peer_is_current_user};
+use apack_proto::messages::BrokerMsg;
 use apack_proto::types::NonZeroStreamId;
 use interprocess::local_socket::traits::Listener as _;
 use interprocess::local_socket::{Listener, Stream};
 
-use crate::transport_loop::{ConnState, ReactorState};
+use crate::transport_loop::{ConnState, MAX_CONNECTIONS, ReactorState, ready_stalled_stream_ids};
 use crate::{fill_random, now_unix_ms};
 
 const WIN_CONN_READ_BUF_BYTES: usize = 32_768;
+
+/// Small per-connection in-flight window so backpressure stays inside `BrokerCore`'s 16 MiB
+/// priority-scheduled `OutboundQueue` and never blocks the single-threaded Control Reactor.
+const WIN_WRITE_WINDOW: usize = 8;
 
 /// Message sent to a Windows per-connection named-pipe writer thread.
 pub(crate) enum WinWriteMsg {
     /// Complete wire-encoded frame bytes.
     Bytes(Vec<u8>),
-    /// Flush and terminate the writer thread cleanly.
-    Close,
+    /// Flush and gracefully release the named pipe without aborting client reads.
+    CloseGraceful,
 }
 
 /// Transport event bridged from Windows named-pipe threads into the single-threaded reactor.
@@ -33,14 +39,24 @@ pub(crate) enum WinTransportEvent {
     Accepted(Stream),
     /// Raw bytes read from `ConnId`.
     Bytes(ConnId, Vec<u8>),
-    /// Connection reached EOF or read error.
+    /// Writer thread drained a chunk and freed a `WIN_WRITE_WINDOW` slot for `ConnId`.
+    WriteReady(ConnId),
+    /// Connection reached EOF or read/write error.
     Closed(ConnId),
 }
 
 /// Per-connection Windows pipe write/close handles held by the Control Reactor.
 pub(crate) struct WinConnHandle {
     pub(crate) tx: mpsc::SyncSender<WinWriteMsg>,
-    pub(crate) hangup: Arc<dyn Fn() + Send + Sync>,
+    pub(crate) pending_chunk: Option<Vec<u8>>,
+    pub(crate) close_graceful: Arc<dyn Fn() + Send + Sync>,
+    pub(crate) close_abrupt: Arc<dyn Fn() + Send + Sync>,
+}
+
+/// Returns `true` when closing a Windows named-pipe connection should flush gracefully (`let_go`)
+/// rather than abruptly cancelling I/O (`hang_up`).
+pub(crate) fn is_graceful_win_close(reason: CloseReason, has_final_error: bool) -> bool {
+    matches!(reason, CloseReason::ClientFin) || has_final_error
 }
 
 /// Waits on the Windows reactor condvar until signalled or `wait_for` elapses.
@@ -97,23 +113,25 @@ pub(crate) fn spawn_win_conn_io(
     let stream = Arc::new(stream);
     let r_stream = Arc::clone(&stream);
     let w_stream = Arc::clone(&stream);
-    let (wtx, wrx) = mpsc::sync_channel::<WinWriteMsg>(256);
+    let (wtx, wrx) = mpsc::sync_channel::<WinWriteMsg>(WIN_WRITE_WINDOW);
 
+    let r_ev_tx = ev_tx.clone();
+    let r_wake = Arc::clone(&wake);
     let _ = std::thread::Builder::new().name(format!("apack-win-r-{}", conn.get())).spawn(move || {
         let mut buf = vec![0u8; WIN_CONN_READ_BUF_BYTES];
         let mut reader: &Stream = &r_stream;
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => {
-                    let _ = ev_tx.send(WinTransportEvent::Closed(conn));
-                    wake();
+                    let _ = r_ev_tx.send(WinTransportEvent::Closed(conn));
+                    r_wake();
                     break;
                 }
                 Ok(n) => {
-                    if ev_tx.send(WinTransportEvent::Bytes(conn, buf[..n].to_vec())).is_err() {
+                    if r_ev_tx.send(WinTransportEvent::Bytes(conn, buf[..n].to_vec())).is_err() {
                         break;
                     }
-                    wake();
+                    r_wake();
                 }
             }
         }
@@ -125,11 +143,16 @@ pub(crate) fn spawn_win_conn_io(
             match msg {
                 WinWriteMsg::Bytes(bytes) => {
                     if writer.write_all(&bytes).is_err() {
+                        let _ = ev_tx.send(WinTransportEvent::Closed(conn));
+                        wake();
                         break;
                     }
+                    let _ = ev_tx.send(WinTransportEvent::WriteReady(conn));
+                    wake();
                 }
-                WinWriteMsg::Close => {
+                WinWriteMsg::CloseGraceful => {
                     let _ = writer.flush();
+                    let _ = let_go(&w_stream, || {});
                     break;
                 }
             }
@@ -137,11 +160,16 @@ pub(crate) fn spawn_win_conn_io(
     });
 
     let close_tx = wtx.clone();
+    let abrupt_tx = wtx.clone();
     let hangup_stream = Arc::clone(&stream);
     WinConnHandle {
         tx: wtx,
-        hangup: Arc::new(move || {
-            let _ = close_tx.try_send(WinWriteMsg::Close);
+        pending_chunk: None,
+        close_graceful: Arc::new(move || {
+            let _ = close_tx.try_send(WinWriteMsg::CloseGraceful);
+        }),
+        close_abrupt: Arc::new(move || {
+            let _ = abrupt_tx.try_send(WinWriteMsg::CloseGraceful);
             let _ = hang_up(&hangup_stream);
         }),
     }
@@ -151,9 +179,16 @@ impl ReactorState {
     pub(crate) fn handle_win_transport_event(&mut self, ev: WinTransportEvent) {
         match ev {
             WinTransportEvent::Accepted(stream) => {
-                let conn = self.alloc_conn_id();
+                if self.shutting_down || self.conns.len() >= MAX_CONNECTIONS {
+                    let _ = hang_up(&stream);
+                    return;
+                }
                 let mut nonce = [0u8; 32];
-                let _ = fill_random(&mut nonce);
+                if fill_random(&mut nonce).is_err() {
+                    let _ = hang_up(&stream);
+                    return;
+                }
+                let conn = self.alloc_conn_id();
                 let now = TimestampMs::from_millis(now_unix_ms());
                 let _ = self.core.open_connection(conn, nonce, now);
                 let win = spawn_win_conn_io(conn, stream, self.win_ev_tx.clone(), Arc::clone(&self.win_wake));
@@ -163,6 +198,7 @@ impl ReactorState {
                 );
             }
             WinTransportEvent::Bytes(conn, bytes) => {
+                self.sync_shard_telemetry();
                 let now = TimestampMs::from_millis(now_unix_ms());
                 let mut actions = Vec::new();
                 self.core.feed_bytes(conn, &bytes, now, &mut actions);
@@ -171,6 +207,9 @@ impl ReactorState {
                 }
                 self.execute_actions(actions, now);
             }
+            WinTransportEvent::WriteReady(conn) => {
+                self.flush_win_writes(conn);
+            }
             WinTransportEvent::Closed(conn) => {
                 self.on_transport_closed(conn);
             }
@@ -178,24 +217,65 @@ impl ReactorState {
     }
 
     pub(crate) fn flush_win_writes(&mut self, conn: ConnId) {
+        // First retry any single chunk that previously hit `TrySendError::Full`.
+        if let Some(pending) = self.conns.get_mut(&conn).and_then(|c| c.win.pending_chunk.take()) {
+            let send_res = self.conns.get(&conn).map(|c| c.win.tx.try_send(WinWriteMsg::Bytes(pending)));
+            match send_res {
+                Some(Ok(())) => {}
+                Some(Err(mpsc::TrySendError::Full(WinWriteMsg::Bytes(buf)))) => {
+                    if let Some(c) = self.conns.get_mut(&conn) {
+                        c.win.pending_chunk = Some(buf);
+                    }
+                    return;
+                }
+                _ => {
+                    self.on_transport_closed(conn);
+                    return;
+                }
+            }
+        }
+
         while let Some(queued) = self.core.pop_outbound(conn) {
+            let is_frame = matches!(queued.msg, BrokerMsg::Frame(_));
+            if is_frame
+                && let Some(nz) = NonZeroStreamId::new(queued.stream_id.raw())
+                && let Some(session_id) = self.conns.get_mut(&conn).and_then(|c| c.queued_frame_streams.remove(&nz))
+            {
+                self.on_outbound_frame_drained(conn, nz, session_id);
+            }
             let mut encoded = Vec::with_capacity(queued.encoded_bytes);
             if queued.msg.encode_to_frame(queued.stream_id, queued.req_id, &mut encoded).is_err() {
                 continue;
             }
-            if let Some(nz) = NonZeroStreamId::new(queued.stream_id.raw())
-                && let Some(c) = self.conns.get_mut(&conn)
-                && let Some(session_id) = c.queued_frame_streams.remove(&nz)
-            {
-                self.on_outbound_frame_drained(conn, nz, session_id);
-            }
-            let send_err = match self.conns.get(&conn) {
-                Some(c) => c.win.tx.send(WinWriteMsg::Bytes(encoded)).is_err(),
-                None => return,
-            };
-            if send_err {
-                self.on_transport_closed(conn);
-                return;
+            let send_res = self.conns.get(&conn).map(|c| c.win.tx.try_send(WinWriteMsg::Bytes(encoded)));
+            match send_res {
+                Some(Ok(())) => {
+                    let ready_stalled = self
+                        .conns
+                        .get(&conn)
+                        .map(|c| ready_stalled_stream_ids(&c.stalled_frames, &c.queued_frame_streams))
+                        .unwrap_or_default();
+                    if !ready_stalled.is_empty() {
+                        let now = TimestampMs::from_millis(now_unix_ms());
+                        for stream_id in ready_stalled {
+                            if let Some((sid, frame)) =
+                                self.conns.get_mut(&conn).and_then(|c| c.stalled_frames.remove(&stream_id))
+                            {
+                                self.try_publish_or_stall_frame(conn, stream_id, sid, frame, now);
+                            }
+                        }
+                    }
+                }
+                Some(Err(mpsc::TrySendError::Full(WinWriteMsg::Bytes(buf)))) => {
+                    if let Some(c) = self.conns.get_mut(&conn) {
+                        c.win.pending_chunk = Some(buf);
+                    }
+                    return;
+                }
+                _ => {
+                    self.on_transport_closed(conn);
+                    return;
+                }
             }
         }
     }
