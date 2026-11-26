@@ -174,9 +174,15 @@ mod tests {
         assert!(!guard.owns(0).expect("pid 0 never owned"));
         assert!(!guard.owns(std::process::id()).expect("broker process not in child job"));
 
-        // Dropping the JobGuard must terminate the child process via KILL_ON_JOB_CLOSE.
+        // Dropping the JobGuard must terminate the 30-second ping child promptly via
+        // `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (Windows terminates job processes with exit code 0,
+        // so we assert the child exits well before the 30s ping could finish naturally).
+        let drop_started = std::time::Instant::now();
         drop(guard);
-        let status = child.wait().expect("reap killed child");
-        assert!(!status.success());
+        let _ = child.wait().expect("reap killed child");
+        assert!(
+            drop_started.elapsed() < std::time::Duration::from_secs(5),
+            "child outlived JobGuard drop instead of being killed by KILL_ON_JOB_CLOSE"
+        );
     }
 }

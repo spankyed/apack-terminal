@@ -129,6 +129,7 @@ impl EpollPoller {
 
     /// Updates readiness `interest` for an already-registered `token`.
     pub fn modify(&mut self, token: PollToken, interest: Interest) -> io::Result<()> {
+        let epoll_fd = self.epoll_fd.as_raw_fd();
         let entry = self
             .entries
             .get_mut(&token)
@@ -141,18 +142,18 @@ impl EpollPoller {
             (false, false) => {}
             (false, true) => {
                 let mut ev = libc::epoll_event { events: new_mask, u64: token.0 };
-                // SAFETY: `self.epoll_fd` is valid and `fd` is currently unregistered in epoll.
-                if unsafe { libc::epoll_ctl(self.epoll_fd.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &mut ev) } != 0 {
+                // SAFETY: `epoll_fd` is valid and `fd` is currently unregistered in epoll.
+                if unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut ev) } != 0 {
                     return Err(io::Error::last_os_error());
                 }
             }
             (true, false) => {
-                self.epoll_del_ignore_closed(fd)?;
+                epoll_del_ignore_closed(epoll_fd, fd)?;
             }
             (true, true) => {
                 let mut ev = libc::epoll_event { events: new_mask, u64: token.0 };
-                // SAFETY: `self.epoll_fd` and `fd` are currently registered descriptors.
-                if unsafe { libc::epoll_ctl(self.epoll_fd.as_raw_fd(), libc::EPOLL_CTL_MOD, fd, &mut ev) } != 0 {
+                // SAFETY: `epoll_fd` and `fd` are currently registered descriptors.
+                if unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_MOD, fd, &mut ev) } != 0 {
                     return Err(io::Error::last_os_error());
                 }
             }
@@ -166,19 +167,7 @@ impl EpollPoller {
         let (fd, interest) =
             self.entries.remove(&token).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown poll token"))?;
         if interest_to_epoll(interest) != 0 {
-            self.epoll_del_ignore_closed(fd)?;
-        }
-        Ok(())
-    }
-
-    fn epoll_del_ignore_closed(&self, fd: RawFd) -> io::Result<()> {
-        // SAFETY: `self.epoll_fd` is valid; `EPOLL_CTL_DEL` ignores the event pointer on Linux >= 2.6.9.
-        let rc = unsafe { libc::epoll_ctl(self.epoll_fd.as_raw_fd(), libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut()) };
-        if rc != 0 {
-            let err = io::Error::last_os_error();
-            if !matches!(err.raw_os_error(), Some(libc::ENOENT | libc::EBADF)) {
-                return Err(err);
-            }
+            epoll_del_ignore_closed(self.epoll_fd.as_raw_fd(), fd)?;
         }
         Ok(())
     }
@@ -254,6 +243,18 @@ impl EpollPoller {
         }
         self.wake_pending.store(false, Ordering::SeqCst);
     }
+}
+
+fn epoll_del_ignore_closed(epoll_fd: RawFd, fd: RawFd) -> io::Result<()> {
+    // SAFETY: `epoll_fd` is valid; `EPOLL_CTL_DEL` ignores the event pointer on Linux >= 2.6.9.
+    let rc = unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut()) };
+    if rc != 0 {
+        let err = io::Error::last_os_error();
+        if !matches!(err.raw_os_error(), Some(libc::ENOENT | libc::EBADF)) {
+            return Err(err);
+        }
+    }
+    Ok(())
 }
 
 fn decode_epoll_event(token: PollToken, mask: u32) -> PollEvent {

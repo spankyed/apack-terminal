@@ -323,7 +323,7 @@ mod tests {
             size: GridSize::new(80, 24).expect("grid"),
             cell_px: CellPx { width: 8, height: 16 },
             shell: Some("cmd.exe".to_owned()),
-            args: vec!["/C".to_owned(), "set /p line= && echo APACK_WIN_GOT:%line%".to_owned()],
+            args: vec!["/V:ON".to_owned(), "/C".to_owned(), "set /p line= && echo APACK_WIN_GOT:!line!".to_owned()],
             env: vec![],
             unset: vec![],
             cwd: None,
