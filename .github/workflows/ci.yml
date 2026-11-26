@@ -69,7 +69,7 @@ jobs:
       # restores `master`'s, which is the one that matches it best. The same in every workflow that builds
       - uses: Swatinem/rust-cache@v2
         with:
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == 'refs/heads/master' || github.ref == 'refs/heads/v2' }}
       - run: cargo fetch --locked
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
@@ -127,7 +127,7 @@ jobs:
       # Saved from `master` only, as in `checks`
       - uses: Swatinem/rust-cache@v2
         with:
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == 'refs/heads/master' || github.ref == 'refs/heads/v2' }}
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.148

@@ -1,0 +1,18 @@
+# Enforce sans-IO purity in `apack-proto` at compile time.
+disallowed-types = [
+    { path = "std::time::Instant", reason = "apack-proto is sans-IO; use explicit virtual timestamps" },
+    { path = "std::time::SystemTime", reason = "apack-proto is sans-IO; use explicit virtual timestamps" },
+    { path = "std::fs::File", reason = "apack-proto is sans-IO; no filesystem access" },
+    { path = "std::fs::OpenOptions", reason = "apack-proto is sans-IO; no filesystem access" },
+    { path = "std::net::TcpStream", reason = "apack-proto is sans-IO; no network I/O" },
+    { path = "std::net::TcpListener", reason = "apack-proto is sans-IO; no network I/O" },
+    { path = "std::net::UdpSocket", reason = "apack-proto is sans-IO; no network I/O" },
+    { path = "std::process::Command", reason = "apack-proto is sans-IO; no process spawning" },
+]
+
+disallowed-methods = [
+    { path = "std::thread::spawn", reason = "apack-proto is sans-IO; no threads" },
+    { path = "std::thread::sleep", reason = "apack-proto is sans-IO; no sleeping" },
+    { path = "std::env::var", reason = "apack-proto is sans-IO; no process environment reads" },
+    { path = "std::env::var_os", reason = "apack-proto is sans-IO; no process environment reads" },
+]
