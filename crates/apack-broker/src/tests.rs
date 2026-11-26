@@ -1775,7 +1775,7 @@ fn e2e_leases_kept_pinning_tier2_compression_foreground_verify_and_kill_escalati
             argv: vec![
                 String::from("/bin/sh"),
                 String::from("-c"),
-                String::from("printf 'TAIL_ARMED\\r\\n'; sleep 0.04; printf 'TAIL_BEFORE_EXIT_99\\r\\n'; sleep 30"),
+                String::from("printf 'TAIL_ARMED\\r\\n'; read _go; printf 'TAIL_BEFORE_EXIT_99\\r\\n'; sleep 30"),
             ],
             cwd: None,
             env: Vec::new(),
@@ -1814,7 +1814,10 @@ fn e2e_leases_kept_pinning_tier2_compression_foreground_verify_and_kill_escalati
         )
         .unwrap();
         c2.send_raw(st_tail.as_stream_id(), RequestId::PUSH, &ClientMsg::Pause).unwrap();
-        std::thread::sleep(Duration::from_millis(70));
+        // Barrier: `list_sessions` roundtrips through the shard, ensuring `Pause` is active first.
+        let _ = c2.list_sessions().unwrap();
+        c2.send_raw(st_tail.as_stream_id(), RequestId::PUSH, &ClientMsg::Write { data: b"go\n".to_vec() }).unwrap();
+        std::thread::sleep(Duration::from_millis(60));
         c2.kill(s_tail).unwrap();
         let mut saw_tail = false;
         let mut saw_exited = false;

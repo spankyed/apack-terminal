@@ -278,7 +278,7 @@ pub(crate) fn run_control_reactor(
     #[cfg(windows)]
     let listener = Arc::new(listener);
     #[cfg(windows)]
-    let _accept_thread = spawn_win_accept_thread(
+    let accept_thread = spawn_win_accept_thread(
         Arc::clone(&listener),
         Arc::clone(&shutdown_flag),
         win_ev_tx.clone(),
@@ -393,10 +393,14 @@ pub(crate) fn run_control_reactor(
     }
     #[cfg(windows)]
     {
-        // Keep listener alive until all shards have drained; wake accept thread via a harmless connect.
+        // Drop our Arc<Listener> FIRST so if `accept_thread` already exited the pipe disappears
+        // immediately (never spinning in `ERROR_PIPE_BUSY`); if `accept_thread` is still parked in
+        // `accept()`, the probe connect wakes it so it observes `shutdown_flag`, drops the last
+        // `Arc<Listener>`, and exits cleanly before `run_control_reactor` returns!
         state.shutdown_flag.store(true, Ordering::Release);
-        let _ = apack_os::transport::connect_local_stream(&config.socket_path);
         drop(listener);
+        let _ = apack_os::transport::connect_local_stream(&config.socket_path);
+        let _ = accept_thread.join();
     }
 
     Ok(())
