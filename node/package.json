@@ -17,6 +17,7 @@
       "default": "./index.js"
     },
     "./view-vectors.json": "./view-vectors.json",
+    "./wire-vectors-v2.json": "./wire-vectors-v2.json",
     "./package.json": "./package.json"
   },
   "files": [
@@ -24,6 +25,7 @@
     "index.d.ts",
     "protocol.d.ts",
     "view-vectors.json",
+    "wire-vectors-v2.json",
     "LICENSE-MIT",
     "LICENSE-APACHE"
   ],

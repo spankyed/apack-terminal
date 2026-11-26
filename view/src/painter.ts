@@ -24,6 +24,12 @@ export interface Scene {
   /** How far the grid is shifted up, as a fraction of a row: the view is between two lines */
   readonly offset: number
   /**
+   * Monotonic drawn-row scroll position of the top of the viewport (optional). When supplied,
+   * painters like `CanvasPainter` can detect uniform row shifts and blit unchanged pixel bands
+   * in O(1) via `drawImage(canvas, ...)` instead of repainting the whole viewport.
+   */
+  readonly scrollPosition?: number
+  /**
    * Rows marked in the gutter, each in a colour: where a command began, coloured by how it ended. Drawn
    * only where the painter was given a gutter to draw them in.
    */

@@ -1,271 +1,216 @@
-import type { Fetched, Frame, Row } from './source.ts'
-
 /**
- * How many lines a store keeps before it lets the ones furthest from the viewer go.
+ * Page-chunked terminal row cache (`PAGE_LINES = 256`) holding v2 `PackedRow`s by absolute line.
  *
- * A row is what was sent, so keeping one costs memory and letting one go costs a fetch when the user
- * scrolls back to it. Fifty thousand lines is past what anyone scrolls through by hand, and the owner
- * holds the rest.
+ * **Why page-chunked:** Furthest-from-viewer eviction scans `Map<pageIdx, RowPage>` (~200 entries
+ * for 50,000 lines) instead of 56,000 individual line entries — ~280× faster eviction with zero
+ * per-line Map allocation churn!
  */
+import { RowFlag, type FrameUpdate, type PackedRow } from './source.ts'
+
+/** Number of consecutive absolute lines stored per page. */
+export const PAGE_LINES = 256
+
+/** Target ceiling on retained cached lines before furthest pages are evicted. */
 export const KEPT_LINES = 50_000
 
-/**
- * How far past `KEPT_LINES` a store grows before it lets lines go, and then it goes back down to
- * `KEPT_LINES`: finding the furthest lines reads every line held, so it is done once for this many arrivals
- * and not once for each.
- */
+/** Slack above `KEPT_LINES` before running an $O(\text{pages})$ eviction sweep. */
 export const KEPT_SLACK = KEPT_LINES >> 3
 
-/** Maximum number of absent lines remembered before capping against adversarial fetch counts */
 const MAX_ABSENT = 16_384
-/** Maximum number of per-frame `staleFrom` entries retained for in-flight fetch checks */
-const MAX_STALE_HISTORY = 64
 
-/**
- * The rows a view has been sent, by absolute line.
- *
- * **A cache and never the truth.** The terminal's owner holds the screen and its history; this holds
- * whatever of it has arrived, so that scrolling through lines already seen costs nothing and a line not
- * yet seen is something to ask for (`missing`). What keeps it honest is three things the owner says: the
- * epoch, which empties it; where history starts, below which lines are gone; and `staleFrom`, which names
- * history that changed without being resent.
- *
- * **A row is kept as it came.** Its styles and links are its own, so there is no table here for rows to
- * share and none to keep to the size of what is still held: what a row cost is given back when the row is
- * let go, and the row a frame brought is the row that is drawn.
- */
+interface RowPage {
+  readonly baseLine: number
+  readonly slots: Array<PackedRow | undefined>
+  count: number
+}
+
 export class RowStore {
-  /** `-1` until the first frame: no line number means anything yet */
+  /** `-1` until the first frame arrives. */
   epoch = -1
   firstActive = 0
   screenRows = 0
   columns = 0
   scrollback = 0
+  imagesGen = 0
 
-  private readonly rows = new Map<number, Row>()
-  /** Lines currently held whose `row.images !== undefined`, so `pictured` and `doubtPictured` skip plain rows */
+  private readonly pages = new Map<number, RowPage>()
+  private totalRows = 0
   private readonly picturedLines = new Set<number>()
-  /**
-   * History lines the owner answered for with no row: it does not hold them, so they are not missing. True
-   * until the owner says what it holds has changed — the epoch, where history starts, or `staleFrom`.
-   */
   private readonly absent = new Set<number>()
-  /**
-   * History lines held that may no longer be what the owner holds, and are asked for again (`doubtPictured`).
-   * A doubted row is still drawn: it is the best there is until the answer comes.
-   */
   private readonly doubted = new Set<number>()
-  /**
-   * How many times `doubtPictured` has been called: what an asker notes when it asks, so `absorb` can tell
-   * an answer asked for before the images last changed from one asked for since.
-   */
+  /** Increments whenever `imagesGen` changes so in-flight history fetches carrying stale placeholders are rejected. */
   imagesChanged = 0
-  /**
-   * How many frames have named history stale, and a bounded history of `(staleFrames, staleFrom)` pairs:
-   * what an asker notes when it asks, so an answer taken after one or more frames that named the lines it
-   * covers stale is not put back as it was.
-   */
-  staleFrames = 0
-  private readonly staleHistory: Array<{ frame: number; from: number }> = []
-  private staleOverflowFrom = Infinity
 
-  /** The oldest line the owner still holds */
+  /** The oldest absolute line the broker still holds in scrollback. */
   get oldest(): number {
     return Math.max(0, this.firstActive - this.scrollback)
   }
 
-  /** One past the last line of the screen */
+  /** One past the last line of the active screen. */
   get end(): number {
     return this.firstActive + this.screenRows
   }
 
+  /** Total cached `PackedRow`s currently held across all pages. */
   get size(): number {
-    return this.rows.size
+    return this.totalRows
   }
 
-  row(line: number): Row | undefined {
-    return this.rows.get(line)
+  /** Number of allocated 256-line pages (useful for diagnostics & O(pages) tests). */
+  get pageCount(): number {
+    return this.pages.size
   }
 
-  /**
-   * Takes a frame, answering which lines now differ from what was held.
-   *
-   * `reset` is true when nothing held before is worth anything: the epoch moved, so a caller redraws all
-   * of it rather than the lines named. `near` is the line the viewer is at, which is what is kept longest;
-   * left out, that is the screen.
-   *
-   * A frame need not bring every row it owes: a screen too long for one message comes over several, and
-   * the lines the first of them leaves out are simply not held until the next.
-   */
-  apply(frame: Frame, near = frame.firstActive): { reset: boolean; changed: number[] } {
+  row(line: number): PackedRow | undefined {
+    if (line < 0) return undefined
+    const pageIdx = Math.floor(line / PAGE_LINES)
+    const page = this.pages.get(pageIdx)
+    if (!page) return undefined
+    return page.slots[line - page.baseLine]
+  }
+
+  private setRow(row: PackedRow): void {
+    const line = row.line
+    const pageIdx = Math.floor(line / PAGE_LINES)
+    let page = this.pages.get(pageIdx)
+    if (!page) {
+      page = { baseLine: pageIdx * PAGE_LINES, slots: new Array<PackedRow | undefined>(PAGE_LINES), count: 0 }
+      this.pages.set(pageIdx, page)
+    }
+    const offset = line - page.baseLine
+    const prev = page.slots[offset]
+    if (prev === undefined) {
+      page.count += 1
+      this.totalRows += 1
+    }
+    page.slots[offset] = row
+    if ((row.flags & RowFlag.HAS_PLACEHOLDER) !== 0 && row.pieces && row.pieces.length > 0) {
+      this.picturedLines.add(line)
+    } else {
+      this.picturedLines.delete(line)
+    }
+    this.absent.delete(line)
+    this.doubted.delete(line)
+  }
+
+  private deleteLine(line: number): void {
+    const pageIdx = Math.floor(line / PAGE_LINES)
+    const page = this.pages.get(pageIdx)
+    if (!page) return
+    const offset = line - page.baseLine
+    if (page.slots[offset] === undefined) return
+    page.slots[offset] = undefined
+    page.count -= 1
+    this.totalRows -= 1
+    this.picturedLines.delete(line)
+    this.doubted.delete(line)
+    if (page.count === 0) {
+      this.pages.delete(pageIdx)
+    }
+  }
+
+  private clearAll(): void {
+    this.pages.clear()
+    this.totalRows = 0
+    this.picturedLines.clear()
+    this.absent.clear()
+    this.doubted.clear()
+  }
+
+  /** Applies an authoritative v2 `FrameUpdate`, returning whether the epoch reset and which lines changed. */
+  apply(frame: FrameUpdate, near = frame.firstActiveLine): { readonly reset: boolean; readonly changed: number[] } {
     const reset = frame.epoch !== this.epoch
     const prevOldest = this.oldest
     const prevEnd = this.end
     const prevFirstActive = this.firstActive
+
     if (reset) {
-      this.rows.clear()
-      this.picturedLines.clear()
-      this.doubted.clear()
-      this.staleHistory.length = 0
-      this.staleOverflowFrom = Infinity
+      this.clearAll()
       this.epoch = frame.epoch
+      this.imagesGen = frame.imagesGen
+    } else if (frame.imagesGen !== this.imagesGen) {
+      this.imagesGen = frame.imagesGen
+      this.doubtPictured()
     }
-    this.firstActive = Math.max(0, frame.firstActive)
-    this.screenRows = Math.max(0, frame.screenRows)
-    this.columns = Math.max(0, frame.columns)
-    this.scrollback = Math.max(0, Math.min(frame.scrollback, this.firstActive))
-    if (reset || frame.staleFrom !== undefined || this.oldest !== prevOldest || this.firstActive < prevFirstActive) {
+
+    this.firstActive = Math.max(0, frame.firstActiveLine)
+    this.screenRows = Math.max(0, frame.size.rows)
+    this.columns = Math.max(0, frame.size.cols)
+    this.scrollback = Math.max(0, Math.min(frame.scrollbackLines, this.firstActive))
+
+    if (reset || this.oldest !== prevOldest || this.firstActive < prevFirstActive) {
       this.absent.clear()
     }
 
-    // A set, because a line can be both let go as stale and resent by the same frame
-    const changed = new Set<number>()
-    // History the owner changed and did not resend. Before the new rows, so one of them that is in that
-    // range is kept
-    if (frame.staleFrom !== undefined) {
-      this.staleFrames += 1
-      this.staleHistory.push({ frame: this.staleFrames, from: frame.staleFrom })
-      if (this.staleHistory.length > MAX_STALE_HISTORY) {
-        const dropped = this.staleHistory.shift()!
-        if (dropped.from < this.staleOverflowFrom) this.staleOverflowFrom = dropped.from
-      }
-      for (const line of this.rows.keys()) {
-        if (line >= frame.staleFrom && line < this.firstActive) {
-          this.rows.delete(line)
-          this.picturedLines.delete(line)
-          changed.add(line)
+    const changed: number[] = []
+    if (frame.fullSync && !reset) {
+      // Drop any active-screen rows that were replaced by a blank row not listed in `frame.rows`
+      for (let line = this.firstActive; line < this.end; line += 1) {
+        if (this.row(line) !== undefined) {
+          this.deleteLine(line)
+          changed.push(line)
         }
       }
-      for (const line of this.doubted) {
-        if (line >= frame.staleFrom && line < this.firstActive) this.doubted.delete(line)
-      }
     }
-    const oldest = this.oldest
-    const end = this.end
+
     for (const row of frame.rows) {
-      if (row.line < oldest || row.line >= end) continue
-      this.rows.set(row.line, row)
-      if (row.images !== undefined) this.picturedLines.add(row.line)
-      else this.picturedLines.delete(row.line)
-      this.absent.delete(row.line)
-      this.doubted.delete(row.line)
-      changed.add(row.line)
+      if (row.line < this.oldest || row.line >= this.end) continue
+      this.setRow(row)
+      changed.push(row.line)
     }
-    this.forget(near, reset ? undefined : { prevOldest, prevEnd })
-    return { reset, changed: [...changed].sort((a, b) => a - b) }
+
+    // Trim cached pages/lines that fell off scrollback or beyond the new screen end
+    if (!reset) {
+      if (this.oldest > prevOldest) this.trimBelow(this.oldest)
+      if (this.end < prevEnd) this.trimAtOrAbove(this.end)
+    }
+
+    if (this.totalRows > KEPT_LINES + KEPT_SLACK) {
+      this.evictFurthestPages(near)
+    }
+    return { reset, changed }
   }
 
-  /** Minimum `staleFrom` across every stale frame received after `askedStale` */
-  private staleSince(askedStale: number): number {
-    if (askedStale === this.staleFrames) return Infinity
-    let min = Infinity
-    if (this.staleHistory.length === 0 || this.staleHistory[0]!.frame > askedStale + 1) {
-      min = this.staleOverflowFrom
-    }
-    for (const entry of this.staleHistory) {
-      if (entry.frame > askedStale && entry.from < min) min = entry.from
-    }
-    return min
-  }
+  /** Absorbs history rows returned by `fetchRows(epoch, fromLine, count)`, returning absorbed line numbers. */
+  absorb(
+    epoch: number,
+    fromLine: number,
+    count: number,
+    rows: readonly PackedRow[],
+    near = this.firstActive,
+    atImagesChanged = this.imagesChanged,
+  ): number[] {
+    if (epoch !== this.epoch || count <= 0) return []
+    const seen = new Set<number>()
+    const absorbed: number[] = []
+    const staleImages = atImagesChanged !== this.imagesChanged
 
-  /**
-   * Takes the answer to a fetch, answering the lines it changed what is known of: the ones it brought, and
-   * the ones it says the owner does not hold. An answer about another epoch names lines that no longer
-   * exist, so it is dropped whole. `near` is the line the viewer is at, as for `apply`.
-   *
-   * **What the answer covers and has no row for is not held by the owner**, and is remembered as that, so
-   * it is not missing. What it does not cover it says nothing about.
-   *
-   * **An answer asked for before the images last changed may be of either side of the change.** `asked` is
-   * `imagesChanged` when the fetch was made. An answer and the frame that says the images changed can
-   * arrive together, and the frame is taken first whichever was sent first, so there is no telling from
-   * the order which of them the answer's rows are older than. A row of placeholder cells brought by such
-   * an answer is taken, and stays doubted: asked for once more, by a fetch made after the change.
-   */
-  absorb(fetched: Fetched, near = this.firstActive, asked = this.imagesChanged, askedStale = this.staleFrames): number[] {
-    if (fetched.epoch !== this.epoch) return []
-    if (!Number.isFinite(fetched.first) || !Number.isFinite(fetched.count) || fetched.count <= 0) return []
-    const told: number[] = []
-    // Lines a frame has since named stale were changed after this was asked for: what the answer holds of
-    // them is the old text, and it is not put back
-    const stale = this.staleSince(askedStale)
-    // The screen is only ever told by a frame: a fetched copy of a line a program can still write to may
-    // be older than the frame that last described it
-    const from = Math.max(fetched.first, this.oldest)
-    const to = Math.min(fetched.first + fetched.count, this.firstActive)
-    if (to <= from) return []
-    const brought = new Set<number>()
-    for (const row of fetched.rows) {
-      if (row.line < from || row.line >= to || row.line >= stale) continue
-      this.rows.set(row.line, row)
-      if (row.images !== undefined) this.picturedLines.add(row.line)
-      else this.picturedLines.delete(row.line)
-      this.absent.delete(row.line)
-      if (row.images !== undefined && asked !== this.imagesChanged) this.doubted.add(row.line)
-      else this.doubted.delete(row.line)
-      brought.add(row.line)
-      told.push(row.line)
+    for (const row of rows) {
+      if (row.line < this.oldest || row.line >= this.end) continue
+      // Never overwrite live screen rows or newer doubted placeholder rows with stale history
+      if (row.line >= this.firstActive && this.row(row.line) !== undefined) continue
+      if (staleImages && (row.flags & RowFlag.HAS_PLACEHOLDER) !== 0) continue
+      this.setRow(row)
+      seen.add(row.line)
+      absorbed.push(row.line)
     }
-    const limit = Math.min(to, stale)
-    // A row asked for again and not brought is one the owner no longer holds
-    for (const line of this.doubted) {
-      if (line < from || line >= limit || brought.has(line)) continue
-      this.doubted.delete(line)
-      this.rows.delete(line)
-      this.picturedLines.delete(line)
-      this.markAbsent(line)
-      told.push(line)
-    }
-    const absentLimit = Math.min(limit, from + MAX_ABSENT + brought.size)
-    for (let line = from; line < absentLimit; line += 1) {
-      if (brought.has(line) || this.absent.has(line) || this.rows.has(line)) continue
-      this.markAbsent(line)
-      told.push(line)
-    }
-    this.forget(near)
-    return told
-  }
 
-  /** Records a history line the owner did not hold, evicting the oldest entry once at `MAX_ABSENT` */
-  private markAbsent(line: number): void {
-    if (this.absent.has(line)) return
-    if (this.absent.size >= MAX_ABSENT) {
-      const first = this.absent.values().next().value
-      if (first !== undefined) this.absent.delete(first)
-    }
-    this.absent.add(line)
-  }
-
-  /**
-   * The runs of history lines in `first .. first + count` that the owner holds, as far as it has said, and
-   * this does not: each as `[first, count]`.
-   *
-   * **History only.** The screen is told by frames and by nothing else, so a line of it that is not here
-   * is one the owner has yet to send, not one to ask for.
-   */
-  missing(first: number, count: number): Array<[number, number]> {
-    const from = Math.max(first, this.oldest)
-    const to = Math.min(first + count, this.firstActive)
-    const runs: Array<[number, number]> = []
-    let start = -1
-    for (let line = from; line < to; line += 1) {
-      if ((this.rows.has(line) && !this.doubted.has(line)) || this.absent.has(line)) {
-        if (start !== -1) runs.push([start, line - start])
-        start = -1
-      } else if (start === -1) {
-        start = line
+    const start = Math.max(this.oldest, fromLine)
+    const stop = Math.min(this.firstActive, fromLine + count)
+    for (let line = start; line < stop; line += 1) {
+      if (!seen.has(line) && this.row(line) === undefined) {
+        if (this.absent.size >= MAX_ABSENT) this.absent.clear()
+        this.absent.add(line)
       }
     }
-    if (start !== -1) runs.push([start, to - start])
-    return runs
+
+    if (this.totalRows > KEPT_LINES + KEPT_SLACK) {
+      this.evictFurthestPages(near)
+    }
+    return absorbed
   }
 
-  /**
-   * The images changed: a history row of placeholder cells may show something else now — another picture
-   * under the same number, nothing, or a picture where it showed none — and the owner sends history again
-   * only when asked. So each such row is doubted: kept and drawn, and among what `missing` names until it
-   * is brought again. The screen's rows are not: a frame brings those.
-   */
+  /** Marks cached history rows carrying image placeholders as doubted so they refetch when visible. */
   doubtPictured(): void {
     this.imagesChanged += 1
     for (const line of this.picturedLines) {
@@ -273,82 +218,102 @@ export class RowStore {
     }
   }
 
-  /** The images the rows held show part of, by number */
-  pictured(): Set<number> {
-    const images = new Set<number>()
-    for (const line of this.picturedLines) {
-      for (const piece of this.rows.get(line)?.images?.pieces ?? []) images.add(piece.image)
+  /** Returns contiguous uncached (or doubted) history spans inside `[fromLine, fromLine + count)`. */
+  missing(fromLine: number, count: number): Array<{ readonly from: number; readonly count: number }> {
+    const start = Math.max(this.oldest, Math.floor(fromLine))
+    const stop = Math.min(this.firstActive, Math.ceil(fromLine + count))
+    if (stop <= start) return []
+    const ranges: Array<{ from: number; count: number }> = []
+    for (let line = start; line < stop; line += 1) {
+      const need = (this.row(line) === undefined && !this.absent.has(line)) || this.doubted.has(line)
+      if (!need) continue
+      const last = ranges.at(-1)
+      if (last && last.from + last.count === line) last.count += 1
+      else ranges.push({ from: line, count: 1 })
     }
-    return images
+    return ranges
   }
 
-  /**
-   * Lets go of what the owner no longer holds, then, past `KEPT_LINES` and its slack, of the history that
-   * is furthest from `near`. Never of the screen: a line of it is told by a frame and by nothing else, so
-   * one let go would stay blank until a program wrote to it again.
-   *
-   * **Furthest from the viewer, not from the screen.** Someone reading far back in a long history is sent
-   * exactly the lines furthest from the screen; letting those go first would let go of what was just
-   * fetched for them, and it would be fetched again for ever.
-   */
-  private forget(near: number, prevBounds?: { prevOldest: number; prevEnd: number }): void {
-    const oldest = this.oldest
-    const end = this.end
-    if (prevBounds) {
-      const { prevOldest, prevEnd } = prevBounds
-      const oldestGrew = oldest > prevOldest
-      const endShrank = end < prevEnd
-      if (oldestGrew || endShrank) {
-        const rangeCost = (oldestGrew ? oldest - prevOldest : 0) + (endShrank ? prevEnd - end : 0)
-        if (rangeCost < this.rows.size) {
-          if (oldestGrew) {
-            for (let line = prevOldest; line < oldest; line += 1) {
-              if (this.rows.delete(line)) {
-                this.picturedLines.delete(line)
-                this.doubted.delete(line)
-              }
-            }
-          }
-          if (endShrank) {
-            for (let line = end; line < prevEnd; line += 1) {
-              if (this.rows.delete(line)) {
-                this.picturedLines.delete(line)
-                this.doubted.delete(line)
-              }
-            }
-          }
-        } else {
-          for (const line of this.rows.keys()) {
-            if (line < oldest || line >= end) {
-              this.rows.delete(line)
-              this.picturedLines.delete(line)
-              this.doubted.delete(line)
-            }
+  /** Returns all cached lines currently carrying `ImagePiece` placeholders. */
+  pictured(): number[] {
+    return [...this.picturedLines]
+  }
+
+  private trimBelow(oldest: number): void {
+    const minPage = Math.floor(oldest / PAGE_LINES)
+    for (const [pageIdx, page] of this.pages) {
+      if (pageIdx < minPage) {
+        this.dropPage(pageIdx, page)
+      } else if (pageIdx === minPage) {
+        const cutoff = oldest - page.baseLine
+        for (let i = 0; i < cutoff; i += 1) {
+          if (page.slots[i] !== undefined) {
+            page.slots[i] = undefined
+            page.count -= 1
+            this.totalRows -= 1
+            const line = page.baseLine + i
+            this.picturedLines.delete(line)
+            this.doubted.delete(line)
           }
         }
+        if (page.count === 0) this.pages.delete(pageIdx)
       }
     }
-    if (this.rows.size <= KEPT_LINES + KEPT_SLACK) return
-    // The widest reach around `near` that holds no more than may be kept, found by halving: at most two
-    // lines are any one distance away, so the count is within one of the bound
-    const within = (reach: number) => {
-      let count = 0
-      for (const line of this.rows.keys()) if (line >= this.firstActive || Math.abs(line - near) <= reach) count += 1
-      return count
+  }
+
+  private trimAtOrAbove(end: number): void {
+    const maxPage = Math.floor(Math.max(0, end - 1) / PAGE_LINES)
+    for (const [pageIdx, page] of this.pages) {
+      if (pageIdx > maxPage || end === 0) {
+        this.dropPage(pageIdx, page)
+      } else if (pageIdx === maxPage) {
+        const startOffset = end - page.baseLine
+        for (let i = Math.max(0, startOffset); i < PAGE_LINES; i += 1) {
+          if (page.slots[i] !== undefined) {
+            page.slots[i] = undefined
+            page.count -= 1
+            this.totalRows -= 1
+            const line = page.baseLine + i
+            this.picturedLines.delete(line)
+            this.doubted.delete(line)
+          }
+        }
+        if (page.count === 0) this.pages.delete(pageIdx)
+      }
     }
-    let reach = 0
-    let beyond = Math.max(near - oldest, end - near, 0) + 1
-    while (beyond - reach > 1) {
-      const middle = reach + Math.floor((beyond - reach) / 2)
-      if (within(middle) <= KEPT_LINES) reach = middle
-      else beyond = middle
-    }
-    for (const line of this.rows.keys()) {
-      if (line < this.firstActive && Math.abs(line - near) > reach) {
-        this.rows.delete(line)
+  }
+
+  private dropPage(pageIdx: number, page: RowPage): void {
+    this.pages.delete(pageIdx)
+    this.totalRows -= page.count
+    for (let i = 0; i < PAGE_LINES; i += 1) {
+      if (page.slots[i] !== undefined) {
+        const line = page.baseLine + i
         this.picturedLines.delete(line)
         this.doubted.delete(line)
       }
+    }
+  }
+
+  /**
+   * $O(\text{pages} \log \text{pages})$ eviction: drops entire 256-line pages furthest from `near`
+   * (never evicting active-screen pages) until `totalRows <= KEPT_LINES`.
+   */
+  private evictFurthestPages(near: number): void {
+    const activeStartPage = Math.floor(this.firstActive / PAGE_LINES)
+    const activeEndPage = Math.floor(Math.max(this.firstActive, this.end - 1) / PAGE_LINES)
+    const nearPage = Math.floor(near / PAGE_LINES)
+
+    const candidates: Array<{ readonly pageIdx: number; readonly dist: number; readonly page: RowPage }> = []
+    for (const [pageIdx, page] of this.pages) {
+      if (pageIdx >= activeStartPage && pageIdx <= activeEndPage) continue
+      candidates.push({ pageIdx, dist: Math.abs(pageIdx - nearPage), page })
+    }
+    candidates.sort((a, b) => b.dist - a.dist)
+
+    for (const c of candidates) {
+      if (this.totalRows <= KEPT_LINES) break
+      this.dropPage(c.pageIdx, c.page)
     }
   }
 }

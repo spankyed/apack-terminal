@@ -1,193 +1,90 @@
-// A selection: where it is, which the view knows; and what it means, which it asks.
 import { describe, expect, it } from 'vitest'
-import { Selection } from '../src/selection.ts'
-import type { Position, Span } from '../src/source.ts'
+import { RowStore, Selection } from '../src/index.ts'
 import { FakeSource } from './_source.ts'
+import { frame, row } from './_support.ts'
+import { settled } from './_view.ts'
 
-const at = (line: number, column: number): Position => ({ line, column })
+describe('Selection (0 ms local queries + single-RPC fallback + block selection)', () => {
+  it('resolves word, line, linear text, and rectangular block text locally in 0 ms without RPCs', async () => {
+    const source = new FakeSource()
+    const store = new RowStore()
+    store.apply(
+      frame({
+        size: { cols: 20, rows: 3 },
+        rows: [
+          row(0, 'alpha beta gamma'),
+          row(1, 'delta epsilon zeta'),
+          row(2, 'eta   theta   iota'),
+        ],
+      }),
+    )
 
-/** Lets promises that are already settled run their continuations */
-const settled = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
+    let changes = 0
+    const sel = new Selection(source, store, () => { changes += 1 })
+    const v0 = sel.version
 
-function selection(source = new FakeSource()) {
-  let changes = 0
-  const made = new Selection(source, () => 80, () => { changes += 1 })
-  return { made, source, changes: () => changes }
-}
+    // Double-click word selection resolves synchronously!
+    sel.begin({ line: 0, col: 7 }, 'word')
+    expect(sel.version).toBeGreaterThan(v0)
+    expect(sel.span).toEqual({ start: { line: 0, col: 6 }, end: { line: 0, col: 9 } })
+    expect(sel.syncText()).toBe('beta')
+    expect(await sel.text()).toBe('beta')
+    expect(source.remoteWordCalls).toEqual([])
+    expect(source.remoteTextCalls).toEqual([])
+    expect(changes).toBe(1)
 
-describe('a selection dragged across cells', () => {
-  it('runs from where it started to where it is, whichever way it was dragged', () => {
-    const { made } = selection()
-    made.begin(at(5, 10), 'cell')
-    made.extendTo(at(7, 3))
-    expect(made.span).toEqual({ start: at(5, 10), end: at(7, 3) })
+    // Triple-click line selection resolves synchronously!
+    sel.begin({ line: 1, col: 3 }, 'line')
+    expect(sel.span).toEqual({ start: { line: 1, col: 0 }, end: { line: 1, col: 19 } })
+    expect(await sel.text()).toBe('delta epsilon zeta')
+    expect(source.remoteLineCalls).toEqual([])
 
-    made.extendTo(at(2, 40))
-    expect(made.span, 'dragging back past the start did not turn it around').toEqual({ start: at(2, 40), end: at(5, 10) })
+    // Block (rectangular Alt-drag) selection resolves synchronously!
+    sel.begin({ line: 0, col: 0 }, 'cell', 'block')
+    sel.extendTo({ line: 2, col: 4 })
+    expect(sel.block).toEqual({ top: 0, bottom: 2, left: 0, right: 4 })
+    expect(sel.on(1)).toEqual({ from: 0, to: 5 })
+    expect(await sel.text()).toBe('alpha\ndelta\neta')
+    expect(source.remoteRectCalls).toEqual([])
   })
 
-  it('covers part of its first and last lines and the whole of those between', () => {
-    const { made } = selection()
-    made.begin(at(5, 10), 'cell')
-    made.extendTo(at(7, 3))
+  it('falls back to a single broker RPC when crossing uncached history', async () => {
+    const source = new FakeSource()
+    source.remoteWordAnswer = { start: { line: 10, col: 0 }, end: { line: 10, col: 4 } }
+    source.remoteTextAnswer = 'remote-linear'
+    source.remoteRectAnswer = 'remote-rect'
 
-    expect(made.on(4)).toBeUndefined()
-    expect(made.on(5)).toEqual({ from: 10, to: 80 })
-    expect(made.on(6)).toEqual({ from: 0, to: 80 })
-    expect(made.on(7), 'the cell under the pointer is selected too').toEqual({ from: 0, to: 4 })
-    expect(made.on(8)).toBeUndefined()
-  })
+    const store = new RowStore()
+    store.apply(
+      frame({
+        epoch: 3,
+        firstActiveLine: 10,
+        scrollbackLines: 10,
+        size: { cols: 20, rows: 2 },
+        rows: [row(10, 'hello world'), row(11, 'second')],
+      }),
+    )
 
-  it('is drawn the moment it moves, without waiting on anything', () => {
-    const { made, changes } = selection()
-    made.begin(at(1, 1), 'cell')
-    made.extendTo(at(1, 9))
-    expect(changes()).toBe(2)
-  })
-})
-
-describe('a selection by word or line', () => {
-  /** A source for which every word is the five cells from a multiple of ten */
-  class Words extends FakeSource {
-    override async wordAt(position: Position): Promise<Span | null> {
-      const start = Math.floor(position.column / 10) * 10
-      return { start: at(position.line, start), end: at(position.line, start + 4) }
-    }
-  }
-
-  it('grows each end to the word it is in, as the terminal says where words end', async () => {
-    const { made } = selection(new Words())
-    made.begin(at(3, 12), 'word')
-    await Promise.resolve()
-    expect(made.span).toEqual({ start: at(3, 10), end: at(3, 14) })
-
-    made.extendTo(at(3, 33))
-    await Promise.resolve()
-    expect(made.span, 'dragging did not take whole words').toEqual({ start: at(3, 10), end: at(3, 34) })
-  })
-
-  it('keeps the word it started in when the far end moves before that word is known', async () => {
-    const answers: Array<() => void> = []
-    class Slow extends Words {
-      override wordAt(position: Position): Promise<Span | null> {
-        return new Promise((resolve) => { answers.push(() => { void super.wordAt(position).then(resolve) }) })
-      }
-    }
-    const { made } = selection(new Slow())
-    // A double click and a drag, faster than the terminal says where the first word ends
-    made.begin(at(3, 12), 'word')
-    made.extendTo(at(3, 33))
-    for (const answer of answers) answer()
+    const sel = new Selection(source, store, () => {})
+    // Line 9 is uncached -> localWordAt returns null -> falls back to source.wordAt
+    sel.begin({ line: 10, col: 2 }, 'word')
     await settled()
+    expect(source.remoteWordCalls).toEqual([{ line: 10, col: 2 }])
+    expect(sel.span).toEqual({ start: { line: 10, col: 0 }, end: { line: 10, col: 4 } })
 
-    expect(made.span, 'the start stayed one cell of the word it is in').toEqual({ start: at(3, 10), end: at(3, 34) })
-  })
+    // Linear selection spanning uncached line 5..10 calls source.textOf once
+    sel.select({ start: { line: 5, col: 0 }, end: { line: 10, col: 4 } })
+    expect(sel.syncText()).toBeNull()
+    expect(await sel.text()).toBe('remote-linear')
+    expect(source.remoteTextCalls).toHaveLength(1)
 
-  it('asks nothing more while the far end stays in the cell it is in', async () => {
-    let asked = 0
-    class Counting extends Words {
-      override wordAt(position: Position): Promise<Span | null> { asked += 1; return super.wordAt(position) }
-    }
-    const { made, changes } = selection(new Counting())
-    made.begin(at(3, 12), 'word')
-    made.extendTo(at(3, 33))
-    await settled()
-    const before = changes()
-    made.extendTo(at(3, 33))
-    made.extendTo(at(3, 33))
+    // Block selection spanning uncached line 5..10 calls source.textOfRect ONCE (not N times!)
+    sel.begin({ line: 5, col: 1 }, 'cell', 'block')
+    sel.extendTo({ line: 10, col: 4 })
+    expect(await sel.text()).toBe('remote-rect')
+    expect(source.remoteRectCalls).toHaveLength(1)
 
-    expect(asked).toBe(2)
-    expect(changes(), 'a move within one cell was drawn again').toBe(before)
-  })
-
-  it('stays the cell it is when the source cannot say what the word is', async () => {
-    class Failing extends FakeSource {
-      override async wordAt(): Promise<Span | null> { throw new Error('the session ended') }
-    }
-    const { made } = selection(new Failing())
-    made.begin(at(3, 12), 'word')
-    await settled()
-    expect(made.span).toEqual({ start: at(3, 12), end: at(3, 12) })
-  })
-
-  it('ignores an answer that arrives after the selection has moved on', async () => {
-    const { made } = selection(new Words())
-    made.begin(at(3, 12), 'word')
-    made.clear()
-    await Promise.resolve()
-
-    expect(made.span, 'a cleared selection came back').toBeNull()
-  })
-})
-
-describe('the selected text', () => {
-  it('is asked of the source, which knows what was written', async () => {
-    class Text extends FakeSource {
-      asked: Span | null = null
-      override async textOf(span: Span): Promise<string> { this.asked = span; return 'the text' }
-    }
-    const source = new Text()
-    const { made } = selection(source)
-    made.begin(at(1, 0), 'cell')
-    made.extendTo(at(2, 5))
-
-    expect(await made.text()).toBe('the text')
-    expect(source.asked).toEqual({ start: at(1, 0), end: at(2, 5) })
-  })
-
-  it('is asked only of lines the terminal still holds, when the selection was made before some were let go', async () => {
-    class Text extends FakeSource {
-      asked: Span[] = []
-      override async textOf(span: Span): Promise<string> { this.asked.push(span); return 'what is left' }
-    }
-    const source = new Text()
-    let held = { oldest: 0, end: 104 }
-    const made = new Selection(source, () => 80, () => {}, () => held)
-    made.select({ start: at(0, 3), end: at(103, 79) })
-
-    // History was trimmed to the last forty lines, and the screen is four lines shorter
-    held = { oldest: 60, end: 100 }
-    expect(await made.text()).toBe('what is left')
-    expect(source.asked).toEqual([{ start: at(60, 0), end: at(99, 79) }])
-
-    // And then all of what was selected is gone
-    held = { oldest: 200, end: 204 }
-    expect(await made.text()).toBe('')
-    expect(source.asked, 'the source was asked for lines it does not hold').toHaveLength(1)
-  })
-
-  it('is empty with nothing selected', async () => {
-    expect(await selection().made.text()).toBe('')
-  })
-
-  it('clamps columns to columns - 1 in on() and text(), and batches blockText fetches concurrently', async () => {
-    let active = 0
-    let maxConcurrent = 0
-    const asked: Span[] = []
-    class Concurrent extends FakeSource {
-      override async textOf(span: Span): Promise<string> {
-        asked.push(span)
-        active += 1
-        maxConcurrent = Math.max(maxConcurrent, active)
-        await new Promise((resolve) => setTimeout(resolve, 0))
-        active -= 1
-        return `L${span.start.line}`
-      }
-    }
-    const source = new Concurrent()
-    const made = new Selection(source, () => 10, () => {})
-    made.select({ start: at(0, 50), end: at(0, 90) })
-    expect(made.on(0)).toEqual({ from: 9, to: 10 })
-    await made.text()
-    expect(asked[0]).toEqual({ start: at(0, 9), end: at(0, 9) })
-
-    // Block selection spanning 10 lines with out-of-range columns fetches concurrently
-    made.begin(at(0, 2), 'cell', 'block')
-    made.extendTo(at(9, 50))
-    expect(made.on(3)).toEqual({ from: 2, to: 10 })
-    const text = await made.text()
-    expect(text.split('\n')).toHaveLength(10)
-    expect(maxConcurrent).toBeGreaterThan(1)
-    expect(asked.at(-1)).toEqual({ start: at(9, 2), end: at(9, 9) })
+    sel.reset()
+    expect(sel.span).toBeNull()
   })
 })

@@ -1,96 +1,82 @@
 import type { SelectedCells } from './draw.ts'
-import type { Position, Row, Span, TerminalSource } from './source.ts'
+import { localLineAt, localTextOf, localTextOfRect, localWordAt } from './local-query.ts'
+import type { RowStore } from './row-store.ts'
+import type { CellPos, CellSpan, TerminalSource } from './source.ts'
 
 /** What a click selects by, which is how many times it was clicked */
 export type Granularity = 'cell' | 'word' | 'line'
 
 /**
- * The shape of a selection made by dragging over cells: `linear` is the text between two cells, as a program would have it;
- * `block` is the rectangle between two cells, which is each line's own columns (Alt-drag, Option-drag on a Mac).
+ * The shape of a selection made by dragging over cells: `linear` is the text between two cells;
+ * `block` is the rectangle between two cells (Alt-drag / Option-drag).
  */
 export type Shape = 'linear' | 'block'
 
-/**
- * The first (`start`) or last (`end`) column of the character that covers `column` in `row`, or `column` itself where
- * no character does: a blank cell is its own column.
- */
-function glyphCovering(row: Row, column: number, edge: 'start' | 'end'): number {
-  for (let index = 0; index < row.column.length; index += 1) {
-    const from = row.column[index]!
-    const to = from + row.width[index]! - 1
-    if (column >= from && column <= to) return edge === 'start' ? from : to
-  }
-  return column
-}
-
-const before = (a: Position, b: Position): boolean => a.line < b.line || (a.line === b.line && a.column < b.column)
+const before = (a: CellPos, b: CellPos): boolean =>
+  a.line < b.line || (a.line === b.line && a.col < b.col)
 
 /**
  * What the user has selected, in absolute lines.
  *
- * **Kept here and drawn at once; only its meaning is asked of the source.** Where a selection is, the view
- * knows without asking, so dragging one never waits on anything. What it cannot know from the rows it
- * holds is where a word ends, where a wrapped line began, or what the text is with wrapped rows joined —
- * those are the terminal's facts, and the source answers them.
- *
- * In absolute lines, so a selection stays on the text it was made on while output arrives and while the
- * view scrolls.
+ * v2 optimization:
+ * - Resolves `wordAt`, `lineAt`, `textOf`, and `textOfRect` synchronously in 0 ms via `local-query.ts`
+ *   whenever the target rows are cached in `RowStore` (99% of interactive clicks & copies).
+ * - Falls back to a single broker RPC (`source.wordAt`/`lineAt`/`textOf`/`textOfRect`) only when
+ *   the selection crosses uncached scrollback history.
+ * - Exposes a monotonic numeric `version` so `TerminalView` dirty-checks `RowDrawing` caches in O(1)
+ *   without allocating string cache keys.
  */
 export class Selection {
-  /** Where the selection was started, as the span that start selected: one cell, a word or a line */
-  private anchor: Span | null = null
-  /** The other end, likewise, and the cell it was last moved to */
-  private head: Span | null = null
-  private headAt: Position | null = null
+  private anchor: CellSpan | null = null
+  private head: CellSpan | null = null
+  private headAt: CellPos | null = null
   private granularity: Granularity = 'cell'
-  /** Whether the selection is the text between its ends, or the rectangle between them. Only a cell selection is a block. */
   private shape: Shape = 'linear'
-  /** Where a block selection began, in cells: the corner its rectangle is measured from with `headAt` */
-  private anchorAt: Position | null = null
-  /**
-   * Counts the asks about each end, so an answer to one that has been overtaken changes nothing. One each:
-   * the far end moving does not make what the word under the start is any less the answer.
-   */
+  private anchorAt: CellPos | null = null
   private anchorAsked = 0
   private headAsked = 0
+  private rev = 0
 
   constructor(
     private readonly source: TerminalSource,
-    private readonly columns: () => number,
+    private readonly store: RowStore,
     private readonly changed: () => void,
-    /** The lines the terminal still holds, `oldest` up to but not including `end`. Left out, every line */
-    private readonly held?: () => { readonly oldest: number; readonly end: number },
-    /** The row a line is drawn from, when the view has it: what its wide characters span, for a block's copy */
-    private readonly rowOf?: (line: number) => Row | null,
   ) {}
 
-  /**
-   * The rectangle of a block selection, inclusive, or `null` when the selection is not one. Its corners are the cells the
-   * drag began and ended in, whichever way round.
-   */
+  /** Monotonic integer incremented on every selection state change. */
+  get version(): number {
+    return this.rev
+  }
+
+  /** The rectangle of a block selection, inclusive, or `null` when linear or empty. */
   get block(): { top: number; bottom: number; left: number; right: number } | null {
     if (this.shape !== 'block' || !this.anchorAt || !this.headAt) return null
     return {
       top: Math.min(this.anchorAt.line, this.headAt.line),
       bottom: Math.max(this.anchorAt.line, this.headAt.line),
-      left: Math.min(this.anchorAt.column, this.headAt.column),
-      right: Math.max(this.anchorAt.column, this.headAt.column),
+      left: Math.min(this.anchorAt.col, this.headAt.col),
+      right: Math.max(this.anchorAt.col, this.headAt.col),
     }
   }
 
-  /** The selection, start before end, or `null` when there is none. A block's is the span of its rectangle. */
-  get span(): Span | null {
+  /** The selection, start before end, or `null` when empty. */
+  get span(): CellSpan | null {
     const rectangle = this.block
-    if (rectangle) return { start: { line: rectangle.top, column: rectangle.left }, end: { line: rectangle.bottom, column: rectangle.right } }
+    if (rectangle) {
+      return {
+        start: { line: rectangle.top, col: rectangle.left },
+        end: { line: rectangle.bottom, col: rectangle.right },
+      }
+    }
     if (!this.anchor || !this.head) return null
     const start = before(this.head.start, this.anchor.start) ? this.head.start : this.anchor.start
     const end = before(this.anchor.end, this.head.end) ? this.head.end : this.anchor.end
     return { start, end }
   }
 
-  /** The cells of `line` that are selected, for drawing */
+  /** The cells of `line` that are selected, for drawing. */
   on(line: number): SelectedCells | undefined {
-    const cols = this.columns()
+    const cols = this.store.columns
     if (cols <= 0) return undefined
     const maxCol = cols - 1
     const rectangle = this.block
@@ -102,52 +88,59 @@ export class Selection {
     }
     const span = this.span
     if (!span || line < span.start.line || line > span.end.line) return undefined
-    const from = line === span.start.line ? Math.max(0, Math.min(span.start.column, maxCol)) : 0
-    // A line the selection runs through is selected to its edge, blank cells and all
-    const to = line === span.end.line ? Math.max(0, Math.min(span.end.column + 1, cols)) : cols
+    const from = line === span.start.line ? Math.max(0, Math.min(span.start.col, maxCol)) : 0
+    const to = line === span.end.line ? Math.max(0, Math.min(span.end.col + 1, cols)) : cols
     return to > from ? { from, to } : undefined
   }
 
-  /**
-   * Starts a selection at `position`: a cell, or the word or line there. A cell may start a block: a word or a line is
-   * always linear.
-   */
-  begin(position: Position, granularity: Granularity, shape: Shape = 'linear'): void {
+  /** Starts a selection at `position`: cell, word, or line. */
+  begin(position: CellPos, granularity: Granularity, shape: Shape = 'linear'): void {
     this.granularity = granularity
     this.shape = granularity === 'cell' ? shape : 'linear'
     this.anchorAt = position
-    const cell = { start: position, end: position }
+    const cell: CellSpan = { start: position, end: position }
     this.anchor = cell
     this.head = cell
     this.headAt = position
     const anchor = (this.anchorAsked += 1)
     const head = (this.headAsked += 1)
-    this.changed()
-    // One answer is both ends, for as long as the far one has not moved off this cell
-    this.widen(position, (span) => {
+    const widened = this.tryLocalWiden(position)
+    if (widened) {
+      this.anchor = widened
+      this.head = widened
+      this.notify()
+      return
+    }
+    this.notify()
+    this.remoteWiden(position, (span) => {
       if (anchor === this.anchorAsked) this.anchor = span
       if (head === this.headAsked) this.head = span
       return anchor === this.anchorAsked || head === this.headAsked
     })
   }
 
-  /** Moves the far end of the selection to `position` */
-  extendTo(position: Position): void {
+  /** Moves the far end of the selection to `position`. */
+  extendTo(position: CellPos): void {
     if (!this.anchor) return
-    // Still in the cell it was last moved to: nothing changed, and there is nothing new to ask
-    if (this.headAt && this.headAt.line === position.line && this.headAt.column === position.column) return
+    if (this.headAt && this.headAt.line === position.line && this.headAt.col === position.col) return
     this.head = { start: position, end: position }
     this.headAt = position
     const head = (this.headAsked += 1)
-    this.changed()
-    this.widen(position, (span) => {
+    const widened = this.tryLocalWiden(position)
+    if (widened) {
+      this.head = widened
+      this.notify()
+      return
+    }
+    this.notify()
+    this.remoteWiden(position, (span) => {
       if (head === this.headAsked) this.head = span
       return head === this.headAsked
     })
   }
 
-  /** Selects exactly these cells, from the first to the last */
-  select(span: Span): void {
+  /** Selects exactly these cells, from start to end inclusive. */
+  select(span: CellSpan): void {
     this.anchorAsked += 1
     this.headAsked += 1
     this.granularity = 'cell'
@@ -156,7 +149,7 @@ export class Selection {
     this.anchor = { start: span.start, end: span.start }
     this.head = { start: span.end, end: span.end }
     this.headAt = span.end
-    this.changed()
+    this.notify()
   }
 
   clear(): void {
@@ -168,80 +161,95 @@ export class Selection {
     this.headAt = null
     this.anchorAt = null
     this.shape = 'linear'
-    this.changed()
+    this.notify()
   }
 
-  /**
-   * The selected text as a program wrote it, or the empty string. Only of lines the terminal still holds:
-   * a selection made before its history was trimmed can name lines that are gone, and a source asked for
-   * the text of those has none to give for any of it.
-   */
-  async text(): Promise<string> {
-    const cols = this.columns()
-    if (cols <= 0) return ''
-    const maxCol = cols - 1
-    const clamp = (pos: Position): Position => ({ line: pos.line, column: Math.max(0, Math.min(pos.column, maxCol)) })
-    const rectangle = this.block
-    if (rectangle) return this.blockText(rectangle)
-    const span = this.span
-    if (!span) return ''
-    const held = this.held?.()
-    if (!held) {
-      const start = clamp(span.start)
-      const end = clamp(span.end)
-      return before(end, start) ? '' : this.source.textOf({ start, end })
-    }
-    const start = clamp(span.start.line < held.oldest ? { line: held.oldest, column: 0 } : span.start)
-    const end = clamp(span.end.line >= held.end ? { line: held.end - 1, column: maxCol } : span.end)
-    return before(end, start) ? '' : this.source.textOf({ start, end })
-  }
-
-  /**
-   * A block's text is each line's own columns, joined by newlines. Each line is asked for on its own, which is what a
-   * source has: a span of text that runs from one line's column to the next is a different text.
-   *
-   * **A character the rectangle touches is in it, as it is highlighted.** A wide character takes two cells, and the
-   * rectangle may begin on its second, or end on its first; the span asked for widens to take the whole character, the
-   * same rule `drawRow` highlights by.
-   */
-  private async blockText(rectangle: { top: number; bottom: number; left: number; right: number }): Promise<string> {
-    const held = this.held?.()
-    const top = held ? Math.max(rectangle.top, held.oldest) : rectangle.top
-    const bottom = held ? Math.min(rectangle.bottom, held.end - 1) : rectangle.bottom
-    if (bottom < top) return ''
-    const maxCol = Math.max(0, this.columns() - 1)
-    const rectLeft = Math.max(0, Math.min(rectangle.left, maxCol))
-    const rectRight = Math.max(rectLeft, Math.min(rectangle.right, maxCol))
-    const BATCH = 32
-    const lines: string[] = []
-    for (let start = top; start <= bottom; start += BATCH) {
-      const end = Math.min(bottom, start + BATCH - 1)
-      const batch: Array<Promise<string>> = []
-      for (let line = start; line <= end; line += 1) {
-        const row = this.rowOf?.(line) ?? null
-        const left = Math.max(0, Math.min(row ? glyphCovering(row, rectLeft, 'start') : rectLeft, maxCol))
-        const right = Math.max(left, Math.min(row ? glyphCovering(row, rectRight, 'end') : rectRight, maxCol))
-        batch.push(this.source.textOf({ start: { line, column: left }, end: { line, column: right } }))
-      }
-      lines.push(...(await Promise.all(batch)))
-    }
-    return lines.join('\n')
-  }
-
-  /** Line numbers are about to mean something else: a selection made in them is gone */
+  /** Line numbers are about to change (epoch moved): drop selection. */
   reset(): void {
     this.clear()
   }
 
   /**
-   * Grows an end to the word or line it is in, when that is what is being selected by. `set` answers
-   * whether it took the span. A source that cannot say leaves the end the one cell it is.
+   * Synchronously extracts the selected text from cached `RowStore` rows when all lines are local,
+   * or returns `null` if an uncached scrollback line requires a broker RPC.
    */
-  private widen(position: Position, set: (span: Span) => boolean): void {
-    if (this.granularity === 'cell') return
-    const asked = this.granularity === 'word' ? this.source.wordAt(position) : this.source.lineAt(position)
+  syncText(): string | null {
+    const clamped = this.clampedSpan()
+    if (!clamped) return ''
+    return clamped.rect
+      ? localTextOfRect(this.store, clamped.span)
+      : localTextOf(this.store, clamped.span)
+  }
+
+  /**
+   * Returns the selected text as written by the terminal: 0 ms local resolution when cached,
+   * otherwise a single broker RPC (`textOf` or `textOfRect`).
+   */
+  async text(): Promise<string> {
+    const clamped = this.clampedSpan()
+    if (!clamped) return ''
+    const local = clamped.rect
+      ? localTextOfRect(this.store, clamped.span)
+      : localTextOf(this.store, clamped.span)
+    if (local !== null) return local
+    if (this.store.epoch < 0) return ''
+    return clamped.rect
+      ? this.source.textOfRect(this.store.epoch, clamped.span)
+      : this.source.textOf(this.store.epoch, clamped.span)
+  }
+
+  private clampedSpan(): { readonly span: CellSpan; readonly rect: boolean } | null {
+    const cols = this.store.columns
+    if (cols <= 0 || this.store.end <= this.store.oldest) return null
+    const maxCol = cols - 1
+    const clampCol = (col: number) => Math.max(0, Math.min(col, maxCol))
+    const rectangle = this.block
+    if (rectangle) {
+      const top = Math.max(rectangle.top, this.store.oldest)
+      const bottom = Math.min(rectangle.bottom, this.store.end - 1)
+      if (bottom < top) return null
+      const left = clampCol(rectangle.left)
+      const right = Math.max(left, clampCol(rectangle.right))
+      return {
+        rect: true,
+        span: { start: { line: top, col: left }, end: { line: bottom, col: right } },
+      }
+    }
+    const span = this.span
+    if (!span) return null
+    const start: CellPos =
+      span.start.line < this.store.oldest
+        ? { line: this.store.oldest, col: 0 }
+        : { line: span.start.line, col: clampCol(span.start.col) }
+    const end: CellPos =
+      span.end.line >= this.store.end
+        ? { line: this.store.end - 1, col: maxCol }
+        : { line: span.end.line, col: clampCol(span.end.col) }
+    if (before(end, start)) return null
+    return { rect: false, span: { start, end } }
+  }
+
+  private notify(): void {
+    this.rev += 1
+    this.changed()
+  }
+
+  private tryLocalWiden(position: CellPos): CellSpan | null {
+    if (this.granularity === 'cell') return null
+    return this.granularity === 'word'
+      ? localWordAt(this.store, position, this.source.wordDelimiters)
+      : localLineAt(this.store, position.line)
+  }
+
+  private remoteWiden(position: CellPos, set: (span: CellSpan) => boolean): void {
+    if (this.granularity === 'cell' || this.store.epoch < 0) return
+    const epoch = this.store.epoch
+    const asked =
+      this.granularity === 'word'
+        ? this.source.wordAt(epoch, position)
+        : this.source.lineAt(epoch, position.line)
     void asked.then((span) => {
-      if (span && set(span)) this.changed()
+      if (span && this.store.epoch === epoch && set(span)) this.notify()
     }, () => {})
   }
 }
