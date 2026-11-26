@@ -2075,12 +2075,12 @@ mod win_shard_tests {
         assert!(!runner.drain_windows_ptys(1));
 
         // 4. Two real ConPTY sessions: paused_id stays paused while live_id exhausts budget=1.
-        let make_session = |sid: SessionId, marker: &str, paused: bool| {
+        let make_session = |sid: SessionId, cmd: &str, paused: bool| {
             let cfg = PtySpawnConfig {
                 size: GridSize::new(80, 24).unwrap(),
                 cell_px: CellPx { width: 8, height: 16 },
                 shell: Some(String::from("cmd.exe")),
-                args: vec![String::from("/C"), format!("echo {marker}")],
+                args: vec![String::from("/C"), cmd.to_owned()],
                 env: Vec::new(),
                 unset: Vec::new(),
                 cwd: None,
@@ -2119,8 +2119,8 @@ mod win_shard_tests {
 
         let paused_id = SessionId::new(1).unwrap();
         let live_id = SessionId::new(2).unwrap();
-        runner.sessions.insert(paused_id, make_session(paused_id, "WIN_PAUSED_ONLY", true));
-        runner.sessions.insert(live_id, make_session(live_id, "WIN_LIVE_ONLY", false));
+        runner.sessions.insert(paused_id, make_session(paused_id, "echo WIN_PAUSED_ONLY", true));
+        runner.sessions.insert(live_id, make_session(live_id, "echo WIN_LIVE_ONLY && set /p _x=", false));
 
         // Wait until live_id produces output and exhausts budget=1 while paused_id stays unread.
         let mut saw_exhausted = false;
@@ -2151,19 +2151,18 @@ mod win_shard_tests {
         }
         assert!(saw_paused_after, "unpaused ConPTY must drain its output");
 
-        // Direct drain_conpty_quantum check for (false, false) empty and (true, false) EOF.
-        let quick_cfg = PtySpawnConfig {
-            size: GridSize::new(80, 24).unwrap(),
-            cell_px: CellPx::default(),
-            shell: Some(String::from("cmd.exe")),
-            args: vec![String::from("/C"), String::from("echo QEOF")],
-            env: Vec::new(),
-            unset: Vec::new(),
-            cwd: None,
+        // Direct drain_conpty_quantum check for (true, false) EOF and (false, false) empty using
+        // live_id's already-active bridge (no 3rd ConPTY spawn or DSR wait).
+        let mut live_sess = runner.sessions.remove(&live_id).expect("live session");
+        if let Some(mut killer) = live_sess.killer.take() {
+            let _ = killer.kill();
+        }
+        if let Some(mut child) = live_sess.child.take() {
+            let _ = child.wait();
+        }
+        let Some(LivePty::Windows { bridge, .. }) = live_sess.pty.take() else {
+            panic!("expected Windows LivePty");
         };
-        let mut quick = spawn_pty(&quick_cfg).expect("spawn quick");
-        let bridge = ConPtyBridge::start(quick.master, || {}).expect("bridge");
-        let _ = quick.child.wait();
         bridge.close_master_async();
         let mut saw_eof = false;
         let deadline3 = Instant::now() + Duration::from_secs(5);
@@ -2179,9 +2178,7 @@ mod win_shard_tests {
         assert!(saw_eof, "drain_conpty_quantum must report (true, false) on EOF");
         assert_eq!(drain_conpty_quantum(&bridge, PTY_READ_QUANTUM_BYTES, |_| {}), (false, false));
 
-        // Clean up test sessions.
-        for sid in [paused_id, live_id] {
-            runner.force_drop_session(sid);
-        }
+        // Clean up remaining test session.
+        runner.force_drop_session(paused_id);
     }
 }

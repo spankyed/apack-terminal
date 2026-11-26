@@ -95,6 +95,9 @@ pub(crate) fn open_regular_read_only(path: &Path, what: &'static str) -> Result<
         if lstat.file_type().is_symlink() {
             return Err(WalError::SymlinkRefused);
         }
+        if !lstat.is_file() {
+            return Err(WalError::InvalidFormat(what));
+        }
     }
     let mut opts = fs::OpenOptions::new();
     opts.read(true);
