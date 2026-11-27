@@ -135,20 +135,31 @@ pub(crate) fn hydrate_slice_blobs(reader: &WalReader, slice: &SeekSlice, image_s
 
 /// Reconstructs sanitized printable text for a [`PackedRow`], stripping all C0 (`< 0x20`, `0x7F`)
 /// and C1 (`U+0080..=U+009F`) control characters, clamping column offsets to `cols`, skipping
-/// overlapping/out-of-order runs, and enforcing a strict per-row byte budget (`max_bytes`).
+/// overlapping/out-of-order runs, and bounding total scanned + emitted bytes by `max_bytes`.
 pub(super) fn reconstruct_visual_row(row: &PackedRow, cols: u16, max_bytes: usize) -> (String, u16) {
+    let mut budget_used = 0usize;
     if row.runs.is_empty() {
         let mut out = String::new();
-        for ch in row.text.chars().filter(|c| !c.is_control()).take(usize::from(cols)) {
-            if out.len().saturating_add(ch.len_utf8()) > max_bytes {
+        let mut emitted_chars = 0usize;
+        for ch in row.text.chars() {
+            budget_used = budget_used.saturating_add(ch.len_utf8());
+            if budget_used > max_bytes {
+                break;
+            }
+            if ch.is_control() {
+                continue;
+            }
+            if emitted_chars >= usize::from(cols) {
                 break;
             }
             out.push(ch);
+            emitted_chars += 1;
         }
         return (out, 0);
     }
     let mut out = String::with_capacity(row.text.len().min(max_bytes));
     let mut cur_col = 0u16;
+    let mut had_any_control = false;
     for run in &row.runs {
         if run.col_start >= cols || run.col_start < cur_col {
             continue;
@@ -159,34 +170,33 @@ pub(super) fn reconstruct_visual_row(row: &PackedRow, cols: u16, max_bytes: usiz
             continue;
         };
         let pad = usize::from(run.col_start - cur_col);
-        if out.len().saturating_add(pad) > max_bytes {
+        budget_used = budget_used.saturating_add(pad);
+        if budget_used > max_bytes {
             break;
         }
         for _ in 0..pad {
             out.push(' ');
         }
         cur_col = run.col_start;
-        let mut had_control = false;
         let mut hit_budget = false;
         for ch in slice.chars() {
-            if ch.is_control() {
-                had_control = true;
-                continue;
-            }
-            if out.len().saturating_add(ch.len_utf8()) > max_bytes {
+            budget_used = budget_used.saturating_add(ch.len_utf8());
+            if budget_used > max_bytes {
                 hit_budget = true;
                 break;
+            }
+            if ch.is_control() {
+                had_any_control = true;
+                continue;
             }
             out.push(ch);
         }
         if hit_budget {
             break;
         }
-        if !had_control {
-            cur_col = cur_col.saturating_add(run.col_len).min(cols);
-        }
+        cur_col = cur_col.saturating_add(run.col_len).min(cols);
     }
-    (out, cur_col)
+    (out, if had_any_control { 0 } else { cur_col })
 }
 
 fn feed_primary_visual_rows(engine: &mut GhosttyEngine, rows: &[PackedRow], cols: u16) {
@@ -208,6 +218,9 @@ fn feed_primary_visual_rows(engine: &mut GhosttyEngine, rows: &[PackedRow], cols
 
 fn feed_alt_visual_rows(engine: &mut GhosttyEngine, rows: &[PackedRow], cols: u16, max_rows: u16) {
     let mut events = Vec::new();
+    // Disable DECAWM auto-wrap so wide chars or crafted overlong runs on the bottom alt row
+    // can never wrap and scroll earlier alt-screen rows off screen.
+    engine.feed(b"\x1b[?7l", &mut events);
     for (idx, row) in rows.iter().take(usize::from(max_rows)).enumerate() {
         let (clean, _) = reconstruct_visual_row(row, cols, apack_proto::MAX_PACKED_ROW_TEXT_BYTES);
         if !clean.is_empty() {
@@ -218,6 +231,8 @@ fn feed_alt_visual_rows(engine: &mut GhosttyEngine, rows: &[PackedRow], cols: u1
             engine.feed(clean.as_bytes(), &mut events);
         }
     }
+    events.clear();
+    engine.feed(b"\x1b[?7h", &mut events);
 }
 
 /// Reconstructs visible primary/alt screen text and cursor position safely when the `libghostty-vt`
