@@ -16,8 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::WalError;
-use crate::blobs::{create_private_dir, create_private_file, read_regular_file_bounded, sync_dir, verify_real_dir};
 use crate::format::{META_LEN, RecordingMeta};
+use crate::safe_fs::{create_private_dir, create_private_file, read_regular_file_bounded, sync_dir, verify_real_dir};
 
 /// Canonical filename for recording metadata inside the recording directory.
 pub const META_FILENAME: &str = "meta.apkm";
@@ -164,6 +164,13 @@ impl std::fmt::Debug for RecordingRegistry {
     }
 }
 
+/// Result of atomically discovering and pinning all segments in a recording directory.
+pub(crate) struct PinnedDiscovery {
+    pub segments: Vec<(u64, PathBuf)>,
+    pub is_claimed: bool,
+    pub pin: PinGuard,
+}
+
 impl RecordingRegistry {
     /// Creates an empty registry.
     pub fn new() -> Self {
@@ -180,17 +187,19 @@ impl RecordingRegistry {
         Ok(WriterClaim { canonical, registry: self.clone() })
     }
 
-    /// Atomically discovers all segments in `dir` and pins them before any concurrent eviction can
-    /// unlink them (eliminating both POSIX vanish races and Windows delete-pending sharing errors).
-    pub(crate) fn discover_and_pin(&self, dir: &Path) -> Result<(Vec<(u64, PathBuf)>, PinGuard), WalError> {
+    /// Atomically discovers all segments in `dir`, notes whether an active writer currently holds
+    /// `dir`, and pins them before any concurrent eviction can unlink them (eliminating both POSIX
+    /// vanish races and Windows delete-pending sharing errors).
+    pub(crate) fn discover_and_pin(&self, dir: &Path) -> Result<PinnedDiscovery, WalError> {
         let canonical = fs::canonicalize(dir)?;
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let discovered = discover_segments(dir)?;
-        let seg_ids: Vec<u64> = discovered.iter().map(|(id, _)| *id).collect();
+        let is_claimed = inner.active_writers.contains(&canonical);
+        let segments = discover_segments(dir)?;
+        let seg_ids: Vec<u64> = segments.iter().map(|(id, _)| *id).collect();
         for &seg_id in &seg_ids {
             *inner.pinned_segments.entry((canonical.clone(), seg_id)).or_insert(0) += 1;
         }
-        Ok((discovered, PinGuard { canonical, seg_ids, registry: self.clone() }))
+        Ok(PinnedDiscovery { segments, is_claimed, pin: PinGuard { canonical, seg_ids, registry: self.clone() } })
     }
 
     /// Atomically checks whether `(canonical_dir, seg_id)` is pinned and, if unpinned, runs

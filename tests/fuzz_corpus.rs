@@ -119,7 +119,16 @@ fn committed_seeds_exercise_deep_parser_branches() {
         "osc7501_raw_payload seed must parse into ProgramStatusUpdate::Set"
     );
 
-    // 2. `torn_tail_segment` must decode a valid keyframe + output prefix before hitting the torn tail.
+    // 2. WAL seeds must exercise the 72-byte SHA-256 `SegmentFooter`, complete sealed scan, and torn-tail truncation.
+    let footer_bytes = fs::read(seeds_root.join("v2_wal").join("segment_footer_v2")).expect("read footer seed");
+    assert_eq!(footer_bytes.len(), apack_wal::SEGMENT_FOOTER_LEN, "segment_footer_v2 must be 72 bytes");
+    apack_wal::SegmentFooter::decode(&footer_bytes).expect("segment_footer_v2 must decode cleanly");
+
+    let sealed_bytes = fs::read(seeds_root.join("v2_wal").join("complete_sealed_segment")).expect("read sealed seed");
+    let sealed_scan = scan_segment(&sealed_bytes);
+    assert!(sealed_scan.footer.is_some(), "complete_sealed_segment must pass SHA-256 footer verification");
+    assert!(!sealed_scan.had_torn_tail, "complete_sealed_segment must not have a torn tail");
+
     let torn_bytes = fs::read(seeds_root.join("v2_wal").join("torn_tail_segment")).expect("read torn seed");
     let scan = scan_segment(&torn_bytes);
     assert_eq!(scan.records.len(), 2, "torn_tail_segment must decode keyframe + output prefix");
@@ -185,6 +194,7 @@ fn regenerate_fuzz_seeds() {
     };
     use apack_wal::format::{
         GapReason, KeyframeV2, RecordingMeta, SegmentFooter, VisualKeyframe, WalRecord, encode_framed_record,
+        hash_segment_records,
     };
 
     let seeds_root = repo_root().join("fuzz").join("seeds");
@@ -364,6 +374,7 @@ fn regenerate_fuzz_seeds() {
         last_ms: 1_700_000_005_000,
         records_end_offset: 128,
         record_count: 3,
+        records_sha256: [0x11; 32],
     };
     write_seed("v2_wal", "segment_footer_v2", &footer.encode());
 
@@ -424,6 +435,7 @@ fn regenerate_fuzz_seeds() {
         last_ms: 1_700_000_000_400,
         records_end_offset: sealed_seg.len() as u64,
         record_count: 5,
+        records_sha256: hash_segment_records(&sealed_seg),
     };
     sealed_seg.extend_from_slice(&seg_footer.encode());
     write_seed("v2_wal", "complete_sealed_segment", &sealed_seg);

@@ -58,7 +58,7 @@ static PIPE_SEQ: AtomicU64 = AtomicU64::new(1);
 fn unique_endpoint(dir: &std::path::Path, label: &str) -> String {
     #[cfg(unix)]
     {
-        dir.join(format!("{label}.sock")).to_string_lossy().into_owned()
+        dir.join("p").join(format!("{label}.sock")).to_string_lossy().into_owned()
     }
     #[cfg(windows)]
     {

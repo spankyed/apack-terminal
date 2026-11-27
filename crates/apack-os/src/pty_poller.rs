@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -157,11 +157,13 @@ impl PollPoller {
     }
 
     /// Registers `fd` under `token` with initial `interest`.
-    pub fn register(&mut self, token: PollToken, fd: RawFd, interest: Interest) -> io::Result<()> {
+    ///
+    /// Callers must call [`Self::deregister`] before closing the underlying descriptor.
+    pub fn register(&mut self, token: PollToken, fd: BorrowedFd<'_>, interest: Interest) -> io::Result<()> {
         if self.entries.contains_key(&token) {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, "duplicate poll token"));
         }
-        self.entries.insert(token, (fd, interest));
+        self.entries.insert(token, (fd.as_raw_fd(), interest));
         Ok(())
     }
 
@@ -256,7 +258,7 @@ impl PollPoller {
         // have its byte drained while leaving `wake_pending == true` (which would cause a permanent
         // lost-wakeup deadlock).
         let mut drain = [0u8; 64];
-        while matches!(read_fd_nonblocking(self.wake_read.as_raw_fd(), &mut drain), Ok(NonBlockingRead::Bytes(_))) {}
+        while matches!(read_fd_nonblocking(self.wake_read.as_fd(), &mut drain), Ok(NonBlockingRead::Bytes(_))) {}
         self.wake_pending.store(false, Ordering::SeqCst);
     }
 }
@@ -323,12 +325,12 @@ fn create_nonblocking_pipe_posix() -> io::Result<(OwnedFd, OwnedFd)> {
     // SAFETY: `pipe(2)` succeeded and returned two freshly opened exclusive descriptors.
     let write_end = unsafe { OwnedFd::from_raw_fd(fds[1]) };
 
-    for fd in [read_end.as_raw_fd(), write_end.as_raw_fd()] {
+    for fd in [&read_end, &write_end] {
         // SAFETY: setting `FD_CLOEXEC` on freshly created owned pipe fds.
-        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        set_fd_nonblocking(fd, true)?;
+        set_fd_nonblocking(fd.as_fd(), true)?;
     }
     Ok((read_end, write_end))
 }
@@ -399,7 +401,7 @@ mod tests {
         // Multi-chunk wake pipe drain clears > 64 bytes in a single poll call.
         let mut poller = PollPoller::new().expect("poller");
         let bulk = [1u8; 100];
-        assert_eq!(write_fd_nonblocking(poller.wake_write.as_raw_fd(), &bulk).expect("write bulk"), 100);
+        assert_eq!(write_fd_nonblocking(poller.wake_write.as_fd(), &bulk).expect("write bulk"), 100);
         let mut events = Vec::new();
         assert!(poller.poll(&mut events, Some(Duration::from_millis(50))).expect("drain bulk"));
         assert!(!poller.poll(&mut events, Some(Duration::from_millis(10))).expect("fully drained"));
@@ -416,13 +418,13 @@ mod tests {
         let t1 = PollToken(1);
         let t2 = PollToken(2);
 
-        poller.register(t1, r1.as_raw_fd(), Interest::READ).expect("reg t1");
+        poller.register(t1, r1.as_fd(), Interest::READ).expect("reg t1");
         // Duplicate token rejected.
         assert_eq!(
-            poller.register(t1, r1.as_raw_fd(), Interest::READ).expect_err("dup").kind(),
+            poller.register(t1, r1.as_fd(), Interest::READ).expect_err("dup").kind(),
             io::ErrorKind::AlreadyExists
         );
-        poller.register(t2, r2.as_raw_fd(), Interest::NONE).expect("reg t2 paused");
+        poller.register(t2, r2.as_fd(), Interest::NONE).expect("reg t2 paused");
         assert_eq!(poller.len(), 2);
         assert!(!poller.is_empty());
 
@@ -439,8 +441,8 @@ mod tests {
         assert!(events.is_empty());
 
         // Write to both pipes; only t1 has READ interest (t2 is paused with Interest::NONE).
-        assert_eq!(write_fd_nonblocking(w1.as_raw_fd(), b"one").expect("w1"), 3);
-        assert_eq!(write_fd_nonblocking(w2.as_raw_fd(), b"two").expect("w2"), 3);
+        assert_eq!(write_fd_nonblocking(w1.as_fd(), b"one").expect("w1"), 3);
+        assert_eq!(write_fd_nonblocking(w2.as_fd(), b"two").expect("w2"), 3);
         assert!(!poller.poll(&mut events, Some(Duration::from_millis(50))).expect("poll t1"));
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].token, t1);
@@ -448,7 +450,7 @@ mod tests {
         assert!(!events[0].writable);
 
         let mut buf = [0u8; 16];
-        assert_eq!(read_fd_nonblocking(r1.as_raw_fd(), &mut buf).expect("r1"), NonBlockingRead::Bytes(3));
+        assert_eq!(read_fd_nonblocking(r1.as_fd(), &mut buf).expect("r1"), NonBlockingRead::Bytes(3));
         assert_eq!(&buf[..3], b"one");
 
         // Unpause t2 and verify it immediately reports readable.
@@ -457,12 +459,12 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].token, t2);
         assert!(events[0].readable);
-        assert_eq!(read_fd_nonblocking(r2.as_raw_fd(), &mut buf).expect("r2"), NonBlockingRead::Bytes(3));
+        assert_eq!(read_fd_nonblocking(r2.as_fd(), &mut buf).expect("r2"), NonBlockingRead::Bytes(3));
         assert_eq!(&buf[..3], b"two");
 
         // Verify WRITE interest on w1.
         let tw = PollToken(3);
-        poller.register(tw, w1.as_raw_fd(), Interest::WRITE).expect("reg w1");
+        poller.register(tw, w1.as_fd(), Interest::WRITE).expect("reg w1");
         assert!(!poller.poll(&mut events, Some(Duration::from_millis(50))).expect("poll w1"));
         assert!(events.iter().any(|e| e.token == tw && e.writable));
         poller.deregister(tw).expect("dereg w1");
@@ -488,7 +490,7 @@ mod tests {
         drop(w1);
         assert!(!poller.poll(&mut events, Some(Duration::from_millis(50))).expect("hangup poll"));
         assert!(events.iter().any(|e| e.token == t1 && e.readable && e.hangup));
-        assert_eq!(read_fd_nonblocking(r1.as_raw_fd(), &mut buf).expect("eof"), NonBlockingRead::Eof);
+        assert_eq!(read_fd_nonblocking(r1.as_fd(), &mut buf).expect("eof"), NonBlockingRead::Eof);
 
         poller.deregister(t1).expect("dereg t1");
         poller.deregister(t2).expect("dereg t2");

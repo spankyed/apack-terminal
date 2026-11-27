@@ -26,6 +26,24 @@ impl Drop for TokenHandle {
     }
 }
 
+struct LocalMem(HLOCAL);
+
+impl Drop for LocalMem {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` was allocated by `ConvertSidToStringSidW` and is freed exactly once here.
+        unsafe { LocalFree(self.0) };
+    }
+}
+
+/// Validates that `needed` bytes returned by `GetTokenInformation(TokenUser)` can hold `TOKEN_USER`.
+fn check_token_user_len(needed: u32) -> io::Result<usize> {
+    let bytes = usize::try_from(needed).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "token length"))?;
+    if bytes < size_of::<TOKEN_USER>() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "short TOKEN_USER buffer"));
+    }
+    Ok(bytes)
+}
+
 /// Builds the protected owner-only `SecurityDescriptor` for the broker's named pipe.
 pub fn owner_only_security_descriptor() -> io::Result<SecurityDescriptor> {
     let sid = current_user_sid()?;
@@ -57,19 +75,24 @@ pub(crate) fn user_sid_for_process(process: HANDLE) -> io::Result<U16CString> {
         if needed == 0 {
             return Err(io::Error::last_os_error());
         }
+        let alloc_bytes = check_token_user_len(needed)?;
 
-        let mut buffer = vec![0u64; (needed as usize).div_ceil(size_of::<u64>())];
+        let mut buffer = vec![0u64; alloc_bytes.div_ceil(size_of::<u64>())];
         if GetTokenInformation(token.0, TokenUser, buffer.as_mut_ptr().cast(), needed, &mut needed) == 0 {
             return Err(io::Error::last_os_error());
         }
+        let _ = check_token_user_len(needed)?;
 
         let user = &*buffer.as_ptr().cast::<TOKEN_USER>();
         let mut text: windows_sys::core::PWSTR = std::ptr::null_mut();
         if ConvertSidToStringSidW(user.User.Sid, &mut text) == 0 {
             return Err(io::Error::last_os_error());
         }
-        let sid = U16CStr::from_ptr_str(text).to_ucstring();
-        LocalFree(text.cast::<core::ffi::c_void>() as HLOCAL);
+        let Some(ptr) = std::ptr::NonNull::new(text) else {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "null SID string"));
+        };
+        let _guard = LocalMem(ptr.as_ptr().cast::<core::ffi::c_void>() as HLOCAL);
+        let sid = U16CStr::from_ptr_str(ptr.as_ptr()).to_ucstring();
         Ok(sid)
     }
 }
@@ -80,6 +103,10 @@ mod tests {
 
     #[test]
     fn current_user_sid_and_descriptor_succeed() {
+        assert!(check_token_user_len(0).is_err());
+        assert!(check_token_user_len((size_of::<TOKEN_USER>() - 1) as u32).is_err());
+        assert_eq!(check_token_user_len(size_of::<TOKEN_USER>() as u32).unwrap(), size_of::<TOKEN_USER>());
+
         let sid = current_user_sid().expect("read current user SID");
         let text = sid.to_string_lossy();
         assert!(text.starts_with("S-1-"), "unexpected SID format: {text}");

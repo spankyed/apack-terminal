@@ -7,7 +7,7 @@
 //! <recording-dir>/
 //! ├── meta.apkm                # 40B CRC32C-verified metadata header
 //! ├── blobs/<sha256>.png|zst   # Immutable content-addressed image blobs
-//! ├── seg-000001.apks          # Sealed immutable segment (KEYFRAME_V2 + records + 40B footer)
+//! ├── seg-000001.apks          # Sealed immutable segment (KEYFRAME_V2 + records + 72B SHA-256 footer)
 //! └── seg-000002.apks          # Active append-only tail segment
 //! ```
 //!
@@ -15,8 +15,9 @@
 //! - **$O(1)$ budget eviction:** unlinks oldest unpinned closed segments and sweeps unreferenced
 //!   blobs — zero full-file copies and zero Windows rename sharing violations.
 //! - **Crash-only safety:** `sync_data()` + directory sync on segment seal; on resume, closed
-//!   segments read only record 0 + their 40-byte footer while only an unsealed active tail segment
-//!   is scanned and truncated at the last valid CRC32C boundary via `set_len()`.
+//!   non-tail segments read only record 0 + their 72-byte footer while the tail segment and any
+//!   unsealed segment are scanned with SHA-256 verification and truncated at the last valid CRC32C
+//!   boundary via `set_len()`.
 //! - **Dual-layer `KeyframeV2`:** always carries a broker-owned, version-stable [`VisualKeyframe`]
 //!   plus an optional ABI-hashed [`EngineCheckpoint`] (`libghostty-vt` snapshot) for lossless
 //!   restore across matching builds with automatic visual fallback on VT upgrades.
@@ -36,17 +37,19 @@ pub mod crc32c;
 pub mod directory;
 pub mod format;
 pub mod reader;
+pub(crate) mod safe_fs;
 pub mod writer;
 
 #[cfg(test)]
 mod tests;
 
-pub use blobs::{blob_filename, hash_blob, parse_blob_filename, read_blob, sweep_unreferenced, write_blob};
+pub use blobs::{WalBlob, blob_filename, hash_blob, parse_blob_filename, read_blob, sweep_unreferenced, write_blob};
 pub use directory::{PinGuard, RecordingRegistry, WriterClaim};
 pub use format::{
     EngineCheckpoint, FORMAT_VERSION, GapReason, KeyframeV2, MAX_ENGINE_SNAPSHOT_BYTES, MAX_KEYFRAME_HISTORY_ROWS,
     MAX_KEYFRAME_UNCOMPRESSED, MAX_RECORD_PAYLOAD, META_LEN, META_MAGIC, RECORD_HEADER_LEN, RECORD_TRAILER_LEN,
     RecordingMeta, SEGMENT_FOOTER_LEN, SEGMENT_FOOTER_MAGIC, SegmentFooter, TimedRecord, VisualKeyframe, WalRecord,
+    hash_segment_records,
 };
 pub use reader::{SeekSlice, SegmentSummary, WalReader};
 pub use writer::{EvictionReport, RolloverHint, WalConfig, WalHandle, WalWorker, WalWriter};

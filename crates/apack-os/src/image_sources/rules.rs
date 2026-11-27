@@ -24,6 +24,38 @@ pub fn refused_once_opened(path: &[u8]) -> bool {
     !matches!(path, [drive, b':', b'\\', ..] if drive.is_ascii_alphabetic()) || refused(path)
 }
 
+/// Parses an explicit absolute ASCII drive-rooted Windows path (`C:\dir\file.png` or `C:/dir/file.png`)
+/// into `(uppercase_drive_letter, components)` for handle-relative `NtCreateFile` traversal.
+///
+/// Rejects relative paths, UNC/device paths, NUL bytes, `..` parent traversal, NTFS alternate data
+/// streams (`:` inside components), reserved DOS device names, and empty component lists.
+pub fn split_windows_drive_path(path: &str) -> Option<(u8, Vec<&str>)> {
+    let bytes = path.as_bytes();
+    if bytes.contains(&0) || refused(bytes) {
+        return None;
+    }
+    let [drive, b':', sep, ..] = bytes else {
+        return None;
+    };
+    if !drive.is_ascii_alphabetic() || !separator(*sep) || bytes.last().is_some_and(|b| separator(*b)) {
+        return None;
+    }
+    let mut components = Vec::new();
+    for segment in path[3..].split(['\\', '/']) {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if segment == ".." || segment.contains(':') {
+            return None;
+        }
+        components.push(segment);
+    }
+    if components.is_empty() {
+        return None;
+    }
+    Some((drive.to_ascii_uppercase(), components))
+}
+
 fn names_a_device(component: &[u8]) -> bool {
     let end = component.iter().position(|byte| matches!(byte, b'.' | b':')).unwrap_or(component.len());
     let mut stem = &component[..end];
@@ -80,5 +112,25 @@ mod tests {
         assert!(refused_once_opened(br"\Users\alice\image.png"));
         assert!(refused_once_opened(br"1:\Users\alice\image.png"));
         assert!(refused_once_opened(br"C:\Users\alice\NUL"));
+
+        assert_eq!(
+            split_windows_drive_path(r"c:\Users\alice\img.png"),
+            Some((b'C', vec!["Users", "alice", "img.png"]))
+        );
+        assert_eq!(split_windows_drive_path("D:/a/./b//img.png"), Some((b'D', vec!["a", "b", "img.png"])));
+        assert_eq!(split_windows_drive_path("img.png"), None);
+        assert_eq!(split_windows_drive_path(r".\img.png"), None);
+        assert_eq!(split_windows_drive_path(r"\img.png"), None);
+        assert_eq!(split_windows_drive_path("C:img.png"), None);
+        assert_eq!(split_windows_drive_path(r"C:\"), None);
+        assert_eq!(split_windows_drive_path(r"C:\."), None);
+        assert_eq!(split_windows_drive_path(r"C:\a\img.png\"), None);
+        assert_eq!(split_windows_drive_path("C:/a/img.png/"), None);
+        assert_eq!(split_windows_drive_path(r"C:\a\..\b.png"), None);
+        assert_eq!(split_windows_drive_path(r"C:\a\file.png:ads"), None);
+        assert_eq!(split_windows_drive_path(r"1:\a\b.png"), None);
+        assert_eq!(split_windows_drive_path("C:\\a\\b\0.png"), None);
+        assert_eq!(split_windows_drive_path(r"\\server\share\a.png"), None);
+        assert_eq!(split_windows_drive_path(r"C:\tmp\NUL"), None);
     }
 }

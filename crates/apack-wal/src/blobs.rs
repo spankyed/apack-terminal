@@ -5,17 +5,53 @@
 //! and garbage-collected whenever closed segments are evicted or new segments roll over.
 
 use std::collections::HashSet;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs;
+use std::io::{self, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use apack_proto::types::{BlobHash, ImageEncoding};
 use sha2::{Digest, Sha256};
 
+use crate::safe_fs::{
+    check_file_size, create_private_dir, create_private_file, read_regular_file_bounded, sync_dir, verify_real_dir,
+};
 use crate::{MAX_BLOB_FILE_BYTES, WalError};
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Validated, non-empty, size-bounded image blob payload ready for WAL storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalBlob {
+    encoding: ImageEncoding,
+    bytes: Vec<u8>,
+}
+
+impl WalBlob {
+    /// Constructs a validated [`WalBlob`], rejecting empty or oversized (`> MAX_BLOB_FILE_BYTES`) payloads.
+    pub fn new(encoding: ImageEncoding, bytes: Vec<u8>) -> Result<Self, WalError> {
+        if bytes.is_empty() {
+            return Err(WalError::InvalidFormat("empty image blob"));
+        }
+        check_file_size(bytes.len() as u64, MAX_BLOB_FILE_BYTES, "image blob file size")?;
+        Ok(Self { encoding, bytes })
+    }
+
+    /// Returns the blob's on-disk encoding.
+    pub fn encoding(&self) -> ImageEncoding {
+        self.encoding
+    }
+
+    /// Returns the validated non-empty blob bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Consumes this blob into its `(encoding, bytes)` pair.
+    pub fn into_parts(self) -> (ImageEncoding, Vec<u8>) {
+        (self.encoding, self.bytes)
+    }
+}
 
 /// Computes the 32-byte SHA-256 content hash for an image blob.
 pub fn hash_blob(bytes: &[u8]) -> BlobHash {
@@ -63,83 +99,8 @@ pub fn parse_blob_filename(name: &str) -> Option<(BlobHash, ImageEncoding)> {
     Some((BlobHash(out), encoding))
 }
 
-pub(crate) fn check_file_size(len: u64, max_bytes: u64, what: &'static str) -> Result<(), WalError> {
-    if len > max_bytes {
-        return Err(WalError::LimitExceeded(what));
-    }
-    Ok(())
-}
-
 pub(crate) fn verify_existing_blob_hash(bytes: &[u8], expected: BlobHash) -> bool {
     hash_blob(bytes) == expected
-}
-
-/// Validates that `dir` is a real directory (not a symlink or file).
-pub(crate) fn verify_real_dir(dir: &Path) -> Result<(), WalError> {
-    let meta = fs::symlink_metadata(dir)?;
-    if meta.file_type().is_symlink() {
-        return Err(WalError::SymlinkRefused);
-    }
-    if !meta.is_dir() {
-        return Err(WalError::InvalidFormat("path is not a directory"));
-    }
-    Ok(())
-}
-
-/// Classifies `symlink_metadata` flags on platforms without atomic `O_NOFOLLOW`, rejecting
-/// symlinks and directories before opening.
-#[cfg_attr(unix, allow(dead_code))]
-pub(crate) fn validate_lstat(is_symlink: bool, is_dir: bool, what: &'static str) -> Result<(), WalError> {
-    if is_symlink {
-        return Err(WalError::SymlinkRefused);
-    }
-    if is_dir {
-        return Err(WalError::InvalidFormat(what));
-    }
-    Ok(())
-}
-
-/// Opens `path` read-only without following symlinks or blocking on FIFOs (`O_NOFOLLOW | O_NONBLOCK`
-/// on Unix), verifying that the opened descriptor is a regular file.
-pub(crate) fn open_regular_read_only(path: &Path, what: &'static str) -> Result<(File, fs::Metadata), WalError> {
-    #[cfg(not(unix))]
-    {
-        let lstat = fs::symlink_metadata(path)?;
-        validate_lstat(lstat.file_type().is_symlink(), lstat.is_dir(), what)?;
-    }
-    let mut opts = fs::OpenOptions::new();
-    opts.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let file = opts.open(path).map_err(|err| {
-        #[cfg(unix)]
-        if err.raw_os_error() == Some(libc::ELOOP) {
-            return WalError::SymlinkRefused;
-        }
-        WalError::Io(err)
-    })?;
-    let fstat = file.metadata()?;
-    if !fstat.is_file() {
-        return Err(WalError::InvalidFormat(what));
-    }
-    Ok((file, fstat))
-}
-
-/// Opens `path` as a regular non-symlink file and reads up to `max_bytes` using a bounded handle.
-///
-/// Refuses symlinks, FIFOs/devices/directories, and files exceeding `max_bytes` BEFORE allocating.
-pub(crate) fn read_regular_file_bounded(path: &Path, max_bytes: u64, what: &'static str) -> Result<Vec<u8>, WalError> {
-    let (file, fstat) = open_regular_read_only(path, what)?;
-    check_file_size(fstat.len(), max_bytes, what)?;
-
-    let cap = usize::try_from(fstat.len().min(max_bytes)).unwrap_or(0);
-    let mut out = Vec::with_capacity(cap);
-    file.take(max_bytes.saturating_add(1)).read_to_end(&mut out)?;
-    check_file_size(out.len() as u64, max_bytes, what)?;
-    Ok(out)
 }
 
 fn hex_nibble(v: u8) -> char {
@@ -300,41 +261,5 @@ fn ensure_blobs_dir(blobs_dir: &Path) -> Result<(), WalError> {
             create_private_dir(blobs_dir)?;
             Ok(())
         }
-    }
-}
-
-pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        fs::DirBuilder::new().mode(0o700).create(path)
-    }
-    #[cfg(not(unix))]
-    {
-        fs::create_dir(path)
-    }
-}
-
-pub(crate) fn create_private_file(path: &Path) -> io::Result<File> {
-    let mut opts = OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    opts.open(path)
-}
-
-/// Parent directory sync on POSIX after atomic renames or file creation.
-pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        File::open(dir)?.sync_all()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = dir;
-        Ok(())
     }
 }

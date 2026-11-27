@@ -108,16 +108,83 @@ pub fn acquire_socket_hold(socket: &str) -> Result<SocketHold, OsError> {
 }
 
 #[cfg(unix)]
-fn socket_parent_dir(socket: &str) -> &Path {
-    match Path::new(socket).parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
+fn socket_parent_dir(socket: &str) -> Result<&Path, OsError> {
+    use std::path::Component;
+
+    if Path::new(socket).components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(OsError::UnsafePath(format!("{socket} contains parent traversal (`..`)")));
+    }
+    let (parent, file) = match socket.rsplit_once('/') {
+        Some(("", file)) => ("/", file),
+        Some((parent, file)) => (parent, file),
+        None => (".", socket),
+    };
+    if file.is_empty() || file == "." {
+        return Err(OsError::UnsafePath(format!("{socket} does not name a socket file")));
+    }
+    Ok(Path::new(parent))
+}
+
+#[cfg(unix)]
+fn create_private_dir_allow_race(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    match std::fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(unix)]
+fn ancestor_is_safe(uid: libc::uid_t, mode: u32, euid: libc::uid_t) -> bool {
+    (uid == 0 || uid == euid) && ((mode & 0o022) == 0 || (mode & 0o1000) != 0)
+}
+
+#[cfg(unix)]
+fn is_safe_ancestor_dir(is_dir: bool, uid: libc::uid_t, mode: u32, euid: libc::uid_t) -> bool {
+    is_dir && ancestor_is_safe(uid, mode, euid)
+}
+
+#[cfg(unix)]
+fn dir_is_private(is_symlink: bool, is_dir: bool, uid: libc::uid_t, mode: u32, euid: libc::uid_t) -> bool {
+    !is_symlink && is_dir && uid == euid && (mode & 0o077) == 0
+}
+
+#[cfg(unix)]
+fn ancestor_symlink_is_safe(uid: libc::uid_t, euid: libc::uid_t) -> bool {
+    uid == 0 || uid == euid
+}
+
+#[cfg(unix)]
+const MAX_ANCESTOR_SYMLINK_HOPS: usize = 40;
+
+#[cfg(unix)]
+enum WalkSegment {
+    Normal(std::ffi::OsString),
+    Parent,
+}
+
+#[cfg(unix)]
+fn push_path_segments_front(queue: &mut std::collections::VecDeque<WalkSegment>, path: &Path) {
+    use std::path::Component;
+    let mut segs = Vec::new();
+    for comp in path.components() {
+        match comp {
+            Component::Normal(name) => segs.push(WalkSegment::Normal(name.to_os_string())),
+            Component::ParentDir => segs.push(WalkSegment::Parent),
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+        }
+    }
+    for seg in segs.into_iter().rev() {
+        queue.push_front(seg);
     }
 }
 
 /// Ensures the parent directory of `socket` exists with mode `0o700` (if missing) and verifies it
-/// is a real directory (not a symlink) owned by the current effective UID with no group/other write
-/// bits (`mode & 0o022 == 0`).
+/// is a real directory (not a symlink) owned by the current effective UID with strict owner-only
+/// permissions (`mode & 0o077 == 0`) by walking left-to-right across every directory and symlink
+/// hop (verifying every traversed symlink owner and every traversed real directory).
 pub fn ensure_private_directory(socket: &str) -> Result<(), OsError> {
     #[cfg(not(unix))]
     {
@@ -126,35 +193,123 @@ pub fn ensure_private_directory(socket: &str) -> Result<(), OsError> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        use std::collections::VecDeque;
+        use std::os::unix::fs::MetadataExt;
+        use std::path::PathBuf;
 
-        let dir = socket_parent_dir(socket);
-        if std::fs::symlink_metadata(dir).is_err() {
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(dir)
-                .map_err(|err| OsError::io("creating private socket directory", err))?;
-        }
-        let meta = std::fs::symlink_metadata(dir).map_err(|err| OsError::io("inspecting socket directory", err))?;
-        if meta.file_type().is_symlink() {
-            return Err(OsError::UnsafePath(format!(
-                "{} is a symbolic link and cannot host a private broker socket",
-                dir.display()
-            )));
-        }
-        if !meta.is_dir() {
-            return Err(OsError::UnsafePath(format!("{} is not a directory", dir.display())));
-        }
+        let dir = socket_parent_dir(socket)?;
+        let abs = if dir.is_absolute() {
+            dir.to_path_buf()
+        } else {
+            std::env::current_dir().map_err(|err| OsError::io("resolving socket directory", err))?.join(dir)
+        };
         // SAFETY: `geteuid` takes no arguments and cannot fail.
         let euid = unsafe { libc::geteuid() };
-        if meta.uid() != euid {
-            return Err(OsError::UnsafePath(format!("{} is owned by another user", dir.display())));
+
+        let mut cur = PathBuf::from("/");
+        let root_meta = std::fs::symlink_metadata(&cur).map_err(|err| OsError::io("inspecting root directory", err))?;
+        if !is_safe_ancestor_dir(root_meta.is_dir(), root_meta.uid(), root_meta.mode(), euid) {
+            return Err(OsError::UnsafePath("/ is not a safe root directory".to_owned()));
         }
-        if meta.mode() & 0o022 != 0 {
-            return Err(OsError::UnsafePath(format!("{} is writable by group or others", dir.display())));
+
+        let mut pending: VecDeque<WalkSegment> = VecDeque::new();
+        push_path_segments_front(&mut pending, &abs);
+        if pending.is_empty() {
+            return Err(OsError::UnsafePath("/ cannot host a private broker socket".to_owned()));
         }
-        Ok(())
+        let mut remaining_hops = MAX_ANCESTOR_SYMLINK_HOPS;
+
+        while let Some(segment) = pending.pop_front() {
+            let name = match segment {
+                WalkSegment::Parent => {
+                    cur.pop();
+                    continue;
+                }
+                WalkSegment::Normal(name) => name,
+            };
+            let is_leaf = pending.is_empty();
+            let next = cur.join(&name);
+
+            match std::fs::symlink_metadata(&next) {
+                Ok(lmeta) => {
+                    if lmeta.file_type().is_symlink() {
+                        if is_leaf {
+                            return Err(OsError::UnsafePath(format!(
+                                "{} is a symbolic link and cannot host a private broker socket",
+                                next.display()
+                            )));
+                        }
+                        if !ancestor_symlink_is_safe(lmeta.uid(), euid) {
+                            return Err(OsError::UnsafePath(format!(
+                                "{} is a symlink owned by another user",
+                                next.display()
+                            )));
+                        }
+                        remaining_hops = remaining_hops.checked_sub(1).ok_or_else(|| {
+                            OsError::UnsafePath(format!("{} exceeds symlink hop limit", dir.display()))
+                        })?;
+                        let target =
+                            std::fs::read_link(&next).map_err(|err| OsError::io("reading ancestor symlink", err))?;
+                        if target.is_absolute() {
+                            cur = PathBuf::from("/");
+                        }
+                        push_path_segments_front(&mut pending, &target);
+                        continue;
+                    }
+                    if !lmeta.is_dir() {
+                        return Err(OsError::UnsafePath(format!("{} is not a directory", next.display())));
+                    }
+                    if is_leaf {
+                        if !dir_is_private(false, true, lmeta.uid(), lmeta.mode(), euid) {
+                            return Err(OsError::UnsafePath(format!(
+                                "{} must be owned by current user with mode 0o700",
+                                next.display()
+                            )));
+                        }
+                        return Ok(());
+                    }
+                    if !ancestor_is_safe(lmeta.uid(), lmeta.mode(), euid) {
+                        return Err(OsError::UnsafePath(format!(
+                            "{} is an unsafe ancestor directory (wrong owner or non-sticky group/world writable)",
+                            next.display()
+                        )));
+                    }
+                    cur = next;
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    if pending.iter().any(|s| matches!(s, WalkSegment::Parent)) {
+                        return Err(OsError::UnsafePath(format!(
+                            "{} traverses `..` across a missing path component",
+                            dir.display()
+                        )));
+                    }
+                    // `cur` is already a verified real safe directory; create strictly one component at a time.
+                    // Tolerate `AlreadyExists` from a concurrent broker startup and verify the entry below.
+                    create_private_dir_allow_race(&next)
+                        .map_err(|e| OsError::io("creating private socket directory", e))?;
+                    let created = std::fs::symlink_metadata(&next)
+                        .map_err(|e| OsError::io("inspecting created socket directory", e))?;
+                    if !dir_is_private(
+                        created.file_type().is_symlink(),
+                        created.is_dir(),
+                        created.uid(),
+                        created.mode(),
+                        euid,
+                    ) {
+                        return Err(OsError::UnsafePath(format!(
+                            "{} failed post-create private directory verification",
+                            next.display()
+                        )));
+                    }
+                    if is_leaf {
+                        return Ok(());
+                    }
+                    cur = next;
+                }
+                Err(err) => return Err(OsError::io("inspecting socket directory", err)),
+            }
+        }
+        Err(OsError::UnsafePath(format!("{} resolved to an empty path", dir.display())))
     }
 }
 
@@ -289,12 +444,13 @@ pub use crate::transport_windows::{ShutdownSignalGuard, install_shutdown_signals
 #[cfg(unix)]
 mod unix_signals {
     use std::io;
-    use std::os::fd::RawFd;
+    use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
     pub(crate) const INVALID_FD: RawFd = -1;
     static SIGNAL_PIPE_WR: AtomicI32 = AtomicI32::new(INVALID_FD);
+    static SIGNAL_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum SignalReadAction {
@@ -313,13 +469,33 @@ mod unix_signals {
         }
     }
 
+    const SIGNAL_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// Waits up to `timeout` until every in-flight `handle_shutdown_signal` invocation has exited so
+    /// closing the write end of the self-pipe can never race a signal handler `write(2)` onto a reused fd.
+    pub(crate) fn wait_for_signal_handlers(in_flight: &AtomicUsize, timeout: std::time::Duration) -> bool {
+        let start = std::time::Instant::now();
+        while in_flight.load(Ordering::SeqCst) != 0 {
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            std::hint::spin_loop();
+        }
+        true
+    }
+
     #[inline]
     // SAFETY: returns the calling thread's libc `errno` pointer; valid for the lifetime of the thread.
     unsafe fn errno_ptr() -> *mut libc::c_int {
-        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "openbsd"))]
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
         {
             // SAFETY: platform libc thread-local errno accessor is async-signal-safe.
             unsafe { libc::__error() }
+        }
+        #[cfg(any(target_os = "openbsd", target_os = "netbsd"))]
+        {
+            // SAFETY: platform libc thread-local errno accessor is async-signal-safe.
+            unsafe { libc::__errno() }
         }
         #[cfg(target_os = "linux")]
         {
@@ -333,12 +509,15 @@ mod unix_signals {
         let err_ptr = unsafe { errno_ptr() };
         // SAFETY: `err_ptr` points to the current thread's `errno` storage.
         let saved_errno = unsafe { *err_ptr };
-        let fd = SIGNAL_PIPE_WR.load(Ordering::Relaxed);
+        SIGNAL_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+        let fd = SIGNAL_PIPE_WR.load(Ordering::SeqCst);
         if fd >= 0 {
             let byte: u8 = 1;
-            // SAFETY: `write(2)` of 1 byte to a non-blocking pipe fd is POSIX async-signal-safe.
+            // SAFETY: `write(2)` of 1 byte to a non-blocking pipe fd is POSIX async-signal-safe,
+            // and `SIGNAL_IN_FLIGHT` pins `fd` open until `fetch_sub` completes below.
             let _ = unsafe { libc::write(fd, (&raw const byte).cast(), 1) };
         }
+        SIGNAL_IN_FLIGHT.fetch_sub(1, Ordering::Release);
         // SAFETY: restoring saved `errno` before returning from signal handler.
         unsafe {
             *err_ptr = saved_errno;
@@ -349,14 +528,14 @@ mod unix_signals {
     pub struct ShutdownSignalGuard {
         prev_int: libc::sigaction,
         prev_term: libc::sigaction,
-        wr_fd: RawFd,
+        wr_fd: Option<OwnedFd>,
         worker: Option<std::thread::JoinHandle<()>>,
     }
 
     impl ShutdownSignalGuard {
         #[cfg(test)]
         pub(crate) fn write_fd(&self) -> RawFd {
-            self.wr_fd
+            self.wr_fd.as_ref().expect("live signal guard write fd").as_raw_fd()
         }
     }
 
@@ -367,13 +546,17 @@ mod unix_signals {
                 libc::sigaction(libc::SIGINT, &self.prev_int, std::ptr::null_mut());
                 libc::sigaction(libc::SIGTERM, &self.prev_term, std::ptr::null_mut());
             }
-            SIGNAL_PIPE_WR.store(INVALID_FD, Ordering::Release);
-            // SAFETY: closing the write end unblocks the reader thread cleanly with EOF.
-            unsafe {
-                libc::close(self.wr_fd);
-            }
-            if let Some(handle) = self.worker.take() {
-                let _ = handle.join();
+            // Clear the global fd and drain any in-flight handler BEFORE closing `wr_fd` so a
+            // concurrent handler on another thread can never `write(2)` into a reused fd number.
+            SIGNAL_PIPE_WR.store(INVALID_FD, Ordering::SeqCst);
+            if wait_for_signal_handlers(&SIGNAL_IN_FLIGHT, SIGNAL_DRAIN_TIMEOUT) {
+                drop(self.wr_fd.take());
+                if let Some(handle) = self.worker.take() {
+                    let _ = handle.join();
+                }
+            } else if let Some(fd) = self.wr_fd.take() {
+                // Fail-safe: never close `wr_fd` while a handler is still executing `write(fd)`.
+                std::mem::forget(fd);
             }
         }
     }
@@ -383,30 +566,12 @@ mod unix_signals {
         flag: Arc<AtomicBool>,
         wake: impl Fn() + Send + Sync + 'static,
     ) -> io::Result<ShutdownSignalGuard> {
-        let mut fds = [0 as RawFd; 2];
-        // SAFETY: `fds` is a valid 2-element array for `pipe(2)`.
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let (rd_fd, wr_fd) = (fds[0], fds[1]);
-        for fd in [rd_fd, wr_fd] {
-            // SAFETY: setting `FD_CLOEXEC` on freshly created pipe descriptors.
-            unsafe {
-                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-            }
-        }
-        // SAFETY: setting `O_NONBLOCK` on write end so signal handler `write(2)` never blocks.
-        unsafe {
-            let fl = libc::fcntl(wr_fd, libc::F_GETFL);
-            libc::fcntl(wr_fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
-        }
+        let (rd_fd, wr_fd) = crate::pty_poller::create_nonblocking_pipe()?;
+        // Reader thread blocks cleanly in `read(2)` until a signal byte arrives or `wr_fd` closes.
+        crate::pty::set_fd_nonblocking(rd_fd.as_fd(), false)?;
+        let wr_raw = wr_fd.as_raw_fd();
 
-        if SIGNAL_PIPE_WR.compare_exchange(INVALID_FD, wr_fd, Ordering::AcqRel, Ordering::Acquire).is_err() {
-            // SAFETY: closing unused pipe fds on duplicate registration.
-            unsafe {
-                libc::close(rd_fd);
-                libc::close(wr_fd);
-            }
+        if SIGNAL_PIPE_WR.compare_exchange(INVALID_FD, wr_raw, Ordering::AcqRel, Ordering::Acquire).is_err() {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, "shutdown signal handler already installed"));
         }
 
@@ -416,7 +581,7 @@ mod unix_signals {
             let mut buf = [0u8; 16];
             loop {
                 // SAFETY: `rd_fd` is owned exclusively by this thread and `buf` is valid for 16 bytes.
-                let n = unsafe { libc::read(rd_fd, buf.as_mut_ptr().cast(), buf.len()) };
+                let n = unsafe { libc::read(rd_fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
                 let kind = io::Error::last_os_error().kind();
                 match classify_signal_read(n, kind) {
                     SignalReadAction::Wake => {
@@ -427,19 +592,10 @@ mod unix_signals {
                     SignalReadAction::Stop => break,
                 }
             }
-            // SAFETY: closing owned read end before thread exits.
-            unsafe {
-                libc::close(rd_fd);
-            }
         }) {
             Ok(w) => w,
             Err(err) => {
-                SIGNAL_PIPE_WR.store(INVALID_FD, Ordering::Release);
-                // SAFETY: closing unused pipe fds on thread spawn failure.
-                unsafe {
-                    libc::close(rd_fd);
-                    libc::close(wr_fd);
-                }
+                SIGNAL_PIPE_WR.store(INVALID_FD, Ordering::SeqCst);
                 return Err(err);
             }
         };
@@ -468,16 +624,17 @@ mod unix_signals {
                     libc::sigaction(libc::SIGINT, &prev_int, std::ptr::null_mut());
                 }
             }
-            SIGNAL_PIPE_WR.store(INVALID_FD, Ordering::Release);
-            // SAFETY: closing write end unblocks `worker` with EOF before joining.
-            unsafe {
-                libc::close(wr_fd);
+            SIGNAL_PIPE_WR.store(INVALID_FD, Ordering::SeqCst);
+            if wait_for_signal_handlers(&SIGNAL_IN_FLIGHT, SIGNAL_DRAIN_TIMEOUT) {
+                drop(wr_fd);
+                let _ = worker.join();
+            } else {
+                std::mem::forget(wr_fd);
             }
-            let _ = worker.join();
             return Err(err);
         }
 
-        Ok(ShutdownSignalGuard { prev_int, prev_term, wr_fd, worker: Some(worker) })
+        Ok(ShutdownSignalGuard { prev_int, prev_term, wr_fd: Some(wr_fd), worker: Some(worker) })
     }
 }
 
@@ -528,20 +685,20 @@ pub fn set_listener_nonblocking(listener: &Listener, nonblocking: bool) -> io::R
     listener.set_nonblocking(mode)
 }
 
-/// Returns the underlying Unix raw file descriptor of a local [`Stream`].
+/// Returns the borrowed Unix file descriptor of a local [`Stream`].
 #[cfg(unix)]
-pub fn stream_raw_fd(stream: &Stream) -> std::os::fd::RawFd {
-    use std::os::fd::AsRawFd;
+pub fn stream_fd(stream: &Stream) -> std::os::fd::BorrowedFd<'_> {
+    use std::os::fd::AsFd;
     let Stream::UdSocket(socket) = stream;
-    socket.inner().as_raw_fd()
+    socket.inner().as_fd()
 }
 
-/// Returns the underlying Unix raw file descriptor of a local [`Listener`].
+/// Returns the borrowed Unix file descriptor of a local [`Listener`].
 #[cfg(unix)]
-pub fn listener_raw_fd(listener: &Listener) -> std::os::fd::RawFd {
-    use std::os::fd::{AsFd, AsRawFd};
+pub fn listener_fd(listener: &Listener) -> std::os::fd::BorrowedFd<'_> {
+    use std::os::fd::AsFd;
     let Listener::UdSocket(socket) = listener;
-    socket.as_fd().as_raw_fd()
+    socket.as_fd()
 }
 
 /// Performs a single vectored write (`writev`) of `slices`, retrying on `EINTR`.
@@ -648,8 +805,16 @@ mod tests {
         use std::os::fd::AsRawFd;
         use std::os::unix::fs::PermissionsExt;
 
-        assert_eq!(socket_parent_dir("bare.sock"), Path::new("."));
-        assert_eq!(socket_parent_dir("/tmp/sub/broker.sock"), Path::new("/tmp/sub"));
+        assert_eq!(socket_parent_dir("bare.sock").expect("bare"), Path::new("."));
+        assert_eq!(socket_parent_dir("/broker.sock").expect("root parent"), Path::new("/"));
+        assert_eq!(socket_parent_dir("/tmp/sub/broker.sock").expect("nested"), Path::new("/tmp/sub"));
+        assert!(matches!(socket_parent_dir(""), Err(OsError::UnsafePath(_))));
+        assert!(matches!(socket_parent_dir("/"), Err(OsError::UnsafePath(_))));
+        assert!(matches!(socket_parent_dir("."), Err(OsError::UnsafePath(_))));
+        assert!(matches!(socket_parent_dir(".."), Err(OsError::UnsafePath(_))));
+        assert!(matches!(socket_parent_dir("/safe/unsafe_dir/"), Err(OsError::UnsafePath(_))));
+        assert!(matches!(socket_parent_dir("/safe/unsafe_dir/."), Err(OsError::UnsafePath(_))));
+        assert!(matches!(socket_parent_dir("/safe/priv/.."), Err(OsError::UnsafePath(_))));
 
         let base = tempfile::tempdir().expect("tempdir");
         let nested = base.path().join("private/broker.sock");
@@ -660,12 +825,151 @@ mod tests {
         let dir_meta = std::fs::symlink_metadata(nested.parent().expect("parent")).expect("meta");
         assert_eq!(dir_meta.permissions().mode() & 0o777, 0o700);
 
-        // Rejects group/other writable directory.
+        // Rejects group/other readable or writable directory (strict 0o700).
         let wide_dir = base.path().join("wide");
         std::fs::create_dir(&wide_dir).expect("mkdir");
-        std::fs::set_permissions(&wide_dir, std::fs::Permissions::from_mode(0o770)).expect("chmod");
+        std::fs::set_permissions(&wide_dir, std::fs::Permissions::from_mode(0o750)).expect("chmod 0750");
         let wide_sock = wide_dir.join("broker.sock");
         assert!(matches!(ensure_private_directory(&wide_sock.to_string_lossy()), Err(OsError::UnsafePath(_))));
+        std::fs::set_permissions(&wide_dir, std::fs::Permissions::from_mode(0o755)).expect("chmod 0755");
+        assert!(matches!(ensure_private_directory(&wide_sock.to_string_lossy()), Err(OsError::UnsafePath(_))));
+
+        // Trailing `/` or `/.` on a wide directory must NOT bypass leaf verification via `Path::parent()`.
+        assert!(matches!(ensure_private_directory(&format!("{}/", wide_dir.display())), Err(OsError::UnsafePath(_))));
+        assert!(matches!(ensure_private_directory(&format!("{}/.", wide_dir.display())), Err(OsError::UnsafePath(_))));
+        // Concurrent startup race helper creates 0o700 dir, tolerates AlreadyExists, and propagates other errors.
+        let race_dir = base.path().join("race-dir");
+        create_private_dir_allow_race(&race_dir).expect("create race dir");
+        assert_eq!(std::fs::symlink_metadata(&race_dir).unwrap().permissions().mode() & 0o777, 0o700);
+        create_private_dir_allow_race(&race_dir).expect("AlreadyExists tolerated for concurrent startup");
+        assert_eq!(
+            create_private_dir_allow_race(&base.path().join("no-such-parent/child"))
+                .expect_err("missing parent error")
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+
+        // Ancestor safety rules: root or euid, non-writable or sticky; ancestor symlinks owned by root or euid.
+        assert!(ancestor_is_safe(0, 0o755, 1000));
+        assert!(ancestor_is_safe(0, 0o1777, 1000));
+        assert!(!ancestor_is_safe(0, 0o777, 1000));
+        assert!(!ancestor_is_safe(0, 0o775, 1000));
+        assert!(ancestor_is_safe(1000, 0o700, 1000));
+        assert!(ancestor_is_safe(1000, 0o1770, 1000));
+        assert!(!ancestor_is_safe(1000, 0o770, 1000));
+        assert!(!ancestor_is_safe(1001, 0o700, 1000));
+        assert!(!ancestor_is_safe(1001, 0o1777, 1000));
+        assert!(ancestor_symlink_is_safe(0, 1000));
+        assert!(ancestor_symlink_is_safe(1000, 1000));
+        assert!(!ancestor_symlink_is_safe(1001, 1000));
+        assert!(is_safe_ancestor_dir(true, 0, 0o755, 1000));
+        assert!(!is_safe_ancestor_dir(false, 0, 0o755, 1000));
+        assert!(!is_safe_ancestor_dir(true, 0, 0o777, 1000));
+        assert!(dir_is_private(false, true, 1000, 0o700, 1000));
+        assert!(!dir_is_private(true, true, 1000, 0o700, 1000));
+        assert!(!dir_is_private(false, false, 1000, 0o700, 1000));
+        assert!(!dir_is_private(false, true, 1001, 0o700, 1000));
+        assert!(!dir_is_private(false, true, 1000, 0o750, 1000));
+
+        // Ancestor symlink owned by euid pointing to a safe parent is allowed, while target dir symlink is refused.
+        let anc_sym = base.path().join("anc-sym");
+        std::os::unix::fs::symlink(base.path(), &anc_sym).expect("anc symlink");
+        ensure_private_directory(&anc_sym.join("private/broker.sock").to_string_lossy()).expect("owned anc symlink ok");
+
+        // Rejects a 0o700 socket directory hosted under a non-sticky group/world-writable ancestor,
+        // refuses to create a missing directory under an unsafe ancestor, and catches canonical
+        // unsafe ancestors hidden behind an euid-owned symlink.
+        let unsafe_parent = base.path().join("unsafe-parent");
+        let safe_child = unsafe_parent.join("priv");
+        std::fs::create_dir_all(&safe_child).expect("mkdir unsafe tree");
+        std::fs::set_permissions(&safe_child, std::fs::Permissions::from_mode(0o700)).expect("chmod child");
+        std::fs::set_permissions(&unsafe_parent, std::fs::Permissions::from_mode(0o777)).expect("chmod parent");
+        assert!(matches!(
+            ensure_private_directory(&safe_child.join("broker.sock").to_string_lossy()),
+            Err(OsError::UnsafePath(_))
+        ));
+        let uncreated_child = unsafe_parent.join("must-not-create");
+        assert!(matches!(
+            ensure_private_directory(&uncreated_child.join("broker.sock").to_string_lossy()),
+            Err(OsError::UnsafePath(_))
+        ));
+        assert!(!uncreated_child.exists(), "must not create directory beneath an unsafe ancestor");
+        let sym_to_unsafe_target = base.path().join("sym-to-unsafe");
+        std::os::unix::fs::symlink(&safe_child, &sym_to_unsafe_target).expect("symlink to safe_child");
+        let deep_priv = safe_child.join("deep");
+        std::fs::create_dir(&deep_priv).expect("mkdir deep");
+        std::fs::set_permissions(&deep_priv, std::fs::Permissions::from_mode(0o700)).expect("chmod deep");
+        assert!(matches!(
+            ensure_private_directory(&sym_to_unsafe_target.join("deep/broker.sock").to_string_lossy()),
+            Err(OsError::UnsafePath(_))
+        ));
+        // Multi-hop symlink bounce through an unsafe directory and back to a safe directory MUST be refused!
+        let bounce_safe = base.path().join("bounce-safe");
+        let bounce_priv = bounce_safe.join("priv");
+        std::fs::create_dir_all(&bounce_priv).expect("mkdir bounce");
+        std::fs::set_permissions(&bounce_safe, std::fs::Permissions::from_mode(0o700)).expect("chmod bounce safe");
+        std::fs::set_permissions(&bounce_priv, std::fs::Permissions::from_mode(0o700)).expect("chmod bounce priv");
+        let link_b = safe_child.join("link-b");
+        std::os::unix::fs::symlink(&bounce_safe, &link_b).expect("link_b");
+        assert!(matches!(
+            ensure_private_directory(&sym_to_unsafe_target.join("link-b/priv/broker.sock").to_string_lossy()),
+            Err(OsError::UnsafePath(_))
+        ));
+        // `..` in socket path is refused BEFORE creating any missing component.
+        let nonexist_escape = base.path().join("nonexist/../unsafe-parent/priv-escape/broker.sock");
+        assert!(matches!(ensure_private_directory(&nonexist_escape.to_string_lossy()), Err(OsError::UnsafePath(_))));
+        assert!(!base.path().join("nonexist").exists());
+        assert!(!unsafe_parent.join("priv-escape").exists());
+        // Dangling ancestor symlink containing `missing/..` must fail closed WITHOUT creating `missing`.
+        let dangling_parent = base.path().join("dangling-parent-sym");
+        std::os::unix::fs::symlink("missing_hop/../private", &dangling_parent).expect("dangling parent symlink");
+        assert!(matches!(
+            ensure_private_directory(&dangling_parent.join("sub/broker.sock").to_string_lossy()),
+            Err(OsError::UnsafePath(_))
+        ));
+        assert!(!base.path().join("missing_hop").exists(), "must not create missing hop before `..`");
+        // Relative ancestor symlink with `..` across an EXISTING safe directory still works cleanly.
+        let rel_holder = base.path().join("rel-holder");
+        std::fs::create_dir(&rel_holder).expect("mkdir rel-holder");
+        std::fs::set_permissions(&rel_holder, std::fs::Permissions::from_mode(0o700)).expect("chmod rel-holder");
+        let rel_sym = rel_holder.join("up-to-priv");
+        std::os::unix::fs::symlink("../private", &rel_sym).expect("rel symlink");
+        ensure_private_directory(&rel_sym.join("child/broker.sock").to_string_lossy()).expect("valid rel symlink ok");
+        assert_eq!(
+            std::fs::symlink_metadata(base.path().join("private/child")).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        // Symlink loop in ancestor chain fails closed cleanly.
+        let loop1 = base.path().join("loop1");
+        let loop2 = base.path().join("loop2");
+        std::os::unix::fs::symlink(&loop2, &loop1).expect("loop1");
+        std::os::unix::fs::symlink(&loop1, &loop2).expect("loop2");
+        assert!(matches!(
+            ensure_private_directory(&loop1.join("priv/broker.sock").to_string_lossy()),
+            Err(OsError::UnsafePath(_))
+        ));
+        // Multi-level missing directory creation under a safe ancestor creates every level with 0o700.
+        let deep_new = base.path().join("nested_a/nested_b/broker.sock");
+        ensure_private_directory(&deep_new.to_string_lossy()).expect("create nested 0o700 dirs");
+        assert_eq!(
+            std::fs::symlink_metadata(base.path().join("nested_a")).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(base.path().join("nested_a/nested_b")).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        // Root `/` cannot host a private socket directly.
+        assert!(matches!(ensure_private_directory("/broker.sock"), Err(OsError::UnsafePath(_))));
+        // Non-NotFound metadata errors (e.g. ENAMETOOLONG) fail at inspection rather than attempting mkdir.
+        let overlong = base.path().join("a".repeat(300)).join("broker.sock");
+        assert!(matches!(
+            ensure_private_directory(&overlong.to_string_lossy()),
+            Err(OsError::Io { context: "inspecting socket directory", .. })
+        ));
+        std::fs::set_permissions(&unsafe_parent, std::fs::Permissions::from_mode(0o1777)).expect("chmod sticky");
+        ensure_private_directory(&safe_child.join("broker.sock").to_string_lossy()).expect("sticky ancestor ok");
+        std::fs::set_permissions(&unsafe_parent, std::fs::Permissions::from_mode(0o700)).expect("restore parent");
 
         // Rejects symlink directory.
         let link_dir = base.path().join("link_dir");
@@ -714,7 +1018,7 @@ mod tests {
         }
         let sock_meta = std::fs::symlink_metadata(&nested).expect("socket meta");
         assert_eq!(sock_meta.permissions().mode() & 0o777, 0o600, "socket must be 0o600 owner-only");
-        let lfd = listener_raw_fd(&listener);
+        let lfd = listener_fd(&listener).as_raw_fd();
         assert!(lfd > 2, "listener fd must be > 2");
 
         // Verify `O_NONBLOCK` flag directly via fcntl BEFORE calling accept() so a broken
@@ -735,9 +1039,9 @@ mod tests {
         assert!(verify_peer_is_current_user(&server).expect("peer check server"));
         assert!(verify_peer_is_current_user(&client).expect("peer check client"));
         assert!(verify_client_is_current_user(&server).expect("client check server"));
-        let sfd = stream_raw_fd(&server);
+        let sfd = stream_fd(&server).as_raw_fd();
         assert!(sfd > 2, "stream fd must be > 2");
-        let cfd = stream_raw_fd(&client);
+        let cfd = stream_fd(&client).as_raw_fd();
         assert!(cfd > 2 && cfd != sfd);
 
         // Vectored write + read roundtrip.
@@ -829,6 +1133,22 @@ mod tests {
         }
         assert!(flag.load(Ordering::Acquire), "SIGINT must set shutdown flag");
         assert!(wakes.load(Ordering::Acquire) > after_term);
+
+        // Verify `wait_for_signal_handlers` waits until an in-flight handler decrements the counter to 0,
+        // and returns `false` cleanly on timeout rather than spinning forever.
+        let stuck = AtomicUsize::new(1);
+        assert!(!unix_signals::wait_for_signal_handlers(&stuck, Duration::from_millis(5)));
+        let idle = AtomicUsize::new(0);
+        assert!(unix_signals::wait_for_signal_handlers(&idle, Duration::from_millis(50)));
+        let in_flight = Arc::new(AtomicUsize::new(1));
+        let releaser = Arc::clone(&in_flight);
+        let t_rel = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            releaser.fetch_sub(1, Ordering::Release);
+        });
+        assert!(unix_signals::wait_for_signal_handlers(&in_flight, Duration::from_secs(1)));
+        assert_eq!(in_flight.load(Ordering::Acquire), 0);
+        t_rel.join().expect("join releaser");
 
         // Dropping guard restores handlers and releases the global slot so reinstall succeeds.
         drop(guard);

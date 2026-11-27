@@ -27,8 +27,8 @@ use apack_core::time::TimestampMs;
 use apack_os::pty_poller::{Interest, PollEvent, PollToken, PtyPoller};
 #[cfg(unix)]
 use apack_os::transport::{
-    hang_up, listener_raw_fd, set_listener_nonblocking, set_stream_nonblocking, stream_raw_fd,
-    verify_peer_is_current_user, write_vectored_some,
+    hang_up, listener_fd, set_listener_nonblocking, set_stream_nonblocking, stream_fd, verify_peer_is_current_user,
+    write_vectored_some,
 };
 use apack_proto::messages::{BrokerMsg, FrameUpdate, SessionSummary};
 use apack_proto::types::{NonZeroStreamId, RequestId, SessionId, StreamId};
@@ -294,7 +294,7 @@ pub(crate) fn run_control_reactor(
     #[cfg(unix)]
     let (poller, reactor_wake) = {
         let mut poller = PtyPoller::new()?;
-        poller.register(LISTENER_TOKEN, listener_raw_fd(&listener), Interest::READ)?;
+        poller.register(LISTENER_TOKEN, listener_fd(&listener), Interest::READ)?;
         let wake = ReactorWake { waker: poller.waker() };
         (poller, wake)
     };
@@ -673,7 +673,7 @@ impl ReactorState {
                     }
                     let conn = self.alloc_conn_id();
                     let token = PollToken(conn.get());
-                    if self.poller.register(token, stream_raw_fd(&stream), Interest::READ).is_err() {
+                    if self.poller.register(token, stream_fd(&stream), Interest::READ).is_err() {
                         let _ = hang_up(&stream);
                         continue;
                     }

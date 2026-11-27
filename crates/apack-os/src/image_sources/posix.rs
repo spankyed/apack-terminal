@@ -14,6 +14,7 @@ const SHARED_MEMORY_FLAGS: libc::c_int = libc::O_NONBLOCK | libc::O_CLOEXEC;
 const _: () = assert!(libc::O_RDONLY == 0);
 
 const MAX_SYMLINK_HOPS: usize = 40;
+const MAX_PATH_DEPTH: usize = 128;
 const REFUSED_MOUNTS: [&str; 3] = ["/proc", "/sys", "/dev"];
 const TAKEN_MOUNT: &str = "/dev/shm";
 
@@ -53,12 +54,22 @@ fn is_refused_prefix(resolved: &[Vec<u8>]) -> bool {
     resolved != [b"dev".as_slice()] && is_refused_components(resolved)
 }
 
-/// Opens `path` read-only by walking components left-to-right via `openat(..., O_NOFOLLOW | O_CLOEXEC)`
-/// and `readlinkat`, eliminating symlink-swap TOCTOU races between path validation and `open()`.
+fn should_check_hop_device(resolved: &[Vec<u8>]) -> bool {
+    resolved != [b"dev".as_slice()]
+}
+
+/// Opens `path` read-only by walking components left-to-right via `openat2` (on Linux, enforcing
+/// `RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS` + `RESOLVE_NO_XDEV` on the leaf) or
+/// `openat(..., O_NOFOLLOW | O_CLOEXEC)` and `readlinkat`, keeping an explicit `dir_stack` of
+/// opened parent descriptors so `..` never desynchronizes under concurrent directory renames.
 ///
 /// Refuses `/proc`, `/sys`, `/dev` (except `/dev/shm`), symlink loops (`> MAX_SYMLINK_HOPS`),
-/// non-regular files (FIFOs, sockets, devices, directories), and special filesystems.
+/// non-regular files (FIFOs, sockets, devices, directories), and special filesystems at every hop.
 pub fn open_file(path: &[u8]) -> Option<File> {
+    open_file_bounded(path, MAX_PATH_DEPTH)
+}
+
+fn open_file_bounded(path: &[u8], max_depth: usize) -> Option<File> {
     let owned;
     let combined = if path.starts_with(b"/") {
         path
@@ -76,7 +87,8 @@ pub fn open_file(path: &[u8]) -> Option<File> {
         return None;
     }
 
-    let mut dirfd = open_abs_dir(c"/")?;
+    let special = special_filesystems();
+    let mut dir_stack: Vec<OwnedFd> = vec![open_abs_dir(c"/")?];
     let mut resolved: Vec<Vec<u8>> = Vec::new();
     let mut remaining_hops = MAX_SYMLINK_HOPS;
 
@@ -86,7 +98,9 @@ pub fn open_file(path: &[u8]) -> Option<File> {
         }
         if segment == b".." {
             resolved.pop();
-            dirfd = open_dir_at(&dirfd, b"..")?;
+            if dir_stack.len() > 1 {
+                dir_stack.pop();
+            }
             continue;
         }
         resolved.push(segment.clone());
@@ -94,16 +108,17 @@ pub fn open_file(path: &[u8]) -> Option<File> {
             return None;
         }
 
+        let dirfd = dir_stack.last().expect("root directory fd always present");
         let is_leaf = pending.is_empty();
         if is_leaf {
-            match open_leaf_at(&dirfd, &segment) {
+            match open_leaf_at(dirfd, &segment) {
                 LeafOpen::Opened(fd) => {
                     if is_refused_components(&resolved) {
                         return None;
                     }
                     let file = File::from(fd);
                     let found = file.metadata().ok()?;
-                    if !found.is_file() || on_special_filesystem(device(found.dev()), &special_filesystems()) {
+                    if !found.is_file() || on_special_filesystem(device(found.dev()), &special) {
                         return None;
                     }
                     // SAFETY: `file` is an open regular file descriptor; clear `O_NONBLOCK` before returning.
@@ -113,11 +128,11 @@ pub fn open_file(path: &[u8]) -> Option<File> {
                     return Some(file);
                 }
                 LeafOpen::Symlink => {
-                    let target = readlink_at(&dirfd, &segment, super::PATH_BYTES)?;
+                    let target = readlink_at(dirfd, &segment, super::PATH_BYTES)?;
                     remaining_hops = remaining_hops.checked_sub(1)?;
                     if target.starts_with(b"/") {
                         resolved.clear();
-                        dirfd = open_abs_dir(c"/")?;
+                        dir_stack.truncate(1);
                     } else {
                         resolved.pop();
                     }
@@ -128,16 +143,24 @@ pub fn open_file(path: &[u8]) -> Option<File> {
                 LeafOpen::Failed => return None,
             }
         } else {
-            match open_subdir_at(&dirfd, &segment) {
+            match open_subdir_at(dirfd, &segment) {
                 SubdirOpen::Opened(next_dir) => {
-                    dirfd = next_dir;
+                    // Check special-filesystem mount IDs at EVERY intermediate hop (allowing bare
+                    // `/dev` solely so `/dev/shm/...` can traverse into its tmpfs mount), and bound
+                    // `dir_stack` depth so deep paths cannot exhaust `RLIMIT_NOFILE`.
+                    if dir_stack.len() >= max_depth
+                        || (should_check_hop_device(&resolved) && fd_on_special_filesystem(&next_dir, &special))
+                    {
+                        return None;
+                    }
+                    dir_stack.push(next_dir);
                 }
                 SubdirOpen::Symlink => {
-                    let target = readlink_at(&dirfd, &segment, super::PATH_BYTES)?;
+                    let target = readlink_at(dirfd, &segment, super::PATH_BYTES)?;
                     remaining_hops = remaining_hops.checked_sub(1)?;
                     if target.starts_with(b"/") {
                         resolved.clear();
-                        dirfd = open_abs_dir(c"/")?;
+                        dir_stack.truncate(1);
                     } else {
                         resolved.pop();
                     }
@@ -168,20 +191,64 @@ const DIR_FLAGS: libc::c_int = libc::O_DIRECTORY | libc::O_CLOEXEC;
 const LEAF_FLAGS: libc::c_int = FILE_FLAGS | libc::O_NOFOLLOW | libc::O_CLOEXEC;
 const SUBDIR_FLAGS: libc::c_int = DIR_FLAGS | libc::O_NOFOLLOW;
 
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+
+#[cfg(target_os = "linux")]
+const RESOLVE_NO_XDEV: u64 = 0x01;
+#[cfg(target_os = "linux")]
+const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+#[cfg(target_os = "linux")]
+const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+#[cfg(target_os = "linux")]
+const SUBDIR_RESOLVE: u64 = RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS;
+#[cfg(target_os = "linux")]
+const LEAF_RESOLVE: u64 = RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV;
+
+#[cfg(target_os = "linux")]
+fn should_fallback_openat(res: libc::c_long, errno: Option<i32>) -> bool {
+    res == -1 && errno == Some(libc::ENOSYS)
+}
+
+#[cfg(target_os = "linux")]
+fn open_component_at(dirfd: &OwnedFd, c_name: &CString, flags: libc::c_int, resolve: u64) -> libc::c_int {
+    let how = OpenHow { flags: u64::from(flags.cast_unsigned()), mode: 0, resolve };
+    // SAFETY: `dirfd` is an open directory fd, `c_name` is a valid C string, and `how` matches the
+    // Linux `struct open_how` ABI for `SYS_openat2`.
+    let res = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            dirfd.as_raw_fd(),
+            c_name.as_ptr(),
+            &raw const how,
+            std::mem::size_of::<OpenHow>(),
+        )
+    };
+    if should_fallback_openat(res, std::io::Error::last_os_error().raw_os_error()) {
+        // SAFETY: fallback to `openat` only when the kernel lacks `openat2` (`ENOSYS`).
+        return unsafe { libc::openat(dirfd.as_raw_fd(), c_name.as_ptr(), flags) };
+    }
+    res as libc::c_int
+}
+
+fn fd_on_special_filesystem(fd: &OwnedFd, special: &[Device]) -> bool {
+    // SAFETY: `libc::stat` is plain old data where all-zeroes is valid.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is an open descriptor and `stat` is a writable out-pointer.
+    if unsafe { libc::fstat(fd.as_raw_fd(), &raw mut stat) } != 0 {
+        return true;
+    }
+    on_special_filesystem(device(stat.st_dev as u64), special)
+}
+
 fn open_abs_dir(path: &std::ffi::CStr) -> Option<OwnedFd> {
     // SAFETY: `path` is a valid C string; `open` returns a fresh fd or `-1`.
     let fd = unsafe { libc::open(path.as_ptr(), DIR_FLAGS) };
-    if fd == -1 {
-        return None;
-    }
-    // SAFETY: `fd != -1` is exclusively owned by this call.
-    Some(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-fn open_dir_at(dirfd: &OwnedFd, name: &[u8]) -> Option<OwnedFd> {
-    let c_name = CString::new(name).ok()?;
-    // SAFETY: `dirfd` is an open directory fd and `c_name` is a valid C string.
-    let fd = unsafe { libc::openat(dirfd.as_raw_fd(), c_name.as_ptr(), DIR_FLAGS) };
     if fd == -1 {
         return None;
     }
@@ -193,6 +260,9 @@ fn open_subdir_at(dirfd: &OwnedFd, name: &[u8]) -> SubdirOpen {
     let Ok(c_name) = CString::new(name) else {
         return SubdirOpen::Failed;
     };
+    #[cfg(target_os = "linux")]
+    let fd = open_component_at(dirfd, &c_name, SUBDIR_FLAGS, SUBDIR_RESOLVE);
+    #[cfg(not(target_os = "linux"))]
     // SAFETY: `dirfd` is an open directory fd and `c_name` is a valid C string.
     let fd = unsafe { libc::openat(dirfd.as_raw_fd(), c_name.as_ptr(), SUBDIR_FLAGS) };
     if fd != -1 {
@@ -209,6 +279,9 @@ fn open_leaf_at(dirfd: &OwnedFd, name: &[u8]) -> LeafOpen {
     let Ok(c_name) = CString::new(name) else {
         return LeafOpen::Failed;
     };
+    #[cfg(target_os = "linux")]
+    let fd = open_component_at(dirfd, &c_name, LEAF_FLAGS, LEAF_RESOLVE);
+    #[cfg(not(target_os = "linux"))]
     // SAFETY: `dirfd` is an open directory fd and `c_name` is a valid C string.
     let fd = unsafe { libc::openat(dirfd.as_raw_fd(), c_name.as_ptr(), LEAF_FLAGS) };
     if fd != -1 {
@@ -341,6 +414,9 @@ pub fn shared_memory(
     range: impl FnOnce(u64) -> Result<Range<u64>, Refused>,
 ) -> Result<Vec<Vec<u8>>, Refused> {
     let invalid = Refused::InvalidData;
+    if !super::shared_memory_name(name) {
+        return Err(invalid);
+    }
     let name = CString::new(name).map_err(|_| invalid)?;
     let object = open_shm_fd(&name).ok_or(invalid)?;
     // SAFETY: `libc::stat` is plain old data where all-zeroes is valid.
@@ -358,7 +434,9 @@ pub fn shared_memory(
     if range.is_empty() {
         return Ok(Vec::new());
     }
-    if cfg!(target_os = "linux") { read_fd_range(object, range) } else { read_mapped_range(object, range) }
+    // Only macOS requires `mmap` for `shm_open` descriptors (where `read(2)` returns `ENODEV`);
+    // Linux and BSDs read cleanly through `read_fd_range` without `SIGBUS` shrink hazards.
+    if cfg!(target_os = "macos") { read_mapped_range(object, range) } else { read_fd_range(object, range) }
 }
 
 /// Reads `[range.start..range.end]` from a seekable fd via standard file I/O (Linux shm).
@@ -498,16 +576,40 @@ mod tests {
         // `is_refused_prefix` leaves bare `/dev` open so `/dev/shm/...` can traverse it, while
         // refusing `/proc`, `/sys`, and any non-shm child of `/dev`.
         assert!(!is_refused_prefix(&[b"dev".to_vec()]));
+        assert!(!should_check_hop_device(&[b"dev".to_vec()]));
+        assert!(should_check_hop_device(&[b"tmp".to_vec()]));
         assert!(!is_refused_prefix(&[b"dev".to_vec(), b"shm".to_vec()]));
         assert!(is_refused_prefix(&[b"dev".to_vec(), b"fd".to_vec()]));
         assert!(is_refused_prefix(&[b"proc".to_vec()]));
         assert!(is_refused_prefix(&[b"sys".to_vec()]));
 
-        // `open_abs_dir` / `open_dir_at` return `None` on missing directories, and `readlink_at`
-        // refuses non-symlinks and targets filling the buffer.
+        // `open_abs_dir` returns `None` on missing directories; per-hop `fd_on_special_filesystem`
+        // flags `/dev` as special while accepting `/`, and on Linux `should_fallback_openat` only
+        // falls back on `(-1, Some(ENOSYS))`.
         assert!(open_abs_dir(c"/nonexistent_apack_v2_dir").is_none());
         let root_fd = open_abs_dir(c"/").expect("open root");
-        assert!(open_dir_at(&root_fd, b"nonexistent_apack_v2_dir").is_none());
+        let dev_fd = open_abs_dir(c"/dev").expect("open /dev");
+        let special = special_filesystems();
+        assert!(!fd_on_special_filesystem(&root_fd, &special));
+        assert!(fd_on_special_filesystem(&dev_fd, &special));
+        #[cfg(target_os = "linux")]
+        {
+            assert_ne!(SUBDIR_RESOLVE & RESOLVE_NO_SYMLINKS, 0);
+            assert_ne!(SUBDIR_RESOLVE & RESOLVE_NO_MAGICLINKS, 0);
+            assert_ne!(LEAF_RESOLVE & RESOLVE_NO_SYMLINKS, 0);
+            assert_ne!(LEAF_RESOLVE & RESOLVE_NO_MAGICLINKS, 0);
+            assert_ne!(LEAF_RESOLVE & RESOLVE_NO_XDEV, 0);
+            assert!(should_fallback_openat(-1, Some(libc::ENOSYS)));
+            assert!(!should_fallback_openat(-1, Some(libc::ELOOP)));
+            assert!(!should_fallback_openat(-1, Some(libc::EXDEV)));
+            assert!(!should_fallback_openat(3, Some(libc::ENOSYS)));
+            assert!(!should_fallback_openat(3, None));
+        }
+
+        // Direct `shared_memory` refuses traversal names even if called without `Scanner`.
+        assert_eq!(shared_memory(b"/../escape", |_| Ok(0..1)), Err(Refused::InvalidData));
+        assert_eq!(shared_memory(b"/sub/name", |_| Ok(0..1)), Err(Refused::InvalidData));
+        assert_eq!(shared_memory(b"/..", |_| Ok(0..1)), Err(Refused::InvalidData));
 
         // Device extraction and special mount detection.
         let root_dev = device(std::fs::metadata("/").expect("root meta").dev());
@@ -521,7 +623,6 @@ mod tests {
         let mounted = mounted_at(&["/dev", "/"]);
         assert!(mounted.contains(&dev_id));
         assert!(!mounted.contains(&root_dev));
-        let special = special_filesystems();
         assert!(special.contains(&dev_id));
         assert!(!special.contains(&root_dev));
 
@@ -668,6 +769,14 @@ mod tests {
 
         let dotdot = sub.join("../ok.bin");
         assert!(open_file(dotdot.as_os_str().as_bytes()).is_some());
+        let above_root = format!("/..{}", real.display());
+        assert!(open_file(above_root.as_bytes()).is_some());
+
+        // Exact `max_depth` boundary on `dir_stack` bounds open directory fds.
+        let canon_sub = std::fs::canonicalize(&sub).expect("canon sub");
+        let dir_depth = canon_sub.as_os_str().as_bytes().split(|&b| b == b'/').filter(|s| !s.is_empty()).count();
+        assert!(open_file_bounded(inside.as_os_str().as_bytes(), dir_depth).is_none());
+        assert!(open_file_bounded(inside.as_os_str().as_bytes(), dir_depth + 1).is_some());
 
         let good_link = dir.path().join("good_link");
         std::os::unix::fs::symlink("ok.bin", &good_link).expect("good link");

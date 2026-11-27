@@ -89,9 +89,14 @@ pub fn says_unreadable(reply: &str) -> bool {
     reply.ends_with(INVALID_DATA)
 }
 
-/// Validates a POSIX shared memory object name (`1..=255` bytes, not `"/"`, no interior NUL).
+/// Validates a POSIX shared memory object name (`1..=255` bytes, optional leading `/`, no
+/// interior `/` or NUL, and not `.` or `..`).
 pub fn shared_memory_name(name: &[u8]) -> bool {
-    !name.is_empty() && name.len() <= SHARED_NAME_BYTES && name != b"/" && !name.contains(&0)
+    if name.len() > SHARED_NAME_BYTES {
+        return false;
+    }
+    let body = name.strip_prefix(b"/").unwrap_or(name);
+    !body.is_empty() && body != b"." && body != b".." && !body.contains(&0) && !body.contains(&b'/')
 }
 
 /// Quietness level (`q=` key) controlling Kitty graphics replies.
@@ -524,8 +529,17 @@ mod tests {
 
         // Shared memory name validation.
         assert!(shared_memory_name(b"/valid-name"));
+        assert!(shared_memory_name(b"valid-name"));
+        assert!(shared_memory_name(&vec![b'a'; SHARED_NAME_BYTES]));
         assert!(!shared_memory_name(b""));
         assert!(!shared_memory_name(b"/"));
+        assert!(!shared_memory_name(b"."));
+        assert!(!shared_memory_name(b"/."));
+        assert!(!shared_memory_name(b".."));
+        assert!(!shared_memory_name(b"/.."));
+        assert!(!shared_memory_name(b"//double"));
+        assert!(!shared_memory_name(b"/sub/path"));
+        assert!(!shared_memory_name(b"sub/path"));
         assert!(!shared_memory_name(b"/bad\0name"));
         assert!(!shared_memory_name(&vec![b'a'; SHARED_NAME_BYTES + 1]));
     }

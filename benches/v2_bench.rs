@@ -94,7 +94,7 @@ fn unique_endpoint(dir: &Path, label: &str) -> String {
     #[cfg(unix)]
     {
         let _ = label;
-        dir.join(format!("{seq}.sock")).display().to_string()
+        dir.join("p").join(format!("{seq}.sock")).display().to_string()
     }
     #[cfg(windows)]
     {

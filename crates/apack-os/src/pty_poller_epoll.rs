@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -108,7 +108,10 @@ impl EpollPoller {
     }
 
     /// Registers `fd` under `token` with initial `interest`.
-    pub fn register(&mut self, token: PollToken, fd: RawFd, interest: Interest) -> io::Result<()> {
+    ///
+    /// Callers must call [`Self::deregister`] before closing the underlying descriptor.
+    pub fn register(&mut self, token: PollToken, fd: BorrowedFd<'_>, interest: Interest) -> io::Result<()> {
+        let fd = fd.as_raw_fd();
         if token.0 == WAKE_SENTINEL {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "reserved poll token"));
         }
@@ -228,7 +231,7 @@ impl EpollPoller {
         // Drain `eventfd` completely (retrying `EINTR` via `read_fd_nonblocking`) BEFORE clearing
         // `wake_pending` so a concurrent `wake()` can never be lost while leaving `wake_pending == true`.
         let mut buf = [0u8; std::mem::size_of::<u64>()];
-        let _ = crate::pty::read_fd_nonblocking(self.event_fd.as_raw_fd(), &mut buf);
+        let _ = crate::pty::read_fd_nonblocking(self.event_fd.as_fd(), &mut buf);
         self.wake_pending.store(false, Ordering::SeqCst);
     }
 }
@@ -305,17 +308,17 @@ mod tests {
 
         // Sentinel token rejected.
         assert_eq!(
-            poller.register(PollToken(WAKE_SENTINEL), r1.as_raw_fd(), Interest::READ).expect_err("sentinel").kind(),
+            poller.register(PollToken(WAKE_SENTINEL), r1.as_fd(), Interest::READ).expect_err("sentinel").kind(),
             io::ErrorKind::InvalidInput
         );
 
-        poller.register(t1, r1.as_raw_fd(), Interest::READ).expect("reg t1");
+        poller.register(t1, r1.as_fd(), Interest::READ).expect("reg t1");
         assert_eq!(
-            poller.register(t1, r1.as_raw_fd(), Interest::READ).expect_err("dup").kind(),
+            poller.register(t1, r1.as_fd(), Interest::READ).expect_err("dup").kind(),
             io::ErrorKind::AlreadyExists
         );
-        poller.register(t2, r2.as_raw_fd(), Interest::NONE).expect("reg t2 paused");
-        poller.register(t3, r3.as_raw_fd(), Interest::READ).expect("reg t3");
+        poller.register(t2, r2.as_fd(), Interest::NONE).expect("reg t2 paused");
+        poller.register(t3, r3.as_fd(), Interest::READ).expect("reg t3");
         assert_eq!(poller.len(), 3);
         assert!(!poller.is_empty());
 
@@ -344,8 +347,8 @@ mod tests {
         epoll_del_ignore_closed(poller.epoll_fd.as_raw_fd(), r3.as_raw_fd()).expect("ignore ENOENT on unregistered fd");
         drop(r3);
 
-        assert_eq!(write_fd_nonblocking(w1.as_raw_fd(), b"one").expect("w1"), 3);
-        assert_eq!(write_fd_nonblocking(w2.as_raw_fd(), b"two").expect("w2"), 3);
+        assert_eq!(write_fd_nonblocking(w1.as_fd(), b"one").expect("w1"), 3);
+        assert_eq!(write_fd_nonblocking(w2.as_fd(), b"two").expect("w2"), 3);
         assert!(!poller.poll(&mut events, Some(Duration::from_millis(50))).expect("poll t1"));
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].token, t1);
@@ -353,7 +356,7 @@ mod tests {
         assert!(!events[0].writable);
 
         let mut buf = [0u8; 16];
-        assert_eq!(read_fd_nonblocking(r1.as_raw_fd(), &mut buf).expect("r1"), NonBlockingRead::Bytes(3));
+        assert_eq!(read_fd_nonblocking(r1.as_fd(), &mut buf).expect("r1"), NonBlockingRead::Bytes(3));
         assert_eq!(&buf[..3], b"one");
 
         poller.modify(t2, Interest::READ).expect("unpause t2");
@@ -363,11 +366,11 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].token, t2);
         assert!(events[0].readable);
-        assert_eq!(read_fd_nonblocking(r2.as_raw_fd(), &mut buf).expect("r2"), NonBlockingRead::Bytes(3));
+        assert_eq!(read_fd_nonblocking(r2.as_fd(), &mut buf).expect("r2"), NonBlockingRead::Bytes(3));
         assert_eq!(&buf[..3], b"two");
 
         let tw = PollToken(4);
-        poller.register(tw, w1.as_raw_fd(), Interest::WRITE).expect("reg w1");
+        poller.register(tw, w1.as_fd(), Interest::WRITE).expect("reg w1");
         assert!(!poller.poll(&mut events, Some(Duration::from_millis(50))).expect("poll w1"));
         assert!(events.iter().any(|e| e.token == tw && e.writable));
         poller.deregister(tw).expect("dereg w1");
@@ -390,7 +393,7 @@ mod tests {
         drop(w1);
         assert!(!poller.poll(&mut events, Some(Duration::from_millis(50))).expect("hangup"));
         assert!(events.iter().any(|e| e.token == t1 && e.readable && e.hangup));
-        assert_eq!(read_fd_nonblocking(r1.as_raw_fd(), &mut buf).expect("eof"), NonBlockingRead::Eof);
+        assert_eq!(read_fd_nonblocking(r1.as_fd(), &mut buf).expect("eof"), NonBlockingRead::Eof);
 
         poller.deregister(t1).expect("dereg t1");
         poller.modify(t2, Interest::NONE).expect("pause t2 before dereg");
