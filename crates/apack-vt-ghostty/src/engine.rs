@@ -1114,23 +1114,69 @@ impl Drop for GhosttyEngine {
     }
 }
 
-impl VtEngine for GhosttyEngine {
-    fn feed(&mut self, bytes: &[u8], events: &mut Vec<VtEvent>) {
+impl GhosttyEngine {
+    /// Temporarily overrides `libghostty-vt`'s per-command Kitty graphics APC byte limit
+    /// (`Some(n)` for large `a=q` queries, `None` to restore the library default).
+    pub fn set_kitty_command_bytes(&mut self, bytes: Option<usize>) {
+        let ptr = bytes.as_ref().map_or(std::ptr::null(), |b| std::ptr::from_ref(b).cast::<std::ffi::c_void>());
+        // SAFETY: `self.handle` is live for `&mut self`; `APC_MAX_BYTES_KITTY` takes `*const usize` or null.
+        let _ = unsafe { sys::ghostty_terminal_set(self.handle, sys::TerminalOption::APC_MAX_BYTES_KITTY, ptr) };
+    }
+
+    /// Feeds a NUL-payload Kitty graphics probe command (`Load::asked()` or `Load::refusal()`)
+    /// with file and shared-memory mediums temporarily enabled so `libghostty-vt` validates all
+    /// command keys and returns its native reply without ever opening a real path, unconditionally
+    /// disabling both mediums again before returning.
+    pub fn feed_named_probe(&mut self, probe: &[u8], events: &mut Vec<VtEvent>) {
+        struct DisableNamedMediums(sys::Terminal);
+        impl Drop for DisableNamedMediums {
+            fn drop(&mut self) {
+                let disabled = false;
+                let ptr = (&raw const disabled).cast::<std::ffi::c_void>();
+                // SAFETY: `self.0` stays live for the duration of `feed_named_probe`.
+                unsafe {
+                    let _ = sys::ghostty_terminal_set(self.0, sys::TerminalOption::KITTY_IMAGE_MEDIUM_FILE, ptr);
+                    let _ = sys::ghostty_terminal_set(self.0, sys::TerminalOption::KITTY_IMAGE_MEDIUM_SHARED_MEM, ptr);
+                }
+            }
+        }
+        let enabled = true;
+        let ptr = (&raw const enabled).cast::<std::ffi::c_void>();
+        // SAFETY: `self.handle` is live for `&mut self`; `DisableNamedMediums` restores `false` on exit.
+        unsafe {
+            let _ = sys::ghostty_terminal_set(self.handle, sys::TerminalOption::KITTY_IMAGE_MEDIUM_FILE, ptr);
+            let _ = sys::ghostty_terminal_set(self.handle, sys::TerminalOption::KITTY_IMAGE_MEDIUM_SHARED_MEM, ptr);
+        }
+        let _guard = DisableNamedMediums(self.handle);
+        let _ = self.feed_inner(probe, false, events);
+    }
+
+    /// Feeds `bytes` up to the first APC/SOS/PM string introducer (`TerminalBoundary::APC_START`),
+    /// returning `(bytes_consumed, entered_apc)`.
+    ///
+    /// When `entered_apc` is `true`, `libghostty-vt` has consumed the introducer and sits at the
+    /// start of the string body so an external scanner can inspect named Kitty graphics commands.
+    pub fn feed_until_apc(&mut self, bytes: &[u8], events: &mut Vec<VtEvent>) -> (usize, bool) {
+        self.feed_inner(bytes, true, events)
+    }
+
+    fn feed_inner(&mut self, bytes: &[u8], stop_on_apc: bool, events: &mut Vec<VtEvent>) -> (usize, bool) {
         let mut rest = bytes;
+        let mut total_consumed = 0usize;
+        let mut entered_apc = false;
         let mut total_scrolled = 0u64;
         let mut raw_events: Vec<VtEvent> = Vec::new();
+        let boundaries = if stop_on_apc {
+            sys::TerminalBoundary::OSC_END | sys::TerminalBoundary::APC_START
+        } else {
+            sys::TerminalBoundary::OSC_END
+        };
         while !rest.is_empty() {
             let mut stop =
                 sys::TerminalWriteStop { size: std::mem::size_of::<sys::TerminalWriteStop>(), ..Default::default() };
             // SAFETY: `self.handle` is live for `&mut self`, `rest` outlives the call, `stop` is sized.
             let res = unsafe {
-                sys::ghostty_terminal_vt_write_until(
-                    self.handle,
-                    rest.as_ptr(),
-                    rest.len(),
-                    sys::TerminalBoundary::OSC_END,
-                    &raw mut stop,
-                )
+                sys::ghostty_terminal_vt_write_until(self.handle, rest.as_ptr(), rest.len(), boundaries, &raw mut stop)
             };
             let consumed = match res {
                 sys::Result::SUCCESS => stop.consumed.clamp(1, rest.len()),
@@ -1142,6 +1188,7 @@ impl VtEngine for GhosttyEngine {
                 }
             };
             rest = &rest[consumed..];
+            total_consumed = total_consumed.saturating_add(consumed);
 
             // Synchronize scroll / alt-screen epoch BEFORE stamping cursor_line on callbacks from this slice!
             let mut pending = self.callbacks.with_mut(|cb| std::mem::take(&mut cb.events));
@@ -1157,11 +1204,27 @@ impl VtEngine for GhosttyEngine {
                 }
             }
             raw_events.extend(pending);
+
+            if stop_on_apc
+                && res == sys::Result::SUCCESS
+                && stop.reached == sys::TerminalBoundary::APC_START
+                && matches!(stop.byte, b'_' | 0x9f)
+            {
+                entered_apc = true;
+                break;
+            }
         }
         coalesce_feed_events(raw_events, events);
-        if !bytes.is_empty() {
+        if total_consumed != 0 {
             self.refresh_render_state(false, total_scrolled);
         }
+        (total_consumed, entered_apc)
+    }
+}
+
+impl VtEngine for GhosttyEngine {
+    fn feed(&mut self, bytes: &[u8], events: &mut Vec<VtEvent>) {
+        let _ = self.feed_inner(bytes, false, events);
     }
 
     fn resize(&mut self, size: GridSize, cell_px: CellPx, events: &mut Vec<VtEvent>) {

@@ -24,7 +24,11 @@ use apack_core::lease::ConnId;
 use apack_core::marks::MarksMode;
 use apack_core::session::{SessionEffect, SessionMachine, StreamKey};
 use apack_core::time::TimestampMs;
-use apack_core::vt::VtEngine;
+use apack_core::vt::{VtEngine, VtEvent};
+use apack_os::image_sources::{
+    Load, Loaded, QUIET as IMAGE_SOURCE_QUIET, Quiet as ImageQuiet, Refused as ImageRefused, Scanner as ImageScanner,
+    Worker as ImageWorker, says_unreadable,
+};
 #[cfg(unix)]
 use apack_os::pty::{NonBlockingRead, PtyMaster};
 use apack_os::pty::{PtySpawnConfig, spawn_pty};
@@ -327,6 +331,15 @@ pub enum ShardCmd {
         /// Verification verdict.
         confirmed: Confirmed,
     },
+    /// Off-shard Kitty graphics named-source (`t=f` / `t=s`) read completion.
+    ImageSourceLoaded {
+        /// Target session ID.
+        session_id: SessionId,
+        /// Per-session ticket rejecting stale completions after cancel/teardown.
+        ticket: u64,
+        /// Completed load result, or `None` when timed out / circuit-breaker tripped.
+        loaded: Option<Loaded>,
+    },
     /// Gracefully tear down all sessions and exit the shard thread.
     Shutdown,
 }
@@ -503,7 +516,6 @@ pub fn spawn_shard(
     let worker_mailbox = Arc::clone(&mailbox);
     let worker_load = Arc::clone(&load);
     let worker_telemetry = Arc::clone(&telemetry);
-    #[cfg(windows)]
     let worker_wake = wake.clone();
     let thread = thread::Builder::new().name(format!("apack-shard-{shard_idx}")).spawn(move || {
         let mut runner = ShardRunner {
@@ -514,7 +526,6 @@ pub fn spawn_shard(
             mailbox: worker_mailbox,
             load: worker_load,
             telemetry: worker_telemetry,
-            #[cfg(windows)]
             self_wake: worker_wake,
             fg_tx: Some(fg_tx),
             fg_worker: Some(fg_worker),
@@ -547,6 +558,20 @@ pub(crate) enum LivePty {
     Windows { bridge: ConPtyBridge, eof: bool },
 }
 
+/// How to emit a Kitty graphics refusal if an off-shard named-source read fails or times out.
+enum ImageRefusal {
+    /// Core already emitted a native `EINVAL: invalid data` reply during `Load::asked()` probe.
+    Said { reply: String, quiet: ImageQuiet },
+    /// Unaskable command (`!askable() && read_unasked()`): feed `Load::refusal()` probe to core.
+    ByCore(Vec<u8>),
+}
+
+/// State for the single in-flight off-shard Kitty named-source load on a session.
+struct PendingImageLoad {
+    ticket: u64,
+    refusal: ImageRefusal,
+}
+
 pub(crate) struct LiveSession {
     pub(crate) machine: SessionMachine<GhosttyEngine>,
     pub(crate) pty: Option<LivePty>,
@@ -571,11 +596,23 @@ pub(crate) struct LiveSession {
     view_slot_free: HashSet<StreamKey>,
     /// Active `SUB_RAW_OUTPUT` subscribers (avoids sending `PublishRawOutput` when empty).
     raw_output_subs: HashSet<StreamKey>,
+    /// Streaming Kitty graphics APC scanner when `SpawnSpec::image_files` is enabled.
+    image_scanner: Option<ImageScanner>,
+    /// Per-session off-shard single-flight worker with quiet timeout & stuck-mount circuit breaker.
+    image_worker: Option<Arc<ImageWorker>>,
+    /// Monotonic ticket invalidating stale off-shard image completions on cancel/teardown.
+    image_ticket: u64,
+    /// In-flight off-shard image read pausing PTY ingestion until completion or termination.
+    pending_image: Option<PendingImageLoad>,
+    /// Unconsumed PTY bytes queued behind `pending_image` to preserve exact byte-stream ordering.
+    pending_image_tail: Vec<u8>,
+    /// Cached natural exit status deferred until any in-flight `pending_image` finishes.
+    reaped_exit: Option<(Option<i32>, Option<String>)>,
 }
 
 impl LiveSession {
     pub(crate) fn is_pty_paused(&self) -> bool {
-        self.paused_by_stream || self.paused_by_raw_flow
+        self.paused_by_stream || self.paused_by_raw_flow || self.pending_image.is_some()
     }
 
     fn summary(&self) -> SessionSummary {
@@ -607,7 +644,6 @@ pub(crate) struct ShardRunner {
     mailbox: Arc<Mutex<ShardMailboxState>>,
     load: Arc<AtomicUsize>,
     telemetry: Arc<ShardTelemetryAtomics>,
-    #[cfg(windows)]
     self_wake: ShardWake,
     fg_tx: Option<mpsc::SyncSender<FgVerifyReq>>,
     fg_worker: Option<JoinHandle<()>>,
@@ -848,6 +884,9 @@ impl ShardRunner {
                     self.apply_effects(session_id, effects);
                 }
             }
+            ShardCmd::ImageSourceLoaded { session_id, ticket, loaded } => {
+                self.handle_image_source_loaded(session_id, ticket, loaded);
+            }
             ShardCmd::Shutdown => {
                 self.running = false;
             }
@@ -858,17 +897,6 @@ impl ShardRunner {
         if self.tearing_down_all {
             self.emit(ReactorEvent::SpawnOrRewindFailed);
             self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Busy, "broker is shutting down");
-            return;
-        }
-        if spec.image_files {
-            self.emit(ReactorEvent::SpawnOrRewindFailed);
-            self.send_error(
-                conn,
-                StreamId::CONTROL,
-                req_id,
-                ErrorCode::Malformed,
-                "image_files file-transmission loading is not enabled on this broker",
-            );
             return;
         }
         let scrollback_lines = resolve_scrollback_lines(spec.scrollback_limit);
@@ -1016,6 +1044,11 @@ impl ShardRunner {
 
         let pid_target = i32::try_from(spawned.pid).ok().and_then(SignalTarget::new);
         let kept = spec.kept;
+        let (image_scanner, image_worker) = if spec.image_files {
+            (Some(ImageScanner::default()), Some(Arc::new(ImageWorker::default())))
+        } else {
+            (None, None)
+        };
         self.sessions.insert(
             session_id,
             LiveSession {
@@ -1040,6 +1073,12 @@ impl ShardRunner {
                 escalated_sigkill: false,
                 view_slot_free: HashSet::new(),
                 raw_output_subs: HashSet::new(),
+                image_scanner,
+                image_worker,
+                image_ticket: 0,
+                pending_image: None,
+                pending_image_tail: Vec::new(),
+                reaped_exit: None,
             },
         );
         self.load.store(self.sessions.len(), Ordering::Relaxed);
@@ -1148,6 +1187,12 @@ impl ShardRunner {
                 escalated_sigkill: false,
                 view_slot_free: HashSet::new(),
                 raw_output_subs: HashSet::new(),
+                image_scanner: None,
+                image_worker: None,
+                image_ticket: 0,
+                pending_image: None,
+                pending_image_tail: Vec::new(),
+                reaped_exit: None,
             },
         );
         self.load.store(self.sessions.len(), Ordering::Relaxed);
@@ -1331,6 +1376,10 @@ impl ShardRunner {
     }
 
     fn apply_effects(&mut self, session_id: SessionId, effects: Vec<SessionEffect>) {
+        self.apply_effects_inner(session_id, effects, true);
+    }
+
+    fn apply_effects_inner(&mut self, session_id: SessionId, effects: Vec<SessionEffect>, sync_and_reap: bool) {
         let mut views_dirty = false;
         let mut write_ready = false;
 
@@ -1402,7 +1451,7 @@ impl ShardRunner {
         }
 
         if write_ready {
-            self.drain_pty_writes_for(session_id);
+            self.drain_pty_writes_for(session_id, sync_and_reap);
         }
         if views_dirty {
             self.try_publish_dirty_views(session_id);
@@ -1456,7 +1505,7 @@ impl ShardRunner {
                 continue;
             };
             if ev.writable {
-                self.drain_pty_writes_for(session_id);
+                self.drain_pty_writes_for(session_id, true);
             }
             if ev.readable || ev.hangup {
                 self.read_unix_pty_quantum(session_id);
@@ -1508,37 +1557,187 @@ impl ShardRunner {
     }
 
     pub(crate) fn ingest_pty_bytes(&mut self, session_id: SessionId, bytes: &[u8]) {
-        self.total_pty_bytes = self.total_pty_bytes.saturating_add(bytes.len() as u64);
+        if bytes.is_empty() {
+            return;
+        }
         let now_ms = now_unix_ms();
+        let now = TimestampMs::from_millis(now_ms);
         let mut effects = Vec::new();
         let mut has_raw_subs = false;
+        let mut consumed = bytes.len();
+        let mut dispatch: Option<(Load, ImageRefusal, Vec<u8>)> = None;
 
         if let Some(sess) = self.sessions.get_mut(&session_id) {
+            if sess.pending_image.is_some() {
+                sess.pending_image_tail.extend_from_slice(bytes);
+                return;
+            }
             sess.last_activity = Instant::now();
             sess.compressed_idle = false;
             has_raw_subs = !sess.raw_output_subs.is_empty();
-            sess.machine.on_pty_output(bytes, TimestampMs::from_millis(now_ms), &mut effects);
-            let at_ground = sess.machine.vt().at_ground();
-            if let Some(wal) = &sess.wal {
-                let _ = wal.write_output(now_ms, bytes.to_vec(), at_ground);
-                if wal.take_rollover_needed() {
-                    sess.pending_wal_rollover = true;
+
+            if let Some(mut scanner) = sess.image_scanner.take() {
+                let mut rest = bytes;
+                consumed = 0;
+                while !rest.is_empty() {
+                    if !scanner.reading() {
+                        let (n, entered_apc) =
+                            sess.machine.on_vt_feed_with(now, &mut effects, |vt, evs| vt.feed_until_apc(rest, evs));
+                        debug_assert!(n != 0 || entered_apc);
+                        rest = &rest[n..];
+                        consumed = consumed.saturating_add(n);
+                        if entered_apc {
+                            scanner.begin();
+                        }
+                    } else {
+                        let mut passthrough = Vec::new();
+                        let (n, maybe_load) = scanner.read(rest, |b| passthrough.extend_from_slice(b));
+                        debug_assert!(n != 0 || !scanner.reading());
+                        rest = &rest[n..];
+                        consumed = consumed.saturating_add(n);
+                        if !passthrough.is_empty() {
+                            sess.machine.on_vt_feed_with(now, &mut effects, |vt, evs| vt.feed(&passthrough, evs));
+                        }
+                        if let Some(load) = maybe_load
+                            && let Some(refusal) = probe_named_image_load(&mut sess.machine, &load, &mut effects)
+                        {
+                            dispatch = Some((load, refusal, rest.to_vec()));
+                            break;
+                        }
+                    }
                 }
-                if at_ground && sess.pending_wal_rollover {
-                    let kf = capture_keyframe(&sess.machine, &self.shared.engine_abi_hash);
-                    if wal.start_segment(now_ms, kf) {
-                        sess.pending_wal_rollover = false;
+                sess.image_scanner = Some(scanner);
+            } else {
+                sess.machine.on_pty_output(bytes, now, &mut effects);
+            }
+
+            let committed = &bytes[..consumed];
+            if !committed.is_empty() {
+                let at_ground = sess.machine.vt().at_ground();
+                if let Some(wal) = &sess.wal {
+                    let _ = wal.write_output(now_ms, committed.to_vec(), at_ground);
+                    if wal.take_rollover_needed() {
+                        sess.pending_wal_rollover = true;
+                    }
+                    if at_ground && sess.pending_wal_rollover {
+                        let kf = capture_keyframe(&sess.machine, &self.shared.engine_abi_hash);
+                        if wal.start_segment(now_ms, kf) {
+                            sess.pending_wal_rollover = false;
+                        }
                     }
                 }
             }
         }
-        if has_raw_subs {
-            self.emit(ReactorEvent::PublishRawOutput { session: session_id, bytes: bytes.to_vec() });
+
+        let committed = &bytes[..consumed];
+        self.total_pty_bytes = self.total_pty_bytes.saturating_add(committed.len() as u64);
+        if has_raw_subs && !committed.is_empty() {
+            self.emit(ReactorEvent::PublishRawOutput { session: session_id, bytes: committed.to_vec() });
+        }
+        if let Some((load, refusal, tail)) = dispatch {
+            self.dispatch_image_load(session_id, load, refusal, &tail);
         }
         self.apply_effects(session_id, effects);
     }
 
-    fn drain_pty_writes_for(&mut self, session_id: SessionId) {
+    fn dispatch_image_load(&mut self, session_id: SessionId, load: Load, refusal: ImageRefusal, tail: &[u8]) {
+        let (worker, ticket) = {
+            let Some(sess) = self.sessions.get_mut(&session_id) else {
+                return;
+            };
+            let Some(worker) = sess.image_worker.as_ref().map(Arc::clone) else {
+                return;
+            };
+            sess.image_ticket = sess.image_ticket.wrapping_add(1);
+            let ticket = sess.image_ticket;
+            sess.pending_image = Some(PendingImageLoad { ticket, refusal });
+            sess.pending_image_tail.extend_from_slice(tail);
+            (worker, ticket)
+        };
+
+        let mailbox = Arc::clone(&self.mailbox);
+        let wake = self.self_wake.clone();
+        let spawned = thread::Builder::new().name(format!("apack-img-{}", session_id.get())).spawn(move || {
+            let loaded = worker.run(IMAGE_SOURCE_QUIET, move |progress| load.read_with(progress));
+            {
+                let mut state = mailbox.lock().unwrap_or_else(|e| e.into_inner());
+                state.queue.push_back(ShardCmd::ImageSourceLoaded { session_id, ticket, loaded });
+                state.woken = true;
+            }
+            wake.wake();
+        });
+        if spawned.is_err() {
+            // Queue the failure via the mailbox instead of recursing synchronously so thread
+            // exhaustion cannot overflow the shard stack on consecutive named-source commands.
+            {
+                let mut state = self.mailbox.lock().unwrap_or_else(|e| e.into_inner());
+                state.queue.push_back(ShardCmd::ImageSourceLoaded { session_id, ticket, loaded: None });
+                state.woken = true;
+            }
+            self.self_wake.wake();
+        }
+        self.sync_pty_interest(session_id);
+    }
+
+    fn handle_image_source_loaded(&mut self, session_id: SessionId, ticket: u64, loaded: Option<Loaded>) {
+        let now_ms = now_unix_ms();
+        let now = TimestampMs::from_millis(now_ms);
+        let mut effects = Vec::new();
+        let tail = {
+            let Some(sess) = self.sessions.get_mut(&session_id) else {
+                return;
+            };
+            if sess.pending_image.as_ref().is_none_or(|p| p.ticket != ticket) {
+                return;
+            }
+            let pending = sess.pending_image.take().expect("checked pending_image");
+            let body_res = match loaded {
+                Some(loaded) => loaded.body(),
+                None => Err(ImageRefused::InvalidData),
+            };
+            match body_res {
+                Ok(body) => {
+                    let query_bytes = body.query_bytes();
+                    if query_bytes.is_some() {
+                        sess.machine.vt_mut().set_kitty_command_bytes(query_bytes);
+                    }
+                    for piece in body {
+                        sess.machine.on_vt_feed_with(now, &mut effects, |vt, evs| vt.feed(&piece, evs));
+                    }
+                    if query_bytes.is_some() {
+                        sess.machine.vt_mut().set_kitty_command_bytes(None);
+                    }
+                }
+                Err(why) => match pending.refusal {
+                    ImageRefusal::Said { reply, quiet } => {
+                        if quiet != ImageQuiet::Failures {
+                            let msg = why.reworded(&reply);
+                            sess.machine.enqueue_pty_reply(msg.as_bytes(), &mut effects);
+                        }
+                    }
+                    ImageRefusal::ByCore(refusal_probe) => {
+                        let mut probe_events = Vec::new();
+                        sess.machine.vt_mut().feed_named_probe(&refusal_probe, &mut probe_events);
+                        for ev in probe_events {
+                            if let VtEvent::DeviceResponse(resp) = ev {
+                                sess.machine.enqueue_pty_reply(&resp, &mut effects);
+                            }
+                        }
+                    }
+                },
+            }
+            std::mem::take(&mut sess.pending_image_tail)
+        };
+
+        self.apply_effects_inner(session_id, effects, false);
+        if !tail.is_empty() {
+            self.ingest_pty_bytes(session_id, &tail);
+        }
+        self.sync_pty_interest(session_id);
+        self.try_reap_session(session_id);
+    }
+
+    fn drain_pty_writes_for(&mut self, session_id: SessionId, sync_and_reap: bool) {
         let Some(sess) = self.sessions.get_mut(&session_id) else {
             return;
         };
@@ -1565,13 +1764,18 @@ impl ShardRunner {
                     }
                 }
             }
-            self.sync_pty_interest(session_id);
-            if hit_write_err {
-                self.try_reap_session(session_id);
+            if sync_and_reap {
+                self.sync_pty_interest(session_id);
+                if hit_write_err {
+                    self.try_reap_session(session_id);
+                }
             }
         }
         #[cfg(windows)]
-        drain_windows_pty_writes(sess);
+        {
+            let _ = sync_and_reap;
+            drain_windows_pty_writes(sess);
+        }
     }
 
     fn sync_pty_interest(&mut self, session_id: SessionId) {
@@ -1607,6 +1811,19 @@ impl ShardRunner {
             return;
         }
         sess.terminating_since = Some(Instant::now());
+        // If `libghostty-vt` is currently sitting inside an open APC (either awaiting an off-shard
+        // image load or mid-scan), abort it with CAN (0x18) so subsequent teardown output is not
+        // swallowed inside the unclosed APC string.
+        if sess.pending_image.is_some() || sess.image_scanner.as_ref().is_some_and(ImageScanner::reading) {
+            let mut evs = Vec::new();
+            sess.machine.vt_mut().feed(&[0x18], &mut evs);
+        }
+        // Cancel any in-flight named-source read immediately so Kill / teardown never stalls on a
+        // stuck mount, and stop scanning new named sources while draining teardown bytes.
+        sess.image_scanner = None;
+        sess.image_ticket = sess.image_ticket.wrapping_add(1);
+        sess.pending_image = None;
+        sess.pending_image_tail.clear();
         // Unpause PTY reads during teardown so macOS/BSD kernel `ttydrain()` cannot wedge an
         // exiting child in `?Es` state waiting for unread master PTY bytes!
         sess.paused_by_stream = false;
@@ -1642,32 +1859,68 @@ impl ShardRunner {
     }
 
     pub(crate) fn try_reap_session(&mut self, session_id: SessionId) {
-        let status_opt = {
+        let exit_opt = {
             let Some(sess) = self.sessions.get_mut(&session_id) else {
                 return;
             };
-            let Some(child) = sess.child.as_mut() else {
+            // Defer natural exit while an off-shard Kitty named-source load is still in flight;
+            // explicit termination clears `pending_image` before calling `try_reap_session`.
+            if sess.pending_image.is_some() {
                 return;
-            };
-            match child.try_wait() {
-                Ok(Some(status)) => Some(status),
-                _ => None,
+            }
+            if let Some(exit) = sess.reaped_exit.take() {
+                Some(exit)
+            } else {
+                let Some(child) = sess.child.as_mut() else {
+                    return;
+                };
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let parsed = parse_exit_status(&status);
+                        // Clear reaped child handles immediately; on natural exit also clear `pid`
+                        // right away so a PID recycled by the OS during a deferred `pending_image`
+                        // load can never be signalled by a late `Kill`/`Signal`/shutdown.
+                        sess.child = None;
+                        sess.killer = None;
+                        if sess.terminating_since.is_none() {
+                            sess.pid = None;
+                            #[cfg(unix)]
+                            {
+                                sess.tree = None;
+                            }
+                        }
+                        Some(parsed)
+                    }
+                    _ => None,
+                }
             }
         };
 
-        let Some(status) = status_opt else {
+        let Some((code, signal)) = exit_opt else {
             return;
         };
 
-        let (code, signal) = parse_exit_status(&status);
+        // Drain tail PTY bytes BEFORE finalizing exit so both ordinary tail output and short-lived
+        // commands that print a `t=f` / `t=s` APC and exit immediately are ingested before `Exited`.
+        // Explicit termination clears `image_scanner` upfront so it never starts a new image load.
+        self.drain_tail_pty_bytes(session_id);
+        if let Some(sess) = self.sessions.get_mut(&session_id)
+            && sess.pending_image.is_some()
+        {
+            sess.reaped_exit = Some((code, signal));
+            return;
+        }
+
         self.finish_and_remove_session(session_id, code, signal);
     }
 
-    fn finish_and_remove_session(&mut self, session_id: SessionId, code: Option<i32>, signal: Option<String>) {
-        // Drain any tail output still buffered in the PTY before emitting `Exited`!
+    fn drain_tail_pty_bytes(&mut self, session_id: SessionId) {
         #[cfg(unix)]
         {
-            let mut buf = std::mem::take(&mut self.read_buf);
+            // Use a fresh buffer instead of taking `self.read_buf` so re-entrant calls from
+            // `read_unix_pty_quantum -> apply_effects -> drain_pty_writes_for -> try_reap_session`
+            // never see a 0-length `self.read_buf`.
+            let mut buf = vec![0u8; PTY_READ_BUF_BYTES];
             let mut chunks = Vec::new();
             if let Some(LivePty::Unix { master, eof: false, .. }) =
                 self.sessions.get(&session_id).and_then(|s| s.pty.as_ref())
@@ -1676,7 +1929,6 @@ impl ShardRunner {
                     chunks.push(chunk.to_vec());
                 });
             }
-            self.read_buf = buf;
             for chunk in chunks {
                 self.ingest_pty_bytes(session_id, &chunk);
             }
@@ -1695,7 +1947,9 @@ impl ShardRunner {
                 self.ingest_pty_bytes(session_id, &chunk);
             }
         }
+    }
 
+    fn finish_and_remove_session(&mut self, session_id: SessionId, code: Option<i32>, signal: Option<String>) {
         let mut effects = Vec::new();
         if let Some(mut sess) = self.sessions.remove(&session_id) {
             #[cfg(unix)]
@@ -1777,7 +2031,7 @@ impl ShardRunner {
         for id in ids {
             // 1. Child reap & 2-second SIGKILL escalation BEFORE firing timers so tail PTY bytes
             //    from an exited child satisfy pending `Wait` conditions before any deadline expires.
-            let is_live = self.sessions.get(&id).is_some_and(|s| s.child.is_some());
+            let is_live = self.sessions.get(&id).is_some_and(|s| s.child.is_some() || s.reaped_exit.is_some());
             if is_live {
                 if let Some(sess) = self.sessions.get_mut(&id)
                     && let Some(since) = sess.terminating_since
@@ -1848,6 +2102,52 @@ impl ShardRunner {
     }
 }
 
+/// Determines whether a non-`EINVAL: invalid data` reply from a `Load::asked()` probe should be
+/// forwarded to the PTY according to the original command's `q=` quietness level.
+pub(crate) fn should_forward_probe_reply(reply: &str, quiet: ImageQuiet) -> bool {
+    match quiet {
+        ImageQuiet::No => true,
+        ImageQuiet::Ok => !reply.ends_with(";OK\x1b\\"),
+        ImageQuiet::Failures => false,
+    }
+}
+
+/// Probes a named Kitty graphics command against `libghostty-vt` with NUL payload (`AA==`) and
+/// returns `Some(ImageRefusal)` when the command should be dispatched to the off-shard `Worker`.
+fn probe_named_image_load(
+    machine: &mut SessionMachine<GhosttyEngine>,
+    load: &Load,
+    effects: &mut Vec<SessionEffect>,
+) -> Option<ImageRefusal> {
+    if load.askable() {
+        let mut probe_events = Vec::new();
+        machine.vt_mut().feed_named_probe(&load.asked(), &mut probe_events);
+        let reply = probe_events.into_iter().find_map(|ev| match ev {
+            VtEvent::DeviceResponse(bytes) => String::from_utf8(bytes).ok(),
+            _ => None,
+        })?;
+        if says_unreadable(&reply) {
+            Some(ImageRefusal::Said { reply, quiet: load.quiet() })
+        } else {
+            if should_forward_probe_reply(&reply, load.quiet()) {
+                machine.enqueue_pty_reply(reply.as_bytes(), effects);
+            }
+            None
+        }
+    } else if load.read_unasked() {
+        Some(ImageRefusal::ByCore(load.refusal()))
+    } else {
+        let mut probe_events = Vec::new();
+        machine.vt_mut().feed_named_probe(&load.refusal(), &mut probe_events);
+        for ev in probe_events {
+            if let VtEvent::DeviceResponse(resp) = ev {
+                machine.enqueue_pty_reply(&resp, effects);
+            }
+        }
+        None
+    }
+}
+
 /// Drains up to `budget` bytes of immediately available non-blocking Unix PTY output.
 #[cfg(unix)]
 pub(crate) fn drain_unix_pty_nonblocking(
@@ -1856,6 +2156,9 @@ pub(crate) fn drain_unix_pty_nonblocking(
     mut budget: usize,
     mut on_bytes: impl FnMut(&[u8]),
 ) {
+    if buf.is_empty() {
+        return;
+    }
     while budget != 0 {
         let cap = budget.min(buf.len());
         match master.read_nonblocking(&mut buf[..cap]) {
@@ -2124,6 +2427,12 @@ mod win_shard_tests {
                 escalated_sigkill: false,
                 view_slot_free: HashSet::new(),
                 raw_output_subs: HashSet::new(),
+                image_scanner: None,
+                image_worker: None,
+                image_ticket: 0,
+                pending_image: None,
+                pending_image_tail: Vec::new(),
+                reaped_exit: None,
             }
         };
 
@@ -2198,5 +2507,372 @@ mod win_shard_tests {
 
         // Clean up remaining test session.
         runner.force_drop_session(paused_id);
+    }
+}
+
+#[cfg(test)]
+mod image_source_shard_tests {
+    use super::*;
+    use apack_os::image_sources::encoded;
+    use apack_proto::types::{CellPos, CellPx, CellSpan, GridSize};
+
+    fn make_test_runner() -> (ShardRunner, mpsc::Receiver<ReactorEvent>) {
+        let mb = Arc::new(Mutex::new(ShardMailboxState::default()));
+        #[cfg(unix)]
+        let (poller, self_wake) = {
+            let p = PtyPoller::new().expect("poller");
+            let w = ShardWake::Poller(p.waker());
+            (p, w)
+        };
+        #[cfg(windows)]
+        let (cond, self_wake) = {
+            let cv = Arc::new(Condvar::new());
+            let w = ShardWake::Cond(Arc::clone(&mb), Arc::clone(&cv));
+            (cv, w)
+        };
+        let (rtx, rrx) = mpsc::channel();
+        let runner = ShardRunner {
+            shard_idx: 0,
+            shared: ShardShared {
+                image_store: Arc::new(Mutex::new(ImageStore::default())),
+                wal_registry: RecordingRegistry::new(),
+                wal_config: WalConfig::default(),
+                idle_compress_after: Duration::from_secs(60),
+                kill_escalate_after: Duration::from_secs(1),
+                engine_abi_hash: [0u8; 32],
+            },
+            reactor_tx: rtx,
+            wake_reactor: Arc::new(|| {}),
+            mailbox: mb,
+            load: Arc::new(AtomicUsize::new(0)),
+            telemetry: Arc::new(ShardTelemetryAtomics::default()),
+            self_wake,
+            fg_tx: None,
+            fg_worker: None,
+            fg_inflight: HashSet::new(),
+            sessions: HashMap::new(),
+            #[cfg(unix)]
+            poller,
+            #[cfg(unix)]
+            token_to_session: HashMap::new(),
+            #[cfg(windows)]
+            cond,
+            #[cfg(unix)]
+            read_buf: vec![0u8; PTY_READ_BUF_BYTES],
+            #[cfg(unix)]
+            write_scratch: Vec::new(),
+            total_pty_bytes: 0,
+            running: true,
+            tearing_down_all: false,
+        };
+        (runner, rrx)
+    }
+
+    fn insert_image_session(runner: &mut ShardRunner, sid: SessionId, image_files: bool) {
+        let size = GridSize::new(80, 24).unwrap();
+        let cell_px = CellPx { width: 8, height: 16 };
+        let mut vt_cfg = GhosttyConfig::new(size);
+        vt_cfg.cell_px = cell_px;
+        vt_cfg.scrollback_lines = 100;
+        vt_cfg.image_store = Some(Arc::clone(&runner.shared.image_store));
+        let engine = GhosttyEngine::new(vt_cfg).expect("ghostty");
+        let machine = SessionMachine::new(sid, engine, ResizePolicy::LatestActive, MarksMode::Claimed, cell_px);
+        let (image_scanner, image_worker) = if image_files {
+            (Some(ImageScanner::default()), Some(Arc::new(ImageWorker::default())))
+        } else {
+            (None, None)
+        };
+        runner.sessions.insert(
+            sid,
+            LiveSession {
+                machine,
+                pty: None,
+                child: None,
+                killer: None,
+                tree: None,
+                pid: None,
+                kept: false,
+                rewound: false,
+                created_ms: 0,
+                wal: None,
+                pending_wal_rollover: false,
+                rewind_reader: None,
+                rewind_at_ms: 0,
+                last_activity: Instant::now(),
+                compressed_idle: false,
+                paused_by_stream: false,
+                paused_by_raw_flow: false,
+                terminating_since: None,
+                escalated_sigkill: false,
+                view_slot_free: HashSet::new(),
+                raw_output_subs: HashSet::new(),
+                image_scanner,
+                image_worker,
+                image_ticket: 0,
+                pending_image: None,
+                pending_image_tail: Vec::new(),
+                reaped_exit: None,
+            },
+        );
+    }
+
+    fn wait_and_drain_image(runner: &mut ShardRunner, sid: SessionId) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            runner.drain_mailbox();
+            if runner.sessions.get(&sid).is_none_or(|s| s.pending_image.is_none()) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("timed out waiting for off-shard image load");
+    }
+
+    fn drain_pty_reply_text(runner: &mut ShardRunner, sid: SessionId) -> String {
+        let sess = runner.sessions.get_mut(&sid).expect("session");
+        let mut out = Vec::new();
+        while sess.machine.pty_write_len() != 0 {
+            let mut chunk = Vec::new();
+            sess.machine.peek_pty_write(4096, &mut chunk);
+            let n = chunk.len();
+            out.extend_from_slice(&chunk);
+            sess.machine.consume_pty_write(n);
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    #[test]
+    fn shard_image_sources_cover_file_query_refusals_ordering_and_cancel() {
+        // 1. `should_forward_probe_reply` truth table.
+        assert!(should_forward_probe_reply("\x1b_Gi=1;OK\x1b\\", ImageQuiet::No));
+        assert!(should_forward_probe_reply("\x1b_Gi=1;EINVAL: bad\x1b\\", ImageQuiet::No));
+        assert!(!should_forward_probe_reply("\x1b_Gi=1;OK\x1b\\", ImageQuiet::Ok));
+        assert!(should_forward_probe_reply("\x1b_Gi=1;EINVAL: bad\x1b\\", ImageQuiet::Ok));
+        assert!(!should_forward_probe_reply("\x1b_Gi=1;OK\x1b\\", ImageQuiet::Failures));
+        assert!(!should_forward_probe_reply("\x1b_Gi=1;EINVAL: bad\x1b\\", ImageQuiet::Failures));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let img_path = dir.path().join("px.rgba");
+        let pixels: Vec<u8> =
+            vec![0xaa, 0x11, 0x22, 0xff, 0x33, 0x44, 0x55, 0xff, 0x66, 0x77, 0x88, 0xff, 0x99, 0xbb, 0xcc, 0xff];
+        std::fs::write(&img_path, &pixels).expect("write rgba");
+        let b64_ok = String::from_utf8(encoded(img_path.to_string_lossy().as_bytes())).unwrap();
+        let b64_missing =
+            String::from_utf8(encoded(dir.path().join("missing.rgba").to_string_lossy().as_bytes())).unwrap();
+
+        let (mut runner, rrx) = make_test_runner();
+        let sid = SessionId::new(1).unwrap();
+        insert_image_session(&mut runner, sid, true);
+
+        // 2. Askable `t=f` load + inline trailing bytes + queued follow-up chunk while `pending_image` is active.
+        let apc1 = format!("\x1b_Ga=T,f=32,s=2,v=2,i=7,t=f;{b64_ok}\x1b\\TAIL_ONE ");
+        runner.ingest_pty_bytes(sid, apc1.as_bytes());
+        assert!(runner.sessions[&sid].is_pty_paused(), "pending_image must pause PTY reads");
+        runner.ingest_pty_bytes(sid, b"TAIL_TWO");
+        wait_and_drain_image(&mut runner, sid);
+        assert!(!runner.sessions[&sid].is_pty_paused());
+        assert_eq!(runner.total_pty_bytes as usize, apc1.len() + b"TAIL_TWO".len());
+        while let Ok(ev) = rrx.try_recv() {
+            assert!(
+                !matches!(ev, ReactorEvent::PublishRawOutput { .. }),
+                "must not publish raw output when raw_output_subs is empty"
+            );
+        }
+
+        let images = runner.sessions[&sid].machine.vt().images();
+        assert_eq!(images.len(), 1, "expected 1 placed image, got {images:?}");
+        assert_eq!(images[0].pixel_size, [2, 2]);
+        let blob_chunk = runner.shared.image_store.lock().unwrap().get_chunk(images[0].blob, 0, 1024).expect("blob");
+        assert_eq!(blob_chunk.encoding, apack_proto::types::ImageEncoding::Png);
+        assert!(blob_chunk.data.starts_with(b"\x89PNG\r\n\x1a\n"), "expected PNG blob");
+        assert!(blob_chunk.data.windows(8).any(|w| w == &pixels[..8]));
+        assert!(blob_chunk.data.windows(8).any(|w| w == &pixels[8..]));
+
+        let full_span = CellSpan { start: CellPos { line: 0, col: 0 }, end: CellPos { line: 23, col: 79 } };
+        let screen_text = runner.sessions[&sid].machine.vt().text_of(full_span, 4096);
+        assert!(screen_text.contains("TAIL_ONE TAIL_TWO"), "inline ordering broken: {screen_text:?}");
+        let reply1 = drain_pty_reply_text(&mut runner, sid);
+        assert!(reply1.contains("i=7;OK"), "expected OK reply for i=7, got {reply1:?}");
+
+        // 3. `a=q` query (`query_bytes().is_some()`) succeeds with OK reply and adds no placement.
+        let apc_q = format!("\x1b_Ga=q,f=32,s=2,v=2,i=8,t=f;{b64_ok}\x1b\\");
+        runner.ingest_pty_bytes(sid, apc_q.as_bytes());
+        wait_and_drain_image(&mut runner, sid);
+        let reply_q = drain_pty_reply_text(&mut runner, sid);
+        assert!(reply_q.contains("i=8;OK"), "expected query OK reply, got {reply_q:?}");
+        assert_eq!(runner.sessions[&sid].machine.vt().images().len(), 1);
+
+        // 4. Unaskable `read_unasked()` (`!askable()`, `a=T`) succeeds AND failing unaskable hits `ByCore`.
+        let apc_unasked_ok = format!("\x1b_Ga=T,f=32,s=2,v=2,t=f;{b64_ok}\x1b\\");
+        runner.ingest_pty_bytes(sid, apc_unasked_ok.as_bytes());
+        wait_and_drain_image(&mut runner, sid);
+        assert_eq!(runner.sessions[&sid].machine.vt().images().len(), 2);
+        let apc_unasked_fail = format!("\x1b_Ga=T,f=32,s=2,v=2,t=f;{b64_missing}\x1b\\");
+        runner.ingest_pty_bytes(sid, apc_unasked_fail.as_bytes());
+        wait_and_drain_image(&mut runner, sid);
+        assert_eq!(runner.sessions[&sid].machine.vt().images().len(), 2);
+
+        // 5. Refused askable loads: `q=0` emits `EINVAL: invalid data`, `q=2` suppresses reply.
+        let apc_fail_loud = format!("\x1b_Ga=T,f=32,s=2,v=2,i=9,q=0,t=f;{b64_missing}\x1b\\");
+        runner.ingest_pty_bytes(sid, apc_fail_loud.as_bytes());
+        wait_and_drain_image(&mut runner, sid);
+        let reply_fail_loud = drain_pty_reply_text(&mut runner, sid);
+        assert!(reply_fail_loud.contains("i=9;EINVAL: invalid data"), "got {reply_fail_loud:?}");
+
+        let apc_fail_quiet = format!("\x1b_Ga=T,f=32,s=2,v=2,i=10,q=2,t=f;{b64_missing}\x1b\\");
+        runner.ingest_pty_bytes(sid, apc_fail_quiet.as_bytes());
+        wait_and_drain_image(&mut runner, sid);
+        assert!(drain_pty_reply_text(&mut runner, sid).is_empty(), "q=2 must suppress refusal reply");
+
+        // 6. Invalid-key askable probe (`f=99`) is answered directly without off-shard read, and
+        //    `!askable && !read_unasked` (`a=q` without `i`/`I`) feeds refusal cleanly without stalling.
+        let apc_bad_fmt = format!("\x1b_Ga=T,f=99,s=2,v=2,i=11,q=0,t=f;{b64_ok}\x1b\\");
+        runner.ingest_pty_bytes(sid, apc_bad_fmt.as_bytes());
+        assert!(runner.sessions[&sid].pending_image.is_none());
+        let reply_bad_fmt = drain_pty_reply_text(&mut runner, sid);
+        assert!(reply_bad_fmt.contains("i=11;"), "expected core error reply, got {reply_bad_fmt:?}");
+
+        let apc_unask_q = format!("\x1b_Ga=q,f=32,s=2,v=2,t=f;{b64_ok}\x1b\\");
+        runner.ingest_pty_bytes(sid, apc_unask_q.as_bytes());
+        assert!(runner.sessions[&sid].pending_image.is_none());
+
+        // 7. Non-named inline `t=d` passthrough still works when `image_files == true`.
+        let inline_b64 = String::from_utf8(encoded(&pixels)).unwrap();
+        let apc_inline = format!("\x1b_Ga=T,f=32,s=2,v=2,i=12,t=d;{inline_b64}\x1b\\");
+        runner.ingest_pty_bytes(sid, apc_inline.as_bytes());
+        assert!(runner.sessions[&sid].pending_image.is_none());
+        assert_eq!(runner.sessions[&sid].machine.vt().images().len(), 3);
+        let _ = drain_pty_reply_text(&mut runner, sid);
+
+        // 8. Platform security refusals: Windows NTFS junction / UNC / pipe; Unix `/dev/null` symlink.
+        #[cfg(windows)]
+        {
+            let target_dir = dir.path().join("real-target");
+            std::fs::create_dir(&target_dir).expect("mkdir target");
+            std::fs::write(target_dir.join("secret.rgba"), &pixels).expect("write target");
+            let junction_dir = dir.path().join("junc");
+            let st = std::process::Command::new("cmd.exe")
+                .args(["/C", "mklink", "/J"])
+                .arg(&junction_dir)
+                .arg(&target_dir)
+                .status()
+                .expect("mklink");
+            assert!(st.success(), "mklink /J failed");
+            for (idx, bad) in [
+                junction_dir.join("secret.rgba").to_string_lossy().into_owned(),
+                String::from(r"\\127.0.0.1\share\x.rgba"),
+                String::from(r"\\.\pipe\apack-refused-pipe"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let b64 = String::from_utf8(encoded(bad.as_bytes())).unwrap();
+                let id = 40 + idx;
+                runner.ingest_pty_bytes(sid, format!("\x1b_Ga=T,f=32,s=2,v=2,i={id},t=f;{b64}\x1b\\").as_bytes());
+                wait_and_drain_image(&mut runner, sid);
+                let reply = drain_pty_reply_text(&mut runner, sid);
+                assert!(reply.contains("EINVAL: invalid data"), "expected refusal for {bad:?}, got {reply:?}");
+            }
+            assert_eq!(runner.sessions[&sid].machine.vt().images().len(), 3);
+        }
+
+        // 9. Stale ticket rejection + `None` (timeout/circuit-breaker) refusal + `initiate_session_termination` cancel.
+        {
+            let sess = runner.sessions.get_mut(&sid).unwrap();
+            sess.image_ticket = 500;
+            sess.pending_image = Some(PendingImageLoad {
+                ticket: 500,
+                refusal: ImageRefusal::Said {
+                    reply: String::from("\x1b_Gi=77;EINVAL: invalid data\x1b\\"),
+                    quiet: ImageQuiet::No,
+                },
+            });
+            sess.pending_image_tail = b"\x1b\\AFTER_TIMEOUT".to_vec();
+        }
+        // Stale ticket 499 must be ignored completely.
+        runner.handle_image_source_loaded(sid, 499, None);
+        assert!(runner.sessions[&sid].pending_image.is_some());
+        // Matching ticket 500 with `None` emits refusal reply and drains tail cleanly.
+        runner.handle_image_source_loaded(sid, 500, None);
+        assert!(runner.sessions[&sid].pending_image.is_none());
+        let timeout_reply = drain_pty_reply_text(&mut runner, sid);
+        assert!(timeout_reply.contains("i=77;EINVAL: invalid data"), "got {timeout_reply:?}");
+        assert!(runner.sessions[&sid].machine.vt().text_of(full_span, 4096).contains("AFTER_TIMEOUT"));
+
+        // Explicit termination clears pending_image, image_scanner, and tail immediately AND aborts
+        // any open APC in `libghostty-vt` via CAN (0x18) so subsequent teardown text still renders!
+        runner.ingest_pty_bytes(sid, b"\x1b_Ga=T,f=32,s=2,v=2,t=f;L2E=");
+        assert!(runner.sessions[&sid].image_scanner.as_ref().is_some_and(ImageScanner::reading));
+        runner.initiate_session_termination(sid);
+        {
+            let sess = &runner.sessions[&sid];
+            assert!(sess.pending_image.is_none());
+            assert!(sess.image_scanner.is_none());
+            assert!(sess.pending_image_tail.is_empty());
+        }
+        runner.ingest_pty_bytes(sid, b"TEARDOWN_AFTER_SCAN");
+        assert!(runner.sessions[&sid].machine.vt().text_of(full_span, 4096).contains("TEARDOWN_AFTER_SCAN"));
+
+        // Also verify CAN abort when `pending_image.is_some()` (with scanner NOT mid-read).
+        let sid2 = SessionId::new(2).unwrap();
+        insert_image_session(&mut runner, sid2, true);
+        {
+            let sess = runner.sessions.get_mut(&sid2).unwrap();
+            let mut evs = Vec::new();
+            sess.machine.vt_mut().feed(b"\x1b_", &mut evs);
+            sess.image_ticket = 600;
+            sess.pending_image = Some(PendingImageLoad {
+                ticket: 600,
+                refusal: ImageRefusal::Said {
+                    reply: String::from("\x1b_Gi=88;EINVAL: invalid data\x1b\\"),
+                    quiet: ImageQuiet::No,
+                },
+            });
+            sess.pending_image_tail = b"DROPPED".to_vec();
+        }
+        runner.initiate_session_termination(sid2);
+        {
+            let sess = &runner.sessions[&sid2];
+            assert!(sess.pending_image.is_none());
+            assert!(sess.image_scanner.is_none());
+            assert!(sess.pending_image_tail.is_empty());
+            assert_ne!(sess.image_ticket, 600);
+        }
+        runner.ingest_pty_bytes(sid2, b"TEARDOWN_AFTER_PENDING");
+        assert!(runner.sessions[&sid2].machine.vt().text_of(full_span, 4096).contains("TEARDOWN_AFTER_PENDING"));
+
+        // Direct check of `drain_tail_pty_bytes` on a real Unix PTY master (no poller reads first).
+        #[cfg(unix)]
+        {
+            let sid3 = SessionId::new(3).unwrap();
+            insert_image_session(&mut runner, sid3, false);
+            let pty_cfg = PtySpawnConfig {
+                size: GridSize::new(80, 24).unwrap(),
+                cell_px: CellPx { width: 8, height: 16 },
+                shell: Some(String::from("/bin/sh")),
+                args: vec![String::from("-c"), String::from("printf 'DRAIN_TAIL_UNIT_OK'")],
+                env: Vec::new(),
+                unset: Vec::new(),
+                cwd: None,
+            };
+            let mut spawned = spawn_pty(&pty_cfg).expect("spawn pty");
+            runner.sessions.get_mut(&sid3).unwrap().pty = Some(LivePty::Unix {
+                master: spawned.master,
+                token: PollToken(sid3.get()),
+                eof: false,
+                write_broken: false,
+            });
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                runner.drain_tail_pty_bytes(sid3);
+                if runner.sessions[&sid3].machine.vt().text_of(full_span, 4096).contains("DRAIN_TAIL_UNIT_OK") {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(runner.sessions[&sid3].machine.vt().text_of(full_span, 4096).contains("DRAIN_TAIL_UNIT_OK"));
+            runner.sessions.get_mut(&sid3).unwrap().pty = None;
+            let _ = spawned.child.wait();
+        }
     }
 }
