@@ -9,7 +9,7 @@ use apack_broker::inspect::{collect_report, format_report};
 use apack_broker::proxy::run_stdio_proxy;
 use apack_broker::runtime::BrokerServer;
 use apack_os::OsError;
-use apack_os::transport::{HELD_EXIT, START_GRACE_ENV, take_secret_env_at_startup};
+use apack_os::transport::{HELD_EXIT, START_GRACE_ENV, prepare_detached_daemon, take_secret_env_at_startup};
 use apack_proto::PROTOCOL_VERSION;
 
 fn main() -> ExitCode {
@@ -58,6 +58,9 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            // Still strictly single-threaded: now that bind succeeded, ignore SIGHUP and redirect
+            // piped startup stderr to /dev/null (NUL on Windows) when running detached.
+            prepare_detached_daemon();
             if let Err(err) = server.run() {
                 eprintln!("apack-terminal: {err}");
                 return ExitCode::FAILURE;
