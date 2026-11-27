@@ -188,7 +188,9 @@ pub(super) fn tokenize(source: &str) -> Vec<Tok> {
                         i += 1;
                     }
                 }
-                if bytes.get(i.saturating_sub(1)).is_some_and(|&c| c == b'e' || c == b'E')
+                if i > num_start + 1
+                    && bytes[i - 1].eq_ignore_ascii_case(&b'e')
+                    && bytes[num_start..i - 1].iter().all(|c| c.is_ascii_digit() || *c == b'_' || *c == b'.')
                     && bytes.get(i).is_some_and(|&c| c == b'+' || c == b'-')
                     && bytes.get(i + 1).is_some_and(u8::is_ascii_digit)
                 {

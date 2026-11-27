@@ -47,6 +47,12 @@ pub fn run(state: &mut State, pty: &Pty) -> Option<usize> {
     let _cb3 = |Foo { x }: Foo| handle(x);
 
     #[cfg(windows)]
+    let _cb4 = |buf: [u8; 4]| handle(buf);
+
+    #[cfg(windows)]
+    let _arr = Option::<[u8; 4]>::None;
+
+    #[cfg(windows)]
     let _timeout = 1e-5;
 
     #[cfg(windows)]
@@ -191,9 +197,20 @@ fn rejects_mutable_logic_inside_windows_blocks_bitwise_ops_and_match_guards() {
             "fn f(x: i32, limit: usize) {\n    #[cfg(windows)]\n    { let _ = x as usize < limit; }\n}\n",
             "comparison operator `<`",
         ),
-        ("fn f(n: usize) -> bool {\n    #[cfg(windows)]\n    { MAX_LEN < n && n > 0 }\n}\n", "boolean logic operator"),
+        ("fn f(n: usize) -> bool {\n    #[cfg(windows)]\n    { MAX_LEN < n }\n}\n", "comparison operator `<`"),
+        ("fn f(n: usize) -> bool {\n    #[cfg(windows)]\n    { MAX_LEN > n }\n}\n", "comparison operator `>`"),
+        (
+            "fn f(x: i32, a: usize) -> bool {\n    #[cfg(windows)]\n    { x as usize < a >> 1 }\n}\n",
+            "comparison operator `<`",
+        ),
+        (
+            "fn f(x: i32, a: usize, b: usize) -> (bool, bool) {\n    #[cfg(windows)]\n    { (x as usize < a, b > 0) }\n}\n",
+            "comparison operator `<`",
+        ),
         ("fn f() {\n    #[cfg(windows)]\n    foo(|Foo { x }| bar(x + 1), |y| y);\n}\n", "arithmetic/bitwise operator"),
         ("fn f() -> u32 {\n    #[cfg(windows)]\n    { 0xfe-1 }\n}\n", "subtraction operator"),
+        ("fn f() -> usize {\n    #[cfg(windows)]\n    { 1usize-1 }\n}\n", "subtraction operator"),
+        ("fn f() -> isize {\n    #[cfg(windows)]\n    { 1isize+1 }\n}\n", "arithmetic/bitwise operator"),
         (
             "fn f(x: Option<u32>) {\n    match x {\n        #[cfg(windows)]\n        Some(n) if n > 0 => drop(n),\n        _ => {}\n    }\n}\n",
             "conditional `if` branch",

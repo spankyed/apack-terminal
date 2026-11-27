@@ -502,7 +502,7 @@ fn find_mutable_logic_reason(tokens: &[Tok]) -> Option<&'static str> {
                 "<" | ">" => {
                     let lhs_is_value = i > 0
                         && match &tokens[i - 1].kind {
-                            TokKind::Ident(name) => name.chars().next().is_some_and(|c| c.is_lowercase() || c == '_'),
+                            TokKind::Ident(name) => !is_camel_type_ident(name),
                             TokKind::NumberLit => true,
                             TokKind::Punct(lp) => matches!(lp.as_str(), ")" | "]"),
                             _ => false,
@@ -534,7 +534,7 @@ fn skip_closure_params(tokens: &[Tok], open_bar: usize) -> Option<usize> {
     let mut angle = 0usize;
     while i < tokens.len() {
         let t = &tokens[i];
-        if t.is_punct(";") {
+        if bracket == 0 && t.is_punct(";") {
             return None;
         }
         if t.is_punct("(") {
@@ -604,11 +604,13 @@ fn skip_type_expr(tokens: &[Tok], mut i: usize, mut allow_plus_bounds: bool) -> 
                 i += 1;
             }
             while let Some(seg) = tokens.get(i) {
-                if !matches!(seg.kind, TokKind::Ident(_)) {
+                let TokKind::Ident(seg_name) = &seg.kind else {
                     break;
-                }
+                };
+                let seg_can_have_generics = is_camel_type_ident(seg_name);
                 i += 1;
-                if tokens.get(i).is_some_and(|n| n.is_punct("<"))
+                if seg_can_have_generics
+                    && tokens.get(i).is_some_and(|n| n.is_punct("<"))
                     && let Some(end) = try_skip_type_angle_group(tokens, i)
                 {
                     i = end;
@@ -660,18 +662,23 @@ fn try_skip_type_angle_group(tokens: &[Tok], open_idx: usize) -> Option<usize> {
                 return Some(idx + 1);
             }
         } else if tok.is_punct(">>") {
-            depth = depth.saturating_sub(2);
+            if depth < 2 {
+                return None;
+            }
+            depth -= 2;
             if depth == 0 && paren == 0 && bracket == 0 {
                 return Some(idx + 1);
             }
-        } else if matches!(
-            &tok.kind,
-            TokKind::Punct(p)
-                if matches!(
-                    p.as_str(),
-                    ";" | "{" | "}" | "&&" | "||" | "==" | "!=" | "<=" | ">=" | "+=" | "-=" | "*=" | "/=" | "%="
-                )
-        ) {
+        } else if (bracket == 0 && tok.is_punct(";"))
+            || matches!(
+                &tok.kind,
+                TokKind::Punct(p)
+                    if matches!(
+                        p.as_str(),
+                        "{" | "}" | "&&" | "||" | "==" | "!=" | "<=" | ">=" | "+=" | "-=" | "*=" | "/=" | "%="
+                    )
+            )
+        {
             return None;
         }
     }
