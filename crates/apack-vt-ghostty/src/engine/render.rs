@@ -4,20 +4,21 @@ use std::collections::{BTreeSet, HashSet};
 use std::ptr::NonNull;
 
 use apack_core::vt::VtEvent;
-use apack_proto::types::{CellPos, CellSpan, CursorShape, CursorState, ImageEncoding, ViewModes};
+use apack_proto::types::{BlobHash, CellPos, CellSpan, CursorShape, CursorState, ImageEncoding, ViewModes};
 use ghostty_vt_rs_sys as sys;
 
+use crate::MAX_IMAGE_PLACEMENTS;
 use crate::image_store::encode_png_pixels;
 use crate::input::query_mode;
 use crate::rows::VirtualImageInfo;
 
-use super::GhosttyEngine;
 use super::ffi_queries::{
     copy_kitty_pixels, hash_viewport_row, query_alt_screen, query_graphics, query_image_generation,
     query_images_generation, query_mouse_tracking, query_palette_overrides, query_scrollback_rows, read_placement_u32,
     read_u16, track_active_top, tracked_screen_row, viewport_row_has_placeholder,
 };
 use super::vt_impl::coalesce_feed_events;
+use super::{GhosttyEngine, NamedImageProbe};
 
 const REVERSE_VIDEO_MODE: u16 = 5;
 const BRACKETED_PASTE_MODE: u16 = 2004;
@@ -278,6 +279,7 @@ impl GhosttyEngine {
         if new_images_gen != self.raw_images_gen {
             self.raw_images_gen = new_images_gen;
             self.gens.images = self.gens.images.saturating_add(1);
+            self.sync_images_cache();
             // When images upload/replace/delete after U+10EEEE placeholders are already on screen,
             // mark placeholder-bearing viewport rows dirty so `PackedRow.pieces` updates!
             if !self.full_dirty {
@@ -291,30 +293,28 @@ impl GhosttyEngine {
         }
     }
 
-    pub(super) fn sync_images_cache(&self) {
+    pub(super) fn sync_images_cache(&mut self) {
+        self.sync_images_cache_capped(MAX_IMAGE_PLACEMENTS);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resync_images_capped(&mut self, max_placements: usize) -> (usize, usize) {
+        self.image_cache.images_gen = 0;
+        self.sync_images_cache_capped(max_placements);
+        (self.image_cache.blobs.len(), self.image_cache.virtual_named.len())
+    }
+
+    pub(crate) fn sync_images_cache_capped(&mut self, max_placements: usize) {
         let cur_gen = query_images_generation(self.handle);
-        let mut cache = self.image_cache.borrow_mut();
-        let gen_changed = cache.images_gen != cur_gen;
-        if !gen_changed && cache.blobs.is_empty() {
+        if self.image_cache.images_gen == cur_gen {
             return;
         }
-        // Fast path when `cur_gen` unchanged: touch every cached blob in `ImageStore` under one brief
-        // lock; if all are still resident, nothing to re-encode!
-        if !gen_changed {
-            let all_resident = {
-                let mut store = self.image_store.lock().expect("ImageStore mutex poisoned");
-                cache.blobs.values().all(|&(hash, _, _)| store.touch(hash))
-            };
-            if all_resident {
-                return;
-            }
-        }
 
-        cache.images_gen = cur_gen;
-        cache.virtual_named.clear();
-        cache.virtual_lowest.clear();
+        self.image_cache.images_gen = cur_gen;
+        self.image_cache.virtual_named.clear();
+        self.image_cache.virtual_lowest.clear();
         let Some(graphics) = query_graphics(self.handle) else {
-            cache.blobs.clear();
+            self.image_cache.blobs.clear();
             return;
         };
 
@@ -337,7 +337,7 @@ impl GhosttyEngine {
         let mut active_keys: HashSet<(u32, u64)> = HashSet::new();
         let mut to_encode: Vec<(u32, u64, u32, u32, u8, Vec<u8>)> = Vec::new();
         if filled == sys::Result::SUCCESS {
-            let mut store = self.image_store.lock().expect("ImageStore mutex poisoned");
+            let mut store = self.image_store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             // SAFETY: iterating placements while no write mutates `self.handle`.
             while unsafe { sys::ghostty_kitty_graphics_placement_next(iter) } {
                 let mut image_id: u32 = 0;
@@ -352,13 +352,14 @@ impl GhosttyEngine {
                 {
                     continue;
                 }
-                // SAFETY: `graphics` is live for `&self`.
+                // SAFETY: `graphics` is live for `&mut self`.
                 let img = unsafe { sys::ghostty_kitty_graphics_image(graphics, image_id) };
                 if !img.is_null() {
                     let img_gen = query_image_generation(img);
                     let key = (image_id, img_gen);
-                    if active_keys.insert(key) {
-                        let still_resident = cache.blobs.get(&key).is_some_and(|&(hash, _, _)| store.touch(hash));
+                    if active_keys.len() < max_placements && active_keys.insert(key) {
+                        let still_resident =
+                            self.image_cache.blobs.get(&key).is_some_and(|&(hash, _, _)| store.touch(hash));
                         if !still_resident && let Some((w, h, ch, px)) = copy_kitty_pixels(img) {
                             to_encode.push((image_id, img_gen, w, h, ch, px));
                         }
@@ -374,13 +375,13 @@ impl GhosttyEngine {
                         (&raw mut is_virtual).cast(),
                     )
                 };
-                if is_virtual {
+                if is_virtual && self.image_cache.virtual_named.len() < max_placements {
                     let pid = read_placement_u32(iter, sys::KittyGraphicsPlacementData::PLACEMENT_ID).unwrap_or(0);
                     let cols = read_placement_u32(iter, sys::KittyGraphicsPlacementData::COLUMNS).unwrap_or(0);
                     let rows = read_placement_u32(iter, sys::KittyGraphicsPlacementData::ROWS).unwrap_or(0);
                     let grid = (cols, rows);
-                    cache.virtual_named.insert((image_id, pid), grid);
-                    cache
+                    self.image_cache.virtual_named.insert((image_id, pid), grid);
+                    self.image_cache
                         .virtual_lowest
                         .entry(image_id)
                         .and_modify(|e| *e = (*e).min((pid, grid)))
@@ -392,8 +393,8 @@ impl GhosttyEngine {
         // SAFETY: freeing iterator once.
         unsafe { sys::ghostty_kitty_graphics_placement_iterator_free(iter) };
 
-        // Evict deleted/replaced image metadata so `cache.blobs` never grows unboundedly.
-        cache.blobs.retain(|k, _| active_keys.contains(k));
+        // Evict deleted/replaced image metadata so `image_cache.blobs` never grows unboundedly.
+        self.image_cache.blobs.retain(|k, _| active_keys.contains(k));
 
         // Encode PNGs completely OUTSIDE the global `ImageStore` mutex so slow compression
         // never stalls other sessions/shards!
@@ -402,17 +403,42 @@ impl GhosttyEngine {
                 .into_iter()
                 .filter_map(|(id, g, w, h, ch, px)| encode_png_pixels(w, h, ch, &px).map(|png| (id, g, w, h, png)))
                 .collect();
-            let mut store = self.image_store.lock().expect("ImageStore mutex poisoned");
+            let mut store = self.image_store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             for (id, g, w, h, png) in encoded {
                 if let Some(hash) = store.insert_encoded(ImageEncoding::Png, png) {
-                    cache.blobs.insert((id, g), (hash, w, h));
+                    self.image_cache.blobs.insert((id, g), (hash, w, h));
                 }
             }
         }
     }
 
+    /// Re-encodes a live session image back into the shared [`ImageStore`] if another session
+    /// evicted it under global LRU pressure, keeping `&self` row/placement reads completely lock-free.
+    pub fn rehydrate_image_blob(&mut self, blob: BlobHash) -> bool {
+        let Some(image_id) =
+            self.image_cache.blobs.iter().find_map(|(&(id, _), &(hash, _, _))| (hash == blob).then_some(id))
+        else {
+            return false;
+        };
+        let Some(graphics) = query_graphics(self.handle) else {
+            return false;
+        };
+        // SAFETY: `graphics` is live for `&mut self`.
+        let img = unsafe { sys::ghostty_kitty_graphics_image(graphics, image_id) };
+        if img.is_null() {
+            return false;
+        }
+        let Some((w, h, ch, px)) = copy_kitty_pixels(img) else {
+            return false;
+        };
+        let Some(png) = encode_png_pixels(w, h, ch, &px) else {
+            return false;
+        };
+        let mut store = self.image_store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.insert_encoded(ImageEncoding::Png, png) == Some(blob)
+    }
+
     pub(super) fn resolve_virtual(&self, image_id: u32, placement_id: u32) -> Option<VirtualImageInfo> {
-        self.sync_images_cache();
         let graphics = query_graphics(self.handle)?;
         // SAFETY: `graphics` is live for `&self`.
         let img = unsafe { sys::ghostty_kitty_graphics_image(graphics, image_id) };
@@ -420,13 +446,27 @@ impl GhosttyEngine {
             return None;
         }
         let img_gen = query_image_generation(img);
-        let cache = self.image_cache.borrow();
-        let &(blob, w, h) = cache.blobs.get(&(image_id, img_gen))?;
+        let &(blob, w, h) = self.image_cache.blobs.get(&(image_id, img_gen))?;
         let grid = match placement_id {
-            0 => cache.virtual_lowest.get(&image_id).map(|(_, g)| *g)?,
-            pid => *cache.virtual_named.get(&(image_id, pid))?,
+            0 => self.image_cache.virtual_lowest.get(&image_id).map(|(_, g)| *g)?,
+            pid => *self.image_cache.virtual_named.get(&(image_id, pid))?,
         };
         Some(VirtualImageInfo { blob, picture_px: (w, h), grid })
+    }
+
+    pub(super) fn screen_row_is_wrapped(&self, abs_line: u64) -> bool {
+        let Some(grid_ref) = self.screen_grid_ref(CellPos { line: abs_line, col: 0 }) else {
+            return false;
+        };
+        let mut raw_row: sys::Row = 0;
+        let mut wrapped = false;
+        // SAFETY: `grid_ref` was resolved on live `self.handle`; `WRAP` writes a `bool`.
+        unsafe {
+            if sys::ghostty_grid_ref_row(&raw const grid_ref, &raw mut raw_row) == sys::Result::SUCCESS {
+                let _ = sys::ghostty_row_get(raw_row, sys::RowData::WRAP, (&raw mut wrapped).cast());
+            }
+        }
+        wrapped
     }
 
     pub(super) fn epoch_to_screen_row(&self, abs_line: u64) -> Option<u32> {
@@ -491,11 +531,11 @@ impl GhosttyEngine {
         let _ = unsafe { sys::ghostty_terminal_set(self.handle, sys::TerminalOption::APC_MAX_BYTES_KITTY, ptr) };
     }
 
-    /// Feeds a NUL-payload Kitty graphics probe command (`Load::asked()` or `Load::refusal()`)
+    /// Feeds a validated single-command NUL-payload Kitty graphics probe ([`NamedImageProbe`])
     /// with file and shared-memory mediums temporarily enabled so `libghostty-vt` validates all
     /// command keys and returns its native reply without ever opening a real path, unconditionally
     /// disabling both mediums again before returning.
-    pub fn feed_named_probe(&mut self, probe: &[u8], events: &mut Vec<VtEvent>) {
+    pub fn feed_named_probe(&mut self, probe: &NamedImageProbe, events: &mut Vec<VtEvent>) {
         struct DisableNamedMediums(sys::Terminal);
         impl Drop for DisableNamedMediums {
             fn drop(&mut self) {
@@ -516,7 +556,7 @@ impl GhosttyEngine {
             let _ = sys::ghostty_terminal_set(self.handle, sys::TerminalOption::KITTY_IMAGE_MEDIUM_SHARED_MEM, ptr);
         }
         let _guard = DisableNamedMediums(self.handle);
-        let _ = self.feed_inner(probe, false, events);
+        let _ = self.feed_inner(probe.as_bytes(), false, events);
     }
 
     /// Feeds `bytes` up to the first APC/SOS/PM string introducer (`TerminalBoundary::APC_START`),

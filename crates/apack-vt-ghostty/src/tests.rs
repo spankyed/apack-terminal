@@ -13,8 +13,9 @@ use apack_proto::types::{
 };
 
 use crate::engine::{
-    GhosttyConfig, GhosttyEngine, checked_image_placement, coalesce_feed_events, decode_osc7_cwd, escape_osc633_field,
-    features, last_snapshot_record_end, sanitize_osc633_body,
+    GhosttyConfig, GhosttyEngine, NamedImageProbe, check_decode_loop_outcome, checked_image_placement,
+    coalesce_feed_events, decode_osc7_cwd, escape_osc633_field, features, ffi_guard, last_snapshot_record_end,
+    resolve_drawn_pixel_size, sanitize_osc633_body,
 };
 use crate::error::GhosttyError;
 use crate::image_store::{ImageStore, decode_png_rgba, encode_png_pixels, encode_png_rgba, png_rgba_pixel_count};
@@ -1006,16 +1007,23 @@ fn image_store_o1_lru_eviction_recovery_placeholder_dirtying_and_hostile_rejecti
     let blob1 = imgs1[0].blob;
 
     // Simulate another session evicting `blob1` from the shared global `ImageStore`:
-    // next `vt.images()` MUST detect the eviction and re-populate `ImageStore` cleanly (zero 404)!
+    // 1. `vt.images()` and `vt.extract_viewport_rows` MUST stay 100% lock-free (zero ImageStore lock!).
+    // 2. On cache miss in `FetchImageBlob`, `vt.rehydrate_image_blob(blob1)` re-encodes and restores it!
     {
         let mut s = shared.lock().unwrap();
         let _ = s.insert_encoded(ImageEncoding::Png, vec![0xAA; 4096]).unwrap();
         assert!(s.get_chunk(blob1, 0, 64).is_none());
+        // Holding `shared` lock while calling `&self` read paths proves zero mutex contention!
+        let imgs_lockfree = vt.images();
+        assert_eq!(imgs_lockfree.len(), 1);
+        assert_eq!(imgs_lockfree[0].blob, blob1);
+        let mut lockfree_rows = Vec::new();
+        vt.extract_viewport_rows(&[0], &mut lockfree_rows);
+        assert_eq!(lockfree_rows.len(), 1);
     }
-    let imgs_recovered = vt.images();
-    assert_eq!(imgs_recovered.len(), 1);
-    assert_eq!(imgs_recovered[0].blob, blob1);
-    assert!(shared.lock().unwrap().get_chunk(blob1, 0, 64).is_some(), "evicted live image must re-populate ImageStore");
+    assert!(vt.rehydrate_image_blob(blob1), "evicted live image must rehydrate into ImageStore");
+    assert!(!vt.rehydrate_image_blob(apack_proto::types::BlobHash([0xFF; 32])), "unknown blob must return false");
+    assert!(shared.lock().unwrap().get_chunk(blob1, 0, 64).is_some(), "rehydrated live image must be in ImageStore");
 
     // Re-transmit image id=7 with DIFFERENT pixels -> generation bumps and new blob replaces old
     let raw_rgb2 = [0u8, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110];
@@ -1348,9 +1356,10 @@ fn review_mutants_batched_text_cell_px_resize_placeholder_bg_long_grapheme_and_s
     let (used_apc, apc_hit) = a_vt.feed_until_apc(stream, &mut ev);
     assert!(apc_hit, "feed_until_apc must stop at ESC _");
     assert_eq!(&stream[..used_apc], b"AB\x1b_");
-    // Feed NUL-payload probe while sitting inside the open APC string -> returns EINVAL: invalid data
+    // Feed validated NUL-payload probe while sitting inside the open APC string -> returns EINVAL: invalid data
     ev.clear();
-    a_vt.feed_named_probe(b"Ga=t,f=32,s=1,v=1,i=7,t=f;AA==\x1b\\\x1b_", &mut ev);
+    let probe = NamedImageProbe::parse(b"Ga=t,f=32,s=1,v=1,i=7,t=f;AA==\x1b\\\x1b_".to_vec()).expect("valid probe");
+    a_vt.feed_named_probe(&probe, &mut ev);
     let probe_reply = ev.iter().find_map(|e| match e {
         VtEvent::DeviceResponse(b) => Some(String::from_utf8_lossy(b).into_owned()),
         _ => None,
@@ -1492,16 +1501,155 @@ fn packed_row_text_cap_and_checked_image_placement_bounds() {
         assert_eq!(PackedRow::decode(&mut r).unwrap(), *row);
     }
 
-    // 3. `checked_image_placement` rejects any zero dimension and clamps oversized spans.
+    // 3. `checked_image_placement` rejects any zero dimension or source_rect overflow and clamps oversized spans.
     let blob = BlobHash([0x22; 32]);
-    assert!(checked_image_placement(blob, 1, 2, 0, 10, 2, 2, 0).is_none());
-    assert!(checked_image_placement(blob, 1, 2, 10, 0, 2, 2, 0).is_none());
-    assert!(checked_image_placement(blob, 1, 2, 10, 10, 0, 2, 0).is_none());
-    assert!(checked_image_placement(blob, 1, 2, 10, 10, 2, 0, 0).is_none());
-    let ok = checked_image_placement(blob, 5, -1, 120, 80, u32::MAX, 70_000, -3).unwrap();
-    assert_eq!(ok.source_rect, [0, 0, 120, 80]);
-    assert_eq!(ok.cell_offset, [0, 0]);
-    assert_eq!(ok.pixel_size, [120, 80]);
+    assert!(checked_image_placement(blob, 1, 2, [0, 0, 0, 10], [0, 0], [10, 10], 2, 2, 0).is_none());
+    assert!(checked_image_placement(blob, 1, 2, [0, 0, 10, 0], [0, 0], [10, 10], 2, 2, 0).is_none());
+    assert!(checked_image_placement(blob, 1, 2, [u32::MAX, 0, 1, 10], [0, 0], [10, 10], 2, 2, 0).is_none());
+    assert!(checked_image_placement(blob, 1, 2, [0, u32::MAX, 10, 1], [0, 0], [10, 10], 2, 2, 0).is_none());
+    assert!(checked_image_placement(blob, 1, 2, [0, 0, 10, 10], [0, 0], [0, 10], 2, 2, 0).is_none());
+    assert!(checked_image_placement(blob, 1, 2, [0, 0, 10, 10], [0, 0], [10, 0], 2, 2, 0).is_none());
+    assert!(checked_image_placement(blob, 1, 2, [0, 0, 10, 10], [0, 0], [10, 10], 0, 2, 0).is_none());
+    assert!(checked_image_placement(blob, 1, 2, [0, 0, 10, 10], [0, 0], [10, 10], 2, 0, 0).is_none());
+    let ok = checked_image_placement(blob, 5, -1, [4, 8, 120, 80], [2, 3], [240, 160], u32::MAX, 70_000, -3).unwrap();
+    assert_eq!(ok.source_rect, [4, 8, 120, 80]);
+    assert_eq!(ok.cell_offset, [2, 3]);
+    assert_eq!(ok.pixel_size, [240, 160]);
     assert_eq!(ok.cell_span, [u16::MAX, u16::MAX]);
     assert_eq!(ok.z_index, -3);
+}
+
+#[test]
+fn vt_ghostty_seams_placement_geometry_bounded_batch_ffi_guard_poison_and_sealed_probe() {
+    // 1. NamedImageProbe validation rejects oversize, non-G, non-NUL payload, secondary APC/ESC, and control chars.
+    assert!(NamedImageProbe::parse(b"Ga=t,t=f,i=1,z=-2,X=+1;AA==\x1b\\\x1b_".to_vec()).is_some());
+    assert!(NamedImageProbe::parse(b"G;AA==\x1b\\\x1b_".to_vec()).is_some());
+    assert!(NamedImageProbe::parse(b"Xa=t;AA==\x1b\\\x1b_".to_vec()).is_none());
+    assert!(NamedImageProbe::parse(b"Ga=t;L2V0Yy9wYXNz\x1b\\\x1b_".to_vec()).is_none());
+    assert!(NamedImageProbe::parse(b"Ga=t;L2V0Yy9wYXNz\x1b\\\x1b_Ga=t;AA==\x1b\\\x1b_".to_vec()).is_none());
+    assert!(NamedImageProbe::parse(b"Ga=t, ;AA==\x1b\\\x1b_".to_vec()).is_none());
+    // Exact MAX_BYTES (4096) passes; MAX_BYTES + 1 (4097) fails.
+    let suffix = b";AA==\x1b\\\x1b_";
+    let mut exact = Vec::with_capacity(NamedImageProbe::MAX_BYTES);
+    exact.push(b'G');
+    exact.extend(std::iter::repeat_n(b'a', NamedImageProbe::MAX_BYTES - 1 - suffix.len()));
+    exact.extend_from_slice(suffix);
+    assert_eq!(exact.len(), NamedImageProbe::MAX_BYTES);
+    assert!(NamedImageProbe::parse(exact).is_some());
+
+    let mut over = Vec::with_capacity(NamedImageProbe::MAX_BYTES + 1);
+    over.push(b'G');
+    over.extend(std::iter::repeat_n(b'a', NamedImageProbe::MAX_BYTES - suffix.len()));
+    over.extend_from_slice(suffix);
+    assert_eq!(over.len(), NamedImageProbe::MAX_BYTES + 1);
+    assert!(NamedImageProbe::parse(over).is_none());
+
+    // `resolve_drawn_pixel_size` exact boundary checks.
+    assert_eq!(resolve_drawn_pixel_size(true, 23, 30, [10, 8]), [23, 30]);
+    assert_eq!(resolve_drawn_pixel_size(false, 23, 30, [10, 8]), [10, 8]);
+    assert_eq!(resolve_drawn_pixel_size(true, 0, 30, [10, 8]), [10, 8]);
+    assert_eq!(resolve_drawn_pixel_size(true, 23, 0, [10, 8]), [10, 8]);
+
+    // Placement & virtual-cache cap enforcement (`images_capped` and `sync_images_cache_capped`).
+    let mut cap_cfg = GhosttyConfig::new(grid(20, 6));
+    cap_cfg.cell_px = CellPx { width: 8, height: 16 };
+    let mut cap_vt = GhosttyEngine::new(cap_cfg).unwrap();
+    let mut cap_ev = Vec::new();
+    let px1 = base64_encode(&[10u8, 20, 30, 255]);
+    let px2 = base64_encode(&[40u8, 50, 60, 255]);
+    let px3 = base64_encode(&[70u8, 80, 90, 255]);
+    cap_vt.feed(
+        format!(
+            "\x1b_Ga=T,f=32,s=1,v=1,i=1;{px1}\x1b\\\x1b_Ga=T,f=32,s=1,v=1,i=2;{px2}\x1b\\\x1b_Ga=T,f=32,s=1,v=1,i=3;{px3}\x1b\\"
+        )
+        .as_bytes(),
+        &mut cap_ev,
+    );
+    assert_eq!(cap_vt.images().len(), 3);
+    assert_eq!(cap_vt.images_capped(2).len(), 2);
+    // Also exercise `resync_images_capped(2)` with 3 virtual placements + 1 non-virtual placement.
+    let mut vcap_vt = GhosttyEngine::new(GhosttyConfig::new(grid(20, 6))).unwrap();
+    vcap_vt.feed(
+        format!(
+            "\x1b_Ga=T,U=1,f=32,s=1,v=1,i=1,p=1,c=1,r=1;{px1}\x1b\\\
+             \x1b_Ga=T,U=1,f=32,s=1,v=1,i=2,p=2,c=1,r=1;{px2}\x1b\\\
+             \x1b_Ga=T,U=1,f=32,s=1,v=1,i=3,p=3,c=1,r=1;{px3}\x1b\\"
+        )
+        .as_bytes(),
+        &mut cap_ev,
+    );
+    assert_eq!(vcap_vt.resync_images_capped(2), (2, 2));
+    assert_eq!(vcap_vt.images_capped(0).len(), 0);
+    // Non-virtual placement must NOT be counted as virtual even when cap allows more.
+    assert_eq!(cap_vt.resync_images_capped(2), (2, 0));
+
+    // 2. ffi_guard catches panics without unwinding across C FFI and returns default; check_decode_loop_outcome enforces NO_VALUE.
+    assert!(ffi_guard(false, || true));
+    assert!(!ffi_guard(false, || panic!("simulated panic in FFI callback")));
+    assert!(check_decode_loop_outcome(true, None).is_ok());
+    assert!(check_decode_loop_outcome(false, None).is_err());
+    let err = GhosttyError { call: "test", code: ghostty_vt_rs_sys::Result::OUT_OF_MEMORY };
+    assert_eq!(check_decode_loop_outcome(true, Some(err)).unwrap_err().code, ghostty_vt_rs_sys::Result::OUT_OF_MEMORY);
+
+    // 3. H10 (VT): real Kitty placement extracts exact source_rect, cell_offset, drawn pixel_size, cell_span, and z_index.
+    let mut cfg = GhosttyConfig::new(grid(20, 6));
+    cfg.cell_px = CellPx { width: 8, height: 16 };
+    let mut vt = GhosttyEngine::new(cfg).unwrap();
+    let mut ev = Vec::new();
+    let rgba16 = vec![0x80u8; 16 * 16 * 4];
+    let cmd =
+        format!("\x1b_Ga=T,f=32,s=16,v=16,i=4,x=2,y=3,w=10,h=8,X=1,Y=2,c=3,r=2,z=-5;{}\x1b\\", base64_encode(&rgba16));
+    vt.feed(cmd.as_bytes(), &mut ev);
+    let placements = vt.images();
+    assert_eq!(placements.len(), 1);
+    assert_eq!(placements[0].source_rect, [2, 3, 10, 8]);
+    assert_eq!(placements[0].cell_offset, [1, 2]);
+    // 3 cols * 8 px - X_OFFSET(1) = 23, 2 rows * 16 px - Y_OFFSET(2) = 30
+    assert_eq!(placements[0].pixel_size, [23, 30]);
+    assert_eq!(placements[0].cell_span, [3, 2]);
+    assert_eq!(placements[0].z_index, -5);
+
+    // Headless (`cell_px = 0x0`) placement falls back cleanly to non-zero source_rect dimensions for pixel_size.
+    let mut h_vt = GhosttyEngine::new(GhosttyConfig::new(grid(20, 6))).unwrap();
+    h_vt.feed(cmd.as_bytes(), &mut ev);
+    let h_placements = h_vt.images();
+    assert_eq!(h_placements.len(), 1);
+    assert_eq!(h_placements[0].source_rect, [2, 3, 10, 8]);
+    assert_eq!(h_placements[0].pixel_size, [10, 8]);
+
+    // 4. H5: `text_of_batched` bounds logical-line extension across batches WITHOUT injecting spurious '\n'
+    //    inside a wrapped line, while preserving '\n' between distinct logical lines.
+    let mut w_vt = GhosttyEngine::new(GhosttyConfig::new(grid(10, 20))).unwrap();
+    let wrapped_line: String = (0..95).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+    let input = format!("{wrapped_line}\r\nSECOND_LINE");
+    w_vt.feed(input.as_bytes(), &mut ev);
+    let meta = w_vt.meta();
+    let full_span = CellSpan {
+        start: CellPos { line: 0, col: 0 },
+        end: CellPos { line: meta.total_lines() - 1, col: meta.size.cols.get() - 1 },
+    };
+    // `batch_lines = 2` caps each formatter call to 4 physical rows (< 10 wrapped rows), forcing 3 batches inside line 0!
+    let extracted = w_vt.text_of_batched(full_span, 10_000, 2);
+    assert_eq!(extracted.trim_end_matches('\n'), format!("{wrapped_line}\nSECOND_LINE"));
+
+    // 5. Poison-tolerant ImageStore mutex recovery: a poisoned shared ImageStore must never panic GhosttyEngine!
+    let poisoned = Arc::new(Mutex::new(ImageStore::default()));
+    let p_clone = Arc::clone(&poisoned);
+    let _ = std::thread::spawn(move || {
+        let _g = p_clone.lock().unwrap();
+        panic!("poison ImageStore mutex");
+    })
+    .join();
+    assert!(poisoned.is_poisoned());
+    let mut p_cfg = GhosttyConfig::new(grid(20, 6));
+    p_cfg.cell_px = CellPx { width: 8, height: 16 };
+    p_cfg.image_store = Some(Arc::clone(&poisoned));
+    let mut p_vt = GhosttyEngine::new(p_cfg).unwrap();
+    p_vt.feed(cmd.as_bytes(), &mut ev);
+    assert_eq!(p_vt.images().len(), 1);
+    assert!(p_vt.rehydrate_image_blob(p_vt.images()[0].blob));
+
+    // 6. Empty OSC 52 clipboard write (`contents_len == 0` / empty payload) does not panic/UB.
+    ev.clear();
+    p_vt.feed(b"\x1b]52;c;\x07", &mut ev);
 }

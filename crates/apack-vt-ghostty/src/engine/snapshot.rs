@@ -10,7 +10,7 @@ use crate::{SESSION_IMAGE_STORAGE_BYTES, UNKNOWN_OSC_MAX_BYTES};
 
 use super::callbacks::{
     cb_bell, cb_clipboard_write, cb_notification, cb_program_status, cb_progress, cb_pwd_changed, cb_render_hold,
-    cb_semantic_prompt, cb_size, cb_title_changed, cb_unknown_sequence, cb_write_pty,
+    cb_semantic_prompt, cb_size, cb_title_changed, cb_unknown_sequence, cb_write_pty, ffi_guard,
 };
 use super::ffi_queries::{
     handle_at_ground, query_alt_screen, query_images_generation, query_scrollback_rows, read_u16, track_active_top,
@@ -33,20 +33,22 @@ impl GhosttyEngine {
         }
         // SAFETY: called synchronously by `ghostty_snapshot_encode` with `userdata` pointing to `CapBuf`.
         unsafe extern "C" fn write_cb(userdata: *mut std::ffi::c_void, data: *const u8, len: usize) -> bool {
-            if userdata.is_null() || (len > 0 && data.is_null()) {
-                return false;
-            }
-            // SAFETY: `userdata` is a valid `&mut CapBuf` alive for the encode call.
-            let cap = unsafe { &mut *userdata.cast::<CapBuf>() };
-            if cap.cut || len > cap.max.saturating_sub(cap.out.len()) {
-                cap.cut = true;
-                return false;
-            }
-            if len > 0 {
-                // SAFETY: `data` is non-null and readable for `len` bytes.
-                cap.out.extend_from_slice(unsafe { std::slice::from_raw_parts(data, len) });
-            }
-            true
+            ffi_guard(false, || {
+                if userdata.is_null() || (len > 0 && data.is_null()) {
+                    return false;
+                }
+                // SAFETY: `userdata` is a valid `&mut CapBuf` alive for the encode call.
+                let cap = unsafe { &mut *userdata.cast::<CapBuf>() };
+                if cap.cut || len > cap.max.saturating_sub(cap.out.len()) {
+                    cap.cut = true;
+                    return false;
+                }
+                if len > 0 {
+                    // SAFETY: `data` is non-null and readable for `len` bytes.
+                    cap.out.extend_from_slice(unsafe { std::slice::from_raw_parts(data, len) });
+                }
+                true
+            })
         }
         let mut cap = CapBuf { out: Vec::new(), max: max_bytes, cut: false };
         let writer = sys::Writer { write: Some(write_cb), userdata: (&raw mut cap).cast() };
@@ -107,11 +109,26 @@ impl GhosttyEngine {
             unsafe { sys::ghostty_snapshot_decoder_free(decoder) };
             return Err(GhosttyError { call: "ghostty_snapshot_decoder_ready", code: sys::Result::OUT_OF_MEMORY });
         }
+        // Validate grid geometry immediately after header decode BEFORE decoding history/image records.
+        let Some(new_size) = read_u16(new_handle, sys::TerminalData::COLS)
+            .zip(read_u16(new_handle, sys::TerminalData::ROWS))
+            .and_then(|(c, r)| GridSize::new(c, r))
+        else {
+            // SAFETY: freeing both decoder and handle on invalid grid dimensions.
+            unsafe {
+                sys::ghostty_snapshot_decoder_free(decoder);
+                sys::ghostty_terminal_free(new_handle);
+            }
+            return Err(GhosttyError { call: "restore_snapshot(grid_size)", code: sys::Result::INVALID_VALUE });
+        };
+
         // SAFETY: decode all remaining history/image records while both `decoder` and `new_handle` are live.
+        let mut finished = false;
         let mut decode_err: Option<GhosttyError> = None;
         for _ in 0..=snapshot.len() {
             let next_res = unsafe { sys::ghostty_snapshot_decoder_next(decoder) };
             if next_res == sys::Result::NO_VALUE {
+                finished = true;
                 break;
             }
             if next_res != sys::Result::SUCCESS {
@@ -121,25 +138,30 @@ impl GhosttyEngine {
         }
         // SAFETY: decoder is no longer needed once all records are decoded or failed.
         unsafe { sys::ghostty_snapshot_decoder_free(decoder) };
-        if let Some(err) = decode_err {
-            // SAFETY: freeing decoded handle on corrupt-record failure without touching `self`.
+        if let Err(err) = check_decode_loop_outcome(finished, decode_err) {
+            // SAFETY: freeing decoded handle on corrupt/incomplete record failure without touching `self`.
             unsafe { sys::ghostty_terminal_free(new_handle) };
             return Err(err);
         }
 
-        let Some(new_size) = read_u16(new_handle, sys::TerminalData::COLS)
-            .zip(read_u16(new_handle, sys::TerminalData::ROWS))
-            .and_then(|(c, r)| GridSize::new(c, r))
-        else {
-            // SAFETY: freeing decoded handle on invalid grid dimensions.
-            unsafe { sys::ghostty_terminal_free(new_handle) };
-            return Err(GhosttyError { call: "restore_snapshot(grid_size)", code: sys::Result::INVALID_VALUE });
+        // Allocate `new_mark` BEFORE `configure_handle`/`resize` so any failure leaves `self` and
+        // `self.callbacks` completely untouched.
+        let new_mark = match track_active_top(new_handle) {
+            Ok(m) => m,
+            Err(e) => {
+                // SAFETY: freeing decoded handle if mark creation fails.
+                unsafe { sys::ghostty_terminal_free(new_handle) };
+                return Err(e);
+            }
         };
 
         // Configure `new_handle` BEFORE swapping so any error leaves `self` completely intact!
         if let Err(e) = self.configure_handle(new_handle, true) {
-            // SAFETY: freeing decoded handle on settings failure.
-            unsafe { sys::ghostty_terminal_free(new_handle) };
+            // SAFETY: freeing mark strictly before its owning decoded handle on settings failure.
+            unsafe {
+                sys::ghostty_tracked_grid_ref_free(new_mark);
+                sys::ghostty_terminal_free(new_handle);
+            }
             return Err(e);
         }
         // SAFETY: `new_handle` is live; restores pixel cell geometry without changing grid cols/rows.
@@ -151,15 +173,6 @@ impl GhosttyEngine {
                 u32::from(self.cell_px.width),
                 u32::from(self.cell_px.height),
             )
-        };
-
-        let new_mark = match track_active_top(new_handle) {
-            Ok(m) => m,
-            Err(e) => {
-                // SAFETY: freeing decoded handle if mark creation fails.
-                unsafe { sys::ghostty_terminal_free(new_handle) };
-                return Err(e);
-            }
         };
 
         // Commit swap: free old active_top strictly BEFORE freeing old terminal handle.
@@ -187,15 +200,13 @@ impl GhosttyEngine {
         self.dirty_rows.clear();
         self.scroll_delta = 0;
         self.encoders.reset_cache();
-        {
-            let mut cache = self.image_cache.borrow_mut();
-            cache.images_gen = 0;
-            cache.blobs.clear();
-            cache.virtual_named.clear();
-            cache.virtual_lowest.clear();
-        }
+        self.image_cache.images_gen = 0;
+        self.image_cache.blobs.clear();
+        self.image_cache.virtual_named.clear();
+        self.image_cache.virtual_lowest.clear();
         self.raw_images_gen = query_images_generation(self.handle);
         self.gens.images = self.gens.images.saturating_add(1);
+        self.sync_images_cache();
         self.refresh_render_state(true, 0);
         Ok(())
     }
@@ -336,6 +347,17 @@ impl GhosttyEngine {
         }
         Ok(())
     }
+}
+
+/// Validates that the snapshot decode loop exited cleanly with `NO_VALUE` and zero errors.
+pub(crate) fn check_decode_loop_outcome(finished: bool, decode_err: Option<GhosttyError>) -> Result<(), GhosttyError> {
+    if let Some(err) = decode_err {
+        return Err(err);
+    }
+    if !finished {
+        return Err(GhosttyError { call: "ghostty_snapshot_decoder_next", code: sys::Result::INVALID_VALUE });
+    }
+    Ok(())
 }
 
 /// Computes the byte offset of the end of the last complete record in a `libghostty-vt` snapshot.

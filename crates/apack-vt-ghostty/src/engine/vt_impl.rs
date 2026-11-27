@@ -7,6 +7,7 @@ use apack_proto::types::{
 };
 use ghostty_vt_rs_sys as sys;
 
+use crate::MAX_IMAGE_PLACEMENTS;
 use crate::input::{encode_focus, encode_paste};
 use crate::placeholders::PLACEHOLDER;
 use crate::rows::extract_row;
@@ -20,6 +21,8 @@ use super::ffi_queries::{
 /// Hard cap on `ghostty_search_get(MATCHES)` allocation (~3 MiB) to prevent OOM on dense single-page bursts.
 const MAX_SEARCH_ALLOC: usize = 65_536;
 const SEARCH_CANDIDATES: usize = 20_000;
+/// Maximum physical rows formatted in a single `libghostty-vt` formatter call so a 100k-row wrapped line cannot OOM.
+const MAX_FORMAT_BATCH_ROWS: u64 = 512;
 
 impl VtEngine for GhosttyEngine {
     fn feed(&mut self, bytes: &[u8], events: &mut Vec<VtEvent>) {
@@ -271,85 +274,7 @@ impl VtEngine for GhosttyEngine {
     }
 
     fn images(&self) -> Vec<ImagePlacement> {
-        self.sync_images_cache();
-        let Some(graphics) = query_graphics(self.handle) else {
-            return Vec::new();
-        };
-        let mut iter: sys::KittyGraphicsPlacementIterator = std::ptr::null_mut();
-        // SAFETY: `iter` is a valid out-pointer; freed below.
-        if unsafe { sys::ghostty_kitty_graphics_placement_iterator_new(std::ptr::null(), &raw mut iter) }
-            != sys::Result::SUCCESS
-        {
-            return Vec::new();
-        }
-        // SAFETY: `PLACEMENT_ITERATOR` fills `iter`.
-        let filled = unsafe {
-            sys::ghostty_kitty_graphics_get(
-                graphics,
-                sys::KittyGraphicsData::PLACEMENT_ITERATOR,
-                (&raw mut iter).cast(),
-            )
-        };
-        let mut out = Vec::new();
-        if filled == sys::Result::SUCCESS {
-            let cache = self.image_cache.borrow();
-            // SAFETY: iterating placements while `self.handle` is borrowed immutably.
-            while unsafe { sys::ghostty_kitty_graphics_placement_next(iter) } {
-                let Some(id) = read_placement_u32(iter, sys::KittyGraphicsPlacementData::IMAGE_ID) else {
-                    continue;
-                };
-                // SAFETY: `graphics` is live for `&self`.
-                let img = unsafe { sys::ghostty_kitty_graphics_image(graphics, id) };
-                if img.is_null() {
-                    continue;
-                }
-                let img_gen = query_image_generation(img);
-                let Some(&(blob, w, h)) = cache.blobs.get(&(id, img_gen)) else {
-                    continue;
-                };
-                let mut rect = sys::Selection::default();
-                // SAFETY: virtual placements return non-SUCCESS here and are skipped (they live in `PackedRow.pieces`).
-                if unsafe { sys::ghostty_kitty_graphics_placement_rect(iter, img, self.handle, &raw mut rect) }
-                    != sys::Result::SUCCESS
-                {
-                    continue;
-                }
-                let Some(span) = self.selection_to_span(&rect) else {
-                    continue;
-                };
-                let (mut cols, mut rows) = (0u32, 0u32);
-                // SAFETY: querying grid span of this live placement.
-                if unsafe {
-                    sys::ghostty_kitty_graphics_placement_grid_size(
-                        iter,
-                        img,
-                        self.handle,
-                        &raw mut cols,
-                        &raw mut rows,
-                    )
-                } != sys::Result::SUCCESS
-                {
-                    continue;
-                }
-                let mut z: i32 = 0;
-                // SAFETY: `Z` writes an `int32_t`.
-                let _ = unsafe {
-                    sys::ghostty_kitty_graphics_placement_get(
-                        iter,
-                        sys::KittyGraphicsPlacementData::Z,
-                        (&raw mut z).cast(),
-                    )
-                };
-                if let Some(placement) =
-                    checked_image_placement(blob, span.start.line, i32::from(span.start.col), w, h, cols, rows, z)
-                {
-                    out.push(placement);
-                }
-            }
-        }
-        // SAFETY: freeing placement iterator once.
-        unsafe { sys::ghostty_kitty_graphics_placement_iterator_free(iter) };
-        out
+        self.images_capped(MAX_IMAGE_PLACEMENTS)
     }
 
     fn encode_key(&mut self, key: &KeyInput, out: &mut Vec<u8>) {
@@ -446,21 +371,146 @@ pub(crate) fn coalesce_feed_events(raw: Vec<VtEvent>, out: &mut Vec<VtEvent>) {
 }
 
 impl GhosttyEngine {
+    pub(crate) fn images_capped(&self, max_placements: usize) -> Vec<ImagePlacement> {
+        let Some(graphics) = query_graphics(self.handle) else {
+            return Vec::new();
+        };
+        let mut iter: sys::KittyGraphicsPlacementIterator = std::ptr::null_mut();
+        // SAFETY: `iter` is a valid out-pointer; freed below.
+        if unsafe { sys::ghostty_kitty_graphics_placement_iterator_new(std::ptr::null(), &raw mut iter) }
+            != sys::Result::SUCCESS
+        {
+            return Vec::new();
+        }
+        // SAFETY: `PLACEMENT_ITERATOR` fills `iter`.
+        let filled = unsafe {
+            sys::ghostty_kitty_graphics_get(
+                graphics,
+                sys::KittyGraphicsData::PLACEMENT_ITERATOR,
+                (&raw mut iter).cast(),
+            )
+        };
+        let mut out = Vec::new();
+        if filled == sys::Result::SUCCESS {
+            // SAFETY: iterating placements while `self.handle` is borrowed immutably.
+            while unsafe { sys::ghostty_kitty_graphics_placement_next(iter) } {
+                if out.len() >= max_placements {
+                    break;
+                }
+                let Some(id) = read_placement_u32(iter, sys::KittyGraphicsPlacementData::IMAGE_ID) else {
+                    continue;
+                };
+                // SAFETY: `graphics` is live for `&self`.
+                let img = unsafe { sys::ghostty_kitty_graphics_image(graphics, id) };
+                if img.is_null() {
+                    continue;
+                }
+                let img_gen = query_image_generation(img);
+                let Some(&(blob, _img_w, _img_h)) = self.image_cache.blobs.get(&(id, img_gen)) else {
+                    continue;
+                };
+                let mut rect = sys::Selection::default();
+                // SAFETY: virtual placements return non-SUCCESS here and are skipped (they live in `PackedRow.pieces`).
+                if unsafe { sys::ghostty_kitty_graphics_placement_rect(iter, img, self.handle, &raw mut rect) }
+                    != sys::Result::SUCCESS
+                {
+                    continue;
+                }
+                let Some(span) = self.selection_to_span(&rect) else {
+                    continue;
+                };
+                let (mut cols, mut rows) = (0u32, 0u32);
+                // SAFETY: querying grid span of this live placement.
+                if unsafe {
+                    sys::ghostty_kitty_graphics_placement_grid_size(
+                        iter,
+                        img,
+                        self.handle,
+                        &raw mut cols,
+                        &raw mut rows,
+                    )
+                } != sys::Result::SUCCESS
+                {
+                    continue;
+                }
+                let (mut src_x, mut src_y, mut src_w, mut src_h) = (0u32, 0u32, 0u32, 0u32);
+                // SAFETY: querying source crop rectangle of this live placement.
+                if unsafe {
+                    sys::ghostty_kitty_graphics_placement_source_rect(
+                        iter,
+                        img,
+                        &raw mut src_x,
+                        &raw mut src_y,
+                        &raw mut src_w,
+                        &raw mut src_h,
+                    )
+                } != sys::Result::SUCCESS
+                {
+                    continue;
+                }
+                let (mut px_w, mut px_h) = (0u32, 0u32);
+                // SAFETY: querying drawn physical pixel size of this live placement.
+                let drawn_res = unsafe {
+                    sys::ghostty_kitty_graphics_placement_pixel_size(
+                        iter,
+                        img,
+                        self.handle,
+                        &raw mut px_w,
+                        &raw mut px_h,
+                    )
+                };
+                let pixel_size =
+                    resolve_drawn_pixel_size(drawn_res == sys::Result::SUCCESS, px_w, px_h, [src_w, src_h]);
+                let x_off = read_placement_u32(iter, sys::KittyGraphicsPlacementData::X_OFFSET).unwrap_or(0);
+                let y_off = read_placement_u32(iter, sys::KittyGraphicsPlacementData::Y_OFFSET).unwrap_or(0);
+                let mut z: i32 = 0;
+                // SAFETY: `Z` writes an `int32_t`.
+                let _ = unsafe {
+                    sys::ghostty_kitty_graphics_placement_get(
+                        iter,
+                        sys::KittyGraphicsPlacementData::Z,
+                        (&raw mut z).cast(),
+                    )
+                };
+                if let Some(placement) = checked_image_placement(
+                    blob,
+                    span.start.line,
+                    i32::from(span.start.col),
+                    [src_x, src_y, src_w, src_h],
+                    [x_off, y_off],
+                    pixel_size,
+                    cols,
+                    rows,
+                    z,
+                ) {
+                    out.push(placement);
+                }
+            }
+        }
+        // SAFETY: freeing placement iterator once.
+        unsafe { sys::ghostty_kitty_graphics_placement_iterator_free(iter) };
+        out
+    }
+
     pub(crate) fn text_of_batched(&self, span: CellSpan, max_bytes: usize, batch_lines: u64) -> String {
-        let step = batch_lines.max(1);
+        let step = batch_lines.clamp(1, MAX_FORMAT_BATCH_ROWS);
+        let max_batch_rows = step.saturating_mul(2).min(MAX_FORMAT_BATCH_ROWS);
         let max_col = self.size.cols.get().saturating_sub(1);
         let mut out = String::new();
         let mut cur_line = span.start.line;
+        let mut prev_wrapped = false;
         while cur_line <= span.end.line && out.len() < max_bytes {
-            let mut batch_end = cur_line.saturating_add(step.saturating_sub(1)).min(span.end.line);
-            if let Some(logical) = self.line_at(batch_end) {
-                batch_end = logical.end.line.min(span.end.line);
-            }
+            let base_end = cur_line.saturating_add(step.saturating_sub(1)).min(span.end.line);
+            let hard_end = cur_line.saturating_add(max_batch_rows.saturating_sub(1)).min(span.end.line);
+            let batch_end = match self.line_at(base_end) {
+                Some(logical) => logical.end.line.clamp(base_end, hard_end),
+                None => base_end,
+            };
             let sub = CellSpan {
                 start: CellPos { line: cur_line, col: if cur_line == span.start.line { span.start.col } else { 0 } },
                 end: CellPos { line: batch_end, col: if batch_end == span.end.line { span.end.col } else { max_col } },
             };
-            if cur_line > span.start.line {
+            if cur_line > span.start.line && !prev_wrapped {
                 out.push('\n');
             }
             let chunk = self.format_span_raw(sub);
@@ -470,6 +520,7 @@ impl GhosttyEngine {
             if take != chunk.len() {
                 break;
             }
+            prev_wrapped = self.screen_row_is_wrapped(batch_end);
             let Some(next) = batch_end.checked_add(1) else {
                 break;
             };
@@ -603,30 +654,44 @@ impl GhosttyEngine {
     }
 }
 
-/// Builds a wire-valid [`ImagePlacement`], returning `None` for degenerate zero-sized placements.
+/// Resolves the drawn pixel dimensions of an image placement, falling back to `fallback` when headless.
+pub(crate) fn resolve_drawn_pixel_size(drawn_ok: bool, px_w: u32, px_h: u32, fallback: [u32; 2]) -> [u32; 2] {
+    if drawn_ok && px_w > 0 && px_h > 0 { [px_w, px_h] } else { fallback }
+}
+
+/// Builds a wire-valid [`ImagePlacement`], returning `None` for degenerate zero-sized or overflowing placements.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn checked_image_placement(
     blob: BlobHash,
     line: u64,
     col: i32,
-    w: u32,
-    h: u32,
+    source_rect: [u32; 4],
+    cell_offset: [u32; 2],
+    pixel_size: [u32; 2],
     cols: u32,
     rows: u32,
     z_index: i32,
 ) -> Option<ImagePlacement> {
     let span_cols = cols.min(u32::from(u16::MAX)) as u16;
     let span_rows = rows.min(u32::from(u16::MAX)) as u16;
-    if w == 0 || h == 0 || span_cols == 0 || span_rows == 0 {
+    if source_rect[2] == 0
+        || source_rect[3] == 0
+        || source_rect[0].checked_add(source_rect[2]).is_none()
+        || source_rect[1].checked_add(source_rect[3]).is_none()
+        || pixel_size[0] == 0
+        || pixel_size[1] == 0
+        || span_cols == 0
+        || span_rows == 0
+    {
         return None;
     }
     Some(ImagePlacement {
         blob,
         line,
         col,
-        source_rect: [0, 0, w, h],
-        cell_offset: [0, 0],
-        pixel_size: [w, h],
+        source_rect,
+        cell_offset,
+        pixel_size,
         cell_span: [span_cols, span_rows],
         z_index,
     })

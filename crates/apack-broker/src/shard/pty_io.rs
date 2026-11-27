@@ -72,10 +72,17 @@ impl ShardRunner {
                     self.dispatch_verify_foreground(session_id, id, changed, app);
                 }
                 SessionEffect::FetchImageBlob { conn, stream_id, req_id, blob, offset, max_bytes } => {
-                    let chunk_opt = {
+                    let mut chunk_opt = {
                         let mut store = self.shared.image_store.lock().unwrap_or_else(|e| e.into_inner());
                         store.get_chunk(blob, offset, max_bytes)
                     };
+                    if chunk_opt.is_none()
+                        && let Some(sess) = self.sessions.get_mut(&session_id)
+                        && sess.machine.vt_mut().rehydrate_image_blob(blob)
+                    {
+                        let mut store = self.shared.image_store.lock().unwrap_or_else(|e| e.into_inner());
+                        chunk_opt = store.get_chunk(blob, offset, max_bytes);
+                    }
                     let msg = match chunk_opt {
                         Some(chunk) => BrokerMsg::ImageBlobChunk {
                             blob: chunk.blob,
