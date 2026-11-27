@@ -1521,25 +1521,38 @@ pub(crate) fn text_matches_in_range_chunked<V: VtEngine>(
         return false;
     }
     // When `search_lines` truncates (e.g. dense scrollback matches hit global candidate/alloc caps)
-    // before reaching `[from_line, to_line)`, fall back to a bounded direct text scan over the range.
+    // before reaching `[from_line, to_line)`, stream bounded non-overlapping row chunks in O(N)
+    // with a rolling `needle.len() - 1` byte tail carry so needles split across soft-wrapped lines
+    // or arbitrary multi-line boundaries are always matched with bounded memory.
     let step = chunk_lines.max(1);
     let meta = vt.meta();
     let max_col = meta.size.cols.get().saturating_sub(1);
     let end_line = to_line.saturating_sub(1);
-    let overlap = (needle.bytes().filter(|&b| b == b'\n').count() as u64).min(step.saturating_sub(1));
+    let keep = needle.len().saturating_sub(1);
+    let mut carry = String::new();
+    let mut prev_wrapped = false;
     let mut cur = from_line;
     while cur <= end_line {
-        let raw_end = cur.saturating_add(step.saturating_sub(1)).min(end_line);
-        let hard_end = cur.saturating_add(step.saturating_mul(2).saturating_sub(1)).min(end_line);
-        let chunk_end = vt.line_at(raw_end).map_or(raw_end, |l| l.end.line.clamp(raw_end, hard_end));
+        let chunk_end = cur.saturating_add(step.saturating_sub(1)).min(end_line);
         let span = CellSpan { start: CellPos { line: cur, col: 0 }, end: CellPos { line: chunk_end, col: max_col } };
-        if vt.text_of(span, MAX_STRING_BYTES).contains(needle) {
+        let chunk = vt.text_of(span, MAX_STRING_BYTES);
+        let mut combined = String::with_capacity(carry.len() + 1 + chunk.len());
+        combined.push_str(&carry);
+        if cur > from_line && !prev_wrapped {
+            combined.push('\n');
+        }
+        combined.push_str(&chunk);
+        if combined.contains(needle) {
             return true;
         }
         if chunk_end >= end_line {
             break;
         }
-        cur = chunk_end.saturating_add(1).saturating_sub(overlap).max(cur.saturating_add(1));
+        prev_wrapped = vt.line_at(chunk_end).is_some_and(|l| l.end.line > chunk_end);
+        let start = combined.ceil_char_boundary(combined.len().saturating_sub(keep));
+        carry.clear();
+        carry.push_str(&combined[start..]);
+        cur = chunk_end.saturating_add(1);
     }
     false
 }

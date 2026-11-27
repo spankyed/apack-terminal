@@ -2,7 +2,7 @@
 
 use apack_core::vt::{CompressStep, DirtyViewport, PasteEncode, VtEngine, VtEvent, VtGenerations, VtSnapshotMeta};
 use apack_proto::types::{
-    BlobHash, CellPos, CellPx, CellSpan, CursorShape, GridSize, ImagePlacement, KeyInput, PackedRow, PaletteOverrides,
+    CellPos, CellPx, CellSpan, CursorShape, GridSize, ImagePlacement, KeyInput, PackedRow, PaletteOverrides,
     PointerInput,
 };
 use ghostty_vt_rs_sys as sys;
@@ -14,8 +14,8 @@ use crate::rows::extract_row;
 
 use super::GhosttyEngine;
 use super::ffi_queries::{
-    query_graphics, query_image_generation, query_scrollback_rows, read_grapheme_codepoints, read_placement_u32,
-    selection_matches_exact, viewport_row_has_placeholder,
+    checked_image_placement, query_graphics, query_image_generation, query_scrollback_rows, read_grapheme_codepoints,
+    read_placement_u32, resolve_drawn_pixel_size, selection_matches_exact, viewport_row_has_placeholder,
 };
 
 /// Hard cap on `ghostty_search_get(MATCHES)` allocation (~3 MiB) to prevent OOM on dense single-page bursts.
@@ -513,14 +513,17 @@ impl GhosttyEngine {
             if cur_line > span.start.line && !prev_wrapped {
                 out.push('\n');
             }
-            let chunk = self.format_span_raw(sub);
+            let wrapped = self.screen_row_is_wrapped(batch_end);
+            // Preserve interior trailing spaces when a batch cuts mid-way through a soft-wrapped logical line.
+            let trim = !(wrapped && sub.end.col == max_col);
+            let chunk = self.format_span_raw(sub, trim);
             let remaining = max_bytes.saturating_sub(out.len());
             let take = chunk.floor_char_boundary(remaining);
             out.push_str(&chunk[..take]);
             if take != chunk.len() {
                 break;
             }
-            prev_wrapped = self.screen_row_is_wrapped(batch_end);
+            prev_wrapped = wrapped;
             let Some(next) = batch_end.checked_add(1) else {
                 break;
             };
@@ -652,47 +655,4 @@ impl GhosttyEngine {
         out.extend(filtered);
         truncated
     }
-}
-
-/// Resolves the drawn pixel dimensions of an image placement, falling back to `fallback` when headless.
-pub(crate) fn resolve_drawn_pixel_size(drawn_ok: bool, px_w: u32, px_h: u32, fallback: [u32; 2]) -> [u32; 2] {
-    if drawn_ok && px_w > 0 && px_h > 0 { [px_w, px_h] } else { fallback }
-}
-
-/// Builds a wire-valid [`ImagePlacement`], returning `None` for degenerate zero-sized or overflowing placements.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn checked_image_placement(
-    blob: BlobHash,
-    line: u64,
-    col: i32,
-    source_rect: [u32; 4],
-    cell_offset: [u32; 2],
-    pixel_size: [u32; 2],
-    cols: u32,
-    rows: u32,
-    z_index: i32,
-) -> Option<ImagePlacement> {
-    let span_cols = cols.min(u32::from(u16::MAX)) as u16;
-    let span_rows = rows.min(u32::from(u16::MAX)) as u16;
-    if source_rect[2] == 0
-        || source_rect[3] == 0
-        || source_rect[0].checked_add(source_rect[2]).is_none()
-        || source_rect[1].checked_add(source_rect[3]).is_none()
-        || pixel_size[0] == 0
-        || pixel_size[1] == 0
-        || span_cols == 0
-        || span_rows == 0
-    {
-        return None;
-    }
-    Some(ImagePlacement {
-        blob,
-        line,
-        col,
-        source_rect,
-        cell_offset,
-        pixel_size,
-        cell_span: [span_cols, span_rows],
-        z_index,
-    })
 }

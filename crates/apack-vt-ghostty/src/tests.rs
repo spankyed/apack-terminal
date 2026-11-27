@@ -1580,8 +1580,36 @@ fn vt_ghostty_seams_placement_geometry_bounded_batch_ffi_guard_poison_and_sealed
     );
     assert_eq!(vcap_vt.resync_images_capped(2), (2, 2));
     assert_eq!(vcap_vt.images_capped(0).len(), 0);
-    // Non-virtual placement must NOT be counted as virtual even when cap allows more.
+    // 3 direct placements capped at 2 admit exactly 2 direct blobs and 0 virtual entries.
     assert_eq!(cap_vt.resync_images_capped(2), (2, 0));
+    // Independent direct vs virtual placement caps: 2 virtual placements must NOT starve a direct placement!
+    let mut mixed_cfg = GhosttyConfig::new(grid(20, 6));
+    mixed_cfg.cell_px = CellPx { width: 8, height: 16 };
+    let mut mixed_vt = GhosttyEngine::new(mixed_cfg.clone()).unwrap();
+    mixed_vt.feed(
+        format!(
+            "\x1b_Ga=T,U=1,f=32,s=1,v=1,i=1,p=1,c=1,r=1;{px1}\x1b\\\
+             \x1b_Ga=T,U=1,f=32,s=1,v=1,i=2,p=2,c=1,r=1;{px2}\x1b\\\
+             \x1b_Ga=T,f=32,s=1,v=1,i=3;{px3}\x1b\\"
+        )
+        .as_bytes(),
+        &mut cap_ev,
+    );
+    assert_eq!(mixed_vt.resync_images_capped(2), (3, 2));
+    assert_eq!(mixed_vt.images().len(), 1, "virtual placements must not starve direct placements");
+    // Conversely, 2 direct placements must NOT starve a virtual placement (nor leave orphaned virtual entries).
+    let mut mixed_vt2 = GhosttyEngine::new(mixed_cfg).unwrap();
+    mixed_vt2.feed(
+        format!(
+            "\x1b_Ga=T,f=32,s=1,v=1,i=1;{px1}\x1b\\\
+             \x1b_Ga=T,f=32,s=1,v=1,i=2;{px2}\x1b\\\
+             \x1b_Ga=T,U=1,f=32,s=1,v=1,i=3,p=1,c=1,r=1;{px3}\x1b\\"
+        )
+        .as_bytes(),
+        &mut cap_ev,
+    );
+    assert_eq!(mixed_vt2.resync_images_capped(2), (3, 1));
+    assert_eq!(mixed_vt2.images().len(), 2);
 
     // 2. ffi_guard catches panics without unwinding across C FFI and returns default; check_decode_loop_outcome enforces NO_VALUE.
     assert!(ffi_guard(false, || true));
@@ -1618,19 +1646,21 @@ fn vt_ghostty_seams_placement_geometry_bounded_batch_ffi_guard_poison_and_sealed
     assert_eq!(h_placements[0].pixel_size, [10, 8]);
 
     // 4. H5: `text_of_batched` bounds logical-line extension across batches WITHOUT injecting spurious '\n'
-    //    inside a wrapped line, while preserving '\n' between distinct logical lines.
+    //    OR stripping interior spaces at a mid-wrap batch cut, while preserving '\n' between distinct lines.
     let mut w_vt = GhosttyEngine::new(GhosttyConfig::new(grid(10, 20))).unwrap();
-    let wrapped_line: String = (0..95).map(|i| (b'a' + (i % 26) as u8) as char).collect();
-    let input = format!("{wrapped_line}\r\nSECOND_LINE");
+    let wrapped_line = "aaaaaaaaaabbbbbbbbbbccccccccccdddd      eeeeeeeeee";
+    // Include an unwrapped line with explicit trailing spaces to verify `TRIM = true` still trims normal lines.
+    let input = format!("{wrapped_line}\r\nSECOND   ");
     w_vt.feed(input.as_bytes(), &mut ev);
     let meta = w_vt.meta();
     let full_span = CellSpan {
         start: CellPos { line: 0, col: 0 },
         end: CellPos { line: meta.total_lines() - 1, col: meta.size.cols.get() - 1 },
     };
-    // `batch_lines = 2` caps each formatter call to 4 physical rows (< 10 wrapped rows), forcing 3 batches inside line 0!
+    // `batch_lines = 2` caps batch 1 to rows 0..=3, cutting right at row 3 (`"dddd      "`):
+    // spaces at the end of row 3 MUST be preserved across the batch cut, while unwrapped trailing spaces trim!
     let extracted = w_vt.text_of_batched(full_span, 10_000, 2);
-    assert_eq!(extracted.trim_end_matches('\n'), format!("{wrapped_line}\nSECOND_LINE"));
+    assert_eq!(extracted.trim_end_matches('\n'), format!("{wrapped_line}\nSECOND"));
 
     // 5. Poison-tolerant ImageStore mutex recovery: a poisoned shared ImageStore must never panic GhosttyEngine!
     let poisoned = Arc::new(Mutex::new(ImageStore::default()));

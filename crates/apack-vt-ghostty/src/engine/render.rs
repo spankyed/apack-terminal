@@ -101,7 +101,7 @@ impl GhosttyEngine {
         applied_scroll
     }
 
-    pub(super) fn format_span_raw(&self, span: CellSpan) -> String {
+    pub(super) fn format_span_raw(&self, span: CellSpan, trim: bool) -> String {
         let (Some(start_ref), Some(end_ref)) = (self.screen_grid_ref(span.start), self.screen_grid_ref(span.end))
         else {
             return String::new();
@@ -117,11 +117,14 @@ impl GhosttyEngine {
         let unwrap = true;
         let mut ptr: *mut u8 = std::ptr::null_mut();
         let mut len: usize = 0;
-        // SAFETY: `SELECTION` takes `GhosttySelection*`, `UNWRAP` takes `bool*`; buffer freed below.
+        // SAFETY: `SELECTION` takes `GhosttySelection*`, `UNWRAP` and `TRIM` take `bool*`; buffer freed below.
         let res = unsafe {
             let mut r = sys::ghostty_formatter_set(formatter, sys::FormatterOption::SELECTION, (&raw const sel).cast());
             if r == sys::Result::SUCCESS {
                 r = sys::ghostty_formatter_set(formatter, sys::FormatterOption::UNWRAP, (&raw const unwrap).cast());
+            }
+            if r == sys::Result::SUCCESS {
+                r = sys::ghostty_formatter_set(formatter, sys::FormatterOption::TRIM, (&raw const trim).cast());
             }
             if r == sys::Result::SUCCESS {
                 r = sys::ghostty_formatter_format_alloc(formatter, std::ptr::null(), &raw mut ptr, &raw mut len);
@@ -310,11 +313,11 @@ impl GhosttyEngine {
             return;
         }
 
-        self.image_cache.images_gen = cur_gen;
-        self.image_cache.virtual_named.clear();
-        self.image_cache.virtual_lowest.clear();
         let Some(graphics) = query_graphics(self.handle) else {
+            self.image_cache.images_gen = cur_gen;
             self.image_cache.blobs.clear();
+            self.image_cache.virtual_named.clear();
+            self.image_cache.virtual_lowest.clear();
             return;
         };
 
@@ -333,10 +336,20 @@ impl GhosttyEngine {
                 (&raw mut iter).cast(),
             )
         };
+        if filled != sys::Result::SUCCESS {
+            // SAFETY: freeing iterator on transient query error without latching `images_gen`.
+            unsafe { sys::ghostty_kitty_graphics_placement_iterator_free(iter) };
+            return;
+        }
 
+        self.image_cache.images_gen = cur_gen;
+        self.image_cache.virtual_named.clear();
+        self.image_cache.virtual_lowest.clear();
+
+        let mut direct_keys: HashSet<(u32, u64)> = HashSet::new();
         let mut active_keys: HashSet<(u32, u64)> = HashSet::new();
         let mut to_encode: Vec<(u32, u64, u32, u32, u8, Vec<u8>)> = Vec::new();
-        if filled == sys::Result::SUCCESS {
+        {
             let mut store = self.image_store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             // SAFETY: iterating placements while no write mutates `self.handle`.
             while unsafe { sys::ghostty_kitty_graphics_placement_next(iter) } {
@@ -352,20 +365,6 @@ impl GhosttyEngine {
                 {
                     continue;
                 }
-                // SAFETY: `graphics` is live for `&mut self`.
-                let img = unsafe { sys::ghostty_kitty_graphics_image(graphics, image_id) };
-                if !img.is_null() {
-                    let img_gen = query_image_generation(img);
-                    let key = (image_id, img_gen);
-                    if active_keys.len() < max_placements && active_keys.insert(key) {
-                        let still_resident =
-                            self.image_cache.blobs.get(&key).is_some_and(|&(hash, _, _)| store.touch(hash));
-                        if !still_resident && let Some((w, h, ch, px)) = copy_kitty_pixels(img) {
-                            to_encode.push((image_id, img_gen, w, h, ch, px));
-                        }
-                    }
-                }
-
                 let mut is_virtual = false;
                 // SAFETY: `IS_VIRTUAL` writes a `bool`.
                 let _ = unsafe {
@@ -375,20 +374,49 @@ impl GhosttyEngine {
                         (&raw mut is_virtual).cast(),
                     )
                 };
-                if is_virtual && self.image_cache.virtual_named.len() < max_placements {
-                    let pid = read_placement_u32(iter, sys::KittyGraphicsPlacementData::PLACEMENT_ID).unwrap_or(0);
-                    let cols = read_placement_u32(iter, sys::KittyGraphicsPlacementData::COLUMNS).unwrap_or(0);
-                    let rows = read_placement_u32(iter, sys::KittyGraphicsPlacementData::ROWS).unwrap_or(0);
-                    let grid = (cols, rows);
-                    self.image_cache.virtual_named.insert((image_id, pid), grid);
-                    self.image_cache
-                        .virtual_lowest
-                        .entry(image_id)
-                        .and_modify(|e| *e = (*e).min((pid, grid)))
-                        .or_insert((pid, grid));
+                // SAFETY: `graphics` is live for `&mut self`.
+                let img = unsafe { sys::ghostty_kitty_graphics_image(graphics, image_id) };
+                if img.is_null() {
+                    continue;
+                }
+                let img_gen = query_image_generation(img);
+                let key = (image_id, img_gen);
+
+                // Direct and virtual placements enforce independent caps so virtual placements
+                // never starve `vt.images()` and every cached virtual entry has its blob cached.
+                let admitted = if is_virtual {
+                    if self.image_cache.virtual_named.len() < max_placements {
+                        let pid = read_placement_u32(iter, sys::KittyGraphicsPlacementData::PLACEMENT_ID).unwrap_or(0);
+                        let cols = read_placement_u32(iter, sys::KittyGraphicsPlacementData::COLUMNS).unwrap_or(0);
+                        let rows = read_placement_u32(iter, sys::KittyGraphicsPlacementData::ROWS).unwrap_or(0);
+                        let grid = (cols, rows);
+                        self.image_cache.virtual_named.insert((image_id, pid), grid);
+                        self.image_cache
+                            .virtual_lowest
+                            .entry(image_id)
+                            .and_modify(|e| *e = (*e).min((pid, grid)))
+                            .or_insert((pid, grid));
+                        true
+                    } else {
+                        false
+                    }
+                } else if direct_keys.contains(&key) {
+                    true
+                } else if direct_keys.len() < max_placements {
+                    direct_keys.insert(key);
+                    true
+                } else {
+                    false
+                };
+
+                if admitted && active_keys.insert(key) {
+                    let still_resident =
+                        self.image_cache.blobs.get(&key).is_some_and(|&(hash, _, _)| store.touch(hash));
+                    if !still_resident && let Some((w, h, ch, px)) = copy_kitty_pixels(img) {
+                        to_encode.push((image_id, img_gen, w, h, ch, px));
+                    }
                 }
             }
-            drop(store);
         }
         // SAFETY: freeing iterator once.
         unsafe { sys::ghostty_kitty_graphics_placement_iterator_free(iter) };

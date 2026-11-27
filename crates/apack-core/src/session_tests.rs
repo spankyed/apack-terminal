@@ -261,7 +261,10 @@ impl VtEngine for StubVt {
             let mut out = String::new();
             for line in span.start.line..=span.end.line {
                 if line > span.start.line {
-                    out.push('\n');
+                    let prev_wrapped = self.wrapped_logical.is_some_and(|(s, e)| (line - 1) >= s && (line - 1) < e);
+                    if !prev_wrapped {
+                        out.push('\n');
+                    }
                 }
                 if line >= self.first_active_line
                     && let Some(row) = self.rows.get((line - self.first_active_line) as usize)
@@ -288,7 +291,7 @@ impl VtEngine for StubVt {
         out: &mut Vec<CellSpan>,
     ) -> bool {
         self.last_search_range.set((from_line, to_line));
-        if needle.starts_with("__TRUNC__") {
+        if needle.contains("__TRUNC__") {
             return true;
         }
         if needle == "__OOB_SPAN__" && from_line < to_line {
@@ -2143,28 +2146,49 @@ fn review_mutants_rows_budget_clamp_rect_and_logical_line_expansion() {
             if *req_id == RequestId::from_raw(2)
     )));
 
-    // Direct boundary tests on `text_matches_in_range_chunked` (empty/inverted range, exact chunk step,
-    // wrapped logical hard cap, and newline overlap clamping).
+    // Direct boundary tests on `text_matches_in_range_chunked`:
+    // 1. Empty needle, empty/inverted range, and spurious leading `\n` before `from_line` return false.
     let mut vt_chunk = StubVt::new(40, 20);
     vt_chunk.use_row_text_of = true;
     vt_chunk.rows = (0..20).map(|i| format!("r{i}")).collect();
+    vt_chunk.rows[0] = String::from("__TRUNC__r0");
     assert!(!crate::session::text_matches_in_range_chunked(&vt_chunk, 0, 5, "", 4));
     assert!(!crate::session::text_matches_in_range_chunked(&vt_chunk, 5, 5, "__TRUNC__x", 4));
-    // Plain unwrapped rows with chunk_lines = 4 -> exact spans [0..=3], [4..=7], ...
+    assert!(!crate::session::text_matches_in_range_chunked(&vt_chunk, 0, 4, "\n__TRUNC__r0", 4));
+    // 2. Non-overlapping O(N) chunks: exact spans [0..=3], [4..=7], [8..=9].
     vt_chunk.text_of_spans.borrow_mut().clear();
     assert!(!crate::session::text_matches_in_range_chunked(&vt_chunk, 0, 10, "__TRUNC__MISSING", 4));
     assert_eq!(*vt_chunk.text_of_spans.borrow(), vec![(0, 3), (4, 7), (8, 9)]);
-    // 1-newline needle -> overlap == 1, so next chunk starts at 3 (not 1 or 4).
+    // 3. Multi-line needle spanning an unwrapped chunk boundary matches in O(N) with zero overlap!
+    vt_chunk.rows[3] = String::from("__TRUNC__A");
+    vt_chunk.rows[4] = String::from("B");
     vt_chunk.text_of_spans.borrow_mut().clear();
-    assert!(!crate::session::text_matches_in_range_chunked(&vt_chunk, 0, 10, "__TRUNC__A\nB", 4));
-    assert_eq!(*vt_chunk.text_of_spans.borrow(), vec![(0, 3), (3, 6), (6, 9)]);
-    // Many-newline needle -> overlap clamped to step - 1 = 3, advancing by 1 per chunk.
+    assert!(crate::session::text_matches_in_range_chunked(&vt_chunk, 0, 10, "__TRUNC__A\nB", 4));
+    assert_eq!(*vt_chunk.text_of_spans.borrow(), vec![(0, 3), (4, 7)]);
+    // 4. Single-line UTF-8 needle split across a long soft-wrapped logical line (`> chunk_lines` rows)
+    //    matches seamlessly without spurious `\n`!
+    vt_chunk.wrapped_logical = Some((0, 9));
+    vt_chunk.rows[3] = String::from("xxxx__TRUNC__é");
+    vt_chunk.rows[4] = String::from("WORLDyyyy");
     vt_chunk.text_of_spans.borrow_mut().clear();
-    assert!(!crate::session::text_matches_in_range_chunked(&vt_chunk, 0, 6, "__TRUNC__\n\n\n\n\n\n", 4));
-    assert_eq!(*vt_chunk.text_of_spans.borrow(), vec![(0, 3), (1, 4), (2, 5)]);
-    // Huge wrapped logical line [3..=19] -> hard_end clamped to cur + 2*step - 1 = 7.
-    vt_chunk.wrapped_logical = Some((3, 19));
-    vt_chunk.text_of_spans.borrow_mut().clear();
-    assert!(!crate::session::text_matches_in_range_chunked(&vt_chunk, 0, 12, "__TRUNC__MISSING", 4));
-    assert_eq!(*vt_chunk.text_of_spans.borrow(), vec![(0, 7), (8, 11)]);
+    assert!(crate::session::text_matches_in_range_chunked(&vt_chunk, 0, 10, "__TRUNC__éWORLD", 4));
+    assert_eq!(*vt_chunk.text_of_spans.borrow(), vec![(0, 3), (4, 7)]);
+    // 5. Multi-line needle preceded by a soft-wrapped line (rows 2..=3 wrapped -> row 4 unwrapped) matches!
+    vt_chunk.wrapped_logical = Some((2, 3));
+    vt_chunk.rows[2] = String::from("__TRUNC__WRAPPED_");
+    vt_chunk.rows[3] = String::from("TAIL");
+    vt_chunk.rows[4] = String::from("NEXT");
+    assert!(crate::session::text_matches_in_range_chunked(&vt_chunk, 0, 10, "__TRUNC__WRAPPED_TAIL\nNEXT", 4));
+    // 6. 1-byte needle (`keep == 0`) does not carry across chunks.
+    vt_chunk.wrapped_logical = None;
+    vt_chunk.rows[3] = String::from("abc");
+    vt_chunk.rows[4] = String::from("def");
+    // Using a 1-char needle isn't `__TRUNC__`, so check short carry (`combined.len() <= keep`) too:
+    assert!(!crate::session::text_matches_in_range_chunked(
+        &vt_chunk,
+        0,
+        6,
+        "__TRUNC__VERY_LONG_MISSING_NEEDLE_0123456789",
+        1
+    ));
 }

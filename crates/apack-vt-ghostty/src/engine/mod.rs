@@ -20,13 +20,13 @@ use crate::input::InputEncoders;
 
 #[cfg(test)]
 pub(crate) use callbacks::{escape_osc633_field, ffi_guard, sanitize_osc633_body};
-#[cfg(test)]
-pub(crate) use ffi_queries::decode_osc7_cwd;
 pub(crate) use ffi_queries::read_grapheme_codepoints;
+#[cfg(test)]
+pub(crate) use ffi_queries::{checked_image_placement, decode_osc7_cwd, resolve_drawn_pixel_size};
 #[cfg(test)]
 pub(crate) use snapshot::{check_decode_loop_outcome, last_snapshot_record_end};
 #[cfg(test)]
-pub(crate) use vt_impl::{checked_image_placement, coalesce_feed_events, resolve_drawn_pixel_size};
+pub(crate) use vt_impl::coalesce_feed_events;
 
 use ffi_queries::{handle_at_ground, track_active_top};
 
