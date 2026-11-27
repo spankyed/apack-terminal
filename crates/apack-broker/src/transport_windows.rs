@@ -101,6 +101,29 @@ pub(crate) fn try_push_win_write(
     }
 }
 
+/// Drains up to `limit` queued Windows transport events, then probes one additional event so the
+/// caller knows whether more remain (`true` -> spin immediately on the next turn without sleeping).
+pub(crate) fn drain_win_events_bounded<T>(rx: &mpsc::Receiver<T>, limit: usize, mut handle: impl FnMut(T)) -> bool {
+    for _ in 0..limit {
+        match rx.try_recv() {
+            Ok(ev) => handle(ev),
+            Err(_) => return false,
+        }
+    }
+    match rx.try_recv() {
+        Ok(ev) => {
+            handle(ev);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Clamps the reactor wait duration to zero when a turn hit the Windows transport event cap.
+pub(crate) fn clamp_win_wait(wait_for: Duration, hit_cap: bool) -> Duration {
+    if hit_cap { Duration::ZERO } else { wait_for }
+}
+
 /// Waits on the Windows reactor condvar until signalled or `wait_for` elapses.
 pub(crate) fn wait_for_win_wake(win_cond: &(Mutex<bool>, Condvar), wait_for: Duration) {
     let (lock, cv) = win_cond;

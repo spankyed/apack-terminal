@@ -86,18 +86,26 @@ pub(crate) fn verify_real_dir(dir: &Path) -> Result<(), WalError> {
     Ok(())
 }
 
+/// Classifies `symlink_metadata` flags on platforms without atomic `O_NOFOLLOW`, rejecting
+/// symlinks and directories before opening.
+#[cfg_attr(unix, allow(dead_code))]
+pub(crate) fn validate_lstat(is_symlink: bool, is_dir: bool, what: &'static str) -> Result<(), WalError> {
+    if is_symlink {
+        return Err(WalError::SymlinkRefused);
+    }
+    if is_dir {
+        return Err(WalError::InvalidFormat(what));
+    }
+    Ok(())
+}
+
 /// Opens `path` read-only without following symlinks or blocking on FIFOs (`O_NOFOLLOW | O_NONBLOCK`
 /// on Unix), verifying that the opened descriptor is a regular file.
 pub(crate) fn open_regular_read_only(path: &Path, what: &'static str) -> Result<(File, fs::Metadata), WalError> {
     #[cfg(not(unix))]
     {
         let lstat = fs::symlink_metadata(path)?;
-        if lstat.file_type().is_symlink() {
-            return Err(WalError::SymlinkRefused);
-        }
-        if lstat.is_dir() {
-            return Err(WalError::InvalidFormat(what));
-        }
+        validate_lstat(lstat.file_type().is_symlink(), lstat.is_dir(), what)?;
     }
     let mut opts = fs::OpenOptions::new();
     opts.read(true);
