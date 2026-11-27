@@ -956,6 +956,143 @@ mod image_source_shard_tests {
         );
         assert_eq!(crate::shard::images::split_st_ground_chunk(b"no-terminator"), None);
 
+        // Adversarial `reconstruct_visual_row` bounds: unclamped `col_start = u16::MAX`, overlapping/OOB runs,
+        // multiplicative run-slice amplification, control-char column suppression, and runs-empty `cols` + byte budget!
+        let hostile_amplified = PackedRow {
+            line: 0,
+            text: "A".repeat(32),
+            runs: vec![
+                // Valid run at col 1 (len 4) -> " AAAA" (5 bytes, cur_col = 5)
+                PackedRun {
+                    col_start: 1,
+                    col_len: 4,
+                    byte_offset: 0,
+                    byte_len: 4,
+                    style_idx: 0,
+                    link_idx: 0,
+                    flags: 0,
+                },
+                // Overlapping/out-of-order run (col_start 3 < cur_col 5) -> MUST be skipped!
+                PackedRun {
+                    col_start: 3,
+                    col_len: 4,
+                    byte_offset: 0,
+                    byte_len: 4,
+                    style_idx: 0,
+                    link_idx: 0,
+                    flags: 0,
+                },
+                // Unclamped col_start = u16::MAX (>= cols=10) -> MUST be skipped!
+                PackedRun {
+                    col_start: u16::MAX,
+                    col_len: 4,
+                    byte_offset: 0,
+                    byte_len: 4,
+                    style_idx: 0,
+                    link_idx: 0,
+                    flags: 0,
+                },
+                // Out-of-bounds byte slice -> MUST be skipped!
+                PackedRun {
+                    col_start: 6,
+                    col_len: 2,
+                    byte_offset: 99,
+                    byte_len: 4,
+                    style_idx: 0,
+                    link_idx: 0,
+                    flags: 0,
+                },
+                // Valid run hitting exact `max_bytes = 8` budget during padding/text -> stops cleanly at <= 8 bytes!
+                PackedRun {
+                    col_start: 6,
+                    col_len: 4,
+                    byte_offset: 0,
+                    byte_len: 4,
+                    style_idx: 0,
+                    link_idx: 0,
+                    flags: 0,
+                },
+            ],
+            styles: vec![],
+            links: vec![],
+            pieces: vec![],
+            flags: 0,
+        };
+        let (out_cap, end_col_cap) = crate::shard::replay::reconstruct_visual_row(&hostile_amplified, 10, 8);
+        assert_eq!(out_cap, " AAAA AA");
+        assert!(out_cap.len() <= 8);
+        assert_eq!(end_col_cap, 6);
+        // Padding itself exceeding `max_bytes` breaks cleanly without exceeding budget:
+        let pad_overflow = PackedRow {
+            line: 0,
+            text: String::from("Z"),
+            runs: vec![PackedRun {
+                col_start: 9,
+                col_len: 1,
+                byte_offset: 0,
+                byte_len: 1,
+                style_idx: 0,
+                link_idx: 0,
+                flags: 0,
+            }],
+            styles: vec![],
+            links: vec![],
+            pieces: vec![],
+            flags: 0,
+        };
+        assert_eq!(crate::shard::replay::reconstruct_visual_row(&pad_overflow, 10, 4), (String::new(), 0));
+        // Exact padding fit (`pad == max_bytes`) succeeds (kills `>` -> `>=`):
+        let pad_exact = PackedRow {
+            line: 0,
+            text: String::new(),
+            runs: vec![PackedRun {
+                col_start: 4,
+                col_len: 0,
+                byte_offset: 0,
+                byte_len: 0,
+                style_idx: 0,
+                link_idx: 0,
+                flags: 0,
+            }],
+            styles: vec![],
+            links: vec![],
+            pieces: vec![],
+            flags: 0,
+        };
+        assert_eq!(crate::shard::replay::reconstruct_visual_row(&pad_exact, 10, 4), (String::from("    "), 4));
+        // Control chars stripped inside a run do NOT advance `end_col` to `cols` (no false wrap suppression!):
+        let ctrl_row = PackedRow {
+            line: 0,
+            text: String::from("\x1bX"),
+            runs: vec![PackedRun {
+                col_start: 0,
+                col_len: 10,
+                byte_offset: 0,
+                byte_len: 2,
+                style_idx: 0,
+                link_idx: 0,
+                flags: 0,
+            }],
+            styles: vec![],
+            links: vec![],
+            pieces: vec![],
+            flags: 0,
+        };
+        assert_eq!(crate::shard::replay::reconstruct_visual_row(&ctrl_row, 10, 64), (String::from("X"), 0));
+        // Runs-empty row truncated strictly to `cols` AND `max_bytes` (prevents alt-screen wrap/scroll!):
+        let long_plain = PackedRow {
+            line: 0,
+            text: "é".repeat(20), // 2 bytes per char
+            runs: vec![],
+            styles: vec![],
+            links: vec![],
+            pieces: vec![],
+            flags: 0,
+        };
+        assert_eq!(crate::shard::replay::reconstruct_visual_row(&long_plain, 5, 64).0.chars().count(), 5);
+        assert_eq!(crate::shard::replay::reconstruct_visual_row(&long_plain, 20, 4).0.len(), 4);
+        assert_eq!(crate::shard::replay::reconstruct_visual_row(&long_plain, 20, 5).0.len(), 4);
+
         // 2. Virtual `U=1` Kitty image persisted via `active_image_blobs` even after `ImageStore` eviction (`H2` + `H3`),
         //    WAL retry leaves `wal_images_gen` unlatched when `write_blob` fails, and `hydrate_slice_blobs` loads it!
         let dir = tempfile::tempdir().unwrap();

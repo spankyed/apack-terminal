@@ -2546,19 +2546,33 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
         // Newer descendant ("anc/child") inherits `app = Some("oldapp")` from "anc".
         ev_table.ingest("id=anc/child;state=working", ts(2), &mut efx);
         assert_eq!(ev_table.get("anc/child").unwrap().app.as_deref(), Some("oldapp"));
-        // Fill remaining slots up to MAX_STATUSES, then insert one more to evict oldest "anc".
-        for i in 0..(MAX_STATUSES - 1) {
+        // Fill remaining slots up to MAX_STATUSES, then insert a direct child of "anc" ("anc/new") to evict "anc":
+        // "anc/new" MUST emit ONLY ONE Updated event with `app: None` (no transient double-Updated!).
+        for i in 0..(MAX_STATUSES - 2) {
             ev_table.ingest(&format!("id=pad{i};state=working"), ts(3 + i as u64), &mut efx);
         }
+        efx.clear();
+        ev_table.ingest("id=anc/new;state=working", ts(999), &mut efx);
         assert!(ev_table.get("anc").is_none(), "oldest non-root ancestor must be evicted");
         assert_eq!(
             ev_table.get("anc/child").unwrap().app,
             None,
             "surviving descendant must drop stale app after ancestor eviction"
         );
+        let new_updates: Vec<_> = efx
+            .iter()
+            .filter_map(|e| match e {
+                crate::status::StatusEffect::Updated(r) if r.id == "anc/new" => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(new_updates.len(), 1, "newly inserted descendant of evicted ancestor must emit a single Updated");
+        assert_eq!(new_updates[0].app, None);
     }
 
-    // 2c. Live `CommandFinished` clears active statuses while retaining terminal `Done`/`Error` (`M1`):
+    // 2c. Live `CommandFinished` clears active statuses while retaining terminal `Done`/`Error`,
+    //     preserves `pending_verify` on retained `Done` so WaitCondition::Status neither hangs nor bypasses
+    //     spoofing verification, and suppresses redundant VerifyForeground on same-chunk working+D!
     {
         let mut live_sess = SessionMachine::new(
             sid(91),
@@ -2568,18 +2582,64 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
             CellPx::default(),
         );
         let mut lfx = Vec::new();
+        live_sess.register_wait(
+            conn(1),
+            RequestId::from_raw(70),
+            WaitCondition::Status(vec![StatusState::Done]),
+            5_000,
+            ts(1),
+            &mut lfx,
+        );
+        assert!(lfx.is_empty());
+        // Emit working (same-chunk cleared by D;0 -> NO VerifyForeground!) + root done;app=claude + D;0:
         live_sess.vt_mut().next_events = vec![
             VtEvent::Osc133 { payload: String::from("C"), cursor_line: 0 },
-            VtEvent::ProgramStatus(crate::status::parse_osc7501("state=working").unwrap()),
-            VtEvent::ProgramStatus(crate::status::parse_osc7501("id=done;state=done").unwrap()),
+            VtEvent::ProgramStatus(crate::status::parse_osc7501("id=w;state=working;app=foo").unwrap()),
+            VtEvent::ProgramStatus(crate::status::parse_osc7501("state=done;app=claude").unwrap()),
+            VtEvent::Osc133 { payload: String::from("D;0"), cursor_line: 1 },
         ];
-        live_sess.on_pty_output(b"a", ts(1), &mut lfx);
-        assert_eq!(live_sess.active_statuses().len(), 2);
+        live_sess.on_pty_output(b"a", ts(2), &mut lfx);
+        assert_eq!(live_sess.active_statuses().len(), 1, "CommandFinished must clear active `w` and retain `Done`");
+        assert!(
+            !lfx.iter().any(|e| matches!(e, SessionEffect::VerifyForeground { id, .. } if id == "w")),
+            "same-chunk cleared active status must not dispatch redundant VerifyForeground"
+        );
+        assert!(
+            !lfx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Waited { .. }, .. })),
+            "retained Done must remain pending_verify after CommandFinished"
+        );
+        let done_changed = lfx
+            .iter()
+            .find_map(|e| match e {
+                SessionEffect::VerifyForeground { id, changed, app } if id.is_empty() && app == "claude" => {
+                    Some(*changed)
+                }
+                _ => None,
+            })
+            .expect("expected VerifyForeground for retained Done");
+        // Late waiter registered before fg_worker replies MUST also wait (no spoof bypass)!
         lfx.clear();
-        live_sess.vt_mut().next_events = vec![VtEvent::Osc133 { payload: String::from("D;0"), cursor_line: 1 }];
-        live_sess.on_pty_output(b"b", ts(2), &mut lfx);
-        assert_eq!(live_sess.active_statuses().len(), 1, "CommandFinished must clear active root status");
-        assert_eq!(live_sess.active_statuses()[0].id, "done");
+        live_sess.register_wait(
+            conn(1),
+            RequestId::from_raw(71),
+            WaitCondition::Status(vec![StatusState::Done]),
+            5_000,
+            ts(3),
+            &mut lfx,
+        );
+        assert!(lfx.is_empty(), "late waiter must stay gated until foreground verification completes");
+        // When fg_worker resolves as Confirmed::Unknown (Windows / fast-exit POSIX), BOTH waiters MUST wake!
+        live_sess.apply_status_confirmation("", done_changed, Confirmed::Unknown, &mut lfx);
+        assert!(lfx.iter().any(|e| matches!(
+            e,
+            SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. }
+            if *req_id == RequestId::from_raw(70)
+        )));
+        assert!(lfx.iter().any(|e| matches!(
+            e,
+            SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. }
+            if *req_id == RequestId::from_raw(71)
+        )));
     }
 
     // 3. WaitCondition::Status defers pending VerifyForeground, rejects Mismatched, wakes on Matched or Unknown!
@@ -2987,4 +3047,62 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
     assert_eq!(live_cmd.command.as_deref(), Some("new_cmd"));
     assert!(live_cmd.id > 2, "live command ID ({}) must not collide with historical id=2", live_cmd.id);
     assert_eq!(live_cmd.outcome, CommandOutcome::Exited(VouchedExitCode::from_vouched(0)));
+
+    // Post-restore WAL rollover keyframe where remapped Running command has `id (11) > last_seq (1)`:
+    // `restore_from_keyframe` must derive `active_vouched_seq = Some(1)` so replaying `V;F;1` succeeds!
+    let mut remapped_mt = MarksTracker::new(MarksMode::Claimed);
+    remapped_mt.restore_from_keyframe(
+        MarksMode::Keyed(key),
+        1,
+        0,
+        vec![
+            CommandRecord {
+                id: 10,
+                command: Some(String::from("prior")),
+                cwd: None,
+                started_ms: Some(1),
+                finished_ms: Some(2),
+                outcome: CommandOutcome::Exited(VouchedExitCode::from_vouched(0)),
+                prompt_line: None,
+                output_line: None,
+                end_line: None,
+            },
+            CommandRecord {
+                id: 11,
+                command: Some(String::from("build")),
+                cwd: None,
+                started_ms: Some(3),
+                finished_ms: None,
+                outcome: CommandOutcome::Running,
+                prompt_line: None,
+                output_line: None,
+                end_line: None,
+            },
+        ],
+    );
+    let mut rmt_fx = Vec::new();
+    remapped_mt.on_osc633(&format!("V;F;1;{};0;/proj", key.as_str()), 4, ts(30), &mut rmt_fx);
+    assert_eq!(remapped_mt.refused(), 0, "V;F;1 must match remapped running command id=11");
+    assert_eq!(remapped_mt.commands()[1].outcome, CommandOutcome::Exited(VouchedExitCode::from_vouched(0)));
+    assert_eq!(remapped_mt.last_cwd(), Some("/proj"));
+    // Also verify `last_seq == 0` with Running id > 0 does not invent active_vouched_seq = Some(0)!
+    let mut zero_seq_mt = MarksTracker::new(MarksMode::Claimed);
+    zero_seq_mt.restore_from_keyframe(
+        MarksMode::Keyed(key),
+        0,
+        0,
+        vec![CommandRecord {
+            id: 5,
+            command: None,
+            cwd: None,
+            started_ms: None,
+            finished_ms: None,
+            outcome: CommandOutcome::Running,
+            prompt_line: None,
+            output_line: None,
+            end_line: None,
+        }],
+    );
+    zero_seq_mt.on_osc633(&format!("V;F;5;{};0;/bad", key.as_str()), 0, ts(31), &mut rmt_fx);
+    assert_eq!(zero_seq_mt.refused(), 1);
 }

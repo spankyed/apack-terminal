@@ -536,7 +536,7 @@ impl<V: VtEngine> SessionMachine<V> {
                                 self.marks.on_osc133(&payload, cursor_line, *at_ms, &mut mark_effects);
                                 if mark_effects.iter().any(|m| matches!(m, MarkEffect::CommandFinished(_))) {
                                     status_effects.clear();
-                                    self.statuses.on_session_exit(&mut status_effects);
+                                    self.statuses.clear_active_on_command_finished(&mut status_effects);
                                 }
                             }
                             VtEvent::Osc633 { payload, cursor_line } => {
@@ -544,7 +544,7 @@ impl<V: VtEngine> SessionMachine<V> {
                                 self.marks.on_osc633(&payload, cursor_line, *at_ms, &mut mark_effects);
                                 if mark_effects.iter().any(|m| matches!(m, MarkEffect::CommandFinished(_))) {
                                     status_effects.clear();
-                                    self.statuses.on_session_exit(&mut status_effects);
+                                    self.statuses.clear_active_on_command_finished(&mut status_effects);
                                 }
                             }
                             VtEvent::ProgramStatus(update) => {
@@ -817,12 +817,12 @@ impl<V: VtEngine> SessionMachine<V> {
                 VtEvent::Osc133 { payload, cursor_line } => {
                     let mut mark_effects = Vec::new();
                     self.marks.on_osc133(&payload, cursor_line, now, &mut mark_effects);
-                    self.apply_mark_effects(mark_effects, effects);
+                    self.apply_mark_effects(mark_effects, Some(&mut pending_verify), effects);
                 }
                 VtEvent::Osc633 { payload, cursor_line } => {
                     let mut mark_effects = Vec::new();
                     self.marks.on_osc633(&payload, cursor_line, now, &mut mark_effects);
-                    self.apply_mark_effects(mark_effects, effects);
+                    self.apply_mark_effects(mark_effects, Some(&mut pending_verify), effects);
                 }
                 VtEvent::ProgramStatus(update) => {
                     let mut status_effects = Vec::new();
@@ -939,7 +939,7 @@ impl<V: VtEngine> SessionMachine<V> {
 
         let mut mark_effects = Vec::new();
         self.marks.on_session_exit(now, &mut mark_effects);
-        self.apply_mark_effects(mark_effects, effects);
+        self.apply_mark_effects(mark_effects, None, effects);
 
         let mut status_effects = Vec::new();
         self.statuses.on_session_exit(&mut status_effects);
@@ -1550,7 +1550,12 @@ impl<V: VtEngine> SessionMachine<V> {
         self.notify_views_dirty(effects);
     }
 
-    fn apply_mark_effects(&mut self, mark_effects: Vec<MarkEffect>, effects: &mut Vec<SessionEffect>) {
+    fn apply_mark_effects(
+        &mut self,
+        mark_effects: Vec<MarkEffect>,
+        coalesce_verify: Option<&mut BTreeMap<String, (u64, String)>>,
+        effects: &mut Vec<SessionEffect>,
+    ) {
         let mut idle_triggered = false;
         let mut command_finished = false;
         for me in mark_effects {
@@ -1572,8 +1577,8 @@ impl<V: VtEngine> SessionMachine<V> {
         }
         if command_finished {
             let mut st_fx = Vec::new();
-            self.statuses.on_session_exit(&mut st_fx);
-            self.apply_status_effects(st_fx, None, effects);
+            self.statuses.clear_active_on_command_finished(&mut st_fx);
+            self.apply_status_effects(st_fx, coalesce_verify, effects);
         }
         if idle_triggered {
             self.wake_waiters(|c| matches!(c, WaitCondition::Idle), effects);

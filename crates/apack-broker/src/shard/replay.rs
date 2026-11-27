@@ -134,29 +134,57 @@ pub(crate) fn hydrate_slice_blobs(reader: &WalReader, slice: &SeekSlice, image_s
 }
 
 /// Reconstructs sanitized printable text for a [`PackedRow`], stripping all C0 (`< 0x20`, `0x7F`)
-/// and C1 (`U+0080..=U+009F`) control characters and preserving `col_start` column offsets.
-fn reconstruct_visual_row(row: &PackedRow) -> (String, u16) {
+/// and C1 (`U+0080..=U+009F`) control characters, clamping column offsets to `cols`, skipping
+/// overlapping/out-of-order runs, and enforcing a strict per-row byte budget (`max_bytes`).
+pub(super) fn reconstruct_visual_row(row: &PackedRow, cols: u16, max_bytes: usize) -> (String, u16) {
     if row.runs.is_empty() {
-        let clean: String = row.text.chars().filter(|c| !c.is_control()).collect();
-        return (clean, 0);
+        let mut out = String::new();
+        for ch in row.text.chars().filter(|c| !c.is_control()).take(usize::from(cols)) {
+            if out.len().saturating_add(ch.len_utf8()) > max_bytes {
+                break;
+            }
+            out.push(ch);
+        }
+        return (out, 0);
     }
-    let mut out = String::with_capacity(row.text.len());
+    let mut out = String::with_capacity(row.text.len().min(max_bytes));
     let mut cur_col = 0u16;
     for run in &row.runs {
-        for _ in cur_col..run.col_start {
-            out.push(' ');
+        if run.col_start >= cols || run.col_start < cur_col {
+            continue;
         }
-        cur_col = cur_col.max(run.col_start);
         let start = run.byte_offset as usize;
         let end = start.saturating_add(run.byte_len as usize);
-        if let Some(slice) = row.text.get(start..end) {
-            for ch in slice.chars() {
-                if !ch.is_control() {
-                    out.push(ch);
-                }
-            }
+        let Some(slice) = row.text.get(start..end) else {
+            continue;
+        };
+        let pad = usize::from(run.col_start - cur_col);
+        if out.len().saturating_add(pad) > max_bytes {
+            break;
         }
-        cur_col = cur_col.saturating_add(run.col_len);
+        for _ in 0..pad {
+            out.push(' ');
+        }
+        cur_col = run.col_start;
+        let mut had_control = false;
+        let mut hit_budget = false;
+        for ch in slice.chars() {
+            if ch.is_control() {
+                had_control = true;
+                continue;
+            }
+            if out.len().saturating_add(ch.len_utf8()) > max_bytes {
+                hit_budget = true;
+                break;
+            }
+            out.push(ch);
+        }
+        if hit_budget {
+            break;
+        }
+        if !had_control {
+            cur_col = cur_col.saturating_add(run.col_len).min(cols);
+        }
     }
     (out, cur_col)
 }
@@ -169,7 +197,7 @@ fn feed_primary_visual_rows(engine: &mut GhosttyEngine, rows: &[PackedRow], cols
             events.clear();
             engine.feed(b"\r\n", &mut events);
         }
-        let (clean, end_col) = reconstruct_visual_row(row);
+        let (clean, end_col) = reconstruct_visual_row(row, cols, apack_proto::MAX_PACKED_ROW_TEXT_BYTES);
         if !clean.is_empty() {
             events.clear();
             engine.feed(clean.as_bytes(), &mut events);
@@ -178,10 +206,10 @@ fn feed_primary_visual_rows(engine: &mut GhosttyEngine, rows: &[PackedRow], cols
     }
 }
 
-fn feed_alt_visual_rows(engine: &mut GhosttyEngine, rows: &[PackedRow], max_rows: u16) {
+fn feed_alt_visual_rows(engine: &mut GhosttyEngine, rows: &[PackedRow], cols: u16, max_rows: u16) {
     let mut events = Vec::new();
     for (idx, row) in rows.iter().take(usize::from(max_rows)).enumerate() {
-        let (clean, _) = reconstruct_visual_row(row);
+        let (clean, _) = reconstruct_visual_row(row, cols, apack_proto::MAX_PACKED_ROW_TEXT_BYTES);
         if !clean.is_empty() {
             let pos = format!("\x1b[{};1H", idx + 1);
             events.clear();
@@ -201,7 +229,7 @@ pub(crate) fn apply_visual_fallback(engine: &mut GhosttyEngine, visual: &VisualK
     if visual.active_alt_screen {
         events.clear();
         engine.feed(b"\x1b[?1049h", &mut events);
-        feed_alt_visual_rows(engine, &visual.alt_rows, visual.size.rows.get());
+        feed_alt_visual_rows(engine, &visual.alt_rows, visual.size.cols.get(), visual.size.rows.get());
     }
     let move_cursor = format!("\x1b[{};{}H", visual.cursor.row.saturating_add(1), visual.cursor.col.saturating_add(1));
     events.clear();

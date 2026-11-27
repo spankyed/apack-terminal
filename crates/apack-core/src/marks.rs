@@ -92,8 +92,13 @@ impl MarksTracker {
             }
         }
         let max_cmd_id = commands.iter().map(|c| c.id).max().unwrap_or(0);
-        let active_vouched_seq =
-            active_index.and_then(|idx| matches!(mode, MarksMode::Keyed(_)).then_some(commands[idx].id));
+        let active_vouched_seq = active_index.and_then(|idx| {
+            if !matches!(mode, MarksMode::Keyed(_)) {
+                return None;
+            }
+            let cmd_id = commands[idx].id;
+            if cmd_id <= last_seq { Some(cmd_id) } else { (last_seq != 0).then_some(last_seq) }
+        });
         self.mode = mode;
         self.last_seq = last_seq;
         self.refused = refused;

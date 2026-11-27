@@ -243,19 +243,19 @@ impl StatusTable {
             ),
         };
 
-        let effective_app = own_app.clone().or_else(|| self.ancestor_app_of(&id));
-
         // Identical-report deduplication: a program repeating the exact same record emits nothing.
-        if let Some(prev) = self.records.get(&id)
-            && prev.record.state == state
-            && prev.record.kind == kind
-            && prev.record.progress == progress
-            && prev.own_app == own_app
-            && prev.record.app == effective_app
-            && prev.record.title == title
-            && prev.record.message == message
-        {
-            return;
+        if let Some(prev) = self.records.get(&id) {
+            let effective_app = own_app.clone().or_else(|| self.ancestor_app_of(&id));
+            if prev.record.state == state
+                && prev.record.kind == kind
+                && prev.record.progress == progress
+                && prev.own_app == own_app
+                && prev.record.app == effective_app
+                && prev.record.title == title
+                && prev.record.message == message
+            {
+                return;
+            }
         }
 
         let prev_own_app = self.records.get(&id).and_then(|e| e.own_app.clone());
@@ -279,6 +279,10 @@ impl StatusTable {
                 effects.push(StatusEffect::Cleared { id: evict_key });
             }
         }
+
+        // Compute effective `app` AFTER any LRU eviction so a newly inserted descendant of the
+        // evicted ancestor never emits a transient double `Updated` event.
+        let effective_app = own_app.clone().or_else(|| self.ancestor_app_of(&id));
 
         self.revision += 1;
         let changed = self.revision;
@@ -339,9 +343,10 @@ impl StatusTable {
         id.is_empty() && was_pending
     }
 
-    /// Clears active/in-progress statuses (`Idle`, `Working`, `Blocked`) when a session exits,
-    /// retaining terminal `Done` and `Error` records until inspected or cleared.
-    pub fn on_session_exit(&mut self, effects: &mut Vec<StatusEffect>) {
+    /// Clears active/in-progress statuses (`Idle`, `Working`, `Blocked`) when a live foreground
+    /// command finishes, retaining terminal `Done` and `Error` records AND preserving their
+    /// `pending_verify` flags so in-flight foreground verification still gates/wakes waiters.
+    pub fn clear_active_on_command_finished(&mut self, effects: &mut Vec<StatusEffect>) {
         let to_clear: Vec<String> = self
             .records
             .iter()
@@ -352,6 +357,13 @@ impl StatusTable {
             self.records.remove(&id);
             effects.push(StatusEffect::Cleared { id });
         }
+    }
+
+    /// Clears active/in-progress statuses (`Idle`, `Working`, `Blocked`) when a session exits
+    /// (or transitions from a dead recording), retaining terminal `Done` and `Error` records
+    /// and clearing `pending_verify` since no live foreground process remains to verify.
+    pub fn on_session_exit(&mut self, effects: &mut Vec<StatusEffect>) {
+        self.clear_active_on_command_finished(effects);
         for entry in self.records.values_mut() {
             entry.pending_verify = false;
         }
