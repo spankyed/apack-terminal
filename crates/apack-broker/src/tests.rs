@@ -1548,7 +1548,7 @@ fn e2e_leases_kept_pinning_tier2_compression_foreground_verify_and_kill_escalati
     let mut cfg = BrokerConfig::for_socket(&sock);
     cfg.shard_count = 1;
     cfg.idle_compress_after = Duration::from_millis(25);
-    cfg.kill_escalate_after = Duration::from_millis(200);
+    cfg.kill_escalate_after = Duration::from_millis(400);
     cfg.wal_config.segment_target_bytes = apack_wal::MIN_SEGMENT_TARGET_BYTES;
     let mut handle = BrokerServer::bind(cfg).unwrap().spawn().unwrap();
 
