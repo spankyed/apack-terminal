@@ -30,21 +30,23 @@ Measured on **Apple M1 Pro (10 cores), macOS 26.3.1 (`aarch64`), `rustc 1.99.1`,
 
 ### 1. Sustained PTY Flood Throughput & Peak Broker RSS (`pty_flood`)
 
-Streams `32.0 MiB` of 70-byte lines through a real OS PTY (`cat` loop on a 1 MiB fixture file, gated on a
-stdin start signal so `SUB_VIEW | SUB_EVENTS` is synchronously attached before byte 0 and shell cold-start
-is excluded from throughput) into an isolated `apack-terminal serve` broker subprocess
-(`scrollback_limit = 50,000`) while acknowledging every `FrameUpdate`
-(`FrameCredit { max_frames: 8, max_bytes: 512 KiB }`) until `BrokerMsg::Exited`. Peak broker RSS is tracked
-via kernel `VmHWM` on Linux, `PeakWorkingSet64` on Windows, and 15 ms `ps` sampling on macOS.
+Streams `32.0 MiB` of 70-byte lines through a real OS PTY (`cat` loop on a 1 MiB fixture file) into an
+isolated `apack-terminal serve` broker subprocess (`scrollback_limit = 50,000`). The child prints `READY`
+and blocks on stdin until the harness waits for `WaitCondition::Text("READY")`, attaches
+`SUB_VIEW | SUB_EVENTS`, drains and ACKs the initial `full_sync` frame, starts the timer, and writes the
+start line (`go\n` on Unix, `go\r\n` on Windows ConPTY) — excluding shell cold-start while ensuring byte 0
+streams under live frame credit (`FrameCredit { max_frames: 8, max_bytes: 512 KiB }`) until
+`BrokerMsg::Exited`. Peak broker RSS is tracked via kernel `VmHWM` on Linux, `PeakWorkingSet64` on Windows,
+and 15 ms `ps` sampling on macOS.
 
 | Metric | Measured Baseline |
 | --- | ---: |
 | Target flood payload | `32.0 MiB` |
-| Broker PTY bytes ingested (incl. PTY `ONLCR` expansion) | `32.46 MiB` (`34,032,981 B`) |
-| Wall time from start signal to `Exited` | `1.445 s` |
-| Sustained PTY ingestion throughput | **`22.46 MiB/s`** |
-| Live differential `FrameUpdate`s delivered & ACKed | `5,416` frames |
-| Peak isolated broker RSS (`50,000`-line scrollback cap) | **`58.75 MiB`** |
+| Broker PTY bytes ingested (incl. PTY `ONLCR` expansion) | `32.46 MiB` (`34,032,988 B`) |
+| Wall time from start signal to `Exited` | `1.448 s` |
+| Sustained PTY ingestion throughput | **`22.41 MiB/s`** |
+| Live differential `FrameUpdate`s delivered & ACKed | `5,564` frames |
+| Peak isolated broker RSS (`50,000`-line scrollback cap) | **`58.81 MiB`** |
 
 ### 2. 60/120Hz TUI Frame Diffing + Wire Encode/Decode (`tui_frames`)
 

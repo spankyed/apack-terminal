@@ -29,6 +29,7 @@ use apack_proto::frame::{DecodedFrame, FrameDecoder};
 use apack_proto::messages::{BrokerMsg, ClientMsg, FrameUpdate, SpawnSpec};
 use apack_proto::types::{
     CellPx, FrameCredit, GridSize, LeaseKind, NonZeroStreamId, RequestId, ResizePolicy, StreamId, SubFlags,
+    WaitCondition, WaitOutcome,
 };
 use apack_vt_ghostty::{GhosttyConfig, GhosttyEngine};
 use apack_wal::{
@@ -292,15 +293,16 @@ fn bench_pty_flood(quick: bool) -> PtyFloodResult {
         }
     };
     let (lease_id, _) = control.acquire_lease(LeaseKind::BrokerImmediate).expect("acquire lease");
-    let metrics_before = control.metrics().expect("metrics before");
 
     // Connect the VIEW client BEFORE spawning so attach is synchronous and race-free.
     let mut view = BrokerClient::connect(&endpoint, &AuthConfig::None, "bench-view").expect("connect view");
 
     let sampler = RssSamplerGuard::start(broker_pid);
 
-    // Bounded `cat` PTY flood generator gated on a single stdin line so the VIEW subscriber is
-    // guaranteed attached before byte 0 and shell/PowerShell startup is excluded from throughput.
+    // Bounded `cat` PTY flood generator that prints `READY` once the shell/PowerShell runtime has
+    // booted and blocks on a single stdin line before writing byte 0, ensuring:
+    //  1. Shell/PowerShell cold-start (and Windows ConPTY DSR init) is excluded from throughput.
+    //  2. The live `VIEW | EVENTS` subscriber is attached and synced before the flood begins.
     let chunk_bytes: usize = 1024 * 1024;
     let repeats: u64 = (target_bytes / (chunk_bytes as u64)).max(1);
     let fixture_path = tmp.path().join("flood-1m.txt");
@@ -321,7 +323,7 @@ fn bench_pty_flood(quick: bool) -> PtyFloodResult {
         String::from("/bin/sh"),
         String::from("-c"),
         String::from(
-            "IFS= read -r _; i=0; while [ \"$i\" -lt \"$APACK_BENCH_REPEATS\" ]; do cat \"$APACK_BENCH_FILE\"; i=$((i + 1)); done",
+            "printf 'READY\\n'; IFS= read -r _; i=0; while [ \"$i\" -lt \"$APACK_BENCH_REPEATS\" ]; do cat \"$APACK_BENCH_FILE\"; i=$((i + 1)); done",
         ),
     ];
     #[cfg(windows)]
@@ -330,7 +332,8 @@ fn bench_pty_flood(quick: bool) -> PtyFloodResult {
         String::from("-NoProfile"),
         String::from("-Command"),
         String::from(
-            "[void][Console]::ReadLine(); \
+            "[Console]::WriteLine('READY'); \
+             [void][Console]::ReadLine(); \
              $bytes = [IO.File]::ReadAllBytes($env:APACK_BENCH_FILE); \
              $out = [Console]::OpenStandardOutput(); \
              $n = [int]$env:APACK_BENCH_REPEATS; \
@@ -356,8 +359,11 @@ fn bench_pty_flood(quick: bool) -> PtyFloodResult {
 
     let (session_id, _) = control.spawn(spec).expect("spawn flood session");
 
-    // Synchronously attach VIEW | EVENTS before releasing the flood via stdin so every frame and
-    // the final Exited event are guaranteed observed without any spawn->attach/wait race.
+    // Wait for the child runtime to finish cold-start and block on stdin (`READY`).
+    let ready = control.wait(session_id, WaitCondition::Text(String::from("READY")), 15_000).expect("wait READY");
+    assert_eq!(ready, WaitOutcome::Met, "flood shell did not print READY: {ready:?}");
+
+    // Synchronously attach VIEW | EVENTS and ACK the initial full-sync frame before releasing the flood.
     let stream_id = NonZeroStreamId::new(1).unwrap();
     let credit = FrameCredit { max_frames: 8, max_bytes: 512 * 1024 };
     view.attach(
@@ -369,10 +375,24 @@ fn bench_pty_flood(quick: bool) -> PtyFloodResult {
         credit,
     )
     .expect("attach view");
+    loop {
+        let init = view.recv_frame().expect("recv initial sync frame");
+        if let BrokerMsg::Frame(f) = init.msg {
+            view.send_raw(stream_id.as_stream_id(), RequestId::PUSH, &ClientMsg::FrameAck { seq: f.seq, credit })
+                .expect("ack initial sync frame");
+            break;
+        }
+    }
 
-    // Release the gated flood script and start timing from the first byte.
+    // Snapshot baseline metrics and release the gated flood via platform newline (`\r\n` on ConPTY).
+    let metrics_before = control.metrics().expect("metrics before");
+    #[cfg(unix)]
+    let go_bytes: &[u8] = b"go\n";
+    #[cfg(windows)]
+    let go_bytes: &[u8] = b"go\r\n";
+
     let start = Instant::now();
-    view.send_raw(stream_id.as_stream_id(), RequestId::PUSH, &ClientMsg::Write { data: b"go\n".to_vec() })
+    view.send_raw(stream_id.as_stream_id(), RequestId::PUSH, &ClientMsg::Write { data: go_bytes.to_vec() })
         .expect("send flood start signal");
 
     let mut frames_received = 0u64;
