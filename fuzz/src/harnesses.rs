@@ -208,7 +208,8 @@ pub fn fuzz_v2_kitty_apc(data: &[u8]) {
                 vt.feed(&passthrough, &mut events);
             }
             if let Some(load) = maybe_load {
-                let refusal = load.refusal();
+                let refusal = apack_vt_ghostty::NamedImageProbe::parse(load.refusal())
+                    .expect("Load::refusal must always be a valid NamedImageProbe");
                 inspect_load_without_io(load);
                 vt.feed_named_probe(&refusal, &mut events);
             }

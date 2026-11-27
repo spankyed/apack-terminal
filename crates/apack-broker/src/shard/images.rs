@@ -10,7 +10,7 @@ use apack_os::image_sources::{
     Load, Loaded, QUIET as IMAGE_SOURCE_QUIET, Quiet as ImageQuiet, Refused as ImageRefused, says_unreadable,
 };
 use apack_proto::types::SessionId;
-use apack_vt_ghostty::GhosttyEngine;
+use apack_vt_ghostty::{GhosttyEngine, NamedImageProbe};
 
 use crate::now_unix_ms;
 
@@ -20,8 +20,8 @@ use super::{ShardCmd, ShardRunner};
 pub(super) enum ImageRefusal {
     /// Core already emitted a native `EINVAL: invalid data` reply during `Load::asked()` probe.
     Said { reply: String, quiet: ImageQuiet },
-    /// Unaskable command (`!askable() && read_unasked()`): feed `Load::refusal()` probe to core.
-    ByCore(Vec<u8>),
+    /// Unaskable command (`!askable() && read_unasked()`): feed validated `Load::refusal()` probe to core.
+    ByCore(Option<NamedImageProbe>),
 }
 
 /// State for the single in-flight off-shard Kitty named-source load on a session.
@@ -113,11 +113,13 @@ impl ShardRunner {
                         }
                     }
                     ImageRefusal::ByCore(refusal_probe) => {
-                        let mut probe_events = Vec::new();
-                        sess.machine.vt_mut().feed_named_probe(&refusal_probe, &mut probe_events);
-                        for ev in probe_events {
-                            if let VtEvent::DeviceResponse(resp) = ev {
-                                sess.machine.enqueue_pty_reply(&resp, &mut effects);
+                        if let Some(probe) = refusal_probe {
+                            let mut probe_events = Vec::new();
+                            sess.machine.vt_mut().feed_named_probe(&probe, &mut probe_events);
+                            for ev in probe_events {
+                                if let VtEvent::DeviceResponse(resp) = ev {
+                                    sess.machine.enqueue_pty_reply(&resp, &mut effects);
+                                }
                             }
                         }
                     }
@@ -153,8 +155,9 @@ pub(super) fn probe_named_image_load(
     effects: &mut Vec<SessionEffect>,
 ) -> Option<ImageRefusal> {
     if load.askable() {
+        let probe = NamedImageProbe::parse(load.asked())?;
         let mut probe_events = Vec::new();
-        machine.vt_mut().feed_named_probe(&load.asked(), &mut probe_events);
+        machine.vt_mut().feed_named_probe(&probe, &mut probe_events);
         let reply = probe_events.into_iter().find_map(|ev| match ev {
             VtEvent::DeviceResponse(bytes) => String::from_utf8(bytes).ok(),
             _ => None,
@@ -168,13 +171,15 @@ pub(super) fn probe_named_image_load(
             None
         }
     } else if load.read_unasked() {
-        Some(ImageRefusal::ByCore(load.refusal()))
+        Some(ImageRefusal::ByCore(NamedImageProbe::parse(load.refusal())))
     } else {
-        let mut probe_events = Vec::new();
-        machine.vt_mut().feed_named_probe(&load.refusal(), &mut probe_events);
-        for ev in probe_events {
-            if let VtEvent::DeviceResponse(resp) = ev {
-                machine.enqueue_pty_reply(&resp, effects);
+        if let Some(probe) = NamedImageProbe::parse(load.refusal()) {
+            let mut probe_events = Vec::new();
+            machine.vt_mut().feed_named_probe(&probe, &mut probe_events);
+            for ev in probe_events {
+                if let VtEvent::DeviceResponse(resp) = ev {
+                    machine.enqueue_pty_reply(&resp, effects);
+                }
             }
         }
         None

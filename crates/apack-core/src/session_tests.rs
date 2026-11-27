@@ -49,6 +49,8 @@ struct StubVt {
     dirty: DirtyViewport,
     wrapped_logical: Option<(u64, u64)>,
     last_search_range: core::cell::Cell<(u64, u64)>,
+    use_row_text_of: bool,
+    text_of_spans: core::cell::RefCell<Vec<(u64, u64)>>,
 }
 
 impl StubVt {
@@ -66,6 +68,8 @@ impl StubVt {
             dirty: DirtyViewport { scroll_delta: 0, dirty_rows: Vec::new(), full_dirty: true },
             wrapped_logical: None,
             last_search_range: core::cell::Cell::new((0, 0)),
+            use_row_text_of: false,
+            text_of_spans: core::cell::RefCell::new(Vec::new()),
         }
     }
 }
@@ -252,6 +256,24 @@ impl VtEngine for StubVt {
     }
 
     fn text_of(&self, span: CellSpan, _max_bytes: usize) -> String {
+        self.text_of_spans.borrow_mut().push((span.start.line, span.end.line));
+        if self.use_row_text_of {
+            let mut out = String::new();
+            for line in span.start.line..=span.end.line {
+                if line > span.start.line {
+                    let prev_wrapped = self.wrapped_logical.is_some_and(|(s, e)| (line - 1) >= s && (line - 1) < e);
+                    if !prev_wrapped {
+                        out.push('\n');
+                    }
+                }
+                if line >= self.first_active_line
+                    && let Some(row) = self.rows.get((line - self.first_active_line) as usize)
+                {
+                    out.push_str(row);
+                }
+            }
+            return out;
+        }
         format!("{}:{}:{}:{}", span.start.line, span.start.col, span.end.line, span.end.col)
     }
 
@@ -269,6 +291,9 @@ impl VtEngine for StubVt {
         out: &mut Vec<CellSpan>,
     ) -> bool {
         self.last_search_range.set((from_line, to_line));
+        if needle.contains("__TRUNC__") {
+            return true;
+        }
         if needle == "__OOB_SPAN__" && from_line < to_line {
             // One span below from_line, one span at end_line == to_line, and one valid span inside [from_line, to_line)
             if from_line > 0 {
@@ -2076,4 +2101,94 @@ fn review_mutants_rows_budget_clamp_rect_and_logical_line_expansion() {
     let mut reply_buf = Vec::new();
     s.peek_pty_write(64, &mut reply_buf);
     assert_eq!(reply_buf, b"\x1b_Gi=1;OK\x1b\\");
+
+    // 6. L2: WaitCondition::Text falls back to direct bounded text scan when search_lines truncates!
+    let mut vt_trunc = StubVt::new(40, 200);
+    vt_trunc.use_row_text_of = true;
+    vt_trunc.rows = (0..200).map(|i| format!("line-{i}")).collect();
+    // Place a multi-line needle right across the 128-line chunk boundary (rows 127 & 128)!
+    vt_trunc.rows[127] = String::from("__TRUNC__HALF1");
+    vt_trunc.rows[128] = String::from("HALF2");
+    let mut s_trunc =
+        SessionMachine::new(sid(99), vt_trunc, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    // Immediate wait on multi-line needle spanning chunk boundary meets via fallback!
+    fx.clear();
+    s_trunc.register_wait(
+        conn(1),
+        RequestId::from_raw(1),
+        WaitCondition::Text("__TRUNC__HALF1\nHALF2".into()),
+        500,
+        ts(10),
+        &mut fx,
+    );
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. }
+            if *req_id == RequestId::from_raw(1)
+    )));
+    // Absent truncated needle stays pending, then wakes reactively when it arrives on a dirty line!
+    fx.clear();
+    s_trunc.register_wait(
+        conn(1),
+        RequestId::from_raw(2),
+        WaitCondition::Text("__TRUNC__LATE_MARKER".into()),
+        500,
+        ts(20),
+        &mut fx,
+    );
+    assert!(!fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Waited { .. }, .. })));
+    s_trunc.vt_mut().rows[190] = String::from("prefix __TRUNC__LATE_MARKER suffix");
+    s_trunc.vt_mut().dirty = DirtyViewport { scroll_delta: 0, dirty_rows: vec![190], full_dirty: false };
+    s_trunc.on_pty_output(b"NOOP", ts(30), &mut fx);
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. }
+            if *req_id == RequestId::from_raw(2)
+    )));
+
+    // Direct boundary tests on `text_matches_in_range_chunked`:
+    // 1. Empty needle, empty/inverted range, and spurious leading `\n` before `from_line` return false.
+    let mut vt_chunk = StubVt::new(40, 20);
+    vt_chunk.use_row_text_of = true;
+    vt_chunk.rows = (0..20).map(|i| format!("r{i}")).collect();
+    vt_chunk.rows[0] = String::from("__TRUNC__r0");
+    assert!(!crate::session::text_matches_in_range_chunked(&vt_chunk, 0, 5, "", 4));
+    assert!(!crate::session::text_matches_in_range_chunked(&vt_chunk, 5, 5, "__TRUNC__x", 4));
+    assert!(!crate::session::text_matches_in_range_chunked(&vt_chunk, 0, 4, "\n__TRUNC__r0", 4));
+    // 2. Non-overlapping O(N) chunks: exact spans [0..=3], [4..=7], [8..=9].
+    vt_chunk.text_of_spans.borrow_mut().clear();
+    assert!(!crate::session::text_matches_in_range_chunked(&vt_chunk, 0, 10, "__TRUNC__MISSING", 4));
+    assert_eq!(*vt_chunk.text_of_spans.borrow(), vec![(0, 3), (4, 7), (8, 9)]);
+    // 3. Multi-line needle spanning an unwrapped chunk boundary matches in O(N) with zero overlap!
+    vt_chunk.rows[3] = String::from("__TRUNC__A");
+    vt_chunk.rows[4] = String::from("B");
+    vt_chunk.text_of_spans.borrow_mut().clear();
+    assert!(crate::session::text_matches_in_range_chunked(&vt_chunk, 0, 10, "__TRUNC__A\nB", 4));
+    assert_eq!(*vt_chunk.text_of_spans.borrow(), vec![(0, 3), (4, 7)]);
+    // 4. Single-line UTF-8 needle split across a long soft-wrapped logical line (`> chunk_lines` rows)
+    //    matches seamlessly without spurious `\n`!
+    vt_chunk.wrapped_logical = Some((0, 9));
+    vt_chunk.rows[3] = String::from("xxxx__TRUNC__é");
+    vt_chunk.rows[4] = String::from("WORLDyyyy");
+    vt_chunk.text_of_spans.borrow_mut().clear();
+    assert!(crate::session::text_matches_in_range_chunked(&vt_chunk, 0, 10, "__TRUNC__éWORLD", 4));
+    assert_eq!(*vt_chunk.text_of_spans.borrow(), vec![(0, 3), (4, 7)]);
+    // 5. Multi-line needle preceded by a soft-wrapped line (rows 2..=3 wrapped -> row 4 unwrapped) matches!
+    vt_chunk.wrapped_logical = Some((2, 3));
+    vt_chunk.rows[2] = String::from("__TRUNC__WRAPPED_");
+    vt_chunk.rows[3] = String::from("TAIL");
+    vt_chunk.rows[4] = String::from("NEXT");
+    assert!(crate::session::text_matches_in_range_chunked(&vt_chunk, 0, 10, "__TRUNC__WRAPPED_TAIL\nNEXT", 4));
+    // 6. 1-byte needle (`keep == 0`) does not carry across chunks.
+    vt_chunk.wrapped_logical = None;
+    vt_chunk.rows[3] = String::from("abc");
+    vt_chunk.rows[4] = String::from("def");
+    // Using a 1-char needle isn't `__TRUNC__`, so check short carry (`combined.len() <= keep`) too:
+    assert!(!crate::session::text_matches_in_range_chunked(
+        &vt_chunk,
+        0,
+        6,
+        "__TRUNC__VERY_LONG_MISSING_NEEDLE_0123456789",
+        1
+    ));
 }

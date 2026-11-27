@@ -6,7 +6,6 @@ mod render;
 mod snapshot;
 mod vt_impl;
 
-use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
@@ -20,14 +19,14 @@ use crate::image_store::{ImageStore, install_png_decoder};
 use crate::input::InputEncoders;
 
 #[cfg(test)]
-pub(crate) use callbacks::{escape_osc633_field, sanitize_osc633_body};
-#[cfg(test)]
-pub(crate) use ffi_queries::decode_osc7_cwd;
+pub(crate) use callbacks::{escape_osc633_field, ffi_guard, sanitize_osc633_body};
 pub(crate) use ffi_queries::read_grapheme_codepoints;
 #[cfg(test)]
-pub(crate) use snapshot::last_snapshot_record_end;
+pub(crate) use ffi_queries::{checked_image_placement, decode_osc7_cwd, resolve_drawn_pixel_size};
 #[cfg(test)]
-pub(crate) use vt_impl::{checked_image_placement, coalesce_feed_events};
+pub(crate) use snapshot::{check_decode_loop_outcome, last_snapshot_record_end};
+#[cfg(test)]
+pub(crate) use vt_impl::coalesce_feed_events;
 
 use ffi_queries::{handle_at_ground, track_active_top};
 
@@ -149,6 +148,36 @@ impl Drop for CallbackBox {
     }
 }
 
+/// Validated single-command NUL-payload Kitty graphics probe (`G<keys>;AA==\x1b\\\x1b_`).
+///
+/// Guarantees by construction that feeding this probe while `KITTY_IMAGE_MEDIUM_{FILE,SHARED_MEM}`
+/// are temporarily enabled can never open a host path or inject a secondary APC/escape sequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedImageProbe(Vec<u8>);
+
+impl NamedImageProbe {
+    /// Maximum byte length of a validated named-image probe command.
+    pub const MAX_BYTES: usize = 4096;
+    const SUFFIX: &'static [u8] = b";AA==\x1b\\\x1b_";
+
+    /// Validates `bytes` as a single NUL-payload Kitty probe command with strictly ASCII key bytes.
+    pub fn parse(bytes: Vec<u8>) -> Option<Self> {
+        if bytes.len() > Self::MAX_BYTES {
+            return None;
+        }
+        let inner = bytes.strip_prefix(b"G")?.strip_suffix(Self::SUFFIX)?;
+        if !inner.iter().all(|&b| b.is_ascii_alphanumeric() || matches!(b, b',' | b'=' | b'-' | b'+')) {
+            return None;
+        }
+        Some(Self(bytes))
+    }
+
+    /// Returns the validated probe wire bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 #[derive(Default)]
 struct ImageSyncCache {
     images_gen: u64,
@@ -171,7 +200,7 @@ pub struct GhosttyEngine {
     active_top: sys::TrackedGridRef,
     encoders: InputEncoders,
     image_store: Arc<Mutex<ImageStore>>,
-    image_cache: RefCell<ImageSyncCache>,
+    image_cache: ImageSyncCache,
     size: GridSize,
     cell_px: CellPx,
     scrollback_lines_limit: usize,
@@ -278,7 +307,7 @@ impl GhosttyEngine {
             active_top,
             encoders,
             image_store,
-            image_cache: RefCell::new(ImageSyncCache::default()),
+            image_cache: ImageSyncCache::default(),
             size: config.size,
             cell_px: config.cell_px,
             scrollback_lines_limit: config.scrollback_lines,

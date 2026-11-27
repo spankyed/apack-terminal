@@ -2,7 +2,7 @@
 
 use std::ptr::NonNull;
 
-use apack_proto::types::{PaletteOverrides, Rgb};
+use apack_proto::types::{BlobHash, ImagePlacement, PaletteOverrides, Rgb};
 use ghostty_vt_rs_sys as sys;
 
 use crate::error::GhosttyError;
@@ -380,4 +380,47 @@ pub(crate) fn read_grapheme_codepoints(grid_ref: &sys::GridRef, out: &mut Vec<u3
         }
     }
     false
+}
+
+/// Resolves the drawn pixel dimensions of an image placement, falling back to `fallback` when headless.
+pub(crate) fn resolve_drawn_pixel_size(drawn_ok: bool, px_w: u32, px_h: u32, fallback: [u32; 2]) -> [u32; 2] {
+    if drawn_ok && px_w > 0 && px_h > 0 { [px_w, px_h] } else { fallback }
+}
+
+/// Builds a wire-valid [`ImagePlacement`], returning `None` for degenerate zero-sized or overflowing placements.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn checked_image_placement(
+    blob: BlobHash,
+    line: u64,
+    col: i32,
+    source_rect: [u32; 4],
+    cell_offset: [u32; 2],
+    pixel_size: [u32; 2],
+    cols: u32,
+    rows: u32,
+    z_index: i32,
+) -> Option<ImagePlacement> {
+    let span_cols = cols.min(u32::from(u16::MAX)) as u16;
+    let span_rows = rows.min(u32::from(u16::MAX)) as u16;
+    if source_rect[2] == 0
+        || source_rect[3] == 0
+        || source_rect[0].checked_add(source_rect[2]).is_none()
+        || source_rect[1].checked_add(source_rect[3]).is_none()
+        || pixel_size[0] == 0
+        || pixel_size[1] == 0
+        || span_cols == 0
+        || span_rows == 0
+    {
+        return None;
+    }
+    Some(ImagePlacement {
+        blob,
+        line,
+        col,
+        source_rect,
+        cell_offset,
+        pixel_size,
+        cell_span: [span_cols, span_rows],
+        z_index,
+    })
 }

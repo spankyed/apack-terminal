@@ -15,9 +15,12 @@ pub mod rows;
 #[cfg(test)]
 mod tests;
 
-pub use engine::{GhosttyConfig, GhosttyEngine, VtFeatures, features};
+pub use engine::{GhosttyConfig, GhosttyEngine, NamedImageProbe, VtFeatures, features};
 pub use error::GhosttyError;
 pub use image_store::{BlobChunk, ImageStore, decode_png_rgba, encode_png_rgba};
+
+/// Maximum cached/reported Kitty image placements per session (aligned with `MAX_IMAGES_REPLY`).
+pub const MAX_IMAGE_PLACEMENTS: usize = apack_proto::MAX_IMAGES_REPLY;
 
 /// Default broker-wide deduplicated image store cap (`256 MiB`).
 pub const GLOBAL_IMAGE_STORE_BYTES: usize = 256 << 20;

@@ -1417,9 +1417,7 @@ impl<V: VtEngine> SessionMachine<V> {
             WaitCondition::Idle => self.marks.is_idle(),
             WaitCondition::Text(needle) => {
                 let meta = self.vt.meta();
-                let mut found = Vec::new();
-                let _ = self.vt.search_lines(meta.oldest_line(), meta.total_lines(), needle, true, 1, &mut found);
-                !found.is_empty()
+                text_matches_in_range(&self.vt, meta.oldest_line(), meta.total_lines(), needle)
             }
             WaitCondition::Status(states) => self.statuses.root().is_some_and(|r| states.contains(&r.state)),
             WaitCondition::Exit => !self.alive,
@@ -1430,11 +1428,7 @@ impl<V: VtEngine> SessionMachine<V> {
         let mut kept = Vec::new();
         for w in self.waiters.drain(..) {
             let matched = match &w.condition {
-                WaitCondition::Text(needle) => {
-                    let mut found = Vec::new();
-                    let _ = self.vt.search_lines(from_line, to_line, needle, true, 1, &mut found);
-                    !found.is_empty()
-                }
+                WaitCondition::Text(needle) => text_matches_in_range(&self.vt, from_line, to_line, needle),
                 _ => false,
             };
             if matched {
@@ -1502,6 +1496,65 @@ impl<V: VtEngine> SessionMachine<V> {
             }
         }
     }
+}
+
+fn text_matches_in_range<V: VtEngine>(vt: &V, from_line: u64, to_line: u64, needle: &str) -> bool {
+    text_matches_in_range_chunked(vt, from_line, to_line, needle, 128)
+}
+
+pub(crate) fn text_matches_in_range_chunked<V: VtEngine>(
+    vt: &V,
+    from_line: u64,
+    to_line: u64,
+    needle: &str,
+    chunk_lines: u64,
+) -> bool {
+    if needle.is_empty() || from_line >= to_line {
+        return false;
+    }
+    let mut found = Vec::new();
+    let truncated = vt.search_lines(from_line, to_line, needle, true, 1, &mut found);
+    if !found.is_empty() {
+        return true;
+    }
+    if !truncated {
+        return false;
+    }
+    // When `search_lines` truncates (e.g. dense scrollback matches hit global candidate/alloc caps)
+    // before reaching `[from_line, to_line)`, stream bounded non-overlapping row chunks in O(N)
+    // with a rolling `needle.len() - 1` byte tail carry so needles split across soft-wrapped lines
+    // or arbitrary multi-line boundaries are always matched with bounded memory.
+    let step = chunk_lines.max(1);
+    let meta = vt.meta();
+    let max_col = meta.size.cols.get().saturating_sub(1);
+    let end_line = to_line.saturating_sub(1);
+    let keep = needle.len().saturating_sub(1);
+    let mut carry = String::new();
+    let mut prev_wrapped = false;
+    let mut cur = from_line;
+    while cur <= end_line {
+        let chunk_end = cur.saturating_add(step.saturating_sub(1)).min(end_line);
+        let span = CellSpan { start: CellPos { line: cur, col: 0 }, end: CellPos { line: chunk_end, col: max_col } };
+        let chunk = vt.text_of(span, MAX_STRING_BYTES);
+        let mut combined = String::with_capacity(carry.len() + 1 + chunk.len());
+        combined.push_str(&carry);
+        if cur > from_line && !prev_wrapped {
+            combined.push('\n');
+        }
+        combined.push_str(&chunk);
+        if combined.contains(needle) {
+            return true;
+        }
+        if chunk_end >= end_line {
+            break;
+        }
+        prev_wrapped = vt.line_at(chunk_end).is_some_and(|l| l.end.line > chunk_end);
+        let start = combined.ceil_char_boundary(combined.len().saturating_sub(keep));
+        carry.clear();
+        carry.push_str(&combined[start..]);
+        cur = chunk_end.saturating_add(1);
+    }
+    false
 }
 
 fn normalize_progress(state: ProgressState, percent: Option<u8>) -> Option<u8> {
