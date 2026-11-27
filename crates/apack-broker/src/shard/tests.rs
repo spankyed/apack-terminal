@@ -174,7 +174,13 @@ mod win_shard_tests {
             let _ = child.wait();
         }
         let drain_now = Instant::now();
+        live_sess.paused_by_stream = true;
+        live_sess.paused_by_raw_flow = true;
+        live_sess.paused_by_raw_inflight = true;
         assert_eq!(finish_or_begin_win_exit_drain(&mut live_sess, (Some(42), None), drain_now), None);
+        assert!(!live_sess.paused_by_stream);
+        assert!(!live_sess.paused_by_raw_flow);
+        assert!(!live_sess.paused_by_raw_inflight);
         let drain_state = live_sess.exit_drain.as_ref().expect("exit_drain set");
         assert_eq!(drain_state.code, Some(42));
         assert_eq!(drain_state.deadline, drain_now + WIN_CONPTY_DRAIN_TIMEOUT);
@@ -1340,8 +1346,8 @@ mod image_source_shard_tests {
             deadline: Instant::now() + Duration::from_secs(1),
         });
         let wait_t = runner.compute_wait_timeout(TimestampMs::from_millis(2_000));
-        assert!(
-            wait_t <= TERMINATE_POLL_INTERVAL,
+        assert_eq!(
+            wait_t, TERMINATE_POLL_INTERVAL,
             "exit_drain must clamp shard wait timeout to TERMINATE_POLL_INTERVAL, got {wait_t:?}"
         );
         runner.sessions.get_mut(&sid_drain).unwrap().exit_drain =

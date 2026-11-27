@@ -1,6 +1,6 @@
 //! `apack-terminal` v2 broker CLI entrypoint (`serve`, `proxy`, `inspect`, `version`).
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 use std::process::ExitCode;
 
@@ -39,10 +39,12 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
-            // Read and strip `APACK_TERMINAL_AUTH_KEY` from the broker process environment while
-            // still strictly single-threaded so neither `/proc/<pid>/environ` nor child shells see it.
+            // Read and strip `APACK_TERMINAL_AUTH_KEY` from the broker process `environ` while
+            // still strictly single-threaded so spawned child shells cannot inherit it.
             let grace_env = std::env::var(START_GRACE_ENV).ok();
-            let auth_key = take_secret_env_at_startup(AUTH_KEY_ENV);
+            #[allow(unsafe_code)]
+            // SAFETY: invoked strictly at single-threaded `main()` startup before any threads exist.
+            let auth_key = unsafe { take_secret_env_at_startup(AUTH_KEY_ENV) };
             let mut cfg =
                 BrokerConfig::for_socket(socket_path).apply_env_overrides(grace_env.as_deref(), auth_key.as_deref());
             if let Some(n) = shards {

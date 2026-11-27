@@ -346,21 +346,21 @@ fn find_descendant_leader(
     lookup: impl Fn(u32) -> Option<(Option<u32>, Option<u32>)>,
     leaders: &[u32],
     pid_u32: u32,
-) -> Option<u32> {
+) -> Option<(u32, usize)> {
     if leaders.contains(&pid_u32) {
         return None;
     }
     let mut at = pid_u32;
-    for _ in 0..MAX_TREE_DEPTH {
+    for depth in 0..MAX_TREE_DEPTH {
         let (session, parent) = lookup(at)?;
         if let Some(sid) = session
             && leaders.contains(&sid)
         {
-            return Some(sid);
+            return Some((sid, depth));
         }
         let parent = parent?;
         if leaders.contains(&parent) {
-            return Some(parent);
+            return Some((parent, depth + 1));
         }
         if parent == at {
             return None;
@@ -393,11 +393,16 @@ fn signal_session_descendants(leaders: &[u32], kind: SignalKind) {
                 .get(&Pid::from_u32(p))
                 .map(|proc| (proc.session_id().map(|s| s.as_u32()), proc.parent().map(|par| par.as_u32())))
         };
-        let others: Vec<(u32, u32)> = processes
+        let mut others: Vec<(u32, u32, usize)> = processes
             .keys()
-            .filter_map(|&pid| find_descendant_leader(lookup, leaders, pid.as_u32()).map(|l| (l, pid.as_u32())))
+            .filter_map(|&pid| {
+                find_descendant_leader(lookup, leaders, pid.as_u32()).map(|(l, depth)| (l, pid.as_u32(), depth))
+            })
             .collect();
-        for (leader, pid) in others {
+        // Signal deepest descendants first so killing an intermediate `setsid()` parent cannot
+        // reparent its children to PID 1 before they are verified and signaled.
+        others.sort_unstable_by_key(|a| std::cmp::Reverse(a.2));
+        for (leader, pid, _) in others {
             if let Some(target) = i32::try_from(pid).ok().and_then(SignalTarget::new) {
                 let _ = deliver_signal(leader, kind, SignalScope::Pid(target));
             }
@@ -710,9 +715,9 @@ mod tests {
         snap.insert(201, (Some(201), Some(1))); // unrelated process
         let lookup = |p: u32| snap.get(&p).copied();
         assert_eq!(find_descendant_leader(lookup, &[100], 100), None);
-        assert_eq!(find_descendant_leader(lookup, &[100], 101), Some(100));
-        assert_eq!(find_descendant_leader(lookup, &[100], 102), Some(100));
-        assert_eq!(find_descendant_leader(lookup, &[100], 103), Some(100));
+        assert_eq!(find_descendant_leader(lookup, &[100], 101), Some((100, 0)));
+        assert_eq!(find_descendant_leader(lookup, &[100], 102), Some((100, 1)));
+        assert_eq!(find_descendant_leader(lookup, &[100], 103), Some((100, 2)));
         assert_eq!(find_descendant_leader(lookup, &[100], 200), None);
         assert_eq!(find_descendant_leader(lookup, &[100], 201), None);
         assert_eq!(find_descendant_leader(lookup, &[100], 999), None);

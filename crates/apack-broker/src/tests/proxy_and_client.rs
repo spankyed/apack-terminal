@@ -774,12 +774,22 @@ fn shard_keyframe_seek_fallback_and_exit_status_unit() {
     use crate::config::{CLI_HELP, CliCommand, INSPECT_HELP, PROXY_HELP, SERVE_HELP, VERSION_HELP, parse_cli};
     assert_eq!(parse_cli(&["-h".into()]), Ok(CliCommand::Help(CLI_HELP)));
     assert_eq!(parse_cli(&["--help".into()]), Ok(CliCommand::Help(CLI_HELP)));
+    assert!(parse_cli(&["--help".into(), "--bogus".into()]).is_err());
     assert_eq!(parse_cli(&["help".into()]), Ok(CliCommand::Help(CLI_HELP)));
+    assert_eq!(parse_cli(&["help".into(), "serve".into()]), Ok(CliCommand::Help(SERVE_HELP)));
+    assert_eq!(parse_cli(&["help".into(), "proxy".into()]), Ok(CliCommand::Help(PROXY_HELP)));
+    assert_eq!(parse_cli(&["help".into(), "inspect".into()]), Ok(CliCommand::Help(INSPECT_HELP)));
+    assert_eq!(parse_cli(&["help".into(), "version".into()]), Ok(CliCommand::Help(VERSION_HELP)));
+    assert!(parse_cli(&["help".into(), "bogus".into()]).is_err());
+    assert!(parse_cli(&["help".into(), "serve".into(), "extra".into()]).is_err());
     assert_eq!(parse_cli(&["serve".into(), "--help".into()]), Ok(CliCommand::Help(SERVE_HELP)));
     assert_eq!(parse_cli(&["serve".into(), "-h".into()]), Ok(CliCommand::Help(SERVE_HELP)));
     assert_eq!(parse_cli(&["proxy".into(), "--help".into()]), Ok(CliCommand::Help(PROXY_HELP)));
     assert_eq!(parse_cli(&["inspect".into(), "-h".into()]), Ok(CliCommand::Help(INSPECT_HELP)));
     assert_eq!(parse_cli(&["version".into(), "--help".into()]), Ok(CliCommand::Help(VERSION_HELP)));
+    assert_eq!(parse_cli(&["version".into(), "-h".into()]), Ok(CliCommand::Help(VERSION_HELP)));
+    assert!(parse_cli(&["version".into(), "--bogus".into(), "--help".into()]).is_err());
+    assert!(parse_cli(&["--version".into(), "--help".into()]).is_err());
     let sample_report = crate::inspect::build_report(&[], apack_proto::types::MetricsSnapshot::default());
     assert!(crate::inspect::format_report(&sample_report, true).ends_with('\n'));
 
@@ -879,4 +889,34 @@ fn pr6_proxy_large_full_duplex_reconnect_replay_never_deadlocks() {
     assert!(stdout_buf.iter().all(|&b| b == b'R'));
     assert_eq!(&server_got[..total_payload], input_bytes.as_slice());
     assert_eq!(&server_got[total_payload..], &apack_proto::FIN_FRAME);
+
+    // Also verify consistent `BrokenPipe` error when replay buffer overflows (> 1 MiB) before
+    // `stream1` hits EOF without sending any bytes.
+    let sock_ovf = unique_endpoint(tmp.path(), "pr6-overflow-1");
+    #[cfg(unix)]
+    if let Some(p) = std::path::Path::new(&sock_ovf).parent() {
+        std::fs::create_dir_all(p).unwrap();
+    }
+    let l_ovf = apack_os::transport::bind_local_listener(&sock_ovf).unwrap();
+    let t_ovf = std::thread::spawn(move || {
+        use interprocess::local_socket::traits::Listener as _;
+        use std::io::Read;
+        if let Ok(mut s) = l_ovf.accept() {
+            let mut sink = [0u8; 32_768];
+            let mut got = 0usize;
+            while got < 1_200_000 {
+                match s.read(&mut sink) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => got += n,
+                }
+            }
+            drop(s);
+        }
+    });
+    let big_input = std::io::Cursor::new(vec![b'X'; 1_200_000]);
+    let mut ovf_out = Vec::new();
+    let ovf_err = run_proxy_over(big_input, &mut ovf_out, move || apack_os::transport::connect_local_stream(&sock_ovf))
+        .expect_err("overflowed replay buffer before first broker byte must return BrokenPipe");
+    assert_eq!(ovf_err.kind(), std::io::ErrorKind::BrokenPipe);
+    t_ovf.join().expect("join t_ovf");
 }

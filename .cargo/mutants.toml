@@ -40,6 +40,7 @@ exclude_re = [
     "crates/apack-os/src/image_sources/windows.rs:.*replace \\| with \\^$",
     "crates/apack-os/src/pty_poller.rs:.*replace \\| with \\^ in create_nonblocking_pipe",
     "crates/apack-os/src/tree_windows.rs:.*replace \\| with \\^ in JobGuard::attach",
+    "crates/apack-os/src/transport_windows.rs:.*replace \\| with \\^$",
     "crates/apack-wal/src/safe_fs.rs:.*replace \\| with \\^ in (open_regular|sync_dir)",
     # 3. Testing a peer owned by another OS user or pipe access denial to another local account
     #    requires a second local OS account not present in CI.

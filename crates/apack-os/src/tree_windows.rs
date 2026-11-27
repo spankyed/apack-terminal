@@ -7,8 +7,9 @@
 
 use std::io;
 use std::mem::{offset_of, size_of};
+use std::os::windows::io::{AsRawHandle, BorrowedHandle};
 
-use windows_sys::Win32::Foundation::{CloseHandle, ERROR_MORE_DATA, FALSE, GetLastError, HANDLE};
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_MORE_DATA, FALSE, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_PROCESS_ID_LIST,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation,
@@ -35,6 +36,12 @@ unsafe impl Send for JobGuard {}
 // only runs in `Drop` when no shared references remain.
 unsafe impl Sync for JobGuard {}
 
+/// Returns `true` when `handle` is neither null nor `INVALID_HANDLE_VALUE` (`-1`, which Win32
+/// interprets as the `GetCurrentProcess()` pseudo-handle).
+fn is_valid_process_handle(handle: HANDLE) -> bool {
+    !handle.is_null() && handle != INVALID_HANDLE_VALUE
+}
+
 impl JobGuard {
     /// Creates a `KILL_ON_JOB_CLOSE` Job Object without assigning any process yet.
     fn create_kill_on_close_job() -> Option<HANDLE> {
@@ -60,16 +67,20 @@ impl JobGuard {
         }
     }
 
-    /// Creates a `KILL_ON_JOB_CLOSE` Job Object and assigns the already-open pinned child process
-    /// `HANDLE` directly, eliminating `OpenProcess(pid)` PID-reuse TOCTOU races.
-    pub fn attach_handle(process_handle: std::os::windows::io::RawHandle) -> Option<Self> {
-        if process_handle.is_null() {
+    /// Creates a `KILL_ON_JOB_CLOSE` Job Object and assigns the borrowed pinned child process
+    /// handle directly, eliminating `OpenProcess(pid)` PID-reuse TOCTOU races.
+    ///
+    /// Rejects null handles and `INVALID_HANDLE_VALUE` (`-1`, which Win32 interprets as the
+    /// `GetCurrentProcess()` pseudo-handle and would otherwise kill the broker itself on drop).
+    pub fn attach_handle(process_handle: BorrowedHandle<'_>) -> Option<Self> {
+        let raw = process_handle.as_raw_handle() as HANDLE;
+        if !is_valid_process_handle(raw) {
             return None;
         }
         let job = Self::create_kill_on_close_job()?;
-        // SAFETY: `job` is a valid newly created Job Object handle and `process_handle` is a
-        // caller-borrowed live Win32 process handle (never closed by `AssignProcessToJobObject`).
-        let assigned = unsafe { AssignProcessToJobObject(job, process_handle as HANDLE) };
+        // SAFETY: `job` is a valid newly created Job Object handle and `raw` comes from a live
+        // `BorrowedHandle<'_>` that is neither null nor `INVALID_HANDLE_VALUE`.
+        let assigned = unsafe { AssignProcessToJobObject(job, raw) };
         if assigned == 0 {
             // SAFETY: `job` was created above and is unused on failure.
             unsafe { CloseHandle(job) };
@@ -172,13 +183,21 @@ impl JobGuard {
     }
 }
 
-/// Attaches a `KILL_ON_JOB_CLOSE` Job Object to a newly spawned `portable_pty::Child`,
-/// preferring its pinned Win32 process `HANDLE` directly over `OpenProcess(pid)`.
+/// Attaches a `KILL_ON_JOB_CLOSE` Job Object to a newly spawned `portable_pty::Child`.
+///
+/// When `child.as_raw_handle()` is available, attaches exclusively via that pinned Win32 process
+/// `HANDLE` (never falling back to `OpenProcess(pid)`, which would re-introduce PID-reuse TOCTOU
+/// if the child already exited). Falls back to `JobGuard::attach(pid)` only when `as_raw_handle()`
+/// returns `None` and `pid >= 2`.
 pub(crate) fn attach_child_job(child: &dyn portable_pty::Child, pid: u32) -> Option<JobGuard> {
-    if let Some(handle) = child.as_raw_handle()
-        && let Some(guard) = JobGuard::attach_handle(handle)
-    {
-        return Some(guard);
+    if let Some(handle) = child.as_raw_handle() {
+        if !is_valid_process_handle(handle as HANDLE) {
+            return None;
+        }
+        // SAFETY: `child` owns this Win32 process handle for the duration of this borrow, and we
+        // verified it is neither null nor `INVALID_HANDLE_VALUE`.
+        let borrowed = unsafe { BorrowedHandle::borrow_raw(handle) };
+        return JobGuard::attach_handle(borrowed);
     }
     JobGuard::attach(pid)
 }
@@ -196,9 +215,11 @@ mod tests {
 
     #[test]
     fn job_guard_owns_assigned_child_grows_on_more_data_and_kills_on_drop() {
-        use std::os::windows::io::AsRawHandle;
+        use std::os::windows::io::AsHandle;
 
-        assert!(JobGuard::attach_handle(std::ptr::null_mut()).is_none());
+        // SAFETY: testing explicit rejection of `INVALID_HANDLE_VALUE` (`GetCurrentProcess()`).
+        let pseudo = unsafe { BorrowedHandle::borrow_raw(INVALID_HANDLE_VALUE as std::os::windows::io::RawHandle) };
+        assert!(JobGuard::attach_handle(pseudo).is_none());
 
         let mut child = std::process::Command::new("cmd.exe")
             .args(["/C", "ping -n 30 127.0.0.1 >nul"])
@@ -206,7 +227,7 @@ mod tests {
             .expect("spawn child");
         let child_pid = child.id();
 
-        let guard = JobGuard::attach_handle(child.as_raw_handle()).expect("attach job via pinned handle");
+        let guard = JobGuard::attach_handle(child.as_handle()).expect("attach job via pinned handle");
         // Give `cmd.exe` a brief moment to spawn `ping.exe` so the Job Object has >= 2 processes,
         // exercising the `ERROR_MORE_DATA` growth path when queried with `initial_capacity = 1`.
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -235,15 +256,59 @@ mod tests {
             panic!("child outlived JobGuard drop instead of being killed by KILL_ON_JOB_CLOSE");
         }
 
-        // Also exercise `JobGuard::attach(pid)` directly (and invalid pid 0 -> None).
+        // Also exercise `JobGuard::attach(pid)` and `attach_child_job` directly (handle path,
+        // null/INVALID_HANDLE_VALUE non-fallback, and `None` handle fallback with pid < 2 guard).
+        #[derive(Debug)]
+        struct FakeChild(Option<usize>);
+        impl portable_pty::ChildKiller for FakeChild {
+            fn kill(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+            fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+                Box::new(FakeChild(None))
+            }
+        }
+        impl portable_pty::Child for FakeChild {
+            fn try_wait(&mut self) -> io::Result<Option<portable_pty::ExitStatus>> {
+                Ok(None)
+            }
+            fn wait(&mut self) -> io::Result<portable_pty::ExitStatus> {
+                Ok(portable_pty::ExitStatus::with_exit_code(0))
+            }
+            fn process_id(&self) -> Option<u32> {
+                None
+            }
+            fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+                self.0.map(|h| h as std::os::windows::io::RawHandle)
+            }
+        }
+
+        assert!(!is_valid_process_handle(std::ptr::null_mut()));
+        assert!(!is_valid_process_handle(INVALID_HANDLE_VALUE));
+        assert!(is_valid_process_handle(4usize as HANDLE));
         assert!(JobGuard::attach(0).is_none());
+        assert!(attach_child_job(&FakeChild(None), 0).is_none());
+        assert!(attach_child_job(&FakeChild(None), 1).is_none());
+
         let mut child2 = std::process::Command::new("cmd.exe")
             .args(["/C", "ping -n 30 127.0.0.1 >nul"])
             .spawn()
             .expect("spawn child2");
-        let guard2 = JobGuard::attach(child2.id()).expect("attach job via pid");
+        assert!(attach_child_job(&FakeChild(Some(0)), child2.id()).is_none());
+        assert!(attach_child_job(&FakeChild(Some(INVALID_HANDLE_VALUE as usize)), child2.id()).is_none());
+        let guard2 =
+            attach_child_job(&FakeChild(Some(child2.as_raw_handle() as usize)), 0).expect("attach via child handle");
         assert!(guard2.owns(child2.id()).expect("owns child2"));
         drop(guard2);
         let _ = child2.wait();
+
+        let mut child3 = std::process::Command::new("cmd.exe")
+            .args(["/C", "ping -n 30 127.0.0.1 >nul"])
+            .spawn()
+            .expect("spawn child3");
+        let guard3 = attach_child_job(&FakeChild(None), child3.id()).expect("fallback attach via pid");
+        assert!(guard3.owns(child3.id()).expect("owns child3"));
+        drop(guard3);
+        let _ = child3.wait();
     }
 }

@@ -89,7 +89,7 @@ pub fn connect_or_autostart(socket_path: &str, autostart: bool) -> io::Result<St
     connect_or_autostart_with(socket_path, autostart, AUTOSTART_TIMEOUT, |path| spawn_detached_broker(path).map(Some))
 }
 
-fn spawn_stderr_collector(mut stderr: std::process::ChildStderr) -> thread::JoinHandle<String> {
+fn spawn_stderr_collector(mut stderr: std::process::ChildStderr) -> Option<thread::JoinHandle<String>> {
     thread::Builder::new()
         .name(String::from("apack-proxy-stderr"))
         .spawn(move || {
@@ -106,7 +106,7 @@ fn spawn_stderr_collector(mut stderr: std::process::ChildStderr) -> thread::Join
             }
             String::from_utf8_lossy(&captured).trim().to_owned()
         })
-        .expect("spawn stderr collector")
+        .ok()
 }
 
 pub(crate) fn reap_child_in_background(mut child: Child) {
@@ -132,7 +132,7 @@ where
     }
 
     let mut child = spawn_broker(socket_path)?;
-    let mut stderr_handle = child.as_mut().and_then(|c| c.stderr.take()).map(spawn_stderr_collector);
+    let mut stderr_handle = child.as_mut().and_then(|c| c.stderr.take()).and_then(spawn_stderr_collector);
     let started = Instant::now();
     let backoff = Duration::from_millis(15);
     loop {
@@ -305,15 +305,23 @@ where
     // FIRST, take the replay snapshot under `link` (zero I/O under lock), hand the write to a
     // dedicated replay writer thread, and immediately resume reading `stream2` so full-duplex
     // responses can never deadlock behind a large (up to 1 MiB) replay write.
-    let should_reconnect = {
+    let (should_reconnect, overflowed_before_eof) = {
         let guard = link.0.lock().unwrap_or_else(|e| e.into_inner());
-        should_reconnect_proxy(
+        let overflowed = first_read_eof && guard.replay.is_overflowed();
+        let reconnect = should_reconnect_proxy(
             first_read_eof,
             guard.replay.is_overflowed(),
             guard.stdin_eof,
             guard.replay.replay_slice().is_some(),
-        )
+        );
+        (reconnect, overflowed)
     };
+    if overflowed_before_eof {
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "proxy replay buffer overflowed before broker responded",
+        ));
+    }
 
     if should_reconnect {
         let stream2 = Arc::new(connect()?);
@@ -331,14 +339,18 @@ where
             (bytes, eof)
         };
 
+        let replay_cancel = Arc::new(AtomicBool::new(false));
         let replay_stream = Arc::clone(&stream2);
         let replay_link = Arc::clone(&link);
-        let replay_writer = thread::Builder::new().name(String::from("apack-proxy-replay")).spawn(move || {
-            let mut tx2: &Stream = &replay_stream;
-            let write_ok = tx2.write_all(&replay_bytes).and_then(|()| tx2.flush()).is_ok();
-            if write_ok && already_eof {
-                let _ = tx2.write_all(&FIN_FRAME);
-                let _ = tx2.flush();
+        let replay_cancel_w = Arc::clone(&replay_cancel);
+        let replay_writer = match thread::Builder::new().name(String::from("apack-proxy-replay")).spawn(move || {
+            if !replay_cancel_w.load(Ordering::Acquire) {
+                let mut tx2: &Stream = &replay_stream;
+                let write_ok = tx2.write_all(&replay_bytes).and_then(|()| tx2.flush()).is_ok();
+                if write_ok && already_eof {
+                    let _ = tx2.write_all(&FIN_FRAME);
+                    let _ = tx2.flush();
+                }
             }
             let (lock, cond) = &*replay_link;
             let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -346,7 +358,16 @@ where
             guard.reconnected = true;
             guard.replaying = false;
             cond.notify_all();
-        })?;
+        }) {
+            Ok(h) => h,
+            Err(err) => {
+                let (lock, cond) = &*link;
+                let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                guard.replaying = false;
+                cond.notify_all();
+                return Err(err);
+            }
+        };
 
         let mut rx2: &Stream = &stream2;
         let read_res = loop {
@@ -360,6 +381,7 @@ where
                 }
             }
         };
+        replay_cancel.store(true, Ordering::Release);
         let _ = hang_up(&stream2);
         let _ = replay_writer.join();
         read_res?;

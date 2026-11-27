@@ -2053,13 +2053,23 @@ fn pr6_explicit_session_lifetime_and_disconnect_teardown() {
     assert!(!actions.contains(&BrokerAction::SessionUnpinned(sid(1))));
     let _ = broker.pop_outbound(conn(2));
 
+    // conn(1) ALSO holds its own LeaseKind::Session(sid(1)) pin: disconnecting conn(1) must emit
+    // `TeardownSession(sid(1))` exactly ONCE (no duplicate from `unpinned_sessions`).
+    broker.feed_bytes(
+        conn(1),
+        &encode_client(StreamId::CONTROL, 1, &ClientMsg::AcquireLease { kind: LeaseKind::Session(sid(1)) }),
+        ts(5),
+        &mut actions,
+    );
+    let _ = broker.pop_outbound(conn(1));
+
     // conn(1) disconnects while conn(2) stays connected:
-    // - unpinned ConnBound sid(1) tears down immediately (`TeardownSession(1)`)
+    // - unpinned ConnBound sid(1) tears down immediately (`TeardownSession(1)` exactly once)
     // - pinned ConnBound sid(2) stays alive until conn(2) unpins it
     // - LeaseBound sid(3) stays alive because conn(2) is still connected!
     actions.clear();
     broker.close_connection(conn(1), CloseReason::TransportClosed, ts(6), &mut actions);
-    assert!(actions.contains(&BrokerAction::TeardownSession(sid(1))));
+    assert_eq!(actions.iter().filter(|a| **a == BrokerAction::TeardownSession(sid(1))).count(), 1);
     assert!(!actions.contains(&BrokerAction::TeardownSession(sid(2))));
     assert!(!actions.contains(&BrokerAction::TeardownNonKeptSessions));
 

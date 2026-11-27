@@ -650,10 +650,12 @@ impl BrokerCore {
                 (rec.lifetime == SessionLifetime::ConnBound(conn) && !self.leases.is_session_pinned(sid)).then_some(sid)
             })
             .collect();
-        for sid in conn_bound_victims {
+        for &sid in &conn_bound_victims {
             actions.push(BrokerAction::TeardownSession(sid));
         }
-        self.emit_unpinned_actions(changes.unpinned_sessions, actions);
+        let remaining_unpinned: Vec<SessionId> =
+            changes.unpinned_sessions.into_iter().filter(|sid| !conn_bound_victims.contains(sid)).collect();
+        self.emit_unpinned_actions(remaining_unpinned, actions);
         if changes.teardown_non_kept || (self.conns.is_empty() && !self.leases.has_active_broker_lease()) {
             actions.push(BrokerAction::TeardownNonKeptSessions);
         }

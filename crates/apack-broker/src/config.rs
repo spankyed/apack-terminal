@@ -185,7 +185,23 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
         return Err(String::from(CLI_USAGE));
     };
     match cmd.as_str() {
-        "-h" | "--help" | "help" => Ok(CliCommand::Help(CLI_HELP)),
+        "-h" | "--help" => {
+            if !rest.is_empty() {
+                return Err(format!("unexpected arguments to {cmd}: {}", rest.join(" ")));
+            }
+            Ok(CliCommand::Help(CLI_HELP))
+        }
+        "help" => match rest {
+            [] => Ok(CliCommand::Help(CLI_HELP)),
+            [sub] => match sub.as_str() {
+                "serve" => Ok(CliCommand::Help(SERVE_HELP)),
+                "proxy" => Ok(CliCommand::Help(PROXY_HELP)),
+                "inspect" => Ok(CliCommand::Help(INSPECT_HELP)),
+                "version" => Ok(CliCommand::Help(VERSION_HELP)),
+                other => Err(format!("unknown subcommand: {other} (expected serve, proxy, inspect, or version)")),
+            },
+            _ => Err(format!("unexpected arguments to help: {}", rest.join(" "))),
+        },
         "serve" => {
             let mut socket = None;
             let mut shards = None;
@@ -248,15 +264,11 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
             }
             Ok(CliCommand::Inspect { socket, json })
         }
-        "--version" | "-V" | "version" => {
-            if rest.iter().any(|a| a == "-h" || a == "--help") {
-                return Ok(CliCommand::Help(VERSION_HELP));
-            }
-            if !rest.is_empty() {
-                return Err(format!("unexpected arguments to version: {}", rest.join(" ")));
-            }
-            Ok(CliCommand::Version)
-        }
+        "--version" | "-V" | "version" => match rest {
+            [] => Ok(CliCommand::Version),
+            [flag] if cmd == "version" && (flag == "-h" || flag == "--help") => Ok(CliCommand::Help(VERSION_HELP)),
+            _ => Err(format!("unexpected arguments to version: {}", rest.join(" "))),
+        },
         other => Err(format!("unknown subcommand: {other} (expected serve, proxy, inspect, or version)")),
     }
 }

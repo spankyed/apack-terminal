@@ -733,6 +733,9 @@ fn pr6_session_lifetime_conn_bound_rewind_and_unleased_disconnect_e2e() {
     //    - `s_lease_bound` (`LeaseBound`) MUST tear down immediately (`TeardownNonKeptSessions`),
     //      while `s_kept` keeps the broker alive and survives for a fresh client to inspect!
     drop(observer);
+    // Let the reactor observe `observer`'s socket EOF while `conns` is genuinely empty before
+    // `inspector` connects (otherwise `inspector` could accept before `observer`'s FIN is polled).
+    std::thread::sleep(Duration::from_millis(80));
     let mut inspector = BrokerClient::connect(handle.socket_path(), &AuthConfig::None, "inspector").unwrap();
     for _ in 0..150 {
         let ids: Vec<SessionId> = inspector.list_sessions().unwrap().into_iter().map(|s| s.id).collect();

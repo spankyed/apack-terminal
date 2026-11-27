@@ -109,8 +109,10 @@ impl ShardRunner {
                 Some(exit)
             } else {
                 // On Unix explicit teardown, probe leader exit via `waitid(..., WNOHANG | WNOWAIT)`
-                // FIRST so the zombie leader pins its PID while we `SIGKILL` any surviving session
-                // or `setsid()` descendants, then reap and clear `sess.pid = None` immediately.
+                // FIRST so the zombie leader pins its PID (preventing PID reuse) while we `SIGKILL`
+                // any surviving `sid == leader` session descendants; `setsid()` descendants are
+                // signaled pre-exit via `hang_up_session_descendants` / escalation. Then reap and
+                // clear `sess.pid = None` immediately.
                 #[cfg(unix)]
                 if sess.terminating_since.is_some()
                     && let Some(pid) = sess.pid

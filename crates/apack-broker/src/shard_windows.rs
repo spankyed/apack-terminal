@@ -24,6 +24,11 @@ pub(crate) fn finish_or_begin_win_exit_drain(
     now: Instant,
 ) -> Option<(Option<i32>, Option<String>)> {
     if let Some(LivePty::Windows { bridge, eof: false }) = &sess.pty {
+        // Clear flow-control pauses so `drain_windows_ptys` flushes trailing ConPTY output through
+        // EOF promptly instead of stalling behind a paused stream for the full 2s drain window.
+        sess.paused_by_stream = false;
+        sess.paused_by_raw_flow = false;
+        sess.paused_by_raw_inflight = false;
         bridge.close_master_async();
         sess.exit_drain =
             Some(ExitDrainState { code: parsed.0, signal: parsed.1, deadline: now + WIN_CONPTY_DRAIN_TIMEOUT });
