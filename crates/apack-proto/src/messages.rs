@@ -17,7 +17,9 @@ use crate::types::{
     SessionId, SignalKind, SignalScope, SignalTarget, StatusRecord, StreamId, SubFlags, ViewModes, ViewportHint,
     WaitCondition, WaitOutcome,
 };
-use crate::{BULK_CHUNK_BYTES, MAX_CLIENT_NAME_BYTES, MAX_COMMANDS, MAX_ROWS_PER_FETCH, MAX_SEARCH_MATCHES};
+use crate::{
+    BULK_CHUNK_BYTES, MAX_CLIENT_NAME_BYTES, MAX_COMMANDS, MAX_ROWS_PER_FETCH, MAX_SEARCH_MATCHES, MAX_STATUSES,
+};
 
 /// Explicit `u16` wire discriminants shared between Rust and TypeScript codecs.
 #[allow(missing_docs)]
@@ -874,6 +876,8 @@ pub enum BrokerMsg {
         scrollback_lines: u64,
         /// Current foreground process (POSIX live sessions only).
         foreground: Option<ForegroundProcess>,
+        /// Active OSC 7501 program status records at attach time (sorted by ID, `<= MAX_STATUSES`).
+        statuses: Vec<StatusRecord>,
     },
     /// Reply to `Wait`.
     Waited {
@@ -1110,7 +1114,16 @@ impl BrokerMsg {
             }
             Self::Sought { at_ms } => w.var_u64(*at_ms),
             Self::MetricsReply(m) => m.encode(w),
-            Self::Attached { session, stream_id, size, epoch, first_active_line, scrollback_lines, foreground } => {
+            Self::Attached {
+                session,
+                stream_id,
+                size,
+                epoch,
+                first_active_line,
+                scrollback_lines,
+                foreground,
+                statuses,
+            } => {
                 session.encode(w);
                 stream_id.encode(w);
                 size.encode(w);
@@ -1118,6 +1131,7 @@ impl BrokerMsg {
                 w.var_u64(*first_active_line);
                 w.var_u64(*scrollback_lines);
                 w.opt(foreground.as_ref(), |w, f| f.encode(w));
+                w.slice(statuses, |w, s| s.encode(w));
             }
             Self::Waited { outcome } => outcome.encode(w),
             Self::Frame(frame) => frame.encode(w),
@@ -1219,7 +1233,17 @@ impl BrokerMsg {
                     return Err(WireError::InvalidValue("Attached.scrollback_lines > first_active_line"));
                 }
                 let foreground = r.opt(ForegroundProcess::decode)?;
-                Self::Attached { session, stream_id, size, epoch, first_active_line, scrollback_lines, foreground }
+                let statuses = r.vec_bounded(MAX_STATUSES, "attached statuses", StatusRecord::decode)?;
+                Self::Attached {
+                    session,
+                    stream_id,
+                    size,
+                    epoch,
+                    first_active_line,
+                    scrollback_lines,
+                    foreground,
+                    statuses,
+                }
             }
             msg_type::WAITED => Self::Waited { outcome: WaitOutcome::decode(&mut r)? },
             msg_type::FRAME => Self::Frame(Box::new(FrameUpdate::decode(&mut r)?)),

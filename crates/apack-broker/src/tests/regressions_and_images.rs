@@ -163,18 +163,19 @@ fn review_regressions_env_grace_pipelined_fin_teardown_spawn_and_seek_cell_px() 
     assert!(saw_failed && saw_busy, "Spawn after TeardownAll must fail cleanly with Busy");
     shard.shutdown();
 
-    // 4. apply_seek_slice returns effective post-Resize CellPx.
+    // 4. restore_machine_from_slice updates effective post-Resize CellPx and monotonically bumps epoch.
     let init_px = CellPx { width: 8, height: 16 };
     let resized_px = CellPx { width: 11, height: 22 };
     let size = GridSize::new(80, 24).unwrap();
-    let mut eng = apack_vt_ghostty::GhosttyEngine::new(apack_vt_ghostty::GhosttyConfig::new(size)).unwrap();
-    let machine = apack_core::session::SessionMachine::new(
+    let img_store = std::sync::Arc::new(std::sync::Mutex::new(apack_vt_ghostty::ImageStore::default()));
+    let mut machine = apack_core::session::SessionMachine::new(
         SessionId::new(1).unwrap(),
         apack_vt_ghostty::GhosttyEngine::new(apack_vt_ghostty::GhosttyConfig::new(size)).unwrap(),
         ResizePolicy::ExplicitOverride,
         apack_core::marks::MarksMode::Claimed,
         init_px,
     );
+    let prev_epoch = machine.vt().meta().epoch;
     let abi = engine_abi_hash();
     let kf = capture_keyframe(&machine, &abi);
     let slice = apack_wal::SeekSlice {
@@ -186,8 +187,11 @@ fn review_regressions_env_grace_pipelined_fin_teardown_spawn_and_seek_cell_px() 
             record: apack_wal::WalRecord::Resize { size, cell_px: resized_px },
         }],
     };
-    let effective = apply_seek_slice(&mut eng, &slice, &abi);
-    assert_eq!(effective, resized_px);
+    let fresh_eng = build_keyframe_engine(&slice, &abi, &img_store, 100).unwrap();
+    let mut replay_fx = Vec::new();
+    restore_machine_from_slice(&mut machine, fresh_eng, &slice, None, false, &mut replay_fx);
+    assert_eq!(machine.current_cell_px(), resized_px);
+    assert!(machine.vt().meta().epoch > prev_epoch);
 
     // 5. Pure transport/shard helper truth tables
     use crate::transport_loop::{
@@ -850,4 +854,250 @@ fn e2e_stream_attachment_isolation_no_redundant_stream_closed_and_prehello_size_
     client.kill(s_b).unwrap();
     drop(client);
     srv.shutdown().unwrap();
+}
+
+#[test]
+fn e2e_pr5_wal_blobs_marks_rewind_seek_epoch_search_and_attached_statuses() {
+    let dir = tempfile::tempdir().unwrap();
+    let rec_dir = dir.path().join("rec");
+    let key = apack_proto::types::MarksKey::parse(b"0123456789abcdef0123456789abcdef").unwrap();
+    let png_bytes = apack_vt_ghostty::encode_png_rgba(1, 1, &[255, 0, 0, 255]).unwrap();
+    let png_b64 = String::from_utf8(apack_os::image_sources::encoded(&png_bytes)).unwrap();
+
+    #[cfg(unix)]
+    let tf_file = {
+        let p = dir.path().join("kitty_tf.png");
+        let green_png = apack_vt_ghostty::encode_png_rgba(1, 1, &[0, 255, 0, 255]).unwrap();
+        std::fs::write(&p, &green_png).unwrap();
+        (p, green_png)
+    };
+
+    #[cfg(unix)]
+    {
+        let sock = unique_endpoint(dir.path(), "pr5-rec");
+        let mut cfg = BrokerConfig::for_socket(&sock);
+        cfg.auth = AuthConfig::None;
+        let mut srv = BrokerServer::bind(cfg.clone()).unwrap().spawn().unwrap();
+        let mut client = BrokerClient::connect(srv.socket_path(), &cfg.auth, "pr5-writer").unwrap();
+
+        let tf_b64 =
+            String::from_utf8(apack_os::image_sources::encoded(tf_file.0.as_os_str().as_encoded_bytes())).unwrap();
+        let title_b64 = String::from_utf8(apack_os::image_sources::encoded(b"Busy")).unwrap();
+        let script = format!(
+            "printf '\\033]633;V;S;1;{k};echo hi\\007PHASE_ONE\\r\\n\\033]633;V;F;1;{k};0;/tmp\\007'; \
+             printf '\\033]7501;state=working:app=sh:title={title_b64}\\033\\\\\\033]7501;id=sub:state=blocked:kind=permission\\033\\\\'; \
+             printf '\\033_Ga=T,f=100,t=d,i=10,q=2;{png_b64}\\033\\\\'; \
+             printf '\\033_Ga=T,f=100,t=f,i=11,q=2;{tf_b64}\\033\\\\'; \
+             printf 'READY_PR5\\r\\n'; read _go; printf 'PHASE_TWO\\r\\n'",
+            k = key.as_str(),
+        );
+        let mut spec = echo_command_spec("x", Some(rec_dir.to_string_lossy().into_owned()), None);
+        spec.marks_key = Some(key);
+        spec.image_files = true;
+        spec.argv = vec![String::from("/bin/sh"), String::from("-c"), script];
+
+        let (sid, _) = client.spawn(spec).unwrap();
+        assert_eq!(client.wait(sid, WaitCondition::Text(String::from("READY_PR5")), 10_000).unwrap(), WaitOutcome::Met);
+
+        // 1. Late-attaching client receives active statuses (root + child with inherited `app`) in BrokerMsg::Attached!
+        let st = NonZeroStreamId::new(1).unwrap();
+        let attached = client
+            .attach(
+                sid,
+                st,
+                SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(),
+                None,
+                0,
+                FrameCredit { max_frames: 4, max_bytes: 262_144 },
+            )
+            .unwrap();
+        let BrokerMsg::Attached { statuses, .. } = attached else {
+            panic!("expected Attached");
+        };
+        assert!(statuses.iter().any(|s| s.id.is_empty() && s.state == apack_proto::types::StatusState::Working));
+        let sub_st = statuses.iter().find(|s| s.id == "sub").expect("expected child status in Attached.statuses");
+        assert_eq!(sub_st.state, apack_proto::types::StatusState::Blocked);
+        assert!(sub_st.app.is_some(), "child status must inherit ancestor app");
+
+        // Finish session cleanly so WAL seals and flushes blobs + marks + tail output.
+        client.send_raw(st.as_stream_id(), RequestId::PUSH, &ClientMsg::Write { data: b"go\r\n".to_vec() }).unwrap();
+        assert_eq!(client.wait(sid, WaitCondition::Exit, 5_000).unwrap(), WaitOutcome::Met);
+        drop(client);
+        srv.shutdown().unwrap();
+
+        // Remove the original t=f temp file on Unix to prove Rewind hydrates from WAL blobs/output, NOT the deleted file!
+        let _ = std::fs::remove_file(&tf_file.0);
+    }
+
+    // On Windows ConPTY strips raw APC/OSC 7501 from child processes, so build the identical WAL
+    // recording directly via `WalWriter` (using `capture_keyframe` + `write_blob` + `write_marks`)
+    // and verify the real broker's `Rewind` + `Seek` + `SearchWatch` + `Attached.statuses` end-to-end!
+    #[cfg(not(unix))]
+    {
+        let reg = apack_wal::RecordingRegistry::new();
+        let mut writer =
+            apack_wal::WalWriter::open_or_create(&rec_dir, [0x55; 16], 1_000, apack_wal::WalConfig::default(), reg)
+                .unwrap();
+        let size = GridSize::new(80, 24).unwrap();
+        let cell_px = CellPx { width: 8, height: 16 };
+        let mut vt_cfg = apack_vt_ghostty::GhosttyConfig::new(size);
+        vt_cfg.cell_px = cell_px;
+        let eng = apack_vt_ghostty::GhosttyEngine::new(vt_cfg).unwrap();
+        let machine = SessionMachine::new(
+            SessionId::new(1).unwrap(),
+            eng,
+            ResizePolicy::ExplicitOverride,
+            MarksMode::Keyed(key),
+            cell_px,
+        );
+        let kf = capture_keyframe(&machine, &engine_abi_hash());
+        writer.start_segment_with_keyframe(1_000, &kf).unwrap();
+        let _ = writer.write_blob(apack_proto::types::ImageEncoding::Png, &png_bytes).unwrap();
+        let title_b64 = String::from_utf8(apack_os::image_sources::encoded(b"Busy")).unwrap();
+        let payload = format!(
+            "\x1b]633;V;S;1;{k};echo hi\x07PHASE_ONE\r\n\x1b]633;V;F;1;{k};0;/tmp\x07\
+             \x1b]7501;state=working:app=pwsh:title={title_b64}\x1b\\\
+             \x1b]7501;id=sub:state=blocked:kind=permission\x1b\\\
+             \x1b_Ga=T,f=100,t=d,i=10,q=2;{png_b64}\x1b\\READY_PR5\r\n",
+            k = key.as_str(),
+        );
+        writer.record_output(1_100, payload.as_bytes(), true).unwrap();
+        writer.record_marks(1_100, Some(key), 1).unwrap();
+        writer.record_output(1_200, b"PHASE_TWO\r\n", true).unwrap();
+        writer.seal_active().unwrap();
+    }
+
+    // Verify `<record_dir>/blobs/` has persisted `.png` blobs written via `WalHandle::write_blob`.
+    let blobs_dir = rec_dir.join("blobs");
+    assert!(blobs_dir.is_dir(), "WAL blobs directory must exist after recording Kitty images");
+    let blob_files: Vec<_> = std::fs::read_dir(&blobs_dir).unwrap().filter_map(Result::ok).collect();
+    assert!(!blob_files.is_empty(), "expected persisted image blobs in WAL blobs/");
+
+    // Also verify WAL recorded `Marks` strictly when vouched `marks_seq` advanced (not on non-mark output),
+    // AND verify `hydrate_slice_blobs` populates an empty `ImageStore` from `<dir>/blobs/` when referenced by keyframe!
+    let reg = apack_wal::RecordingRegistry::new();
+    let reader = apack_wal::WalReader::open(&rec_dir, &reg).unwrap();
+    let mut latest_slice = reader.latest_segment_records().unwrap().unwrap();
+    let mark_recs: Vec<u64> = latest_slice
+        .tail_records
+        .iter()
+        .filter_map(|r| match &r.record {
+            apack_wal::WalRecord::Marks { last_seq, .. } => Some(*last_seq),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(mark_recs, vec![1], "WAL must record Marks strictly when vouched marks_seq advances");
+    let png_hash = apack_vt_ghostty::image_store::hash_bytes(&png_bytes);
+    latest_slice.keyframe.visual.images.push(apack_proto::types::ImagePlacement {
+        blob: png_hash,
+        line: 0,
+        col: 0,
+        source_rect: [0, 0, 1, 1],
+        cell_offset: [0, 0],
+        pixel_size: [1, 1],
+        cell_span: [1, 1],
+        z_index: 0,
+    });
+    let empty_store = std::sync::Arc::new(std::sync::Mutex::new(apack_vt_ghostty::ImageStore::default()));
+    assert!(empty_store.lock().unwrap().get_blob(png_hash).is_none());
+    hydrate_slice_blobs(&reader, &latest_slice, &empty_store);
+    assert_eq!(
+        empty_store.lock().unwrap().get_blob(png_hash),
+        Some((apack_proto::types::ImageEncoding::Png, png_bytes.clone()))
+    );
+    // Second call while already resident keeps blob intact without re-reading disk.
+    hydrate_slice_blobs(&reader, &latest_slice, &empty_store);
+    assert!(empty_store.lock().unwrap().get_blob(png_hash).is_some());
+
+    // Start a BRAND-NEW broker (empty ImageStore!) to verify full Rewind + Seek hydration!
+    let sock2 = unique_endpoint(dir.path(), "pr5-rewind");
+    let mut cfg2 = BrokerConfig::for_socket(&sock2);
+    cfg2.auth = AuthConfig::None;
+    let mut srv2 = BrokerServer::bind(cfg2.clone()).unwrap().spawn().unwrap();
+    let mut c2 = BrokerClient::connect(srv2.socket_path(), &cfg2.auth, "pr5-reader").unwrap();
+
+    let (rw_sid, dur_ms, _) = c2.rewind(rec_dir.to_string_lossy().into_owned(), None).unwrap();
+    let st2 = NonZeroStreamId::new(1).unwrap();
+    let att2 = c2
+        .attach(
+            rw_sid,
+            st2,
+            SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(),
+            None,
+            0,
+            FrameCredit { max_frames: 8, max_bytes: 262_144 },
+        )
+        .unwrap();
+    let BrokerMsg::Attached { epoch: ep0, statuses: rw_statuses, .. } = att2 else {
+        panic!("expected Attached on Rewind");
+    };
+    assert!(rw_statuses.iter().any(|s| s.id == "sub"), "Rewind must replay OSC 7501 statuses via SessionMachine");
+
+    // Vouched command hydrated via WAL replay on Rewind!
+    let BrokerMsg::CommandsReply { commands: cmds } = c2.stream_request(st2, &ClientMsg::Commands).unwrap() else {
+        panic!("expected CommandsReply");
+    };
+    assert!(
+        cmds.iter().any(|c| c.id == 1 && c.command.as_deref() == Some("echo hi")),
+        "Rewind must hydrate vouched command history: {cmds:?}"
+    );
+
+    // Kitty image placements AND blob bytes hydrated on the brand-new broker!
+    let BrokerMsg::ImagesReply { placements: imgs, .. } = c2.stream_request(st2, &ClientMsg::Images).unwrap() else {
+        panic!("expected ImagesReply");
+    };
+    #[cfg(unix)]
+    assert!(imgs.len() >= 2, "expected both t=d and resolved t=f images on Rewind, got {imgs:?}");
+    #[cfg(windows)]
+    assert!(!imgs.is_empty(), "expected inline t=d image on Rewind, got {imgs:?}");
+    let mut fetched_blobs = Vec::new();
+    for p in &imgs {
+        let BrokerMsg::ImageBlobChunk { data, .. } =
+            c2.stream_request(st2, &ClientMsg::GetImageBlob { blob: p.blob, offset: 0, max_bytes: 4096 }).unwrap()
+        else {
+            panic!("expected ImageBlobChunk");
+        };
+        assert!(data.starts_with(b"\x89PNG\r\n\x1a\n"));
+        fetched_blobs.push(data);
+    }
+    assert!(fetched_blobs.iter().any(|b| b == &png_bytes), "missing inline t=d PNG blob on Rewind");
+    #[cfg(unix)]
+    assert!(
+        fetched_blobs.iter().any(|b| b == &tf_file.1),
+        "missing resolved t=f PNG blob on Rewind after deleting original file"
+    );
+
+    // Active SearchWatch refreshes AND epoch strictly increases across repeated Seek calls (`B1`)!
+    let sreq = c2.alloc_req_id();
+    c2.send_raw(
+        st2.as_stream_id(),
+        sreq,
+        &ClientMsg::SetSearch { query: String::from("PHASE_ONE"), case_sensitive: true },
+    )
+    .unwrap();
+    // Seek to start (at_ms = 0), then Seek to end (at_ms = dur_ms): epoch must strictly increase!
+    let _ = c2.seek(rw_sid, 0).unwrap();
+    let _ = c2.seek(rw_sid, dur_ms.saturating_add(1000)).unwrap();
+    let mut max_frame_epoch = ep0;
+    let mut saw_refreshed_search = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline && (!saw_refreshed_search || max_frame_epoch <= ep0 + 1) {
+        let f = c2.recv_frame().unwrap();
+        if f.stream_id == st2.as_stream_id() {
+            match f.msg {
+                BrokerMsg::Frame(upd) => {
+                    max_frame_epoch = max_frame_epoch.max(upd.epoch);
+                }
+                BrokerMsg::SearchMatches { epoch, matches, .. } if epoch > ep0 && !matches.is_empty() => {
+                    saw_refreshed_search = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(max_frame_epoch >= ep0 + 2, "two Seeks must bump epoch monotonically ({max_frame_epoch} vs {ep0})");
+    assert!(saw_refreshed_search, "SearchWatch must refresh automatically on Seek at new epoch");
+
+    drop(c2);
+    srv2.shutdown().unwrap();
 }

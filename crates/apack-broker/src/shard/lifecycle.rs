@@ -1,6 +1,5 @@
 //! Session termination, SIGHUP/SIGKILL escalation, child reaping, and Tier-2 idle compression.
 
-use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -370,15 +369,4 @@ pub(crate) fn parse_exit_status(status: &portable_pty::ExitStatus) -> (Option<i3
     } else {
         (Some(status.exit_code() as i32), None)
     }
-}
-
-pub(crate) fn argv_matches_app(argv: &[String], app: &str) -> bool {
-    let needle = app.trim();
-    if needle.is_empty() {
-        return false;
-    }
-    argv.iter().any(|arg| {
-        let base = Path::new(arg).file_name().and_then(|s| s.to_str()).unwrap_or(arg.as_str());
-        base.eq_ignore_ascii_case(needle)
-    })
 }

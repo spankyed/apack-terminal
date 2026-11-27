@@ -20,7 +20,6 @@ use crate::now_unix_ms;
 #[cfg(windows)]
 use crate::shard_windows::drain_windows_pty_writes;
 
-use super::commands::capture_keyframe;
 use super::images::{ImageRefusal, probe_named_image_load};
 use super::protocol::FgVerifyReq;
 use super::{LivePty, ReactorEvent, ShardRunner};
@@ -141,10 +140,27 @@ impl ShardRunner {
                 self.fg_pending.insert(session_id, (id, changed, app));
                 return;
             }
-            if tx.try_send(FgVerifyReq { session_id, pgid, id, changed, app }).is_err() {
-                self.fg_inflight.remove(&session_id);
+            if tx.try_send(FgVerifyReq { session_id, pgid, id: id.clone(), changed, app }).is_ok() {
+                return;
             }
+            self.fg_inflight.remove(&session_id);
         }
+        // Fallback when `fg_tx` is absent or saturated: resolve as `Confirmed::Unknown` via the
+        // shard mailbox so `pending_verify` never stalls a `WaitCondition::Status` waiter forever.
+        {
+            let mut state = self.mailbox.lock().unwrap_or_else(|e| e.into_inner());
+            state.queue.push_back((
+                super::ShardCmd::ForegroundVerified {
+                    session_id,
+                    id,
+                    changed,
+                    confirmed: apack_proto::types::Confirmed::Unknown,
+                },
+                None,
+            ));
+            state.woken = true;
+        }
+        self.self_wake.wake();
     }
 
     pub(super) fn try_publish_dirty_views(&mut self, session_id: SessionId) {
@@ -272,6 +288,7 @@ impl ShardRunner {
             sess.compressed_idle = false;
             has_raw_subs = !sess.raw_output_subs.is_empty();
 
+            let prev_marks_seq = sess.machine.marks_last_seq();
             if let Some(mut scanner) = sess.image_scanner.take() {
                 let mut rest = bytes;
                 consumed = 0;
@@ -309,19 +326,17 @@ impl ShardRunner {
 
             let committed = &bytes[..consumed];
             if !committed.is_empty() {
+                let marks_seq = sess.machine.marks_last_seq();
+                let marks_key = sess.machine.marks_key();
                 let at_ground = sess.machine.vt().at_ground();
+                super::replay::sync_wal_image_blobs(sess, &self.shared.image_store);
                 if let Some(wal) = &sess.wal {
                     let _ = wal.write_output(now_ms, committed.to_vec(), at_ground);
-                    if wal.take_rollover_needed() {
-                        sess.pending_wal_rollover = true;
-                    }
-                    if at_ground && sess.pending_wal_rollover {
-                        let kf = capture_keyframe(&sess.machine, &self.shared.engine_abi_hash);
-                        if wal.start_segment(now_ms, kf) {
-                            sess.pending_wal_rollover = false;
-                        }
+                    if marks_seq != prev_marks_seq {
+                        let _ = wal.write_marks(now_ms, marks_key, marks_seq);
                     }
                 }
+                super::replay::maybe_rollover_wal(sess, now_ms, at_ground, &self.shared.engine_abi_hash);
             }
         }
 

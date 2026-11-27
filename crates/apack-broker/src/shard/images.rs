@@ -98,11 +98,26 @@ impl ShardRunner {
                     if query_bytes.is_some() {
                         sess.machine.vt_mut().set_kitty_command_bytes(query_bytes);
                     }
+                    let record_wal = sess.wal.is_some();
+                    let mut wal_pieces = Vec::new();
                     for piece in body {
+                        if record_wal {
+                            wal_pieces.push(piece.clone());
+                        }
                         sess.machine.on_vt_feed_with(now, &mut effects, |vt, evs| vt.feed(&piece, evs));
                     }
                     if query_bytes.is_some() {
                         sess.machine.vt_mut().set_kitty_command_bytes(None);
+                    }
+                    if record_wal {
+                        super::replay::sync_wal_image_blobs(sess, &self.shared.image_store);
+                        let at_ground = sess.machine.vt().at_ground();
+                        if let Some(wal) = &sess.wal {
+                            for piece in wal_pieces {
+                                let _ = wal.write_output(now_ms, piece, at_ground);
+                            }
+                        }
+                        super::replay::maybe_rollover_wal(sess, now_ms, at_ground, &self.shared.engine_abi_hash);
                     }
                 }
                 Err(why) => match pending.refusal {

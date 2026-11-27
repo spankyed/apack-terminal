@@ -15,6 +15,7 @@ mod images;
 mod lifecycle;
 mod protocol;
 mod pty_io;
+mod replay;
 #[cfg(test)]
 mod tests;
 
@@ -29,6 +30,7 @@ use std::time::{Duration, Instant};
 use apack_core::flow::OutboundPriority;
 use apack_core::lease::ConnId;
 use apack_core::session::{SessionMachine, StreamAttachmentId};
+use apack_core::status::confirm_foreground_app;
 use apack_core::time::TimestampMs;
 use apack_os::image_sources::{Scanner as ImageScanner, Worker as ImageWorker};
 #[cfg(unix)]
@@ -39,7 +41,7 @@ use apack_os::pty_poller::{PollEvent, PollToken, PtyPoller};
 use apack_os::pty_windows::ConPtyBridge;
 use apack_os::tree::TreeGuard;
 use apack_proto::messages::{BrokerMsg, SessionSummary};
-use apack_proto::types::{Confirmed, ErrorCode, RequestId, SessionId, SignalTarget, StreamId};
+use apack_proto::types::{BlobHash, ErrorCode, RequestId, SessionId, SignalTarget, StreamId};
 use apack_vt_ghostty::GhosttyEngine;
 use apack_wal::{WalHandle, WalReader};
 
@@ -48,10 +50,10 @@ use crate::now_unix_ms;
 use crate::shard_windows::{clamp_win_write_timeout, maybe_wait_win_mailbox};
 
 #[cfg(test)]
-pub(crate) use commands::{apply_seek_slice, capture_keyframe, resolve_scrollback_lines};
+pub(crate) use commands::resolve_scrollback_lines;
 #[cfg(test)]
 pub(crate) use images::should_forward_probe_reply;
-pub(crate) use lifecycle::{argv_matches_app, shard_session_wait_timeout};
+pub(crate) use lifecycle::shard_session_wait_timeout;
 #[cfg(test)]
 pub(crate) use lifecycle::{maybe_compress_idle, parse_exit_status};
 #[cfg(test)]
@@ -60,6 +62,8 @@ pub use protocol::{ReactorEvent, ShardCmd, ShardHandle, ShardShared};
 pub(crate) use protocol::{ShardCmdPermit, ShardMailboxState, should_notify_raw_drained, should_pause_raw_inflight};
 #[cfg(all(test, unix))]
 pub(crate) use pty_io::{drain_unix_pty_nonblocking, unix_pty_interest};
+#[cfg(test)]
+pub(crate) use replay::{build_keyframe_engine, capture_keyframe, hydrate_slice_blobs, restore_machine_from_slice};
 
 use images::PendingImageLoad;
 use protocol::{FgVerifyReq, ShardTelemetryAtomics, ShardWake};
@@ -117,16 +121,8 @@ pub fn spawn_shard(
     let fg_wake = wake.clone();
     let fg_worker = thread::Builder::new().name(format!("apack-fg-{shard_idx}")).spawn(move || {
         while let Ok(req) = fg_rx.recv() {
-            let confirmed = match req.pgid.and_then(apack_os::tree::argv_for_pid) {
-                Some(argv) => {
-                    if argv_matches_app(&argv, &req.app) {
-                        Confirmed::Matched
-                    } else {
-                        Confirmed::Mismatched
-                    }
-                }
-                None => Confirmed::Unknown,
-            };
+            let argv = req.pgid.and_then(apack_os::tree::argv_for_pid);
+            let confirmed = confirm_foreground_app(&req.app, argv.as_deref());
             {
                 let mut state = fg_mailbox.lock().unwrap_or_else(|e| e.into_inner());
                 state.queue.push_back((
@@ -203,6 +199,10 @@ pub(crate) struct LiveSession {
     created_ms: u64,
     wal: Option<WalHandle>,
     pending_wal_rollover: bool,
+    /// Last `VtGenerations::images` observed when syncing image blobs to `wal`.
+    wal_images_gen: u64,
+    /// Content hashes already persisted to `<record_dir>/blobs/` during this session.
+    wal_written_blobs: HashSet<BlobHash>,
     rewind_reader: Option<WalReader>,
     rewind_at_ms: u64,
     last_activity: Instant,

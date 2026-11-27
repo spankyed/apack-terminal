@@ -70,6 +70,49 @@ impl MarksTracker {
         }
     }
 
+    /// Restores tracker state transactionally from a WAL [`KeyframeV2`](apack_wal) snapshot.
+    pub fn restore_from_keyframe(
+        &mut self,
+        mode: MarksMode,
+        last_seq: u64,
+        refused: u64,
+        mut commands: Vec<CommandRecord>,
+    ) {
+        let drop_n = commands.len().saturating_sub(MAX_COMMANDS);
+        commands.drain(..drop_n);
+        let max_cmd_id = commands.iter().map(|c| c.id).max().unwrap_or(0);
+        let active_index = commands.iter().rposition(|c| matches!(c.outcome, CommandOutcome::Running));
+        self.mode = mode;
+        self.last_seq = last_seq;
+        self.refused = refused;
+        self.next_id = max_cmd_id.max(last_seq).saturating_add(1);
+        self.commands = commands.into();
+        self.active_index = active_index;
+        self.pending_prompt_line = None;
+        self.pending_command = None;
+        self.last_cwd = self.commands.iter().rev().find_map(|c| c.cwd.clone());
+        self.at_prompt = false;
+    }
+
+    /// Applies a replayed WAL `Marks` checkpoint record, restoring the trust mode and monotonic sequence.
+    pub fn apply_wal_marks(&mut self, key: Option<MarksKey>, last_seq: u64) {
+        self.mode = match key {
+            Some(k) => MarksMode::Keyed(k),
+            None => MarksMode::Claimed,
+        };
+        self.last_seq = self.last_seq.max(last_seq);
+        self.next_id = self.next_id.max(self.last_seq.saturating_add(1));
+    }
+
+    /// Updates the live trust mode after historical restoration (preserving hydrated command history;
+    /// resets `last_seq` only when switching to a different trust mode/key).
+    pub fn set_live_mode(&mut self, mode: MarksMode) {
+        if self.mode != mode {
+            self.mode = mode;
+            self.last_seq = 0;
+        }
+    }
+
     /// Returns `true` when the shell is currently idle at a prompt (no running command).
     pub fn is_idle(&self) -> bool {
         self.at_prompt && self.active_index.is_none()

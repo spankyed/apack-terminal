@@ -125,6 +125,17 @@ impl ImageStore {
         self.insert_encoded(ImageEncoding::Png, png_bytes)
     }
 
+    /// Returns the full encoded bytes and format of a resident blob, refreshing its LRU recency.
+    pub fn get_blob(&mut self, blob: BlobHash) -> Option<(ImageEncoding, Vec<u8>)> {
+        self.clock += 1;
+        let tick = self.clock;
+        let entry = self.blobs.get_mut(&blob)?;
+        entry.last_used = tick;
+        let result = (entry.encoding, entry.bytes.clone());
+        self.push_lru(blob, tick);
+        Some(result)
+    }
+
     /// Reads up to `max_bytes` (clamped to `BULK_CHUNK_BYTES`) starting at `offset` for `blob`.
     pub fn get_chunk(&mut self, blob: BlobHash, offset: u32, max_bytes: u32) -> Option<BlobChunk> {
         self.clock += 1;

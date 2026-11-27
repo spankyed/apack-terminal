@@ -69,11 +69,27 @@ fn cli_parsing_config_and_helpers() {
 
     assert_eq!(PROXY_REPLAY_CAP, 1_048_576);
 
-    // argv_matches_app
+    // OSC 7501 foreground confirmation (`confirm_foreground_app` in apack-core):
     let argv = vec![String::from("/usr/local/bin/Claude"), String::from("--flag")];
-    assert!(argv_matches_app(&argv, "claude"));
-    assert!(!argv_matches_app(&argv, "vim"));
-    assert!(!argv_matches_app(&argv, "   "));
+    assert_eq!(
+        apack_core::status::confirm_foreground_app("claude", Some(&argv)),
+        apack_proto::types::Confirmed::Matched
+    );
+    assert_eq!(
+        apack_core::status::confirm_foreground_app("claude-code", Some(&argv)),
+        apack_proto::types::Confirmed::Matched
+    );
+    assert_eq!(
+        apack_core::status::confirm_foreground_app("vim", Some(&argv)),
+        apack_proto::types::Confirmed::Mismatched
+    );
+    assert_eq!(apack_core::status::confirm_foreground_app("   ", Some(&argv)), apack_proto::types::Confirmed::Unknown);
+    // Trailing args must NEVER match (anti-spoofing: `cat claude` != `claude`).
+    let cat_argv = vec![String::from("/bin/cat"), String::from("claude")];
+    assert_eq!(
+        apack_core::status::confirm_foreground_app("claude", Some(&cat_argv)),
+        apack_proto::types::Confirmed::Mismatched
+    );
 
     // ReplayBuffer cap & overflow
     let mut rb = ReplayBuffer::new(10);

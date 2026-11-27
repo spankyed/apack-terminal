@@ -321,6 +321,10 @@ impl VtEngine for GhosttyEngine {
             unsafe { sys::ghostty_terminal_get(self.handle, sys::TerminalData::MEMORY_USAGE, (&raw mut usage).cast()) };
         if res == sys::Result::SUCCESS { usage.primary_resident_bytes } else { 0 }
     }
+
+    fn ensure_min_epoch(&mut self, min_epoch: u64) {
+        self.epoch = self.epoch.max(min_epoch);
+    }
 }
 
 pub(super) fn apply_cursor_defaults(handle: sys::Terminal, shape: CursorShape, blinking: bool) {

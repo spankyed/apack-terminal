@@ -2392,6 +2392,18 @@ fn broker_msg_variants() -> Vec<MsgVariant> {
                         decode_fn: "decodeForegroundProcess",
                     })),
                 ),
+                f(
+                    "statuses",
+                    FieldCodec::VecBounded {
+                        max_expr: "MAX_STATUSES",
+                        label: "attached statuses",
+                        item: Box::new(FieldCodec::Custom {
+                            ts_type: "StatusRecord",
+                            encode_fn: "encodeStatusRecord",
+                            decode_fn: "decodeStatusRecord",
+                        }),
+                    },
+                ),
             ],
         },
         MsgVariant {
@@ -3155,17 +3167,18 @@ fn _assert_exhaustive_apack_proto_coverage(
         }
         BrokerMsg::Sought { at_ms } => ty::<u64>(at_ms),
         BrokerMsg::MetricsReply(m) => ty::<MetricsSnapshot>(m),
-        BrokerMsg::Attached { session, stream_id, size, epoch, first_active_line, scrollback_lines, foreground } => {
-            ty::<(SessionId, NonZeroStreamId, GridSize, u64, u64, u64, Option<ForegroundProcess>)>((
-                session,
-                stream_id,
-                size,
-                epoch,
-                first_active_line,
-                scrollback_lines,
-                foreground,
-            ))
-        }
+        BrokerMsg::Attached {
+            session,
+            stream_id,
+            size,
+            epoch,
+            first_active_line,
+            scrollback_lines,
+            foreground,
+            statuses,
+        } => ty::<(SessionId, NonZeroStreamId, GridSize, u64, u64, u64, Option<ForegroundProcess>, Vec<StatusRecord>)>(
+            (session, stream_id, size, epoch, first_active_line, scrollback_lines, foreground, statuses),
+        ),
         BrokerMsg::Waited { outcome } => ty::<WaitOutcome>(outcome),
         BrokerMsg::Frame(f) => ty::<Box<FrameUpdate>>(f),
         BrokerMsg::Rows { epoch, rows } => ty::<(u64, Vec<PackedRow>)>((epoch, rows)),
@@ -3358,6 +3371,7 @@ mod tests {
                 first_active_line: 0,
                 scrollback_lines: 0,
                 foreground: None,
+                statuses: vec![],
             },
             BrokerMsg::Waited { outcome: WaitOutcome::Met },
             BrokerMsg::Frame(Box::new(FrameUpdate {

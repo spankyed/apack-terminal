@@ -17,6 +17,7 @@ import {
   MAX_SESSIONS_LIST,
   MAX_SPAWN_ARGV,
   MAX_SPAWN_ENV,
+  MAX_STATUSES,
 } from './constants.ts'
 import { WireError, WireReader, WireWriter } from './codec.ts'
 import { encodeFrame } from './frame.ts'
@@ -399,7 +400,7 @@ export type BrokerMsg =
   | { readonly kind: 'rewound'; readonly session: number; readonly durationMs: number; readonly atMs: number }
   | { readonly kind: 'sought'; readonly atMs: number }
   | { readonly kind: 'metricsReply'; readonly metrics: MetricsSnapshot }
-  | { readonly kind: 'attached'; readonly session: number; readonly streamId: number; readonly size: GridSize; readonly epoch: number; readonly firstActiveLine: number; readonly scrollbackLines: number; readonly foreground: ForegroundProcess | null }
+  | { readonly kind: 'attached'; readonly session: number; readonly streamId: number; readonly size: GridSize; readonly epoch: number; readonly firstActiveLine: number; readonly scrollbackLines: number; readonly foreground: ForegroundProcess | null; readonly statuses: readonly StatusRecord[] }
   | { readonly kind: 'waited'; readonly outcome: WaitOutcome }
   | { readonly kind: 'frame'; readonly frame: FrameUpdate }
   | { readonly kind: 'rows'; readonly epoch: number; readonly rows: readonly PackedRow[] }
@@ -925,6 +926,7 @@ export function encodeBrokerPayload(msg: BrokerMsg): { readonly msgType: number;
       if (msg.scrollbackLines > msg.firstActiveLine) {
         throw new WireError('InvalidValue', 'Attached.scrollback_lines > first_active_line')
       }
+      if (msg.statuses.length > MAX_STATUSES) throw new WireError('LimitExceeded', 'wire limit exceeded: attached statuses')
       encodeSessionId(w, msg.session)
       encodeNonZeroStreamId(w, msg.streamId)
       encodeGridSize(w, msg.size)
@@ -932,6 +934,7 @@ export function encodeBrokerPayload(msg: BrokerMsg): { readonly msgType: number;
       w.varU64(msg.firstActiveLine)
       w.varU64(msg.scrollbackLines)
       w.opt(msg.foreground, encodeForegroundProcess)
+      w.slice(msg.statuses, encodeStatusRecord)
       return { msgType: MsgType.ATTACHED, payload: w.toBytes() }
     case 'waited':
       encodeWaitOutcome(w, msg.outcome)
@@ -1154,7 +1157,8 @@ export function decodeBrokerMsg(msgType: number, payload: Uint8Array): BrokerMsg
         throw new WireError('InvalidValue', 'Attached.scrollback_lines > first_active_line')
       }
       const foreground = r.opt(decodeForegroundProcess)
-      msg = { kind: 'attached', session, streamId, size, epoch, firstActiveLine, scrollbackLines, foreground }
+      const statuses = r.vecBounded(MAX_STATUSES, 'attached statuses', decodeStatusRecord)
+      msg = { kind: 'attached', session, streamId, size, epoch, firstActiveLine, scrollbackLines, foreground, statuses }
       break
     }
     case MsgType.WAITED: {

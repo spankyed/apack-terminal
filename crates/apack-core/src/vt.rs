@@ -243,4 +243,7 @@ pub trait VtEngine {
 
     /// Reports current estimated scrollback memory footprint in bytes.
     fn scrollback_bytes(&self) -> u64;
+
+    /// Raises the engine's monotonic screen epoch to at least `min_epoch` (no-op if already `>= min_epoch`).
+    fn ensure_min_epoch(&mut self, min_epoch: u64);
 }

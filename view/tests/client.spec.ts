@@ -193,6 +193,7 @@ describe('TerminalClient & BrokerSessionSource', () => {
           firstActiveLine: 0,
           scrollbackLines: 0,
           foreground: null,
+          statuses: [],
         })
       } else if (msg.kind === 'detach') {
         pipe.pushBroker(CONTROL_STREAM_ID, reqId, { kind: 'ok' })
@@ -384,6 +385,7 @@ describe('TerminalClient & BrokerSessionSource', () => {
           firstActiveLine: 0,
           scrollbackLines: 0,
           foreground: null,
+          statuses: [],
         })
       } else if (msg.kind === 'getImageBlob') {
         imgPipe.pushBroker(streamId, reqId, {
@@ -431,6 +433,23 @@ describe('TerminalClient & BrokerSessionSource', () => {
           firstActiveLine: 0,
           scrollbackLines: 0,
           foreground: null,
+          statuses:
+            msg.session === 1
+              ? [
+                  {
+                    id: '',
+                    state: 'working',
+                    kind: null,
+                    progress: 40,
+                    app: 'codex',
+                    title: 'Working',
+                    message: null,
+                    changed: 1,
+                    sinceMs: 1000,
+                    confirmed: 'matched',
+                  },
+                ]
+              : [],
         })
       }
     }
@@ -444,6 +463,9 @@ describe('TerminalClient & BrokerSessionSource', () => {
     const client = await TerminalClient.connect(pipe.stream, { clientName: 'a'.repeat(256) })
     const viewOnly = await client.attachSession(1, { flags: SubFlags.VIEW | SubFlags.EVENTS })
     const rawAlso = await client.attachSession(2, { flags: SubFlags.VIEW | SubFlags.EVENTS | SubFlags.RAW_OUTPUT })
+    expect(viewOnly.initialStatuses).toHaveLength(1)
+    expect(viewOnly.initialStatuses[0]?.app).toBe('codex')
+    expect(rawAlso.initialStatuses).toHaveLength(0)
 
     // Pending RPC on non-RAW_OUTPUT stream rejects immediately on Exited (broker suppresses redundant StreamClosed)
     // and marks BrokerSessionSource locally disposed without emitting a synthetic streamClosed.

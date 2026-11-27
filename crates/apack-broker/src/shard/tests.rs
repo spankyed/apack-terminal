@@ -94,6 +94,8 @@ mod win_shard_tests {
                 created_ms: 0,
                 wal: None,
                 pending_wal_rollover: false,
+                wal_images_gen: 0,
+                wal_written_blobs: HashSet::new(),
                 rewind_reader: None,
                 rewind_at_ms: 0,
                 last_activity: Instant::now(),
@@ -196,6 +198,7 @@ mod image_source_shard_tests {
     use apack_os::image_sources::{Quiet as ImageQuiet, encoded};
     #[cfg(unix)]
     use apack_os::pty::{PtySpawnConfig, spawn_pty};
+    use apack_proto::types::Confirmed;
     use apack_proto::types::{CellPos, CellPx, CellSpan, GridSize, ResizePolicy};
     use apack_vt_ghostty::{GhosttyConfig, GhosttyEngine, ImageStore};
     use apack_wal::{RecordingRegistry, WalConfig};
@@ -285,6 +288,8 @@ mod image_source_shard_tests {
                 created_ms: 0,
                 wal: None,
                 pending_wal_rollover: false,
+                wal_images_gen: 0,
+                wal_written_blobs: HashSet::new(),
                 rewind_reader: None,
                 rewind_at_ms: 0,
                 last_activity: Instant::now(),
