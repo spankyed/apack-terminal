@@ -30,10 +30,6 @@ export class CommandFoldController {
     return this.commandList
   }
 
-  get folds(): readonly Fold[] {
-    return this.foldList
-  }
-
   setFolds(folds: readonly Fold[]): void {
     const sorted = folds.filter((fold) => fold.last > fold.first).sort((a, b) => a.first - b.first)
     for (let index = 1; index < sorted.length; index += 1) {

@@ -15,10 +15,12 @@ use apack_proto::types::{SessionId, SignalKind, SignalScope};
 use crate::now_unix_ms;
 
 #[cfg(unix)]
-use super::pty_io::drain_unix_pty_nonblocking;
-use super::{COMPRESS_PAGES_PER_TURN, LivePty, ReactorEvent, ShardRunner, TERMINATE_POLL_INTERVAL};
+use super::PTY_READ_BUF_BYTES;
 #[cfg(unix)]
-use super::{PTY_READ_BUF_BYTES, PTY_READ_QUANTUM_BYTES};
+use super::pty_io::drain_unix_pty_nonblocking;
+use super::{
+    COMPRESS_PAGES_PER_TURN, LivePty, PTY_READ_QUANTUM_BYTES, ReactorEvent, ShardRunner, TERMINATE_POLL_INTERVAL,
+};
 
 impl ShardRunner {
     pub(super) fn initiate_session_termination(&mut self, session_id: SessionId) {

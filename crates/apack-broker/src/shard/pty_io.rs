@@ -21,9 +21,9 @@ use crate::shard_windows::drain_windows_pty_writes;
 use super::commands::capture_keyframe;
 use super::images::{ImageRefusal, probe_named_image_load};
 use super::protocol::FgVerifyReq;
-use super::{LivePty, LiveSession, ReactorEvent, ShardRunner};
+use super::{LivePty, ReactorEvent, ShardRunner};
 #[cfg(unix)]
-use super::{PTY_READ_QUANTUM_BYTES, PTY_WRITE_CHUNK_BYTES};
+use super::{LiveSession, PTY_READ_QUANTUM_BYTES, PTY_WRITE_CHUNK_BYTES};
 
 impl ShardRunner {
     pub(super) fn apply_effects(&mut self, session_id: SessionId, effects: Vec<SessionEffect>) {

@@ -120,10 +120,6 @@ export class PointerController {
     return this.cachedBox
   }
 
-  clearBox(): void {
-    this.cachedBox = null
-  }
-
   releaseOnUnmount(): void {
     this.cachedBox = null
     this.thumbRelease?.()
