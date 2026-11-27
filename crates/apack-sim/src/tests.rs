@@ -332,4 +332,33 @@ fn session_machine_direct_rpcs_and_wait_outcomes() {
         ),
         "\n\n\n\n\n\n\n"
     );
+
+    // SimWorld exit flushes final dirty view (including released DEC 2026 sync hold) strictly BEFORE Exited
+    // detaches a !RAW_OUTPUT stream.
+    let mut world = SimWorld::new(77);
+    let sid = SessionId::new(1).unwrap();
+    let conn = ConnId::new(1).unwrap();
+    let st = NonZeroStreamId::new(1).unwrap();
+    world.add_session(sid, GridSize::new(40, 6).unwrap(), ResizePolicy::ExplicitOverride, MarksMode::Keyed(key));
+    world.connect_client(conn);
+    world.send_client_msg(
+        conn,
+        StreamId::CONTROL,
+        RequestId::from_raw(1),
+        &ClientMsg::Attach {
+            session: sid,
+            stream_id: st,
+            flags: SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(),
+            initial_viewport: None,
+            initial_output_credit: 0,
+            initial_frame_credit: FrameCredit { max_frames: 4, max_bytes: 262_144 },
+        },
+    );
+    world.feed_pty(sid, b"\x1b[?2026hSIM_FINAL_SYNC");
+    world.exit_session(sid, Some(0), None);
+    let view = world.client_view(conn, st).expect("client view");
+    assert!(
+        view.rows.iter().any(|r| r.contains("SIM_FINAL_SYNC")),
+        "final frame held under DEC 2026 sync hold must flush before Exited on !RAW_OUTPUT stream"
+    );
 }

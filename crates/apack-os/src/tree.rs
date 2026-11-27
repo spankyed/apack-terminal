@@ -63,6 +63,7 @@ fn parse_proc_comm(raw: &str) -> Option<String> {
 
 /// Decodes a NUL-terminated UTF-8-lossy buffer returned by `libc::proc_name`.
 #[cfg(unix)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn decode_proc_name_buf(buf: &[u8], len: i32) -> Option<String> {
     let used = usize::try_from(len).ok()?.min(buf.len());
     let nul = buf[..used].iter().position(|&b| b == 0).unwrap_or(used);

@@ -182,6 +182,15 @@ impl ShardRunner {
     ) {
         self.fg_pending.remove(&session_id);
         let mut effects = Vec::new();
+        if let Some(sess) = self.sessions.get_mut(&session_id) {
+            let now = TimestampMs::from_millis(now_unix_ms());
+            if !sess.rewound {
+                sess.machine.on_process_exit(code, signal, now, &mut effects);
+            }
+        }
+        // Apply exit effects while `sess` is still present in `self.sessions` so `try_publish_dirty_views`
+        // can emit any final dirty frame (e.g. released DEC 2026 sync hold) strictly before `Exited`.
+        self.apply_effects(session_id, effects);
         if let Some(mut sess) = self.sessions.remove(&session_id) {
             #[cfg(unix)]
             {
@@ -206,14 +215,9 @@ impl ShardRunner {
                 let _ = wal.seal();
                 let _ = wal.shutdown();
             }
-            let now = TimestampMs::from_millis(now_unix_ms());
-            if !sess.rewound {
-                sess.machine.on_process_exit(code, signal, now, &mut effects);
-            }
             drop(sess);
         }
         self.load.store(self.sessions.len(), Ordering::Relaxed);
-        self.apply_effects(session_id, effects);
         self.emit(ReactorEvent::SessionEnded { session: session_id });
     }
 

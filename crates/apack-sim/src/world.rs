@@ -345,6 +345,25 @@ impl SimWorld {
         }
     }
 
+    /// Returns the reconstructed client view model for `(conn, stream)`, if any frames were received.
+    pub fn client_view(&self, conn: ConnId, stream: NonZeroStreamId) -> Option<&ClientViewModel> {
+        self.views.get(&(conn, stream))
+    }
+
+    /// Simulates process exit for session `sid`, flushing exit effects and pumping outbound frames.
+    pub fn exit_session(&mut self, sid: SessionId, exit_code: Option<i32>, signal: Option<String>) {
+        let mut s_effects = Vec::new();
+        if let Some(sess) = self.sessions.get_mut(&sid) {
+            sess.on_process_exit(exit_code, signal, self.now, &mut s_effects);
+        }
+        self.process_session_effects(sid, s_effects);
+        self.sessions.remove(&sid);
+        let mut b_actions = Vec::new();
+        self.broker.unregister_session(sid, "session ended", self.now, &mut b_actions);
+        self.process_broker_actions(b_actions);
+        self.pump_all_outbound();
+    }
+
     /// Flushes any delayed client `FrameAck`s accumulated while `auto_ack == false`.
     pub fn flush_pending_acks(&mut self) {
         let pending = core::mem::take(&mut self.pending_acks);
@@ -658,11 +677,22 @@ impl SimWorld {
         }
     }
 
+    fn flush_dirty_views(&mut self, sid: SessionId) {
+        let subs = self.sessions.get(&sid).map_or_else(Vec::new, SessionMachine::view_subscribers);
+        for (key, att) in subs {
+            self.publish_dirty_view(sid, key, att);
+        }
+    }
+
     fn process_session_effects(&mut self, sid: SessionId, effects: Vec<SessionEffect>) {
         let mut views_dirty = false;
         for ef in effects {
             match ef {
                 SessionEffect::Send { conn, stream_id, attachment, req_id, priority, msg } => {
+                    if matches!(msg, BrokerMsg::Exited { .. }) {
+                        views_dirty = false;
+                        self.flush_dirty_views(sid);
+                    }
                     if let Some(att) = attachment {
                         let Some(nz) = NonZeroStreamId::new(stream_id.raw()) else {
                             continue;
@@ -680,10 +710,7 @@ impl SimWorld {
             }
         }
         if views_dirty {
-            let subs = self.sessions.get(&sid).map_or_else(Vec::new, SessionMachine::view_subscribers);
-            for (key, att) in subs {
-                self.publish_dirty_view(sid, key, att);
-            }
+            self.flush_dirty_views(sid);
         }
     }
 

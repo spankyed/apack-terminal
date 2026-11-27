@@ -682,8 +682,11 @@ fn e2e_stream_attachment_isolation_no_redundant_stream_closed_and_prehello_size_
     let mut exit_spec = echo_command_spec("x", None, None);
     #[cfg(unix)]
     {
-        exit_spec.argv =
-            vec![String::from("/bin/sh"), String::from("-c"), String::from("printf 'EXIT_READY\\r\\n'; read _go")];
+        exit_spec.argv = vec![
+            String::from("/bin/sh"),
+            String::from("-c"),
+            String::from("printf 'EXIT_READY\\r\\n'; read _go; printf '\\033[?2026hFINAL_SYNC_LINE\\r\\n'"),
+        ];
     }
     #[cfg(windows)]
     {
@@ -706,11 +709,27 @@ fn e2e_stream_attachment_isolation_no_redundant_stream_closed_and_prehello_size_
     client.send_raw(st_exit.as_stream_id(), RequestId::PUSH, &ClientMsg::Write { data: b"go\r\n".to_vec() }).unwrap();
     let mut saw_exited = false;
     let mut saw_stream_closed = false;
+    let mut saw_final_sync_line = false;
     let wait_deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < wait_deadline {
         let frame = client.recv_frame().unwrap();
         if frame.stream_id == st_exit.as_stream_id() {
             match frame.msg {
+                BrokerMsg::Frame(upd) => {
+                    if upd.rows.iter().any(|r| r.text.contains("FINAL_SYNC_LINE")) {
+                        saw_final_sync_line = true;
+                    }
+                    client
+                        .send_raw(
+                            st_exit.as_stream_id(),
+                            RequestId::PUSH,
+                            &ClientMsg::FrameAck {
+                                seq: upd.seq,
+                                credit: FrameCredit { max_frames: 4, max_bytes: 262_144 },
+                            },
+                        )
+                        .unwrap();
+                }
                 BrokerMsg::Exited { .. } => {
                     saw_exited = true;
                     break;
@@ -723,6 +742,13 @@ fn e2e_stream_attachment_isolation_no_redundant_stream_closed_and_prehello_size_
         }
     }
     assert!(saw_exited, "expected Exited on VIEW | EVENTS stream");
+    #[cfg(unix)]
+    assert!(
+        saw_final_sync_line,
+        "final frame held behind DEC 2026 sync hold must flush before Exited on !RAW_OUTPUT stream"
+    );
+    #[cfg(not(unix))]
+    let _ = saw_final_sync_line;
     // Send a round-trip ListSessions fence and inspect every pushed frame until its reply arrives.
     let fence_req = client.alloc_req_id();
     client.send_raw(apack_proto::types::StreamId::CONTROL, fence_req, &ClientMsg::ListSessions).unwrap();

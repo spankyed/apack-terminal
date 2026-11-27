@@ -370,7 +370,7 @@ impl RawOutputFlow {
             }
             let rest = &decoded[offset..];
             let stream_room = self.max_pending_bytes.saturating_sub(self.pending_utf8.len());
-            let room = stream_room.min(budget.pending_raw_room());
+            let room = stream_room.min(budget.pending_raw_room().saturating_sub(offset));
             let keep = floor_char_boundary(rest, room);
             if keep != 0 {
                 self.pending_utf8.extend_from_slice(&rest.as_bytes()[..keep]);

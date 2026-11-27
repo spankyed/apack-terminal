@@ -44,6 +44,10 @@ impl ShardRunner {
         for effect in effects {
             match effect {
                 SessionEffect::Send { conn, stream_id, attachment, req_id, priority, msg } => {
+                    if matches!(msg, BrokerMsg::Exited { .. }) {
+                        views_dirty = false;
+                        self.try_publish_dirty_views(session_id);
+                    }
                     self.emit(ReactorEvent::SendMsg { conn, stream_id, attachment, req_id, priority, msg });
                 }
                 SessionEffect::ResizePty { size, cell_px } => {

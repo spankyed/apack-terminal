@@ -1941,9 +1941,34 @@ fn pr4_stream_attachment_phase_decoders_unified_budget_and_exited_suppression() 
     );
     assert_eq!(broker.pop_outbound(conn(1)).unwrap().msg, BrokerMsg::Ok);
     assert_eq!(broker.connection_budget_used(conn(1)), Some(0));
-    // Re-attach stream 2, refill pending_utf8 to 300B, then push a 120B outbound message -> 300 + ~136 > 400 -> SlowReader!
-    broker.feed_bytes(conn(1), &attach_raw(24, sid(3), 2), ts(36), &mut actions);
-    broker.publish_raw_output(sid(3), &[b'c'; 300], ts(37), &mut actions);
+    // Re-attach stream 2 with initial_output_credit = 200 and publish 500B in a single call:
+    // ingest emits 200B directly (`offset = 200`), caps pending_utf8 to `pending_raw_room() - 200 = 100B`,
+    // drops 200B, and enqueues Output(200B) + OutputDropped(200B) WITHOUT tripping SlowReader!
+    actions.clear();
+    broker.feed_bytes(
+        conn(1),
+        &encode_client(
+            StreamId::CONTROL,
+            24,
+            &ClientMsg::Attach {
+                session: sid(3),
+                stream_id: nz_stream(2),
+                flags: SubFlags::from_bits(SubFlags::RAW_OUTPUT | SubFlags::BACKPRESSURE_PTY).unwrap(),
+                initial_viewport: None,
+                initial_output_credit: 200,
+                initial_frame_credit: FrameCredit { max_frames: 0, max_bytes: 0 },
+            },
+        ),
+        ts(36),
+        &mut actions,
+    );
+    broker.publish_raw_output(sid(3), &[b'd'; 500], ts(37), &mut actions);
+    assert_eq!(broker.connection_count(), 1);
+    assert_eq!(broker.pop_outbound(conn(1)).unwrap().msg, BrokerMsg::Output { text: "d".repeat(200) });
+    assert_eq!(broker.pop_outbound(conn(1)).unwrap().msg, BrokerMsg::OutputDropped { bytes: 200 });
+    assert_eq!(broker.connection_budget_used(conn(1)), Some(100));
+    // Refill remaining pending_utf8 room (+200B -> 300B total), then push a 120B outbound message -> SlowReader!
+    broker.publish_raw_output(sid(3), &[b'c'; 200], ts(38), &mut actions);
     assert_eq!(broker.connection_budget_used(conn(1)), Some(300));
     actions.clear();
     broker.enqueue_message(
@@ -1952,7 +1977,7 @@ fn pr4_stream_attachment_phase_decoders_unified_budget_and_exited_suppression() 
         RequestId::PUSH,
         OutboundPriority::Event,
         BrokerMsg::Title { title: "z".repeat(120) },
-        ts(38),
+        ts(39),
         &mut actions,
     );
     assert!(matches!(actions.last(), Some(BrokerAction::CloseConn { reason: CloseReason::SlowReader, .. })));
