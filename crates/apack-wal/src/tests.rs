@@ -69,7 +69,16 @@ fn sample_keyframe(blob_a: Option<BlobHash>, blob_b: Option<BlobHash>, abi: Opti
     }];
     let images = blob_a
         .into_iter()
-        .map(|blob| ImagePlacement { blob, line: 42, col: 0, pixel_size: [64, 32], cell_span: [4, 2], z_index: 0 })
+        .map(|blob| ImagePlacement {
+            blob,
+            line: 42,
+            col: 0,
+            source_rect: [0, 0, 64, 32],
+            cell_offset: [0, 0],
+            pixel_size: [64, 32],
+            cell_span: [4, 2],
+            z_index: 0,
+        })
         .collect();
     let visual = VisualKeyframe {
         size: GridSize::new(80, 24).expect("valid grid"),

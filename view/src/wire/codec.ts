@@ -17,6 +17,7 @@ export {
   MAX_GRID_COLS,
   MAX_GRID_ROWS,
   MAX_LEASE_GRACE_MS,
+  MAX_PACKED_ROW_TEXT_BYTES,
   MAX_ROWS_PER_FETCH,
   MAX_SEARCH_MATCHES,
   MAX_SEARCH_NEEDLE_BYTES,
@@ -60,6 +61,17 @@ export class WireWriter {
 
   get length(): number {
     return this.len
+  }
+
+  /** Executes `fn` atomically: if it throws, rewinds `this.len` so no partial bytes remain. */
+  atomic(fn: (w: WireWriter) => void): void {
+    const start = this.len
+    try {
+      fn(this)
+    } catch (err) {
+      this.len = start
+      throw err
+    }
   }
 
   private ensure(extra: number): void {
@@ -166,19 +178,24 @@ export class WireWriter {
   }
 
   bytes(bytes: Uint8Array): void {
+    if (bytes.length > MAX_BLOB_BYTES) {
+      throw new WireError('LimitExceeded', 'wire limit exceeded: blob bytes')
+    }
     this.varU32(bytes.length)
     this.raw(bytes)
   }
 
   str(text: string): void {
-    const encoded = textEncoder.encode(text)
-    this.bytes(encoded)
+    this.strBounded(text, MAX_STRING_BYTES, 'string bytes')
   }
 
   strBounded(text: string, maxLen: number, label: string): void {
+    if (!Number.isFinite(maxLen) || maxLen < 0) {
+      throw new WireError('InvalidValue', `invalid string max length: ${maxLen}`)
+    }
     const encoded = textEncoder.encode(text)
     const cap = Math.min(maxLen, MAX_STRING_BYTES)
-    if (encoded.length > cap) {
+    if (!(encoded.length <= cap)) {
       throw new WireError('LimitExceeded', `wire limit exceeded: ${label}`)
     }
     this.bytes(encoded)
@@ -315,8 +332,12 @@ export class WireReader {
   }
 
   bytesBounded(maxLen: number, label: string): Uint8Array {
+    if (!Number.isFinite(maxLen) || maxLen < 0) {
+      throw new WireError('InvalidValue', `invalid bytes max length: ${maxLen}`)
+    }
+    const cap = Math.min(maxLen, MAX_BLOB_BYTES)
     const len = this.varU32()
-    if (len > maxLen) {
+    if (!(len <= cap)) {
       throw new WireError('LimitExceeded', `wire limit exceeded: ${label}`)
     }
     return this.take(len)
@@ -335,6 +356,9 @@ export class WireReader {
   }
 
   strBounded(maxLen: number, label: string): string {
+    if (!Number.isFinite(maxLen) || maxLen < 0) {
+      throw new WireError('InvalidValue', `invalid string max length: ${maxLen}`)
+    }
     const raw = this.bytesBounded(Math.min(maxLen, MAX_STRING_BYTES), label)
     try {
       return textDecoder.decode(raw)

@@ -28,15 +28,27 @@ export function encodeHeader(
   reqId: number,
   payloadLen: number,
 ): Uint8Array {
-  if (!Number.isInteger(payloadLen) || payloadLen < 0 || payloadLen > MAX_FRAME_PAYLOAD) {
+  if (!Number.isInteger(streamId) || streamId < 0 || streamId > 0xffff_ffff) {
+    throw new WireError('InvalidValue', `streamId out of range: ${streamId}`)
+  }
+  if (!Number.isInteger(msgType) || msgType < 0 || msgType > 0xffff) {
+    throw new WireError('InvalidValue', `msgType out of range: ${msgType}`)
+  }
+  if (!Number.isInteger(reqId) || reqId < 0 || reqId > 0xffff_ffff) {
+    throw new WireError('InvalidValue', `reqId out of range: ${reqId}`)
+  }
+  if (!Number.isInteger(payloadLen) || payloadLen < 0) {
+    throw new WireError('InvalidValue', `payloadLen out of range: ${payloadLen}`)
+  }
+  if (payloadLen > MAX_FRAME_PAYLOAD) {
     throw new WireError('FrameTooLarge', `wire frame payload ${payloadLen} bytes exceeds limit`)
   }
   const header = new Uint8Array(FRAME_HEADER_LEN)
   const view = new DataView(header.buffer)
   view.setUint32(0, INNER_HEADER_LEN + payloadLen, true)
-  view.setUint32(4, streamId >>> 0, true)
-  view.setUint16(8, msgType & 0xffff, true)
-  view.setUint32(10, reqId >>> 0, true)
+  view.setUint32(4, streamId, true)
+  view.setUint16(8, msgType, true)
+  view.setUint32(10, reqId, true)
   return header
 }
 

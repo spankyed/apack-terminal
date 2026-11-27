@@ -30,6 +30,7 @@ export const MAX_SPAWN_ENV = 1024
 export const MAX_SESSIONS_LIST = 4096
 export const MAX_IMAGES_REPLY = 4096
 export const MAX_PALETTE_OVERRIDES = 256
+export const MAX_PACKED_ROW_TEXT_BYTES = 65535
 export const MAX_PACKED_RUNS = 4096
 export const MAX_PACKED_STYLES = 4096
 export const MAX_PACKED_LINKS = 1024

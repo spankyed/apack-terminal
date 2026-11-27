@@ -137,6 +137,7 @@ fn render_constants_ts() -> String {
     writeln!(out, "export const MAX_SESSIONS_LIST = {}", apack_proto::MAX_SESSIONS_LIST).unwrap();
     writeln!(out, "export const MAX_IMAGES_REPLY = {}", apack_proto::MAX_IMAGES_REPLY).unwrap();
     writeln!(out, "export const MAX_PALETTE_OVERRIDES = {}", apack_proto::MAX_PALETTE_OVERRIDES).unwrap();
+    writeln!(out, "export const MAX_PACKED_ROW_TEXT_BYTES = {}", apack_proto::MAX_PACKED_ROW_TEXT_BYTES).unwrap();
     writeln!(out, "export const MAX_PACKED_RUNS = {}", apack_proto::MAX_PACKED_RUNS).unwrap();
     writeln!(out, "export const MAX_PACKED_STYLES = {}", apack_proto::MAX_PACKED_STYLES).unwrap();
     writeln!(out, "export const MAX_PACKED_LINKS = {}", apack_proto::MAX_PACKED_LINKS).unwrap();
@@ -273,6 +274,45 @@ impl FieldCodec {
         }
     }
 
+    fn emit_pre_check(&self, expr: &str, indent: &str, out: &mut String) {
+        match self {
+            Self::ProgressPercent { err_msg } => {
+                writeln!(
+                    out,
+                    "{indent}if (!Number.isInteger({expr}) || {expr} < 0 || {expr} > MAX_PROGRESS_PERCENT) throw new WireError('InvalidValue', '{err_msg}')"
+                )
+                .unwrap();
+            }
+            Self::BytesCopyBounded(max_expr, label)
+            | Self::VecBounded { max_expr, label, .. }
+            | Self::EnvPairs { max_expr, label }
+            | Self::PaletteEntries { max_expr, label } => {
+                writeln!(
+                    out,
+                    "{indent}if ({expr}.length > {max_expr}) throw new WireError('LimitExceeded', 'wire limit exceeded: {label}')"
+                )
+                .unwrap();
+            }
+            Self::FixedBytes { len_expr, len_val, label } => {
+                writeln!(
+                    out,
+                    "{indent}if ({expr}.length !== {len_expr}) throw new WireError('InvalidValue', '{label} must be {len_val} bytes')"
+                )
+                .unwrap();
+            }
+            Self::Opt(inner) => {
+                let mut inner_check = String::new();
+                inner.emit_pre_check(expr, "", &mut inner_check);
+                if !inner_check.is_empty() {
+                    let joined =
+                        inner_check.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("; ");
+                    writeln!(out, "{indent}if ({expr} !== null) {{ {joined} }}").unwrap();
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn emit_encode(&self, w: &str, expr: &str, indent: &str, out: &mut String) {
         match self {
             Self::U8 | Self::ProgressPercent { .. } => writeln!(out, "{indent}{w}.u8({expr})").unwrap(),
@@ -287,12 +327,7 @@ impl FieldCodec {
                 writeln!(out, "{indent}{w}.strBounded({expr}, {max_expr}, '{label}')").unwrap()
             }
             Self::Bytes | Self::BytesCopyBounded(_, _) => writeln!(out, "{indent}{w}.bytes({expr})").unwrap(),
-            Self::FixedBytes { len_expr, len_val, label } => {
-                writeln!(
-                    out,
-                    "{indent}if ({expr}.length !== {len_expr}) throw new WireError('InvalidValue', '{label} must be {len_val} bytes')"
-                )
-                .unwrap();
+            Self::FixedBytes { .. } => {
                 writeln!(out, "{indent}{w}.raw({expr})").unwrap();
             }
             Self::Opt(inner) => match inner.as_ref() {
@@ -300,15 +335,18 @@ impl FieldCodec {
                 other => {
                     let mut body = String::new();
                     other.emit_encode("wr", "item", "", &mut body);
-                    writeln!(out, "{indent}{w}.opt({expr}, (wr, item) => {{ {} }})", body.trim()).unwrap();
+                    let joined = body.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("; ");
+                    writeln!(out, "{indent}{w}.opt({expr}, (wr, item) => {{ {joined} }})").unwrap();
                 }
             },
             Self::VecBounded { item, .. } => match item.as_ref() {
                 Self::Custom { encode_fn, .. } => writeln!(out, "{indent}{w}.slice({expr}, {encode_fn})").unwrap(),
                 other => {
                     let mut body = String::new();
+                    other.emit_pre_check("item", "", &mut body);
                     other.emit_encode("wr", "item", "", &mut body);
-                    writeln!(out, "{indent}{w}.slice({expr}, (wr, item) => {{ {} }})", body.trim()).unwrap();
+                    let joined = body.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("; ");
+                    writeln!(out, "{indent}{w}.slice({expr}, (wr, item) => {{ {joined} }})").unwrap();
                 }
             },
             Self::EnvPairs { .. } => {
@@ -456,12 +494,17 @@ fn emit_struct_schema(out: &mut String, s: &StructSchema) {
 
     let vis = if s.exported_codec { "export " } else { "" };
     writeln!(out, "{vis}function encode{}(w: WireWriter, v: {}): void {{", s.name, s.name).unwrap();
+    writeln!(out, "  w.atomic((w) => {{").unwrap();
     for field in &s.fields {
+        field.codec.emit_pre_check(&format!("v.{}", field.name), "    ", out);
         if let Some(check) = field.before_encode {
-            emit_indented_lines(out, "  ", check);
+            emit_indented_lines(out, "    ", check);
         }
-        field.codec.emit_encode("w", &format!("v.{}", field.name), "  ", out);
     }
+    for field in &s.fields {
+        field.codec.emit_encode("w", &format!("v.{}", field.name), "    ", out);
+    }
+    writeln!(out, "  }})").unwrap();
     writeln!(out, "}}").unwrap();
 
     writeln!(out, "{vis}function decode{}(r: WireReader): {} {{", s.name, s.name).unwrap();
@@ -521,21 +564,24 @@ fn emit_tagged_union(out: &mut String, u: &TaggedUnionSchema) {
     out.push('\n');
 
     writeln!(out, "export function encode{}(w: WireWriter, v: {}): void {{", u.name, u.name).unwrap();
-    writeln!(out, "  switch (v.kind) {{").unwrap();
+    writeln!(out, "  w.atomic((w) => {{").unwrap();
+    writeln!(out, "    switch (v.kind) {{").unwrap();
     for v in &u.variants {
-        writeln!(out, "    case '{}':", v.kind).unwrap();
+        writeln!(out, "      case '{}':", v.kind).unwrap();
         for field in &v.fields {
+            field.codec.emit_pre_check(&format!("v.{}", field.name), "        ", out);
             if let Some(check) = field.before_encode {
-                emit_indented_lines(out, "      ", check);
+                emit_indented_lines(out, "        ", check);
             }
         }
-        writeln!(out, "      w.u8({})", v.tag).unwrap();
+        writeln!(out, "        w.u8({})", v.tag).unwrap();
         for field in &v.fields {
-            field.codec.emit_encode("w", &format!("v.{}", field.name), "      ", out);
+            field.codec.emit_encode("w", &format!("v.{}", field.name), "        ", out);
         }
-        writeln!(out, "      return").unwrap();
+        writeln!(out, "        return").unwrap();
     }
-    writeln!(out, "  }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "  }})").unwrap();
     writeln!(out, "}}").unwrap();
 
     writeln!(out, "export function decode{}(r: WireReader): {} {{", u.name, u.name).unwrap();
@@ -599,9 +645,12 @@ fn emit_msg_codecs(out: &mut String, name: &str, type_name: &str, variants: &[Ms
     for v in variants {
         writeln!(out, "    case '{}':", v.kind).unwrap();
         for field in &v.fields {
+            field.codec.emit_pre_check(&format!("msg.{}", field.name), "      ", out);
             if let Some(check) = field.before_encode {
                 emit_indented_lines(out, "      ", check);
             }
+        }
+        for field in &v.fields {
             field.codec.emit_encode("w", &format!("msg.{}", field.name), "      ", out);
         }
         writeln!(out, "      return {{ msgType: MsgType.{}, payload: w.toBytes() }}", v.const_name).unwrap();
@@ -887,16 +936,18 @@ fn tagged_unions() -> Vec<TaggedUnionSchema> {
                         f_encode_decode_check(
                             "graceMs",
                             FieldCodec::VarU32,
-                            "if (!Number.isInteger(v.graceMs) || v.graceMs < 1 || v.graceMs > MAX_LEASE_GRACE_MS) throw new WireError('LimitExceeded', 'lease grace_ms')\nif (v.resumeToken.length !== RESUME_TOKEN_LEN) throw new WireError('InvalidValue', 'resumeToken must be 32 bytes')",
+                            "if (!Number.isInteger(v.graceMs) || v.graceMs < 1 || v.graceMs > MAX_LEASE_GRACE_MS) throw new WireError('LimitExceeded', 'lease grace_ms')",
                             "if (graceMs < 1 || graceMs > MAX_LEASE_GRACE_MS) throw new WireError('LimitExceeded', 'lease grace_ms')",
                         ),
-                        f(
+                        f_encode_decode_check(
                             "resumeToken",
                             FieldCodec::FixedBytes {
                                 len_expr: "RESUME_TOKEN_LEN",
                                 len_val: ResumeToken::LEN,
                                 label: "resumeToken",
                             },
+                            "if (v.resumeToken.every((b) => b === 0)) throw new WireError('InvalidValue', 'resumeToken must be non-zero')",
+                            "if (resumeToken.every((b) => b === 0)) throw new WireError('InvalidValue', 'resumeToken must be non-zero')",
                         ),
                     ],
                 },
@@ -965,6 +1016,9 @@ fn emit_primitive_helpers(out: &mut String) {
 export type Rgb24 = number
 
 export function encodeRgb24(w: WireWriter, rgb: Rgb24): void {
+  if (!Number.isInteger(rgb) || rgb < 0 || rgb > 0xff_ffff) {
+    throw new WireError('InvalidValue', `rgb24 out of range: ${rgb}`)
+  }
   w.u8((rgb >>> 16) & 0xff)
   w.u8((rgb >>> 8) & 0xff)
   w.u8(rgb & 0xff)
@@ -1079,10 +1133,12 @@ fn emit_bitpacked_structs(out: &mut String) {
 }
 
 export function encodeCursorState(w: WireWriter, state: CursorState): void {
-  w.u16(state.col)
-  w.u16(state.row)
-  encodeCursorShape(w, state.shape)
-  w.u8((state.blinking ? 1 : 0) | (state.hidden ? 2 : 0))
+  w.atomic((w) => {
+    w.u16(state.col)
+    w.u16(state.row)
+    encodeCursorShape(w, state.shape)
+    w.u8((state.blinking ? 1 : 0) | (state.hidden ? 2 : 0))
+  })
 }
 export function decodeCursorState(r: WireReader): CursorState {
   const col = r.u16()
@@ -1159,8 +1215,9 @@ function buildUtf8ToUtf16Map(utf8: Uint8Array): Int32Array {
   return map
 }
 
-function buildUtf16ToUtf8Map(text: string): Uint32Array {
-  const map = new Uint32Array(text.length + 1)
+function buildUtf16ToUtf8Map(text: string): Int32Array {
+  const map = new Int32Array(text.length + 1)
+  map.fill(-1)
   let bytePos = 0
   let i = 0
   while (i < text.length) {
@@ -1177,7 +1234,6 @@ function buildUtf16ToUtf8Map(text: string): Uint32Array {
       i += 1
     } else {
       bytePos += 4
-      map[i + 1] = bytePos
       i += 2
     }
   }
@@ -1186,49 +1242,121 @@ function buildUtf16ToUtf8Map(text: string): Uint32Array {
 }
 
 export function encodePackedRow(w: WireWriter, row: PackedRow): void {
-  w.varU64(row.line)
-  w.u8(row.flags)
-  const utf8 = encodeUtf8(row.text)
-  w.bytes(utf8)
-  const isAscii = utf8.length === row.text.length
-  const utf16ToUtf8 = isAscii ? null : buildUtf16ToUtf8Map(row.text)
+  w.atomic((w) => {
+    if (!Number.isInteger(row.flags) || row.flags < 0 || row.flags > RowFlag.ALL_MASK) {
+      throw new WireError('InvalidValue', 'unknown PackedRow flag bits')
+    }
+    const utf8 = encodeUtf8(row.text)
+    if (utf8.length > MAX_PACKED_ROW_TEXT_BYTES) {
+      throw new WireError('LimitExceeded', 'wire limit exceeded: packed row text')
+    }
+    if (row.runs.length % 4 !== 0) {
+      throw new WireError('InvalidValue', 'PackedRow.runs length must be a multiple of 4')
+    }
+    const runCount = row.runs.length >>> 2
+    if (runCount > MAX_PACKED_RUNS) {
+      throw new WireError('LimitExceeded', 'wire limit exceeded: packed runs')
+    }
+    if (row.styles.length % 4 !== 0) {
+      throw new WireError('InvalidValue', 'PackedRow.styles length must be a multiple of 4')
+    }
+    const styleCount = row.styles.length >>> 2
+    if (styleCount > MAX_PACKED_STYLES) {
+      throw new WireError('LimitExceeded', 'wire limit exceeded: packed styles')
+    }
+    if (row.links.length > MAX_PACKED_LINKS) {
+      throw new WireError('LimitExceeded', 'wire limit exceeded: packed links')
+    }
+    if (row.links.length > 0 && row.links[0] !== '') {
+      throw new WireError('InvalidValue', 'links[0] must be empty')
+    }
+    for (let i = 1; i < row.links.length; i += 1) {
+      if (row.links[i] === '') {
+        throw new WireError('InvalidValue', 'non-zero link entry must be non-empty')
+      }
+    }
+    const pieces = row.pieces ?? []
+    if (pieces.length > MAX_PACKED_PIECES) {
+      throw new WireError('LimitExceeded', 'wire limit exceeded: image pieces')
+    }
+    if (pieces.length > 0 && (row.flags & RowFlag.HAS_PLACEHOLDER) === 0) {
+      throw new WireError('InvalidValue', 'pieces require FLAG_HAS_PLACEHOLDER')
+    }
 
-  const runCount = row.runs.length >>> 2
-  w.varU32(runCount)
-  for (let i = 0; i < row.runs.length; i += 4) {
-    const colWord = row.runs[i]!
-    const txtWord = row.runs[i + 1]!
-    const slWord = row.runs[i + 2]!
-    const runFlags = row.runs[i + 3]!
-    const colStart = colWord & 0xffff
-    const colLen = colWord >>> 16
-    const u16Off = txtWord & 0xffff
-    const u16Len = txtWord >>> 16
-    const byteOffset = utf16ToUtf8 ? utf16ToUtf8[u16Off]! : u16Off
-    const byteEnd = utf16ToUtf8 ? utf16ToUtf8[u16Off + u16Len]! : u16Off + u16Len
-    const styleIdx = slWord & 0xffff
-    const linkIdx = slWord >>> 16
-    w.u16(colStart)
-    w.u16(colLen)
-    w.varU32(byteOffset)
-    w.varU32(byteEnd - byteOffset)
-    w.u16(styleIdx)
-    w.u16(linkIdx)
-    w.u8(runFlags)
-  }
+    w.varU64(row.line)
+    w.u8(row.flags)
+    w.bytes(utf8)
+    const isAscii = utf8.length === row.text.length
+    const utf16ToUtf8 = isAscii ? null : buildUtf16ToUtf8Map(row.text)
 
-  const styleCount = row.styles.length >>> 2
-  w.varU32(styleCount)
-  for (let i = 0; i < row.styles.length; i += 4) {
-    w.u32(row.styles[i]!)
-    w.u32(row.styles[i + 1]!)
-    w.u32(row.styles[i + 2]!)
-    w.u32(row.styles[i + 3]!)
-  }
+    w.varU32(runCount)
+    for (let i = 0; i < row.runs.length; i += 4) {
+      const colWord = row.runs[i]!
+      const txtWord = row.runs[i + 1]!
+      const slWord = row.runs[i + 2]!
+      const runFlags = row.runs[i + 3]!
+      const colStart = colWord & 0xffff
+      const colLen = colWord >>> 16
+      if (colLen === 0 || colStart + colLen > 0xffff) {
+        throw new WireError('InvalidValue', 'invalid PackedRun column span')
+      }
+      if (runFlags > RunFlag.ALL_MASK) {
+        throw new WireError('InvalidValue', 'unknown PackedRun flag bits')
+      }
+      const u16Off = txtWord & 0xffff
+      const u16Len = txtWord >>> 16
+      if (u16Off + u16Len > row.text.length) {
+        throw new WireError('InvalidValue', 'run text range out of bounds')
+      }
+      const byteOffset = utf16ToUtf8 ? utf16ToUtf8[u16Off]! : u16Off
+      const byteEnd = utf16ToUtf8 ? utf16ToUtf8[u16Off + u16Len]! : u16Off + u16Len
+      if (byteOffset < 0 || byteEnd < 0) {
+        throw new WireError('InvalidValue', 'run text range splits UTF-16 surrogate pair')
+      }
+      const styleIdx = slWord & 0xffff
+      const linkIdx = slWord >>> 16
+      if (styleIdx >= styleCount && styleIdx !== 0) {
+        throw new WireError('InvalidValue', 'run style_idx out of bounds')
+      }
+      if (linkIdx >= row.links.length && linkIdx !== 0) {
+        throw new WireError('InvalidValue', 'run link_idx out of bounds')
+      }
+      w.u16(colStart)
+      w.u16(colLen)
+      w.varU32(byteOffset)
+      w.varU32(byteEnd - byteOffset)
+      w.u16(styleIdx)
+      w.u16(linkIdx)
+      w.u8(runFlags)
+    }
 
-  w.slice(row.links, (wr, link) => wr.str(link))
-  const pieces = row.pieces ?? []
-  w.slice(pieces, encodeImagePiece)
+    w.varU32(styleCount)
+    for (let i = 0; i < row.styles.length; i += 4) {
+      const fg = row.styles[i]!
+      const bg = row.styles[i + 1]!
+      const ul = row.styles[i + 2]!
+      const sf = row.styles[i + 3]!
+      if (!isValidPackedColor(fg) || !isValidPackedColor(bg) || !isValidPackedColor(ul)) {
+        throw new WireError('InvalidValue', 'invalid PackedStyle colour encoding')
+      }
+      if (
+        (sf & ~PackedStyleFlag.ALL_MASK) !== 0 ||
+        (sf & PackedStyleFlag.UNDERLINE_MASK) > PackedStyleFlag.UNDERLINE_MAX
+      ) {
+        throw new WireError('InvalidValue', 'invalid PackedStyle flags')
+      }
+      if (i === 0 && (fg !== 0 || bg !== 0 || ul !== 0 || sf !== 0)) {
+        throw new WireError('InvalidValue', 'styles[0] must be default style')
+      }
+      w.u32(fg)
+      w.u32(bg)
+      w.u32(ul)
+      w.u32(sf)
+    }
+
+    w.slice(row.links, (wr, link) => wr.str(link))
+    w.slice(pieces, encodeImagePiece)
+  })
 }
 
 export function decodePackedRow(r: WireReader): PackedRow {
@@ -1236,7 +1364,7 @@ export function decodePackedRow(r: WireReader): PackedRow {
   const flags = r.u8()
   if (flags > RowFlag.ALL_MASK) throw new WireError('InvalidValue', 'unknown PackedRow flag bits')
 
-  const textBytes = r.strBytes()
+  const textBytes = r.bytesBounded(MAX_PACKED_ROW_TEXT_BYTES, 'packed row text')
   const text = decodeUtf8Strict(textBytes)
   const isAscii = textBytes.length === text.length
   const byteToUtf16 = isAscii ? null : buildUtf8ToUtf16Map(textBytes)
@@ -1275,9 +1403,6 @@ export function decodePackedRow(r: WireReader): PackedRow {
       }
     }
     const u16Len = u16End - u16Start
-    if (u16Start > 0xffff || u16Len > 0xffff) {
-      throw new WireError('LimitExceeded', 'packed row text offset exceeds u16')
-    }
     const base = i << 2
     runs[base] = (colStart | (colLen << 16)) >>> 0
     runs[base + 1] = (u16Start | (u16Len << 16)) >>> 0
@@ -1316,6 +1441,11 @@ export function decodePackedRow(r: WireReader): PackedRow {
   const links = r.vecBounded(MAX_PACKED_LINKS, 'packed links', (rd) => rd.str())
   if (links.length > 0 && links[0] !== '') {
     throw new WireError('InvalidValue', 'links[0] must be empty')
+  }
+  for (let i = 1; i < links.length; i += 1) {
+    if (links[i] === '') {
+      throw new WireError('InvalidValue', 'non-zero link entry must be non-empty')
+    }
   }
 
   const pieces = r.vecBounded(MAX_PACKED_PIECES, 'image pieces', decodeImagePiece)
@@ -1422,19 +1552,22 @@ fn domain_structs() -> Vec<StructSchema> {
             fields: vec![
                 f_custom("blob", "Uint8Array", "encodeBlobHash", "decodeBlobHash"),
                 f("colStart", FieldCodec::U16),
-                f_check(
+                f_encode_decode_check(
                     "colLen",
                     FieldCodec::U16,
+                    "if (!Number.isInteger(v.colStart) || !Number.isInteger(v.colLen) || v.colStart < 0 || v.colLen < 1 || v.colStart + v.colLen > 0xffff) {\n  throw new WireError('InvalidValue', 'invalid ImagePiece column span')\n}",
                     "if (colLen === 0 || colStart + colLen > 0xffff) {\n  throw new WireError('InvalidValue', 'invalid ImagePiece column span')\n}",
                 ),
-                f_check(
+                f_encode_decode_check(
                     "srcRect",
                     FieldCodec::Tuple4VarU32,
+                    "if (!v.srcRect.every((n) => Number.isInteger(n) && n >= 0 && n <= 0xffff_ffff) || v.srcRect[2] === 0 || v.srcRect[3] === 0 || v.srcRect[0] + v.srcRect[2] > 0xffff_ffff || v.srcRect[1] + v.srcRect[3] > 0xffff_ffff) {\n  throw new WireError('InvalidValue', 'invalid ImagePiece src_rect')\n}",
                     "if (srcRect[2] === 0 || srcRect[3] === 0 || srcRect[0] + srcRect[2] > 0xffff_ffff || srcRect[1] + srcRect[3] > 0xffff_ffff) {\n  throw new WireError('InvalidValue', 'invalid ImagePiece src_rect')\n}",
                 ),
-                f_check(
+                f_encode_decode_check(
                     "dstPx",
                     FieldCodec::Tuple2VarU32,
+                    "if (!v.dstPx.every((n) => Number.isInteger(n) && n >= 1 && n <= 0xffff_ffff)) throw new WireError('InvalidValue', 'invalid ImagePiece dst_px')",
                     "if (dstPx[0] === 0 || dstPx[1] === 0) throw new WireError('InvalidValue', 'invalid ImagePiece dst_px')",
                 ),
             ],
@@ -1449,9 +1582,10 @@ fn domain_structs() -> Vec<StructSchema> {
             exported_codec: true,
             fields: vec![
                 f_custom("start", "CellPos", "encodeCellPos", "decodeCellPos"),
-                f_check(
+                f_encode_decode_check(
                     "end",
                     FieldCodec::Custom { ts_type: "CellPos", encode_fn: "encodeCellPos", decode_fn: "decodeCellPos" },
+                    "if (v.end.line < v.start.line || (v.end.line === v.start.line && v.end.col < v.start.col)) {\n  throw new WireError('InvalidValue', 'CellSpan end before start')\n}",
                     "if (end.line < start.line || (end.line === start.line && end.col < start.col)) {\n  throw new WireError('InvalidValue', 'CellSpan end before start')\n}",
                 ),
             ],
@@ -1485,13 +1619,14 @@ fn domain_structs() -> Vec<StructSchema> {
             fields: vec![
                 f("id", FieldCodec::Str),
                 f_custom("state", "StatusState", "encodeStatusState", "decodeStatusState"),
-                f_check(
+                f_encode_decode_check(
                     "kind",
                     FieldCodec::Opt(Box::new(FieldCodec::Custom {
                         ts_type: "BlockedKind",
                         encode_fn: "encodeBlockedKind",
                         decode_fn: "decodeBlockedKind",
                     })),
+                    "if (v.state !== 'blocked' && v.kind !== null) {\n  throw new WireError('InvalidValue', 'status kind requires Blocked state')\n}",
                     "if (state !== 'blocked' && kind !== null) {\n  throw new WireError('InvalidValue', 'status kind requires Blocked state')\n}",
                 ),
                 f(
@@ -1512,15 +1647,17 @@ fn domain_structs() -> Vec<StructSchema> {
             fields: vec![
                 f("code", FieldCodec::Str),
                 f_custom("action", "KeyAction", "encodeKeyAction", "decodeKeyAction"),
-                f_check(
+                f_encode_decode_check(
                     "modifiers",
                     FieldCodec::U8,
+                    "if (!Number.isInteger(v.modifiers) || v.modifiers < 0 || v.modifiers > MODIFIER_ALL_MASK) throw new WireError('InvalidValue', 'unknown KeyInput modifier bits')",
                     "if (modifiers > MODIFIER_ALL_MASK) throw new WireError('InvalidValue', 'unknown KeyInput modifier bits')",
                 ),
                 f("text", FieldCodec::Str),
-                f_check(
+                f_encode_decode_check(
                     "unshiftedCodepoint",
                     FieldCodec::VarU32,
+                    "if (!Number.isInteger(v.unshiftedCodepoint) || v.unshiftedCodepoint < 0 || v.unshiftedCodepoint > 0x10_ffff || (v.unshiftedCodepoint >= 0xd800 && v.unshiftedCodepoint <= 0xdfff)) {\n  throw new WireError('InvalidValue', 'invalid Unicode scalar codepoint')\n}",
                     "if (unshiftedCodepoint > 0x10_ffff || (unshiftedCodepoint >= 0xd800 && unshiftedCodepoint <= 0xdfff)) {\n  throw new WireError('InvalidValue', 'invalid Unicode scalar codepoint')\n}",
                 ),
                 f("composed", FieldCodec::Bool),
@@ -1531,14 +1668,16 @@ fn domain_structs() -> Vec<StructSchema> {
             exported_codec: true,
             fields: vec![
                 f_custom("action", "PointerAction", "encodePointerAction", "decodePointerAction"),
-                f_check(
+                f_encode_decode_check(
                     "button",
                     FieldCodec::U8,
+                    "if (!Number.isInteger(v.button) || v.button < 0 || (v.button > POINTER_MAX_BUTTON && v.button !== POINTER_BUTTON_NONE)) {\n  throw new WireError('InvalidValue', 'invalid PointerInput button')\n}",
                     "if (button > POINTER_MAX_BUTTON && button !== POINTER_BUTTON_NONE) {\n  throw new WireError('InvalidValue', 'invalid PointerInput button')\n}",
                 ),
-                f_check(
+                f_encode_decode_check(
                     "modifiers",
                     FieldCodec::U8,
+                    "if (!Number.isInteger(v.modifiers) || v.modifiers < 0 || v.modifiers > MODIFIER_ALL_MASK) throw new WireError('InvalidValue', 'unknown PointerInput modifier bits')",
                     "if (modifiers > MODIFIER_ALL_MASK) throw new WireError('InvalidValue', 'unknown PointerInput modifier bits')",
                 ),
                 f("xPx", FieldCodec::VarU32),
@@ -1553,8 +1692,25 @@ fn domain_structs() -> Vec<StructSchema> {
                 f_custom("blob", "Uint8Array", "encodeBlobHash", "decodeBlobHash"),
                 f("line", FieldCodec::VarU64),
                 f("col", FieldCodec::I32),
-                f("pixelSize", FieldCodec::Tuple2VarU32),
-                f("cellSpan", FieldCodec::Tuple2U16),
+                f_encode_decode_check(
+                    "sourceRect",
+                    FieldCodec::Tuple4VarU32,
+                    "if (!v.sourceRect.every((n) => Number.isInteger(n) && n >= 0 && n <= 0xffff_ffff) || v.sourceRect[2] === 0 || v.sourceRect[3] === 0 || v.sourceRect[0] + v.sourceRect[2] > 0xffff_ffff || v.sourceRect[1] + v.sourceRect[3] > 0xffff_ffff) {\n  throw new WireError('InvalidValue', 'invalid ImagePlacement source_rect')\n}",
+                    "if (sourceRect[2] === 0 || sourceRect[3] === 0 || sourceRect[0] + sourceRect[2] > 0xffff_ffff || sourceRect[1] + sourceRect[3] > 0xffff_ffff) {\n  throw new WireError('InvalidValue', 'invalid ImagePlacement source_rect')\n}",
+                ),
+                f("cellOffset", FieldCodec::Tuple2VarU32),
+                f_encode_decode_check(
+                    "pixelSize",
+                    FieldCodec::Tuple2VarU32,
+                    "if (!v.pixelSize.every((n) => Number.isInteger(n) && n >= 1 && n <= 0xffff_ffff)) throw new WireError('InvalidValue', 'invalid ImagePlacement pixel_size')",
+                    "if (pixelSize[0] === 0 || pixelSize[1] === 0) throw new WireError('InvalidValue', 'invalid ImagePlacement pixel_size')",
+                ),
+                f_encode_decode_check(
+                    "cellSpan",
+                    FieldCodec::Tuple2U16,
+                    "if (!v.cellSpan.every((n) => Number.isInteger(n) && n >= 1 && n <= 0xffff)) throw new WireError('InvalidValue', 'invalid ImagePlacement cell_span')",
+                    "if (cellSpan[0] === 0 || cellSpan[1] === 0) throw new WireError('InvalidValue', 'invalid ImagePlacement cell_span')",
+                ),
                 f("zIndex", FieldCodec::I32),
             ],
         },
@@ -1588,6 +1744,7 @@ import {
   MAX_LEASE_GRACE_MS,
   MAX_PACKED_LINKS,
   MAX_PACKED_PIECES,
+  MAX_PACKED_ROW_TEXT_BYTES,
   MAX_PACKED_RUNS,
   MAX_PACKED_STYLES,
   MAX_PALETTE_OVERRIDES,
@@ -1669,7 +1826,7 @@ import {
 
     writeln!(
         out,
-        "export type UnderlineKind = 'none' | 'single' | 'double' | 'curly' | 'dotted' | 'dashed'\nconst UNDERLINE_NAMES: readonly UnderlineKind[] = ['none', 'single', 'double', 'curly', 'dotted', 'dashed']\n\nexport function underlineOfStyleFlags(flags: number): UnderlineKind {{\n  return UNDERLINE_NAMES[(flags & PackedStyleFlag.UNDERLINE_MASK) >> {}] ?? 'none'\n}}\n\nexport function isValidPackedColor(color: number): boolean {{\n  const c = color >>> 0\n  return c <= {} || (c >= {:#010x} && c <= {:#010x})\n}}\n",
+        "export type UnderlineKind = 'none' | 'single' | 'double' | 'curly' | 'dotted' | 'dashed'\nconst UNDERLINE_NAMES: readonly UnderlineKind[] = ['none', 'single', 'double', 'curly', 'dotted', 'dashed']\n\nexport function underlineOfStyleFlags(flags: number): UnderlineKind {{\n  return UNDERLINE_NAMES[(flags & PackedStyleFlag.UNDERLINE_MASK) >> {}] ?? 'none'\n}}\n\nexport function isValidPackedColor(color: number): boolean {{\n  if (!Number.isInteger(color) || color < 0 || color > 0xffff_ffff) return false\n  return color <= {} || (color >= {:#010x} && color <= {:#010x})\n}}\n",
         PackedStyle::UNDERLINE_SHIFT,
         PackedStyle::MAX_PALETTE_COLOR,
         PackedStyle::RGB_COLOR_MIN,
@@ -1774,9 +1931,10 @@ fn message_structs() -> Vec<StructSchema> {
                 f("epoch", FieldCodec::VarU64),
                 f_custom("size", "GridSize", "encodeGridSize", "decodeGridSize"),
                 f("firstActiveLine", FieldCodec::VarU64),
-                f_check(
+                f_encode_decode_check(
                     "scrollbackLines",
                     FieldCodec::VarU64,
+                    "if (v.scrollbackLines > v.firstActiveLine) {\n  throw new WireError('InvalidValue', 'FrameUpdate.scrollback_lines > first_active_line')\n}",
                     "if (scrollbackLines > firstActiveLine) {\n  throw new WireError('InvalidValue', 'FrameUpdate.scrollback_lines > first_active_line')\n}",
                 ),
                 f("scrollDelta", FieldCodec::I32),
@@ -2025,9 +2183,10 @@ fn client_msg_variants() -> Vec<MsgVariant> {
             fields: vec![
                 f("epoch", FieldCodec::VarU64),
                 f("fromLine", FieldCodec::VarU64),
-                f_check(
+                f_encode_decode_check(
                     "count",
                     FieldCodec::VarU32,
+                    "if (!Number.isInteger(msg.count) || msg.count < 1 || msg.count > MAX_ROWS_PER_FETCH) throw new WireError('LimitExceeded', 'fetch rows count')",
                     "if (count === 0 || count > MAX_ROWS_PER_FETCH) throw new WireError('LimitExceeded', 'fetch rows count')",
                 ),
             ],
@@ -2086,9 +2245,10 @@ fn client_msg_variants() -> Vec<MsgVariant> {
             fields: vec![
                 f_custom("blob", "Uint8Array", "encodeBlobHash", "decodeBlobHash"),
                 f("offset", FieldCodec::VarU32),
-                f_check(
+                f_encode_decode_check(
                     "maxBytes",
                     FieldCodec::VarU32,
+                    "if (!Number.isInteger(msg.maxBytes) || msg.maxBytes < 1 || msg.maxBytes > 0xffff_ffff) throw new WireError('InvalidValue', 'get_image_blob max_bytes must be non-zero')",
                     "if (maxBytes === 0) throw new WireError('InvalidValue', 'get_image_blob max_bytes must be non-zero')",
                 ),
             ],
@@ -2217,9 +2377,10 @@ fn broker_msg_variants() -> Vec<MsgVariant> {
                 f_custom("size", "GridSize", "encodeGridSize", "decodeGridSize"),
                 f("epoch", FieldCodec::VarU64),
                 f("firstActiveLine", FieldCodec::VarU64),
-                f_check(
+                f_encode_decode_check(
                     "scrollbackLines",
                     FieldCodec::VarU64,
+                    "if (msg.scrollbackLines > msg.firstActiveLine) {\n  throw new WireError('InvalidValue', 'Attached.scrollback_lines > first_active_line')\n}",
                     "if (scrollbackLines > firstActiveLine) {\n  throw new WireError('InvalidValue', 'Attached.scrollback_lines > first_active_line')\n}",
                 ),
                 f(
@@ -2317,12 +2478,13 @@ fn broker_msg_variants() -> Vec<MsgVariant> {
             fields: vec![
                 f("epoch", FieldCodec::VarU64),
                 f("fromLine", FieldCodec::VarU64),
-                f_check(
+                f_encode_decode_check(
                     "toLine",
                     FieldCodec::VarU64,
+                    "if (msg.toLine < msg.fromLine) throw new WireError('InvalidValue', 'search delta to_line < from_line')",
                     "if (toLine < fromLine) throw new WireError('InvalidValue', 'search delta to_line < from_line')",
                 ),
-                f_check(
+                f_encode_decode_check(
                     "added",
                     FieldCodec::VecBounded {
                         max_expr: "MAX_SEARCH_MATCHES",
@@ -2333,6 +2495,7 @@ fn broker_msg_variants() -> Vec<MsgVariant> {
                             decode_fn: "decodeCellSpan",
                         }),
                     },
+                    "for (const span of msg.added) {\n  if (span.start.line < msg.fromLine || span.end.line >= msg.toLine) {\n    throw new WireError('InvalidValue', 'search delta span outside [from_line, to_line)')\n  }\n}",
                     "for (const span of added) {\n  if (span.start.line < fromLine || span.end.line >= toLine) {\n    throw new WireError('InvalidValue', 'search delta span outside [from_line, to_line)')\n  }\n}",
                 ),
                 f("truncated", FieldCodec::Bool),
@@ -2390,9 +2553,10 @@ fn broker_msg_variants() -> Vec<MsgVariant> {
                 f_custom("encoding", "ImageEncoding", "encodeImageEncoding", "decodeImageEncoding"),
                 f("totalBytes", FieldCodec::VarU32),
                 f("offset", FieldCodec::VarU32),
-                f_check(
+                f_encode_decode_check(
                     "data",
                     FieldCodec::BytesCopyBounded("BULK_CHUNK_BYTES", "image blob chunk"),
+                    "if (msg.offset + msg.data.length > msg.totalBytes) {\n  throw new WireError('InvalidValue', 'image blob chunk exceeds total_bytes')\n}",
                     "if (offset + data.length > totalBytes) {\n  throw new WireError('InvalidValue', 'image blob chunk exceeds total_bytes')\n}",
                 ),
             ],
@@ -2422,9 +2586,10 @@ fn broker_msg_variants() -> Vec<MsgVariant> {
             tag: msg_type::PROGRESS,
             fields: vec![
                 f_custom("state", "ProgressState", "encodeProgressState", "decodeProgressState"),
-                f_check(
+                f_encode_decode_check(
                     "percent",
                     FieldCodec::Opt(Box::new(FieldCodec::ProgressPercent { err_msg: "progress percent > 100" })),
+                    "if (msg.percent !== null && (msg.state === 'none' || msg.state === 'indeterminate')) {\n  throw new WireError('InvalidValue', 'progress percent invalid for state')\n}",
                     "if (percent !== null && (state === 'none' || state === 'indeterminate')) {\n  throw new WireError('InvalidValue', 'progress percent invalid for state')\n}",
                 ),
             ],
@@ -2686,8 +2851,17 @@ fn _assert_exhaustive_apack_proto_coverage(
     ty::<(String, KeyAction, u8, String, u32, bool)>((code, action, modifiers, text, unshifted_codepoint, composed));
     let PointerInput { action, button, modifiers, x_px, y_px, cell_px } = pi;
     ty::<(PointerAction, u8, u8, u32, u32, CellPx)>((action, button, modifiers, x_px, y_px, cell_px));
-    let ImagePlacement { blob, line, col, pixel_size, cell_span, z_index } = imp;
-    ty::<(BlobHash, u64, i32, [u32; 2], [u16; 2], i32)>((blob, line, col, pixel_size, cell_span, z_index));
+    let ImagePlacement { blob, line, col, source_rect, cell_offset, pixel_size, cell_span, z_index } = imp;
+    ty::<(BlobHash, u64, i32, [u32; 4], [u32; 2], [u32; 2], [u16; 2], i32)>((
+        blob,
+        line,
+        col,
+        source_rect,
+        cell_offset,
+        pixel_size,
+        cell_span,
+        z_index,
+    ));
     let MetricsSnapshot {
         live_sessions,
         rewound_sessions,

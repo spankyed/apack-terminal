@@ -532,7 +532,7 @@ fn lease_table_caps_immediate_grace_resume_stale_timer_and_session_cleanup() {
     assert!(!table.has_active_broker_lease());
 
     // Expiring grace with wrong TimerId is ignored; matching TimerId expires it
-    let tok_a = ResumeToken::new([0x66; 32]);
+    let tok_a = ResumeToken::new([0x66; 32]).unwrap();
     let grace = LeaseGraceMs::new(30_000).unwrap();
     let la = table.acquire(conn(20), LeaseKind::BrokerGrace { grace_ms: grace, resume_token: tok_a }).unwrap();
     let lb = table.acquire(conn(21), LeaseKind::BrokerImmediate).unwrap();
@@ -550,7 +550,7 @@ fn lease_table_caps_immediate_grace_resume_stale_timer_and_session_cleanup() {
     assert!(table.release(conn(21), lb.lease_id).unwrap().teardown_non_kept);
 
     // Remote BrokerGrace: TokenInUse blocks live duplicate; resume decrements in_grace_count
-    let tok = ResumeToken::new([0x77; 32]);
+    let tok = ResumeToken::new([0x77; 32]).unwrap();
     let lg = table.acquire(conn(3), LeaseKind::BrokerGrace { grace_ms: grace, resume_token: tok }).unwrap();
     assert_eq!(
         table.acquire(conn(4), LeaseKind::BrokerGrace { grace_ms: grace, resume_token: tok }),
@@ -612,9 +612,11 @@ fn lease_table_caps_immediate_grace_resume_stale_timer_and_session_cleanup() {
     // Global in-grace cap across separate connections
     for i in 0..=(MAX_IN_GRACE_LEASES as u64) {
         let mut t = [0u8; 32];
-        t[0..8].copy_from_slice(&i.to_le_bytes());
+        t[0..8].copy_from_slice(&(i + 1).to_le_bytes());
         let cid = conn(100 + i);
-        table.acquire(cid, LeaseKind::BrokerGrace { grace_ms: grace, resume_token: ResumeToken::new(t) }).unwrap();
+        table
+            .acquire(cid, LeaseKind::BrokerGrace { grace_ms: grace, resume_token: ResumeToken::new(t).unwrap() })
+            .unwrap();
         table.on_disconnect(cid, ts(5_000), |id, at| wheel.schedule(at, id));
     }
     assert_eq!(table.in_grace_count(), MAX_IN_GRACE_LEASES);
@@ -1070,7 +1072,7 @@ fn broker_leases_grace_expiry_multi_stream_backpressure_and_limits() {
     ));
 
     // Acquire BrokerGrace lease, check TokenInUse from conn(2) and LimitExceeded from conn(1)
-    let tok = ResumeToken::new([0x33; 32]);
+    let tok = ResumeToken::new([0x33; 32]).unwrap();
     let grace = LeaseGraceMs::new(5_000).unwrap();
     let acq = encode_client(
         StreamId::CONTROL,

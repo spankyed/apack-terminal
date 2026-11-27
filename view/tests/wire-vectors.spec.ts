@@ -14,15 +14,37 @@ import {
   decodePackedRow,
   encodeBrokerFrame,
   encodeClientFrame,
+  encodeHeader,
+  encodePackedRow,
   verifyServerProof,
 } from '../src/index.ts'
 import {
+  MAX_BLOB_BYTES,
+  MAX_PACKED_ROW_TEXT_BYTES,
+  MAX_ROWS_PER_FETCH,
+  MAX_SEARCH_NEEDLE_BYTES,
+  MAX_STRING_BYTES,
+  MAX_WAIT_STATUSES,
+} from '../src/wire/constants.ts'
+import { encodeBrokerPayload, encodeClientPayload } from '../src/wire/messages.ts'
+import {
   SubFlags,
+  decodeImagePlacement,
   decodeMarksKey,
   decodeSubFlags,
+  encodeCellSpan,
   encodeGridSize,
+  encodeImagePiece,
+  encodeImagePlacement,
+  encodeKeyInput,
   encodeLeaseKind,
+  encodePointerInput,
+  encodeRgb24,
+  encodeSignalScope,
+  encodeStatusRecord,
   encodeSubFlags,
+  encodeWaitCondition,
+  isValidPackedColor,
 } from '../src/wire/types.ts'
 
 interface GoldenFrame {
@@ -226,10 +248,15 @@ describe('v2 golden wire vectors (Rust <-> TypeScript parity)', () => {
     expectWireErr(() => encodeGridSize(wGrid, { cols: 80.5, rows: 24 }), 'InvalidValue')
     expect(wGrid.length).toBe(0)
 
-    // 3. encodeLeaseKind brokerGrace validates resumeToken length before writing tag/graceMs.
+    // 3. encodeLeaseKind brokerGrace validates resumeToken length & non-zero BEFORE writing tag/graceMs.
     const wLease = new WireWriter()
     expectWireErr(
       () => encodeLeaseKind(wLease, { kind: 'brokerGrace', graceMs: 1000, resumeToken: new Uint8Array(4) }),
+      'InvalidValue',
+    )
+    expect(wLease.length).toBe(0)
+    expectWireErr(
+      () => encodeLeaseKind(wLease, { kind: 'brokerGrace', graceMs: 1000, resumeToken: new Uint8Array(32) }),
       'InvalidValue',
     )
     expect(wLease.length).toBe(0)
@@ -238,20 +265,52 @@ describe('v2 golden wire vectors (Rust <-> TypeScript parity)', () => {
     const badUtf8 = new Uint8Array(32).fill(0xff)
     expectWireErr(() => decodeMarksKey(new WireReader(badUtf8)), 'InvalidValue')
 
-    // 5. decodePackedRow rejects UTF-16 run offset/length > 0xffff with LimitExceeded.
-    const bigRow = new WireWriter()
-    bigRow.varU64(0) // line
-    bigRow.u8(0) // flags
-    bigRow.bytes(new Uint8Array(70_000).fill(0x61)) // 70k ASCII 'a'
-    bigRow.varU32(1) // 1 run
-    bigRow.u16(0) // colStart
-    bigRow.u16(1) // colLen
-    bigRow.varU32(66_000) // byteOffset > 0xffff
-    bigRow.varU32(1) // byteLen
-    bigRow.u16(0) // styleIdx
-    bigRow.u16(0) // linkIdx
-    bigRow.u8(0) // runFlags
-    expectWireErr(() => decodePackedRow(new WireReader(bigRow.toBytes())), 'LimitExceeded')
+    // 5. PackedRow MAX_PACKED_ROW_TEXT_BYTES exact pass (65_535) and reject (65_536) on both encode & decode,
+    //    plus empty non-zero links rejection.
+    const exactText = 'a'.repeat(MAX_PACKED_ROW_TEXT_BYTES)
+    const exactRuns = new Uint32Array([0 | (1 << 16), (MAX_PACKED_ROW_TEXT_BYTES - 1) | (1 << 16), 0, 0])
+    const exactW = new WireWriter()
+    encodePackedRow(exactW, {
+      line: 0,
+      flags: 0,
+      text: exactText,
+      runs: exactRuns,
+      styles: new Uint32Array(0),
+      links: [],
+    })
+    const exactDecoded = decodePackedRow(new WireReader(exactW.toBytes()))
+    expect(exactDecoded.text.length).toBe(MAX_PACKED_ROW_TEXT_BYTES)
+    expect(exactDecoded.runs[1]).toBe((MAX_PACKED_ROW_TEXT_BYTES - 1) | (1 << 16))
+
+    const overRow = new WireWriter()
+    overRow.varU64(0) // line
+    overRow.u8(0) // flags
+    overRow.bytes(new Uint8Array(MAX_PACKED_ROW_TEXT_BYTES + 1).fill(0x61))
+    expectWireErr(() => decodePackedRow(new WireReader(overRow.toBytes())), 'LimitExceeded')
+    expectWireErr(
+      () =>
+        encodePackedRow(new WireWriter(), {
+          line: 0,
+          flags: 0,
+          text: 'a'.repeat(MAX_PACKED_ROW_TEXT_BYTES + 1),
+          runs: new Uint32Array(0),
+          styles: new Uint32Array(0),
+          links: [],
+        }),
+      'LimitExceeded',
+    )
+    expectWireErr(
+      () =>
+        encodePackedRow(new WireWriter(), {
+          line: 0,
+          flags: 0,
+          text: '',
+          runs: new Uint32Array(0),
+          styles: new Uint32Array(0),
+          links: ['', 'https://ok.test', ''],
+        }),
+      'InvalidValue',
+    )
 
     // 6. Fail-fast header validation throws InvalidValue even on truncated trailing payloads.
     const badFrame = new WireWriter()
@@ -278,5 +337,390 @@ describe('v2 golden wire vectors (Rust <-> TypeScript parity)', () => {
     badDelta.varU64(10) // fromLine
     badDelta.varU64(9) // toLine < fromLine (truncated before added!)
     expectWireErr(() => decodeBrokerMsg(MsgType.SEARCH_DELTA, badDelta.toBytes()), 'InvalidValue')
+  })
+
+  it('validates encodeHeader ranges, bytesBounded clamp, varU64 safe integer boundary, and symmetric TS encoders', () => {
+    const expectWireErr = (fn: () => void, kind: WireError['kind']) => {
+      let caught: unknown
+      try {
+        fn()
+      } catch (e) {
+        caught = e
+      }
+      expect(caught).toBeInstanceOf(WireError)
+      expect((caught as WireError).kind).toBe(kind)
+    }
+
+    // 1. encodeHeader rejects out-of-range / non-integer streamId, msgType, reqId.
+    expectWireErr(() => encodeHeader(-1, MsgType.OK, 0, 0), 'InvalidValue')
+    expectWireErr(() => encodeHeader(0x1_0000_0000, MsgType.OK, 0, 0), 'InvalidValue')
+    expectWireErr(() => encodeHeader(1.5, MsgType.OK, 0, 0), 'InvalidValue')
+    expectWireErr(() => encodeHeader(0, -1, 0, 0), 'InvalidValue')
+    expectWireErr(() => encodeHeader(0, 0x1_0000, 0, 0), 'InvalidValue')
+    expectWireErr(() => encodeHeader(0, MsgType.OK, -1, 0), 'InvalidValue')
+    expectWireErr(() => encodeHeader(0, MsgType.OK, 0x1_0000_0000, 0), 'InvalidValue')
+
+    // 2. WireReader.bytesBounded clamps maxLen > MAX_BLOB_BYTES to MAX_BLOB_BYTES.
+    const overBlob = new WireWriter()
+    overBlob.varU32(MAX_BLOB_BYTES + 1)
+    expectWireErr(
+      () => new WireReader(overBlob.toBytes()).bytesBounded(MAX_BLOB_BYTES + 1024, 'oversized'),
+      'LimitExceeded',
+    )
+
+    // 3. varU64 exact Number.MAX_SAFE_INTEGER boundary pass + MAX_SAFE_INTEGER + 1 reject.
+    const wSafe = new WireWriter()
+    wSafe.varU64(Number.MAX_SAFE_INTEGER)
+    expect(new WireReader(wSafe.toBytes()).varU64()).toBe(Number.MAX_SAFE_INTEGER)
+    expectWireErr(() => new WireWriter().varU64(Number.MAX_SAFE_INTEGER + 1), 'InvalidValue')
+    const wBig = new WireWriter()
+    wBig.varU64(BigInt(Number.MAX_SAFE_INTEGER) + 1n)
+    expect(new WireReader(wBig.toBytes()).varU64Big()).toBe(BigInt(Number.MAX_SAFE_INTEGER) + 1n)
+    expectWireErr(() => new WireReader(wBig.toBytes()).varU64(), 'LimitExceeded')
+
+    // 4. Symmetric TS encoder validation matches Rust decode constraints without partial writes.
+    const blob = new Uint8Array(32).fill(0x42)
+
+    const wWait = new WireWriter()
+    expectWireErr(() => encodeWaitCondition(wWait, { kind: 'status', states: [] }), 'InvalidValue')
+    expectWireErr(
+      () =>
+        encodeWaitCondition(wWait, {
+          kind: 'status',
+          states: Array.from({ length: MAX_WAIT_STATUSES + 1 }, () => 'idle' as const),
+        }),
+      'LimitExceeded',
+    )
+    expect(wWait.length).toBe(0)
+
+    const wSpan = new WireWriter()
+    expectWireErr(
+      () => encodeCellSpan(wSpan, { start: { line: 5, col: 2 }, end: { line: 4, col: 9 } }),
+      'InvalidValue',
+    )
+    expect(wSpan.length).toBe(0)
+
+    const wKey = new WireWriter()
+    expectWireErr(
+      () =>
+        encodeKeyInput(wKey, {
+          code: 'KeyA',
+          action: 'press',
+          modifiers: 0xff,
+          text: 'a',
+          unshiftedCodepoint: 97,
+          composed: false,
+        }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () =>
+        encodeKeyInput(wKey, {
+          code: 'KeyA',
+          action: 'press',
+          modifiers: 0,
+          text: '',
+          unshiftedCodepoint: 0xd800,
+          composed: false,
+        }),
+      'InvalidValue',
+    )
+    expect(wKey.length).toBe(0)
+
+    const wPtr = new WireWriter()
+    expectWireErr(
+      () =>
+        encodePointerInput(wPtr, {
+          action: 'press',
+          button: 99,
+          modifiers: 0,
+          xPx: 0,
+          yPx: 0,
+          cellPx: { width: 8, height: 16 },
+        }),
+      'InvalidValue',
+    )
+    expect(wPtr.length).toBe(0)
+
+    const wPiece = new WireWriter()
+    expectWireErr(
+      () => encodeImagePiece(wPiece, { blob, colStart: 0, colLen: 0, srcRect: [0, 0, 1, 1], dstPx: [1, 1] }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () => encodeImagePiece(wPiece, { blob, colStart: 0, colLen: 1, srcRect: [0, 0, 0, 1], dstPx: [1, 1] }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () => encodeImagePiece(wPiece, { blob, colStart: 0, colLen: 1, srcRect: [0, 0, 1, 1], dstPx: [0, 1] }),
+      'InvalidValue',
+    )
+    expect(wPiece.length).toBe(0)
+
+    const validPlacement = {
+      blob,
+      line: 3,
+      col: -1,
+      sourceRect: [2, 4, 30, 20] as const,
+      cellOffset: [1, 3] as const,
+      pixelSize: [60, 40] as const,
+      cellSpan: [4, 2] as const,
+      zIndex: -2,
+    }
+    const wPlace = new WireWriter()
+    encodeImagePlacement(wPlace, validPlacement)
+    expect(decodeImagePlacement(new WireReader(wPlace.toBytes()))).toEqual(validPlacement)
+
+    const wBadPlace = new WireWriter()
+    expectWireErr(
+      () => encodeImagePlacement(wBadPlace, { ...validPlacement, sourceRect: [0, 0, 0, 10] }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () => encodeImagePlacement(wBadPlace, { ...validPlacement, sourceRect: [0xffff_ffff, 0, 1, 10] }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () => encodeImagePlacement(wBadPlace, { ...validPlacement, pixelSize: [0, 40] }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () => encodeImagePlacement(wBadPlace, { ...validPlacement, cellSpan: [4, 0] }),
+      'InvalidValue',
+    )
+    expect(wBadPlace.length).toBe(0)
+
+    const wStatus = new WireWriter()
+    expectWireErr(
+      () =>
+        encodeStatusRecord(wStatus, {
+          id: 'agent',
+          state: 'working',
+          kind: 'permission',
+          progress: null,
+          app: null,
+          title: null,
+          message: null,
+          changed: 1,
+          sinceMs: 1,
+          confirmed: 'unknown',
+        }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () =>
+        encodeStatusRecord(wStatus, {
+          id: 'agent',
+          state: 'working',
+          kind: null,
+          progress: 101,
+          app: null,
+          title: null,
+          message: null,
+          changed: 1,
+          sinceMs: 1,
+          confirmed: 'unknown',
+        }),
+      'InvalidValue',
+    )
+    expect(wStatus.length).toBe(0)
+
+    expectWireErr(
+      () => encodeClientPayload({ kind: 'fetchRows', epoch: 1, fromLine: 0, count: 0 }),
+      'LimitExceeded',
+    )
+    expectWireErr(
+      () => encodeClientPayload({ kind: 'fetchRows', epoch: 1, fromLine: 0, count: -1 }),
+      'LimitExceeded',
+    )
+    expectWireErr(
+      () => encodeClientPayload({ kind: 'fetchRows', epoch: 1, fromLine: 0, count: MAX_ROWS_PER_FETCH + 1 }),
+      'LimitExceeded',
+    )
+    expectWireErr(
+      () => encodeClientPayload({ kind: 'getImageBlob', blob, offset: 0, maxBytes: 0 }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () => encodeClientPayload({ kind: 'getImageBlob', blob, offset: 0, maxBytes: -1 }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () => encodeBrokerPayload({ kind: 'progress', state: 'indeterminate', percent: 50 }),
+      'InvalidValue',
+    )
+
+    // 5. Additional adversarial checks: atomic rollback, surrogate-pair split, rgb24/color validation,
+    //    NaN maxLen fail-closed, WireWriter.str/bytes caps, remaining ImagePlacement axes & broker encoders.
+    expectWireErr(() => encodeHeader(0, MsgType.OK, 0, -1), 'InvalidValue')
+    expectWireErr(() => encodeHeader(0, MsgType.OK, 0, Number.NaN), 'InvalidValue')
+    expectWireErr(() => encodeHeader(0, MsgType.OK, 0, MAX_BLOB_BYTES + 1), 'FrameTooLarge')
+
+    expectWireErr(() => new WireReader(new Uint8Array([0])).bytesBounded(Number.NaN, 'nan'), 'InvalidValue')
+    expectWireErr(() => new WireWriter().strBounded('a', Number.NaN, 'nan'), 'InvalidValue')
+    expectWireErr(() => new WireWriter().str('a'.repeat(MAX_STRING_BYTES + 1)), 'LimitExceeded')
+    expectWireErr(() => new WireWriter().bytes(new Uint8Array(MAX_BLOB_BYTES + 1)), 'LimitExceeded')
+
+    const wRgb = new WireWriter()
+    expectWireErr(() => encodeRgb24(wRgb, Number.NaN), 'InvalidValue')
+    expectWireErr(() => encodeRgb24(wRgb, -1), 'InvalidValue')
+    expectWireErr(() => encodeRgb24(wRgb, 1.5), 'InvalidValue')
+    expectWireErr(() => encodeRgb24(wRgb, 0x01_00_00_00), 'InvalidValue')
+    expect(wRgb.length).toBe(0)
+    expect(isValidPackedColor(Number.NaN)).toBe(false)
+    expect(isValidPackedColor(1.5)).toBe(false)
+    expect(isValidPackedColor(0x1_0000_0001)).toBe(false)
+
+    // Atomic rollback on tagged unions, structs, and PackedRow mid-encode errors.
+    const wAtom = new WireWriter()
+    expectWireErr(
+      () => encodeWaitCondition(wAtom, { kind: 'text', needle: 'a'.repeat(MAX_SEARCH_NEEDLE_BYTES + 1) }),
+      'LimitExceeded',
+    )
+    expectWireErr(() => encodeLeaseKind(wAtom, { kind: 'session', session: 0 }), 'InvalidValue')
+    expectWireErr(() => encodeSignalScope(wAtom, { kind: 'pid', pid: 0 }), 'InvalidValue')
+    expectWireErr(
+      () => encodeCellSpan(wAtom, { start: { line: 0, col: 0 }, end: { line: Number.NaN, col: 0 } }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () => encodeImagePiece(wAtom, { blob, colStart: 10, colLen: -5, srcRect: [0, 0, 1, 1], dstPx: [1, 1] }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () => encodeImagePiece(wAtom, { blob, colStart: 0, colLen: 1, srcRect: [-1, 0, 0x1_0000_0000, 1], dstPx: [1, 1] }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () => encodeImagePiece(wAtom, { blob, colStart: 0, colLen: 1, srcRect: [0, 0, 1, 1], dstPx: [-1, 1] }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () => encodeImagePlacement(wAtom, { ...validPlacement, sourceRect: [0, 0, 10, 0] }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () => encodeImagePlacement(wAtom, { ...validPlacement, sourceRect: [0, 0xffff_ffff, 10, 1] }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () => encodeImagePlacement(wAtom, { ...validPlacement, sourceRect: [-1, 0, 10, 10] }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () => encodeImagePlacement(wAtom, { ...validPlacement, pixelSize: [10, 0] }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () => encodeImagePlacement(wAtom, { ...validPlacement, pixelSize: [-1, 10] }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () => encodeImagePlacement(wAtom, { ...validPlacement, cellSpan: [0, 2] }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () => encodeImagePlacement(wAtom, { ...validPlacement, zIndex: Number.NaN }),
+      'InvalidValue',
+    )
+    // PackedRow surrogate-pair split ("🚀" has UTF-16 length 2) + invalid run/style atomic rollback.
+    expectWireErr(
+      () =>
+        encodePackedRow(wAtom, {
+          line: 0,
+          flags: 0,
+          text: '🚀',
+          runs: new Uint32Array([0 | (2 << 16), 0 | (1 << 16), 0, 1]),
+          styles: new Uint32Array(0),
+          links: [],
+        }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () =>
+        encodePackedRow(wAtom, {
+          line: 0,
+          flags: 0,
+          text: '🚀',
+          runs: new Uint32Array([0 | (2 << 16), 1 | (1 << 16), 0, 1]),
+          styles: new Uint32Array(0),
+          links: [],
+        }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () =>
+        encodePackedRow(wAtom, {
+          line: 0,
+          flags: 0,
+          text: 'hi',
+          runs: new Uint32Array([0 | (2 << 16), 0 | (2 << 16), 0, 0]),
+          styles: new Uint32Array([1, 0, 0, 0]), // styles[0] not default
+          links: [],
+        }),
+      'InvalidValue',
+    )
+    expect(wAtom.length).toBe(0)
+
+    // Broker message encode invariants (FrameUpdate, Attached, SearchDelta, ImageBlobChunk).
+    expectWireErr(
+      () =>
+        encodeBrokerPayload({
+          kind: 'frame',
+          frame: {
+            seq: 1,
+            epoch: 1,
+            size: { cols: 80, rows: 24 },
+            firstActiveLine: 5,
+            scrollbackLines: 6,
+            scrollDelta: 0,
+            cursor: { col: 0, row: 0, shape: 'block', blinking: false, hidden: false },
+            modes: { altScreen: false, mouse: false, reverseVideo: false, bracketedPaste: false },
+            palette: null,
+            rows: [],
+            imagesGen: 0,
+            fullSync: true,
+          },
+        }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () =>
+        encodeBrokerPayload({
+          kind: 'attached',
+          session: 1,
+          streamId: 1,
+          size: { cols: 80, rows: 24 },
+          epoch: 1,
+          firstActiveLine: 5,
+          scrollbackLines: 6,
+          foreground: null,
+        }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () =>
+        encodeBrokerPayload({
+          kind: 'searchDelta',
+          epoch: 1,
+          fromLine: 10,
+          toLine: 5,
+          added: [],
+          truncated: false,
+        }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () =>
+        encodeBrokerPayload({
+          kind: 'imageBlobChunk',
+          blob,
+          encoding: 'png',
+          totalBytes: 4,
+          offset: 2,
+          data: new Uint8Array([1, 2, 3]),
+        }),
+      'InvalidValue',
+    )
   })
 })

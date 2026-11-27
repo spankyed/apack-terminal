@@ -2,7 +2,7 @@
 
 use apack_core::vt::{CompressStep, DirtyViewport, PasteEncode, VtEngine, VtEvent, VtGenerations, VtSnapshotMeta};
 use apack_proto::types::{
-    CellPos, CellPx, CellSpan, CursorShape, GridSize, ImagePlacement, KeyInput, PackedRow, PaletteOverrides,
+    BlobHash, CellPos, CellPx, CellSpan, CursorShape, GridSize, ImagePlacement, KeyInput, PackedRow, PaletteOverrides,
     PointerInput,
 };
 use ghostty_vt_rs_sys as sys;
@@ -340,14 +340,11 @@ impl VtEngine for GhosttyEngine {
                         (&raw mut z).cast(),
                     )
                 };
-                out.push(ImagePlacement {
-                    blob,
-                    line: span.start.line,
-                    col: i32::from(span.start.col),
-                    pixel_size: [w, h],
-                    cell_span: [cols.min(u32::from(u16::MAX)) as u16, rows.min(u32::from(u16::MAX)) as u16],
-                    z_index: z,
-                });
+                if let Some(placement) =
+                    checked_image_placement(blob, span.start.line, i32::from(span.start.col), w, h, cols, rows, z)
+                {
+                    out.push(placement);
+                }
             }
         }
         // SAFETY: freeing placement iterator once.
@@ -604,4 +601,33 @@ impl GhosttyEngine {
         out.extend(filtered);
         truncated
     }
+}
+
+/// Builds a wire-valid [`ImagePlacement`], returning `None` for degenerate zero-sized placements.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn checked_image_placement(
+    blob: BlobHash,
+    line: u64,
+    col: i32,
+    w: u32,
+    h: u32,
+    cols: u32,
+    rows: u32,
+    z_index: i32,
+) -> Option<ImagePlacement> {
+    let span_cols = cols.min(u32::from(u16::MAX)) as u16;
+    let span_rows = rows.min(u32::from(u16::MAX)) as u16;
+    if w == 0 || h == 0 || span_cols == 0 || span_rows == 0 {
+        return None;
+    }
+    Some(ImagePlacement {
+        blob,
+        line,
+        col,
+        source_rect: [0, 0, w, h],
+        cell_offset: [0, 0],
+        pixel_size: [w, h],
+        cell_span: [span_cols, span_rows],
+        z_index,
+    })
 }

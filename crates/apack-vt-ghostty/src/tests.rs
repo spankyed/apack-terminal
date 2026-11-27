@@ -13,14 +13,14 @@ use apack_proto::types::{
 };
 
 use crate::engine::{
-    GhosttyConfig, GhosttyEngine, coalesce_feed_events, decode_osc7_cwd, escape_osc633_field, features,
-    last_snapshot_record_end, sanitize_osc633_body,
+    GhosttyConfig, GhosttyEngine, checked_image_placement, coalesce_feed_events, decode_osc7_cwd, escape_osc633_field,
+    features, last_snapshot_record_end, sanitize_osc633_body,
 };
 use crate::error::GhosttyError;
 use crate::image_store::{ImageStore, decode_png_rgba, encode_png_pixels, encode_png_rgba, png_rgba_pixel_count};
 use crate::input::consumed;
 use crate::placeholders::{PLACEHOLDER, PlaceholderRun, Said, fit};
-use crate::rows::{ROW_LINK_BYTES, intern_link};
+use crate::rows::{ROW_LINK_BYTES, fits_row_text, intern_link};
 use crate::{
     GLOBAL_IMAGE_STORE_BYTES, GLOBAL_SCROLLBACK_PRESSURE_BYTES, SESSION_IMAGE_STORAGE_BYTES, UNKNOWN_OSC_MAX_BYTES,
 };
@@ -1408,4 +1408,100 @@ fn review_mutants_batched_text_cell_px_resize_placeholder_bg_long_grapheme_and_s
         !ev.iter().any(|e| matches!(e, VtEvent::DeviceResponse(b) if b.ends_with(b";EINVAL: invalid data\x1b\\"))),
         "shared-memory medium must remain disabled after feed_named_probe"
     );
+}
+
+#[test]
+fn packed_row_text_cap_and_checked_image_placement_bounds() {
+    use apack_proto::codec::{Reader, Writer};
+    use apack_proto::types::BlobHash;
+
+    // 1. Exact boundary unit tests for `fits_row_text`.
+    assert!(fits_row_text(0, 0, 0));
+    assert!(!fits_row_text(0, 1, 0));
+    assert!(fits_row_text(65_534, 1, 65_535));
+    assert!(!fits_row_text(65_535, 1, 65_535));
+    assert!(fits_row_text(65_533, 2, 65_535));
+    assert!(!fits_row_text(65_534, 2, 65_535));
+
+    // 2. Real `GhosttyEngine` row extraction caps `PackedRow.text` at `MAX_PACKED_ROW_TEXT_BYTES`
+    //    without silent glyph corruption, mid-row holes, or orphan links.
+    let mut vt = GhosttyEngine::new(GhosttyConfig::new(grid(1000, 3))).unwrap();
+    let mut ev = Vec::new();
+    // 1 ASCII base + 64 3-byte combining marks (`U+20D0`) = 193 bytes/cell; 339 cells = 65,427 bytes
+    // (108 bytes left). Cell 339 is a styled 193-byte grapheme that hits the cap and MUST stop
+    // row text emission cleanly (no space corruption, no mid-row hole, no trailing orphan link).
+    let mut cluster = String::from("a");
+    for _ in 0..64 {
+        cluster.push('\u{20D0}');
+    }
+    let mut row0 = String::with_capacity(400 * cluster.len() + 256);
+    for _ in 0..339 {
+        row0.push_str(&cluster);
+    }
+    row0.push_str("\x1b[31m");
+    row0.push_str(&cluster); // 340th grapheme exceeds cap while styled -> must NOT become ' '
+    row0.push_str("ZZZ"); // trailing ASCII after cap -> must NOT emit past a mid-row hole
+    row0.push_str("\x1b]8;;https://orphan.example\x1b\\L\x1b]8;;\x1b\\"); // orphan link past cap -> must NOT intern
+    row0.push_str("\x1b[0m\r\n");
+
+    // Row 1: exact 65,533 bytes (339 * 193 = 65,427 + 106 ASCII 'A' = 65,533, 2 bytes left),
+    // followed by styled wide CJK `'中'` (3 UTF-8 bytes) -> MUST NOT turn `'中'` into a styled `' '`.
+    let mut row1 = String::with_capacity(339 * cluster.len() + 256);
+    for _ in 0..339 {
+        row1.push_str(&cluster);
+    }
+    row1.push_str(&"A".repeat(106));
+    row1.push_str("\x1b[32m中\x1b[0m\r\n");
+
+    // Row 2: exact 65,535 bytes (339 * 193 = 65,427 + 108 ASCII 'B' = 65,535),
+    // followed by ECH styled blanks (`BG_COLOR_PALETTE`) + hyperlinked blank -> all dropped cleanly.
+    let mut row2 = String::with_capacity(339 * cluster.len() + 256);
+    for _ in 0..339 {
+        row2.push_str(&cluster);
+    }
+    row2.push_str(&"B".repeat(108));
+    row2.push_str("\x1b[41m\x1b[20X\x1b[0m");
+
+    vt.feed(row0.as_bytes(), &mut ev);
+    vt.feed(row1.as_bytes(), &mut ev);
+    vt.feed(row2.as_bytes(), &mut ev);
+
+    let mut rows = Vec::new();
+    vt.extract_viewport_rows(&[0, 1, 2], &mut rows);
+    assert_eq!(rows.len(), 3);
+
+    // Row 0 assertions: stopped cleanly at 339 * 193 = 65,427 bytes; no 'Z', no ' ', no orphan link.
+    assert_eq!(rows[0].text.len(), 339 * 193);
+    assert!(!rows[0].text.contains('Z'), "must not emit cells after cap creating a mid-row hole");
+    assert!(!rows[0].text.contains(' '), "styled grapheme at cap must not degrade to space");
+    assert!(rows[0].links.is_empty(), "dropped cells past cap must not intern orphan links");
+
+    // Row 1 assertions: stopped cleanly at 65,533 bytes; styled `'中'` did NOT degrade to `' '`.
+    assert_eq!(rows[1].text.len(), 65_533);
+    assert!(rows[1].text.ends_with('A'));
+    assert!(!rows[1].text.ends_with(' '), "styled multibyte char at cap must not degrade to space");
+
+    // Row 2 assertions: saturated at exact 65,535 bytes; trailing styled blanks dropped.
+    assert_eq!(rows[2].text.len(), apack_proto::MAX_PACKED_ROW_TEXT_BYTES);
+    assert!(rows[2].text.ends_with('B'));
+
+    for row in &rows {
+        let mut w = Writer::new();
+        row.encode(&mut w);
+        let mut r = Reader::new(w.as_slice());
+        assert_eq!(PackedRow::decode(&mut r).unwrap(), *row);
+    }
+
+    // 3. `checked_image_placement` rejects any zero dimension and clamps oversized spans.
+    let blob = BlobHash([0x22; 32]);
+    assert!(checked_image_placement(blob, 1, 2, 0, 10, 2, 2, 0).is_none());
+    assert!(checked_image_placement(blob, 1, 2, 10, 0, 2, 2, 0).is_none());
+    assert!(checked_image_placement(blob, 1, 2, 10, 10, 0, 2, 0).is_none());
+    assert!(checked_image_placement(blob, 1, 2, 10, 10, 2, 0, 0).is_none());
+    let ok = checked_image_placement(blob, 5, -1, 120, 80, u32::MAX, 70_000, -3).unwrap();
+    assert_eq!(ok.source_rect, [0, 0, 120, 80]);
+    assert_eq!(ok.cell_offset, [0, 0]);
+    assert_eq!(ok.pixel_size, [120, 80]);
+    assert_eq!(ok.cell_span, [u16::MAX, u16::MAX]);
+    assert_eq!(ok.z_index, -3);
 }

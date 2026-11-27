@@ -81,8 +81,26 @@ describe('ImageCache and TerminalView image placements', () => {
     source.imagesGen = 1
     source.imagePlacements = [
       // Large natural pixelSize (2000x1500) placed in 4x1 cells -> drawn at 4*10=40 by 1*20=20 CSS px!
-      { blob: fgBlob, line: 1, col: 2, pixelSize: [2000, 1500], cellSpan: [4, 1], zIndex: 5 },
-      { blob: bgBlob, line: 0, col: 0, pixelSize: [800, 600], cellSpan: [2, 1], zIndex: -2 },
+      {
+        blob: fgBlob,
+        line: 1,
+        col: 2,
+        sourceRect: [0, 0, 2000, 1500],
+        cellOffset: [0, 0],
+        pixelSize: [2000, 1500],
+        cellSpan: [4, 1],
+        zIndex: 5,
+      },
+      {
+        blob: bgBlob,
+        line: 0,
+        col: 0,
+        sourceRect: [0, 0, 800, 600],
+        cellOffset: [0, 0],
+        pixelSize: [800, 600],
+        cellSpan: [2, 1],
+        zIndex: -2,
+      },
     ]
 
     const pics = new Map<string, CanvasImageSource>()

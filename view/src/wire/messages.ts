@@ -215,18 +215,22 @@ export interface SpawnSpec {
 }
 
 function encodeSpawnSpec(w: WireWriter, v: SpawnSpec): void {
-  w.slice(v.argv, (wr, item) => { wr.str(item) })
-  w.opt(v.cwd, (wr, item) => { wr.str(item) })
-  w.slice(v.env, (wr, [k, val]) => { wr.str(k); wr.str(val) })
-  encodeGridSize(w, v.size)
-  encodeCellPx(w, v.cellPx)
-  w.varU32(v.scrollbackLimit)
-  w.opt(v.marksKey, encodeMarksKey)
-  encodeResizePolicy(w, v.resizePolicy)
-  w.opt(v.recordDir, (wr, item) => { wr.str(item) })
-  w.opt(v.restoreFrom, (wr, item) => { wr.str(item) })
-  w.bool(v.imageFiles)
-  w.bool(v.kept)
+  w.atomic((w) => {
+    if (v.argv.length > MAX_SPAWN_ARGV) throw new WireError('LimitExceeded', 'wire limit exceeded: spawn argv')
+    if (v.env.length > MAX_SPAWN_ENV) throw new WireError('LimitExceeded', 'wire limit exceeded: spawn env')
+    w.slice(v.argv, (wr, item) => { wr.str(item) })
+    w.opt(v.cwd, (wr, item) => { wr.str(item) })
+    w.slice(v.env, (wr, [k, val]) => { wr.str(k); wr.str(val) })
+    encodeGridSize(w, v.size)
+    encodeCellPx(w, v.cellPx)
+    w.varU32(v.scrollbackLimit)
+    w.opt(v.marksKey, encodeMarksKey)
+    encodeResizePolicy(w, v.resizePolicy)
+    w.opt(v.recordDir, (wr, item) => { wr.str(item) })
+    w.opt(v.restoreFrom, (wr, item) => { wr.str(item) })
+    w.bool(v.imageFiles)
+    w.bool(v.kept)
+  })
 }
 function decodeSpawnSpec(r: WireReader): SpawnSpec {
   return {
@@ -259,16 +263,18 @@ export interface SessionSummary {
 }
 
 function encodeSessionSummary(w: WireWriter, v: SessionSummary): void {
-  encodeSessionId(w, v.id)
-  encodeGridSize(w, v.size)
-  w.bool(v.alive)
-  w.bool(v.kept)
-  w.bool(v.rewound)
-  w.str(v.title)
-  w.opt(v.cwd, (wr, item) => { wr.str(item) })
-  w.opt(v.pid, encodeSignalTarget)
-  w.opt(v.foreground, encodeForegroundProcess)
-  w.varU64(v.createdMs)
+  w.atomic((w) => {
+    encodeSessionId(w, v.id)
+    encodeGridSize(w, v.size)
+    w.bool(v.alive)
+    w.bool(v.kept)
+    w.bool(v.rewound)
+    w.str(v.title)
+    w.opt(v.cwd, (wr, item) => { wr.str(item) })
+    w.opt(v.pid, encodeSignalTarget)
+    w.opt(v.foreground, encodeForegroundProcess)
+    w.varU64(v.createdMs)
+  })
 }
 function decodeSessionSummary(r: WireReader): SessionSummary {
   return {
@@ -301,18 +307,24 @@ export interface FrameUpdate {
 }
 
 function encodeFrameUpdate(w: WireWriter, v: FrameUpdate): void {
-  w.varU64(v.seq)
-  w.varU64(v.epoch)
-  encodeGridSize(w, v.size)
-  w.varU64(v.firstActiveLine)
-  w.varU64(v.scrollbackLines)
-  w.i32(v.scrollDelta)
-  encodeCursorState(w, v.cursor)
-  encodeViewModes(w, v.modes)
-  w.opt(v.palette, encodePaletteOverrides)
-  w.slice(v.rows, encodePackedRow)
-  w.varU64(v.imagesGen)
-  w.bool(v.fullSync)
+  w.atomic((w) => {
+    if (v.scrollbackLines > v.firstActiveLine) {
+      throw new WireError('InvalidValue', 'FrameUpdate.scrollback_lines > first_active_line')
+    }
+    if (v.rows.length > MAX_ROWS_PER_FETCH) throw new WireError('LimitExceeded', 'wire limit exceeded: frame rows')
+    w.varU64(v.seq)
+    w.varU64(v.epoch)
+    encodeGridSize(w, v.size)
+    w.varU64(v.firstActiveLine)
+    w.varU64(v.scrollbackLines)
+    w.i32(v.scrollDelta)
+    encodeCursorState(w, v.cursor)
+    encodeViewModes(w, v.modes)
+    w.opt(v.palette, encodePaletteOverrides)
+    w.slice(v.rows, encodePackedRow)
+    w.varU64(v.imagesGen)
+    w.bool(v.fullSync)
+  })
 }
 function decodeFrameUpdate(r: WireReader): FrameUpdate {
   const seq = r.varU64()
@@ -419,8 +431,8 @@ export function encodeClientPayload(msg: ClientMsg): { readonly msgType: number;
   const w = new WireWriter()
   switch (msg.kind) {
     case 'hello':
-      w.u16(msg.protocolVersion)
       if (msg.clientNonce.length !== AUTH_TOKEN_LEN) throw new WireError('InvalidValue', 'clientNonce must be 32 bytes')
+      w.u16(msg.protocolVersion)
       w.raw(msg.clientNonce)
       w.str(msg.clientName)
       return { msgType: MsgType.HELLO, payload: w.toBytes() }
@@ -523,6 +535,7 @@ export function encodeClientPayload(msg: ClientMsg): { readonly msgType: number;
       w.varU32(msg.bytes)
       return { msgType: MsgType.OUTPUT_CREDIT, payload: w.toBytes() }
     case 'fetchRows':
+      if (!Number.isInteger(msg.count) || msg.count < 1 || msg.count > MAX_ROWS_PER_FETCH) throw new WireError('LimitExceeded', 'fetch rows count')
       w.varU64(msg.epoch)
       w.varU64(msg.fromLine)
       w.varU32(msg.count)
@@ -555,6 +568,7 @@ export function encodeClientPayload(msg: ClientMsg): { readonly msgType: number;
     case 'images':
       return { msgType: MsgType.IMAGES, payload: w.toBytes() }
     case 'getImageBlob':
+      if (!Number.isInteger(msg.maxBytes) || msg.maxBytes < 1 || msg.maxBytes > 0xffff_ffff) throw new WireError('InvalidValue', 'get_image_blob max_bytes must be non-zero')
       encodeBlobHash(w, msg.blob)
       w.varU32(msg.offset)
       w.varU32(msg.maxBytes)
@@ -863,9 +877,9 @@ export function encodeBrokerPayload(msg: BrokerMsg): { readonly msgType: number;
   const w = new WireWriter()
   switch (msg.kind) {
     case 'helloOk':
+      if (msg.serverNonce.length !== AUTH_TOKEN_LEN) throw new WireError('InvalidValue', 'serverNonce must be 32 bytes')
       w.u16(msg.protocolVersion)
       w.bool(msg.authRequired)
-      if (msg.serverNonce.length !== AUTH_TOKEN_LEN) throw new WireError('InvalidValue', 'serverNonce must be 32 bytes')
       w.raw(msg.serverNonce)
       w.str(msg.wordDelimiters)
       w.u32(msg.capabilities)
@@ -892,6 +906,7 @@ export function encodeBrokerPayload(msg: BrokerMsg): { readonly msgType: number;
       w.bool(msg.owned)
       return { msgType: MsgType.OWNS_REPLY, payload: w.toBytes() }
     case 'sessionsList':
+      if (msg.sessions.length > MAX_SESSIONS_LIST) throw new WireError('LimitExceeded', 'wire limit exceeded: sessions list')
       w.slice(msg.sessions, encodeSessionSummary)
       return { msgType: MsgType.SESSIONS_LIST, payload: w.toBytes() }
     case 'rewound':
@@ -906,6 +921,9 @@ export function encodeBrokerPayload(msg: BrokerMsg): { readonly msgType: number;
       encodeMetricsSnapshot(w, msg.metrics)
       return { msgType: MsgType.METRICS_REPLY, payload: w.toBytes() }
     case 'attached':
+      if (msg.scrollbackLines > msg.firstActiveLine) {
+        throw new WireError('InvalidValue', 'Attached.scrollback_lines > first_active_line')
+      }
       encodeSessionId(w, msg.session)
       encodeNonZeroStreamId(w, msg.streamId)
       encodeGridSize(w, msg.size)
@@ -921,6 +939,7 @@ export function encodeBrokerPayload(msg: BrokerMsg): { readonly msgType: number;
       encodeFrameUpdate(w, msg.frame)
       return { msgType: MsgType.FRAME, payload: w.toBytes() }
     case 'rows':
+      if (msg.rows.length > MAX_ROWS_PER_FETCH) throw new WireError('LimitExceeded', 'wire limit exceeded: rows reply')
       w.varU64(msg.epoch)
       w.slice(msg.rows, encodePackedRow)
       return { msgType: MsgType.ROWS, payload: w.toBytes() }
@@ -934,11 +953,19 @@ export function encodeBrokerPayload(msg: BrokerMsg): { readonly msgType: number;
       w.str(msg.text)
       return { msgType: MsgType.TEXT_REPLY, payload: w.toBytes() }
     case 'searchMatches':
+      if (msg.matches.length > MAX_SEARCH_MATCHES) throw new WireError('LimitExceeded', 'wire limit exceeded: search matches')
       w.varU64(msg.epoch)
       w.slice(msg.matches, encodeCellSpan)
       w.bool(msg.truncated)
       return { msgType: MsgType.SEARCH_MATCHES, payload: w.toBytes() }
     case 'searchDelta':
+      if (msg.toLine < msg.fromLine) throw new WireError('InvalidValue', 'search delta to_line < from_line')
+      if (msg.added.length > MAX_SEARCH_MATCHES) throw new WireError('LimitExceeded', 'wire limit exceeded: search delta')
+      for (const span of msg.added) {
+        if (span.start.line < msg.fromLine || span.end.line >= msg.toLine) {
+          throw new WireError('InvalidValue', 'search delta span outside [from_line, to_line)')
+        }
+      }
       w.varU64(msg.epoch)
       w.varU64(msg.fromLine)
       w.varU64(msg.toLine)
@@ -946,16 +973,22 @@ export function encodeBrokerPayload(msg: BrokerMsg): { readonly msgType: number;
       w.bool(msg.truncated)
       return { msgType: MsgType.SEARCH_DELTA, payload: w.toBytes() }
     case 'commandsReply':
+      if (msg.commands.length > MAX_COMMANDS) throw new WireError('LimitExceeded', 'wire limit exceeded: commands')
       w.slice(msg.commands, encodeCommandRecord)
       return { msgType: MsgType.COMMANDS_REPLY, payload: w.toBytes() }
     case 'commandOutputReply':
       w.opt(msg.text, (wr, item) => { wr.str(item) })
       return { msgType: MsgType.COMMAND_OUTPUT_REPLY, payload: w.toBytes() }
     case 'imagesReply':
+      if (msg.placements.length > MAX_IMAGES_REPLY) throw new WireError('LimitExceeded', 'wire limit exceeded: image placements')
       w.varU64(msg.imagesGen)
       w.slice(msg.placements, encodeImagePlacement)
       return { msgType: MsgType.IMAGES_REPLY, payload: w.toBytes() }
     case 'imageBlobChunk':
+      if (msg.data.length > BULK_CHUNK_BYTES) throw new WireError('LimitExceeded', 'wire limit exceeded: image blob chunk')
+      if (msg.offset + msg.data.length > msg.totalBytes) {
+        throw new WireError('InvalidValue', 'image blob chunk exceeds total_bytes')
+      }
       encodeBlobHash(w, msg.blob)
       encodeImageEncoding(w, msg.encoding)
       w.varU32(msg.totalBytes)
@@ -976,6 +1009,10 @@ export function encodeBrokerPayload(msg: BrokerMsg): { readonly msgType: number;
       w.str(msg.body)
       return { msgType: MsgType.NOTIFICATION, payload: w.toBytes() }
     case 'progress':
+      if (msg.percent !== null) { if (!Number.isInteger(msg.percent) || msg.percent < 0 || msg.percent > MAX_PROGRESS_PERCENT) throw new WireError('InvalidValue', 'progress percent > 100') }
+      if (msg.percent !== null && (msg.state === 'none' || msg.state === 'indeterminate')) {
+        throw new WireError('InvalidValue', 'progress percent invalid for state')
+      }
       encodeProgressState(w, msg.state)
       w.opt(msg.percent, (wr, item) => { wr.u8(item) })
       return { msgType: MsgType.PROGRESS, payload: w.toBytes() }

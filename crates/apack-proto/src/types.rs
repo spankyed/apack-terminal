@@ -549,9 +549,9 @@ impl ResumeToken {
     /// Byte length of an opaque resume token.
     pub const LEN: usize = 32;
 
-    /// Wraps a 32-byte reconnect token.
-    pub const fn new(bytes: [u8; 32]) -> Self {
-        Self(bytes)
+    /// Wraps a 32-byte reconnect token, rejecting the all-zero token.
+    pub fn new(bytes: [u8; 32]) -> Option<Self> {
+        (bytes != [0u8; 32]).then_some(Self(bytes))
     }
 
     /// Returns the raw 32-byte token.
@@ -611,7 +611,8 @@ impl LeaseKind {
             Self::TAG_BROKER_GRACE => {
                 let raw_ms = r.var_u32()?;
                 let grace_ms = LeaseGraceMs::new(raw_ms).ok_or(WireError::LimitExceeded("lease grace_ms"))?;
-                let resume_token = ResumeToken::new(r.fixed::<32>()?);
+                let resume_token = ResumeToken::new(r.fixed::<32>()?)
+                    .ok_or(WireError::InvalidValue("resume_token must be non-zero"))?;
                 Ok(Self::BrokerGrace { grace_ms, resume_token })
             }
             Self::TAG_SESSION => Ok(Self::Session(SessionId::decode(r)?)),
@@ -1151,7 +1152,7 @@ impl PackedRow {
         if flags > Self::ALL_FLAGS_MASK {
             return Err(WireError::InvalidValue("unknown PackedRow flag bits"));
         }
-        let text = r.str()?;
+        let text = r.str_bounded(crate::MAX_PACKED_ROW_TEXT_BYTES, "packed row text")?;
         let runs = r.vec_bounded(crate::MAX_PACKED_RUNS, "packed runs", PackedRun::decode)?;
         let styles = r.vec_bounded(crate::MAX_PACKED_STYLES, "packed styles", PackedStyle::decode)?;
         if styles.first().is_some_and(|s| *s != PackedStyle::default()) {
@@ -1160,6 +1161,9 @@ impl PackedRow {
         let links = r.vec_bounded(crate::MAX_PACKED_LINKS, "packed links", Reader::str)?;
         if links.first().is_some_and(|l| !l.is_empty()) {
             return Err(WireError::InvalidValue("links[0] must be empty"));
+        }
+        if links.iter().skip(1).any(String::is_empty) {
+            return Err(WireError::InvalidValue("non-zero link entry must be non-empty"));
         }
         let pieces = r.vec_bounded(crate::MAX_PACKED_PIECES, "image pieces", ImagePiece::decode)?;
         if !pieces.is_empty() && (flags & Self::FLAG_HAS_PLACEHOLDER == 0) {
@@ -1238,9 +1242,13 @@ pub struct ImagePlacement {
     pub line: u64,
     /// Starting column (signed for clipped relative placements).
     pub col: i32,
-    /// Natural image width & height in pixels.
+    /// Source crop rectangle `(x, y, w, h)` in natural image pixels (non-zero width & height).
+    pub source_rect: [u32; 4],
+    /// Sub-cell offset `(x_px, y_px)` inside the anchor cell.
+    pub cell_offset: [u32; 2],
+    /// Drawn image width & height in physical pixels (non-zero).
     pub pixel_size: [u32; 2],
-    /// Draw width & height in cells.
+    /// Draw width & height in cells (non-zero).
     pub cell_span: [u16; 2],
     /// Z-index (`< 0` behind text, `>= 0` above text).
     pub z_index: i32,
@@ -1252,6 +1260,11 @@ impl ImagePlacement {
         self.blob.encode(w);
         w.var_u64(self.line);
         w.i32(self.col);
+        for v in self.source_rect {
+            w.var_u32(v);
+        }
+        w.var_u32(self.cell_offset[0]);
+        w.var_u32(self.cell_offset[1]);
         w.var_u32(self.pixel_size[0]);
         w.var_u32(self.pixel_size[1]);
         w.u16(self.cell_span[0]);
@@ -1259,16 +1272,30 @@ impl ImagePlacement {
         w.i32(self.z_index);
     }
 
-    /// Decodes an image placement from `r`.
+    /// Decodes and validates an image placement from `r`.
     pub fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
-        Ok(Self {
-            blob: BlobHash::decode(r)?,
-            line: r.var_u64()?,
-            col: r.i32()?,
-            pixel_size: [r.var_u32()?, r.var_u32()?],
-            cell_span: [r.u16()?, r.u16()?],
-            z_index: r.i32()?,
-        })
+        let blob = BlobHash::decode(r)?;
+        let line = r.var_u64()?;
+        let col = r.i32()?;
+        let source_rect = [r.var_u32()?, r.var_u32()?, r.var_u32()?, r.var_u32()?];
+        if source_rect[2] == 0
+            || source_rect[3] == 0
+            || source_rect[0].checked_add(source_rect[2]).is_none()
+            || source_rect[1].checked_add(source_rect[3]).is_none()
+        {
+            return Err(WireError::InvalidValue("invalid ImagePlacement source_rect"));
+        }
+        let cell_offset = [r.var_u32()?, r.var_u32()?];
+        let pixel_size = [r.var_u32()?, r.var_u32()?];
+        if pixel_size[0] == 0 || pixel_size[1] == 0 {
+            return Err(WireError::InvalidValue("invalid ImagePlacement pixel_size"));
+        }
+        let cell_span = [r.u16()?, r.u16()?];
+        if cell_span[0] == 0 || cell_span[1] == 0 {
+            return Err(WireError::InvalidValue("invalid ImagePlacement cell_span"));
+        }
+        let z_index = r.i32()?;
+        Ok(Self { blob, line, col, source_rect, cell_offset, pixel_size, cell_span, z_index })
     }
 }
 
