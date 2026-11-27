@@ -1,8 +1,8 @@
 //! Binary on-disk format for `meta.apkm`, framed WAL records, dual-layer `KeyframeV2`, and
-//! 40-byte sealed segment footers.
+//! 72-byte SHA-256-committed sealed segment footers.
 //!
 //! All framing is little-endian, bounds-checked, and protected by trailing Castagnoli CRC32C
-//! checksums.
+//! checksums, with sealed segment footers committing the SHA-256 digest of all preceding records.
 
 use std::collections::BTreeSet;
 
@@ -14,6 +14,7 @@ use apack_proto::types::{
 };
 use miniz_oxide::deflate::compress_to_vec_zlib;
 use miniz_oxide::inflate::decompress_to_vec_zlib_with_limit;
+use sha2::{Digest, Sha256};
 
 use crate::WalError;
 use crate::crc32c::{crc32c, crc32c_append};
@@ -40,8 +41,8 @@ pub const MIN_RECORD_LEN: usize = RECORD_HEADER_LEN + RECORD_TRAILER_LEN;
 pub const SEGMENT_FOOTER_MAGIC: [u8; 8] = *b"APKFTR2\0";
 
 /// Exact byte length of a sealed segment footer
-/// (`magic[8] + first_ms[8] + last_ms[8] + records_end_offset[8] + record_count[4] + crc32c[4]`).
-pub const SEGMENT_FOOTER_LEN: usize = 40;
+/// (`magic[8] + first_ms[8] + last_ms[8] + records_end_offset[8] + record_count[4] + records_sha256[32] + crc32c[4]`).
+pub const SEGMENT_FOOTER_LEN: usize = 72;
 
 /// Maximum on-disk payload bytes of a single WAL record (`16 MiB`).
 pub const MAX_RECORD_PAYLOAD: usize = 16 << 20;
@@ -131,10 +132,15 @@ impl RecordingMeta {
     }
 }
 
-/// 40-byte immutable footer appended when sealing a segment file for $O(1)$ `Rewind` open.
+/// Computes the 32-byte SHA-256 digest over a segment's raw framed record bytes `[0..records_end_offset]`.
+pub fn hash_segment_records(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+/// 72-byte immutable footer appended when sealing a segment file for $O(1)$ `Rewind` open.
 ///
-/// Commits `records_end_offset` (the exact byte offset at which the footer begins) so untrusted
-/// PTY output embedded inside a record can never spoof a valid footer at EOF.
+/// Commits `records_end_offset` and `records_sha256` (the SHA-256 digest of `[0..records_end_offset]`)
+/// so untrusted PTY output embedded inside a record can never spoof a valid sealed footer at EOF.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentFooter {
     /// Timestamp of record 0 in the segment.
@@ -145,10 +151,12 @@ pub struct SegmentFooter {
     pub records_end_offset: u64,
     /// Number of valid records in the segment (`>= 1`).
     pub record_count: u32,
+    /// SHA-256 digest of the segment bytes `[0..records_end_offset]`.
+    pub records_sha256: [u8; 32],
 }
 
 impl SegmentFooter {
-    /// Encodes the footer into its exact 40-byte CRC32C-protected representation.
+    /// Encodes the footer into its exact 72-byte CRC32C-protected representation.
     pub fn encode(&self) -> [u8; SEGMENT_FOOTER_LEN] {
         let mut out = [0u8; SEGMENT_FOOTER_LEN];
         out[0..8].copy_from_slice(&SEGMENT_FOOTER_MAGIC);
@@ -156,12 +164,13 @@ impl SegmentFooter {
         out[16..24].copy_from_slice(&self.last_ms.to_le_bytes());
         out[24..32].copy_from_slice(&self.records_end_offset.to_le_bytes());
         out[32..36].copy_from_slice(&self.record_count.to_le_bytes());
-        let checksum = crc32c(&out[0..36]);
-        out[36..40].copy_from_slice(&checksum.to_le_bytes());
+        out[36..68].copy_from_slice(&self.records_sha256);
+        let checksum = crc32c(&out[0..68]);
+        out[68..72].copy_from_slice(&checksum.to_le_bytes());
         out
     }
 
-    /// Decodes and verifies a 40-byte segment footer.
+    /// Decodes and verifies a 72-byte segment footer.
     pub fn decode(bytes: &[u8]) -> Result<Self, WalError> {
         if bytes.len() != SEGMENT_FOOTER_LEN {
             return Err(WalError::InvalidFormat("segment footer length"));
@@ -169,18 +178,19 @@ impl SegmentFooter {
         if bytes[0..8] != SEGMENT_FOOTER_MAGIC {
             return Err(WalError::InvalidFormat("segment footer magic"));
         }
-        let expected_crc = u32::from_le_bytes([bytes[36], bytes[37], bytes[38], bytes[39]]);
-        if crc32c(&bytes[0..36]) != expected_crc {
+        let expected_crc = u32::from_le_bytes([bytes[68], bytes[69], bytes[70], bytes[71]]);
+        if crc32c(&bytes[0..68]) != expected_crc {
             return Err(WalError::ChecksumMismatch("segment footer"));
         }
         let first_ms = u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes"));
         let last_ms = u64::from_le_bytes(bytes[16..24].try_into().expect("8 bytes"));
         let records_end_offset = u64::from_le_bytes(bytes[24..32].try_into().expect("8 bytes"));
         let record_count = u32::from_le_bytes(bytes[32..36].try_into().expect("4 bytes"));
+        let records_sha256: [u8; 32] = bytes[36..68].try_into().expect("32 bytes");
         if last_ms < first_ms || record_count == 0 || records_end_offset < MIN_RECORD_LEN as u64 {
             return Err(WalError::CorruptSegment("invalid footer bounds"));
         }
-        Ok(Self { first_ms, last_ms, records_end_offset, record_count })
+        Ok(Self { first_ms, last_ms, records_end_offset, record_count, records_sha256 })
     }
 }
 
@@ -507,6 +517,7 @@ pub fn scan_segment(bytes: &[u8]) -> SegmentScan {
                 && parsed_footer.records_end_offset == valid_so_far as u64
                 && parsed_footer.first_ms == first.at_ms
                 && parsed_footer.last_ms == last.at_ms
+                && parsed_footer.records_sha256 == hash_segment_records(&bytes[..valid_so_far])
             {
                 footer = Some(parsed_footer);
             } else {

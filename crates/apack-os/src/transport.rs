@@ -115,9 +115,48 @@ fn socket_parent_dir(socket: &str) -> &Path {
     }
 }
 
+#[cfg(unix)]
+fn ancestor_is_safe(uid: libc::uid_t, mode: u32, euid: libc::uid_t) -> bool {
+    (uid == 0 || uid == euid) && ((mode & 0o022) == 0 || (mode & 0o1000) != 0)
+}
+
+#[cfg(unix)]
+fn ancestor_symlink_is_safe(uid: libc::uid_t, euid: libc::uid_t) -> bool {
+    uid == 0 || uid == euid
+}
+
+#[cfg(unix)]
+fn verify_ancestor_chain(dir: &Path, euid: libc::uid_t) -> Result<(), OsError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let abs = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        std::env::current_dir().map_err(|err| OsError::io("resolving socket directory", err))?.join(dir)
+    };
+    for ancestor in abs.ancestors().skip(1) {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        let lmeta =
+            std::fs::symlink_metadata(ancestor).map_err(|err| OsError::io("inspecting socket ancestor", err))?;
+        if lmeta.file_type().is_symlink() && !ancestor_symlink_is_safe(lmeta.uid(), euid) {
+            return Err(OsError::UnsafePath(format!("{} is a symlink owned by another user", ancestor.display())));
+        }
+        let meta = std::fs::metadata(ancestor).map_err(|err| OsError::io("inspecting socket ancestor", err))?;
+        if !ancestor_is_safe(meta.uid(), meta.mode(), euid) {
+            return Err(OsError::UnsafePath(format!(
+                "{} is an unsafe ancestor directory (wrong owner or non-sticky group/world writable)",
+                ancestor.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Ensures the parent directory of `socket` exists with mode `0o700` (if missing) and verifies it
-/// is a real directory (not a symlink) owned by the current effective UID with no group/other write
-/// bits (`mode & 0o022 == 0`).
+/// is a real directory (not a symlink) owned by the current effective UID with strict owner-only
+/// permissions (`mode & 0o077 == 0`) and a safe ancestor chain.
 pub fn ensure_private_directory(socket: &str) -> Result<(), OsError> {
     #[cfg(not(unix))]
     {
@@ -151,9 +190,10 @@ pub fn ensure_private_directory(socket: &str) -> Result<(), OsError> {
         if meta.uid() != euid {
             return Err(OsError::UnsafePath(format!("{} is owned by another user", dir.display())));
         }
-        if meta.mode() & 0o022 != 0 {
-            return Err(OsError::UnsafePath(format!("{} is writable by group or others", dir.display())));
+        if meta.mode() & 0o077 != 0 {
+            return Err(OsError::UnsafePath(format!("{} must be owner-only (0o700)", dir.display())));
         }
+        verify_ancestor_chain(dir, euid)?;
         Ok(())
     }
 }
@@ -289,12 +329,13 @@ pub use crate::transport_windows::{ShutdownSignalGuard, install_shutdown_signals
 #[cfg(unix)]
 mod unix_signals {
     use std::io;
-    use std::os::fd::RawFd;
+    use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
     pub(crate) const INVALID_FD: RawFd = -1;
     static SIGNAL_PIPE_WR: AtomicI32 = AtomicI32::new(INVALID_FD);
+    static SIGNAL_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum SignalReadAction {
@@ -311,6 +352,21 @@ mod unix_signals {
         } else {
             SignalReadAction::Stop
         }
+    }
+
+    const SIGNAL_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// Waits up to `timeout` until every in-flight `handle_shutdown_signal` invocation has exited so
+    /// closing the write end of the self-pipe can never race a signal handler `write(2)` onto a reused fd.
+    pub(crate) fn wait_for_signal_handlers(in_flight: &AtomicUsize, timeout: std::time::Duration) -> bool {
+        let start = std::time::Instant::now();
+        while in_flight.load(Ordering::SeqCst) != 0 {
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            std::hint::spin_loop();
+        }
+        true
     }
 
     #[inline]
@@ -333,12 +389,15 @@ mod unix_signals {
         let err_ptr = unsafe { errno_ptr() };
         // SAFETY: `err_ptr` points to the current thread's `errno` storage.
         let saved_errno = unsafe { *err_ptr };
-        let fd = SIGNAL_PIPE_WR.load(Ordering::Relaxed);
+        SIGNAL_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+        let fd = SIGNAL_PIPE_WR.load(Ordering::SeqCst);
         if fd >= 0 {
             let byte: u8 = 1;
-            // SAFETY: `write(2)` of 1 byte to a non-blocking pipe fd is POSIX async-signal-safe.
+            // SAFETY: `write(2)` of 1 byte to a non-blocking pipe fd is POSIX async-signal-safe,
+            // and `SIGNAL_IN_FLIGHT` pins `fd` open until `fetch_sub` completes below.
             let _ = unsafe { libc::write(fd, (&raw const byte).cast(), 1) };
         }
+        SIGNAL_IN_FLIGHT.fetch_sub(1, Ordering::Release);
         // SAFETY: restoring saved `errno` before returning from signal handler.
         unsafe {
             *err_ptr = saved_errno;
@@ -349,14 +408,14 @@ mod unix_signals {
     pub struct ShutdownSignalGuard {
         prev_int: libc::sigaction,
         prev_term: libc::sigaction,
-        wr_fd: RawFd,
+        wr_fd: Option<OwnedFd>,
         worker: Option<std::thread::JoinHandle<()>>,
     }
 
     impl ShutdownSignalGuard {
         #[cfg(test)]
         pub(crate) fn write_fd(&self) -> RawFd {
-            self.wr_fd
+            self.wr_fd.as_ref().expect("live signal guard write fd").as_raw_fd()
         }
     }
 
@@ -367,13 +426,17 @@ mod unix_signals {
                 libc::sigaction(libc::SIGINT, &self.prev_int, std::ptr::null_mut());
                 libc::sigaction(libc::SIGTERM, &self.prev_term, std::ptr::null_mut());
             }
-            SIGNAL_PIPE_WR.store(INVALID_FD, Ordering::Release);
-            // SAFETY: closing the write end unblocks the reader thread cleanly with EOF.
-            unsafe {
-                libc::close(self.wr_fd);
-            }
-            if let Some(handle) = self.worker.take() {
-                let _ = handle.join();
+            // Clear the global fd and drain any in-flight handler BEFORE closing `wr_fd` so a
+            // concurrent handler on another thread can never `write(2)` into a reused fd number.
+            SIGNAL_PIPE_WR.store(INVALID_FD, Ordering::SeqCst);
+            if wait_for_signal_handlers(&SIGNAL_IN_FLIGHT, SIGNAL_DRAIN_TIMEOUT) {
+                drop(self.wr_fd.take());
+                if let Some(handle) = self.worker.take() {
+                    let _ = handle.join();
+                }
+            } else if let Some(fd) = self.wr_fd.take() {
+                // Fail-safe: never close `wr_fd` while a handler is still executing `write(fd)`.
+                std::mem::forget(fd);
             }
         }
     }
@@ -383,30 +446,12 @@ mod unix_signals {
         flag: Arc<AtomicBool>,
         wake: impl Fn() + Send + Sync + 'static,
     ) -> io::Result<ShutdownSignalGuard> {
-        let mut fds = [0 as RawFd; 2];
-        // SAFETY: `fds` is a valid 2-element array for `pipe(2)`.
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let (rd_fd, wr_fd) = (fds[0], fds[1]);
-        for fd in [rd_fd, wr_fd] {
-            // SAFETY: setting `FD_CLOEXEC` on freshly created pipe descriptors.
-            unsafe {
-                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-            }
-        }
-        // SAFETY: setting `O_NONBLOCK` on write end so signal handler `write(2)` never blocks.
-        unsafe {
-            let fl = libc::fcntl(wr_fd, libc::F_GETFL);
-            libc::fcntl(wr_fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
-        }
+        let (rd_fd, wr_fd) = crate::pty_poller::create_nonblocking_pipe()?;
+        // Reader thread blocks cleanly in `read(2)` until a signal byte arrives or `wr_fd` closes.
+        crate::pty::set_fd_nonblocking(rd_fd.as_fd(), false)?;
+        let wr_raw = wr_fd.as_raw_fd();
 
-        if SIGNAL_PIPE_WR.compare_exchange(INVALID_FD, wr_fd, Ordering::AcqRel, Ordering::Acquire).is_err() {
-            // SAFETY: closing unused pipe fds on duplicate registration.
-            unsafe {
-                libc::close(rd_fd);
-                libc::close(wr_fd);
-            }
+        if SIGNAL_PIPE_WR.compare_exchange(INVALID_FD, wr_raw, Ordering::AcqRel, Ordering::Acquire).is_err() {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, "shutdown signal handler already installed"));
         }
 
@@ -416,7 +461,7 @@ mod unix_signals {
             let mut buf = [0u8; 16];
             loop {
                 // SAFETY: `rd_fd` is owned exclusively by this thread and `buf` is valid for 16 bytes.
-                let n = unsafe { libc::read(rd_fd, buf.as_mut_ptr().cast(), buf.len()) };
+                let n = unsafe { libc::read(rd_fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
                 let kind = io::Error::last_os_error().kind();
                 match classify_signal_read(n, kind) {
                     SignalReadAction::Wake => {
@@ -427,19 +472,10 @@ mod unix_signals {
                     SignalReadAction::Stop => break,
                 }
             }
-            // SAFETY: closing owned read end before thread exits.
-            unsafe {
-                libc::close(rd_fd);
-            }
         }) {
             Ok(w) => w,
             Err(err) => {
-                SIGNAL_PIPE_WR.store(INVALID_FD, Ordering::Release);
-                // SAFETY: closing unused pipe fds on thread spawn failure.
-                unsafe {
-                    libc::close(rd_fd);
-                    libc::close(wr_fd);
-                }
+                SIGNAL_PIPE_WR.store(INVALID_FD, Ordering::SeqCst);
                 return Err(err);
             }
         };
@@ -468,16 +504,17 @@ mod unix_signals {
                     libc::sigaction(libc::SIGINT, &prev_int, std::ptr::null_mut());
                 }
             }
-            SIGNAL_PIPE_WR.store(INVALID_FD, Ordering::Release);
-            // SAFETY: closing write end unblocks `worker` with EOF before joining.
-            unsafe {
-                libc::close(wr_fd);
+            SIGNAL_PIPE_WR.store(INVALID_FD, Ordering::SeqCst);
+            if wait_for_signal_handlers(&SIGNAL_IN_FLIGHT, SIGNAL_DRAIN_TIMEOUT) {
+                drop(wr_fd);
+                let _ = worker.join();
+            } else {
+                std::mem::forget(wr_fd);
             }
-            let _ = worker.join();
             return Err(err);
         }
 
-        Ok(ShutdownSignalGuard { prev_int, prev_term, wr_fd, worker: Some(worker) })
+        Ok(ShutdownSignalGuard { prev_int, prev_term, wr_fd: Some(wr_fd), worker: Some(worker) })
     }
 }
 
@@ -528,20 +565,20 @@ pub fn set_listener_nonblocking(listener: &Listener, nonblocking: bool) -> io::R
     listener.set_nonblocking(mode)
 }
 
-/// Returns the underlying Unix raw file descriptor of a local [`Stream`].
+/// Returns the borrowed Unix file descriptor of a local [`Stream`].
 #[cfg(unix)]
-pub fn stream_raw_fd(stream: &Stream) -> std::os::fd::RawFd {
-    use std::os::fd::AsRawFd;
+pub fn stream_fd(stream: &Stream) -> std::os::fd::BorrowedFd<'_> {
+    use std::os::fd::AsFd;
     let Stream::UdSocket(socket) = stream;
-    socket.inner().as_raw_fd()
+    socket.inner().as_fd()
 }
 
-/// Returns the underlying Unix raw file descriptor of a local [`Listener`].
+/// Returns the borrowed Unix file descriptor of a local [`Listener`].
 #[cfg(unix)]
-pub fn listener_raw_fd(listener: &Listener) -> std::os::fd::RawFd {
-    use std::os::fd::{AsFd, AsRawFd};
+pub fn listener_fd(listener: &Listener) -> std::os::fd::BorrowedFd<'_> {
+    use std::os::fd::AsFd;
     let Listener::UdSocket(socket) = listener;
-    socket.as_fd().as_raw_fd()
+    socket.as_fd()
 }
 
 /// Performs a single vectored write (`writev`) of `slices`, retrying on `EINTR`.
@@ -660,12 +697,47 @@ mod tests {
         let dir_meta = std::fs::symlink_metadata(nested.parent().expect("parent")).expect("meta");
         assert_eq!(dir_meta.permissions().mode() & 0o777, 0o700);
 
-        // Rejects group/other writable directory.
+        // Rejects group/other readable or writable directory (strict 0o700).
         let wide_dir = base.path().join("wide");
         std::fs::create_dir(&wide_dir).expect("mkdir");
-        std::fs::set_permissions(&wide_dir, std::fs::Permissions::from_mode(0o770)).expect("chmod");
+        std::fs::set_permissions(&wide_dir, std::fs::Permissions::from_mode(0o750)).expect("chmod 0750");
         let wide_sock = wide_dir.join("broker.sock");
         assert!(matches!(ensure_private_directory(&wide_sock.to_string_lossy()), Err(OsError::UnsafePath(_))));
+        std::fs::set_permissions(&wide_dir, std::fs::Permissions::from_mode(0o755)).expect("chmod 0755");
+        assert!(matches!(ensure_private_directory(&wide_sock.to_string_lossy()), Err(OsError::UnsafePath(_))));
+
+        // Ancestor safety rules: root or euid, non-writable or sticky; ancestor symlinks owned by root or euid.
+        assert!(ancestor_is_safe(0, 0o755, 1000));
+        assert!(ancestor_is_safe(0, 0o1777, 1000));
+        assert!(!ancestor_is_safe(0, 0o777, 1000));
+        assert!(!ancestor_is_safe(0, 0o775, 1000));
+        assert!(ancestor_is_safe(1000, 0o700, 1000));
+        assert!(ancestor_is_safe(1000, 0o1770, 1000));
+        assert!(!ancestor_is_safe(1000, 0o770, 1000));
+        assert!(!ancestor_is_safe(1001, 0o700, 1000));
+        assert!(!ancestor_is_safe(1001, 0o1777, 1000));
+        assert!(ancestor_symlink_is_safe(0, 1000));
+        assert!(ancestor_symlink_is_safe(1000, 1000));
+        assert!(!ancestor_symlink_is_safe(1001, 1000));
+
+        // Ancestor symlink owned by euid pointing to a safe parent is allowed, while target dir symlink is refused.
+        let anc_sym = base.path().join("anc-sym");
+        std::os::unix::fs::symlink(base.path(), &anc_sym).expect("anc symlink");
+        ensure_private_directory(&anc_sym.join("private/broker.sock").to_string_lossy()).expect("owned anc symlink ok");
+
+        // Rejects a 0o700 socket directory hosted under a non-sticky group/world-writable ancestor.
+        let unsafe_parent = base.path().join("unsafe-parent");
+        let safe_child = unsafe_parent.join("priv");
+        std::fs::create_dir_all(&safe_child).expect("mkdir unsafe tree");
+        std::fs::set_permissions(&safe_child, std::fs::Permissions::from_mode(0o700)).expect("chmod child");
+        std::fs::set_permissions(&unsafe_parent, std::fs::Permissions::from_mode(0o777)).expect("chmod parent");
+        assert!(matches!(
+            ensure_private_directory(&safe_child.join("broker.sock").to_string_lossy()),
+            Err(OsError::UnsafePath(_))
+        ));
+        std::fs::set_permissions(&unsafe_parent, std::fs::Permissions::from_mode(0o1777)).expect("chmod sticky");
+        ensure_private_directory(&safe_child.join("broker.sock").to_string_lossy()).expect("sticky ancestor ok");
+        std::fs::set_permissions(&unsafe_parent, std::fs::Permissions::from_mode(0o700)).expect("restore parent");
 
         // Rejects symlink directory.
         let link_dir = base.path().join("link_dir");
@@ -714,7 +786,7 @@ mod tests {
         }
         let sock_meta = std::fs::symlink_metadata(&nested).expect("socket meta");
         assert_eq!(sock_meta.permissions().mode() & 0o777, 0o600, "socket must be 0o600 owner-only");
-        let lfd = listener_raw_fd(&listener);
+        let lfd = listener_fd(&listener).as_raw_fd();
         assert!(lfd > 2, "listener fd must be > 2");
 
         // Verify `O_NONBLOCK` flag directly via fcntl BEFORE calling accept() so a broken
@@ -735,9 +807,9 @@ mod tests {
         assert!(verify_peer_is_current_user(&server).expect("peer check server"));
         assert!(verify_peer_is_current_user(&client).expect("peer check client"));
         assert!(verify_client_is_current_user(&server).expect("client check server"));
-        let sfd = stream_raw_fd(&server);
+        let sfd = stream_fd(&server).as_raw_fd();
         assert!(sfd > 2, "stream fd must be > 2");
-        let cfd = stream_raw_fd(&client);
+        let cfd = stream_fd(&client).as_raw_fd();
         assert!(cfd > 2 && cfd != sfd);
 
         // Vectored write + read roundtrip.
@@ -829,6 +901,22 @@ mod tests {
         }
         assert!(flag.load(Ordering::Acquire), "SIGINT must set shutdown flag");
         assert!(wakes.load(Ordering::Acquire) > after_term);
+
+        // Verify `wait_for_signal_handlers` waits until an in-flight handler decrements the counter to 0,
+        // and returns `false` cleanly on timeout rather than spinning forever.
+        let stuck = AtomicUsize::new(1);
+        assert!(!unix_signals::wait_for_signal_handlers(&stuck, Duration::from_millis(5)));
+        let idle = AtomicUsize::new(0);
+        assert!(unix_signals::wait_for_signal_handlers(&idle, Duration::from_millis(50)));
+        let in_flight = Arc::new(AtomicUsize::new(1));
+        let releaser = Arc::clone(&in_flight);
+        let t_rel = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            releaser.fetch_sub(1, Ordering::Release);
+        });
+        assert!(unix_signals::wait_for_signal_handlers(&in_flight, Duration::from_secs(1)));
+        assert_eq!(in_flight.load(Ordering::Acquire), 0);
+        t_rel.join().expect("join releaser");
 
         // Dropping guard restores handlers and releases the global slot so reinstall succeeds.
         drop(guard);

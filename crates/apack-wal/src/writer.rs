@@ -13,7 +13,7 @@
 //!   records and exposing `take_rollover_needed()` for shard keyframe capture.
 
 use std::collections::{BTreeSet, HashSet, VecDeque};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,21 +22,21 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use apack_proto::types::{BlobHash, CellPx, GridSize, ImageEncoding, MarksKey};
+use sha2::{Digest, Sha256};
 
-use crate::blobs::{
-    blobs_total_bytes, create_private_file, read_regular_file_bounded, sweep_unreferenced, sync_dir, write_blob,
-};
+use crate::blobs::{WalBlob, blobs_total_bytes, sweep_unreferenced, write_blob};
 use crate::directory::{
     RecordingRegistry, WriterClaim, discover_segments, prepare_recording_dir, segment_filename, write_meta_atomic,
 };
 use crate::format::{
     GapReason, KeyframeV2, MAX_RECORD_PAYLOAD, RecordingMeta, SegmentFooter, WalRecord, encode_framed_record,
-    scan_segment,
+    hash_segment_records, scan_segment,
 };
 use crate::reader::read_sealed_header_and_footer;
+use crate::safe_fs::{create_private_file, open_regular_rw, read_regular_file_bounded, sync_dir};
 use crate::{
     DEFAULT_BUDGET_BYTES, DEFAULT_MAX_BACKLOG_BYTES, DEFAULT_MAX_NON_GROUND_BYTES, DEFAULT_SEGMENT_TARGET_BYTES,
-    MAX_BLOB_FILE_BYTES, MAX_SEGMENT_FILE_BYTES, MIN_SEGMENT_TARGET_BYTES, WalError,
+    MAX_SEGMENT_FILE_BYTES, MIN_SEGMENT_TARGET_BYTES, WalError,
 };
 
 /// Maximum queued control commands (resize/marks/segment/seal/barrier) permitted in [`WalWorker`].
@@ -110,6 +110,7 @@ struct ActiveSegment {
     first_ms: u64,
     last_ms: u64,
     record_count: u32,
+    hasher: Sha256,
     referenced_blobs: BTreeSet<BlobHash>,
 }
 
@@ -168,8 +169,10 @@ impl WalWriter {
                 next_segment_id.max(seg_id.checked_add(1).ok_or(WalError::LimitExceeded("segment id overflow"))?);
             let is_last = idx + 1 == total;
 
-            // Fast path: sealed segment reads ONLY record 0 + 40B footer (never scans full body!).
-            if let Some((first, footer, file_len)) = read_sealed_header_and_footer(&path)?
+            // Fast path: closed non-tail sealed segments read ONLY record 0 + 72B footer.
+            // Never trust the O(1) footer fast path on the tail segment (`is_last`).
+            if !is_last
+                && let Some((first, footer, file_len)) = read_sealed_header_and_footer(&path)?
                 && let WalRecord::Keyframe(kf) = first.record
             {
                 last_at_ms = last_at_ms.max(footer.last_ms);
@@ -182,7 +185,7 @@ impl WalWriter {
                 continue;
             }
 
-            // Unsealed segment (or corrupt footer): bounded read + full scan + torn-tail recovery.
+            // Tail segment or unsealed/corrupt earlier segment: bounded read + full SHA-256 scan.
             let bytes = read_regular_file_bounded(&path, MAX_SEGMENT_FILE_BYTES, "WAL segment file")?;
             let scan = scan_segment(&bytes);
             let Some(first) = scan.records.first() else {
@@ -201,6 +204,17 @@ impl WalWriter {
                 continue;
             };
 
+            if let Some(footer) = scan.footer {
+                last_at_ms = last_at_ms.max(footer.last_ms);
+                closed.push(ClosedSegment {
+                    id: seg_id,
+                    path,
+                    size_bytes: bytes.len() as u64,
+                    referenced_blobs: kf.referenced_blobs(),
+                });
+                continue;
+            }
+
             let seg_last_ms = scan.records.last().map_or(first.at_ms, |r| r.at_ms);
             last_at_ms = last_at_ms.max(seg_last_ms);
             let record_count = u32::try_from(scan.records.len()).unwrap_or(u32::MAX);
@@ -208,7 +222,7 @@ impl WalWriter {
             // Atomically check pin state and truncate/seal under the registry mutex so no
             // concurrent `WalReader::open` (`discover_and_pin`) can observe a half-mutated segment.
             let mutated = registry.try_mutate_if_unpinned(&canonical, seg_id, || {
-                let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+                let (mut file, _) = open_regular_rw(&path, "segment is not a regular file")?;
                 if scan.had_torn_tail {
                     file.set_len(scan.valid_records_end as u64)?;
                     file.sync_data()?;
@@ -222,6 +236,7 @@ impl WalWriter {
                         last_ms: seg_last_ms,
                         records_end_offset: scan.valid_records_end as u64,
                         record_count,
+                        records_sha256: hash_segment_records(&bytes[..scan.valid_records_end]),
                     };
                     let encoded_footer = footer.encode();
                     file.write_all(&encoded_footer)?;
@@ -250,6 +265,8 @@ impl WalWriter {
                     });
                 }
                 Some((Some(file), None)) => {
+                    let mut hasher = Sha256::new();
+                    hasher.update(&bytes[..scan.valid_records_end]);
                     active = Some(ActiveSegment {
                         id: seg_id,
                         path,
@@ -258,6 +275,7 @@ impl WalWriter {
                         first_ms: first.at_ms,
                         last_ms: seg_last_ms,
                         record_count,
+                        hasher,
                         referenced_blobs: kf.referenced_blobs(),
                     });
                 }
@@ -359,6 +377,8 @@ impl WalWriter {
         let size_bytes = encoded_kf.len() as u64;
 
         self.next_segment_id = next_id;
+        let mut hasher = Sha256::new();
+        hasher.update(&encoded_kf);
         self.active = Some(ActiveSegment {
             id: seg_id,
             path,
@@ -367,6 +387,7 @@ impl WalWriter {
             first_ms: at_ms,
             last_ms: at_ms,
             record_count: 1,
+            hasher,
             referenced_blobs: keyframe.referenced_blobs(),
         });
         // The newly captured keyframe now reflects the authoritative live image set; clear staged pins.
@@ -402,11 +423,13 @@ impl WalWriter {
         if vt_at_ground {
             if self.non_ground_dropped > 0 {
                 let dropped = self.non_ground_dropped;
-                let _ = self.append_record_capped(
+                if !self.append_record_capped(
                     at_ms,
                     &WalRecord::Gap { dropped_bytes: dropped, reason: GapReason::NonGroundCap },
                     max_file_bytes,
-                )?;
+                )? {
+                    return Ok(RolloverHint::NeedKeyframe);
+                }
                 self.non_ground_dropped = 0;
             }
             self.non_ground_run = 0;
@@ -452,36 +475,36 @@ impl WalWriter {
         Ok(if needs_rollover { RolloverHint::NeedKeyframe } else { RolloverHint::Continue })
     }
 
-    /// Appends a `Resize` record to the active segment (respecting the hard segment file cap).
-    pub fn record_resize(&mut self, at_ms: u64, size: GridSize, cell_px: CellPx) -> Result<(), WalError> {
-        if self.active.is_none() {
-            return Err(WalError::CorruptSegment("no active segment"));
-        }
-        let at_ms = self.monotonic_ms(at_ms);
-        let _ =
-            self.append_record_capped(at_ms, &WalRecord::Resize { size, cell_px }, crate::MAX_SEGMENT_FILE_BYTES)?;
-        Ok(())
+    /// Appends a `Resize` record to the active segment (returning [`RolloverHint::NeedKeyframe`] if
+    /// the hard segment file cap prevents appending without a rollover).
+    pub fn record_resize(&mut self, at_ms: u64, size: GridSize, cell_px: CellPx) -> Result<RolloverHint, WalError> {
+        self.record_control_capped(at_ms, &WalRecord::Resize { size, cell_px }, crate::MAX_SEGMENT_FILE_BYTES)
     }
 
-    /// Appends a `Marks` record to the active segment (respecting the hard segment file cap).
-    pub fn record_marks(&mut self, at_ms: u64, key: Option<MarksKey>, last_seq: u64) -> Result<(), WalError> {
-        if self.active.is_none() {
-            return Err(WalError::CorruptSegment("no active segment"));
-        }
-        let at_ms = self.monotonic_ms(at_ms);
-        let _ = self.append_record_capped(at_ms, &WalRecord::Marks { key, last_seq }, crate::MAX_SEGMENT_FILE_BYTES)?;
-        Ok(())
+    /// Appends a `Marks` record to the active segment (returning [`RolloverHint::NeedKeyframe`] if
+    /// the hard segment file cap prevents appending without a rollover).
+    pub fn record_marks(&mut self, at_ms: u64, key: Option<MarksKey>, last_seq: u64) -> Result<RolloverHint, WalError> {
+        self.record_control_capped(at_ms, &WalRecord::Marks { key, last_seq }, crate::MAX_SEGMENT_FILE_BYTES)
     }
 
-    /// Appends an explicit `Gap` marker to the active segment (respecting the hard segment file cap).
-    pub fn record_gap(&mut self, at_ms: u64, dropped_bytes: u64, reason: GapReason) -> Result<(), WalError> {
+    /// Appends an explicit `Gap` marker to the active segment (returning [`RolloverHint::NeedKeyframe`]
+    /// if the hard segment file cap prevents appending without a rollover).
+    pub fn record_gap(&mut self, at_ms: u64, dropped_bytes: u64, reason: GapReason) -> Result<RolloverHint, WalError> {
+        self.record_control_capped(at_ms, &WalRecord::Gap { dropped_bytes, reason }, crate::MAX_SEGMENT_FILE_BYTES)
+    }
+
+    pub(crate) fn record_control_capped(
+        &mut self,
+        at_ms: u64,
+        record: &WalRecord,
+        max_file_bytes: u64,
+    ) -> Result<RolloverHint, WalError> {
         if self.active.is_none() {
             return Err(WalError::CorruptSegment("no active segment"));
         }
         let at_ms = self.monotonic_ms(at_ms);
-        let _ =
-            self.append_record_capped(at_ms, &WalRecord::Gap { dropped_bytes, reason }, crate::MAX_SEGMENT_FILE_BYTES)?;
-        Ok(())
+        let written = self.append_record_capped(at_ms, record, max_file_bytes)?;
+        Ok(if written { RolloverHint::Continue } else { RolloverHint::NeedKeyframe })
     }
 
     /// Seals the currently active segment by flushing pending non-ground gaps, syncing data,
@@ -510,6 +533,7 @@ impl WalWriter {
             last_ms: active.last_ms,
             records_end_offset: active.size_bytes,
             record_count: active.record_count,
+            records_sha256: active.hasher.clone().finalize().into(),
         };
         let encoded_footer = footer.encode();
         if let Err(err) = active.file.write_all(&encoded_footer).and_then(|()| active.file.sync_data()) {
@@ -659,6 +683,7 @@ impl WalWriter {
             let _ = active.file.seek(SeekFrom::Start(active.size_bytes));
             return Err(WalError::Io(err));
         }
+        active.hasher.update(&self.encode_buf);
         active.size_bytes = active.size_bytes.saturating_add(self.encode_buf.len() as u64);
         active.last_ms = active.last_ms.max(at_ms);
         active.record_count = active.record_count.saturating_add(1);
@@ -672,7 +697,7 @@ enum WorkerCmd {
     Resize { at_ms: u64, size: GridSize, cell_px: CellPx },
     Marks { at_ms: u64, key: Option<MarksKey>, last_seq: u64 },
     BacklogGap { at_ms: u64, dropped_bytes: u64 },
-    Blob { encoding: ImageEncoding, bytes: Vec<u8> },
+    Blob(WalBlob),
     Seal,
     FlushBarrier(mpsc::SyncSender<Result<(), String>>),
 }
@@ -738,6 +763,12 @@ pub(crate) fn try_coalesce_output(
     true
 }
 
+fn note_rollover_hint(rollover_needed: &AtomicBool, hint: RolloverHint) {
+    if hint == RolloverHint::NeedKeyframe {
+        rollover_needed.store(true, Ordering::Release);
+    }
+}
+
 fn run_worker_loop(
     mut writer: WalWriter,
     shared: Arc<(Mutex<QueueState>, Condvar)>,
@@ -782,23 +813,25 @@ fn run_worker_loop(
                         rollover_needed.store(false, Ordering::Release);
                         writer.start_segment_with_keyframe(at_ms, &keyframe).map(|_| ())
                     }
-                    WorkerCmd::Output { at_ms, bytes, vt_at_ground } => {
-                        writer.record_output(at_ms, &bytes, vt_at_ground).map(|hint| {
-                            if hint == RolloverHint::NeedKeyframe {
-                                rollover_needed.store(true, Ordering::Release);
-                            }
-                        })
+                    WorkerCmd::Output { at_ms, bytes, vt_at_ground } => writer
+                        .record_output(at_ms, &bytes, vt_at_ground)
+                        .map(|hint| note_rollover_hint(&rollover_needed, hint)),
+                    WorkerCmd::Resize { at_ms, size, cell_px } => writer
+                        .record_resize(at_ms, size, cell_px)
+                        .map(|hint| note_rollover_hint(&rollover_needed, hint)),
+                    WorkerCmd::Marks { at_ms, key, last_seq } => {
+                        writer.record_marks(at_ms, key, last_seq).map(|hint| note_rollover_hint(&rollover_needed, hint))
                     }
-                    WorkerCmd::Resize { at_ms, size, cell_px } => writer.record_resize(at_ms, size, cell_px),
-                    WorkerCmd::Marks { at_ms, key, last_seq } => writer.record_marks(at_ms, key, last_seq),
                     WorkerCmd::BacklogGap { at_ms, dropped_bytes } => {
                         if writer.active_segment_id().is_some() {
-                            writer.record_gap(at_ms, dropped_bytes, GapReason::BacklogOverflow)
+                            writer
+                                .record_gap(at_ms, dropped_bytes, GapReason::BacklogOverflow)
+                                .map(|hint| note_rollover_hint(&rollover_needed, hint))
                         } else {
                             Ok(())
                         }
                     }
-                    WorkerCmd::Blob { encoding, bytes } => writer.write_blob(encoding, &bytes).map(|_| ()),
+                    WorkerCmd::Blob(blob) => writer.write_blob(blob.encoding(), blob.bytes()).map(|_| ()),
                     WorkerCmd::Seal => writer.seal_active(),
                     WorkerCmd::FlushBarrier(_) => unreachable!("handled above"),
                 };
@@ -926,19 +959,24 @@ impl WalHandle {
         self.push_control(WorkerCmd::Marks { at_ms, key, last_seq })
     }
 
-    /// Enqueues an immutable blob write (`blobs/<sha256>.<ext>`), respecting `max_backlog_bytes`
-    /// while still admitting a single valid blob up to [`MAX_BLOB_FILE_BYTES`] when the queue is empty.
+    /// Enqueues an immutable non-empty blob write (`blobs/<sha256>.<ext>`), respecting
+    /// `max_backlog_bytes` while still admitting a single valid blob up to [`MAX_BLOB_FILE_BYTES`]
+    /// when the queue is empty. Rejects empty/oversized blobs or writes after worker close without
+    /// poisoning the background worker.
     pub fn write_blob(&self, encoding: ImageEncoding, bytes: Vec<u8>) -> bool {
-        if self.is_failed() || crate::blobs::check_file_size(bytes.len() as u64, MAX_BLOB_FILE_BYTES, "blob").is_err() {
+        if self.is_failed() {
             return false;
         }
-        let cost = bytes.len();
+        let Ok(blob) = WalBlob::new(encoding, bytes) else {
+            return false;
+        };
+        let cost = blob.bytes().len();
         let (lock, cv) = &*self.shared;
         let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
-        if !try_reserve_blob_backlog(&mut state.queued_bytes, cost, self.max_backlog) {
+        if state.closed || !try_reserve_blob_backlog(&mut state.queued_bytes, cost, self.max_backlog) {
             return false;
         }
-        state.queue.push_back((cost, WorkerCmd::Blob { encoding, bytes }));
+        state.queue.push_back((cost, WorkerCmd::Blob(blob)));
         cv.notify_one();
         true
     }
@@ -1024,7 +1062,7 @@ impl WalHandle {
         true
     }
 
-    fn stop_thread(&mut self) {
+    pub(crate) fn stop_thread(&mut self) {
         {
             let (lock, cv) = &*self.shared;
             let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());

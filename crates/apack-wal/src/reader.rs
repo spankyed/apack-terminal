@@ -11,12 +11,13 @@ use std::path::{Path, PathBuf};
 
 use apack_proto::types::{BlobHash, ImageEncoding};
 
-use crate::blobs::{check_file_size, open_regular_read_only, read_blob, read_regular_file_bounded};
+use crate::blobs::read_blob;
 use crate::directory::{PinGuard, RecordingRegistry, read_meta};
 use crate::format::{
     KeyframeV2, MAX_RECORD_PAYLOAD, MIN_RECORD_LEN, RECORD_HEADER_LEN, RECORD_TRAILER_LEN, RecordingMeta,
     SEGMENT_FOOTER_LEN, SegmentFooter, TimedRecord, WalRecord, check_payload_limit, decode_one_record, scan_segment,
 };
+use crate::safe_fs::{check_file_size, open_regular_ro, read_regular_file_bounded};
 use crate::{MAX_SEGMENT_FILE_BYTES, WalError};
 
 /// Indexed metadata for one segment discovered by [`WalReader::open`].
@@ -59,15 +60,22 @@ pub struct WalReader {
 
 impl WalReader {
     /// Opens a recording directory, atomically discovers and pins all segments against concurrent
-    /// eviction, and indexes their `[first_ms, last_ms]` spans using 40-byte footers whenever sealed.
+    /// eviction, and indexes their `[first_ms, last_ms]` spans using 72-byte sealed footers for
+    /// closed historical segments while always SHA-256-verifying the tail segment and any actively
+    /// claimed recording.
     pub fn open(dir: impl AsRef<Path>, registry: &RecordingRegistry) -> Result<Self, WalError> {
         let dir = dir.as_ref().to_path_buf();
         let meta = read_meta(&dir)?;
-        let (discovered, pin) = registry.discover_and_pin(&dir)?;
+        let discovery = registry.discover_and_pin(&dir)?;
+        let is_claimed = discovery.is_claimed;
+        let pin = discovery.pin;
+        let discovered = discovery.segments;
 
-        let mut segments: Vec<SegmentSummary> = Vec::with_capacity(discovered.len());
-        for (seg_id, path) in discovered {
-            if let Some(summary) = index_segment(seg_id, path)? {
+        let total = discovered.len();
+        let mut segments: Vec<SegmentSummary> = Vec::with_capacity(total);
+        for (idx, (seg_id, path)) in discovered.into_iter().enumerate() {
+            let allow_fast_footer = !is_claimed && idx + 1 < total;
+            if let Some(summary) = index_segment(seg_id, path, allow_fast_footer)? {
                 if segments.last().is_some_and(|prev| summary.first_ms < prev.last_ms) {
                     return Err(WalError::CorruptSegment("non-monotonic segment timestamps"));
                 }
@@ -125,8 +133,8 @@ impl WalReader {
     }
 }
 
-fn index_segment(seg_id: u64, path: PathBuf) -> Result<Option<SegmentSummary>, WalError> {
-    if let Some(footer) = try_read_footer(&path)? {
+fn index_segment(seg_id: u64, path: PathBuf, allow_fast_footer: bool) -> Result<Option<SegmentSummary>, WalError> {
+    if allow_fast_footer && let Some(footer) = try_read_footer(&path)? {
         return Ok(Some(SegmentSummary {
             id: seg_id,
             path,
@@ -137,9 +145,19 @@ fn index_segment(seg_id: u64, path: PathBuf) -> Result<Option<SegmentSummary>, W
         }));
     }
 
-    // Unsealed active tail segment: bounded regular-file read + scan.
+    // Active/tail/claimed segment (or unsealed segment): bounded regular-file read + full SHA-256 scan.
     let bytes = read_regular_file_bounded(&path, MAX_SEGMENT_FILE_BYTES, "WAL segment file")?;
     let scan = scan_segment(&bytes);
+    if let Some(footer) = scan.footer {
+        return Ok(Some(SegmentSummary {
+            id: seg_id,
+            path,
+            first_ms: footer.first_ms,
+            last_ms: footer.last_ms,
+            record_count: footer.record_count,
+            sealed: true,
+        }));
+    }
     let Some(first) = scan.records.first() else {
         return Ok(None);
     };
@@ -171,19 +189,19 @@ fn try_read_footer_from_file(file: &mut File, len: u64) -> Result<Option<Segment
     Ok(Some(footer))
 }
 
-/// Reads and verifies a sealed segment's 40-byte footer in $O(1)$, verifying that `file_len`
+/// Reads and verifies a sealed segment's 72-byte footer in $O(1)$, verifying that `file_len`
 /// matches `footer.records_end_offset + SEGMENT_FOOTER_LEN` and contains at least one record.
 pub(crate) fn try_read_footer(path: &Path) -> Result<Option<SegmentFooter>, WalError> {
-    let (mut file, meta) = open_regular_read_only(path, "segment is not a regular file")?;
+    let (mut file, meta) = open_regular_ro(path, "segment is not a regular file")?;
     try_read_footer_from_file(&mut file, meta.len())
 }
 
-/// Reads ONLY record 0 (the `KeyframeV2`) and the 40-byte footer of a sealed segment without
+/// Reads ONLY record 0 (the `KeyframeV2`) and the 72-byte footer of a sealed segment without
 /// loading the entire segment body into RAM, reusing one validated file descriptor.
 pub(crate) fn read_sealed_header_and_footer(
     path: &Path,
 ) -> Result<Option<(TimedRecord, SegmentFooter, u64)>, WalError> {
-    let (mut file, meta) = open_regular_read_only(path, "segment is not a regular file")?;
+    let (mut file, meta) = open_regular_ro(path, "segment is not a regular file")?;
     let file_len = meta.len();
     let Some(footer) = try_read_footer_from_file(&mut file, file_len)? else {
         return Ok(None);

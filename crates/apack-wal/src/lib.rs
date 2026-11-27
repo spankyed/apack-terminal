@@ -36,17 +36,19 @@ pub mod crc32c;
 pub mod directory;
 pub mod format;
 pub mod reader;
+pub(crate) mod safe_fs;
 pub mod writer;
 
 #[cfg(test)]
 mod tests;
 
-pub use blobs::{blob_filename, hash_blob, parse_blob_filename, read_blob, sweep_unreferenced, write_blob};
+pub use blobs::{WalBlob, blob_filename, hash_blob, parse_blob_filename, read_blob, sweep_unreferenced, write_blob};
 pub use directory::{PinGuard, RecordingRegistry, WriterClaim};
 pub use format::{
     EngineCheckpoint, FORMAT_VERSION, GapReason, KeyframeV2, MAX_ENGINE_SNAPSHOT_BYTES, MAX_KEYFRAME_HISTORY_ROWS,
     MAX_KEYFRAME_UNCOMPRESSED, MAX_RECORD_PAYLOAD, META_LEN, META_MAGIC, RECORD_HEADER_LEN, RECORD_TRAILER_LEN,
     RecordingMeta, SEGMENT_FOOTER_LEN, SEGMENT_FOOTER_MAGIC, SegmentFooter, TimedRecord, VisualKeyframe, WalRecord,
+    hash_segment_records,
 };
 pub use reader::{SeekSlice, SegmentSummary, WalReader};
 pub use writer::{EvictionReport, RolloverHint, WalConfig, WalHandle, WalWorker, WalWriter};

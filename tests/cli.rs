@@ -31,7 +31,7 @@ fn cli_binary_usage_version_serve_inspect_and_proxy() {
     #[cfg(unix)]
     let tmp = tempdir().unwrap();
     #[cfg(unix)]
-    let sock = tmp.path().join("cli-e2e.sock").to_string_lossy().into_owned();
+    let sock = tmp.path().join("p/cli-e2e.sock").to_string_lossy().into_owned();
     #[cfg(windows)]
     let sock = format!(r"\\.\pipe\apack-v2-cli-test-{}", std::process::id());
 
@@ -91,7 +91,7 @@ fn cli_binary_usage_version_serve_inspect_and_proxy() {
 
     // `proxy --socket <fresh>` WITH autostart spawns a detached broker, serves handshake, and exits cleanly!
     #[cfg(unix)]
-    let auto_sock = tmp.path().join("cli-autostart.sock").to_string_lossy().into_owned();
+    let auto_sock = tmp.path().join("p/cli-autostart.sock").to_string_lossy().into_owned();
     #[cfg(windows)]
     let auto_sock = format!(r"\\.\pipe\apack-v2-cli-auto-{}", std::process::id());
     let mut auto_proxy = Command::new(bin)
@@ -112,7 +112,7 @@ fn cli_binary_usage_version_serve_inspect_and_proxy() {
 
     // `serve --socket <fresh>` with short APACK_TERMINAL_START_GRACE_MS exits cleanly on grace timeout!
     #[cfg(unix)]
-    let grace_sock = tmp.path().join("cli-grace.sock").to_string_lossy().into_owned();
+    let grace_sock = tmp.path().join("p/cli-grace.sock").to_string_lossy().into_owned();
     #[cfg(windows)]
     let grace_sock = format!(r"\\.\pipe\apack-v2-cli-grace-{}", std::process::id());
     let grace = Command::new(bin)

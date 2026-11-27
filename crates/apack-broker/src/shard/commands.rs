@@ -151,7 +151,7 @@ impl ShardRunner {
         let live_pty: Result<LivePty, (ErrorCode, String)> = {
             let token = PollToken(session_id.get());
             self.poller
-                .register(token, spawned.master.raw_fd(), Interest::READ)
+                .register(token, spawned.master.fd(), Interest::READ)
                 .map_err(|err| (ErrorCode::Pty, err.to_string()))
                 .map(|()| {
                     self.token_to_session.insert(token, session_id);

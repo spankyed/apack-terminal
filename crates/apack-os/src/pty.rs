@@ -86,11 +86,12 @@ impl PtyMaster {
         foreground_argv(self.master.as_ref())
     }
 
-    /// Returns the non-blocking Unix master PTY file descriptor for registration with
-    /// [`crate::pty_poller::PtyPoller`].
+    /// Returns the non-blocking Unix master PTY file descriptor borrowed for the lifetime of
+    /// `self`, suitable for registration with [`crate::pty_poller::PtyPoller`].
     #[cfg(unix)]
-    pub fn raw_fd(&self) -> std::os::fd::RawFd {
-        self.raw_fd
+    pub fn fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        // SAFETY: `self.raw_fd` is owned by `self.master` and stays open for the lifetime of `&self`.
+        unsafe { std::os::fd::BorrowedFd::borrow_raw(self.raw_fd) }
     }
 
     /// Performs a single non-blocking read from the Unix PTY master fd.
@@ -100,7 +101,7 @@ impl PtyMaster {
     /// [`NonBlockingRead::WouldBlock`].
     #[cfg(unix)]
     pub fn read_nonblocking(&self, buf: &mut [u8]) -> io::Result<NonBlockingRead> {
-        read_fd_nonblocking(self.raw_fd, buf)
+        read_fd_nonblocking(self.fd(), buf)
     }
 
     /// Performs a single non-blocking write to the Unix PTY master fd.
@@ -109,7 +110,14 @@ impl PtyMaster {
     /// `EINTR`.
     #[cfg(unix)]
     pub fn write_nonblocking(&self, data: &[u8]) -> io::Result<usize> {
-        write_fd_nonblocking(self.raw_fd, data)
+        write_fd_nonblocking(self.fd(), data)
+    }
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsFd for PtyMaster {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.fd()
     }
 }
 
@@ -178,7 +186,9 @@ pub fn spawn_pty(config: &PtySpawnConfig) -> Result<SpawnedPty, OsError> {
                 io::Error::other("unix master pty did not expose a raw fd"),
             ));
         };
-        if let Err(err) = set_fd_nonblocking(raw_fd, true) {
+        // SAFETY: `raw_fd` is owned by `pair.master` which stays alive for this call.
+        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(raw_fd) };
+        if let Err(err) = set_fd_nonblocking(borrowed, true) {
             let _ = child.kill();
             let _ = child.wait();
             return Err(OsError::io("setting pty master O_NONBLOCK", err));
@@ -202,15 +212,17 @@ pub fn to_pty_size(size: GridSize, cell_px: CellPx) -> PtySize {
 
 /// Sets or clears `O_NONBLOCK` on a Unix file descriptor.
 #[cfg(unix)]
-pub fn set_fd_nonblocking(fd: std::os::fd::RawFd, nonblocking: bool) -> io::Result<()> {
-    // SAFETY: `fcntl(F_GETFL)` reads file status flags for a valid descriptor.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+pub fn set_fd_nonblocking(fd: std::os::fd::BorrowedFd<'_>, nonblocking: bool) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let raw = fd.as_raw_fd();
+    // SAFETY: `fcntl(F_GETFL)` reads file status flags for a borrowed live descriptor.
+    let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
     if flags == -1 {
         return Err(io::Error::last_os_error());
     }
     let updated = if nonblocking { flags | libc::O_NONBLOCK } else { flags & !libc::O_NONBLOCK };
     // SAFETY: `fcntl(F_SETFL)` updates the descriptor's status flags computed above.
-    if unsafe { libc::fcntl(fd, libc::F_SETFL, updated) } != 0 {
+    if unsafe { libc::fcntl(raw, libc::F_SETFL, updated) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -241,13 +253,15 @@ fn classify_read_error(err: &io::Error) -> ReadErrAction {
 
 /// Performs a single non-blocking read on `fd`, treating `0` and `EIO` as [`NonBlockingRead::Eof`].
 #[cfg(unix)]
-pub fn read_fd_nonblocking(fd: std::os::fd::RawFd, buf: &mut [u8]) -> io::Result<NonBlockingRead> {
+pub fn read_fd_nonblocking(fd: std::os::fd::BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<NonBlockingRead> {
+    use std::os::fd::AsRawFd;
     if buf.is_empty() {
         return Ok(NonBlockingRead::Bytes(0));
     }
+    let raw = fd.as_raw_fd();
     loop {
-        // SAFETY: `fd` is valid and `buf` is a live mutable byte slice of length `buf.len()`.
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        // SAFETY: `raw` is a borrowed live descriptor and `buf` is a live mutable byte slice.
+        let n = unsafe { libc::read(raw, buf.as_mut_ptr().cast(), buf.len()) };
         if n > 0 {
             return Ok(NonBlockingRead::Bytes(n as usize));
         }
@@ -285,13 +299,15 @@ fn classify_write_error(err: &io::Error) -> WriteErrAction {
 
 /// Performs a single non-blocking write on `fd`, returning `Ok(0)` on `EAGAIN`/`EWOULDBLOCK`.
 #[cfg(unix)]
-pub fn write_fd_nonblocking(fd: std::os::fd::RawFd, data: &[u8]) -> io::Result<usize> {
+pub fn write_fd_nonblocking(fd: std::os::fd::BorrowedFd<'_>, data: &[u8]) -> io::Result<usize> {
+    use std::os::fd::AsRawFd;
     if data.is_empty() {
         return Ok(0);
     }
+    let raw = fd.as_raw_fd();
     loop {
-        // SAFETY: `fd` is valid and `data` is a live byte slice of length `data.len()`.
-        let n = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
+        // SAFETY: `raw` is a borrowed live descriptor and `data` is a live byte slice.
+        let n = unsafe { libc::write(raw, data.as_ptr().cast(), data.len()) };
         if n != -1 {
             return Ok(n as usize);
         }
@@ -329,25 +345,25 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn set_fd_nonblocking_and_error_classifiers() {
-        use std::os::fd::AsRawFd;
+        use std::os::fd::{AsFd, AsRawFd};
         let (r, w) = crate::pty_poller::create_nonblocking_pipe().expect("pipe");
         // 1-byte write kills `n != -1` -> `n != 1` mutant in `write_fd_nonblocking`.
-        assert_eq!(write_fd_nonblocking(w.as_raw_fd(), b"x").expect("1-byte write"), 1);
+        assert_eq!(write_fd_nonblocking(w.as_fd(), b"x").expect("1-byte write"), 1);
         let mut one = [0u8; 1];
-        assert_eq!(read_fd_nonblocking(r.as_raw_fd(), &mut one).expect("1-byte read"), NonBlockingRead::Bytes(1));
+        assert_eq!(read_fd_nonblocking(r.as_fd(), &mut one).expect("1-byte read"), NonBlockingRead::Bytes(1));
         assert_eq!(&one, b"x");
         // Clear nonblocking, check flag cleared, then re-enable and check flag set.
-        set_fd_nonblocking(r.as_raw_fd(), false).expect("clear nonblock");
+        set_fd_nonblocking(r.as_fd(), false).expect("clear nonblock");
         // SAFETY: `F_GETFL` on open pipe fd.
         let cleared = unsafe { libc::fcntl(r.as_raw_fd(), libc::F_GETFL) };
         assert_eq!(cleared & libc::O_NONBLOCK, 0);
 
-        set_fd_nonblocking(r.as_raw_fd(), true).expect("set nonblock");
+        set_fd_nonblocking(r.as_fd(), true).expect("set nonblock");
         // SAFETY: `F_GETFL` on open pipe fd.
         let set_flags = unsafe { libc::fcntl(r.as_raw_fd(), libc::F_GETFL) };
         assert_ne!(set_flags & libc::O_NONBLOCK, 0);
         // Setting again when already set must keep O_NONBLOCK set (kills `|` -> `^`).
-        set_fd_nonblocking(r.as_raw_fd(), true).expect("set nonblock idempotent");
+        set_fd_nonblocking(r.as_fd(), true).expect("set nonblock idempotent");
         // SAFETY: `F_GETFL` on open pipe fd.
         let still_set = unsafe { libc::fcntl(r.as_raw_fd(), libc::F_GETFL) };
         assert_ne!(still_set & libc::O_NONBLOCK, 0);
@@ -383,7 +399,10 @@ mod tests {
         };
         let mut spawned = spawn_pty(&config).expect("spawn pty");
         assert!(spawned.pid >= 2);
-        assert!(spawned.master.raw_fd() > 2, "master raw_fd must be an opened descriptor");
+        {
+            use std::os::fd::{AsFd, AsRawFd};
+            assert!(spawned.master.as_fd().as_raw_fd() > 2, "master fd must be an opened descriptor");
+        }
         assert!(spawned.tree.as_ref().expect("tree").owns(spawned.pid).expect("owns"));
 
         spawned.master.resize(GridSize::new(100, 30).expect("grid"), CellPx { width: 8, height: 16 }).expect("resize");

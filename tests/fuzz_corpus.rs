@@ -185,6 +185,7 @@ fn regenerate_fuzz_seeds() {
     };
     use apack_wal::format::{
         GapReason, KeyframeV2, RecordingMeta, SegmentFooter, VisualKeyframe, WalRecord, encode_framed_record,
+        hash_segment_records,
     };
 
     let seeds_root = repo_root().join("fuzz").join("seeds");
@@ -364,6 +365,7 @@ fn regenerate_fuzz_seeds() {
         last_ms: 1_700_000_005_000,
         records_end_offset: 128,
         record_count: 3,
+        records_sha256: [0x11; 32],
     };
     write_seed("v2_wal", "segment_footer_v2", &footer.encode());
 
@@ -424,6 +426,7 @@ fn regenerate_fuzz_seeds() {
         last_ms: 1_700_000_000_400,
         records_end_offset: sealed_seg.len() as u64,
         record_count: 5,
+        records_sha256: hash_segment_records(&sealed_seg),
     };
     sealed_seg.extend_from_slice(&seg_footer.encode());
     write_seed("v2_wal", "complete_sealed_segment", &sealed_seg);
