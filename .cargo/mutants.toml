@@ -20,7 +20,7 @@ exclude_re = [
     # **`apack-vt-ghostty` proven-equivalent & ASAN-covered Drop exclusions:**
     # 1. Freeing exclusively-owned FFI handles and `CallbackBox` in `Drop` cannot be observed by
     #    functional tests (verified by AddressSanitizer in CI).
-    "crates/apack-vt-ghostty/src/engine.rs:.*<impl Drop for (GhosttyEngine|CallbackBox)>::drop",
+    "crates/apack-vt-ghostty/src/engine/mod.rs:.*<impl Drop for (GhosttyEngine|CallbackBox)>::drop",
     "crates/apack-vt-ghostty/src/input.rs:.*<impl Drop for InputEncoders>::drop",
     # 2. Boundary strictness (`<`/`<=`, `>`/`>=`) in Kitty placeholder aspect-ratio `fit`, where both
     #    branches compute the exact same floating-point value at the dividing boundary.
@@ -35,7 +35,7 @@ exclude_re = [
     "crates/apack-os/src/signal.rs:.*in KillTarget::at",
     "crates/apack-os/src/signal.rs:.*in signal_session_descendants",
     # 2. Disjoint single-bit POSIX/Win32/Ghostty flags produce identical bitmasks under `|` and `^`.
-    "crates/apack-vt-ghostty/src/engine.rs:.*replace \\| with \\^ in GhosttyEngine::feed_inner",
+    "crates/apack-vt-ghostty/src/engine/render.rs:.*replace \\| with \\^ in GhosttyEngine::feed_inner",
     "crates/apack-os/src/transport.rs:.*replace \\| with \\^ in acquire_socket_hold",
     "crates/apack-os/src/transport.rs:.*replace \\| with \\^ in unix_signals::install_shutdown_signals",
     "crates/apack-os/src/image_sources/posix.rs:.*replace \\| with \\^",
