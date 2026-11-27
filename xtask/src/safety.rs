@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 /// The trees and files scanned, relative to the repository root.
-pub const ROOTS: [&str; 6] = ["src", "crates", "tests", "xtask", "fuzz/fuzz_targets", "build.rs"];
+pub const ROOTS: [&str; 7] = ["src", "crates", "tests", "xtask", "fuzz/src", "fuzz/fuzz_targets", "build.rs"];
 
 /// How many lines above a site a justification may sit.
 const WINDOW: usize = 8;

@@ -216,10 +216,42 @@ jobs:
           node-version: 24
       - run: npm test
 
+  # Deterministic fuzz seed corpus replay + short timed libFuzzer smoke run across every fuzz target.
+  fuzz-smoke:
+    name: fuzz-smoke (Linux x64)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+      - uses: dtolnay/rust-toolchain@nightly
+      - id: nightly-version
+        run: echo "key=$(rustc +nightly -Vv | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: nightly-${{ steps.nightly-version.outputs.key }}
+          workspaces: |
+            . -> target
+            fuzz -> fuzz/target
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - run: cargo xtask fuzz-smoke --target x86_64-unknown-linux-gnu --seconds 10 --rss-limit-mb 2048
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-smoke-crash
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+
   # The one check a merge waits on: every job above passed or was skipped (a documentation-only change)
   ci-pass:
     if: always()
-    needs: [changes, checks, platforms, view, view-e2e, node]
+    needs: [changes, checks, platforms, view, view-e2e, node, fuzz-smoke]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
