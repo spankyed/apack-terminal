@@ -387,6 +387,10 @@ impl VtEngine for StubVt {
     fn scrollback_bytes(&self) -> u64 {
         self.scrollback * 100
     }
+
+    fn ensure_min_epoch(&mut self, min_epoch: u64) {
+        self.epoch = self.epoch.max(min_epoch);
+    }
 }
 
 #[test]
@@ -2093,18 +2097,12 @@ fn session_machine_runtime_accessors_and_nonblocking_pty_peek_consume() {
     assert_eq!(sess.cwd(), Some("/home/me"));
     assert_eq!(sess.commands().len(), 1);
 
-    // mark_all_views_full_sync forces a clean subscriber to emit a full_sync frame
+    // restore_from_replay monotonically advances epoch, forces full_sync, refreshes search watches,
+    // resets/hydrates marks & statuses, and syncs geometry transactionally.
     let k1 = (conn(1), nz_stream(1));
-    sess.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, &mut fx);
+    sess.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
     assert!(sess.try_publish_view(k1, |_| true));
     assert!(!sess.try_publish_view(k1, |_| true));
-    sess.mark_all_views_full_sync();
-    let mut got_full = false;
-    assert!(sess.try_publish_view(k1, |f| {
-        got_full = f.full_sync;
-        true
-    }));
-    assert!(got_full);
 
     // peek_pty_write + consume_pty_write handle partial writes and VecDeque wraparound cleanly
     sess.handle_stream_msg(
@@ -2131,14 +2129,37 @@ fn session_machine_runtime_accessors_and_nonblocking_pty_peek_consume() {
     sess.consume_pty_write(9);
     assert_eq!(sess.pty_write_len(), 0);
 
-    // sync_vt_geometry updates cached current_size & current_cell_px after external VT replacement
+    // Transactional restore_from_replay replaces VT, advances epoch > prev_epoch, updates geometry, and forces full_sync!
+    let prev_epoch = sess.vt().meta().epoch;
     let new_sz = GridSize::new(100, 30).unwrap();
     let new_px = CellPx { width: 10, height: 20 };
-    let mut evs = Vec::new();
-    sess.vt_mut().resize(new_sz, new_px, &mut evs);
-    sess.sync_vt_geometry(new_px);
+    let mut fresh_vt = StubVt::new(100, 30);
+    fresh_vt.epoch = 1; // lower than prev_epoch -> must be raised to prev_epoch + 1!
+    fx.clear();
+    sess.restore_from_replay(
+        fresh_vt,
+        crate::session::RestoreKeyframe {
+            cell_px: new_px,
+            marks_mode: MarksMode::Keyed(key),
+            marks_last_seq: 5,
+            marks_refused: 2,
+            commands: Vec::new(),
+        },
+        &[],
+        true,
+        &mut fx,
+    );
     assert_eq!(sess.current_size(), new_sz);
     assert_eq!(sess.current_cell_px(), new_px);
+    assert!(sess.vt().meta().epoch > prev_epoch, "restore_from_replay must bump epoch monotonically");
+    assert_eq!(sess.marks_last_seq(), 5);
+    assert_eq!(sess.marks_refused(), 2);
+    let mut got_full = false;
+    assert!(sess.try_publish_view(k1, |f| {
+        got_full = f.full_sync;
+        true
+    }));
+    assert!(got_full);
 }
 
 #[test]
@@ -2401,4 +2422,687 @@ fn session_machine_attachment_id_tracks_lifecycle_and_drops_stale_stream_msgs() 
 
     sess.detach_stream(k1, &mut fx);
     assert_eq!(sess.attachment_of(k1), None);
+}
+
+#[test]
+fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
+    use apack_proto::types::CommandRecord;
+
+    use crate::session::{ReplayRecord, RestoreKeyframe};
+    use crate::status::{StatusEffect, confirm_foreground_app};
+
+    // 1. confirm_foreground_app: argv[0], login shell `-`, `.exe`, path separators, aliases, interpreters, anti-spoofing.
+    assert_eq!(confirm_foreground_app("claude", Some(&["/usr/local/bin/claude".into()])), Confirmed::Matched);
+    assert_eq!(confirm_foreground_app("claude-code", Some(&["C:\\tools\\CLAUDE.EXE".into()])), Confirmed::Matched);
+    assert_eq!(confirm_foreground_app("zsh", Some(&["-zsh".into()])), Confirmed::Matched);
+    assert_eq!(
+        confirm_foreground_app("codex", Some(&["node".into(), "--no-warnings".into(), "/opt/bin/codex.mjs".into()])),
+        Confirmed::Matched
+    );
+    assert_eq!(
+        confirm_foreground_app("agent", Some(&["/usr/bin/python3".into(), "-u".into(), "agent.py".into()])),
+        Confirmed::Matched
+    );
+    assert_eq!(confirm_foreground_app("bun", Some(&["bun".into(), "--version".into()])), Confirmed::Matched);
+    assert_eq!(confirm_foreground_app("node", Some(&["node".into(), ".hidden".into()])), Confirmed::Matched);
+    // Anti-spoofing: trailing args of non-interpreters must NEVER match, and alias must only apply to aliased `app`!
+    assert_eq!(confirm_foreground_app("claude", Some(&["/bin/cat".into(), "claude".into()])), Confirmed::Mismatched);
+    assert_eq!(confirm_foreground_app("vim", Some(&["claude".into()])), Confirmed::Mismatched);
+    assert_eq!(confirm_foreground_app("claude", None), Confirmed::Unknown);
+    assert_eq!(confirm_foreground_app("", Some(&["claude".into()])), Confirmed::Unknown);
+    assert_eq!(confirm_foreground_app("claude", Some(&["---".into()])), Confirmed::Unknown);
+
+    // 2. Prefix-based hierarchical Clear, ancestor app inheritance & propagation, identical-report dedup, on_session_exit.
+    let mut table = StatusTable::new();
+    let mut sfx = Vec::new();
+    table.ingest("state=working;app=claude;title=Root", ts(10), &mut sfx);
+    assert_eq!(table.root().unwrap().app.as_deref(), Some("claude"));
+    // Identical report is deduplicated -> zero effects, revision unchanged!
+    sfx.clear();
+    let rev_before = table.root().unwrap().changed;
+    table.ingest("state=working;app=claude;title=Root", ts(11), &mut sfx);
+    assert!(sfx.is_empty(), "identical status report must be deduplicated");
+    assert_eq!(table.root().unwrap().changed, rev_before);
+
+    // Child without `app` inherits ancestor `app=claude` AND emits VerifyForeground!
+    sfx.clear();
+    table.ingest("id=build;state=working", ts(12), &mut sfx);
+    assert_eq!(table.get("build").unwrap().app.as_deref(), Some("claude"));
+    assert!(
+        sfx.iter()
+            .any(|e| matches!(e, StatusEffect::VerifyForeground { id, app, .. } if id == "build" && app == "claude"))
+    );
+
+    // Grandchild inherits from nearest ancestor; sibling with explicit own_app stays independent.
+    sfx.clear();
+    table.ingest("id=build/test;state=blocked;kind=permission", ts(13), &mut sfx);
+    assert_eq!(table.get("build/test").unwrap().app.as_deref(), Some("claude"));
+    table.ingest("id=build/own;state=done;app=cargo", ts(14), &mut sfx);
+    assert_eq!(table.get("build/own").unwrap().app.as_deref(), Some("cargo"));
+    table.ingest("id=builder;state=error", ts(15), &mut sfx);
+    assert_eq!(table.get("builder").unwrap().app.as_deref(), Some("claude"));
+
+    // Updating root `own_app` propagates to inheriting descendants (`build`, `build/test`, `builder`) but NOT `build/own`!
+    // Revision counter on descendants must strictly increase, and non-root apply_confirmation returns false!
+    let build_rev_before = table.get("build").unwrap().changed;
+    assert!(!table.apply_confirmation("build", build_rev_before, Confirmed::Unknown, &mut sfx));
+    sfx.clear();
+    table.ingest("state=working;app=codex;title=Root", ts(16), &mut sfx);
+    let root_rev = table.root().unwrap().changed;
+    assert_eq!(table.get("build").unwrap().app.as_deref(), Some("codex"));
+    assert!(table.get("build").unwrap().changed > root_rev, "descendant revision must strictly exceed ancestor");
+    assert_eq!(table.get("build/test").unwrap().app.as_deref(), Some("codex"));
+    assert_eq!(table.get("builder").unwrap().app.as_deref(), Some("codex"));
+    assert_eq!(table.get("build/own").unwrap().app.as_deref(), Some("cargo"));
+
+    // Clearing root `own_app` (app=) clears inherited app on descendants, and setting a non-root
+    // ancestor `own_app` propagates ONLY to its descendants (never to unrelated siblings like `builder`)!
+    sfx.clear();
+    table.ingest("state=working;title=Root", ts(17), &mut sfx);
+    assert_eq!(table.get("build").unwrap().app, None);
+    assert_eq!(table.get("build/test").unwrap().app, None);
+    assert_eq!(table.get("builder").unwrap().app, None);
+    assert_eq!(table.get("build/own").unwrap().app.as_deref(), Some("cargo"));
+    sfx.clear();
+    table.ingest("id=build;state=working;app=make", ts(17), &mut sfx);
+    assert_eq!(table.get("build/test").unwrap().app.as_deref(), Some("make"));
+    assert_eq!(
+        table.get("builder").unwrap().app,
+        None,
+        "non-root ancestor propagation must NOT touch unrelated siblings"
+    );
+
+    // Hierarchical Clear: `id=build` clears `build`, `build/test`, `build/own` but leaves `builder` and root intact!
+    sfx.clear();
+    table.ingest("id=build;state=clear", ts(18), &mut sfx);
+    assert!(table.get("build").is_none());
+    assert!(table.get("build/test").is_none());
+    assert!(table.get("build/own").is_none());
+    assert!(table.get("builder").is_some());
+    assert!(table.root().is_some());
+
+    // on_session_exit clears active (`Working`/`Idle`/`Blocked`) and retains terminal (`Error`/`Done`).
+    sfx.clear();
+    table.ingest("id=done1;state=done", ts(19), &mut sfx);
+    table.ingest("id=idle1;state=idle", ts(19), &mut sfx);
+    sfx.clear();
+    table.on_session_exit(&mut sfx);
+    assert!(table.root().is_none(), "active root Working must clear on exit");
+    assert!(table.get("idle1").is_none(), "active Idle must clear on exit");
+    assert!(table.get("builder").is_some(), "terminal Error stays on exit");
+    assert!(table.get("done1").is_some(), "terminal Done stays on exit");
+
+    // Clear with empty id clears everything.
+    sfx.clear();
+    table.ingest("state=clear", ts(20), &mut sfx);
+    assert!(table.is_empty());
+
+    // 2b. MAX_STATUSES LRU eviction of an ancestor with `own_app` refreshes surviving descendants (`M1`):
+    {
+        let mut ev_table = StatusTable::new();
+        let mut efx = Vec::new();
+        // Oldest non-root entry ("anc") declares `own_app = Some("oldapp")`.
+        ev_table.ingest("id=anc;state=working;app=oldapp", ts(1), &mut efx);
+        // Newer descendant ("anc/child") inherits `app = Some("oldapp")` from "anc".
+        ev_table.ingest("id=anc/child;state=working", ts(2), &mut efx);
+        assert_eq!(ev_table.get("anc/child").unwrap().app.as_deref(), Some("oldapp"));
+        // Fill remaining slots up to MAX_STATUSES, then insert a direct child of "anc" ("anc/new") to evict "anc":
+        // "anc/new" MUST emit ONLY ONE Updated event with `app: None` (no transient double-Updated!).
+        for i in 0..(MAX_STATUSES - 2) {
+            ev_table.ingest(&format!("id=pad{i};state=working"), ts(3 + i as u64), &mut efx);
+        }
+        efx.clear();
+        ev_table.ingest("id=anc/new;state=working", ts(999), &mut efx);
+        assert!(ev_table.get("anc").is_none(), "oldest non-root ancestor must be evicted");
+        assert_eq!(
+            ev_table.get("anc/child").unwrap().app,
+            None,
+            "surviving descendant must drop stale app after ancestor eviction"
+        );
+        let new_updates: Vec<_> = efx
+            .iter()
+            .filter_map(|e| match e {
+                crate::status::StatusEffect::Updated(r) if r.id == "anc/new" => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(new_updates.len(), 1, "newly inserted descendant of evicted ancestor must emit a single Updated");
+        assert_eq!(new_updates[0].app, None);
+    }
+
+    // 2c. Live `CommandFinished` clears active statuses while retaining terminal `Done`/`Error`,
+    //     preserves `pending_verify` on retained `Done` so WaitCondition::Status neither hangs nor bypasses
+    //     spoofing verification, and suppresses redundant VerifyForeground on same-chunk working+D!
+    {
+        let mut live_sess = SessionMachine::new(
+            sid(91),
+            StubVt::new(40, 4),
+            ResizePolicy::ExplicitOverride,
+            MarksMode::Claimed,
+            CellPx::default(),
+        );
+        let mut lfx = Vec::new();
+        live_sess.register_wait(
+            conn(1),
+            RequestId::from_raw(70),
+            WaitCondition::Status(vec![StatusState::Done]),
+            5_000,
+            ts(1),
+            &mut lfx,
+        );
+        assert!(lfx.is_empty());
+        // Emit working (same-chunk cleared by D;0 -> NO VerifyForeground!) + root done;app=claude + D;0:
+        live_sess.vt_mut().next_events = vec![
+            VtEvent::Osc133 { payload: String::from("C"), cursor_line: 0 },
+            VtEvent::ProgramStatus(crate::status::parse_osc7501("id=w;state=working;app=foo").unwrap()),
+            VtEvent::ProgramStatus(crate::status::parse_osc7501("state=done;app=claude").unwrap()),
+            VtEvent::Osc133 { payload: String::from("D;0"), cursor_line: 1 },
+        ];
+        live_sess.on_pty_output(b"a", ts(2), &mut lfx);
+        assert_eq!(live_sess.active_statuses().len(), 1, "CommandFinished must clear active `w` and retain `Done`");
+        assert!(
+            !lfx.iter().any(|e| matches!(e, SessionEffect::VerifyForeground { id, .. } if id == "w")),
+            "same-chunk cleared active status must not dispatch redundant VerifyForeground"
+        );
+        assert!(
+            !lfx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Waited { .. }, .. })),
+            "retained Done must remain pending_verify after CommandFinished"
+        );
+        let done_changed = lfx
+            .iter()
+            .find_map(|e| match e {
+                SessionEffect::VerifyForeground { id, changed, app } if id.is_empty() && app == "claude" => {
+                    Some(*changed)
+                }
+                _ => None,
+            })
+            .expect("expected VerifyForeground for retained Done");
+        // Late waiter registered before fg_worker replies MUST also wait (no spoof bypass)!
+        lfx.clear();
+        live_sess.register_wait(
+            conn(1),
+            RequestId::from_raw(71),
+            WaitCondition::Status(vec![StatusState::Done]),
+            5_000,
+            ts(3),
+            &mut lfx,
+        );
+        assert!(lfx.is_empty(), "late waiter must stay gated until foreground verification completes");
+        // When fg_worker resolves as Confirmed::Unknown (Windows / fast-exit POSIX), BOTH waiters MUST wake!
+        live_sess.apply_status_confirmation("", done_changed, Confirmed::Unknown, &mut lfx);
+        assert!(lfx.iter().any(|e| matches!(
+            e,
+            SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. }
+            if *req_id == RequestId::from_raw(70)
+        )));
+        assert!(lfx.iter().any(|e| matches!(
+            e,
+            SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. }
+            if *req_id == RequestId::from_raw(71)
+        )));
+    }
+
+    // 3. WaitCondition::Status defers pending VerifyForeground, rejects Mismatched, wakes on Matched or Unknown!
+    let mut sess = SessionMachine::new(
+        sid(90),
+        StubVt::new(40, 4),
+        ResizePolicy::ExplicitOverride,
+        MarksMode::Claimed,
+        CellPx::default(),
+    );
+    let mut fx = Vec::new();
+    sess.register_wait(
+        conn(1),
+        RequestId::from_raw(1),
+        WaitCondition::Status(vec![StatusState::Blocked]),
+        5_000,
+        ts(1),
+        &mut fx,
+    );
+    assert!(fx.is_empty());
+
+    // Claimed `app=claude` emits VerifyForeground and DEFERS WaitCondition::Status wakeup!
+    sess.vt_mut().next_events =
+        vec![VtEvent::ProgramStatus(crate::status::parse_osc7501("state=blocked;app=claude").unwrap())];
+    sess.on_pty_output(b"x", ts(2), &mut fx);
+    assert!(
+        !fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Waited { .. }, .. })),
+        "must defer while pending verify"
+    );
+    let changed1 = fx
+        .iter()
+        .find_map(|e| match e {
+            SessionEffect::VerifyForeground { id, changed, app } if id.is_empty() && app == "claude" => Some(*changed),
+            _ => None,
+        })
+        .expect("expected VerifyForeground");
+    // Late waiter while pending_verify MUST also defer!
+    fx.clear();
+    sess.register_wait(
+        conn(1),
+        RequestId::from_raw(2),
+        WaitCondition::Status(vec![StatusState::Blocked]),
+        5_000,
+        ts(3),
+        &mut fx,
+    );
+    assert!(fx.is_empty(), "late waiter must also defer while pending verify");
+
+    // Confirmed::Mismatched (spoofed!) MUST NOT wake either waiter!
+    fx.clear();
+    sess.apply_status_confirmation("", changed1, Confirmed::Mismatched, &mut fx);
+    assert!(
+        !fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Waited { .. }, .. })),
+        "mismatched must NOT wake status waiters"
+    );
+    // Late waiter after Mismatched must ALSO NOT immediately wake!
+    fx.clear();
+    sess.register_wait(
+        conn(1),
+        RequestId::from_raw(3),
+        WaitCondition::Status(vec![StatusState::Blocked]),
+        5_000,
+        ts(4),
+        &mut fx,
+    );
+    assert!(fx.is_empty(), "late waiter must reject Confirmed::Mismatched");
+
+    // Legitimate update confirmed Matched -> wakes all 3 waiting clients immediately!
+    fx.clear();
+    sess.vt_mut().next_events =
+        vec![VtEvent::ProgramStatus(crate::status::parse_osc7501("state=blocked;kind=auth;app=claude").unwrap())];
+    sess.on_pty_output(b"y", ts(5), &mut fx);
+    let changed2 = fx
+        .iter()
+        .find_map(|e| match e {
+            SessionEffect::VerifyForeground { changed, .. } => Some(*changed),
+            _ => None,
+        })
+        .expect("expected VerifyForeground #2");
+    fx.clear();
+    sess.apply_status_confirmation("", changed2, Confirmed::Matched, &mut fx);
+    let woken = fx
+        .iter()
+        .filter(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. }))
+        .count();
+    assert_eq!(woken, 3);
+
+    // Unknown confirmation (e.g. Windows / no foreground pgid) also unblocks deferred waiter!
+    fx.clear();
+    sess.register_wait(
+        conn(1),
+        RequestId::from_raw(4),
+        WaitCondition::Status(vec![StatusState::Working]),
+        5_000,
+        ts(6),
+        &mut fx,
+    );
+    sess.vt_mut().next_events =
+        vec![VtEvent::ProgramStatus(crate::status::parse_osc7501("state=working;app=tool").unwrap())];
+    sess.on_pty_output(b"z", ts(7), &mut fx);
+    let changed3 = fx
+        .iter()
+        .find_map(|e| match e {
+            SessionEffect::VerifyForeground { changed, .. } => Some(*changed),
+            _ => None,
+        })
+        .expect("expected VerifyForeground #3");
+    assert!(!fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Waited { .. }, .. })));
+    fx.clear();
+    sess.apply_status_confirmation("", changed3, Confirmed::Unknown, &mut fx);
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. } if *req_id == RequestId::from_raw(4))));
+
+    // 4. Transactional restore_from_replay: monotonic epoch, marks hydration, status reset/replay, SearchWatch refresh, full_sync!
+    let k1 = (conn(1), nz_stream(1));
+    fx.clear();
+    sess.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
+    let _ = sess.try_publish_view(k1, |_| true);
+    sess.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(10),
+        ClientMsg::SetSearch { query: String::from("SEEK_TARGET"), case_sensitive: true },
+        &mut fx,
+    );
+    // Start a sync hold before seeking so we verify restore_from_replay cancels it cleanly.
+    sess.vt_mut().next_events = vec![VtEvent::SyncOutput(true)];
+    sess.on_pty_output(b"h", ts(8), &mut fx);
+    assert!(sess.is_sync_held());
+
+    let key = MarksKey::parse(b"abcdef0123456789abcdef0123456789").unwrap();
+    let prev_epoch = sess.vt().meta().epoch;
+    let mut fresh = StubVt::new(50, 5);
+    fresh.epoch = 1;
+    fresh.rows[0] = String::from("SEEK_TARGET row");
+    fresh.next_events = vec![
+        VtEvent::Title(String::from("ReplayedTitle")),
+        VtEvent::Osc633 { payload: format!("V;S;11;{};ls", key.as_str()), cursor_line: 2 },
+        VtEvent::Osc633 { payload: format!("V;F;11;{};0;/replayed", key.as_str()), cursor_line: 2 },
+        VtEvent::ProgramStatus(crate::status::parse_osc7501("state=working;app=agent").unwrap()),
+        VtEvent::ProgramStatus(crate::status::parse_osc7501("id=sub;state=done;app=agent").unwrap()),
+    ];
+    let prior_cmd = CommandRecord {
+        id: 1,
+        command: Some(String::from("init")),
+        cwd: Some(String::from("/init")),
+        started_ms: Some(1),
+        finished_ms: Some(2),
+        outcome: CommandOutcome::Exited(VouchedExitCode::from_vouched(0)),
+        prompt_line: None,
+        output_line: None,
+        end_line: None,
+    };
+    let tail = [
+        ReplayRecord::Output { at_ms: ts(100), bytes: b"SEEK_TARGET row" },
+        ReplayRecord::Resize { size: GridSize::new(60, 6).unwrap(), cell_px: CellPx { width: 9, height: 18 } },
+        ReplayRecord::Marks { key: Some(key), last_seq: 15 },
+    ];
+    fx.clear();
+    sess.restore_from_replay(
+        fresh,
+        RestoreKeyframe {
+            cell_px: CellPx { width: 8, height: 16 },
+            marks_mode: MarksMode::Keyed(key),
+            marks_last_seq: 10,
+            marks_refused: 1,
+            commands: vec![prior_cmd.clone()],
+        },
+        &tail,
+        true,
+        &mut fx,
+    );
+    assert!(!sess.is_sync_held(), "restore_from_replay must cancel sync hold");
+    assert!(sess.vt().meta().epoch > prev_epoch, "epoch must advance monotonically");
+    assert_eq!(sess.current_size(), GridSize::new(60, 6).unwrap());
+    assert_eq!(sess.current_cell_px(), CellPx { width: 9, height: 18 });
+    assert_eq!(sess.title(), "ReplayedTitle");
+    assert_eq!(sess.marks_last_seq(), 15);
+    assert_eq!(sess.commands().len(), 2);
+    assert_eq!(sess.commands()[1].id, 11);
+    // The Resize tail record bumped epoch, invalidating prior command line anchors!
+    assert_eq!(sess.commands()[1].output_line, None);
+    assert_eq!(sess.cwd(), Some("/replayed"));
+    assert!(
+        fx.iter().any(
+            |e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Title { title }, .. } if title == "ReplayedTitle")
+        ),
+        "Seek with emit_status_events must broadcast changed Title"
+    );
+    // Old root status cleared + replayed root & `sub` statuses emitted & exposed in active_statuses()!
+    assert!(fx.iter().any(
+        |e| matches!(e, SessionEffect::Send { msg: BrokerMsg::ProgramStatusCleared { id }, .. } if id.is_empty())
+    ));
+    assert!(
+        fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::ProgramStatus(r), .. } if r.id == "sub"))
+    );
+    assert_eq!(sess.active_statuses().len(), 2);
+    assert!(sess.active_statuses().iter().any(|r| r.id == "sub"));
+    // Replay verification finished: WaitCondition::Status(Working) wakes immediately without pending_verify!
+    fx.clear();
+    sess.register_wait(
+        conn(1),
+        RequestId::from_raw(12),
+        WaitCondition::Status(vec![StatusState::Working]),
+        5_000,
+        ts(101),
+        &mut fx,
+    );
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. }
+        if *req_id == RequestId::from_raw(12)
+    )));
+    // Second seek clearing title (no Title event in tail) broadcasts empty Title when emit_status_events == true (`M3`),
+    // AND CommandFinished during replay clears active statuses (`M1`)!
+    let new_epoch = sess.vt().meta().epoch;
+    let mut fresh2 = StubVt::new(60, 6);
+    fresh2.epoch = 1;
+    fresh2.next_events = vec![
+        VtEvent::ProgramStatus(crate::status::parse_osc7501("state=working").unwrap()),
+        VtEvent::ProgramStatus(crate::status::parse_osc7501("id=keep;state=done").unwrap()),
+        VtEvent::Osc633 { payload: format!("V;S;12;{};echo", key.as_str()), cursor_line: 2 },
+        VtEvent::Osc633 { payload: format!("V;F;12;{};0;/stay", key.as_str()), cursor_line: 2 },
+    ];
+    let tail_no_epoch = [ReplayRecord::Output { at_ms: ts(102), bytes: b"SEEK_TARGET row" }];
+    fx.clear();
+    sess.restore_from_replay(
+        fresh2,
+        RestoreKeyframe {
+            cell_px: CellPx { width: 9, height: 18 },
+            marks_mode: MarksMode::Keyed(key),
+            marks_last_seq: 11,
+            marks_refused: 0,
+            commands: vec![prior_cmd.clone()],
+        },
+        &tail_no_epoch,
+        true,
+        &mut fx,
+    );
+    assert!(sess.vt().meta().epoch > new_epoch);
+    assert!(
+        fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Title { title }, .. } if title.is_empty())),
+        "Seek clearing Title must broadcast empty Title"
+    );
+    assert_eq!(sess.active_statuses().len(), 1, "CommandFinished during replay must clear active statuses");
+    assert_eq!(sess.active_statuses()[0].id, "keep");
+    // Without an epoch bump during tail output, the command's output_line anchor is preserved!
+    assert_eq!(sess.commands()[1].output_line, Some(2));
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        SessionEffect::Send { msg: BrokerMsg::SearchMatches { epoch, matches, .. }, .. }
+        if *epoch == sess.vt().meta().epoch && !matches.is_empty()
+    )));
+    // MarksTracker::restore_from_keyframe truncates > MAX_COMMANDS, normalizes multiple Running records,
+    // and resists u64::MAX overflow panics (`B2`)!
+    let mut many_cmds = Vec::with_capacity(MAX_COMMANDS + 3);
+    for i in 0..(MAX_COMMANDS + 3) {
+        many_cmds.push(CommandRecord {
+            id: (i + 1) as u64,
+            command: Some(format!("c{i}")),
+            cwd: None,
+            started_ms: Some(1),
+            finished_ms: if i + 2 >= MAX_COMMANDS + 3 { None } else { Some(2) },
+            outcome: if i + 2 >= MAX_COMMANDS + 3 {
+                CommandOutcome::Running
+            } else {
+                CommandOutcome::Exited(VouchedExitCode::from_vouched(0))
+            },
+            prompt_line: None,
+            output_line: None,
+            end_line: None,
+        });
+    }
+    let mut mt = MarksTracker::new(MarksMode::Claimed);
+    mt.restore_from_keyframe(MarksMode::Keyed(key), 99, 4, many_cmds);
+    assert_eq!(mt.commands().len(), MAX_COMMANDS);
+    assert_eq!(mt.commands()[0].id, 4);
+    assert_eq!(mt.commands().last().unwrap().id, (MAX_COMMANDS + 3) as u64);
+    assert_eq!(
+        mt.commands()[MAX_COMMANDS - 2].outcome,
+        CommandOutcome::Unknown(UnknownReason::Superseded),
+        "earlier Running record in keyframe must be normalized"
+    );
+    assert_eq!(mt.commands()[MAX_COMMANDS - 1].outcome, CommandOutcome::Running);
+    assert!(!mt.is_idle(), "running last command means tracker is not idle");
+    assert_eq!(mt.last_seq(), 99);
+    assert_eq!(mt.refused(), 4);
+
+    // Crafted u64::MAX command ID in WAL never panics on subsequent Claimed or Keyed commands!
+    let mut max_mt = MarksTracker::new(MarksMode::Claimed);
+    max_mt.restore_from_keyframe(
+        MarksMode::Claimed,
+        u64::MAX,
+        0,
+        vec![
+            CommandRecord {
+                id: 1,
+                command: None,
+                cwd: None,
+                started_ms: None,
+                finished_ms: Some(1),
+                outcome: CommandOutcome::Claimed(Some(0)),
+                prompt_line: None,
+                output_line: None,
+                end_line: None,
+            },
+            CommandRecord {
+                id: u64::MAX,
+                command: None,
+                cwd: None,
+                started_ms: None,
+                finished_ms: Some(2),
+                outcome: CommandOutcome::Claimed(Some(0)),
+                prompt_line: None,
+                output_line: None,
+                end_line: None,
+            },
+        ],
+    );
+    let mut mfx = Vec::new();
+    max_mt.on_osc133("C", 0, ts(1), &mut mfx);
+    assert_eq!(max_mt.commands().last().unwrap().id, 2, "must wrap cleanly past u64::MAX and skip existing id=1");
+
+    // prepare_for_live_after_restore (`B2`): finalizes stuck Running command, clears active statuses,
+    // resets last_seq unconditionally (even for SAME marks_key!), and assigns non-colliding IDs!
+    let mut live_restore = SessionMachine::from_replay(
+        sid(92),
+        StubVt::new(40, 4),
+        ResizePolicy::ExplicitOverride,
+        RestoreKeyframe {
+            cell_px: CellPx { width: 8, height: 16 },
+            marks_mode: MarksMode::Keyed(key),
+            marks_last_seq: 50,
+            marks_refused: 0,
+            commands: vec![
+                CommandRecord {
+                    id: 1,
+                    command: Some(String::from("old_done")),
+                    cwd: None,
+                    started_ms: Some(1),
+                    finished_ms: Some(2),
+                    outcome: CommandOutcome::Exited(VouchedExitCode::from_vouched(0)),
+                    prompt_line: None,
+                    output_line: None,
+                    end_line: None,
+                },
+                CommandRecord {
+                    id: 2,
+                    command: Some(String::from("old_running")),
+                    cwd: None,
+                    started_ms: Some(3),
+                    finished_ms: None,
+                    outcome: CommandOutcome::Running,
+                    prompt_line: None,
+                    output_line: None,
+                    end_line: None,
+                },
+            ],
+        },
+        &[],
+    );
+    // Inject an active Working status + terminal Done status before transitioning to live.
+    live_restore.vt_mut().next_events = vec![
+        VtEvent::ProgramStatus(crate::status::parse_osc7501("state=working").unwrap()),
+        VtEvent::ProgramStatus(crate::status::parse_osc7501("id=d;state=done").unwrap()),
+    ];
+    let mut rfx = Vec::new();
+    live_restore.on_pty_output(b"x", ts(10), &mut rfx);
+    assert_eq!(live_restore.active_statuses().len(), 2);
+
+    // Transition to live with the SAME `marks_key`:
+    live_restore.prepare_for_live_after_restore(MarksMode::Keyed(key), ts(20));
+    assert_eq!(live_restore.marks_last_seq(), 0, "last_seq must reset unconditionally for new live shell");
+    assert_eq!(
+        live_restore.commands()[1].outcome,
+        CommandOutcome::Unknown(UnknownReason::SessionEnded),
+        "stuck Running command must be finalized before live shell starts"
+    );
+    assert_eq!(live_restore.active_statuses().len(), 1, "active Working status from dead recording must be cleared");
+    assert_eq!(live_restore.active_statuses()[0].id, "d");
+
+    // New shell emits V;A;1 (prompt -> is_idle!), then V;S;2 & V;F;2: NO id collision with historical id=2!
+    rfx.clear();
+    live_restore.vt_mut().next_events =
+        vec![VtEvent::Osc633 { payload: format!("V;A;1;{}", key.as_str()), cursor_line: 0 }];
+    live_restore.on_pty_output(b"p", ts(21), &mut rfx);
+    rfx.clear();
+    live_restore.register_wait(conn(1), RequestId::from_raw(55), WaitCondition::Idle, 5_000, ts(21), &mut rfx);
+    assert!(
+        rfx.iter().any(|e| matches!(
+            e,
+            SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. }
+            if *req_id == RequestId::from_raw(55)
+        )),
+        "new live shell prompt must satisfy WaitCondition::Idle after finalizing dead Running cmd"
+    );
+
+    rfx.clear();
+    live_restore.vt_mut().next_events = vec![
+        VtEvent::Osc633 { payload: format!("V;S;2;{};new_cmd", key.as_str()), cursor_line: 1 },
+        VtEvent::Osc633 { payload: format!("V;F;2;{};0;/live", key.as_str()), cursor_line: 2 },
+    ];
+    live_restore.on_pty_output(b"q", ts(22), &mut rfx);
+    assert_eq!(live_restore.commands().len(), 3);
+    let live_cmd = &live_restore.commands()[2];
+    assert_eq!(live_cmd.command.as_deref(), Some("new_cmd"));
+    assert!(live_cmd.id > 2, "live command ID ({}) must not collide with historical id=2", live_cmd.id);
+    assert_eq!(live_cmd.outcome, CommandOutcome::Exited(VouchedExitCode::from_vouched(0)));
+
+    // Post-restore WAL rollover keyframe where remapped Running command has `id (11) > last_seq (1)`:
+    // `restore_from_keyframe` must derive `active_vouched_seq = Some(1)` so replaying `V;F;1` succeeds!
+    let mut remapped_mt = MarksTracker::new(MarksMode::Claimed);
+    remapped_mt.restore_from_keyframe(
+        MarksMode::Keyed(key),
+        1,
+        0,
+        vec![
+            CommandRecord {
+                id: 10,
+                command: Some(String::from("prior")),
+                cwd: None,
+                started_ms: Some(1),
+                finished_ms: Some(2),
+                outcome: CommandOutcome::Exited(VouchedExitCode::from_vouched(0)),
+                prompt_line: None,
+                output_line: None,
+                end_line: None,
+            },
+            CommandRecord {
+                id: 11,
+                command: Some(String::from("build")),
+                cwd: None,
+                started_ms: Some(3),
+                finished_ms: None,
+                outcome: CommandOutcome::Running,
+                prompt_line: None,
+                output_line: None,
+                end_line: None,
+            },
+        ],
+    );
+    let mut rmt_fx = Vec::new();
+    remapped_mt.on_osc633(&format!("V;F;1;{};0;/proj", key.as_str()), 4, ts(30), &mut rmt_fx);
+    assert_eq!(remapped_mt.refused(), 0, "V;F;1 must match remapped running command id=11");
+    assert_eq!(remapped_mt.commands()[1].outcome, CommandOutcome::Exited(VouchedExitCode::from_vouched(0)));
+    assert_eq!(remapped_mt.last_cwd(), Some("/proj"));
+    // Also verify `last_seq == 0` with Running id > 0 does not invent active_vouched_seq = Some(0)!
+    let mut zero_seq_mt = MarksTracker::new(MarksMode::Claimed);
+    zero_seq_mt.restore_from_keyframe(
+        MarksMode::Keyed(key),
+        0,
+        0,
+        vec![CommandRecord {
+            id: 5,
+            command: None,
+            cwd: None,
+            started_ms: None,
+            finished_ms: None,
+            outcome: CommandOutcome::Running,
+            prompt_line: None,
+            output_line: None,
+            end_line: None,
+        }],
+    );
+    zero_seq_mt.on_osc633(&format!("V;F;5;{};0;/bad", key.as_str()), 0, ts(31), &mut rmt_fx);
+    assert_eq!(zero_seq_mt.refused(), 1);
 }

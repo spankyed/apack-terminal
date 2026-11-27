@@ -695,6 +695,7 @@ describe('v2 golden wire vectors (Rust <-> TypeScript parity)', () => {
           firstActiveLine: 5,
           scrollbackLines: 6,
           foreground: null,
+          statuses: [],
         }),
       'InvalidValue',
     )

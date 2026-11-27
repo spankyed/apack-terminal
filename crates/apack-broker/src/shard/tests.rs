@@ -94,6 +94,8 @@ mod win_shard_tests {
                 created_ms: 0,
                 wal: None,
                 pending_wal_rollover: false,
+                wal_images_gen: 0,
+                wal_written_blobs: HashSet::new(),
                 rewind_reader: None,
                 rewind_at_ms: 0,
                 last_activity: Instant::now(),
@@ -196,6 +198,7 @@ mod image_source_shard_tests {
     use apack_os::image_sources::{Quiet as ImageQuiet, encoded};
     #[cfg(unix)]
     use apack_os::pty::{PtySpawnConfig, spawn_pty};
+    use apack_proto::types::Confirmed;
     use apack_proto::types::{CellPos, CellPx, CellSpan, GridSize, ResizePolicy};
     use apack_vt_ghostty::{GhosttyConfig, GhosttyEngine, ImageStore};
     use apack_wal::{RecordingRegistry, WalConfig};
@@ -285,6 +288,8 @@ mod image_source_shard_tests {
                 created_ms: 0,
                 wal: None,
                 pending_wal_rollover: false,
+                wal_images_gen: 0,
+                wal_written_blobs: HashSet::new(),
                 rewind_reader: None,
                 rewind_at_ms: 0,
                 last_activity: Instant::now(),
@@ -573,39 +578,85 @@ mod image_source_shard_tests {
         let sid = SessionId::new(10).unwrap();
         insert_image_session(&mut runner, sid, false);
 
-        // 1. fg_inflight single-flight gating + 1-slot coalescing (`L7`):
-        let (fg_tx, fg_rx) = mpsc::sync_channel::<FgVerifyReq>(4);
+        // 1. Batched per-session fg_inflight gating + multi-slot preservation (`B1`) + Full backpressure retry (`M2`):
+        let (fg_tx, fg_rx) = mpsc::sync_channel::<FgVerifyReq>(1);
         runner.fg_tx = Some(fg_tx);
-        for i in 1..=10u64 {
-            runner.dispatch_verify_foreground(sid, format!("slot-{i}"), i, format!("app-{i}"));
-        }
-        // Only the 1st request enters fg_tx; the 10th coalesces into fg_pending!
-        let first = fg_rx.try_recv().expect("first fg verify queued");
-        assert_eq!(first.id, "slot-1");
-        assert_eq!(first.changed, 1);
-        assert!(fg_rx.try_recv().is_err(), "fg_inflight must prevent flooding fg_tx");
+        // Dispatch slot-a immediately -> enters fg_tx (capacity 1, now FULL!).
+        runner.fg_pending.entry(sid).or_default().insert(String::from("slot-a"), (1, String::from("app-a")));
+        runner.flush_pending_fg_verify(sid);
         assert!(runner.fg_inflight.contains(&sid));
 
-        // Completing slot-1 clears fg_inflight and immediately dispatches coalesced slot-10!
-        runner.handle_cmd(ShardCmd::ForegroundVerified {
-            session_id: sid,
-            id: first.id,
-            changed: first.changed,
-            confirmed: Confirmed::Unknown,
-        });
-        let second = fg_rx.try_recv().expect("coalesced slot-10 dispatched");
-        assert_eq!(second.id, "slot-10");
-        assert_eq!(second.changed, 10);
-        assert!(fg_rx.try_recv().is_err());
+        // While sid is in flight, enqueue root "" + "slot-b" (updated twice) + "slot-c":
+        // NONE of the distinct slots may overwrite each other!
+        runner.fg_pending.entry(sid).or_default().insert(String::new(), (2, String::from("claude")));
+        runner.fg_pending.entry(sid).or_default().insert(String::from("slot-b"), (3, String::from("old")));
+        runner.fg_pending.entry(sid).or_default().insert(String::from("slot-b"), (4, String::from("new")));
+        runner.fg_pending.entry(sid).or_default().insert(String::from("slot-c"), (5, String::from("cargo")));
+        runner.flush_pending_fg_verify(sid);
 
-        // Completing slot-10 leaves fg_inflight empty.
+        // Second session while fg_tx is FULL must stay in fg_pending (NEVER degrade to Confirmed::Unknown)!
+        let sid2 = SessionId::new(11).unwrap();
+        insert_image_session(&mut runner, sid2, false);
+        runner.fg_pending.entry(sid2).or_default().insert(String::new(), (1, String::from("codex")));
+        runner.flush_pending_fg_verify(sid2);
+        assert!(
+            runner.fg_pending.contains_key(&sid2),
+            "Full fg_tx must retain pending items instead of faking Unknown"
+        );
+        assert!(runner.mailbox.lock().unwrap().queue.is_empty(), "Full fg_tx must NOT queue fallback Unknown");
+
+        // Drain slot-a from fg_rx:
+        let first = fg_rx.try_recv().expect("first fg verify queued");
+        assert_eq!(first.session_id, sid);
+        assert_eq!(first.items, vec![(String::from("slot-a"), 1, String::from("app-a"))]);
+
+        // Local fallback completion (from_worker: false) must NOT clear fg_inflight!
+        runner.handle_cmd(ShardCmd::ForegroundVerified { session_id: sid, results: vec![], from_worker: false });
+        assert!(runner.fg_inflight.contains(&sid));
+
+        // Worker completion (from_worker: true) frees sid's slot AND flushes BOTH sid's batched items AND sid2!
+        let (fg_tx2, fg_rx2) = mpsc::sync_channel::<FgVerifyReq>(4);
+        runner.fg_tx = Some(fg_tx2);
         runner.handle_cmd(ShardCmd::ForegroundVerified {
             session_id: sid,
-            id: second.id,
-            changed: second.changed,
-            confirmed: Confirmed::Unknown,
+            results: vec![(String::from("slot-a"), 1, Confirmed::Unknown)],
+            from_worker: true,
         });
+        let mut dispatched = Vec::new();
+        while let Ok(req) = fg_rx2.try_recv() {
+            dispatched.push(req);
+        }
+        let sid_batch = dispatched.iter().find(|r| r.session_id == sid).expect("sid batch flushed");
+        assert_eq!(
+            sid_batch.items,
+            vec![
+                (String::new(), 2, String::from("claude")),
+                (String::from("slot-b"), 4, String::from("new")),
+                (String::from("slot-c"), 5, String::from("cargo")),
+            ],
+            "all distinct status slots (including root) must be verified in one batch without overwriting"
+        );
+        let sid2_batch = dispatched.iter().find(|r| r.session_id == sid2).expect("backlogged sid2 flushed");
+        assert_eq!(sid2_batch.items, vec![(String::new(), 1, String::from("codex"))]);
+
+        // Complete both batches cleanly.
+        runner.handle_cmd(ShardCmd::ForegroundVerified { session_id: sid, results: vec![], from_worker: true });
+        runner.handle_cmd(ShardCmd::ForegroundVerified { session_id: sid2, results: vec![], from_worker: true });
         assert!(!runner.fg_inflight.contains(&sid));
+        assert!(!runner.fg_inflight.contains(&sid2));
+
+        // Disconnected / absent fg_tx resolves via mailbox fallback (from_worker: false) so waits never deadlock!
+        drop(fg_rx2);
+        runner.fg_pending.entry(sid).or_default().insert(String::new(), (9, String::from("sh")));
+        runner.flush_pending_fg_verify(sid);
+        let fb = runner.mailbox.lock().unwrap().queue.pop_front().expect("disconnected fg_tx queues fallback").0;
+        assert!(matches!(
+            fb,
+            ShardCmd::ForegroundVerified { session_id, ref results, from_worker: false }
+            if session_id == sid && results == &vec![(String::new(), 9, Confirmed::Unknown)]
+        ));
+        runner.fg_tx = None;
+        runner.sessions.remove(&sid2);
 
         // 2. Stale StreamAttachmentId on Detach / ViewSlotFree / StreamMsg cannot affect newer attachment (`B2`):
         let conn = ConnId::new(1).unwrap();
@@ -751,5 +802,506 @@ mod image_source_shard_tests {
         assert!(frame_pos.is_some(), "expected full_sync final frame containing EXIT_FINAL");
         assert!(exit_pos.is_some(), "expected Exited message");
         assert!(frame_pos.unwrap() < exit_pos.unwrap(), "final frame must precede Exited");
+    }
+
+    #[test]
+    fn pr5_review_fixes_visual_fallback_sanitization_virtual_blobs_and_multichunk_tf_wal() {
+        use apack_proto::types::{CursorShape, CursorState, PackedRow, PackedRun, ViewModes};
+        use apack_wal::{KeyframeV2, SeekSlice, VisualKeyframe, WalConfig, WalReader, WalRecord, WalWorker, WalWriter};
+
+        // 1. `apply_visual_fallback` (`H1`): hostile C0/C1 escapes in PackedRow.text cannot lock up VT
+        //    or disable alt-screen; `col_start` indentation preserved; truncated FLAG_WRAPPED does NOT collapse rows!
+        let size = GridSize::new(20, 4).unwrap();
+        let cell_px = CellPx { width: 8, height: 16 };
+        let visual = VisualKeyframe {
+            size,
+            cell_px,
+            active_alt_screen: true,
+            cursor: CursorState { col: 3, row: 2, shape: CursorShape::Block, blinking: false, hidden: false },
+            modes: ViewModes { alt_screen: true, ..ViewModes::default() },
+            palette: Default::default(),
+            primary_rows: vec![
+                PackedRow {
+                    line: 0,
+                    text: String::from("\x1b]HOSTILE\u{009d}P0"),
+                    runs: vec![PackedRun {
+                        col_start: 2,
+                        col_len: 10,
+                        byte_offset: 0,
+                        byte_len: "\x1b]HOSTILE\u{009d}P0".len() as u32,
+                        style_idx: 0,
+                        link_idx: 0,
+                        flags: 0,
+                    }],
+                    styles: vec![],
+                    links: vec![],
+                    pieces: vec![],
+                    flags: PackedRow::FLAG_WRAPPED, // end_col=12 < cols=20 -> must NOT collapse next row!
+                },
+                PackedRow {
+                    line: 1,
+                    text: String::from("01234567890123456789"),
+                    runs: vec![PackedRun {
+                        col_start: 0,
+                        col_len: 20,
+                        byte_offset: 0,
+                        byte_len: 20,
+                        style_idx: 0,
+                        link_idx: 0,
+                        flags: 0,
+                    }],
+                    styles: vec![],
+                    links: vec![],
+                    pieces: vec![],
+                    flags: PackedRow::FLAG_WRAPPED, // full 20-col wrapped row -> MUST soft-wrap into row 2!
+                },
+                PackedRow {
+                    line: 2,
+                    text: String::from("P2_CONT_FULL_20_COLS"),
+                    runs: vec![PackedRun {
+                        col_start: 0,
+                        col_len: 20,
+                        byte_offset: 0,
+                        byte_len: 20,
+                        style_idx: 0,
+                        link_idx: 0,
+                        flags: 0,
+                    }],
+                    styles: vec![],
+                    links: vec![],
+                    pieces: vec![],
+                    flags: 0, // full 20-col row WITHOUT FLAG_WRAPPED -> must hard-break (NOT soft-wrap)!
+                },
+                PackedRow {
+                    line: 3,
+                    text: String::from("P3_HARD"),
+                    runs: vec![],
+                    styles: vec![],
+                    links: vec![],
+                    pieces: vec![],
+                    flags: 0,
+                },
+            ],
+            alt_rows: vec![
+                PackedRow {
+                    line: 0,
+                    text: String::from("\x1b[?1049lALT0"),
+                    runs: vec![],
+                    styles: vec![],
+                    links: vec![],
+                    pieces: vec![],
+                    flags: 0,
+                },
+                PackedRow {
+                    line: 1,
+                    text: String::from("ALT1"),
+                    runs: vec![],
+                    styles: vec![],
+                    links: vec![],
+                    pieces: vec![],
+                    flags: 0,
+                },
+                PackedRow {
+                    line: 2,
+                    text: String::new(),
+                    runs: vec![],
+                    styles: vec![],
+                    links: vec![],
+                    pieces: vec![],
+                    flags: 0,
+                },
+                // Bottom alt row (row 3 of 4-row grid) with wide chars + overlong run must NOT wrap/scroll ALT0 off!
+                PackedRow {
+                    line: 3,
+                    text: "中".repeat(20),
+                    runs: vec![PackedRun {
+                        col_start: 0,
+                        col_len: 1,
+                        byte_offset: 0,
+                        byte_len: ("中".repeat(20)).len() as u32,
+                        style_idx: 0,
+                        link_idx: 0,
+                        flags: 0,
+                    }],
+                    styles: vec![],
+                    links: vec![],
+                    pieces: vec![],
+                    flags: 0,
+                },
+            ],
+            images: vec![],
+            marks_key: None,
+            marks_last_seq: 0,
+            marks_refused: 0,
+            commands: vec![],
+        };
+        let slice = SeekSlice {
+            segment_id: 1,
+            keyframe_at_ms: 0,
+            keyframe: KeyframeV2 { visual, engine: None },
+            tail_records: vec![],
+        };
+        let store = Arc::new(Mutex::new(ImageStore::default()));
+        let mut eng = crate::shard::replay::build_keyframe_engine(&slice, &[0u8; 32], &store, 100).unwrap();
+        assert!(eng.at_ground(), "sanitized visual fallback must end cleanly at ground state");
+        assert!(eng.meta().modes.alt_screen, "hostile \\x1b[?1049l in row text must NOT exit alt screen");
+        assert_eq!((eng.meta().cursor.row, eng.meta().cursor.col), (2, 3));
+        let mut alt_out = Vec::new();
+        eng.extract_viewport_rows(&[0, 1], &mut alt_out);
+        assert!(alt_out[0].text.contains("ALT0") && alt_out[1].text.contains("ALT1"));
+        // Switch back to primary screen to verify col_start indentation + non-collapsed P1_NEXT row!
+        let mut ev_pri = Vec::new();
+        eng.feed(b"\x1b[?1049l", &mut ev_pri);
+        let mut pri_out = Vec::new();
+        eng.extract_viewport_rows(&[0, 1, 2, 3], &mut pri_out);
+        assert_eq!(
+            eng.text_of(
+                apack_proto::types::CellSpan {
+                    start: apack_proto::types::CellPos { line: 0, col: 2 },
+                    end: apack_proto::types::CellPos { line: 0, col: 11 },
+                },
+                64
+            ),
+            "]HOSTILEP0",
+            "col_start indentation must place text at exact column 2"
+        );
+        assert_eq!(pri_out[0].flags & PackedRow::FLAG_WRAPPED, 0, "truncated FLAG_WRAPPED must NOT soft-wrap row 0");
+        assert!(pri_out[1].text.contains("01234567890123456789"));
+        assert_ne!(pri_out[1].flags & PackedRow::FLAG_WRAPPED, 0, "full-width FLAG_WRAPPED row must soft-wrap");
+        assert!(pri_out[2].text.contains("P2_CONT"));
+        assert_eq!(pri_out[2].flags & PackedRow::FLAG_WRAPPED, 0);
+        assert!(pri_out[3].text.contains("P3_HARD"));
+
+        // Direct unit check on `split_st_ground_chunk` (both leading ST and mid-chunk ST + no-ST).
+        assert_eq!(
+            crate::shard::images::split_st_ground_chunk(b"\x1b\\\x1b_Gm=0;AA=="),
+            Some((&b"\x1b\\"[..], &b"\x1b_Gm=0;AA=="[..]))
+        );
+        assert_eq!(
+            crate::shard::images::split_st_ground_chunk(b"Ga=t\x1b\\\x1b_Grest"),
+            Some((&b"Ga=t\x1b\\"[..], &b"\x1b_Grest"[..]))
+        );
+        assert_eq!(crate::shard::images::split_st_ground_chunk(b"no-terminator"), None);
+
+        // Adversarial `reconstruct_visual_row` bounds: unclamped `col_start = u16::MAX`, overlapping/OOB runs,
+        // multiplicative run-slice amplification, control-char column suppression, and runs-empty `cols` + byte budget!
+        let hostile_amplified = PackedRow {
+            line: 0,
+            text: "A".repeat(32),
+            runs: vec![
+                // Valid run at col 1 (len 4) -> " AAAA" (5 bytes, cur_col = 5)
+                PackedRun {
+                    col_start: 1,
+                    col_len: 4,
+                    byte_offset: 0,
+                    byte_len: 4,
+                    style_idx: 0,
+                    link_idx: 0,
+                    flags: 0,
+                },
+                // Overlapping/out-of-order run (col_start 3 < cur_col 5) -> MUST be skipped!
+                PackedRun {
+                    col_start: 3,
+                    col_len: 4,
+                    byte_offset: 0,
+                    byte_len: 4,
+                    style_idx: 0,
+                    link_idx: 0,
+                    flags: 0,
+                },
+                // Unclamped col_start = u16::MAX (>= cols=10) -> MUST be skipped!
+                PackedRun {
+                    col_start: u16::MAX,
+                    col_len: 4,
+                    byte_offset: 0,
+                    byte_len: 4,
+                    style_idx: 0,
+                    link_idx: 0,
+                    flags: 0,
+                },
+                // Out-of-bounds byte slice -> MUST be skipped!
+                PackedRun {
+                    col_start: 6,
+                    col_len: 2,
+                    byte_offset: 99,
+                    byte_len: 4,
+                    style_idx: 0,
+                    link_idx: 0,
+                    flags: 0,
+                },
+                // Valid run hitting exact `max_bytes = 8` budget during padding/text -> stops cleanly at <= 8 bytes!
+                PackedRun {
+                    col_start: 6,
+                    col_len: 4,
+                    byte_offset: 0,
+                    byte_len: 4,
+                    style_idx: 0,
+                    link_idx: 0,
+                    flags: 0,
+                },
+            ],
+            styles: vec![],
+            links: vec![],
+            pieces: vec![],
+            flags: 0,
+        };
+        let (out_cap, end_col_cap) = crate::shard::replay::reconstruct_visual_row(&hostile_amplified, 10, 8);
+        assert_eq!(out_cap, " AAAA AA");
+        assert!(out_cap.len() <= 8);
+        assert_eq!(end_col_cap, 6);
+        // Padding itself exceeding `max_bytes` breaks cleanly without exceeding budget:
+        let pad_overflow = PackedRow {
+            line: 0,
+            text: String::from("Z"),
+            runs: vec![PackedRun {
+                col_start: 9,
+                col_len: 1,
+                byte_offset: 0,
+                byte_len: 1,
+                style_idx: 0,
+                link_idx: 0,
+                flags: 0,
+            }],
+            styles: vec![],
+            links: vec![],
+            pieces: vec![],
+            flags: 0,
+        };
+        assert_eq!(crate::shard::replay::reconstruct_visual_row(&pad_overflow, 10, 4), (String::new(), 0));
+        // Exact padding fit (`pad == max_bytes`) succeeds (kills `>` -> `>=`):
+        let pad_exact = PackedRow {
+            line: 0,
+            text: String::new(),
+            runs: vec![PackedRun {
+                col_start: 4,
+                col_len: 0,
+                byte_offset: 0,
+                byte_len: 0,
+                style_idx: 0,
+                link_idx: 0,
+                flags: 0,
+            }],
+            styles: vec![],
+            links: vec![],
+            pieces: vec![],
+            flags: 0,
+        };
+        assert_eq!(crate::shard::replay::reconstruct_visual_row(&pad_exact, 10, 4), (String::from("    "), 4));
+        // Control chars stripped inside a run still advance `cur_col` (rejecting overlapping runs & aligning
+        // subsequent padding) while returning `end_col == 0` so wrap suppression never misfires, AND total
+        // scanned control bytes count toward `max_bytes` (defeating control-only CPU amplification DoS)!
+        let ctrl_multi_row = PackedRow {
+            line: 0,
+            text: String::from("ab\x07cdXYZ"),
+            runs: vec![
+                // Run 0 at col 0, len 5 -> emits "abcd", advances cur_col to 5!
+                PackedRun {
+                    col_start: 0,
+                    col_len: 5,
+                    byte_offset: 0,
+                    byte_len: 5,
+                    style_idx: 0,
+                    link_idx: 0,
+                    flags: 0,
+                },
+                // Overlapping run at col 0 (< cur_col 5) -> MUST be skipped!
+                PackedRun {
+                    col_start: 0,
+                    col_len: 5,
+                    byte_offset: 0,
+                    byte_len: 5,
+                    style_idx: 0,
+                    link_idx: 0,
+                    flags: 0,
+                },
+                // Run 2 at col 5 (== cur_col 5) -> NO spurious 5-space padding, emits "XYZ"!
+                PackedRun {
+                    col_start: 5,
+                    col_len: 3,
+                    byte_offset: 5,
+                    byte_len: 3,
+                    style_idx: 0,
+                    link_idx: 0,
+                    flags: 0,
+                },
+            ],
+            styles: vec![],
+            links: vec![],
+            pieces: vec![],
+            flags: 0,
+        };
+        assert_eq!(crate::shard::replay::reconstruct_visual_row(&ctrl_multi_row, 10, 64), (String::from("abcdXYZ"), 0));
+        // Control-only slices count against `max_bytes`, stopping before trailing run past budget:
+        let ctrl_budget_row = PackedRow {
+            line: 0,
+            text: String::from("\x00\x00\x00\x00\x00OK"),
+            runs: vec![
+                PackedRun {
+                    col_start: 0,
+                    col_len: 1,
+                    byte_offset: 0,
+                    byte_len: 5,
+                    style_idx: 0,
+                    link_idx: 0,
+                    flags: 0,
+                },
+                PackedRun {
+                    col_start: 1,
+                    col_len: 2,
+                    byte_offset: 5,
+                    byte_len: 2,
+                    style_idx: 0,
+                    link_idx: 0,
+                    flags: 0,
+                },
+            ],
+            styles: vec![],
+            links: vec![],
+            pieces: vec![],
+            flags: 0,
+        };
+        assert_eq!(crate::shard::replay::reconstruct_visual_row(&ctrl_budget_row, 10, 4), (String::new(), 0));
+        // Runs-empty row truncated strictly to `cols` AND scanned `max_bytes` (including control bytes!):
+        let long_plain = PackedRow {
+            line: 0,
+            text: "é".repeat(20), // 2 bytes per char
+            runs: vec![],
+            styles: vec![],
+            links: vec![],
+            pieces: vec![],
+            flags: 0,
+        };
+        assert_eq!(crate::shard::replay::reconstruct_visual_row(&long_plain, 5, 64).0.chars().count(), 5);
+        assert_eq!(crate::shard::replay::reconstruct_visual_row(&long_plain, 20, 4).0.len(), 4);
+        assert_eq!(crate::shard::replay::reconstruct_visual_row(&long_plain, 20, 5).0.len(), 4);
+        let plain_ctrl_budget = PackedRow {
+            line: 0,
+            text: String::from("\x00\x00\x00\x00\x00OK"),
+            runs: vec![],
+            styles: vec![],
+            links: vec![],
+            pieces: vec![],
+            flags: 0,
+        };
+        assert_eq!(crate::shard::replay::reconstruct_visual_row(&plain_ctrl_budget, 20, 4).0, "");
+        assert_eq!(crate::shard::replay::reconstruct_visual_row(&plain_ctrl_budget, 20, 7).0, "OK");
+
+        // 2. Virtual `U=1` Kitty image persisted via `active_image_blobs` even after `ImageStore` eviction (`H2` + `H3`),
+        //    WAL retry leaves `wal_images_gen` unlatched when `write_blob` fails, and `hydrate_slice_blobs` loads it!
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("virt-wal");
+        let (mut runner, _rrx) = make_test_runner();
+        let sid = SessionId::new(42).unwrap();
+        insert_image_session(&mut runner, sid, true);
+        {
+            let sess = runner.sessions.get_mut(&sid).unwrap();
+            let writer = WalWriter::open_or_create(
+                &wal_dir,
+                [0x42; 16],
+                1_000,
+                WalConfig { max_non_ground_bytes: 8_192, ..WalConfig::default() },
+                runner.shared.wal_registry.clone(),
+            )
+            .unwrap();
+            let kf = crate::shard::replay::capture_keyframe(&sess.machine, &runner.shared.engine_abi_hash);
+            let wal = WalWorker::spawn(writer);
+            assert!(wal.start_segment(1_000, kf));
+            sess.wal = Some(wal);
+        }
+        let virt_png = apack_vt_ghostty::encode_png_rgba(2, 2, &[77u8; 16]).unwrap();
+        let virt_b64 = String::from_utf8(apack_os::image_sources::encoded(&virt_png)).unwrap();
+        let virt_seq = format!(
+            "\x1b_Ga=T,U=1,f=100,i=21,p=1,c=1,r=1,q=2;{virt_b64}\x1b\\\x1b[38;2;0;0;21;58;2;0;0;1m\u{10EEEE}\x1b[0m"
+        );
+        {
+            let sess = runner.sessions.get_mut(&sid).unwrap();
+            let mut evs = Vec::new();
+            sess.machine.vt_mut().feed(virt_seq.as_bytes(), &mut evs);
+            let blobs = sess.machine.vt().active_image_blobs();
+            assert_eq!(blobs.len(), 1, "active_image_blobs must include virtual U=1 images");
+            *runner.shared.image_store.lock().unwrap() = ImageStore::default();
+            assert!(runner.shared.image_store.lock().unwrap().get_blob(blobs[0]).is_none());
+            crate::shard::replay::sync_wal_image_blobs(sess, &runner.shared.image_store);
+            assert!(sess.wal_written_blobs.contains(&blobs[0]));
+            assert_eq!(sess.wal_images_gen, sess.machine.vt().generations().images);
+            let kf2 = crate::shard::replay::capture_keyframe(&sess.machine, &runner.shared.engine_abi_hash);
+            assert!(kf2.referenced_blobs().contains(&blobs[0]), "keyframe referenced_blobs must include virtual piece");
+            if let Some(wal) = sess.wal.take() {
+                let _ = wal.seal();
+                let _ = wal.shutdown();
+            }
+            let reader = WalReader::open(&wal_dir, &runner.shared.wal_registry).unwrap();
+            let fresh_store = Arc::new(Mutex::new(ImageStore::default()));
+            let fake_slice = SeekSlice { segment_id: 1, keyframe_at_ms: 1_000, keyframe: kf2, tail_records: vec![] };
+            crate::shard::replay::hydrate_slice_blobs(&reader, &fake_slice, &fresh_store);
+            assert!(
+                fresh_store.lock().unwrap().get_blob(blobs[0]).is_some(),
+                "hydrate_slice_blobs must hydrate virtual U=1 blobs from <dir>/blobs/"
+            );
+        }
+
+        // 3. Multi-chunk `t=f` image exceeding `max_non_ground_bytes` (1.5 MiB) writes without
+        //    `NonGroundCap` AND never leaks the host file path into WAL (`H4`)!
+        let tf_wal_dir = dir.path().join("tf-wal");
+        let secret_file = dir.path().join("SUPER_SECRET_HOST_PATH_PR5.raw");
+        // 1.6 MiB raw RGBA (800x512x4) -> 3 chunks (~2.18 MiB base64 > 1.5 MiB max_non_ground_bytes!).
+        let big_rgba = vec![0x5Au8; 800 * 512 * 4];
+        std::fs::write(&secret_file, &big_rgba).unwrap();
+        let sid_tf = SessionId::new(43).unwrap();
+        insert_image_session(&mut runner, sid_tf, true);
+        {
+            let sess = runner.sessions.get_mut(&sid_tf).unwrap();
+            let writer = WalWriter::open_or_create(
+                &tf_wal_dir,
+                [0x43; 16],
+                1_000,
+                WalConfig { max_non_ground_bytes: 1_500_000, ..WalConfig::default() },
+                runner.shared.wal_registry.clone(),
+            )
+            .unwrap();
+            let kf = crate::shard::replay::capture_keyframe(&sess.machine, &runner.shared.engine_abi_hash);
+            let wal = WalWorker::spawn(writer);
+            assert!(wal.start_segment(1_000, kf));
+            sess.wal = Some(wal);
+        }
+        let secret_b64 =
+            String::from_utf8(apack_os::image_sources::encoded(secret_file.as_os_str().as_encoded_bytes())).unwrap();
+        let tf_apc = format!("\x1b_Ga=T,f=32,s=800,v=512,i=30,t=f,q=2;{secret_b64}\x1b\\AFTER_TF");
+        runner.ingest_pty_bytes(sid_tf, tf_apc.as_bytes());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            runner.drain_mailbox();
+            if runner.sessions[&sid_tf].pending_image.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(runner.sessions[&sid_tf].pending_image.is_none());
+        assert_eq!(runner.sessions[&sid_tf].machine.vt().images().len(), 1);
+        if let Some(wal) = runner.sessions.get_mut(&sid_tf).unwrap().wal.take() {
+            let _ = wal.seal();
+            let _ = wal.shutdown();
+        }
+        let tf_reader = WalReader::open(&tf_wal_dir, &runner.shared.wal_registry).unwrap();
+        let tf_slice = tf_reader.latest_segment_records().unwrap().unwrap();
+        assert!(
+            !tf_slice.tail_records.iter().any(|r| matches!(r.record, WalRecord::Gap { .. })),
+            "multi-chunk t=f exceeding max_non_ground_bytes must NOT trigger NonGroundCap Gap!"
+        );
+        let all_wal_out: Vec<u8> = tf_slice
+            .tail_records
+            .iter()
+            .filter_map(|r| match &r.record {
+                WalRecord::Output(b) => Some(b.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect();
+        let all_wal_str = String::from_utf8_lossy(&all_wal_out);
+        assert!(
+            !all_wal_str.contains(&secret_b64) && !all_wal_str.contains("SUPER_SECRET_HOST_PATH_PR5"),
+            "WAL must NEVER leak raw intercepted t=f host paths"
+        );
     }
 }

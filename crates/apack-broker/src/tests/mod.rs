@@ -39,8 +39,9 @@ use crate::runtime::BrokerServer;
 #[cfg(unix)]
 use crate::shard::drain_unix_pty_nonblocking;
 use crate::shard::{
-    ReactorEvent, ShardCmd, ShardShared, apply_seek_slice, argv_matches_app, capture_keyframe, maybe_compress_idle,
-    parse_exit_status, resolve_scrollback_lines, shard_session_wait_timeout, should_forward_probe_reply, spawn_shard,
+    ReactorEvent, ShardCmd, ShardShared, build_keyframe_engine, capture_keyframe, hydrate_slice_blobs,
+    maybe_compress_idle, parse_exit_status, resolve_scrollback_lines, restore_machine_from_slice,
+    shard_session_wait_timeout, should_forward_probe_reply, spawn_shard,
 };
 #[cfg(unix)]
 use crate::transport_loop::{

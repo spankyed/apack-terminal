@@ -1688,4 +1688,41 @@ fn vt_ghostty_seams_placement_geometry_bounded_batch_ffi_guard_poison_and_sealed
     // 6. Empty OSC 52 clipboard write (`contents_len == 0` / empty payload) does not panic/UB.
     ev.clear();
     p_vt.feed(b"\x1b]52;c;\x07", &mut ev);
+
+    // 7. ImageStore::get_blob (including LRU recency refresh!) & GhosttyEngine::ensure_min_epoch coverage.
+    let b1_raw = crate::encode_png_rgba(2, 2, &[10u8; 16]).unwrap();
+    let b2_raw = crate::encode_png_rgba(2, 2, &[20u8; 16]).unwrap();
+    let b3_raw = crate::encode_png_rgba(2, 2, &[30u8; 16]).unwrap();
+    let cap = b1_raw.len() + b2_raw.len();
+    let mut store = ImageStore::new(cap);
+    let h1 = store.insert_encoded(ImageEncoding::Png, b1_raw.clone()).expect("insert h1");
+    let h2 = store.insert_encoded(ImageEncoding::Png, b2_raw).expect("insert h2");
+    // Touch h1, then touch h2 via get_blob: h2 is most-recent ONLY if each get_blob strictly advances `clock`!
+    let (enc, blob_bytes) = store.get_blob(h1).expect("get_blob h1");
+    assert_eq!(enc, ImageEncoding::Png);
+    assert_eq!(blob_bytes, b1_raw);
+    assert!(store.get_blob(h2).is_some());
+    let _h3 = store.insert_encoded(ImageEncoding::Png, b3_raw).expect("insert h3");
+    assert!(store.get_blob(h2).is_some(), "most recently get_blob-touched h2 must survive LRU eviction");
+    assert!(store.get_blob(h1).is_none(), "older h1 must be evicted before h2");
+    assert!(store.get_blob(apack_proto::types::BlobHash([0xAB; 32])).is_none());
+
+    let e0 = p_vt.meta().epoch;
+    p_vt.ensure_min_epoch(e0);
+    assert_eq!(p_vt.meta().epoch, e0);
+    p_vt.ensure_min_epoch(e0 + 5);
+    assert_eq!(p_vt.meta().epoch, e0 + 5);
+    p_vt.ensure_min_epoch(e0 + 2);
+    assert_eq!(p_vt.meta().epoch, e0 + 5);
+
+    // 8. `GhosttyEngine::active_image_blobs` returns deduplicated live blobs (including duplicates & virtual U=1).
+    let dup_png = crate::encode_png_rgba(1, 1, &[99, 88, 77, 255]).unwrap();
+    let dup_b64 = base64_encode(&dup_png);
+    let mut blob_vt = GhosttyEngine::new(GhosttyConfig::new(grid(20, 6))).unwrap();
+    let mut b_ev = Vec::new();
+    blob_vt.feed(format!("\x1b_Ga=T,f=100,i=51,q=2;{dup_b64}\x1b\\").as_bytes(), &mut b_ev);
+    blob_vt.feed(format!("\x1b_Ga=T,U=1,f=100,i=52,p=1,c=1,r=1,q=2;{dup_b64}\x1b\\").as_bytes(), &mut b_ev);
+    let active_blobs = blob_vt.active_image_blobs();
+    assert_eq!(active_blobs.len(), 1, "identical blobs across direct + virtual images must be deduplicated");
+    assert_eq!(active_blobs[0], crate::image_store::hash_bytes(&dup_png));
 }

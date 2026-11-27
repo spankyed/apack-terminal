@@ -48,6 +48,7 @@ import {
   type SignalKind,
   type SignalScope,
   type SourceSink,
+  type StatusRecord,
   type TerminalSource,
   type ViewportHint,
   type WaitCondition,
@@ -562,6 +563,7 @@ export class TerminalClient {
         initialFrameCredit,
       })
       if (reply.kind !== 'attached') throw new WireError('InvalidTag', `expected attached, got ${reply.kind}`)
+      source.setInitialStatuses(reply.statuses)
       return source
     } catch (err) {
       this.streams.delete(streamId)
@@ -596,6 +598,7 @@ export class BrokerSessionSource implements TerminalSource {
   private visible: boolean
   private everGrantedCredit: boolean
   private disposed = false
+  private _initialStatuses: readonly StatusRecord[] = []
 
   constructor(
     private readonly client: TerminalClient,
@@ -612,6 +615,16 @@ export class BrokerSessionSource implements TerminalSource {
 
   get wordDelimiters(): string {
     return this.client.wordDelimiters
+  }
+
+  /** Active OSC 7501 program status records present on the session at attach time. */
+  get initialStatuses(): readonly StatusRecord[] {
+    return this._initialStatuses
+  }
+
+  /** @internal Populated by `TerminalClient.attachSession` from the `Attached` reply. */
+  setInitialStatuses(statuses: readonly StatusRecord[]): void {
+    this._initialStatuses = statuses
   }
 
   /** Smoothed frame inter-arrival / ack interval estimate in milliseconds. */

@@ -254,6 +254,18 @@ fn all_broker_messages() -> Vec<BrokerMsg> {
             first_active_line: 600,
             scrollback_lines: 500,
             foreground: Some(fg),
+            statuses: vec![StatusRecord {
+                id: String::new(),
+                state: StatusState::Working,
+                kind: None,
+                progress: Some(50),
+                app: Some(String::from("codex")),
+                title: Some(String::from("Indexing")),
+                message: None,
+                changed: 1,
+                since_ms: 1_700_000_000_000,
+                confirmed: Confirmed::Matched,
+            }],
         },
         BrokerMsg::Waited { outcome: WaitOutcome::Met },
         BrokerMsg::Frame(Box::new(FrameUpdate {
@@ -1512,6 +1524,7 @@ fn enum_variant_and_flag_exhaustiveness() {
         first_active_line: 10,
         scrollback_lines: 10,
         foreground: None,
+        statuses: Vec::new(),
     };
     let mut w = Writer::new();
     ok_attached.encode(&mut w);
@@ -1525,6 +1538,7 @@ fn enum_variant_and_flag_exhaustiveness() {
         first_active_line: 10,
         scrollback_lines: 11,
         foreground: None,
+        statuses: Vec::new(),
     };
     let mut w = Writer::new();
     bad_attached.encode(&mut w);

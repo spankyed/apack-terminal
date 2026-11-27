@@ -321,6 +321,10 @@ impl VtEngine for GhosttyEngine {
             unsafe { sys::ghostty_terminal_get(self.handle, sys::TerminalData::MEMORY_USAGE, (&raw mut usage).cast()) };
         if res == sys::Result::SUCCESS { usage.primary_resident_bytes } else { 0 }
     }
+
+    fn ensure_min_epoch(&mut self, min_epoch: u64) {
+        self.epoch = self.epoch.max(min_epoch);
+    }
 }
 
 pub(super) fn apply_cursor_defaults(handle: sys::Terminal, shape: CursorShape, blinking: bool) {
@@ -489,6 +493,18 @@ impl GhosttyEngine {
         }
         // SAFETY: freeing placement iterator once.
         unsafe { sys::ghostty_kitty_graphics_placement_iterator_free(iter) };
+        out
+    }
+
+    /// Returns all content hashes currently cached for live Kitty images (both direct placements
+    /// and virtual `U=1` Unicode placeholder placements).
+    pub fn active_image_blobs(&self) -> Vec<apack_proto::types::BlobHash> {
+        let mut out = Vec::with_capacity(self.image_cache.blobs.len());
+        for &(blob, _, _) in self.image_cache.blobs.values() {
+            if !out.contains(&blob) {
+                out.push(blob);
+            }
+        }
         out
     }
 

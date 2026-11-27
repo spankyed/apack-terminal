@@ -547,4 +547,8 @@ impl VtEngine for MockVt {
     fn scrollback_bytes(&self) -> u64 {
         self.scrollback.iter().map(|s| s.len() as u64).sum()
     }
+
+    fn ensure_min_epoch(&mut self, min_epoch: u64) {
+        self.epoch = self.epoch.max(min_epoch);
+    }
 }

@@ -530,6 +530,18 @@ fn build_broker_vectors() -> Vec<BrokerVector> {
                     pid: SignalTarget::new(4243).unwrap(),
                     name: Some(String::from("zsh")),
                 }),
+                statuses: vec![StatusRecord {
+                    id: String::new(),
+                    state: StatusState::Working,
+                    kind: None,
+                    progress: Some(25),
+                    app: Some(String::from("codex")),
+                    title: Some(String::from("Running")),
+                    message: None,
+                    changed: 1,
+                    since_ms: 1_700_000_000_000,
+                    confirmed: Confirmed::Matched,
+                }],
             },
         },
         BrokerVector {

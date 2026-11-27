@@ -339,16 +339,15 @@ pub enum ShardCmd {
         /// Whether any broker-wide lease is currently active.
         broker_lease_active: bool,
     },
-    /// Foreground-process verification result from the off-shard blocking worker.
+    /// Batched foreground-process verification results from the off-shard blocking worker.
     ForegroundVerified {
         /// Target session ID.
         session_id: SessionId,
-        /// OSC 7501 slot ID.
-        id: String,
-        /// Revision to match.
-        changed: u64,
-        /// Verification verdict.
-        confirmed: Confirmed,
+        /// `(slot_id, revision, verdict)` tuples verified against the same foreground `argv`.
+        results: Vec<(String, u64, Confirmed)>,
+        /// `true` when produced by `fg_worker` (releasing the session's in-flight slot),
+        /// `false` for local fallback completions when `fg_worker` is unavailable.
+        from_worker: bool,
     },
     /// Off-shard Kitty graphics named-source (`t=f` / `t=s`) read completion.
     ImageSourceLoaded {
@@ -475,11 +474,9 @@ pub struct ShardShared {
     pub engine_abi_hash: [u8; 32],
 }
 
-/// Request sent to the shard's off-shard blocking worker to inspect a foreground PID's `argv`.
+/// Batched request sent to the shard's off-shard blocking worker to inspect a foreground PID's `argv`.
 pub(super) struct FgVerifyReq {
     pub(super) session_id: SessionId,
     pub(super) pgid: Option<u32>,
-    pub(super) id: String,
-    pub(super) changed: u64,
-    pub(super) app: String,
+    pub(super) items: Vec<(String, u64, String)>,
 }

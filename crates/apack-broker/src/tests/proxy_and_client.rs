@@ -666,9 +666,9 @@ fn shard_keyframe_seek_fallback_and_exit_status_unit() {
 
     let slice = apack_wal::SeekSlice { segment_id: 1, keyframe_at_ms: 0, keyframe: kf, tail_records: Vec::new() };
 
+    let img_store = std::sync::Arc::new(std::sync::Mutex::new(apack_vt_ghostty::ImageStore::default()));
     // 1. Lossless restore on matching ABI
-    let mut eng_same = GhosttyEngine::new(GhosttyConfig::new(size)).unwrap();
-    apply_seek_slice(&mut eng_same, &slice, &abi);
+    let eng_same = build_keyframe_engine(&slice, &abi, &img_store, 100).unwrap();
     let mut hits = Vec::new();
     let m1 = eng_same.meta();
     eng_same.search_lines(0, m1.first_active_line + u64::from(m1.size.rows.get()), "HIST_LINE_1", true, 16, &mut hits);
@@ -676,8 +676,7 @@ fn shard_keyframe_seek_fallback_and_exit_status_unit() {
 
     // 2. Visual fallback on mismatched ABI: verify exact row separation (no missing or extra leading CRLF!)
     let wrong_abi = [0xEE; 32];
-    let mut eng_fallback = GhosttyEngine::new(GhosttyConfig::new(size)).unwrap();
-    apply_seek_slice(&mut eng_fallback, &slice, &wrong_abi);
+    let eng_fallback = build_keyframe_engine(&slice, &wrong_abi, &img_store, 100).unwrap();
     let m2 = eng_fallback.meta();
     let mut fb_rows = Vec::new();
     eng_fallback.extract_history_rows(0, m2.first_active_line as u32, &mut fb_rows);
@@ -688,6 +687,31 @@ fn shard_keyframe_seek_fallback_and_exit_status_unit() {
     assert_eq!(lines[1], "HIST_LINE_2", "row 1 must be separated by CRLF: {lines:?}");
     assert_eq!(lines[2], "", "blank row 2 must be preserved: {lines:?}");
     assert_eq!(lines[3], "VP_LINE_A", "row 3 must follow blank row: {lines:?}");
+
+    // 3. Alt-screen capture populates `alt_rows` and ABI-mismatch fallback restores alt screen cleanly!
+    let mut alt_eng = GhosttyEngine::new(GhosttyConfig::new(size)).unwrap();
+    let mut alt_evs = Vec::new();
+    alt_eng.feed(b"\x1b[?1049hALT_SCREEN_BODY\x1b[2;5H", &mut alt_evs);
+    assert!(alt_eng.meta().modes.alt_screen);
+    let alt_machine = SessionMachine::new(
+        SessionId::new(2).unwrap(),
+        alt_eng,
+        ResizePolicy::LatestActive,
+        MarksMode::Claimed,
+        cell_px,
+    );
+    let alt_kf = capture_keyframe(&alt_machine, &abi);
+    assert!(alt_kf.visual.active_alt_screen);
+    assert!(alt_kf.visual.alt_rows.iter().any(|r| r.text.contains("ALT_SCREEN_BODY")));
+    let alt_slice =
+        apack_wal::SeekSlice { segment_id: 1, keyframe_at_ms: 0, keyframe: alt_kf, tail_records: Vec::new() };
+    let alt_fallback = build_keyframe_engine(&alt_slice, &wrong_abi, &img_store, 100).unwrap();
+    assert!(alt_fallback.meta().modes.alt_screen, "alt-screen fallback must enter alt screen");
+    assert_eq!(alt_fallback.meta().cursor.row, 1);
+    assert_eq!(alt_fallback.meta().cursor.col, 4);
+    let mut alt_fb_rows = Vec::new();
+    alt_fallback.extract_viewport_rows(&[0], &mut alt_fb_rows);
+    assert!(alt_fb_rows[0].text.contains("ALT_SCREEN_BODY"));
     assert_eq!(lines[4], "VP_LINE_B", "row 4 must follow row 3: {lines:?}");
     assert_eq!(lines[5], "VP_LINE_C", "row 5 must follow row 4: {lines:?}");
 }

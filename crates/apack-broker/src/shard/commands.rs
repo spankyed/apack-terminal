@@ -1,4 +1,4 @@
-//! Session creation, rewind/seek, kill/signal/owns, stream attachment, and WAL keyframe helpers.
+//! Session creation, rewind/seek, kill/signal/owns, and stream attachment commands.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -20,18 +20,19 @@ use apack_os::pty_windows::ConPtyBridge;
 use apack_os::signal::deliver_signal;
 use apack_proto::messages::{BrokerMsg, SpawnSpec};
 use apack_proto::types::{
-    ErrorCode, NonZeroStreamId, RequestId, ResizePolicy, SessionId, SignalKind, SignalScope, SignalTarget, StreamId,
-    SubFlags, ViewportHint,
+    ErrorCode, NonZeroStreamId, RequestId, SessionId, SignalKind, SignalScope, SignalTarget, StreamId, SubFlags,
+    ViewportHint,
 };
 use apack_vt_ghostty::{GhosttyConfig, GhosttyEngine};
-use apack_wal::{
-    EngineCheckpoint, KeyframeV2, MAX_ENGINE_SNAPSHOT_BYTES, MAX_KEYFRAME_HISTORY_ROWS, RecordingRegistry,
-    VisualKeyframe, WalReader, WalRecord, WalWorker, WalWriter,
-};
+use apack_wal::{WalReader, WalWorker, WalWriter};
 
 use crate::config::AUTH_KEY_ENV;
 use crate::{fill_random, now_unix_ms};
 
+use super::replay::{
+    build_keyframe_engine, build_machine_from_slice, capture_keyframe, hydrate_slice_blobs, restore_machine_from_dir,
+    restore_machine_from_slice, sync_wal_image_blobs,
+};
 use super::{DEFAULT_SCROLLBACK_LINES, LivePty, LiveSession, ReactorEvent, ShardRunner};
 
 impl ShardRunner {
@@ -47,7 +48,7 @@ impl ShardRunner {
         vt_cfg.scrollback_lines = scrollback_lines;
         vt_cfg.image_store = Some(Arc::clone(&self.shared.image_store));
 
-        let mut engine = match GhosttyEngine::new(vt_cfg) {
+        let engine = match GhosttyEngine::new(vt_cfg) {
             Ok(e) => e,
             Err(err) => {
                 self.emit(ReactorEvent::SpawnOrRewindFailed);
@@ -56,23 +57,29 @@ impl ShardRunner {
             }
         };
 
-        // Optional dual-layer restoration BEFORE spawning the live shell.
-        if let Some(restore_dir) = &spec.restore_from {
-            if let Err(err) = restore_engine_from_dir(
-                &mut engine,
+        let marks_mode = match spec.marks_key {
+            Some(key) => MarksMode::Keyed(key),
+            None => MarksMode::Claimed,
+        };
+        let mut machine = SessionMachine::new(session_id, engine, spec.resize_policy, marks_mode, spec.cell_px);
+
+        // Optional dual-layer restoration through `SessionMachine::restore_from_replay` BEFORE spawning the live shell.
+        if let Some(restore_dir) = &spec.restore_from
+            && let Err(err) = restore_machine_from_dir(
+                &mut machine,
                 Path::new(restore_dir),
                 &self.shared.wal_registry,
                 &self.shared.engine_abi_hash,
-            ) {
-                self.emit(ReactorEvent::SpawnOrRewindFailed);
-                self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Pty, &format!("restore failed: {err}"));
-                return;
-            }
-            // Align restored VT geometry with the live PTY dimensions requested by the caller.
-            if engine.meta().size != spec.size {
-                let mut evs = Vec::new();
-                engine.resize(spec.size, spec.cell_px, &mut evs);
-            }
+                &self.shared.image_store,
+                scrollback_lines,
+                spec.marks_key,
+                spec.size,
+                spec.cell_px,
+            )
+        {
+            self.emit(ReactorEvent::SpawnOrRewindFailed);
+            self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Pty, &format!("restore failed: {err}"));
+            return;
         }
 
         // Optional segmented WAL recording setup.
@@ -134,18 +141,6 @@ impl ShardRunner {
             }
         };
 
-        let marks_mode = match spec.marks_key {
-            Some(key) => MarksMode::Keyed(key),
-            None => MarksMode::Claimed,
-        };
-        let machine = SessionMachine::new(session_id, engine, spec.resize_policy, marks_mode, spec.cell_px);
-
-        // Capture initial KeyframeV2 as record 0 if recording is enabled.
-        if let Some(handle) = &wal {
-            let kf = capture_keyframe(&machine, &self.shared.engine_abi_hash);
-            let _ = handle.start_segment(created_ms, kf);
-        }
-
         // Register PTY with shard multiplexer; kill & reap child if registration fails.
         #[cfg(unix)]
         let live_pty: Result<LivePty, (ErrorCode, String)> = {
@@ -192,40 +187,50 @@ impl ShardRunner {
         } else {
             (None, None)
         };
-        self.sessions.insert(
-            session_id,
-            LiveSession {
-                machine,
-                pty: Some(live_pty),
-                child: Some(spawned.child),
-                killer: Some(spawned.killer),
-                tree: spawned.tree,
-                pid: pid_target,
-                kept,
-                rewound: false,
-                created_ms,
-                wal,
-                pending_wal_rollover: false,
-                rewind_reader: None,
-                rewind_at_ms: 0,
-                last_activity: Instant::now(),
-                compressed_idle: false,
-                paused_by_stream: false,
-                paused_by_raw_flow: false,
-                paused_by_raw_inflight: false,
-                raw_output_inflight: Arc::new(AtomicUsize::new(0)),
-                terminating_since: None,
-                escalated_sigkill: false,
-                view_slot_free: HashSet::new(),
-                raw_output_subs: HashSet::new(),
-                image_scanner,
-                image_worker,
-                image_ticket: 0,
-                pending_image: None,
-                pending_image_tail: Vec::new(),
-                reaped_exit: None,
-            },
-        );
+        let mut live_sess = LiveSession {
+            machine,
+            pty: Some(live_pty),
+            child: Some(spawned.child),
+            killer: Some(spawned.killer),
+            tree: spawned.tree,
+            pid: pid_target,
+            kept,
+            rewound: false,
+            created_ms,
+            wal,
+            pending_wal_rollover: false,
+            wal_images_gen: 0,
+            wal_written_blobs: HashSet::new(),
+            rewind_reader: None,
+            rewind_at_ms: 0,
+            last_activity: Instant::now(),
+            compressed_idle: false,
+            paused_by_stream: false,
+            paused_by_raw_flow: false,
+            paused_by_raw_inflight: false,
+            raw_output_inflight: Arc::new(AtomicUsize::new(0)),
+            terminating_since: None,
+            escalated_sigkill: false,
+            view_slot_free: HashSet::new(),
+            raw_output_subs: HashSet::new(),
+            image_scanner,
+            image_worker,
+            image_ticket: 0,
+            pending_image: None,
+            pending_image_tail: Vec::new(),
+            reaped_exit: None,
+        };
+
+        // Persist any restored image blobs BEFORE capturing initial KeyframeV2 as record 0.
+        if live_sess.wal.is_some() {
+            sync_wal_image_blobs(&mut live_sess, &self.shared.image_store);
+            if let Some(handle) = &live_sess.wal {
+                let kf = capture_keyframe(&live_sess.machine, &self.shared.engine_abi_hash);
+                let _ = handle.start_segment(created_ms, kf);
+            }
+        }
+
+        self.sessions.insert(session_id, live_sess);
         self.load.store(self.sessions.len(), Ordering::Relaxed);
 
         self.emit(ReactorEvent::SessionRegistered {
@@ -287,10 +292,14 @@ impl ShardRunner {
             }
         };
 
-        let mut vt_cfg = GhosttyConfig::new(slice.keyframe.visual.size);
-        vt_cfg.cell_px = slice.keyframe.visual.cell_px;
-        vt_cfg.image_store = Some(Arc::clone(&self.shared.image_store));
-        let mut engine = match GhosttyEngine::new(vt_cfg) {
+        hydrate_slice_blobs(&reader, &slice, &self.shared.image_store);
+
+        let fresh_engine = match build_keyframe_engine(
+            &slice,
+            &self.shared.engine_abi_hash,
+            &self.shared.image_store,
+            DEFAULT_SCROLLBACK_LINES,
+        ) {
             Ok(e) => e,
             Err(err) => {
                 self.emit(ReactorEvent::SpawnOrRewindFailed);
@@ -299,14 +308,7 @@ impl ShardRunner {
             }
         };
 
-        let effective_cell_px = apply_seek_slice(&mut engine, &slice, &self.shared.engine_abi_hash);
-        let machine = SessionMachine::new(
-            session_id,
-            engine,
-            ResizePolicy::ExplicitOverride,
-            MarksMode::Claimed,
-            effective_cell_px,
-        );
+        let machine = build_machine_from_slice(session_id, fresh_engine, &slice);
         let actual_offset_ms = target_ms.saturating_sub(first_ms);
 
         self.sessions.insert(
@@ -323,6 +325,8 @@ impl ShardRunner {
                 created_ms: reader.meta().created_ms,
                 wal: None,
                 pending_wal_rollover: false,
+                wal_images_gen: 0,
+                wal_written_blobs: HashSet::new(),
                 rewind_reader: Some(reader),
                 rewind_at_ms: actual_offset_ms,
                 last_activity: Instant::now(),
@@ -362,54 +366,59 @@ impl ShardRunner {
     }
 
     pub(super) fn handle_seek(&mut self, session_id: SessionId, conn: ConnId, req_id: RequestId, at_ms: u64) {
-        let Some(sess) = self.sessions.get_mut(&session_id) else {
-            self.send_no_such_session(conn, req_id);
-            return;
-        };
-        let Some(reader) = &sess.rewind_reader else {
-            self.send_error(
-                conn,
-                StreamId::CONTROL,
-                req_id,
-                ErrorCode::Malformed,
-                "session is not a rewound recording",
-            );
-            return;
-        };
-        let Some((first_ms, last_ms)) = reader.span() else {
-            self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Malformed, "recording is empty");
-            return;
-        };
-        let target_ms = first_ms.saturating_add(at_ms).min(last_ms);
-        let slice = match reader.records_for_moment(target_ms) {
-            Ok(Some(s)) => s,
-            Ok(None) => {
-                self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Malformed, "seek target missing");
+        let mut effects = Vec::new();
+        let actual_offset_ms = {
+            let Some(sess) = self.sessions.get_mut(&session_id) else {
+                self.send_no_such_session(conn, req_id);
                 return;
-            }
-            Err(err) => {
-                self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Pty, &format!("seek failed: {err}"));
+            };
+            let Some(reader) = &sess.rewind_reader else {
+                self.send_error(
+                    conn,
+                    StreamId::CONTROL,
+                    req_id,
+                    ErrorCode::Malformed,
+                    "session is not a rewound recording",
+                );
                 return;
-            }
-        };
+            };
+            let Some((first_ms, last_ms)) = reader.span() else {
+                self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Malformed, "recording is empty");
+                return;
+            };
+            let target_ms = first_ms.saturating_add(at_ms).min(last_ms);
+            let slice = match reader.records_for_moment(target_ms) {
+                Ok(Some(s)) => s,
+                Ok(None) => {
+                    self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Malformed, "seek target missing");
+                    return;
+                }
+                Err(err) => {
+                    self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Pty, &format!("seek failed: {err}"));
+                    return;
+                }
+            };
 
-        // Construct a clean VT engine on seek so ABI-mismatch fallback never appends onto old seek rows!
-        let mut vt_cfg = GhosttyConfig::new(slice.keyframe.visual.size);
-        vt_cfg.cell_px = slice.keyframe.visual.cell_px;
-        vt_cfg.image_store = Some(Arc::clone(&self.shared.image_store));
-        let mut fresh_engine = match GhosttyEngine::new(vt_cfg) {
-            Ok(e) => e,
-            Err(err) => {
-                self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Pty, &err.to_string());
-                return;
-            }
+            hydrate_slice_blobs(reader, &slice, &self.shared.image_store);
+
+            let fresh_engine = match build_keyframe_engine(
+                &slice,
+                &self.shared.engine_abi_hash,
+                &self.shared.image_store,
+                DEFAULT_SCROLLBACK_LINES,
+            ) {
+                Ok(e) => e,
+                Err(err) => {
+                    self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Pty, &err.to_string());
+                    return;
+                }
+            };
+
+            restore_machine_from_slice(&mut sess.machine, fresh_engine, &slice, None, true, &mut effects);
+            let actual = target_ms.saturating_sub(first_ms);
+            sess.rewind_at_ms = actual;
+            actual
         };
-        let effective_cell_px = apply_seek_slice(&mut fresh_engine, &slice, &self.shared.engine_abi_hash);
-        *sess.machine.vt_mut() = fresh_engine;
-        sess.machine.sync_vt_geometry(effective_cell_px);
-        sess.machine.mark_all_views_full_sync();
-        let actual_offset_ms = target_ms.saturating_sub(first_ms);
-        sess.rewind_at_ms = actual_offset_ms;
 
         self.emit(ReactorEvent::SendMsg {
             conn,
@@ -419,7 +428,7 @@ impl ShardRunner {
             priority: OutboundPriority::Control,
             msg: BrokerMsg::Sought { at_ms: actual_offset_ms },
         });
-        self.try_publish_dirty_views(session_id);
+        self.apply_effects(session_id, effects);
     }
 
     pub(super) fn handle_kill(&mut self, session_id: SessionId, conn: ConnId, req_id: RequestId) {
@@ -516,6 +525,7 @@ impl ShardRunner {
                 first_active_line: meta.first_active_line,
                 scrollback_lines: meta.scrollback_lines,
                 foreground,
+                statuses: sess.machine.active_statuses(),
             }
         };
         self.emit(ReactorEvent::SendMsg {
@@ -533,95 +543,4 @@ impl ShardRunner {
 /// Resolves `SpawnSpec::scrollback_limit` (`0` selects [`DEFAULT_SCROLLBACK_LINES`]).
 pub(crate) fn resolve_scrollback_lines(limit: u32) -> usize {
     if limit == 0 { DEFAULT_SCROLLBACK_LINES } else { limit as usize }
-}
-
-/// Captures a dual-layer [`KeyframeV2`] (broker-owned [`VisualKeyframe`] + ABI-hashed Ghostty snapshot).
-pub(crate) fn capture_keyframe(machine: &SessionMachine<GhosttyEngine>, abi_hash: &[u8; 32]) -> KeyframeV2 {
-    let vt = machine.vt();
-    let meta = vt.meta();
-    let mut primary_rows = Vec::new();
-    let hist_take = meta.scrollback_lines.min(MAX_KEYFRAME_HISTORY_ROWS as u64);
-    if hist_take != 0 {
-        let from_line = meta.first_active_line.saturating_sub(hist_take);
-        vt.extract_history_rows(from_line, hist_take as u32, &mut primary_rows);
-    }
-    let vp_indices: Vec<u16> = (0..meta.size.rows.get()).collect();
-    vt.extract_viewport_rows(&vp_indices, &mut primary_rows);
-
-    let visual = VisualKeyframe {
-        size: meta.size,
-        cell_px: machine.current_cell_px(),
-        active_alt_screen: meta.modes.alt_screen,
-        cursor: meta.cursor,
-        modes: meta.modes,
-        palette: vt.palette_overrides(),
-        primary_rows,
-        alt_rows: Vec::new(),
-        images: vt.images(),
-        marks_key: machine.marks_key(),
-        marks_last_seq: machine.marks_last_seq(),
-        marks_refused: machine.marks_refused(),
-        commands: machine.commands(),
-    };
-
-    let engine = vt
-        .export_snapshot(MAX_ENGINE_SNAPSHOT_BYTES)
-        .ok()
-        .map(|snapshot_bytes| EngineCheckpoint { engine_abi_hash: *abi_hash, snapshot_bytes });
-
-    KeyframeV2 { visual, engine }
-}
-
-fn restore_engine_from_dir(
-    engine: &mut GhosttyEngine,
-    dir: &Path,
-    registry: &RecordingRegistry,
-    abi_hash: &[u8; 32],
-) -> Result<(), apack_wal::WalError> {
-    let reader = WalReader::open(dir, registry)?;
-    let Some(slice) = reader.latest_segment_records()? else {
-        return Ok(());
-    };
-    apply_seek_slice(engine, &slice, abi_hash);
-    Ok(())
-}
-
-pub(crate) fn apply_seek_slice(
-    engine: &mut GhosttyEngine,
-    slice: &apack_wal::SeekSlice,
-    abi_hash: &[u8; 32],
-) -> apack_proto::types::CellPx {
-    let mut events = Vec::new();
-    let mut restored_lossless = false;
-    let mut effective_cell_px = slice.keyframe.visual.cell_px;
-    if let Some(snap) = slice.keyframe.engine_snapshot_if_compatible(abi_hash)
-        && engine.restore_snapshot(snap).is_ok()
-    {
-        restored_lossless = true;
-    }
-    if !restored_lossless {
-        // Visual fallback when `libghostty-vt` ABI hash changed across an upgrade:
-        // resize to visual geometry and reconstruct visible text lines cleanly.
-        engine.resize(slice.keyframe.visual.size, slice.keyframe.visual.cell_px, &mut events);
-        for (idx, row) in slice.keyframe.visual.primary_rows.iter().enumerate() {
-            if idx > 0 {
-                engine.feed(b"\r\n", &mut events);
-            }
-            if !row.text.is_empty() {
-                engine.feed(row.text.as_bytes(), &mut events);
-            }
-        }
-    }
-    for timed in &slice.tail_records {
-        events.clear();
-        match &timed.record {
-            WalRecord::Output(bytes) => engine.feed(bytes, &mut events),
-            WalRecord::Resize { size, cell_px } => {
-                effective_cell_px = *cell_px;
-                engine.resize(*size, *cell_px, &mut events);
-            }
-            WalRecord::Keyframe(_) | WalRecord::Marks { .. } | WalRecord::Gap { .. } => {}
-        }
-    }
-    effective_cell_px
 }
