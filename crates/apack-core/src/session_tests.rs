@@ -2068,4 +2068,12 @@ fn review_mutants_rows_budget_clamp_rect_and_logical_line_expansion() {
     let mut f_rows_over = vec![r10, r11, r13];
     assert_eq!(crate::session::budget_frame_rows(&mut f_rows_over, 10, exact_two - 1), vec![1, 3]);
     assert_eq!(f_rows_over.len(), 1);
+
+    // 5. enqueue_pty_reply queues reply bytes into the PTY write buffer and emits PtyWriteReady.
+    fx.clear();
+    s.enqueue_pty_reply(b"\x1b_Gi=1;OK\x1b\\", &mut fx);
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::PtyWriteReady)));
+    let mut reply_buf = Vec::new();
+    s.peek_pty_write(64, &mut reply_buf);
+    assert_eq!(reply_buf, b"\x1b_Gi=1;OK\x1b\\");
 }

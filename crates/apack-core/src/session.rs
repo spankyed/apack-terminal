@@ -489,9 +489,21 @@ impl<V: VtEngine> SessionMachine<V> {
         if bytes.is_empty() {
             return;
         }
+        self.on_vt_feed_with(now, effects, |vt, vt_events| vt.feed(bytes, vt_events));
+    }
+
+    /// Runs a custom VT feed closure (such as `feed_until_apc` or inline Kitty body chunks) and
+    /// applies the exact same dirty-viewport, event, mark, search, and wait transitions as
+    /// [`Self::on_pty_output`].
+    pub fn on_vt_feed_with<R>(
+        &mut self,
+        now: TimestampMs,
+        effects: &mut Vec<SessionEffect>,
+        feed: impl FnOnce(&mut V, &mut Vec<VtEvent>) -> R,
+    ) -> R {
         let before_meta = self.vt.meta();
         let mut vt_events = Vec::new();
-        self.vt.feed(bytes, &mut vt_events);
+        let result = feed(&mut self.vt, &mut vt_events);
 
         let after_meta = self.vt.meta();
         let dirty = self.vt.take_dirty_viewport();
@@ -631,6 +643,13 @@ impl<V: VtEngine> SessionMachine<V> {
         }
 
         self.notify_views_dirty(effects);
+        result
+    }
+
+    /// Enqueues a terminal-generated reply (such as a Kitty graphics refusal response) into the
+    /// bounded PTY write queue, emitting [`SessionEffect::PtyWriteReady`] when accepted.
+    pub fn enqueue_pty_reply(&mut self, reply: &[u8], effects: &mut Vec<SessionEffect>) {
+        let _ = self.enqueue_device_response(reply, effects);
     }
 
     /// Applies an asynchronous OSC 7501 foreground-process verification result.

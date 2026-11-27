@@ -1327,4 +1327,77 @@ fn review_mutants_batched_text_cell_px_resize_placeholder_bg_long_grapheme_and_s
     b_vt.feed(b"\r\nhello", &mut ev);
     let b_span = CellSpan { start: CellPos { line: 0, col: 0 }, end: CellPos { line: 1, col: 19 } };
     assert_eq!(b_vt.text_of_batched(b_span, 1024, 1), "\nhello");
+
+    // 7. feed_until_apc, feed_named_probe (re-disabling mediums on drop), and set_kitty_command_bytes
+    let mut a_cfg = GhosttyConfig::new(grid(20, 4));
+    a_cfg.cell_px = CellPx { width: 8, height: 16 };
+    let mut a_vt = GhosttyEngine::new(a_cfg).unwrap();
+    ev.clear();
+    assert_eq!(a_vt.feed_until_apc(b"hello", &mut ev), (5, false));
+    // OSC boundary must NOT be mistaken for APC_START!
+    assert_eq!(a_vt.feed_until_apc(b"\x1b]0;hi\x07ok", &mut ev), (9, false));
+    let stream = b"AB\x1b_Ga=t,f=32,s=1,v=1,i=7,t=f;L2E=\x1b\\CD";
+    let (used_apc, apc_hit) = a_vt.feed_until_apc(stream, &mut ev);
+    assert!(apc_hit, "feed_until_apc must stop at ESC _");
+    assert_eq!(&stream[..used_apc], b"AB\x1b_");
+    // Feed NUL-payload probe while sitting inside the open APC string -> returns EINVAL: invalid data
+    ev.clear();
+    a_vt.feed_named_probe(b"Ga=t,f=32,s=1,v=1,i=7,t=f;AA==\x1b\\\x1b_", &mut ev);
+    let probe_reply = ev.iter().find_map(|e| match e {
+        VtEvent::DeviceResponse(b) => Some(String::from_utf8_lossy(b).into_owned()),
+        _ => None,
+    });
+    assert!(
+        probe_reply.as_deref().is_some_and(|r| r.ends_with(";EINVAL: invalid data\x1b\\")),
+        "expected EINVAL: invalid data from feed_named_probe, got {probe_reply:?}"
+    );
+    // Close the trailing open APC.
+    ev.clear();
+    a_vt.feed(b"\x1b\\CD", &mut ev);
+    // `set_kitty_command_bytes` actually enforces a tighter command-byte cap, and `None` restores it.
+    a_vt.set_kitty_command_bytes(Some(4));
+    ev.clear();
+    a_vt.feed(b"\x1b_Ga=q,f=32,s=1,v=1,i=10,t=d;AQIDBA==\x1b\\", &mut ev);
+    assert!(
+        !ev.iter().any(|e| matches!(e, VtEvent::DeviceResponse(b) if b.ends_with(b";OK\x1b\\"))),
+        "tightened APC_MAX_BYTES_KITTY must reject over-limit query"
+    );
+    a_vt.set_kitty_command_bytes(None);
+    ev.clear();
+    a_vt.feed(b"\x1b_Ga=q,f=32,s=1,v=1,i=10,t=d;AQIDBA==\x1b\\", &mut ev);
+    assert!(
+        ev.iter().any(|e| matches!(e, VtEvent::DeviceResponse(b) if b.ends_with(b";OK\x1b\\"))),
+        "restored APC_MAX_BYTES_KITTY must accept query"
+    );
+    // Feeding a real readable 4-byte RGBA file with `t=f` after `feed_named_probe` must STILL be
+    // refused (proves `DisableNamedMediums::drop` re-disabled file mediums!).
+    let tmp_path = std::env::temp_dir().join(format!("apack-vt-probe-{}.rgba", std::process::id()));
+    std::fs::write(&tmp_path, [1u8, 2, 3, 255]).unwrap();
+    let raw_path = tmp_path.to_string_lossy();
+    let b64_table = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut b64_path = String::new();
+    for chunk in raw_path.as_bytes().chunks(3) {
+        let b0 = u32::from(chunk[0]);
+        let b1 = u32::from(*chunk.get(1).unwrap_or(&0));
+        let b2 = u32::from(*chunk.get(2).unwrap_or(&0));
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        b64_path.push(b64_table[((n >> 18) & 63) as usize] as char);
+        b64_path.push(b64_table[((n >> 12) & 63) as usize] as char);
+        b64_path.push(if chunk.len() > 1 { b64_table[((n >> 6) & 63) as usize] as char } else { '=' });
+        b64_path.push(if chunk.len() > 2 { b64_table[(n & 63) as usize] as char } else { '=' });
+    }
+    ev.clear();
+    a_vt.feed(format!("\x1b_Ga=T,f=32,s=1,v=1,i=9,t=f;{b64_path}\x1b\\").as_bytes(), &mut ev);
+    let _ = std::fs::remove_file(&tmp_path);
+    assert!(a_vt.images().is_empty(), "file medium must remain disabled after feed_named_probe");
+    assert!(
+        !ev.iter().any(|e| matches!(e, VtEvent::DeviceResponse(b) if b.ends_with(b";OK\x1b\\"))),
+        "file medium must not return OK after feed_named_probe"
+    );
+    ev.clear();
+    a_vt.feed(b"\x1b_Ga=t,f=32,s=1,v=1,i=11,t=s;AA==\x1b\\", &mut ev);
+    assert!(
+        !ev.iter().any(|e| matches!(e, VtEvent::DeviceResponse(b) if b.ends_with(b";EINVAL: invalid data\x1b\\"))),
+        "shared-memory medium must remain disabled after feed_named_probe"
+    );
 }

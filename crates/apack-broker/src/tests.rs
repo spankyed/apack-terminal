@@ -34,7 +34,7 @@ use crate::runtime::BrokerServer;
 use crate::shard::drain_unix_pty_nonblocking;
 use crate::shard::{
     ReactorEvent, ShardCmd, ShardShared, apply_seek_slice, argv_matches_app, capture_keyframe, maybe_compress_idle,
-    parse_exit_status, resolve_scrollback_lines, shard_session_wait_timeout, spawn_shard,
+    parse_exit_status, resolve_scrollback_lines, shard_session_wait_timeout, should_forward_probe_reply, spawn_shard,
 };
 #[cfg(unix)]
 use crate::transport_loop::{
@@ -1631,10 +1631,13 @@ fn e2e_leases_kept_pinning_tier2_compression_foreground_verify_and_kill_escalati
     // below to prove explicit broker shutdown terminates kept sessions cleanly without deadlocking!
     let (_bl2, _) = c2.acquire_lease(LeaseKind::BrokerImmediate).unwrap();
 
-    // `SpawnSpec { image_files: true }` must be rejected cleanly (and not leak `pending_spawns`)!
-    let mut bad_img_spec = echo_command_spec("NO_IMG", None, None);
-    bad_img_spec.image_files = true;
-    assert!(matches!(c2.spawn(bad_img_spec), Err(ClientError::Broker { code: ErrorCode::Malformed, .. })));
+    // Failed `Spawn` (missing `restore_from` directory) must return an error cleanly without leaking `pending_spawns`!
+    let bad_restore_spec = echo_command_spec(
+        "NO_RESTORE",
+        None,
+        Some(tmp.path().join("does-not-exist-wal").to_string_lossy().into_owned()),
+    );
+    assert!(matches!(c2.spawn(bad_restore_spec), Err(ClientError::Broker { code: ErrorCode::Pty, .. })));
 
     // 2. WAL rollover (> 64 KiB output) + idle compression (25 ms) + Unix foreground verify + SIGKILL escalation!
     #[cfg(unix)]
@@ -2594,4 +2597,214 @@ fn review_regressions_env_grace_pipelined_fin_teardown_spawn_and_seek_cell_px() 
             "close_conn_transport must close idle clients immediately (took {eof_dt:?}, before 300ms SIGKILL)"
         );
     }
+}
+
+#[test]
+fn kitty_image_sources_e2e_file_shm_security_and_teardown() {
+    use apack_os::image_sources::{Quiet as ImageQuiet, encoded};
+
+    assert!(should_forward_probe_reply("\x1b_Gi=1;OK\x1b\\", ImageQuiet::No));
+    assert!(!should_forward_probe_reply("\x1b_Gi=1;OK\x1b\\", ImageQuiet::Ok));
+    assert!(!should_forward_probe_reply("\x1b_Gi=1;EINVAL: x\x1b\\", ImageQuiet::Failures));
+
+    let tmp = tempdir().unwrap();
+    let endpoint = unique_endpoint(tmp.path(), "kitty-img-src");
+    let mut cfg = BrokerConfig::for_socket(&endpoint);
+    cfg.shard_count = 1;
+    let mut srv = BrokerServer::bind(cfg).unwrap().spawn().unwrap();
+    let mut client = BrokerClient::connect(srv.socket_path(), &AuthConfig::None, "img-e2e").unwrap();
+    let (_lease, _) = client.acquire_lease(LeaseKind::BrokerImmediate).unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        use std::process::Command;
+
+        let pixels: Vec<u8> =
+            vec![0xde, 0xad, 0xbe, 0xff, 0x10, 0x20, 0x30, 0xff, 0x40, 0x50, 0x60, 0xff, 0x70, 0x80, 0x90, 0xff];
+        let img_path = tmp.path().join("ok.rgba");
+        std::fs::write(&img_path, &pixels).unwrap();
+        let b64_ok = String::from_utf8(encoded(img_path.as_os_str().as_bytes())).unwrap();
+
+        // 1. `image_files: false` MUST refuse `t=f` (hostile-PTY boundary).
+        let seq_disabled = tmp.path().join("seq-disabled.bin");
+        std::fs::write(&seq_disabled, format!("\x1b_Ga=T,f=32,s=2,v=2,i=1,t=f;{b64_ok}\x1b\\DISABLED_DONE\r\n"))
+            .unwrap();
+        let mut spec_disabled = echo_command_spec("x", None, None);
+        spec_disabled.argv =
+            vec![String::from("/bin/sh"), String::from("-c"), format!("cat '{}'; sleep 10", seq_disabled.display())];
+        spec_disabled.image_files = false;
+        let (s_dis, _) = client.spawn(spec_disabled).unwrap();
+        assert_eq!(
+            client.wait(s_dis, WaitCondition::Text(String::from("DISABLED_DONE")), 5_000).unwrap(),
+            WaitOutcome::Met
+        );
+        let st_dis = NonZeroStreamId::new(1).unwrap();
+        client
+            .attach(
+                s_dis,
+                st_dis,
+                SubFlags::from_bits(SubFlags::VIEW).unwrap(),
+                None,
+                0,
+                FrameCredit { max_frames: 8, max_bytes: 1 << 20 },
+            )
+            .unwrap();
+        let BrokerMsg::ImagesReply { placements: dis_placements, .. } =
+            client.stream_request(st_dis, &ClientMsg::Images).unwrap()
+        else {
+            panic!("expected ImagesReply");
+        };
+        assert!(dis_placements.is_empty(), "t=f must be blocked when image_files=false");
+        client.kill(s_dis).unwrap();
+
+        // 2. `image_files: true`: `t=f` file load + `t=s` POSIX shared memory + symlink/FIFO refusals!
+        struct ShmCleanup(String);
+        impl Drop for ShmCleanup {
+            fn drop(&mut self) {
+                let _ = Command::new("python3")
+                    .args([
+                        "-c",
+                        "import sys; from multiprocessing.shared_memory import SharedMemory\n\
+                         try:\n  s = SharedMemory(name=sys.argv[1])\n  s.close()\n  s.unlink()\n\
+                         except FileNotFoundError:\n  pass",
+                        &self.0,
+                    ])
+                    .status();
+            }
+        }
+        let shm_bare = format!("apack-img-e2e-{}", std::process::id());
+        let shm_name = format!("/{shm_bare}");
+        let _shm_guard = ShmCleanup(shm_bare.clone());
+        let shm_pixels: Vec<u8> =
+            vec![0x01, 0x02, 0x03, 0xff, 0x04, 0x05, 0x06, 0xff, 0x07, 0x08, 0x09, 0xff, 0x0a, 0x0b, 0x0c, 0xff];
+        let shm_status = Command::new("python3")
+            .args([
+                "-c",
+                "import sys; from multiprocessing.shared_memory import SharedMemory\n\
+                 from multiprocessing import resource_tracker\n\
+                 s = SharedMemory(name=sys.argv[1], create=True, size=16)\n\
+                 resource_tracker.unregister(s._name, 'shared_memory')\n\
+                 s.buf[:16] = bytes.fromhex('010203ff040506ff070809ff0a0b0cff')\n\
+                 s.close()",
+                &shm_bare,
+            ])
+            .status()
+            .expect("python3 shm setup");
+        assert!(shm_status.success(), "python3 shared_memory creation failed");
+        let b64_shm = String::from_utf8(encoded(shm_name.as_bytes())).unwrap();
+
+        // Hostile sources: symlink to `/dev/null`, symlink loop, and a FIFO (named pipe).
+        let dev_link = tmp.path().join("to-dev-null");
+        std::os::unix::fs::symlink("/dev/null", &dev_link).unwrap();
+        let loop_a = tmp.path().join("loop-a");
+        let loop_b = tmp.path().join("loop-b");
+        std::os::unix::fs::symlink(&loop_b, &loop_a).unwrap();
+        std::os::unix::fs::symlink(&loop_a, &loop_b).unwrap();
+        let fifo_path = tmp.path().join("trap.fifo");
+        assert!(Command::new("mkfifo").arg(&fifo_path).status().expect("mkfifo").success());
+
+        let b64_dev = String::from_utf8(encoded(dev_link.as_os_str().as_bytes())).unwrap();
+        let b64_loop = String::from_utf8(encoded(loop_a.as_os_str().as_bytes())).unwrap();
+        let b64_fifo = String::from_utf8(encoded(fifo_path.as_os_str().as_bytes())).unwrap();
+
+        let seq_enabled = tmp.path().join("seq-enabled.bin");
+        let stream = format!(
+            "\x1b_Ga=T,f=32,s=2,v=2,i=2,t=f;{b64_ok}\x1b\\\
+             \x1b_Ga=T,f=32,s=2,v=2,i=3,t=s;{b64_shm}\x1b\\\
+             \x1b_Ga=T,f=32,s=2,v=2,i=4,t=f;{b64_dev}\x1b\\\
+             \x1b_Ga=T,f=32,s=2,v=2,i=5,t=f;{b64_loop}\x1b\\\
+             \x1b_Ga=T,f=32,s=2,v=2,i=6,t=f;{b64_fifo}\x1b\\\
+             ALL_IMAGES_DONE\r\n"
+        );
+        std::fs::write(&seq_enabled, stream).unwrap();
+
+        let mut spec_ok = echo_command_spec("x", None, None);
+        spec_ok.argv =
+            vec![String::from("/bin/sh"), String::from("-c"), format!("cat '{}'; sleep 10", seq_enabled.display())];
+        spec_ok.image_files = true;
+        let (s_ok, _) = client.spawn(spec_ok).unwrap();
+        assert_eq!(
+            client.wait(s_ok, WaitCondition::Text(String::from("ALL_IMAGES_DONE")), 5_000).unwrap(),
+            WaitOutcome::Met
+        );
+        let st_ok = NonZeroStreamId::new(2).unwrap();
+        client
+            .attach(
+                s_ok,
+                st_ok,
+                SubFlags::from_bits(SubFlags::VIEW).unwrap(),
+                None,
+                0,
+                FrameCredit { max_frames: 8, max_bytes: 1 << 20 },
+            )
+            .unwrap();
+        let BrokerMsg::ImagesReply { placements, .. } = client.stream_request(st_ok, &ClientMsg::Images).unwrap()
+        else {
+            panic!("expected ImagesReply");
+        };
+        assert_eq!(placements.len(), 2, "expected exactly 2 valid images (t=f + t=s), got {placements:?}");
+        let mut blobs = Vec::new();
+        for p in &placements {
+            assert_eq!(p.pixel_size, [2, 2]);
+            let BrokerMsg::ImageBlobChunk { encoding, data, .. } = client
+                .stream_request(st_ok, &ClientMsg::GetImageBlob { blob: p.blob, offset: 0, max_bytes: 1024 })
+                .unwrap()
+            else {
+                panic!("expected ImageBlobChunk");
+            };
+            assert_eq!(encoding, apack_proto::types::ImageEncoding::Png);
+            assert!(data.starts_with(b"\x89PNG\r\n\x1a\n"));
+            blobs.push(data);
+        }
+        assert!(
+            blobs.iter().any(|b| b.windows(8).any(|w| w == &pixels[..8]) && b.windows(8).any(|w| w == &pixels[8..])),
+            "missing t=f PNG pixel blob"
+        );
+        assert!(
+            blobs
+                .iter()
+                .any(|b| b.windows(8).any(|w| w == &shm_pixels[..8]) && b.windows(8).any(|w| w == &shm_pixels[8..])),
+            "missing t=s PNG pixel blob"
+        );
+
+        // 3. Explicit `Kill` tears down an `image_files: true` session cleanly and promptly.
+        let t_kill = std::time::Instant::now();
+        client.kill(s_ok).unwrap();
+        assert!(t_kill.elapsed() < Duration::from_secs(2));
+
+        // 4. Short-lived child printing `t=f` and exiting IMMEDIATELY still completes off-shard load!
+        let seq_fast = tmp.path().join("seq-fast.bin");
+        std::fs::write(&seq_fast, format!("\x1b_Ga=T,f=32,s=2,v=2,i=31,t=f;{b64_ok}\x1b\\FAST_EXIT_OK\r\n")).unwrap();
+        let mut spec_fast = echo_command_spec("x", None, None);
+        spec_fast.argv = vec![String::from("/bin/sh"), String::from("-c"), format!("cat '{}'", seq_fast.display())];
+        spec_fast.image_files = true;
+        let (s_fast, _) = client.spawn(spec_fast).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if !client.list_sessions().unwrap().iter().any(|s| s.id == s_fast) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !client.list_sessions().unwrap().iter().any(|s| s.id == s_fast),
+            "short-lived image_files session must exit cleanly without hanging"
+        );
+    }
+
+    #[cfg(windows)]
+    {
+        let mut spec_win = echo_command_spec("WIN_IMG_READY", None, None);
+        spec_win.image_files = true;
+        let (s_win, _) = client.spawn(spec_win).unwrap();
+        assert_eq!(
+            client.wait(s_win, WaitCondition::Text(String::from("WIN_IMG_READY")), 5_000).unwrap(),
+            WaitOutcome::Met
+        );
+        client.kill(s_win).unwrap();
+    }
+
+    drop(client);
+    srv.shutdown().unwrap();
 }
