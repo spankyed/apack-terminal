@@ -126,15 +126,16 @@ fn ancestor_symlink_is_safe(uid: libc::uid_t, euid: libc::uid_t) -> bool {
 }
 
 #[cfg(unix)]
-fn verify_ancestor_chain(dir: &Path, euid: libc::uid_t) -> Result<(), OsError> {
+fn verify_path_chain(path: &Path, include_self: bool, euid: libc::uid_t) -> Result<(), OsError> {
     use std::os::unix::fs::MetadataExt;
 
-    let abs = if dir.is_absolute() {
-        dir.to_path_buf()
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
     } else {
-        std::env::current_dir().map_err(|err| OsError::io("resolving socket directory", err))?.join(dir)
+        std::env::current_dir().map_err(|err| OsError::io("resolving socket directory", err))?.join(path)
     };
-    for ancestor in abs.ancestors().skip(1) {
+    let skip = usize::from(!include_self);
+    for ancestor in abs.ancestors().skip(skip) {
         if ancestor.as_os_str().is_empty() {
             continue;
         }
@@ -151,12 +152,43 @@ fn verify_ancestor_chain(dir: &Path, euid: libc::uid_t) -> Result<(), OsError> {
             )));
         }
     }
+    // Also validate the canonical ancestor chain so symlink targets cannot hide an unsafe parent
+    // directory (e.g. an euid-owned symlink pointing into a world-writable non-sticky directory).
+    let canon = std::fs::canonicalize(&abs).map_err(|err| OsError::io("canonicalizing socket ancestor", err))?;
+    for ancestor in canon.ancestors().skip(skip) {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        let meta = std::fs::metadata(ancestor).map_err(|err| OsError::io("inspecting canonical ancestor", err))?;
+        if !ancestor_is_safe(meta.uid(), meta.mode(), euid) {
+            return Err(OsError::UnsafePath(format!(
+                "{} is an unsafe canonical ancestor directory (wrong owner or non-sticky group/world writable)",
+                ancestor.display()
+            )));
+        }
+    }
     Ok(())
+}
+
+#[cfg(unix)]
+fn verify_existing_prefix_before_create(dir: &Path, euid: libc::uid_t) -> Result<(), OsError> {
+    let abs = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        std::env::current_dir().map_err(|err| OsError::io("resolving socket directory", err))?.join(dir)
+    };
+    let mut existing = abs.as_path();
+    while std::fs::symlink_metadata(existing).is_err() {
+        existing = existing
+            .parent()
+            .ok_or_else(|| OsError::UnsafePath(format!("no existing ancestor for {}", dir.display())))?;
+    }
+    verify_path_chain(existing, true, euid)
 }
 
 /// Ensures the parent directory of `socket` exists with mode `0o700` (if missing) and verifies it
 /// is a real directory (not a symlink) owned by the current effective UID with strict owner-only
-/// permissions (`mode & 0o077 == 0`) and a safe ancestor chain.
+/// permissions (`mode & 0o077 == 0`) and a safe lexical + canonical ancestor chain.
 pub fn ensure_private_directory(socket: &str) -> Result<(), OsError> {
     #[cfg(not(unix))]
     {
@@ -168,7 +200,11 @@ pub fn ensure_private_directory(socket: &str) -> Result<(), OsError> {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 
         let dir = socket_parent_dir(socket);
+        // SAFETY: `geteuid` takes no arguments and cannot fail.
+        let euid = unsafe { libc::geteuid() };
         if std::fs::symlink_metadata(dir).is_err() {
+            // Validate deepest existing ancestor (and its canonical chain) BEFORE creating any directory.
+            verify_existing_prefix_before_create(dir, euid)?;
             std::fs::DirBuilder::new()
                 .recursive(true)
                 .mode(0o700)
@@ -185,15 +221,13 @@ pub fn ensure_private_directory(socket: &str) -> Result<(), OsError> {
         if !meta.is_dir() {
             return Err(OsError::UnsafePath(format!("{} is not a directory", dir.display())));
         }
-        // SAFETY: `geteuid` takes no arguments and cannot fail.
-        let euid = unsafe { libc::geteuid() };
         if meta.uid() != euid {
             return Err(OsError::UnsafePath(format!("{} is owned by another user", dir.display())));
         }
         if meta.mode() & 0o077 != 0 {
             return Err(OsError::UnsafePath(format!("{} must be owner-only (0o700)", dir.display())));
         }
-        verify_ancestor_chain(dir, euid)?;
+        verify_path_chain(dir, false, euid)?;
         Ok(())
     }
 }
@@ -372,10 +406,15 @@ mod unix_signals {
     #[inline]
     // SAFETY: returns the calling thread's libc `errno` pointer; valid for the lifetime of the thread.
     unsafe fn errno_ptr() -> *mut libc::c_int {
-        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "openbsd"))]
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
         {
             // SAFETY: platform libc thread-local errno accessor is async-signal-safe.
             unsafe { libc::__error() }
+        }
+        #[cfg(any(target_os = "openbsd", target_os = "netbsd"))]
+        {
+            // SAFETY: platform libc thread-local errno accessor is async-signal-safe.
+            unsafe { libc::__errno() }
         }
         #[cfg(target_os = "linux")]
         {
@@ -725,7 +764,9 @@ mod tests {
         std::os::unix::fs::symlink(base.path(), &anc_sym).expect("anc symlink");
         ensure_private_directory(&anc_sym.join("private/broker.sock").to_string_lossy()).expect("owned anc symlink ok");
 
-        // Rejects a 0o700 socket directory hosted under a non-sticky group/world-writable ancestor.
+        // Rejects a 0o700 socket directory hosted under a non-sticky group/world-writable ancestor,
+        // refuses to create a missing directory under an unsafe ancestor, and catches canonical
+        // unsafe ancestors hidden behind an euid-owned symlink.
         let unsafe_parent = base.path().join("unsafe-parent");
         let safe_child = unsafe_parent.join("priv");
         std::fs::create_dir_all(&safe_child).expect("mkdir unsafe tree");
@@ -733,6 +774,21 @@ mod tests {
         std::fs::set_permissions(&unsafe_parent, std::fs::Permissions::from_mode(0o777)).expect("chmod parent");
         assert!(matches!(
             ensure_private_directory(&safe_child.join("broker.sock").to_string_lossy()),
+            Err(OsError::UnsafePath(_))
+        ));
+        let uncreated_child = unsafe_parent.join("must-not-create");
+        assert!(matches!(
+            ensure_private_directory(&uncreated_child.join("broker.sock").to_string_lossy()),
+            Err(OsError::UnsafePath(_))
+        ));
+        assert!(!uncreated_child.exists(), "must not create directory beneath an unsafe ancestor");
+        let sym_to_unsafe_target = base.path().join("sym-to-unsafe");
+        std::os::unix::fs::symlink(&safe_child, &sym_to_unsafe_target).expect("symlink to safe_child");
+        let deep_priv = safe_child.join("deep");
+        std::fs::create_dir(&deep_priv).expect("mkdir deep");
+        std::fs::set_permissions(&deep_priv, std::fs::Permissions::from_mode(0o700)).expect("chmod deep");
+        assert!(matches!(
+            ensure_private_directory(&sym_to_unsafe_target.join("deep/broker.sock").to_string_lossy()),
             Err(OsError::UnsafePath(_))
         ));
         std::fs::set_permissions(&unsafe_parent, std::fs::Permissions::from_mode(0o1777)).expect("chmod sticky");

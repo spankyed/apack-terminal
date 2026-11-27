@@ -491,7 +491,7 @@ pub struct SegmentScan {
     pub records: Vec<TimedRecord>,
     /// Byte offset of the end of the last valid record (truncation point on crash recovery).
     pub valid_records_end: usize,
-    /// Present iff a valid 40-byte [`SegmentFooter`] terminated the file cleanly and matched all records.
+    /// Present iff a valid 72-byte [`SegmentFooter`] terminated the file cleanly and matched all records.
     pub footer: Option<SegmentFooter>,
     /// `true` iff trailing bytes after `valid_records_end` were truncated, corrupt, or invalid.
     pub had_torn_tail: bool,

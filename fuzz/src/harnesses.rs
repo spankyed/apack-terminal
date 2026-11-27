@@ -161,6 +161,9 @@ pub fn fuzz_v2_kitty_apc(data: &[u8]) {
     // 2. Direct path-rule and base64 totality + round-trip invariants.
     let _ = rules::refused(data);
     let _ = rules::refused_once_opened(data);
+    if let Ok(text) = std::str::from_utf8(data) {
+        let _ = rules::split_windows_drive_path(text);
+    }
     let _ = shared_memory_name(data);
 
     let mut b64 = Base64::default();

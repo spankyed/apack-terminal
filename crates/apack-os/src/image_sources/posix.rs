@@ -14,6 +14,7 @@ const SHARED_MEMORY_FLAGS: libc::c_int = libc::O_NONBLOCK | libc::O_CLOEXEC;
 const _: () = assert!(libc::O_RDONLY == 0);
 
 const MAX_SYMLINK_HOPS: usize = 40;
+const MAX_PATH_DEPTH: usize = 128;
 const REFUSED_MOUNTS: [&str; 3] = ["/proc", "/sys", "/dev"];
 const TAKEN_MOUNT: &str = "/dev/shm";
 
@@ -65,6 +66,10 @@ fn should_check_hop_device(resolved: &[Vec<u8>]) -> bool {
 /// Refuses `/proc`, `/sys`, `/dev` (except `/dev/shm`), symlink loops (`> MAX_SYMLINK_HOPS`),
 /// non-regular files (FIFOs, sockets, devices, directories), and special filesystems at every hop.
 pub fn open_file(path: &[u8]) -> Option<File> {
+    open_file_bounded(path, MAX_PATH_DEPTH)
+}
+
+fn open_file_bounded(path: &[u8], max_depth: usize) -> Option<File> {
     let owned;
     let combined = if path.starts_with(b"/") {
         path
@@ -141,8 +146,11 @@ pub fn open_file(path: &[u8]) -> Option<File> {
             match open_subdir_at(dirfd, &segment) {
                 SubdirOpen::Opened(next_dir) => {
                     // Check special-filesystem mount IDs at EVERY intermediate hop (allowing bare
-                    // `/dev` solely so `/dev/shm/...` can traverse into its tmpfs mount).
-                    if should_check_hop_device(&resolved) && fd_on_special_filesystem(&next_dir, &special) {
+                    // `/dev` solely so `/dev/shm/...` can traverse into its tmpfs mount), and bound
+                    // `dir_stack` depth so deep paths cannot exhaust `RLIMIT_NOFILE`.
+                    if dir_stack.len() >= max_depth
+                        || (should_check_hop_device(&resolved) && fd_on_special_filesystem(&next_dir, &special))
+                    {
                         return None;
                     }
                     dir_stack.push(next_dir);
@@ -763,6 +771,12 @@ mod tests {
         assert!(open_file(dotdot.as_os_str().as_bytes()).is_some());
         let above_root = format!("/..{}", real.display());
         assert!(open_file(above_root.as_bytes()).is_some());
+
+        // Exact `max_depth` boundary on `dir_stack` bounds open directory fds.
+        let canon_sub = std::fs::canonicalize(&sub).expect("canon sub");
+        let dir_depth = canon_sub.as_os_str().as_bytes().split(|&b| b == b'/').filter(|s| !s.is_empty()).count();
+        assert!(open_file_bounded(inside.as_os_str().as_bytes(), dir_depth).is_none());
+        assert!(open_file_bounded(inside.as_os_str().as_bytes(), dir_depth + 1).is_some());
 
         let good_link = dir.path().join("good_link");
         std::os::unix::fs::symlink("ok.bin", &good_link).expect("good link");

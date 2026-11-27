@@ -5,7 +5,7 @@
 //! - Direct whole-record `File::write_all` (no `BufWriter` partial-record flushes across 8 KiB edges).
 //! - Automatic segment rollover hint at `segment_target_bytes` when the VT parser is at ground.
 //! - Non-ground infinite-escape cap (`max_non_ground_bytes`) emitting explicit [`GapReason::NonGroundCap`].
-//! - `sync_data()` + 40-byte [`SegmentFooter`] (committing `records_end_offset`) + parent dir sync on seal.
+//! - `sync_data()` + 72-byte [`SegmentFooter`] (committing `records_end_offset` + SHA-256) + parent dir sync on seal.
 //! - $O(1)$ budget eviction accounting for both segments and `blobs/`, serialized against reader discovery.
 //! - Fast crash recovery on resume: sealed closed segments read only record 0 + footer; only an
 //!   unsealed active tail segment is scanned and truncated via `File::set_len(valid_records_end)`.
@@ -135,8 +135,9 @@ pub struct WalWriter {
 impl WalWriter {
     /// Opens an existing recording directory (recovering any torn active segment) or creates a new one.
     ///
-    /// Sealed closed segments read ONLY record 0 (keyframe) + their 40-byte footer; only an
-    /// unsealed tail segment is scanned sequentially and truncated at the last valid CRC32C record.
+    /// Sealed closed non-tail segments read ONLY record 0 (keyframe) + their 72-byte footer; the
+    /// tail segment and any unsealed segment are scanned sequentially with SHA-256 verification and
+    /// truncated at the last valid CRC32C record.
     pub fn open_or_create(
         dir: impl AsRef<Path>,
         session_uuid: [u8; 16],
@@ -188,19 +189,18 @@ impl WalWriter {
             // Tail segment or unsealed/corrupt earlier segment: bounded read + full SHA-256 scan.
             let bytes = read_regular_file_bounded(&path, MAX_SEGMENT_FILE_BYTES, "WAL segment file")?;
             let scan = scan_segment(&bytes);
-            let Some(first) = scan.records.first() else {
+            let Some((first, kf)) = scan.records.first().and_then(|rec| match &rec.record {
+                WalRecord::Keyframe(kf) => Some((rec, kf)),
+                _ => None,
+            }) else {
                 // Record 0 was torn/empty or not a KeyframeV2: unlink only if no reader holds a pin.
-                let _ = registry.try_unlink_if_unpinned(&canonical, seg_id, || {
+                // Never leave an unusable/corrupt segment behind to become a non-tail segment.
+                if !registry.try_unlink_if_unpinned(&canonical, seg_id, || {
                     let _ = fs::remove_file(&path);
                     Ok(())
-                });
-                continue;
-            };
-            let WalRecord::Keyframe(kf) = &first.record else {
-                let _ = registry.try_unlink_if_unpinned(&canonical, seg_id, || {
-                    let _ = fs::remove_file(&path);
-                    Ok(())
-                });
+                })? {
+                    return Err(WalError::AlreadyClaimed);
+                }
                 continue;
             };
 
@@ -248,14 +248,10 @@ impl WalWriter {
             })?;
 
             match mutated {
-                None => {
-                    closed.push(ClosedSegment {
-                        id: seg_id,
-                        path,
-                        size_bytes: bytes.len() as u64,
-                        referenced_blobs: kf.referenced_blobs(),
-                    });
-                }
+                // Never promote a reader-pinned unsealed/torn segment into `closed`: doing so
+                // would allow a later rollover to turn an unsealed/spoofed segment into a non-tail
+                // segment trusted by the O(1) footer fast path.
+                None => return Err(WalError::AlreadyClaimed),
                 Some((None, Some(sealed_len))) => {
                     closed.push(ClosedSegment {
                         id: seg_id,
@@ -441,7 +437,7 @@ impl WalWriter {
             }
         }
 
-        // Hard ceiling leaving room for a final Gap record and 40-byte SegmentFooter so an active
+        // Hard ceiling leaving room for a final Gap record and 72-byte SegmentFooter so an active
         // segment can NEVER exceed `max_file_bytes` and brick subsequent reopen/reads.
         let footer_reserve = crate::SEGMENT_FOOTER_LEN as u64;
         let hard_data_cap = max_file_bytes.saturating_sub(footer_reserve).saturating_sub(1024);
@@ -508,7 +504,7 @@ impl WalWriter {
     }
 
     /// Seals the currently active segment by flushing pending non-ground gaps, syncing data,
-    /// appending its 40-byte [`SegmentFooter`], and syncing again. Keeps `self.active` intact on
+    /// appending its 72-byte [`SegmentFooter`], and syncing again. Keeps `self.active` intact on
     /// I/O error so no segment is orphaned.
     pub fn seal_active(&mut self) -> Result<(), WalError> {
         if self.non_ground_dropped > 0 && self.active.is_some() {

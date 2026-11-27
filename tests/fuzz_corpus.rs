@@ -119,7 +119,16 @@ fn committed_seeds_exercise_deep_parser_branches() {
         "osc7501_raw_payload seed must parse into ProgramStatusUpdate::Set"
     );
 
-    // 2. `torn_tail_segment` must decode a valid keyframe + output prefix before hitting the torn tail.
+    // 2. WAL seeds must exercise the 72-byte SHA-256 `SegmentFooter`, complete sealed scan, and torn-tail truncation.
+    let footer_bytes = fs::read(seeds_root.join("v2_wal").join("segment_footer_v2")).expect("read footer seed");
+    assert_eq!(footer_bytes.len(), apack_wal::SEGMENT_FOOTER_LEN, "segment_footer_v2 must be 72 bytes");
+    apack_wal::SegmentFooter::decode(&footer_bytes).expect("segment_footer_v2 must decode cleanly");
+
+    let sealed_bytes = fs::read(seeds_root.join("v2_wal").join("complete_sealed_segment")).expect("read sealed seed");
+    let sealed_scan = scan_segment(&sealed_bytes);
+    assert!(sealed_scan.footer.is_some(), "complete_sealed_segment must pass SHA-256 footer verification");
+    assert!(!sealed_scan.had_torn_tail, "complete_sealed_segment must not have a torn tail");
+
     let torn_bytes = fs::read(seeds_root.join("v2_wal").join("torn_tail_segment")).expect("read torn seed");
     let scan = scan_segment(&torn_bytes);
     assert_eq!(scan.records.len(), 2, "torn_tail_segment must decode keyframe + output prefix");

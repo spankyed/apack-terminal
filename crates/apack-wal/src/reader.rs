@@ -1,9 +1,9 @@
 //! Fast footer-indexed [`WalReader`] for `Rewind`, `Seek(at_ms)`, and `Spawn { restore }`.
 //!
 //! Opening a recording validates the directory against symlinks, atomically discovers and pins all
-//! segments in [`RecordingRegistry`] before reading their 40-byte footers (falling back to a
-//! bounded scan only for an unsealed active tail segment), and verifies monotonic segment bounds
-//! for binary-search seeking.
+//! segments in [`RecordingRegistry`] before reading 72-byte sealed footers for closed historical
+//! segments (always SHA-256-verifying the tail segment and any actively claimed recording), and
+//! verifies monotonic segment bounds for binary-search seeking.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -33,7 +33,7 @@ pub struct SegmentSummary {
     pub last_ms: u64,
     /// Number of valid records in this segment.
     pub record_count: u32,
-    /// `true` if opened in $O(1)$ via its 40-byte sealed [`SegmentFooter`].
+    /// `true` if sealed with a verified 72-byte [`SegmentFooter`].
     pub sealed: bool,
 }
 

@@ -1461,8 +1461,19 @@ fn seam4_sha256_footer_tail_validation_safe_rw_wal_blob_and_control_rollover_hin
     // Restore genuine seg-1 before testing WalWriter recovery on spoofed tail seg-2.
     fs::write(&seg1_path, &seg1_orig).unwrap();
 
-    // WalWriter::open_or_create must reject spoofed tail footer, truncate it, reseed incremental SHA-256,
-    // append another record, and produce a genuine sealed SHA-256 footer!
+    // Finding 1 regression: while a WalReader pins an unsealed/spoofed segment, WalWriter::open_or_create
+    // MUST refuse with AlreadyClaimed rather than promoting an unsealed segment into `closed`!
+    {
+        let pinned_reader = WalReader::open(&spoof_dir, &registry).unwrap();
+        assert!(!pinned_reader.segments()[1].sealed);
+        assert!(matches!(
+            WalWriter::open_or_create(&spoof_dir, [31; 16], 100, WalConfig::default(), registry.clone()),
+            Err(WalError::AlreadyClaimed)
+        ));
+    }
+
+    // Once the reader drops, WalWriter::open_or_create must reject spoofed tail footer, truncate it,
+    // reseed incremental SHA-256, append another record, and produce a genuine sealed SHA-256 footer!
     let mut w2 = WalWriter::open_or_create(&spoof_dir, [31; 16], 100, WalConfig::default(), registry.clone()).unwrap();
     assert_eq!(w2.active_segment_id(), Some(2));
     assert_eq!(w2.record_output(220, b"after-recover", true).unwrap(), RolloverHint::Continue);

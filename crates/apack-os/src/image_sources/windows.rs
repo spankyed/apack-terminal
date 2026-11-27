@@ -20,7 +20,7 @@ use windows_sys::Wdk::Storage::FileSystem::{
     FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
     NtCreateFile,
 };
-use windows_sys::Win32::Foundation::{HANDLE, OBJ_CASE_INSENSITIVE, UNICODE_STRING};
+use windows_sys::Win32::Foundation::{HANDLE, NTSTATUS, OBJ_CASE_INSENSITIVE, UNICODE_STRING};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_ACCESS_RIGHTS, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_GENERIC_READ, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
@@ -49,6 +49,10 @@ fn is_local_drive(drive: u8) -> bool {
     let root = [u16::from(drive), u16::from(b':'), u16::from(b'\\'), 0u16];
     // SAFETY: `root` is a NUL-terminated UTF-16 drive root path (`"X:\\\0"`).
     drive_type_allowed(unsafe { GetDriveTypeW(root.as_ptr()) })
+}
+
+fn nt_status_ok(status: NTSTATUS) -> bool {
+    status >= 0
 }
 
 fn nt_open_component(
@@ -87,7 +91,7 @@ fn nt_open_component(
             0,
         )
     };
-    if status < 0 {
+    if !nt_status_ok(status) {
         return None;
     }
     let raw = std::ptr::NonNull::new(handle)?;
@@ -245,6 +249,11 @@ mod tests {
         assert!(!drive_type_allowed(DRIVE_CDROM));
         assert!(!drive_type_allowed(DRIVE_UNKNOWN));
         assert!(!drive_type_allowed(DRIVE_NO_ROOT_DIR));
+        assert!((b'A'..=b'Z').any(|d| !is_local_drive(d)), "at least one drive letter must be non-local/unmounted");
+
+        assert!(nt_status_ok(0));
+        assert!(nt_status_ok(1));
+        assert!(!nt_status_ok(-1));
 
         let dir = tempfile::tempdir().expect("tempdir");
         let file_path = dir.path().join("img.bin");
@@ -286,5 +295,23 @@ mod tests {
             open_file(junction_dir.join("secret.bin").to_string_lossy().as_bytes()).is_none(),
             "open_file must refuse files reached through an intermediate NTFS directory junction"
         );
+        // Directly verify `is_non_reparse_directory` rejects an open junction handle (kills `-> true`).
+        let junc_str = junction_dir.to_string_lossy();
+        let (j_drive, j_comps) = rules::split_windows_drive_path(&junc_str).expect("split junction path");
+        let root_w = [
+            u16::from(b'\\'),
+            u16::from(b'?'),
+            u16::from(b'?'),
+            u16::from(b'\\'),
+            u16::from(j_drive),
+            u16::from(b':'),
+            u16::from(b'\\'),
+        ];
+        let mut h = nt_open_component(std::ptr::null_mut(), &root_w, DIR_ACCESS, DIR_OPTIONS).expect("open root");
+        for comp in j_comps {
+            let w: Vec<u16> = comp.encode_utf16().collect();
+            h = nt_open_component(h.as_raw_handle() as HANDLE, &w, DIR_ACCESS, DIR_OPTIONS).expect("open hop");
+        }
+        assert!(!is_non_reparse_directory(&h), "junction handle must be flagged as a reparse point");
     }
 }

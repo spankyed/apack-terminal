@@ -37,7 +37,7 @@ pub fn split_windows_drive_path(path: &str) -> Option<(u8, Vec<&str>)> {
     let [drive, b':', sep, ..] = bytes else {
         return None;
     };
-    if !drive.is_ascii_alphabetic() || !separator(*sep) {
+    if !drive.is_ascii_alphabetic() || !separator(*sep) || bytes.last().is_some_and(|b| separator(*b)) {
         return None;
     }
     let mut components = Vec::new();
@@ -123,6 +123,8 @@ mod tests {
         assert_eq!(split_windows_drive_path(r"\img.png"), None);
         assert_eq!(split_windows_drive_path("C:img.png"), None);
         assert_eq!(split_windows_drive_path(r"C:\"), None);
+        assert_eq!(split_windows_drive_path(r"C:\a\img.png\"), None);
+        assert_eq!(split_windows_drive_path("C:/a/img.png/"), None);
         assert_eq!(split_windows_drive_path(r"C:\a\..\b.png"), None);
         assert_eq!(split_windows_drive_path(r"C:\a\file.png:ads"), None);
         assert_eq!(split_windows_drive_path(r"1:\a\b.png"), None);
