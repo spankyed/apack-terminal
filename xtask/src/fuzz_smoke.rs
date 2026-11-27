@@ -3,7 +3,7 @@
 
 use std::fs;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 /// Maximum allowed size of an individual committed seed file (64 KiB).
 pub const MAX_SEED_BYTES: u64 = 64 * 1024;
@@ -79,10 +79,9 @@ pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
     //    (which does not accept `--locked` directly).
     let lock_status = Command::new("cargo")
         .current_dir(&fuzz_dir)
-        .args(["+nightly", "metadata", "--locked", "--no-deps", "--format-version", "1"])
-        .stdout(Stdio::null())
+        .args(["+nightly", "fetch", "--locked"])
         .status()
-        .map_err(|err| format!("failed to verify fuzz/Cargo.lock with `cargo +nightly metadata --locked`: {err}"))?;
+        .map_err(|err| format!("failed to verify fuzz/Cargo.lock with `cargo +nightly fetch --locked`: {err}"))?;
     if !lock_status.success() {
         return Err(format!("fuzz/Cargo.lock is out of sync with fuzz/Cargo.toml (exit {lock_status})"));
     }
