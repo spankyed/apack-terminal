@@ -639,14 +639,16 @@ fn kitty_image_sources_e2e_file_shm_security_and_teardown() {
         let b64_ok = String::from_utf8(encoded(img_path.to_string_lossy().as_bytes())).unwrap();
 
         // 1. `image_files: false` MUST refuse `t=f` on Windows ConPTY too (hostile-PTY boundary).
+        //    Use `spec.cwd = tmp` + quote-free relative filename so `portable-pty` never backslash-escapes quotes for `cmd.exe /C`.
         let seq_disabled = tmp.path().join("win-seq-disabled.bin");
         std::fs::write(&seq_disabled, format!("\x1b_Ga=T,f=32,s=2,v=2,i=1,t=f;{b64_ok}\x1b\\WIN_DISABLED_DONE\r\n"))
             .unwrap();
         let mut spec_disabled = echo_command_spec("x", None, None);
+        spec_disabled.cwd = Some(tmp.path().to_string_lossy().into_owned());
         spec_disabled.argv = vec![
             String::from("cmd.exe"),
             String::from("/C"),
-            format!("type \"{}\" & ping -n 10 127.0.0.1 >nul", seq_disabled.display()),
+            String::from("type win-seq-disabled.bin & ping -n 10 127.0.0.1 >nul"),
         ];
         spec_disabled.image_files = false;
         let (s_dis, _) = client.spawn(spec_disabled).unwrap();
@@ -679,7 +681,9 @@ fn kitty_image_sources_e2e_file_shm_security_and_teardown() {
         let junc_target = tmp.path().join("jtarget");
         std::fs::create_dir(&junc_target).unwrap();
         let junc_secret = junc_target.join("secret.rgba");
-        std::fs::write(&junc_secret, &pixels).unwrap();
+        // Distinct pixel bytes from `ok.rgba` so we can verify the loaded blob is strictly `ok.rgba`.
+        let secret_pixels: Vec<u8> = vec![0x11; 16];
+        std::fs::write(&junc_secret, &secret_pixels).unwrap();
         let junc_dir = tmp.path().join("junc");
         let mk_status = Command::new("cmd.exe")
             .args(["/C", "mklink", "/J"])
@@ -705,10 +709,11 @@ fn kitty_image_sources_e2e_file_shm_security_and_teardown() {
         )
         .unwrap();
         let mut spec_win = echo_command_spec("x", None, None);
+        spec_win.cwd = Some(tmp.path().to_string_lossy().into_owned());
         spec_win.argv = vec![
             String::from("cmd.exe"),
             String::from("/C"),
-            format!("type \"{}\" & ping -n 10 127.0.0.1 >nul", seq_enabled.display()),
+            String::from("type win-seq-enabled.bin & ping -n 10 127.0.0.1 >nul"),
         ];
         spec_win.image_files = true;
         let (s_win, _) = client.spawn(spec_win).unwrap();
@@ -736,6 +741,7 @@ fn kitty_image_sources_e2e_file_shm_security_and_teardown() {
             1,
             "only the valid regular file must load on Windows (NTFS junction, UNC, and named pipe must be refused); got {placements:?}"
         );
+        assert_eq!(placements[0].pixel_size, [2, 2]);
         let BrokerMsg::ImageBlobChunk { data, encoding, total_bytes, .. } = client
             .stream_request(st_win, &ClientMsg::GetImageBlob { blob: placements[0].blob, offset: 0, max_bytes: 65_536 })
             .unwrap()
@@ -744,6 +750,13 @@ fn kitty_image_sources_e2e_file_shm_security_and_teardown() {
         };
         assert_eq!(encoding, apack_proto::types::ImageEncoding::Png);
         assert!(total_bytes > 8 && data.starts_with(b"\x89PNG\r\n\x1a\n"));
+        // Cryptographically verify the loaded blob hash matches `ok.rgba` (not `junc_secret`).
+        let mut ref_vt = GhosttyEngine::new(GhosttyConfig::new(GridSize::new(80, 24).unwrap())).unwrap();
+        let mut ref_ev = Vec::new();
+        let b64_pixels = String::from_utf8(encoded(&pixels)).unwrap();
+        ref_vt.feed(format!("\x1b_Ga=T,f=32,s=2,v=2,i=9,t=d;{b64_pixels}\x1b\\").as_bytes(), &mut ref_ev);
+        let expected_blob = ref_vt.images()[0].blob;
+        assert_eq!(placements[0].blob, expected_blob, "loaded Windows image must match ok.rgba, not junction target");
         client.detach(st_win).unwrap();
         client.kill(s_win).unwrap();
     }

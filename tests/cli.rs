@@ -22,6 +22,10 @@ impl KillOnDrop {
     fn wait_and_disarm(mut self) -> std::io::Result<ExitStatus> {
         self.0.take().expect("child still armed").wait()
     }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
 }
 
 impl Drop for KillOnDrop {
@@ -251,22 +255,20 @@ fn cli_binary_usage_version_serve_inspect_and_proxy() {
     );
     let _ = auth_client.send_fin();
     drop(auth_client);
-    // Let `auth_srv` exit cleanly after its sole client disconnects (tearing down session & unlinking socket);
-    // `KillOnDrop` still guarantees cleanup on panic or unexpected hang.
+    // `auth_srv` MUST auto-exit cleanly with status 0 once its sole client disconnects (tearing down
+    // the session & unlinking its socket); `KillOnDrop` still guarantees cleanup on assertion panic.
     let auth_exit_dl = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let mut auth_exited = false;
+    let mut auth_status = None;
     while std::time::Instant::now() < auth_exit_dl {
-        if auth_srv.inner_mut().try_wait().expect("try_wait auth_srv").is_some() {
-            auth_exited = true;
+        if let Some(st) = auth_srv.inner_mut().try_wait().expect("try_wait auth_srv") {
+            auth_status = Some(st);
+            auth_srv.disarm();
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    if auth_exited {
-        let _ = auth_srv.wait_and_disarm();
-    } else {
-        drop(auth_srv);
-    }
+    let status = auth_status.expect("auth serve must auto-exit cleanly after sole client disconnects");
+    assert!(status.success(), "auth serve exited with non-zero status: {status}");
     #[cfg(unix)]
     {
         let unlink_dl = std::time::Instant::now() + std::time::Duration::from_secs(2);

@@ -14,7 +14,7 @@ this one carried each.
 
 **How it is found.** `portable-pty` loads a `conpty.dll` that sits beside the executable in preference to the
 system's, and that `conpty.dll` starts the `OpenConsole.exe` beside it. So the two files go wherever the broker
-binary goes: `build.rs` puts them beside the one `cargo` builds, and `binaries.yml` publishes them beside the
+binary goes: `crates/apack-os/build.rs` puts them beside the ones `cargo` builds (and test executables in `deps/`), and `binaries.yml` publishes them beside the
 Windows binary it releases. Each directory here is one architecture's; the build takes the target's.
 
 | File | SHA-256 |

@@ -76,8 +76,8 @@ Repeatable throughput, frame-budget, scrollback, WAL, and proxy-RTT benchmarks l
     draining at most `PTY_READ_QUANTUM_BYTES` (`256 KiB`) per session per tick so one flooding session cannot
     starve peer sessions on the same shard.
   - **Windows:** `shard_windows.rs` (`ConPtyBridge`) bridges blocking ConPTY pipe I/O into the shard's
-    bounded command channel, using a two-phase `ExitDrainState` (`Running -> DrainingToEof(deadline)`) so
-    trailing ConPTY bytes flush before `Exited`.
+    bounded command channel, using a two-phase `Option<ExitDrainState>` (`None -> Some(ExitDrainState { code, signal, deadline })`)
+    so trailing ConPTY bytes flush before `Exited`.
 - **Bounded Foreground-Verification Worker (`shard/mod.rs`):** Blocking `sysinfo`/Win32 foreground-process checks
   for OSC 7501 status confirmation run off the shard thread via a bounded queue (`FG_VERIFY_QUEUE_CAP = 64`)
   with per-session `fg_inflight` coalescing, posting typed confirmation events back to the owning shard.
@@ -126,7 +126,7 @@ Session lifetimes are explicitly modeled by `SessionLifetime` (`Kept`, `LeaseBou
 ### Windows ConPTY
 
 Windows sessions run against the bundled Microsoft ConPTY (`windows/conpty/conpty.dll` + `OpenConsole.exe`),
-copied beside the binary by `build.rs`. `crates/apack-os/src/pty_windows.rs` handles ConPTY-specific quirks
+copied beside built binaries and test executables by `crates/apack-os/build.rs`. `crates/apack-os/src/pty_windows.rs` handles ConPTY-specific quirks
 explicitly: `ClosePseudoConsole` teardown sequencing, input `\r\n` normalization, and bounded drain behavior
 without hanging on missing EOF.
 
@@ -138,9 +138,11 @@ Everything written into a PTY is treated as **hostile untrusted bytes**:
   and `t=s` (POSIX/Win32 shared memory) transmissions are **never opened** by the VT core (`libghostty-vt`
   never touches the filesystem; probe validation uses the sealed `NamedImageProbe` type and all `extern "C"`
   callbacks route through a `catch_unwind` trampoline). When `SpawnSpec.image_files` is enabled, validated
-  file/SHM reads run off-shard in `crates/apack-os/src/image_sources/` using handle-relative traversal
-  (`openat2` / `dir_stack` on POSIX, `NtCreateFile` + `FILE_OPEN_REPARSE_POINT` on Windows) to refuse
-  symlinks, NTFS junctions, UNC shares, devices, and named pipes; otherwise only inline payloads (`t=d`) are
+  file/SHM reads run off-shard in `crates/apack-os/src/image_sources/` using handle-relative traversal:
+  Windows (`NtCreateFile` + `FILE_OPEN_REPARSE_POINT`) refuses all reparse points (symlinks and NTFS
+  junctions), UNC shares, devices, and named pipes; POSIX (`openat2` / `readlinkat` + `dir_stack`) resolves
+  safe symlinks (e.g., macOS `/var -> /private/var`) while refusing `/proc`/`/sys`/`/dev` (except `/dev/shm`),
+  symlink loops, special filesystems, and non-regular files. Otherwise only inline payloads (`t=d`) are
   accepted.
 - **Push-synced image cache & content-addressed `ImageStore` (`256 MiB` LRU cap):** `GhosttyEngine` pushes
   decoded Kitty image metadata into its bounded local cache on `&mut self` mutations (`feed` / `restore_snapshot`)
@@ -187,9 +189,9 @@ through `safe_fs` (`O_NOFOLLOW | O_NONBLOCK` + regular-file verification):
 - **Dual-layer `KeyframeV2` & transactional replay:** Record 0 of every segment is a zlib-compressed
   `KeyframeV2` (capped at `32 MiB` uncompressed; multi-keyframe amplification bombs after record 0 are
   rejected before inflation). Live shards persist image blobs (`write_blob`) and vouched marks (`write_marks`)
-  alongside output, and `Rewind`/`Seek`/`restore_from` hydrate referenced blobs from `<dir>/blobs/` and
-  restore through `SessionMachine::restore_from_slice` (monotonically advancing `epoch`, resetting/replaying
-  marks & statuses, refreshing `SearchWatch`es, and forcing full sync):
+  alongside output, and `Rewind`/`Seek`/`restore_from` hydrate referenced blobs from `<dir>/blobs/` and restore
+  through `restore_machine_from_slice` -> `SessionMachine::restore_from_replay` (monotonically advancing `epoch`,
+  resetting/replaying marks & statuses, refreshing `SearchWatch`es, and forcing full sync):
   1. `VisualKeyframe` — broker-owned, version-stable snapshot of screen rows, up to `1_000` history rows,
      cursor, modes, palette, image placements, `MarksKey` state, and command history (sanitized on fallback).
   2. Optional `EngineCheckpoint` — ABI-hashed `libghostty-vt` binary snapshot (`<= 8 MiB`) enabling lossless

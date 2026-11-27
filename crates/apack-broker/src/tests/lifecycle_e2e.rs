@@ -113,17 +113,17 @@ fn e2e_leases_kept_pinning_tier2_compression_foreground_verify_and_kill_escalati
 
         #[cfg(unix)]
         let roll_argv =
-            vec![String::from("/bin/sh"), String::from("-c"), format!("cat '{}'; sleep 10", roll_file.display())];
+            vec![String::from("/bin/sh"), String::from("-c"), String::from("cat rollover-lines.txt; sleep 10")];
         #[cfg(windows)]
         let roll_argv = vec![
             String::from("cmd.exe"),
             String::from("/C"),
-            format!("type \"{}\" & ping -n 10 127.0.0.1 >nul", roll_file.display()),
+            String::from("type rollover-lines.txt & ping -n 10 127.0.0.1 >nul"),
         ];
 
         let spec_roll = SpawnSpec {
             argv: roll_argv,
-            cwd: None,
+            cwd: Some(tmp.path().to_string_lossy().into_owned()),
             env: Vec::new(),
             size: GridSize::new(80, 10).unwrap(),
             cell_px: CellPx { width: 8, height: 16 },
@@ -137,7 +137,7 @@ fn e2e_leases_kept_pinning_tier2_compression_foreground_verify_and_kill_escalati
         };
         let (s_roll, _) = c2.spawn(spec_roll).unwrap();
         assert_eq!(
-            c2.wait(s_roll, WaitCondition::Text(String::from("ROLLOVER_LINE_1399")), 8_000).unwrap(),
+            c2.wait(s_roll, WaitCondition::Text(String::from("ROLLOVER_LINE_1399")), 5_000).unwrap(),
             WaitOutcome::Met
         );
 
@@ -248,7 +248,7 @@ fn e2e_leases_kept_pinning_tier2_compression_foreground_verify_and_kill_escalati
         }
         assert!(!c2.list_sessions().unwrap().iter().any(|s| s.id == s_fg));
 
-        // Verify graceful SIGHUP runs BEFORE SIGKILL escalation (`kill_escalate_after = 120ms`):
+        // Verify graceful SIGHUP runs BEFORE SIGKILL escalation (`kill_escalate_after = 400ms`):
         // a shell trapping SIGHUP and exiting with code 7 must exit cleanly with Some(7) (not SIGKILL)!
         let hup_spec = SpawnSpec {
             argv: vec![

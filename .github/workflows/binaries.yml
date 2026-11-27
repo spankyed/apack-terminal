@@ -132,7 +132,7 @@ jobs:
       - name: SBOM
         shell: bash
         run: cargo cyclonedx --format json --spec-version 1.5 --describe binaries --no-build-deps --target ${{ matrix.target }}
-      # The binary and what `build.rs` placed beside it (the ConPTY on Windows), renamed for a release that has no
+      # The binary and what `crates/apack-os/build.rs` placed beside it (the ConPTY on Windows), renamed for a release that has no
       # folders
       - name: Collect this platform's files
         shell: bash

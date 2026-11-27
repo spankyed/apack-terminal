@@ -1,7 +1,7 @@
 // Runs the broker as a consumer reaches it: from a project that installed `@apackdev/terminal`, asks the package for
 // this platform's binary and runs it (`.github/workflows/binaries.yml`, before and after the release is published).
 //
-//   node node/release/smoke.mjs <project dir>
+//   node node/release/smoke.mjs <project dir> [--require-view]
 //
 // **Run with no arguments, which is the whole probe.** The broker answers that with its usage and exit 2, so it
 // needs no socket and no cleanup, and what it proves is what can be wrong in a package: a binary built for another
@@ -49,19 +49,37 @@ const viewPkgPath = path.join(scope, 'terminal-view', 'package.json');
 if (requireView || fs.existsSync(viewPkgPath)) {
   if (!fs.existsSync(viewPkgPath)) fail('@apackdev/terminal-view is not installed');
   const viewManifest = JSON.parse(fs.readFileSync(viewPkgPath, 'utf8'));
+  const brokerManifest = JSON.parse(fs.readFileSync(path.join(scope, 'terminal', 'package.json'), 'utf8'));
   if (typeof viewManifest.gitHead !== 'string' || !/^[0-9a-f]{40}$/.test(viewManifest.gitHead)) {
     fail(`@apackdev/terminal-view package.json has invalid gitHead: ${JSON.stringify(viewManifest.gitHead)}`);
   }
-  if (required.commit && viewManifest.gitHead !== required.commit) {
+  if (typeof required.commit !== 'string' || !/^[0-9a-f]{40}$/.test(required.commit)) {
+    fail(`@apackdev/terminal package.json has invalid gitHead/commit: ${JSON.stringify(required.commit)}`);
+  }
+  if (viewManifest.gitHead !== required.commit) {
     fail(`@apackdev/terminal-view gitHead (${viewManifest.gitHead}) != @apackdev/terminal commit (${required.commit})`);
   }
-  const viewEntry = path.join(scope, 'terminal-view', 'dist', 'index.js');
-  if (!fs.existsSync(viewEntry)) fail(`@apackdev/terminal-view is missing ${viewEntry}`);
-  const viewMod = await import(pathToFileURL(viewEntry).href);
-  for (const symbol of ['TerminalView', 'TerminalClient', 'WebGL2AtlasPainter', 'CanvasPainter', 'createPainter']) {
-    if (typeof viewMod[symbol] !== 'function') {
-      fail(`@apackdev/terminal-view missing expected export ${symbol}`);
-    }
+  if (viewManifest.version !== brokerManifest.version) {
+    fail(`@apackdev/terminal-view version (${viewManifest.version}) != @apackdev/terminal version (${brokerManifest.version})`);
+  }
+  const viewDts = path.join(scope, 'terminal-view', 'dist', 'index.d.ts');
+  if (!fs.existsSync(viewDts)) fail(`@apackdev/terminal-view is missing ${viewDts}`);
+  // Exercise bare-specifier ESM resolution through `@apackdev/terminal-view`'s `exports` map from `project`.
+  const viewProbe = spawnSync(
+    process.execPath,
+    [
+      '--input-type=module',
+      '-e',
+      "import * as m from '@apackdev/terminal-view';"
+        + "for (const s of ['TerminalView','TerminalClient','WebGL2AtlasPainter','CanvasPainter','createPainter']) {"
+        + "  if (typeof m[s] !== 'function') { console.error('missing export: ' + s); process.exit(1); }"
+        + '}',
+    ],
+    { cwd: project, encoding: 'utf8', timeout: 30_000 },
+  );
+  if (viewProbe.error) fail(`@apackdev/terminal-view import failed to run: ${viewProbe.error.message}`);
+  if (viewProbe.status !== 0) {
+    fail(`@apackdev/terminal-view bare-specifier ESM import failed (${viewProbe.status}): ${viewProbe.stderr}`);
   }
   console.log(`smoke: @apackdev/terminal-view@${viewManifest.version} imports cleanly (gitHead ${viewManifest.gitHead})`);
 }

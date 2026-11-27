@@ -134,12 +134,14 @@ test('packs @apackdev/terminal-view with gitHead stamped and refuses missing bui
   const fakeView = fs.mkdtempSync(path.join(os.tmpdir(), 'apack-terminal-view-'));
   fs.mkdirSync(path.join(fakeView, 'dist'), { recursive: true });
   fs.writeFileSync(path.join(fakeView, 'dist', 'index.js'), 'export const TerminalView = () => {};\n');
+  fs.writeFileSync(path.join(fakeView, 'dist', 'index.d.ts'), 'export declare const TerminalView: () => void;\n');
   fs.writeFileSync(path.join(fakeView, 'README.md'), '# view\n');
   const viewPkg = {
     name: '@apackdev/terminal-view',
     version: MAIN.version,
     type: 'module',
     main: './dist/index.js',
+    types: './dist/index.d.ts',
     files: ['dist', 'README.md'],
     scripts: { build: 'vite build' },
     devDependencies: { vite: '^7.0.0' },
@@ -160,6 +162,7 @@ test('packs @apackdev/terminal-view with gitHead stamped and refuses missing bui
   assert.equal(manifest.version, MAIN.version);
   assert.equal(manifest.scripts, undefined);
   assert.ok(fs.existsSync(path.join(unpacked, 'dist', 'index.js')));
+  assert.ok(fs.existsSync(path.join(unpacked, 'dist', 'index.d.ts')));
 
   // Version drift between node/package.json and view/package.json must fail packAll
   fs.writeFileSync(path.join(fakeView, 'package.json'), `${JSON.stringify({ ...viewPkg, version: '0.0.1' })}\n`);
@@ -168,8 +171,11 @@ test('packs @apackdev/terminal-view with gitHead stamped and refuses missing bui
     /view\/package\.json is at 0\.0\.1/,
   );
 
-  // Missing built dist/index.js must fail packView
-  fs.rmSync(path.join(fakeView, 'dist', 'index.js'));
+  // Missing built dist/index.d.ts and dist/index.js must fail packView
   fs.writeFileSync(path.join(fakeView, 'package.json'), `${JSON.stringify(viewPkg)}\n`);
+  fs.rmSync(path.join(fakeView, 'dist', 'index.d.ts'));
+  assert.throws(() => packView({ commit: COMMIT, viewDir: fakeView, out }), /dist\/index\.d\.ts/);
+  fs.writeFileSync(path.join(fakeView, 'dist', 'index.d.ts'), 'export {};\n');
+  fs.rmSync(path.join(fakeView, 'dist', 'index.js'));
   assert.throws(() => packView({ commit: COMMIT, viewDir: fakeView, out }), /dist\/index\.js/);
 });

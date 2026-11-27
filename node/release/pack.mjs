@@ -1,7 +1,7 @@
 // Packs the npm packages a `bin-<commit>` release carries: one per platform from that platform's built files, and
 // `@apackdev/terminal` itself, as `.tgz` files a consumer installs by URL (`.github/workflows/binaries.yml`).
 //
-//   node node/release/pack.mjs --commit <sha> --files <dir> --out <dir> [--repo <owner/name>]
+//   node node/release/pack.mjs --commit <sha> --files <dir> --out <dir> [--view <dir>] [--repo <owner/name>]
 //
 // `--files` holds the release's `<platform>__<file>` assets for every platform.
 //
@@ -127,8 +127,10 @@ export function packView({ commit, viewDir, out }) {
       if (!fs.existsSync(src)) throw new Error(`${viewDir} is missing required release entry ${entry}`);
       fs.cpSync(src, path.join(directory, entry), { recursive: true });
     }
-    if (!fs.existsSync(path.join(directory, 'dist', 'index.js'))) {
-      throw new Error(`${viewDir} has no built dist/index.js (run npm --prefix view run build first)`);
+    for (const required of ['index.js', 'index.d.ts']) {
+      if (!fs.existsSync(path.join(directory, 'dist', required))) {
+        throw new Error(`${viewDir} has no built dist/${required} (run npm --prefix view run build first)`);
+      }
     }
     fs.writeFileSync(path.join(directory, 'package.json'), `${JSON.stringify(released, null, 2)}\n`);
     return npmPack(directory, out);

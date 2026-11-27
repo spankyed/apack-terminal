@@ -21,7 +21,7 @@ anything, and the document that owns the area you are changing — [`protocol.md
 | `view/` | `@apackdev/terminal-view` npm package: v2 binary wire codec (`src/wire/`), multiplexed `TerminalClient` & `BrokerSessionSource` (`src/broker/client.ts`), `RowStore`, `Viewport`, `Input`, `Selection`, `links.ts`, `CanvasPainter`, `WebGL2AtlasPainter`, `ShelfPacker`, `createPainter` |
 | `xtask/` | workspace tasks (`pre-push`, `generate`, `check-generated`, `check-safety`, `notices`, `check-notices`, `check-exclusions`, `clear-mutants`, `vt-prebuilt`) |
 | `fuzz/` | standalone libFuzzer workspace (`v2_wire`, `v2_wal`, `v2_vt`) run nightly by `.github/workflows/fuzz.yml` |
-| `windows/conpty/`, `build.rs` | bundled Microsoft ConPTY (`conpty.dll`, `OpenConsole.exe`) copied beside Windows binaries by `build.rs` |
+| `windows/conpty/`, `crates/apack-os/build.rs` | bundled Microsoft ConPTY (`conpty.dll`, `OpenConsole.exe`) copied beside Windows binaries & test executables by `crates/apack-os/build.rs` |
 | `about.toml`, `about.hbs`, `licenses/` | third-party license config and verbatim non-crate notices used by `cargo xtask notices` |
 | `THIRD-PARTY-NOTICES`, `COPYRIGHT-rust-library.html` | **generated** by `cargo xtask notices`; shipped beside every platform binary in `binaries.yml` |
 
