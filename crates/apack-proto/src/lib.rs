@@ -75,3 +75,39 @@ pub const MAX_VEC_ITEMS: usize = 65_536;
 
 /// Maximum length in bytes of a single decoded byte-blob field (8 MiB).
 pub const MAX_BLOB_BYTES: usize = MAX_FRAME_PAYLOAD;
+
+/// Maximum progress percentage reported in `Progress` and `StatusRecord`.
+pub const MAX_PROGRESS_PERCENT: u8 = 100;
+
+/// Maximum `argv` entries in a `SpawnSpec`.
+pub const MAX_SPAWN_ARGV: usize = 1_024;
+
+/// Maximum `env` pairs in a `SpawnSpec`.
+pub const MAX_SPAWN_ENV: usize = 1_024;
+
+/// Maximum session summaries returned in `SessionsList`.
+pub const MAX_SESSIONS_LIST: usize = 4_096;
+
+/// Maximum image placements returned in `ImagesReply`.
+pub const MAX_IMAGES_REPLY: usize = 4_096;
+
+/// Maximum dynamic palette overrides in a `PaletteOverrides` table.
+pub const MAX_PALETTE_OVERRIDES: usize = 256;
+
+/// Maximum style runs in a single `PackedRow`.
+pub const MAX_PACKED_RUNS: usize = 4_096;
+
+/// Maximum style entries in a single `PackedRow`.
+pub const MAX_PACKED_STYLES: usize = 4_096;
+
+/// Maximum hyperlink entries in a single `PackedRow`.
+pub const MAX_PACKED_LINKS: usize = 1_024;
+
+/// Maximum Kitty placeholder image pieces in a single `PackedRow`.
+pub const MAX_PACKED_PIECES: usize = 1_024;
+
+/// Maximum status states listed in `WaitCondition::Status`.
+pub const MAX_WAIT_STATUSES: usize = 8;
+
+/// Length in bytes of nonces and mutual-auth HMAC proofs.
+pub const AUTH_TOKEN_LEN: usize = 32;

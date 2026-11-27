@@ -196,12 +196,19 @@ pub enum SignalScope {
 }
 
 impl SignalScope {
+    /// Wire tag for [`Self::Leader`].
+    pub const TAG_LEADER: u8 = 0;
+    /// Wire tag for [`Self::Group`].
+    pub const TAG_GROUP: u8 = 1;
+    /// Wire tag for [`Self::Pid`].
+    pub const TAG_PID: u8 = 2;
+
     pub(crate) fn encode(self, w: &mut Writer) {
         match self {
-            Self::Leader => w.u8(0),
-            Self::Group => w.u8(1),
+            Self::Leader => w.u8(Self::TAG_LEADER),
+            Self::Group => w.u8(Self::TAG_GROUP),
             Self::Pid(target) => {
-                w.u8(2);
+                w.u8(Self::TAG_PID);
                 target.encode(w);
             }
         }
@@ -209,9 +216,9 @@ impl SignalScope {
 
     pub(crate) fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
         match r.u8()? {
-            0 => Ok(Self::Leader),
-            1 => Ok(Self::Group),
-            2 => Ok(Self::Pid(SignalTarget::decode(r)?)),
+            Self::TAG_LEADER => Ok(Self::Leader),
+            Self::TAG_GROUP => Ok(Self::Group),
+            Self::TAG_PID => Ok(Self::Pid(SignalTarget::decode(r)?)),
             other => Err(WireError::InvalidTag { kind: "SignalScope", tag: u16::from(other) }),
         }
     }
@@ -222,6 +229,9 @@ impl SignalScope {
 pub struct MarksKey([u8; 32]);
 
 impl MarksKey {
+    /// Byte length of an ASCII hex marks key.
+    pub const LEN: usize = 32;
+
     /// Parses a 32-character lowercase hexadecimal key.
     pub fn parse(input: &[u8]) -> Option<Self> {
         if input.len() != 32 {
@@ -321,19 +331,28 @@ pub enum CommandOutcome {
 }
 
 impl CommandOutcome {
+    /// Wire tag for [`Self::Running`].
+    pub const TAG_RUNNING: u8 = 0;
+    /// Wire tag for [`Self::Exited`].
+    pub const TAG_EXITED: u8 = 1;
+    /// Wire tag for [`Self::Unknown`].
+    pub const TAG_UNKNOWN: u8 = 2;
+    /// Wire tag for [`Self::Claimed`].
+    pub const TAG_CLAIMED: u8 = 3;
+
     pub(crate) fn encode(self, w: &mut Writer) {
         match self {
-            Self::Running => w.u8(0),
+            Self::Running => w.u8(Self::TAG_RUNNING),
             Self::Exited(code) => {
-                w.u8(1);
+                w.u8(Self::TAG_EXITED);
                 w.i32(code.code());
             }
             Self::Unknown(why) => {
-                w.u8(2);
+                w.u8(Self::TAG_UNKNOWN);
                 why.encode(w);
             }
             Self::Claimed(code) => {
-                w.u8(3);
+                w.u8(Self::TAG_CLAIMED);
                 w.opt(code.as_ref(), |w, c| w.i32(*c));
             }
         }
@@ -341,10 +360,10 @@ impl CommandOutcome {
 
     pub(crate) fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
         match r.u8()? {
-            0 => Ok(Self::Running),
-            1 => Ok(Self::Exited(VouchedExitCode::from_vouched(r.i32()?))),
-            2 => Ok(Self::Unknown(UnknownReason::decode(r)?)),
-            3 => Ok(Self::Claimed(r.opt(|r| r.i32())?)),
+            Self::TAG_RUNNING => Ok(Self::Running),
+            Self::TAG_EXITED => Ok(Self::Exited(VouchedExitCode::from_vouched(r.i32()?))),
+            Self::TAG_UNKNOWN => Ok(Self::Unknown(UnknownReason::decode(r)?)),
+            Self::TAG_CLAIMED => Ok(Self::Claimed(r.opt(|r| r.i32())?)),
             other => Err(WireError::InvalidTag { kind: "CommandOutcome", tag: u16::from(other) }),
         }
     }
@@ -527,6 +546,9 @@ impl LeaseGraceMs {
 pub struct ResumeToken([u8; 32]);
 
 impl ResumeToken {
+    /// Byte length of an opaque resume token.
+    pub const LEN: usize = 32;
+
     /// Wraps a 32-byte reconnect token.
     pub const fn new(bytes: [u8; 32]) -> Self {
         Self(bytes)
@@ -561,16 +583,23 @@ pub enum LeaseKind {
 }
 
 impl LeaseKind {
+    /// Wire tag for [`Self::BrokerImmediate`].
+    pub const TAG_BROKER_IMMEDIATE: u8 = 0;
+    /// Wire tag for [`Self::BrokerGrace`].
+    pub const TAG_BROKER_GRACE: u8 = 1;
+    /// Wire tag for [`Self::Session`].
+    pub const TAG_SESSION: u8 = 2;
+
     pub(crate) fn encode(&self, w: &mut Writer) {
         match *self {
-            Self::BrokerImmediate => w.u8(0),
+            Self::BrokerImmediate => w.u8(Self::TAG_BROKER_IMMEDIATE),
             Self::BrokerGrace { grace_ms, resume_token } => {
-                w.u8(1);
+                w.u8(Self::TAG_BROKER_GRACE);
                 w.var_u32(grace_ms.get());
                 w.raw(resume_token.as_bytes());
             }
             Self::Session(id) => {
-                w.u8(2);
+                w.u8(Self::TAG_SESSION);
                 id.encode(w);
             }
         }
@@ -578,14 +607,14 @@ impl LeaseKind {
 
     pub(crate) fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
         match r.u8()? {
-            0 => Ok(Self::BrokerImmediate),
-            1 => {
+            Self::TAG_BROKER_IMMEDIATE => Ok(Self::BrokerImmediate),
+            Self::TAG_BROKER_GRACE => {
                 let raw_ms = r.var_u32()?;
                 let grace_ms = LeaseGraceMs::new(raw_ms).ok_or(WireError::LimitExceeded("lease grace_ms"))?;
                 let resume_token = ResumeToken::new(r.fixed::<32>()?);
                 Ok(Self::BrokerGrace { grace_ms, resume_token })
             }
-            2 => Ok(Self::Session(SessionId::decode(r)?)),
+            Self::TAG_SESSION => Ok(Self::Session(SessionId::decode(r)?)),
             other => Err(WireError::InvalidTag { kind: "LeaseKind", tag: u16::from(other) }),
         }
     }
@@ -711,6 +740,9 @@ pub struct CursorState {
 }
 
 impl CursorState {
+    /// Mask of all defined cursor state flag bits (`blinking | hidden`).
+    pub const ALL_FLAGS_MASK: u8 = 0x03;
+
     /// Encodes the cursor state into `w`.
     pub fn encode(self, w: &mut Writer) {
         w.u16(self.col);
@@ -732,7 +764,7 @@ impl CursorState {
         let row = r.u16()?;
         let shape = CursorShape::decode(r)?;
         let flags = r.u8()?;
-        if flags > 0x03 {
+        if flags > Self::ALL_FLAGS_MASK {
             return Err(WireError::InvalidValue("unknown CursorState flag bits"));
         }
         Ok(Self { col, row, shape, blinking: flags & 1 != 0, hidden: flags & 2 != 0 })
@@ -784,7 +816,8 @@ impl PaletteOverrides {
             fg: r.opt(Rgb::decode)?,
             bg: r.opt(Rgb::decode)?,
             cursor: r.opt(Rgb::decode)?,
-            palette: r.vec_bounded(256, "palette overrides", |r| Ok((r.u8()?, Rgb::decode(r)?)))?,
+            palette: r
+                .vec_bounded(crate::MAX_PALETTE_OVERRIDES, "palette overrides", |r| Ok((r.u8()?, Rgb::decode(r)?)))?,
         })
     }
 }
@@ -803,6 +836,9 @@ pub struct ViewModes {
 }
 
 impl ViewModes {
+    /// Mask of all defined view-mode flag bits.
+    pub const ALL_FLAGS_MASK: u8 = 0x0F;
+
     /// Encodes view modes into `w`.
     pub fn encode(self, w: &mut Writer) {
         let mut bits = 0u8;
@@ -824,7 +860,7 @@ impl ViewModes {
     /// Decodes view modes from `r`.
     pub fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
         let bits = r.u8()?;
-        if bits > 0x0F {
+        if bits > Self::ALL_FLAGS_MASK {
             return Err(WireError::InvalidValue("unknown ViewModes flag bits"));
         }
         Ok(Self {
@@ -841,6 +877,9 @@ impl ViewModes {
 pub struct BlobHash(pub [u8; 32]);
 
 impl BlobHash {
+    /// Byte length of a BLAKE3 blob hash.
+    pub const LEN: usize = 32;
+
     /// Encodes the 32-byte hash into `w`.
     pub fn encode(self, w: &mut Writer) {
         w.raw(&self.0);
@@ -951,6 +990,8 @@ pub struct PackedRun {
 impl PackedRun {
     /// Wide character or grapheme cluster needing per-cell placement.
     pub const FLAG_PER_CELL: u8 = 0x01;
+    /// Mask of all defined run flag bits.
+    pub const ALL_FLAGS_MASK: u8 = Self::FLAG_PER_CELL;
 
     pub(crate) fn encode(&self, w: &mut Writer) {
         w.u16(self.col_start);
@@ -973,7 +1014,7 @@ impl PackedRun {
         let style_idx = r.u16()?;
         let link_idx = r.u16()?;
         let flags = r.u8()?;
-        if flags > 0x01 {
+        if flags > Self::ALL_FLAGS_MASK {
             return Err(WireError::InvalidValue("unknown PackedRun flag bits"));
         }
         Ok(Self { col_start, col_len, byte_offset, byte_len, style_idx, link_idx, flags })
@@ -1014,11 +1055,19 @@ impl PackedStyle {
     pub const FLAG_FAINT: u32 = 0x0200;
     /// Mask of all defined style attribute bits.
     pub const ALL_FLAGS_MASK: u32 = 0x03FF;
+    /// Bit shift of the 3-bit underline field inside `flags`.
+    pub const UNDERLINE_SHIFT: u32 = 2;
+    /// Maximum encoded palette colour (`0` = default, `1..=256` = palette+1).
+    pub const MAX_PALETTE_COLOR: u32 = 256;
+    /// Minimum encoded 24-bit RGB colour (`0x01_00_00_00`).
+    pub const RGB_COLOR_MIN: u32 = 0x01_00_00_00;
+    /// Maximum encoded 24-bit RGB colour (`0x01_FF_FF_FF`).
+    pub const RGB_COLOR_MAX: u32 = 0x01_FF_FF_FF;
 
     /// Returns `true` iff `color` is a valid packed colour (`0` default, `1..=256` palette+1,
     /// or `0x01_00_00_00..=0x01_FF_FF_FF` RGB).
     pub const fn is_valid_color(color: u32) -> bool {
-        color <= 256 || (color >= 0x01_00_00_00 && color <= 0x01_FF_FF_FF)
+        color <= Self::MAX_PALETTE_COLOR || (color >= Self::RGB_COLOR_MIN && color <= Self::RGB_COLOR_MAX)
     }
 
     pub(crate) fn encode(&self, w: &mut Writer) {
@@ -1071,6 +1120,8 @@ impl PackedRow {
     pub const FLAG_HAS_BLINK: u8 = 0x04;
     /// Row contains Kitty Unicode placeholder cells.
     pub const FLAG_HAS_PLACEHOLDER: u8 = 0x08;
+    /// Mask of all defined row flag bits.
+    pub const ALL_FLAGS_MASK: u8 = 0x0F;
 
     /// Safely resolves `style_idx`, returning [`PackedStyle::default`] for index `0` even when `styles` is omitted.
     pub fn style(&self, idx: u16) -> PackedStyle {
@@ -1097,20 +1148,20 @@ impl PackedRow {
     pub fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
         let line = r.var_u64()?;
         let flags = r.u8()?;
-        if flags > 0x0F {
+        if flags > Self::ALL_FLAGS_MASK {
             return Err(WireError::InvalidValue("unknown PackedRow flag bits"));
         }
         let text = r.str()?;
-        let runs = r.vec_bounded(4096, "packed runs", PackedRun::decode)?;
-        let styles = r.vec_bounded(4096, "packed styles", PackedStyle::decode)?;
+        let runs = r.vec_bounded(crate::MAX_PACKED_RUNS, "packed runs", PackedRun::decode)?;
+        let styles = r.vec_bounded(crate::MAX_PACKED_STYLES, "packed styles", PackedStyle::decode)?;
         if styles.first().is_some_and(|s| *s != PackedStyle::default()) {
             return Err(WireError::InvalidValue("styles[0] must be default style"));
         }
-        let links = r.vec_bounded(1024, "packed links", Reader::str)?;
+        let links = r.vec_bounded(crate::MAX_PACKED_LINKS, "packed links", Reader::str)?;
         if links.first().is_some_and(|l| !l.is_empty()) {
             return Err(WireError::InvalidValue("links[0] must be empty"));
         }
-        let pieces = r.vec_bounded(1024, "image pieces", ImagePiece::decode)?;
+        let pieces = r.vec_bounded(crate::MAX_PACKED_PIECES, "image pieces", ImagePiece::decode)?;
         if !pieces.is_empty() && (flags & Self::FLAG_HAS_PLACEHOLDER == 0) {
             return Err(WireError::InvalidValue("pieces require FLAG_HAS_PLACEHOLDER"));
         }
@@ -1409,7 +1460,11 @@ impl StatusRecord {
         }
         let progress = r.opt(|r| {
             let p = r.u8()?;
-            if p > 100 { Err(WireError::InvalidValue("progress must be 0..=100")) } else { Ok(p) }
+            if p > crate::MAX_PROGRESS_PERCENT {
+                Err(WireError::InvalidValue("progress must be 0..=100"))
+            } else {
+                Ok(p)
+            }
         })?;
         Ok(Self {
             id,
@@ -1486,6 +1541,24 @@ impl KeyAction {
     }
 }
 
+/// Modifier bitmask constants shared by [`KeyInput`] and [`PointerInput`].
+pub mod modifier {
+    /// Shift key modifier.
+    pub const SHIFT: u8 = 0x01;
+    /// Control key modifier.
+    pub const CTRL: u8 = 0x02;
+    /// Alt / Option key modifier.
+    pub const ALT: u8 = 0x04;
+    /// Super / Meta / Command key modifier.
+    pub const SUPER: u8 = 0x08;
+    /// Caps Lock modifier.
+    pub const CAPS: u8 = 0x10;
+    /// Num Lock modifier.
+    pub const NUM: u8 = 0x20;
+    /// Mask of all defined modifier bits.
+    pub const ALL_MASK: u8 = 0x3F;
+}
+
 /// Structured keyboard input sent by a view for broker-side VT encoding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyInput {
@@ -1517,7 +1590,7 @@ impl KeyInput {
         let code = r.str()?;
         let action = KeyAction::decode(r)?;
         let modifiers = r.u8()?;
-        if modifiers > 0x3F {
+        if modifiers > modifier::ALL_MASK {
             return Err(WireError::InvalidValue("unknown KeyInput modifier bits"));
         }
         let text = r.str()?;
@@ -1587,6 +1660,11 @@ pub struct PointerInput {
 }
 
 impl PointerInput {
+    /// Highest numbered mouse button index (`0` = left, `1` = middle, `2` = right).
+    pub const MAX_BUTTON: u8 = 2;
+    /// Sentinel value indicating no mouse button (`255`).
+    pub const BUTTON_NONE: u8 = 255;
+
     pub(crate) fn encode(self, w: &mut Writer) {
         self.action.encode(w);
         w.u8(self.button);
@@ -1599,11 +1677,11 @@ impl PointerInput {
     pub(crate) fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
         let action = PointerAction::decode(r)?;
         let button = r.u8()?;
-        if button > 2 && button != 255 {
+        if button > Self::MAX_BUTTON && button != Self::BUTTON_NONE {
             return Err(WireError::InvalidValue("invalid PointerInput button"));
         }
         let modifiers = r.u8()?;
-        if modifiers > 0x3F {
+        if modifiers > modifier::ALL_MASK {
             return Err(WireError::InvalidValue("unknown PointerInput modifier bits"));
         }
         Ok(Self { action, button, modifiers, x_px: r.var_u32()?, y_px: r.var_u32()?, cell_px: CellPx::decode(r)? })
@@ -1648,39 +1726,48 @@ pub enum WaitCondition {
 }
 
 impl WaitCondition {
+    /// Wire tag for [`Self::Idle`].
+    pub const TAG_IDLE: u8 = 0;
+    /// Wire tag for [`Self::Text`].
+    pub const TAG_TEXT: u8 = 1;
+    /// Wire tag for [`Self::Status`].
+    pub const TAG_STATUS: u8 = 2;
+    /// Wire tag for [`Self::Exit`].
+    pub const TAG_EXIT: u8 = 3;
+
     pub(crate) fn encode(&self, w: &mut Writer) {
         match self {
-            Self::Idle => w.u8(0),
+            Self::Idle => w.u8(Self::TAG_IDLE),
             Self::Text(needle) => {
-                w.u8(1);
+                w.u8(Self::TAG_TEXT);
                 w.str(needle);
             }
             Self::Status(states) => {
-                w.u8(2);
+                w.u8(Self::TAG_STATUS);
                 w.slice(states, |w, s| s.encode(w));
             }
-            Self::Exit => w.u8(3),
+            Self::Exit => w.u8(Self::TAG_EXIT),
         }
     }
 
     pub(crate) fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
         match r.u8()? {
-            0 => Ok(Self::Idle),
-            1 => {
+            Self::TAG_IDLE => Ok(Self::Idle),
+            Self::TAG_TEXT => {
                 let needle = r.str_bounded(crate::MAX_SEARCH_NEEDLE_BYTES, "wait text needle")?;
                 if needle.is_empty() {
                     return Err(WireError::InvalidValue("wait text needle must be non-empty"));
                 }
                 Ok(Self::Text(needle))
             }
-            2 => {
-                let states = r.vec_bounded(8, "wait states", StatusState::decode)?;
+            Self::TAG_STATUS => {
+                let states = r.vec_bounded(crate::MAX_WAIT_STATUSES, "wait states", StatusState::decode)?;
                 if states.is_empty() {
                     return Err(WireError::InvalidValue("wait status list must be non-empty"));
                 }
                 Ok(Self::Status(states))
             }
-            3 => Ok(Self::Exit),
+            Self::TAG_EXIT => Ok(Self::Exit),
             other => Err(WireError::InvalidTag { kind: "WaitCondition", tag: u16::from(other) }),
         }
     }

@@ -1,18 +1,20 @@
 //! Deterministic Rust -> TypeScript wire schema codegen driven directly by `apack-proto`.
 //!
 //! Generates:
-//! - `view/src/wire/constants.ts`: protocol version, frame sizes, and wire bounds pulled directly
-//!   from `apack_proto::*` constants.
-//! - `view/src/wire/types.ts`: domain types, bitflags, discriminant tag tables (encoded directly
-//!   from `apack_proto::types::*`), and bounds-checked binary encoders/decoders.
+//! - `view/src/wire/constants.ts`: protocol version, framing constants, and wire bounds pulled
+//!   directly from `apack_proto::*` and `apack_proto::frame::*`.
+//! - `view/src/wire/types.ts`: bitflags, simple-enum discriminant tag tables (from `#[repr]`
+//!   enums), tagged-union discriminated unions (from `TAG_*` constants), domain structs, and
+//!   bounds-checked binary encoders/decoders.
 //! - `view/src/wire/messages.ts`: `MsgType` tags (from `apack_proto::messages::msg_type::*`),
-//!   `SpawnSpec`, `SessionSummary`, `FrameUpdate`, `ClientMsg`, `BrokerMsg`, and all payload/frame
-//!   encode & decode functions synthesized from a declarative schema IR.
+//!   `SpawnSpec`, `SessionSummary`, `FrameUpdate`, `ClientMsg`, `BrokerMsg`, and fail-fast
+//!   payload/frame encode & decode functions synthesized from a declarative schema IR.
 //!
-//! A compile-time exhaustive guard (`_assert_exhaustive_apack_proto_coverage`) destructures every
-//! `apack-proto` struct, enum, and message variant so adding, renaming, or removing any wire type
-//! in `apack-proto` fails `xtask` compilation until the schema is updated.
+//! A compile-time exhaustive guard (`_assert_exhaustive_apack_proto_coverage`) destructures and
+//! type-checks every `apack-proto` struct, enum, and message variant with zero wildcards so any
+//! schema drift in `apack-proto` fails `xtask` compilation until the codegen IR is updated.
 
+use std::collections::{BTreeSet, HashSet};
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -20,9 +22,10 @@ use apack_proto::messages::{BrokerMsg, ClientMsg, FrameUpdate, SessionSummary, S
 use apack_proto::types::{
     BlobHash, BlockedKind, CellPos, CellPx, CellSpan, CommandOutcome, CommandRecord, Confirmed, CursorShape,
     CursorState, ErrorCode, ForegroundProcess, FrameCredit, GridSize, ImageEncoding, ImagePiece, ImagePlacement,
-    KeyAction, KeyInput, LeaseKind, MetricsSnapshot, PackedRow, PackedRun, PackedStyle, PaletteOverrides, PasteOutcome,
-    PointerAction, PointerInput, ProgressState, RequestId, ResizePolicy, SignalKind, SignalScope, StatusRecord,
-    StatusState, StreamId, SubFlags, UnknownReason, ViewModes, ViewportHint, WaitCondition, WaitOutcome,
+    KeyAction, KeyInput, LeaseGraceMs, LeaseKind, MarksKey, MetricsSnapshot, NonZeroStreamId, PackedRow, PackedRun,
+    PackedStyle, PaletteOverrides, PasteOutcome, PointerAction, PointerInput, ProgressState, RequestId, ResizePolicy,
+    ResumeToken, Rgb, SessionId, SignalKind, SignalScope, SignalTarget, StatusRecord, StatusState, StreamId, SubFlags,
+    UnknownReason, ViewModes, ViewportHint, VouchedExitCode, WaitCondition, WaitOutcome, modifier,
 };
 
 const GENERATED_HEADER: &str = "\
@@ -37,149 +40,194 @@ pub const TS_WIRE_FILES: [&str; 3] =
 /// Renders all generated TypeScript wire files as `(relative_path, contents)` pairs.
 pub fn render_all() -> Vec<(&'static str, String)> {
     vec![
-        ("view/src/wire/constants.ts", render_constants_ts()),
-        ("view/src/wire/types.ts", render_types_ts()),
-        ("view/src/wire/messages.ts", render_messages_ts()),
+        (TS_WIRE_FILES[0], render_constants_ts()),
+        (TS_WIRE_FILES[1], render_types_ts()),
+        (TS_WIRE_FILES[2], render_messages_ts()),
     ]
 }
 
-/// Writes all generated TypeScript wire files to `root`.
-pub fn write_all(root: &Path) -> Result<(), String> {
-    for (rel, content) in render_all() {
+/// Writes pre-rendered TypeScript wire files to `root`, creating parent directories as needed.
+pub fn write_rendered(root: &Path, rendered: &[(&'static str, String)]) -> Result<(), String> {
+    for (rel, content) in rendered {
         let path = root.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("creating parent dir for {}: {e}", path.display()))?;
+        }
         std::fs::write(&path, content).map_err(|e| format!("writing {}: {e}", path.display()))?;
     }
     Ok(())
 }
 
-/// Verifies every committed generated TypeScript wire file matches `render_all()` byte-for-byte.
+/// Renders and writes all generated TypeScript wire files to `root`.
+pub fn write_all(root: &Path) -> Result<(), String> {
+    write_rendered(root, &render_all())
+}
+
+/// Verifies every committed generated TypeScript wire file matches `render_all()` after
+/// normalizing CRLF line endings (so Windows `core.autocrlf=true` checkouts pass cleanly).
 pub fn check_all(root: &Path) -> Result<(), String> {
-    let mut drifted = Vec::new();
+    let mut issues = Vec::new();
     for (rel, expected) in render_all() {
         let path = root.join(rel);
-        let actual = std::fs::read_to_string(&path)
-            .map_err(|e| format!("reading committed {rel} failed (run `cargo xtask generate`): {e}"))?;
+        let raw_actual = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                issues.push(format!("  - {rel} (missing or unreadable: {e})"));
+                continue;
+            }
+        };
+        let actual = raw_actual.replace("\r\n", "\n");
         if actual != expected {
             let line = actual
                 .lines()
                 .zip(expected.lines())
                 .position(|(a, b)| a != b)
                 .map_or_else(|| actual.lines().count().min(expected.lines().count()) + 1, |i| i + 1);
-            drifted.push(format!("  - {rel} (first difference at line {line})"));
+            issues.push(format!("  - {rel} (first difference at line {line})"));
         }
     }
-    if !drifted.is_empty() {
+    if !issues.is_empty() {
         return Err(format!(
             "generated TypeScript wire files drifted from `apack-proto`; run `cargo xtask generate` and commit:\n{}",
-            drifted.join("\n")
+            issues.join("\n")
         ));
     }
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// 1. view/src/wire/constants.ts
+// Constants file (`view/src/wire/constants.ts`)
 // ---------------------------------------------------------------------------
 
 fn render_constants_ts() -> String {
-    let fin = apack_proto::FIN_FRAME;
-    format!(
-        "{GENERATED_HEADER}\
-/**
- * Wire protocol framing & bounds constants generated directly from `crates/apack-proto/src/lib.rs`.
- */
-
-export const PROTOCOL_VERSION = {}
-export const FRAME_HEADER_LEN = {}
-export const INNER_HEADER_LEN = FRAME_HEADER_LEN - 4
-export const MAX_FRAME_PAYLOAD = {}
-export const MAX_BODY_LEN = INNER_HEADER_LEN + MAX_FRAME_PAYLOAD
-export const BULK_CHUNK_BYTES = {}
-export const FIN_FRAME = new Uint8Array([{}, {}, {}, {}])
-
-export const MAX_GRID_COLS = {}
-export const MAX_GRID_ROWS = {}
-export const MAX_ROWS_PER_FETCH = {}
-export const MAX_COMMANDS = {}
-export const MAX_STATUSES = {}
-export const MAX_SEARCH_MATCHES = {}
-export const MAX_SEARCH_NEEDLE_BYTES = {}
-export const MAX_LEASE_GRACE_MS = {}
-export const DEFAULT_SSH_GRACE_MS = {}
-export const MAX_STRING_BYTES = {}
-export const MAX_VEC_ITEMS = {}
-export const MAX_BLOB_BYTES = {}
-",
-        apack_proto::PROTOCOL_VERSION,
-        apack_proto::FRAME_HEADER_LEN,
-        apack_proto::MAX_FRAME_PAYLOAD,
-        apack_proto::BULK_CHUNK_BYTES,
-        fin[0],
-        fin[1],
-        fin[2],
-        fin[3],
-        apack_proto::MAX_GRID_COLS,
-        apack_proto::MAX_GRID_ROWS,
-        apack_proto::MAX_ROWS_PER_FETCH,
-        apack_proto::MAX_COMMANDS,
-        apack_proto::MAX_STATUSES,
-        apack_proto::MAX_SEARCH_MATCHES,
-        apack_proto::MAX_SEARCH_NEEDLE_BYTES,
-        apack_proto::MAX_LEASE_GRACE_MS,
-        apack_proto::DEFAULT_SSH_GRACE_MS,
-        apack_proto::MAX_STRING_BYTES,
-        apack_proto::MAX_VEC_ITEMS,
-        apack_proto::MAX_BLOB_BYTES,
+    let mut out = String::from(GENERATED_HEADER);
+    out.push_str(
+        "/**\n * Wire protocol framing & bounds constants generated directly from `crates/apack-proto`.\n */\n\n",
+    );
+    writeln!(out, "export const PROTOCOL_VERSION = {}", apack_proto::PROTOCOL_VERSION).unwrap();
+    writeln!(out, "export const FRAME_HEADER_LEN = {}", apack_proto::FRAME_HEADER_LEN).unwrap();
+    writeln!(out, "export const INNER_HEADER_LEN = {}", apack_proto::frame::INNER_HEADER_LEN).unwrap();
+    writeln!(out, "export const MAX_FRAME_PAYLOAD = {}", apack_proto::MAX_FRAME_PAYLOAD).unwrap();
+    writeln!(out, "export const MAX_BODY_LEN = {}", apack_proto::frame::MAX_BODY_LEN).unwrap();
+    writeln!(out, "export const BULK_CHUNK_BYTES = {}", apack_proto::BULK_CHUNK_BYTES).unwrap();
+    writeln!(
+        out,
+        "export const FIN_FRAME = new Uint8Array([{}, {}, {}, {}])\n",
+        apack_proto::FIN_FRAME[0],
+        apack_proto::FIN_FRAME[1],
+        apack_proto::FIN_FRAME[2],
+        apack_proto::FIN_FRAME[3],
     )
+    .unwrap();
+    writeln!(out, "export const MAX_GRID_COLS = {}", apack_proto::MAX_GRID_COLS).unwrap();
+    writeln!(out, "export const MAX_GRID_ROWS = {}", apack_proto::MAX_GRID_ROWS).unwrap();
+    writeln!(out, "export const MAX_ROWS_PER_FETCH = {}", apack_proto::MAX_ROWS_PER_FETCH).unwrap();
+    writeln!(out, "export const MAX_COMMANDS = {}", apack_proto::MAX_COMMANDS).unwrap();
+    writeln!(out, "export const MAX_STATUSES = {}", apack_proto::MAX_STATUSES).unwrap();
+    writeln!(out, "export const MAX_SEARCH_MATCHES = {}", apack_proto::MAX_SEARCH_MATCHES).unwrap();
+    writeln!(out, "export const MAX_SEARCH_NEEDLE_BYTES = {}", apack_proto::MAX_SEARCH_NEEDLE_BYTES).unwrap();
+    writeln!(out, "export const MAX_LEASE_GRACE_MS = {}", apack_proto::MAX_LEASE_GRACE_MS).unwrap();
+    writeln!(out, "export const DEFAULT_SSH_GRACE_MS = {}", apack_proto::DEFAULT_SSH_GRACE_MS).unwrap();
+    writeln!(out, "export const MAX_STRING_BYTES = {}", apack_proto::MAX_STRING_BYTES).unwrap();
+    writeln!(out, "export const MAX_VEC_ITEMS = {}", apack_proto::MAX_VEC_ITEMS).unwrap();
+    writeln!(out, "export const MAX_BLOB_BYTES = {}", apack_proto::MAX_BLOB_BYTES).unwrap();
+    writeln!(out, "export const MAX_PROGRESS_PERCENT = {}", apack_proto::MAX_PROGRESS_PERCENT).unwrap();
+    writeln!(out, "export const MAX_SPAWN_ARGV = {}", apack_proto::MAX_SPAWN_ARGV).unwrap();
+    writeln!(out, "export const MAX_SPAWN_ENV = {}", apack_proto::MAX_SPAWN_ENV).unwrap();
+    writeln!(out, "export const MAX_SESSIONS_LIST = {}", apack_proto::MAX_SESSIONS_LIST).unwrap();
+    writeln!(out, "export const MAX_IMAGES_REPLY = {}", apack_proto::MAX_IMAGES_REPLY).unwrap();
+    writeln!(out, "export const MAX_PALETTE_OVERRIDES = {}", apack_proto::MAX_PALETTE_OVERRIDES).unwrap();
+    writeln!(out, "export const MAX_PACKED_RUNS = {}", apack_proto::MAX_PACKED_RUNS).unwrap();
+    writeln!(out, "export const MAX_PACKED_STYLES = {}", apack_proto::MAX_PACKED_STYLES).unwrap();
+    writeln!(out, "export const MAX_PACKED_LINKS = {}", apack_proto::MAX_PACKED_LINKS).unwrap();
+    writeln!(out, "export const MAX_PACKED_PIECES = {}", apack_proto::MAX_PACKED_PIECES).unwrap();
+    writeln!(out, "export const MAX_WAIT_STATUSES = {}", apack_proto::MAX_WAIT_STATUSES).unwrap();
+    writeln!(out, "export const AUTH_TOKEN_LEN = {}", apack_proto::AUTH_TOKEN_LEN).unwrap();
+    out
 }
 
 // ---------------------------------------------------------------------------
-// 2. Declarative Schema IR for TS generation
+// Declarative Schema IR for TS Codegen
 // ---------------------------------------------------------------------------
 
 struct SimpleEnum {
     name: &'static str,
-    tag_bits: u8, // 8 or 16
+    tag_bits: u8,
     const_prefix: &'static str,
     emit_codec: bool,
     variants: Vec<(&'static str, u16)>,
 }
 
 fn emit_simple_enum(out: &mut String, e: &SimpleEnum) {
+    let mut seen_tags = HashSet::new();
+    let mut seen_names = HashSet::new();
+    for (name, tag) in &e.variants {
+        assert!(seen_names.insert(*name), "duplicate variant name `{name}` in {}", e.name);
+        assert!(seen_tags.insert(*tag), "duplicate wire tag `{tag}` in {}", e.name);
+    }
+
     let union = e.variants.iter().map(|(v, _)| format!("'{v}'")).collect::<Vec<_>>().join(" | ");
     writeln!(out, "export type {} = {union}", e.name).unwrap();
 
-    let to_entries = e.variants.iter().map(|(v, t)| format!("{v}: {t}")).collect::<Vec<_>>().join(", ");
-    writeln!(out, "const {}_TO_TAG: Record<{}, number> = {{ {to_entries} }}", e.const_prefix, e.name).unwrap();
-
-    let max_tag = e.variants.iter().map(|(_, t)| *t).max().unwrap_or(0) as usize;
-    let mut table = vec!["undefined".to_owned(); max_tag + 1];
+    writeln!(out, "const {}_TO_TAG: Record<{}, number> = {{", e.const_prefix, e.name).unwrap();
     for (v, t) in &e.variants {
-        table[*t as usize] = format!("'{v}'");
+        writeln!(out, "  {v}: {t},").unwrap();
     }
-    writeln!(out, "const TAG_TO_{}: readonly ({} | undefined)[] = [{}]", e.const_prefix, e.name, table.join(", "))
-        .unwrap();
+    writeln!(out, "}}").unwrap();
 
-    if e.emit_codec {
-        let rw = if e.tag_bits == 16 { "u16" } else { "u8" };
-        writeln!(
-            out,
-            "export function encode{}(w: WireWriter, value: {}): void {{\n  w.{rw}({}_TO_TAG[value])\n}}",
-            e.name, e.name, e.const_prefix
-        )
-        .unwrap();
-        writeln!(
-            out,
-            "export function decode{}(r: WireReader): {} {{\n  const tag = r.{rw}()\n  const value = TAG_TO_{}[tag]\n  if (!value) throw new WireError('InvalidTag', `invalid {} wire tag ${{tag}}`)\n  return value\n}}",
-            e.name, e.name, e.const_prefix, e.name
-        )
-        .unwrap();
+    let max_tag = e.variants.iter().map(|(_, t)| usize::from(*t)).max().unwrap_or(0);
+    if max_tag <= 64 {
+        let mut table: Vec<Option<&str>> = vec![None; max_tag + 1];
+        for (v, t) in &e.variants {
+            table[usize::from(*t)] = Some(*v);
+        }
+        let entries = table
+            .into_iter()
+            .map(|opt| match opt {
+                Some(v) => format!("'{v}'"),
+                None => "undefined".to_owned(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(out, "const TAG_TO_{}: readonly ({} | undefined)[] = [{entries}]", e.const_prefix, e.name).unwrap();
+    } else {
+        writeln!(out, "const TAG_TO_{}: Readonly<Record<number, {} | undefined>> = {{", e.const_prefix, e.name)
+            .unwrap();
+        for (v, t) in &e.variants {
+            writeln!(out, "  {t}: '{v}',").unwrap();
+        }
+        writeln!(out, "}}").unwrap();
     }
+
+    let rw = if e.tag_bits == 16 { "u16" } else { "u8" };
+    let vis = if e.emit_codec { "export " } else { "" };
+    writeln!(
+        out,
+        "{vis}function encode{}(w: WireWriter, value: {}): void {{\n  w.{rw}({}_TO_TAG[value])\n}}",
+        e.name, e.name, e.const_prefix
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "{vis}function decode{}(r: WireReader): {} {{\n  const tag = r.{rw}()\n  const value = TAG_TO_{}[tag]\n  if (!value) throw new WireError('InvalidTag', `invalid {} wire tag ${{tag}}`)\n  return value\n}}",
+        e.name, e.name, e.const_prefix, e.name
+    )
+    .unwrap();
     out.push('\n');
+}
+
+fn emit_indented_lines(out: &mut String, indent: &str, block: &str) {
+    for raw_line in block.lines() {
+        let trimmed = raw_line.trim();
+        if !trimmed.is_empty() {
+            writeln!(out, "{indent}{trimmed}").unwrap();
+        }
+    }
 }
 
 #[derive(Clone)]
 enum FieldCodec {
+    U8,
     U16,
     U32,
     I32,
@@ -190,36 +238,44 @@ enum FieldCodec {
     StrBounded(&'static str, &'static str),
     Bytes,
     BytesCopyBounded(&'static str, &'static str),
-    FixedBytes { len: usize, label: &'static str },
+    FixedBytes { len_expr: &'static str, len_val: usize, label: &'static str },
     Opt(Box<FieldCodec>),
     VecBounded { max_expr: &'static str, label: &'static str, item: Box<FieldCodec> },
     EnvPairs { max_expr: &'static str, label: &'static str },
+    PaletteEntries { max_expr: &'static str, label: &'static str },
     Custom { ts_type: &'static str, encode_fn: &'static str, decode_fn: &'static str },
     Tuple2VarU32,
+    Tuple4VarU32,
     Tuple2U16,
-    ProgressPercent,
+    ProgressPercent { err_msg: &'static str },
 }
 
 impl FieldCodec {
     fn ts_type(&self) -> String {
         match self {
-            Self::U16 | Self::U32 | Self::I32 | Self::VarU32 | Self::VarU64 | Self::ProgressPercent => {
-                "number".to_owned()
-            }
+            Self::U8
+            | Self::U16
+            | Self::U32
+            | Self::I32
+            | Self::VarU32
+            | Self::VarU64
+            | Self::ProgressPercent { .. } => "number".to_owned(),
             Self::Bool => "boolean".to_owned(),
             Self::Str | Self::StrBounded(_, _) => "string".to_owned(),
             Self::Bytes | Self::BytesCopyBounded(_, _) | Self::FixedBytes { .. } => "Uint8Array".to_owned(),
             Self::Opt(inner) => format!("{} | null", inner.ts_type()),
             Self::VecBounded { item, .. } => format!("readonly {}[]", item.ts_type()),
             Self::EnvPairs { .. } => "ReadonlyArray<readonly [string, string]>".to_owned(),
+            Self::PaletteEntries { .. } => "ReadonlyArray<{ readonly index: number; readonly rgb: Rgb24 }>".to_owned(),
             Self::Custom { ts_type, .. } => (*ts_type).to_owned(),
             Self::Tuple2VarU32 | Self::Tuple2U16 => "readonly [number, number]".to_owned(),
+            Self::Tuple4VarU32 => "readonly [number, number, number, number]".to_owned(),
         }
     }
 
     fn emit_encode(&self, w: &str, expr: &str, indent: &str, out: &mut String) {
         match self {
-            Self::ProgressPercent => writeln!(out, "{indent}{w}.u8({expr})").unwrap(),
+            Self::U8 | Self::ProgressPercent { .. } => writeln!(out, "{indent}{w}.u8({expr})").unwrap(),
             Self::U16 => writeln!(out, "{indent}{w}.u16({expr})").unwrap(),
             Self::U32 => writeln!(out, "{indent}{w}.u32({expr})").unwrap(),
             Self::I32 => writeln!(out, "{indent}{w}.i32({expr})").unwrap(),
@@ -231,10 +287,10 @@ impl FieldCodec {
                 writeln!(out, "{indent}{w}.strBounded({expr}, {max_expr}, '{label}')").unwrap()
             }
             Self::Bytes | Self::BytesCopyBounded(_, _) => writeln!(out, "{indent}{w}.bytes({expr})").unwrap(),
-            Self::FixedBytes { len, label } => {
+            Self::FixedBytes { len_expr, len_val, label } => {
                 writeln!(
                     out,
-                    "{indent}if ({expr}.length !== {len}) throw new WireError('InvalidValue', '{label} must be {len} bytes')"
+                    "{indent}if ({expr}.length !== {len_expr}) throw new WireError('InvalidValue', '{label} must be {len_val} bytes')"
                 )
                 .unwrap();
                 writeln!(out, "{indent}{w}.raw({expr})").unwrap();
@@ -243,25 +299,38 @@ impl FieldCodec {
                 Self::Custom { encode_fn, .. } => writeln!(out, "{indent}{w}.opt({expr}, {encode_fn})").unwrap(),
                 other => {
                     let mut body = String::new();
-                    other.emit_encode("wr", "v", "", &mut body);
-                    writeln!(out, "{indent}{w}.opt({expr}, (wr, v) => {{ {} }})", body.trim()).unwrap();
+                    other.emit_encode("wr", "item", "", &mut body);
+                    writeln!(out, "{indent}{w}.opt({expr}, (wr, item) => {{ {} }})", body.trim()).unwrap();
                 }
             },
             Self::VecBounded { item, .. } => match item.as_ref() {
                 Self::Custom { encode_fn, .. } => writeln!(out, "{indent}{w}.slice({expr}, {encode_fn})").unwrap(),
                 other => {
                     let mut body = String::new();
-                    other.emit_encode("wr", "v", "", &mut body);
-                    writeln!(out, "{indent}{w}.slice({expr}, (wr, v) => {{ {} }})", body.trim()).unwrap();
+                    other.emit_encode("wr", "item", "", &mut body);
+                    writeln!(out, "{indent}{w}.slice({expr}, (wr, item) => {{ {} }})", body.trim()).unwrap();
                 }
             },
             Self::EnvPairs { .. } => {
-                writeln!(out, "{indent}{w}.slice({expr}, (wr, [k, v]) => {{ wr.str(k); wr.str(v) }})").unwrap();
+                writeln!(out, "{indent}{w}.slice({expr}, (wr, [k, val]) => {{ wr.str(k); wr.str(val) }})").unwrap();
+            }
+            Self::PaletteEntries { .. } => {
+                writeln!(
+                    out,
+                    "{indent}{w}.slice({expr}, (wr, entry) => {{ wr.u8(entry.index); encodeRgb24(wr, entry.rgb) }})"
+                )
+                .unwrap();
             }
             Self::Custom { encode_fn, .. } => writeln!(out, "{indent}{encode_fn}({w}, {expr})").unwrap(),
             Self::Tuple2VarU32 => {
                 writeln!(out, "{indent}{w}.varU32({expr}[0])").unwrap();
                 writeln!(out, "{indent}{w}.varU32({expr}[1])").unwrap();
+            }
+            Self::Tuple4VarU32 => {
+                writeln!(out, "{indent}{w}.varU32({expr}[0])").unwrap();
+                writeln!(out, "{indent}{w}.varU32({expr}[1])").unwrap();
+                writeln!(out, "{indent}{w}.varU32({expr}[2])").unwrap();
+                writeln!(out, "{indent}{w}.varU32({expr}[3])").unwrap();
             }
             Self::Tuple2U16 => {
                 writeln!(out, "{indent}{w}.u16({expr}[0])").unwrap();
@@ -272,6 +341,7 @@ impl FieldCodec {
 
     fn decode_expr(&self, r: &str) -> String {
         match self {
+            Self::U8 => format!("{r}.u8()"),
             Self::U16 => format!("{r}.u16()"),
             Self::U32 => format!("{r}.u32()"),
             Self::I32 => format!("{r}.i32()"),
@@ -282,7 +352,7 @@ impl FieldCodec {
             Self::StrBounded(max_expr, label) => format!("{r}.strBounded({max_expr}, '{label}')"),
             Self::Bytes => format!("{r}.bytes()"),
             Self::BytesCopyBounded(max_expr, label) => format!("{r}.bytesBounded({max_expr}, '{label}').slice()"),
-            Self::FixedBytes { len, .. } => format!("{r}.fixedCopy({len})"),
+            Self::FixedBytes { len_expr, .. } => format!("{r}.fixedCopy({len_expr})"),
             Self::Opt(inner) => match inner.as_ref() {
                 Self::Custom { decode_fn, .. } => format!("{r}.opt({decode_fn})"),
                 other => format!("{r}.opt((rd) => {})", other.decode_expr("rd")),
@@ -294,14 +364,51 @@ impl FieldCodec {
             Self::EnvPairs { max_expr, label } => {
                 format!("{r}.vecBounded({max_expr}, '{label}', (rd) => [rd.str(), rd.str()] as const)")
             }
-            Self::Custom { decode_fn, .. } => format!("{decode_fn}({r})"),
-            Self::Tuple2VarU32 => format!("[{r}.varU32(), {r}.varU32()]"),
-            Self::Tuple2U16 => format!("[{r}.u16(), {r}.u16()]"),
-            Self::ProgressPercent => {
-                format!(
-                    "((p) => {{ if (p > 100) throw new WireError('InvalidValue', 'progress percent > 100'); return p }})({r}.u8())"
-                )
+            Self::PaletteEntries { max_expr, label } => {
+                format!("{r}.vecBounded({max_expr}, '{label}', (rd) => ({{ index: rd.u8(), rgb: decodeRgb24(rd) }}))")
             }
+            Self::Custom { decode_fn, .. } => format!("{decode_fn}({r})"),
+            Self::Tuple2VarU32 => format!("[{r}.varU32(), {r}.varU32()] as const"),
+            Self::Tuple4VarU32 => format!("[{r}.varU32(), {r}.varU32(), {r}.varU32(), {r}.varU32()] as const"),
+            Self::Tuple2U16 => format!("[{r}.u16(), {r}.u16()] as const"),
+            Self::ProgressPercent { err_msg } => format!(
+                "((p) => {{ if (p > MAX_PROGRESS_PERCENT) throw new WireError('InvalidValue', '{err_msg}'); return p }})({r}.u8())"
+            ),
+        }
+    }
+
+    fn collect_refs(
+        &self,
+        types_vals: &mut BTreeSet<&'static str>,
+        types_only: &mut BTreeSet<&'static str>,
+        consts: &mut BTreeSet<&'static str>,
+    ) {
+        match self {
+            Self::StrBounded(m, _)
+            | Self::BytesCopyBounded(m, _)
+            | Self::EnvPairs { max_expr: m, .. }
+            | Self::PaletteEntries { max_expr: m, .. } => {
+                consts.insert(*m);
+            }
+            Self::FixedBytes { len_expr, .. } => {
+                consts.insert(*len_expr);
+            }
+            Self::ProgressPercent { .. } => {
+                consts.insert("MAX_PROGRESS_PERCENT");
+            }
+            Self::Opt(inner) => inner.collect_refs(types_vals, types_only, consts),
+            Self::VecBounded { max_expr, item, .. } => {
+                consts.insert(*max_expr);
+                item.collect_refs(types_vals, types_only, consts);
+            }
+            Self::Custom { ts_type, encode_fn, decode_fn } => {
+                types_vals.insert(*encode_fn);
+                types_vals.insert(*decode_fn);
+                if *ts_type != "number" && *ts_type != "string" && *ts_type != "Uint8Array" && *ts_type != "boolean" {
+                    types_only.insert(*ts_type);
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -309,55 +416,158 @@ impl FieldCodec {
 struct FieldSpec {
     name: &'static str,
     codec: FieldCodec,
+    before_encode: Option<&'static str>,
+    after_decode: Option<&'static str>,
+}
+
+fn f(name: &'static str, codec: FieldCodec) -> FieldSpec {
+    FieldSpec { name, codec, before_encode: None, after_decode: None }
+}
+
+fn f_check(name: &'static str, codec: FieldCodec, after_decode: &'static str) -> FieldSpec {
+    FieldSpec { name, codec, before_encode: None, after_decode: Some(after_decode) }
+}
+
+fn f_encode_decode_check(
+    name: &'static str,
+    codec: FieldCodec,
+    before_encode: &'static str,
+    after_decode: &'static str,
+) -> FieldSpec {
+    FieldSpec { name, codec, before_encode: Some(before_encode), after_decode: Some(after_decode) }
+}
+
+fn f_custom(name: &'static str, ts_type: &'static str, encode_fn: &'static str, decode_fn: &'static str) -> FieldSpec {
+    f(name, FieldCodec::Custom { ts_type, encode_fn, decode_fn })
 }
 
 struct StructSchema {
     name: &'static str,
     exported_codec: bool,
     fields: Vec<FieldSpec>,
-    post_decode_check: Option<&'static str>,
 }
 
 fn emit_struct_schema(out: &mut String, s: &StructSchema) {
     writeln!(out, "export interface {} {{", s.name).unwrap();
-    for f in &s.fields {
-        writeln!(out, "  readonly {}: {}", f.name, f.codec.ts_type()).unwrap();
+    for field in &s.fields {
+        writeln!(out, "  readonly {}: {}", field.name, field.codec.ts_type()).unwrap();
     }
     writeln!(out, "}}\n").unwrap();
 
     let vis = if s.exported_codec { "export " } else { "" };
     writeln!(out, "{vis}function encode{}(w: WireWriter, v: {}): void {{", s.name, s.name).unwrap();
-    for f in &s.fields {
-        f.codec.emit_encode("w", &format!("v.{}", f.name), "  ", out);
+    for field in &s.fields {
+        if let Some(check) = field.before_encode {
+            emit_indented_lines(out, "  ", check);
+        }
+        field.codec.emit_encode("w", &format!("v.{}", field.name), "  ", out);
     }
     writeln!(out, "}}").unwrap();
 
     writeln!(out, "{vis}function decode{}(r: WireReader): {} {{", s.name, s.name).unwrap();
-    if let Some(check) = s.post_decode_check {
-        for f in &s.fields {
-            writeln!(out, "  const {} = {}", f.name, f.codec.decode_expr("r")).unwrap();
+    let needs_locals = s.fields.iter().any(|field| field.after_decode.is_some());
+    if needs_locals {
+        for field in &s.fields {
+            writeln!(out, "  const {} = {}", field.name, field.codec.decode_expr("r")).unwrap();
+            if let Some(check) = field.after_decode {
+                emit_indented_lines(out, "  ", check);
+            }
         }
-        for line in check.lines() {
-            writeln!(out, "  {line}").unwrap();
-        }
-        let field_names = s.fields.iter().map(|f| f.name).collect::<Vec<_>>().join(", ");
+        let field_names = s.fields.iter().map(|field| field.name).collect::<Vec<_>>().join(", ");
         writeln!(out, "  return {{ {field_names} }}").unwrap();
     } else {
         writeln!(out, "  return {{").unwrap();
-        for f in &s.fields {
-            writeln!(out, "    {}: {},", f.name, f.codec.decode_expr("r")).unwrap();
+        for field in &s.fields {
+            writeln!(out, "    {}: {},", field.name, field.codec.decode_expr("r")).unwrap();
         }
         writeln!(out, "  }}").unwrap();
     }
     writeln!(out, "}}\n").unwrap();
 }
 
+struct TaggedVariant {
+    kind: &'static str,
+    tag: u8,
+    fields: Vec<FieldSpec>,
+}
+
+struct TaggedUnionSchema {
+    name: &'static str,
+    variants: Vec<TaggedVariant>,
+}
+
+fn emit_tagged_union(out: &mut String, u: &TaggedUnionSchema) {
+    let mut seen_tags = HashSet::new();
+    let mut seen_kinds = HashSet::new();
+    for v in &u.variants {
+        assert!(seen_kinds.insert(v.kind), "duplicate kind `{}` in {}", v.kind, u.name);
+        assert!(seen_tags.insert(v.tag), "duplicate tag `{}` in {}", v.tag, u.name);
+    }
+
+    writeln!(out, "export type {} =", u.name).unwrap();
+    for v in &u.variants {
+        if v.fields.is_empty() {
+            writeln!(out, "  | {{ readonly kind: '{}' }}", v.kind).unwrap();
+        } else {
+            let fs = v
+                .fields
+                .iter()
+                .map(|field| format!("readonly {}: {}", field.name, field.codec.ts_type()))
+                .collect::<Vec<_>>()
+                .join("; ");
+            writeln!(out, "  | {{ readonly kind: '{}'; {fs} }}", v.kind).unwrap();
+        }
+    }
+    out.push('\n');
+
+    writeln!(out, "export function encode{}(w: WireWriter, v: {}): void {{", u.name, u.name).unwrap();
+    writeln!(out, "  switch (v.kind) {{").unwrap();
+    for v in &u.variants {
+        writeln!(out, "    case '{}':", v.kind).unwrap();
+        for field in &v.fields {
+            if let Some(check) = field.before_encode {
+                emit_indented_lines(out, "      ", check);
+            }
+        }
+        writeln!(out, "      w.u8({})", v.tag).unwrap();
+        for field in &v.fields {
+            field.codec.emit_encode("w", &format!("v.{}", field.name), "      ", out);
+        }
+        writeln!(out, "      return").unwrap();
+    }
+    writeln!(out, "  }}").unwrap();
+    writeln!(out, "}}").unwrap();
+
+    writeln!(out, "export function decode{}(r: WireReader): {} {{", u.name, u.name).unwrap();
+    writeln!(out, "  const tag = r.u8()").unwrap();
+    writeln!(out, "  switch (tag) {{").unwrap();
+    for v in &u.variants {
+        writeln!(out, "    case {}: {{", v.tag).unwrap();
+        if v.fields.is_empty() {
+            writeln!(out, "      return {{ kind: '{}' }}", v.kind).unwrap();
+        } else {
+            for field in &v.fields {
+                writeln!(out, "      const {} = {}", field.name, field.codec.decode_expr("r")).unwrap();
+                if let Some(check) = field.after_decode {
+                    emit_indented_lines(out, "      ", check);
+                }
+            }
+            let field_names = v.fields.iter().map(|field| field.name).collect::<Vec<_>>().join(", ");
+            writeln!(out, "      return {{ kind: '{}', {field_names} }}", v.kind).unwrap();
+        }
+        writeln!(out, "    }}").unwrap();
+    }
+    writeln!(out, "    default:").unwrap();
+    writeln!(out, "      throw new WireError('InvalidTag', `invalid {} wire tag ${{tag}}`)", u.name).unwrap();
+    writeln!(out, "  }}").unwrap();
+    writeln!(out, "}}\n").unwrap();
+}
+
 struct MsgVariant {
     const_name: &'static str,
-    tag: u16,
     kind: &'static str,
+    tag: u16,
     fields: Vec<FieldSpec>,
-    post_decode_check: Option<&'static str>,
 }
 
 fn emit_msg_union(out: &mut String, type_name: &str, variants: &[MsgVariant]) {
@@ -366,190 +576,93 @@ fn emit_msg_union(out: &mut String, type_name: &str, variants: &[MsgVariant]) {
         if v.fields.is_empty() {
             writeln!(out, "  | {{ readonly kind: '{}' }}", v.kind).unwrap();
         } else {
-            let fields = v
+            let fs = v
                 .fields
                 .iter()
-                .map(|f| format!("readonly {}: {}", f.name, f.codec.ts_type()))
+                .map(|field| format!("readonly {}: {}", field.name, field.codec.ts_type()))
                 .collect::<Vec<_>>()
                 .join("; ");
-            writeln!(out, "  | {{ readonly kind: '{}'; {fields} }}", v.kind).unwrap();
+            writeln!(out, "  | {{ readonly kind: '{}'; {fs} }}", v.kind).unwrap();
         }
     }
     out.push('\n');
 }
 
-fn emit_msg_codecs(out: &mut String, prefix_lower: &str, type_name: &str, variants: &[MsgVariant]) {
-    // 1. `<prefix>MsgType`
-    writeln!(out, "export function {prefix_lower}MsgType(msg: {type_name}): number {{").unwrap();
-    writeln!(out, "  switch (msg.kind) {{").unwrap();
-    for v in variants {
-        writeln!(out, "    case '{}': return MsgType.{}", v.kind, v.const_name).unwrap();
-    }
-    writeln!(out, "  }}\n}}\n").unwrap();
-
-    // 2. `encode<Prefix>Payload`
-    let cap = if prefix_lower == "client" { "Client" } else { "Broker" };
-    writeln!(out, "export function encode{cap}Payload(msg: {type_name}): Uint8Array {{").unwrap();
+fn emit_msg_codecs(out: &mut String, name: &str, type_name: &str, variants: &[MsgVariant]) {
+    writeln!(
+        out,
+        "export function encode{name}Payload(msg: {type_name}): {{ readonly msgType: number; readonly payload: Uint8Array }} {{"
+    )
+    .unwrap();
     writeln!(out, "  const w = new WireWriter()").unwrap();
     writeln!(out, "  switch (msg.kind) {{").unwrap();
     for v in variants {
         writeln!(out, "    case '{}':", v.kind).unwrap();
-        for f in &v.fields {
-            f.codec.emit_encode("w", &format!("msg.{}", f.name), "      ", out);
+        for field in &v.fields {
+            if let Some(check) = field.before_encode {
+                emit_indented_lines(out, "      ", check);
+            }
+            field.codec.emit_encode("w", &format!("msg.{}", field.name), "      ", out);
         }
-        writeln!(out, "      break").unwrap();
+        writeln!(out, "      return {{ msgType: MsgType.{}, payload: w.toBytes() }}", v.const_name).unwrap();
     }
-    writeln!(out, "  }}\n  return w.toBytes()\n}}\n").unwrap();
+    writeln!(out, "  }}").unwrap();
+    writeln!(out, "}}\n").unwrap();
 
-    // 3. `encode<Prefix>Frame`
     writeln!(
         out,
-        "export function encode{cap}Frame(streamId: number, reqId: number, msg: {type_name}): Uint8Array {{\n  return encodeFrame(streamId, {prefix_lower}MsgType(msg), reqId, encode{cap}Payload(msg))\n}}\n"
+        "export function encode{name}Frame(streamId: number, reqId: number, msg: {type_name}): Uint8Array {{"
     )
     .unwrap();
+    writeln!(out, "  const {{ msgType, payload }} = encode{name}Payload(msg)").unwrap();
+    writeln!(out, "  return encodeFrame(streamId, msgType, reqId, payload)").unwrap();
+    writeln!(out, "}}\n").unwrap();
 
-    // 4. `decode<Prefix>Msg`
-    writeln!(out, "export function decode{cap}Msg(msgType: number, payload: Uint8Array): {type_name} {{").unwrap();
+    writeln!(out, "export function decode{name}Msg(msgType: number, payload: Uint8Array): {type_name} {{").unwrap();
     writeln!(out, "  const r = new WireReader(payload)").unwrap();
     writeln!(out, "  let msg: {type_name}").unwrap();
     writeln!(out, "  switch (msgType) {{").unwrap();
     for v in variants {
-        if let Some(check) = v.post_decode_check {
-            writeln!(out, "    case MsgType.{}: {{", v.const_name).unwrap();
-            for f in &v.fields {
-                writeln!(out, "      const {} = {}", f.name, f.codec.decode_expr("r")).unwrap();
-            }
-            for line in check.lines() {
-                writeln!(out, "      {line}").unwrap();
-            }
-            let field_names = v.fields.iter().map(|f| f.name).collect::<Vec<_>>().join(", ");
-            writeln!(out, "      msg = {{ kind: '{}', {field_names} }}", v.kind).unwrap();
-            writeln!(out, "      break\n    }}").unwrap();
-        } else if v.fields.is_empty() {
-            writeln!(out, "    case MsgType.{}:", v.const_name).unwrap();
+        writeln!(out, "    case MsgType.{}: {{", v.const_name).unwrap();
+        if v.fields.is_empty() {
             writeln!(out, "      msg = {{ kind: '{}' }}", v.kind).unwrap();
-            writeln!(out, "      break").unwrap();
         } else {
-            writeln!(out, "    case MsgType.{}:", v.const_name).unwrap();
-            let assigns = v
-                .fields
-                .iter()
-                .map(|f| format!("{}: {}", f.name, f.codec.decode_expr("r")))
-                .collect::<Vec<_>>()
-                .join(", ");
-            writeln!(out, "      msg = {{ kind: '{}', {assigns} }}", v.kind).unwrap();
-            writeln!(out, "      break").unwrap();
+            let needs_locals = v.fields.iter().any(|field| field.after_decode.is_some());
+            if needs_locals {
+                for field in &v.fields {
+                    writeln!(out, "      const {} = {}", field.name, field.codec.decode_expr("r")).unwrap();
+                    if let Some(check) = field.after_decode {
+                        emit_indented_lines(out, "      ", check);
+                    }
+                }
+                let field_names = v.fields.iter().map(|field| field.name).collect::<Vec<_>>().join(", ");
+                writeln!(out, "      msg = {{ kind: '{}', {field_names} }}", v.kind).unwrap();
+            } else {
+                writeln!(out, "      msg = {{").unwrap();
+                writeln!(out, "        kind: '{}',", v.kind).unwrap();
+                for field in &v.fields {
+                    writeln!(out, "        {}: {},", field.name, field.codec.decode_expr("r")).unwrap();
+                }
+                writeln!(out, "      }}").unwrap();
+            }
         }
+        writeln!(out, "      break").unwrap();
+        writeln!(out, "    }}").unwrap();
     }
-    writeln!(
-        out,
-        "    default:\n      throw new WireError('InvalidTag', `invalid {type_name} wire tag ${{msgType}}`)\n  }}\n  r.finish()\n  return msg\n}}"
-    )
-    .unwrap();
+    writeln!(out, "    default:").unwrap();
+    writeln!(out, "      throw new WireError('InvalidTag', `invalid {type_name} wire tag ${{msgType}}`)").unwrap();
+    writeln!(out, "  }}").unwrap();
+    writeln!(out, "  r.finish()").unwrap();
+    writeln!(out, "  return msg").unwrap();
+    writeln!(out, "}}\n").unwrap();
 }
 
 // ---------------------------------------------------------------------------
-// 3. view/src/wire/types.ts
+// Types file (`view/src/wire/types.ts`)
 // ---------------------------------------------------------------------------
 
-fn f_custom(name: &'static str, ts_type: &'static str, encode_fn: &'static str, decode_fn: &'static str) -> FieldSpec {
-    FieldSpec { name, codec: FieldCodec::Custom { ts_type, encode_fn, decode_fn } }
-}
-
-fn render_types_ts() -> String {
-    let mut out = String::with_capacity(32 * 1024);
-    out.push_str(GENERATED_HEADER);
-    out.push_str(
-        r#"/**
- * Correct-by-construction domain types and `PackedRow` typed-array representation matching
- * `crates/apack-proto/src/types.rs`.
- */
-import {
-  MAX_GRID_COLS,
-  MAX_GRID_ROWS,
-  MAX_LEASE_GRACE_MS,
-  MAX_SEARCH_NEEDLE_BYTES,
-  WireError,
-  decodeUtf8Strict,
-  encodeUtf8,
-  type WireReader,
-  type WireWriter,
-} from './codec.ts'
-
-"#,
-    );
-
-    writeln!(out, "export const CONTROL_STREAM_ID = {}", StreamId::CONTROL.raw()).unwrap();
-    writeln!(out, "export const PUSH_REQ_ID = {}\n", RequestId::PUSH.raw()).unwrap();
-
-    writeln!(
-        out,
-        "export const SubFlags = {{\n  VIEW: {:#04x},\n  EVENTS: {:#04x},\n  RAW_OUTPUT: {:#04x},\n  BACKPRESSURE_PTY: {:#04x},\n  ALL_MASK: {:#04x},\n}} as const\n",
-        SubFlags::VIEW,
-        SubFlags::EVENTS,
-        SubFlags::RAW_OUTPUT,
-        SubFlags::BACKPRESSURE_PTY,
-        SubFlags::ALL_MASK,
-    )
-    .unwrap();
-
-    writeln!(
-        out,
-        "export const Modifier = {{\n  shift: 0x01,\n  ctrl: 0x02,\n  alt: 0x04,\n  super: 0x08,\n  caps: 0x10,\n  num: 0x20,\n}} as const\n"
-    )
-    .unwrap();
-
-    writeln!(
-        out,
-        "export const RowFlag = {{\n  WRAPPED: {:#04x},\n  PROMPT: {:#04x},\n  HAS_BLINK: {:#04x},\n  HAS_PLACEHOLDER: {:#04x},\n}} as const\n",
-        PackedRow::FLAG_WRAPPED,
-        PackedRow::FLAG_PROMPT,
-        PackedRow::FLAG_HAS_BLINK,
-        PackedRow::FLAG_HAS_PLACEHOLDER,
-    )
-    .unwrap();
-
-    writeln!(
-        out,
-        "export const RunFlag = {{\n  /** Wide character or grapheme cluster needing per-cell placement */\n  PER_CELL: {:#04x},\n}} as const\n",
-        PackedRun::FLAG_PER_CELL,
-    )
-    .unwrap();
-
-    writeln!(
-        out,
-        "export const PackedStyleFlag = {{\n  BOLD: {:#06x},\n  ITALIC: {:#06x},\n  UNDERLINE_MASK: {:#06x},\n  UNDERLINE_MAX: {:#06x},\n  STRIKETHROUGH: {:#06x},\n  BLINK: {:#06x},\n  INVERSE: {:#06x},\n  INVISIBLE: {:#06x},\n  FAINT: {:#06x},\n  ALL_MASK: {:#06x},\n}} as const\n",
-        PackedStyle::FLAG_BOLD,
-        PackedStyle::FLAG_ITALIC,
-        PackedStyle::FLAG_UNDERLINE_MASK,
-        PackedStyle::FLAG_UNDERLINE_MAX,
-        PackedStyle::FLAG_STRIKETHROUGH,
-        PackedStyle::FLAG_BLINK,
-        PackedStyle::FLAG_INVERSE,
-        PackedStyle::FLAG_INVISIBLE,
-        PackedStyle::FLAG_FAINT,
-        PackedStyle::ALL_FLAGS_MASK,
-    )
-    .unwrap();
-
-    out.push_str(
-        r#"export type UnderlineKind = 'none' | 'single' | 'double' | 'curly' | 'dotted' | 'dashed'
-const UNDERLINE_NAMES: readonly UnderlineKind[] = ['none', 'single', 'double', 'curly', 'dotted', 'dashed']
-
-export function underlineOfStyleFlags(flags: number): UnderlineKind {
-  return UNDERLINE_NAMES[(flags & PackedStyleFlag.UNDERLINE_MASK) >> 2] ?? 'none'
-}
-
-export function isValidPackedColor(color: number): boolean {
-  const c = color >>> 0
-  return c <= 256 || (c >= 0x01_00_00_00 && c <= 0x01_ff_ff_ff)
-}
-
-"#,
-    );
-
-    // Simple enums — EVERY wire tag is derived directly from the `#[repr(u8|u16)]` `apack-proto` enum!
-    let simple_enums = vec![
+fn simple_enums() -> Vec<SimpleEnum> {
+    vec![
         SimpleEnum {
             name: "SignalKind",
             tag_bits: 8,
@@ -725,21 +838,485 @@ export function isValidPackedColor(color: number): boolean {
                 ("exited", u16::from(WaitOutcome::Exited as u8)),
             ],
         },
-    ];
-    for e in &simple_enums {
-        emit_simple_enum(&mut out, e);
-    }
+    ]
+}
 
-    // Standard schema-driven domain structs.
-    let domain_structs = vec![
+fn tagged_unions() -> Vec<TaggedUnionSchema> {
+    vec![
+        TaggedUnionSchema {
+            name: "SignalScope",
+            variants: vec![
+                TaggedVariant { kind: "leader", tag: SignalScope::TAG_LEADER, fields: vec![] },
+                TaggedVariant { kind: "group", tag: SignalScope::TAG_GROUP, fields: vec![] },
+                TaggedVariant {
+                    kind: "pid",
+                    tag: SignalScope::TAG_PID,
+                    fields: vec![f_custom("pid", "number", "encodeSignalTarget", "decodeSignalTarget")],
+                },
+            ],
+        },
+        TaggedUnionSchema {
+            name: "CommandOutcome",
+            variants: vec![
+                TaggedVariant { kind: "running", tag: CommandOutcome::TAG_RUNNING, fields: vec![] },
+                TaggedVariant {
+                    kind: "exited",
+                    tag: CommandOutcome::TAG_EXITED,
+                    fields: vec![f("code", FieldCodec::I32)],
+                },
+                TaggedVariant {
+                    kind: "unknown",
+                    tag: CommandOutcome::TAG_UNKNOWN,
+                    fields: vec![f_custom("reason", "UnknownReason", "encodeUnknownReason", "decodeUnknownReason")],
+                },
+                TaggedVariant {
+                    kind: "claimed",
+                    tag: CommandOutcome::TAG_CLAIMED,
+                    fields: vec![f("code", FieldCodec::Opt(Box::new(FieldCodec::I32)))],
+                },
+            ],
+        },
+        TaggedUnionSchema {
+            name: "LeaseKind",
+            variants: vec![
+                TaggedVariant { kind: "brokerImmediate", tag: LeaseKind::TAG_BROKER_IMMEDIATE, fields: vec![] },
+                TaggedVariant {
+                    kind: "brokerGrace",
+                    tag: LeaseKind::TAG_BROKER_GRACE,
+                    fields: vec![
+                        f_encode_decode_check(
+                            "graceMs",
+                            FieldCodec::VarU32,
+                            "if (!Number.isInteger(v.graceMs) || v.graceMs < 1 || v.graceMs > MAX_LEASE_GRACE_MS) throw new WireError('LimitExceeded', 'lease grace_ms')",
+                            "if (graceMs < 1 || graceMs > MAX_LEASE_GRACE_MS) throw new WireError('LimitExceeded', 'lease grace_ms')",
+                        ),
+                        f(
+                            "resumeToken",
+                            FieldCodec::FixedBytes {
+                                len_expr: "RESUME_TOKEN_LEN",
+                                len_val: ResumeToken::LEN,
+                                label: "resumeToken",
+                            },
+                        ),
+                    ],
+                },
+                TaggedVariant {
+                    kind: "session",
+                    tag: LeaseKind::TAG_SESSION,
+                    fields: vec![f_custom("session", "number", "encodeSessionId", "decodeSessionId")],
+                },
+            ],
+        },
+        TaggedUnionSchema {
+            name: "WaitCondition",
+            variants: vec![
+                TaggedVariant { kind: "idle", tag: WaitCondition::TAG_IDLE, fields: vec![] },
+                TaggedVariant {
+                    kind: "text",
+                    tag: WaitCondition::TAG_TEXT,
+                    fields: vec![f_encode_decode_check(
+                        "needle",
+                        FieldCodec::StrBounded("MAX_SEARCH_NEEDLE_BYTES", "wait text needle"),
+                        "if (v.needle.length === 0) throw new WireError('InvalidValue', 'wait text needle must be non-empty')",
+                        "if (needle.length === 0) throw new WireError('InvalidValue', 'wait text needle must be non-empty')",
+                    )],
+                },
+                TaggedVariant {
+                    kind: "status",
+                    tag: WaitCondition::TAG_STATUS,
+                    fields: vec![f_encode_decode_check(
+                        "states",
+                        FieldCodec::VecBounded {
+                            max_expr: "MAX_WAIT_STATUSES",
+                            label: "wait states",
+                            item: Box::new(FieldCodec::Custom {
+                                ts_type: "StatusState",
+                                encode_fn: "encodeStatusState",
+                                decode_fn: "decodeStatusState",
+                            }),
+                        },
+                        "if (v.states.length === 0) throw new WireError('InvalidValue', 'wait status list must be non-empty')",
+                        "if (states.length === 0) throw new WireError('InvalidValue', 'wait status list must be non-empty')",
+                    )],
+                },
+                TaggedVariant { kind: "exit", tag: WaitCondition::TAG_EXIT, fields: vec![] },
+            ],
+        },
+    ]
+}
+
+fn emit_primitive_helpers(out: &mut String) {
+    writeln!(
+        out,
+        "const MARKS_KEY_LEN = {}\nconst RESUME_TOKEN_LEN = {}\nconst BLOB_HASH_LEN = {}\nconst CURSOR_ALL_FLAGS_MASK = {:#04x}\nconst VIEW_MODES_ALL_FLAGS_MASK = {:#04x}\nconst MODIFIER_ALL_MASK = {:#04x}\nconst POINTER_MAX_BUTTON = {}\nconst POINTER_BUTTON_NONE = {}\n",
+        MarksKey::LEN,
+        ResumeToken::LEN,
+        BlobHash::LEN,
+        CursorState::ALL_FLAGS_MASK,
+        ViewModes::ALL_FLAGS_MASK,
+        modifier::ALL_MASK,
+        PointerInput::MAX_BUTTON,
+        PointerInput::BUTTON_NONE,
+    )
+    .unwrap();
+
+    writeln!(
+        out,
+        "/** 24-bit `0xRRGGBB` colour integer */\nexport type Rgb24 = number\n\n\
+export function encodeRgb24(w: WireWriter, rgb: Rgb24): void {{\n\
+  w.u8((rgb >>> 16) & 0xff)\n\
+  w.u8((rgb >>> 8) & 0xff)\n\
+  w.u8(rgb & 0xff)\n\
+}}\n\
+export function decodeRgb24(r: WireReader): Rgb24 {{\n\
+  const red = r.u8()\n\
+  const green = r.u8()\n\
+  const blue = r.u8()\n\
+  return ((red << 16) | (green << 8) | blue) >>> 0\n\
+}}\n\n\
+export function encodeSessionId(w: WireWriter, id: number): void {{\n\
+  if (!Number.isInteger(id) || id < 1) throw new WireError('InvalidValue', 'zero session id')\n\
+  w.varU64(id)\n\
+}}\n\
+export function decodeSessionId(r: WireReader): number {{\n\
+  const id = r.varU64()\n\
+  if (id === 0) throw new WireError('InvalidValue', 'zero session id')\n\
+  return id\n\
+}}\n\n\
+export function encodeNonZeroStreamId(w: WireWriter, id: number): void {{\n\
+  if (!Number.isInteger(id) || id < 1 || id > 0xffff_ffff) {{\n\
+    throw new WireError('InvalidValue', 'stream id must be non-zero')\n\
+  }}\n\
+  w.u32(id)\n\
+}}\n\
+export function decodeNonZeroStreamId(r: WireReader): number {{\n\
+  const id = r.u32()\n\
+  if (id === 0) throw new WireError('InvalidValue', 'stream id must be non-zero')\n\
+  return id\n\
+}}\n\n\
+export function encodeSignalTarget(w: WireWriter, pid: number): void {{\n\
+  if (!Number.isInteger(pid) || pid < 1 || pid > 0x7fff_ffff) {{\n\
+    throw new WireError('InvalidValue', 'signal target pid must be > 0')\n\
+  }}\n\
+  w.i32(pid)\n\
+}}\n\
+export function decodeSignalTarget(r: WireReader): number {{\n\
+  const pid = r.i32()\n\
+  if (pid < 1) throw new WireError('InvalidValue', 'signal target pid must be > 0')\n\
+  return pid\n\
+}}\n\n\
+export function encodeSubFlags(w: WireWriter, flags: number): void {{\n\
+  if ((flags & ~SubFlags.ALL_MASK) !== 0) throw new WireError('InvalidValue', 'unknown SubFlags bits')\n\
+  w.u8(flags)\n\
+}}\n\
+export function decodeSubFlags(r: WireReader): number {{\n\
+  const flags = r.u8()\n\
+  if ((flags & ~SubFlags.ALL_MASK) !== 0) throw new WireError('InvalidValue', 'unknown SubFlags bits')\n\
+  return flags\n\
+}}\n\n\
+const HEX_MARKS_KEY = new RegExp(`^[0-9a-f]{{${{MARKS_KEY_LEN}}}}$`)\n\
+export function encodeMarksKey(w: WireWriter, key: string): void {{\n\
+  if (!HEX_MARKS_KEY.test(key)) throw new WireError('InvalidValue', 'marks key must be 32 lowercase hex chars')\n\
+  w.raw(encodeUtf8(key))\n\
+}}\n\
+export function decodeMarksKey(r: WireReader): string {{\n\
+  const bytes = r.take(MARKS_KEY_LEN)\n\
+  for (let i = 0; i < bytes.length; i += 1) {{\n\
+    const b = bytes[i]!\n\
+    if (!((b >= 0x30 && b <= 0x39) || (b >= 0x61 && b <= 0x66))) {{\n\
+      throw new WireError('InvalidValue', 'marks key must be 32 lowercase hex chars')\n\
+    }}\n\
+  }}\n\
+  return decodeUtf8Strict(bytes)\n\
+}}\n\n\
+export function encodeBlobHash(w: WireWriter, hash: Uint8Array): void {{\n\
+  if (hash.length !== BLOB_HASH_LEN) throw new WireError('InvalidValue', 'blob hash must be 32 bytes')\n\
+  w.raw(hash)\n\
+}}\n\
+export function decodeBlobHash(r: WireReader): Uint8Array {{\n\
+  return r.fixedCopy(BLOB_HASH_LEN)\n\
+}}\n\n\
+export function blobHashToHex(hash: Uint8Array): string {{\n\
+  let out = ''\n\
+  for (let i = 0; i < hash.length; i += 1) {{\n\
+    out += hash[i]!.toString(16).padStart(2, '0')\n\
+  }}\n\
+  return out\n\
+}}\n",
+    )
+    .unwrap();
+}
+
+fn emit_bitpacked_structs(out: &mut String) {
+    out.push_str(
+        "export interface CursorState {\n\
+  readonly col: number\n\
+  readonly row: number\n\
+  readonly shape: CursorShape\n\
+  readonly blinking: boolean\n\
+  readonly hidden: boolean\n\
+}\n\n\
+export function encodeCursorState(w: WireWriter, state: CursorState): void {\n\
+  w.u16(state.col)\n\
+  w.u16(state.row)\n\
+  encodeCursorShape(w, state.shape)\n\
+  w.u8((state.blinking ? 1 : 0) | (state.hidden ? 2 : 0))\n\
+}\n\
+export function decodeCursorState(r: WireReader): CursorState {\n\
+  const col = r.u16()\n\
+  const row = r.u16()\n\
+  const shape = decodeCursorShape(r)\n\
+  const flags = r.u8()\n\
+  if (flags > CURSOR_ALL_FLAGS_MASK) throw new WireError('InvalidValue', 'unknown CursorState flag bits')\n\
+  return { col, row, shape, blinking: (flags & 1) !== 0, hidden: (flags & 2) !== 0 }\n\
+}\n\n\
+export interface ViewModes {\n\
+  readonly altScreen: boolean\n\
+  readonly mouse: boolean\n\
+  readonly reverseVideo: boolean\n\
+  readonly bracketedPaste: boolean\n\
+}\n\n\
+export function encodeViewModes(w: WireWriter, m: ViewModes): void {\n\
+  w.u8((m.altScreen ? 1 : 0) | (m.mouse ? 2 : 0) | (m.reverseVideo ? 4 : 0) | (m.bracketedPaste ? 8 : 0))\n\
+}\n\
+export function decodeViewModes(r: WireReader): ViewModes {\n\
+  const bits = r.u8()\n\
+  if (bits > VIEW_MODES_ALL_FLAGS_MASK) throw new WireError('InvalidValue', 'unknown ViewModes flag bits')\n\
+  return {\n\
+    altScreen: (bits & 1) !== 0,\n\
+    mouse: (bits & 2) !== 0,\n\
+    reverseVideo: (bits & 4) !== 0,\n\
+    bracketedPaste: (bits & 8) !== 0,\n\
+  }\n\
+}\n\n",
+    );
+}
+
+fn emit_packed_row(out: &mut String) {
+    writeln!(
+        out,
+        "/**\n\
+ * Self-contained, zero-per-cell-object style-run encoded terminal row.\n\
+ */\n\
+export interface PackedRow {{\n\
+  readonly line: number\n\
+  readonly flags: number\n\
+  readonly text: string\n\
+  readonly runs: Uint32Array\n\
+  readonly styles: Uint32Array\n\
+  readonly links: readonly string[]\n\
+  readonly pieces?: readonly ImagePiece[]\n\
+}}\n\n\
+function buildUtf8ToUtf16Map(utf8: Uint8Array): Int32Array {{\n\
+  const map = new Int32Array(utf8.length + 1)\n\
+  map.fill(-1)\n\
+  let bytePos = 0\n\
+  let utf16Pos = 0\n\
+  while (bytePos < utf8.length) {{\n\
+    map[bytePos] = utf16Pos\n\
+    const b0 = utf8[bytePos]!\n\
+    if (b0 < 0x80) {{\n\
+      bytePos += 1\n\
+      utf16Pos += 1\n\
+    }} else if (b0 < 0xe0) {{\n\
+      bytePos += 2\n\
+      utf16Pos += 1\n\
+    }} else if (b0 < 0xf0) {{\n\
+      bytePos += 3\n\
+      utf16Pos += 1\n\
+    }} else {{\n\
+      bytePos += 4\n\
+      utf16Pos += 2\n\
+    }}\n\
+  }}\n\
+  map[utf8.length] = utf16Pos\n\
+  return map\n\
+}}\n\n\
+function buildUtf16ToUtf8Map(text: string): Uint32Array {{\n\
+  const map = new Uint32Array(text.length + 1)\n\
+  let bytePos = 0\n\
+  let i = 0\n\
+  while (i < text.length) {{\n\
+    map[i] = bytePos\n\
+    const cp = text.codePointAt(i)!\n\
+    if (cp <= 0x7f) {{\n\
+      bytePos += 1\n\
+      i += 1\n\
+    }} else if (cp <= 0x7ff) {{\n\
+      bytePos += 2\n\
+      i += 1\n\
+    }} else if (cp <= 0xffff) {{\n\
+      bytePos += 3\n\
+      i += 1\n\
+    }} else {{\n\
+      bytePos += 4\n\
+      map[i + 1] = bytePos\n\
+      i += 2\n\
+    }}\n\
+  }}\n\
+  map[text.length] = bytePos\n\
+  return map\n\
+}}\n\n\
+export function encodePackedRow(w: WireWriter, row: PackedRow): void {{\n\
+  w.varU64(row.line)\n\
+  w.u8(row.flags)\n\
+  const utf8 = encodeUtf8(row.text)\n\
+  w.bytes(utf8)\n\
+  const isAscii = utf8.length === row.text.length\n\
+  const utf16ToUtf8 = isAscii ? null : buildUtf16ToUtf8Map(row.text)\n\n\
+  const runCount = row.runs.length >>> 2\n\
+  w.varU32(runCount)\n\
+  for (let i = 0; i < row.runs.length; i += 4) {{\n\
+    const colWord = row.runs[i]!\n\
+    const txtWord = row.runs[i + 1]!\n\
+    const slWord = row.runs[i + 2]!\n\
+    const runFlags = row.runs[i + 3]!\n\
+    const colStart = colWord & 0xffff\n\
+    const colLen = colWord >>> 16\n\
+    const u16Off = txtWord & 0xffff\n\
+    const u16Len = txtWord >>> 16\n\
+    const byteOffset = utf16ToUtf8 ? utf16ToUtf8[u16Off]! : u16Off\n\
+    const byteEnd = utf16ToUtf8 ? utf16ToUtf8[u16Off + u16Len]! : u16Off + u16Len\n\
+    const styleIdx = slWord & 0xffff\n\
+    const linkIdx = slWord >>> 16\n\
+    w.u16(colStart)\n\
+    w.u16(colLen)\n\
+    w.varU32(byteOffset)\n\
+    w.varU32(byteEnd - byteOffset)\n\
+    w.u16(styleIdx)\n\
+    w.u16(linkIdx)\n\
+    w.u8(runFlags)\n\
+  }}\n\n\
+  const styleCount = row.styles.length >>> 2\n\
+  w.varU32(styleCount)\n\
+  for (let i = 0; i < row.styles.length; i += 4) {{\n\
+    w.u32(row.styles[i]!)\n\
+    w.u32(row.styles[i + 1]!)\n\
+    w.u32(row.styles[i + 2]!)\n\
+    w.u32(row.styles[i + 3]!)\n\
+  }}\n\n\
+  w.slice(row.links, (wr, link) => wr.str(link))\n\
+  const pieces = row.pieces ?? []\n\
+  w.slice(pieces, encodeImagePiece)\n\
+}}\n\n\
+export function decodePackedRow(r: WireReader): PackedRow {{\n\
+  const line = r.varU64()\n\
+  const flags = r.u8()\n\
+  if (flags > RowFlag.ALL_MASK) throw new WireError('InvalidValue', 'unknown PackedRow flag bits')\n\n\
+  const textBytes = r.strBytes()\n\
+  const text = decodeUtf8Strict(textBytes)\n\
+  const isAscii = textBytes.length === text.length\n\
+  const byteToUtf16 = isAscii ? null : buildUtf8ToUtf16Map(textBytes)\n\n\
+  const runCount = r.varU32()\n\
+  if (runCount > MAX_PACKED_RUNS) throw new WireError('LimitExceeded', 'wire limit exceeded: packed runs')\n\
+  if (runCount * 11 > r.remaining) throw new WireError('UnexpectedEof', 'truncated packed runs')\n\
+  const runs = new Uint32Array(runCount * 4)\n\
+  for (let i = 0; i < runCount; i += 1) {{\n\
+    const colStart = r.u16()\n\
+    const colLen = r.u16()\n\
+    if (colLen === 0 || colStart + colLen > 0xffff) {{\n\
+      throw new WireError('InvalidValue', 'invalid PackedRun column span')\n\
+    }}\n\
+    const byteOffset = r.varU32()\n\
+    const byteLen = r.varU32()\n\
+    const styleIdx = r.u16()\n\
+    const linkIdx = r.u16()\n\
+    const runFlags = r.u8()\n\
+    if (runFlags > RunFlag.ALL_MASK) throw new WireError('InvalidValue', 'unknown PackedRun flag bits')\n\n\
+    const byteEnd = byteOffset + byteLen\n\
+    if (byteEnd > textBytes.length) {{\n\
+      throw new WireError('InvalidValue', 'run byte range out of bounds or mid-UTF-8')\n\
+    }}\n\
+    let u16Start: number\n\
+    let u16End: number\n\
+    if (byteToUtf16 === null) {{\n\
+      u16Start = byteOffset\n\
+      u16End = byteEnd\n\
+    }} else {{\n\
+      u16Start = byteToUtf16[byteOffset]!\n\
+      u16End = byteToUtf16[byteEnd]!\n\
+      if (u16Start < 0 || u16End < 0) {{\n\
+        throw new WireError('InvalidValue', 'run byte range out of bounds or mid-UTF-8')\n\
+      }}\n\
+    }}\n\
+    const u16Len = u16End - u16Start\n\
+    const base = i << 2\n\
+    runs[base] = (colStart | (colLen << 16)) >>> 0\n\
+    runs[base + 1] = (u16Start | (u16Len << 16)) >>> 0\n\
+    runs[base + 2] = (styleIdx | (linkIdx << 16)) >>> 0\n\
+    runs[base + 3] = runFlags\n\
+  }}\n\n\
+  const styleCount = r.varU32()\n\
+  if (styleCount > MAX_PACKED_STYLES) throw new WireError('LimitExceeded', 'wire limit exceeded: packed styles')\n\
+  if (styleCount * 16 > r.remaining) throw new WireError('UnexpectedEof', 'truncated packed styles')\n\
+  const styles = new Uint32Array(styleCount * 4)\n\
+  for (let i = 0; i < styleCount; i += 1) {{\n\
+    const fg = r.u32()\n\
+    const bg = r.u32()\n\
+    const ul = r.u32()\n\
+    const sf = r.u32()\n\
+    if (!isValidPackedColor(fg) || !isValidPackedColor(bg) || !isValidPackedColor(ul)) {{\n\
+      throw new WireError('InvalidValue', 'invalid PackedStyle colour encoding')\n\
+    }}\n\
+    if (\n\
+      (sf & ~PackedStyleFlag.ALL_MASK) !== 0 ||\n\
+      (sf & PackedStyleFlag.UNDERLINE_MASK) > PackedStyleFlag.UNDERLINE_MAX\n\
+    ) {{\n\
+      throw new WireError('InvalidValue', 'invalid PackedStyle flags')\n\
+    }}\n\
+    if (i === 0 && (fg !== 0 || bg !== 0 || ul !== 0 || sf !== 0)) {{\n\
+      throw new WireError('InvalidValue', 'styles[0] must be default style')\n\
+    }}\n\
+    const base = i << 2\n\
+    styles[base] = fg\n\
+    styles[base + 1] = bg\n\
+    styles[base + 2] = ul\n\
+    styles[base + 3] = sf\n\
+  }}\n\n\
+  const links = r.vecBounded(MAX_PACKED_LINKS, 'packed links', (rd) => rd.str())\n\
+  if (links.length > 0 && links[0] !== '') {{\n\
+    throw new WireError('InvalidValue', 'links[0] must be empty')\n\
+  }}\n\n\
+  const pieces = r.vecBounded(MAX_PACKED_PIECES, 'image pieces', decodeImagePiece)\n\
+  if (pieces.length > 0 && (flags & RowFlag.HAS_PLACEHOLDER) === 0) {{\n\
+    throw new WireError('InvalidValue', 'pieces require FLAG_HAS_PLACEHOLDER')\n\
+  }}\n\n\
+  for (let i = 0; i < runCount; i += 1) {{\n\
+    const slWord = runs[(i << 2) + 2]!\n\
+    const styleIdx = slWord & 0xffff\n\
+    const linkIdx = slWord >>> 16\n\
+    if (styleIdx >= styleCount && styleIdx !== 0) {{\n\
+      throw new WireError('InvalidValue', 'run style_idx out of bounds')\n\
+    }}\n\
+    if (linkIdx >= links.length && linkIdx !== 0) {{\n\
+      throw new WireError('InvalidValue', 'run link_idx out of bounds')\n\
+    }}\n\
+  }}\n\n\
+  return pieces.length > 0 ? {{ line, flags, text, runs, styles, links, pieces }} : {{ line, flags, text, runs, styles, links }}\n\
+}}\n",
+    )
+    .unwrap();
+}
+
+fn domain_structs() -> Vec<StructSchema> {
+    vec![
+        StructSchema {
+            name: "GridSize",
+            exported_codec: true,
+            fields: vec![
+                f("cols", FieldCodec::U16),
+                f_encode_decode_check(
+                    "rows",
+                    FieldCodec::U16,
+                    "if (v.cols < 1 || v.cols > MAX_GRID_COLS || v.rows < 1 || v.rows > MAX_GRID_ROWS) {\n  throw new WireError('InvalidValue', 'grid dimensions out of range')\n}",
+                    "if (cols < 1 || cols > MAX_GRID_COLS || rows < 1 || rows > MAX_GRID_ROWS) {\n  throw new WireError('InvalidValue', 'grid dimensions out of range')\n}",
+                ),
+            ],
+        },
         StructSchema {
             name: "CellPx",
             exported_codec: true,
-            fields: vec![
-                FieldSpec { name: "width", codec: FieldCodec::U16 },
-                FieldSpec { name: "height", codec: FieldCodec::U16 },
-            ],
-            post_decode_check: None,
+            fields: vec![f("width", FieldCodec::U16), f("height", FieldCodec::U16)],
         },
         StructSchema {
             name: "ViewportHint",
@@ -747,1755 +1324,371 @@ export function isValidPackedColor(color: number): boolean {
             fields: vec![
                 f_custom("size", "GridSize", "encodeGridSize", "decodeGridSize"),
                 f_custom("cellPx", "CellPx", "encodeCellPx", "decodeCellPx"),
-                FieldSpec { name: "visible", codec: FieldCodec::Bool },
-                FieldSpec { name: "focused", codec: FieldCodec::Bool },
+                f("visible", FieldCodec::Bool),
+                f("focused", FieldCodec::Bool),
             ],
-            post_decode_check: None,
         },
         StructSchema {
             name: "FrameCredit",
             exported_codec: true,
+            fields: vec![f("maxFrames", FieldCodec::U16), f("maxBytes", FieldCodec::VarU32)],
+        },
+        StructSchema {
+            name: "PaletteOverrides",
+            exported_codec: true,
             fields: vec![
-                FieldSpec { name: "maxFrames", codec: FieldCodec::U16 },
-                FieldSpec { name: "maxBytes", codec: FieldCodec::VarU32 },
+                f(
+                    "fg",
+                    FieldCodec::Opt(Box::new(FieldCodec::Custom {
+                        ts_type: "Rgb24",
+                        encode_fn: "encodeRgb24",
+                        decode_fn: "decodeRgb24",
+                    })),
+                ),
+                f(
+                    "bg",
+                    FieldCodec::Opt(Box::new(FieldCodec::Custom {
+                        ts_type: "Rgb24",
+                        encode_fn: "encodeRgb24",
+                        decode_fn: "decodeRgb24",
+                    })),
+                ),
+                f(
+                    "cursor",
+                    FieldCodec::Opt(Box::new(FieldCodec::Custom {
+                        ts_type: "Rgb24",
+                        encode_fn: "encodeRgb24",
+                        decode_fn: "decodeRgb24",
+                    })),
+                ),
+                f(
+                    "palette",
+                    FieldCodec::PaletteEntries { max_expr: "MAX_PALETTE_OVERRIDES", label: "palette overrides" },
+                ),
             ],
-            post_decode_check: None,
+        },
+        StructSchema {
+            name: "ImagePiece",
+            exported_codec: true,
+            fields: vec![
+                f_custom("blob", "Uint8Array", "encodeBlobHash", "decodeBlobHash"),
+                f("colStart", FieldCodec::U16),
+                f_check(
+                    "colLen",
+                    FieldCodec::U16,
+                    "if (colLen === 0 || colStart + colLen > 0xffff) {\n  throw new WireError('InvalidValue', 'invalid ImagePiece column span')\n}",
+                ),
+                f_check(
+                    "srcRect",
+                    FieldCodec::Tuple4VarU32,
+                    "if (srcRect[2] === 0 || srcRect[3] === 0 || srcRect[0] + srcRect[2] > 0xffff_ffff || srcRect[1] + srcRect[3] > 0xffff_ffff) {\n  throw new WireError('InvalidValue', 'invalid ImagePiece src_rect')\n}",
+                ),
+                f_check(
+                    "dstPx",
+                    FieldCodec::Tuple2VarU32,
+                    "if (dstPx[0] === 0 || dstPx[1] === 0) throw new WireError('InvalidValue', 'invalid ImagePiece dst_px')",
+                ),
+            ],
         },
         StructSchema {
             name: "CellPos",
             exported_codec: true,
-            fields: vec![
-                FieldSpec { name: "line", codec: FieldCodec::VarU64 },
-                FieldSpec { name: "col", codec: FieldCodec::U16 },
-            ],
-            post_decode_check: None,
+            fields: vec![f("line", FieldCodec::VarU64), f("col", FieldCodec::U16)],
         },
         StructSchema {
             name: "CellSpan",
             exported_codec: true,
             fields: vec![
                 f_custom("start", "CellPos", "encodeCellPos", "decodeCellPos"),
-                f_custom("end", "CellPos", "encodeCellPos", "decodeCellPos"),
+                f_check(
+                    "end",
+                    FieldCodec::Custom { ts_type: "CellPos", encode_fn: "encodeCellPos", decode_fn: "decodeCellPos" },
+                    "if (end.line < start.line || (end.line === start.line && end.col < start.col)) {\n  throw new WireError('InvalidValue', 'CellSpan end before start')\n}",
+                ),
             ],
-            post_decode_check: Some(
-                "if (end.line < start.line || (end.line === start.line && end.col < start.col)) {\n    throw new WireError('InvalidValue', 'span end before start')\n  }",
-            ),
-        },
-        StructSchema {
-            name: "ImagePlacement",
-            exported_codec: true,
-            fields: vec![
-                f_custom("blob", "Uint8Array", "encodeBlobHash", "decodeBlobHash"),
-                FieldSpec { name: "line", codec: FieldCodec::VarU64 },
-                FieldSpec { name: "col", codec: FieldCodec::I32 },
-                FieldSpec { name: "pixelSize", codec: FieldCodec::Tuple2VarU32 },
-                FieldSpec { name: "cellSpan", codec: FieldCodec::Tuple2U16 },
-                FieldSpec { name: "zIndex", codec: FieldCodec::I32 },
-            ],
-            post_decode_check: None,
-        },
-        StructSchema {
-            name: "CommandRecord",
-            exported_codec: true,
-            fields: vec![
-                FieldSpec { name: "id", codec: FieldCodec::VarU64 },
-                FieldSpec { name: "command", codec: FieldCodec::Opt(Box::new(FieldCodec::Str)) },
-                FieldSpec { name: "cwd", codec: FieldCodec::Opt(Box::new(FieldCodec::Str)) },
-                FieldSpec { name: "startedMs", codec: FieldCodec::Opt(Box::new(FieldCodec::VarU64)) },
-                FieldSpec { name: "finishedMs", codec: FieldCodec::Opt(Box::new(FieldCodec::VarU64)) },
-                f_custom("outcome", "CommandOutcome", "encodeCommandOutcome", "decodeCommandOutcome"),
-                FieldSpec { name: "promptLine", codec: FieldCodec::Opt(Box::new(FieldCodec::VarU64)) },
-                FieldSpec { name: "outputLine", codec: FieldCodec::Opt(Box::new(FieldCodec::VarU64)) },
-                FieldSpec { name: "endLine", codec: FieldCodec::Opt(Box::new(FieldCodec::VarU64)) },
-            ],
-            post_decode_check: None,
         },
         StructSchema {
             name: "ForegroundProcess",
             exported_codec: true,
             fields: vec![
                 f_custom("pid", "number", "encodeSignalTarget", "decodeSignalTarget"),
-                FieldSpec { name: "name", codec: FieldCodec::Opt(Box::new(FieldCodec::Str)) },
+                f("name", FieldCodec::Opt(Box::new(FieldCodec::Str))),
             ],
-            post_decode_check: None,
+        },
+        StructSchema {
+            name: "CommandRecord",
+            exported_codec: true,
+            fields: vec![
+                f("id", FieldCodec::VarU64),
+                f("command", FieldCodec::Opt(Box::new(FieldCodec::Str))),
+                f("cwd", FieldCodec::Opt(Box::new(FieldCodec::Str))),
+                f("startedMs", FieldCodec::Opt(Box::new(FieldCodec::VarU64))),
+                f("finishedMs", FieldCodec::Opt(Box::new(FieldCodec::VarU64))),
+                f_custom("outcome", "CommandOutcome", "encodeCommandOutcome", "decodeCommandOutcome"),
+                f("promptLine", FieldCodec::Opt(Box::new(FieldCodec::VarU64))),
+                f("outputLine", FieldCodec::Opt(Box::new(FieldCodec::VarU64))),
+                f("endLine", FieldCodec::Opt(Box::new(FieldCodec::VarU64))),
+            ],
+        },
+        StructSchema {
+            name: "StatusRecord",
+            exported_codec: true,
+            fields: vec![
+                f("id", FieldCodec::Str),
+                f_custom("state", "StatusState", "encodeStatusState", "decodeStatusState"),
+                f_check(
+                    "kind",
+                    FieldCodec::Opt(Box::new(FieldCodec::Custom {
+                        ts_type: "BlockedKind",
+                        encode_fn: "encodeBlockedKind",
+                        decode_fn: "decodeBlockedKind",
+                    })),
+                    "if (state !== 'blocked' && kind !== null) {\n  throw new WireError('InvalidValue', 'status kind requires Blocked state')\n}",
+                ),
+                f(
+                    "progress",
+                    FieldCodec::Opt(Box::new(FieldCodec::ProgressPercent { err_msg: "progress must be 0..=100" })),
+                ),
+                f("app", FieldCodec::Opt(Box::new(FieldCodec::Str))),
+                f("title", FieldCodec::Opt(Box::new(FieldCodec::Str))),
+                f("message", FieldCodec::Opt(Box::new(FieldCodec::Str))),
+                f("changed", FieldCodec::VarU64),
+                f("sinceMs", FieldCodec::VarU64),
+                f_custom("confirmed", "Confirmed", "encodeConfirmed", "decodeConfirmed"),
+            ],
+        },
+        StructSchema {
+            name: "KeyInput",
+            exported_codec: true,
+            fields: vec![
+                f("code", FieldCodec::Str),
+                f_custom("action", "KeyAction", "encodeKeyAction", "decodeKeyAction"),
+                f_check(
+                    "modifiers",
+                    FieldCodec::U8,
+                    "if (modifiers > MODIFIER_ALL_MASK) throw new WireError('InvalidValue', 'unknown KeyInput modifier bits')",
+                ),
+                f("text", FieldCodec::Str),
+                f_check(
+                    "unshiftedCodepoint",
+                    FieldCodec::VarU32,
+                    "if (unshiftedCodepoint > 0x10_ffff || (unshiftedCodepoint >= 0xd800 && unshiftedCodepoint <= 0xdfff)) {\n  throw new WireError('InvalidValue', 'invalid Unicode scalar codepoint')\n}",
+                ),
+                f("composed", FieldCodec::Bool),
+            ],
+        },
+        StructSchema {
+            name: "PointerInput",
+            exported_codec: true,
+            fields: vec![
+                f_custom("action", "PointerAction", "encodePointerAction", "decodePointerAction"),
+                f_check(
+                    "button",
+                    FieldCodec::U8,
+                    "if (button > POINTER_MAX_BUTTON && button !== POINTER_BUTTON_NONE) {\n  throw new WireError('InvalidValue', 'invalid PointerInput button')\n}",
+                ),
+                f_check(
+                    "modifiers",
+                    FieldCodec::U8,
+                    "if (modifiers > MODIFIER_ALL_MASK) throw new WireError('InvalidValue', 'unknown PointerInput modifier bits')",
+                ),
+                f("xPx", FieldCodec::VarU32),
+                f("yPx", FieldCodec::VarU32),
+                f_custom("cellPx", "CellPx", "encodeCellPx", "decodeCellPx"),
+            ],
+        },
+        StructSchema {
+            name: "ImagePlacement",
+            exported_codec: true,
+            fields: vec![
+                f_custom("blob", "Uint8Array", "encodeBlobHash", "decodeBlobHash"),
+                f("line", FieldCodec::VarU64),
+                f("col", FieldCodec::I32),
+                f("pixelSize", FieldCodec::Tuple2VarU32),
+                f("cellSpan", FieldCodec::Tuple2U16),
+                f("zIndex", FieldCodec::I32),
+            ],
         },
         StructSchema {
             name: "MetricsSnapshot",
             exported_codec: true,
             fields: vec![
-                FieldSpec { name: "liveSessions", codec: FieldCodec::VarU32 },
-                FieldSpec { name: "rewoundSessions", codec: FieldCodec::VarU32 },
-                FieldSpec { name: "connections", codec: FieldCodec::VarU32 },
-                FieldSpec { name: "activeTimers", codec: FieldCodec::VarU32 },
-                FieldSpec { name: "scrollbackBytes", codec: FieldCodec::VarU64 },
-                FieldSpec { name: "imageStoreBytes", codec: FieldCodec::VarU64 },
-                FieldSpec { name: "totalPtyBytes", codec: FieldCodec::VarU64 },
-                FieldSpec { name: "totalThrottledUs", codec: FieldCodec::VarU64 },
+                f("liveSessions", FieldCodec::VarU32),
+                f("rewoundSessions", FieldCodec::VarU32),
+                f("connections", FieldCodec::VarU32),
+                f("activeTimers", FieldCodec::VarU32),
+                f("scrollbackBytes", FieldCodec::VarU64),
+                f("imageStoreBytes", FieldCodec::VarU64),
+                f("totalPtyBytes", FieldCodec::VarU64),
+                f("totalThrottledUs", FieldCodec::VarU64),
             ],
-            post_decode_check: None,
         },
-    ];
-    for s in &domain_structs {
+    ]
+}
+
+fn render_types_ts() -> String {
+    let mut out = String::from(GENERATED_HEADER);
+    out.push_str(
+        "/**\n * Correct-by-construction domain types and `PackedRow` typed-array representation\n * generated directly from `crates/apack-proto/src/types.rs`.\n */\n\
+import {\n\
+  MAX_GRID_COLS,\n\
+  MAX_GRID_ROWS,\n\
+  MAX_LEASE_GRACE_MS,\n\
+  MAX_PACKED_LINKS,\n\
+  MAX_PACKED_PIECES,\n\
+  MAX_PACKED_RUNS,\n\
+  MAX_PACKED_STYLES,\n\
+  MAX_PALETTE_OVERRIDES,\n\
+  MAX_PROGRESS_PERCENT,\n\
+  MAX_SEARCH_NEEDLE_BYTES,\n\
+  MAX_WAIT_STATUSES,\n\
+} from './constants.ts'\n\
+import {\n\
+  WireError,\n\
+  decodeUtf8Strict,\n\
+  encodeUtf8,\n\
+  type WireReader,\n\
+  type WireWriter,\n\
+} from './codec.ts'\n\n",
+    );
+
+    writeln!(out, "export const CONTROL_STREAM_ID = {}", StreamId::CONTROL.raw()).unwrap();
+    writeln!(out, "export const PUSH_REQ_ID = {}\n", RequestId::PUSH.raw()).unwrap();
+
+    writeln!(
+        out,
+        "export const SubFlags = {{\n  VIEW: {:#04x},\n  EVENTS: {:#04x},\n  RAW_OUTPUT: {:#04x},\n  BACKPRESSURE_PTY: {:#04x},\n  ALL_MASK: {:#04x},\n}} as const\n",
+        SubFlags::VIEW,
+        SubFlags::EVENTS,
+        SubFlags::RAW_OUTPUT,
+        SubFlags::BACKPRESSURE_PTY,
+        SubFlags::ALL_MASK,
+    )
+    .unwrap();
+
+    writeln!(
+        out,
+        "export const Modifier = {{\n  shift: {:#04x},\n  ctrl: {:#04x},\n  alt: {:#04x},\n  super: {:#04x},\n  caps: {:#04x},\n  num: {:#04x},\n}} as const\n",
+        modifier::SHIFT,
+        modifier::CTRL,
+        modifier::ALT,
+        modifier::SUPER,
+        modifier::CAPS,
+        modifier::NUM,
+    )
+    .unwrap();
+
+    writeln!(
+        out,
+        "export const RowFlag = {{\n  WRAPPED: {:#04x},\n  PROMPT: {:#04x},\n  HAS_BLINK: {:#04x},\n  HAS_PLACEHOLDER: {:#04x},\n  ALL_MASK: {:#04x},\n}} as const\n",
+        PackedRow::FLAG_WRAPPED,
+        PackedRow::FLAG_PROMPT,
+        PackedRow::FLAG_HAS_BLINK,
+        PackedRow::FLAG_HAS_PLACEHOLDER,
+        PackedRow::ALL_FLAGS_MASK,
+    )
+    .unwrap();
+
+    writeln!(
+        out,
+        "export const RunFlag = {{\n  /** Wide character or grapheme cluster needing per-cell placement */\n  PER_CELL: {:#04x},\n  ALL_MASK: {:#04x},\n}} as const\n",
+        PackedRun::FLAG_PER_CELL,
+        PackedRun::ALL_FLAGS_MASK,
+    )
+    .unwrap();
+
+    writeln!(
+        out,
+        "export const PackedStyleFlag = {{\n  BOLD: {:#06x},\n  ITALIC: {:#06x},\n  UNDERLINE_MASK: {:#06x},\n  UNDERLINE_MAX: {:#06x},\n  STRIKETHROUGH: {:#06x},\n  BLINK: {:#06x},\n  INVERSE: {:#06x},\n  INVISIBLE: {:#06x},\n  FAINT: {:#06x},\n  ALL_MASK: {:#06x},\n}} as const\n",
+        PackedStyle::FLAG_BOLD,
+        PackedStyle::FLAG_ITALIC,
+        PackedStyle::FLAG_UNDERLINE_MASK,
+        PackedStyle::FLAG_UNDERLINE_MAX,
+        PackedStyle::FLAG_STRIKETHROUGH,
+        PackedStyle::FLAG_BLINK,
+        PackedStyle::FLAG_INVERSE,
+        PackedStyle::FLAG_INVISIBLE,
+        PackedStyle::FLAG_FAINT,
+        PackedStyle::ALL_FLAGS_MASK,
+    )
+    .unwrap();
+
+    writeln!(
+        out,
+        "export type UnderlineKind = 'none' | 'single' | 'double' | 'curly' | 'dotted' | 'dashed'\n\
+const UNDERLINE_NAMES: readonly UnderlineKind[] = ['none', 'single', 'double', 'curly', 'dotted', 'dashed']\n\n\
+export function underlineOfStyleFlags(flags: number): UnderlineKind {{\n\
+  return UNDERLINE_NAMES[(flags & PackedStyleFlag.UNDERLINE_MASK) >> {}] ?? 'none'\n\
+}}\n\n\
+export function isValidPackedColor(color: number): boolean {{\n\
+  const c = color >>> 0\n\
+  return c <= {} || (c >= {:#010x} && c <= {:#010x})\n\
+}}\n",
+        PackedStyle::UNDERLINE_SHIFT,
+        PackedStyle::MAX_PALETTE_COLOR,
+        PackedStyle::RGB_COLOR_MIN,
+        PackedStyle::RGB_COLOR_MAX,
+    )
+    .unwrap();
+
+    for e in &simple_enums() {
+        emit_simple_enum(&mut out, e);
+    }
+
+    emit_primitive_helpers(&mut out);
+
+    for u in &tagged_unions() {
+        emit_tagged_union(&mut out, u);
+    }
+
+    emit_bitpacked_structs(&mut out);
+
+    for s in &domain_structs() {
         emit_struct_schema(&mut out, s);
     }
 
-    // Custom domain types with specialized bit-packing, validation, or typed-array representation
-    // (such as `PackedRow` UTF-8 <-> UTF-16 offset translation).
-    out.push_str(CUSTOM_TYPES_TS);
+    emit_packed_row(&mut out);
+
     out
 }
 
-const CUSTOM_TYPES_TS: &str = r#"export type SignalScope =
-  | { readonly kind: 'leader' }
-  | { readonly kind: 'group' }
-  | { readonly kind: 'pid'; readonly pid: number }
-
-export type CommandOutcome =
-  | { readonly kind: 'running' }
-  | { readonly kind: 'exited'; readonly code: number }
-  | { readonly kind: 'unknown'; readonly reason: UnknownReason }
-  | { readonly kind: 'claimed'; readonly code: number | null }
-
-export interface GridSize {
-  readonly cols: number
-  readonly rows: number
-}
-
-export type LeaseKind =
-  | { readonly kind: 'brokerImmediate' }
-  | { readonly kind: 'brokerGrace'; readonly graceMs: number; readonly resumeToken: Uint8Array }
-  | { readonly kind: 'session'; readonly session: number }
-
-export interface CursorState {
-  readonly col: number
-  readonly row: number
-  readonly shape: CursorShape
-  readonly blinking: boolean
-  readonly hidden: boolean
-}
-
-/** 24-bit `0xRRGGBB` colour integer */
-export type Rgb24 = number
-
-export interface PaletteOverrides {
-  readonly fg: Rgb24 | null
-  readonly bg: Rgb24 | null
-  readonly cursor: Rgb24 | null
-  readonly palette: ReadonlyArray<{ readonly index: number; readonly rgb: Rgb24 }>
-}
-
-export interface ViewModes {
-  readonly altScreen: boolean
-  readonly mouse: boolean
-  readonly reverseVideo: boolean
-  readonly bracketedPaste: boolean
-}
-
-export interface ImagePiece {
-  /** 32-byte BLAKE3 hash */
-  readonly blob: Uint8Array
-  readonly colStart: number
-  readonly colLen: number
-  readonly srcRect: readonly [number, number, number, number]
-  readonly dstPx: readonly [number, number]
-}
-
-/**
- * Self-contained, zero-per-cell-object style-run encoded terminal row.
- */
-export interface PackedRow {
-  readonly line: number
-  readonly flags: number
-  readonly text: string
-  readonly runs: Uint32Array
-  readonly styles: Uint32Array
-  readonly links: readonly string[]
-  readonly pieces?: readonly ImagePiece[]
-}
-
-export interface StatusRecord {
-  readonly id: string
-  readonly state: StatusState
-  readonly kind: BlockedKind | null
-  readonly progress: number | null
-  readonly app: string | null
-  readonly title: string | null
-  readonly message: string | null
-  readonly changed: number
-  readonly sinceMs: number
-  readonly confirmed: Confirmed
-}
-
-export interface KeyInput {
-  readonly code: string
-  readonly action: KeyAction
-  readonly modifiers: number
-  readonly text: string
-  readonly unshiftedCodepoint: number
-  readonly composed: boolean
-}
-
-export interface PointerInput {
-  readonly action: PointerAction
-  /** `0` = left, `1` = middle, `2` = right, `255` = none */
-  readonly button: number
-  readonly modifiers: number
-  readonly xPx: number
-  readonly yPx: number
-  readonly cellPx: CellPx
-}
-
-export type WaitCondition =
-  | { readonly kind: 'idle' }
-  | { readonly kind: 'text'; readonly needle: string }
-  | { readonly kind: 'status'; readonly states: readonly StatusState[] }
-  | { readonly kind: 'exit' }
-
-export function encodeSessionId(w: WireWriter, id: number): void {
-  if (!Number.isInteger(id) || id < 1) throw new WireError('InvalidValue', 'zero session id')
-  w.varU64(id)
-}
-export function decodeSessionId(r: WireReader): number {
-  const id = r.varU64()
-  if (id === 0) throw new WireError('InvalidValue', 'zero session id')
-  return id
-}
-
-export function encodeNonZeroStreamId(w: WireWriter, id: number): void {
-  if (!Number.isInteger(id) || id < 1 || id > 0xffff_ffff) {
-    throw new WireError('InvalidValue', 'stream id must be non-zero')
-  }
-  w.u32(id)
-}
-export function decodeNonZeroStreamId(r: WireReader): number {
-  const id = r.u32()
-  if (id === 0) throw new WireError('InvalidValue', 'stream id must be non-zero')
-  return id
-}
-
-export function encodeSignalTarget(w: WireWriter, pid: number): void {
-  if (!Number.isInteger(pid) || pid < 1 || pid > 0x7fff_ffff) {
-    throw new WireError('InvalidValue', 'signal target pid must be > 0')
-  }
-  w.i32(pid)
-}
-export function decodeSignalTarget(r: WireReader): number {
-  const pid = r.i32()
-  if (pid < 1) throw new WireError('InvalidValue', 'signal target pid must be > 0')
-  return pid
-}
-
-export function encodeSignalScope(w: WireWriter, scope: SignalScope): void {
-  if (scope.kind === 'leader') w.u8(0)
-  else if (scope.kind === 'group') w.u8(1)
-  else {
-    w.u8(2)
-    encodeSignalTarget(w, scope.pid)
-  }
-}
-export function decodeSignalScope(r: WireReader): SignalScope {
-  const tag = r.u8()
-  if (tag === 0) return { kind: 'leader' }
-  if (tag === 1) return { kind: 'group' }
-  if (tag === 2) return { kind: 'pid', pid: decodeSignalTarget(r) }
-  throw new WireError('InvalidTag', `invalid SignalScope wire tag ${tag}`)
-}
-
-const HEX_32 = /^[0-9a-f]{32}$/
-export function encodeMarksKey(w: WireWriter, key: string): void {
-  if (!HEX_32.test(key)) throw new WireError('InvalidValue', 'marks key must be 32 lowercase hex chars')
-  w.raw(encodeUtf8(key))
-}
-export function decodeMarksKey(r: WireReader): string {
-  const s = decodeUtf8Strict(r.take(32))
-  if (!HEX_32.test(s)) throw new WireError('InvalidValue', 'marks key must be 32 lowercase hex chars')
-  return s
-}
-
-export function encodeCommandOutcome(w: WireWriter, outcome: CommandOutcome): void {
-  switch (outcome.kind) {
-    case 'running':
-      w.u8(0)
-      break
-    case 'exited':
-      w.u8(1)
-      w.i32(outcome.code)
-      break
-    case 'unknown':
-      w.u8(2)
-      w.u8(UNKNOWN_TO_TAG[outcome.reason])
-      break
-    case 'claimed':
-      w.u8(3)
-      w.opt(outcome.code, (wr, c) => wr.i32(c))
-      break
-  }
-}
-export function decodeCommandOutcome(r: WireReader): CommandOutcome {
-  const tag = r.u8()
-  if (tag === 0) return { kind: 'running' }
-  if (tag === 1) return { kind: 'exited', code: r.i32() }
-  if (tag === 2) {
-    const ut = r.u8()
-    const reason = TAG_TO_UNKNOWN[ut]
-    if (!reason) throw new WireError('InvalidTag', `invalid UnknownReason wire tag ${ut}`)
-    return { kind: 'unknown', reason }
-  }
-  if (tag === 3) return { kind: 'claimed', code: r.opt((rd) => rd.i32()) }
-  throw new WireError('InvalidTag', `invalid CommandOutcome wire tag ${tag}`)
-}
-
-export function encodeGridSize(w: WireWriter, size: GridSize): void {
-  if (
-    !Number.isInteger(size.cols) ||
-    !Number.isInteger(size.rows) ||
-    size.cols < 1 ||
-    size.cols > MAX_GRID_COLS ||
-    size.rows < 1 ||
-    size.rows > MAX_GRID_ROWS
-  ) {
-    throw new WireError('InvalidValue', 'grid dimensions out of range')
-  }
-  w.u16(size.cols)
-  w.u16(size.rows)
-}
-export function decodeGridSize(r: WireReader): GridSize {
-  const cols = r.u16()
-  const rows = r.u16()
-  if (cols < 1 || cols > MAX_GRID_COLS || rows < 1 || rows > MAX_GRID_ROWS) {
-    throw new WireError('InvalidValue', 'grid dimensions out of range')
-  }
-  return { cols, rows }
-}
-
-export function encodeSubFlags(w: WireWriter, flags: number): void {
-  if (
-    flags < 0 ||
-    flags > SubFlags.ALL_MASK ||
-    ((flags & SubFlags.BACKPRESSURE_PTY) !== 0 && (flags & SubFlags.RAW_OUTPUT) === 0)
-  ) {
-    throw new WireError('InvalidValue', 'unknown SubFlags bits')
-  }
-  w.u8(flags)
-}
-export function decodeSubFlags(r: WireReader): number {
-  const flags = r.u8()
-  if (
-    flags > SubFlags.ALL_MASK ||
-    ((flags & SubFlags.BACKPRESSURE_PTY) !== 0 && (flags & SubFlags.RAW_OUTPUT) === 0)
-  ) {
-    throw new WireError('InvalidValue', 'unknown SubFlags bits')
-  }
-  return flags
-}
-
-export function encodeLeaseKind(w: WireWriter, kind: LeaseKind): void {
-  switch (kind.kind) {
-    case 'brokerImmediate':
-      w.u8(0)
-      break
-    case 'brokerGrace':
-      if (!Number.isInteger(kind.graceMs) || kind.graceMs < 1 || kind.graceMs > MAX_LEASE_GRACE_MS) {
-        throw new WireError('LimitExceeded', 'lease grace_ms')
-      }
-      if (kind.resumeToken.length !== 32) {
-        throw new WireError('InvalidValue', 'resumeToken must be 32 bytes')
-      }
-      w.u8(1)
-      w.varU32(kind.graceMs)
-      w.raw(kind.resumeToken)
-      break
-    case 'session':
-      w.u8(2)
-      encodeSessionId(w, kind.session)
-      break
-  }
-}
-export function decodeLeaseKind(r: WireReader): LeaseKind {
-  const tag = r.u8()
-  if (tag === 0) return { kind: 'brokerImmediate' }
-  if (tag === 1) {
-    const graceMs = r.varU32()
-    if (graceMs < 1 || graceMs > MAX_LEASE_GRACE_MS) throw new WireError('LimitExceeded', 'lease grace_ms')
-    const resumeToken = r.fixedCopy(32)
-    return { kind: 'brokerGrace', graceMs, resumeToken }
-  }
-  if (tag === 2) return { kind: 'session', session: decodeSessionId(r) }
-  throw new WireError('InvalidTag', `invalid LeaseKind wire tag ${tag}`)
-}
-
-export function encodeCursorState(w: WireWriter, state: CursorState): void {
-  w.u16(state.col)
-  w.u16(state.row)
-  encodeCursorShape(w, state.shape)
-  w.u8((state.blinking ? 1 : 0) | (state.hidden ? 2 : 0))
-}
-export function decodeCursorState(r: WireReader): CursorState {
-  const col = r.u16()
-  const row = r.u16()
-  const shape = decodeCursorShape(r)
-  const flags = r.u8()
-  if (flags > 0x03) throw new WireError('InvalidValue', 'unknown CursorState flag bits')
-  return { col, row, shape, blinking: (flags & 1) !== 0, hidden: (flags & 2) !== 0 }
-}
-
-export function encodeRgb24(w: WireWriter, rgb: Rgb24): void {
-  w.u8((rgb >> 16) & 0xff)
-  w.u8((rgb >> 8) & 0xff)
-  w.u8(rgb & 0xff)
-}
-export function decodeRgb24(r: WireReader): Rgb24 {
-  const b = r.take(3)
-  return ((b[0]! << 16) | (b[1]! << 8) | b[2]!) >>> 0
-}
-
-export function encodePaletteOverrides(w: WireWriter, p: PaletteOverrides): void {
-  w.opt(p.fg, encodeRgb24)
-  w.opt(p.bg, encodeRgb24)
-  w.opt(p.cursor, encodeRgb24)
-  w.slice(p.palette, (wr, entry) => {
-    wr.u8(entry.index)
-    encodeRgb24(wr, entry.rgb)
-  })
-}
-export function decodePaletteOverrides(r: WireReader): PaletteOverrides {
-  return {
-    fg: r.opt(decodeRgb24),
-    bg: r.opt(decodeRgb24),
-    cursor: r.opt(decodeRgb24),
-    palette: r.vecBounded(256, 'palette overrides', (rd) => ({ index: rd.u8(), rgb: decodeRgb24(rd) })),
-  }
-}
-
-export function encodeViewModes(w: WireWriter, m: ViewModes): void {
-  w.u8((m.altScreen ? 1 : 0) | (m.mouse ? 2 : 0) | (m.reverseVideo ? 4 : 0) | (m.bracketedPaste ? 8 : 0))
-}
-export function decodeViewModes(r: WireReader): ViewModes {
-  const bits = r.u8()
-  if (bits > 0x0f) throw new WireError('InvalidValue', 'unknown ViewModes flag bits')
-  return {
-    altScreen: (bits & 1) !== 0,
-    mouse: (bits & 2) !== 0,
-    reverseVideo: (bits & 4) !== 0,
-    bracketedPaste: (bits & 8) !== 0,
-  }
-}
-
-export function encodeBlobHash(w: WireWriter, hash: Uint8Array): void {
-  if (hash.length !== 32) throw new WireError('InvalidValue', 'blob hash must be 32 bytes')
-  w.raw(hash)
-}
-export function decodeBlobHash(r: WireReader): Uint8Array {
-  return r.fixedCopy(32)
-}
-
-export function blobHashToHex(hash: Uint8Array): string {
-  let out = ''
-  for (let i = 0; i < hash.length; i += 1) {
-    out += hash[i]!.toString(16).padStart(2, '0')
-  }
-  return out
-}
-
-export function encodeImagePiece(w: WireWriter, p: ImagePiece): void {
-  encodeBlobHash(w, p.blob)
-  w.u16(p.colStart)
-  w.u16(p.colLen)
-  for (let i = 0; i < 4; i += 1) w.varU32(p.srcRect[i]!)
-  for (let i = 0; i < 2; i += 1) w.varU32(p.dstPx[i]!)
-}
-export function decodeImagePiece(r: WireReader): ImagePiece {
-  const blob = decodeBlobHash(r)
-  const colStart = r.u16()
-  const colLen = r.u16()
-  if (colLen === 0 || colStart + colLen > 0xffff) {
-    throw new WireError('InvalidValue', 'invalid ImagePiece column span')
-  }
-  const sx = r.varU32(), sy = r.varU32(), sw = r.varU32(), sh = r.varU32()
-  if (sw === 0 || sh === 0 || sx + sw > 0xffff_ffff || sy + sh > 0xffff_ffff) {
-    throw new WireError('InvalidValue', 'invalid ImagePiece src_rect')
-  }
-  const dw = r.varU32(), dh = r.varU32()
-  if (dw === 0 || dh === 0) throw new WireError('InvalidValue', 'invalid ImagePiece dst_px')
-  return { blob, colStart, colLen, srcRect: [sx, sy, sw, sh], dstPx: [dw, dh] }
-}
-
-function buildUtf8ToUtf16Map(utf8: Uint8Array): Int32Array {
-  const map = new Int32Array(utf8.length + 1)
-  map.fill(-1)
-  let bytePos = 0
-  let utf16Pos = 0
-  while (bytePos < utf8.length) {
-    map[bytePos] = utf16Pos
-    const b0 = utf8[bytePos]!
-    if (b0 < 0x80) {
-      bytePos += 1
-      utf16Pos += 1
-    } else if (b0 < 0xe0) {
-      bytePos += 2
-      utf16Pos += 1
-    } else if (b0 < 0xf0) {
-      bytePos += 3
-      utf16Pos += 1
-    } else {
-      bytePos += 4
-      utf16Pos += 2
-    }
-  }
-  map[utf8.length] = utf16Pos
-  return map
-}
-
-function buildUtf16ToUtf8Map(text: string): Uint32Array {
-  const map = new Uint32Array(text.length + 1)
-  let bytePos = 0
-  let i = 0
-  while (i < text.length) {
-    map[i] = bytePos
-    const cp = text.codePointAt(i)!
-    if (cp <= 0x7f) {
-      bytePos += 1
-      i += 1
-    } else if (cp <= 0x7ff) {
-      bytePos += 2
-      i += 1
-    } else if (cp <= 0xffff) {
-      bytePos += 3
-      i += 1
-    } else {
-      bytePos += 4
-      map[i + 1] = bytePos
-      i += 2
-    }
-  }
-  map[text.length] = bytePos
-  return map
-}
-
-export function encodePackedRow(w: WireWriter, row: PackedRow): void {
-  w.varU64(row.line)
-  w.u8(row.flags)
-  const utf8 = encodeUtf8(row.text)
-  w.bytes(utf8)
-  const isAscii = utf8.length === row.text.length
-  const utf16ToUtf8 = isAscii ? null : buildUtf16ToUtf8Map(row.text)
-
-  const runCount = row.runs.length >>> 2
-  w.varU32(runCount)
-  for (let i = 0; i < row.runs.length; i += 4) {
-    const colWord = row.runs[i]!
-    const txtWord = row.runs[i + 1]!
-    const slWord = row.runs[i + 2]!
-    const runFlags = row.runs[i + 3]!
-    const colStart = colWord & 0xffff
-    const colLen = colWord >>> 16
-    const u16Off = txtWord & 0xffff
-    const u16Len = txtWord >>> 16
-    const byteOffset = utf16ToUtf8 ? utf16ToUtf8[u16Off]! : u16Off
-    const byteEnd = utf16ToUtf8 ? utf16ToUtf8[u16Off + u16Len]! : u16Off + u16Len
-    const styleIdx = slWord & 0xffff
-    const linkIdx = slWord >>> 16
-    w.u16(colStart)
-    w.u16(colLen)
-    w.varU32(byteOffset)
-    w.varU32(byteEnd - byteOffset)
-    w.u16(styleIdx)
-    w.u16(linkIdx)
-    w.u8(runFlags)
-  }
-
-  const styleCount = row.styles.length >>> 2
-  w.varU32(styleCount)
-  for (let i = 0; i < row.styles.length; i += 4) {
-    w.u32(row.styles[i]!)
-    w.u32(row.styles[i + 1]!)
-    w.u32(row.styles[i + 2]!)
-    w.u32(row.styles[i + 3]!)
-  }
-
-  w.slice(row.links, (wr, l) => wr.str(l))
-  const pieces = row.pieces ?? []
-  w.slice(pieces, encodeImagePiece)
-}
-
-export function decodePackedRow(r: WireReader): PackedRow {
-  const line = r.varU64()
-  const flags = r.u8()
-  if (flags > 0x0f) throw new WireError('InvalidValue', 'unknown PackedRow flag bits')
-
-  const textBytes = r.strBytes()
-  const text = decodeUtf8Strict(textBytes)
-  const isAscii = textBytes.length === text.length
-  const byteToUtf16 = isAscii ? null : buildUtf8ToUtf16Map(textBytes)
-
-  const runCount = r.varU32()
-  if (runCount > 4096) throw new WireError('LimitExceeded', 'wire limit exceeded: packed runs')
-  if (runCount * 11 > r.remaining) throw new WireError('UnexpectedEof', 'truncated packed runs')
-  const runs = new Uint32Array(runCount * 4)
-  for (let i = 0; i < runCount; i += 1) {
-    const colStart = r.u16()
-    const colLen = r.u16()
-    if (colLen === 0 || colStart + colLen > 0xffff) {
-      throw new WireError('InvalidValue', 'invalid PackedRun column span')
-    }
-    const byteOffset = r.varU32()
-    const byteLen = r.varU32()
-    const styleIdx = r.u16()
-    const linkIdx = r.u16()
-    const runFlags = r.u8()
-    if (runFlags > 0x01) throw new WireError('InvalidValue', 'unknown PackedRun flag bits')
-
-    const byteEnd = byteOffset + byteLen
-    if (byteEnd > textBytes.length) {
-      throw new WireError('InvalidValue', 'run byte range out of bounds or mid-UTF-8')
-    }
-    let u16Start: number
-    let u16End: number
-    if (byteToUtf16 === null) {
-      u16Start = byteOffset
-      u16End = byteEnd
-    } else {
-      u16Start = byteToUtf16[byteOffset]!
-      u16End = byteToUtf16[byteEnd]!
-      if (u16Start < 0 || u16End < 0) {
-        throw new WireError('InvalidValue', 'run byte range out of bounds or mid-UTF-8')
-      }
-    }
-    const u16Len = u16End - u16Start
-    if (u16Start > 0xffff || u16Len > 0xffff) {
-      throw new WireError('LimitExceeded', 'packed row text offset exceeds u16')
-    }
-    const base = i * 4
-    runs[base] = (colStart | (colLen << 16)) >>> 0
-    runs[base + 1] = (u16Start | (u16Len << 16)) >>> 0
-    runs[base + 2] = (styleIdx | (linkIdx << 16)) >>> 0
-    runs[base + 3] = runFlags
-  }
-
-  const styleCount = r.varU32()
-  if (styleCount > 4096) throw new WireError('LimitExceeded', 'wire limit exceeded: packed styles')
-  if (styleCount * 16 > r.remaining) throw new WireError('UnexpectedEof', 'truncated packed styles')
-  const styles = new Uint32Array(styleCount * 4)
-  for (let i = 0; i < styleCount; i += 1) {
-    const fg = r.u32()
-    const bg = r.u32()
-    const ul = r.u32()
-    const sFlags = r.u32()
-    if (!isValidPackedColor(fg) || !isValidPackedColor(bg) || !isValidPackedColor(ul)) {
-      throw new WireError('InvalidValue', 'invalid PackedStyle colour encoding')
-    }
-    if (
-      (sFlags & ~PackedStyleFlag.ALL_MASK) !== 0 ||
-      (sFlags & PackedStyleFlag.UNDERLINE_MASK) > PackedStyleFlag.UNDERLINE_MAX
-    ) {
-      throw new WireError('InvalidValue', 'invalid PackedStyle flags')
-    }
-    if (i === 0 && (fg !== 0 || bg !== 0 || ul !== 0 || sFlags !== 0)) {
-      throw new WireError('InvalidValue', 'styles[0] must be default style')
-    }
-    const base = i * 4
-    styles[base] = fg
-    styles[base + 1] = bg
-    styles[base + 2] = ul
-    styles[base + 3] = sFlags
-  }
-
-  const links = r.vecBounded(1024, 'packed links', (rd) => rd.str())
-  if (links.length > 0 && links[0] !== '') {
-    throw new WireError('InvalidValue', 'links[0] must be empty')
-  }
-
-  const pieces = r.vecBounded(1024, 'image pieces', decodeImagePiece)
-  if (pieces.length > 0 && (flags & RowFlag.HAS_PLACEHOLDER) === 0) {
-    throw new WireError('InvalidValue', 'pieces require FLAG_HAS_PLACEHOLDER')
-  }
-
-  for (let i = 0; i < runs.length; i += 4) {
-    const slWord = runs[i + 2]!
-    const styleIdx = slWord & 0xffff
-    const linkIdx = slWord >>> 16
-    if (styleIdx >= styleCount && styleIdx !== 0) {
-      throw new WireError('InvalidValue', 'run style_idx out of bounds')
-    }
-    if (linkIdx >= links.length && linkIdx !== 0) {
-      throw new WireError('InvalidValue', 'run link_idx out of bounds')
-    }
-  }
-
-  return pieces.length > 0
-    ? { line, flags, text, runs, styles, links, pieces }
-    : { line, flags, text, runs, styles, links }
-}
-
-export function encodeStatusRecord(w: WireWriter, s: StatusRecord): void {
-  w.str(s.id)
-  encodeStatusState(w, s.state)
-  w.opt(s.kind, (wr, k) => wr.u8(BLOCKED_TO_TAG[k]))
-  w.opt(s.progress, (wr, p) => wr.u8(p))
-  w.opt(s.app, (wr, v) => wr.str(v))
-  w.opt(s.title, (wr, v) => wr.str(v))
-  w.opt(s.message, (wr, v) => wr.str(v))
-  w.varU64(s.changed)
-  w.varU64(s.sinceMs)
-  w.u8(CONFIRMED_TO_TAG[s.confirmed])
-}
-export function decodeStatusRecord(r: WireReader): StatusRecord {
-  const id = r.str()
-  const state = decodeStatusState(r)
-  const kind = r.opt((rd) => {
-    const t = rd.u8()
-    const k = TAG_TO_BLOCKED[t]
-    if (!k) throw new WireError('InvalidTag', `invalid BlockedKind wire tag ${t}`)
-    return k
-  })
-  if (state !== 'blocked' && kind !== null) {
-    throw new WireError('InvalidValue', 'status kind requires Blocked state')
-  }
-  const progress = r.opt((rd) => {
-    const p = rd.u8()
-    if (p > 100) throw new WireError('InvalidValue', 'progress must be 0..=100')
-    return p
-  })
-  const app = r.opt((rd) => rd.str())
-  const title = r.opt((rd) => rd.str())
-  const message = r.opt((rd) => rd.str())
-  const changed = r.varU64()
-  const sinceMs = r.varU64()
-  const ct = r.u8()
-  const confirmed = TAG_TO_CONFIRMED[ct]
-  if (!confirmed) throw new WireError('InvalidTag', `invalid Confirmed wire tag ${ct}`)
-  return { id, state, kind, progress, app, title, message, changed, sinceMs, confirmed }
-}
-
-export function encodeKeyInput(w: WireWriter, k: KeyInput): void {
-  w.str(k.code)
-  w.u8(KEY_ACTION_TO_TAG[k.action])
-  w.u8(k.modifiers)
-  w.str(k.text)
-  w.varU32(k.unshiftedCodepoint)
-  w.bool(k.composed)
-}
-export function decodeKeyInput(r: WireReader): KeyInput {
-  const code = r.str()
-  const at = r.u8()
-  const action = TAG_TO_KEY_ACTION[at]
-  if (!action) throw new WireError('InvalidTag', `invalid KeyAction wire tag ${at}`)
-  const modifiers = r.u8()
-  if (modifiers > 0x3f) throw new WireError('InvalidValue', 'unknown KeyInput modifier bits')
-  const text = r.str()
-  const unshiftedCodepoint = r.varU32()
-  if (
-    unshiftedCodepoint !== 0 &&
-    (unshiftedCodepoint > 0x10_ffff || (unshiftedCodepoint >= 0xd800 && unshiftedCodepoint <= 0xdfff))
-  ) {
-    throw new WireError('InvalidValue', 'invalid Unicode scalar codepoint')
-  }
-  const composed = r.bool()
-  return { code, action, modifiers, text, unshiftedCodepoint, composed }
-}
-
-export function encodePointerInput(w: WireWriter, p: PointerInput): void {
-  w.u8(POINTER_TO_TAG[p.action])
-  w.u8(p.button)
-  w.u8(p.modifiers)
-  w.varU32(p.xPx)
-  w.varU32(p.yPx)
-  encodeCellPx(w, p.cellPx)
-}
-export function decodePointerInput(r: WireReader): PointerInput {
-  const at = r.u8()
-  const action = TAG_TO_POINTER[at]
-  if (!action) throw new WireError('InvalidTag', `invalid PointerAction wire tag ${at}`)
-  const button = r.u8()
-  if (button > 2 && button !== 255) throw new WireError('InvalidValue', 'invalid PointerInput button')
-  const modifiers = r.u8()
-  if (modifiers > 0x3f) throw new WireError('InvalidValue', 'unknown PointerInput modifier bits')
-  return { action, button, modifiers, xPx: r.varU32(), yPx: r.varU32(), cellPx: decodeCellPx(r) }
-}
-
-export function encodeWaitCondition(w: WireWriter, c: WaitCondition): void {
-  switch (c.kind) {
-    case 'idle':
-      w.u8(0)
-      break
-    case 'text':
-      w.u8(1)
-      w.strBounded(c.needle, MAX_SEARCH_NEEDLE_BYTES, 'wait text needle')
-      break
-    case 'status':
-      w.u8(2)
-      w.slice(c.states, encodeStatusState)
-      break
-    case 'exit':
-      w.u8(3)
-      break
-  }
-}
-export function decodeWaitCondition(r: WireReader): WaitCondition {
-  const tag = r.u8()
-  if (tag === 0) return { kind: 'idle' }
-  if (tag === 1) {
-    const needle = r.strBounded(MAX_SEARCH_NEEDLE_BYTES, 'wait text needle')
-    if (needle.length === 0) throw new WireError('InvalidValue', 'wait text needle must be non-empty')
-    return { kind: 'text', needle }
-  }
-  if (tag === 2) {
-    const states = r.vecBounded(8, 'wait states', decodeStatusState)
-    if (states.length === 0) throw new WireError('InvalidValue', 'wait status list must be non-empty')
-    return { kind: 'status', states }
-  }
-  if (tag === 3) return { kind: 'exit' }
-  throw new WireError('InvalidTag', `invalid WaitCondition wire tag ${tag}`)
-}
-"#;
-
 // ---------------------------------------------------------------------------
-// 4. view/src/wire/messages.ts
+// Messages file (`view/src/wire/messages.ts`)
 // ---------------------------------------------------------------------------
 
-fn client_msg_variants() -> Vec<MsgVariant> {
+fn message_structs() -> Vec<StructSchema> {
     vec![
-        MsgVariant {
-            const_name: "HELLO",
-            tag: msg_type::HELLO,
-            kind: "hello",
-            fields: vec![
-                FieldSpec { name: "protocolVersion", codec: FieldCodec::U16 },
-                FieldSpec { name: "clientNonce", codec: FieldCodec::FixedBytes { len: 32, label: "clientNonce" } },
-                FieldSpec { name: "clientName", codec: FieldCodec::Str },
-            ],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "AUTH_PROOF",
-            tag: msg_type::AUTH_PROOF,
-            kind: "authProof",
-            fields: vec![FieldSpec { name: "hmac", codec: FieldCodec::FixedBytes { len: 32, label: "hmac" } }],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "ACQUIRE_LEASE",
-            tag: msg_type::ACQUIRE_LEASE,
-            kind: "acquireLease",
-            fields: vec![f_custom("lease", "LeaseKind", "encodeLeaseKind", "decodeLeaseKind")],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "RELEASE_LEASE",
-            tag: msg_type::RELEASE_LEASE,
-            kind: "releaseLease",
-            fields: vec![FieldSpec { name: "leaseId", codec: FieldCodec::VarU64 }],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "SPAWN",
-            tag: msg_type::SPAWN,
-            kind: "spawn",
-            fields: vec![f_custom("spec", "SpawnSpec", "encodeSpawnSpec", "decodeSpawnSpec")],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "KILL",
-            tag: msg_type::KILL,
-            kind: "kill",
-            fields: vec![f_custom("session", "number", "encodeSessionId", "decodeSessionId")],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "SIGNAL",
-            tag: msg_type::SIGNAL,
-            kind: "signal",
-            fields: vec![
-                f_custom("session", "number", "encodeSessionId", "decodeSessionId"),
-                f_custom("signal", "SignalKind", "encodeSignalKind", "decodeSignalKind"),
-                f_custom("scope", "SignalScope", "encodeSignalScope", "decodeSignalScope"),
-            ],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "OWNS",
-            tag: msg_type::OWNS,
-            kind: "owns",
-            fields: vec![
-                f_custom("session", "number", "encodeSessionId", "decodeSessionId"),
-                f_custom("pid", "number", "encodeSignalTarget", "decodeSignalTarget"),
-            ],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "LIST_SESSIONS",
-            tag: msg_type::LIST_SESSIONS,
-            kind: "listSessions",
-            fields: vec![],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "REWIND",
-            tag: msg_type::REWIND,
-            kind: "rewind",
-            fields: vec![
-                FieldSpec { name: "recordDir", codec: FieldCodec::Str },
-                FieldSpec { name: "atMs", codec: FieldCodec::Opt(Box::new(FieldCodec::VarU64)) },
-            ],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "SEEK",
-            tag: msg_type::SEEK,
-            kind: "seek",
-            fields: vec![
-                f_custom("session", "number", "encodeSessionId", "decodeSessionId"),
-                FieldSpec { name: "atMs", codec: FieldCodec::VarU64 },
-            ],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "METRICS",
-            tag: msg_type::METRICS,
-            kind: "metrics",
-            fields: vec![],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "ATTACH",
-            tag: msg_type::ATTACH,
-            kind: "attach",
-            fields: vec![
-                f_custom("session", "number", "encodeSessionId", "decodeSessionId"),
-                f_custom("streamId", "number", "encodeNonZeroStreamId", "decodeNonZeroStreamId"),
-                f_custom("flags", "number", "encodeSubFlags", "decodeSubFlags"),
-                FieldSpec {
-                    name: "initialViewport",
-                    codec: FieldCodec::Opt(Box::new(FieldCodec::Custom {
-                        ts_type: "ViewportHint",
-                        encode_fn: "encodeViewportHint",
-                        decode_fn: "decodeViewportHint",
-                    })),
-                },
-                FieldSpec { name: "initialOutputCredit", codec: FieldCodec::VarU32 },
-                f_custom("initialFrameCredit", "FrameCredit", "encodeFrameCredit", "decodeFrameCredit"),
-            ],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "DETACH",
-            tag: msg_type::DETACH,
-            kind: "detach",
-            fields: vec![f_custom("streamId", "number", "encodeNonZeroStreamId", "decodeNonZeroStreamId")],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "KEEP",
-            tag: msg_type::KEEP,
-            kind: "keep",
-            fields: vec![
-                f_custom("session", "number", "encodeSessionId", "decodeSessionId"),
-                FieldSpec { name: "kept", codec: FieldCodec::Bool },
-            ],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "WAIT",
-            tag: msg_type::WAIT,
-            kind: "wait",
-            fields: vec![
-                f_custom("session", "number", "encodeSessionId", "decodeSessionId"),
-                f_custom("condition", "WaitCondition", "encodeWaitCondition", "decodeWaitCondition"),
-                FieldSpec { name: "timeoutMs", codec: FieldCodec::VarU32 },
-            ],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "FRAME_ACK",
-            tag: msg_type::FRAME_ACK,
-            kind: "frameAck",
-            fields: vec![
-                FieldSpec { name: "seq", codec: FieldCodec::VarU64 },
-                f_custom("credit", "FrameCredit", "encodeFrameCredit", "decodeFrameCredit"),
-            ],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "VIEWPORT_HINT",
-            tag: msg_type::VIEWPORT_HINT,
-            kind: "viewportHint",
-            fields: vec![f_custom("hint", "ViewportHint", "encodeViewportHint", "decodeViewportHint")],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "EXPLICIT_RESIZE",
-            tag: msg_type::EXPLICIT_RESIZE,
-            kind: "explicitResize",
-            fields: vec![
-                f_custom("size", "GridSize", "encodeGridSize", "decodeGridSize"),
-                f_custom("cellPx", "CellPx", "encodeCellPx", "decodeCellPx"),
-            ],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "SET_CURSOR_DEFAULTS",
-            tag: msg_type::SET_CURSOR_DEFAULTS,
-            kind: "setCursorDefaults",
-            fields: vec![
-                f_custom("shape", "CursorShape", "encodeCursorShape", "decodeCursorShape"),
-                FieldSpec { name: "blinking", codec: FieldCodec::Bool },
-            ],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "KEY",
-            tag: msg_type::KEY,
-            kind: "key",
-            fields: vec![f_custom("input", "KeyInput", "encodeKeyInput", "decodeKeyInput")],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "TEXT",
-            tag: msg_type::TEXT,
-            kind: "text",
-            fields: vec![FieldSpec { name: "text", codec: FieldCodec::Str }],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "POINTER",
-            tag: msg_type::POINTER,
-            kind: "pointer",
-            fields: vec![f_custom("input", "PointerInput", "encodePointerInput", "decodePointerInput")],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "FOCUS",
-            tag: msg_type::FOCUS,
-            kind: "focus",
-            fields: vec![FieldSpec { name: "focused", codec: FieldCodec::Bool }],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "PASTE",
-            tag: msg_type::PASTE,
-            kind: "paste",
-            fields: vec![
-                FieldSpec { name: "text", codec: FieldCodec::Str },
-                FieldSpec { name: "allowUnsafe", codec: FieldCodec::Bool },
-            ],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "WRITE",
-            tag: msg_type::WRITE,
-            kind: "write",
-            fields: vec![FieldSpec { name: "data", codec: FieldCodec::Bytes }],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "PAUSE",
-            tag: msg_type::PAUSE,
-            kind: "pause",
-            fields: vec![],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "RESUME",
-            tag: msg_type::RESUME,
-            kind: "resume",
-            fields: vec![],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "OUTPUT_CREDIT",
-            tag: msg_type::OUTPUT_CREDIT,
-            kind: "outputCredit",
-            fields: vec![FieldSpec { name: "bytes", codec: FieldCodec::VarU32 }],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "FETCH_ROWS",
-            tag: msg_type::FETCH_ROWS,
-            kind: "fetchRows",
-            fields: vec![
-                FieldSpec { name: "epoch", codec: FieldCodec::VarU64 },
-                FieldSpec { name: "fromLine", codec: FieldCodec::VarU64 },
-                FieldSpec { name: "count", codec: FieldCodec::VarU32 },
-            ],
-            post_decode_check: Some(
-                "if (count === 0 || count > MAX_ROWS_PER_FETCH) throw new WireError('LimitExceeded', 'fetch rows count')",
-            ),
-        },
-        MsgVariant {
-            const_name: "WORD_AT",
-            tag: msg_type::WORD_AT,
-            kind: "wordAt",
-            fields: vec![
-                FieldSpec { name: "epoch", codec: FieldCodec::VarU64 },
-                f_custom("pos", "CellPos", "encodeCellPos", "decodeCellPos"),
-            ],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "LINE_AT",
-            tag: msg_type::LINE_AT,
-            kind: "lineAt",
-            fields: vec![
-                FieldSpec { name: "epoch", codec: FieldCodec::VarU64 },
-                FieldSpec { name: "line", codec: FieldCodec::VarU64 },
-            ],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "TEXT_OF",
-            tag: msg_type::TEXT_OF,
-            kind: "textOf",
-            fields: vec![
-                FieldSpec { name: "epoch", codec: FieldCodec::VarU64 },
-                f_custom("span", "CellSpan", "encodeCellSpan", "decodeCellSpan"),
-            ],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "TEXT_OF_RECT",
-            tag: msg_type::TEXT_OF_RECT,
-            kind: "textOfRect",
-            fields: vec![
-                FieldSpec { name: "epoch", codec: FieldCodec::VarU64 },
-                f_custom("span", "CellSpan", "encodeCellSpan", "decodeCellSpan"),
-            ],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "SET_SEARCH",
-            tag: msg_type::SET_SEARCH,
-            kind: "setSearch",
-            fields: vec![
-                FieldSpec { name: "query", codec: FieldCodec::StrBounded("MAX_SEARCH_NEEDLE_BYTES", "search query") },
-                FieldSpec { name: "caseSensitive", codec: FieldCodec::Bool },
-            ],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "COMMANDS",
-            tag: msg_type::COMMANDS,
-            kind: "commands",
-            fields: vec![],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "COMMAND_OUTPUT",
-            tag: msg_type::COMMAND_OUTPUT,
-            kind: "commandOutput",
-            fields: vec![FieldSpec { name: "commandId", codec: FieldCodec::VarU64 }],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "IMAGES",
-            tag: msg_type::IMAGES,
-            kind: "images",
-            fields: vec![],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "GET_IMAGE_BLOB",
-            tag: msg_type::GET_IMAGE_BLOB,
-            kind: "getImageBlob",
-            fields: vec![
-                f_custom("blob", "Uint8Array", "encodeBlobHash", "decodeBlobHash"),
-                FieldSpec { name: "offset", codec: FieldCodec::VarU32 },
-                FieldSpec { name: "maxBytes", codec: FieldCodec::VarU32 },
-            ],
-            post_decode_check: Some(
-                "if (maxBytes === 0) throw new WireError('InvalidValue', 'get_image_blob max_bytes must be non-zero')",
-            ),
-        },
-    ]
-}
-
-fn broker_msg_variants() -> Vec<MsgVariant> {
-    vec![
-        MsgVariant {
-            const_name: "HELLO_OK",
-            tag: msg_type::HELLO_OK,
-            kind: "helloOk",
-            fields: vec![
-                FieldSpec { name: "protocolVersion", codec: FieldCodec::U16 },
-                FieldSpec { name: "authRequired", codec: FieldCodec::Bool },
-                FieldSpec { name: "serverNonce", codec: FieldCodec::FixedBytes { len: 32, label: "serverNonce" } },
-                FieldSpec { name: "wordDelimiters", codec: FieldCodec::Str },
-                FieldSpec { name: "capabilities", codec: FieldCodec::U32 },
-            ],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "AUTH_OK",
-            tag: msg_type::AUTH_OK,
-            kind: "authOk",
-            fields: vec![FieldSpec {
-                name: "serverHmac",
-                codec: FieldCodec::FixedBytes { len: 32, label: "serverHmac" },
-            }],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "ERROR",
-            tag: msg_type::ERROR,
-            kind: "error",
-            fields: vec![
-                f_custom("code", "ErrorCode", "encodeErrorCode", "decodeErrorCode"),
-                FieldSpec { name: "message", codec: FieldCodec::Str },
-            ],
-            post_decode_check: None,
-        },
-        MsgVariant { const_name: "OK", tag: msg_type::OK, kind: "ok", fields: vec![], post_decode_check: None },
-        MsgVariant {
-            const_name: "LEASE_ACK",
-            tag: msg_type::LEASE_ACK,
-            kind: "leaseAck",
-            fields: vec![
-                FieldSpec { name: "leaseId", codec: FieldCodec::VarU64 },
-                FieldSpec { name: "resumed", codec: FieldCodec::Bool },
-            ],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "SPAWNED",
-            tag: msg_type::SPAWNED,
-            kind: "spawned",
-            fields: vec![
-                f_custom("session", "number", "encodeSessionId", "decodeSessionId"),
-                FieldSpec {
-                    name: "pid",
-                    codec: FieldCodec::Opt(Box::new(FieldCodec::Custom {
-                        ts_type: "number",
-                        encode_fn: "encodeSignalTarget",
-                        decode_fn: "decodeSignalTarget",
-                    })),
-                },
-            ],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "OWNS_REPLY",
-            tag: msg_type::OWNS_REPLY,
-            kind: "ownsReply",
-            fields: vec![FieldSpec { name: "owned", codec: FieldCodec::Bool }],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "SESSIONS_LIST",
-            tag: msg_type::SESSIONS_LIST,
-            kind: "sessionsList",
-            fields: vec![FieldSpec {
-                name: "sessions",
-                codec: FieldCodec::VecBounded {
-                    max_expr: "4096",
-                    label: "sessions list",
-                    item: Box::new(FieldCodec::Custom {
-                        ts_type: "SessionSummary",
-                        encode_fn: "encodeSessionSummary",
-                        decode_fn: "decodeSessionSummary",
-                    }),
-                },
-            }],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "REWOUND",
-            tag: msg_type::REWOUND,
-            kind: "rewound",
-            fields: vec![
-                f_custom("session", "number", "encodeSessionId", "decodeSessionId"),
-                FieldSpec { name: "durationMs", codec: FieldCodec::VarU64 },
-                FieldSpec { name: "atMs", codec: FieldCodec::VarU64 },
-            ],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "SOUGHT",
-            tag: msg_type::SOUGHT,
-            kind: "sought",
-            fields: vec![FieldSpec { name: "atMs", codec: FieldCodec::VarU64 }],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "METRICS_REPLY",
-            tag: msg_type::METRICS_REPLY,
-            kind: "metricsReply",
-            fields: vec![f_custom("metrics", "MetricsSnapshot", "encodeMetricsSnapshot", "decodeMetricsSnapshot")],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "ATTACHED",
-            tag: msg_type::ATTACHED,
-            kind: "attached",
-            fields: vec![
-                f_custom("session", "number", "encodeSessionId", "decodeSessionId"),
-                f_custom("streamId", "number", "encodeNonZeroStreamId", "decodeNonZeroStreamId"),
-                f_custom("size", "GridSize", "encodeGridSize", "decodeGridSize"),
-                FieldSpec { name: "epoch", codec: FieldCodec::VarU64 },
-                FieldSpec { name: "firstActiveLine", codec: FieldCodec::VarU64 },
-                FieldSpec { name: "scrollbackLines", codec: FieldCodec::VarU64 },
-                FieldSpec {
-                    name: "foreground",
-                    codec: FieldCodec::Opt(Box::new(FieldCodec::Custom {
-                        ts_type: "ForegroundProcess",
-                        encode_fn: "encodeForegroundProcess",
-                        decode_fn: "decodeForegroundProcess",
-                    })),
-                },
-            ],
-            post_decode_check: Some(
-                "if (scrollbackLines > firstActiveLine) {\n        throw new WireError('InvalidValue', 'Attached.scrollback_lines > first_active_line')\n      }",
-            ),
-        },
-        MsgVariant {
-            const_name: "WAITED",
-            tag: msg_type::WAITED,
-            kind: "waited",
-            fields: vec![f_custom("outcome", "WaitOutcome", "encodeWaitOutcome", "decodeWaitOutcome")],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "FRAME",
-            tag: msg_type::FRAME,
-            kind: "frame",
-            fields: vec![f_custom("frame", "FrameUpdate", "encodeFrameUpdate", "decodeFrameUpdate")],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "ROWS",
-            tag: msg_type::ROWS,
-            kind: "rows",
-            fields: vec![
-                FieldSpec { name: "epoch", codec: FieldCodec::VarU64 },
-                FieldSpec {
-                    name: "rows",
-                    codec: FieldCodec::VecBounded {
-                        max_expr: "MAX_ROWS_PER_FETCH",
-                        label: "rows reply",
-                        item: Box::new(FieldCodec::Custom {
-                            ts_type: "PackedRow",
-                            encode_fn: "encodePackedRow",
-                            decode_fn: "decodePackedRow",
-                        }),
-                    },
-                },
-            ],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "PASTED",
-            tag: msg_type::PASTED,
-            kind: "pasted",
-            fields: vec![f_custom("outcome", "PasteOutcome", "encodePasteOutcome", "decodePasteOutcome")],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "SPAN_REPLY",
-            tag: msg_type::SPAN_REPLY,
-            kind: "spanReply",
-            fields: vec![FieldSpec {
-                name: "span",
-                codec: FieldCodec::Opt(Box::new(FieldCodec::Custom {
-                    ts_type: "CellSpan",
-                    encode_fn: "encodeCellSpan",
-                    decode_fn: "decodeCellSpan",
-                })),
-            }],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "TEXT_REPLY",
-            tag: msg_type::TEXT_REPLY,
-            kind: "textReply",
-            fields: vec![FieldSpec { name: "text", codec: FieldCodec::Str }],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "SEARCH_MATCHES",
-            tag: msg_type::SEARCH_MATCHES,
-            kind: "searchMatches",
-            fields: vec![
-                FieldSpec { name: "epoch", codec: FieldCodec::VarU64 },
-                FieldSpec {
-                    name: "matches",
-                    codec: FieldCodec::VecBounded {
-                        max_expr: "MAX_SEARCH_MATCHES",
-                        label: "search matches",
-                        item: Box::new(FieldCodec::Custom {
-                            ts_type: "CellSpan",
-                            encode_fn: "encodeCellSpan",
-                            decode_fn: "decodeCellSpan",
-                        }),
-                    },
-                },
-                FieldSpec { name: "truncated", codec: FieldCodec::Bool },
-            ],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "SEARCH_DELTA",
-            tag: msg_type::SEARCH_DELTA,
-            kind: "searchDelta",
-            fields: vec![
-                FieldSpec { name: "epoch", codec: FieldCodec::VarU64 },
-                FieldSpec { name: "fromLine", codec: FieldCodec::VarU64 },
-                FieldSpec { name: "toLine", codec: FieldCodec::VarU64 },
-                FieldSpec {
-                    name: "added",
-                    codec: FieldCodec::VecBounded {
-                        max_expr: "MAX_SEARCH_MATCHES",
-                        label: "search delta",
-                        item: Box::new(FieldCodec::Custom {
-                            ts_type: "CellSpan",
-                            encode_fn: "encodeCellSpan",
-                            decode_fn: "decodeCellSpan",
-                        }),
-                    },
-                },
-                FieldSpec { name: "truncated", codec: FieldCodec::Bool },
-            ],
-            post_decode_check: Some(
-                "if (toLine < fromLine) throw new WireError('InvalidValue', 'search delta to_line < from_line')\n      for (const span of added) {\n        if (span.start.line < fromLine || span.end.line >= toLine) {\n          throw new WireError('InvalidValue', 'search delta span outside [from_line, to_line)')\n        }\n      }",
-            ),
-        },
-        MsgVariant {
-            const_name: "COMMANDS_REPLY",
-            tag: msg_type::COMMANDS_REPLY,
-            kind: "commandsReply",
-            fields: vec![FieldSpec {
-                name: "commands",
-                codec: FieldCodec::VecBounded {
-                    max_expr: "MAX_COMMANDS",
-                    label: "commands",
-                    item: Box::new(FieldCodec::Custom {
-                        ts_type: "CommandRecord",
-                        encode_fn: "encodeCommandRecord",
-                        decode_fn: "decodeCommandRecord",
-                    }),
-                },
-            }],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "COMMAND_OUTPUT_REPLY",
-            tag: msg_type::COMMAND_OUTPUT_REPLY,
-            kind: "commandOutputReply",
-            fields: vec![FieldSpec { name: "text", codec: FieldCodec::Opt(Box::new(FieldCodec::Str)) }],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "IMAGES_REPLY",
-            tag: msg_type::IMAGES_REPLY,
-            kind: "imagesReply",
-            fields: vec![
-                FieldSpec { name: "imagesGen", codec: FieldCodec::VarU64 },
-                FieldSpec {
-                    name: "placements",
-                    codec: FieldCodec::VecBounded {
-                        max_expr: "4096",
-                        label: "image placements",
-                        item: Box::new(FieldCodec::Custom {
-                            ts_type: "ImagePlacement",
-                            encode_fn: "encodeImagePlacement",
-                            decode_fn: "decodeImagePlacement",
-                        }),
-                    },
-                },
-            ],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "IMAGE_BLOB_CHUNK",
-            tag: msg_type::IMAGE_BLOB_CHUNK,
-            kind: "imageBlobChunk",
-            fields: vec![
-                f_custom("blob", "Uint8Array", "encodeBlobHash", "decodeBlobHash"),
-                f_custom("encoding", "ImageEncoding", "encodeImageEncoding", "decodeImageEncoding"),
-                FieldSpec { name: "totalBytes", codec: FieldCodec::VarU32 },
-                FieldSpec { name: "offset", codec: FieldCodec::VarU32 },
-                FieldSpec { name: "data", codec: FieldCodec::BytesCopyBounded("BULK_CHUNK_BYTES", "image blob chunk") },
-            ],
-            post_decode_check: Some(
-                "if (offset + data.length > totalBytes) {\n        throw new WireError('InvalidValue', 'image blob chunk exceeds total_bytes')\n      }",
-            ),
-        },
-        MsgVariant {
-            const_name: "TITLE",
-            tag: msg_type::TITLE,
-            kind: "title",
-            fields: vec![FieldSpec { name: "title", codec: FieldCodec::Str }],
-            post_decode_check: None,
-        },
-        MsgVariant { const_name: "BELL", tag: msg_type::BELL, kind: "bell", fields: vec![], post_decode_check: None },
-        MsgVariant {
-            const_name: "CLIPBOARD",
-            tag: msg_type::CLIPBOARD,
-            kind: "clipboard",
-            fields: vec![
-                FieldSpec { name: "selection", codec: FieldCodec::Str },
-                FieldSpec { name: "data", codec: FieldCodec::Str },
-            ],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "NOTIFICATION",
-            tag: msg_type::NOTIFICATION,
-            kind: "notification",
-            fields: vec![
-                FieldSpec { name: "title", codec: FieldCodec::Str },
-                FieldSpec { name: "body", codec: FieldCodec::Str },
-            ],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "PROGRESS",
-            tag: msg_type::PROGRESS,
-            kind: "progress",
-            fields: vec![
-                f_custom("state", "ProgressState", "encodeProgressState", "decodeProgressState"),
-                FieldSpec { name: "percent", codec: FieldCodec::Opt(Box::new(FieldCodec::ProgressPercent)) },
-            ],
-            post_decode_check: Some(
-                "if (percent !== null && (state === 'none' || state === 'indeterminate')) {\n        throw new WireError('InvalidValue', 'progress percent invalid for state')\n      }",
-            ),
-        },
-        MsgVariant {
-            const_name: "PROGRAM_STATUS",
-            tag: msg_type::PROGRAM_STATUS,
-            kind: "programStatus",
-            fields: vec![f_custom("record", "StatusRecord", "encodeStatusRecord", "decodeStatusRecord")],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "PROGRAM_STATUS_CLEARED",
-            tag: msg_type::PROGRAM_STATUS_CLEARED,
-            kind: "programStatusCleared",
-            fields: vec![FieldSpec { name: "id", codec: FieldCodec::Str }],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "COMMAND_STARTED",
-            tag: msg_type::COMMAND_STARTED,
-            kind: "commandStarted",
-            fields: vec![f_custom("record", "CommandRecord", "encodeCommandRecord", "decodeCommandRecord")],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "COMMAND_FINISHED",
-            tag: msg_type::COMMAND_FINISHED,
-            kind: "commandFinished",
-            fields: vec![f_custom("record", "CommandRecord", "encodeCommandRecord", "decodeCommandRecord")],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "CWD_CHANGED",
-            tag: msg_type::CWD_CHANGED,
-            kind: "cwdChanged",
-            fields: vec![FieldSpec { name: "cwd", codec: FieldCodec::Str }],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "EXITED",
-            tag: msg_type::EXITED,
-            kind: "exited",
-            fields: vec![
-                FieldSpec { name: "exitCode", codec: FieldCodec::Opt(Box::new(FieldCodec::I32)) },
-                FieldSpec { name: "signal", codec: FieldCodec::Opt(Box::new(FieldCodec::Str)) },
-            ],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "OUTPUT",
-            tag: msg_type::OUTPUT,
-            kind: "output",
-            fields: vec![FieldSpec { name: "text", codec: FieldCodec::Str }],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "THROTTLED",
-            tag: msg_type::THROTTLED,
-            kind: "throttled",
-            fields: vec![FieldSpec { name: "waitedUs", codec: FieldCodec::VarU64 }],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "OUTPUT_DROPPED",
-            tag: msg_type::OUTPUT_DROPPED,
-            kind: "outputDropped",
-            fields: vec![FieldSpec { name: "bytes", codec: FieldCodec::VarU64 }],
-            post_decode_check: None,
-        },
-        MsgVariant {
-            const_name: "STREAM_CLOSED",
-            tag: msg_type::STREAM_CLOSED,
-            kind: "streamClosed",
-            fields: vec![FieldSpec { name: "reason", codec: FieldCodec::Str }],
-            post_decode_check: None,
-        },
-    ]
-}
-
-fn render_messages_ts() -> String {
-    let client_variants = client_msg_variants();
-    let broker_variants = broker_msg_variants();
-
-    let mut out = String::with_capacity(48 * 1024);
-    out.push_str(GENERATED_HEADER);
-    out.push_str(
-        r#"/**
- * Unified v2 binary protocol message encoders & decoders matching
- * `crates/apack-proto/src/messages.rs` byte-for-byte.
- */
-import {
-  BULK_CHUNK_BYTES,
-  MAX_COMMANDS,
-  MAX_ROWS_PER_FETCH,
-  MAX_SEARCH_MATCHES,
-  MAX_SEARCH_NEEDLE_BYTES,
-  WireError,
-  WireReader,
-  WireWriter,
-} from './codec.ts'
-import { encodeFrame } from './frame.ts'
-import {
-  decodeBlobHash,
-  decodeCellPos,
-  decodeCellPx,
-  decodeCellSpan,
-  decodeCommandRecord,
-  decodeCursorShape,
-  decodeCursorState,
-  decodeErrorCode,
-  decodeForegroundProcess,
-  decodeFrameCredit,
-  decodeGridSize,
-  decodeImageEncoding,
-  decodeImagePlacement,
-  decodeKeyInput,
-  decodeLeaseKind,
-  decodeMarksKey,
-  decodeMetricsSnapshot,
-  decodeNonZeroStreamId,
-  decodePackedRow,
-  decodePaletteOverrides,
-  decodePasteOutcome,
-  decodePointerInput,
-  decodeProgressState,
-  decodeResizePolicy,
-  decodeSessionId,
-  decodeSignalKind,
-  decodeSignalScope,
-  decodeSignalTarget,
-  decodeStatusRecord,
-  decodeSubFlags,
-  decodeViewModes,
-  decodeViewportHint,
-  decodeWaitCondition,
-  decodeWaitOutcome,
-  encodeBlobHash,
-  encodeCellPos,
-  encodeCellPx,
-  encodeCellSpan,
-  encodeCommandRecord,
-  encodeCursorShape,
-  encodeCursorState,
-  encodeErrorCode,
-  encodeForegroundProcess,
-  encodeFrameCredit,
-  encodeGridSize,
-  encodeImageEncoding,
-  encodeImagePlacement,
-  encodeKeyInput,
-  encodeLeaseKind,
-  encodeMarksKey,
-  encodeMetricsSnapshot,
-  encodeNonZeroStreamId,
-  encodePackedRow,
-  encodePaletteOverrides,
-  encodePasteOutcome,
-  encodePointerInput,
-  encodeProgressState,
-  encodeResizePolicy,
-  encodeSessionId,
-  encodeSignalKind,
-  encodeSignalScope,
-  encodeSignalTarget,
-  encodeStatusRecord,
-  encodeSubFlags,
-  encodeViewModes,
-  encodeViewportHint,
-  encodeWaitCondition,
-  encodeWaitOutcome,
-  type CellPos,
-  type CellPx,
-  type CellSpan,
-  type CommandRecord,
-  type CursorShape,
-  type CursorState,
-  type ErrorCode,
-  type ForegroundProcess,
-  type FrameCredit,
-  type GridSize,
-  type ImageEncoding,
-  type ImagePlacement,
-  type KeyInput,
-  type LeaseKind,
-  type MetricsSnapshot,
-  type PackedRow,
-  type PaletteOverrides,
-  type PasteOutcome,
-  type PointerInput,
-  type ProgressState,
-  type ResizePolicy,
-  type SignalKind,
-  type SignalScope,
-  type StatusRecord,
-  type ViewModes,
-  type ViewportHint,
-  type WaitCondition,
-  type WaitOutcome,
-} from './types.ts'
-
-export const MsgType = {
-"#,
-    );
-
-    for v in client_variants.iter().chain(broker_variants.iter()) {
-        writeln!(out, "  {}: {:#06x},", v.const_name, v.tag).unwrap();
-    }
-    writeln!(out, "}} as const\n").unwrap();
-
-    let message_structs = vec![
         StructSchema {
             name: "SpawnSpec",
             exported_codec: false,
             fields: vec![
-                FieldSpec {
-                    name: "argv",
-                    codec: FieldCodec::VecBounded {
-                        max_expr: "1024",
+                f(
+                    "argv",
+                    FieldCodec::VecBounded {
+                        max_expr: "MAX_SPAWN_ARGV",
                         label: "spawn argv",
                         item: Box::new(FieldCodec::Str),
                     },
-                },
-                FieldSpec { name: "cwd", codec: FieldCodec::Opt(Box::new(FieldCodec::Str)) },
-                FieldSpec { name: "env", codec: FieldCodec::EnvPairs { max_expr: "1024", label: "spawn env" } },
+                ),
+                f("cwd", FieldCodec::Opt(Box::new(FieldCodec::Str))),
+                f("env", FieldCodec::EnvPairs { max_expr: "MAX_SPAWN_ENV", label: "spawn env" }),
                 f_custom("size", "GridSize", "encodeGridSize", "decodeGridSize"),
                 f_custom("cellPx", "CellPx", "encodeCellPx", "decodeCellPx"),
-                FieldSpec { name: "scrollbackLimit", codec: FieldCodec::VarU32 },
-                FieldSpec {
-                    name: "marksKey",
-                    codec: FieldCodec::Opt(Box::new(FieldCodec::Custom {
+                f("scrollbackLimit", FieldCodec::VarU32),
+                f(
+                    "marksKey",
+                    FieldCodec::Opt(Box::new(FieldCodec::Custom {
                         ts_type: "string",
                         encode_fn: "encodeMarksKey",
                         decode_fn: "decodeMarksKey",
                     })),
-                },
+                ),
                 f_custom("resizePolicy", "ResizePolicy", "encodeResizePolicy", "decodeResizePolicy"),
-                FieldSpec { name: "recordDir", codec: FieldCodec::Opt(Box::new(FieldCodec::Str)) },
-                FieldSpec { name: "restoreFrom", codec: FieldCodec::Opt(Box::new(FieldCodec::Str)) },
-                FieldSpec { name: "imageFiles", codec: FieldCodec::Bool },
-                FieldSpec { name: "kept", codec: FieldCodec::Bool },
+                f("recordDir", FieldCodec::Opt(Box::new(FieldCodec::Str))),
+                f("restoreFrom", FieldCodec::Opt(Box::new(FieldCodec::Str))),
+                f("imageFiles", FieldCodec::Bool),
+                f("kept", FieldCodec::Bool),
             ],
-            post_decode_check: None,
         },
         StructSchema {
             name: "SessionSummary",
@@ -2503,54 +1696,57 @@ export const MsgType = {
             fields: vec![
                 f_custom("id", "number", "encodeSessionId", "decodeSessionId"),
                 f_custom("size", "GridSize", "encodeGridSize", "decodeGridSize"),
-                FieldSpec { name: "alive", codec: FieldCodec::Bool },
-                FieldSpec { name: "kept", codec: FieldCodec::Bool },
-                FieldSpec { name: "rewound", codec: FieldCodec::Bool },
-                FieldSpec { name: "title", codec: FieldCodec::Str },
-                FieldSpec { name: "cwd", codec: FieldCodec::Opt(Box::new(FieldCodec::Str)) },
-                FieldSpec {
-                    name: "pid",
-                    codec: FieldCodec::Opt(Box::new(FieldCodec::Custom {
+                f("alive", FieldCodec::Bool),
+                f("kept", FieldCodec::Bool),
+                f("rewound", FieldCodec::Bool),
+                f("title", FieldCodec::Str),
+                f("cwd", FieldCodec::Opt(Box::new(FieldCodec::Str))),
+                f(
+                    "pid",
+                    FieldCodec::Opt(Box::new(FieldCodec::Custom {
                         ts_type: "number",
                         encode_fn: "encodeSignalTarget",
                         decode_fn: "decodeSignalTarget",
                     })),
-                },
-                FieldSpec {
-                    name: "foreground",
-                    codec: FieldCodec::Opt(Box::new(FieldCodec::Custom {
+                ),
+                f(
+                    "foreground",
+                    FieldCodec::Opt(Box::new(FieldCodec::Custom {
                         ts_type: "ForegroundProcess",
                         encode_fn: "encodeForegroundProcess",
                         decode_fn: "decodeForegroundProcess",
                     })),
-                },
-                FieldSpec { name: "createdMs", codec: FieldCodec::VarU64 },
+                ),
+                f("createdMs", FieldCodec::VarU64),
             ],
-            post_decode_check: None,
         },
         StructSchema {
             name: "FrameUpdate",
             exported_codec: false,
             fields: vec![
-                FieldSpec { name: "seq", codec: FieldCodec::VarU64 },
-                FieldSpec { name: "epoch", codec: FieldCodec::VarU64 },
+                f("seq", FieldCodec::VarU64),
+                f("epoch", FieldCodec::VarU64),
                 f_custom("size", "GridSize", "encodeGridSize", "decodeGridSize"),
-                FieldSpec { name: "firstActiveLine", codec: FieldCodec::VarU64 },
-                FieldSpec { name: "scrollbackLines", codec: FieldCodec::VarU64 },
-                FieldSpec { name: "scrollDelta", codec: FieldCodec::I32 },
+                f("firstActiveLine", FieldCodec::VarU64),
+                f_check(
+                    "scrollbackLines",
+                    FieldCodec::VarU64,
+                    "if (scrollbackLines > firstActiveLine) {\n  throw new WireError('InvalidValue', 'FrameUpdate.scrollback_lines > first_active_line')\n}",
+                ),
+                f("scrollDelta", FieldCodec::I32),
                 f_custom("cursor", "CursorState", "encodeCursorState", "decodeCursorState"),
                 f_custom("modes", "ViewModes", "encodeViewModes", "decodeViewModes"),
-                FieldSpec {
-                    name: "palette",
-                    codec: FieldCodec::Opt(Box::new(FieldCodec::Custom {
+                f(
+                    "palette",
+                    FieldCodec::Opt(Box::new(FieldCodec::Custom {
                         ts_type: "PaletteOverrides",
                         encode_fn: "encodePaletteOverrides",
                         decode_fn: "decodePaletteOverrides",
                     })),
-                },
-                FieldSpec {
-                    name: "rows",
-                    codec: FieldCodec::VecBounded {
+                ),
+                f(
+                    "rows",
+                    FieldCodec::VecBounded {
                         max_expr: "MAX_ROWS_PER_FETCH",
                         label: "frame rows",
                         item: Box::new(FieldCodec::Custom {
@@ -2559,37 +1755,784 @@ export const MsgType = {
                             decode_fn: "decodePackedRow",
                         }),
                     },
-                },
-                FieldSpec { name: "imagesGen", codec: FieldCodec::VarU64 },
-                FieldSpec { name: "fullSync", codec: FieldCodec::Bool },
+                ),
+                f("imagesGen", FieldCodec::VarU64),
+                f("fullSync", FieldCodec::Bool),
             ],
-            post_decode_check: Some(
-                "if (scrollbackLines > firstActiveLine) {\n    throw new WireError('InvalidValue', 'FrameUpdate.scrollback_lines > first_active_line')\n  }",
-            ),
         },
-    ];
-    for s in &message_structs {
+    ]
+}
+
+fn client_msg_variants() -> Vec<MsgVariant> {
+    vec![
+        MsgVariant {
+            const_name: "HELLO",
+            kind: "hello",
+            tag: msg_type::HELLO,
+            fields: vec![
+                f("protocolVersion", FieldCodec::U16),
+                f(
+                    "clientNonce",
+                    FieldCodec::FixedBytes {
+                        len_expr: "AUTH_TOKEN_LEN",
+                        len_val: apack_proto::AUTH_TOKEN_LEN,
+                        label: "clientNonce",
+                    },
+                ),
+                f("clientName", FieldCodec::Str),
+            ],
+        },
+        MsgVariant {
+            const_name: "AUTH_PROOF",
+            kind: "authProof",
+            tag: msg_type::AUTH_PROOF,
+            fields: vec![f(
+                "hmac",
+                FieldCodec::FixedBytes {
+                    len_expr: "AUTH_TOKEN_LEN",
+                    len_val: apack_proto::AUTH_TOKEN_LEN,
+                    label: "hmac",
+                },
+            )],
+        },
+        MsgVariant {
+            const_name: "ACQUIRE_LEASE",
+            kind: "acquireLease",
+            tag: msg_type::ACQUIRE_LEASE,
+            fields: vec![f_custom("lease", "LeaseKind", "encodeLeaseKind", "decodeLeaseKind")],
+        },
+        MsgVariant {
+            const_name: "RELEASE_LEASE",
+            kind: "releaseLease",
+            tag: msg_type::RELEASE_LEASE,
+            fields: vec![f("leaseId", FieldCodec::VarU64)],
+        },
+        MsgVariant {
+            const_name: "SPAWN",
+            kind: "spawn",
+            tag: msg_type::SPAWN,
+            fields: vec![f_custom("spec", "SpawnSpec", "encodeSpawnSpec", "decodeSpawnSpec")],
+        },
+        MsgVariant {
+            const_name: "KILL",
+            kind: "kill",
+            tag: msg_type::KILL,
+            fields: vec![f_custom("session", "number", "encodeSessionId", "decodeSessionId")],
+        },
+        MsgVariant {
+            const_name: "SIGNAL",
+            kind: "signal",
+            tag: msg_type::SIGNAL,
+            fields: vec![
+                f_custom("session", "number", "encodeSessionId", "decodeSessionId"),
+                f_custom("signal", "SignalKind", "encodeSignalKind", "decodeSignalKind"),
+                f_custom("scope", "SignalScope", "encodeSignalScope", "decodeSignalScope"),
+            ],
+        },
+        MsgVariant {
+            const_name: "OWNS",
+            kind: "owns",
+            tag: msg_type::OWNS,
+            fields: vec![
+                f_custom("session", "number", "encodeSessionId", "decodeSessionId"),
+                f_custom("pid", "number", "encodeSignalTarget", "decodeSignalTarget"),
+            ],
+        },
+        MsgVariant { const_name: "LIST_SESSIONS", kind: "listSessions", tag: msg_type::LIST_SESSIONS, fields: vec![] },
+        MsgVariant {
+            const_name: "REWIND",
+            kind: "rewind",
+            tag: msg_type::REWIND,
+            fields: vec![f("recordDir", FieldCodec::Str), f("atMs", FieldCodec::Opt(Box::new(FieldCodec::VarU64)))],
+        },
+        MsgVariant {
+            const_name: "SEEK",
+            kind: "seek",
+            tag: msg_type::SEEK,
+            fields: vec![
+                f_custom("session", "number", "encodeSessionId", "decodeSessionId"),
+                f("atMs", FieldCodec::VarU64),
+            ],
+        },
+        MsgVariant { const_name: "METRICS", kind: "metrics", tag: msg_type::METRICS, fields: vec![] },
+        MsgVariant {
+            const_name: "ATTACH",
+            kind: "attach",
+            tag: msg_type::ATTACH,
+            fields: vec![
+                f_custom("session", "number", "encodeSessionId", "decodeSessionId"),
+                f_custom("streamId", "number", "encodeNonZeroStreamId", "decodeNonZeroStreamId"),
+                f_custom("flags", "number", "encodeSubFlags", "decodeSubFlags"),
+                f(
+                    "initialViewport",
+                    FieldCodec::Opt(Box::new(FieldCodec::Custom {
+                        ts_type: "ViewportHint",
+                        encode_fn: "encodeViewportHint",
+                        decode_fn: "decodeViewportHint",
+                    })),
+                ),
+                f("initialOutputCredit", FieldCodec::VarU32),
+                f_custom("initialFrameCredit", "FrameCredit", "encodeFrameCredit", "decodeFrameCredit"),
+            ],
+        },
+        MsgVariant {
+            const_name: "DETACH",
+            kind: "detach",
+            tag: msg_type::DETACH,
+            fields: vec![f_custom("streamId", "number", "encodeNonZeroStreamId", "decodeNonZeroStreamId")],
+        },
+        MsgVariant {
+            const_name: "KEEP",
+            kind: "keep",
+            tag: msg_type::KEEP,
+            fields: vec![
+                f_custom("session", "number", "encodeSessionId", "decodeSessionId"),
+                f("kept", FieldCodec::Bool),
+            ],
+        },
+        MsgVariant {
+            const_name: "WAIT",
+            kind: "wait",
+            tag: msg_type::WAIT,
+            fields: vec![
+                f_custom("session", "number", "encodeSessionId", "decodeSessionId"),
+                f_custom("condition", "WaitCondition", "encodeWaitCondition", "decodeWaitCondition"),
+                f("timeoutMs", FieldCodec::VarU32),
+            ],
+        },
+        MsgVariant {
+            const_name: "FRAME_ACK",
+            kind: "frameAck",
+            tag: msg_type::FRAME_ACK,
+            fields: vec![
+                f("seq", FieldCodec::VarU64),
+                f_custom("credit", "FrameCredit", "encodeFrameCredit", "decodeFrameCredit"),
+            ],
+        },
+        MsgVariant {
+            const_name: "VIEWPORT_HINT",
+            kind: "viewportHint",
+            tag: msg_type::VIEWPORT_HINT,
+            fields: vec![f_custom("hint", "ViewportHint", "encodeViewportHint", "decodeViewportHint")],
+        },
+        MsgVariant {
+            const_name: "EXPLICIT_RESIZE",
+            kind: "explicitResize",
+            tag: msg_type::EXPLICIT_RESIZE,
+            fields: vec![
+                f_custom("size", "GridSize", "encodeGridSize", "decodeGridSize"),
+                f_custom("cellPx", "CellPx", "encodeCellPx", "decodeCellPx"),
+            ],
+        },
+        MsgVariant {
+            const_name: "SET_CURSOR_DEFAULTS",
+            kind: "setCursorDefaults",
+            tag: msg_type::SET_CURSOR_DEFAULTS,
+            fields: vec![
+                f_custom("shape", "CursorShape", "encodeCursorShape", "decodeCursorShape"),
+                f("blinking", FieldCodec::Bool),
+            ],
+        },
+        MsgVariant {
+            const_name: "KEY",
+            kind: "key",
+            tag: msg_type::KEY,
+            fields: vec![f_custom("input", "KeyInput", "encodeKeyInput", "decodeKeyInput")],
+        },
+        MsgVariant { const_name: "TEXT", kind: "text", tag: msg_type::TEXT, fields: vec![f("text", FieldCodec::Str)] },
+        MsgVariant {
+            const_name: "POINTER",
+            kind: "pointer",
+            tag: msg_type::POINTER,
+            fields: vec![f_custom("input", "PointerInput", "encodePointerInput", "decodePointerInput")],
+        },
+        MsgVariant {
+            const_name: "FOCUS",
+            kind: "focus",
+            tag: msg_type::FOCUS,
+            fields: vec![f("focused", FieldCodec::Bool)],
+        },
+        MsgVariant {
+            const_name: "PASTE",
+            kind: "paste",
+            tag: msg_type::PASTE,
+            fields: vec![f("text", FieldCodec::Str), f("allowUnsafe", FieldCodec::Bool)],
+        },
+        MsgVariant {
+            const_name: "WRITE",
+            kind: "write",
+            tag: msg_type::WRITE,
+            fields: vec![f("data", FieldCodec::Bytes)],
+        },
+        MsgVariant { const_name: "PAUSE", kind: "pause", tag: msg_type::PAUSE, fields: vec![] },
+        MsgVariant { const_name: "RESUME", kind: "resume", tag: msg_type::RESUME, fields: vec![] },
+        MsgVariant {
+            const_name: "OUTPUT_CREDIT",
+            kind: "outputCredit",
+            tag: msg_type::OUTPUT_CREDIT,
+            fields: vec![f("bytes", FieldCodec::VarU32)],
+        },
+        MsgVariant {
+            const_name: "FETCH_ROWS",
+            kind: "fetchRows",
+            tag: msg_type::FETCH_ROWS,
+            fields: vec![
+                f("epoch", FieldCodec::VarU64),
+                f("fromLine", FieldCodec::VarU64),
+                f_check(
+                    "count",
+                    FieldCodec::VarU32,
+                    "if (count === 0 || count > MAX_ROWS_PER_FETCH) throw new WireError('LimitExceeded', 'fetch rows count')",
+                ),
+            ],
+        },
+        MsgVariant {
+            const_name: "WORD_AT",
+            kind: "wordAt",
+            tag: msg_type::WORD_AT,
+            fields: vec![f("epoch", FieldCodec::VarU64), f_custom("pos", "CellPos", "encodeCellPos", "decodeCellPos")],
+        },
+        MsgVariant {
+            const_name: "LINE_AT",
+            kind: "lineAt",
+            tag: msg_type::LINE_AT,
+            fields: vec![f("epoch", FieldCodec::VarU64), f("line", FieldCodec::VarU64)],
+        },
+        MsgVariant {
+            const_name: "TEXT_OF",
+            kind: "textOf",
+            tag: msg_type::TEXT_OF,
+            fields: vec![
+                f("epoch", FieldCodec::VarU64),
+                f_custom("span", "CellSpan", "encodeCellSpan", "decodeCellSpan"),
+            ],
+        },
+        MsgVariant {
+            const_name: "TEXT_OF_RECT",
+            kind: "textOfRect",
+            tag: msg_type::TEXT_OF_RECT,
+            fields: vec![
+                f("epoch", FieldCodec::VarU64),
+                f_custom("span", "CellSpan", "encodeCellSpan", "decodeCellSpan"),
+            ],
+        },
+        MsgVariant {
+            const_name: "SET_SEARCH",
+            kind: "setSearch",
+            tag: msg_type::SET_SEARCH,
+            fields: vec![
+                f("query", FieldCodec::StrBounded("MAX_SEARCH_NEEDLE_BYTES", "search query")),
+                f("caseSensitive", FieldCodec::Bool),
+            ],
+        },
+        MsgVariant { const_name: "COMMANDS", kind: "commands", tag: msg_type::COMMANDS, fields: vec![] },
+        MsgVariant {
+            const_name: "COMMAND_OUTPUT",
+            kind: "commandOutput",
+            tag: msg_type::COMMAND_OUTPUT,
+            fields: vec![f("commandId", FieldCodec::VarU64)],
+        },
+        MsgVariant { const_name: "IMAGES", kind: "images", tag: msg_type::IMAGES, fields: vec![] },
+        MsgVariant {
+            const_name: "GET_IMAGE_BLOB",
+            kind: "getImageBlob",
+            tag: msg_type::GET_IMAGE_BLOB,
+            fields: vec![
+                f_custom("blob", "Uint8Array", "encodeBlobHash", "decodeBlobHash"),
+                f("offset", FieldCodec::VarU32),
+                f_check(
+                    "maxBytes",
+                    FieldCodec::VarU32,
+                    "if (maxBytes === 0) throw new WireError('InvalidValue', 'get_image_blob max_bytes must be non-zero')",
+                ),
+            ],
+        },
+    ]
+}
+
+fn broker_msg_variants() -> Vec<MsgVariant> {
+    vec![
+        MsgVariant {
+            const_name: "HELLO_OK",
+            kind: "helloOk",
+            tag: msg_type::HELLO_OK,
+            fields: vec![
+                f("protocolVersion", FieldCodec::U16),
+                f("authRequired", FieldCodec::Bool),
+                f(
+                    "serverNonce",
+                    FieldCodec::FixedBytes {
+                        len_expr: "AUTH_TOKEN_LEN",
+                        len_val: apack_proto::AUTH_TOKEN_LEN,
+                        label: "serverNonce",
+                    },
+                ),
+                f("wordDelimiters", FieldCodec::Str),
+                f("capabilities", FieldCodec::U32),
+            ],
+        },
+        MsgVariant {
+            const_name: "AUTH_OK",
+            kind: "authOk",
+            tag: msg_type::AUTH_OK,
+            fields: vec![f(
+                "serverHmac",
+                FieldCodec::FixedBytes {
+                    len_expr: "AUTH_TOKEN_LEN",
+                    len_val: apack_proto::AUTH_TOKEN_LEN,
+                    label: "serverHmac",
+                },
+            )],
+        },
+        MsgVariant {
+            const_name: "ERROR",
+            kind: "error",
+            tag: msg_type::ERROR,
+            fields: vec![
+                f_custom("code", "ErrorCode", "encodeErrorCode", "decodeErrorCode"),
+                f("message", FieldCodec::Str),
+            ],
+        },
+        MsgVariant { const_name: "OK", kind: "ok", tag: msg_type::OK, fields: vec![] },
+        MsgVariant {
+            const_name: "LEASE_ACK",
+            kind: "leaseAck",
+            tag: msg_type::LEASE_ACK,
+            fields: vec![f("leaseId", FieldCodec::VarU64), f("resumed", FieldCodec::Bool)],
+        },
+        MsgVariant {
+            const_name: "SPAWNED",
+            kind: "spawned",
+            tag: msg_type::SPAWNED,
+            fields: vec![
+                f_custom("session", "number", "encodeSessionId", "decodeSessionId"),
+                f(
+                    "pid",
+                    FieldCodec::Opt(Box::new(FieldCodec::Custom {
+                        ts_type: "number",
+                        encode_fn: "encodeSignalTarget",
+                        decode_fn: "decodeSignalTarget",
+                    })),
+                ),
+            ],
+        },
+        MsgVariant {
+            const_name: "OWNS_REPLY",
+            kind: "ownsReply",
+            tag: msg_type::OWNS_REPLY,
+            fields: vec![f("owned", FieldCodec::Bool)],
+        },
+        MsgVariant {
+            const_name: "SESSIONS_LIST",
+            kind: "sessionsList",
+            tag: msg_type::SESSIONS_LIST,
+            fields: vec![f(
+                "sessions",
+                FieldCodec::VecBounded {
+                    max_expr: "MAX_SESSIONS_LIST",
+                    label: "sessions list",
+                    item: Box::new(FieldCodec::Custom {
+                        ts_type: "SessionSummary",
+                        encode_fn: "encodeSessionSummary",
+                        decode_fn: "decodeSessionSummary",
+                    }),
+                },
+            )],
+        },
+        MsgVariant {
+            const_name: "REWOUND",
+            kind: "rewound",
+            tag: msg_type::REWOUND,
+            fields: vec![
+                f_custom("session", "number", "encodeSessionId", "decodeSessionId"),
+                f("durationMs", FieldCodec::VarU64),
+                f("atMs", FieldCodec::VarU64),
+            ],
+        },
+        MsgVariant {
+            const_name: "SOUGHT",
+            kind: "sought",
+            tag: msg_type::SOUGHT,
+            fields: vec![f("atMs", FieldCodec::VarU64)],
+        },
+        MsgVariant {
+            const_name: "METRICS_REPLY",
+            kind: "metricsReply",
+            tag: msg_type::METRICS_REPLY,
+            fields: vec![f_custom("metrics", "MetricsSnapshot", "encodeMetricsSnapshot", "decodeMetricsSnapshot")],
+        },
+        MsgVariant {
+            const_name: "ATTACHED",
+            kind: "attached",
+            tag: msg_type::ATTACHED,
+            fields: vec![
+                f_custom("session", "number", "encodeSessionId", "decodeSessionId"),
+                f_custom("streamId", "number", "encodeNonZeroStreamId", "decodeNonZeroStreamId"),
+                f_custom("size", "GridSize", "encodeGridSize", "decodeGridSize"),
+                f("epoch", FieldCodec::VarU64),
+                f("firstActiveLine", FieldCodec::VarU64),
+                f_check(
+                    "scrollbackLines",
+                    FieldCodec::VarU64,
+                    "if (scrollbackLines > firstActiveLine) {\n  throw new WireError('InvalidValue', 'Attached.scrollback_lines > first_active_line')\n}",
+                ),
+                f(
+                    "foreground",
+                    FieldCodec::Opt(Box::new(FieldCodec::Custom {
+                        ts_type: "ForegroundProcess",
+                        encode_fn: "encodeForegroundProcess",
+                        decode_fn: "decodeForegroundProcess",
+                    })),
+                ),
+            ],
+        },
+        MsgVariant {
+            const_name: "WAITED",
+            kind: "waited",
+            tag: msg_type::WAITED,
+            fields: vec![f_custom("outcome", "WaitOutcome", "encodeWaitOutcome", "decodeWaitOutcome")],
+        },
+        MsgVariant {
+            const_name: "FRAME",
+            kind: "frame",
+            tag: msg_type::FRAME,
+            fields: vec![f_custom("frame", "FrameUpdate", "encodeFrameUpdate", "decodeFrameUpdate")],
+        },
+        MsgVariant {
+            const_name: "ROWS",
+            kind: "rows",
+            tag: msg_type::ROWS,
+            fields: vec![
+                f("epoch", FieldCodec::VarU64),
+                f(
+                    "rows",
+                    FieldCodec::VecBounded {
+                        max_expr: "MAX_ROWS_PER_FETCH",
+                        label: "rows reply",
+                        item: Box::new(FieldCodec::Custom {
+                            ts_type: "PackedRow",
+                            encode_fn: "encodePackedRow",
+                            decode_fn: "decodePackedRow",
+                        }),
+                    },
+                ),
+            ],
+        },
+        MsgVariant {
+            const_name: "PASTED",
+            kind: "pasted",
+            tag: msg_type::PASTED,
+            fields: vec![f_custom("outcome", "PasteOutcome", "encodePasteOutcome", "decodePasteOutcome")],
+        },
+        MsgVariant {
+            const_name: "SPAN_REPLY",
+            kind: "spanReply",
+            tag: msg_type::SPAN_REPLY,
+            fields: vec![f(
+                "span",
+                FieldCodec::Opt(Box::new(FieldCodec::Custom {
+                    ts_type: "CellSpan",
+                    encode_fn: "encodeCellSpan",
+                    decode_fn: "decodeCellSpan",
+                })),
+            )],
+        },
+        MsgVariant {
+            const_name: "TEXT_REPLY",
+            kind: "textReply",
+            tag: msg_type::TEXT_REPLY,
+            fields: vec![f("text", FieldCodec::Str)],
+        },
+        MsgVariant {
+            const_name: "SEARCH_MATCHES",
+            kind: "searchMatches",
+            tag: msg_type::SEARCH_MATCHES,
+            fields: vec![
+                f("epoch", FieldCodec::VarU64),
+                f(
+                    "matches",
+                    FieldCodec::VecBounded {
+                        max_expr: "MAX_SEARCH_MATCHES",
+                        label: "search matches",
+                        item: Box::new(FieldCodec::Custom {
+                            ts_type: "CellSpan",
+                            encode_fn: "encodeCellSpan",
+                            decode_fn: "decodeCellSpan",
+                        }),
+                    },
+                ),
+                f("truncated", FieldCodec::Bool),
+            ],
+        },
+        MsgVariant {
+            const_name: "SEARCH_DELTA",
+            kind: "searchDelta",
+            tag: msg_type::SEARCH_DELTA,
+            fields: vec![
+                f("epoch", FieldCodec::VarU64),
+                f("fromLine", FieldCodec::VarU64),
+                f_check(
+                    "toLine",
+                    FieldCodec::VarU64,
+                    "if (toLine < fromLine) throw new WireError('InvalidValue', 'search delta to_line < from_line')",
+                ),
+                f_check(
+                    "added",
+                    FieldCodec::VecBounded {
+                        max_expr: "MAX_SEARCH_MATCHES",
+                        label: "search delta",
+                        item: Box::new(FieldCodec::Custom {
+                            ts_type: "CellSpan",
+                            encode_fn: "encodeCellSpan",
+                            decode_fn: "decodeCellSpan",
+                        }),
+                    },
+                    "for (const span of added) {\n  if (span.start.line < fromLine || span.end.line >= toLine) {\n    throw new WireError('InvalidValue', 'search delta span outside [from_line, to_line)')\n  }\n}",
+                ),
+                f("truncated", FieldCodec::Bool),
+            ],
+        },
+        MsgVariant {
+            const_name: "COMMANDS_REPLY",
+            kind: "commandsReply",
+            tag: msg_type::COMMANDS_REPLY,
+            fields: vec![f(
+                "commands",
+                FieldCodec::VecBounded {
+                    max_expr: "MAX_COMMANDS",
+                    label: "commands",
+                    item: Box::new(FieldCodec::Custom {
+                        ts_type: "CommandRecord",
+                        encode_fn: "encodeCommandRecord",
+                        decode_fn: "decodeCommandRecord",
+                    }),
+                },
+            )],
+        },
+        MsgVariant {
+            const_name: "COMMAND_OUTPUT_REPLY",
+            kind: "commandOutputReply",
+            tag: msg_type::COMMAND_OUTPUT_REPLY,
+            fields: vec![f("text", FieldCodec::Opt(Box::new(FieldCodec::Str)))],
+        },
+        MsgVariant {
+            const_name: "IMAGES_REPLY",
+            kind: "imagesReply",
+            tag: msg_type::IMAGES_REPLY,
+            fields: vec![
+                f("imagesGen", FieldCodec::VarU64),
+                f(
+                    "placements",
+                    FieldCodec::VecBounded {
+                        max_expr: "MAX_IMAGES_REPLY",
+                        label: "image placements",
+                        item: Box::new(FieldCodec::Custom {
+                            ts_type: "ImagePlacement",
+                            encode_fn: "encodeImagePlacement",
+                            decode_fn: "decodeImagePlacement",
+                        }),
+                    },
+                ),
+            ],
+        },
+        MsgVariant {
+            const_name: "IMAGE_BLOB_CHUNK",
+            kind: "imageBlobChunk",
+            tag: msg_type::IMAGE_BLOB_CHUNK,
+            fields: vec![
+                f_custom("blob", "Uint8Array", "encodeBlobHash", "decodeBlobHash"),
+                f_custom("encoding", "ImageEncoding", "encodeImageEncoding", "decodeImageEncoding"),
+                f("totalBytes", FieldCodec::VarU32),
+                f("offset", FieldCodec::VarU32),
+                f_check(
+                    "data",
+                    FieldCodec::BytesCopyBounded("BULK_CHUNK_BYTES", "image blob chunk"),
+                    "if (offset + data.length > totalBytes) {\n  throw new WireError('InvalidValue', 'image blob chunk exceeds total_bytes')\n}",
+                ),
+            ],
+        },
+        MsgVariant {
+            const_name: "TITLE",
+            kind: "title",
+            tag: msg_type::TITLE,
+            fields: vec![f("title", FieldCodec::Str)],
+        },
+        MsgVariant { const_name: "BELL", kind: "bell", tag: msg_type::BELL, fields: vec![] },
+        MsgVariant {
+            const_name: "CLIPBOARD",
+            kind: "clipboard",
+            tag: msg_type::CLIPBOARD,
+            fields: vec![f("selection", FieldCodec::Str), f("data", FieldCodec::Str)],
+        },
+        MsgVariant {
+            const_name: "NOTIFICATION",
+            kind: "notification",
+            tag: msg_type::NOTIFICATION,
+            fields: vec![f("title", FieldCodec::Str), f("body", FieldCodec::Str)],
+        },
+        MsgVariant {
+            const_name: "PROGRESS",
+            kind: "progress",
+            tag: msg_type::PROGRESS,
+            fields: vec![
+                f_custom("state", "ProgressState", "encodeProgressState", "decodeProgressState"),
+                f_check(
+                    "percent",
+                    FieldCodec::Opt(Box::new(FieldCodec::ProgressPercent { err_msg: "progress percent > 100" })),
+                    "if (percent !== null && (state === 'none' || state === 'indeterminate')) {\n  throw new WireError('InvalidValue', 'progress percent invalid for state')\n}",
+                ),
+            ],
+        },
+        MsgVariant {
+            const_name: "PROGRAM_STATUS",
+            kind: "programStatus",
+            tag: msg_type::PROGRAM_STATUS,
+            fields: vec![f_custom("record", "StatusRecord", "encodeStatusRecord", "decodeStatusRecord")],
+        },
+        MsgVariant {
+            const_name: "PROGRAM_STATUS_CLEARED",
+            kind: "programStatusCleared",
+            tag: msg_type::PROGRAM_STATUS_CLEARED,
+            fields: vec![f("id", FieldCodec::Str)],
+        },
+        MsgVariant {
+            const_name: "COMMAND_STARTED",
+            kind: "commandStarted",
+            tag: msg_type::COMMAND_STARTED,
+            fields: vec![f_custom("record", "CommandRecord", "encodeCommandRecord", "decodeCommandRecord")],
+        },
+        MsgVariant {
+            const_name: "COMMAND_FINISHED",
+            kind: "commandFinished",
+            tag: msg_type::COMMAND_FINISHED,
+            fields: vec![f_custom("record", "CommandRecord", "encodeCommandRecord", "decodeCommandRecord")],
+        },
+        MsgVariant {
+            const_name: "CWD_CHANGED",
+            kind: "cwdChanged",
+            tag: msg_type::CWD_CHANGED,
+            fields: vec![f("cwd", FieldCodec::Str)],
+        },
+        MsgVariant {
+            const_name: "EXITED",
+            kind: "exited",
+            tag: msg_type::EXITED,
+            fields: vec![
+                f("exitCode", FieldCodec::Opt(Box::new(FieldCodec::I32))),
+                f("signal", FieldCodec::Opt(Box::new(FieldCodec::Str))),
+            ],
+        },
+        MsgVariant {
+            const_name: "OUTPUT",
+            kind: "output",
+            tag: msg_type::OUTPUT,
+            fields: vec![f("text", FieldCodec::Str)],
+        },
+        MsgVariant {
+            const_name: "THROTTLED",
+            kind: "throttled",
+            tag: msg_type::THROTTLED,
+            fields: vec![f("waitedUs", FieldCodec::VarU64)],
+        },
+        MsgVariant {
+            const_name: "OUTPUT_DROPPED",
+            kind: "outputDropped",
+            tag: msg_type::OUTPUT_DROPPED,
+            fields: vec![f("bytes", FieldCodec::VarU64)],
+        },
+        MsgVariant {
+            const_name: "STREAM_CLOSED",
+            kind: "streamClosed",
+            tag: msg_type::STREAM_CLOSED,
+            fields: vec![f("reason", FieldCodec::Str)],
+        },
+    ]
+}
+
+fn render_messages_ts() -> String {
+    let structs = message_structs();
+    let client_variants = client_msg_variants();
+    let broker_variants = broker_msg_variants();
+
+    // Dynamically derive imports from the schema IR so no unused import can ever linger.
+    let local_structs: HashSet<&str> = structs.iter().map(|s| s.name).collect();
+    let local_codecs: HashSet<String> =
+        structs.iter().flat_map(|s| [format!("encode{}", s.name), format!("decode{}", s.name)]).collect();
+
+    let mut types_vals = BTreeSet::new();
+    let mut types_only = BTreeSet::new();
+    let mut consts = BTreeSet::new();
+
+    for s in &structs {
+        for field in &s.fields {
+            field.codec.collect_refs(&mut types_vals, &mut types_only, &mut consts);
+        }
+    }
+    for v in client_variants.iter().chain(broker_variants.iter()) {
+        for field in &v.fields {
+            field.codec.collect_refs(&mut types_vals, &mut types_only, &mut consts);
+        }
+    }
+
+    // Filter out locally defined message structs & their codecs.
+    types_vals.retain(|sym| !local_codecs.contains(*sym));
+    types_only.retain(|sym| !local_structs.contains(*sym));
+
+    let mut out = String::from(GENERATED_HEADER);
+    out.push_str(
+        "/**\n * Complete v2 wire message definitions and encoders/decoders generated directly from\n * `crates/apack-proto/src/messages.rs`.\n */\n",
+    );
+
+    // Imports from `./constants.ts`.
+    writeln!(out, "import {{").unwrap();
+    for c in &consts {
+        writeln!(out, "  {c},").unwrap();
+    }
+    writeln!(out, "}} from './constants.ts'").unwrap();
+    writeln!(out, "import {{ WireError, WireReader, WireWriter }} from './codec.ts'").unwrap();
+    writeln!(out, "import {{ encodeFrame }} from './frame.ts'").unwrap();
+
+    // Imports from `./types.ts`.
+    writeln!(out, "import {{").unwrap();
+    for sym in &types_vals {
+        writeln!(out, "  {sym},").unwrap();
+    }
+    for ty in &types_only {
+        writeln!(out, "  type {ty},").unwrap();
+    }
+    writeln!(out, "}} from './types.ts'\n").unwrap();
+
+    writeln!(out, "export const MsgType = {{").unwrap();
+    for v in &client_variants {
+        writeln!(out, "  {}: {:#06x},", v.const_name, v.tag).unwrap();
+    }
+    for v in &broker_variants {
+        writeln!(out, "  {}: {:#06x},", v.const_name, v.tag).unwrap();
+    }
+    writeln!(out, "}} as const\n").unwrap();
+
+    for s in &structs {
         emit_struct_schema(&mut out, s);
     }
 
     emit_msg_union(&mut out, "ClientMsg", &client_variants);
     emit_msg_union(&mut out, "BrokerMsg", &broker_variants);
-    emit_msg_codecs(&mut out, "client", "ClientMsg", &client_variants);
-    out.push('\n');
-    emit_msg_codecs(&mut out, "broker", "BrokerMsg", &broker_variants);
+    emit_msg_codecs(&mut out, "Client", "ClientMsg", &client_variants);
+    emit_msg_codecs(&mut out, "Broker", "BrokerMsg", &broker_variants);
+
     out
 }
 
 // ---------------------------------------------------------------------------
-// 5. Compile-time exhaustiveness guard against `apack-proto`
+// Compile-time exhaustive schema & field-type guard
 // ---------------------------------------------------------------------------
-// Any addition, removal, or field rename on `apack-proto` structs/enums breaks compilation right here.
-#[allow(dead_code, clippy::too_many_arguments)]
+
+#[allow(clippy::too_many_arguments, dead_code)]
 fn _assert_exhaustive_apack_proto_coverage(
     c: ClientMsg,
     b: BrokerMsg,
-    sk: SignalKind,
     ss: SignalScope,
+    sk: SignalKind,
     ur: UnknownReason,
     co: CommandOutcome,
     ec: ErrorCode,
@@ -2606,117 +2549,216 @@ fn _assert_exhaustive_apack_proto_coverage(
     po: PasteOutcome,
     wc: WaitCondition,
     wo: WaitOutcome,
-    sp: SpawnSpec,
-    sum: SessionSummary,
-    fu: FrameUpdate,
     gs: GridSize,
-    cpx: CellPx,
+    cp: CellPx,
     vh: ViewportHint,
     fc: FrameCredit,
-    cst: CursorState,
-    pov: PaletteOverrides,
+    cur: CursorState,
+    rgb: Rgb,
+    pal: PaletteOverrides,
     vm: ViewModes,
     ip: ImagePiece,
-    cp: CellPos,
-    csp: CellSpan,
-    ipl: ImagePlacement,
-    cr: CommandRecord,
+    prun: PackedRun,
+    psty: PackedStyle,
+    prow: PackedRow,
+    cpos: CellPos,
+    cspan: CellSpan,
+    fg: ForegroundProcess,
+    cmd: CommandRecord,
     sr: StatusRecord,
     ki: KeyInput,
     pi: PointerInput,
-    fp: ForegroundProcess,
+    imp: ImagePlacement,
     ms: MetricsSnapshot,
-    bh: BlobHash,
+    sp: SpawnSpec,
+    sum: SessionSummary,
+    fu: FrameUpdate,
 ) {
-    let _ = bh.0;
-    let SpawnSpec {
-        argv: _,
-        cwd: _,
-        env: _,
-        size: _,
-        cell_px: _,
-        scrollback_limit: _,
-        marks_key: _,
-        resize_policy: _,
-        record_dir: _,
-        restore_from: _,
-        image_files: _,
-        kept: _,
-    } = sp;
-    let SessionSummary {
-        id: _,
-        size: _,
-        alive: _,
-        kept: _,
-        rewound: _,
-        title: _,
-        cwd: _,
-        pid: _,
-        foreground: _,
-        created_ms: _,
-    } = sum;
-    let FrameUpdate {
-        seq: _,
-        epoch: _,
-        size: _,
-        first_active_line: _,
-        scrollback_lines: _,
-        scroll_delta: _,
-        cursor: _,
-        modes: _,
-        palette: _,
-        rows: _,
-        images_gen: _,
-        full_sync: _,
-    } = fu;
-    let GridSize { cols: _, rows: _ } = gs;
-    let CellPx { width: _, height: _ } = cpx;
-    let ViewportHint { size: _, cell_px: _, visible: _, focused: _ } = vh;
-    let FrameCredit { max_frames: _, max_bytes: _ } = fc;
-    let CursorState { col: _, row: _, shape: _, blinking: _, hidden: _ } = cst;
-    let PaletteOverrides { fg: _, bg: _, cursor: _, palette: _ } = pov;
-    let ViewModes { alt_screen: _, mouse: _, reverse_video: _, bracketed_paste: _ } = vm;
-    let ImagePiece { blob: _, col_start: _, col_len: _, src_rect: _, dst_px: _ } = ip;
-    let CellPos { line: _, col: _ } = cp;
-    let CellSpan { start: _, end: _ } = csp;
-    let ImagePlacement { blob: _, line: _, col: _, pixel_size: _, cell_span: _, z_index: _ } = ipl;
-    let CommandRecord {
-        id: _,
-        command: _,
-        cwd: _,
-        started_ms: _,
-        finished_ms: _,
-        outcome: _,
-        prompt_line: _,
-        output_line: _,
-        end_line: _,
-    } = cr;
-    let StatusRecord {
-        id: _,
-        state: _,
-        kind: _,
-        progress: _,
-        app: _,
-        title: _,
-        message: _,
-        changed: _,
-        since_ms: _,
-        confirmed: _,
-    } = sr;
-    let KeyInput { code: _, action: _, modifiers: _, text: _, unshifted_codepoint: _, composed: _ } = ki;
-    let PointerInput { action: _, button: _, modifiers: _, x_px: _, y_px: _, cell_px: _ } = pi;
-    let ForegroundProcess { pid: _, name: _ } = fp;
-    let MetricsSnapshot {
-        live_sessions: _,
-        rewound_sessions: _,
-        connections: _,
-        active_timers: _,
-        scrollback_bytes: _,
-        image_store_bytes: _,
-        total_pty_bytes: _,
-        total_throttled_us: _,
-    } = ms;
+    fn ty<T>(_: T) {}
 
+    let GridSize { cols, rows } = gs;
+    ty::<(std::num::NonZeroU16, std::num::NonZeroU16)>((cols, rows));
+    let CellPx { width, height } = cp;
+    ty::<(u16, u16)>((width, height));
+    let ViewportHint { size, cell_px, visible, focused } = vh;
+    ty::<(GridSize, CellPx, bool, bool)>((size, cell_px, visible, focused));
+    let FrameCredit { max_frames, max_bytes } = fc;
+    ty::<(u16, u32)>((max_frames, max_bytes));
+    let CursorState { col, row, shape, blinking, hidden } = cur;
+    ty::<(u16, u16, CursorShape, bool, bool)>((col, row, shape, blinking, hidden));
+    let Rgb(rgb_arr) = rgb;
+    ty::<[u8; 3]>(rgb_arr);
+    let PaletteOverrides { fg: pfg, bg: pbg, cursor: pcur, palette } = pal;
+    ty::<(Option<Rgb>, Option<Rgb>, Option<Rgb>, Vec<(u8, Rgb)>)>((pfg, pbg, pcur, palette));
+    let ViewModes { alt_screen, mouse, reverse_video, bracketed_paste } = vm;
+    ty::<(bool, bool, bool, bool)>((alt_screen, mouse, reverse_video, bracketed_paste));
+    let ImagePiece { blob, col_start, col_len, src_rect, dst_px } = ip;
+    ty::<(BlobHash, u16, u16, [u32; 4], [u32; 2])>((blob, col_start, col_len, src_rect, dst_px));
+    let PackedRun { col_start, col_len, byte_offset, byte_len, style_idx, link_idx, flags } = prun;
+    ty::<(u16, u16, u32, u32, u16, u16, u8)>((col_start, col_len, byte_offset, byte_len, style_idx, link_idx, flags));
+    let PackedStyle { fg: sfg, bg: sbg, underline_color, flags } = psty;
+    ty::<(u32, u32, u32, u32)>((sfg, sbg, underline_color, flags));
+    let PackedRow { line, flags, text, runs, styles, links, pieces } = prow;
+    ty::<(u64, u8, String, Vec<PackedRun>, Vec<PackedStyle>, Vec<String>, Vec<ImagePiece>)>((
+        line, flags, text, runs, styles, links, pieces,
+    ));
+    let CellPos { line, col } = cpos;
+    ty::<(u64, u16)>((line, col));
+    let CellSpan { start, end } = cspan;
+    ty::<(CellPos, CellPos)>((start, end));
+    let ForegroundProcess { pid, name } = fg;
+    ty::<(SignalTarget, Option<String>)>((pid, name));
+    let CommandRecord { id, command, cwd, started_ms, finished_ms, outcome, prompt_line, output_line, end_line } = cmd;
+    ty::<(
+        u64,
+        Option<String>,
+        Option<String>,
+        Option<u64>,
+        Option<u64>,
+        CommandOutcome,
+        Option<u64>,
+        Option<u64>,
+        Option<u64>,
+    )>((id, command, cwd, started_ms, finished_ms, outcome, prompt_line, output_line, end_line));
+    let StatusRecord { id, state, kind, progress, app, title, message, changed, since_ms, confirmed } = sr;
+    ty::<(
+        String,
+        StatusState,
+        Option<BlockedKind>,
+        Option<u8>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        u64,
+        u64,
+        Confirmed,
+    )>((id, state, kind, progress, app, title, message, changed, since_ms, confirmed));
+    let KeyInput { code, action, modifiers, text, unshifted_codepoint, composed } = ki;
+    ty::<(String, KeyAction, u8, String, u32, bool)>((code, action, modifiers, text, unshifted_codepoint, composed));
+    let PointerInput { action, button, modifiers, x_px, y_px, cell_px } = pi;
+    ty::<(PointerAction, u8, u8, u32, u32, CellPx)>((action, button, modifiers, x_px, y_px, cell_px));
+    let ImagePlacement { blob, line, col, pixel_size, cell_span, z_index } = imp;
+    ty::<(BlobHash, u64, i32, [u32; 2], [u16; 2], i32)>((blob, line, col, pixel_size, cell_span, z_index));
+    let MetricsSnapshot {
+        live_sessions,
+        rewound_sessions,
+        connections,
+        active_timers,
+        scrollback_bytes,
+        image_store_bytes,
+        total_pty_bytes,
+        total_throttled_us,
+    } = ms;
+    ty::<(u32, u32, u32, u32, u64, u64, u64, u64)>((
+        live_sessions,
+        rewound_sessions,
+        connections,
+        active_timers,
+        scrollback_bytes,
+        image_store_bytes,
+        total_pty_bytes,
+        total_throttled_us,
+    ));
+    let SpawnSpec {
+        argv,
+        cwd,
+        env,
+        size,
+        cell_px,
+        scrollback_limit,
+        marks_key,
+        resize_policy,
+        record_dir,
+        restore_from,
+        image_files,
+        kept,
+    } = sp;
+    ty::<(
+        Vec<String>,
+        Option<String>,
+        Vec<(String, String)>,
+        GridSize,
+        CellPx,
+        u32,
+        Option<MarksKey>,
+        ResizePolicy,
+        Option<String>,
+        Option<String>,
+        bool,
+        bool,
+    )>((
+        argv,
+        cwd,
+        env,
+        size,
+        cell_px,
+        scrollback_limit,
+        marks_key,
+        resize_policy,
+        record_dir,
+        restore_from,
+        image_files,
+        kept,
+    ));
+    let SessionSummary { id, size, alive, kept, rewound, title, cwd, pid, foreground, created_ms } = sum;
+    ty::<(
+        SessionId,
+        GridSize,
+        bool,
+        bool,
+        bool,
+        String,
+        Option<String>,
+        Option<SignalTarget>,
+        Option<ForegroundProcess>,
+        u64,
+    )>((id, size, alive, kept, rewound, title, cwd, pid, foreground, created_ms));
+    let FrameUpdate {
+        seq,
+        epoch,
+        size,
+        first_active_line,
+        scrollback_lines,
+        scroll_delta,
+        cursor,
+        modes,
+        palette,
+        rows,
+        images_gen,
+        full_sync,
+    } = fu;
+    ty::<(
+        u64,
+        u64,
+        GridSize,
+        u64,
+        u64,
+        i32,
+        CursorState,
+        ViewModes,
+        Option<PaletteOverrides>,
+        Vec<PackedRow>,
+        u64,
+        bool,
+    )>((
+        seq,
+        epoch,
+        size,
+        first_active_line,
+        scrollback_lines,
+        scroll_delta,
+        cursor,
+        modes,
+        palette,
+        rows,
+        images_gen,
+        full_sync,
+    ));
+
+    match ss {
+        SignalScope::Leader | SignalScope::Group => {}
+        SignalScope::Pid(t) => ty::<SignalTarget>(t),
+    }
     match sk {
         SignalKind::Hup
         | SignalKind::Int
@@ -2728,17 +2770,14 @@ fn _assert_exhaustive_apack_proto_coverage(
         | SignalKind::Stop
         | SignalKind::Cont => {}
     }
-    match ss {
-        SignalScope::Leader | SignalScope::Group | SignalScope::Pid(_) => {}
-    }
     match ur {
         UnknownReason::NoStatus | UnknownReason::Superseded | UnknownReason::SessionEnded => {}
     }
     match co {
-        CommandOutcome::Running
-        | CommandOutcome::Exited(_)
-        | CommandOutcome::Unknown(_)
-        | CommandOutcome::Claimed(_) => {}
+        CommandOutcome::Running => {}
+        CommandOutcome::Exited(c) => ty::<VouchedExitCode>(c),
+        CommandOutcome::Unknown(r) => ty::<UnknownReason>(r),
+        CommandOutcome::Claimed(c) => ty::<Option<i32>>(c),
     }
     match ec {
         ErrorCode::Handshake
@@ -2754,7 +2793,11 @@ fn _assert_exhaustive_apack_proto_coverage(
         | ErrorCode::Busy => {}
     }
     match lk {
-        LeaseKind::BrokerImmediate | LeaseKind::BrokerGrace { .. } | LeaseKind::Session(_) => {}
+        LeaseKind::BrokerImmediate => {}
+        LeaseKind::BrokerGrace { grace_ms, resume_token } => {
+            ty::<(LeaseGraceMs, ResumeToken)>((grace_ms, resume_token))
+        }
+        LeaseKind::Session(s) => ty::<SessionId>(s),
     }
     match rp {
         ResizePolicy::LatestActive | ResizePolicy::MinFit | ResizePolicy::ExplicitOverride => {}
@@ -2797,143 +2840,379 @@ fn _assert_exhaustive_apack_proto_coverage(
         PasteOutcome::Pasted | PasteOutcome::Unsafe => {}
     }
     match wc {
-        WaitCondition::Idle | WaitCondition::Text(_) | WaitCondition::Status(_) | WaitCondition::Exit => {}
+        WaitCondition::Idle | WaitCondition::Exit => {}
+        WaitCondition::Text(s) => ty::<String>(s),
+        WaitCondition::Status(v) => ty::<Vec<StatusState>>(v),
     }
     match wo {
         WaitOutcome::Met | WaitOutcome::Timeout | WaitOutcome::Exited => {}
     }
     match c {
-        ClientMsg::Hello { protocol_version: _, client_nonce: _, client_name: _ }
-        | ClientMsg::AuthProof { hmac: _ }
-        | ClientMsg::AcquireLease { kind: _ }
-        | ClientMsg::ReleaseLease { lease_id: _ }
-        | ClientMsg::Spawn(_)
-        | ClientMsg::Kill { session: _ }
-        | ClientMsg::Signal { session: _, signal: _, scope: _ }
-        | ClientMsg::Owns { session: _, pid: _ }
-        | ClientMsg::ListSessions
-        | ClientMsg::Rewind { record_dir: _, at_ms: _ }
-        | ClientMsg::Seek { session: _, at_ms: _ }
-        | ClientMsg::Metrics
-        | ClientMsg::Attach {
-            session: _,
-            stream_id: _,
-            flags: _,
-            initial_viewport: _,
-            initial_output_credit: _,
-            initial_frame_credit: _,
+        ClientMsg::Hello { protocol_version, client_nonce, client_name } => {
+            ty::<(u16, [u8; 32], String)>((protocol_version, client_nonce, client_name))
         }
-        | ClientMsg::Detach { stream_id: _ }
-        | ClientMsg::Keep { session: _, kept: _ }
-        | ClientMsg::Wait { session: _, condition: _, timeout_ms: _ }
-        | ClientMsg::FrameAck { seq: _, credit: _ }
-        | ClientMsg::ViewportHint(_)
-        | ClientMsg::ExplicitResize { size: _, cell_px: _ }
-        | ClientMsg::SetCursorDefaults { shape: _, blinking: _ }
-        | ClientMsg::Key(_)
-        | ClientMsg::Text { text: _ }
-        | ClientMsg::Pointer(_)
-        | ClientMsg::Focus { focused: _ }
-        | ClientMsg::Paste { text: _, allow_unsafe: _ }
-        | ClientMsg::Write { data: _ }
+        ClientMsg::AuthProof { hmac } => ty::<[u8; 32]>(hmac),
+        ClientMsg::AcquireLease { kind } => ty::<LeaseKind>(kind),
+        ClientMsg::ReleaseLease { lease_id } => ty::<u64>(lease_id),
+        ClientMsg::Spawn(s) => ty::<Box<SpawnSpec>>(s),
+        ClientMsg::Kill { session } => ty::<SessionId>(session),
+        ClientMsg::Signal { session, signal, scope } => {
+            ty::<(SessionId, SignalKind, SignalScope)>((session, signal, scope))
+        }
+        ClientMsg::Owns { session, pid } => ty::<(SessionId, SignalTarget)>((session, pid)),
+        ClientMsg::ListSessions
+        | ClientMsg::Metrics
         | ClientMsg::Pause
         | ClientMsg::Resume
-        | ClientMsg::OutputCredit { bytes: _ }
-        | ClientMsg::FetchRows { epoch: _, from_line: _, count: _ }
-        | ClientMsg::WordAt { epoch: _, pos: _ }
-        | ClientMsg::LineAt { epoch: _, line: _ }
-        | ClientMsg::TextOf { epoch: _, span: _ }
-        | ClientMsg::TextOfRect { epoch: _, span: _ }
-        | ClientMsg::SetSearch { query: _, case_sensitive: _ }
         | ClientMsg::Commands
-        | ClientMsg::CommandOutput { command_id: _ }
-        | ClientMsg::Images
-        | ClientMsg::GetImageBlob { blob: _, offset: _, max_bytes: _ } => {}
+        | ClientMsg::Images => {}
+        ClientMsg::Rewind { record_dir, at_ms } => ty::<(String, Option<u64>)>((record_dir, at_ms)),
+        ClientMsg::Seek { session, at_ms } => ty::<(SessionId, u64)>((session, at_ms)),
+        ClientMsg::Attach {
+            session,
+            stream_id,
+            flags,
+            initial_viewport,
+            initial_output_credit,
+            initial_frame_credit,
+        } => ty::<(SessionId, NonZeroStreamId, SubFlags, Option<ViewportHint>, u32, FrameCredit)>((
+            session,
+            stream_id,
+            flags,
+            initial_viewport,
+            initial_output_credit,
+            initial_frame_credit,
+        )),
+        ClientMsg::Detach { stream_id } => ty::<NonZeroStreamId>(stream_id),
+        ClientMsg::Keep { session, kept } => ty::<(SessionId, bool)>((session, kept)),
+        ClientMsg::Wait { session, condition, timeout_ms } => {
+            ty::<(SessionId, WaitCondition, u32)>((session, condition, timeout_ms))
+        }
+        ClientMsg::FrameAck { seq, credit } => ty::<(u64, FrameCredit)>((seq, credit)),
+        ClientMsg::ViewportHint(h) => ty::<ViewportHint>(h),
+        ClientMsg::ExplicitResize { size, cell_px } => ty::<(GridSize, CellPx)>((size, cell_px)),
+        ClientMsg::SetCursorDefaults { shape, blinking } => ty::<(CursorShape, bool)>((shape, blinking)),
+        ClientMsg::Key(k) => ty::<KeyInput>(k),
+        ClientMsg::Text { text } => ty::<String>(text),
+        ClientMsg::Pointer(p) => ty::<PointerInput>(p),
+        ClientMsg::Focus { focused } => ty::<bool>(focused),
+        ClientMsg::Paste { text, allow_unsafe } => ty::<(String, bool)>((text, allow_unsafe)),
+        ClientMsg::Write { data } => ty::<Vec<u8>>(data),
+        ClientMsg::OutputCredit { bytes } => ty::<u32>(bytes),
+        ClientMsg::FetchRows { epoch, from_line, count } => ty::<(u64, u64, u32)>((epoch, from_line, count)),
+        ClientMsg::WordAt { epoch, pos } => ty::<(u64, CellPos)>((epoch, pos)),
+        ClientMsg::LineAt { epoch, line } => ty::<(u64, u64)>((epoch, line)),
+        ClientMsg::TextOf { epoch, span } | ClientMsg::TextOfRect { epoch, span } => {
+            ty::<(u64, CellSpan)>((epoch, span))
+        }
+        ClientMsg::SetSearch { query, case_sensitive } => ty::<(String, bool)>((query, case_sensitive)),
+        ClientMsg::CommandOutput { command_id } => ty::<u64>(command_id),
+        ClientMsg::GetImageBlob { blob, offset, max_bytes } => ty::<(BlobHash, u32, u32)>((blob, offset, max_bytes)),
     }
     match b {
-        BrokerMsg::HelloOk {
-            protocol_version: _,
-            auth_required: _,
-            server_nonce: _,
-            word_delimiters: _,
-            capabilities: _,
+        BrokerMsg::HelloOk { protocol_version, auth_required, server_nonce, word_delimiters, capabilities } => {
+            ty::<(u16, bool, [u8; 32], String, u32)>((
+                protocol_version,
+                auth_required,
+                server_nonce,
+                word_delimiters,
+                capabilities,
+            ))
         }
-        | BrokerMsg::AuthOk { server_hmac: _ }
-        | BrokerMsg::Error { code: _, message: _ }
-        | BrokerMsg::Ok
-        | BrokerMsg::LeaseAck { lease_id: _, resumed: _ }
-        | BrokerMsg::Spawned { session: _, pid: _ }
-        | BrokerMsg::OwnsReply { owned: _ }
-        | BrokerMsg::SessionsList { sessions: _ }
-        | BrokerMsg::Rewound { session: _, duration_ms: _, at_ms: _ }
-        | BrokerMsg::Sought { at_ms: _ }
-        | BrokerMsg::MetricsReply(MetricsSnapshot { .. })
-        | BrokerMsg::Attached {
-            session: _,
-            stream_id: _,
-            size: _,
-            epoch: _,
-            first_active_line: _,
-            scrollback_lines: _,
-            foreground: _,
+        BrokerMsg::AuthOk { server_hmac } => ty::<[u8; 32]>(server_hmac),
+        BrokerMsg::Error { code, message } => ty::<(ErrorCode, String)>((code, message)),
+        BrokerMsg::Ok | BrokerMsg::Bell => {}
+        BrokerMsg::LeaseAck { lease_id, resumed } => ty::<(u64, bool)>((lease_id, resumed)),
+        BrokerMsg::Spawned { session, pid } => ty::<(SessionId, Option<SignalTarget>)>((session, pid)),
+        BrokerMsg::OwnsReply { owned } => ty::<bool>(owned),
+        BrokerMsg::SessionsList { sessions } => ty::<Vec<SessionSummary>>(sessions),
+        BrokerMsg::Rewound { session, duration_ms, at_ms } => {
+            ty::<(SessionId, u64, u64)>((session, duration_ms, at_ms))
         }
-        | BrokerMsg::Waited { outcome: _ }
-        | BrokerMsg::Frame(_)
-        | BrokerMsg::Rows { epoch: _, rows: _ }
-        | BrokerMsg::Pasted { outcome: _ }
-        | BrokerMsg::SpanReply { span: _ }
-        | BrokerMsg::TextReply { text: _ }
-        | BrokerMsg::SearchMatches { epoch: _, matches: _, truncated: _ }
-        | BrokerMsg::SearchDelta { epoch: _, from_line: _, to_line: _, added: _, truncated: _ }
-        | BrokerMsg::CommandsReply { commands: _ }
-        | BrokerMsg::CommandOutputReply { text: _ }
-        | BrokerMsg::ImagesReply { images_gen: _, placements: _ }
-        | BrokerMsg::ImageBlobChunk { blob: _, encoding: _, total_bytes: _, offset: _, data: _ }
-        | BrokerMsg::Title { title: _ }
-        | BrokerMsg::Bell
-        | BrokerMsg::Clipboard { selection: _, data: _ }
-        | BrokerMsg::Notification { title: _, body: _ }
-        | BrokerMsg::Progress { state: _, percent: _ }
-        | BrokerMsg::ProgramStatus(_)
-        | BrokerMsg::ProgramStatusCleared { id: _ }
-        | BrokerMsg::CommandStarted(_)
-        | BrokerMsg::CommandFinished(_)
-        | BrokerMsg::CwdChanged { cwd: _ }
-        | BrokerMsg::Exited { exit_code: _, signal: _ }
-        | BrokerMsg::Output { text: _ }
-        | BrokerMsg::Throttled { waited_us: _ }
-        | BrokerMsg::OutputDropped { bytes: _ }
-        | BrokerMsg::StreamClosed { reason: _ } => {}
+        BrokerMsg::Sought { at_ms } => ty::<u64>(at_ms),
+        BrokerMsg::MetricsReply(m) => ty::<MetricsSnapshot>(m),
+        BrokerMsg::Attached { session, stream_id, size, epoch, first_active_line, scrollback_lines, foreground } => {
+            ty::<(SessionId, NonZeroStreamId, GridSize, u64, u64, u64, Option<ForegroundProcess>)>((
+                session,
+                stream_id,
+                size,
+                epoch,
+                first_active_line,
+                scrollback_lines,
+                foreground,
+            ))
+        }
+        BrokerMsg::Waited { outcome } => ty::<WaitOutcome>(outcome),
+        BrokerMsg::Frame(f) => ty::<Box<FrameUpdate>>(f),
+        BrokerMsg::Rows { epoch, rows } => ty::<(u64, Vec<PackedRow>)>((epoch, rows)),
+        BrokerMsg::Pasted { outcome } => ty::<PasteOutcome>(outcome),
+        BrokerMsg::SpanReply { span } => ty::<Option<CellSpan>>(span),
+        BrokerMsg::TextReply { text }
+        | BrokerMsg::Title { title: text }
+        | BrokerMsg::CwdChanged { cwd: text }
+        | BrokerMsg::Output { text }
+        | BrokerMsg::StreamClosed { reason: text }
+        | BrokerMsg::ProgramStatusCleared { id: text } => ty::<String>(text),
+        BrokerMsg::SearchMatches { epoch, matches, truncated } => {
+            ty::<(u64, Vec<CellSpan>, bool)>((epoch, matches, truncated))
+        }
+        BrokerMsg::SearchDelta { epoch, from_line, to_line, added, truncated } => {
+            ty::<(u64, u64, u64, Vec<CellSpan>, bool)>((epoch, from_line, to_line, added, truncated))
+        }
+        BrokerMsg::CommandsReply { commands } => ty::<Vec<CommandRecord>>(commands),
+        BrokerMsg::CommandOutputReply { text } => ty::<Option<String>>(text),
+        BrokerMsg::ImagesReply { images_gen, placements } => ty::<(u64, Vec<ImagePlacement>)>((images_gen, placements)),
+        BrokerMsg::ImageBlobChunk { blob, encoding, total_bytes, offset, data } => {
+            ty::<(BlobHash, ImageEncoding, u32, u32, Vec<u8>)>((blob, encoding, total_bytes, offset, data))
+        }
+        BrokerMsg::Clipboard { selection, data } => ty::<(String, String)>((selection, data)),
+        BrokerMsg::Notification { title, body } => ty::<(String, String)>((title, body)),
+        BrokerMsg::Progress { state, percent } => ty::<(ProgressState, Option<u8>)>((state, percent)),
+        BrokerMsg::ProgramStatus(s) => ty::<Box<StatusRecord>>(s),
+        BrokerMsg::CommandStarted(c) | BrokerMsg::CommandFinished(c) => ty::<Box<CommandRecord>>(c),
+        BrokerMsg::Exited { exit_code, signal } => ty::<(Option<i32>, Option<String>)>((exit_code, signal)),
+        BrokerMsg::Throttled { waited_us } => ty::<u64>(waited_us),
+        BrokerMsg::OutputDropped { bytes } => ty::<u64>(bytes),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
 
     #[test]
-    fn codegen_is_deterministic_unique_tags_and_detects_drift() {
+    fn codegen_is_deterministic_unique_tags_and_matches_apack_proto_msg_types() {
         let first = render_all();
         let second = render_all();
         assert_eq!(first, second, "wire codegen must be 100% deterministic");
 
         // Every ClientMsg and BrokerMsg wire tag must be globally unique.
+        let client_vs = client_msg_variants();
+        let broker_vs = broker_msg_variants();
         let mut seen = HashSet::new();
-        for v in client_msg_variants().into_iter().chain(broker_msg_variants()) {
+        for v in client_vs.iter().chain(broker_vs.iter()) {
             assert!(seen.insert(v.tag), "duplicate MsgType tag {:#06x} for {}", v.tag, v.const_name);
         }
 
-        // Write to tempdir -> check_all passes; mutate 1 byte -> check_all fails naming the drifted file!
-        let tmp = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(tmp.path().join("view/src/wire")).unwrap();
-        write_all(tmp.path()).expect("write_all");
-        check_all(tmp.path()).expect("check_all clean");
+        // Construct EVERY ClientMsg and BrokerMsg variant and verify exact 1:1 msg_type() agreement.
+        let sid = SessionId::new(1).unwrap();
+        let stream = NonZeroStreamId::new(1).unwrap();
+        let size = GridSize::new(80, 24).unwrap();
+        let cell_px = CellPx { width: 8, height: 16 };
+        let pos = CellPos { line: 0, col: 0 };
+        let span = CellSpan { start: pos, end: pos };
+        let credit = FrameCredit { max_frames: 1, max_bytes: 1024 };
+        let vh = ViewportHint { size, cell_px, visible: true, focused: true };
+        let blob = BlobHash([0u8; 32]);
+        let cmd = CommandRecord {
+            id: 1,
+            command: None,
+            cwd: None,
+            started_ms: None,
+            finished_ms: None,
+            outcome: CommandOutcome::Running,
+            prompt_line: None,
+            output_line: None,
+            end_line: None,
+        };
+        let status = StatusRecord {
+            id: String::from("s"),
+            state: StatusState::Idle,
+            kind: None,
+            progress: None,
+            app: None,
+            title: None,
+            message: None,
+            changed: 0,
+            since_ms: 0,
+            confirmed: Confirmed::Unknown,
+        };
 
-        let drifted_path = tmp.path().join("view/src/wire/constants.ts");
-        let orig = std::fs::read_to_string(&drifted_path).unwrap();
-        std::fs::write(&drifted_path, orig.replace("4096", "9999")).unwrap();
-        let err = check_all(tmp.path()).unwrap_err();
-        assert!(err.contains("view/src/wire/constants.ts"), "expected drift error for constants.ts, got: {err}");
+        let all_client: Vec<ClientMsg> = vec![
+            ClientMsg::Hello { protocol_version: 2, client_nonce: [0; 32], client_name: String::new() },
+            ClientMsg::AuthProof { hmac: [0; 32] },
+            ClientMsg::AcquireLease { kind: LeaseKind::BrokerImmediate },
+            ClientMsg::ReleaseLease { lease_id: 1 },
+            ClientMsg::Spawn(Box::new(SpawnSpec {
+                argv: vec![],
+                cwd: None,
+                env: vec![],
+                size,
+                cell_px,
+                scrollback_limit: 0,
+                marks_key: None,
+                resize_policy: ResizePolicy::LatestActive,
+                record_dir: None,
+                restore_from: None,
+                image_files: false,
+                kept: false,
+            })),
+            ClientMsg::Kill { session: sid },
+            ClientMsg::Signal { session: sid, signal: SignalKind::Term, scope: SignalScope::Leader },
+            ClientMsg::Owns { session: sid, pid: SignalTarget::new(1).unwrap() },
+            ClientMsg::ListSessions,
+            ClientMsg::Rewind { record_dir: String::new(), at_ms: None },
+            ClientMsg::Seek { session: sid, at_ms: 0 },
+            ClientMsg::Metrics,
+            ClientMsg::Attach {
+                session: sid,
+                stream_id: stream,
+                flags: SubFlags::from_bits(SubFlags::VIEW).unwrap(),
+                initial_viewport: None,
+                initial_output_credit: 0,
+                initial_frame_credit: credit,
+            },
+            ClientMsg::Detach { stream_id: stream },
+            ClientMsg::Keep { session: sid, kept: false },
+            ClientMsg::Wait { session: sid, condition: WaitCondition::Idle, timeout_ms: 1 },
+            ClientMsg::FrameAck { seq: 1, credit },
+            ClientMsg::ViewportHint(vh),
+            ClientMsg::ExplicitResize { size, cell_px },
+            ClientMsg::SetCursorDefaults { shape: CursorShape::Block, blinking: false },
+            ClientMsg::Key(KeyInput {
+                code: String::from("KeyA"),
+                action: KeyAction::Press,
+                modifiers: 0,
+                text: String::new(),
+                unshifted_codepoint: 0,
+                composed: false,
+            }),
+            ClientMsg::Text { text: String::new() },
+            ClientMsg::Pointer(PointerInput {
+                action: PointerAction::Press,
+                button: 0,
+                modifiers: 0,
+                x_px: 0,
+                y_px: 0,
+                cell_px,
+            }),
+            ClientMsg::Focus { focused: true },
+            ClientMsg::Paste { text: String::new(), allow_unsafe: false },
+            ClientMsg::Write { data: vec![] },
+            ClientMsg::Pause,
+            ClientMsg::Resume,
+            ClientMsg::OutputCredit { bytes: 1 },
+            ClientMsg::FetchRows { epoch: 0, from_line: 0, count: 1 },
+            ClientMsg::WordAt { epoch: 0, pos },
+            ClientMsg::LineAt { epoch: 0, line: 0 },
+            ClientMsg::TextOf { epoch: 0, span },
+            ClientMsg::TextOfRect { epoch: 0, span },
+            ClientMsg::SetSearch { query: String::new(), case_sensitive: false },
+            ClientMsg::Commands,
+            ClientMsg::CommandOutput { command_id: 1 },
+            ClientMsg::Images,
+            ClientMsg::GetImageBlob { blob, offset: 0, max_bytes: 1 },
+        ];
+        assert_eq!(all_client.len(), client_vs.len());
+        for (msg, spec) in all_client.iter().zip(client_vs.iter()) {
+            assert_eq!(msg.msg_type(), spec.tag, "ClientMsg tag mismatch for {}", spec.const_name);
+        }
+
+        let all_broker: Vec<BrokerMsg> = vec![
+            BrokerMsg::HelloOk {
+                protocol_version: 2,
+                auth_required: false,
+                server_nonce: [0; 32],
+                word_delimiters: String::new(),
+                capabilities: 0,
+            },
+            BrokerMsg::AuthOk { server_hmac: [0; 32] },
+            BrokerMsg::Error { code: ErrorCode::Malformed, message: String::new() },
+            BrokerMsg::Ok,
+            BrokerMsg::LeaseAck { lease_id: 1, resumed: false },
+            BrokerMsg::Spawned { session: sid, pid: None },
+            BrokerMsg::OwnsReply { owned: false },
+            BrokerMsg::SessionsList { sessions: vec![] },
+            BrokerMsg::Rewound { session: sid, duration_ms: 0, at_ms: 0 },
+            BrokerMsg::Sought { at_ms: 0 },
+            BrokerMsg::MetricsReply(MetricsSnapshot::default()),
+            BrokerMsg::Attached {
+                session: sid,
+                stream_id: stream,
+                size,
+                epoch: 0,
+                first_active_line: 0,
+                scrollback_lines: 0,
+                foreground: None,
+            },
+            BrokerMsg::Waited { outcome: WaitOutcome::Met },
+            BrokerMsg::Frame(Box::new(FrameUpdate {
+                seq: 1,
+                epoch: 0,
+                size,
+                first_active_line: 0,
+                scrollback_lines: 0,
+                scroll_delta: 0,
+                cursor: CursorState { col: 0, row: 0, shape: CursorShape::Block, blinking: false, hidden: false },
+                modes: ViewModes::default(),
+                palette: None,
+                rows: vec![],
+                images_gen: 0,
+                full_sync: true,
+            })),
+            BrokerMsg::Rows { epoch: 0, rows: vec![] },
+            BrokerMsg::Pasted { outcome: PasteOutcome::Pasted },
+            BrokerMsg::SpanReply { span: None },
+            BrokerMsg::TextReply { text: String::new() },
+            BrokerMsg::SearchMatches { epoch: 0, matches: vec![], truncated: false },
+            BrokerMsg::SearchDelta { epoch: 0, from_line: 0, to_line: 0, added: vec![], truncated: false },
+            BrokerMsg::CommandsReply { commands: vec![] },
+            BrokerMsg::CommandOutputReply { text: None },
+            BrokerMsg::ImagesReply { images_gen: 0, placements: vec![] },
+            BrokerMsg::ImageBlobChunk { blob, encoding: ImageEncoding::Png, total_bytes: 0, offset: 0, data: vec![] },
+            BrokerMsg::Title { title: String::new() },
+            BrokerMsg::Bell,
+            BrokerMsg::Clipboard { selection: String::new(), data: String::new() },
+            BrokerMsg::Notification { title: String::new(), body: String::new() },
+            BrokerMsg::Progress { state: ProgressState::None, percent: None },
+            BrokerMsg::ProgramStatus(Box::new(status)),
+            BrokerMsg::ProgramStatusCleared { id: String::new() },
+            BrokerMsg::CommandStarted(Box::new(cmd.clone())),
+            BrokerMsg::CommandFinished(Box::new(cmd)),
+            BrokerMsg::CwdChanged { cwd: String::new() },
+            BrokerMsg::Exited { exit_code: None, signal: None },
+            BrokerMsg::Output { text: String::new() },
+            BrokerMsg::Throttled { waited_us: 0 },
+            BrokerMsg::OutputDropped { bytes: 0 },
+            BrokerMsg::StreamClosed { reason: String::new() },
+        ];
+        assert_eq!(all_broker.len(), broker_vs.len());
+        for (msg, spec) in all_broker.iter().zip(broker_vs.iter()) {
+            assert_eq!(msg.msg_type(), spec.tag, "BrokerMsg tag mismatch for {}", spec.const_name);
+        }
+    }
+
+    #[test]
+    fn check_all_detects_drift_missing_files_and_handles_crlf() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        // Missing files: reports all 3 missing files at once.
+        let missing_err = check_all(tmp.path()).expect_err("missing files must fail");
+        for rel in TS_WIRE_FILES {
+            assert!(missing_err.contains(rel), "missing error must name {rel}: {missing_err}");
+        }
+
+        // write_all creates parent directories automatically and check_all passes.
+        write_all(tmp.path()).expect("write_all");
+        check_all(tmp.path()).expect("check_all passes after write_all");
+
+        // Windows CRLF line endings pass check_all cleanly.
+        for rel in TS_WIRE_FILES {
+            let p = tmp.path().join(rel);
+            let crlf = std::fs::read_to_string(&p).unwrap().replace('\n', "\r\n");
+            std::fs::write(&p, crlf).unwrap();
+        }
+        check_all(tmp.path()).expect("check_all must normalize CRLF");
+
+        // Drift in every individual generated file is caught and reported by name.
+        for rel in TS_WIRE_FILES {
+            write_all(tmp.path()).expect("restore clean files");
+            let p = tmp.path().join(rel);
+            let mut body = std::fs::read_to_string(&p).unwrap();
+            body.push_str("\n// drift\n");
+            std::fs::write(&p, body).unwrap();
+            let err = check_all(tmp.path()).expect_err("drifted file must fail");
+            assert!(err.contains(rel), "drift error must name {rel}: {err}");
+        }
     }
 }

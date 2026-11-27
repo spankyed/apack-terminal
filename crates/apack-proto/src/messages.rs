@@ -159,9 +159,9 @@ impl SpawnSpec {
 
     fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
         Ok(Self {
-            argv: r.vec_bounded(1024, "spawn argv", Reader::str)?,
+            argv: r.vec_bounded(crate::MAX_SPAWN_ARGV, "spawn argv", Reader::str)?,
             cwd: r.opt(Reader::str)?,
-            env: r.vec_bounded(1024, "spawn env", |r| Ok((r.str()?, r.str()?)))?,
+            env: r.vec_bounded(crate::MAX_SPAWN_ENV, "spawn env", |r| Ok((r.str()?, r.str()?)))?,
             size: GridSize::decode(r)?,
             cell_px: CellPx::decode(r)?,
             scrollback_limit: r.var_u32()?,
@@ -1198,9 +1198,9 @@ impl BrokerMsg {
                 Self::Spawned { session: SessionId::decode(&mut r)?, pid: r.opt(SignalTarget::decode)? }
             }
             msg_type::OWNS_REPLY => Self::OwnsReply { owned: r.bool()? },
-            msg_type::SESSIONS_LIST => {
-                Self::SessionsList { sessions: r.vec_bounded(4096, "sessions list", SessionSummary::decode)? }
-            }
+            msg_type::SESSIONS_LIST => Self::SessionsList {
+                sessions: r.vec_bounded(crate::MAX_SESSIONS_LIST, "sessions list", SessionSummary::decode)?,
+            },
             msg_type::REWOUND => {
                 Self::Rewound { session: SessionId::decode(&mut r)?, duration_ms: r.var_u64()?, at_ms: r.var_u64()? }
             }
@@ -1254,7 +1254,7 @@ impl BrokerMsg {
             msg_type::COMMAND_OUTPUT_REPLY => Self::CommandOutputReply { text: r.opt(Reader::str)? },
             msg_type::IMAGES_REPLY => Self::ImagesReply {
                 images_gen: r.var_u64()?,
-                placements: r.vec_bounded(4096, "image placements", ImagePlacement::decode)?,
+                placements: r.vec_bounded(crate::MAX_IMAGES_REPLY, "image placements", ImagePlacement::decode)?,
             },
             msg_type::IMAGE_BLOB_CHUNK => {
                 let blob = BlobHash::decode(&mut r)?;
@@ -1278,7 +1278,11 @@ impl BrokerMsg {
                 let state = ProgressState::decode(&mut r)?;
                 let percent = r.opt(|r| {
                     let p = r.u8()?;
-                    if p > 100 { Err(WireError::InvalidValue("progress percent > 100")) } else { Ok(p) }
+                    if p > crate::MAX_PROGRESS_PERCENT {
+                        Err(WireError::InvalidValue("progress percent > 100"))
+                    } else {
+                        Ok(p)
+                    }
                 })?;
                 if percent.is_some() && matches!(state, ProgressState::None | ProgressState::Indeterminate) {
                     return Err(WireError::InvalidValue("progress percent invalid for state"));
