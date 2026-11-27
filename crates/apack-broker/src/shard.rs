@@ -1917,7 +1917,10 @@ impl ShardRunner {
     fn drain_tail_pty_bytes(&mut self, session_id: SessionId) {
         #[cfg(unix)]
         {
-            let mut buf = std::mem::take(&mut self.read_buf);
+            // Use a fresh buffer instead of taking `self.read_buf` so re-entrant calls from
+            // `read_unix_pty_quantum -> apply_effects -> drain_pty_writes_for -> try_reap_session`
+            // never see a 0-length `self.read_buf`.
+            let mut buf = vec![0u8; PTY_READ_BUF_BYTES];
             let mut chunks = Vec::new();
             if let Some(LivePty::Unix { master, eof: false, .. }) =
                 self.sessions.get(&session_id).and_then(|s| s.pty.as_ref())
@@ -1926,7 +1929,6 @@ impl ShardRunner {
                     chunks.push(chunk.to_vec());
                 });
             }
-            self.read_buf = buf;
             for chunk in chunks {
                 self.ingest_pty_bytes(session_id, &chunk);
             }
@@ -2154,6 +2156,9 @@ pub(crate) fn drain_unix_pty_nonblocking(
     mut budget: usize,
     mut on_bytes: impl FnMut(&[u8]),
 ) {
+    if buf.is_empty() {
+        return;
+    }
     while budget != 0 {
         let cap = budget.min(buf.len());
         match master.read_nonblocking(&mut buf[..cap]) {
@@ -2835,5 +2840,39 @@ mod image_source_shard_tests {
         }
         runner.ingest_pty_bytes(sid2, b"TEARDOWN_AFTER_PENDING");
         assert!(runner.sessions[&sid2].machine.vt().text_of(full_span, 4096).contains("TEARDOWN_AFTER_PENDING"));
+
+        // Direct check of `drain_tail_pty_bytes` on a real Unix PTY master (no poller reads first).
+        #[cfg(unix)]
+        {
+            let sid3 = SessionId::new(3).unwrap();
+            insert_image_session(&mut runner, sid3, false);
+            let pty_cfg = PtySpawnConfig {
+                size: GridSize::new(80, 24).unwrap(),
+                cell_px: CellPx { width: 8, height: 16 },
+                shell: Some(String::from("/bin/sh")),
+                args: vec![String::from("-c"), String::from("printf 'DRAIN_TAIL_UNIT_OK'")],
+                env: Vec::new(),
+                unset: Vec::new(),
+                cwd: None,
+            };
+            let mut spawned = spawn_pty(&pty_cfg).expect("spawn pty");
+            runner.sessions.get_mut(&sid3).unwrap().pty = Some(LivePty::Unix {
+                master: spawned.master,
+                token: PollToken(sid3.get()),
+                eof: false,
+                write_broken: false,
+            });
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                runner.drain_tail_pty_bytes(sid3);
+                if runner.sessions[&sid3].machine.vt().text_of(full_span, 4096).contains("DRAIN_TAIL_UNIT_OK") {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(runner.sessions[&sid3].machine.vt().text_of(full_span, 4096).contains("DRAIN_TAIL_UNIT_OK"));
+            runner.sessions.get_mut(&sid3).unwrap().pty = None;
+            let _ = spawned.child.wait();
+        }
     }
 }

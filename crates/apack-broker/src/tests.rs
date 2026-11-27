@@ -1954,6 +1954,8 @@ fn e2e_leases_kept_pinning_tier2_compression_foreground_verify_and_kill_escalati
             cwd: None,
         };
         let mut spawned = apack_os::pty::spawn_pty(&pty_cfg).unwrap();
+        // Empty scratch slice must return immediately without spinning on `Bytes(0)`.
+        drain_unix_pty_nonblocking(&spawned.master, &mut [], 256, |_| panic!("empty buffer must not emit chunks"));
         let mut drained = Vec::new();
         let mut scratch = [0u8; 256];
         for _ in 0..50 {
@@ -2774,75 +2776,83 @@ fn kitty_image_sources_e2e_file_shm_security_and_teardown() {
         client.kill(s_ok).unwrap();
         assert!(t_kill.elapsed() < Duration::from_secs(2));
 
-        // 4. Short-lived child printing a DSR reply-trigger + refused `t=f` (which triggers a
-        //    PTY refusal reply on completion -> Unix `EIO` after exit) + valid `t=f` + trailing
-        //    text and exiting IMMEDIATELY still completes both off-shard loads and drains
-        //    `FAST_EXIT_OK` before `Exited` (pipelined `Wait(Text)` MUST return `WaitOutcome::Met`).
+        // 4a. Path B: short-lived child printing ONLY a refused `t=f` (`q=0`, so `write_broken`
+        //     stays `false` until `handle_image_source_loaded` enqueues its refusal reply and hits
+        //     Unix `EIO`) + trailing text, exiting immediately -> must NOT reap before `FAST_EXIT_B`!
         let b64_missing =
             String::from_utf8(encoded(tmp.path().join("no-such-img.rgba").as_os_str().as_bytes())).unwrap();
-        let seq_fast = tmp.path().join("seq-fast.bin");
-        std::fs::write(
-            &seq_fast,
-            format!(
-                "\x1b[6n\
-                 \x1b_Ga=T,f=32,s=2,v=2,i=30,q=0,t=f;{b64_missing}\x1b\\\
-                 \x1b_Ga=T,f=32,s=2,v=2,i=31,t=f;{b64_ok}\x1b\\\
-                 FAST_EXIT_OK\r\n"
+        for (idx, (seq_name, payload, marker, stream_num)) in [
+            (
+                "seq-fast-b.bin",
+                format!("\x1b_Ga=T,f=32,s=2,v=2,i=30,q=0,t=f;{b64_missing}\x1b\\FAST_EXIT_B\r\n"),
+                "FAST_EXIT_B",
+                3u32,
             ),
-        )
-        .unwrap();
-        let mut spec_fast = echo_command_spec("x", None, None);
-        spec_fast.argv = vec![
-            String::from("/bin/sh"),
-            String::from("-c"),
-            format!("printf 'FAST_READY\\r\\n'; read _go; cat '{}'", seq_fast.display()),
-        ];
-        spec_fast.image_files = true;
-        let (s_fast, _) = client.spawn(spec_fast).unwrap();
-        assert_eq!(
-            client.wait(s_fast, WaitCondition::Text(String::from("FAST_READY")), 5_000).unwrap(),
-            WaitOutcome::Met
-        );
-        let st_fast = NonZeroStreamId::new(3).unwrap();
-        client
-            .attach(
-                s_fast,
-                st_fast,
-                SubFlags::from_bits(SubFlags::EVENTS).unwrap(),
-                None,
-                0,
-                FrameCredit { max_frames: 16, max_bytes: 1 << 20 },
-            )
-            .unwrap();
-        let wait_req = client.alloc_req_id();
-        client
-            .send_raw(
-                apack_proto::types::StreamId::CONTROL,
-                wait_req,
-                &ClientMsg::Wait {
-                    session: s_fast,
-                    condition: WaitCondition::Text(String::from("FAST_EXIT_OK")),
-                    timeout_ms: 5_000,
-                },
-            )
-            .unwrap();
-        client.send_raw(st_fast.as_stream_id(), RequestId::PUSH, &ClientMsg::Write { data: b"go\n".to_vec() }).unwrap();
-        assert_eq!(
-            client.wait_reply(wait_req).unwrap(),
-            BrokerMsg::Waited { outcome: WaitOutcome::Met },
-            "deferred natural exit must complete off-shard t=f load and drain FAST_EXIT_OK before Exited"
-        );
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            if !client.list_sessions().unwrap().iter().any(|s| s.id == s_fast) {
-                break;
+            (
+                "seq-fast-a.bin",
+                format!("\x1b[6n\x1b_Ga=T,f=32,s=2,v=2,i=31,t=f;{b64_ok}\x1b\\FAST_EXIT_A\r\n"),
+                "FAST_EXIT_A",
+                4u32,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let seq_fast = tmp.path().join(seq_name);
+            std::fs::write(&seq_fast, payload).unwrap();
+            let ready_tok = format!("FAST_READY_{idx}");
+            let mut spec_fast = echo_command_spec("x", None, None);
+            spec_fast.argv = vec![
+                String::from("/bin/sh"),
+                String::from("-c"),
+                format!("printf '{ready_tok}\\r\\n'; read _go; cat '{}'", seq_fast.display()),
+            ];
+            spec_fast.image_files = true;
+            let (s_fast, _) = client.spawn(spec_fast).unwrap();
+            assert_eq!(client.wait(s_fast, WaitCondition::Text(ready_tok), 5_000).unwrap(), WaitOutcome::Met);
+            let st_fast = NonZeroStreamId::new(stream_num).unwrap();
+            client
+                .attach(
+                    s_fast,
+                    st_fast,
+                    SubFlags::from_bits(SubFlags::EVENTS).unwrap(),
+                    None,
+                    0,
+                    FrameCredit { max_frames: 16, max_bytes: 1 << 20 },
+                )
+                .unwrap();
+            let wait_req = client.alloc_req_id();
+            client
+                .send_raw(
+                    apack_proto::types::StreamId::CONTROL,
+                    wait_req,
+                    &ClientMsg::Wait {
+                        session: s_fast,
+                        condition: WaitCondition::Text(String::from(marker)),
+                        timeout_ms: 5_000,
+                    },
+                )
+                .unwrap();
+            client
+                .send_raw(st_fast.as_stream_id(), RequestId::PUSH, &ClientMsg::Write { data: b"go\n".to_vec() })
+                .unwrap();
+            assert_eq!(
+                client.wait_reply(wait_req).unwrap(),
+                BrokerMsg::Waited { outcome: WaitOutcome::Met },
+                "deferred natural exit must complete off-shard t=f load and drain {marker} before Exited"
+            );
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                if !client.list_sessions().unwrap().iter().any(|s| s.id == s_fast) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
             }
-            std::thread::sleep(Duration::from_millis(20));
+            assert!(
+                !client.list_sessions().unwrap().iter().any(|s| s.id == s_fast),
+                "short-lived image_files session must exit cleanly after deferred load completes ({marker})"
+            );
         }
-        assert!(
-            !client.list_sessions().unwrap().iter().any(|s| s.id == s_fast),
-            "short-lived image_files session must exit cleanly after deferred load completes"
-        );
     }
 
     #[cfg(windows)]
