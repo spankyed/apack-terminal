@@ -39,6 +39,7 @@ impl ShardRunner {
     ) {
         let mut views_dirty = false;
         let mut write_ready = false;
+        let mut fg_dirty = false;
 
         for effect in effects {
             match effect {
@@ -74,7 +75,8 @@ impl ShardRunner {
                     views_dirty = true;
                 }
                 SessionEffect::VerifyForeground { id, changed, app } => {
-                    self.dispatch_verify_foreground(session_id, id, changed, app);
+                    self.fg_pending.entry(session_id).or_default().insert(id, (changed, app));
+                    fg_dirty = true;
                 }
                 SessionEffect::FetchImageBlob { conn, stream_id, attachment, req_id, blob, offset, max_bytes } => {
                     let mut chunk_opt = {
@@ -125,39 +127,63 @@ impl ShardRunner {
         if views_dirty {
             self.try_publish_dirty_views(session_id);
         }
+        if fg_dirty {
+            self.flush_pending_fg_verify(session_id);
+        }
     }
 
-    pub(super) fn dispatch_verify_foreground(&mut self, session_id: SessionId, id: String, changed: u64, app: String) {
-        let pgid = match self.sessions.get(&session_id).and_then(|s| s.pty.as_ref()) {
+    pub(super) fn flush_all_pending_fg_verify(&mut self) {
+        let pending_ids: Vec<SessionId> = self.fg_pending.keys().copied().collect();
+        for sid in pending_ids {
+            self.flush_pending_fg_verify(sid);
+        }
+    }
+
+    pub(super) fn flush_pending_fg_verify(&mut self, session_id: SessionId) {
+        if self.fg_inflight.contains(&session_id) {
+            return;
+        }
+        let Some(items_map) = self.fg_pending.remove(&session_id) else {
+            return;
+        };
+        let Some(sess) = self.sessions.get(&session_id) else {
+            return;
+        };
+        let pgid = match sess.pty.as_ref() {
             #[cfg(unix)]
             Some(LivePty::Unix { master, .. }) => master.foreground_pgid(),
             _ => None,
         };
-        // Dispatch off-shard onto the bounded foreground worker (never block hot shard on sysinfo!),
-        // allowing at most one in-flight verification per session (coalescing any newer update).
+        // Dispatch all pending status verifications for `session_id` as one off-shard batch (one
+        // `argv_for_pid` lookup per session, zero hot-shard sysinfo blocking, and zero dropped slots).
         if let Some(tx) = &self.fg_tx {
-            if !self.fg_inflight.insert(session_id) {
-                self.fg_pending.insert(session_id, (id, changed, app));
-                return;
+            let items: Vec<(String, u64, String)> =
+                items_map.iter().map(|(id, (changed, app))| (id.clone(), *changed, app.clone())).collect();
+            match tx.try_send(FgVerifyReq { session_id, pgid, items }) {
+                Ok(()) => {
+                    self.fg_inflight.insert(session_id);
+                    return;
+                }
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                    // Retain in `fg_pending` and retry as soon as any in-flight verification completes;
+                    // never degrade a spoofed `app=` to `Confirmed::Unknown` under transient backpressure.
+                    self.fg_pending.insert(session_id, items_map);
+                    return;
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
             }
-            if tx.try_send(FgVerifyReq { session_id, pgid, id: id.clone(), changed, app }).is_ok() {
-                return;
-            }
-            self.fg_inflight.remove(&session_id);
         }
-        // Fallback when `fg_tx` is absent or saturated: resolve as `Confirmed::Unknown` via the
-        // shard mailbox so `pending_verify` never stalls a `WaitCondition::Status` waiter forever.
+        // Fallback ONLY when `fg_tx` is absent or disconnected: resolve as `Confirmed::Unknown`
+        // so `pending_verify` cannot deadlock a `WaitCondition::Status` waiter forever.
+        let results: Vec<(String, u64, apack_proto::types::Confirmed)> = items_map
+            .into_iter()
+            .map(|(id, (changed, _))| (id, changed, apack_proto::types::Confirmed::Unknown))
+            .collect();
         {
             let mut state = self.mailbox.lock().unwrap_or_else(|e| e.into_inner());
-            state.queue.push_back((
-                super::ShardCmd::ForegroundVerified {
-                    session_id,
-                    id,
-                    changed,
-                    confirmed: apack_proto::types::Confirmed::Unknown,
-                },
-                None,
-            ));
+            state
+                .queue
+                .push_back((super::ShardCmd::ForegroundVerified { session_id, results, from_worker: false }, None));
             state.woken = true;
         }
         self.self_wake.wake();
@@ -289,14 +315,19 @@ impl ShardRunner {
             has_raw_subs = !sess.raw_output_subs.is_empty();
 
             let prev_marks_seq = sess.machine.marks_last_seq();
+            let mut wal_scanner_bytes: Option<Vec<u8>> = None;
             if let Some(mut scanner) = sess.image_scanner.take() {
                 let mut rest = bytes;
                 consumed = 0;
+                let mut fed_bytes = if sess.wal.is_some() { Vec::with_capacity(bytes.len()) } else { Vec::new() };
                 while !rest.is_empty() {
                     if !scanner.reading() {
                         let (n, entered_apc) =
                             sess.machine.on_vt_feed_with(now, &mut effects, |vt, evs| vt.feed_until_apc(rest, evs));
                         debug_assert!(n != 0 || entered_apc);
+                        if sess.wal.is_some() {
+                            fed_bytes.extend_from_slice(&rest[..n]);
+                        }
                         rest = &rest[n..];
                         consumed = consumed.saturating_add(n);
                         if entered_apc {
@@ -309,6 +340,9 @@ impl ShardRunner {
                         rest = &rest[n..];
                         consumed = consumed.saturating_add(n);
                         if !passthrough.is_empty() {
+                            if sess.wal.is_some() {
+                                fed_bytes.extend_from_slice(&passthrough);
+                            }
                             sess.machine.on_vt_feed_with(now, &mut effects, |vt, evs| vt.feed(&passthrough, evs));
                         }
                         if let Some(load) = maybe_load
@@ -320,6 +354,9 @@ impl ShardRunner {
                     }
                 }
                 sess.image_scanner = Some(scanner);
+                if sess.wal.is_some() {
+                    wal_scanner_bytes = Some(fed_bytes);
+                }
             } else {
                 sess.machine.on_pty_output(bytes, now, &mut effects);
             }
@@ -331,7 +368,10 @@ impl ShardRunner {
                 let at_ground = sess.machine.vt().at_ground();
                 super::replay::sync_wal_image_blobs(sess, &self.shared.image_store);
                 if let Some(wal) = &sess.wal {
-                    let _ = wal.write_output(now_ms, committed.to_vec(), at_ground);
+                    let wal_chunk = wal_scanner_bytes.unwrap_or_else(|| committed.to_vec());
+                    if !wal_chunk.is_empty() {
+                        let _ = wal.write_output(now_ms, wal_chunk, at_ground);
+                    }
                     if marks_seq != prev_marks_seq {
                         let _ = wal.write_marks(now_ms, marks_key, marks_seq);
                     }

@@ -8,16 +8,20 @@ use apack_core::marks::MarksMode;
 use apack_core::session::{ReplayRecord, RestoreKeyframe, SessionEffect, SessionMachine};
 use apack_core::time::TimestampMs;
 use apack_core::vt::VtEngine;
-use apack_proto::types::{CellPx, GridSize, ImageEncoding, MarksKey, PackedRow};
+use apack_proto::types::{CellPx, GridSize, ImageEncoding, MarksKey, PackedRow, ResizePolicy, SessionId};
 use apack_vt_ghostty::{GhosttyConfig, GhosttyEngine, GhosttyError, ImageStore};
 use apack_wal::{
     EngineCheckpoint, KeyframeV2, MAX_ENGINE_SNAPSHOT_BYTES, MAX_KEYFRAME_HISTORY_ROWS, RecordingRegistry, SeekSlice,
     VisualKeyframe, WalReader, WalRecord,
 };
 
+use crate::now_unix_ms;
+
 use super::LiveSession;
 
-/// Persists any newly created image blobs referenced by `sess.machine` into `sess.wal` (`<dir>/blobs/`).
+/// Persists any newly created image blobs (direct + virtual `U=1`) referenced by `sess.machine`
+/// into `sess.wal` (`<dir>/blobs/`), rehydrating from `GhosttyEngine` on `ImageStore` eviction
+/// and retrying automatically if `WalWorker` is transiently backlogged.
 pub(super) fn sync_wal_image_blobs(sess: &mut LiveSession, image_store: &Arc<Mutex<ImageStore>>) {
     let Some(wal) = &sess.wal else {
         return;
@@ -26,22 +30,34 @@ pub(super) fn sync_wal_image_blobs(sess: &mut LiveSession, image_store: &Arc<Mut
     if cur_gen == sess.wal_images_gen {
         return;
     }
-    sess.wal_images_gen = cur_gen;
-    let placements = sess.machine.vt().images();
-    let mut store = image_store.lock().unwrap_or_else(|e| e.into_inner());
-    let mut active = HashSet::with_capacity(placements.len());
-    for p in placements {
-        active.insert(p.blob);
-        if sess.wal_written_blobs.contains(&p.blob) {
+    let blobs = sess.machine.vt().active_image_blobs();
+    let mut active = HashSet::with_capacity(blobs.len());
+    let mut all_persisted = true;
+    for blob in blobs {
+        active.insert(blob);
+        if sess.wal_written_blobs.contains(&blob) {
             continue;
         }
-        if let Some((encoding, bytes)) = store.get_blob(p.blob)
+        let mut loaded = {
+            let mut store = image_store.lock().unwrap_or_else(|e| e.into_inner());
+            store.get_blob(blob)
+        };
+        if loaded.is_none() && sess.machine.vt_mut().rehydrate_image_blob(blob) {
+            let mut store = image_store.lock().unwrap_or_else(|e| e.into_inner());
+            loaded = store.get_blob(blob);
+        }
+        if let Some((encoding, bytes)) = loaded
             && wal.write_blob(encoding, bytes)
         {
-            sess.wal_written_blobs.insert(p.blob);
+            sess.wal_written_blobs.insert(blob);
+        } else {
+            all_persisted = false;
         }
     }
     sess.wal_written_blobs.retain(|h| active.contains(h));
+    if all_persisted {
+        sess.wal_images_gen = cur_gen;
+    }
 }
 
 /// Checks for pending WAL rollover and starts a fresh keyframe segment once the VT is at ground.
@@ -102,46 +118,90 @@ pub(crate) fn capture_keyframe(machine: &SessionMachine<GhosttyEngine>, abi_hash
     KeyframeV2 { visual, engine }
 }
 
-/// Loads any image blobs referenced by `slice.keyframe.visual.images` from `<dir>/blobs/` into `image_store`.
+/// Loads every image blob referenced by `slice.keyframe` (direct placements AND virtual `U=1`
+/// row pieces) from `<dir>/blobs/` into `image_store`.
 pub(crate) fn hydrate_slice_blobs(reader: &WalReader, slice: &SeekSlice, image_store: &Arc<Mutex<ImageStore>>) {
-    for img in &slice.keyframe.visual.images {
+    for blob in slice.keyframe.referenced_blobs() {
         let already = {
             let mut store = image_store.lock().unwrap_or_else(|e| e.into_inner());
-            store.touch(img.blob)
+            store.touch(blob)
         };
-        if !already && let Ok(bytes) = reader.read_blob(img.blob, ImageEncoding::Png) {
+        if !already && let Ok(bytes) = reader.read_blob(blob, ImageEncoding::Png) {
             let mut store = image_store.lock().unwrap_or_else(|e| e.into_inner());
             let _ = store.insert_encoded(ImageEncoding::Png, bytes);
         }
     }
 }
 
-fn feed_visual_rows(engine: &mut GhosttyEngine, rows: &[PackedRow]) {
+/// Reconstructs sanitized printable text for a [`PackedRow`], stripping all C0 (`< 0x20`, `0x7F`)
+/// and C1 (`U+0080..=U+009F`) control characters and preserving `col_start` column offsets.
+fn reconstruct_visual_row(row: &PackedRow) -> (String, u16) {
+    if row.runs.is_empty() {
+        let clean: String = row.text.chars().filter(|c| !c.is_control()).collect();
+        return (clean, 0);
+    }
+    let mut out = String::with_capacity(row.text.len());
+    let mut cur_col = 0u16;
+    for run in &row.runs {
+        for _ in cur_col..run.col_start {
+            out.push(' ');
+        }
+        cur_col = cur_col.max(run.col_start);
+        let start = run.byte_offset as usize;
+        let end = start.saturating_add(run.byte_len as usize);
+        if let Some(slice) = row.text.get(start..end) {
+            for ch in slice.chars() {
+                if !ch.is_control() {
+                    out.push(ch);
+                }
+            }
+        }
+        cur_col = cur_col.saturating_add(run.col_len);
+    }
+    (out, cur_col)
+}
+
+fn feed_primary_visual_rows(engine: &mut GhosttyEngine, rows: &[PackedRow], cols: u16) {
     let mut events = Vec::new();
-    let mut prev_wrapped = false;
+    let mut prev_wrapped_full = false;
     for (idx, row) in rows.iter().enumerate() {
-        if idx > 0 && !prev_wrapped {
+        if idx > 0 && !prev_wrapped_full {
             events.clear();
             engine.feed(b"\r\n", &mut events);
         }
-        if !row.text.is_empty() {
+        let (clean, end_col) = reconstruct_visual_row(row);
+        if !clean.is_empty() {
             events.clear();
-            engine.feed(row.text.as_bytes(), &mut events);
+            engine.feed(clean.as_bytes(), &mut events);
         }
-        prev_wrapped = (row.flags & PackedRow::FLAG_WRAPPED) != 0;
+        prev_wrapped_full = (row.flags & PackedRow::FLAG_WRAPPED) != 0 && end_col >= cols;
     }
 }
 
-/// Reconstructs visible primary/alt screen text and cursor position when the `libghostty-vt`
+fn feed_alt_visual_rows(engine: &mut GhosttyEngine, rows: &[PackedRow], max_rows: u16) {
+    let mut events = Vec::new();
+    for (idx, row) in rows.iter().take(usize::from(max_rows)).enumerate() {
+        let (clean, _) = reconstruct_visual_row(row);
+        if !clean.is_empty() {
+            let pos = format!("\x1b[{};1H", idx + 1);
+            events.clear();
+            engine.feed(pos.as_bytes(), &mut events);
+            events.clear();
+            engine.feed(clean.as_bytes(), &mut events);
+        }
+    }
+}
+
+/// Reconstructs visible primary/alt screen text and cursor position safely when the `libghostty-vt`
 /// binary snapshot ABI hash is absent or incompatible.
 pub(crate) fn apply_visual_fallback(engine: &mut GhosttyEngine, visual: &VisualKeyframe) {
     let mut events = Vec::new();
     engine.resize(visual.size, visual.cell_px, &mut events);
-    feed_visual_rows(engine, &visual.primary_rows);
+    feed_primary_visual_rows(engine, &visual.primary_rows, visual.size.cols.get());
     if visual.active_alt_screen {
         events.clear();
         engine.feed(b"\x1b[?1049h", &mut events);
-        feed_visual_rows(engine, &visual.alt_rows);
+        feed_alt_visual_rows(engine, &visual.alt_rows, visual.size.rows.get());
     }
     let move_cursor = format!("\x1b[{};{}H", visual.cursor.row.saturating_add(1), visual.cursor.col.saturating_add(1));
     events.clear();
@@ -169,14 +229,10 @@ pub(crate) fn build_keyframe_engine(
     Ok(engine)
 }
 
-pub(crate) fn restore_machine_from_slice(
-    machine: &mut SessionMachine<GhosttyEngine>,
-    fresh_engine: GhosttyEngine,
+fn slice_to_replay_inputs(
     slice: &SeekSlice,
     trailing_resize: Option<(GridSize, CellPx)>,
-    emit_status_events: bool,
-    effects: &mut Vec<SessionEffect>,
-) {
+) -> (RestoreKeyframe, Vec<ReplayRecord<'_>>) {
     let visual = &slice.keyframe.visual;
     let restore_kf = RestoreKeyframe {
         cell_px: visual.cell_px,
@@ -200,6 +256,27 @@ pub(crate) fn restore_machine_from_slice(
     if let Some((size, cell_px)) = trailing_resize {
         tail.push(ReplayRecord::Resize { size, cell_px });
     }
+    (restore_kf, tail)
+}
+
+pub(super) fn build_machine_from_slice(
+    session_id: SessionId,
+    fresh_engine: GhosttyEngine,
+    slice: &SeekSlice,
+) -> SessionMachine<GhosttyEngine> {
+    let (restore_kf, tail) = slice_to_replay_inputs(slice, None);
+    SessionMachine::from_replay(session_id, fresh_engine, ResizePolicy::ExplicitOverride, restore_kf, &tail)
+}
+
+pub(crate) fn restore_machine_from_slice(
+    machine: &mut SessionMachine<GhosttyEngine>,
+    fresh_engine: GhosttyEngine,
+    slice: &SeekSlice,
+    trailing_resize: Option<(GridSize, CellPx)>,
+    emit_status_events: bool,
+    effects: &mut Vec<SessionEffect>,
+) {
+    let (restore_kf, tail) = slice_to_replay_inputs(slice, trailing_resize);
     machine.restore_from_replay(fresh_engine, restore_kf, &tail, emit_status_events, effects);
 }
 
@@ -225,6 +302,6 @@ pub(super) fn restore_machine_from_dir(
     let mut effects = Vec::new();
     restore_machine_from_slice(machine, fresh_engine, &slice, Some((target_size, target_cell_px)), false, &mut effects);
     let live_mode = live_marks_key.map_or(MarksMode::Claimed, MarksMode::Keyed);
-    machine.set_live_marks_mode(live_mode);
+    machine.prepare_for_live_after_restore(live_mode, TimestampMs::from_millis(now_unix_ms()));
     Ok(())
 }

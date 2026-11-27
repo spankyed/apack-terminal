@@ -400,9 +400,13 @@ impl<V: VtEngine> SessionMachine<V> {
         self.statuses.all()
     }
 
-    /// Updates the live shell-marker trust mode after restoring from a historical recording.
-    pub fn set_live_marks_mode(&mut self, mode: MarksMode) {
-        self.marks.set_live_mode(mode);
+    /// Transitions a historically restored session into a fresh live shell process:
+    /// finalizes any in-flight recorded command, resets shell sequence tracking for the new shell,
+    /// and clears active (`Idle`/`Working`/`Blocked`) statuses from the dead recording.
+    pub fn prepare_for_live_after_restore(&mut self, mode: MarksMode, now: TimestampMs) {
+        self.marks.prepare_for_live_after_restore(mode, now);
+        let mut ignored = Vec::new();
+        self.statuses.on_session_exit(&mut ignored);
     }
 
     /// Returns the current arbitrated grid size.
@@ -413,6 +417,21 @@ impl<V: VtEngine> SessionMachine<V> {
     /// Returns the current arbitrated cell pixel dimensions.
     pub fn current_cell_px(&self) -> CellPx {
         self.current_cell_px
+    }
+
+    /// Creates a new [`SessionMachine`] directly from a hydrated WAL keyframe engine and tail records
+    /// without allocating a throwaway VT engine first.
+    pub fn from_replay(
+        id: SessionId,
+        vt: V,
+        resize_policy: ResizePolicy,
+        keyframe: RestoreKeyframe,
+        tail: &[ReplayRecord<'_>],
+    ) -> Self {
+        let mut machine = Self::new(id, vt, resize_policy, keyframe.marks_mode, keyframe.cell_px);
+        let mut ignored = Vec::new();
+        machine.apply_replay_tail(keyframe, tail, false, &mut ignored);
+        machine
     }
 
     /// Transactionally replaces the VT engine from a WAL keyframe and replays `tail` through
@@ -437,7 +456,42 @@ impl<V: VtEngine> SessionMachine<V> {
             self.timers.cancel(tid);
         }
         self.sync_hold_started = None;
-        self.title.clear();
+
+        self.apply_replay_tail(keyframe, tail, emit_status_events, effects);
+
+        // Guarantee monotonic epoch even if `fresh_vt` started below `min_epoch`.
+        self.vt.ensure_min_epoch(min_epoch);
+
+        for view in self.views.values_mut() {
+            view.needs_full_sync = true;
+            view.dirty_rows.clear();
+            view.scroll_delta = 0;
+        }
+
+        let new_epoch = self.vt.meta().epoch;
+        if !self.searches.is_empty() {
+            if let Some(tid) = self.search_flush_timer.take() {
+                self.timers.cancel(tid);
+            }
+            for watch in self.searches.values_mut() {
+                watch.epoch = new_epoch;
+                watch.needs_full_refresh = true;
+                watch.dirty_range = None;
+            }
+            self.flush_searches(effects);
+        }
+
+        self.notify_views_dirty(effects);
+    }
+
+    fn apply_replay_tail(
+        &mut self,
+        keyframe: RestoreKeyframe,
+        tail: &[ReplayRecord<'_>],
+        emit_status_events: bool,
+        effects: &mut Vec<SessionEffect>,
+    ) {
+        let prev_title = core::mem::take(&mut self.title);
 
         self.marks.restore_from_keyframe(
             keyframe.marks_mode,
@@ -480,10 +534,18 @@ impl<V: VtEngine> SessionMachine<V> {
                             VtEvent::Osc133 { payload, cursor_line } => {
                                 mark_effects.clear();
                                 self.marks.on_osc133(&payload, cursor_line, *at_ms, &mut mark_effects);
+                                if mark_effects.iter().any(|m| matches!(m, MarkEffect::CommandFinished(_))) {
+                                    status_effects.clear();
+                                    self.statuses.on_session_exit(&mut status_effects);
+                                }
                             }
                             VtEvent::Osc633 { payload, cursor_line } => {
                                 mark_effects.clear();
                                 self.marks.on_osc633(&payload, cursor_line, *at_ms, &mut mark_effects);
+                                if mark_effects.iter().any(|m| matches!(m, MarkEffect::CommandFinished(_))) {
+                                    status_effects.clear();
+                                    self.statuses.on_session_exit(&mut status_effects);
+                                }
                             }
                             VtEvent::ProgramStatus(update) => {
                                 status_effects.clear();
@@ -516,37 +578,17 @@ impl<V: VtEngine> SessionMachine<V> {
             }
         }
 
-        // Guarantee monotonic epoch even if `fresh_vt` started below `min_epoch`.
-        self.vt.ensure_min_epoch(min_epoch);
         let _ = self.vt.take_dirty_viewport();
         self.statuses.finish_replay_verification();
 
         if emit_status_events {
+            if self.title != prev_title {
+                self.broadcast_event(BrokerMsg::Title { title: self.title.clone() }, effects);
+            }
             for rec in self.statuses.all() {
                 self.broadcast_event(BrokerMsg::ProgramStatus(Box::new(rec)), effects);
             }
         }
-
-        for view in self.views.values_mut() {
-            view.needs_full_sync = true;
-            view.dirty_rows.clear();
-            view.scroll_delta = 0;
-        }
-
-        let new_epoch = self.vt.meta().epoch;
-        if !self.searches.is_empty() {
-            if let Some(tid) = self.search_flush_timer.take() {
-                self.timers.cancel(tid);
-            }
-            for watch in self.searches.values_mut() {
-                watch.epoch = new_epoch;
-                watch.needs_full_refresh = true;
-                watch.dirty_range = None;
-            }
-            self.flush_searches(effects);
-        }
-
-        self.notify_views_dirty(effects);
     }
 
     /// Returns the earliest pending timer deadline for this session (DEC 2026 hold, search flush, or wait timeout).
@@ -1510,12 +1552,14 @@ impl<V: VtEngine> SessionMachine<V> {
 
     fn apply_mark_effects(&mut self, mark_effects: Vec<MarkEffect>, effects: &mut Vec<SessionEffect>) {
         let mut idle_triggered = false;
+        let mut command_finished = false;
         for me in mark_effects {
             match me {
                 MarkEffect::CommandStarted(rec) => {
                     self.broadcast_event(BrokerMsg::CommandStarted(Box::new(rec)), effects);
                 }
                 MarkEffect::CommandFinished(rec) => {
+                    command_finished = true;
                     self.broadcast_event(BrokerMsg::CommandFinished(Box::new(rec)), effects);
                 }
                 MarkEffect::PromptArrived => {
@@ -1525,6 +1569,11 @@ impl<V: VtEngine> SessionMachine<V> {
                     self.broadcast_event(BrokerMsg::CwdChanged { cwd }, effects);
                 }
             }
+        }
+        if command_finished {
+            let mut st_fx = Vec::new();
+            self.statuses.on_session_exit(&mut st_fx);
+            self.apply_status_effects(st_fx, None, effects);
         }
         if idle_triggered {
             self.wake_waiters(|c| matches!(c, WaitCondition::Idle), effects);

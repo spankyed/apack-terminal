@@ -2537,6 +2537,51 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
     table.ingest("state=clear", ts(20), &mut sfx);
     assert!(table.is_empty());
 
+    // 2b. MAX_STATUSES LRU eviction of an ancestor with `own_app` refreshes surviving descendants (`M1`):
+    {
+        let mut ev_table = StatusTable::new();
+        let mut efx = Vec::new();
+        // Oldest non-root entry ("anc") declares `own_app = Some("oldapp")`.
+        ev_table.ingest("id=anc;state=working;app=oldapp", ts(1), &mut efx);
+        // Newer descendant ("anc/child") inherits `app = Some("oldapp")` from "anc".
+        ev_table.ingest("id=anc/child;state=working", ts(2), &mut efx);
+        assert_eq!(ev_table.get("anc/child").unwrap().app.as_deref(), Some("oldapp"));
+        // Fill remaining slots up to MAX_STATUSES, then insert one more to evict oldest "anc".
+        for i in 0..(MAX_STATUSES - 1) {
+            ev_table.ingest(&format!("id=pad{i};state=working"), ts(3 + i as u64), &mut efx);
+        }
+        assert!(ev_table.get("anc").is_none(), "oldest non-root ancestor must be evicted");
+        assert_eq!(
+            ev_table.get("anc/child").unwrap().app,
+            None,
+            "surviving descendant must drop stale app after ancestor eviction"
+        );
+    }
+
+    // 2c. Live `CommandFinished` clears active statuses while retaining terminal `Done`/`Error` (`M1`):
+    {
+        let mut live_sess = SessionMachine::new(
+            sid(91),
+            StubVt::new(40, 4),
+            ResizePolicy::ExplicitOverride,
+            MarksMode::Claimed,
+            CellPx::default(),
+        );
+        let mut lfx = Vec::new();
+        live_sess.vt_mut().next_events = vec![
+            VtEvent::Osc133 { payload: String::from("C"), cursor_line: 0 },
+            VtEvent::ProgramStatus(crate::status::parse_osc7501("state=working").unwrap()),
+            VtEvent::ProgramStatus(crate::status::parse_osc7501("id=done;state=done").unwrap()),
+        ];
+        live_sess.on_pty_output(b"a", ts(1), &mut lfx);
+        assert_eq!(live_sess.active_statuses().len(), 2);
+        lfx.clear();
+        live_sess.vt_mut().next_events = vec![VtEvent::Osc133 { payload: String::from("D;0"), cursor_line: 1 }];
+        live_sess.on_pty_output(b"b", ts(2), &mut lfx);
+        assert_eq!(live_sess.active_statuses().len(), 1, "CommandFinished must clear active root status");
+        assert_eq!(live_sess.active_statuses()[0].id, "done");
+    }
+
     // 3. WaitCondition::Status defers pending VerifyForeground, rejects Mismatched, wakes on Matched or Unknown!
     let mut sess = SessionMachine::new(
         sid(90),
@@ -2717,6 +2762,12 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
     // The Resize tail record bumped epoch, invalidating prior command line anchors!
     assert_eq!(sess.commands()[1].output_line, None);
     assert_eq!(sess.cwd(), Some("/replayed"));
+    assert!(
+        fx.iter().any(
+            |e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Title { title }, .. } if title == "ReplayedTitle")
+        ),
+        "Seek with emit_status_events must broadcast changed Title"
+    );
     // Old root status cleared + replayed root & `sub` statuses emitted & exposed in active_statuses()!
     assert!(fx.iter().any(
         |e| matches!(e, SessionEffect::Send { msg: BrokerMsg::ProgramStatusCleared { id }, .. } if id.is_empty())
@@ -2741,11 +2792,14 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
         SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. }
         if *req_id == RequestId::from_raw(12)
     )));
-    // SearchWatch immediately refreshed at new epoch!
+    // Second seek clearing title (no Title event in tail) broadcasts empty Title when emit_status_events == true (`M3`),
+    // AND CommandFinished during replay clears active statuses (`M1`)!
     let new_epoch = sess.vt().meta().epoch;
     let mut fresh2 = StubVt::new(60, 6);
     fresh2.epoch = 1;
     fresh2.next_events = vec![
+        VtEvent::ProgramStatus(crate::status::parse_osc7501("state=working").unwrap()),
+        VtEvent::ProgramStatus(crate::status::parse_osc7501("id=keep;state=done").unwrap()),
         VtEvent::Osc633 { payload: format!("V;S;12;{};echo", key.as_str()), cursor_line: 2 },
         VtEvent::Osc633 { payload: format!("V;F;12;{};0;/stay", key.as_str()), cursor_line: 2 },
     ];
@@ -2761,10 +2815,16 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
             commands: vec![prior_cmd.clone()],
         },
         &tail_no_epoch,
-        false,
+        true,
         &mut fx,
     );
     assert!(sess.vt().meta().epoch > new_epoch);
+    assert!(
+        fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Title { title }, .. } if title.is_empty())),
+        "Seek clearing Title must broadcast empty Title"
+    );
+    assert_eq!(sess.active_statuses().len(), 1, "CommandFinished during replay must clear active statuses");
+    assert_eq!(sess.active_statuses()[0].id, "keep");
     // Without an epoch bump during tail output, the command's output_line anchor is preserved!
     assert_eq!(sess.commands()[1].output_line, Some(2));
     assert!(fx.iter().any(|e| matches!(
@@ -2772,7 +2832,8 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
         SessionEffect::Send { msg: BrokerMsg::SearchMatches { epoch, matches, .. }, .. }
         if *epoch == sess.vt().meta().epoch && !matches.is_empty()
     )));
-    // MarksTracker::restore_from_keyframe truncates > MAX_COMMANDS to the newest MAX_COMMANDS!
+    // MarksTracker::restore_from_keyframe truncates > MAX_COMMANDS, normalizes multiple Running records,
+    // and resists u64::MAX overflow panics (`B2`)!
     let mut many_cmds = Vec::with_capacity(MAX_COMMANDS + 3);
     for i in 0..(MAX_COMMANDS + 3) {
         many_cmds.push(CommandRecord {
@@ -2780,8 +2841,8 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
             command: Some(format!("c{i}")),
             cwd: None,
             started_ms: Some(1),
-            finished_ms: if i + 1 == MAX_COMMANDS + 3 { None } else { Some(2) },
-            outcome: if i + 1 == MAX_COMMANDS + 3 {
+            finished_ms: if i + 2 >= MAX_COMMANDS + 3 { None } else { Some(2) },
+            outcome: if i + 2 >= MAX_COMMANDS + 3 {
                 CommandOutcome::Running
             } else {
                 CommandOutcome::Exited(VouchedExitCode::from_vouched(0))
@@ -2796,13 +2857,134 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
     assert_eq!(mt.commands().len(), MAX_COMMANDS);
     assert_eq!(mt.commands()[0].id, 4);
     assert_eq!(mt.commands().last().unwrap().id, (MAX_COMMANDS + 3) as u64);
+    assert_eq!(
+        mt.commands()[MAX_COMMANDS - 2].outcome,
+        CommandOutcome::Unknown(UnknownReason::Superseded),
+        "earlier Running record in keyframe must be normalized"
+    );
+    assert_eq!(mt.commands()[MAX_COMMANDS - 1].outcome, CommandOutcome::Running);
     assert!(!mt.is_idle(), "running last command means tracker is not idle");
     assert_eq!(mt.last_seq(), 99);
     assert_eq!(mt.refused(), 4);
-    // set_live_marks_mode preserves last_seq on matching key, resets last_seq on switching mode!
-    sess.set_live_marks_mode(MarksMode::Keyed(key));
-    assert_eq!(sess.marks_last_seq(), 12);
-    sess.set_live_marks_mode(MarksMode::Claimed);
-    assert_eq!(sess.marks_last_seq(), 0);
-    assert_eq!(sess.commands().len(), 2);
+
+    // Crafted u64::MAX command ID in WAL never panics on subsequent Claimed or Keyed commands!
+    let mut max_mt = MarksTracker::new(MarksMode::Claimed);
+    max_mt.restore_from_keyframe(
+        MarksMode::Claimed,
+        u64::MAX,
+        0,
+        vec![
+            CommandRecord {
+                id: 1,
+                command: None,
+                cwd: None,
+                started_ms: None,
+                finished_ms: Some(1),
+                outcome: CommandOutcome::Claimed(Some(0)),
+                prompt_line: None,
+                output_line: None,
+                end_line: None,
+            },
+            CommandRecord {
+                id: u64::MAX,
+                command: None,
+                cwd: None,
+                started_ms: None,
+                finished_ms: Some(2),
+                outcome: CommandOutcome::Claimed(Some(0)),
+                prompt_line: None,
+                output_line: None,
+                end_line: None,
+            },
+        ],
+    );
+    let mut mfx = Vec::new();
+    max_mt.on_osc133("C", 0, ts(1), &mut mfx);
+    assert_eq!(max_mt.commands().last().unwrap().id, 2, "must wrap cleanly past u64::MAX and skip existing id=1");
+
+    // prepare_for_live_after_restore (`B2`): finalizes stuck Running command, clears active statuses,
+    // resets last_seq unconditionally (even for SAME marks_key!), and assigns non-colliding IDs!
+    let mut live_restore = SessionMachine::from_replay(
+        sid(92),
+        StubVt::new(40, 4),
+        ResizePolicy::ExplicitOverride,
+        RestoreKeyframe {
+            cell_px: CellPx { width: 8, height: 16 },
+            marks_mode: MarksMode::Keyed(key),
+            marks_last_seq: 50,
+            marks_refused: 0,
+            commands: vec![
+                CommandRecord {
+                    id: 1,
+                    command: Some(String::from("old_done")),
+                    cwd: None,
+                    started_ms: Some(1),
+                    finished_ms: Some(2),
+                    outcome: CommandOutcome::Exited(VouchedExitCode::from_vouched(0)),
+                    prompt_line: None,
+                    output_line: None,
+                    end_line: None,
+                },
+                CommandRecord {
+                    id: 2,
+                    command: Some(String::from("old_running")),
+                    cwd: None,
+                    started_ms: Some(3),
+                    finished_ms: None,
+                    outcome: CommandOutcome::Running,
+                    prompt_line: None,
+                    output_line: None,
+                    end_line: None,
+                },
+            ],
+        },
+        &[],
+    );
+    // Inject an active Working status + terminal Done status before transitioning to live.
+    live_restore.vt_mut().next_events = vec![
+        VtEvent::ProgramStatus(crate::status::parse_osc7501("state=working").unwrap()),
+        VtEvent::ProgramStatus(crate::status::parse_osc7501("id=d;state=done").unwrap()),
+    ];
+    let mut rfx = Vec::new();
+    live_restore.on_pty_output(b"x", ts(10), &mut rfx);
+    assert_eq!(live_restore.active_statuses().len(), 2);
+
+    // Transition to live with the SAME `marks_key`:
+    live_restore.prepare_for_live_after_restore(MarksMode::Keyed(key), ts(20));
+    assert_eq!(live_restore.marks_last_seq(), 0, "last_seq must reset unconditionally for new live shell");
+    assert_eq!(
+        live_restore.commands()[1].outcome,
+        CommandOutcome::Unknown(UnknownReason::SessionEnded),
+        "stuck Running command must be finalized before live shell starts"
+    );
+    assert_eq!(live_restore.active_statuses().len(), 1, "active Working status from dead recording must be cleared");
+    assert_eq!(live_restore.active_statuses()[0].id, "d");
+
+    // New shell emits V;A;1 (prompt -> is_idle!), then V;S;2 & V;F;2: NO id collision with historical id=2!
+    rfx.clear();
+    live_restore.vt_mut().next_events =
+        vec![VtEvent::Osc633 { payload: format!("V;A;1;{}", key.as_str()), cursor_line: 0 }];
+    live_restore.on_pty_output(b"p", ts(21), &mut rfx);
+    rfx.clear();
+    live_restore.register_wait(conn(1), RequestId::from_raw(55), WaitCondition::Idle, 5_000, ts(21), &mut rfx);
+    assert!(
+        rfx.iter().any(|e| matches!(
+            e,
+            SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. }
+            if *req_id == RequestId::from_raw(55)
+        )),
+        "new live shell prompt must satisfy WaitCondition::Idle after finalizing dead Running cmd"
+    );
+
+    rfx.clear();
+    live_restore.vt_mut().next_events = vec![
+        VtEvent::Osc633 { payload: format!("V;S;2;{};new_cmd", key.as_str()), cursor_line: 1 },
+        VtEvent::Osc633 { payload: format!("V;F;2;{};0;/live", key.as_str()), cursor_line: 2 },
+    ];
+    live_restore.on_pty_output(b"q", ts(22), &mut rfx);
+    assert_eq!(live_restore.commands().len(), 3);
+    let live_cmd = &live_restore.commands()[2];
+    assert_eq!(live_cmd.command.as_deref(), Some("new_cmd"));
+    assert!(live_cmd.id > 2, "live command ID ({}) must not collide with historical id=2", live_cmd.id);
+    assert_eq!(live_cmd.outcome, CommandOutcome::Exited(VouchedExitCode::from_vouched(0)));
 }

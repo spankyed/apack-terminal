@@ -47,6 +47,7 @@ pub struct MarksTracker {
     refused: u64,
     commands: VecDeque<CommandRecord>,
     active_index: Option<usize>,
+    active_vouched_seq: Option<u64>,
     pending_prompt_line: Option<u64>,
     pending_command: Option<String>,
     last_cwd: Option<String>,
@@ -63,6 +64,7 @@ impl MarksTracker {
             refused: 0,
             commands: VecDeque::new(),
             active_index: None,
+            active_vouched_seq: None,
             pending_prompt_line: None,
             pending_command: None,
             last_cwd: None,
@@ -80,14 +82,25 @@ impl MarksTracker {
     ) {
         let drop_n = commands.len().saturating_sub(MAX_COMMANDS);
         commands.drain(..drop_n);
-        let max_cmd_id = commands.iter().map(|c| c.id).max().unwrap_or(0);
         let active_index = commands.iter().rposition(|c| matches!(c.outcome, CommandOutcome::Running));
+        for (idx, cmd) in commands.iter_mut().enumerate() {
+            if matches!(cmd.outcome, CommandOutcome::Running) && Some(idx) != active_index {
+                cmd.outcome = match mode {
+                    MarksMode::Keyed(_) => CommandOutcome::Unknown(UnknownReason::Superseded),
+                    MarksMode::Claimed => CommandOutcome::Claimed(None),
+                };
+            }
+        }
+        let max_cmd_id = commands.iter().map(|c| c.id).max().unwrap_or(0);
+        let active_vouched_seq =
+            active_index.and_then(|idx| matches!(mode, MarksMode::Keyed(_)).then_some(commands[idx].id));
         self.mode = mode;
         self.last_seq = last_seq;
         self.refused = refused;
-        self.next_id = max_cmd_id.max(last_seq).saturating_add(1);
+        self.next_id = max_cmd_id.max(last_seq).checked_add(1).unwrap_or(1);
         self.commands = commands.into();
         self.active_index = active_index;
+        self.active_vouched_seq = active_vouched_seq;
         self.pending_prompt_line = None;
         self.pending_command = None;
         self.last_cwd = self.commands.iter().rev().find_map(|c| c.cwd.clone());
@@ -101,16 +114,39 @@ impl MarksTracker {
             None => MarksMode::Claimed,
         };
         self.last_seq = self.last_seq.max(last_seq);
-        self.next_id = self.next_id.max(self.last_seq.saturating_add(1));
+        if let Some(next) = self.last_seq.checked_add(1) {
+            self.next_id = self.next_id.max(next);
+        }
     }
 
-    /// Updates the live trust mode after historical restoration (preserving hydrated command history;
-    /// resets `last_seq` only when switching to a different trust mode/key).
-    pub fn set_live_mode(&mut self, mode: MarksMode) {
-        if self.mode != mode {
-            self.mode = mode;
-            self.last_seq = 0;
+    /// Transitions a historically restored tracker into a fresh live shell process:
+    /// finalizes any still-running command from the dead recording, resets prompt/sequence state
+    /// unconditionally for the new shell, and preserves historical commands with non-colliding IDs.
+    pub fn prepare_for_live_after_restore(&mut self, mode: MarksMode, now: TimestampMs) {
+        if let Some(idx) = self.active_index.take()
+            && let Some(cmd) = self.commands.get_mut(idx)
+        {
+            cmd.finished_ms = Some(now.as_millis());
+            cmd.outcome = match self.mode {
+                MarksMode::Keyed(_) => CommandOutcome::Unknown(UnknownReason::SessionEnded),
+                MarksMode::Claimed => CommandOutcome::Claimed(None),
+            };
         }
+        self.active_vouched_seq = None;
+        self.pending_prompt_line = None;
+        self.pending_command = None;
+        self.at_prompt = false;
+        self.mode = mode;
+        self.last_seq = 0;
+    }
+
+    fn alloc_id(&mut self, preferred: Option<u64>) -> u64 {
+        let mut candidate = preferred.map_or(self.next_id, |p| self.next_id.max(p));
+        while self.commands.iter().any(|c| c.id == candidate) {
+            candidate = candidate.wrapping_add(1).max(1);
+        }
+        self.next_id = candidate.wrapping_add(1).max(1);
+        candidate
     }
 
     /// Returns `true` when the shell is currently idle at a prompt (no running command).
@@ -197,6 +233,7 @@ impl MarksTracker {
     /// Finalizes any currently running command when the session process exits.
     pub fn on_session_exit(&mut self, now: TimestampMs, effects: &mut Vec<MarkEffect>) {
         self.at_prompt = false;
+        self.active_vouched_seq = None;
         let Some(idx) = self.active_index.take() else {
             return;
         };
@@ -262,10 +299,11 @@ impl MarksTracker {
                     effects.push(MarkEffect::CommandFinished(prev.clone()));
                 }
                 self.at_prompt = false;
+                let id = self.alloc_id(Some(seq));
                 let decoded = truncate_utf8(&unescape_osc633(raw_cmd), MAX_EVENT_STRING_BYTES);
                 let command = (!decoded.is_empty()).then_some(decoded);
                 let record = CommandRecord {
-                    id: seq,
+                    id,
                     command,
                     cwd: self.last_cwd.clone(),
                     started_ms: Some(now.as_millis()),
@@ -276,6 +314,7 @@ impl MarksTracker {
                     end_line: None,
                 };
                 self.push_command(record.clone());
+                self.active_vouched_seq = Some(seq);
                 effects.push(MarkEffect::CommandStarted(record));
                 true
             }
@@ -289,7 +328,7 @@ impl MarksTracker {
                 let Some(idx) = self.active_index else {
                     return false;
                 };
-                if self.commands.get(idx).map(|c| c.id) != Some(seq) {
+                if self.active_vouched_seq != Some(seq) {
                     return false;
                 }
                 let outcome = if status_str.is_empty() {
@@ -302,6 +341,7 @@ impl MarksTracker {
                 };
 
                 self.active_index = None;
+                self.active_vouched_seq = None;
                 let new_cwd = if raw_cwd.is_empty() {
                     None
                 } else {
@@ -380,8 +420,7 @@ impl MarksTracker {
                     effects.push(MarkEffect::CommandFinished(prev.clone()));
                 }
                 self.at_prompt = false;
-                let id = self.next_id;
-                self.next_id += 1;
+                let id = self.alloc_id(None);
                 let record = CommandRecord {
                     id,
                     command: self.pending_command.take(),

@@ -34,8 +34,9 @@ pub const SOURCE_BYTES: u64 = 64 << 20;
 /// Maximum bytes read for a query (`a=q`), matching `apack-vt-ghostty`'s 64 MiB single-image cap.
 pub const QUERY_SOURCE_BYTES: u64 = 64 << 20;
 
-/// Chunk size fed per inline transmission command (3 MiB, a multiple of 3 for whole base64 groups).
-pub const CHUNK_BYTES: usize = 3 << 20;
+/// Chunk size fed per inline transmission command (768 KiB, a multiple of 3 for whole base64
+/// groups -> 1 MiB base64 per chunk, strictly under WAL `DEFAULT_MAX_NON_GROUND_BYTES` = 4 MiB).
+pub const CHUNK_BYTES: usize = 3 << 18;
 
 /// Maximum bytes requested per individual `read(2)` syscall so slow filesystems report progress
 /// well within [`QUIET`].
@@ -429,7 +430,7 @@ mod tests {
     fn constants_and_read_piece_error_handling() {
         assert_eq!(SOURCE_BYTES, 64 * 1024 * 1024);
         assert_eq!(QUERY_SOURCE_BYTES, 64 * 1024 * 1024);
-        assert_eq!(CHUNK_BYTES, 3 * 1024 * 1024);
+        assert_eq!(CHUNK_BYTES, 768 * 1024);
         assert_eq!(READ_BYTES, 1024 * 1024);
 
         struct FlakyReader {

@@ -1714,4 +1714,15 @@ fn vt_ghostty_seams_placement_geometry_bounded_batch_ffi_guard_poison_and_sealed
     assert_eq!(p_vt.meta().epoch, e0 + 5);
     p_vt.ensure_min_epoch(e0 + 2);
     assert_eq!(p_vt.meta().epoch, e0 + 5);
+
+    // 8. `GhosttyEngine::active_image_blobs` returns deduplicated live blobs (including duplicates & virtual U=1).
+    let dup_png = crate::encode_png_rgba(1, 1, &[99, 88, 77, 255]).unwrap();
+    let dup_b64 = base64_encode(&dup_png);
+    let mut blob_vt = GhosttyEngine::new(GhosttyConfig::new(grid(20, 6))).unwrap();
+    let mut b_ev = Vec::new();
+    blob_vt.feed(format!("\x1b_Ga=T,f=100,i=51,q=2;{dup_b64}\x1b\\").as_bytes(), &mut b_ev);
+    blob_vt.feed(format!("\x1b_Ga=T,U=1,f=100,i=52,p=1,c=1,r=1,q=2;{dup_b64}\x1b\\").as_bytes(), &mut b_ev);
+    let active_blobs = blob_vt.active_image_blobs();
+    assert_eq!(active_blobs.len(), 1, "identical blobs across direct + virtual images must be deduplicated");
+    assert_eq!(active_blobs[0], crate::image_store::hash_bytes(&dup_png));
 }

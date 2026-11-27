@@ -19,7 +19,7 @@ mod replay;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(windows)]
 use std::sync::Condvar;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -122,16 +122,18 @@ pub fn spawn_shard(
     let fg_worker = thread::Builder::new().name(format!("apack-fg-{shard_idx}")).spawn(move || {
         while let Ok(req) = fg_rx.recv() {
             let argv = req.pgid.and_then(apack_os::tree::argv_for_pid);
-            let confirmed = confirm_foreground_app(&req.app, argv.as_deref());
+            let results: Vec<(String, u64, apack_proto::types::Confirmed)> = req
+                .items
+                .into_iter()
+                .map(|(id, changed, app)| {
+                    let confirmed = confirm_foreground_app(&app, argv.as_deref());
+                    (id, changed, confirmed)
+                })
+                .collect();
             {
                 let mut state = fg_mailbox.lock().unwrap_or_else(|e| e.into_inner());
                 state.queue.push_back((
-                    ShardCmd::ForegroundVerified {
-                        session_id: req.session_id,
-                        id: req.id,
-                        changed: req.changed,
-                        confirmed,
-                    },
+                    ShardCmd::ForegroundVerified { session_id: req.session_id, results, from_worker: true },
                     None,
                 ));
                 state.woken = true;
@@ -269,7 +271,7 @@ pub(crate) struct ShardRunner {
     fg_tx: Option<mpsc::SyncSender<FgVerifyReq>>,
     fg_worker: Option<JoinHandle<()>>,
     fg_inflight: HashSet<SessionId>,
-    fg_pending: HashMap<SessionId, (String, u64, String)>,
+    fg_pending: HashMap<SessionId, BTreeMap<String, (u64, String)>>,
     raw_output_inflight: Arc<AtomicUsize>,
     pub(crate) sessions: HashMap<SessionId, LiveSession>,
     #[cfg(unix)]
@@ -522,17 +524,19 @@ impl ShardRunner {
                     self.initiate_session_termination(session_id);
                 }
             }
-            ShardCmd::ForegroundVerified { session_id, id, changed, confirmed } => {
-                self.fg_inflight.remove(&session_id);
+            ShardCmd::ForegroundVerified { session_id, results, from_worker } => {
+                if from_worker {
+                    self.fg_inflight.remove(&session_id);
+                }
                 let mut effects = Vec::new();
                 if let Some(sess) = self.sessions.get_mut(&session_id) {
-                    sess.machine.apply_status_confirmation(&id, changed, confirmed, &mut effects);
+                    for (id, changed, confirmed) in results {
+                        sess.machine.apply_status_confirmation(&id, changed, confirmed, &mut effects);
+                    }
                     self.apply_effects(session_id, effects);
                 }
-                if let Some((next_id, next_changed, next_app)) = self.fg_pending.remove(&session_id)
-                    && self.sessions.contains_key(&session_id)
-                {
-                    self.dispatch_verify_foreground(session_id, next_id, next_changed, next_app);
+                if from_worker {
+                    self.flush_all_pending_fg_verify();
                 }
             }
             ShardCmd::ImageSourceLoaded { session_id, ticket, loaded } => {

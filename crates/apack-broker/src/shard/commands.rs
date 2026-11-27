@@ -20,8 +20,8 @@ use apack_os::pty_windows::ConPtyBridge;
 use apack_os::signal::deliver_signal;
 use apack_proto::messages::{BrokerMsg, SpawnSpec};
 use apack_proto::types::{
-    ErrorCode, NonZeroStreamId, RequestId, ResizePolicy, SessionId, SignalKind, SignalScope, SignalTarget, StreamId,
-    SubFlags, ViewportHint,
+    ErrorCode, NonZeroStreamId, RequestId, SessionId, SignalKind, SignalScope, SignalTarget, StreamId, SubFlags,
+    ViewportHint,
 };
 use apack_vt_ghostty::{GhosttyConfig, GhosttyEngine};
 use apack_wal::{WalReader, WalWorker, WalWriter};
@@ -30,8 +30,8 @@ use crate::config::AUTH_KEY_ENV;
 use crate::{fill_random, now_unix_ms};
 
 use super::replay::{
-    build_keyframe_engine, capture_keyframe, hydrate_slice_blobs, restore_machine_from_dir, restore_machine_from_slice,
-    sync_wal_image_blobs,
+    build_keyframe_engine, build_machine_from_slice, capture_keyframe, hydrate_slice_blobs, restore_machine_from_dir,
+    restore_machine_from_slice, sync_wal_image_blobs,
 };
 use super::{DEFAULT_SCROLLBACK_LINES, LivePty, LiveSession, ReactorEvent, ShardRunner};
 
@@ -308,27 +308,7 @@ impl ShardRunner {
             }
         };
 
-        let mut placeholder_cfg = GhosttyConfig::new(slice.keyframe.visual.size);
-        placeholder_cfg.cell_px = slice.keyframe.visual.cell_px;
-        placeholder_cfg.scrollback_lines = 0;
-        let placeholder_engine = match GhosttyEngine::new(placeholder_cfg) {
-            Ok(e) => e,
-            Err(err) => {
-                self.emit(ReactorEvent::SpawnOrRewindFailed);
-                self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Pty, &err.to_string());
-                return;
-            }
-        };
-
-        let mut machine = SessionMachine::new(
-            session_id,
-            placeholder_engine,
-            ResizePolicy::ExplicitOverride,
-            MarksMode::Claimed,
-            slice.keyframe.visual.cell_px,
-        );
-        let mut init_effects = Vec::new();
-        restore_machine_from_slice(&mut machine, fresh_engine, &slice, None, false, &mut init_effects);
+        let machine = build_machine_from_slice(session_id, fresh_engine, &slice);
         let actual_offset_ms = target_ms.saturating_sub(first_ms);
 
         self.sessions.insert(

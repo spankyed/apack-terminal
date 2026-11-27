@@ -898,6 +898,11 @@ fn e2e_pr5_wal_blobs_marks_rewind_seek_epoch_search_and_attached_statuses() {
 
         let (sid, _) = client.spawn(spec).unwrap();
         assert_eq!(client.wait(sid, WaitCondition::Text(String::from("READY_PR5")), 10_000).unwrap(), WaitOutcome::Met);
+        // Live WaitCondition::Status must NOT deadlock even when root + child statuses were emitted together (`B1`)!
+        assert_eq!(
+            client.wait(sid, WaitCondition::Status(vec![apack_proto::types::StatusState::Working]), 5_000).unwrap(),
+            WaitOutcome::Met
+        );
 
         // 1. Late-attaching client receives active statuses (root + child with inherited `app`) in BrokerMsg::Attached!
         let st = NonZeroStreamId::new(1).unwrap();
@@ -1097,6 +1102,55 @@ fn e2e_pr5_wal_blobs_marks_rewind_seek_epoch_search_and_attached_statuses() {
     }
     assert!(max_frame_epoch >= ep0 + 2, "two Seeks must bump epoch monotonically ({max_frame_epoch} vs {ep0})");
     assert!(saw_refreshed_search, "SearchWatch must refresh automatically on Seek at new epoch");
+
+    // On Unix, verify `Spawn { restore_from }` with the SAME `marks_key` cleanly transitions to live shell (`B2`):
+    // no duplicate command IDs, `WaitCondition::Idle` works, and active statuses from dead recording are cleared!
+    #[cfg(unix)]
+    {
+        let mut live_spec = echo_command_spec("x", None, Some(rec_dir.to_string_lossy().into_owned()));
+        live_spec.marks_key = Some(key);
+        live_spec.argv = vec![
+            String::from("/bin/sh"),
+            String::from("-c"),
+            format!(
+                "printf '\\033]633;V;A;1;{k}\\007\\033]633;V;S;2;{k};echo live2\\007LIVE2\\r\\n\\033]633;V;F;2;{k};0;/live\\007'; sleep 5",
+                k = key.as_str()
+            ),
+        ];
+        let (live_sid, _) = c2.spawn(live_spec).unwrap();
+        assert_eq!(c2.wait(live_sid, WaitCondition::Text(String::from("LIVE2")), 5_000).unwrap(), WaitOutcome::Met);
+        assert_eq!(c2.wait(live_sid, WaitCondition::Idle, 5_000).unwrap(), WaitOutcome::Met);
+        let st_live = NonZeroStreamId::new(2).unwrap();
+        let BrokerMsg::Attached { statuses: live_statuses, .. } = c2
+            .attach(
+                live_sid,
+                st_live,
+                SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(),
+                None,
+                0,
+                FrameCredit { max_frames: 4, max_bytes: 262_144 },
+            )
+            .unwrap()
+        else {
+            panic!("expected Attached on restored live session");
+        };
+        assert!(
+            live_statuses.is_empty(),
+            "stale active statuses from dead recording must be cleared on Spawn restore_from: {live_statuses:?}"
+        );
+        let BrokerMsg::CommandsReply { commands: live_cmds } =
+            c2.stream_request(st_live, &ClientMsg::Commands).unwrap()
+        else {
+            panic!("expected CommandsReply");
+        };
+        assert!(live_cmds.iter().any(|c| c.command.as_deref() == Some("echo hi")));
+        assert!(live_cmds.iter().any(|c| c.command.as_deref() == Some("echo live2")));
+        let mut unique_ids = std::collections::HashSet::new();
+        for cmd in &live_cmds {
+            assert!(unique_ids.insert(cmd.id), "restored + live commands must have unique IDs: {live_cmds:?}");
+        }
+        c2.kill(live_sid).unwrap();
+    }
 
     drop(c2);
     srv2.shutdown().unwrap();

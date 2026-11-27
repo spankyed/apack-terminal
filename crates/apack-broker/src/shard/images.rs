@@ -95,29 +95,26 @@ impl ShardRunner {
             match body_res {
                 Ok(body) => {
                     let query_bytes = body.query_bytes();
-                    if query_bytes.is_some() {
+                    let is_query = query_bytes.is_some();
+                    if is_query {
                         sess.machine.vt_mut().set_kitty_command_bytes(query_bytes);
                     }
-                    let record_wal = sess.wal.is_some();
-                    let mut wal_pieces = Vec::new();
                     for piece in body {
-                        if record_wal {
-                            wal_pieces.push(piece.clone());
-                        }
                         sess.machine.on_vt_feed_with(now, &mut effects, |vt, evs| vt.feed(&piece, evs));
-                    }
-                    if query_bytes.is_some() {
-                        sess.machine.vt_mut().set_kitty_command_bytes(None);
-                    }
-                    if record_wal {
-                        super::replay::sync_wal_image_blobs(sess, &self.shared.image_store);
-                        let at_ground = sess.machine.vt().at_ground();
-                        if let Some(wal) = &sess.wal {
-                            for piece in wal_pieces {
-                                let _ = wal.write_output(now_ms, piece, at_ground);
+                        if !is_query && let Some(wal) = &sess.wal {
+                            // Stream chunks straight to WAL and split on each `\x1b\\` ground
+                            // transition so multi-chunk >4 MiB `t=f`/`t=s` images never exceed
+                            // `WalConfig::max_non_ground_bytes` (`NonGroundCap`).
+                            if let Some((before, after)) = split_st_ground_chunk(&piece) {
+                                let _ = wal.write_output(now_ms, before.to_vec(), true);
+                                let _ = wal.write_output(now_ms, after.to_vec(), false);
+                            } else {
+                                let _ = wal.write_output(now_ms, piece, false);
                             }
                         }
-                        super::replay::maybe_rollover_wal(sess, now_ms, at_ground, &self.shared.engine_abi_hash);
+                    }
+                    if is_query {
+                        sess.machine.vt_mut().set_kitty_command_bytes(None);
                     }
                 }
                 Err(why) => match pending.refusal {
@@ -150,6 +147,13 @@ impl ShardRunner {
         self.sync_pty_interest(session_id);
         self.try_reap_session(session_id);
     }
+}
+
+/// Splits a resolved Kitty chunk right after its `\x1b\\` String Terminator so the WAL writer
+/// observes the return-to-ground transition before opening the next inline APC chunk.
+pub(crate) fn split_st_ground_chunk(piece: &[u8]) -> Option<(&[u8], &[u8])> {
+    let st_pos = piece.windows(2).position(|w| w == b"\x1b\\")?;
+    Some(piece.split_at(st_pos + 2))
 }
 
 /// Determines whether a non-`EINVAL: invalid data` reply from a `Load::asked()` probe should be

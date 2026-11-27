@@ -496,6 +496,18 @@ impl GhosttyEngine {
         out
     }
 
+    /// Returns all content hashes currently cached for live Kitty images (both direct placements
+    /// and virtual `U=1` Unicode placeholder placements).
+    pub fn active_image_blobs(&self) -> Vec<apack_proto::types::BlobHash> {
+        let mut out = Vec::with_capacity(self.image_cache.blobs.len());
+        for &(blob, _, _) in self.image_cache.blobs.values() {
+            if !out.contains(&blob) {
+                out.push(blob);
+            }
+        }
+        out
+    }
+
     pub(crate) fn text_of_batched(&self, span: CellSpan, max_bytes: usize, batch_lines: u64) -> String {
         let step = batch_lines.clamp(1, MAX_FORMAT_BATCH_ROWS);
         let max_batch_rows = step.saturating_mul(2).min(MAX_FORMAT_BATCH_ROWS);

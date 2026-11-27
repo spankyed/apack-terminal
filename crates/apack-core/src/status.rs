@@ -265,6 +265,7 @@ impl StatusTable {
             .filter(|prev| prev.record.state == state)
             .map_or(now.as_millis(), |prev| prev.record.since_ms);
 
+        let mut evicted_had_app = false;
         if !self.records.contains_key(&id) && self.records.len() >= MAX_STATUSES {
             // Evict the oldest non-root entry (lowest `changed` revision) so root `""` is never evicted.
             if let Some(evict_key) = self
@@ -274,7 +275,7 @@ impl StatusTable {
                 .min_by_key(|(_, entry)| entry.record.changed)
                 .map(|(k, _)| k.clone())
             {
-                self.records.remove(&evict_key);
+                evicted_had_app = self.records.remove(&evict_key).is_some_and(|e| e.own_app.is_some());
                 effects.push(StatusEffect::Cleared { id: evict_key });
             }
         }
@@ -303,8 +304,9 @@ impl StatusTable {
             effects.push(StatusEffect::VerifyForeground { id: id.clone(), changed, app: app_name });
         }
 
-        // If this record's declared `own_app` changed, re-resolve any descendants that inherit `app`.
-        if prev_own_app != own_app {
+        // If this record's declared `own_app` changed (or an evicted ancestor had `own_app`),
+        // re-resolve any descendants that inherit `app`.
+        if evicted_had_app || prev_own_app != own_app {
             self.refresh_descendant_apps(effects);
         }
     }

@@ -176,6 +176,7 @@ impl ShardRunner {
         signal: Option<String>,
     ) {
         self.fg_pending.remove(&session_id);
+        self.fg_inflight.remove(&session_id);
         let mut effects = Vec::new();
         if let Some(sess) = self.sessions.get_mut(&session_id) {
             #[cfg(unix)]
@@ -217,6 +218,7 @@ impl ShardRunner {
 
     pub(super) fn force_drop_session(&mut self, session_id: SessionId) {
         self.fg_pending.remove(&session_id);
+        self.fg_inflight.remove(&session_id);
         if let Some(mut sess) = self.sessions.remove(&session_id) {
             #[cfg(unix)]
             {
