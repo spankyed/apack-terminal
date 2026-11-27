@@ -629,3 +629,178 @@ fn kitty_image_sources_e2e_file_shm_security_and_teardown() {
     drop(client);
     srv.shutdown().unwrap();
 }
+
+#[test]
+fn e2e_stream_attachment_isolation_no_redundant_stream_closed_and_prehello_size_cap() {
+    use apack_proto::frame::INNER_HEADER_LEN;
+    use std::io::Write;
+
+    let tmp = tempdir().unwrap();
+    let endpoint = unique_endpoint(tmp.path(), "pr4");
+    let mut cfg = BrokerConfig::for_socket(&endpoint);
+    cfg.shard_count = 2;
+    cfg.auth = AuthConfig::Required(apack_core::auth::AuthSecret::new([0x55; 32]));
+    let mut srv = BrokerServer::bind(cfg.clone()).unwrap().spawn().unwrap();
+
+    // 1. Unauthenticated peer sending a > 4 KiB frame length header before Hello is rejected immediately!
+    let mut raw = apack_os::transport::connect_local_stream(srv.socket_path()).expect("connect raw");
+    let over_hello = (INNER_HEADER_LEN + apack_proto::MAX_HELLO_FRAME_PAYLOAD + 1) as u32;
+    raw.write_all(&over_hello.to_le_bytes()).expect("write oversized header");
+    let mut dec = apack_proto::frame::FrameDecoder::new();
+    let mut saw_error_or_eof = false;
+    let mut buf = [0u8; 4096];
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        match std::io::Read::read(&mut raw, &mut buf) {
+            Ok(0) | Err(_) => {
+                saw_error_or_eof = true;
+                break;
+            }
+            Ok(n) => {
+                let mut off = 0;
+                while off < n {
+                    if let Ok((used, Some(apack_proto::frame::DecodedFrame::Frame { header, payload }))) =
+                        dec.step(&buf[off..n])
+                    {
+                        off += used;
+                        if let Ok(BrokerMsg::Error { code: ErrorCode::Malformed, .. }) =
+                            BrokerMsg::decode(header.msg_type, &payload)
+                        {
+                            saw_error_or_eof = true;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    assert!(saw_error_or_eof, "pre-Hello > 4 KiB frame must be rejected immediately");
+
+    // 2. Authenticated client: live exit on VIEW | EVENTS (without RAW_OUTPUT) emits Exited with NO redundant StreamClosed!
+    let mut client = BrokerClient::connect(srv.socket_path(), &cfg.auth, "pr4-e2e").unwrap();
+    let mut exit_spec = echo_command_spec("x", None, None);
+    #[cfg(unix)]
+    {
+        exit_spec.argv =
+            vec![String::from("/bin/sh"), String::from("-c"), String::from("printf 'EXIT_READY\\r\\n'; read _go")];
+    }
+    #[cfg(windows)]
+    {
+        exit_spec.argv =
+            vec![String::from("cmd.exe"), String::from("/C"), String::from("echo EXIT_READY & set /p _go=")];
+    }
+    let (s_exit, _) = client.spawn(exit_spec).unwrap();
+    assert_eq!(client.wait(s_exit, WaitCondition::Text(String::from("EXIT_READY")), 5_000).unwrap(), WaitOutcome::Met);
+    let st_exit = NonZeroStreamId::new(1).unwrap();
+    client
+        .attach(
+            s_exit,
+            st_exit,
+            SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(),
+            None,
+            0,
+            FrameCredit { max_frames: 4, max_bytes: 262_144 },
+        )
+        .unwrap();
+    client.send_raw(st_exit.as_stream_id(), RequestId::PUSH, &ClientMsg::Write { data: b"go\r\n".to_vec() }).unwrap();
+    let mut saw_exited = false;
+    let mut saw_stream_closed = false;
+    let wait_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < wait_deadline {
+        let frame = client.recv_frame().unwrap();
+        if frame.stream_id == st_exit.as_stream_id() {
+            match frame.msg {
+                BrokerMsg::Exited { .. } => {
+                    saw_exited = true;
+                    break;
+                }
+                BrokerMsg::StreamClosed { .. } => {
+                    saw_stream_closed = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(saw_exited, "expected Exited on VIEW | EVENTS stream");
+    // Send a round-trip ListSessions fence and inspect every pushed frame until its reply arrives.
+    let fence_req = client.alloc_req_id();
+    client.send_raw(apack_proto::types::StreamId::CONTROL, fence_req, &ClientMsg::ListSessions).unwrap();
+    loop {
+        let f = client.recv_frame().unwrap();
+        if f.stream_id == st_exit.as_stream_id() && matches!(f.msg, BrokerMsg::StreamClosed { .. }) {
+            saw_stream_closed = true;
+        }
+        if f.req_id == fence_req {
+            break;
+        }
+    }
+    assert!(!saw_stream_closed, "must NOT emit redundant StreamClosed after Exited when !RAW_OUTPUT");
+
+    // 3. Reusing stream_id 1 immediately across Detach + Re-Attach on a live session works cleanly without stale cross-talk.
+    let make_sleeper = || {
+        let mut spec = echo_command_spec("x", None, None);
+        #[cfg(unix)]
+        {
+            spec.argv = vec![String::from("/bin/sh"), String::from("-c"), String::from("sleep 10")];
+        }
+        #[cfg(windows)]
+        {
+            spec.argv = vec![String::from("cmd.exe"), String::from("/C"), String::from("ping -n 11 127.0.0.1 >nul")];
+        }
+        spec
+    };
+    let (s_a, _) = client.spawn(make_sleeper()).unwrap();
+    let (s_b, _) = client.spawn(make_sleeper()).unwrap();
+    client
+        .attach(
+            s_a,
+            st_exit,
+            SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(),
+            None,
+            0,
+            FrameCredit { max_frames: 4, max_bytes: 262_144 },
+        )
+        .unwrap();
+    client.detach(st_exit).unwrap();
+    client
+        .attach(
+            s_b,
+            st_exit,
+            SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(),
+            None,
+            0,
+            FrameCredit { max_frames: 4, max_bytes: 262_144 },
+        )
+        .unwrap();
+    client.kill(s_a).unwrap();
+    // Poll ListSessions via raw frames so we observe every pushed event until s_a is gone.
+    let mut leaked_exited = false;
+    let wait_a = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < wait_a {
+        let req = client.alloc_req_id();
+        client.send_raw(apack_proto::types::StreamId::CONTROL, req, &ClientMsg::ListSessions).unwrap();
+        let mut s_a_alive = true;
+        loop {
+            let f = client.recv_frame().unwrap();
+            if f.stream_id == st_exit.as_stream_id() && matches!(f.msg, BrokerMsg::Exited { .. }) {
+                leaked_exited = true;
+            }
+            if f.req_id == req {
+                if let BrokerMsg::SessionsList { sessions } = f.msg {
+                    s_a_alive = sessions.iter().any(|s| s.id == s_a);
+                }
+                break;
+            }
+        }
+        if !s_a_alive {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!leaked_exited, "detached session s_a must NOT leak Exited onto reused stream_id attached to s_b");
+
+    client.kill(s_b).unwrap();
+    drop(client);
+    srv.shutdown().unwrap();
+}

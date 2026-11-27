@@ -408,4 +408,54 @@ describe('TerminalClient & BrokerSessionSource', () => {
     await expect(session.commands()).rejects.toBeInstanceOf(DisconnectedError)
     client.close()
   })
+
+  it('cleans up stream on exited when !RAW_OUTPUT and enforces MAX_CLIENT_NAME_BYTES', async () => {
+    const pipe = new MockBrokerPipe()
+    pipe.onClientFrame = (streamId, reqId, msg) => {
+      if (msg.kind === 'hello') {
+        pipe.pushBroker(streamId, reqId, {
+          kind: 'helloOk',
+          protocolVersion: PROTOCOL_VERSION,
+          authRequired: false,
+          serverNonce: new Uint8Array(32),
+          wordDelimiters: ' ',
+          capabilities: 0,
+        })
+      } else if (msg.kind === 'attach') {
+        pipe.pushBroker(streamId, reqId, {
+          kind: 'attached',
+          session: msg.session,
+          streamId: msg.streamId,
+          size: { cols: 80, rows: 24 },
+          epoch: 1,
+          firstActiveLine: 0,
+          scrollbackLines: 0,
+          foreground: null,
+        })
+      }
+    }
+
+    // Overlong clientName (> 256 bytes) rejected before connecting
+    const badPipe = new MockBrokerPipe()
+    await expect(
+      TerminalClient.connect(badPipe.stream, { clientName: 'a'.repeat(257) }),
+    ).rejects.toThrow(/limit exceeded/i)
+
+    const client = await TerminalClient.connect(pipe.stream, { clientName: 'a'.repeat(256) })
+    const viewOnly = await client.attachSession(1, { flags: SubFlags.VIEW | SubFlags.EVENTS })
+    const rawAlso = await client.attachSession(2, { flags: SubFlags.VIEW | SubFlags.EVENTS | SubFlags.RAW_OUTPUT })
+
+    // Pending RPC on non-RAW_OUTPUT stream rejects immediately on Exited (broker suppresses redundant StreamClosed)
+    const pendingView = viewOnly.fetchRows(1, 0, 10)
+    pipe.pushBroker(viewOnly.streamId, PUSH_REQ_ID, { kind: 'exited', exitCode: 0, signal: null })
+    await expect(pendingView).rejects.toBeInstanceOf(DisconnectedError)
+
+    // Pending RPC on RAW_OUTPUT stream stays alive across Exited until trailing StreamClosed arrives
+    const pendingRaw = rawAlso.fetchRows(1, 0, 10)
+    pipe.pushBroker(rawAlso.streamId, PUSH_REQ_ID, { kind: 'exited', exitCode: 0, signal: null })
+    pipe.pushBroker(rawAlso.streamId, PUSH_REQ_ID, { kind: 'streamClosed', reason: 'session ended' })
+    await expect(pendingRaw).rejects.toBeInstanceOf(DisconnectedError)
+
+    client.close()
+  })
 })

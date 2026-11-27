@@ -108,6 +108,7 @@ interface PendingRpc {
 }
 
 interface AttachedStream {
+  readonly hasRawOutput: boolean
   onMessage(msg: BrokerMsg): void
   onClosed(reason: string): void
 }
@@ -413,6 +414,10 @@ export class TerminalClient {
         if (msg.kind === 'streamClosed') {
           this.streams.delete(streamId)
           this.rejectPendingForStream(streamId, new DisconnectedError(msg.reason))
+        } else if (msg.kind === 'exited' && !st.hasRawOutput) {
+          this.streams.delete(streamId)
+          const reason = msg.signal ?? (msg.exitCode !== null ? `exited (${msg.exitCode})` : 'session ended')
+          this.rejectPendingForStream(streamId, new DisconnectedError(reason))
         }
       }
       return
@@ -544,7 +549,7 @@ export class TerminalClient {
       visible,
       this.nowMs,
     )
-    this.streams.set(streamId, source.handler())
+    this.streams.set(streamId, source.handler((flags & SubFlags.RAW_OUTPUT) !== 0))
 
     try {
       const reply = await this.request(CONTROL_STREAM_ID, {
@@ -632,8 +637,9 @@ export class BrokerSessionSource implements TerminalSource {
     for (const sink of currentSinks) sink.onEvent?.({ kind: 'streamClosed', reason })
   }
 
-  handler(): AttachedStream {
+  handler(hasRawOutput: boolean): AttachedStream {
     return {
+      hasRawOutput,
       onMessage: (msg) => this.handleStreamMessage(msg),
       onClosed: (reason) => this.markClosed(reason),
     }

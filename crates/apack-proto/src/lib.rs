@@ -115,3 +115,12 @@ pub const MAX_WAIT_STATUSES: usize = 8;
 
 /// Length in bytes of nonces and mutual-auth HMAC proofs.
 pub const AUTH_TOKEN_LEN: usize = 32;
+
+/// Maximum length in bytes of `ClientMsg::Hello::client_name`.
+pub const MAX_CLIENT_NAME_BYTES: usize = 256;
+
+/// Maximum frame payload permitted before `Hello` completes (4 KiB).
+pub const MAX_HELLO_FRAME_PAYLOAD: usize = 4_096;
+
+/// Maximum frame payload permitted while awaiting `AuthProof` (64 bytes).
+pub const MAX_AUTH_FRAME_PAYLOAD: usize = 64;

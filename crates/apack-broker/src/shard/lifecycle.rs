@@ -52,6 +52,7 @@ impl ShardRunner {
         // exiting child in `?Es` state waiting for unread master PTY bytes!
         sess.paused_by_stream = false;
         sess.paused_by_raw_flow = false;
+        sess.paused_by_raw_inflight = false;
         #[cfg(unix)]
         let raw_pid = sess.pid.map(|p| p.pid() as u32);
         self.sync_pty_interest(session_id);
@@ -179,6 +180,7 @@ impl ShardRunner {
         code: Option<i32>,
         signal: Option<String>,
     ) {
+        self.fg_pending.remove(&session_id);
         let mut effects = Vec::new();
         if let Some(mut sess) = self.sessions.remove(&session_id) {
             #[cfg(unix)]
@@ -216,6 +218,7 @@ impl ShardRunner {
     }
 
     pub(super) fn force_drop_session(&mut self, session_id: SessionId) {
+        self.fg_pending.remove(&session_id);
         if let Some(mut sess) = self.sessions.remove(&session_id) {
             #[cfg(unix)]
             {
@@ -258,6 +261,21 @@ impl ShardRunner {
         let now_instant = Instant::now();
 
         for id in ids {
+            // 0. Liveness safety check: if in-flight raw-output bytes drained below caps, unpause PTY.
+            let should_resume_raw = self.sessions.get(&id).is_some_and(|s| {
+                s.paused_by_raw_inflight
+                    && !super::protocol::should_pause_raw_inflight(
+                        s.raw_output_inflight.load(Ordering::Acquire),
+                        self.raw_output_inflight.load(Ordering::Acquire),
+                    )
+            });
+            if should_resume_raw {
+                if let Some(sess) = self.sessions.get_mut(&id) {
+                    sess.paused_by_raw_inflight = false;
+                }
+                self.sync_pty_interest(id);
+            }
+
             // 1. Child reap & 2-second SIGKILL escalation BEFORE firing timers so tail PTY bytes
             //    from an exited child satisfy pending `Wait` conditions before any deadline expires.
             let is_live = self.sessions.get(&id).is_some_and(|s| s.child.is_some() || s.reaped_exit.is_some());

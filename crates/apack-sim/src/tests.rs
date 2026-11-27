@@ -215,13 +215,15 @@ fn session_machine_direct_rpcs_and_wait_outcomes() {
     );
     let c1 = ConnId::new(1).unwrap();
     let st1 = NonZeroStreamId::new(1).unwrap();
+    let att1 = apack_core::session::StreamAttachmentId::new(1).unwrap();
     let mut fx = Vec::new();
-    sess.attach_stream((c1, st1), SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
+    sess.attach_stream((c1, st1), att1, SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
 
     // ExplicitResize updates size even under ExplicitOverride
     fx.clear();
     sess.handle_stream_msg(
         (c1, st1),
+        att1,
         RequestId::from_raw(1),
         ClientMsg::ExplicitResize { size: GridSize::new(50, 8).unwrap(), cell_px: CellPx { width: 9, height: 18 } },
         &mut fx,
@@ -233,6 +235,7 @@ fn session_machine_direct_rpcs_and_wait_outcomes() {
     fx.clear();
     sess.handle_stream_msg(
         (c1, st1),
+        att1,
         RequestId::from_raw(2),
         ClientMsg::Write { data: b"123456789".to_vec() },
         &mut fx,
@@ -241,7 +244,13 @@ fn session_machine_direct_rpcs_and_wait_outcomes() {
         e,
         SessionEffect::Send { msg: BrokerMsg::Error { code: apack_proto::types::ErrorCode::Pty, .. }, .. }
     )));
-    sess.handle_stream_msg((c1, st1), RequestId::from_raw(3), ClientMsg::Write { data: b"abcd".to_vec() }, &mut fx);
+    sess.handle_stream_msg(
+        (c1, st1),
+        att1,
+        RequestId::from_raw(3),
+        ClientMsg::Write { data: b"abcd".to_vec() },
+        &mut fx,
+    );
     assert_eq!(sess.pty_write_len(), 4);
     assert_eq!(sess.drain_pty_write(2), b"ab");
     assert_eq!(sess.drain_pty_write(10), b"cd");
@@ -250,6 +259,7 @@ fn session_machine_direct_rpcs_and_wait_outcomes() {
     fx.clear();
     sess.handle_stream_msg(
         (c1, st1),
+        att1,
         RequestId::from_raw(4),
         ClientMsg::Paste { text: "rm -rf /\n".into(), allow_unsafe: false },
         &mut fx,

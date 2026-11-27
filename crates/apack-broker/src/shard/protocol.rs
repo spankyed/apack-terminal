@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use apack_core::flow::OutboundPriority;
 use apack_core::lease::ConnId;
+use apack_core::session::StreamAttachmentId;
 use apack_os::image_sources::Loaded;
 #[cfg(unix)]
 use apack_os::pty_poller::PtyWaker;
@@ -21,6 +22,64 @@ use apack_proto::types::{
 use apack_vt_ghostty::ImageStore;
 use apack_wal::{RecordingRegistry, WalConfig};
 
+/// Per-session high-water cap (`2 MiB`) on raw PTY output bytes in flight to the Control Reactor.
+pub(crate) const RAW_OUTPUT_SESSION_HIGH_WATER: usize = 2_097_152;
+
+/// Per-session low-water resume threshold (`1 MiB`) for in-flight raw PTY output bytes.
+pub(crate) const RAW_OUTPUT_SESSION_LOW_WATER: usize = 1_048_576;
+
+/// Per-shard aggregate high-water cap (`8 MiB`) on raw PTY output bytes in flight to the Control Reactor.
+pub(crate) const RAW_OUTPUT_SHARD_HIGH_WATER: usize = 8_388_608;
+
+/// Per-shard aggregate low-water resume threshold (`4 MiB`) for in-flight raw PTY output bytes.
+pub(crate) const RAW_OUTPUT_SHARD_LOW_WATER: usize = 4_194_304;
+
+/// Returns `true` when in-flight `PublishRawOutput` bytes hit either the per-session or per-shard cap.
+pub(crate) const fn should_pause_raw_inflight(session_bytes: usize, shard_bytes: usize) -> bool {
+    session_bytes >= RAW_OUTPUT_SESSION_HIGH_WATER || shard_bytes >= RAW_OUTPUT_SHARD_HIGH_WATER
+}
+
+/// Returns `true` when draining `PublishRawOutput` crossed from `>= low_water` to `< low_water`.
+pub(crate) const fn crossed_raw_low_water(prev_bytes: usize, next_bytes: usize, low_water: usize) -> bool {
+    prev_bytes >= low_water && next_bytes < low_water
+}
+
+/// Returns `true` when draining `PublishRawOutput` crossed either the per-session or per-shard low-water mark.
+pub(crate) const fn should_notify_raw_drained(
+    prev_sess: usize,
+    next_sess: usize,
+    prev_shard: usize,
+    next_shard: usize,
+) -> bool {
+    crossed_raw_low_water(prev_sess, next_sess, RAW_OUTPUT_SESSION_LOW_WATER)
+        || crossed_raw_low_water(prev_shard, next_shard, RAW_OUTPUT_SHARD_LOW_WATER)
+}
+
+/// RAII permit bounding concurrent in-flight shard mailbox commands per client connection.
+///
+/// Dropping the permit (after shard command execution or on shard shutdown) releases the slot
+/// automatically, guaranteeing zero counter drift across RPCs and fire-and-forget messages alike.
+#[derive(Debug)]
+pub struct ShardCmdPermit {
+    counter: Arc<AtomicUsize>,
+}
+
+impl ShardCmdPermit {
+    /// Attempts to acquire one command slot below `limit`, returning `None` if already at cap.
+    pub fn try_acquire(counter: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
+        counter
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| (cur < limit).then_some(cur + 1))
+            .ok()
+            .map(|_| Self { counter: Arc::clone(counter) })
+    }
+}
+
+impl Drop for ShardCmdPermit {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Events sent from a Session Shard back to the single-threaded Control & Transport Reactor.
 #[derive(Debug)]
 pub enum ReactorEvent {
@@ -30,6 +89,8 @@ pub enum ReactorEvent {
         conn: ConnId,
         /// Destination wire stream.
         stream_id: StreamId,
+        /// Attachment lifecycle ID (`Some` for stream-scoped messages, `None` for control stream).
+        attachment: Option<StreamAttachmentId>,
         /// Correlation ID (`RequestId::PUSH` for unsolicited events).
         req_id: RequestId,
         /// Outbound priority tier.
@@ -37,12 +98,14 @@ pub enum ReactorEvent {
         /// Encoded protocol message.
         msg: BrokerMsg,
     },
-    /// Publish a coalesced differential or full-sync view frame for `(conn, stream_id)`.
+    /// Publish a coalesced differential or full-sync view frame for `(conn, stream_id, attachment_id)`.
     PublishFrame {
         /// Destination connection.
         conn: ConnId,
         /// Bound view stream.
         stream_id: NonZeroStreamId,
+        /// Monotonic attachment lifecycle ID.
+        attachment_id: StreamAttachmentId,
         /// Owning session.
         session: SessionId,
         /// Frame payload.
@@ -54,6 +117,10 @@ pub enum ReactorEvent {
         session: SessionId,
         /// Raw output bytes.
         bytes: Vec<u8>,
+        /// Per-session in-flight byte counter decremented on reactor drain.
+        session_inflight: Arc<AtomicUsize>,
+        /// Per-shard aggregate in-flight byte counter decremented on reactor drain.
+        shard_inflight: Arc<AtomicUsize>,
     },
     /// Confirm a session was spawned or rewound and registered on `shard_idx`.
     SessionRegistered {
@@ -194,6 +261,8 @@ pub enum ShardCmd {
         req_id: RequestId,
         /// Non-zero stream ID.
         stream_id: NonZeroStreamId,
+        /// Monotonic attachment lifecycle ID minted by `BrokerCore`.
+        attachment_id: StreamAttachmentId,
         /// Subscription flags.
         flags: SubFlags,
         /// Optional initial viewport hint.
@@ -207,6 +276,8 @@ pub enum ShardCmd {
         conn: ConnId,
         /// Stream ID.
         stream_id: NonZeroStreamId,
+        /// Monotonic attachment lifecycle ID being detached.
+        attachment_id: StreamAttachmentId,
     },
     /// Cancel all pending waits and subscriptions owned by `conn` across all sessions on this shard.
     CancelConnWaiters {
@@ -221,13 +292,15 @@ pub enum ShardCmd {
         conn: ConnId,
         /// Stream ID.
         stream_id: NonZeroStreamId,
+        /// Active attachment lifecycle ID.
+        attachment_id: StreamAttachmentId,
         /// Correlation ID.
         req_id: RequestId,
         /// Client message.
         msg: ClientMsg,
     },
-    /// Notify the shard that the Control Reactor accepted the previous view frame for `(conn, stream_id)`
-    /// and is ready for the next coalesced diff.
+    /// Notify the shard that the Control Reactor accepted the previous view frame for
+    /// `(conn, stream_id, attachment_id)` and is ready for the next coalesced diff.
     ViewSlotFree {
         /// Target session ID.
         session_id: SessionId,
@@ -235,7 +308,11 @@ pub enum ShardCmd {
         conn: ConnId,
         /// Bound view stream ID.
         stream_id: NonZeroStreamId,
+        /// Monotonic attachment lifecycle ID.
+        attachment_id: StreamAttachmentId,
     },
+    /// Notify the shard that in-flight `PublishRawOutput` bytes drained below low-water mark.
+    RawOutputDrained,
     /// Engage or release `BACKPRESSURE_PTY` pause on `session_id`.
     SetPtyPaused {
         /// Target session ID.
@@ -290,7 +367,7 @@ pub enum ShardCmd {
 /// notifications can never be lost between draining output and waiting on `Condvar`.
 #[derive(Default)]
 pub(crate) struct ShardMailboxState {
-    pub(crate) queue: VecDeque<ShardCmd>,
+    pub(crate) queue: VecDeque<(ShardCmd, Option<Arc<ShardCmdPermit>>)>,
     pub(crate) woken: bool,
 }
 
@@ -350,11 +427,17 @@ impl ShardHandle {
         )
     }
 
-    /// Pushes a Tier 0 command into this shard's mailbox and wakes the shard thread immediately.
+    /// Pushes a system/lifecycle Tier 0 command into this shard's mailbox and wakes the shard thread immediately.
     pub fn send(&self, cmd: ShardCmd) {
+        self.send_with_permit(cmd, None);
+    }
+
+    /// Pushes a Tier 0 command paired with an optional per-connection [`ShardCmdPermit`] into this
+    /// shard's mailbox and wakes the shard thread immediately.
+    pub fn send_with_permit(&self, cmd: ShardCmd, permit: Option<Arc<ShardCmdPermit>>) {
         {
             let mut state = self.mailbox.lock().unwrap_or_else(|e| e.into_inner());
-            state.queue.push_back(cmd);
+            state.queue.push_back((cmd, permit));
             state.woken = true;
         }
         self.wake.wake();

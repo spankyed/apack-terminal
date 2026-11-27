@@ -8,6 +8,7 @@ use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::num::NonZeroU64;
 
 use apack_proto::messages::{BrokerMsg, ClientMsg, FrameUpdate};
 use apack_proto::types::{
@@ -31,6 +32,28 @@ use crate::{
 /// Identifies one attached multiplexed stream across connections.
 pub type StreamKey = (ConnId, NonZeroStreamId);
 
+/// Monotonic attachment identifier minted by [`crate::broker::BrokerCore`] on every `Attach`,
+/// uniquely identifying one `(ConnId, NonZeroStreamId)` lifecycle so stale in-flight shard
+/// replies, push events, view frames, and `ViewSlotFree` tokens can never cross a `Detach` +
+/// re-`Attach` boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StreamAttachmentId(NonZeroU64);
+
+impl StreamAttachmentId {
+    /// Wraps a non-zero monotonic attachment counter.
+    pub const fn new(raw: u64) -> Option<Self> {
+        match NonZeroU64::new(raw) {
+            Some(v) => Some(Self(v)),
+            None => None,
+        }
+    }
+
+    /// Returns the non-zero numeric attachment ID.
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
 /// Outbound side effect emitted by [`SessionMachine`] for the shard / transport reactor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEffect {
@@ -40,6 +63,8 @@ pub enum SessionEffect {
         conn: ConnId,
         /// Target wire stream (`StreamId::CONTROL` for control replies like `Wait`).
         stream_id: StreamId,
+        /// Attachment lifecycle ID (`Some` for non-control stream messages, `None` for control).
+        attachment: Option<StreamAttachmentId>,
         /// Correlation ID (`RequestId::PUSH` for unsolicited events).
         req_id: RequestId,
         /// Outbound priority tier.
@@ -73,6 +98,8 @@ pub enum SessionEffect {
         conn: ConnId,
         /// Requesting stream.
         stream_id: NonZeroStreamId,
+        /// Requesting attachment lifecycle ID.
+        attachment: StreamAttachmentId,
         /// Request correlation ID.
         req_id: RequestId,
         /// Content hash.
@@ -208,7 +235,7 @@ pub struct SessionMachine<V: VtEngine> {
     search_flush_timer: Option<TimerId>,
     viewport_seq: u64,
     viewports: BTreeMap<StreamKey, (ViewportHint, u64)>,
-    subscribers: BTreeMap<StreamKey, SubFlags>,
+    subscribers: BTreeMap<StreamKey, (StreamAttachmentId, SubFlags)>,
     views: BTreeMap<StreamKey, ViewSubscriber>,
     held_buttons: BTreeMap<StreamKey, u8>,
     searches: BTreeMap<StreamKey, SearchWatch>,
@@ -379,15 +406,21 @@ impl<V: VtEngine> SessionMachine<V> {
         self.pty_write_queue.drain(..take).collect()
     }
 
-    /// Attaches a stream to this session, recording its subscription flags and optional initial viewport hint.
+    /// Returns the active [`StreamAttachmentId`] for `key`, if currently attached.
+    pub fn attachment_of(&self, key: StreamKey) -> Option<StreamAttachmentId> {
+        self.subscribers.get(&key).map(|&(att, _)| att)
+    }
+
+    /// Attaches a stream to this session, recording its attachment ID, subscription flags, and optional initial viewport hint.
     pub fn attach_stream(
         &mut self,
         key: StreamKey,
+        attachment_id: StreamAttachmentId,
         flags: SubFlags,
         initial_viewport: Option<ViewportHint>,
         effects: &mut Vec<SessionEffect>,
     ) {
-        self.subscribers.insert(key, flags);
+        self.subscribers.insert(key, (attachment_id, flags));
         if flags.contains(SubFlags::VIEW) {
             self.views.insert(key, ViewSubscriber::new());
             if let Some(hint) = initial_viewport {
@@ -451,6 +484,7 @@ impl<V: VtEngine> SessionMachine<V> {
             effects.push(SessionEffect::Send {
                 conn,
                 stream_id: StreamId::CONTROL,
+                attachment: None,
                 req_id,
                 priority: OutboundPriority::Control,
                 msg: BrokerMsg::Waited { outcome: WaitOutcome::Met },
@@ -461,6 +495,7 @@ impl<V: VtEngine> SessionMachine<V> {
             effects.push(SessionEffect::Send {
                 conn,
                 stream_id: StreamId::CONTROL,
+                attachment: None,
                 req_id,
                 priority: OutboundPriority::Control,
                 msg: BrokerMsg::Waited { outcome: WaitOutcome::Exited },
@@ -471,6 +506,7 @@ impl<V: VtEngine> SessionMachine<V> {
             send_stream_error(
                 conn,
                 StreamId::CONTROL,
+                None,
                 req_id,
                 ErrorCode::ResourceLimit,
                 "too many concurrent waiters on session",
@@ -699,6 +735,7 @@ impl<V: VtEngine> SessionMachine<V> {
             effects.push(SessionEffect::Send {
                 conn: w.conn,
                 stream_id: StreamId::CONTROL,
+                attachment: None,
                 req_id: w.req_id,
                 priority: OutboundPriority::Control,
                 msg: BrokerMsg::Waited { outcome },
@@ -731,6 +768,7 @@ impl<V: VtEngine> SessionMachine<V> {
                         effects.push(SessionEffect::Send {
                             conn: w.conn,
                             stream_id: StreamId::CONTROL,
+                            attachment: None,
                             req_id: w.req_id,
                             priority: OutboundPriority::Control,
                             msg: BrokerMsg::Waited { outcome: WaitOutcome::Timeout },
@@ -745,22 +783,36 @@ impl<V: VtEngine> SessionMachine<V> {
     pub fn handle_stream_msg(
         &mut self,
         key: StreamKey,
+        attachment_id: StreamAttachmentId,
         req_id: RequestId,
         msg: ClientMsg,
         effects: &mut Vec<SessionEffect>,
     ) {
         let (conn, stream_id) = key;
         let wire_stream = stream_id.as_stream_id();
-        let Some(&flags) = self.subscribers.get(&key) else {
-            send_stream_error(conn, wire_stream, req_id, ErrorCode::NoSuchStream, "stream not attached", effects);
+        let Some(&(cur_att, flags)) = self.subscribers.get(&key) else {
+            send_stream_error(
+                conn,
+                wire_stream,
+                Some(attachment_id),
+                req_id,
+                ErrorCode::NoSuchStream,
+                "stream not attached",
+                effects,
+            );
             return;
         };
+        if cur_att != attachment_id {
+            return;
+        }
+        let att = Some(attachment_id);
         match msg {
             ClientMsg::ViewportHint(hint) => {
                 if !flags.contains(SubFlags::VIEW) {
                     send_stream_error(
                         conn,
                         wire_stream,
+                        att,
                         req_id,
                         ErrorCode::Malformed,
                         "ViewportHint requires SUB_VIEW",
@@ -777,6 +829,7 @@ impl<V: VtEngine> SessionMachine<V> {
                 effects.push(SessionEffect::Send {
                     conn,
                     stream_id: wire_stream,
+                    attachment: att,
                     req_id,
                     priority: OutboundPriority::Control,
                     msg: BrokerMsg::Ok,
@@ -787,6 +840,7 @@ impl<V: VtEngine> SessionMachine<V> {
                 effects.push(SessionEffect::Send {
                     conn,
                     stream_id: wire_stream,
+                    attachment: att,
                     req_id,
                     priority: OutboundPriority::Control,
                     msg: BrokerMsg::Ok,
@@ -797,12 +851,12 @@ impl<V: VtEngine> SessionMachine<V> {
                 let mut buf = Vec::new();
                 self.vt.encode_key(&input, &mut buf);
                 if self.enqueue_pty_bytes(&buf, effects).is_err() {
-                    send_stream_error(conn, wire_stream, req_id, ErrorCode::Pty, "PTY write rejected", effects);
+                    send_stream_error(conn, wire_stream, att, req_id, ErrorCode::Pty, "PTY write rejected", effects);
                 }
             }
             ClientMsg::Text { text } => {
                 if self.enqueue_pty_bytes(text.as_bytes(), effects).is_err() {
-                    send_stream_error(conn, wire_stream, req_id, ErrorCode::Pty, "PTY write rejected", effects);
+                    send_stream_error(conn, wire_stream, att, req_id, ErrorCode::Pty, "PTY write rejected", effects);
                 }
             }
             ClientMsg::Pointer(input) => {
@@ -810,7 +864,7 @@ impl<V: VtEngine> SessionMachine<V> {
                 let mut buf = Vec::new();
                 self.vt.encode_pointer(&input, held, &mut buf);
                 if self.enqueue_pty_bytes(&buf, effects).is_err() {
-                    send_stream_error(conn, wire_stream, req_id, ErrorCode::Pty, "PTY write rejected", effects);
+                    send_stream_error(conn, wire_stream, att, req_id, ErrorCode::Pty, "PTY write rejected", effects);
                 }
             }
             ClientMsg::Focus { focused } => {
@@ -826,6 +880,7 @@ impl<V: VtEngine> SessionMachine<V> {
                     effects.push(SessionEffect::Send {
                         conn,
                         stream_id: wire_stream,
+                        attachment: att,
                         req_id,
                         priority: OutboundPriority::Control,
                         msg: BrokerMsg::Pasted { outcome: PasteOutcome::Unsafe },
@@ -833,11 +888,20 @@ impl<V: VtEngine> SessionMachine<V> {
                 }
                 PasteEncode::Bytes(bytes) => {
                     if self.enqueue_pty_bytes(&bytes, effects).is_err() {
-                        send_stream_error(conn, wire_stream, req_id, ErrorCode::Pty, "PTY write rejected", effects);
+                        send_stream_error(
+                            conn,
+                            wire_stream,
+                            att,
+                            req_id,
+                            ErrorCode::Pty,
+                            "PTY write rejected",
+                            effects,
+                        );
                     } else {
                         effects.push(SessionEffect::Send {
                             conn,
                             stream_id: wire_stream,
+                            attachment: att,
                             req_id,
                             priority: OutboundPriority::Control,
                             msg: BrokerMsg::Pasted { outcome: PasteOutcome::Pasted },
@@ -847,7 +911,7 @@ impl<V: VtEngine> SessionMachine<V> {
             },
             ClientMsg::Write { data } => {
                 if self.enqueue_pty_bytes(&data, effects).is_err() {
-                    send_stream_error(conn, wire_stream, req_id, ErrorCode::Pty, "PTY write rejected", effects);
+                    send_stream_error(conn, wire_stream, att, req_id, ErrorCode::Pty, "PTY write rejected", effects);
                 }
             }
             ClientMsg::Pause => {
@@ -859,6 +923,7 @@ impl<V: VtEngine> SessionMachine<V> {
                 effects.push(SessionEffect::Send {
                     conn,
                     stream_id: wire_stream,
+                    attachment: att,
                     req_id,
                     priority: OutboundPriority::Control,
                     msg: BrokerMsg::Ok,
@@ -871,6 +936,7 @@ impl<V: VtEngine> SessionMachine<V> {
                 effects.push(SessionEffect::Send {
                     conn,
                     stream_id: wire_stream,
+                    attachment: att,
                     req_id,
                     priority: OutboundPriority::Control,
                     msg: BrokerMsg::Ok,
@@ -879,7 +945,7 @@ impl<V: VtEngine> SessionMachine<V> {
             ClientMsg::FetchRows { epoch, from_line, count } => {
                 let cur_epoch = self.vt.meta().epoch;
                 if epoch != cur_epoch {
-                    send_stream_error(conn, wire_stream, req_id, ErrorCode::StaleEpoch, "stale epoch", effects);
+                    send_stream_error(conn, wire_stream, att, req_id, ErrorCode::StaleEpoch, "stale epoch", effects);
                     return;
                 }
                 let mut rows = Vec::new();
@@ -890,6 +956,7 @@ impl<V: VtEngine> SessionMachine<V> {
                 effects.push(SessionEffect::Send {
                     conn,
                     stream_id: wire_stream,
+                    attachment: att,
                     req_id,
                     priority: OutboundPriority::Bulk,
                     msg: BrokerMsg::Rows { epoch: cur_epoch, rows },
@@ -897,13 +964,14 @@ impl<V: VtEngine> SessionMachine<V> {
             }
             ClientMsg::WordAt { epoch, pos } => {
                 if epoch != self.vt.meta().epoch {
-                    send_stream_error(conn, wire_stream, req_id, ErrorCode::StaleEpoch, "stale epoch", effects);
+                    send_stream_error(conn, wire_stream, att, req_id, ErrorCode::StaleEpoch, "stale epoch", effects);
                     return;
                 }
                 let span = self.vt.word_at(pos, &self.word_delimiters);
                 effects.push(SessionEffect::Send {
                     conn,
                     stream_id: wire_stream,
+                    attachment: att,
                     req_id,
                     priority: OutboundPriority::Control,
                     msg: BrokerMsg::SpanReply { span },
@@ -911,13 +979,14 @@ impl<V: VtEngine> SessionMachine<V> {
             }
             ClientMsg::LineAt { epoch, line } => {
                 if epoch != self.vt.meta().epoch {
-                    send_stream_error(conn, wire_stream, req_id, ErrorCode::StaleEpoch, "stale epoch", effects);
+                    send_stream_error(conn, wire_stream, att, req_id, ErrorCode::StaleEpoch, "stale epoch", effects);
                     return;
                 }
                 let span = self.vt.line_at(line);
                 effects.push(SessionEffect::Send {
                     conn,
                     stream_id: wire_stream,
+                    attachment: att,
                     req_id,
                     priority: OutboundPriority::Control,
                     msg: BrokerMsg::SpanReply { span },
@@ -926,7 +995,7 @@ impl<V: VtEngine> SessionMachine<V> {
             ClientMsg::TextOf { epoch, span } => {
                 let meta = self.vt.meta();
                 if epoch != meta.epoch {
-                    send_stream_error(conn, wire_stream, req_id, ErrorCode::StaleEpoch, "stale epoch", effects);
+                    send_stream_error(conn, wire_stream, att, req_id, ErrorCode::StaleEpoch, "stale epoch", effects);
                     return;
                 }
                 let text = match clamp_span(span, &meta) {
@@ -936,6 +1005,7 @@ impl<V: VtEngine> SessionMachine<V> {
                 effects.push(SessionEffect::Send {
                     conn,
                     stream_id: wire_stream,
+                    attachment: att,
                     req_id,
                     priority: OutboundPriority::Bulk,
                     msg: BrokerMsg::TextReply { text },
@@ -944,7 +1014,7 @@ impl<V: VtEngine> SessionMachine<V> {
             ClientMsg::TextOfRect { epoch, span } => {
                 let meta = self.vt.meta();
                 if epoch != meta.epoch {
-                    send_stream_error(conn, wire_stream, req_id, ErrorCode::StaleEpoch, "stale epoch", effects);
+                    send_stream_error(conn, wire_stream, att, req_id, ErrorCode::StaleEpoch, "stale epoch", effects);
                     return;
                 }
                 let text = match clamp_rect_span(span, &meta) {
@@ -954,6 +1024,7 @@ impl<V: VtEngine> SessionMachine<V> {
                 effects.push(SessionEffect::Send {
                     conn,
                     stream_id: wire_stream,
+                    attachment: att,
                     req_id,
                     priority: OutboundPriority::Bulk,
                     msg: BrokerMsg::TextReply { text },
@@ -971,6 +1042,7 @@ impl<V: VtEngine> SessionMachine<V> {
                     effects.push(SessionEffect::Send {
                         conn,
                         stream_id: wire_stream,
+                        attachment: att,
                         req_id,
                         priority: OutboundPriority::Bulk,
                         msg: BrokerMsg::SearchMatches { epoch: meta.epoch, matches: Vec::new(), truncated: false },
@@ -998,6 +1070,7 @@ impl<V: VtEngine> SessionMachine<V> {
                 effects.push(SessionEffect::Send {
                     conn,
                     stream_id: wire_stream,
+                    attachment: att,
                     req_id,
                     priority: OutboundPriority::Bulk,
                     msg: BrokerMsg::SearchMatches { epoch: meta.epoch, matches, truncated },
@@ -1007,6 +1080,7 @@ impl<V: VtEngine> SessionMachine<V> {
                 effects.push(SessionEffect::Send {
                     conn,
                     stream_id: wire_stream,
+                    attachment: att,
                     req_id,
                     priority: OutboundPriority::Bulk,
                     msg: BrokerMsg::CommandsReply { commands: self.marks.commands() },
@@ -1017,6 +1091,7 @@ impl<V: VtEngine> SessionMachine<V> {
                 effects.push(SessionEffect::Send {
                     conn,
                     stream_id: wire_stream,
+                    attachment: att,
                     req_id,
                     priority: OutboundPriority::Bulk,
                     msg: BrokerMsg::CommandOutputReply { text },
@@ -1029,6 +1104,7 @@ impl<V: VtEngine> SessionMachine<V> {
                 effects.push(SessionEffect::Send {
                     conn,
                     stream_id: wire_stream,
+                    attachment: att,
                     req_id,
                     priority: OutboundPriority::Bulk,
                     msg: BrokerMsg::ImagesReply { images_gen: meta.images_gen, placements },
@@ -1036,7 +1112,15 @@ impl<V: VtEngine> SessionMachine<V> {
             }
             ClientMsg::GetImageBlob { blob, offset, max_bytes } => {
                 let max_bytes = max_bytes.clamp(1, BULK_CHUNK_BYTES as u32);
-                effects.push(SessionEffect::FetchImageBlob { conn, stream_id, req_id, blob, offset, max_bytes });
+                effects.push(SessionEffect::FetchImageBlob {
+                    conn,
+                    stream_id,
+                    attachment: attachment_id,
+                    req_id,
+                    blob,
+                    offset,
+                    max_bytes,
+                });
             }
             _ => {}
         }
@@ -1119,9 +1203,9 @@ impl<V: VtEngine> SessionMachine<V> {
         true
     }
 
-    /// Returns all currently attached `SUB_VIEW` stream keys.
-    pub fn view_subscribers(&self) -> Vec<StreamKey> {
-        self.views.keys().copied().collect()
+    /// Returns all currently attached `SUB_VIEW` `(StreamKey, StreamAttachmentId)` pairs.
+    pub fn view_subscribers(&self) -> Vec<(StreamKey, StreamAttachmentId)> {
+        self.views.keys().filter_map(|&k| self.subscribers.get(&k).map(|&(att, _)| (k, att))).collect()
     }
 
     fn notify_views_dirty(&self, effects: &mut Vec<SessionEffect>) {
@@ -1346,21 +1430,25 @@ impl<V: VtEngine> SessionMachine<V> {
                 );
                 matches.truncate(MAX_SEARCH_MATCHES);
                 watch.was_truncated = truncated;
+                let att = self.subscribers.get(&(conn, stream_id)).map(|&(a, _)| a);
                 effects.push(SessionEffect::Send {
                     conn,
                     stream_id: stream_id.as_stream_id(),
+                    attachment: att,
                     req_id: RequestId::PUSH,
                     priority: OutboundPriority::Bulk,
                     msg: BrokerMsg::SearchMatches { epoch: meta.epoch, matches, truncated },
                 });
                 continue;
             }
+            let att = self.subscribers.get(&(conn, stream_id)).map(|&(a, _)| a);
             if oldest > watch.last_oldest_line {
                 let evicted_from = watch.last_oldest_line;
                 watch.last_oldest_line = oldest;
                 effects.push(SessionEffect::Send {
                     conn,
                     stream_id: stream_id.as_stream_id(),
+                    attachment: att,
                     req_id: RequestId::PUSH,
                     priority: OutboundPriority::Bulk,
                     msg: BrokerMsg::SearchDelta {
@@ -1398,6 +1486,7 @@ impl<V: VtEngine> SessionMachine<V> {
                 effects.push(SessionEffect::Send {
                     conn,
                     stream_id: stream_id.as_stream_id(),
+                    attachment: att,
                     req_id: RequestId::PUSH,
                     priority: OutboundPriority::Bulk,
                     msg: BrokerMsg::SearchDelta {
@@ -1436,6 +1525,7 @@ impl<V: VtEngine> SessionMachine<V> {
                 effects.push(SessionEffect::Send {
                     conn: w.conn,
                     stream_id: StreamId::CONTROL,
+                    attachment: None,
                     req_id: w.req_id,
                     priority: OutboundPriority::Control,
                     msg: BrokerMsg::Waited { outcome: WaitOutcome::Met },
@@ -1455,6 +1545,7 @@ impl<V: VtEngine> SessionMachine<V> {
                 effects.push(SessionEffect::Send {
                     conn: w.conn,
                     stream_id: StreamId::CONTROL,
+                    attachment: None,
                     req_id: w.req_id,
                     priority: OutboundPriority::Control,
                     msg: BrokerMsg::Waited { outcome: WaitOutcome::Met },
@@ -1484,11 +1575,12 @@ impl<V: VtEngine> SessionMachine<V> {
     }
 
     fn broadcast_event(&self, msg: BrokerMsg, effects: &mut Vec<SessionEffect>) {
-        for (&(conn, stream_id), &flags) in &self.subscribers {
+        for (&(conn, stream_id), &(att, flags)) in &self.subscribers {
             if flags.contains(SubFlags::EVENTS) {
                 effects.push(SessionEffect::Send {
                     conn,
                     stream_id: stream_id.as_stream_id(),
+                    attachment: Some(att),
                     req_id: RequestId::PUSH,
                     priority: OutboundPriority::Event,
                     msg: msg.clone(),
@@ -1674,6 +1766,7 @@ fn compute_dirty_abs_range(
 fn send_stream_error(
     conn: ConnId,
     stream_id: StreamId,
+    attachment: Option<StreamAttachmentId>,
     req_id: RequestId,
     code: ErrorCode,
     message: &str,
@@ -1682,6 +1775,7 @@ fn send_stream_error(
     effects.push(SessionEffect::Send {
         conn,
         stream_id,
+        attachment,
         req_id,
         priority: OutboundPriority::Control,
         msg: BrokerMsg::Error { code, message: String::from(message) },

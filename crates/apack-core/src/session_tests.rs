@@ -9,7 +9,7 @@ use apack_proto::{BULK_CHUNK_BYTES, MAX_COMMANDS, MAX_SEARCH_MATCHES, MAX_STATUS
 
 use crate::lease::ConnId;
 use crate::marks::{MarkEffect, MarksMode, MarksTracker};
-use crate::session::{SessionEffect, SessionMachine};
+use crate::session::{SessionEffect, SessionMachine, StreamAttachmentId};
 use crate::status::StatusTable;
 use crate::time::TimestampMs;
 use crate::vt::{CompressStep, DirtyViewport, PasteEncode, VtEngine, VtEvent, VtGenerations, VtSnapshotMeta};
@@ -29,6 +29,10 @@ fn conn(n: u64) -> ConnId {
 
 fn nz_stream(n: u32) -> NonZeroStreamId {
     NonZeroStreamId::new(n).unwrap()
+}
+
+fn att_for(k: (ConnId, NonZeroStreamId)) -> StreamAttachmentId {
+    StreamAttachmentId::new((k.0.get() << 16) | u64::from(k.1.raw())).unwrap()
 }
 
 fn sample_key() -> MarksKey {
@@ -614,7 +618,7 @@ fn session_machine_view_dirty_tracking_and_individual_publish_triggers() {
     sess.on_pty_output(b"NOOP", ts(1), &mut fx);
     assert!(!fx.contains(&SessionEffect::ViewsDirty));
 
-    sess.attach_stream(k1, SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
+    sess.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
     assert!(fx.contains(&SessionEffect::ViewsDirty));
 
     // Initial full sync
@@ -698,6 +702,7 @@ fn session_machine_viewport_policies_resizes_and_pty_queue() {
     );
     s.attach_stream(
         k1,
+        att_for(k1),
         SubFlags::from_bits(SubFlags::VIEW).unwrap(),
         Some(ViewportHint {
             size: GridSize::new(80, 24).unwrap(),
@@ -711,6 +716,7 @@ fn session_machine_viewport_policies_resizes_and_pty_queue() {
     // Attach k2 focused -> switches to k2 (100x30)
     s.attach_stream(
         k2,
+        att_for(k2),
         SubFlags::from_bits(SubFlags::VIEW).unwrap(),
         Some(ViewportHint {
             size: GridSize::new(100, 30).unwrap(),
@@ -725,6 +731,7 @@ fn session_machine_viewport_policies_resizes_and_pty_queue() {
     fx.clear();
     s.handle_stream_msg(
         k1,
+        att_for(k1),
         RequestId::from_raw(1),
         ClientMsg::ViewportHint(ViewportHint {
             size: GridSize::new(90, 25).unwrap(),
@@ -744,6 +751,7 @@ fn session_machine_viewport_policies_resizes_and_pty_queue() {
     fx.clear();
     s.handle_stream_msg(
         k1,
+        att_for(k1),
         RequestId::from_raw(2),
         ClientMsg::ExplicitResize { size: GridSize::new(90, 25).unwrap(), cell_px: CellPx { width: 10, height: 20 } },
         &mut fx,
@@ -752,6 +760,7 @@ fn session_machine_viewport_policies_resizes_and_pty_queue() {
     fx.clear();
     s.handle_stream_msg(
         k1,
+        att_for(k1),
         RequestId::from_raw(3),
         ClientMsg::ExplicitResize { size: GridSize::new(90, 25).unwrap(), cell_px: CellPx { width: 10, height: 20 } },
         &mut fx,
@@ -760,10 +769,16 @@ fn session_machine_viewport_policies_resizes_and_pty_queue() {
 
     // PTY write queue exact boundary (8 bytes fits; 9th byte returns ErrorCode::Pty)
     fx.clear();
-    s.handle_stream_msg(k1, RequestId::from_raw(4), ClientMsg::Write { data: b"12345678".to_vec() }, &mut fx);
+    s.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(4),
+        ClientMsg::Write { data: b"12345678".to_vec() },
+        &mut fx,
+    );
     assert_eq!(s.pty_write_len(), 8);
     assert!(!fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Error { .. }, .. })));
-    s.handle_stream_msg(k1, RequestId::from_raw(5), ClientMsg::Write { data: b"x".to_vec() }, &mut fx);
+    s.handle_stream_msg(k1, att_for(k1), RequestId::from_raw(5), ClientMsg::Write { data: b"x".to_vec() }, &mut fx);
     assert!(
         fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Error { code: ErrorCode::Pty, .. }, .. }))
     );
@@ -774,6 +789,7 @@ fn session_machine_viewport_policies_resizes_and_pty_queue() {
     fx.clear();
     s.handle_stream_msg(
         k1,
+        att_for(k1),
         RequestId::from_raw(6),
         ClientMsg::Paste { text: "a\nb".into(), allow_unsafe: false },
         &mut fx,
@@ -785,6 +801,7 @@ fn session_machine_viewport_policies_resizes_and_pty_queue() {
     fx.clear();
     s.handle_stream_msg(
         k1,
+        att_for(k1),
         RequestId::from_raw(7),
         ClientMsg::Paste { text: "a\nb".into(), allow_unsafe: true },
         &mut fx,
@@ -800,6 +817,7 @@ fn session_machine_viewport_policies_resizes_and_pty_queue() {
         SessionMachine::new(sid(2), StubVt::new(80, 24), ResizePolicy::MinFit, MarksMode::Claimed, CellPx::default());
     min_s.attach_stream(
         k1,
+        att_for(k1),
         SubFlags::from_bits(SubFlags::VIEW).unwrap(),
         Some(ViewportHint {
             size: GridSize::new(70, 20).unwrap(),
@@ -811,6 +829,7 @@ fn session_machine_viewport_policies_resizes_and_pty_queue() {
     );
     min_s.attach_stream(
         k2,
+        att_for(k2),
         SubFlags::from_bits(SubFlags::VIEW).unwrap(),
         Some(ViewportHint {
             size: GridSize::new(50, 30).unwrap(),
@@ -831,6 +850,7 @@ fn session_machine_viewport_policies_resizes_and_pty_queue() {
     );
     exp_s.attach_stream(
         k1,
+        att_for(k1),
         SubFlags::from_bits(SubFlags::VIEW).unwrap(),
         Some(ViewportHint {
             size: GridSize::new(50, 15).unwrap(),
@@ -863,7 +883,7 @@ fn session_machine_marks_search_waiters_command_output_and_exit() {
 
     let k1 = (conn(1), nz_stream(1));
     let mut fx = Vec::new();
-    sess.attach_stream(k1, SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
+    sess.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
 
     // Initial PTY output emits all VT events + CommandStarted (id=1) + VerifyForeground + DeviceResponse
     fx.clear();
@@ -894,9 +914,21 @@ fn session_machine_marks_search_waiters_command_output_and_exit() {
 
     // CommandOutput for active command id=1 returns Some("0:0:3:39"); unknown id=99 returns None
     fx.clear();
-    sess.handle_stream_msg(k1, RequestId::from_raw(40), ClientMsg::Commands, &mut fx);
-    sess.handle_stream_msg(k1, RequestId::from_raw(41), ClientMsg::CommandOutput { command_id: 1 }, &mut fx);
-    sess.handle_stream_msg(k1, RequestId::from_raw(42), ClientMsg::CommandOutput { command_id: 99 }, &mut fx);
+    sess.handle_stream_msg(k1, att_for(k1), RequestId::from_raw(40), ClientMsg::Commands, &mut fx);
+    sess.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(41),
+        ClientMsg::CommandOutput { command_id: 1 },
+        &mut fx,
+    );
+    sess.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(42),
+        ClientMsg::CommandOutput { command_id: 99 },
+        &mut fx,
+    );
     assert!(fx.iter().any(|e| matches!(
         e,
         SessionEffect::Send { req_id, msg: BrokerMsg::CommandsReply { commands }, .. }
@@ -926,6 +958,7 @@ fn session_machine_marks_search_waiters_command_output_and_exit() {
     fx.clear();
     sess.handle_stream_msg(
         k1,
+        att_for(k1),
         RequestId::from_raw(50),
         ClientMsg::SetSearch { query: "new-line".into(), case_sensitive: true },
         &mut fx,
@@ -1017,7 +1050,7 @@ fn session_machine_marks_search_waiters_command_output_and_exit() {
         (75, ClientMsg::Focus { focused: true }),
         (76, ClientMsg::SetCursorDefaults { shape: CursorShape::Underline, blinking: true }),
     ] {
-        sess.handle_stream_msg(k1, RequestId::from_raw(req), msg, &mut fx);
+        sess.handle_stream_msg(k1, att_for(k1), RequestId::from_raw(req), msg, &mut fx);
     }
     assert_eq!(sess.drain_pty_write(32), b"abM1I");
     assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Error { code: ErrorCode::StaleEpoch, .. }, .. } if *req_id == RequestId::from_raw(60))));
@@ -1059,7 +1092,7 @@ fn session_machine_marks_search_waiters_command_output_and_exit() {
     let mut vt2 = StubVt::new(40, 4);
     vt2.next_events = vec![VtEvent::SyncOutput(true)];
     let mut s2 = SessionMachine::new(sid(2), vt2, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
-    s2.attach_stream(k1, SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
+    s2.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
     fx.clear();
     s2.on_pty_output(b"x", ts(500), &mut fx);
     assert!(s2.is_sync_held());
@@ -1090,7 +1123,7 @@ fn session_machine_marks_search_waiters_command_output_and_exit() {
         VtEvent::ProgramStatus(crate::status::parse_osc7501("state=done").unwrap()),
     ];
     let mut s3 = SessionMachine::new(sid(3), vt3, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
-    s3.attach_stream(k1, SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
+    s3.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
     s3.register_wait(conn(1), RequestId::from_raw(90), WaitCondition::Idle, 500, ts(2_000), &mut fx);
     s3.register_wait(
         conn(1),
@@ -1123,7 +1156,7 @@ fn session_edge_cases_and_boundary_invariants() {
     vt.dirty.full_dirty = false;
     let mut sess = SessionMachine::new(sid(10), vt, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
     let k1 = (conn(1), nz_stream(1));
-    sess.attach_stream(k1, SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
+    sess.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
     assert!(sess.try_publish_view(k1, |_| true)); // initial full sync establishes last_epoch = Some(1)
 
     // Same epoch + full_dirty=true -> full_sync frame!
@@ -1184,8 +1217,20 @@ fn session_edge_cases_and_boundary_invariants() {
         visible: true,
         focused: false,
     };
-    s_vp.attach_stream((conn(2), nz_stream(1)), SubFlags::from_bits(SubFlags::VIEW).unwrap(), Some(hint2), &mut fx);
-    s_vp.attach_stream((conn(1), nz_stream(1)), SubFlags::from_bits(SubFlags::VIEW).unwrap(), Some(hint1), &mut fx);
+    s_vp.attach_stream(
+        (conn(2), nz_stream(1)),
+        att_for((conn(2), nz_stream(1))),
+        SubFlags::from_bits(SubFlags::VIEW).unwrap(),
+        Some(hint2),
+        &mut fx,
+    );
+    s_vp.attach_stream(
+        (conn(1), nz_stream(1)),
+        att_for((conn(1), nz_stream(1))),
+        SubFlags::from_bits(SubFlags::VIEW).unwrap(),
+        Some(hint1),
+        &mut fx,
+    );
     assert_eq!(s_vp.current_size(), GridSize::new(50, 15).unwrap());
 
     // 3. cancel_waiters_for_conn cancels ONLY the disconnected conn's waiters, keeping other conns' waiters live!
@@ -1209,7 +1254,7 @@ fn session_edge_cases_and_boundary_invariants() {
     vt_st.next_events = vec![VtEvent::ProgramStatus(crate::status::parse_osc7501("state=blocked;app=claude").unwrap())];
     let mut s_st =
         SessionMachine::new(sid(13), vt_st, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
-    s_st.attach_stream(k1, SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
+    s_st.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
     fx.clear();
     s_st.on_pty_output(b"NOOP", ts(10), &mut fx);
     s_st.apply_status_confirmation("", 1, Confirmed::Matched, &mut fx);
@@ -1223,10 +1268,17 @@ fn session_edge_cases_and_boundary_invariants() {
     vt_srch.dirty.full_dirty = false;
     let mut s_srch =
         SessionMachine::new(sid(14), vt_srch, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
-    s_srch.attach_stream(k1, SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
+    s_srch.attach_stream(
+        k1,
+        att_for(k1),
+        SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(),
+        None,
+        &mut fx,
+    );
     fx.clear();
     s_srch.handle_stream_msg(
         k1,
+        att_for(k1),
         RequestId::from_raw(1),
         ClientMsg::SetSearch { query: "row-two".into(), case_sensitive: true },
         &mut fx,
@@ -1254,18 +1306,25 @@ fn session_edge_cases_and_boundary_invariants() {
     ];
     let mut s_rs =
         SessionMachine::new(sid(15), vt_rs, ResizePolicy::ExplicitOverride, MarksMode::Claimed, CellPx::default());
-    s_rs.attach_stream(k1, SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
+    s_rs.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
     s_rs.on_pty_output(b"NOOP", ts(10), &mut fx);
     // Single-line command output (start_line == end_line == 0): kills start_line > end_line -> >= and ==!
     // Also send a subsequent normal NOOP chunk (epoch unchanged) to prove marks are NOT wiped (kills epoch_changed != -> ==)!
     s_rs.on_pty_output(b"NOOP", ts(11), &mut fx);
     fx.clear();
-    s_rs.handle_stream_msg(k1, RequestId::from_raw(1), ClientMsg::CommandOutput { command_id: 1 }, &mut fx);
+    s_rs.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(1),
+        ClientMsg::CommandOutput { command_id: 1 },
+        &mut fx,
+    );
     assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::CommandOutputReply { text: Some(t) }, .. } if *req_id == RequestId::from_raw(1) && t == "0:0:0:39")));
 
     // Active search watch flushes immediately on epoch-bumping resize!
     s_rs.handle_stream_msg(
         k1,
+        att_for(k1),
         RequestId::from_raw(10),
         ClientMsg::SetSearch { query: "foo".into(), case_sensitive: true },
         &mut fx,
@@ -1275,18 +1334,26 @@ fn session_edge_cases_and_boundary_invariants() {
     // CellPx-only resize keeps same epoch -> mark anchors survive!
     s_rs.handle_stream_msg(
         k1,
+        att_for(k1),
         RequestId::from_raw(2),
         ClientMsg::ExplicitResize { size: GridSize::new(40, 4).unwrap(), cell_px: CellPx { width: 12, height: 24 } },
         &mut fx,
     );
     fx.clear();
-    s_rs.handle_stream_msg(k1, RequestId::from_raw(3), ClientMsg::CommandOutput { command_id: 1 }, &mut fx);
+    s_rs.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(3),
+        ClientMsg::CommandOutput { command_id: 1 },
+        &mut fx,
+    );
     assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::CommandOutputReply { text: Some(_) }, .. } if *req_id == RequestId::from_raw(3))));
 
     // Grid resize bumps epoch -> mark anchors cleared, SearchMatches flushed immediately, pending timer cancelled!
     fx.clear();
     s_rs.handle_stream_msg(
         k1,
+        att_for(k1),
         RequestId::from_raw(4),
         ClientMsg::ExplicitResize { size: GridSize::new(50, 5).unwrap(), cell_px: CellPx { width: 12, height: 24 } },
         &mut fx,
@@ -1294,7 +1361,13 @@ fn session_edge_cases_and_boundary_invariants() {
     assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::SearchMatches { .. }, .. })));
     assert_eq!(s_rs.next_deadline(), None);
     fx.clear();
-    s_rs.handle_stream_msg(k1, RequestId::from_raw(5), ClientMsg::CommandOutput { command_id: 1 }, &mut fx);
+    s_rs.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(5),
+        ClientMsg::CommandOutput { command_id: 1 },
+        &mut fx,
+    );
     assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::CommandOutputReply { text: None }, .. } if *req_id == RequestId::from_raw(5))));
 
     // 7. CommandOutput where start_line (2) > end_line (0) while end_line < total_lines (4) must return None!
@@ -1303,11 +1376,17 @@ fn session_edge_cases_and_boundary_invariants() {
     vt_cmd.next_events = vec![VtEvent::Osc133 { payload: "C".into(), cursor_line: 2 }];
     let mut s_cmd =
         SessionMachine::new(sid(16), vt_cmd, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
-    s_cmd.attach_stream(k1, SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
+    s_cmd.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
     s_cmd.on_pty_output(b"NOOP", ts(10), &mut fx);
     s_cmd.on_pty_output(b"CURSOR_HOME", ts(11), &mut fx);
     fx.clear();
-    s_cmd.handle_stream_msg(k1, RequestId::from_raw(1), ClientMsg::CommandOutput { command_id: 1 }, &mut fx);
+    s_cmd.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(1),
+        ClientMsg::CommandOutput { command_id: 1 },
+        &mut fx,
+    );
     assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::CommandOutputReply { text: None }, .. } if *req_id == RequestId::from_raw(1))));
 
     // 8. Non-prompt mark (Osc133("C")) must NOT wake WaitCondition::Idle; PromptArrived (Osc133("A")) DOES wake it.
@@ -1331,7 +1410,7 @@ fn session_security_hardening_and_audit_fixes() {
     let mut vt = StubVt::new(40, 4);
     vt.dirty.full_dirty = false;
     let mut sess = SessionMachine::new(sid(20), vt, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
-    sess.attach_stream(k1, SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
+    sess.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
     assert!(sess.try_publish_view(k1, |_| true));
     sess.on_pty_output(b"SCROLL_ONLY", ts(1), &mut fx);
     sess.on_pty_output(b"SCROLL_DOWN_ONLY", ts(2), &mut fx);
@@ -1359,7 +1438,7 @@ fn session_security_hardening_and_audit_fixes() {
 
     // 2. Unattached stream rejected (NoSuchStream) and non-VIEW ViewportHint rejected (Malformed)
     fx.clear();
-    sess.handle_stream_msg(k2, RequestId::from_raw(1), ClientMsg::Commands, &mut fx);
+    sess.handle_stream_msg(k2, att_for(k2), RequestId::from_raw(1), ClientMsg::Commands, &mut fx);
     assert!(
         fx.iter().any(|e| matches!(
             e,
@@ -1367,10 +1446,11 @@ fn session_security_hardening_and_audit_fixes() {
         ))
     );
 
-    sess.attach_stream(k2, SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
+    sess.attach_stream(k2, att_for(k2), SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
     fx.clear();
     sess.handle_stream_msg(
         k2,
+        att_for(k2),
         RequestId::from_raw(2),
         ClientMsg::ViewportHint(ViewportHint {
             size: GridSize::new(30, 10).unwrap(),
@@ -1387,13 +1467,13 @@ fn session_security_hardening_and_audit_fixes() {
 
     // 3. Pause / Resume reference counting + automatic unpause on detach_stream
     fx.clear();
-    sess.handle_stream_msg(k1, RequestId::from_raw(10), ClientMsg::Pause, &mut fx);
+    sess.handle_stream_msg(k1, att_for(k1), RequestId::from_raw(10), ClientMsg::Pause, &mut fx);
     assert!(fx.contains(&SessionEffect::SetPtyPaused(true)));
     fx.clear();
-    sess.handle_stream_msg(k2, RequestId::from_raw(11), ClientMsg::Pause, &mut fx);
+    sess.handle_stream_msg(k2, att_for(k2), RequestId::from_raw(11), ClientMsg::Pause, &mut fx);
     assert!(!fx.contains(&SessionEffect::SetPtyPaused(true))); // already paused
     fx.clear();
-    sess.handle_stream_msg(k1, RequestId::from_raw(12), ClientMsg::Resume, &mut fx);
+    sess.handle_stream_msg(k1, att_for(k1), RequestId::from_raw(12), ClientMsg::Resume, &mut fx);
     assert!(!fx.contains(&SessionEffect::SetPtyPaused(false))); // k2 still holds pause
     fx.clear();
     sess.detach_stream(k2, &mut fx);
@@ -1411,7 +1491,7 @@ fn session_security_hardening_and_audit_fixes() {
     ];
     let mut s_ev =
         SessionMachine::new(sid(21), vt_ev, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
-    s_ev.attach_stream(k1, SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
+    s_ev.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
     fx.clear();
     s_ev.on_pty_output(b"NOOP", ts(10), &mut fx);
     assert!(fx.iter().any(|e| matches!(
@@ -1445,7 +1525,13 @@ fn session_security_hardening_and_audit_fixes() {
         CellPx::default(),
         10,
     );
-    s_sync.attach_stream(k1, SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
+    s_sync.attach_stream(
+        k1,
+        att_for(k1),
+        SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(),
+        None,
+        &mut fx,
+    );
     s_sync.on_pty_output(b"x", ts(1_000), &mut fx);
     assert_eq!(s_sync.next_deadline(), Some(ts(1_000 + SYNC_HOLD_MAX_MS)));
     // Attempt starvation at t=1900 by toggling 2026l + 2026h without publishing a frame
@@ -1461,7 +1547,13 @@ fn session_security_hardening_and_audit_fixes() {
     assert!(s_sync.is_sync_held());
 
     // DSR sub-quota leaves half the queue free for interactive user input!
-    s_sync.handle_stream_msg(k1, RequestId::from_raw(1), ClientMsg::Write { data: b"1234".to_vec() }, &mut fx);
+    s_sync.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(1),
+        ClientMsg::Write { data: b"1234".to_vec() },
+        &mut fx,
+    );
     assert_eq!(s_sync.pty_write_len(), 4);
     // Queue cap is 10, DSR cap is 5; DSR of 6 bytes (> 5) is dropped, while user write of 8 bytes (<= 10) succeeds!
     let mut vt_dsr = StubVt::new(40, 4);
@@ -1474,10 +1566,16 @@ fn session_security_hardening_and_audit_fixes() {
         CellPx::default(),
         10,
     );
-    s_dsr.attach_stream(k1, SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
+    s_dsr.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
     s_dsr.on_pty_output(b"NOOP", ts(1), &mut fx);
     assert_eq!(s_dsr.pty_write_len(), 0); // 6 > 10/2 rejected!
-    s_dsr.handle_stream_msg(k1, RequestId::from_raw(1), ClientMsg::Write { data: b"12345678".to_vec() }, &mut fx);
+    s_dsr.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(1),
+        ClientMsg::Write { data: b"12345678".to_vec() },
+        &mut fx,
+    );
     assert_eq!(s_dsr.pty_write_len(), 8); // user input still works!
 
     // on_process_exit releases sync hold, clears pty_write_queue, and rejects subsequent PTY writes
@@ -1487,7 +1585,13 @@ fn session_security_hardening_and_audit_fixes() {
     assert_eq!(s_sync.pty_write_len(), 0);
     assert!(fx.contains(&SessionEffect::ViewsDirty));
     fx.clear();
-    s_sync.handle_stream_msg(k1, RequestId::from_raw(2), ClientMsg::Write { data: b"hi".to_vec() }, &mut fx);
+    s_sync.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(2),
+        ClientMsg::Write { data: b"hi".to_vec() },
+        &mut fx,
+    );
     assert!(
         fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Error { code: ErrorCode::Pty, .. }, .. }))
     );
@@ -1515,9 +1619,10 @@ fn session_security_hardening_and_audit_fixes() {
     let mut vt_s = StubVt::new(40, 4);
     vt_s.dirty.full_dirty = false;
     let mut s_s = SessionMachine::new(sid(25), vt_s, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
-    s_s.attach_stream(k1, SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
+    s_s.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
     s_s.handle_stream_msg(
         k1,
+        att_for(k1),
         RequestId::from_raw(1),
         ClientMsg::SetSearch { query: "row".into(), case_sensitive: true },
         &mut fx,
@@ -1534,6 +1639,7 @@ fn session_security_hardening_and_audit_fixes() {
     assert!(s_s.next_deadline().is_some());
     s_s.handle_stream_msg(
         k1,
+        att_for(k1),
         RequestId::from_raw(2),
         ClientMsg::SetSearch { query: String::new(), case_sensitive: true },
         &mut fx,
@@ -1545,6 +1651,7 @@ fn session_security_hardening_and_audit_fixes() {
     fx.clear();
     s_s.handle_stream_msg(
         k1,
+        att_for(k1),
         RequestId::from_raw(3),
         ClientMsg::TextOf {
             epoch: ep,
@@ -1554,6 +1661,7 @@ fn session_security_hardening_and_audit_fixes() {
     );
     s_s.handle_stream_msg(
         k1,
+        att_for(k1),
         RequestId::from_raw(4),
         ClientMsg::TextOfRect {
             epoch: ep,
@@ -1563,12 +1671,14 @@ fn session_security_hardening_and_audit_fixes() {
     );
     s_s.handle_stream_msg(
         k1,
+        att_for(k1),
         RequestId::from_raw(5),
         ClientMsg::GetImageBlob { blob: BlobHash([2; 32]), offset: 0, max_bytes: u32::MAX },
         &mut fx,
     );
     s_s.handle_stream_msg(
         k1,
+        att_for(k1),
         RequestId::from_raw(6),
         ClientMsg::GetImageBlob { blob: BlobHash([2; 32]), offset: 0, max_bytes: 0 },
         &mut fx,
@@ -1581,6 +1691,7 @@ fn session_security_hardening_and_audit_fixes() {
     // Detach cancels pending SearchFlush timer when last search watch leaves
     s_s.handle_stream_msg(
         k1,
+        att_for(k1),
         RequestId::from_raw(7),
         ClientMsg::SetSearch { query: "row".into(), case_sensitive: true },
         &mut fx,
@@ -1602,11 +1713,23 @@ fn session_security_hardening_and_audit_fixes() {
     ];
     let mut s_ep =
         SessionMachine::new(sid(26), vt_ep, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
-    s_ep.attach_stream(k1, SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
+    s_ep.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
     s_ep.on_pty_output(b"ALT", ts(1), &mut fx);
     fx.clear();
-    s_ep.handle_stream_msg(k1, RequestId::from_raw(1), ClientMsg::CommandOutput { command_id: 1 }, &mut fx);
-    s_ep.handle_stream_msg(k1, RequestId::from_raw(2), ClientMsg::CommandOutput { command_id: 2 }, &mut fx);
+    s_ep.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(1),
+        ClientMsg::CommandOutput { command_id: 1 },
+        &mut fx,
+    );
+    s_ep.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(2),
+        ClientMsg::CommandOutput { command_id: 2 },
+        &mut fx,
+    );
     assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::CommandOutputReply { text: None }, .. } if *req_id == RequestId::from_raw(1))));
     assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::CommandOutputReply { text: Some(t) }, .. } if *req_id == RequestId::from_raw(2) && t == "1:0:1:39")));
 
@@ -1615,7 +1738,7 @@ fn session_security_hardening_and_audit_fixes() {
     vt_sd.next_events = vec![VtEvent::SyncOutput(true)];
     let mut s_sd =
         SessionMachine::new(sid(27), vt_sd, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
-    s_sd.attach_stream(k1, SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, &mut fx);
+    s_sd.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, &mut fx);
     s_sd.on_pty_output(b"NOOP", ts(100), &mut fx);
     s_sd.poll_timers(ts(100 + SYNC_HOLD_MAX_MS), &mut fx);
     s_sd.on_pty_output(b"SYNC_REARM", ts(100 + SYNC_HOLD_MAX_MS), &mut fx);
@@ -1653,10 +1776,11 @@ fn session_security_hardening_and_audit_fixes() {
     vt_sf.dirty.full_dirty = false;
     let mut s_sf =
         SessionMachine::new(sid(30), vt_sf, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
-    s_sf.attach_stream(k1, SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
+    s_sf.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
     s_sf.on_pty_output(b"SCROLL", ts(1), &mut fx); // first_active_line=1, scrollback=1, oldest=0
     s_sf.handle_stream_msg(
         k1,
+        att_for(k1),
         RequestId::from_raw(1),
         ClientMsg::SetSearch { query: "__OOB_SPAN__".into(), case_sensitive: true },
         &mut fx,
@@ -1690,6 +1814,7 @@ fn session_security_hardening_and_audit_fixes() {
     // __EXACT_LIMIT__ (len == MAX_SEARCH_MATCHES -> truncated == false) vs __OVER_LIMIT__ (len > MAX -> truncated == true)
     s_sf.handle_stream_msg(
         k1,
+        att_for(k1),
         RequestId::from_raw(2),
         ClientMsg::SetSearch { query: "__EXACT_LIMIT__".into(), case_sensitive: true },
         &mut fx,
@@ -1701,6 +1826,7 @@ fn session_security_hardening_and_audit_fixes() {
 
     s_sf.handle_stream_msg(
         k1,
+        att_for(k1),
         RequestId::from_raw(3),
         ClientMsg::SetSearch { query: "__OVER_LIMIT__".into(), case_sensitive: true },
         &mut fx,
@@ -1718,9 +1844,10 @@ fn session_security_hardening_and_audit_fixes() {
     vt_cl.dirty.full_dirty = false;
     let mut s_cl =
         SessionMachine::new(sid(31), vt_cl, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
-    s_cl.attach_stream(k1, SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
+    s_cl.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
     s_cl.handle_stream_msg(
         k1,
+        att_for(k1),
         RequestId::from_raw(1),
         ClientMsg::SetSearch { query: "row".into(), case_sensitive: true },
         &mut fx,
@@ -1745,13 +1872,25 @@ fn session_security_hardening_and_audit_fixes() {
     ];
     let mut s_co =
         SessionMachine::new(sid(32), vt_co, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
-    s_co.attach_stream(k1, SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
+    s_co.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
     s_co.on_pty_output(b"SCROLL", ts(1), &mut fx);
     s_co.on_pty_output(b"SCROLL", ts(2), &mut fx);
     s_co.on_pty_output(b"CLEAR_SB", ts(3), &mut fx); // oldest = 2, total_lines = 6
     fx.clear();
-    s_co.handle_stream_msg(k1, RequestId::from_raw(1), ClientMsg::CommandOutput { command_id: 1 }, &mut fx);
-    s_co.handle_stream_msg(k1, RequestId::from_raw(2), ClientMsg::CommandOutput { command_id: 2 }, &mut fx);
+    s_co.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(1),
+        ClientMsg::CommandOutput { command_id: 1 },
+        &mut fx,
+    );
+    s_co.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(2),
+        ClientMsg::CommandOutput { command_id: 2 },
+        &mut fx,
+    );
     assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::CommandOutputReply { text: None }, .. } if *req_id == RequestId::from_raw(1))));
     assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::CommandOutputReply { text: Some(t) }, .. } if *req_id == RequestId::from_raw(2) && t == "3:0:3:39")));
 
@@ -1759,7 +1898,13 @@ fn session_security_hardening_and_audit_fixes() {
     let ep_cl = s_cl.vt().meta().epoch;
     let check_text_of = |s: &mut SessionMachine<StubVt>, span: CellSpan, expected: &str| {
         let mut local_fx = Vec::new();
-        s.handle_stream_msg(k1, RequestId::from_raw(1), ClientMsg::TextOf { epoch: ep_cl, span }, &mut local_fx);
+        s.handle_stream_msg(
+            k1,
+            att_for(k1),
+            RequestId::from_raw(1),
+            ClientMsg::TextOf { epoch: ep_cl, span },
+            &mut local_fx,
+        );
         let got = local_fx
             .into_iter()
             .find_map(|e| match e {
@@ -1855,8 +2000,8 @@ fn status_clear_per_stream_held_buttons_and_resize_side_effects() {
     let k1 = (conn(1), NonZeroStreamId::new(1).unwrap());
     let k2 = (conn(2), NonZeroStreamId::new(1).unwrap());
     let mut fx = Vec::new();
-    sess.attach_stream(k1, SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, &mut fx);
-    sess.attach_stream(k2, SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, &mut fx);
+    sess.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, &mut fx);
+    sess.attach_stream(k2, att_for(k2), SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, &mut fx);
 
     let press0 = PointerInput {
         action: PointerAction::Press,
@@ -1874,22 +2019,22 @@ fn status_clear_per_stream_held_buttons_and_resize_side_effects() {
         y_px: 0,
         cell_px: CellPx::default(),
     };
-    sess.handle_stream_msg(k1, RequestId::from_raw(1), ClientMsg::Pointer(press0), &mut fx);
+    sess.handle_stream_msg(k1, att_for(k1), RequestId::from_raw(1), ClientMsg::Pointer(press0), &mut fx);
     assert_eq!(sess.drain_pty_write(64), b"M1");
     // Stream k2 still has held_buttons == 0!
-    sess.handle_stream_msg(k2, RequestId::from_raw(2), ClientMsg::Pointer(move0), &mut fx);
+    sess.handle_stream_msg(k2, att_for(k2), RequestId::from_raw(2), ClientMsg::Pointer(move0), &mut fx);
     assert_eq!(sess.drain_pty_write(64), b"M0");
     // Blur on k1 clears k1's held_buttons!
-    sess.handle_stream_msg(k1, RequestId::from_raw(3), ClientMsg::Focus { focused: false }, &mut fx);
+    sess.handle_stream_msg(k1, att_for(k1), RequestId::from_raw(3), ClientMsg::Focus { focused: false }, &mut fx);
     let _ = sess.drain_pty_write(64);
-    sess.handle_stream_msg(k1, RequestId::from_raw(4), ClientMsg::Pointer(move0), &mut fx);
+    sess.handle_stream_msg(k1, att_for(k1), RequestId::from_raw(4), ClientMsg::Pointer(move0), &mut fx);
     assert_eq!(sess.drain_pty_write(64), b"M0");
     // Detach removes held_buttons entry cleanly
-    sess.handle_stream_msg(k1, RequestId::from_raw(5), ClientMsg::Pointer(press0), &mut fx);
+    sess.handle_stream_msg(k1, att_for(k1), RequestId::from_raw(5), ClientMsg::Pointer(press0), &mut fx);
     let _ = sess.drain_pty_write(64);
     sess.detach_stream(k1, &mut fx);
-    sess.attach_stream(k1, SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, &mut fx);
-    sess.handle_stream_msg(k1, RequestId::from_raw(6), ClientMsg::Pointer(move0), &mut fx);
+    sess.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, &mut fx);
+    sess.handle_stream_msg(k1, att_for(k1), RequestId::from_raw(6), ClientMsg::Pointer(move0), &mut fx);
     assert_eq!(sess.drain_pty_write(64), b"M0");
 
     // 3. Resize drains VtEvent::SyncOutput(false) and VtEvent::DeviceResponse immediately!
@@ -1897,12 +2042,13 @@ fn status_clear_per_stream_held_buttons_and_resize_side_effects() {
     vt_rs.next_events = vec![VtEvent::SyncOutput(true)];
     let mut s_rs =
         SessionMachine::new(sid(41), vt_rs, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
-    s_rs.attach_stream(k1, SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, &mut fx);
+    s_rs.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, &mut fx);
     s_rs.on_pty_output(b"HOLD", ts(100), &mut fx);
     assert!(s_rs.is_sync_held());
     fx.clear();
     s_rs.handle_stream_msg(
         k1,
+        att_for(k1),
         RequestId::from_raw(7),
         ClientMsg::ViewportHint(ViewportHint {
             size: GridSize::new(50, 10).unwrap(),
@@ -1949,7 +2095,7 @@ fn session_machine_runtime_accessors_and_nonblocking_pty_peek_consume() {
 
     // mark_all_views_full_sync forces a clean subscriber to emit a full_sync frame
     let k1 = (conn(1), nz_stream(1));
-    sess.attach_stream(k1, SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, &mut fx);
+    sess.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, &mut fx);
     assert!(sess.try_publish_view(k1, |_| true));
     assert!(!sess.try_publish_view(k1, |_| true));
     sess.mark_all_views_full_sync();
@@ -1961,13 +2107,25 @@ fn session_machine_runtime_accessors_and_nonblocking_pty_peek_consume() {
     assert!(got_full);
 
     // peek_pty_write + consume_pty_write handle partial writes and VecDeque wraparound cleanly
-    sess.handle_stream_msg(k1, RequestId::from_raw(1), ClientMsg::Write { data: b"abcdefgh".to_vec() }, &mut fx);
+    sess.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(1),
+        ClientMsg::Write { data: b"abcdefgh".to_vec() },
+        &mut fx,
+    );
     let mut buf = Vec::new();
     sess.peek_pty_write(3, &mut buf);
     assert_eq!(buf, b"abc");
     sess.consume_pty_write(3);
     // Push more to exercise VecDeque wraparound across head + tail slices
-    sess.handle_stream_msg(k1, RequestId::from_raw(2), ClientMsg::Write { data: b"ijkl".to_vec() }, &mut fx);
+    sess.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(2),
+        ClientMsg::Write { data: b"ijkl".to_vec() },
+        &mut fx,
+    );
     sess.peek_pty_write(20, &mut buf);
     assert_eq!(buf, b"defghijkl");
     sess.consume_pty_write(9);
@@ -2042,9 +2200,10 @@ fn review_mutants_rows_budget_clamp_rect_and_logical_line_expansion() {
     let mut s = SessionMachine::new(sid(40), vt, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
     let k1 = (ConnId::new(1).unwrap(), NonZeroStreamId::new(1).unwrap());
     let mut fx = Vec::new();
-    s.attach_stream(k1, SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, &mut fx);
+    s.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, &mut fx);
     s.handle_stream_msg(
         k1,
+        att_for(k1),
         RequestId::from_raw(1),
         ClientMsg::SetSearch { query: "foo".into(), case_sensitive: false },
         &mut fx,
@@ -2191,4 +2350,39 @@ fn review_mutants_rows_budget_clamp_rect_and_logical_line_expansion() {
         "__TRUNC__VERY_LONG_MISSING_NEEDLE_0123456789",
         1
     ));
+}
+
+#[test]
+fn session_machine_attachment_id_tracks_lifecycle_and_drops_stale_stream_msgs() {
+    let mut sess = SessionMachine::new(
+        sid(55),
+        StubVt::new(40, 4),
+        ResizePolicy::LatestActive,
+        MarksMode::Claimed,
+        CellPx::default(),
+    );
+    let k1 = (conn(1), nz_stream(1));
+    let a1 = StreamAttachmentId::new(101).unwrap();
+    let a2 = StreamAttachmentId::new(102).unwrap();
+    let mut fx = Vec::new();
+
+    assert_eq!(sess.attachment_of(k1), None);
+    sess.attach_stream(k1, a1, SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
+    assert_eq!(sess.attachment_of(k1), Some(a1));
+    assert_eq!(sess.view_subscribers(), vec![(k1, a1)]);
+
+    // Mismatched attachment_id on handle_stream_msg is ignored with zero effects!
+    fx.clear();
+    sess.handle_stream_msg(k1, a2, RequestId::from_raw(1), ClientMsg::Commands, &mut fx);
+    assert!(fx.is_empty(), "stale attachment_id must emit zero effects");
+
+    // Matching attachment_id succeeds and tags the reply with `Some(a1)`.
+    sess.handle_stream_msg(k1, a1, RequestId::from_raw(2), ClientMsg::Commands, &mut fx);
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        SessionEffect::Send { attachment: Some(att), msg: BrokerMsg::CommandsReply { .. }, .. } if *att == a1
+    )));
+
+    sess.detach_stream(k1, &mut fx);
+    assert_eq!(sess.attachment_of(k1), None);
 }

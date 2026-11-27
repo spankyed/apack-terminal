@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use apack_core::flow::OutboundPriority;
 use apack_core::lease::ConnId;
-use apack_core::session::{SessionMachine, StreamKey};
+use apack_core::session::{SessionMachine, StreamAttachmentId};
 use apack_core::time::TimestampMs;
 use apack_os::image_sources::{Scanner as ImageScanner, Worker as ImageWorker};
 #[cfg(unix)]
@@ -54,8 +54,10 @@ pub(crate) use images::should_forward_probe_reply;
 pub(crate) use lifecycle::{argv_matches_app, shard_session_wait_timeout};
 #[cfg(test)]
 pub(crate) use lifecycle::{maybe_compress_idle, parse_exit_status};
-pub(crate) use protocol::ShardMailboxState;
+#[cfg(test)]
+pub(crate) use protocol::{RAW_OUTPUT_SESSION_LOW_WATER, RAW_OUTPUT_SHARD_LOW_WATER, crossed_raw_low_water};
 pub use protocol::{ReactorEvent, ShardCmd, ShardHandle, ShardShared};
+pub(crate) use protocol::{ShardCmdPermit, ShardMailboxState, should_notify_raw_drained, should_pause_raw_inflight};
 #[cfg(all(test, unix))]
 pub(crate) use pty_io::{drain_unix_pty_nonblocking, unix_pty_interest};
 
@@ -127,12 +129,15 @@ pub fn spawn_shard(
             };
             {
                 let mut state = fg_mailbox.lock().unwrap_or_else(|e| e.into_inner());
-                state.queue.push_back(ShardCmd::ForegroundVerified {
-                    session_id: req.session_id,
-                    id: req.id,
-                    changed: req.changed,
-                    confirmed,
-                });
+                state.queue.push_back((
+                    ShardCmd::ForegroundVerified {
+                        session_id: req.session_id,
+                        id: req.id,
+                        changed: req.changed,
+                        confirmed,
+                    },
+                    None,
+                ));
                 state.woken = true;
             }
             fg_wake.wake();
@@ -156,6 +161,8 @@ pub fn spawn_shard(
             fg_tx: Some(fg_tx),
             fg_worker: Some(fg_worker),
             fg_inflight: HashSet::new(),
+            fg_pending: HashMap::new(),
+            raw_output_inflight: Arc::new(AtomicUsize::new(0)),
             sessions: HashMap::new(),
             #[cfg(unix)]
             poller,
@@ -202,12 +209,14 @@ pub(crate) struct LiveSession {
     compressed_idle: bool,
     paused_by_stream: bool,
     paused_by_raw_flow: bool,
+    paused_by_raw_inflight: bool,
+    raw_output_inflight: Arc<AtomicUsize>,
     terminating_since: Option<Instant>,
     escalated_sigkill: bool,
-    /// View streams currently ready to accept the next `FrameUpdate` (1-slot lossless handshake).
-    view_slot_free: HashSet<StreamKey>,
-    /// Active `SUB_RAW_OUTPUT` subscribers (avoids sending `PublishRawOutput` when empty).
-    raw_output_subs: HashSet<StreamKey>,
+    /// View attachments currently ready to accept the next `FrameUpdate` (1-slot lossless handshake).
+    view_slot_free: HashSet<StreamAttachmentId>,
+    /// Active `SUB_RAW_OUTPUT` subscriber attachments (avoids sending `PublishRawOutput` when empty).
+    raw_output_subs: HashSet<StreamAttachmentId>,
     /// Streaming Kitty graphics APC scanner when `SpawnSpec::image_files` is enabled.
     image_scanner: Option<ImageScanner>,
     /// Per-session off-shard single-flight worker with quiet timeout & stuck-mount circuit breaker.
@@ -224,7 +233,7 @@ pub(crate) struct LiveSession {
 
 impl LiveSession {
     pub(crate) fn is_pty_paused(&self) -> bool {
-        self.paused_by_stream || self.paused_by_raw_flow || self.pending_image.is_some()
+        self.paused_by_stream || self.paused_by_raw_flow || self.paused_by_raw_inflight || self.pending_image.is_some()
     }
 
     fn summary(&self) -> SessionSummary {
@@ -260,6 +269,8 @@ pub(crate) struct ShardRunner {
     fg_tx: Option<mpsc::SyncSender<FgVerifyReq>>,
     fg_worker: Option<JoinHandle<()>>,
     fg_inflight: HashSet<SessionId>,
+    fg_pending: HashMap<SessionId, (String, u64, String)>,
+    raw_output_inflight: Arc<AtomicUsize>,
     pub(crate) sessions: HashMap<SessionId, LiveSession>,
     #[cfg(unix)]
     poller: PtyPoller,
@@ -358,11 +369,11 @@ impl ShardRunner {
 
     fn drain_mailbox(&mut self) {
         while self.running {
-            let cmd = {
+            let entry = {
                 let mut state = self.mailbox.lock().unwrap_or_else(|e| e.into_inner());
                 state.queue.pop_front()
             };
-            let Some(cmd) = cmd else {
+            let Some((cmd, _permit)) = entry else {
                 break;
             };
             self.handle_cmd(cmd);
@@ -418,17 +429,19 @@ impl ShardRunner {
                     self.send_no_such_session(conn, req_id);
                 }
             }
-            ShardCmd::Attach { session_id, conn, req_id, stream_id, flags, initial_viewport } => {
-                self.handle_attach(session_id, conn, req_id, stream_id, flags, initial_viewport);
+            ShardCmd::Attach { session_id, conn, req_id, stream_id, attachment_id, flags, initial_viewport } => {
+                self.handle_attach(session_id, conn, req_id, stream_id, attachment_id, flags, initial_viewport);
             }
-            ShardCmd::Detach { session_id, conn, stream_id } => {
+            ShardCmd::Detach { session_id, conn, stream_id, attachment_id } => {
                 let key = (conn, stream_id);
                 let mut effects = Vec::new();
                 if let Some(sess) = self.sessions.get_mut(&session_id) {
-                    sess.view_slot_free.remove(&key);
-                    sess.raw_output_subs.remove(&key);
-                    sess.machine.detach_stream(key, &mut effects);
-                    self.apply_effects(session_id, effects);
+                    sess.view_slot_free.remove(&attachment_id);
+                    sess.raw_output_subs.remove(&attachment_id);
+                    if sess.machine.attachment_of(key) == Some(attachment_id) {
+                        sess.machine.detach_stream(key, &mut effects);
+                        self.apply_effects(session_id, effects);
+                    }
                 }
             }
             ShardCmd::CancelConnWaiters { conn } => {
@@ -436,25 +449,46 @@ impl ShardRunner {
                     sess.machine.cancel_waiters_for_conn(conn);
                 }
             }
-            ShardCmd::StreamMsg { session_id, conn, stream_id, req_id, msg } => {
+            ShardCmd::StreamMsg { session_id, conn, stream_id, attachment_id, req_id, msg } => {
                 let mut effects = Vec::new();
                 if let Some(sess) = self.sessions.get_mut(&session_id) {
-                    sess.machine.handle_stream_msg((conn, stream_id), req_id, msg, &mut effects);
+                    sess.machine.handle_stream_msg((conn, stream_id), attachment_id, req_id, msg, &mut effects);
                     self.apply_effects(session_id, effects);
                 } else {
-                    self.send_error(
+                    self.send_stream_error(
                         conn,
                         stream_id.as_stream_id(),
+                        Some(attachment_id),
                         req_id,
                         ErrorCode::NoSuchSession,
                         "no such session",
                     );
                 }
             }
-            ShardCmd::ViewSlotFree { session_id, conn, stream_id } => {
-                if let Some(sess) = self.sessions.get_mut(&session_id) {
-                    sess.view_slot_free.insert((conn, stream_id));
+            ShardCmd::ViewSlotFree { session_id, conn, stream_id, attachment_id } => {
+                if let Some(sess) = self.sessions.get_mut(&session_id)
+                    && sess.machine.attachment_of((conn, stream_id)) == Some(attachment_id)
+                {
+                    sess.view_slot_free.insert(attachment_id);
                     self.try_publish_dirty_views(session_id);
+                }
+            }
+            ShardCmd::RawOutputDrained => {
+                let shard_bytes = self.raw_output_inflight.load(Ordering::Acquire);
+                let to_resume: Vec<SessionId> = self
+                    .sessions
+                    .iter()
+                    .filter_map(|(&id, s)| {
+                        (s.paused_by_raw_inflight
+                            && !should_pause_raw_inflight(s.raw_output_inflight.load(Ordering::Acquire), shard_bytes))
+                        .then_some(id)
+                    })
+                    .collect();
+                for id in to_resume {
+                    if let Some(sess) = self.sessions.get_mut(&id) {
+                        sess.paused_by_raw_inflight = false;
+                    }
+                    self.sync_pty_interest(id);
                 }
             }
             ShardCmd::SetPtyPaused { session_id, paused } => {
@@ -495,6 +529,11 @@ impl ShardRunner {
                     sess.machine.apply_status_confirmation(&id, changed, confirmed, &mut effects);
                     self.apply_effects(session_id, effects);
                 }
+                if let Some((next_id, next_changed, next_app)) = self.fg_pending.remove(&session_id)
+                    && self.sessions.contains_key(&session_id)
+                {
+                    self.dispatch_verify_foreground(session_id, next_id, next_changed, next_app);
+                }
             }
             ShardCmd::ImageSourceLoaded { session_id, ticket, loaded } => {
                 self.handle_image_source_loaded(session_id, ticket, loaded);
@@ -509,6 +548,7 @@ impl ShardRunner {
         self.emit(ReactorEvent::SendMsg {
             conn,
             stream_id,
+            attachment: None,
             req_id,
             priority: OutboundPriority::Control,
             msg: BrokerMsg::Ok,
@@ -520,9 +560,22 @@ impl ShardRunner {
     }
 
     fn send_error(&self, conn: ConnId, stream_id: StreamId, req_id: RequestId, code: ErrorCode, message: &str) {
+        self.send_stream_error(conn, stream_id, None, req_id, code, message);
+    }
+
+    fn send_stream_error(
+        &self,
+        conn: ConnId,
+        stream_id: StreamId,
+        attachment: Option<StreamAttachmentId>,
+        req_id: RequestId,
+        code: ErrorCode,
+        message: &str,
+    ) {
         self.emit(ReactorEvent::SendMsg {
             conn,
             stream_id,
+            attachment,
             req_id,
             priority: OutboundPriority::Control,
             msg: BrokerMsg::Error { code, message: message.to_owned() },

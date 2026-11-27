@@ -11,7 +11,7 @@ use apack_core::auth::AuthConfig;
 use apack_core::broker::{BrokerAction, BrokerCore, CloseReason};
 use apack_core::lease::ConnId;
 use apack_core::marks::MarksMode;
-use apack_core::session::{SessionEffect, SessionMachine, StreamKey};
+use apack_core::session::{SessionEffect, SessionMachine, StreamAttachmentId, StreamKey};
 use apack_core::time::TimestampMs;
 use apack_core::vt::VtEngine;
 use apack_proto::frame::FrameDecoder;
@@ -595,7 +595,15 @@ impl SimWorld {
     fn process_broker_actions(&mut self, actions: Vec<BrokerAction>) {
         for action in actions {
             match action {
-                BrokerAction::StreamAttached { conn, stream_id, session, flags, initial_viewport, .. } => {
+                BrokerAction::StreamAttached {
+                    conn,
+                    stream_id,
+                    attachment_id,
+                    session,
+                    flags,
+                    initial_viewport,
+                    ..
+                } => {
                     self.stream_sessions.insert((conn, stream_id), session);
                     if flags.contains(SubFlags::VIEW) {
                         let size = self
@@ -606,11 +614,11 @@ impl SimWorld {
                     }
                     let mut s_effects = Vec::new();
                     if let Some(sess) = self.sessions.get_mut(&session) {
-                        sess.attach_stream((conn, stream_id), flags, initial_viewport, &mut s_effects);
+                        sess.attach_stream((conn, stream_id), attachment_id, flags, initial_viewport, &mut s_effects);
                     }
                     self.process_session_effects(session, s_effects);
                 }
-                BrokerAction::StreamDetached { conn, stream_id, session } => {
+                BrokerAction::StreamDetached { conn, stream_id, session, .. } => {
                     self.stream_sessions.remove(&(conn, stream_id));
                     self.views.remove(&(conn, stream_id));
                     self.searches.remove(&(conn, stream_id));
@@ -621,10 +629,10 @@ impl SimWorld {
                     }
                     self.process_session_effects(session, s_effects);
                 }
-                BrokerAction::DispatchToSession { conn, stream_id, req_id, session, msg } => {
+                BrokerAction::DispatchToSession { conn, stream_id, attachment_id, req_id, session, msg } => {
                     let mut s_effects = Vec::new();
                     if let Some(sess) = self.sessions.get_mut(&session) {
-                        sess.handle_stream_msg((conn, stream_id), req_id, msg, &mut s_effects);
+                        sess.handle_stream_msg((conn, stream_id), attachment_id, req_id, msg, &mut s_effects);
                     }
                     self.process_session_effects(session, s_effects);
                 }
@@ -635,8 +643,8 @@ impl SimWorld {
                     }
                     self.process_session_effects(session, s_effects);
                 }
-                BrokerAction::FrameCreditUpdated { conn, stream_id, session, .. } => {
-                    self.publish_dirty_view(session, (conn, stream_id));
+                BrokerAction::FrameCreditUpdated { conn, stream_id, attachment_id, session, .. } => {
+                    self.publish_dirty_view(session, (conn, stream_id), attachment_id);
                 }
                 BrokerAction::CloseConn { conn, reason, .. } => {
                     let _ = reason;
@@ -654,7 +662,15 @@ impl SimWorld {
         let mut views_dirty = false;
         for ef in effects {
             match ef {
-                SessionEffect::Send { conn, stream_id, req_id, priority, msg } => {
+                SessionEffect::Send { conn, stream_id, attachment, req_id, priority, msg } => {
+                    if let Some(att) = attachment {
+                        let Some(nz) = NonZeroStreamId::new(stream_id.raw()) else {
+                            continue;
+                        };
+                        if !self.broker.is_attachment_active(conn, nz, att) {
+                            continue;
+                        }
+                    }
                     let mut b_actions = Vec::new();
                     self.broker.enqueue_message(conn, stream_id, req_id, priority, msg, self.now, &mut b_actions);
                     self.process_broker_actions(b_actions);
@@ -665,20 +681,21 @@ impl SimWorld {
         }
         if views_dirty {
             let subs = self.sessions.get(&sid).map_or_else(Vec::new, SessionMachine::view_subscribers);
-            for key in subs {
-                self.publish_dirty_view(sid, key);
+            for (key, att) in subs {
+                self.publish_dirty_view(sid, key, att);
             }
         }
     }
 
-    fn publish_dirty_view(&mut self, sid: SessionId, key: StreamKey) {
+    fn publish_dirty_view(&mut self, sid: SessionId, key: StreamKey, attachment_id: StreamAttachmentId) {
         let (conn, stream_id) = key;
         let now = self.now;
         let broker = &mut self.broker;
         let mut b_actions = Vec::new();
         if let Some(sess) = self.sessions.get_mut(&sid) {
-            let _ =
-                sess.try_publish_view(key, |frame| broker.publish_frame(conn, stream_id, frame, now, &mut b_actions));
+            let _ = sess.try_publish_view(key, |frame| {
+                broker.publish_frame(conn, stream_id, attachment_id, frame, now, &mut b_actions)
+            });
         }
         self.process_broker_actions(b_actions);
     }
