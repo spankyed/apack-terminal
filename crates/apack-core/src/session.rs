@@ -1126,6 +1126,13 @@ impl<V: VtEngine> SessionMachine<V> {
         }
     }
 
+    /// Marks view subscriber `key` as requiring a self-contained `full_sync` on its next published frame.
+    pub fn mark_view_full_sync(&mut self, key: StreamKey) {
+        if let Some(sub) = self.views.get_mut(&key) {
+            sub.needs_full_sync = true;
+        }
+    }
+
     /// Atomically builds a differential (or full-sync) [`FrameUpdate`] for `key` and invokes `publish`.
     ///
     /// If `publish` returns `false` (subscriber out of credit or frame already pending), all dirty

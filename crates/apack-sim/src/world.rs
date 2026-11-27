@@ -689,7 +689,7 @@ impl SimWorld {
         for ef in effects {
             match ef {
                 SessionEffect::Send { conn, stream_id, attachment, req_id, priority, msg } => {
-                    if matches!(msg, BrokerMsg::Exited { .. }) {
+                    if let (BrokerMsg::Exited { .. }, true) = (&msg, views_dirty) {
                         views_dirty = false;
                         self.flush_dirty_views(sid);
                     }

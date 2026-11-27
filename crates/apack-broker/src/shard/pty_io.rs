@@ -44,7 +44,7 @@ impl ShardRunner {
         for effect in effects {
             match effect {
                 SessionEffect::Send { conn, stream_id, attachment, req_id, priority, msg } => {
-                    if matches!(msg, BrokerMsg::Exited { .. }) {
+                    if let (BrokerMsg::Exited { .. }, true) = (&msg, views_dirty) {
                         views_dirty = false;
                         self.try_publish_dirty_views(session_id);
                     }
@@ -148,22 +148,35 @@ impl ShardRunner {
     }
 
     pub(super) fn try_publish_dirty_views(&mut self, session_id: SessionId) {
-        let targets: Vec<(StreamKey, StreamAttachmentId)> = match self.sessions.get(&session_id) {
-            Some(sess) => sess
-                .machine
-                .view_subscribers()
-                .into_iter()
-                .filter(|(_, att)| sess.view_slot_free.contains(att))
-                .collect(),
+        let targets: Vec<(StreamKey, StreamAttachmentId, bool)> = match self.sessions.get(&session_id) {
+            Some(sess) => {
+                let force_final = !sess.machine.is_alive();
+                sess.machine
+                    .view_subscribers()
+                    .into_iter()
+                    .filter_map(|(key, att)| {
+                        let slot_free = sess.view_slot_free.contains(&att);
+                        (slot_free || force_final).then_some((key, att, slot_free))
+                    })
+                    .collect()
+            }
             None => return,
         };
-        for (key, attachment_id) in targets {
+        for (key, attachment_id, slot_free) in targets {
             let mut emitted_frame: Option<Box<FrameUpdate>> = None;
             let published = match self.sessions.get_mut(&session_id) {
-                Some(sess) => sess.machine.try_publish_view(key, |frame| {
-                    emitted_frame = Some(frame);
-                    true
-                }),
+                Some(sess) => {
+                    if !slot_free {
+                        // Force a self-contained `full_sync` when publishing while a previous frame's
+                        // `ViewSlotFree` token is still in flight, so overwriting an unsent or stalled
+                        // frame on the reactor can never leave the client with an orphaned delta.
+                        sess.machine.mark_view_full_sync(key);
+                    }
+                    sess.machine.try_publish_view(key, |frame| {
+                        emitted_frame = Some(frame);
+                        true
+                    })
+                }
                 None => return,
             };
             if published && let Some(frame) = emitted_frame {

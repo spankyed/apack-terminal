@@ -2383,6 +2383,22 @@ fn session_machine_attachment_id_tracks_lifecycle_and_drops_stale_stream_msgs() 
         SessionEffect::Send { attachment: Some(att), msg: BrokerMsg::CommandsReply { .. }, .. } if *att == a1
     )));
 
+    // Publish initial full-sync frame, then mark_view_full_sync forces the next frame to be full_sync=true.
+    let mut initial_full = false;
+    assert!(sess.try_publish_view(k1, |f| {
+        initial_full = f.full_sync;
+        true
+    }));
+    assert!(initial_full);
+    assert!(!sess.try_publish_view(k1, |_| true), "no changes => nothing to publish");
+    sess.mark_view_full_sync(k1);
+    let mut forced_full = false;
+    assert!(sess.try_publish_view(k1, |f| {
+        forced_full = f.full_sync;
+        true
+    }));
+    assert!(forced_full, "mark_view_full_sync must force a self-contained full_sync frame");
+
     sess.detach_stream(k1, &mut fx);
     assert_eq!(sess.attachment_of(k1), None);
 }

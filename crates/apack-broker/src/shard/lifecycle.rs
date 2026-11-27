@@ -140,37 +140,33 @@ impl ShardRunner {
     }
 
     pub(super) fn drain_tail_pty_bytes(&mut self, session_id: SessionId) {
+        let mut tail = Vec::new();
         #[cfg(unix)]
         {
             // Use a fresh buffer instead of taking `self.read_buf` so re-entrant calls from
             // `read_unix_pty_quantum -> apply_effects -> drain_pty_writes_for -> try_reap_session`
             // never see a 0-length `self.read_buf`.
             let mut buf = vec![0u8; PTY_READ_BUF_BYTES];
-            let mut chunks = Vec::new();
             if let Some(LivePty::Unix { master, eof: false, .. }) =
                 self.sessions.get(&session_id).and_then(|s| s.pty.as_ref())
             {
                 drain_unix_pty_nonblocking(master, &mut buf, PTY_READ_QUANTUM_BYTES, |chunk| {
-                    chunks.push(chunk.to_vec());
+                    tail.extend_from_slice(chunk);
                 });
-            }
-            for chunk in chunks {
-                self.ingest_pty_bytes(session_id, &chunk);
             }
         }
         #[cfg(windows)]
         {
-            let mut chunks = Vec::new();
             if let Some(LivePty::Windows { bridge, eof: false }) =
                 self.sessions.get(&session_id).and_then(|s| s.pty.as_ref())
             {
                 let _ = crate::shard_windows::drain_conpty_quantum(bridge, PTY_READ_QUANTUM_BYTES, |b| {
-                    chunks.push(b.to_vec())
+                    tail.extend_from_slice(b);
                 });
             }
-            for chunk in chunks {
-                self.ingest_pty_bytes(session_id, &chunk);
-            }
+        }
+        if !tail.is_empty() {
+            self.ingest_pty_bytes(session_id, &tail);
         }
     }
 
@@ -183,15 +179,6 @@ impl ShardRunner {
         self.fg_pending.remove(&session_id);
         let mut effects = Vec::new();
         if let Some(sess) = self.sessions.get_mut(&session_id) {
-            let now = TimestampMs::from_millis(now_unix_ms());
-            if !sess.rewound {
-                sess.machine.on_process_exit(code, signal, now, &mut effects);
-            }
-        }
-        // Apply exit effects while `sess` is still present in `self.sessions` so `try_publish_dirty_views`
-        // can emit any final dirty frame (e.g. released DEC 2026 sync hold) strictly before `Exited`.
-        self.apply_effects(session_id, effects);
-        if let Some(mut sess) = self.sessions.remove(&session_id) {
             #[cfg(unix)]
             {
                 if let Some(LivePty::Unix { token, .. }) = sess.pty {
@@ -211,12 +198,20 @@ impl ShardRunner {
             if let Some(LivePty::Windows { ref bridge, .. }) = sess.pty {
                 bridge.close_master_async();
             }
+            sess.pty = None;
             if let Some(wal) = sess.wal.take() {
                 let _ = wal.seal();
                 let _ = wal.shutdown();
             }
-            drop(sess);
+            let now = TimestampMs::from_millis(now_unix_ms());
+            if !sess.rewound {
+                sess.machine.on_process_exit(code, signal, now, &mut effects);
+            }
         }
+        // Apply exit effects while `sess` is still in `self.sessions` (after WAL seal/shutdown and
+        // descendant teardown) so final dirty views flush strictly before `Exited` / `Waited`.
+        self.apply_effects(session_id, effects);
+        self.sessions.remove(&session_id);
         self.load.store(self.sessions.len(), Ordering::Relaxed);
         self.emit(ReactorEvent::SessionEnded { session: session_id });
     }

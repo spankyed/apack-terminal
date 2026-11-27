@@ -702,4 +702,54 @@ mod image_source_shard_tests {
         runner.run_tier2(TimestampMs::from_millis(10));
         assert!(!runner.sessions[&sid].paused_by_raw_inflight, "Tier 2 must unpause drained raw inflight");
     }
+
+    #[test]
+    fn exit_flush_forces_full_sync_when_view_slot_inflight_while_live_respects_slot() {
+        use apack_proto::types::{NonZeroStreamId, SubFlags};
+
+        let (mut runner, rrx) = make_test_runner();
+        let sid = SessionId::new(100).unwrap();
+        let conn = ConnId::new(1).unwrap();
+        let stream_id = NonZeroStreamId::new(1).unwrap();
+        let att = StreamAttachmentId::new(77).unwrap();
+        insert_image_session(&mut runner, sid, false);
+        runner.handle_cmd(ShardCmd::Attach {
+            session_id: sid,
+            conn,
+            req_id: RequestId::from_raw(1),
+            stream_id,
+            attachment_id: att,
+            flags: SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(),
+            initial_viewport: None,
+        });
+        // Drain initial Attached + Frame(seq=1); `view_slot_free` is now EMPTY (simulating in-flight token).
+        let mut init_frames = 0usize;
+        while let Ok(ev) = rrx.try_recv() {
+            if matches!(ev, ReactorEvent::PublishFrame { .. }) {
+                init_frames += 1;
+            }
+        }
+        assert_eq!(init_frames, 1);
+        assert!(!runner.sessions[&sid].view_slot_free.contains(&att));
+
+        // While live, new PTY output must NOT bypass `view_slot_free` (no duplicate in-flight frame).
+        runner.ingest_pty_bytes(sid, b"LIVE_HELD\r\n");
+        let live_frames: Vec<_> = std::iter::from_fn(|| rrx.try_recv().ok())
+            .filter(|e| matches!(e, ReactorEvent::PublishFrame { .. }))
+            .collect();
+        assert!(live_frames.is_empty(), "live session must respect view_slot_free");
+
+        // On exit, final dirty view MUST flush strictly BEFORE Exited as a self-contained full_sync=true frame!
+        runner.ingest_pty_bytes(sid, b"\x1b[?2026hEXIT_FINAL\r\n");
+        runner.finish_and_remove_session(sid, Some(0), None);
+        let events: Vec<_> = std::iter::from_fn(|| rrx.try_recv().ok()).collect();
+        let frame_pos = events
+            .iter()
+            .position(|e| matches!(e, ReactorEvent::PublishFrame { frame, .. } if frame.full_sync && frame.rows.iter().any(|r| r.text.contains("EXIT_FINAL"))));
+        let exit_pos =
+            events.iter().position(|e| matches!(e, ReactorEvent::SendMsg { msg: BrokerMsg::Exited { .. }, .. }));
+        assert!(frame_pos.is_some(), "expected full_sync final frame containing EXIT_FINAL");
+        assert!(exit_pos.is_some(), "expected Exited message");
+        assert!(frame_pos.unwrap() < exit_pos.unwrap(), "final frame must precede Exited");
+    }
 }
