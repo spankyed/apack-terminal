@@ -260,9 +260,8 @@ export async function copySelection(selection: Selection, onCopy?: (text: string
 }
 
 export interface BlinkHost {
+  isActive(): boolean
   isFocused(): boolean
-  isListening(): boolean
-  isDisposed(): boolean
   cursorBlinks(): boolean
   schedule(): void
 }
@@ -290,18 +289,33 @@ export class BlinkController {
     return this.textVisible
   }
 
+  /** Synchronizes blink timers with `host.isActive()` (`visible && listening && !disposed`). */
+  syncActive(): void {
+    if (!this.host.isActive()) {
+      this.cursorTimer.cancel()
+      this.textTimer.cancel()
+      this.cursorVisible = true
+      this.textVisible = true
+      return
+    }
+    this.resetCursor()
+    if (this.textBlinking && !this.textTimer.active) {
+      this.armText()
+    }
+  }
+
   resetCursor(): void {
     this.cursorTimer.cancel()
     if (!this.cursorVisible) {
       this.cursorVisible = true
       this.host.schedule()
     }
-    if (!this.host.isFocused() || !this.host.isListening() || !this.host.cursorBlinks()) return
+    if (!this.host.isActive() || !this.host.isFocused() || !this.host.cursorBlinks()) return
     this.armCursor()
   }
 
   setTextBlinking(inView: boolean): void {
-    if (inView && this.host.isListening()) {
+    if (inView && this.host.isActive()) {
       this.textBlinking = true
       if (!this.textTimer.active) this.armText()
       return
@@ -316,18 +330,12 @@ export class BlinkController {
 
   private armCursor(): void {
     this.cursorTimer.arm(BLINK_MS, () => {
-      if (!this.host.isFocused() || !this.host.isListening() || this.host.isDisposed() || !this.host.cursorBlinks()) {
+      if (!this.host.isActive() || !this.host.isFocused() || !this.host.cursorBlinks()) {
         return
       }
       this.cursorVisible = !this.cursorVisible
       this.host.schedule()
-      if (
-        this.host.isFocused()
-        && this.host.isListening()
-        && !this.host.isDisposed()
-        && this.host.cursorBlinks()
-        && !this.cursorTimer.active
-      ) {
+      if (this.host.isActive() && this.host.isFocused() && this.host.cursorBlinks() && !this.cursorTimer.active) {
         this.armCursor()
       }
     })
@@ -335,10 +343,10 @@ export class BlinkController {
 
   private armText(): void {
     this.textTimer.arm(BLINK_MS, () => {
-      if (!this.textBlinking || !this.host.isListening() || this.host.isDisposed()) return
+      if (!this.textBlinking || !this.host.isActive()) return
       this.textVisible = !this.textVisible
       this.host.schedule()
-      if (this.textBlinking && this.host.isListening() && !this.host.isDisposed() && !this.textTimer.active) {
+      if (this.textBlinking && this.host.isActive() && !this.textTimer.active) {
         this.armText()
       }
     })

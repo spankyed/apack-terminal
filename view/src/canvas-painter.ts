@@ -42,6 +42,7 @@ export class CanvasPainter implements Painter {
   private readonly colors = new Map<number, string>()
   /** Whether a non-ASCII glyph in a given face is wider than its allocated cells. */
   private readonly wider = new Map<string, boolean>()
+  private disposed = false
 
   constructor(
     private font: Font,
@@ -60,6 +61,7 @@ export class CanvasPainter implements Painter {
   }
 
   private readonly cleared = () => {
+    if (this.disposed) return
     this.shown = null
     this.repaint?.()
   }
@@ -77,6 +79,7 @@ export class CanvasPainter implements Painter {
   }
 
   resize(columns: number, rows: number, pixelRatio: number, gutter = 0): void {
+    if (this.disposed) return
     const ratio = Number.isFinite(pixelRatio) && pixelRatio > 0 ? pixelRatio : 1
     const ratioChanged = ratio !== this.pixelRatio
     const prevWidth = this.metrics.cellWidth
@@ -107,6 +110,7 @@ export class CanvasPainter implements Painter {
   }
 
   setFont(font: Font): void {
+    if (this.disposed) return
     this.font = font
     this.faces = facesOf(font)
     this.wider.clear()
@@ -116,6 +120,7 @@ export class CanvasPainter implements Painter {
   }
 
   paint(scene: Scene): void {
+    if (this.disposed) return
     const { context } = this
     context.setTransform(this.pixelRatio, 0, 0, this.pixelRatio, 0, 0)
     context.textBaseline = 'alphabetic'
@@ -139,6 +144,8 @@ export class CanvasPainter implements Painter {
   }
 
   dispose(): void {
+    if (this.disposed) return
+    this.disposed = true
     this.canvas.removeEventListener('contextrestored', this.cleared)
     this.shown = null
     this.repaint = null
@@ -568,7 +575,7 @@ type Image = NonNullable<Scene['images']>[number]
 const sameMark = (a: Mark, b: Mark): boolean => a.row === b.row && a.color === b.color
 
 const sameImage = (a: Image, b: Image): boolean =>
-  a.picture === b.picture && a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height && a.above === b.above
+  a.key === b.key && a.picture === b.picture && a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height && a.above === b.above
   && a.source.x === b.source.x && a.source.y === b.source.y && a.source.width === b.source.width && a.source.height === b.source.height
 
 function sameCursor(a: Scene['cursor'], b: Scene['cursor']): boolean {

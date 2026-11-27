@@ -131,4 +131,47 @@ describe('pointer, selection, wheel, links, and layout caching', () => {
     view.element.dispatchEvent(new WheelEvent('wheel', { deltaY: -2, deltaMode: 1, cancelable: true }))
     expect(source.keys.map((k) => k.code)).toEqual(['ArrowUp', 'ArrowUp'])
   })
+
+  it('tracks pointerId on Pressed and ignores mismatched pointer events during drag/reporting', () => {
+    const { source, view, painted, point } = mountedView()
+    source.send(
+      frame({
+        size: { cols: 20, rows: 2 },
+        rows: [row(0, 'abcdefghij'), row(1, 'klmnopqrst')],
+      }),
+    )
+    painted()
+
+    // Start drag selection with pointerId 1 at col 1, row 0
+    point('pointerdown', 1, 0, { button: 0, pointerId: 1, at: 100 })
+    // Mismatched pointerId 2 move/up/cancel MUST be completely ignored!
+    point('pointermove', 9, 1, { button: 0, pointerId: 2, at: 120 })
+    point('pointerup', 9, 1, { button: 0, pointerId: 2, at: 130 })
+    point('pointercancel', 9, 1, { button: 0, pointerId: 2, at: 140 })
+    expect(view.selection.span).toBeNull()
+
+    // Matching pointerId 1 continues and completes the drag cleanly
+    point('pointermove', 4, 0, { button: 0, pointerId: 1, at: 150 })
+    point('pointerup', 4, 0, { button: 0, pointerId: 1, at: 160 })
+    expect(view.selection.span).toEqual({ start: { line: 0, col: 1 }, end: { line: 0, col: 4 } })
+
+    // Same isolation in PTY mouse-reporting mode
+    source.send(
+      frame({
+        seq: 2,
+        size: { cols: 20, rows: 2 },
+        modes: { altScreen: false, mouse: true, reverseVideo: false, bracketedPaste: false },
+        rows: [row(0, 'mouse')],
+      }),
+    )
+    painted()
+    point('pointerdown', 2, 0, { button: 0, pointerId: 10, at: 500 })
+    point('pointermove', 8, 1, { button: 0, pointerId: 11, at: 520 })
+    point('pointerup', 8, 1, { button: 0, pointerId: 11, at: 530 })
+    point('pointerup', 3, 0, { button: 0, pointerId: 10, at: 540 })
+    expect(source.pointers.map((p) => [p.action, p.xPx, p.yPx])).toEqual([
+      ['press', 25, 10],
+      ['release', 35, 10],
+    ])
+  })
 })

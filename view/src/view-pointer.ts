@@ -13,6 +13,7 @@ const CLICK_AGAIN_PIXELS = 4
 const THUMB_MIN = 20
 
 interface Pressed {
+  readonly pointerId: number
   readonly button: number
   readonly reporting: boolean
   readonly at: CellPos
@@ -302,7 +303,7 @@ export class PointerController {
     const validButton = event.button >= 0 && event.button <= 2
     const reporting =
       validButton && this.host.frame()?.modes.mouse === true && !event.shiftKey && this.host.viewport.following
-    this.pressed = { button: event.button, reporting, at, moved: false, block: event.altKey }
+    this.pressed = { pointerId: event.pointerId, button: event.button, reporting, at, moved: false, block: event.altKey }
     this.host.element.setPointerCapture?.(event.pointerId)
     if (reporting) {
       const input = this.pointerInput(event, 'press', event.button)
@@ -327,6 +328,7 @@ export class PointerController {
 
   private readonly pointerMove = (event: PointerEvent) => {
     const pressed = this.pressed
+    if (pressed && event.pointerId !== pressed.pointerId) return
     if (pressed?.reporting) {
       this.reportMove(event, pressed.button)
       return
@@ -369,6 +371,7 @@ export class PointerController {
   private released(event: PointerEvent): Pressed | null {
     const pressed = this.pressed
     if (!pressed) return null
+    if (event.pointerId !== pressed.pointerId) return null
     if (event.type === 'pointerup' && event.button !== pressed.button) return null
     this.pressed = null
     this.stopDragScroll()
@@ -459,13 +462,16 @@ export class PointerController {
     event.preventDefault()
     event.stopPropagation()
     this.thumbRelease?.()
+    const pointerId = event.pointerId
     const start = { y: event.clientY, position: this.host.viewport.extent.position }
     const move = (moved: PointerEvent) => {
+      if (moved.pointerId !== pointerId) return
       const { total, shown } = this.host.viewport.extent
       const travel = this.thumbAt()?.travel ?? 0
       if (travel > 0) this.host.scrollToPosition(start.position + ((moved.clientY - start.y) / travel) * (total - shown))
     }
-    const up = () => {
+    const up = (ended?: PointerEvent) => {
+      if (ended && ended.pointerId !== pointerId) return
       window.removeEventListener('pointermove', move)
       window.removeEventListener('pointerup', up)
       window.removeEventListener('pointercancel', up)
@@ -474,6 +480,6 @@ export class PointerController {
     window.addEventListener('pointermove', move)
     window.addEventListener('pointerup', up)
     window.addEventListener('pointercancel', up)
-    this.thumbRelease = up
+    this.thumbRelease = () => up()
   }
 }

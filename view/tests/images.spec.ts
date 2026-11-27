@@ -147,4 +147,112 @@ describe('ImageCache and TerminalView image placements', () => {
     view.dispose()
     cache.dispose()
   })
+
+  it('notifies painter.releaseImage on ImageCache eviction, honors anchored sourceRect/cellOffset/pixelSize, and reschedules doubted askPage fetches', async () => {
+    const source = new FakeSource()
+    const b1 = new Uint8Array(32).fill(0x51)
+    const b2 = new Uint8Array(32).fill(0x52)
+    const b3 = new Uint8Array(32).fill(0x53)
+    for (const b of [b1, b2, b3]) {
+      source.blobs.set(blobHashToHex(b), { blob: b, encoding: 'png', bytes: new Uint8Array([1, 2, 3]) })
+    }
+    source.imagesGen = 1
+    source.imagePlacements = [
+      {
+        blob: b1,
+        line: 0,
+        col: 1,
+        sourceRect: [4, 2, 12, 10],
+        cellOffset: [3, 5],
+        pixelSize: [12, 10],
+        cellSpan: [3, 2],
+        zIndex: 1,
+      },
+    ]
+
+    // Cap at 2048 bytes (each 16x16 RGBA = 1024 bytes => inserting b3 evicts b1)
+    const cache = new ImageCache({
+      maxBytes: 2048,
+      decode: async () => {
+        const pic = document.createElement('canvas')
+        pic.width = 32
+        pic.height = 16
+        return { source: pic, width: 16, height: 16 }
+      },
+    })
+    const { view, painter, painted } = mountedView({ imageCache: cache }, source)
+    source.send(frame({ seq: 1, imagesGen: 1, rows: [row(0, 'anchored'), row(1, 'below')] }))
+    painted()
+    await settled()
+    await settled()
+    const scene = painted()
+
+    // H10 (view): anchored placement honors sourceRect, cellOffset, pixelSize (12x10, not stretched to 30x40), and key!
+    expect(scene.images).toHaveLength(1)
+    const img = scene.images![0]!
+    expect(img.key).toBe(blobHashToHex(b1))
+    expect(img.x).toBe(1 * 10 + 3)
+    expect(img.y).toBe(0 * 20 + 5)
+    expect(img.width).toBe(12)
+    expect(img.height).toBe(10)
+    expect(img.source).toEqual({ x: 4, y: 2, width: 12, height: 10 })
+
+    // H14: evicting b1 from ImageCache immediately calls painter.releaseImage(hex(b1))
+    await cache.ensure(source, b2)
+    await cache.ensure(source, b3)
+    expect(painter.releasedImages).toEqual([blobHashToHex(b1)])
+
+    // M13: when store.imagesChanged increments while fetchRows is in flight, askPage reschedules
+    // so doubted placeholder rows are refetched automatically!
+    let resolveFetch!: (rows: readonly ReturnType<typeof row>[]) => void
+    let fetchCalls = 0
+    const origFetch = source.fetchRows.bind(source)
+    source.fetchRows = (epoch, from, count) => {
+      fetchCalls += 1
+      if (fetchCalls === 1) {
+        return new Promise((res) => { resolveFetch = res })
+      }
+      return origFetch(epoch, from, count)
+    }
+    const pieceRow = row(0, 'stale-placeholder', {
+      pieces: [{ blob: b2, colStart: 0, colLen: 2, srcRect: [0, 0, 16, 16], dstPx: [16, 16] }],
+    })
+    source.history.set(0, row(0, 'fresh-placeholder'))
+    source.send(
+      frame({
+        seq: 2,
+        epoch: 2,
+        imagesGen: 1,
+        firstActiveLine: 5,
+        scrollbackLines: 5,
+        size: { cols: 20, rows: 2 },
+        rows: [row(5, 'bottom0'), row(6, 'bottom1')],
+      }),
+    )
+    view.scrollTo(0)
+    painted()
+    expect(fetchCalls).toBe(1)
+    // Bump imagesGen while fetchRows #1 is still in flight
+    source.send(
+      frame({
+        seq: 3,
+        epoch: 2,
+        imagesGen: 2,
+        firstActiveLine: 5,
+        scrollbackLines: 5,
+        size: { cols: 20, rows: 2 },
+        rows: [row(5, 'bottom0'), row(6, 'bottom1')],
+      }),
+    )
+    painted()
+    // Complete stale fetch #1 returning a placeholder row (doubted/discarded by RowStore.absorb -> absorbed = [])
+    resolveFetch([pieceRow])
+    await settled()
+    painted()
+    await settled()
+    expect(fetchCalls).toBeGreaterThanOrEqual(2)
+
+    view.dispose()
+    cache.dispose()
+  })
 })

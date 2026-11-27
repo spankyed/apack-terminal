@@ -377,6 +377,7 @@ export class TerminalClient {
     try {
       const frames = this.decoder.push(chunk)
       for (const f of frames) {
+        if (this.closed) return
         if (f.kind === 'fin') {
           this.handleClosed('broker sent FIN')
           return

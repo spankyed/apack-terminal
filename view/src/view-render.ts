@@ -208,6 +208,7 @@ export class ViewRenderer {
         const [sx, sy, sw, sh] = piece.srcRect
         const [dstW, dstH] = piece.dstPx
         images.push({
+          key: decoded.key,
           picture: decoded.source,
           x: piece.colStart * cellWidth,
           y: top,
@@ -233,14 +234,26 @@ export class ViewRenderer {
       if (this.host.commands.hiddenIn(placement.line)) continue
       const decoded = this.host.imageCache.get(placement.blob)
       if (!decoded) continue
+      const [rawSx, rawSy, rawSw, rawSh] = placement.sourceRect
+      const sx = Math.min(Math.max(0, rawSx), decoded.width)
+      const sy = Math.min(Math.max(0, rawSy), decoded.height)
+      const sw = Math.min(rawSw > 0 ? rawSw : decoded.width - sx, decoded.width - sx)
+      const sh = Math.min(rawSh > 0 ? rawSh : decoded.height - sy, decoded.height - sy)
+      if (sw <= 0 || sh <= 0) continue
+      const [offX, offY] = placement.cellOffset
       const [pxW, pxH] = placement.pixelSize
+      const maxW = spanCols > 0 ? spanCols * cellWidth : pxW
+      const maxH = spanRows > 0 ? spanRows * cellHeight : pxH
+      const width = pxW > 0 && maxW > 0 ? Math.min(pxW, maxW) : (pxW > 0 ? pxW : maxW)
+      const height = pxH > 0 && maxH > 0 ? Math.min(pxH, maxH) : (pxH > 0 ? pxH : maxH)
       images.push({
+        key: decoded.key,
         picture: decoded.source,
-        x: placement.col * cellWidth,
-        y: this.host.viewport.rowsBetween(first, placement.line) * cellHeight,
-        width: spanCols > 0 ? spanCols * cellWidth : pxW,
-        height: spanRows > 0 ? spanRows * cellHeight : pxH,
-        source: { x: 0, y: 0, width: decoded.width, height: decoded.height },
+        x: placement.col * cellWidth + offX,
+        y: this.host.viewport.rowsBetween(first, placement.line) * cellHeight + offY,
+        width,
+        height,
+        source: { x: sx, y: sy, width: sw, height: sh },
         above: placement.zIndex >= 0,
         z: placement.zIndex,
       })
@@ -353,7 +366,7 @@ export class ViewRenderer {
       this.asking.delete(page)
       const absorbed = this.host.store.absorb(epoch, from, to - from, fetched, this.host.viewport.top, atImagesChanged)
       for (const line of absorbed) this.drawings.delete(line)
-      if (absorbed.length > 0) this.host.schedule()
+      if (absorbed.length > 0 || atImagesChanged !== this.host.store.imagesChanged) this.host.schedule()
     }, () => {
       if (epoch === this.host.store.epoch) this.asking.delete(page)
     })

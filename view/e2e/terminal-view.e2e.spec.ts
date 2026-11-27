@@ -79,6 +79,34 @@ function makeKittyInlineImage(
   return `\x1b_Ga=T,f=32,s=${widthPx},v=${heightPx},c=${cols},r=${rows},i=${imageId},t=d;${b64}\x1b\\`
 }
 
+/**
+ * Builds a 32x16 two-half Kitty image (left 16x16 bright red, right 16x16 bright green) placed
+ * with source crop `x=16,y=0,w=16,h=16` and cell offset `X=6,Y=3` (`H10` view verification).
+ */
+function makeKittyCroppedOffsetImage(imageId: number): string {
+  const w = 32
+  const h = 16
+  const raw = Buffer.alloc(w * h * 4)
+  for (let y = 0; y < h; y += 1) {
+    for (let x = 0; x < w; x += 1) {
+      const idx = (y * w + x) * 4
+      if (x < 16) {
+        raw[idx] = 255
+        raw[idx + 1] = 20
+        raw[idx + 2] = 20
+        raw[idx + 3] = 255
+      } else {
+        raw[idx] = 20
+        raw[idx + 1] = 255
+        raw[idx + 2] = 60
+        raw[idx + 3] = 255
+      }
+    }
+  }
+  const b64 = raw.toString('base64')
+  return `\x1b_Ga=T,f=32,s=${w},v=${h},x=16,y=0,w=16,h=16,X=6,Y=3,c=3,r=2,i=${imageId},t=d;${b64}\x1b\\`
+}
+
 let bridge: LiveBrokerBridge
 
 test.beforeEach(async () => {
@@ -108,13 +136,14 @@ for (const mode of ['webgl2', 'canvas2d'] as const) {
       // never alters escapes or UTF-8 emoji bytes.
       const seqFile = join(bridge.tmpDir, `render-${mode}.bin`)
       const magentaImg = makeKittyInlineImage(16, 16, 6, 3, [255, 0, 255, 255], 7)
+      const croppedGreenImg = makeKittyCroppedOffsetImage(8)
       const stream = [
         '\x1b[38;2;255;40;40mRED_ROW_GLYPHS\x1b[0m\r\n',
         '\x1b[38;2;40;255;40mGREEN_ROW_GLYPHS\x1b[0m\r\n',
         '\x1b[38;2;40;120;255mBLUE_ROW_GLYPHS\x1b[0m\r\n',
         '\x1b[48;2;240;220;30m\x1b[38;2;0;0;0mYELLOW_BG_BLOCK\x1b[0m\r\n',
         '\x1b[38;2;0;120;255m######\x1b[0m  🟥🟥  \x1b[38;2;255;255;255mEMOJI_ROW\x1b[0m\r\n',
-        `${magentaImg}\r\n\r\n\r\n`,
+        `${magentaImg}\x1b[6;16H${croppedGreenImg}\r\n\r\n\r\n`,
         'RENDER_READY_OK ',
       ].join('')
       writeFileSync(seqFile, stream, 'utf8')
@@ -148,13 +177,13 @@ for (const mode of ['webgl2', 'canvas2d'] as const) {
         .poll(async () => (await page.evaluate(() => window.__apackE2E.painterStats()))?.decodedImageCount ?? 0, {
           timeout: 8000,
         })
-        .toBeGreaterThan(0)
+        .toBeGreaterThanOrEqual(2)
       if (mode === 'webgl2') {
         await expect
           .poll(async () => (await page.evaluate(() => window.__apackE2E.painterStats()))?.imageTextureCount ?? 0, {
             timeout: 8000,
           })
-          .toBeGreaterThan(0)
+          .toBeGreaterThanOrEqual(2)
       }
       await page.evaluate(async () => {
         window.__apackE2E.redraw()
@@ -219,6 +248,21 @@ for (const mode of ['webgl2', 'canvas2d'] as const) {
         (r, g, b) => r > 210 && g < 50 && b > 210,
       )
       expect(magentaPixels).toBeGreaterThan(200)
+
+      // Row 5, col 15 (`\x1b[6;16H`, 0-based col 15): cropped right-half green Kitty image (`x=16,w=16,h=16,X=6,Y=3`)
+      // MUST render ONLY bright green pixels (proving sourceRect crop) at the offset position (ZERO red half leaked!).
+      const cropBand = { x: cellW * 15, y: cellH * 5, w: cellW * 5, h: cellH * 2 }
+      const croppedGreenPixels = countMatchingPixels(png, cropBand, (r, g, b) => g > 200 && r < 60 && b < 100)
+      const croppedRedLeak = countMatchingPixels(png, cropBand, (r, g, b) => r > 180 && g < 80 && b < 80)
+      expect(croppedGreenPixels).toBeGreaterThan(150)
+      expect(croppedRedLeak).toBe(0)
+      // Verify `X=6, Y=3` cell offset kept the top-left 4x2 px corner of col 15 row 5 unpainted (background)!
+      const topLeftOffsetPixels = countMatchingPixels(
+        png,
+        { x: Math.round(cellW * 15), y: Math.round(cellH * 5), w: 4, h: 2 },
+        (r, g, b) => g > 200 && r < 60 && b < 100,
+      )
+      expect(topLeftOffsetPixels).toBe(0)
 
       // Cursor: bright cyan (`0x00ffff` -> `r < 40, g > 200, b > 200`) on the `RENDER_READY_OK ` row
       const cursorPixels = countMatchingPixels(

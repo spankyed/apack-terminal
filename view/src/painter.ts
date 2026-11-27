@@ -41,6 +41,8 @@ export interface Scene {
    * top-left of the first row, before `offset` is applied; `source` is the part of the picture drawn.
    */
   readonly images?: ReadonlyArray<{
+    /** Optional content-addressed image key (hex `BlobHash`) for GPU texture ownership & explicit release. */
+    readonly key?: string
     readonly picture: CanvasImageSource
     readonly x: number
     readonly y: number
@@ -83,6 +85,8 @@ export interface Painter {
    * it drew has no need of one.
    */
   whenCleared?(repaint: () => void): void
+  /** Explicitly releases any GPU texture cached under content-addressed image `key`. */
+  releaseImage?(key: string): void
   paint(scene: Scene): void
   dispose(): void
 }

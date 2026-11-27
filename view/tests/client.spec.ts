@@ -506,6 +506,52 @@ describe('TerminalClient & BrokerSessionSource', () => {
     await expect(pendingRaw).rejects.toBeInstanceOf(DisconnectedError)
     expect(rawEvents).toEqual(['exited', 'streamClosed'])
 
+    // L9: if an earlier frame in a multi-frame chunk closes the client, remaining frames are NOT dispatched!
+    const multiPipe = new MockBrokerPipe()
+    multiPipe.onClientFrame = (streamId, reqId, msg) => {
+      if (msg.kind === 'hello') {
+        multiPipe.pushBroker(streamId, reqId, {
+          kind: 'helloOk',
+          protocolVersion: PROTOCOL_VERSION,
+          authRequired: false,
+          serverNonce: new Uint8Array(32),
+          wordDelimiters: ' ',
+          capabilities: 0,
+        })
+      } else if (msg.kind === 'attach') {
+        multiPipe.pushBroker(CONTROL_STREAM_ID, reqId, {
+          kind: 'attached',
+          session: msg.session,
+          streamId: msg.streamId,
+          size: { cols: 80, rows: 24 },
+          epoch: 1,
+          firstActiveLine: 0,
+          scrollbackLines: 0,
+          foreground: null,
+          statuses: [],
+        })
+      }
+    }
+    const cMulti = await TerminalClient.connect(multiPipe.stream)
+    const sMulti = await cMulti.attachSession(9, { flags: SubFlags.VIEW | SubFlags.EVENTS })
+    const seenEvents: string[] = []
+    sMulti.subscribe({
+      onFrame: () => {},
+      onSearchMatches: () => {},
+      onSearchDelta: () => {},
+      onEvent: (ev) => {
+        seenEvents.push(ev.kind)
+        if (ev.kind === 'bell') cMulti.close()
+      },
+    })
+    const f1 = encodeBrokerFrame(sMulti.streamId, PUSH_REQ_ID, { kind: 'bell' })
+    const f2 = encodeBrokerFrame(sMulti.streamId, PUSH_REQ_ID, { kind: 'title', title: 'must-not-dispatch' })
+    const combined = new Uint8Array(f1.length + f2.length)
+    combined.set(f1, 0)
+    combined.set(f2, f1.length)
+    ;(multiPipe as unknown as { dataHandlers: Set<(c: Uint8Array) => void> }).dataHandlers.forEach((cb) => cb(combined))
+    expect(seenEvents).toEqual(['bell', 'streamClosed'])
+
     client.close()
   })
 })

@@ -333,7 +333,6 @@ const HARNESS_HTML = `<!doctype html>
           font: {
             family: 'Menlo, Monaco, Consolas, "DejaVu Sans Mono", "Noto Color Emoji", "Apple Color Emoji", monospace',
             size: 14,
-            lineHeight: 1.25,
           },
           theme: E2E_THEME,
           imageCache,
@@ -530,6 +529,9 @@ const HARNESS_HTML = `<!doctype html>
         state = null
         try {
           s.view.dispose()
+        } catch {}
+        try {
+          s.imageCache.dispose()
         } catch {}
         try {
           await s.client.kill(s.session)
