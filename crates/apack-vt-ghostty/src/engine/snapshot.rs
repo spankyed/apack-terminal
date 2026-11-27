@@ -12,9 +12,7 @@ use super::callbacks::{
     cb_bell, cb_clipboard_write, cb_notification, cb_program_status, cb_progress, cb_pwd_changed, cb_render_hold,
     cb_semantic_prompt, cb_size, cb_title_changed, cb_unknown_sequence, cb_write_pty, ffi_guard,
 };
-use super::ffi_queries::{
-    handle_at_ground, query_alt_screen, query_images_generation, query_scrollback_rows, read_u16, track_active_top,
-};
+use super::ffi_queries::{handle_at_ground, query_alt_screen, query_scrollback_rows, read_u16, track_active_top};
 use super::vt_impl::apply_cursor_defaults;
 use super::{CURSOR_BLINK_MODE, CallbackState, GhosttyEngine};
 
@@ -204,9 +202,9 @@ impl GhosttyEngine {
         self.image_cache.blobs.clear();
         self.image_cache.virtual_named.clear();
         self.image_cache.virtual_lowest.clear();
-        self.raw_images_gen = query_images_generation(self.handle);
         self.gens.images = self.gens.images.saturating_add(1);
         self.sync_images_cache();
+        self.raw_images_gen = self.image_cache.images_gen;
         self.refresh_render_state(true, 0);
         Ok(())
     }

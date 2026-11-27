@@ -503,7 +503,16 @@ impl GhosttyEngine {
             let base_end = cur_line.saturating_add(step.saturating_sub(1)).min(span.end.line);
             let hard_end = cur_line.saturating_add(max_batch_rows.saturating_sub(1)).min(span.end.line);
             let batch_end = match self.line_at(base_end) {
-                Some(logical) => logical.end.line.clamp(base_end, hard_end),
+                Some(logical) => {
+                    let ext = logical.end.line.clamp(base_end, hard_end);
+                    // Never mix earlier unwrapped lines with a mid-wrap cut in the same formatter batch,
+                    // because `FormatterOption::TRIM = false` applies to every line in the batch.
+                    if self.screen_row_is_wrapped(ext) && logical.start.line > cur_line {
+                        logical.start.line - 1
+                    } else {
+                        ext
+                    }
+                }
                 None => base_end,
             };
             let sub = CellSpan {

@@ -1646,21 +1646,25 @@ fn vt_ghostty_seams_placement_geometry_bounded_batch_ffi_guard_poison_and_sealed
     assert_eq!(h_placements[0].pixel_size, [10, 8]);
 
     // 4. H5: `text_of_batched` bounds logical-line extension across batches WITHOUT injecting spurious '\n'
-    //    OR stripping interior spaces at a mid-wrap batch cut, while preserving '\n' between distinct lines.
+    //    OR stripping interior spaces at a mid-wrap batch cut, while trimming BOTH preceding and trailing
+    //    unwrapped lines cleanly.
     let mut w_vt = GhosttyEngine::new(GhosttyConfig::new(grid(10, 20))).unwrap();
     let wrapped_line = "aaaaaaaaaabbbbbbbbbbccccccccccdddd      eeeeeeeeee";
-    // Include an unwrapped line with explicit trailing spaces to verify `TRIM = true` still trims normal lines.
-    let input = format!("{wrapped_line}\r\nSECOND   ");
+    // Preceding unwrapped line (`"FIRST   "`) shares the initial batch range with `wrapped_line`;
+    // batching must split before the wrapped line so `TRIM = false` never leaks onto `"FIRST   "`.
+    let input = format!("FIRST   \r\n{wrapped_line}\r\nSECOND   ");
     w_vt.feed(input.as_bytes(), &mut ev);
     let meta = w_vt.meta();
     let full_span = CellSpan {
         start: CellPos { line: 0, col: 0 },
         end: CellPos { line: meta.total_lines() - 1, col: meta.size.cols.get() - 1 },
     };
-    // `batch_lines = 2` caps batch 1 to rows 0..=3, cutting right at row 3 (`"dddd      "`):
-    // spaces at the end of row 3 MUST be preserved across the batch cut, while unwrapped trailing spaces trim!
     let extracted = w_vt.text_of_batched(full_span, 10_000, 2);
-    assert_eq!(extracted.trim_end_matches('\n'), format!("{wrapped_line}\nSECOND"));
+    assert_eq!(extracted.trim_end_matches('\n'), format!("FIRST\n{wrapped_line}\nSECOND"));
+    // Even a caller span ending mid-wrap (row 4 = `"dddd      "`) MUST still trim preceding `"FIRST   "`
+    // while preserving the interior spaces at the end of row 4!
+    let mid_wrap_span = CellSpan { start: CellPos { line: 0, col: 0 }, end: CellPos { line: 4, col: 9 } };
+    assert_eq!(w_vt.text_of(mid_wrap_span, 10_000), "FIRST\naaaaaaaaaabbbbbbbbbbccccccccccdddd      ");
 
     // 5. Poison-tolerant ImageStore mutex recovery: a poisoned shared ImageStore must never panic GhosttyEngine!
     let poisoned = Arc::new(Mutex::new(ImageStore::default()));

@@ -280,16 +280,18 @@ impl GhosttyEngine {
 
         let new_images_gen = query_images_generation(self.handle);
         if new_images_gen != self.raw_images_gen {
-            self.raw_images_gen = new_images_gen;
-            self.gens.images = self.gens.images.saturating_add(1);
             self.sync_images_cache();
-            // When images upload/replace/delete after U+10EEEE placeholders are already on screen,
-            // mark placeholder-bearing viewport rows dirty so `PackedRow.pieces` updates!
-            if !self.full_dirty {
-                for r in 0..rows_count {
-                    if viewport_row_has_placeholder(self.handle, r as u32) {
-                        self.dirty_rows.insert(r as u16);
-                        self.gens.grid += 1;
+            if self.image_cache.images_gen == new_images_gen {
+                self.raw_images_gen = new_images_gen;
+                self.gens.images = self.gens.images.saturating_add(1);
+                // When images upload/replace/delete after U+10EEEE placeholders are already on screen,
+                // mark placeholder-bearing viewport rows dirty so `PackedRow.pieces` updates!
+                if !self.full_dirty {
+                    for r in 0..rows_count {
+                        if viewport_row_has_placeholder(self.handle, r as u32) {
+                            self.dirty_rows.insert(r as u16);
+                            self.gens.grid += 1;
+                        }
                     }
                 }
             }
