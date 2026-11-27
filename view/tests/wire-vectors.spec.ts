@@ -22,6 +22,8 @@ import {
   MAX_BLOB_BYTES,
   MAX_PACKED_ROW_TEXT_BYTES,
   MAX_ROWS_PER_FETCH,
+  MAX_SEARCH_NEEDLE_BYTES,
+  MAX_STRING_BYTES,
   MAX_WAIT_STATUSES,
 } from '../src/wire/constants.ts'
 import { encodeBrokerPayload, encodeClientPayload } from '../src/wire/messages.ts'
@@ -37,9 +39,12 @@ import {
   encodeKeyInput,
   encodeLeaseKind,
   encodePointerInput,
+  encodeRgb24,
+  encodeSignalScope,
   encodeStatusRecord,
   encodeSubFlags,
   encodeWaitCondition,
+  isValidPackedColor,
 } from '../src/wire/types.ts'
 
 interface GoldenFrame {
@@ -525,6 +530,10 @@ describe('v2 golden wire vectors (Rust <-> TypeScript parity)', () => {
       'LimitExceeded',
     )
     expectWireErr(
+      () => encodeClientPayload({ kind: 'fetchRows', epoch: 1, fromLine: 0, count: -1 }),
+      'LimitExceeded',
+    )
+    expectWireErr(
       () => encodeClientPayload({ kind: 'fetchRows', epoch: 1, fromLine: 0, count: MAX_ROWS_PER_FETCH + 1 }),
       'LimitExceeded',
     )
@@ -533,7 +542,184 @@ describe('v2 golden wire vectors (Rust <-> TypeScript parity)', () => {
       'InvalidValue',
     )
     expectWireErr(
+      () => encodeClientPayload({ kind: 'getImageBlob', blob, offset: 0, maxBytes: -1 }),
+      'InvalidValue',
+    )
+    expectWireErr(
       () => encodeBrokerPayload({ kind: 'progress', state: 'indeterminate', percent: 50 }),
+      'InvalidValue',
+    )
+
+    // 5. Additional adversarial checks: atomic rollback, surrogate-pair split, rgb24/color validation,
+    //    NaN maxLen fail-closed, WireWriter.str/bytes caps, remaining ImagePlacement axes & broker encoders.
+    expectWireErr(() => encodeHeader(0, MsgType.OK, 0, -1), 'InvalidValue')
+    expectWireErr(() => encodeHeader(0, MsgType.OK, 0, Number.NaN), 'InvalidValue')
+    expectWireErr(() => encodeHeader(0, MsgType.OK, 0, MAX_BLOB_BYTES + 1), 'FrameTooLarge')
+
+    expectWireErr(() => new WireReader(new Uint8Array([0])).bytesBounded(Number.NaN, 'nan'), 'InvalidValue')
+    expectWireErr(() => new WireWriter().strBounded('a', Number.NaN, 'nan'), 'InvalidValue')
+    expectWireErr(() => new WireWriter().str('a'.repeat(MAX_STRING_BYTES + 1)), 'LimitExceeded')
+    expectWireErr(() => new WireWriter().bytes(new Uint8Array(MAX_BLOB_BYTES + 1)), 'LimitExceeded')
+
+    const wRgb = new WireWriter()
+    expectWireErr(() => encodeRgb24(wRgb, Number.NaN), 'InvalidValue')
+    expectWireErr(() => encodeRgb24(wRgb, -1), 'InvalidValue')
+    expectWireErr(() => encodeRgb24(wRgb, 1.5), 'InvalidValue')
+    expectWireErr(() => encodeRgb24(wRgb, 0x01_00_00_00), 'InvalidValue')
+    expect(wRgb.length).toBe(0)
+    expect(isValidPackedColor(Number.NaN)).toBe(false)
+    expect(isValidPackedColor(1.5)).toBe(false)
+    expect(isValidPackedColor(0x1_0000_0001)).toBe(false)
+
+    // Atomic rollback on tagged unions, structs, and PackedRow mid-encode errors.
+    const wAtom = new WireWriter()
+    expectWireErr(
+      () => encodeWaitCondition(wAtom, { kind: 'text', needle: 'a'.repeat(MAX_SEARCH_NEEDLE_BYTES + 1) }),
+      'LimitExceeded',
+    )
+    expectWireErr(() => encodeLeaseKind(wAtom, { kind: 'session', session: 0 }), 'InvalidValue')
+    expectWireErr(() => encodeSignalScope(wAtom, { kind: 'pid', pid: 0 }), 'InvalidValue')
+    expectWireErr(
+      () => encodeCellSpan(wAtom, { start: { line: 0, col: 0 }, end: { line: Number.NaN, col: 0 } }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () => encodeImagePiece(wAtom, { blob, colStart: 10, colLen: -5, srcRect: [0, 0, 1, 1], dstPx: [1, 1] }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () => encodeImagePiece(wAtom, { blob, colStart: 0, colLen: 1, srcRect: [-1, 0, 0x1_0000_0000, 1], dstPx: [1, 1] }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () => encodeImagePiece(wAtom, { blob, colStart: 0, colLen: 1, srcRect: [0, 0, 1, 1], dstPx: [-1, 1] }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () => encodeImagePlacement(wAtom, { ...validPlacement, sourceRect: [0, 0, 10, 0] }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () => encodeImagePlacement(wAtom, { ...validPlacement, sourceRect: [0, 0xffff_ffff, 10, 1] }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () => encodeImagePlacement(wAtom, { ...validPlacement, sourceRect: [-1, 0, 10, 10] }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () => encodeImagePlacement(wAtom, { ...validPlacement, pixelSize: [10, 0] }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () => encodeImagePlacement(wAtom, { ...validPlacement, pixelSize: [-1, 10] }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () => encodeImagePlacement(wAtom, { ...validPlacement, cellSpan: [0, 2] }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () => encodeImagePlacement(wAtom, { ...validPlacement, zIndex: Number.NaN }),
+      'InvalidValue',
+    )
+    // PackedRow surrogate-pair split ("🚀" has UTF-16 length 2) + invalid run/style atomic rollback.
+    expectWireErr(
+      () =>
+        encodePackedRow(wAtom, {
+          line: 0,
+          flags: 0,
+          text: '🚀',
+          runs: new Uint32Array([0 | (2 << 16), 0 | (1 << 16), 0, 1]),
+          styles: new Uint32Array(0),
+          links: [],
+        }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () =>
+        encodePackedRow(wAtom, {
+          line: 0,
+          flags: 0,
+          text: '🚀',
+          runs: new Uint32Array([0 | (2 << 16), 1 | (1 << 16), 0, 1]),
+          styles: new Uint32Array(0),
+          links: [],
+        }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () =>
+        encodePackedRow(wAtom, {
+          line: 0,
+          flags: 0,
+          text: 'hi',
+          runs: new Uint32Array([0 | (2 << 16), 0 | (2 << 16), 0, 0]),
+          styles: new Uint32Array([1, 0, 0, 0]), // styles[0] not default
+          links: [],
+        }),
+      'InvalidValue',
+    )
+    expect(wAtom.length).toBe(0)
+
+    // Broker message encode invariants (FrameUpdate, Attached, SearchDelta, ImageBlobChunk).
+    expectWireErr(
+      () =>
+        encodeBrokerPayload({
+          kind: 'frame',
+          frame: {
+            seq: 1,
+            epoch: 1,
+            size: { cols: 80, rows: 24 },
+            firstActiveLine: 5,
+            scrollbackLines: 6,
+            scrollDelta: 0,
+            cursor: { col: 0, row: 0, shape: 'block', blinking: false, hidden: false },
+            modes: { altScreen: false, mouse: false, reverseVideo: false, bracketedPaste: false },
+            palette: null,
+            rows: [],
+            imagesGen: 0,
+            fullSync: true,
+          },
+        }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () =>
+        encodeBrokerPayload({
+          kind: 'attached',
+          session: 1,
+          streamId: 1,
+          size: { cols: 80, rows: 24 },
+          epoch: 1,
+          firstActiveLine: 5,
+          scrollbackLines: 6,
+          foreground: null,
+        }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () =>
+        encodeBrokerPayload({
+          kind: 'searchDelta',
+          epoch: 1,
+          fromLine: 10,
+          toLine: 5,
+          added: [],
+          truncated: false,
+        }),
+      'InvalidValue',
+    )
+    expectWireErr(
+      () =>
+        encodeBrokerPayload({
+          kind: 'imageBlobChunk',
+          blob,
+          encoding: 'png',
+          totalBytes: 4,
+          offset: 2,
+          data: new Uint8Array([1, 2, 3]),
+        }),
       'InvalidValue',
     )
   })

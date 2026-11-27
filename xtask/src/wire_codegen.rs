@@ -494,15 +494,17 @@ fn emit_struct_schema(out: &mut String, s: &StructSchema) {
 
     let vis = if s.exported_codec { "export " } else { "" };
     writeln!(out, "{vis}function encode{}(w: WireWriter, v: {}): void {{", s.name, s.name).unwrap();
+    writeln!(out, "  w.atomic((w) => {{").unwrap();
     for field in &s.fields {
-        field.codec.emit_pre_check(&format!("v.{}", field.name), "  ", out);
+        field.codec.emit_pre_check(&format!("v.{}", field.name), "    ", out);
         if let Some(check) = field.before_encode {
-            emit_indented_lines(out, "  ", check);
+            emit_indented_lines(out, "    ", check);
         }
     }
     for field in &s.fields {
-        field.codec.emit_encode("w", &format!("v.{}", field.name), "  ", out);
+        field.codec.emit_encode("w", &format!("v.{}", field.name), "    ", out);
     }
+    writeln!(out, "  }})").unwrap();
     writeln!(out, "}}").unwrap();
 
     writeln!(out, "{vis}function decode{}(r: WireReader): {} {{", s.name, s.name).unwrap();
@@ -562,22 +564,24 @@ fn emit_tagged_union(out: &mut String, u: &TaggedUnionSchema) {
     out.push('\n');
 
     writeln!(out, "export function encode{}(w: WireWriter, v: {}): void {{", u.name, u.name).unwrap();
-    writeln!(out, "  switch (v.kind) {{").unwrap();
+    writeln!(out, "  w.atomic((w) => {{").unwrap();
+    writeln!(out, "    switch (v.kind) {{").unwrap();
     for v in &u.variants {
-        writeln!(out, "    case '{}':", v.kind).unwrap();
+        writeln!(out, "      case '{}':", v.kind).unwrap();
         for field in &v.fields {
-            field.codec.emit_pre_check(&format!("v.{}", field.name), "      ", out);
+            field.codec.emit_pre_check(&format!("v.{}", field.name), "        ", out);
             if let Some(check) = field.before_encode {
-                emit_indented_lines(out, "      ", check);
+                emit_indented_lines(out, "        ", check);
             }
         }
-        writeln!(out, "      w.u8({})", v.tag).unwrap();
+        writeln!(out, "        w.u8({})", v.tag).unwrap();
         for field in &v.fields {
-            field.codec.emit_encode("w", &format!("v.{}", field.name), "      ", out);
+            field.codec.emit_encode("w", &format!("v.{}", field.name), "        ", out);
         }
-        writeln!(out, "      return").unwrap();
+        writeln!(out, "        return").unwrap();
     }
-    writeln!(out, "  }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "  }})").unwrap();
     writeln!(out, "}}").unwrap();
 
     writeln!(out, "export function decode{}(r: WireReader): {} {{", u.name, u.name).unwrap();
@@ -1012,6 +1016,9 @@ fn emit_primitive_helpers(out: &mut String) {
 export type Rgb24 = number
 
 export function encodeRgb24(w: WireWriter, rgb: Rgb24): void {
+  if (!Number.isInteger(rgb) || rgb < 0 || rgb > 0xff_ffff) {
+    throw new WireError('InvalidValue', `rgb24 out of range: ${rgb}`)
+  }
   w.u8((rgb >>> 16) & 0xff)
   w.u8((rgb >>> 8) & 0xff)
   w.u8(rgb & 0xff)
@@ -1126,10 +1133,12 @@ fn emit_bitpacked_structs(out: &mut String) {
 }
 
 export function encodeCursorState(w: WireWriter, state: CursorState): void {
-  w.u16(state.col)
-  w.u16(state.row)
-  encodeCursorShape(w, state.shape)
-  w.u8((state.blinking ? 1 : 0) | (state.hidden ? 2 : 0))
+  w.atomic((w) => {
+    w.u16(state.col)
+    w.u16(state.row)
+    encodeCursorShape(w, state.shape)
+    w.u8((state.blinking ? 1 : 0) | (state.hidden ? 2 : 0))
+  })
 }
 export function decodeCursorState(r: WireReader): CursorState {
   const col = r.u16()
@@ -1206,8 +1215,9 @@ function buildUtf8ToUtf16Map(utf8: Uint8Array): Int32Array {
   return map
 }
 
-function buildUtf16ToUtf8Map(text: string): Uint32Array {
-  const map = new Uint32Array(text.length + 1)
+function buildUtf16ToUtf8Map(text: string): Int32Array {
+  const map = new Int32Array(text.length + 1)
+  map.fill(-1)
   let bytePos = 0
   let i = 0
   while (i < text.length) {
@@ -1224,7 +1234,6 @@ function buildUtf16ToUtf8Map(text: string): Uint32Array {
       i += 1
     } else {
       bytePos += 4
-      map[i + 1] = bytePos
       i += 2
     }
   }
@@ -1233,116 +1242,121 @@ function buildUtf16ToUtf8Map(text: string): Uint32Array {
 }
 
 export function encodePackedRow(w: WireWriter, row: PackedRow): void {
-  if (!Number.isInteger(row.flags) || row.flags < 0 || row.flags > RowFlag.ALL_MASK) {
-    throw new WireError('InvalidValue', 'unknown PackedRow flag bits')
-  }
-  const utf8 = encodeUtf8(row.text)
-  if (utf8.length > MAX_PACKED_ROW_TEXT_BYTES) {
-    throw new WireError('LimitExceeded', 'wire limit exceeded: packed row text')
-  }
-  if (row.runs.length % 4 !== 0) {
-    throw new WireError('InvalidValue', 'PackedRow.runs length must be a multiple of 4')
-  }
-  const runCount = row.runs.length >>> 2
-  if (runCount > MAX_PACKED_RUNS) {
-    throw new WireError('LimitExceeded', 'wire limit exceeded: packed runs')
-  }
-  if (row.styles.length % 4 !== 0) {
-    throw new WireError('InvalidValue', 'PackedRow.styles length must be a multiple of 4')
-  }
-  const styleCount = row.styles.length >>> 2
-  if (styleCount > MAX_PACKED_STYLES) {
-    throw new WireError('LimitExceeded', 'wire limit exceeded: packed styles')
-  }
-  if (row.links.length > MAX_PACKED_LINKS) {
-    throw new WireError('LimitExceeded', 'wire limit exceeded: packed links')
-  }
-  if (row.links.length > 0 && row.links[0] !== '') {
-    throw new WireError('InvalidValue', 'links[0] must be empty')
-  }
-  for (let i = 1; i < row.links.length; i += 1) {
-    if (row.links[i] === '') {
-      throw new WireError('InvalidValue', 'non-zero link entry must be non-empty')
+  w.atomic((w) => {
+    if (!Number.isInteger(row.flags) || row.flags < 0 || row.flags > RowFlag.ALL_MASK) {
+      throw new WireError('InvalidValue', 'unknown PackedRow flag bits')
     }
-  }
-  const pieces = row.pieces ?? []
-  if (pieces.length > MAX_PACKED_PIECES) {
-    throw new WireError('LimitExceeded', 'wire limit exceeded: image pieces')
-  }
-  if (pieces.length > 0 && (row.flags & RowFlag.HAS_PLACEHOLDER) === 0) {
-    throw new WireError('InvalidValue', 'pieces require FLAG_HAS_PLACEHOLDER')
-  }
+    const utf8 = encodeUtf8(row.text)
+    if (utf8.length > MAX_PACKED_ROW_TEXT_BYTES) {
+      throw new WireError('LimitExceeded', 'wire limit exceeded: packed row text')
+    }
+    if (row.runs.length % 4 !== 0) {
+      throw new WireError('InvalidValue', 'PackedRow.runs length must be a multiple of 4')
+    }
+    const runCount = row.runs.length >>> 2
+    if (runCount > MAX_PACKED_RUNS) {
+      throw new WireError('LimitExceeded', 'wire limit exceeded: packed runs')
+    }
+    if (row.styles.length % 4 !== 0) {
+      throw new WireError('InvalidValue', 'PackedRow.styles length must be a multiple of 4')
+    }
+    const styleCount = row.styles.length >>> 2
+    if (styleCount > MAX_PACKED_STYLES) {
+      throw new WireError('LimitExceeded', 'wire limit exceeded: packed styles')
+    }
+    if (row.links.length > MAX_PACKED_LINKS) {
+      throw new WireError('LimitExceeded', 'wire limit exceeded: packed links')
+    }
+    if (row.links.length > 0 && row.links[0] !== '') {
+      throw new WireError('InvalidValue', 'links[0] must be empty')
+    }
+    for (let i = 1; i < row.links.length; i += 1) {
+      if (row.links[i] === '') {
+        throw new WireError('InvalidValue', 'non-zero link entry must be non-empty')
+      }
+    }
+    const pieces = row.pieces ?? []
+    if (pieces.length > MAX_PACKED_PIECES) {
+      throw new WireError('LimitExceeded', 'wire limit exceeded: image pieces')
+    }
+    if (pieces.length > 0 && (row.flags & RowFlag.HAS_PLACEHOLDER) === 0) {
+      throw new WireError('InvalidValue', 'pieces require FLAG_HAS_PLACEHOLDER')
+    }
 
-  w.varU64(row.line)
-  w.u8(row.flags)
-  w.bytes(utf8)
-  const isAscii = utf8.length === row.text.length
-  const utf16ToUtf8 = isAscii ? null : buildUtf16ToUtf8Map(row.text)
+    w.varU64(row.line)
+    w.u8(row.flags)
+    w.bytes(utf8)
+    const isAscii = utf8.length === row.text.length
+    const utf16ToUtf8 = isAscii ? null : buildUtf16ToUtf8Map(row.text)
 
-  w.varU32(runCount)
-  for (let i = 0; i < row.runs.length; i += 4) {
-    const colWord = row.runs[i]!
-    const txtWord = row.runs[i + 1]!
-    const slWord = row.runs[i + 2]!
-    const runFlags = row.runs[i + 3]!
-    const colStart = colWord & 0xffff
-    const colLen = colWord >>> 16
-    if (colLen === 0 || colStart + colLen > 0xffff) {
-      throw new WireError('InvalidValue', 'invalid PackedRun column span')
+    w.varU32(runCount)
+    for (let i = 0; i < row.runs.length; i += 4) {
+      const colWord = row.runs[i]!
+      const txtWord = row.runs[i + 1]!
+      const slWord = row.runs[i + 2]!
+      const runFlags = row.runs[i + 3]!
+      const colStart = colWord & 0xffff
+      const colLen = colWord >>> 16
+      if (colLen === 0 || colStart + colLen > 0xffff) {
+        throw new WireError('InvalidValue', 'invalid PackedRun column span')
+      }
+      if (runFlags > RunFlag.ALL_MASK) {
+        throw new WireError('InvalidValue', 'unknown PackedRun flag bits')
+      }
+      const u16Off = txtWord & 0xffff
+      const u16Len = txtWord >>> 16
+      if (u16Off + u16Len > row.text.length) {
+        throw new WireError('InvalidValue', 'run text range out of bounds')
+      }
+      const byteOffset = utf16ToUtf8 ? utf16ToUtf8[u16Off]! : u16Off
+      const byteEnd = utf16ToUtf8 ? utf16ToUtf8[u16Off + u16Len]! : u16Off + u16Len
+      if (byteOffset < 0 || byteEnd < 0) {
+        throw new WireError('InvalidValue', 'run text range splits UTF-16 surrogate pair')
+      }
+      const styleIdx = slWord & 0xffff
+      const linkIdx = slWord >>> 16
+      if (styleIdx >= styleCount && styleIdx !== 0) {
+        throw new WireError('InvalidValue', 'run style_idx out of bounds')
+      }
+      if (linkIdx >= row.links.length && linkIdx !== 0) {
+        throw new WireError('InvalidValue', 'run link_idx out of bounds')
+      }
+      w.u16(colStart)
+      w.u16(colLen)
+      w.varU32(byteOffset)
+      w.varU32(byteEnd - byteOffset)
+      w.u16(styleIdx)
+      w.u16(linkIdx)
+      w.u8(runFlags)
     }
-    if (runFlags > RunFlag.ALL_MASK) {
-      throw new WireError('InvalidValue', 'unknown PackedRun flag bits')
-    }
-    const u16Off = txtWord & 0xffff
-    const u16Len = txtWord >>> 16
-    if (u16Off + u16Len > row.text.length) {
-      throw new WireError('InvalidValue', 'run text range out of bounds')
-    }
-    const byteOffset = utf16ToUtf8 ? utf16ToUtf8[u16Off]! : u16Off
-    const byteEnd = utf16ToUtf8 ? utf16ToUtf8[u16Off + u16Len]! : u16Off + u16Len
-    const styleIdx = slWord & 0xffff
-    const linkIdx = slWord >>> 16
-    if (styleIdx >= styleCount && styleIdx !== 0) {
-      throw new WireError('InvalidValue', 'run style_idx out of bounds')
-    }
-    if (linkIdx >= row.links.length && linkIdx !== 0) {
-      throw new WireError('InvalidValue', 'run link_idx out of bounds')
-    }
-    w.u16(colStart)
-    w.u16(colLen)
-    w.varU32(byteOffset)
-    w.varU32(byteEnd - byteOffset)
-    w.u16(styleIdx)
-    w.u16(linkIdx)
-    w.u8(runFlags)
-  }
 
-  w.varU32(styleCount)
-  for (let i = 0; i < row.styles.length; i += 4) {
-    const fg = row.styles[i]!
-    const bg = row.styles[i + 1]!
-    const ul = row.styles[i + 2]!
-    const sf = row.styles[i + 3]!
-    if (!isValidPackedColor(fg) || !isValidPackedColor(bg) || !isValidPackedColor(ul)) {
-      throw new WireError('InvalidValue', 'invalid PackedStyle colour encoding')
+    w.varU32(styleCount)
+    for (let i = 0; i < row.styles.length; i += 4) {
+      const fg = row.styles[i]!
+      const bg = row.styles[i + 1]!
+      const ul = row.styles[i + 2]!
+      const sf = row.styles[i + 3]!
+      if (!isValidPackedColor(fg) || !isValidPackedColor(bg) || !isValidPackedColor(ul)) {
+        throw new WireError('InvalidValue', 'invalid PackedStyle colour encoding')
+      }
+      if (
+        (sf & ~PackedStyleFlag.ALL_MASK) !== 0 ||
+        (sf & PackedStyleFlag.UNDERLINE_MASK) > PackedStyleFlag.UNDERLINE_MAX
+      ) {
+        throw new WireError('InvalidValue', 'invalid PackedStyle flags')
+      }
+      if (i === 0 && (fg !== 0 || bg !== 0 || ul !== 0 || sf !== 0)) {
+        throw new WireError('InvalidValue', 'styles[0] must be default style')
+      }
+      w.u32(fg)
+      w.u32(bg)
+      w.u32(ul)
+      w.u32(sf)
     }
-    if (
-      (sf & ~PackedStyleFlag.ALL_MASK) !== 0 ||
-      (sf & PackedStyleFlag.UNDERLINE_MASK) > PackedStyleFlag.UNDERLINE_MAX
-    ) {
-      throw new WireError('InvalidValue', 'invalid PackedStyle flags')
-    }
-    if (i === 0 && (fg !== 0 || bg !== 0 || ul !== 0 || sf !== 0)) {
-      throw new WireError('InvalidValue', 'styles[0] must be default style')
-    }
-    w.u32(fg)
-    w.u32(bg)
-    w.u32(ul)
-    w.u32(sf)
-  }
 
-  w.slice(row.links, (wr, link) => wr.str(link))
-  w.slice(pieces, encodeImagePiece)
+    w.slice(row.links, (wr, link) => wr.str(link))
+    w.slice(pieces, encodeImagePiece)
+  })
 }
 
 export function decodePackedRow(r: WireReader): PackedRow {
@@ -1541,19 +1555,19 @@ fn domain_structs() -> Vec<StructSchema> {
                 f_encode_decode_check(
                     "colLen",
                     FieldCodec::U16,
-                    "if (!Number.isInteger(v.colStart) || !Number.isInteger(v.colLen) || v.colStart < 0 || v.colLen === 0 || v.colStart + v.colLen > 0xffff) {\n  throw new WireError('InvalidValue', 'invalid ImagePiece column span')\n}",
+                    "if (!Number.isInteger(v.colStart) || !Number.isInteger(v.colLen) || v.colStart < 0 || v.colLen < 1 || v.colStart + v.colLen > 0xffff) {\n  throw new WireError('InvalidValue', 'invalid ImagePiece column span')\n}",
                     "if (colLen === 0 || colStart + colLen > 0xffff) {\n  throw new WireError('InvalidValue', 'invalid ImagePiece column span')\n}",
                 ),
                 f_encode_decode_check(
                     "srcRect",
                     FieldCodec::Tuple4VarU32,
-                    "if (v.srcRect[2] === 0 || v.srcRect[3] === 0 || v.srcRect[0] + v.srcRect[2] > 0xffff_ffff || v.srcRect[1] + v.srcRect[3] > 0xffff_ffff) {\n  throw new WireError('InvalidValue', 'invalid ImagePiece src_rect')\n}",
+                    "if (!v.srcRect.every((n) => Number.isInteger(n) && n >= 0 && n <= 0xffff_ffff) || v.srcRect[2] === 0 || v.srcRect[3] === 0 || v.srcRect[0] + v.srcRect[2] > 0xffff_ffff || v.srcRect[1] + v.srcRect[3] > 0xffff_ffff) {\n  throw new WireError('InvalidValue', 'invalid ImagePiece src_rect')\n}",
                     "if (srcRect[2] === 0 || srcRect[3] === 0 || srcRect[0] + srcRect[2] > 0xffff_ffff || srcRect[1] + srcRect[3] > 0xffff_ffff) {\n  throw new WireError('InvalidValue', 'invalid ImagePiece src_rect')\n}",
                 ),
                 f_encode_decode_check(
                     "dstPx",
                     FieldCodec::Tuple2VarU32,
-                    "if (v.dstPx[0] === 0 || v.dstPx[1] === 0) throw new WireError('InvalidValue', 'invalid ImagePiece dst_px')",
+                    "if (!v.dstPx.every((n) => Number.isInteger(n) && n >= 1 && n <= 0xffff_ffff)) throw new WireError('InvalidValue', 'invalid ImagePiece dst_px')",
                     "if (dstPx[0] === 0 || dstPx[1] === 0) throw new WireError('InvalidValue', 'invalid ImagePiece dst_px')",
                 ),
             ],
@@ -1681,20 +1695,20 @@ fn domain_structs() -> Vec<StructSchema> {
                 f_encode_decode_check(
                     "sourceRect",
                     FieldCodec::Tuple4VarU32,
-                    "if (v.sourceRect[2] === 0 || v.sourceRect[3] === 0 || v.sourceRect[0] + v.sourceRect[2] > 0xffff_ffff || v.sourceRect[1] + v.sourceRect[3] > 0xffff_ffff) {\n  throw new WireError('InvalidValue', 'invalid ImagePlacement source_rect')\n}",
+                    "if (!v.sourceRect.every((n) => Number.isInteger(n) && n >= 0 && n <= 0xffff_ffff) || v.sourceRect[2] === 0 || v.sourceRect[3] === 0 || v.sourceRect[0] + v.sourceRect[2] > 0xffff_ffff || v.sourceRect[1] + v.sourceRect[3] > 0xffff_ffff) {\n  throw new WireError('InvalidValue', 'invalid ImagePlacement source_rect')\n}",
                     "if (sourceRect[2] === 0 || sourceRect[3] === 0 || sourceRect[0] + sourceRect[2] > 0xffff_ffff || sourceRect[1] + sourceRect[3] > 0xffff_ffff) {\n  throw new WireError('InvalidValue', 'invalid ImagePlacement source_rect')\n}",
                 ),
                 f("cellOffset", FieldCodec::Tuple2VarU32),
                 f_encode_decode_check(
                     "pixelSize",
                     FieldCodec::Tuple2VarU32,
-                    "if (v.pixelSize[0] === 0 || v.pixelSize[1] === 0) throw new WireError('InvalidValue', 'invalid ImagePlacement pixel_size')",
+                    "if (!v.pixelSize.every((n) => Number.isInteger(n) && n >= 1 && n <= 0xffff_ffff)) throw new WireError('InvalidValue', 'invalid ImagePlacement pixel_size')",
                     "if (pixelSize[0] === 0 || pixelSize[1] === 0) throw new WireError('InvalidValue', 'invalid ImagePlacement pixel_size')",
                 ),
                 f_encode_decode_check(
                     "cellSpan",
                     FieldCodec::Tuple2U16,
-                    "if (v.cellSpan[0] === 0 || v.cellSpan[1] === 0) throw new WireError('InvalidValue', 'invalid ImagePlacement cell_span')",
+                    "if (!v.cellSpan.every((n) => Number.isInteger(n) && n >= 1 && n <= 0xffff)) throw new WireError('InvalidValue', 'invalid ImagePlacement cell_span')",
                     "if (cellSpan[0] === 0 || cellSpan[1] === 0) throw new WireError('InvalidValue', 'invalid ImagePlacement cell_span')",
                 ),
                 f("zIndex", FieldCodec::I32),
@@ -1812,7 +1826,7 @@ import {
 
     writeln!(
         out,
-        "export type UnderlineKind = 'none' | 'single' | 'double' | 'curly' | 'dotted' | 'dashed'\nconst UNDERLINE_NAMES: readonly UnderlineKind[] = ['none', 'single', 'double', 'curly', 'dotted', 'dashed']\n\nexport function underlineOfStyleFlags(flags: number): UnderlineKind {{\n  return UNDERLINE_NAMES[(flags & PackedStyleFlag.UNDERLINE_MASK) >> {}] ?? 'none'\n}}\n\nexport function isValidPackedColor(color: number): boolean {{\n  const c = color >>> 0\n  return c <= {} || (c >= {:#010x} && c <= {:#010x})\n}}\n",
+        "export type UnderlineKind = 'none' | 'single' | 'double' | 'curly' | 'dotted' | 'dashed'\nconst UNDERLINE_NAMES: readonly UnderlineKind[] = ['none', 'single', 'double', 'curly', 'dotted', 'dashed']\n\nexport function underlineOfStyleFlags(flags: number): UnderlineKind {{\n  return UNDERLINE_NAMES[(flags & PackedStyleFlag.UNDERLINE_MASK) >> {}] ?? 'none'\n}}\n\nexport function isValidPackedColor(color: number): boolean {{\n  if (!Number.isInteger(color) || color < 0 || color > 0xffff_ffff) return false\n  return color <= {} || (color >= {:#010x} && color <= {:#010x})\n}}\n",
         PackedStyle::UNDERLINE_SHIFT,
         PackedStyle::MAX_PALETTE_COLOR,
         PackedStyle::RGB_COLOR_MIN,
@@ -2172,7 +2186,7 @@ fn client_msg_variants() -> Vec<MsgVariant> {
                 f_encode_decode_check(
                     "count",
                     FieldCodec::VarU32,
-                    "if (!Number.isInteger(msg.count) || msg.count === 0 || msg.count > MAX_ROWS_PER_FETCH) throw new WireError('LimitExceeded', 'fetch rows count')",
+                    "if (!Number.isInteger(msg.count) || msg.count < 1 || msg.count > MAX_ROWS_PER_FETCH) throw new WireError('LimitExceeded', 'fetch rows count')",
                     "if (count === 0 || count > MAX_ROWS_PER_FETCH) throw new WireError('LimitExceeded', 'fetch rows count')",
                 ),
             ],
@@ -2234,7 +2248,7 @@ fn client_msg_variants() -> Vec<MsgVariant> {
                 f_encode_decode_check(
                     "maxBytes",
                     FieldCodec::VarU32,
-                    "if (!Number.isInteger(msg.maxBytes) || msg.maxBytes === 0) throw new WireError('InvalidValue', 'get_image_blob max_bytes must be non-zero')",
+                    "if (!Number.isInteger(msg.maxBytes) || msg.maxBytes < 1 || msg.maxBytes > 0xffff_ffff) throw new WireError('InvalidValue', 'get_image_blob max_bytes must be non-zero')",
                     "if (maxBytes === 0) throw new WireError('InvalidValue', 'get_image_blob max_bytes must be non-zero')",
                 ),
             ],

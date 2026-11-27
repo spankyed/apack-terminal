@@ -37,7 +37,10 @@ export function encodeHeader(
   if (!Number.isInteger(reqId) || reqId < 0 || reqId > 0xffff_ffff) {
     throw new WireError('InvalidValue', `reqId out of range: ${reqId}`)
   }
-  if (!Number.isInteger(payloadLen) || payloadLen < 0 || payloadLen > MAX_FRAME_PAYLOAD) {
+  if (!Number.isInteger(payloadLen) || payloadLen < 0) {
+    throw new WireError('InvalidValue', `payloadLen out of range: ${payloadLen}`)
+  }
+  if (payloadLen > MAX_FRAME_PAYLOAD) {
     throw new WireError('FrameTooLarge', `wire frame payload ${payloadLen} bytes exceeds limit`)
   }
   const header = new Uint8Array(FRAME_HEADER_LEN)

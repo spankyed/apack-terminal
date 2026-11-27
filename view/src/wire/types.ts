@@ -81,8 +81,8 @@ export function underlineOfStyleFlags(flags: number): UnderlineKind {
 }
 
 export function isValidPackedColor(color: number): boolean {
-  const c = color >>> 0
-  return c <= 256 || (c >= 0x01000000 && c <= 0x01ffffff)
+  if (!Number.isInteger(color) || color < 0 || color > 0xffff_ffff) return false
+  return color <= 256 || (color >= 0x01000000 && color <= 0x01ffffff)
 }
 
 export type SignalKind = 'hup' | 'int' | 'quit' | 'term' | 'kill' | 'usr1' | 'usr2' | 'stop' | 'cont'
@@ -357,6 +357,9 @@ const POINTER_BUTTON_NONE = 255
 export type Rgb24 = number
 
 export function encodeRgb24(w: WireWriter, rgb: Rgb24): void {
+  if (!Number.isInteger(rgb) || rgb < 0 || rgb > 0xff_ffff) {
+    throw new WireError('InvalidValue', `rgb24 out of range: ${rgb}`)
+  }
   w.u8((rgb >>> 16) & 0xff)
   w.u8((rgb >>> 8) & 0xff)
   w.u8(rgb & 0xff)
@@ -462,18 +465,20 @@ export type SignalScope =
   | { readonly kind: 'pid'; readonly pid: number }
 
 export function encodeSignalScope(w: WireWriter, v: SignalScope): void {
-  switch (v.kind) {
-    case 'leader':
-      w.u8(0)
-      return
-    case 'group':
-      w.u8(1)
-      return
-    case 'pid':
-      w.u8(2)
-      encodeSignalTarget(w, v.pid)
-      return
-  }
+  w.atomic((w) => {
+    switch (v.kind) {
+      case 'leader':
+        w.u8(0)
+        return
+      case 'group':
+        w.u8(1)
+        return
+      case 'pid':
+        w.u8(2)
+        encodeSignalTarget(w, v.pid)
+        return
+    }
+  })
 }
 export function decodeSignalScope(r: WireReader): SignalScope {
   const tag = r.u8()
@@ -500,23 +505,25 @@ export type CommandOutcome =
   | { readonly kind: 'claimed'; readonly code: number | null }
 
 export function encodeCommandOutcome(w: WireWriter, v: CommandOutcome): void {
-  switch (v.kind) {
-    case 'running':
-      w.u8(0)
-      return
-    case 'exited':
-      w.u8(1)
-      w.i32(v.code)
-      return
-    case 'unknown':
-      w.u8(2)
-      encodeUnknownReason(w, v.reason)
-      return
-    case 'claimed':
-      w.u8(3)
-      w.opt(v.code, (wr, item) => { wr.i32(item) })
-      return
-  }
+  w.atomic((w) => {
+    switch (v.kind) {
+      case 'running':
+        w.u8(0)
+        return
+      case 'exited':
+        w.u8(1)
+        w.i32(v.code)
+        return
+      case 'unknown':
+        w.u8(2)
+        encodeUnknownReason(w, v.reason)
+        return
+      case 'claimed':
+        w.u8(3)
+        w.opt(v.code, (wr, item) => { wr.i32(item) })
+        return
+    }
+  })
 }
 export function decodeCommandOutcome(r: WireReader): CommandOutcome {
   const tag = r.u8()
@@ -547,23 +554,25 @@ export type LeaseKind =
   | { readonly kind: 'session'; readonly session: number }
 
 export function encodeLeaseKind(w: WireWriter, v: LeaseKind): void {
-  switch (v.kind) {
-    case 'brokerImmediate':
-      w.u8(0)
-      return
-    case 'brokerGrace':
-      if (!Number.isInteger(v.graceMs) || v.graceMs < 1 || v.graceMs > MAX_LEASE_GRACE_MS) throw new WireError('LimitExceeded', 'lease grace_ms')
-      if (v.resumeToken.length !== RESUME_TOKEN_LEN) throw new WireError('InvalidValue', 'resumeToken must be 32 bytes')
-      if (v.resumeToken.every((b) => b === 0)) throw new WireError('InvalidValue', 'resumeToken must be non-zero')
-      w.u8(1)
-      w.varU32(v.graceMs)
-      w.raw(v.resumeToken)
-      return
-    case 'session':
-      w.u8(2)
-      encodeSessionId(w, v.session)
-      return
-  }
+  w.atomic((w) => {
+    switch (v.kind) {
+      case 'brokerImmediate':
+        w.u8(0)
+        return
+      case 'brokerGrace':
+        if (!Number.isInteger(v.graceMs) || v.graceMs < 1 || v.graceMs > MAX_LEASE_GRACE_MS) throw new WireError('LimitExceeded', 'lease grace_ms')
+        if (v.resumeToken.length !== RESUME_TOKEN_LEN) throw new WireError('InvalidValue', 'resumeToken must be 32 bytes')
+        if (v.resumeToken.every((b) => b === 0)) throw new WireError('InvalidValue', 'resumeToken must be non-zero')
+        w.u8(1)
+        w.varU32(v.graceMs)
+        w.raw(v.resumeToken)
+        return
+      case 'session':
+        w.u8(2)
+        encodeSessionId(w, v.session)
+        return
+    }
+  })
 }
 export function decodeLeaseKind(r: WireReader): LeaseKind {
   const tag = r.u8()
@@ -594,25 +603,27 @@ export type WaitCondition =
   | { readonly kind: 'exit' }
 
 export function encodeWaitCondition(w: WireWriter, v: WaitCondition): void {
-  switch (v.kind) {
-    case 'idle':
-      w.u8(0)
-      return
-    case 'text':
-      if (v.needle.length === 0) throw new WireError('InvalidValue', 'wait text needle must be non-empty')
-      w.u8(1)
-      w.strBounded(v.needle, MAX_SEARCH_NEEDLE_BYTES, 'wait text needle')
-      return
-    case 'status':
-      if (v.states.length > MAX_WAIT_STATUSES) throw new WireError('LimitExceeded', 'wire limit exceeded: wait states')
-      if (v.states.length === 0) throw new WireError('InvalidValue', 'wait status list must be non-empty')
-      w.u8(2)
-      w.slice(v.states, encodeStatusState)
-      return
-    case 'exit':
-      w.u8(3)
-      return
-  }
+  w.atomic((w) => {
+    switch (v.kind) {
+      case 'idle':
+        w.u8(0)
+        return
+      case 'text':
+        if (v.needle.length === 0) throw new WireError('InvalidValue', 'wait text needle must be non-empty')
+        w.u8(1)
+        w.strBounded(v.needle, MAX_SEARCH_NEEDLE_BYTES, 'wait text needle')
+        return
+      case 'status':
+        if (v.states.length > MAX_WAIT_STATUSES) throw new WireError('LimitExceeded', 'wire limit exceeded: wait states')
+        if (v.states.length === 0) throw new WireError('InvalidValue', 'wait status list must be non-empty')
+        w.u8(2)
+        w.slice(v.states, encodeStatusState)
+        return
+      case 'exit':
+        w.u8(3)
+        return
+    }
+  })
 }
 export function decodeWaitCondition(r: WireReader): WaitCondition {
   const tag = r.u8()
@@ -647,10 +658,12 @@ export interface CursorState {
 }
 
 export function encodeCursorState(w: WireWriter, state: CursorState): void {
-  w.u16(state.col)
-  w.u16(state.row)
-  encodeCursorShape(w, state.shape)
-  w.u8((state.blinking ? 1 : 0) | (state.hidden ? 2 : 0))
+  w.atomic((w) => {
+    w.u16(state.col)
+    w.u16(state.row)
+    encodeCursorShape(w, state.shape)
+    w.u8((state.blinking ? 1 : 0) | (state.hidden ? 2 : 0))
+  })
 }
 export function decodeCursorState(r: WireReader): CursorState {
   const col = r.u16()
@@ -688,11 +701,13 @@ export interface GridSize {
 }
 
 export function encodeGridSize(w: WireWriter, v: GridSize): void {
-  if (!Number.isInteger(v.cols) || !Number.isInteger(v.rows) || v.cols < 1 || v.cols > MAX_GRID_COLS || v.rows < 1 || v.rows > MAX_GRID_ROWS) {
-    throw new WireError('InvalidValue', 'grid dimensions out of range')
-  }
-  w.u16(v.cols)
-  w.u16(v.rows)
+  w.atomic((w) => {
+    if (!Number.isInteger(v.cols) || !Number.isInteger(v.rows) || v.cols < 1 || v.cols > MAX_GRID_COLS || v.rows < 1 || v.rows > MAX_GRID_ROWS) {
+      throw new WireError('InvalidValue', 'grid dimensions out of range')
+    }
+    w.u16(v.cols)
+    w.u16(v.rows)
+  })
 }
 export function decodeGridSize(r: WireReader): GridSize {
   const cols = r.u16()
@@ -709,8 +724,10 @@ export interface CellPx {
 }
 
 export function encodeCellPx(w: WireWriter, v: CellPx): void {
-  w.u16(v.width)
-  w.u16(v.height)
+  w.atomic((w) => {
+    w.u16(v.width)
+    w.u16(v.height)
+  })
 }
 export function decodeCellPx(r: WireReader): CellPx {
   return {
@@ -727,10 +744,12 @@ export interface ViewportHint {
 }
 
 export function encodeViewportHint(w: WireWriter, v: ViewportHint): void {
-  encodeGridSize(w, v.size)
-  encodeCellPx(w, v.cellPx)
-  w.bool(v.visible)
-  w.bool(v.focused)
+  w.atomic((w) => {
+    encodeGridSize(w, v.size)
+    encodeCellPx(w, v.cellPx)
+    w.bool(v.visible)
+    w.bool(v.focused)
+  })
 }
 export function decodeViewportHint(r: WireReader): ViewportHint {
   return {
@@ -747,8 +766,10 @@ export interface FrameCredit {
 }
 
 export function encodeFrameCredit(w: WireWriter, v: FrameCredit): void {
-  w.u16(v.maxFrames)
-  w.varU32(v.maxBytes)
+  w.atomic((w) => {
+    w.u16(v.maxFrames)
+    w.varU32(v.maxBytes)
+  })
 }
 export function decodeFrameCredit(r: WireReader): FrameCredit {
   return {
@@ -765,11 +786,13 @@ export interface PaletteOverrides {
 }
 
 export function encodePaletteOverrides(w: WireWriter, v: PaletteOverrides): void {
-  if (v.palette.length > MAX_PALETTE_OVERRIDES) throw new WireError('LimitExceeded', 'wire limit exceeded: palette overrides')
-  w.opt(v.fg, encodeRgb24)
-  w.opt(v.bg, encodeRgb24)
-  w.opt(v.cursor, encodeRgb24)
-  w.slice(v.palette, (wr, entry) => { wr.u8(entry.index); encodeRgb24(wr, entry.rgb) })
+  w.atomic((w) => {
+    if (v.palette.length > MAX_PALETTE_OVERRIDES) throw new WireError('LimitExceeded', 'wire limit exceeded: palette overrides')
+    w.opt(v.fg, encodeRgb24)
+    w.opt(v.bg, encodeRgb24)
+    w.opt(v.cursor, encodeRgb24)
+    w.slice(v.palette, (wr, entry) => { wr.u8(entry.index); encodeRgb24(wr, entry.rgb) })
+  })
 }
 export function decodePaletteOverrides(r: WireReader): PaletteOverrides {
   return {
@@ -789,22 +812,24 @@ export interface ImagePiece {
 }
 
 export function encodeImagePiece(w: WireWriter, v: ImagePiece): void {
-  if (!Number.isInteger(v.colStart) || !Number.isInteger(v.colLen) || v.colStart < 0 || v.colLen === 0 || v.colStart + v.colLen > 0xffff) {
-    throw new WireError('InvalidValue', 'invalid ImagePiece column span')
-  }
-  if (v.srcRect[2] === 0 || v.srcRect[3] === 0 || v.srcRect[0] + v.srcRect[2] > 0xffff_ffff || v.srcRect[1] + v.srcRect[3] > 0xffff_ffff) {
-    throw new WireError('InvalidValue', 'invalid ImagePiece src_rect')
-  }
-  if (v.dstPx[0] === 0 || v.dstPx[1] === 0) throw new WireError('InvalidValue', 'invalid ImagePiece dst_px')
-  encodeBlobHash(w, v.blob)
-  w.u16(v.colStart)
-  w.u16(v.colLen)
-  w.varU32(v.srcRect[0])
-  w.varU32(v.srcRect[1])
-  w.varU32(v.srcRect[2])
-  w.varU32(v.srcRect[3])
-  w.varU32(v.dstPx[0])
-  w.varU32(v.dstPx[1])
+  w.atomic((w) => {
+    if (!Number.isInteger(v.colStart) || !Number.isInteger(v.colLen) || v.colStart < 0 || v.colLen < 1 || v.colStart + v.colLen > 0xffff) {
+      throw new WireError('InvalidValue', 'invalid ImagePiece column span')
+    }
+    if (!v.srcRect.every((n) => Number.isInteger(n) && n >= 0 && n <= 0xffff_ffff) || v.srcRect[2] === 0 || v.srcRect[3] === 0 || v.srcRect[0] + v.srcRect[2] > 0xffff_ffff || v.srcRect[1] + v.srcRect[3] > 0xffff_ffff) {
+      throw new WireError('InvalidValue', 'invalid ImagePiece src_rect')
+    }
+    if (!v.dstPx.every((n) => Number.isInteger(n) && n >= 1 && n <= 0xffff_ffff)) throw new WireError('InvalidValue', 'invalid ImagePiece dst_px')
+    encodeBlobHash(w, v.blob)
+    w.u16(v.colStart)
+    w.u16(v.colLen)
+    w.varU32(v.srcRect[0])
+    w.varU32(v.srcRect[1])
+    w.varU32(v.srcRect[2])
+    w.varU32(v.srcRect[3])
+    w.varU32(v.dstPx[0])
+    w.varU32(v.dstPx[1])
+  })
 }
 export function decodeImagePiece(r: WireReader): ImagePiece {
   const blob = decodeBlobHash(r)
@@ -828,8 +853,10 @@ export interface CellPos {
 }
 
 export function encodeCellPos(w: WireWriter, v: CellPos): void {
-  w.varU64(v.line)
-  w.u16(v.col)
+  w.atomic((w) => {
+    w.varU64(v.line)
+    w.u16(v.col)
+  })
 }
 export function decodeCellPos(r: WireReader): CellPos {
   return {
@@ -844,11 +871,13 @@ export interface CellSpan {
 }
 
 export function encodeCellSpan(w: WireWriter, v: CellSpan): void {
-  if (v.end.line < v.start.line || (v.end.line === v.start.line && v.end.col < v.start.col)) {
-    throw new WireError('InvalidValue', 'CellSpan end before start')
-  }
-  encodeCellPos(w, v.start)
-  encodeCellPos(w, v.end)
+  w.atomic((w) => {
+    if (v.end.line < v.start.line || (v.end.line === v.start.line && v.end.col < v.start.col)) {
+      throw new WireError('InvalidValue', 'CellSpan end before start')
+    }
+    encodeCellPos(w, v.start)
+    encodeCellPos(w, v.end)
+  })
 }
 export function decodeCellSpan(r: WireReader): CellSpan {
   const start = decodeCellPos(r)
@@ -865,8 +894,10 @@ export interface ForegroundProcess {
 }
 
 export function encodeForegroundProcess(w: WireWriter, v: ForegroundProcess): void {
-  encodeSignalTarget(w, v.pid)
-  w.opt(v.name, (wr, item) => { wr.str(item) })
+  w.atomic((w) => {
+    encodeSignalTarget(w, v.pid)
+    w.opt(v.name, (wr, item) => { wr.str(item) })
+  })
 }
 export function decodeForegroundProcess(r: WireReader): ForegroundProcess {
   return {
@@ -888,15 +919,17 @@ export interface CommandRecord {
 }
 
 export function encodeCommandRecord(w: WireWriter, v: CommandRecord): void {
-  w.varU64(v.id)
-  w.opt(v.command, (wr, item) => { wr.str(item) })
-  w.opt(v.cwd, (wr, item) => { wr.str(item) })
-  w.opt(v.startedMs, (wr, item) => { wr.varU64(item) })
-  w.opt(v.finishedMs, (wr, item) => { wr.varU64(item) })
-  encodeCommandOutcome(w, v.outcome)
-  w.opt(v.promptLine, (wr, item) => { wr.varU64(item) })
-  w.opt(v.outputLine, (wr, item) => { wr.varU64(item) })
-  w.opt(v.endLine, (wr, item) => { wr.varU64(item) })
+  w.atomic((w) => {
+    w.varU64(v.id)
+    w.opt(v.command, (wr, item) => { wr.str(item) })
+    w.opt(v.cwd, (wr, item) => { wr.str(item) })
+    w.opt(v.startedMs, (wr, item) => { wr.varU64(item) })
+    w.opt(v.finishedMs, (wr, item) => { wr.varU64(item) })
+    encodeCommandOutcome(w, v.outcome)
+    w.opt(v.promptLine, (wr, item) => { wr.varU64(item) })
+    w.opt(v.outputLine, (wr, item) => { wr.varU64(item) })
+    w.opt(v.endLine, (wr, item) => { wr.varU64(item) })
+  })
 }
 export function decodeCommandRecord(r: WireReader): CommandRecord {
   return {
@@ -926,20 +959,22 @@ export interface StatusRecord {
 }
 
 export function encodeStatusRecord(w: WireWriter, v: StatusRecord): void {
-  if (v.state !== 'blocked' && v.kind !== null) {
-    throw new WireError('InvalidValue', 'status kind requires Blocked state')
-  }
-  if (v.progress !== null) { if (!Number.isInteger(v.progress) || v.progress < 0 || v.progress > MAX_PROGRESS_PERCENT) throw new WireError('InvalidValue', 'progress must be 0..=100') }
-  w.str(v.id)
-  encodeStatusState(w, v.state)
-  w.opt(v.kind, encodeBlockedKind)
-  w.opt(v.progress, (wr, item) => { wr.u8(item) })
-  w.opt(v.app, (wr, item) => { wr.str(item) })
-  w.opt(v.title, (wr, item) => { wr.str(item) })
-  w.opt(v.message, (wr, item) => { wr.str(item) })
-  w.varU64(v.changed)
-  w.varU64(v.sinceMs)
-  encodeConfirmed(w, v.confirmed)
+  w.atomic((w) => {
+    if (v.state !== 'blocked' && v.kind !== null) {
+      throw new WireError('InvalidValue', 'status kind requires Blocked state')
+    }
+    if (v.progress !== null) { if (!Number.isInteger(v.progress) || v.progress < 0 || v.progress > MAX_PROGRESS_PERCENT) throw new WireError('InvalidValue', 'progress must be 0..=100') }
+    w.str(v.id)
+    encodeStatusState(w, v.state)
+    w.opt(v.kind, encodeBlockedKind)
+    w.opt(v.progress, (wr, item) => { wr.u8(item) })
+    w.opt(v.app, (wr, item) => { wr.str(item) })
+    w.opt(v.title, (wr, item) => { wr.str(item) })
+    w.opt(v.message, (wr, item) => { wr.str(item) })
+    w.varU64(v.changed)
+    w.varU64(v.sinceMs)
+    encodeConfirmed(w, v.confirmed)
+  })
 }
 export function decodeStatusRecord(r: WireReader): StatusRecord {
   const id = r.str()
@@ -968,16 +1003,18 @@ export interface KeyInput {
 }
 
 export function encodeKeyInput(w: WireWriter, v: KeyInput): void {
-  if (!Number.isInteger(v.modifiers) || v.modifiers < 0 || v.modifiers > MODIFIER_ALL_MASK) throw new WireError('InvalidValue', 'unknown KeyInput modifier bits')
-  if (!Number.isInteger(v.unshiftedCodepoint) || v.unshiftedCodepoint < 0 || v.unshiftedCodepoint > 0x10_ffff || (v.unshiftedCodepoint >= 0xd800 && v.unshiftedCodepoint <= 0xdfff)) {
-    throw new WireError('InvalidValue', 'invalid Unicode scalar codepoint')
-  }
-  w.str(v.code)
-  encodeKeyAction(w, v.action)
-  w.u8(v.modifiers)
-  w.str(v.text)
-  w.varU32(v.unshiftedCodepoint)
-  w.bool(v.composed)
+  w.atomic((w) => {
+    if (!Number.isInteger(v.modifiers) || v.modifiers < 0 || v.modifiers > MODIFIER_ALL_MASK) throw new WireError('InvalidValue', 'unknown KeyInput modifier bits')
+    if (!Number.isInteger(v.unshiftedCodepoint) || v.unshiftedCodepoint < 0 || v.unshiftedCodepoint > 0x10_ffff || (v.unshiftedCodepoint >= 0xd800 && v.unshiftedCodepoint <= 0xdfff)) {
+      throw new WireError('InvalidValue', 'invalid Unicode scalar codepoint')
+    }
+    w.str(v.code)
+    encodeKeyAction(w, v.action)
+    w.u8(v.modifiers)
+    w.str(v.text)
+    w.varU32(v.unshiftedCodepoint)
+    w.bool(v.composed)
+  })
 }
 export function decodeKeyInput(r: WireReader): KeyInput {
   const code = r.str()
@@ -1003,16 +1040,18 @@ export interface PointerInput {
 }
 
 export function encodePointerInput(w: WireWriter, v: PointerInput): void {
-  if (!Number.isInteger(v.button) || v.button < 0 || (v.button > POINTER_MAX_BUTTON && v.button !== POINTER_BUTTON_NONE)) {
-    throw new WireError('InvalidValue', 'invalid PointerInput button')
-  }
-  if (!Number.isInteger(v.modifiers) || v.modifiers < 0 || v.modifiers > MODIFIER_ALL_MASK) throw new WireError('InvalidValue', 'unknown PointerInput modifier bits')
-  encodePointerAction(w, v.action)
-  w.u8(v.button)
-  w.u8(v.modifiers)
-  w.varU32(v.xPx)
-  w.varU32(v.yPx)
-  encodeCellPx(w, v.cellPx)
+  w.atomic((w) => {
+    if (!Number.isInteger(v.button) || v.button < 0 || (v.button > POINTER_MAX_BUTTON && v.button !== POINTER_BUTTON_NONE)) {
+      throw new WireError('InvalidValue', 'invalid PointerInput button')
+    }
+    if (!Number.isInteger(v.modifiers) || v.modifiers < 0 || v.modifiers > MODIFIER_ALL_MASK) throw new WireError('InvalidValue', 'unknown PointerInput modifier bits')
+    encodePointerAction(w, v.action)
+    w.u8(v.button)
+    w.u8(v.modifiers)
+    w.varU32(v.xPx)
+    w.varU32(v.yPx)
+    encodeCellPx(w, v.cellPx)
+  })
 }
 export function decodePointerInput(r: WireReader): PointerInput {
   const action = decodePointerAction(r)
@@ -1040,25 +1079,27 @@ export interface ImagePlacement {
 }
 
 export function encodeImagePlacement(w: WireWriter, v: ImagePlacement): void {
-  if (v.sourceRect[2] === 0 || v.sourceRect[3] === 0 || v.sourceRect[0] + v.sourceRect[2] > 0xffff_ffff || v.sourceRect[1] + v.sourceRect[3] > 0xffff_ffff) {
-    throw new WireError('InvalidValue', 'invalid ImagePlacement source_rect')
-  }
-  if (v.pixelSize[0] === 0 || v.pixelSize[1] === 0) throw new WireError('InvalidValue', 'invalid ImagePlacement pixel_size')
-  if (v.cellSpan[0] === 0 || v.cellSpan[1] === 0) throw new WireError('InvalidValue', 'invalid ImagePlacement cell_span')
-  encodeBlobHash(w, v.blob)
-  w.varU64(v.line)
-  w.i32(v.col)
-  w.varU32(v.sourceRect[0])
-  w.varU32(v.sourceRect[1])
-  w.varU32(v.sourceRect[2])
-  w.varU32(v.sourceRect[3])
-  w.varU32(v.cellOffset[0])
-  w.varU32(v.cellOffset[1])
-  w.varU32(v.pixelSize[0])
-  w.varU32(v.pixelSize[1])
-  w.u16(v.cellSpan[0])
-  w.u16(v.cellSpan[1])
-  w.i32(v.zIndex)
+  w.atomic((w) => {
+    if (!v.sourceRect.every((n) => Number.isInteger(n) && n >= 0 && n <= 0xffff_ffff) || v.sourceRect[2] === 0 || v.sourceRect[3] === 0 || v.sourceRect[0] + v.sourceRect[2] > 0xffff_ffff || v.sourceRect[1] + v.sourceRect[3] > 0xffff_ffff) {
+      throw new WireError('InvalidValue', 'invalid ImagePlacement source_rect')
+    }
+    if (!v.pixelSize.every((n) => Number.isInteger(n) && n >= 1 && n <= 0xffff_ffff)) throw new WireError('InvalidValue', 'invalid ImagePlacement pixel_size')
+    if (!v.cellSpan.every((n) => Number.isInteger(n) && n >= 1 && n <= 0xffff)) throw new WireError('InvalidValue', 'invalid ImagePlacement cell_span')
+    encodeBlobHash(w, v.blob)
+    w.varU64(v.line)
+    w.i32(v.col)
+    w.varU32(v.sourceRect[0])
+    w.varU32(v.sourceRect[1])
+    w.varU32(v.sourceRect[2])
+    w.varU32(v.sourceRect[3])
+    w.varU32(v.cellOffset[0])
+    w.varU32(v.cellOffset[1])
+    w.varU32(v.pixelSize[0])
+    w.varU32(v.pixelSize[1])
+    w.u16(v.cellSpan[0])
+    w.u16(v.cellSpan[1])
+    w.i32(v.zIndex)
+  })
 }
 export function decodeImagePlacement(r: WireReader): ImagePlacement {
   const blob = decodeBlobHash(r)
@@ -1089,14 +1130,16 @@ export interface MetricsSnapshot {
 }
 
 export function encodeMetricsSnapshot(w: WireWriter, v: MetricsSnapshot): void {
-  w.varU32(v.liveSessions)
-  w.varU32(v.rewoundSessions)
-  w.varU32(v.connections)
-  w.varU32(v.activeTimers)
-  w.varU64(v.scrollbackBytes)
-  w.varU64(v.imageStoreBytes)
-  w.varU64(v.totalPtyBytes)
-  w.varU64(v.totalThrottledUs)
+  w.atomic((w) => {
+    w.varU32(v.liveSessions)
+    w.varU32(v.rewoundSessions)
+    w.varU32(v.connections)
+    w.varU32(v.activeTimers)
+    w.varU64(v.scrollbackBytes)
+    w.varU64(v.imageStoreBytes)
+    w.varU64(v.totalPtyBytes)
+    w.varU64(v.totalThrottledUs)
+  })
 }
 export function decodeMetricsSnapshot(r: WireReader): MetricsSnapshot {
   return {
@@ -1150,8 +1193,9 @@ function buildUtf8ToUtf16Map(utf8: Uint8Array): Int32Array {
   return map
 }
 
-function buildUtf16ToUtf8Map(text: string): Uint32Array {
-  const map = new Uint32Array(text.length + 1)
+function buildUtf16ToUtf8Map(text: string): Int32Array {
+  const map = new Int32Array(text.length + 1)
+  map.fill(-1)
   let bytePos = 0
   let i = 0
   while (i < text.length) {
@@ -1168,7 +1212,6 @@ function buildUtf16ToUtf8Map(text: string): Uint32Array {
       i += 1
     } else {
       bytePos += 4
-      map[i + 1] = bytePos
       i += 2
     }
   }
@@ -1177,116 +1220,121 @@ function buildUtf16ToUtf8Map(text: string): Uint32Array {
 }
 
 export function encodePackedRow(w: WireWriter, row: PackedRow): void {
-  if (!Number.isInteger(row.flags) || row.flags < 0 || row.flags > RowFlag.ALL_MASK) {
-    throw new WireError('InvalidValue', 'unknown PackedRow flag bits')
-  }
-  const utf8 = encodeUtf8(row.text)
-  if (utf8.length > MAX_PACKED_ROW_TEXT_BYTES) {
-    throw new WireError('LimitExceeded', 'wire limit exceeded: packed row text')
-  }
-  if (row.runs.length % 4 !== 0) {
-    throw new WireError('InvalidValue', 'PackedRow.runs length must be a multiple of 4')
-  }
-  const runCount = row.runs.length >>> 2
-  if (runCount > MAX_PACKED_RUNS) {
-    throw new WireError('LimitExceeded', 'wire limit exceeded: packed runs')
-  }
-  if (row.styles.length % 4 !== 0) {
-    throw new WireError('InvalidValue', 'PackedRow.styles length must be a multiple of 4')
-  }
-  const styleCount = row.styles.length >>> 2
-  if (styleCount > MAX_PACKED_STYLES) {
-    throw new WireError('LimitExceeded', 'wire limit exceeded: packed styles')
-  }
-  if (row.links.length > MAX_PACKED_LINKS) {
-    throw new WireError('LimitExceeded', 'wire limit exceeded: packed links')
-  }
-  if (row.links.length > 0 && row.links[0] !== '') {
-    throw new WireError('InvalidValue', 'links[0] must be empty')
-  }
-  for (let i = 1; i < row.links.length; i += 1) {
-    if (row.links[i] === '') {
-      throw new WireError('InvalidValue', 'non-zero link entry must be non-empty')
+  w.atomic((w) => {
+    if (!Number.isInteger(row.flags) || row.flags < 0 || row.flags > RowFlag.ALL_MASK) {
+      throw new WireError('InvalidValue', 'unknown PackedRow flag bits')
     }
-  }
-  const pieces = row.pieces ?? []
-  if (pieces.length > MAX_PACKED_PIECES) {
-    throw new WireError('LimitExceeded', 'wire limit exceeded: image pieces')
-  }
-  if (pieces.length > 0 && (row.flags & RowFlag.HAS_PLACEHOLDER) === 0) {
-    throw new WireError('InvalidValue', 'pieces require FLAG_HAS_PLACEHOLDER')
-  }
+    const utf8 = encodeUtf8(row.text)
+    if (utf8.length > MAX_PACKED_ROW_TEXT_BYTES) {
+      throw new WireError('LimitExceeded', 'wire limit exceeded: packed row text')
+    }
+    if (row.runs.length % 4 !== 0) {
+      throw new WireError('InvalidValue', 'PackedRow.runs length must be a multiple of 4')
+    }
+    const runCount = row.runs.length >>> 2
+    if (runCount > MAX_PACKED_RUNS) {
+      throw new WireError('LimitExceeded', 'wire limit exceeded: packed runs')
+    }
+    if (row.styles.length % 4 !== 0) {
+      throw new WireError('InvalidValue', 'PackedRow.styles length must be a multiple of 4')
+    }
+    const styleCount = row.styles.length >>> 2
+    if (styleCount > MAX_PACKED_STYLES) {
+      throw new WireError('LimitExceeded', 'wire limit exceeded: packed styles')
+    }
+    if (row.links.length > MAX_PACKED_LINKS) {
+      throw new WireError('LimitExceeded', 'wire limit exceeded: packed links')
+    }
+    if (row.links.length > 0 && row.links[0] !== '') {
+      throw new WireError('InvalidValue', 'links[0] must be empty')
+    }
+    for (let i = 1; i < row.links.length; i += 1) {
+      if (row.links[i] === '') {
+        throw new WireError('InvalidValue', 'non-zero link entry must be non-empty')
+      }
+    }
+    const pieces = row.pieces ?? []
+    if (pieces.length > MAX_PACKED_PIECES) {
+      throw new WireError('LimitExceeded', 'wire limit exceeded: image pieces')
+    }
+    if (pieces.length > 0 && (row.flags & RowFlag.HAS_PLACEHOLDER) === 0) {
+      throw new WireError('InvalidValue', 'pieces require FLAG_HAS_PLACEHOLDER')
+    }
 
-  w.varU64(row.line)
-  w.u8(row.flags)
-  w.bytes(utf8)
-  const isAscii = utf8.length === row.text.length
-  const utf16ToUtf8 = isAscii ? null : buildUtf16ToUtf8Map(row.text)
+    w.varU64(row.line)
+    w.u8(row.flags)
+    w.bytes(utf8)
+    const isAscii = utf8.length === row.text.length
+    const utf16ToUtf8 = isAscii ? null : buildUtf16ToUtf8Map(row.text)
 
-  w.varU32(runCount)
-  for (let i = 0; i < row.runs.length; i += 4) {
-    const colWord = row.runs[i]!
-    const txtWord = row.runs[i + 1]!
-    const slWord = row.runs[i + 2]!
-    const runFlags = row.runs[i + 3]!
-    const colStart = colWord & 0xffff
-    const colLen = colWord >>> 16
-    if (colLen === 0 || colStart + colLen > 0xffff) {
-      throw new WireError('InvalidValue', 'invalid PackedRun column span')
+    w.varU32(runCount)
+    for (let i = 0; i < row.runs.length; i += 4) {
+      const colWord = row.runs[i]!
+      const txtWord = row.runs[i + 1]!
+      const slWord = row.runs[i + 2]!
+      const runFlags = row.runs[i + 3]!
+      const colStart = colWord & 0xffff
+      const colLen = colWord >>> 16
+      if (colLen === 0 || colStart + colLen > 0xffff) {
+        throw new WireError('InvalidValue', 'invalid PackedRun column span')
+      }
+      if (runFlags > RunFlag.ALL_MASK) {
+        throw new WireError('InvalidValue', 'unknown PackedRun flag bits')
+      }
+      const u16Off = txtWord & 0xffff
+      const u16Len = txtWord >>> 16
+      if (u16Off + u16Len > row.text.length) {
+        throw new WireError('InvalidValue', 'run text range out of bounds')
+      }
+      const byteOffset = utf16ToUtf8 ? utf16ToUtf8[u16Off]! : u16Off
+      const byteEnd = utf16ToUtf8 ? utf16ToUtf8[u16Off + u16Len]! : u16Off + u16Len
+      if (byteOffset < 0 || byteEnd < 0) {
+        throw new WireError('InvalidValue', 'run text range splits UTF-16 surrogate pair')
+      }
+      const styleIdx = slWord & 0xffff
+      const linkIdx = slWord >>> 16
+      if (styleIdx >= styleCount && styleIdx !== 0) {
+        throw new WireError('InvalidValue', 'run style_idx out of bounds')
+      }
+      if (linkIdx >= row.links.length && linkIdx !== 0) {
+        throw new WireError('InvalidValue', 'run link_idx out of bounds')
+      }
+      w.u16(colStart)
+      w.u16(colLen)
+      w.varU32(byteOffset)
+      w.varU32(byteEnd - byteOffset)
+      w.u16(styleIdx)
+      w.u16(linkIdx)
+      w.u8(runFlags)
     }
-    if (runFlags > RunFlag.ALL_MASK) {
-      throw new WireError('InvalidValue', 'unknown PackedRun flag bits')
-    }
-    const u16Off = txtWord & 0xffff
-    const u16Len = txtWord >>> 16
-    if (u16Off + u16Len > row.text.length) {
-      throw new WireError('InvalidValue', 'run text range out of bounds')
-    }
-    const byteOffset = utf16ToUtf8 ? utf16ToUtf8[u16Off]! : u16Off
-    const byteEnd = utf16ToUtf8 ? utf16ToUtf8[u16Off + u16Len]! : u16Off + u16Len
-    const styleIdx = slWord & 0xffff
-    const linkIdx = slWord >>> 16
-    if (styleIdx >= styleCount && styleIdx !== 0) {
-      throw new WireError('InvalidValue', 'run style_idx out of bounds')
-    }
-    if (linkIdx >= row.links.length && linkIdx !== 0) {
-      throw new WireError('InvalidValue', 'run link_idx out of bounds')
-    }
-    w.u16(colStart)
-    w.u16(colLen)
-    w.varU32(byteOffset)
-    w.varU32(byteEnd - byteOffset)
-    w.u16(styleIdx)
-    w.u16(linkIdx)
-    w.u8(runFlags)
-  }
 
-  w.varU32(styleCount)
-  for (let i = 0; i < row.styles.length; i += 4) {
-    const fg = row.styles[i]!
-    const bg = row.styles[i + 1]!
-    const ul = row.styles[i + 2]!
-    const sf = row.styles[i + 3]!
-    if (!isValidPackedColor(fg) || !isValidPackedColor(bg) || !isValidPackedColor(ul)) {
-      throw new WireError('InvalidValue', 'invalid PackedStyle colour encoding')
+    w.varU32(styleCount)
+    for (let i = 0; i < row.styles.length; i += 4) {
+      const fg = row.styles[i]!
+      const bg = row.styles[i + 1]!
+      const ul = row.styles[i + 2]!
+      const sf = row.styles[i + 3]!
+      if (!isValidPackedColor(fg) || !isValidPackedColor(bg) || !isValidPackedColor(ul)) {
+        throw new WireError('InvalidValue', 'invalid PackedStyle colour encoding')
+      }
+      if (
+        (sf & ~PackedStyleFlag.ALL_MASK) !== 0 ||
+        (sf & PackedStyleFlag.UNDERLINE_MASK) > PackedStyleFlag.UNDERLINE_MAX
+      ) {
+        throw new WireError('InvalidValue', 'invalid PackedStyle flags')
+      }
+      if (i === 0 && (fg !== 0 || bg !== 0 || ul !== 0 || sf !== 0)) {
+        throw new WireError('InvalidValue', 'styles[0] must be default style')
+      }
+      w.u32(fg)
+      w.u32(bg)
+      w.u32(ul)
+      w.u32(sf)
     }
-    if (
-      (sf & ~PackedStyleFlag.ALL_MASK) !== 0 ||
-      (sf & PackedStyleFlag.UNDERLINE_MASK) > PackedStyleFlag.UNDERLINE_MAX
-    ) {
-      throw new WireError('InvalidValue', 'invalid PackedStyle flags')
-    }
-    if (i === 0 && (fg !== 0 || bg !== 0 || ul !== 0 || sf !== 0)) {
-      throw new WireError('InvalidValue', 'styles[0] must be default style')
-    }
-    w.u32(fg)
-    w.u32(bg)
-    w.u32(ul)
-    w.u32(sf)
-  }
 
-  w.slice(row.links, (wr, link) => wr.str(link))
-  w.slice(pieces, encodeImagePiece)
+    w.slice(row.links, (wr, link) => wr.str(link))
+    w.slice(pieces, encodeImagePiece)
+  })
 }
 
 export function decodePackedRow(r: WireReader): PackedRow {

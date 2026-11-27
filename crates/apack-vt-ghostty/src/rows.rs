@@ -117,6 +117,7 @@ pub(crate) fn extract_row(
     }
 
     let mut text = String::new();
+    let mut text_capped = false;
     let mut runs: Vec<PackedRun> = Vec::new();
     let mut styles: Vec<PackedStyle> = Vec::new();
     let mut style_map: HashMap<[u32; 4], u16> = HashMap::new();
@@ -192,25 +193,23 @@ pub(crate) fn extract_row(
             }
             sys::CellContentTag::CODEPOINT => {
                 if let Some(ch) = char::from_u32(codepoint).filter(|&c| c != '\0')
-                    && fits_row_text(text.len(), ch.len_utf8(), max_text)
+                    && !try_push_row_char(&mut text, ch, max_text, &mut text_capped)
                 {
-                    text.push(ch);
+                    continue;
                 }
             }
             sys::CellContentTag::CODEPOINT_GRAPHEME => {
                 let mut cps = Vec::new();
-                if crate::engine::read_grapheme_codepoints(&grid_ref, &mut cps) {
-                    let needed: usize = cps.iter().filter_map(|&c| char::from_u32(c)).map(char::len_utf8).sum();
-                    if fits_row_text(text.len(), needed, max_text) {
-                        is_grapheme = true;
-                        text.extend(cps.iter().filter_map(|&c| char::from_u32(c)));
-                    }
-                } else if let Some(ch) = char::from_u32(codepoint)
-                    && fits_row_text(text.len(), ch.len_utf8(), max_text)
-                {
-                    is_grapheme = true;
-                    text.push(ch);
+                let fallback = [codepoint];
+                let slice: &[u32] =
+                    if crate::engine::read_grapheme_codepoints(&grid_ref, &mut cps) { &cps } else { &fallback };
+                let needed: usize = slice.iter().filter_map(|&c| char::from_u32(c)).map(char::len_utf8).sum();
+                if text_capped || !fits_row_text(text.len(), needed, max_text) {
+                    text_capped = true;
+                    continue;
                 }
+                is_grapheme = true;
+                text.extend(slice.iter().filter_map(|&c| char::from_u32(c)));
             }
             sys::CellContentTag::BG_COLOR_PALETTE => {
                 let mut idx: sys::ColorPaletteIndex = 0;
@@ -233,6 +232,13 @@ pub(crate) fn extract_row(
             _ => {}
         }
 
+        // Stop emitting blank cells once the row text cap is reached, BEFORE interning hyperlinks
+        // so dropped cells never allocate orphan entries in `PackedRow.links`.
+        if text.len() == before && (text_capped || !fits_row_text(text.len(), 1, max_text)) {
+            text_capped = true;
+            continue;
+        }
+
         let link_idx = if linked {
             read_link_index(&grid_ref, &mut links, &mut link_map, &mut link_bytes, &mut link_scratch)
         } else {
@@ -240,9 +246,8 @@ pub(crate) fn extract_row(
         };
 
         // Blank cell with default style and no hyperlink is omitted completely.
-        // Also drop cells if `text` has reached the protocol row-text byte cap.
         if text.len() == before {
-            if (style == PackedStyle::default() && link_idx == 0) || !fits_row_text(text.len(), 1, max_text) {
+            if style == PackedStyle::default() && link_idx == 0 {
                 continue;
             }
             text.push(' ');
@@ -305,6 +310,16 @@ pub(crate) fn extract_row(
 #[inline]
 pub(crate) fn fits_row_text(current_bytes: usize, add_bytes: usize, max_bytes: usize) -> bool {
     current_bytes.saturating_add(add_bytes) <= max_bytes
+}
+
+#[inline]
+fn try_push_row_char(text: &mut String, ch: char, max_text: usize, text_capped: &mut bool) -> bool {
+    if *text_capped || !fits_row_text(text.len(), ch.len_utf8(), max_text) {
+        *text_capped = true;
+        return false;
+    }
+    text.push(ch);
+    true
 }
 
 fn push_placeholder(runs: &mut Vec<PlaceholderRun>, col: u16, said: Said) {

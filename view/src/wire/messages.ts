@@ -215,20 +215,22 @@ export interface SpawnSpec {
 }
 
 function encodeSpawnSpec(w: WireWriter, v: SpawnSpec): void {
-  if (v.argv.length > MAX_SPAWN_ARGV) throw new WireError('LimitExceeded', 'wire limit exceeded: spawn argv')
-  if (v.env.length > MAX_SPAWN_ENV) throw new WireError('LimitExceeded', 'wire limit exceeded: spawn env')
-  w.slice(v.argv, (wr, item) => { wr.str(item) })
-  w.opt(v.cwd, (wr, item) => { wr.str(item) })
-  w.slice(v.env, (wr, [k, val]) => { wr.str(k); wr.str(val) })
-  encodeGridSize(w, v.size)
-  encodeCellPx(w, v.cellPx)
-  w.varU32(v.scrollbackLimit)
-  w.opt(v.marksKey, encodeMarksKey)
-  encodeResizePolicy(w, v.resizePolicy)
-  w.opt(v.recordDir, (wr, item) => { wr.str(item) })
-  w.opt(v.restoreFrom, (wr, item) => { wr.str(item) })
-  w.bool(v.imageFiles)
-  w.bool(v.kept)
+  w.atomic((w) => {
+    if (v.argv.length > MAX_SPAWN_ARGV) throw new WireError('LimitExceeded', 'wire limit exceeded: spawn argv')
+    if (v.env.length > MAX_SPAWN_ENV) throw new WireError('LimitExceeded', 'wire limit exceeded: spawn env')
+    w.slice(v.argv, (wr, item) => { wr.str(item) })
+    w.opt(v.cwd, (wr, item) => { wr.str(item) })
+    w.slice(v.env, (wr, [k, val]) => { wr.str(k); wr.str(val) })
+    encodeGridSize(w, v.size)
+    encodeCellPx(w, v.cellPx)
+    w.varU32(v.scrollbackLimit)
+    w.opt(v.marksKey, encodeMarksKey)
+    encodeResizePolicy(w, v.resizePolicy)
+    w.opt(v.recordDir, (wr, item) => { wr.str(item) })
+    w.opt(v.restoreFrom, (wr, item) => { wr.str(item) })
+    w.bool(v.imageFiles)
+    w.bool(v.kept)
+  })
 }
 function decodeSpawnSpec(r: WireReader): SpawnSpec {
   return {
@@ -261,16 +263,18 @@ export interface SessionSummary {
 }
 
 function encodeSessionSummary(w: WireWriter, v: SessionSummary): void {
-  encodeSessionId(w, v.id)
-  encodeGridSize(w, v.size)
-  w.bool(v.alive)
-  w.bool(v.kept)
-  w.bool(v.rewound)
-  w.str(v.title)
-  w.opt(v.cwd, (wr, item) => { wr.str(item) })
-  w.opt(v.pid, encodeSignalTarget)
-  w.opt(v.foreground, encodeForegroundProcess)
-  w.varU64(v.createdMs)
+  w.atomic((w) => {
+    encodeSessionId(w, v.id)
+    encodeGridSize(w, v.size)
+    w.bool(v.alive)
+    w.bool(v.kept)
+    w.bool(v.rewound)
+    w.str(v.title)
+    w.opt(v.cwd, (wr, item) => { wr.str(item) })
+    w.opt(v.pid, encodeSignalTarget)
+    w.opt(v.foreground, encodeForegroundProcess)
+    w.varU64(v.createdMs)
+  })
 }
 function decodeSessionSummary(r: WireReader): SessionSummary {
   return {
@@ -303,22 +307,24 @@ export interface FrameUpdate {
 }
 
 function encodeFrameUpdate(w: WireWriter, v: FrameUpdate): void {
-  if (v.scrollbackLines > v.firstActiveLine) {
-    throw new WireError('InvalidValue', 'FrameUpdate.scrollback_lines > first_active_line')
-  }
-  if (v.rows.length > MAX_ROWS_PER_FETCH) throw new WireError('LimitExceeded', 'wire limit exceeded: frame rows')
-  w.varU64(v.seq)
-  w.varU64(v.epoch)
-  encodeGridSize(w, v.size)
-  w.varU64(v.firstActiveLine)
-  w.varU64(v.scrollbackLines)
-  w.i32(v.scrollDelta)
-  encodeCursorState(w, v.cursor)
-  encodeViewModes(w, v.modes)
-  w.opt(v.palette, encodePaletteOverrides)
-  w.slice(v.rows, encodePackedRow)
-  w.varU64(v.imagesGen)
-  w.bool(v.fullSync)
+  w.atomic((w) => {
+    if (v.scrollbackLines > v.firstActiveLine) {
+      throw new WireError('InvalidValue', 'FrameUpdate.scrollback_lines > first_active_line')
+    }
+    if (v.rows.length > MAX_ROWS_PER_FETCH) throw new WireError('LimitExceeded', 'wire limit exceeded: frame rows')
+    w.varU64(v.seq)
+    w.varU64(v.epoch)
+    encodeGridSize(w, v.size)
+    w.varU64(v.firstActiveLine)
+    w.varU64(v.scrollbackLines)
+    w.i32(v.scrollDelta)
+    encodeCursorState(w, v.cursor)
+    encodeViewModes(w, v.modes)
+    w.opt(v.palette, encodePaletteOverrides)
+    w.slice(v.rows, encodePackedRow)
+    w.varU64(v.imagesGen)
+    w.bool(v.fullSync)
+  })
 }
 function decodeFrameUpdate(r: WireReader): FrameUpdate {
   const seq = r.varU64()
@@ -529,7 +535,7 @@ export function encodeClientPayload(msg: ClientMsg): { readonly msgType: number;
       w.varU32(msg.bytes)
       return { msgType: MsgType.OUTPUT_CREDIT, payload: w.toBytes() }
     case 'fetchRows':
-      if (!Number.isInteger(msg.count) || msg.count === 0 || msg.count > MAX_ROWS_PER_FETCH) throw new WireError('LimitExceeded', 'fetch rows count')
+      if (!Number.isInteger(msg.count) || msg.count < 1 || msg.count > MAX_ROWS_PER_FETCH) throw new WireError('LimitExceeded', 'fetch rows count')
       w.varU64(msg.epoch)
       w.varU64(msg.fromLine)
       w.varU32(msg.count)
@@ -562,7 +568,7 @@ export function encodeClientPayload(msg: ClientMsg): { readonly msgType: number;
     case 'images':
       return { msgType: MsgType.IMAGES, payload: w.toBytes() }
     case 'getImageBlob':
-      if (!Number.isInteger(msg.maxBytes) || msg.maxBytes === 0) throw new WireError('InvalidValue', 'get_image_blob max_bytes must be non-zero')
+      if (!Number.isInteger(msg.maxBytes) || msg.maxBytes < 1 || msg.maxBytes > 0xffff_ffff) throw new WireError('InvalidValue', 'get_image_blob max_bytes must be non-zero')
       encodeBlobHash(w, msg.blob)
       w.varU32(msg.offset)
       w.varU32(msg.maxBytes)
