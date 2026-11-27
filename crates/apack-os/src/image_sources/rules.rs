@@ -123,6 +123,7 @@ mod tests {
         assert_eq!(split_windows_drive_path(r"\img.png"), None);
         assert_eq!(split_windows_drive_path("C:img.png"), None);
         assert_eq!(split_windows_drive_path(r"C:\"), None);
+        assert_eq!(split_windows_drive_path(r"C:\."), None);
         assert_eq!(split_windows_drive_path(r"C:\a\img.png\"), None);
         assert_eq!(split_windows_drive_path("C:/a/img.png/"), None);
         assert_eq!(split_windows_drive_path(r"C:\a\..\b.png"), None);

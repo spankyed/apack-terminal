@@ -121,74 +121,49 @@ fn ancestor_is_safe(uid: libc::uid_t, mode: u32, euid: libc::uid_t) -> bool {
 }
 
 #[cfg(unix)]
+fn is_safe_ancestor_dir(is_dir: bool, uid: libc::uid_t, mode: u32, euid: libc::uid_t) -> bool {
+    is_dir && ancestor_is_safe(uid, mode, euid)
+}
+
+#[cfg(unix)]
+fn dir_is_private(is_symlink: bool, is_dir: bool, uid: libc::uid_t, mode: u32, euid: libc::uid_t) -> bool {
+    !is_symlink && is_dir && uid == euid && (mode & 0o077) == 0
+}
+
+#[cfg(unix)]
 fn ancestor_symlink_is_safe(uid: libc::uid_t, euid: libc::uid_t) -> bool {
     uid == 0 || uid == euid
 }
 
 #[cfg(unix)]
-fn verify_path_chain(path: &Path, include_self: bool, euid: libc::uid_t) -> Result<(), OsError> {
-    use std::os::unix::fs::MetadataExt;
+const MAX_ANCESTOR_SYMLINK_HOPS: usize = 40;
 
-    let abs = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir().map_err(|err| OsError::io("resolving socket directory", err))?.join(path)
-    };
-    let skip = usize::from(!include_self);
-    for ancestor in abs.ancestors().skip(skip) {
-        if ancestor.as_os_str().is_empty() {
-            continue;
-        }
-        let lmeta =
-            std::fs::symlink_metadata(ancestor).map_err(|err| OsError::io("inspecting socket ancestor", err))?;
-        if lmeta.file_type().is_symlink() && !ancestor_symlink_is_safe(lmeta.uid(), euid) {
-            return Err(OsError::UnsafePath(format!("{} is a symlink owned by another user", ancestor.display())));
-        }
-        let meta = std::fs::metadata(ancestor).map_err(|err| OsError::io("inspecting socket ancestor", err))?;
-        if !ancestor_is_safe(meta.uid(), meta.mode(), euid) {
-            return Err(OsError::UnsafePath(format!(
-                "{} is an unsafe ancestor directory (wrong owner or non-sticky group/world writable)",
-                ancestor.display()
-            )));
-        }
-    }
-    // Also validate the canonical ancestor chain so symlink targets cannot hide an unsafe parent
-    // directory (e.g. an euid-owned symlink pointing into a world-writable non-sticky directory).
-    let canon = std::fs::canonicalize(&abs).map_err(|err| OsError::io("canonicalizing socket ancestor", err))?;
-    for ancestor in canon.ancestors().skip(skip) {
-        if ancestor.as_os_str().is_empty() {
-            continue;
-        }
-        let meta = std::fs::metadata(ancestor).map_err(|err| OsError::io("inspecting canonical ancestor", err))?;
-        if !ancestor_is_safe(meta.uid(), meta.mode(), euid) {
-            return Err(OsError::UnsafePath(format!(
-                "{} is an unsafe canonical ancestor directory (wrong owner or non-sticky group/world writable)",
-                ancestor.display()
-            )));
-        }
-    }
-    Ok(())
+#[cfg(unix)]
+enum WalkSegment {
+    Normal(std::ffi::OsString),
+    Parent,
 }
 
 #[cfg(unix)]
-fn verify_existing_prefix_before_create(dir: &Path, euid: libc::uid_t) -> Result<(), OsError> {
-    let abs = if dir.is_absolute() {
-        dir.to_path_buf()
-    } else {
-        std::env::current_dir().map_err(|err| OsError::io("resolving socket directory", err))?.join(dir)
-    };
-    let mut existing = abs.as_path();
-    while std::fs::symlink_metadata(existing).is_err() {
-        existing = existing
-            .parent()
-            .ok_or_else(|| OsError::UnsafePath(format!("no existing ancestor for {}", dir.display())))?;
+fn push_path_segments_front(queue: &mut std::collections::VecDeque<WalkSegment>, path: &Path) {
+    use std::path::Component;
+    let mut segs = Vec::new();
+    for comp in path.components() {
+        match comp {
+            Component::Normal(name) => segs.push(WalkSegment::Normal(name.to_os_string())),
+            Component::ParentDir => segs.push(WalkSegment::Parent),
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+        }
     }
-    verify_path_chain(existing, true, euid)
+    for seg in segs.into_iter().rev() {
+        queue.push_front(seg);
+    }
 }
 
 /// Ensures the parent directory of `socket` exists with mode `0o700` (if missing) and verifies it
 /// is a real directory (not a symlink) owned by the current effective UID with strict owner-only
-/// permissions (`mode & 0o077 == 0`) and a safe lexical + canonical ancestor chain.
+/// permissions (`mode & 0o077 == 0`) by walking left-to-right across every directory and symlink
+/// hop (verifying every traversed symlink owner and every traversed real directory).
 pub fn ensure_private_directory(socket: &str) -> Result<(), OsError> {
     #[cfg(not(unix))]
     {
@@ -197,38 +172,121 @@ pub fn ensure_private_directory(socket: &str) -> Result<(), OsError> {
     }
     #[cfg(unix)]
     {
+        use std::collections::VecDeque;
         use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        use std::path::{Component, PathBuf};
 
         let dir = socket_parent_dir(socket);
+        if dir.components().any(|c| matches!(c, Component::ParentDir)) {
+            return Err(OsError::UnsafePath(format!("{} contains parent traversal (`..`)", dir.display())));
+        }
+        let abs = if dir.is_absolute() {
+            dir.to_path_buf()
+        } else {
+            std::env::current_dir().map_err(|err| OsError::io("resolving socket directory", err))?.join(dir)
+        };
         // SAFETY: `geteuid` takes no arguments and cannot fail.
         let euid = unsafe { libc::geteuid() };
-        if std::fs::symlink_metadata(dir).is_err() {
-            // Validate deepest existing ancestor (and its canonical chain) BEFORE creating any directory.
-            verify_existing_prefix_before_create(dir, euid)?;
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(dir)
-                .map_err(|err| OsError::io("creating private socket directory", err))?;
+
+        let mut cur = PathBuf::from("/");
+        let root_meta = std::fs::symlink_metadata(&cur).map_err(|err| OsError::io("inspecting root directory", err))?;
+        if !is_safe_ancestor_dir(root_meta.is_dir(), root_meta.uid(), root_meta.mode(), euid) {
+            return Err(OsError::UnsafePath("/ is not a safe root directory".to_owned()));
         }
-        let meta = std::fs::symlink_metadata(dir).map_err(|err| OsError::io("inspecting socket directory", err))?;
-        if meta.file_type().is_symlink() {
-            return Err(OsError::UnsafePath(format!(
-                "{} is a symbolic link and cannot host a private broker socket",
-                dir.display()
-            )));
+
+        let mut pending: VecDeque<WalkSegment> = VecDeque::new();
+        push_path_segments_front(&mut pending, &abs);
+        if pending.is_empty() {
+            return Err(OsError::UnsafePath("/ cannot host a private broker socket".to_owned()));
         }
-        if !meta.is_dir() {
-            return Err(OsError::UnsafePath(format!("{} is not a directory", dir.display())));
+        let mut remaining_hops = MAX_ANCESTOR_SYMLINK_HOPS;
+
+        while let Some(segment) = pending.pop_front() {
+            let name = match segment {
+                WalkSegment::Parent => {
+                    cur.pop();
+                    continue;
+                }
+                WalkSegment::Normal(name) => name,
+            };
+            let is_leaf = pending.is_empty();
+            let next = cur.join(&name);
+
+            match std::fs::symlink_metadata(&next) {
+                Ok(lmeta) => {
+                    if lmeta.file_type().is_symlink() {
+                        if is_leaf {
+                            return Err(OsError::UnsafePath(format!(
+                                "{} is a symbolic link and cannot host a private broker socket",
+                                next.display()
+                            )));
+                        }
+                        if !ancestor_symlink_is_safe(lmeta.uid(), euid) {
+                            return Err(OsError::UnsafePath(format!(
+                                "{} is a symlink owned by another user",
+                                next.display()
+                            )));
+                        }
+                        remaining_hops = remaining_hops.checked_sub(1).ok_or_else(|| {
+                            OsError::UnsafePath(format!("{} exceeds symlink hop limit", dir.display()))
+                        })?;
+                        let target =
+                            std::fs::read_link(&next).map_err(|err| OsError::io("reading ancestor symlink", err))?;
+                        if target.is_absolute() {
+                            cur = PathBuf::from("/");
+                        }
+                        push_path_segments_front(&mut pending, &target);
+                        continue;
+                    }
+                    if !lmeta.is_dir() {
+                        return Err(OsError::UnsafePath(format!("{} is not a directory", next.display())));
+                    }
+                    if is_leaf {
+                        if !dir_is_private(false, true, lmeta.uid(), lmeta.mode(), euid) {
+                            return Err(OsError::UnsafePath(format!(
+                                "{} must be owned by current user with mode 0o700",
+                                next.display()
+                            )));
+                        }
+                        return Ok(());
+                    }
+                    if !ancestor_is_safe(lmeta.uid(), lmeta.mode(), euid) {
+                        return Err(OsError::UnsafePath(format!(
+                            "{} is an unsafe ancestor directory (wrong owner or non-sticky group/world writable)",
+                            next.display()
+                        )));
+                    }
+                    cur = next;
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    // `cur` is already a verified real safe directory; create strictly one component at a time.
+                    std::fs::DirBuilder::new()
+                        .mode(0o700)
+                        .create(&next)
+                        .map_err(|e| OsError::io("creating private socket directory", e))?;
+                    let created = std::fs::symlink_metadata(&next)
+                        .map_err(|e| OsError::io("inspecting created socket directory", e))?;
+                    if !dir_is_private(
+                        created.file_type().is_symlink(),
+                        created.is_dir(),
+                        created.uid(),
+                        created.mode(),
+                        euid,
+                    ) {
+                        return Err(OsError::UnsafePath(format!(
+                            "{} failed post-create private directory verification",
+                            next.display()
+                        )));
+                    }
+                    if is_leaf {
+                        return Ok(());
+                    }
+                    cur = next;
+                }
+                Err(err) => return Err(OsError::io("inspecting socket directory", err)),
+            }
         }
-        if meta.uid() != euid {
-            return Err(OsError::UnsafePath(format!("{} is owned by another user", dir.display())));
-        }
-        if meta.mode() & 0o077 != 0 {
-            return Err(OsError::UnsafePath(format!("{} must be owner-only (0o700)", dir.display())));
-        }
-        verify_path_chain(dir, false, euid)?;
-        Ok(())
+        Err(OsError::UnsafePath(format!("{} resolved to an empty path", dir.display())))
     }
 }
 
@@ -758,6 +816,14 @@ mod tests {
         assert!(ancestor_symlink_is_safe(0, 1000));
         assert!(ancestor_symlink_is_safe(1000, 1000));
         assert!(!ancestor_symlink_is_safe(1001, 1000));
+        assert!(is_safe_ancestor_dir(true, 0, 0o755, 1000));
+        assert!(!is_safe_ancestor_dir(false, 0, 0o755, 1000));
+        assert!(!is_safe_ancestor_dir(true, 0, 0o777, 1000));
+        assert!(dir_is_private(false, true, 1000, 0o700, 1000));
+        assert!(!dir_is_private(true, true, 1000, 0o700, 1000));
+        assert!(!dir_is_private(false, false, 1000, 0o700, 1000));
+        assert!(!dir_is_private(false, true, 1001, 0o700, 1000));
+        assert!(!dir_is_private(false, true, 1000, 0o750, 1000));
 
         // Ancestor symlink owned by euid pointing to a safe parent is allowed, while target dir symlink is refused.
         let anc_sym = base.path().join("anc-sym");
@@ -790,6 +856,51 @@ mod tests {
         assert!(matches!(
             ensure_private_directory(&sym_to_unsafe_target.join("deep/broker.sock").to_string_lossy()),
             Err(OsError::UnsafePath(_))
+        ));
+        // Multi-hop symlink bounce through an unsafe directory and back to a safe directory MUST be refused!
+        let bounce_safe = base.path().join("bounce-safe");
+        let bounce_priv = bounce_safe.join("priv");
+        std::fs::create_dir_all(&bounce_priv).expect("mkdir bounce");
+        std::fs::set_permissions(&bounce_safe, std::fs::Permissions::from_mode(0o700)).expect("chmod bounce safe");
+        std::fs::set_permissions(&bounce_priv, std::fs::Permissions::from_mode(0o700)).expect("chmod bounce priv");
+        let link_b = safe_child.join("link-b");
+        std::os::unix::fs::symlink(&bounce_safe, &link_b).expect("link_b");
+        assert!(matches!(
+            ensure_private_directory(&sym_to_unsafe_target.join("link-b/priv/broker.sock").to_string_lossy()),
+            Err(OsError::UnsafePath(_))
+        ));
+        // `..` in socket path is refused BEFORE creating any missing component.
+        let nonexist_escape = base.path().join("nonexist/../unsafe-parent/priv-escape/broker.sock");
+        assert!(matches!(ensure_private_directory(&nonexist_escape.to_string_lossy()), Err(OsError::UnsafePath(_))));
+        assert!(!base.path().join("nonexist").exists());
+        assert!(!unsafe_parent.join("priv-escape").exists());
+        // Symlink loop in ancestor chain fails closed cleanly.
+        let loop1 = base.path().join("loop1");
+        let loop2 = base.path().join("loop2");
+        std::os::unix::fs::symlink(&loop2, &loop1).expect("loop1");
+        std::os::unix::fs::symlink(&loop1, &loop2).expect("loop2");
+        assert!(matches!(
+            ensure_private_directory(&loop1.join("priv/broker.sock").to_string_lossy()),
+            Err(OsError::UnsafePath(_))
+        ));
+        // Multi-level missing directory creation under a safe ancestor creates every level with 0o700.
+        let deep_new = base.path().join("nested_a/nested_b/broker.sock");
+        ensure_private_directory(&deep_new.to_string_lossy()).expect("create nested 0o700 dirs");
+        assert_eq!(
+            std::fs::symlink_metadata(base.path().join("nested_a")).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(base.path().join("nested_a/nested_b")).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        // Root `/` cannot host a private socket directly.
+        assert!(matches!(ensure_private_directory("/broker.sock"), Err(OsError::UnsafePath(_))));
+        // Non-NotFound metadata errors (e.g. ENAMETOOLONG) fail at inspection rather than attempting mkdir.
+        let overlong = base.path().join("a".repeat(300)).join("broker.sock");
+        assert!(matches!(
+            ensure_private_directory(&overlong.to_string_lossy()),
+            Err(OsError::Io { context: "inspecting socket directory", .. })
         ));
         std::fs::set_permissions(&unsafe_parent, std::fs::Permissions::from_mode(0o1777)).expect("chmod sticky");
         ensure_private_directory(&safe_child.join("broker.sock").to_string_lossy()).expect("sticky ancestor ok");
