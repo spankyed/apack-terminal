@@ -228,10 +228,25 @@ pub enum BrokerAction {
         /// `true` to pause PTY reads, `false` to resume.
         paused: bool,
     },
-    /// Last broker-wide lease ended (or its grace timer expired): tear down all non-kept, non-pinned sessions.
+    /// Last broker-wide lease ended (or its grace timer expired), or the last unleased client
+    /// disconnected: tear down all non-kept, non-pinned `LeaseBound` sessions.
     TeardownNonKeptSessions,
-    /// Last `LeaseKind::Session` pinning `session` ended.
+    /// Last `LeaseKind::Session` pinning a `LeaseBound` session ended.
     SessionUnpinned(SessionId),
+    /// Explicitly tear down a single orphaned or owner-disconnected (`ConnBound`) session.
+    TeardownSession(SessionId),
+}
+
+/// Explicit ownership model governing when a session is automatically torn down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionLifetime {
+    /// Survives all client disconnects and broker lease releases (only explicit `Kill` or broker shutdown ends it).
+    Kept,
+    /// Owned by broker/session leases, or by active client connections when no broker lease exists.
+    LeaseBound,
+    /// Bound to the specific connection that opened it (used for `Rewind` recordings: closed as soon
+    /// as `owner` disconnects, unless pinned by a `LeaseKind::Session`).
+    ConnBound(ConnId),
 }
 
 /// Aggregate shard counters fed into `BrokerCore` for `Metrics` replies.
@@ -289,8 +304,8 @@ struct ConnState {
 
 #[derive(Debug, Clone, Copy)]
 struct SessionRecord {
+    lifetime: SessionLifetime,
     rewound: bool,
-    kept: bool,
     pty_paused: bool,
 }
 
@@ -368,21 +383,64 @@ impl BrokerCore {
         self.leases.is_session_pinned(session)
     }
 
-    /// Registers a live or rewound session in the broker's session table.
-    pub fn register_session(&mut self, session: SessionId, rewound: bool, kept: bool) {
-        self.sessions.insert(session, SessionRecord { rewound, kept, pty_paused: false });
-    }
-
-    /// Updates a session's `kept` flag in the broker's session table.
-    pub fn set_session_kept(&mut self, session: SessionId, kept: bool) {
-        if let Some(rec) = self.sessions.get_mut(&session) {
-            rec.kept = kept;
+    /// Registers a live or rewound session with an explicit [`SessionLifetime`] in the broker's
+    /// session table, immediately scheduling teardown if its owner or last unleased client already
+    /// disconnected while creation was in flight.
+    pub fn register_session(
+        &mut self,
+        session: SessionId,
+        lifetime: SessionLifetime,
+        rewound: bool,
+        actions: &mut Vec<BrokerAction>,
+    ) {
+        self.sessions.insert(session, SessionRecord { lifetime, rewound, pty_paused: false });
+        let orphaned = match lifetime {
+            SessionLifetime::Kept => false,
+            SessionLifetime::ConnBound(owner) => {
+                !self.conns.contains_key(&owner) && !self.leases.is_session_pinned(session)
+            }
+            SessionLifetime::LeaseBound => {
+                self.conns.is_empty()
+                    && !self.leases.has_active_broker_lease()
+                    && !self.leases.is_session_pinned(session)
+            }
+        };
+        if orphaned {
+            actions.push(BrokerAction::TeardownSession(session));
         }
     }
 
-    /// Returns `true` if `session` is registered and marked `kept`.
+    /// Updates a non-rewound session's kept state (`Kept` vs `LeaseBound`).
+    pub fn set_session_kept(&mut self, session: SessionId, kept: bool) {
+        if let Some(rec) = self.sessions.get_mut(&session)
+            && !rec.rewound
+        {
+            rec.lifetime = if kept { SessionLifetime::Kept } else { SessionLifetime::LeaseBound };
+        }
+    }
+
+    /// Returns `true` if `session` is registered with [`SessionLifetime::Kept`].
     pub fn is_session_kept(&self, session: SessionId) -> bool {
-        self.sessions.get(&session).is_some_and(|rec| rec.kept)
+        self.sessions.get(&session).is_some_and(|rec| rec.lifetime == SessionLifetime::Kept)
+    }
+
+    /// Returns the explicit [`SessionLifetime`] of `session`, if registered.
+    pub fn session_lifetime(&self, session: SessionId) -> Option<SessionLifetime> {
+        self.sessions.get(&session).map(|rec| rec.lifetime)
+    }
+
+    fn emit_unpinned_actions(&self, unpinned: Vec<SessionId>, actions: &mut Vec<BrokerAction>) {
+        for sid in unpinned {
+            match self.sessions.get(&sid).map(|r| r.lifetime) {
+                Some(SessionLifetime::ConnBound(owner)) if !self.conns.contains_key(&owner) => {
+                    actions.push(BrokerAction::TeardownSession(sid));
+                }
+                Some(SessionLifetime::LeaseBound) => {
+                    actions.push(BrokerAction::SessionUnpinned(sid));
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Removes a session, cleans up its session leases, drops unsent frames, and enqueues
@@ -585,10 +643,20 @@ impl BrokerCore {
         let changes = self.leases.on_disconnect(conn, now, |lease_id, deadline| {
             self.timers.schedule(deadline, BrokerTimer::LeaseGrace(lease_id))
         });
-        for sid in changes.unpinned_sessions {
-            actions.push(BrokerAction::SessionUnpinned(sid));
+        let conn_bound_victims: Vec<SessionId> = self
+            .sessions
+            .iter()
+            .filter_map(|(&sid, rec)| {
+                (rec.lifetime == SessionLifetime::ConnBound(conn) && !self.leases.is_session_pinned(sid)).then_some(sid)
+            })
+            .collect();
+        for &sid in &conn_bound_victims {
+            actions.push(BrokerAction::TeardownSession(sid));
         }
-        if changes.teardown_non_kept {
+        let remaining_unpinned: Vec<SessionId> =
+            changes.unpinned_sessions.into_iter().filter(|sid| !conn_bound_victims.contains(sid)).collect();
+        self.emit_unpinned_actions(remaining_unpinned, actions);
+        if changes.teardown_non_kept || (self.conns.is_empty() && !self.leases.has_active_broker_lease()) {
             actions.push(BrokerAction::TeardownNonKeptSessions);
         }
         actions.push(BrokerAction::CloseConn { conn, reason, final_error, drained });
@@ -1148,9 +1216,7 @@ impl BrokerCore {
                 };
                 match self.leases.release(conn, lid) {
                     Ok(changes) => {
-                        for sid in changes.unpinned_sessions {
-                            actions.push(BrokerAction::SessionUnpinned(sid));
-                        }
+                        self.emit_unpinned_actions(changes.unpinned_sessions, actions);
                         if changes.teardown_non_kept {
                             actions.push(BrokerAction::TeardownNonKeptSessions);
                         }

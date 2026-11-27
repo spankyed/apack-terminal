@@ -10,13 +10,58 @@ use std::os::windows::io::{AsHandle, AsRawHandle};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree};
 use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, GetSecurityInfo, SE_KERNEL_OBJECT};
 use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
-use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+use windows_sys::Win32::System::Console::{
+    GetConsoleCP, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCtrlHandler,
+    SetStdHandle,
+};
 use windows_sys::Win32::System::IO::CancelIoEx;
 use windows_sys::Win32::System::Pipes::{DisconnectNamedPipe, GetNamedPipeClientProcessId};
-use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+use windows_sys::Win32::System::Threading::{
+    CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+};
+
+const WINDOWS_DETACHED_FLAGS: u32 = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+
+/// Configures a spawned broker [`std::process::Command`] to run detached from the caller's console.
+pub fn configure_detached_command(cmd: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(WINDOWS_DETACHED_FLAGS);
+}
+
+fn should_close_old_stderr(old: HANDLE, stdin: HANDLE, stdout: HANDLE, new_handle: HANDLE) -> bool {
+    !old.is_null() && old != INVALID_HANDLE_VALUE && old != stdin && old != stdout && old != new_handle
+}
+
+/// Redirects `STD_ERROR_HANDLE` to `NUL` and closes the inherited startup stderr pipe write handle
+/// once a detached background broker has finished binding, so the proxy's stderr collector sees
+/// EOF cleanly and post-bind `eprintln!` calls cannot panic with `ERROR_BROKEN_PIPE`.
+pub fn prepare_detached_daemon() {
+    // SAFETY: `GetConsoleCP` queries the attached console code page (0 when detached).
+    if unsafe { GetConsoleCP() } != 0 {
+        return;
+    }
+    if let Ok(nul) = std::fs::OpenOptions::new().write(true).open("NUL") {
+        use std::os::windows::io::IntoRawHandle;
+        // SAFETY: `GetStdHandle` fetches the inherited std handles; `SetStdHandle` installs `nul`'s
+        // handle as process stderr before transferring ownership via `into_raw_handle()`, and we
+        // only close `old` when it is valid and not shared with stdin/stdout/new_handle.
+        unsafe {
+            let old = GetStdHandle(STD_ERROR_HANDLE);
+            let stdin = GetStdHandle(STD_INPUT_HANDLE);
+            let stdout = GetStdHandle(STD_OUTPUT_HANDLE);
+            let new_handle = nul.as_raw_handle() as HANDLE;
+            if SetStdHandle(STD_ERROR_HANDLE, new_handle) != 0 {
+                let _ = nul.into_raw_handle();
+                if should_close_old_stderr(old, stdin, stdout, new_handle) {
+                    CloseHandle(old);
+                }
+            }
+        }
+    }
+}
 
 /// Maps Windows named-pipe bind errors indicating an existing instance to [`crate::OsError::AlreadyHeld`].
 pub fn map_bind_error(err: io::Error) -> crate::OsError {
@@ -304,5 +349,70 @@ mod tests {
         drop(guard);
         // SAFETY: after dropping the guard, CTRL_HOOK is cleared and the callback returns 0.
         assert_eq!(unsafe { console_ctrl_handler(0) }, 0);
+    }
+
+    #[test]
+    fn configure_detached_command_detaches_child_from_console() {
+        const CHILD_ENV: &str = "APACK_TEST_CHECK_DETACHED_CONSOLE";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            // SAFETY: `GetConsoleCP` queries the attached console code page (0 when detached).
+            let cp = unsafe { GetConsoleCP() };
+            println!("CONSOLE_CP={cp}");
+            prepare_detached_daemon();
+            let _ = std::io::stderr().write_all(b"POST_DETACH_MUST_GO_TO_NUL\n");
+            let mut sink = Vec::new();
+            let _ = std::io::stdin().read_to_end(&mut sink);
+            return;
+        }
+        let h1 = 4usize as HANDLE;
+        let h2 = 8usize as HANDLE;
+        let h3 = 12usize as HANDLE;
+        let h4 = 16usize as HANDLE;
+        assert!(!should_close_old_stderr(std::ptr::null_mut(), h2, h3, h4));
+        assert!(!should_close_old_stderr(INVALID_HANDLE_VALUE, h2, h3, h4));
+        assert!(!should_close_old_stderr(h1, h1, h3, h4));
+        assert!(!should_close_old_stderr(h1, h2, h1, h4));
+        assert!(!should_close_old_stderr(h1, h2, h3, h1));
+        assert!(should_close_old_stderr(h1, h2, h3, h4));
+
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args([
+            "--exact",
+            "transport_windows::tests::configure_detached_command_detaches_child_from_console",
+            "--nocapture",
+        ])
+        .env(CHILD_ENV, "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+        configure_detached_command(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn detached test helper");
+        let mut child_stderr = child.stderr.take().expect("piped stderr");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stderr_reader = std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = child_stderr.read_to_string(&mut buf);
+            let _ = tx.send(buf);
+        });
+        let stderr_buf = match rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(buf) => buf,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stderr_reader.join();
+                panic!("prepare_detached_daemon did not close inherited stderr pipe handle before child exit");
+            }
+        };
+        let _ = stderr_reader.join();
+        assert!(
+            stderr_buf.is_empty(),
+            "prepare_detached_daemon must redirect stderr to NUL and close pipe write handle, got: {stderr_buf:?}"
+        );
+        drop(child.stdin.take());
+        let out = child.wait_with_output().expect("wait detached test helper");
+        assert!(out.status.success(), "helper failed: {:?}", out.status);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("CONSOLE_CP=0"), "expected detached child with no console, got: {stdout:?}");
     }
 }

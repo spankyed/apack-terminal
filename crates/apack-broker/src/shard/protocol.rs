@@ -126,6 +126,8 @@ pub enum ReactorEvent {
     SessionRegistered {
         /// Assigned session ID.
         session: SessionId,
+        /// Connection that requested `Spawn` or `Rewind` (owner of `ConnBound` sessions).
+        owner: ConnId,
         /// Owning shard index.
         shard_idx: usize,
         /// `true` for read-only rewound recordings.
@@ -332,12 +334,17 @@ pub enum ShardCmd {
     },
     /// Tear down ALL sessions (kept and non-kept alike) during explicit broker shutdown.
     TeardownAll,
-    /// Close an unpinned rewound or non-kept session if it was only alive due to its session lease.
+    /// Close an unpinned non-kept `LeaseBound` session if no broker-wide lease is active.
     SessionUnpinned {
         /// Unpinned session ID.
         session_id: SessionId,
         /// Whether any broker-wide lease is currently active.
         broker_lease_active: bool,
+    },
+    /// Tear down one specific session (e.g. `ConnBound` owner disconnected or orphaned mid-spawn).
+    TeardownSession {
+        /// Target session ID.
+        session_id: SessionId,
     },
     /// Batched foreground-process verification results from the off-shard blocking worker.
     ForegroundVerified {

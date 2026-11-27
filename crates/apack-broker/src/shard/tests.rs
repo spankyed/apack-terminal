@@ -13,7 +13,10 @@ mod win_shard_tests {
     use apack_wal::{RecordingRegistry, WalConfig};
 
     use super::super::*;
-    use crate::shard_windows::{clamp_win_write_timeout, drain_conpty_quantum, maybe_wait_win_mailbox};
+    use crate::shard_windows::{
+        WIN_CONPTY_DRAIN_TIMEOUT, clamp_win_write_timeout, drain_conpty_quantum, finish_or_begin_win_exit_drain,
+        maybe_wait_win_mailbox,
+    };
 
     #[test]
     fn win_shard_helpers_and_drain_windows_ptys_cover_pause_quantum_and_eof() {
@@ -114,6 +117,7 @@ mod win_shard_tests {
                 pending_image: None,
                 pending_image_tail: Vec::new(),
                 reaped_exit: None,
+                exit_drain: None,
             }
         };
 
@@ -159,19 +163,31 @@ mod win_shard_tests {
         }
         assert!(saw_paused_after, "unpaused ConPTY must drain its output");
 
-        // Direct drain_conpty_quantum check for (true, false) EOF and (false, false) empty using
-        // live_id's already-active bridge (no 3rd ConPTY spawn or DSR wait).
+        // Direct `begin_win_exit_drain` + `drain_conpty_quantum` check for (true, false) EOF and
+        // (false, false) empty using live_id's already-active bridge (no 3rd ConPTY spawn or DSR wait).
         let mut live_sess = runner.sessions.remove(&live_id).expect("live session");
+        assert!(live_sess.tree.is_some(), "Windows PTY spawn must attach JobGuard via pinned handle");
         if let Some(mut killer) = live_sess.killer.take() {
             let _ = killer.kill();
         }
         if let Some(mut child) = live_sess.child.take() {
             let _ = child.wait();
         }
+        let drain_now = Instant::now();
+        live_sess.paused_by_stream = true;
+        live_sess.paused_by_raw_flow = true;
+        live_sess.paused_by_raw_inflight = true;
+        assert_eq!(finish_or_begin_win_exit_drain(&mut live_sess, (Some(42), None), drain_now), None);
+        assert!(!live_sess.paused_by_stream);
+        assert!(!live_sess.paused_by_raw_flow);
+        assert!(!live_sess.paused_by_raw_inflight);
+        let drain_state = live_sess.exit_drain.as_ref().expect("exit_drain set");
+        assert_eq!(drain_state.code, Some(42));
+        assert_eq!(drain_state.deadline, drain_now + WIN_CONPTY_DRAIN_TIMEOUT);
         let Some(LivePty::Windows { bridge, .. }) = live_sess.pty.take() else {
             panic!("expected Windows LivePty");
         };
-        bridge.close_master_async();
+        assert_eq!(finish_or_begin_win_exit_drain(&mut live_sess, (Some(0), None), drain_now), Some((Some(0), None)));
         let mut saw_eof = false;
         let deadline3 = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline3 {
@@ -183,7 +199,7 @@ mod win_shard_tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(saw_eof, "drain_conpty_quantum must report (true, false) on EOF");
+        assert!(saw_eof, "begin_win_exit_drain must close ConPTY master so drain_conpty_quantum observes EOF");
         assert_eq!(drain_conpty_quantum(&bridge, PTY_READ_QUANTUM_BYTES, |_| {}), (false, false));
 
         // Clean up remaining test session.
@@ -308,6 +324,7 @@ mod image_source_shard_tests {
                 pending_image: None,
                 pending_image_tail: Vec::new(),
                 reaped_exit: None,
+                exit_drain: None,
             },
         );
     }
@@ -1302,6 +1319,54 @@ mod image_source_shard_tests {
         assert!(
             !all_wal_str.contains(&secret_b64) && !all_wal_str.contains("SUPER_SECRET_HOST_PATH_PR5"),
             "WAL must NEVER leak raw intercepted t=f host paths"
+        );
+
+        // 4. `take_ready_exit_drain` (`M10` 2-phase ConPTY drain helper) & `ShardCmd::TeardownSession` (`H12`):
+        let base = Instant::now();
+        let mut drain =
+            Some(super::super::ExitDrainState { code: Some(7), signal: None, deadline: base + Duration::from_secs(2) });
+        assert_eq!(super::super::lifecycle::take_ready_exit_drain(&mut drain, false, base), None);
+        assert!(drain.is_some());
+        assert_eq!(
+            super::super::lifecycle::take_ready_exit_drain(&mut drain, false, base + Duration::from_secs(2)),
+            Some((Some(7), None))
+        );
+        assert!(drain.is_none());
+        let mut drain_eof =
+            Some(super::super::ExitDrainState { code: Some(0), signal: None, deadline: base + Duration::from_secs(2) });
+        assert_eq!(super::super::lifecycle::take_ready_exit_drain(&mut drain_eof, true, base), Some((Some(0), None)));
+
+        // 5. `is_pty_paused`, `compute_wait_timeout` & `run_tier2` cover `exit_drain.is_some()`
+        //    and `terminating_since.is_some()` when `child` is `None` (post-reap ConPTY drain state).
+        let sid_drain = SessionId::new(44).unwrap();
+        insert_image_session(&mut runner, sid_drain, false);
+        {
+            let sess = runner.sessions.get_mut(&sid_drain).unwrap();
+            sess.paused_by_stream = true;
+            assert!(sess.is_pty_paused());
+            sess.terminating_since = Some(Instant::now());
+            assert!(!sess.is_pty_paused(), "terminating_since must override flow-control pause");
+            sess.terminating_since = None;
+            assert!(sess.is_pty_paused());
+            sess.exit_drain = Some(super::super::ExitDrainState {
+                code: Some(9),
+                signal: None,
+                deadline: Instant::now() + Duration::from_secs(1),
+            });
+            assert!(!sess.is_pty_paused(), "exit_drain must override flow-control pause");
+            sess.paused_by_stream = false;
+        }
+        let wait_t = runner.compute_wait_timeout(TimestampMs::from_millis(2_000));
+        assert_eq!(
+            wait_t, TERMINATE_POLL_INTERVAL,
+            "exit_drain must clamp shard wait timeout to TERMINATE_POLL_INTERVAL, got {wait_t:?}"
+        );
+        runner.sessions.get_mut(&sid_drain).unwrap().exit_drain =
+            Some(super::super::ExitDrainState { code: Some(9), signal: None, deadline: Instant::now() });
+        runner.run_tier2(TimestampMs::from_millis(2_000));
+        assert!(
+            !runner.sessions.contains_key(&sid_drain),
+            "run_tier2 must finalize and remove a session whose exit_drain deadline elapsed"
         );
     }
 }

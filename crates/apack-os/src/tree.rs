@@ -21,6 +21,22 @@ pub struct TreeGuard {
 }
 
 impl TreeGuard {
+    /// Attaches process-tree ownership to a newly spawned `portable_pty::Child`.
+    ///
+    /// On Windows, attaches the Job Object directly via the child's pinned process `HANDLE`
+    /// (`AssignProcessToJobObject`) instead of `OpenProcess(pid)`, eliminating PID-reuse races.
+    pub(crate) fn attach_child(child: &dyn portable_pty::Child, pid: u32) -> Option<Self> {
+        #[cfg(unix)]
+        {
+            let _ = child;
+            Self::attach(pid)
+        }
+        #[cfg(windows)]
+        {
+            crate::tree_windows::attach_child_job(child, pid).map(|inner| Self { inner })
+        }
+    }
+
     /// Attaches process-tree ownership to the newly spawned session leader `pid`.
     ///
     /// Returns `None` if `pid < 2` or (on Windows) if the OS refuses Job Object creation or

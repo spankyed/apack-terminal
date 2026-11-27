@@ -641,6 +641,89 @@ mod unix_signals {
 #[cfg(unix)]
 pub use unix_signals::{ShutdownSignalGuard, install_shutdown_signals};
 
+/// Configures a spawned background broker [`std::process::Command`] to detach from the caller's
+/// controlling session/console (`setsid(2)` on Unix, `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`
+/// on Windows) so closing the proxy/SSH PTY cannot `SIGHUP` the broker.
+pub fn configure_detached_command(cmd: &mut std::process::Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: `setsid(2)` is async-signal-safe per POSIX and runs in the child between
+        // `fork` and `exec` without touching any parent heap state.
+        unsafe {
+            cmd.pre_exec(|| {
+                let _ = libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    #[cfg(windows)]
+    {
+        crate::transport_windows::configure_detached_command(cmd);
+    }
+}
+
+/// Prepares an already-bound detached background broker daemon (`serve`):
+/// - On Unix (when stdin is not a TTY): ignores `SIGHUP` so closing the caller's PTY cannot kill
+///   the daemon, and redirects non-TTY `stderr` (such as `proxy`'s startup diagnostic pipe) to
+///   `/dev/null` so the proxy's stderr collector hits EOF cleanly and post-bind `eprintln!` calls
+///   cannot panic with `EPIPE`.
+/// - On Windows (when detached with no console): redirects `STD_ERROR_HANDLE` to `NUL` and closes
+///   the inherited startup stderr pipe write handle.
+pub fn prepare_detached_daemon() {
+    #[cfg(unix)]
+    {
+        // SAFETY: `isatty(STDIN_FILENO)` queries whether fd 0 is a terminal; safe with any fd.
+        if unsafe { libc::isatty(libc::STDIN_FILENO) } == 0 {
+            // SAFETY: zeroed `sigaction` with `SIG_IGN` is valid and async-signal-safe.
+            unsafe {
+                let mut sa: libc::sigaction = std::mem::zeroed();
+                sa.sa_sigaction = libc::SIG_IGN;
+                libc::sigemptyset(&raw mut sa.sa_mask);
+                libc::sigaction(libc::SIGHUP, &sa, std::ptr::null_mut());
+            }
+            // SAFETY: `isatty(STDERR_FILENO)` is safe on any fd; `open("/dev/null")` + `dup2`
+            // atomically replaces fd 2 and closes any inherited startup stderr pipe write end.
+            if unsafe { libc::isatty(libc::STDERR_FILENO) } == 0
+                && let Ok(devnull) = std::fs::OpenOptions::new().write(true).open("/dev/null")
+            {
+                use std::os::fd::IntoRawFd;
+                let raw = devnull.into_raw_fd();
+                if raw != libc::STDERR_FILENO {
+                    // SAFETY: `raw` is an open owned fd distinct from fd 2; `dup2` redirects fd 2
+                    // to `/dev/null` and closes any inherited stderr pipe, then `close(raw)` frees
+                    // the temporary descriptor. When `raw == 2` (fd 2 was initially closed), fd 2
+                    // already points to `/dev/null` and stays open.
+                    unsafe {
+                        libc::dup2(raw, libc::STDERR_FILENO);
+                        libc::close(raw);
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        crate::transport_windows::prepare_detached_daemon();
+    }
+}
+
+/// Reads and removes a secret environment variable from the process `environ` so spawned child
+/// shells cannot inherit the broker authentication secret.
+///
+/// # Safety
+/// Caller MUST invoke this strictly during single-threaded process startup before spawning any
+/// worker, signal, or transport threads (mutating process environment concurrently with other
+/// threads is undefined behavior on Unix).
+pub unsafe fn take_secret_env_at_startup(name: &str) -> Option<String> {
+    let val = std::env::var(name).ok();
+    if val.is_some() {
+        // SAFETY: upheld by caller contract (single-threaded startup before spawning threads).
+        unsafe { std::env::remove_var(name) };
+    }
+    val
+}
+
 /// Abruptly shuts down a stream in both directions, unblocking parked reads/writes.
 ///
 /// On macOS a socket whose peer already half-closed its write side returns `ENOTCONN` for
@@ -1155,5 +1238,76 @@ mod tests {
         let guard2 = install_shutdown_signals(Arc::new(AtomicBool::new(false)), || {})
             .expect("reinstall after drop must succeed");
         drop(guard2);
+    }
+
+    #[test]
+    fn detached_command_and_take_secret_env_helpers() {
+        const SECRET_VAR: &str = "APACK_TEST_PR6_SECRET_HELPER";
+        const ISOLATED_CHILD_ENV: &str = "APACK_TEST_PR6_DETACHED_CHILD";
+        if std::env::var_os(ISOLATED_CHILD_ENV).is_some() {
+            // SAFETY: child runs with `--test-threads=1` on the main thread (single-threaded).
+            assert_eq!(unsafe { take_secret_env_at_startup(SECRET_VAR) }.as_deref(), Some("top-secret-42"));
+            assert!(std::env::var_os(SECRET_VAR).is_none());
+            // SAFETY: still single-threaded inside `--test-threads=1` child.
+            assert_eq!(unsafe { take_secret_env_at_startup(SECRET_VAR) }, None);
+            #[cfg(unix)]
+            {
+                use std::io::Write as _;
+                prepare_detached_daemon();
+                let _ = std::io::stderr().write_all(b"POST_DETACH_MUST_GO_TO_DEVNULL\n");
+                // SAFETY: raising SIGHUP to self verifies `prepare_detached_daemon` installed SIG_IGN.
+                assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
+                // Closing fd 2 and re-running `prepare_detached_daemon` must leave fd 2 open at
+                // `/dev/null` instead of closing it again via a dropped `File`.
+                // SAFETY: isolated single-threaded child process testing fd 2 reopen behavior.
+                unsafe { libc::close(libc::STDERR_FILENO) };
+                prepare_detached_daemon();
+                // SAFETY: `fcntl(F_GETFD)` queries whether fd 2 is open without mutating state.
+                assert!(unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_GETFD) } >= 0);
+            }
+            return;
+        }
+
+        let exe = std::env::current_exe().expect("current_exe");
+        let child_out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "transport::tests::detached_command_and_take_secret_env_helpers",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(ISOLATED_CHILD_ENV, "1")
+            .env(SECRET_VAR, "top-secret-42")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .expect("spawn isolated helper child");
+        assert!(
+            child_out.status.success(),
+            "isolated child failed: status={:?} stderr={}",
+            child_out.status,
+            String::from_utf8_lossy(&child_out.stderr)
+        );
+        #[cfg(unix)]
+        {
+            assert!(
+                child_out.stderr.is_empty(),
+                "prepare_detached_daemon must redirect non-TTY stderr to /dev/null, got: {:?}",
+                String::from_utf8_lossy(&child_out.stderr)
+            );
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.args(["-c", "ps -o pgid= -p $$"]).stdout(std::process::Stdio::piped());
+            configure_detached_command(&mut cmd);
+            let child = cmd.spawn().expect("spawn detached sh");
+            let pid = child.id().to_string();
+            let out = child.wait_with_output().expect("wait detached sh");
+            assert!(out.status.success());
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                pid,
+                "configure_detached_command must create a new POSIX session via setsid()"
+            );
+        }
     }
 }

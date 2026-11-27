@@ -4,18 +4,21 @@
 //! - Zero framing inspection or message parsing.
 //! - Retains up to [`PROXY_REPLAY_CAP`] (`1 MiB`) of client bytes written before the first byte
 //!   arrives from the broker; if an idle broker exited right as the proxy connected, reconnects
-//!   once (auto-starting a detached broker if requested) and atomically replays all buffered bytes.
+//!   once (auto-starting a detached broker if requested) and replays all buffered bytes on a
+//!   dedicated writer thread so the reader thread never deadlocks on full-duplex socket buffers.
 //! - Writes the universal 4-byte [`apack_proto::FIN_FRAME`] (`[0, 0, 0, 0]`) on `stdin` EOF across
 //!   every OS (Unix and Windows) without aborting the broker-to-stdout read half.
 
 use std::io::{self, Read, Write};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use apack_os::transport::{connect_local_stream, verify_peer_is_current_user};
+use apack_os::transport::{
+    HELD_EXIT, configure_detached_command, connect_local_stream, hang_up, verify_peer_is_current_user,
+};
 use apack_proto::FIN_FRAME;
 use interprocess::local_socket::Stream;
 
@@ -23,6 +26,9 @@ use interprocess::local_socket::Stream;
 pub const PROXY_REPLAY_CAP: usize = 1_048_576;
 
 const PROXY_BUF_BYTES: usize = 32_768;
+
+/// Maximum stderr bytes captured from an auto-started broker to surface startup failures (`4 KiB`).
+const AUTOSTART_STDERR_CAP: usize = 4_096;
 
 /// Maximum time spent waiting for an auto-started local broker to begin listening (`5 s`).
 const AUTOSTART_TIMEOUT: Duration = Duration::from_secs(5);
@@ -65,6 +71,11 @@ impl ReplayBuffer {
         if self.overflowed || self.bytes.is_empty() { None } else { Some(&self.bytes) }
     }
 
+    /// Takes ownership of all buffered replay bytes without copying, releasing buffer storage.
+    pub fn take_bytes(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.bytes)
+    }
+
     /// Releases buffered memory once the broker sends its first byte.
     pub fn clear(&mut self) {
         self.bytes.clear();
@@ -75,15 +86,33 @@ impl ReplayBuffer {
 /// Connects to `socket_path`, verifying current-user ownership; if `autostart` is true and no
 /// broker is listening, spawns a detached `apack-terminal serve --socket <socket_path>` and retries.
 pub fn connect_or_autostart(socket_path: &str, autostart: bool) -> io::Result<Stream> {
-    connect_or_autostart_with(socket_path, autostart, AUTOSTART_TIMEOUT, |path| {
-        let mut child = spawn_detached_broker(path)?;
-        // Reap the detached broker handle on a tiny background thread so losing autostart racers
-        // do not remain as `<defunct>` zombies while this proxy stays alive.
-        let _ = thread::Builder::new().name(String::from("apack-proxy-reaper")).spawn(move || {
-            let _ = child.wait();
-        });
-        Ok(())
-    })
+    connect_or_autostart_with(socket_path, autostart, AUTOSTART_TIMEOUT, |path| spawn_detached_broker(path).map(Some))
+}
+
+fn spawn_stderr_collector(mut stderr: std::process::ChildStderr) -> Option<thread::JoinHandle<String>> {
+    thread::Builder::new()
+        .name(String::from("apack-proxy-stderr"))
+        .spawn(move || {
+            let mut captured = Vec::new();
+            let mut buf = [0u8; 512];
+            while let Ok(n) = stderr.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                let room = AUTOSTART_STDERR_CAP.saturating_sub(captured.len());
+                if room != 0 {
+                    captured.extend_from_slice(&buf[..n.min(room)]);
+                }
+            }
+            String::from_utf8_lossy(&captured).trim().to_owned()
+        })
+        .ok()
+}
+
+pub(crate) fn reap_child_in_background(mut child: Child) {
+    let _ = thread::Builder::new().name(String::from("apack-proxy-reaper")).spawn(move || {
+        let _ = child.wait();
+    });
 }
 
 /// Testable core of [`connect_or_autostart`] accepting a custom timeout and spawner closure.
@@ -94,7 +123,7 @@ pub(crate) fn connect_or_autostart_with<F>(
     spawn_broker: F,
 ) -> io::Result<Stream>
 where
-    F: FnOnce(&str) -> io::Result<()>,
+    F: FnOnce(&str) -> io::Result<Option<Child>>,
 {
     match connect_verified(socket_path) {
         Ok(stream) => return Ok(stream),
@@ -102,15 +131,39 @@ where
         Err(_) => {}
     }
 
-    spawn_broker(socket_path)?;
+    let mut child = spawn_broker(socket_path)?;
+    let mut stderr_handle = child.as_mut().and_then(|c| c.stderr.take()).and_then(spawn_stderr_collector);
     let started = Instant::now();
     let backoff = Duration::from_millis(15);
     loop {
         match connect_verified(socket_path) {
-            Ok(stream) => return Ok(stream),
+            Ok(stream) => {
+                if let Some(c) = child.take() {
+                    reap_child_in_background(c);
+                }
+                return Ok(stream);
+            }
             Err(err) => {
                 if err.kind() == io::ErrorKind::PermissionDenied || started.elapsed() >= timeout {
+                    if let Some(c) = child.take() {
+                        reap_child_in_background(c);
+                    }
                     return Err(err);
+                }
+                if let Some(c) = child.as_mut()
+                    && let Ok(Some(status)) = c.try_wait()
+                {
+                    child = None;
+                    if status.code() == Some(HELD_EXIT) {
+                        // Another concurrent proxy won the bind race; connect to the winner immediately.
+                        continue;
+                    }
+                    let detail = stderr_handle
+                        .take()
+                        .and_then(|h| h.join().ok())
+                        .filter(|s| !s.is_empty())
+                        .map_or_else(String::new, |s| format!(": {s}"));
+                    return Err(io::Error::other(format!("autostarted broker exited with {status}{detail}")));
                 }
                 thread::sleep(backoff);
             }
@@ -129,23 +182,11 @@ fn connect_verified(socket_path: &str) -> io::Result<Stream> {
     Ok(stream)
 }
 
-fn spawn_detached_broker(socket_path: &str) -> io::Result<std::process::Child> {
+fn spawn_detached_broker(socket_path: &str) -> io::Result<Child> {
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
-    cmd.arg("serve").arg("--socket").arg(socket_path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // Detach into its own process group so SSH/proxy SIGHUP does not kill the broker.
-        cmd.process_group(0);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // DETACHED_PROCESS (0x0000_0008) | CREATE_NEW_PROCESS_GROUP (0x0000_0200) | CREATE_NO_WINDOW (0x0800_0000)
-        const WINDOWS_DETACHED_FLAGS: u32 = 0x0800_0208;
-        cmd.creation_flags(WINDOWS_DETACHED_FLAGS);
-    }
+    cmd.arg("serve").arg("--socket").arg(socket_path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+    configure_detached_command(&mut cmd);
     cmd.spawn()
 }
 
@@ -178,11 +219,12 @@ struct ActiveLink {
     replay: ReplayBuffer,
     stdin_eof: bool,
     reconnected: bool,
+    replaying: bool,
 }
 
 /// Runs the zero-sniff single-channel byte proxy over arbitrary `stdin`/`stdout` streams, using
-/// `connect` to establish the broker link (and retrying once with atomic replay if the broker exits
-/// before emitting its first byte).
+/// `connect` to establish the broker link (and retrying once with non-blocking off-reader replay
+/// if the broker exits before emitting its first byte).
 pub fn run_proxy_over<R, W, F>(mut input: R, mut output: W, mut connect: F) -> io::Result<()>
 where
     R: Read + Send + 'static,
@@ -190,12 +232,16 @@ where
     F: FnMut() -> io::Result<Stream>,
 {
     let stream1 = Arc::new(connect()?);
-    let link = Arc::new(Mutex::new(ActiveLink {
-        stream: Arc::clone(&stream1),
-        replay: ReplayBuffer::new(PROXY_REPLAY_CAP),
-        stdin_eof: false,
-        reconnected: false,
-    }));
+    let link = Arc::new((
+        Mutex::new(ActiveLink {
+            stream: Arc::clone(&stream1),
+            replay: ReplayBuffer::new(PROXY_REPLAY_CAP),
+            stdin_eof: false,
+            reconnected: false,
+            replaying: false,
+        }),
+        Condvar::new(),
+    ));
     let saw_broker_byte = Arc::new(AtomicBool::new(false));
 
     let writer_link = Arc::clone(&link);
@@ -207,7 +253,11 @@ where
             match crate::read_retry_eintr(&mut input, &mut buf) {
                 Ok(0) => {
                     let current = {
-                        let mut guard = writer_link.lock().unwrap_or_else(|e| e.into_inner());
+                        let (lock, cond) = &*writer_link;
+                        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        while guard.replaying {
+                            guard = cond.wait(guard).unwrap_or_else(|e| e.into_inner());
+                        }
                         guard.stdin_eof = true;
                         Arc::clone(&guard.stream)
                     };
@@ -218,7 +268,11 @@ where
                 }
                 Ok(n) => {
                     let current = {
-                        let mut guard = writer_link.lock().unwrap_or_else(|e| e.into_inner());
+                        let (lock, cond) = &*writer_link;
+                        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        while guard.replaying {
+                            guard = cond.wait(guard).unwrap_or_else(|e| e.into_inner());
+                        }
                         if should_buffer_replay(writer_saw.load(Ordering::Acquire), guard.reconnected) {
                             guard.replay.push(&buf[..n]);
                         }
@@ -240,7 +294,7 @@ where
             Ok(0) | Err(_) => break !saw_broker_byte.load(Ordering::Acquire),
             Ok(n) => {
                 saw_broker_byte.store(true, Ordering::Release);
-                link.lock().unwrap_or_else(|e| e.into_inner()).replay.clear();
+                link.0.lock().unwrap_or_else(|e| e.into_inner()).replay.clear();
                 output.write_all(&out_buf[..n])?;
                 output.flush()?;
             }
@@ -248,60 +302,95 @@ where
     };
 
     // If the broker closed before sending a single byte AND replay hasn't overflowed, reconnect
-    // FIRST, then lock `link` atomically to replay ALL bytes buffered so far (including any that
-    // arrived while `connect()` was running) and swap `stream` seamlessly!
-    let should_reconnect = {
-        let guard = link.lock().unwrap_or_else(|e| e.into_inner());
-        should_reconnect_proxy(
+    // FIRST, take the replay snapshot under `link` (zero I/O under lock), hand the write to a
+    // dedicated replay writer thread, and immediately resume reading `stream2` so full-duplex
+    // responses can never deadlock behind a large (up to 1 MiB) replay write.
+    let (should_reconnect, overflowed_before_eof) = {
+        let guard = link.0.lock().unwrap_or_else(|e| e.into_inner());
+        let overflowed = first_read_eof && guard.replay.is_overflowed();
+        let reconnect = should_reconnect_proxy(
             first_read_eof,
             guard.replay.is_overflowed(),
             guard.stdin_eof,
             guard.replay.replay_slice().is_some(),
-        )
+        );
+        (reconnect, overflowed)
     };
+    if overflowed_before_eof {
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "proxy replay buffer overflowed before broker responded",
+        ));
+    }
 
     if should_reconnect {
         let stream2 = Arc::new(connect()?);
-        let already_eof = {
-            let mut guard = link.lock().unwrap_or_else(|e| e.into_inner());
+        let (replay_bytes, already_eof) = {
+            let mut guard = link.0.lock().unwrap_or_else(|e| e.into_inner());
             if guard.replay.is_overflowed() {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "proxy replay buffer overflowed while reconnecting",
                 ));
             }
-            if let Some(bytes) = guard.replay.replay_slice() {
-                let mut tx2: &Stream = &stream2;
-                tx2.write_all(bytes)?;
-                tx2.flush()?;
-            }
-            guard.replay.clear();
-            guard.stream = Arc::clone(&stream2);
-            guard.reconnected = true;
-            guard.stdin_eof
+            let bytes = guard.replay.take_bytes();
+            let eof = guard.stdin_eof;
+            guard.replaying = true;
+            (bytes, eof)
         };
-        if already_eof {
-            let mut tx2: &Stream = &stream2;
-            let _ = tx2.write_all(&FIN_FRAME);
-            let _ = tx2.flush();
-        }
-        let mut rx2: &Stream = &stream2;
-        loop {
-            match crate::read_retry_eintr(&mut rx2, &mut out_buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    saw_broker_byte.store(true, Ordering::Release);
-                    output.write_all(&out_buf[..n])?;
-                    output.flush()?;
+
+        let replay_cancel = Arc::new(AtomicBool::new(false));
+        let replay_stream = Arc::clone(&stream2);
+        let replay_link = Arc::clone(&link);
+        let replay_cancel_w = Arc::clone(&replay_cancel);
+        let replay_writer = match thread::Builder::new().name(String::from("apack-proxy-replay")).spawn(move || {
+            if !replay_cancel_w.load(Ordering::Acquire) {
+                let mut tx2: &Stream = &replay_stream;
+                let write_ok = tx2.write_all(&replay_bytes).and_then(|()| tx2.flush()).is_ok();
+                if write_ok && already_eof {
+                    let _ = tx2.write_all(&FIN_FRAME);
+                    let _ = tx2.flush();
                 }
             }
-        }
+            let (lock, cond) = &*replay_link;
+            let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            guard.stream = replay_stream;
+            guard.reconnected = true;
+            guard.replaying = false;
+            cond.notify_all();
+        }) {
+            Ok(h) => h,
+            Err(err) => {
+                let (lock, cond) = &*link;
+                let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                guard.replaying = false;
+                cond.notify_all();
+                return Err(err);
+            }
+        };
+
+        let mut rx2: &Stream = &stream2;
+        let read_res = loop {
+            match crate::read_retry_eintr(&mut rx2, &mut out_buf) {
+                Ok(0) | Err(_) => break Ok(()),
+                Ok(n) => {
+                    saw_broker_byte.store(true, Ordering::Release);
+                    if let Err(err) = output.write_all(&out_buf[..n]).and_then(|()| output.flush()) {
+                        break Err(err);
+                    }
+                }
+            }
+        };
+        replay_cancel.store(true, Ordering::Release);
+        let _ = hang_up(&stream2);
+        let _ = replay_writer.join();
+        read_res?;
     }
 
     let _ = output.flush();
     // Only join `to_broker` if stdin already hit EOF; if the broker closed first (e.g., auth error
     // over SSH), return immediately so stdout closes without deadlocking in blocking stdin.read().
-    if link.lock().unwrap_or_else(|e| e.into_inner()).stdin_eof {
+    if link.0.lock().unwrap_or_else(|e| e.into_inner()).stdin_eof {
         let _ = to_broker.join();
     }
     Ok(())

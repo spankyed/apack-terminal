@@ -99,10 +99,12 @@ pub fn collect_report(socket_path: &str, auth: &AuthConfig) -> Result<InspectRep
     Ok(build_report(&sessions, metrics))
 }
 
-/// Formats an [`InspectReport`] as either pretty JSON or human-readable plain text.
+/// Formats an [`InspectReport`] as either pretty JSON (with trailing newline) or human-readable plain text.
 pub fn format_report(report: &InspectReport, json: bool) -> String {
     if json {
-        return serde_json::to_string_pretty(report).expect("InspectReport is serializable");
+        let mut s = serde_json::to_string_pretty(report).expect("InspectReport is serializable");
+        s.push('\n');
+        return s;
     }
     let mut out = format!(
         "sessions: {} live / {} rewound  connections: {}  scrollback: {} B  images: {} B  pty_bytes: {}\n",

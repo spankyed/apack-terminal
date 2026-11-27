@@ -280,7 +280,8 @@ impl SimWorld {
         }
         let vt = MockVt::new(size, scrollback_limit);
         let sess = SessionMachine::new(id, vt, policy, marks_mode, CellPx { width: 8, height: 16 });
-        self.broker.register_session(id, false, false);
+        let mut actions = Vec::new();
+        self.broker.register_session(id, apack_core::broker::SessionLifetime::Kept, false, &mut actions);
         self.sessions.insert(id, sess);
     }
 

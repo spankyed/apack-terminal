@@ -189,6 +189,14 @@ pub(crate) enum LivePty {
     Windows { bridge: ConPtyBridge, eof: bool },
 }
 
+/// 2-phase exit drain state (used on Windows after child exit + `close_master_async()` to flush
+/// all trailing ConPTY output through EOF before emitting `BrokerMsg::Exited`).
+pub(crate) struct ExitDrainState {
+    pub(crate) code: Option<i32>,
+    pub(crate) signal: Option<String>,
+    pub(crate) deadline: Instant,
+}
+
 pub(crate) struct LiveSession {
     pub(crate) machine: SessionMachine<GhosttyEngine>,
     pub(crate) pty: Option<LivePty>,
@@ -209,9 +217,9 @@ pub(crate) struct LiveSession {
     rewind_at_ms: u64,
     last_activity: Instant,
     compressed_idle: bool,
-    paused_by_stream: bool,
-    paused_by_raw_flow: bool,
-    paused_by_raw_inflight: bool,
+    pub(crate) paused_by_stream: bool,
+    pub(crate) paused_by_raw_flow: bool,
+    pub(crate) paused_by_raw_inflight: bool,
     raw_output_inflight: Arc<AtomicUsize>,
     terminating_since: Option<Instant>,
     escalated_sigkill: bool,
@@ -231,11 +239,16 @@ pub(crate) struct LiveSession {
     pending_image_tail: Vec<u8>,
     /// Cached natural exit status deferred until any in-flight `pending_image` finishes.
     reaped_exit: Option<(Option<i32>, Option<String>)>,
+    /// Post-exit ConPTY drain window (`ChildExited -> DrainingConPtyToEof(deadline)` on Windows).
+    pub(crate) exit_drain: Option<ExitDrainState>,
 }
 
 impl LiveSession {
     pub(crate) fn is_pty_paused(&self) -> bool {
-        self.paused_by_stream || self.paused_by_raw_flow || self.paused_by_raw_inflight || self.pending_image.is_some()
+        self.pending_image.is_some()
+            || (self.terminating_since.is_none()
+                && self.exit_drain.is_none()
+                && (self.paused_by_stream || self.paused_by_raw_flow || self.paused_by_raw_inflight))
     }
 
     fn summary(&self) -> SessionSummary {
@@ -310,30 +323,7 @@ impl ShardRunner {
             self.run_tier2(now_ms);
             self.refresh_telemetry_atomics();
 
-            let mut timeout = Duration::from_secs(5);
-            for sess in self.sessions.values() {
-                let pty_eof = match &sess.pty {
-                    #[cfg(unix)]
-                    Some(LivePty::Unix { eof, .. }) => *eof,
-                    #[cfg(windows)]
-                    Some(LivePty::Windows { eof, .. }) => *eof,
-                    None => false,
-                };
-                timeout = timeout.min(shard_session_wait_timeout(
-                    sess.machine.next_deadline(),
-                    now_ms,
-                    sess.terminating_since.is_some(),
-                    sess.is_pty_paused(),
-                    pty_eof,
-                    sess.compressed_idle,
-                    sess.last_activity.elapsed(),
-                    self.shared.idle_compress_after,
-                ));
-                #[cfg(windows)]
-                {
-                    timeout = clamp_win_write_timeout(timeout, sess.machine.pty_write_len());
-                }
-            }
+            let timeout = self.compute_wait_timeout(now_ms);
 
             // Wait until next PTY readiness, mailbox wakeup, or earliest deadline.
             #[cfg(unix)]
@@ -367,6 +357,34 @@ impl ShardRunner {
     fn emit(&self, event: ReactorEvent) {
         let _ = self.reactor_tx.send(event);
         (self.wake_reactor)();
+    }
+
+    pub(crate) fn compute_wait_timeout(&self, now_ms: TimestampMs) -> Duration {
+        let mut timeout = Duration::from_secs(5);
+        for sess in self.sessions.values() {
+            let pty_eof = match &sess.pty {
+                #[cfg(unix)]
+                Some(LivePty::Unix { eof, .. }) => *eof,
+                #[cfg(windows)]
+                Some(LivePty::Windows { eof, .. }) => *eof,
+                None => false,
+            };
+            timeout = timeout.min(shard_session_wait_timeout(
+                sess.machine.next_deadline(),
+                now_ms,
+                sess.terminating_since.is_some() || sess.exit_drain.is_some(),
+                sess.is_pty_paused(),
+                pty_eof,
+                sess.compressed_idle,
+                sess.last_activity.elapsed(),
+                self.shared.idle_compress_after,
+            ));
+            #[cfg(windows)]
+            {
+                timeout = clamp_win_write_timeout(timeout, sess.machine.pty_write_len());
+            }
+        }
+        timeout
     }
 
     fn drain_mailbox(&mut self) {
@@ -504,8 +522,12 @@ impl ShardRunner {
                 self.emit(ReactorEvent::SessionListPart { list_id, sessions });
             }
             ShardCmd::TeardownNonKept { pinned } => {
-                let victims: Vec<SessionId> =
-                    self.sessions.iter().filter(|(id, s)| !s.kept && !pinned.contains(id)).map(|(id, _)| *id).collect();
+                let victims: Vec<SessionId> = self
+                    .sessions
+                    .iter()
+                    .filter(|(id, s)| !s.kept && !s.rewound && !pinned.contains(id))
+                    .map(|(id, _)| *id)
+                    .collect();
                 for id in victims {
                     self.initiate_session_termination(id);
                 }
@@ -519,10 +541,15 @@ impl ShardRunner {
             }
             ShardCmd::SessionUnpinned { session_id, broker_lease_active } => {
                 if let Some(sess) = self.sessions.get(&session_id)
-                    && (sess.rewound || (!sess.kept && !broker_lease_active))
+                    && !sess.kept
+                    && !sess.rewound
+                    && !broker_lease_active
                 {
                     self.initiate_session_termination(session_id);
                 }
+            }
+            ShardCmd::TeardownSession { session_id } => {
+                self.initiate_session_termination(session_id);
             }
             ShardCmd::ForegroundVerified { session_id, results, from_worker } => {
                 if from_worker {

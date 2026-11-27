@@ -285,21 +285,89 @@ pub fn deliver_signal(leader: u32, kind: SignalKind, scope: SignalScope) -> Resu
     }
 }
 
-/// Sends `SIGHUP` to every non-leader process belonging to any POSIX session led by `leaders`.
+/// Non-reaping probe result for a Unix child leader via `waitid(P_PID, ..., WEXITED | WNOHANG | WNOWAIT)`.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildExitProbe {
+    /// Child process is still running.
+    StillRunning,
+    /// Child process has exited and remains a zombie pinning its PID until reaped.
+    ExitedZombie,
+    /// `pid` is not a direct unreaped child of this process (e.g. `ECHILD` or invalid PID).
+    NotChild,
+}
+
+/// Probes whether Unix child `pid` has exited WITHOUT reaping it (`WNOWAIT`), keeping any zombie
+/// pinned so its PID cannot be recycled while callers signal remaining session/tree descendants.
+#[cfg(unix)]
+pub fn probe_child_exit_unreaped(pid: u32) -> ChildExitProbe {
+    let raw_pid = pid as libc::id_t;
+    loop {
+        // SAFETY: zero-initialized `libc::siginfo_t` is valid for `waitid(2)`.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is valid writable storage; `P_PID` targets only direct child `raw_pid`
+        // (never broadcasting on 0/-1), and `WNOWAIT` leaves any exited child unreaped.
+        let rc =
+            unsafe { libc::waitid(libc::P_PID, raw_pid, &raw mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) };
+        if rc == 0 {
+            #[cfg(target_os = "linux")]
+            // SAFETY: `waitid` succeeded and populated `info`; `si_pid() == 0` means still running.
+            let exited_pid = unsafe { info.si_pid() };
+            #[cfg(not(target_os = "linux"))]
+            let exited_pid = info.si_pid;
+            return if exited_pid != 0 { ChildExitProbe::ExitedZombie } else { ChildExitProbe::StillRunning };
+        }
+        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return ChildExitProbe::NotChild;
+    }
+}
+
+/// Sends `SIGHUP` to every non-leader descendant belonging to any session or process tree led by `leaders`.
 ///
-/// Must be called **while the session leaders are still alive** so background job-control process
-/// groups (which the kernel does not automatically SIGHUP on leader exit) are discovered via
-/// `session_id` before reparenting.
+/// Must be called **while the session leaders are still alive or unreaped zombies** so both
+/// background job-control process groups (`sid == leader`) and `setsid()` descendants (reachable
+/// via the parent chain) are discovered before reparenting or PID reuse.
 pub fn hang_up_session_descendants(leaders: &[u32]) {
     signal_session_descendants(leaders, SignalKind::Hup);
 }
 
-/// Sends `SIGKILL` to every non-leader process belonging to any POSIX session led by `leaders`.
+/// Sends `SIGKILL` to every non-leader descendant belonging to any session or process tree led by `leaders`.
 ///
-/// Must be called **while the session leaders are still alive** so `SIGHUP`-ignoring background
-/// jobs in separate process groups are terminated before reparenting.
+/// Must be called **while the session leaders are still alive or unreaped zombies** so `SIGHUP`-ignoring
+/// background jobs and `setsid()` descendants are terminated before reparenting or PID reuse.
 pub fn kill_session_descendants(leaders: &[u32]) {
     signal_session_descendants(leaders, SignalKind::Kill);
+}
+
+#[cfg(unix)]
+fn find_descendant_leader(
+    lookup: impl Fn(u32) -> Option<(Option<u32>, Option<u32>)>,
+    leaders: &[u32],
+    pid_u32: u32,
+) -> Option<(u32, usize)> {
+    if leaders.contains(&pid_u32) {
+        return None;
+    }
+    let mut at = pid_u32;
+    for depth in 0..MAX_TREE_DEPTH {
+        let (session, parent) = lookup(at)?;
+        if let Some(sid) = session
+            && leaders.contains(&sid)
+        {
+            return Some((sid, depth));
+        }
+        let parent = parent?;
+        if leaders.contains(&parent) {
+            return Some((parent, depth + 1));
+        }
+        if parent == at {
+            return None;
+        }
+        at = parent;
+    }
+    None
 }
 
 fn signal_session_descendants(leaders: &[u32], kind: SignalKind) {
@@ -310,7 +378,7 @@ fn signal_session_descendants(leaders: &[u32], kind: SignalKind) {
     #[cfg(unix)]
     {
         use apack_proto::types::SignalTarget;
-        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
         if leaders.is_empty() {
             return;
@@ -319,16 +387,22 @@ fn signal_session_descendants(leaders: &[u32], kind: SignalKind) {
             return;
         };
         system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
-        let others: Vec<(u32, u32)> = system
-            .processes()
-            .iter()
-            .filter_map(|(pid, process)| {
-                let session = process.session_id()?.as_u32();
-                let pid_u32 = pid.as_u32();
-                (leaders.contains(&session) && pid_u32 != session).then_some((session, pid_u32))
+        let processes = system.processes();
+        let lookup = |p: u32| {
+            processes
+                .get(&Pid::from_u32(p))
+                .map(|proc| (proc.session_id().map(|s| s.as_u32()), proc.parent().map(|par| par.as_u32())))
+        };
+        let mut others: Vec<(u32, u32, usize)> = processes
+            .keys()
+            .filter_map(|&pid| {
+                find_descendant_leader(lookup, leaders, pid.as_u32()).map(|(l, depth)| (l, pid.as_u32(), depth))
             })
             .collect();
-        for (leader, pid) in others {
+        // Signal deepest descendants first so killing an intermediate `setsid()` parent cannot
+        // reparent its children to PID 1 before they are verified and signaled.
+        others.sort_unstable_by_key(|a| std::cmp::Reverse(a.2));
+        for (leader, pid, _) in others {
             if let Some(target) = i32::try_from(pid).ok().and_then(SignalTarget::new) {
                 let _ = deliver_signal(leader, kind, SignalScope::Pid(target));
             }
@@ -571,6 +645,82 @@ mod tests {
         assert!(spawned_k.child.wait().expect("reap leader").success());
         assert!(text_k.contains("EXITED:") && !text_k.contains("EXITED:0"), "expected SIGKILL exit: {text_k:?}");
         drop(guard_k);
+
+        // 3. `probe_child_exit_unreaped` (`M6`) keeps exited zombie pinned until `wait()` reaps it,
+        //    and `kill_session_descendants` (`M5`) also kills `setsid()` descendants via parent-chain walk!
+        assert_eq!(probe_child_exit_unreaped(0), ChildExitProbe::NotChild);
+        assert_eq!(probe_child_exit_unreaped(1), ChildExitProbe::NotChild);
+        assert_eq!(probe_child_exit_unreaped(std::process::id()), ChildExitProbe::NotChild);
+
+        let mut fast = std::process::Command::new("/bin/sh").args(["-c", "sleep 0.15"]).spawn().expect("spawn fast");
+        let fast_pid = fast.id();
+        assert_eq!(probe_child_exit_unreaped(fast_pid), ChildExitProbe::StillRunning);
+        let probe_dl = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < probe_dl && probe_child_exit_unreaped(fast_pid) != ChildExitProbe::ExitedZombie {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(probe_child_exit_unreaped(fast_pid), ChildExitProbe::ExitedZombie, "zombie must stay unreaped");
+        // Still unreaped on second probe (proving WNOWAIT did not reap it!):
+        assert_eq!(probe_child_exit_unreaped(fast_pid), ChildExitProbe::ExitedZombie);
+        assert!(fast.wait().expect("reap fast").success());
+        assert_eq!(probe_child_exit_unreaped(fast_pid), ChildExitProbe::NotChild);
+
+        struct ReapGuard(std::process::Child);
+        impl Drop for ReapGuard {
+            fn drop(&mut self) {
+                if self.0.try_wait().ok().flatten().is_none() {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+        // Spawn a parent-chain descendant in its OWN `setsid()` session (via python3 `os.setsid()`
+        // or fallback to child sleep verified by `kill_session_descendants`).
+        let mut parent_sh = ReapGuard(
+            std::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "if command -v python3 >/dev/null 2>&1; then python3 -c 'import os, time; os.setsid(); print(\"SID_READY\", flush=True); time.sleep(30)'; else printf 'SID_READY\\n'; sleep 30; fi",
+                ])
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn setsid descendant test"),
+        );
+        let parent_pid = parent_sh.0.id();
+        let mut line = String::new();
+        let mut reader = std::io::BufReader::new(parent_sh.0.stdout.take().unwrap());
+        let _ = std::io::BufRead::read_line(&mut reader, &mut line);
+        assert!(line.contains("SID_READY"), "expected SID_READY, got {line:?}");
+        kill_session_descendants(&[parent_pid]);
+        // Wait briefly for the setsid() grandchild to die so `parent_sh` finishes promptly!
+        let kill_dl = Instant::now() + Duration::from_secs(3);
+        let mut reaped = false;
+        while Instant::now() < kill_dl {
+            if parent_sh.0.try_wait().expect("try_wait setsid parent").is_some() {
+                reaped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        assert!(reaped, "setsid() descendant survived kill_session_descendants");
+
+        // Pure unit coverage for `find_descendant_leader`: leader itself excluded, session match,
+        // `setsid()` grandchild via parent-chain walk, self-loop protection, and unrelated PID.
+        let mut snap: std::collections::HashMap<u32, (Option<u32>, Option<u32>)> = std::collections::HashMap::new();
+        snap.insert(100, (Some(100), Some(1))); // leader
+        snap.insert(101, (Some(100), Some(1))); // reparented to init, same session 100
+        snap.insert(102, (Some(102), Some(100))); // direct child that called setsid()
+        snap.insert(103, (Some(103), Some(102))); // grandchild that called setsid()
+        snap.insert(200, (Some(200), Some(200))); // self-loop outside tree
+        snap.insert(201, (Some(201), Some(1))); // unrelated process
+        let lookup = |p: u32| snap.get(&p).copied();
+        assert_eq!(find_descendant_leader(lookup, &[100], 100), None);
+        assert_eq!(find_descendant_leader(lookup, &[100], 101), Some((100, 0)));
+        assert_eq!(find_descendant_leader(lookup, &[100], 102), Some((100, 1)));
+        assert_eq!(find_descendant_leader(lookup, &[100], 103), Some((100, 2)));
+        assert_eq!(find_descendant_leader(lookup, &[100], 200), None);
+        assert_eq!(find_descendant_leader(lookup, &[100], 201), None);
+        assert_eq!(find_descendant_leader(lookup, &[100], 999), None);
     }
 
     #[cfg(target_os = "linux")]
