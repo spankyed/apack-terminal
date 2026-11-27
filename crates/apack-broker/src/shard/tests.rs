@@ -1336,15 +1336,26 @@ mod image_source_shard_tests {
             Some(super::super::ExitDrainState { code: Some(0), signal: None, deadline: base + Duration::from_secs(2) });
         assert_eq!(super::super::lifecycle::take_ready_exit_drain(&mut drain_eof, true, base), Some((Some(0), None)));
 
-        // 5. `compute_wait_timeout` & `run_tier2` cover `exit_drain.is_some()` when `child` and
-        //    `terminating_since` are both `None` (post-reap ConPTY drain state).
+        // 5. `is_pty_paused`, `compute_wait_timeout` & `run_tier2` cover `exit_drain.is_some()`
+        //    and `terminating_since.is_some()` when `child` is `None` (post-reap ConPTY drain state).
         let sid_drain = SessionId::new(44).unwrap();
         insert_image_session(&mut runner, sid_drain, false);
-        runner.sessions.get_mut(&sid_drain).unwrap().exit_drain = Some(super::super::ExitDrainState {
-            code: Some(9),
-            signal: None,
-            deadline: Instant::now() + Duration::from_secs(1),
-        });
+        {
+            let sess = runner.sessions.get_mut(&sid_drain).unwrap();
+            sess.paused_by_stream = true;
+            assert!(sess.is_pty_paused());
+            sess.terminating_since = Some(Instant::now());
+            assert!(!sess.is_pty_paused(), "terminating_since must override flow-control pause");
+            sess.terminating_since = None;
+            assert!(sess.is_pty_paused());
+            sess.exit_drain = Some(super::super::ExitDrainState {
+                code: Some(9),
+                signal: None,
+                deadline: Instant::now() + Duration::from_secs(1),
+            });
+            assert!(!sess.is_pty_paused(), "exit_drain must override flow-control pause");
+            sess.paused_by_stream = false;
+        }
         let wait_t = runner.compute_wait_timeout(TimestampMs::from_millis(2_000));
         assert_eq!(
             wait_t, TERMINATE_POLL_INTERVAL,

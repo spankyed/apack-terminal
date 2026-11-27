@@ -2071,6 +2071,7 @@ fn pr6_explicit_session_lifetime_and_disconnect_teardown() {
     broker.close_connection(conn(1), CloseReason::TransportClosed, ts(6), &mut actions);
     assert_eq!(actions.iter().filter(|a| **a == BrokerAction::TeardownSession(sid(1))).count(), 1);
     assert!(!actions.contains(&BrokerAction::TeardownSession(sid(2))));
+    assert!(!actions.contains(&BrokerAction::TeardownSession(sid(3))));
     assert!(!actions.contains(&BrokerAction::TeardownNonKeptSessions));
 
     // conn(2) releases pin l2 on sid(2) while owner conn(1) is already gone -> TeardownSession(2)!

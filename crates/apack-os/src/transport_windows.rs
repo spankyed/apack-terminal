@@ -14,7 +14,8 @@ use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, INVALID_HANDLE
 use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, GetSecurityInfo, SE_KERNEL_OBJECT};
 use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
 use windows_sys::Win32::System::Console::{
-    GetConsoleCP, GetStdHandle, STD_ERROR_HANDLE, SetConsoleCtrlHandler, SetStdHandle,
+    GetConsoleCP, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCtrlHandler,
+    SetStdHandle,
 };
 use windows_sys::Win32::System::IO::CancelIoEx;
 use windows_sys::Win32::System::Pipes::{DisconnectNamedPipe, GetNamedPipeClientProcessId};
@@ -30,8 +31,8 @@ pub fn configure_detached_command(cmd: &mut std::process::Command) {
     cmd.creation_flags(WINDOWS_DETACHED_FLAGS);
 }
 
-fn is_closable_handle(handle: HANDLE) -> bool {
-    !handle.is_null() && handle != INVALID_HANDLE_VALUE
+fn should_close_old_stderr(old: HANDLE, stdin: HANDLE, stdout: HANDLE, new_handle: HANDLE) -> bool {
+    !old.is_null() && old != INVALID_HANDLE_VALUE && old != stdin && old != stdout && old != new_handle
 }
 
 /// Redirects `STD_ERROR_HANDLE` to `NUL` and closes the inherited startup stderr pipe write handle
@@ -44,14 +45,19 @@ pub fn prepare_detached_daemon() {
     }
     if let Ok(nul) = std::fs::OpenOptions::new().write(true).open("NUL") {
         use std::os::windows::io::IntoRawHandle;
-        // SAFETY: `GetStdHandle` fetches the inherited stderr handle; `SetStdHandle` installs our
-        // owned `NUL` handle as process stderr; closing the previous handle releases any proxy pipe.
+        // SAFETY: `GetStdHandle` fetches the inherited std handles; `SetStdHandle` installs `nul`'s
+        // handle as process stderr before transferring ownership via `into_raw_handle()`, and we
+        // only close `old` when it is valid and not shared with stdin/stdout/new_handle.
         unsafe {
             let old = GetStdHandle(STD_ERROR_HANDLE);
-            let new_handle = nul.into_raw_handle() as HANDLE;
-            SetStdHandle(STD_ERROR_HANDLE, new_handle);
-            if is_closable_handle(old) {
-                CloseHandle(old);
+            let stdin = GetStdHandle(STD_INPUT_HANDLE);
+            let stdout = GetStdHandle(STD_OUTPUT_HANDLE);
+            let new_handle = nul.as_raw_handle() as HANDLE;
+            if SetStdHandle(STD_ERROR_HANDLE, new_handle) != 0 {
+                let _ = nul.into_raw_handle();
+                if should_close_old_stderr(old, stdin, stdout, new_handle) {
+                    CloseHandle(old);
+                }
             }
         }
     }
@@ -358,9 +364,16 @@ mod tests {
             let _ = std::io::stdin().read_to_end(&mut sink);
             return;
         }
-        assert!(!is_closable_handle(std::ptr::null_mut()));
-        assert!(!is_closable_handle(INVALID_HANDLE_VALUE));
-        assert!(is_closable_handle(4usize as HANDLE));
+        let h1 = 4usize as HANDLE;
+        let h2 = 8usize as HANDLE;
+        let h3 = 12usize as HANDLE;
+        let h4 = 16usize as HANDLE;
+        assert!(!should_close_old_stderr(std::ptr::null_mut(), h2, h3, h4));
+        assert!(!should_close_old_stderr(INVALID_HANDLE_VALUE, h2, h3, h4));
+        assert!(!should_close_old_stderr(h1, h1, h3, h4));
+        assert!(!should_close_old_stderr(h1, h2, h1, h4));
+        assert!(!should_close_old_stderr(h1, h2, h3, h1));
+        assert!(should_close_old_stderr(h1, h2, h3, h4));
 
         let exe = std::env::current_exe().expect("current_exe");
         let mut cmd = std::process::Command::new(exe);

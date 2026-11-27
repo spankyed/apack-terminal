@@ -188,7 +188,7 @@ impl JobGuard {
 /// When `child.as_raw_handle()` is available, attaches exclusively via that pinned Win32 process
 /// `HANDLE` (never falling back to `OpenProcess(pid)`, which would re-introduce PID-reuse TOCTOU
 /// if the child already exited). Falls back to `JobGuard::attach(pid)` only when `as_raw_handle()`
-/// returns `None` and `pid >= 2`.
+/// returns `None`.
 pub(crate) fn attach_child_job(child: &dyn portable_pty::Child, pid: u32) -> Option<JobGuard> {
     if let Some(handle) = child.as_raw_handle() {
         if !is_valid_process_handle(handle as HANDLE) {
@@ -257,7 +257,7 @@ mod tests {
         }
 
         // Also exercise `JobGuard::attach(pid)` and `attach_child_job` directly (handle path,
-        // null/INVALID_HANDLE_VALUE non-fallback, and `None` handle fallback with pid < 2 guard).
+        // null/INVALID_HANDLE_VALUE non-fallback, and `None` handle fallback to `JobGuard::attach`).
         #[derive(Debug)]
         struct FakeChild(Option<usize>);
         impl portable_pty::ChildKiller for FakeChild {

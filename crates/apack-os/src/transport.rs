@@ -642,8 +642,8 @@ mod unix_signals {
 pub use unix_signals::{ShutdownSignalGuard, install_shutdown_signals};
 
 /// Configures a spawned background broker [`std::process::Command`] to detach from the caller's
-/// controlling session/console (`setsid(2)` on Unix, `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-/// | CREATE_NO_WINDOW` on Windows) so closing the proxy/SSH PTY cannot `SIGHUP` the broker.
+/// controlling session/console (`setsid(2)` on Unix, `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`
+/// on Windows) so closing the proxy/SSH PTY cannot `SIGHUP` the broker.
 pub fn configure_detached_command(cmd: &mut std::process::Command) {
     #[cfg(unix)]
     {
@@ -682,16 +682,22 @@ pub fn prepare_detached_daemon() {
                 libc::sigemptyset(&raw mut sa.sa_mask);
                 libc::sigaction(libc::SIGHUP, &sa, std::ptr::null_mut());
             }
-            // SAFETY: `isatty(STDERR_FILENO)` is safe on any fd; `dup2` atomically redirects fd 2
-            // to `/dev/null` and closes any inherited startup stderr pipe write end.
+            // SAFETY: `isatty(STDERR_FILENO)` is safe on any fd; `open("/dev/null")` + `dup2`
+            // atomically replaces fd 2 and closes any inherited startup stderr pipe write end.
             if unsafe { libc::isatty(libc::STDERR_FILENO) } == 0
                 && let Ok(devnull) = std::fs::OpenOptions::new().write(true).open("/dev/null")
             {
-                use std::os::fd::AsRawFd;
-                // SAFETY: `devnull` is a valid open fd; `dup2` atomically redirects fd 2 to
-                // `/dev/null` and closes any inherited startup stderr pipe write end.
-                unsafe {
-                    libc::dup2(devnull.as_raw_fd(), libc::STDERR_FILENO);
+                use std::os::fd::IntoRawFd;
+                let raw = devnull.into_raw_fd();
+                if raw != libc::STDERR_FILENO {
+                    // SAFETY: `raw` is an open owned fd distinct from fd 2; `dup2` redirects fd 2
+                    // to `/dev/null` and closes any inherited stderr pipe, then `close(raw)` frees
+                    // the temporary descriptor. When `raw == 2` (fd 2 was initially closed), fd 2
+                    // already points to `/dev/null` and stays open.
+                    unsafe {
+                        libc::dup2(raw, libc::STDERR_FILENO);
+                        libc::close(raw);
+                    }
                 }
             }
         }
@@ -1251,6 +1257,13 @@ mod tests {
                 let _ = std::io::stderr().write_all(b"POST_DETACH_MUST_GO_TO_DEVNULL\n");
                 // SAFETY: raising SIGHUP to self verifies `prepare_detached_daemon` installed SIG_IGN.
                 assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
+                // Closing fd 2 and re-running `prepare_detached_daemon` must leave fd 2 open at
+                // `/dev/null` instead of closing it again via a dropped `File`.
+                // SAFETY: isolated single-threaded child process testing fd 2 reopen behavior.
+                unsafe { libc::close(libc::STDERR_FILENO) };
+                prepare_detached_daemon();
+                // SAFETY: `fcntl(F_GETFD)` queries whether fd 2 is open without mutating state.
+                assert!(unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_GETFD) } >= 0);
             }
             return;
         }

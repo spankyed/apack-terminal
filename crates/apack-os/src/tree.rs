@@ -25,7 +25,7 @@ impl TreeGuard {
     ///
     /// On Windows, attaches the Job Object directly via the child's pinned process `HANDLE`
     /// (`AssignProcessToJobObject`) instead of `OpenProcess(pid)`, eliminating PID-reuse races.
-    pub fn attach_child(child: &dyn portable_pty::Child, pid: u32) -> Option<Self> {
+    pub(crate) fn attach_child(child: &dyn portable_pty::Child, pid: u32) -> Option<Self> {
         #[cfg(unix)]
         {
             let _ = child;

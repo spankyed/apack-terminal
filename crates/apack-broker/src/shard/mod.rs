@@ -245,7 +245,10 @@ pub(crate) struct LiveSession {
 
 impl LiveSession {
     pub(crate) fn is_pty_paused(&self) -> bool {
-        self.paused_by_stream || self.paused_by_raw_flow || self.paused_by_raw_inflight || self.pending_image.is_some()
+        self.pending_image.is_some()
+            || (self.terminating_since.is_none()
+                && self.exit_drain.is_none()
+                && (self.paused_by_stream || self.paused_by_raw_flow || self.paused_by_raw_inflight))
     }
 
     fn summary(&self) -> SessionSummary {
