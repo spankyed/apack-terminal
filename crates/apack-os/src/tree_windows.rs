@@ -217,9 +217,18 @@ mod tests {
     fn job_guard_owns_assigned_child_grows_on_more_data_and_kills_on_drop() {
         use std::os::windows::io::AsHandle;
 
+        assert!(!is_valid_process_handle(std::ptr::null_mut()));
+        assert!(!is_valid_process_handle(INVALID_HANDLE_VALUE));
+        assert!(is_valid_process_handle(4usize as HANDLE));
+
         // SAFETY: testing explicit rejection of `INVALID_HANDLE_VALUE` (`GetCurrentProcess()`).
+        // `mem::forget` any erroneously returned guard before panicking so `KILL_ON_JOB_CLOSE`
+        // cannot terminate this test process with exit code 0 and mask a mutant failure.
         let pseudo = unsafe { BorrowedHandle::borrow_raw(INVALID_HANDLE_VALUE as std::os::windows::io::RawHandle) };
-        assert!(JobGuard::attach_handle(pseudo).is_none());
+        if let Some(guard) = JobGuard::attach_handle(pseudo) {
+            std::mem::forget(guard);
+            panic!("JobGuard::attach_handle must reject INVALID_HANDLE_VALUE");
+        }
 
         let mut child = std::process::Command::new("cmd.exe")
             .args(["/C", "ping -n 30 127.0.0.1 >nul"])
@@ -283,9 +292,6 @@ mod tests {
             }
         }
 
-        assert!(!is_valid_process_handle(std::ptr::null_mut()));
-        assert!(!is_valid_process_handle(INVALID_HANDLE_VALUE));
-        assert!(is_valid_process_handle(4usize as HANDLE));
         assert!(JobGuard::attach(0).is_none());
         assert!(attach_child_job(&FakeChild(None), 0).is_none());
         assert!(attach_child_job(&FakeChild(None), 1).is_none());
@@ -295,7 +301,10 @@ mod tests {
             .spawn()
             .expect("spawn child2");
         assert!(attach_child_job(&FakeChild(Some(0)), child2.id()).is_none());
-        assert!(attach_child_job(&FakeChild(Some(INVALID_HANDLE_VALUE as usize)), child2.id()).is_none());
+        if let Some(guard) = attach_child_job(&FakeChild(Some(INVALID_HANDLE_VALUE as usize)), child2.id()) {
+            std::mem::forget(guard);
+            panic!("attach_child_job must reject INVALID_HANDLE_VALUE");
+        }
         let guard2 =
             attach_child_job(&FakeChild(Some(child2.as_raw_handle() as usize)), 0).expect("attach via child handle");
         assert!(guard2.owns(child2.id()).expect("owns child2"));
