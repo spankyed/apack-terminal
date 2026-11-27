@@ -2,27 +2,29 @@
  * Total, bounds-checked binary wire reader and writer matching `crates/apack-proto/src/codec.rs`
  * byte-for-byte. Zero runtime dependencies, strict DOM-compatible ES2022.
  */
+import { MAX_BLOB_BYTES, MAX_STRING_BYTES, MAX_VEC_ITEMS } from './constants.ts'
 
-export const PROTOCOL_VERSION = 2
-export const FRAME_HEADER_LEN = 14
-export const INNER_HEADER_LEN = FRAME_HEADER_LEN - 4
-export const MAX_FRAME_PAYLOAD = 8_388_608
-export const MAX_BODY_LEN = INNER_HEADER_LEN + MAX_FRAME_PAYLOAD
-export const BULK_CHUNK_BYTES = 65_536
-export const FIN_FRAME = new Uint8Array([0, 0, 0, 0])
-
-export const MAX_GRID_COLS = 1_000
-export const MAX_GRID_ROWS = 1_000
-export const MAX_ROWS_PER_FETCH = 2_000
-export const MAX_COMMANDS = 256
-export const MAX_STATUSES = 256
-export const MAX_SEARCH_MATCHES = 2_000
-export const MAX_SEARCH_NEEDLE_BYTES = 4_096
-export const MAX_LEASE_GRACE_MS = 300_000
-export const DEFAULT_SSH_GRACE_MS = 30_000
-export const MAX_STRING_BYTES = 1_048_576
-export const MAX_VEC_ITEMS = 65_536
-export const MAX_BLOB_BYTES = MAX_FRAME_PAYLOAD
+export {
+  BULK_CHUNK_BYTES,
+  DEFAULT_SSH_GRACE_MS,
+  FIN_FRAME,
+  FRAME_HEADER_LEN,
+  INNER_HEADER_LEN,
+  MAX_BLOB_BYTES,
+  MAX_BODY_LEN,
+  MAX_COMMANDS,
+  MAX_FRAME_PAYLOAD,
+  MAX_GRID_COLS,
+  MAX_GRID_ROWS,
+  MAX_LEASE_GRACE_MS,
+  MAX_ROWS_PER_FETCH,
+  MAX_SEARCH_MATCHES,
+  MAX_SEARCH_NEEDLE_BYTES,
+  MAX_STATUSES,
+  MAX_STRING_BYTES,
+  MAX_VEC_ITEMS,
+  PROTOCOL_VERSION,
+} from './constants.ts'
 
 export type WireErrorKind =
   | 'UnexpectedEof'

@@ -1,7 +1,7 @@
 //! The repository's own tasks, run as `cargo xtask <task>`:
 //!
-//! - `generate`: regenerates `node/wire-vectors-v2.json` from `apack-proto` and `apack-core`.
-//! - `check-generated`: fails when committed `node/wire-vectors-v2.json` differs from what `generate` writes.
+//! - `generate`: regenerates `view/src/wire/{constants,types,messages}.ts` and `node/wire-vectors-v2.json` from `apack-proto` and `apack-core`.
+//! - `check-generated`: fails when committed generated TS wire files or `node/wire-vectors-v2.json` differ from what `generate` writes.
 //! - `notices`: writes the release binaries' third-party notices, `THIRD-PARTY-NOTICES` and
 //!   `COPYRIGHT-rust-library.html`, at the repository's root (`src/notices.rs`).
 //! - `check-notices`: fails when what `notices` would write differs from what is committed.

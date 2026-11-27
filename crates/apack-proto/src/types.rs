@@ -949,6 +949,9 @@ pub struct PackedRun {
 }
 
 impl PackedRun {
+    /// Wide character or grapheme cluster needing per-cell placement.
+    pub const FLAG_PER_CELL: u8 = 0x01;
+
     pub(crate) fn encode(&self, w: &mut Writer) {
         w.u16(self.col_start);
         w.u16(self.col_len);

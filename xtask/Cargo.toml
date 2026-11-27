@@ -6,6 +6,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+apack-proto = { path = "../crates/apack-proto" }
 tempfile = "3.27.0"
 # For `notices`, which finds the libghostty-vt `ghostty-vt-rs-sys` links in `cargo metadata`'s output
 serde_json = "1.0.154"

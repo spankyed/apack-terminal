@@ -1,15 +1,20 @@
-//! Golden v2 wire & mutual-HMAC test vectors (`node/wire-vectors-v2.json`), derived directly from
+//! Deterministic Rust -> TypeScript wire schema codegen (`view/src/wire/{constants,types,messages}.ts`)
+//! and golden v2 wire & mutual-HMAC test vectors (`node/wire-vectors-v2.json`), derived directly from
 //! `apack-proto` and `apack-core` and verified byte-for-byte on both Rust and TypeScript sides.
 
 use std::path::Path;
 use std::process::Command;
 
+use crate::wire_codegen;
+
 /// The golden v2 wire-vector file committed inside `node/` and consumed by `view/tests/wire-vectors.spec.ts`.
 pub const GENERATED: &str = "wire-vectors-v2.json";
 pub const COMMITTED_DIR: &str = "node";
 
-/// Regenerates `node/wire-vectors-v2.json` from `apack-proto` and `apack-core`.
+/// Regenerates `view/src/wire/{constants,types,messages}.ts` and `node/wire-vectors-v2.json`
+/// from `apack-proto` and `apack-core`.
 pub fn update(root: &Path) -> Result<(), String> {
+    wire_codegen::write_all(root)?;
     let output = Command::new(env!("CARGO"))
         .args(["test", "--locked", "-p", "apack-broker", "--test", "wire_vectors_v2"])
         .env("UPDATE_VECTORS", "1")
@@ -29,8 +34,10 @@ pub fn update(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Verifies committed `node/wire-vectors-v2.json` matches `apack-proto` and `apack-core` byte-for-byte.
+/// Verifies committed generated TypeScript wire modules and `node/wire-vectors-v2.json` match
+/// `apack-proto` and `apack-core` byte-for-byte.
 pub fn check(root: &Path) -> Result<(), String> {
+    wire_codegen::check_all(root)?;
     let output = Command::new(env!("CARGO"))
         .args(["test", "--locked", "-p", "apack-broker", "--test", "wire_vectors_v2"])
         .current_dir(root)
