@@ -1,12 +1,20 @@
 use super::*;
 
 #[test]
-fn allows_thin_windows_wiring_cross_platform_any_and_test_only_cfg() {
+fn allows_thin_windows_wiring_extern_blocks_typed_closures_and_test_only_cfg() {
     let src = r#"
 #[cfg(windows)]
 mod win_impl;
 #[cfg(windows)]
 use crate::win_impl::helper;
+#[cfg(windows)]
+extern "C" {
+    fn win_ffi_decl(x: i32) -> i32;
+}
+#[cfg(windows)]
+trait WinHook {
+    fn on_event(&self);
+}
 
 pub struct State {
     #[cfg(windows)]
@@ -28,6 +36,15 @@ pub fn compiled_on_both(a: usize, b: usize) -> usize {
 pub fn run(state: &mut State, pty: &Pty) -> Option<usize> {
     #[cfg(windows)]
     let _x: Result<usize, String> = helper(state, move || state.count);
+
+    #[cfg(windows)]
+    let _cb = |buf: Vec<u8>| handle(buf);
+
+    #[cfg(windows)]
+    let _cb2 = || -> Option<()> { win_fn() };
+
+    #[cfg(windows)]
+    let _timeout = 1e-5;
 
     #[cfg(windows)]
     {
@@ -61,12 +78,12 @@ fn another_test_helper(x: bool) -> bool {
 }
 "#;
     let res = scan_source("crates/demo/src/lib.rs", src);
-    assert!(res.cfg_attrs_seen >= 8);
+    assert!(res.cfg_attrs_seen >= 10);
     assert!(res.violations.is_empty(), "unexpected violations: {:?}", res.violations);
 }
 
 #[test]
-fn rejects_windows_functions_methods_impls_inline_mods_and_inner_cfg() {
+fn rejects_windows_functions_methods_impls_inline_mods_trait_defaults_and_inner_cfg() {
     let fn_src = "#[cfg(windows)]\npub(crate) fn win_only() -> bool { true }\n";
     let res = scan_source("crates/demo/src/a.rs", fn_src);
     assert_eq!(res.violations.len(), 1);
@@ -83,10 +100,25 @@ fn rejects_windows_functions_methods_impls_inline_mods_and_inner_cfg() {
     assert_eq!(res.violations.len(), 1);
     assert!(res.violations[0].reason.contains("Windows-only function `fallback`"));
 
+    let not_any_unix = "#[cfg(not(any(unix, target_os = \"wasi\")))]\npub fn only_non_unix() {}\n";
+    let res = scan_source("crates/demo/src/b2.rs", not_any_unix);
+    assert_eq!(res.violations.len(), 1);
+    assert!(res.violations[0].reason.contains("Windows-only function `only_non_unix`"));
+
+    let target_family_win = "#[cfg(target_family = \"windows\")]\nconst fn win_const() -> u32 { 1 }\n";
+    let res = scan_source("crates/demo/src/b3.rs", target_family_win);
+    assert_eq!(res.violations.len(), 1);
+    assert!(res.violations[0].reason.contains("Windows-only function `win_const`"));
+
     let impl_src = "#[cfg(windows)]\nimpl Foo { fn bar(&self) {} }\n";
     let res = scan_source("crates/demo/src/c.rs", impl_src);
     assert_eq!(res.violations.len(), 1);
     assert!(res.violations[0].reason.contains("`impl` block"));
+
+    let trait_default = "#[cfg(windows)]\ntrait WinTrait {\n    fn compute(&self, a: usize) -> usize { a + 1 }\n}\n";
+    let res = scan_source("crates/demo/src/trait_default.rs", trait_default);
+    assert_eq!(res.violations.len(), 1);
+    assert!(res.violations[0].reason.contains("default method body"));
 
     let inline_mod = "#[cfg(target_os = \"windows\")]\nmod inner { fn x() {} }\n";
     let res = scan_source("crates/demo/src/d.rs", inline_mod);
@@ -100,7 +132,37 @@ fn rejects_windows_functions_methods_impls_inline_mods_and_inner_cfg() {
 }
 
 #[test]
-fn rejects_mutable_logic_inside_windows_blocks_and_match_guards() {
+fn inline_cfg_test_and_macro_rules_do_not_hide_subsequent_windows_items() {
+    let inline_test_then_win = r#"
+mod tests {
+    #![cfg(test)]
+    #[cfg(windows)]
+    fn ok_in_test(a: usize, b: usize) -> usize { a + b }
+}
+
+#[cfg(windows)]
+pub fn leaked_after_test_mod(x: usize) -> usize { x + 1 }
+"#;
+    let res = scan_source("crates/demo/src/inline_test.rs", inline_test_then_win);
+    assert_eq!(res.violations.len(), 1);
+    assert!(res.violations[0].reason.contains("leaked_after_test_mod"));
+
+    let macro_then_win = r#"
+#[cfg(windows)]
+macro_rules! win_noop {
+    () => {};
+}
+
+#[cfg(windows)]
+pub fn leaked_after_macro(x: usize) -> usize { x + 1 }
+"#;
+    let res = scan_source("crates/demo/src/macro_then_win.rs", macro_then_win);
+    assert_eq!(res.violations.len(), 1);
+    assert!(res.violations[0].reason.contains("leaked_after_macro"));
+}
+
+#[test]
+fn rejects_mutable_logic_inside_windows_blocks_bitwise_ops_and_match_guards() {
     let cases = [
         ("fn f(x: bool) {\n    #[cfg(windows)]\n    if x { do_it(); }\n}\n", "conditional `if` branch"),
         (
@@ -113,6 +175,8 @@ fn rejects_mutable_logic_inside_windows_blocks_and_match_guards() {
             "arithmetic/bitwise operator",
         ),
         ("fn f(a: bool, b: bool) -> bool {\n    #[cfg(windows)]\n    { a || b }\n}\n", "boolean logic operator"),
+        ("fn f(a: u32, b: u32) -> u32 {\n    #[cfg(windows)]\n    let flags = a | b;\n    flags\n}\n", "bitwise OR"),
+        ("fn f(a: u32, m: u32) -> u32 {\n    #[cfg(windows)]\n    let masked = a & m;\n    masked\n}\n", "bitwise AND"),
         (
             "fn f(flag: bool) -> bool {\n    #[cfg(all(windows, not(feature = \"x\")))]\n    { !flag }\n}\n",
             "boolean negation",

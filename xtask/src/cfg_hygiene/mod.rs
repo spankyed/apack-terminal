@@ -5,8 +5,8 @@
 //! - Linux mutation shards skip `#[cfg(windows)]` / `#[cfg(not(unix))]` regions (not compiled on Linux).
 //! - Windows mutation CI (`.github/workflows/mutants.yml`) only mutates files listed in
 //!   `.cargo/windows-only` (because mixed files contain `#[cfg(unix)]` arms that Windows does not compile).
-//! - Consequently, any Windows-only function, `impl`, inline `mod`, or mutable branch/operator placed
-//!   outside `.cargo/windows-only` is a silent blind spot for BOTH mutation gates.
+//! - Consequently, any Windows-only function, `impl`, inline `mod`, trait default method, or mutable
+//!   branch/operator placed outside `.cargo/windows-only` is a silent blind spot for BOTH mutation gates.
 //!
 //! Thin wiring (such as `mod foo_windows;`, `use`, struct/enum fields, match-arm delegation, or
 //! single-call delegation into `*_windows.rs`) is permitted in mixed files; real Windows-only logic
@@ -107,7 +107,7 @@ fn is_skipped_path(rel: &str) -> bool {
         return true;
     }
     let parts: Vec<&str> = rel.split('/').collect();
-    if parts.last().is_some_and(|&name| name == "tests.rs") {
+    if parts.last().is_some_and(|&name| name == "tests.rs" || name.ends_with("_tests.rs")) {
         return true;
     }
     parts.iter().any(|&comp| comp == "tests" || comp == "benches")
@@ -244,14 +244,22 @@ fn pred_mentions_active_test(pred: &[Tok]) -> bool {
     false
 }
 
-fn pred_is_unix_family(pred: &[Tok]) -> bool {
+/// Returns true when `pred` always evaluates to true on Unix/Linux (so `not(pred)` never compiles on Unix).
+fn pred_holds_on_unix(pred: &[Tok]) -> bool {
     if pred.len() == 1 && pred[0].is_ident("unix") {
         return true;
     }
-    pred.len() == 3
+    if pred.len() == 3
         && pred[0].is_ident("target_family")
         && pred[1].is_punct("=")
         && matches!(&pred[2].kind, TokKind::StringLit(s) if s == "unix")
+    {
+        return true;
+    }
+    if let Some(args) = unwrap_call(pred, "any") {
+        return split_top_level_commas(args).into_iter().any(pred_holds_on_unix);
+    }
+    false
 }
 
 fn pred_is_windows_only(pred: &[Tok]) -> bool {
@@ -259,14 +267,14 @@ fn pred_is_windows_only(pred: &[Tok]) -> bool {
         return true;
     }
     if pred.len() == 3
-        && pred[0].is_ident("target_os")
+        && (pred[0].is_ident("target_os") || pred[0].is_ident("target_family"))
         && pred[1].is_punct("=")
         && matches!(&pred[2].kind, TokKind::StringLit(s) if s == "windows")
     {
         return true;
     }
     if let Some(inner) = unwrap_call(pred, "not") {
-        return pred_is_unix_family(inner);
+        return pred_holds_on_unix(inner);
     }
     if let Some(args) = unwrap_call(pred, "all") {
         return split_top_level_commas(args).into_iter().any(pred_is_windows_only);
@@ -278,13 +286,43 @@ fn pred_is_windows_only(pred: &[Tok]) -> bool {
     false
 }
 
+/// Advances from inside an enclosing `{ ... }` block to just past its closing `}`.
+fn skip_to_enclosing_brace_end(tokens: &[Tok], start: usize) -> usize {
+    let mut depth = 1usize;
+    let mut i = start;
+    while i < tokens.len() {
+        if tokens[i].is_punct("{") {
+            depth += 1;
+        } else if tokens[i].is_punct("}") {
+            depth -= 1;
+            if depth == 0 {
+                return i + 1;
+            }
+        }
+        i += 1;
+    }
+    tokens.len()
+}
+
 /// Scans a single Rust source file for mutable `#[cfg(windows)]` / `#[cfg(not(unix))]` sites.
 pub fn scan_source(rel_path: &str, source: &str) -> ScanResult {
     let tokens = tokenize(source);
     let mut result = ScanResult::default();
     let mut i = 0usize;
+    let mut brace_depth = 0usize;
 
     while i < tokens.len() {
+        if tokens[i].is_punct("{") {
+            brace_depth += 1;
+            i += 1;
+            continue;
+        }
+        if tokens[i].is_punct("}") {
+            brace_depth = brace_depth.saturating_sub(1);
+            i += 1;
+            continue;
+        }
+
         let Some(attr) = parse_attr(&tokens, i) else {
             i += 1;
             continue;
@@ -297,14 +335,26 @@ pub fn scan_source(rel_path: &str, source: &str) -> ScanResult {
 
         if attr.is_inner {
             match kind {
-                CfgKind::Test => return result,
+                CfgKind::Test => {
+                    if brace_depth == 0 {
+                        return result;
+                    }
+                    i = skip_to_enclosing_brace_end(&tokens, attr.next_idx);
+                    brace_depth -= 1;
+                    continue;
+                }
                 CfgKind::WindowsOnly => {
                     result.violations.push(Violation {
                         path: rel_path.to_owned(),
                         line: attr.line,
                         reason: "Windows-only inner attribute `#![cfg(...)]` outside .cargo/windows-only".to_owned(),
                     });
-                    return result;
+                    if brace_depth == 0 {
+                        return result;
+                    }
+                    i = skip_to_enclosing_brace_end(&tokens, attr.next_idx);
+                    brace_depth -= 1;
+                    continue;
                 }
                 CfgKind::NotCfg | CfgKind::Other => {
                     i = attr.next_idx;

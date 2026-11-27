@@ -5,11 +5,11 @@
 //! for Windows CI or installing a full MSVC SDK.
 //!
 //! Because `cargo check` / `cargo clippy` only emits metadata and never invokes a native linker,
-//! on non-Windows hosts this task points `ghostty-vt-rs-sys` at a temporary metadata-only stub
-//! prefix inside an isolated `target/windows-check` directory (unless the caller already set
-//! `GHOSTTY_VT_RS_SYS_PREBUILT_DIR` / `GHOSTTY_SOURCE_DIR` or passed `--no-stub`). That keeps the
-//! main `target/` tree untouched for real cross-links while caching incremental check metadata
-//! across runs.
+//! on non-Windows hosts this task points `ghostty-vt-rs-sys` at a deterministic metadata-only stub
+//! directory inside an isolated `target/windows-check/vt-stub` directory (unless a Windows-capable
+//! `GHOSTTY_VT_RS_SYS_PREBUILT_DIR` / non-empty `GHOSTTY_SOURCE_DIR` is already configured or
+//! `--no-stub` was passed). That keeps the main `target/` tree untouched for real cross-links while
+//! preserving incremental check metadata across runs.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -19,6 +19,9 @@ use std::time::Instant;
 /// Default Windows target triple checked locally.
 pub const DEFAULT_WINDOWS_TARGET: &str = "x86_64-pc-windows-msvc";
 
+const CHECK_TARGET_SUBDIR: &str = "windows-check";
+const VT_STUB_SUBDIR: &str = "vt-stub";
+const WINDOWS_STATIC_LIB_REL: &str = "lib/ghostty-vt-static.lib";
 const USAGE: &str = "usage: cargo xtask check-windows [--target TRIPLE] [--check-only] [--xwin] [--no-stub]";
 
 /// Parsed CLI options for `cargo xtask check-windows`.
@@ -110,7 +113,7 @@ pub fn build_cargo_args(opts: &WindowsCheckOpts, native_windows: bool) -> Vec<St
 
 /// Resolves the isolated target directory used when running with the metadata-only VT stub,
 /// preserving incremental check artifacts without ever writing stub outputs into the main
-/// linking target directory.
+/// linking target directory or double-nesting `windows-check`.
 pub fn resolve_check_target_dir(root: &Path, cargo_target_dir_env: Option<&OsStr>) -> PathBuf {
     let base = match cargo_target_dir_env {
         Some(dir) if !dir.is_empty() => {
@@ -119,28 +122,62 @@ pub fn resolve_check_target_dir(root: &Path, cargo_target_dir_env: Option<&OsStr
         }
         _ => root.join("target"),
     };
-    base.join("windows-check")
+    if base.file_name() == Some(OsStr::new(CHECK_TARGET_SUBDIR)) { base } else { base.join(CHECK_TARGET_SUBDIR) }
 }
 
-/// Creates a scoped temporary metadata-only `ghostty-vt-rs-sys` prebuilt directory containing
-/// the placeholder files checked by `ghostty-vt-rs-sys/build.rs`.
+/// Decides whether to use the metadata-only Windows VT stub for non-native cross-checking.
 ///
+/// A host `GHOSTTY_VT_RS_SYS_PREBUILT_DIR` exported by `cargo xtask vt-prebuilt` only ships
+/// `lib/libghostty-vt.a` (no `lib/ghostty-vt-static.lib`), so it cannot satisfy a Windows check.
+/// Empty env vars are ignored rather than treated as valid overrides.
+pub fn should_use_vt_stub(
+    native_windows: bool,
+    no_stub: bool,
+    prebuilt_dir_env: Option<&OsStr>,
+    source_dir_env: Option<&OsStr>,
+) -> bool {
+    if native_windows || no_stub {
+        return false;
+    }
+    if source_dir_env.is_some_and(|v| !v.is_empty()) {
+        return false;
+    }
+    if let Some(dir) = prebuilt_dir_env.filter(|v| !v.is_empty())
+        && Path::new(dir).join(WINDOWS_STATIC_LIB_REL).is_file()
+    {
+        return false;
+    }
+    true
+}
+
+/// Materializes (idempotently) the deterministic metadata-only `ghostty-vt-rs-sys` stub prefix
+/// under `target_dir/vt-stub`.
+///
+/// Using a stable path keeps `GHOSTTY_VT_RS_SYS_PREBUILT_DIR` unchanged across runs so Cargo
+/// reuses incremental check artifacts instead of re-running `ghostty-vt-rs-sys/build.rs`.
 /// Only valid for non-linking commands (`cargo check` / `cargo clippy`).
-pub fn create_vt_check_stub() -> Result<tempfile::TempDir, String> {
-    let dir = tempfile::tempdir().map_err(|e| format!("check-windows: creating temp stub dir: {e}"))?;
-    let lib_dir = dir.path().join("lib");
-    let include_dir = dir.path().join("include").join("ghostty");
+pub fn ensure_vt_check_stub(target_dir: &Path) -> Result<PathBuf, String> {
+    let stub_dir = target_dir.join(VT_STUB_SUBDIR);
+    let lib_dir = stub_dir.join("lib");
+    let include_dir = stub_dir.join("include").join("ghostty");
     std::fs::create_dir_all(&lib_dir).map_err(|e| format!("check-windows: mkdir stub lib: {e}"))?;
     std::fs::create_dir_all(&include_dir).map_err(|e| format!("check-windows: mkdir stub include: {e}"))?;
-    for rel in ["lib/libghostty-vt.a", "lib/ghostty-vt-static.lib", "include/ghostty/vt.h"] {
-        std::fs::write(dir.path().join(rel), b"").map_err(|e| format!("check-windows: writing stub {rel}: {e}"))?;
+    for rel in ["lib/libghostty-vt.a", WINDOWS_STATIC_LIB_REL, "include/ghostty/vt.h"] {
+        let path = stub_dir.join(rel);
+        if !path.is_file() {
+            std::fs::write(&path, b"").map_err(|e| format!("check-windows: writing stub {rel}: {e}"))?;
+        }
     }
-    Ok(dir)
+    Ok(stub_dir)
 }
 
-fn verify_cross_toolchain(opts: &WindowsCheckOpts) -> Result<(), String> {
+fn verify_cross_toolchain(root: &Path, opts: &WindowsCheckOpts) -> Result<(), String> {
     if opts.use_xwin {
-        let xwin_ok = Command::new("cargo").args(["xwin", "--version"]).output().is_ok_and(|out| out.status.success());
+        let xwin_ok = Command::new("cargo")
+            .args(["xwin", "--version"])
+            .current_dir(root)
+            .output()
+            .is_ok_and(|out| out.status.success());
         if !xwin_ok {
             return Err("check-windows: `cargo-xwin` is not installed.\n\
                  Install it with `cargo install cargo-xwin`, or omit `--xwin` to run metadata-only \
@@ -151,6 +188,7 @@ fn verify_cross_toolchain(opts: &WindowsCheckOpts) -> Result<(), String> {
 
     let output = Command::new("rustup")
         .args(["target", "list", "--installed"])
+        .current_dir(root)
         .output()
         .map_err(|e| format!("check-windows: failed to run `rustup target list --installed`: {e}"))?;
     if !output.status.success() {
@@ -176,15 +214,12 @@ pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
     let native_windows = cfg!(windows) && !opts.use_xwin;
 
     if !native_windows || opts.explicit_target {
-        verify_cross_toolchain(&opts)?;
+        verify_cross_toolchain(root, &opts)?;
     }
 
-    let use_stub = !native_windows
-        && !opts.no_stub
-        && std::env::var_os("GHOSTTY_VT_RS_SYS_PREBUILT_DIR").is_none()
-        && std::env::var_os("GHOSTTY_SOURCE_DIR").is_none();
-
-    let _stub_guard = if use_stub { Some(create_vt_check_stub()?) } else { None };
+    let prebuilt_env = std::env::var_os("GHOSTTY_VT_RS_SYS_PREBUILT_DIR");
+    let source_env = std::env::var_os("GHOSTTY_SOURCE_DIR");
+    let use_stub = should_use_vt_stub(native_windows, opts.no_stub, prebuilt_env.as_deref(), source_env.as_deref());
     let cargo_args = build_cargo_args(&opts, native_windows);
     let started = Instant::now();
 
@@ -196,10 +231,12 @@ pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
 
     let mut cmd = Command::new("cargo");
     cmd.args(&cargo_args).current_dir(root);
-    if let Some(ref stub) = _stub_guard {
+    if use_stub {
         let target_dir = resolve_check_target_dir(root, std::env::var_os("CARGO_TARGET_DIR").as_deref());
-        cmd.env("CARGO_TARGET_DIR", target_dir)
-            .env("GHOSTTY_VT_RS_SYS_PREBUILT_DIR", stub.path())
+        let stub_dir = ensure_vt_check_stub(&target_dir)?;
+        cmd.env("CARGO_TARGET_DIR", &target_dir)
+            .env("GHOSTTY_VT_RS_SYS_PREBUILT_DIR", &stub_dir)
+            .env_remove("GHOSTTY_SOURCE_DIR")
             .env_remove("GHOSTTY_VT_RS_SYS_BUILD")
             .env_remove("GHOSTTY_VT_RS_SYS_OPTIMIZE")
             .env_remove("GHOSTTY_VT_RS_SYS_CPU")
@@ -289,7 +326,28 @@ mod tests {
     }
 
     #[test]
-    fn resolves_isolated_target_dir_and_creates_vt_stub() {
+    fn stub_selection_handles_host_prebuilt_empty_envs_and_windows_prebuilt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host_prebuilt = tmp.path().join("host-prebuilt");
+        std::fs::create_dir_all(host_prebuilt.join("lib")).unwrap();
+        std::fs::write(host_prebuilt.join("lib/libghostty-vt.a"), b"").unwrap();
+
+        // Host-only prebuilt (from `cargo xtask vt-prebuilt`) lacks `ghostty-vt-static.lib`, so stub stays enabled.
+        assert!(should_use_vt_stub(false, false, Some(host_prebuilt.as_os_str()), None));
+        // Empty env vars must not disable the stub.
+        assert!(should_use_vt_stub(false, false, Some(OsStr::new("")), Some(OsStr::new(""))));
+        // Non-empty source override or `--no-stub` or native Windows disables the stub.
+        assert!(!should_use_vt_stub(false, false, None, Some(OsStr::new("/src/ghostty"))));
+        assert!(!should_use_vt_stub(false, true, None, None));
+        assert!(!should_use_vt_stub(true, false, None, None));
+
+        // A genuine Windows prebuilt containing `lib/ghostty-vt-static.lib` disables the stub.
+        std::fs::write(host_prebuilt.join(WINDOWS_STATIC_LIB_REL), b"").unwrap();
+        assert!(!should_use_vt_stub(false, false, Some(host_prebuilt.as_os_str()), None));
+    }
+
+    #[test]
+    fn resolves_isolated_target_dir_without_double_nesting_and_creates_idempotent_stub() {
         let root = Path::new("/repo");
         assert_eq!(resolve_check_target_dir(root, None), PathBuf::from("/repo/target/windows-check"));
         assert_eq!(
@@ -300,10 +358,17 @@ mod tests {
             resolve_check_target_dir(root, Some(OsStr::new("/abs/target"))),
             PathBuf::from("/abs/target/windows-check")
         );
+        assert_eq!(
+            resolve_check_target_dir(root, Some(OsStr::new("/abs/target/windows-check"))),
+            PathBuf::from("/abs/target/windows-check")
+        );
 
-        let stub = create_vt_check_stub().unwrap();
-        assert!(stub.path().join("lib/libghostty-vt.a").is_file());
-        assert!(stub.path().join("lib/ghostty-vt-static.lib").is_file());
-        assert!(stub.path().join("include/ghostty/vt.h").is_file());
+        let tmp = tempfile::tempdir().unwrap();
+        let first = ensure_vt_check_stub(tmp.path()).unwrap();
+        let second = ensure_vt_check_stub(tmp.path()).unwrap();
+        assert_eq!(first, second);
+        assert!(first.join("lib/libghostty-vt.a").is_file());
+        assert!(first.join(WINDOWS_STATIC_LIB_REL).is_file());
+        assert!(first.join("include/ghostty/vt.h").is_file());
     }
 }
