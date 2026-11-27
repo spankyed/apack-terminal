@@ -99,6 +99,72 @@ fn replay_all_committed_fuzz_seed_corpora() {
     }
 }
 
+#[test]
+fn committed_seeds_exercise_deep_parser_branches() {
+    use std::num::NonZeroU16;
+    use std::sync::{Arc, Mutex};
+
+    use apack_core::status::parse_osc7501;
+    use apack_core::vt::{ProgramStatusUpdate, VtEngine, VtEvent};
+    use apack_proto::types::{CellPx, GridSize};
+    use apack_vt_ghostty::{GhosttyConfig, GhosttyEngine, ImageStore};
+    use apack_wal::format::scan_segment;
+
+    let seeds_root = repo_root().join("fuzz").join("seeds");
+
+    // 1. `osc7501_raw_payload` must actually parse a structured status update.
+    let raw_osc7501 = fs::read_to_string(seeds_root.join("v2_vt").join("osc7501_raw_payload")).expect("read seed");
+    assert!(
+        matches!(parse_osc7501(&raw_osc7501), Some(ProgramStatusUpdate::Set { .. })),
+        "osc7501_raw_payload seed must parse into ProgramStatusUpdate::Set"
+    );
+
+    // 2. `torn_tail_segment` must decode a valid keyframe + output prefix before hitting the torn tail.
+    let torn_bytes = fs::read(seeds_root.join("v2_wal").join("torn_tail_segment")).expect("read torn seed");
+    let scan = scan_segment(&torn_bytes);
+    assert_eq!(scan.records.len(), 2, "torn_tail_segment must decode keyframe + output prefix");
+    assert!(
+        scan.valid_records_end > 0 && scan.valid_records_end < torn_bytes.len(),
+        "torn_tail_segment must truncate strictly inside trailing partial record"
+    );
+
+    // 3. `v2_vt` seeds must actually exercise OSC 7501 ProgramStatus, OSC 633, scrollback history, and live images.
+    let make_vt = || {
+        GhosttyEngine::new(GhosttyConfig {
+            size: GridSize { cols: NonZeroU16::new(80).unwrap(), rows: NonZeroU16::new(24).unwrap() },
+            cell_px: CellPx { width: 8, height: 16 },
+            scrollback_lines: 256,
+            allow_images: true,
+            terminfo_name: String::from("xterm-256color"),
+            image_store: Some(Arc::new(Mutex::new(ImageStore::new(1 << 20)))),
+        })
+        .expect("construct GhosttyEngine")
+    };
+
+    let mut vt_osc = make_vt();
+    let mut ev_osc = Vec::new();
+    let osc_bytes =
+        fs::read(seeds_root.join("v2_vt").join("osc_7501_titles_hyperlinks_palette")).expect("read osc seed");
+    vt_osc.feed(&osc_bytes, &mut ev_osc);
+    assert!(
+        ev_osc.iter().any(|e| matches!(e, VtEvent::ProgramStatus(ProgramStatusUpdate::Set { .. }))),
+        "osc seed must trigger cb_program_status Set"
+    );
+    assert!(ev_osc.iter().any(|e| matches!(e, VtEvent::Osc633 { .. })), "osc seed must trigger OSC 633 sanitization");
+
+    let mut vt_sb = make_vt();
+    let mut ev_sb = Vec::new();
+    let sb_bytes = fs::read(seeds_root.join("v2_vt").join("primary_scrollback_history")).expect("read scrollback seed");
+    vt_sb.feed(&sb_bytes, &mut ev_sb);
+    assert!(vt_sb.meta().scrollback_lines > 0, "primary_scrollback_history seed must populate scrollback");
+
+    let mut vt_img = make_vt();
+    let mut ev_img = Vec::new();
+    let img_bytes = fs::read(seeds_root.join("v2_vt").join("kitty_inline_direct_and_delete")).expect("read img seed");
+    vt_img.feed(&img_bytes, &mut ev_img);
+    assert!(!vt_img.images().is_empty(), "kitty_inline_direct_and_delete seed must retain a live placed image");
+}
+
 /// Regenerates the compact deterministic seed corpora under `fuzz/seeds/<target>/`.
 ///
 /// Run manually with:
@@ -362,7 +428,8 @@ fn regenerate_fuzz_seeds() {
     sealed_seg.extend_from_slice(&seg_footer.encode());
     write_seed("v2_wal", "complete_sealed_segment", &sealed_seg);
 
-    let mut torn = rec_output.clone();
+    let mut torn = rec_kf.clone();
+    torn.extend_from_slice(&rec_output);
     torn.extend_from_slice(&rec_output[..rec_output.len() / 2]);
     write_seed("v2_wal", "torn_tail_segment", &torn);
 
@@ -383,9 +450,14 @@ fn regenerate_fuzz_seeds() {
         "csi_sync_altscreen_scroll",
         b"\x1b[?2026h\x1b[?1049h\x1b[2J\x1b[1;1HHeader\x1b[2;10r\x1b[5S\x1b[?1049l\x1b[?2026l",
     );
-    write_seed(
-        "v2_vt",
-        "osc_7501_titles_hyperlinks_palette",
+    let mut scrollback_seed = Vec::new();
+    for i in 0..32u32 {
+        scrollback_seed.extend_from_slice(format!("scrollback line {i:02}\r\n").as_bytes());
+    }
+    write_seed("v2_vt", "primary_scrollback_history", &scrollback_seed);
+    let osc7501_title_b64 = String::from_utf8(encoded(b"Run;x=1")).expect("ascii b64");
+    let osc7501_msg_b64 = String::from_utf8(encoded(b"Approve build")).expect("ascii b64");
+    let osc_stream = format!(
         concat!(
             "\x1b]0;Window Title\x07",
             "\x1b]7;file://host/tmp/work\x1b\\",
@@ -393,14 +465,17 @@ fn regenerate_fuzz_seeds() {
             "\x1b]4;1;rgb:ff/10/20\x1b\\",
             "\x1b]10;rgb:ee/ee/ee\x1b\\",
             "\x1b]133;A\x07$ \x1b]133;B\x07ls\x1b]133;C\x07ok\x1b]133;D;0\x07",
-            "\x1b]7501;k=0123456789abcdef0123456789abcdef;s=1;t=prompt;c=/tmp\x07",
-        )
-        .as_bytes(),
+            "\x1b]633;A\x07\x1b]633;V=0123456789abcdef0123456789abcdef;1;C\x07",
+            "\x1b]7501;state=blocked:kind=permission:progress=50:app=claude:title={}:msg={}\x1b\\",
+            "\x1b]7501;state=clear\x1b\\",
+        ),
+        osc7501_title_b64, osc7501_msg_b64
     );
+    write_seed("v2_vt", "osc_7501_titles_hyperlinks_palette", osc_stream.as_bytes());
     write_seed(
         "v2_vt",
         "osc7501_raw_payload",
-        b"k=0123456789abcdef0123456789abcdef;s=42;t=cmd_end;e=0;cmd=cargo%20test",
+        b"id=agent1;state=blocked;kind=permission;progress=50;app=claude;title=Waiting;message=Approve run",
     );
     write_seed(
         "v2_vt",
@@ -410,7 +485,11 @@ fn regenerate_fuzz_seeds() {
     write_seed(
         "v2_vt",
         "kitty_inline_direct_and_delete",
-        b"\x1b_Ga=T,f=32,s=1,v=1,i=42,m=1;AAAA\x1b\\\x1b_Gm=0;AA==\x1b\\\x1b_Ga=d,d=i,i=42\x1b\\",
+        concat!(
+            "\x1b_Ga=T,f=32,s=1,v=1,i=42,m=1;AAAA\x1b\\\x1b_Gm=0;AA==\x1b\\\x1b_Ga=d,d=i,i=42\x1b\\",
+            "\x1b_Ga=T,f=32,s=1,v=1,i=43;/wAA/w==\x1b\\",
+        )
+        .as_bytes(),
     );
     write_seed("v2_vt", "utf8_emoji_cjk_invalid_c1", "hello 🚀 👨‍👩‍👧‍👦 café 中文 日本語 \u{0301}".as_bytes());
     write_seed(

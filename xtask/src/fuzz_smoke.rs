@@ -2,8 +2,8 @@
 //! smoke pass across every `[[bin]]` target declared in `fuzz/Cargo.toml`.
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
+use std::process::{Command, Stdio};
 
 /// Maximum allowed size of an individual committed seed file (64 KiB).
 pub const MAX_SEED_BYTES: u64 = 64 * 1024;
@@ -33,30 +33,23 @@ impl Default for Config {
     }
 }
 
-struct TempDirGuard(PathBuf);
-
-impl Drop for TempDirGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
 /// Runs deterministic corpus replay (`tests/fuzz_corpus.rs`) and, unless `--replay-only` is set,
-/// builds all fuzz targets under nightly `cargo-fuzz` and executes both `-runs=0` ASAN seed replay
-/// and a bounded `-max_total_time` libFuzzer smoke run for each target.
+/// verifies `fuzz/Cargo.lock` (`--locked`), builds the selected fuzz targets under nightly
+/// `cargo-fuzz`, and executes both `-runs=0` ASAN seed replay and a bounded libFuzzer smoke run.
 pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
     let config = parse_args(args)?;
     let fuzz_dir = root.join("fuzz");
-    let manifest = fs::read_to_string(fuzz_dir.join("Cargo.toml"))
-        .map_err(|err| format!("failed to read fuzz/Cargo.toml: {err}"))?;
+    let manifest_path = fuzz_dir.join("Cargo.toml");
+    let manifest =
+        fs::read_to_string(&manifest_path).map_err(|err| format!("failed to read fuzz/Cargo.toml: {err}"))?;
     let all_targets = discover_targets(&manifest)?;
     if all_targets.is_empty() {
         return Err("no [[bin]] fuzz targets found in fuzz/Cargo.toml".to_owned());
     }
 
     let targets: Vec<String> = match &config.filter {
-        Some(needle) => all_targets.into_iter().filter(|name| name.contains(needle.as_str())).collect(),
-        None => all_targets,
+        Some(needle) => all_targets.iter().filter(|name| name.contains(needle.as_str())).cloned().collect(),
+        None => all_targets.clone(),
     };
     if targets.is_empty() {
         return Err(format!("no fuzz targets matched --filter {:?}", config.filter.as_deref().unwrap_or("")));
@@ -82,35 +75,48 @@ pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
         return Ok(());
     }
 
-    // 2. Build the fuzz targets with nightly cargo-fuzz.
-    let mut build_cmd = Command::new("cargo");
-    build_cmd.current_dir(&fuzz_dir).args(["+nightly", "fuzz", "build"]);
-    if let Some(triple) = &config.target_triple {
-        build_cmd.args(["--target", triple]);
-    }
-    if config.filter.is_some() {
-        for target in &targets {
-            build_cmd.arg(target);
-        }
-    }
-    let build_status = build_cmd.status().map_err(|err| {
-        format!("failed to run `cargo +nightly fuzz build` (is cargo-fuzz + nightly installed?): {err}")
-    })?;
-    if !build_status.success() {
-        return Err(format!("`cargo +nightly fuzz build` failed (exit {build_status})"));
+    // 2. Enforce that `fuzz/Cargo.lock` is strictly in sync before invoking `cargo-fuzz`
+    //    (which does not accept `--locked` directly).
+    let lock_status = Command::new("cargo")
+        .current_dir(&fuzz_dir)
+        .args(["+nightly", "metadata", "--locked", "--no-deps", "--format-version", "1"])
+        .stdout(Stdio::null())
+        .status()
+        .map_err(|err| format!("failed to verify fuzz/Cargo.lock with `cargo +nightly metadata --locked`: {err}"))?;
+    if !lock_status.success() {
+        return Err(format!("fuzz/Cargo.lock is out of sync with fuzz/Cargo.toml (exit {lock_status})"));
     }
 
-    // 3. For each target, replay every committed seed under libFuzzer + ASAN, then fuzz briefly
-    //    into a throwaway corpus directory so `fuzz/seeds/` remains strictly read-only.
-    let scratch_root = std::env::temp_dir().join(format!("apack-fuzz-smoke-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&scratch_root);
-    fs::create_dir_all(&scratch_root)
-        .map_err(|err| format!("failed to create scratch dir {}: {err}", scratch_root.display()))?;
-    let _guard = TempDirGuard(scratch_root.clone());
+    // 3. Build the fuzz targets with nightly cargo-fuzz. `cargo-fuzz build` accepts at most one
+    //    optional `[TARGET]`, so build all in one shot when unfiltered (or every target matched),
+    //    otherwise invoke once per matched target.
+    for build_target in build_invocations(&all_targets, &targets) {
+        let mut build_cmd = Command::new("cargo");
+        build_cmd.current_dir(&fuzz_dir).args(["+nightly", "fuzz", "build"]);
+        if let Some(triple) = &config.target_triple {
+            build_cmd.args(["--target", triple]);
+        }
+        if let Some(target) = build_target {
+            build_cmd.arg(target);
+        }
+        let build_status = build_cmd.status().map_err(|err| {
+            format!("failed to run `cargo +nightly fuzz build` (is cargo-fuzz + nightly installed?): {err}")
+        })?;
+        if !build_status.success() {
+            return Err(format!("`cargo +nightly fuzz build` failed (exit {build_status})"));
+        }
+    }
+
+    // 4. For each target, replay every committed seed under libFuzzer + ASAN, then fuzz briefly
+    //    into a unique throwaway corpus directory so `fuzz/seeds/` remains strictly read-only.
+    let scratch_dir = tempfile::Builder::new()
+        .prefix("apack-fuzz-smoke-")
+        .tempdir()
+        .map_err(|err| format!("failed to create scratch tempdir: {err}"))?;
 
     for target in &targets {
         let seed_dir = fuzz_dir.join("seeds").join(target);
-        let work_dir = scratch_root.join(target);
+        let work_dir = scratch_dir.path().join(target);
         fs::create_dir_all(&work_dir)
             .map_err(|err| format!("failed to create work corpus dir {}: {err}", work_dir.display()))?;
 
@@ -131,6 +137,14 @@ pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Returns the list of optional `[TARGET]` arguments to pass to `cargo +nightly fuzz build`.
+///
+/// `cargo-fuzz build` accepts at most one positional target; passing `None` builds all targets
+/// in a single Cargo invocation, while a proper subset builds each target individually.
+fn build_invocations<'a>(all_targets: &'a [String], selected: &'a [String]) -> Vec<Option<&'a str>> {
+    if selected.len() == all_targets.len() { vec![None] } else { selected.iter().map(|t| Some(t.as_str())).collect() }
 }
 
 fn run_libfuzzer(
@@ -300,6 +314,11 @@ name = "v2_kitty_apc" # comment
 path = "fuzz_targets/v2_kitty_apc.rs"
 "#;
         assert_eq!(discover_targets(toml).unwrap(), vec!["v2_wire", "v2_kitty_apc"]);
+
+        let all = vec!["v2_wire".into(), "v2_wal".into(), "v2_vt".into(), "v2_kitty_apc".into()];
+        assert_eq!(build_invocations(&all, &all), vec![None]);
+        assert_eq!(build_invocations(&all, &all[..1]), vec![Some("v2_wire")]);
+        assert_eq!(build_invocations(&all, &all[..2]), vec![Some("v2_wire"), Some("v2_wal")]);
 
         let cfg = parse_args(&[
             "--seconds".into(),

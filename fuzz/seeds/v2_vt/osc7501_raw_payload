@@ -1,1 +1,1 @@
-k=0123456789abcdef0123456789abcdef;s=42;t=cmd_end;e=0;cmd=cargo%20test
+id=agent1;state=blocked;kind=permission;progress=50;app=claude;title=Waiting;message=Approve run

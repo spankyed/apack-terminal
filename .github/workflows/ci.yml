@@ -227,8 +227,11 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup show active-toolchain
       - uses: dtolnay/rust-toolchain@nightly
+      - id: nightly-version
+        run: echo "key=$(rustc +nightly -Vv | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
         with:
+          key: nightly-${{ steps.nightly-version.outputs.key }}
           workspaces: |
             . -> target
             fuzz -> fuzz/target
