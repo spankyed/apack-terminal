@@ -1699,9 +1699,19 @@ impl ShardRunner {
         let mut effects = Vec::new();
         if let Some(mut sess) = self.sessions.remove(&session_id) {
             #[cfg(unix)]
-            if let Some(LivePty::Unix { token, .. }) = sess.pty {
-                let _ = self.poller.deregister(token);
-                self.token_to_session.remove(&token);
+            {
+                if let Some(LivePty::Unix { token, .. }) = sess.pty {
+                    let _ = self.poller.deregister(token);
+                    self.token_to_session.remove(&token);
+                }
+                // If this session was explicitly terminated (Kill / teardown) and the leader exited
+                // on SIGHUP before `kill_escalate_after`, SIGKILL any remaining HUP-ignoring
+                // background jobs in separate process groups belonging to the same POSIX session.
+                if sess.terminating_since.is_some()
+                    && let Some(pid) = sess.pid
+                {
+                    kill_session_descendants(&[pid.pid() as u32]);
+                }
             }
             #[cfg(windows)]
             if let Some(LivePty::Windows { ref bridge, .. }) = sess.pty {

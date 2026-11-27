@@ -140,10 +140,18 @@ mod tests {
         assert!(guard.owns(me).expect("owns self"));
         assert!(!guard.owns(1).expect("does not own init"));
 
-        let mut child = std::process::Command::new("/bin/sh").args(["-c", "sleep 10"]).spawn().expect("spawn child");
-        let child_pid = child.id();
+        struct ChildReapGuard(std::process::Child);
+        impl Drop for ChildReapGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let child = ChildReapGuard(
+            std::process::Command::new("/bin/sh").args(["-c", "sleep 10"]).spawn().expect("spawn child"),
+        );
+        let child_pid = child.0.id();
         assert!(guard.owns(child_pid).expect("owns child"));
-        let _ = child.kill();
-        let _ = child.wait();
+        drop(child);
     }
 }

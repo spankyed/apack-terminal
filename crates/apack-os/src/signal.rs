@@ -418,9 +418,17 @@ mod tests {
         assert!(!inside_tree(me, u32::MAX - 1));
 
         // Spawn a real child and verify inside_tree + signal delivery.
-        let mut child =
-            std::process::Command::new("/bin/sh").args(["-c", "sleep 30"]).spawn().expect("spawn sleep child");
-        let child_pid = child.id();
+        struct ChildReapGuard(std::process::Child);
+        impl Drop for ChildReapGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = ChildReapGuard(
+            std::process::Command::new("/bin/sh").args(["-c", "sleep 10"]).spawn().expect("spawn sleep child"),
+        );
+        let child_pid = child.0.id();
         assert!(inside_tree(me, child_pid));
         assert!(!inside_tree(child_pid, me));
 
@@ -433,7 +441,7 @@ mod tests {
         // Signaling the child via Pid scope within our tree succeeds.
         let child_target = SignalTarget::new(child_pid as i32).expect("child pid");
         deliver_signal(me, SignalKind::Term, SignalScope::Pid(child_target)).expect("SIGTERM child in our tree");
-        let status = child.wait().expect("reap child");
+        let status = child.0.wait().expect("reap child");
         assert!(!status.success());
 
         // Signaling an already-reaped leader returns an OS error (ESRCH).
@@ -448,19 +456,35 @@ mod tests {
         use apack_proto::types::{CellPx, GridSize};
         use std::time::Instant;
 
-        // Spawn a PTY session leader that starts a background `sleep 30`, prints `BG:<pid>`, and
+        struct SpawnedPtyCleanup(Option<crate::pty::SpawnedPty>);
+        impl Drop for SpawnedPtyCleanup {
+            fn drop(&mut self) {
+                if let Some(mut s) = self.0.take() {
+                    if s.pid >= 2 {
+                        kill_session_descendants(&[s.pid]);
+                        let _ = deliver_signal(s.pid, SignalKind::Kill, SignalScope::Group);
+                    }
+                    let _ = s.killer.kill();
+                    drop(s.master);
+                    let _ = s.child.wait();
+                }
+            }
+        }
+
+        // Spawn a PTY session leader that starts a background `sleep 10`, prints `BG:<pid>`, and
         // actively `wait`s on it so `sh` reaps it immediately (avoiding Linux zombie `kill(0)==0`)
         // and reports `EXITED:<status>`.
         let config = PtySpawnConfig {
             size: GridSize::new(80, 24).expect("grid"),
             cell_px: CellPx::default(),
             shell: Some("/bin/sh".to_owned()),
-            args: vec!["-c".to_owned(), "sleep 30 & bg=$!; echo BG:$bg; wait $bg; echo EXITED:$?".to_owned()],
+            args: vec!["-c".to_owned(), "sleep 10 & bg=$!; echo BG:$bg; wait $bg; echo EXITED:$?".to_owned()],
             env: vec![],
             unset: vec![],
             cwd: None,
         };
-        let mut spawned = spawn_pty(&config).expect("spawn pty");
+        let mut guard = SpawnedPtyCleanup(Some(spawn_pty(&config).expect("spawn pty")));
+        let spawned = guard.0.as_mut().expect("spawned");
         let mut output = Vec::new();
         let mut buf = [0u8; 256];
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -479,7 +503,7 @@ mod tests {
             }
         }
 
-        // Send SIGHUP to non-leader descendants while leader is alive; `sleep 30` dies and `sh`
+        // Send SIGHUP to non-leader descendants while leader is alive; `sleep 10` dies and `sh`
         // reaps it and prints `EXITED:<non-zero>` then exits cleanly.
         hang_up_session_descendants(&[spawned.pid]);
 
@@ -500,6 +524,7 @@ mod tests {
         let status = spawned.child.wait().expect("reap leader");
         assert!(status.success(), "leader shell should finish cleanly after wait: {text:?}");
         assert!(text.contains("EXITED:") && !text.contains("EXITED:0"), "expected signal exit: {text:?}");
+        drop(guard);
 
         // Also test kill_session_descendants on a SIGHUP-ignoring background job in its own group!
         let cfg_k = PtySpawnConfig {
@@ -508,13 +533,14 @@ mod tests {
             shell: Some(String::from("/bin/sh")),
             args: vec![
                 String::from("-c"),
-                String::from("set -m; (trap '' HUP; sleep 30) & bg=$!; echo BG:$bg; wait $bg; echo EXITED:$?"),
+                String::from("set -m; (trap '' HUP; sleep 10) & bg=$!; echo BG:$bg; wait $bg; echo EXITED:$?"),
             ],
             env: vec![],
             unset: vec![],
             cwd: None,
         };
-        let mut spawned_k = spawn_pty(&cfg_k).expect("spawn sh for kill_session_descendants");
+        let mut guard_k = SpawnedPtyCleanup(Some(spawn_pty(&cfg_k).expect("spawn sh for kill_session_descendants")));
+        let spawned_k = guard_k.0.as_mut().expect("spawned_k");
         let mut out_k = Vec::new();
         let deadline_k = Instant::now() + Duration::from_secs(5);
         loop {
@@ -544,6 +570,7 @@ mod tests {
         let text_k = String::from_utf8_lossy(&out_k);
         assert!(spawned_k.child.wait().expect("reap leader").success());
         assert!(text_k.contains("EXITED:") && !text_k.contains("EXITED:0"), "expected SIGKILL exit: {text_k:?}");
+        drop(guard_k);
     }
 
     #[cfg(target_os = "linux")]

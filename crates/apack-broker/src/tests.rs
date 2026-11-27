@@ -64,9 +64,9 @@ fn unique_endpoint(dir: &std::path::Path, label: &str) -> String {
 
 fn echo_command_spec(text: &str, record_dir: Option<String>, restore_from: Option<String>) -> SpawnSpec {
     #[cfg(unix)]
-    let argv = vec![String::from("/bin/sh"), String::from("-c"), format!("printf '{text}\\r\\n'; sleep 30")];
+    let argv = vec![String::from("/bin/sh"), String::from("-c"), format!("printf '{text}\\r\\n'; sleep 10")];
     #[cfg(windows)]
-    let argv = vec![String::from("cmd.exe"), String::from("/C"), format!("echo {text} & ping -n 30 127.0.0.1 >nul")];
+    let argv = vec![String::from("cmd.exe"), String::from("/C"), format!("echo {text} & ping -n 10 127.0.0.1 >nul")];
     SpawnSpec {
         argv,
         cwd: None,
@@ -1409,7 +1409,7 @@ fn e2e_interactive_write_resize_pause_raw_output_and_multi_shard() {
             argv: vec![
                 String::from("/bin/sh"),
                 String::from("-c"),
-                String::from("i=0; while [ $i -lt 25 ]; do printf 'SB_%02d\\r\\n' $i; i=$((i+1)); done; sleep 30"),
+                String::from("i=0; while [ $i -lt 25 ]; do printf 'SB_%02d\\r\\n' $i; i=$((i+1)); done; sleep 10"),
             ],
             cwd: None,
             env: Vec::new(),
@@ -1452,7 +1452,7 @@ fn e2e_interactive_write_resize_pause_raw_output_and_multi_shard() {
                 String::from("/bin/sh"),
                 String::from("-c"),
                 String::from(
-                    "stty -echo raw; printf 'READY_BW\\r\\n'; sleep 0.08; grep -m1 -o BIG_WRITE_TAIL; sleep 30",
+                    "stty -echo raw; printf 'READY_BW\\r\\n'; sleep 0.08; grep -m1 -o BIG_WRITE_TAIL; sleep 10",
                 ),
             ],
             cwd: None,
@@ -1568,7 +1568,7 @@ fn e2e_leases_kept_pinning_tier2_compression_foreground_verify_and_kill_escalati
         argv: vec![
             String::from("/bin/sh"),
             String::from("-c"),
-            String::from("trap 'exit 0' HUP; printf 'EPHEM_ALIVE\\r\\n'; sleep 30 & wait"),
+            String::from("trap 'exit 0' HUP; printf 'EPHEM_ALIVE\\r\\n'; sleep 10 & wait"),
         ],
         cwd: None,
         env: Vec::new(),
@@ -1649,7 +1649,7 @@ fn e2e_leases_kept_pinning_tier2_compression_foreground_verify_and_kill_escalati
             "read _go; ",
             "printf '\\033]7501;id=st_ok:app=sh:state=working\\007'; ",
             "printf '\\033]7501;id=st_bad:app=nonexistent_app_xyz:state=working\\007'; ",
-            "trap '' HUP; sleep 30"
+            "trap '' HUP; sleep 10"
         );
         let spec_roll = SpawnSpec {
             argv: vec![String::from("/bin/sh"), String::from("-c"), String::from(script)],
@@ -1742,9 +1742,7 @@ fn e2e_leases_kept_pinning_tier2_compression_foreground_verify_and_kill_escalati
             argv: vec![
                 String::from("/bin/sh"),
                 String::from("-c"),
-                String::from(
-                    "trap 'sleep 0.04; exit 7' HUP; printf 'HUP_TRAP_READY\\r\\n'; while true; do sleep 30 & wait $!; done",
-                ),
+                String::from("trap 'sleep 0.04; exit 7' HUP; printf 'HUP_TRAP_READY\\r\\n'; sleep 10 & wait $!"),
             ],
             cwd: None,
             env: Vec::new(),
@@ -1788,13 +1786,88 @@ fn e2e_leases_kept_pinning_tier2_compression_foreground_verify_and_kill_escalati
             "kill() must deliver graceful SIGHUP and wait kill_escalate_after before SIGKILL"
         );
 
+        // Verify that killing a session whose leader obeys SIGHUP immediately ALSO terminates a
+        // SIGHUP-ignoring background job in its own process group (`finish_and_remove_session`).
+        struct KillPidOnDrop(u32);
+        impl Drop for KillPidOnDrop {
+            fn drop(&mut self) {
+                if self.0 > 1 {
+                    let _ = std::process::Command::new("kill")
+                        .args(["-9", &self.0.to_string()])
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                }
+            }
+        }
+        let bg_pid_file = tmp.path().join("bg-job.pid");
+        let bg_spec = SpawnSpec {
+            argv: vec![
+                String::from("/bin/sh"),
+                String::from("-c"),
+                format!(
+                    "set -m; /bin/sh -c 'trap \"\" HUP; echo $$ > \"$1\"; exec sleep 10' _ '{}' & while [ ! -s '{}' ]; do sleep 0.01; done; printf 'BG_JOB_READY\\r\\n'; sleep 10 & wait",
+                    bg_pid_file.display(),
+                    bg_pid_file.display(),
+                ),
+            ],
+            cwd: None,
+            env: Vec::new(),
+            size: GridSize::new(80, 10).unwrap(),
+            cell_px: CellPx { width: 8, height: 16 },
+            scrollback_limit: 50,
+            marks_key: None,
+            resize_policy: ResizePolicy::LatestActive,
+            record_dir: None,
+            restore_from: None,
+            image_files: false,
+            kept: false,
+        };
+        let (s_bg, _) = c2.spawn(bg_spec).unwrap();
+        assert_eq!(c2.wait(s_bg, WaitCondition::Text(String::from("BG_JOB_READY")), 3_000).unwrap(), WaitOutcome::Met);
+        let bg_pid: u32 = std::fs::read_to_string(&bg_pid_file).unwrap().trim().parse().unwrap();
+        let _bg_guard = KillPidOnDrop(bg_pid);
+        let bg_alive = || {
+            std::process::Command::new("kill")
+                .args(["-0", &bg_pid.to_string()])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        assert!(bg_pid > 1 && bg_alive(), "background job must be alive before kill()");
+        let st_bg = NonZeroStreamId::new(4).unwrap();
+        c2.attach(
+            s_bg,
+            st_bg,
+            SubFlags::from_bits(SubFlags::EVENTS).unwrap(),
+            None,
+            0,
+            FrameCredit { max_frames: 1, max_bytes: 65_536 },
+        )
+        .unwrap();
+        c2.kill(s_bg).unwrap();
+        loop {
+            let frame = c2.recv_frame().unwrap();
+            if frame.stream_id == st_bg.as_stream_id() && matches!(frame.msg, BrokerMsg::Exited { .. }) {
+                break;
+            }
+        }
+        let bg_gone = (0..40).any(|_| {
+            if !bg_alive() {
+                true
+            } else {
+                std::thread::sleep(Duration::from_millis(20));
+                false
+            }
+        });
+        assert!(bg_gone, "kill() must terminate HUP-ignoring background job in its own process group");
+
         // Verify `kill()` on a Paused session with buffered output unpauses reads so macOS/BSD
         // `ttydrain()` does not wedge the exiting child, AND unit-test `drain_unix_pty_nonblocking`!
         let tail_spec = SpawnSpec {
             argv: vec![
                 String::from("/bin/sh"),
                 String::from("-c"),
-                String::from("printf 'TAIL_ARMED\\r\\n'; read _go; printf 'TAIL_BEFORE_EXIT_99\\r\\n'; sleep 30"),
+                String::from("printf 'TAIL_ARMED\\r\\n'; read _go; printf 'TAIL_BEFORE_EXIT_99\\r\\n'; sleep 10"),
             ],
             cwd: None,
             env: Vec::new(),
