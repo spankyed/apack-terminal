@@ -4,8 +4,18 @@
 //! isolated broker subprocess RSS without test-harness overhead, then executes `benches/v2_bench.rs`
 //! under `--release`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+fn target_dir(root: &Path) -> PathBuf {
+    match std::env::var_os("CARGO_TARGET_DIR") {
+        Some(raw) if !raw.is_empty() => {
+            let p = PathBuf::from(raw);
+            if p.is_absolute() { p } else { root.join(p) }
+        }
+        _ => root.join("target"),
+    }
+}
 
 /// Builds the release broker binary and runs the `v2_bench` harness, forwarding `args`.
 pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
@@ -19,7 +29,7 @@ pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
     }
 
     let bin_name = format!("apack-terminal{}", std::env::consts::EXE_SUFFIX);
-    let bin_path = root.join("target").join("release").join(bin_name);
+    let bin_path = target_dir(root).join("release").join(bin_name);
     if !bin_path.is_file() {
         return Err(format!("expected release binary at {}", bin_path.display()));
     }

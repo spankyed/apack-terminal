@@ -29,7 +29,6 @@ use apack_proto::frame::{DecodedFrame, FrameDecoder};
 use apack_proto::messages::{BrokerMsg, ClientMsg, FrameUpdate, SpawnSpec};
 use apack_proto::types::{
     CellPx, FrameCredit, GridSize, LeaseKind, NonZeroStreamId, RequestId, ResizePolicy, StreamId, SubFlags,
-    WaitCondition, WaitOutcome,
 };
 use apack_vt_ghostty::{GhosttyConfig, GhosttyEngine};
 use apack_wal::{
@@ -93,7 +92,8 @@ fn unique_endpoint(dir: &Path, label: &str) -> String {
     let seq = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     #[cfg(unix)]
     {
-        dir.join(format!("b-{label}-{}-{seq}.sock", std::process::id())).display().to_string()
+        let _ = label;
+        dir.join(format!("{seq}.sock")).display().to_string()
     }
     #[cfg(windows)]
     {
@@ -103,39 +103,112 @@ fn unique_endpoint(dir: &Path, label: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// RAII subprocess guard & OS RSS sampling
+// RAII guards & OS peak RSS sampling
 // ---------------------------------------------------------------------------
 
 struct ChildGuard {
-    child: Child,
+    child: Option<Child>,
 }
 
 impl ChildGuard {
     fn new(child: Child) -> Self {
-        Self { child }
+        Self { child: Some(child) }
     }
 
     fn id(&self) -> u32 {
-        self.child.id()
+        self.child.as_ref().expect("child live").id()
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        match self.child.as_mut() {
+            Some(c) => c.try_wait(),
+            None => Ok(None),
+        }
     }
 
     fn shutdown(mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(mut c) = self.child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
     }
 }
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(mut c) = self.child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
     }
 }
 
-/// Reads resident set size (RSS) in bytes for `pid` using OS utilities (`ps` on Unix,
-/// `powershell` on Windows). Returns `None` if the process has already exited or cannot be queried.
-fn read_process_rss_bytes(pid: u32) -> Option<u64> {
-    #[cfg(unix)]
+struct RssSamplerGuard {
+    stop: Arc<AtomicBool>,
+    peak_bytes: Arc<AtomicU64>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl RssSamplerGuard {
+    fn start(pid: u32) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let peak_bytes = Arc::new(AtomicU64::new(read_process_peak_rss_bytes(pid).unwrap_or(0)));
+        // On Linux (`/proc/{pid}/status` VmHWM) and Windows (`PeakWorkingSet64`), the kernel tracks
+        // exact peak RSS natively, so we only need background polling on macOS/other Unix.
+        #[cfg(all(unix, not(target_os = "linux")))]
+        let thread = {
+            let stop_c = Arc::clone(&stop);
+            let peak_c = Arc::clone(&peak_bytes);
+            Some(thread::spawn(move || {
+                while !stop_c.load(Ordering::Relaxed) {
+                    if let Some(rss) = read_process_peak_rss_bytes(pid) {
+                        peak_c.fetch_max(rss, Ordering::Relaxed);
+                    }
+                    thread::sleep(Duration::from_millis(15));
+                }
+            }))
+        };
+        #[cfg(any(target_os = "linux", windows))]
+        let thread: Option<thread::JoinHandle<()>> = None;
+        Self { stop, peak_bytes, thread }
+    }
+
+    fn finish(mut self, pid: u32) -> u64 {
+        if let Some(rss) = read_process_peak_rss_bytes(pid) {
+            self.peak_bytes.fetch_max(rss, Ordering::Relaxed);
+        }
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+        self.peak_bytes.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for RssSamplerGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Reads peak (or current, on macOS where `RssSamplerGuard` polls continuously) resident set size
+/// in bytes for `pid`.
+fn read_process_peak_rss_bytes(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmHWM:") {
+                let kib: u64 = rest.split_whitespace().next()?.parse().ok()?;
+                return Some(kib.saturating_mul(1024));
+            }
+        }
+        None
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
         let out = Command::new("ps").args(["-o", "rss=", "-p", &pid.to_string()]).output().ok()?;
         if !out.status.success() {
@@ -146,7 +219,7 @@ fn read_process_rss_bytes(pid: u32) -> Option<u64> {
     }
     #[cfg(windows)]
     {
-        let script = format!("(Get-Process -Id {pid} -ErrorAction SilentlyContinue).WorkingSet64");
+        let script = format!("(Get-Process -Id {pid} -ErrorAction SilentlyContinue).PeakWorkingSet64");
         let out = Command::new("powershell").args(["-NoProfile", "-Command", &script]).output().ok()?;
         if !out.status.success() {
             return None;
@@ -183,9 +256,11 @@ fn bench_pty_flood(quick: bool) -> PtyFloodResult {
     let broker_pid: u32 = if let Some(bin) = bin_path {
         let child = Command::new(bin)
             .args(["serve", "--socket", &endpoint])
+            .env_remove(apack_broker::config::AUTH_KEY_ENV)
+            .env_remove(apack_os::transport::START_GRACE_ENV)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("spawn apack-terminal serve");
         let guard = ChildGuard::new(child);
@@ -200,9 +275,14 @@ fn bench_pty_flood(quick: bool) -> PtyFloodResult {
         std::process::id()
     };
 
-    // Wait for broker socket readiness (bounded 5s deadline).
+    // Wait for broker socket readiness (bounded 5s deadline), failing immediately if the child exits.
     let connect_deadline = Instant::now() + Duration::from_secs(5);
     let mut control = loop {
+        if let Some(guard) = broker_child.as_mut()
+            && let Ok(Some(status)) = guard.try_wait()
+        {
+            panic!("isolated apack-terminal broker exited prematurely with status {status}");
+        }
         match BrokerClient::connect(&endpoint, &AuthConfig::None, "bench-control") {
             Ok(c) => break c,
             Err(e) => {
@@ -214,20 +294,13 @@ fn bench_pty_flood(quick: bool) -> PtyFloodResult {
     let (lease_id, _) = control.acquire_lease(LeaseKind::BrokerImmediate).expect("acquire lease");
     let metrics_before = control.metrics().expect("metrics before");
 
-    let stop_sampler = Arc::new(AtomicBool::new(false));
-    let peak_rss_bytes = Arc::new(AtomicU64::new(read_process_rss_bytes(broker_pid).unwrap_or(0)));
-    let sampler_stop = Arc::clone(&stop_sampler);
-    let sampler_peak = Arc::clone(&peak_rss_bytes);
-    let sampler_thread = thread::spawn(move || {
-        while !sampler_stop.load(Ordering::Relaxed) {
-            if let Some(rss) = read_process_rss_bytes(broker_pid) {
-                sampler_peak.fetch_max(rss, Ordering::Relaxed);
-            }
-            thread::sleep(Duration::from_millis(15));
-        }
-    });
+    // Connect the VIEW client BEFORE spawning so attach is synchronous and race-free.
+    let mut view = BrokerClient::connect(&endpoint, &AuthConfig::None, "bench-view").expect("connect view");
 
-    // Bounded `cat` PTY flood generator (zero pipes / zero SIGPIPE races; exits cleanly once all bytes are written).
+    let sampler = RssSamplerGuard::start(broker_pid);
+
+    // Bounded `cat` PTY flood generator gated on a single stdin line so the VIEW subscriber is
+    // guaranteed attached before byte 0 and shell/PowerShell startup is excluded from throughput.
     let chunk_bytes: usize = 1024 * 1024;
     let repeats: u64 = (target_bytes / (chunk_bytes as u64)).max(1);
     let fixture_path = tmp.path().join("flood-1m.txt");
@@ -239,14 +312,17 @@ fn bench_pty_flood(quick: bool) -> PtyFloodResult {
         }
         std::fs::write(&fixture_path, &block).expect("write flood fixture");
     }
+    let env = vec![
+        (String::from("APACK_BENCH_FILE"), fixture_path.display().to_string()),
+        (String::from("APACK_BENCH_REPEATS"), repeats.to_string()),
+    ];
     #[cfg(unix)]
     let argv = vec![
         String::from("/bin/sh"),
         String::from("-c"),
-        String::from("f=$1; n=$2; i=0; while [ \"$i\" -lt \"$n\" ]; do cat \"$f\"; i=$((i + 1)); done"),
-        String::from("apack-flood"),
-        fixture_path.display().to_string(),
-        repeats.to_string(),
+        String::from(
+            "IFS= read -r _; i=0; while [ \"$i\" -lt \"$APACK_BENCH_REPEATS\" ]; do cat \"$APACK_BENCH_FILE\"; i=$((i + 1)); done",
+        ),
     ];
     #[cfg(windows)]
     let argv = vec![
@@ -254,19 +330,19 @@ fn bench_pty_flood(quick: bool) -> PtyFloodResult {
         String::from("-NoProfile"),
         String::from("-Command"),
         String::from(
-            "$bytes = [IO.File]::ReadAllBytes($args[0]); \
+            "[void][Console]::ReadLine(); \
+             $bytes = [IO.File]::ReadAllBytes($env:APACK_BENCH_FILE); \
              $out = [Console]::OpenStandardOutput(); \
-             for ($i = 0; $i -lt [int]$args[1]; $i++) { $out.Write($bytes, 0, $bytes.Length) }; \
+             $n = [int]$env:APACK_BENCH_REPEATS; \
+             for ($i = 0; $i -lt $n; $i++) { $out.Write($bytes, 0, $bytes.Length) }; \
              $out.Flush()",
         ),
-        fixture_path.display().to_string(),
-        repeats.to_string(),
     ];
 
     let spec = SpawnSpec {
         argv,
         cwd: None,
-        env: vec![],
+        env,
         size: GridSize::new(120, 40).unwrap(),
         cell_px: CellPx { width: 8, height: 16 },
         scrollback_limit: 50_000,
@@ -275,66 +351,66 @@ fn bench_pty_flood(quick: bool) -> PtyFloodResult {
         record_dir: None,
         restore_from: None,
         image_files: false,
-        kept: true,
+        kept: false,
     };
 
-    let start = Instant::now();
     let (session_id, _) = control.spawn(spec).expect("spawn flood session");
 
-    // Attach a live VIEW subscriber on a second connection to exercise real frame pacing + FrameAck.
-    let view_endpoint = endpoint.clone();
-    let view_stop = Arc::new(AtomicBool::new(false));
-    let view_stop_clone = Arc::clone(&view_stop);
-    let frames_received = Arc::new(AtomicU64::new(0));
-    let frames_clone = Arc::clone(&frames_received);
-    let view_thread = thread::spawn(move || {
-        let mut view = BrokerClient::connect(&view_endpoint, &AuthConfig::None, "bench-view").expect("connect view");
-        let stream_id = NonZeroStreamId::new(1).unwrap();
-        let credit = FrameCredit { max_frames: 8, max_bytes: 512 * 1024 };
-        if view.attach(session_id, stream_id, SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, 0, credit).is_err() {
-            return;
-        }
-        while !view_stop_clone.load(Ordering::Relaxed) {
-            match view.recv_frame() {
-                Ok(frame) => {
-                    if let BrokerMsg::Frame(f) = frame.msg {
-                        frames_clone.fetch_add(1, Ordering::Relaxed);
-                        let _ = view.send_raw(
-                            stream_id.as_stream_id(),
-                            RequestId::PUSH,
-                            &ClientMsg::FrameAck { seq: f.seq, credit },
-                        );
-                    } else if matches!(frame.msg, BrokerMsg::StreamClosed { .. } | BrokerMsg::Exited { .. }) {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        let _ = view.send_fin();
-    });
+    // Synchronously attach VIEW | EVENTS before releasing the flood via stdin so every frame and
+    // the final Exited event are guaranteed observed without any spawn->attach/wait race.
+    let stream_id = NonZeroStreamId::new(1).unwrap();
+    let credit = FrameCredit { max_frames: 8, max_bytes: 512 * 1024 };
+    view.attach(
+        session_id,
+        stream_id,
+        SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(),
+        None,
+        0,
+        credit,
+    )
+    .expect("attach view");
 
-    let outcome = control.wait(session_id, WaitCondition::Exit, 60_000).expect("wait exit");
+    // Release the gated flood script and start timing from the first byte.
+    let start = Instant::now();
+    view.send_raw(stream_id.as_stream_id(), RequestId::PUSH, &ClientMsg::Write { data: b"go\n".to_vec() })
+        .expect("send flood start signal");
+
+    let mut frames_received = 0u64;
+    let mut saw_exit = false;
+    loop {
+        match view.recv_frame() {
+            Ok(frame) => match frame.msg {
+                BrokerMsg::Frame(f) => {
+                    frames_received += 1;
+                    view.send_raw(
+                        stream_id.as_stream_id(),
+                        RequestId::PUSH,
+                        &ClientMsg::FrameAck { seq: f.seq, credit },
+                    )
+                    .expect("send FrameAck");
+                }
+                BrokerMsg::Exited { .. } => {
+                    saw_exit = true;
+                    break;
+                }
+                BrokerMsg::StreamClosed { .. } => {
+                    break;
+                }
+                _ => {}
+            },
+            Err(e) => panic!("view stream error during flood: {e}"),
+        }
+    }
     let elapsed = start.elapsed();
     let metrics_after = control.metrics().expect("metrics after");
-    assert_eq!(
-        outcome,
-        WaitOutcome::Met,
-        "flood session did not exit cleanly: {outcome:?} (pty_bytes_read={}, frames_received={}, elapsed={:.2}s)",
-        metrics_after.total_pty_bytes.saturating_sub(metrics_before.total_pty_bytes),
-        frames_received.load(Ordering::Relaxed),
-        elapsed.as_secs_f64()
-    );
-    if let Some(rss) = read_process_rss_bytes(broker_pid) {
-        peak_rss_bytes.fetch_max(rss, Ordering::Relaxed);
-    }
+    let peak_rss_bytes = sampler.finish(broker_pid);
 
-    // Clean teardown: kill session, stop view & sampler threads, release lease, shut down broker.
-    view_stop.store(true, Ordering::Relaxed);
-    let _ = control.kill(session_id);
-    let _ = view_thread.join();
-    stop_sampler.store(true, Ordering::Relaxed);
-    let _ = sampler_thread.join();
+    assert!(saw_exit, "flood session did not deliver Exited event");
+    assert!(frames_received > 0, "expected live VIEW frames during flood, got 0");
+
+    // Clean teardown: close view, release lease, shut down broker.
+    let _ = view.send_fin();
+    drop(view);
     let _ = control.release_lease(lease_id);
     let _ = control.send_fin();
     drop(control);
@@ -353,7 +429,7 @@ fn bench_pty_flood(quick: bool) -> PtyFloodResult {
     );
     let elapsed_s = elapsed.as_secs_f64().max(1e-9);
     let throughput_mib_s = (pty_bytes_read as f64) / (1024.0 * 1024.0) / elapsed_s;
-    let peak_rss_mib = (peak_rss_bytes.load(Ordering::Relaxed) as f64) / (1024.0 * 1024.0);
+    let peak_rss_mib = (peak_rss_bytes as f64) / (1024.0 * 1024.0);
 
     PtyFloodResult {
         isolated_broker,
@@ -361,7 +437,7 @@ fn bench_pty_flood(quick: bool) -> PtyFloodResult {
         pty_bytes_read,
         elapsed_s,
         throughput_mib_s,
-        frames_received: frames_received.load(Ordering::Relaxed),
+        frames_received,
         peak_rss_mib,
     }
 }
@@ -469,6 +545,8 @@ fn bench_tui_frames(quick: bool) -> TuiFramesResult {
         };
         let t1 = Instant::now();
 
+        let row_count = packed_rows.len();
+        assert!(row_count >= 12, "expected at least 12 dirty TUI rows per frame, got {row_count}");
         let update = FrameUpdate {
             seq: i as u64,
             epoch: meta.epoch,
@@ -494,6 +572,10 @@ fn bench_tui_frames(quick: bool) -> TuiFramesResult {
             panic!("expected Frame");
         };
         let decoded = BrokerMsg::decode(header.msg_type, &frame_payload).expect("BrokerMsg::decode");
+        let BrokerMsg::Frame(ref decoded_frame) = decoded else {
+            panic!("expected decoded Frame");
+        };
+        assert_eq!(decoded_frame.rows.len(), row_count);
         black_box(&decoded);
         let t3 = Instant::now();
 
@@ -677,10 +759,9 @@ fn capture_keyframe(engine: &GhosttyEngine, size: GridSize, cell_px: CellPx) -> 
         marks_refused: 0,
         commands: vec![],
     };
-    let engine_checkpoint = engine
-        .export_snapshot(apack_wal::MAX_ENGINE_SNAPSHOT_BYTES)
-        .ok()
-        .map(|snapshot_bytes| EngineCheckpoint { engine_abi_hash: apack_broker::engine_abi_hash(), snapshot_bytes });
+    let snapshot_bytes =
+        engine.export_snapshot(apack_wal::MAX_ENGINE_SNAPSHOT_BYTES).expect("GhosttyEngine::export_snapshot");
+    let engine_checkpoint = Some(EngineCheckpoint { engine_abi_hash: apack_broker::engine_abi_hash(), snapshot_bytes });
     KeyframeV2 { visual, engine: engine_checkpoint }
 }
 
@@ -726,11 +807,14 @@ fn bench_wal_stream_rollover_seek(quick: bool) -> WalBenchResult {
         pure_write_dur += tw0.elapsed();
 
         if hint == RolloverHint::NeedKeyframe {
+            // Feed realistic screen content into the VT engine before capturing the dual-layer keyframe.
+            engine.feed(&chunk, &mut events);
             let line = format!("segment boundary tick={i}\r\n");
             engine.feed(line.as_bytes(), &mut events);
             events.clear();
             let tr0 = Instant::now();
             let kf = capture_keyframe(&engine, size, cell_px);
+            assert!(kf.engine.is_some(), "expected dual-layer EngineCheckpoint");
             writer.start_segment_with_keyframe(at_ms, &kf).expect("rollover segment");
             rollover_us.push(tr0.elapsed().as_secs_f64() * 1e6);
         }
@@ -774,14 +858,13 @@ fn bench_wal_stream_rollover_seek(quick: bool) -> WalBenchResult {
 // ---------------------------------------------------------------------------
 
 struct DelayedPipeState {
-    queue: VecDeque<(Instant, Instant, Vec<u8>)>,
+    queue: VecDeque<(Instant, Vec<u8>)>,
     buf: Vec<u8>,
     buf_pos: usize,
     closed: bool,
     actual_hold_ns: u64,
 }
 
-#[derive(Clone)]
 struct DelayedPipeWriter {
     state: Arc<(Mutex<DelayedPipeState>, Condvar)>,
     delay: Duration,
@@ -815,8 +898,7 @@ impl Write for DelayedPipeWriter {
         if guard.closed {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "delayed pipe closed"));
         }
-        let now = Instant::now();
-        guard.queue.push_back((now, now + self.delay, data.to_vec()));
+        guard.queue.push_back((Instant::now() + self.delay, data.to_vec()));
         cv.notify_all();
         Ok(data.len())
     }
@@ -827,6 +909,15 @@ impl Write for DelayedPipeWriter {
 }
 
 impl Drop for DelayedPipeWriter {
+    fn drop(&mut self) {
+        let (lock, cv) = &*self.state;
+        let mut guard = lock.lock().unwrap();
+        guard.closed = true;
+        cv.notify_all();
+    }
+}
+
+impl Drop for DelayedPipeReader {
     fn drop(&mut self) {
         let (lock, cv) = &*self.state;
         let mut guard = lock.lock().unwrap();
@@ -850,22 +941,20 @@ impl Read for DelayedPipeReader {
                 guard.buf_pos += n;
                 return Ok(n);
             }
-            if let Some(&(_, deliver_at, _)) = guard.queue.front() {
+            if let Some(&(deliver_at, _)) = guard.queue.front() {
                 let now = Instant::now();
                 if now >= deliver_at {
-                    let (enqueued_at, deliver_at, chunk) = guard.queue.pop_front().unwrap();
-                    if deliver_at > enqueued_at {
-                        let held =
-                            u64::try_from(now.saturating_duration_since(enqueued_at).as_nanos()).unwrap_or(u64::MAX);
-                        guard.actual_hold_ns = guard.actual_hold_ns.saturating_add(held);
-                    }
+                    let (_, chunk) = guard.queue.pop_front().unwrap();
                     guard.buf = chunk;
                     guard.buf_pos = 0;
                     continue;
                 }
                 let wait_for = deliver_at.saturating_duration_since(now);
+                let sleep_start = Instant::now();
                 let (next_guard, _) = cv.wait_timeout(guard, wait_for).unwrap();
                 guard = next_guard;
+                let slept = u64::try_from(sleep_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                guard.actual_hold_ns = guard.actual_hold_ns.saturating_add(slept);
                 continue;
             }
             if guard.closed {
