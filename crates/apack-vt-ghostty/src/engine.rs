@@ -2323,7 +2323,7 @@ impl GhosttyEngine {
                 start: CellPos { line: cur_line, col: if cur_line == span.start.line { span.start.col } else { 0 } },
                 end: CellPos { line: batch_end, col: if batch_end == span.end.line { span.end.col } else { max_col } },
             };
-            if !out.is_empty() {
+            if cur_line > span.start.line {
                 out.push('\n');
             }
             let chunk = self.format_span_raw(sub);

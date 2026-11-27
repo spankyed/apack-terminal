@@ -101,13 +101,16 @@ struct CtrlHook {
 static CTRL_HOOK: Mutex<Option<CtrlHook>> = Mutex::new(None);
 
 // SAFETY: Windows calls this handler on a dedicated OS control thread (not an async POSIX signal
-// context); locking a short non-reentrant mutex to set an atomic flag and wake the reactor is safe.
+// context); locking a short non-reentrant mutex to clone the hook and dropping the lock BEFORE
+// invoking `wake()` avoids holding a global mutex across caller callbacks.
 unsafe extern "system" fn console_ctrl_handler(_ctrl_type: u32) -> i32 {
-    if let Ok(guard) = CTRL_HOOK.lock()
-        && let Some(hook) = guard.as_ref()
-    {
-        hook.flag.store(true, Ordering::Release);
-        (hook.wake)();
+    let cloned = {
+        let guard = CTRL_HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().map(|hook| (Arc::clone(&hook.flag), Arc::clone(&hook.wake)))
+    };
+    if let Some((flag, wake)) = cloned {
+        flag.store(true, Ordering::Release);
+        wake();
         return 1;
     }
     0
@@ -118,10 +121,10 @@ pub struct ShutdownSignalGuard(());
 
 impl Drop for ShutdownSignalGuard {
     fn drop(&mut self) {
-        if let Ok(mut guard) = CTRL_HOOK.lock() {
-            *guard = None;
-        }
-        // SAFETY: removes the exact handler registered in `install_shutdown_signals`.
+        let mut guard = CTRL_HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = None;
+        // SAFETY: removes the exact handler registered in `install_shutdown_signals` while holding
+        // `CTRL_HOOK` so a concurrent `install_shutdown_signals` cannot race with unregistration.
         unsafe {
             SetConsoleCtrlHandler(Some(console_ctrl_handler), 0);
         }
@@ -134,15 +137,15 @@ pub fn install_shutdown_signals(
     flag: Arc<AtomicBool>,
     wake: impl Fn() + Send + Sync + 'static,
 ) -> io::Result<ShutdownSignalGuard> {
-    if let Ok(mut guard) = CTRL_HOOK.lock() {
-        *guard = Some(CtrlHook { flag, wake: Arc::new(wake) });
+    let mut guard = CTRL_HOOK.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_some() {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, "shutdown signal handler already installed"));
     }
-    // SAFETY: registers a valid `extern "system"` console control callback.
+    *guard = Some(CtrlHook { flag, wake: Arc::new(wake) });
+    // SAFETY: registers a valid `extern "system"` console control callback while holding `CTRL_HOOK`.
     let ok = unsafe { SetConsoleCtrlHandler(Some(console_ctrl_handler), 1) } != 0;
     if !ok {
-        if let Ok(mut guard) = CTRL_HOOK.lock() {
-            *guard = None;
-        }
+        *guard = None;
         return Err(io::Error::last_os_error());
     }
     Ok(ShutdownSignalGuard(()))
@@ -280,6 +283,7 @@ mod tests {
         assert!(!let_go(&idle_server, || {}));
         assert!(hang_up(&idle_server));
         assert!(!hang_up(&idle_server));
+        assert!(client_is_this_user(&idle_server).is_err(), "disconnected pipe must fail client_is_this_user");
     }
 
     #[test]
@@ -291,6 +295,8 @@ mod tests {
             woke_cb.store(true, Ordering::Release);
         })
         .expect("install console ctrl handler");
+        let dup = install_shutdown_signals(Arc::new(AtomicBool::new(false)), || {});
+        assert_eq!(dup.err().map(|e| e.kind()), Some(io::ErrorKind::AlreadyExists));
         // SAFETY: invoking the registered callback directly simulates an OS console control event.
         assert_eq!(unsafe { console_ctrl_handler(0) }, 1);
         assert!(flag.load(Ordering::Acquire));

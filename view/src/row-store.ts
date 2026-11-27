@@ -94,6 +94,7 @@ export class RowStore {
   }
 
   private deleteLine(line: number): void {
+    this.doubted.delete(line)
     const pageIdx = Math.floor(line / PAGE_LINES)
     const page = this.pages.get(pageIdx)
     if (!page) return
@@ -103,7 +104,6 @@ export class RowStore {
     page.count -= 1
     this.totalRows -= 1
     this.picturedLines.delete(line)
-    this.doubted.delete(line)
     if (page.count === 0) {
       this.pages.delete(pageIdx)
     }
@@ -151,20 +151,33 @@ export class RowStore {
     const changed: number[] = []
     if (!reset) {
       if (frame.fullSync) {
-        // Drop any active-screen rows that were replaced by a blank row not listed in `frame.rows`,
-        // AND drop rows that scrolled off the previous active screen during skipped/coalesced frames.
-        const clearStart = Math.min(prevFirstActive, this.firstActive)
-        for (let line = clearStart; line < this.end; line += 1) {
+        // Drop any rows that were on the previous active screen and scrolled off during skipped
+        // frames (O(prevScreenRows)), plus any current active-screen rows replaced by blank rows
+        // omitted from `frame.rows` (O(screenRows)). Lines `< this.oldest` are dropped in O(pages)
+        // by `trimBelow(this.oldest)` below.
+        const stalePrevStart = Math.max(this.oldest, prevFirstActive)
+        const stalePrevEnd = Math.min(prevEnd, this.firstActive)
+        for (let line = stalePrevStart; line < stalePrevEnd; line += 1) {
+          if (this.row(line) !== undefined) {
+            this.deleteLine(line)
+            changed.push(line)
+          }
+        }
+        for (let line = this.firstActive; line < this.end; line += 1) {
           if (this.row(line) !== undefined) {
             this.deleteLine(line)
             changed.push(line)
           }
         }
         // If `firstActive` moved backward within the same epoch (e.g. reflow/shrink), doubt older
-        // cached history so scrolled views re-fetch authoritative lines instead of stale wraps.
+        // cached history by iterating allocated pages (O(cached rows)), never O(scrollback).
         if (this.firstActive < prevFirstActive) {
-          for (let line = this.oldest; line < this.firstActive; line += 1) {
-            if (this.row(line) !== undefined) this.doubted.add(line)
+          for (const page of this.pages.values()) {
+            if (page.baseLine >= this.firstActive) continue
+            const limit = Math.min(PAGE_LINES, this.firstActive - page.baseLine)
+            for (let i = 0; i < limit; i += 1) {
+              if (page.slots[i] !== undefined) this.doubted.add(page.baseLine + i)
+            }
           }
         }
       } else if (this.firstActive > prevFirstActive && frame.scrollDelta > 0) {

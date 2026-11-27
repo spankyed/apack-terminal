@@ -20,11 +20,29 @@ const LONGEST_PATH: usize = 32_768;
 const FINAL_PATH: u32 = FILE_NAME_NORMALIZED;
 const _: () = assert!(VOLUME_NAME_DOS == 0);
 
+/// Returns `true` if any ancestor directory component of `path` is an NTFS reparse point
+/// (such as a directory junction or symlink) so `CreateFileW` never traverses into a UNC share
+/// or named pipe before post-open checks run.
+fn has_reparse_ancestor(path: &std::path::Path) -> bool {
+    for ancestor in path.ancestors().skip(1) {
+        if ancestor.parent().is_none() {
+            break;
+        }
+        if std::fs::symlink_metadata(ancestor)
+            .ok()
+            .is_some_and(|meta| (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Opens `path` read-only on Windows after verifying both the requested spelling and the
 /// post-open kernel final path are regular disk files under a drive letter (`C:\...`).
 pub fn open_file(path: &[u8]) -> Option<File> {
     let text = std::str::from_utf8(path).ok()?;
-    if rules::refused(path) {
+    if rules::refused(path) || has_reparse_ancestor(std::path::Path::new(text)) {
         return None;
     }
     // Open without following NTFS reparse points so a hostile symlink/junction pointing to an
@@ -91,5 +109,22 @@ mod tests {
         assert!(open_file(b"NUL").is_none());
         assert!(open_file(b"bad\0path").is_none());
         assert_eq!(shared_memory(b"/shm", |_| Ok(0..1)), Err(super::super::Refused::InvalidData));
+
+        // Unprivileged NTFS directory junction must be refused BEFORE traversing into target.
+        let target_dir = dir.path().join("real-target");
+        std::fs::create_dir(&target_dir).expect("mkdir target");
+        std::fs::write(target_dir.join("secret.bin"), b"pixels").expect("write target");
+        let junction_dir = dir.path().join("junc");
+        let status = std::process::Command::new("cmd.exe")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction_dir)
+            .arg(&target_dir)
+            .status()
+            .expect("mklink /J");
+        assert!(status.success(), "unprivileged mklink /J must succeed on Windows");
+        assert!(
+            open_file(junction_dir.join("secret.bin").to_string_lossy().as_bytes()).is_none(),
+            "open_file must refuse files reached through an intermediate NTFS directory junction"
+        );
     }
 }

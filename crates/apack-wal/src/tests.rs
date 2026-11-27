@@ -1162,9 +1162,9 @@ fn corrupt_record0_payload_len_returns_ok_none_and_overlapping_segments_rejected
     let huge_rec0 = tmp.path().join("huge-rec0.apks");
     let mut bytes = Vec::new();
     encode_framed_record(100, &WalRecord::Keyframe(Box::new(sample_keyframe(None, None, None))), &mut bytes).unwrap();
-    // Bytes 0..4 are u32 LE payload_len in RECORD_HEADER_LEN.
+    // Bytes 12..16 are u32 LE payload_len in RECORD_HEADER_LEN ([kind:1][flags:1][reserved:2][at_ms:8][len:4]).
     let huge_len = ((MAX_RECORD_PAYLOAD as u32) + 1).to_le_bytes();
-    bytes[0..4].copy_from_slice(&huge_len);
+    bytes[12..16].copy_from_slice(&huge_len);
     let end = bytes.len() as u64;
     bytes.extend_from_slice(
         &SegmentFooter { first_ms: 100, last_ms: 100, records_end_offset: end, record_count: 1 }.encode(),
@@ -1203,10 +1203,28 @@ fn wal_handle_coalesces_small_outputs_and_never_drops_seal() {
     let w = WalWriter::open_or_create(&dir, [23; 16], 100, WalConfig::default(), registry.clone()).unwrap();
     let h = WalWorker::spawn(w);
     assert!(h.start_segment(100, sample_keyframe(None, None, None)));
-    // Exercise empty ground-notification path and control_queued decrement across > MAX_CONTROL_QUEUE_LEN resizes.
-    assert!(h.write_output(100, Vec::new(), true));
+    // Unit-check empty-output control-slot release on coalescing + non-output hard segment cap.
+    let mut ctrl = 3usize;
+    crate::writer::release_empty_output_control_slot(5, &mut ctrl);
+    assert_eq!(ctrl, 3, "coalescing onto non-empty output must not decrement control_queued");
+    crate::writer::release_empty_output_control_slot(0, &mut ctrl);
+    assert_eq!(ctrl, 2, "coalescing onto empty output must release its control slot");
+
     let sz = GridSize::new(80, 24).unwrap();
     let px = CellPx { width: 8, height: 16 };
+    let cap_dir = tmp.path().join("cap-non-output");
+    let cap_reg = RecordingRegistry::new();
+    let mut cap_w = WalWriter::open_or_create(&cap_dir, [24; 16], 100, WalConfig::default(), cap_reg).unwrap();
+    cap_w.start_segment_with_keyframe(100, &sample_keyframe(None, None, None)).unwrap();
+    let cur = cap_w.total_segment_bytes();
+    assert!(!cap_w.append_record_capped(101, &WalRecord::Resize { size: sz, cell_px: px }, cur + 40).unwrap());
+    assert!(cap_w.append_record_capped(101, &WalRecord::Resize { size: sz, cell_px: px }, cur + 512).unwrap());
+    drop(cap_w);
+
+    // Exercise empty ground-notification path and control_queued decrement across > MAX_CONTROL_QUEUE_LEN resizes,
+    // including immediate empty->non-empty coalescing without leaking control slots.
+    assert!(h.write_output(100, Vec::new(), true));
+    assert!(h.write_output(100, b"coalesced".to_vec(), true));
     for i in 0..=MAX_CONTROL_QUEUE_LEN {
         if i % 256 == 0 {
             h.flush_barrier_timeout(Duration::from_secs(5)).unwrap();
@@ -1266,10 +1284,15 @@ fn review_mutants_wal_hard_cap_coalesce_control_slot_and_fifo_rejection() {
     let after_gap = w.active_segment_size().unwrap();
     assert!(after_gap > base_size + framed_len, "Gap record must be appended when room remains");
     assert!(after_gap + (SEGMENT_FOOTER_LEN as u64) <= exact_max);
-    // When cur_size + 64 > max_file_bytes - SEGMENT_FOOTER_LEN, no Gap record is appended (stays <= max_file_bytes)
-    let tight_max = after_gap + (SEGMENT_FOOTER_LEN as u64) + 63;
+    // When remaining room before SEGMENT_FOOTER_LEN is smaller than the encoded Gap record, skip appending it
+    let gap_len = after_gap - (base_size + framed_len);
+    let tight_max = after_gap + (SEGMENT_FOOTER_LEN as u64) + gap_len - 1;
     assert_eq!(w.record_output_capped(130, b"w", true, tight_max).unwrap(), RolloverHint::NeedKeyframe);
     assert_eq!(w.active_segment_size().unwrap(), after_gap);
+    // Exact encoded Gap record room accepts it without exceeding max_file_bytes
+    let exact_gap_max = after_gap + (SEGMENT_FOOTER_LEN as u64) + gap_len;
+    assert_eq!(w.record_output_capped(131, b"w", true, exact_gap_max).unwrap(), RolloverHint::NeedKeyframe);
+    assert_eq!(w.active_segment_size().unwrap(), after_gap + gap_len);
     drop(w);
 
     // 4. On Unix, open_regular_read_only refuses a FIFO (O_NONBLOCK avoids blocking) and symlinks (ELOOP).

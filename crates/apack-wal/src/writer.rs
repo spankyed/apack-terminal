@@ -205,52 +205,63 @@ impl WalWriter {
             last_at_ms = last_at_ms.max(seg_last_ms);
             let record_count = u32::try_from(scan.records.len()).unwrap_or(u32::MAX);
 
-            // Never truncate or mutate a segment while a concurrent WalReader holds a pin on it.
-            if registry.is_pinned(&canonical, seg_id) {
-                closed.push(ClosedSegment {
-                    id: seg_id,
-                    path,
-                    size_bytes: bytes.len() as u64,
-                    referenced_blobs: kf.referenced_blobs(),
-                });
-                continue;
-            }
+            // Atomically check pin state and truncate/seal under the registry mutex so no
+            // concurrent `WalReader::open` (`discover_and_pin`) can observe a half-mutated segment.
+            let mutated = registry.try_mutate_if_unpinned(&canonical, seg_id, || {
+                let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+                if scan.had_torn_tail {
+                    file.set_len(scan.valid_records_end as u64)?;
+                    file.sync_data()?;
+                }
+                file.seek(SeekFrom::End(0))?;
 
-            let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
-            if scan.had_torn_tail {
-                file.set_len(scan.valid_records_end as u64)?;
-                file.sync_data()?;
-            }
-            file.seek(SeekFrom::End(0))?;
+                if !is_last {
+                    // Earlier unsealed segment: seal it now so `closed` holds only properly sealed segments.
+                    let footer = SegmentFooter {
+                        first_ms: first.at_ms,
+                        last_ms: seg_last_ms,
+                        records_end_offset: scan.valid_records_end as u64,
+                        record_count,
+                    };
+                    let encoded_footer = footer.encode();
+                    file.write_all(&encoded_footer)?;
+                    file.sync_data()?;
+                    Ok((None, Some((scan.valid_records_end + encoded_footer.len()) as u64)))
+                } else {
+                    Ok((Some(file), None))
+                }
+            })?;
 
-            if !is_last {
-                // Earlier unsealed segment: seal it now so `closed` holds only properly sealed segments.
-                let footer = SegmentFooter {
-                    first_ms: first.at_ms,
-                    last_ms: seg_last_ms,
-                    records_end_offset: scan.valid_records_end as u64,
-                    record_count,
-                };
-                let encoded_footer = footer.encode();
-                file.write_all(&encoded_footer)?;
-                file.sync_data()?;
-                closed.push(ClosedSegment {
-                    id: seg_id,
-                    path,
-                    size_bytes: (scan.valid_records_end + encoded_footer.len()) as u64,
-                    referenced_blobs: kf.referenced_blobs(),
-                });
-            } else {
-                active = Some(ActiveSegment {
-                    id: seg_id,
-                    path,
-                    file,
-                    size_bytes: scan.valid_records_end as u64,
-                    first_ms: first.at_ms,
-                    last_ms: seg_last_ms,
-                    record_count,
-                    referenced_blobs: kf.referenced_blobs(),
-                });
+            match mutated {
+                None => {
+                    closed.push(ClosedSegment {
+                        id: seg_id,
+                        path,
+                        size_bytes: bytes.len() as u64,
+                        referenced_blobs: kf.referenced_blobs(),
+                    });
+                }
+                Some((None, Some(sealed_len))) => {
+                    closed.push(ClosedSegment {
+                        id: seg_id,
+                        path,
+                        size_bytes: sealed_len,
+                        referenced_blobs: kf.referenced_blobs(),
+                    });
+                }
+                Some((Some(file), None)) => {
+                    active = Some(ActiveSegment {
+                        id: seg_id,
+                        path,
+                        file,
+                        size_bytes: scan.valid_records_end as u64,
+                        first_ms: first.at_ms,
+                        last_ms: seg_last_ms,
+                        record_count,
+                        referenced_blobs: kf.referenced_blobs(),
+                    });
+                }
+                Some(_) => unreachable!("try_mutate_if_unpinned returns either sealed len or active file"),
             }
         }
 
@@ -391,9 +402,10 @@ impl WalWriter {
         if vt_at_ground {
             if self.non_ground_dropped > 0 {
                 let dropped = self.non_ground_dropped;
-                self.append_record_unchecked(
+                let _ = self.append_record_capped(
                     at_ms,
                     &WalRecord::Gap { dropped_bytes: dropped, reason: GapReason::NonGroundCap },
+                    max_file_bytes,
                 )?;
                 self.non_ground_dropped = 0;
             }
@@ -423,16 +435,14 @@ impl WalWriter {
                     shed_bytes = shed_bytes.saturating_add(chunk.len() as u64);
                     continue;
                 }
-                self.append_record_unchecked(at_ms, &WalRecord::Output(chunk.to_vec()))?;
+                let _ = self.append_record_capped(at_ms, &WalRecord::Output(chunk.to_vec()), max_file_bytes)?;
             }
             if hit_hard_cap {
-                let cur_size = self.active.as_ref().map_or(0, |a| a.size_bytes);
-                if cur_size.saturating_add(64) <= max_file_bytes.saturating_sub(footer_reserve) {
-                    self.append_record_unchecked(
-                        at_ms,
-                        &WalRecord::Gap { dropped_bytes: shed_bytes, reason: GapReason::BacklogOverflow },
-                    )?;
-                }
+                let _ = self.append_record_capped(
+                    at_ms,
+                    &WalRecord::Gap { dropped_bytes: shed_bytes, reason: GapReason::BacklogOverflow },
+                    max_file_bytes,
+                )?;
                 return Ok(RolloverHint::NeedKeyframe);
             }
         }
@@ -442,31 +452,36 @@ impl WalWriter {
         Ok(if needs_rollover { RolloverHint::NeedKeyframe } else { RolloverHint::Continue })
     }
 
-    /// Appends a `Resize` record to the active segment.
+    /// Appends a `Resize` record to the active segment (respecting the hard segment file cap).
     pub fn record_resize(&mut self, at_ms: u64, size: GridSize, cell_px: CellPx) -> Result<(), WalError> {
         if self.active.is_none() {
             return Err(WalError::CorruptSegment("no active segment"));
         }
         let at_ms = self.monotonic_ms(at_ms);
-        self.append_record_unchecked(at_ms, &WalRecord::Resize { size, cell_px })
+        let _ =
+            self.append_record_capped(at_ms, &WalRecord::Resize { size, cell_px }, crate::MAX_SEGMENT_FILE_BYTES)?;
+        Ok(())
     }
 
-    /// Appends a `Marks` record to the active segment.
+    /// Appends a `Marks` record to the active segment (respecting the hard segment file cap).
     pub fn record_marks(&mut self, at_ms: u64, key: Option<MarksKey>, last_seq: u64) -> Result<(), WalError> {
         if self.active.is_none() {
             return Err(WalError::CorruptSegment("no active segment"));
         }
         let at_ms = self.monotonic_ms(at_ms);
-        self.append_record_unchecked(at_ms, &WalRecord::Marks { key, last_seq })
+        let _ = self.append_record_capped(at_ms, &WalRecord::Marks { key, last_seq }, crate::MAX_SEGMENT_FILE_BYTES)?;
+        Ok(())
     }
 
-    /// Appends an explicit `Gap` marker to the active segment.
+    /// Appends an explicit `Gap` marker to the active segment (respecting the hard segment file cap).
     pub fn record_gap(&mut self, at_ms: u64, dropped_bytes: u64, reason: GapReason) -> Result<(), WalError> {
         if self.active.is_none() {
             return Err(WalError::CorruptSegment("no active segment"));
         }
         let at_ms = self.monotonic_ms(at_ms);
-        self.append_record_unchecked(at_ms, &WalRecord::Gap { dropped_bytes, reason })
+        let _ =
+            self.append_record_capped(at_ms, &WalRecord::Gap { dropped_bytes, reason }, crate::MAX_SEGMENT_FILE_BYTES)?;
+        Ok(())
     }
 
     /// Seals the currently active segment by flushing pending non-ground gaps, syncing data,
@@ -476,9 +491,10 @@ impl WalWriter {
         if self.non_ground_dropped > 0 && self.active.is_some() {
             let dropped = self.non_ground_dropped;
             let at_ms = self.last_at_ms;
-            self.append_record_unchecked(
+            let _ = self.append_record_capped(
                 at_ms,
                 &WalRecord::Gap { dropped_bytes: dropped, reason: GapReason::NonGroundCap },
+                crate::MAX_SEGMENT_FILE_BYTES,
             )?;
             self.non_ground_dropped = 0;
         }
@@ -549,6 +565,7 @@ impl WalWriter {
                     if had_blobs {
                         // Immediately sweep blobs freed by this segment and credit them to `total`
                         // before deciding whether additional closed segments must be evicted.
+                        // Always restore `self.closed` on error so remaining segments are never lost.
                         let mut live = HashSet::new();
                         for s in &kept {
                             live.extend(s.referenced_blobs.iter().copied());
@@ -560,14 +577,30 @@ impl WalWriter {
                             live.extend(active.referenced_blobs.iter().copied());
                         }
                         live.extend(self.pending_blobs.iter().copied());
-                        report.swept_blobs = report.swept_blobs.saturating_add(sweep_unreferenced(&self.dir, &live)?);
+                        let swept = match sweep_unreferenced(&self.dir, &live) {
+                            Ok(n) => n,
+                            Err(err) => {
+                                kept.extend(iter);
+                                self.closed = kept;
+                                return Err(err);
+                            }
+                        };
+                        report.swept_blobs = report.swept_blobs.saturating_add(swept);
+                        let rem_blob_bytes = match blobs_total_bytes(&self.dir) {
+                            Ok(b) => b,
+                            Err(err) => {
+                                kept.extend(iter);
+                                self.closed = kept;
+                                return Err(err);
+                            }
+                        };
                         let rem_seg_bytes: u64 = kept
                             .iter()
                             .chain(iter.as_slice().iter())
                             .map(|s| s.size_bytes)
                             .sum::<u64>()
                             .saturating_add(self.active.as_ref().map_or(0, |a| a.size_bytes));
-                        total = rem_seg_bytes.saturating_add(blobs_total_bytes(&self.dir)?);
+                        total = rem_seg_bytes.saturating_add(rem_blob_bytes);
                     }
                 }
                 Ok(false) => {
@@ -605,12 +638,21 @@ impl WalWriter {
         clamped
     }
 
-    fn append_record_unchecked(&mut self, at_ms: u64, record: &WalRecord) -> Result<(), WalError> {
+    pub(crate) fn append_record_capped(
+        &mut self,
+        at_ms: u64,
+        record: &WalRecord,
+        max_file_bytes: u64,
+    ) -> Result<bool, WalError> {
         let Some(active) = self.active.as_mut() else {
             return Err(WalError::CorruptSegment("no active segment"));
         };
         self.encode_buf.clear();
         encode_framed_record(at_ms, record, &mut self.encode_buf)?;
+        let max_records_end = max_file_bytes.saturating_sub(crate::SEGMENT_FOOTER_LEN as u64);
+        if active.size_bytes.saturating_add(self.encode_buf.len() as u64) > max_records_end {
+            return Ok(false);
+        }
         // Write the complete framed record in one contiguous `write_all` call; roll back length/cursor on failure.
         if let Err(err) = active.file.write_all(&self.encode_buf) {
             let _ = active.file.set_len(active.size_bytes);
@@ -620,7 +662,7 @@ impl WalWriter {
         active.size_bytes = active.size_bytes.saturating_add(self.encode_buf.len() as u64);
         active.last_ms = active.last_ms.max(at_ms);
         active.record_count = active.record_count.saturating_add(1);
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -779,6 +821,12 @@ pub struct WalHandle {
     thread: Option<JoinHandle<()>>,
 }
 
+pub(crate) fn release_empty_output_control_slot(prev_cost: usize, control_queued: &mut usize) {
+    if prev_cost == 0 {
+        *control_queued = control_queued.saturating_sub(1);
+    }
+}
+
 pub(crate) fn try_reserve_backlog(queued: &mut usize, cost: usize, max_backlog: usize) -> bool {
     let next = queued.saturating_add(cost);
     if next > max_backlog {
@@ -856,8 +904,10 @@ impl WalHandle {
             state.queue.back_mut()
             && try_coalesce_output(prev_bytes, *prev_g, &bytes, vt_at_ground, MAX_RECORD_PAYLOAD)
         {
+            let was_cost = *prev_cost;
             *prev_cost = prev_cost.saturating_add(cost);
             *prev_ms = (*prev_ms).max(at_ms);
+            release_empty_output_control_slot(was_cost, &mut state.control_queued);
             cv.notify_one();
             return true;
         }

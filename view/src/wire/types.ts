@@ -1077,7 +1077,7 @@ export function encodeWaitCondition(w: WireWriter, c: WaitCondition): void {
       break
     case 'text':
       w.u8(1)
-      w.str(c.needle)
+      w.strBounded(c.needle, MAX_SEARCH_NEEDLE_BYTES, 'wait text needle')
       break
     case 'status':
       w.u8(2)

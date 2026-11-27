@@ -84,7 +84,7 @@ pub fn acquire_socket_hold(socket: &str) -> Result<SocketHold, OsError> {
             .create(true)
             .truncate(false)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&lock_path)
             .map_err(|err| OsError::io("opening socket lock file", err))?;
         if !lock.metadata().map_err(|err| OsError::io("inspecting socket lock file", err))?.is_file() {
@@ -313,12 +313,35 @@ mod unix_signals {
         }
     }
 
+    #[inline]
+    // SAFETY: returns the calling thread's libc `errno` pointer; valid for the lifetime of the thread.
+    unsafe fn errno_ptr() -> *mut libc::c_int {
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "openbsd"))]
+        {
+            // SAFETY: platform libc thread-local errno accessor is async-signal-safe.
+            unsafe { libc::__error() }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: glibc/musl thread-local errno accessor is async-signal-safe.
+            unsafe { libc::__errno_location() }
+        }
+    }
+
     extern "C" fn handle_shutdown_signal(_sig: libc::c_int) {
+        // SAFETY: preserving thread-local `errno` across `write(2)` is POSIX async-signal-safe.
+        let err_ptr = unsafe { errno_ptr() };
+        // SAFETY: `err_ptr` points to the current thread's `errno` storage.
+        let saved_errno = unsafe { *err_ptr };
         let fd = SIGNAL_PIPE_WR.load(Ordering::Relaxed);
         if fd >= 0 {
             let byte: u8 = 1;
             // SAFETY: `write(2)` of 1 byte to a non-blocking pipe fd is POSIX async-signal-safe.
             let _ = unsafe { libc::write(fd, (&raw const byte).cast(), 1) };
+        }
+        // SAFETY: restoring saved `errno` before returning from signal handler.
+        unsafe {
+            *err_ptr = saved_errno;
         }
     }
 
@@ -387,35 +410,9 @@ mod unix_signals {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, "shutdown signal handler already installed"));
         }
 
-        // SAFETY: zero-initialized `libc::sigaction` is valid before setting `sa_sigaction`/`sa_mask`/`sa_flags`.
-        let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
-        sa.sa_sigaction = handle_shutdown_signal as *const () as usize;
-        sa.sa_flags = libc::SA_RESTART;
-        // SAFETY: `sigemptyset` initializes `sa.sa_mask`.
-        unsafe {
-            libc::sigemptyset(&raw mut sa.sa_mask);
-        }
-        // SAFETY: out-buffer populated by `sigaction`.
-        let mut prev_int: libc::sigaction = unsafe { std::mem::zeroed() };
-        // SAFETY: out-buffer populated by `sigaction`.
-        let mut prev_term: libc::sigaction = unsafe { std::mem::zeroed() };
-        // SAFETY: installing async-signal-safe handlers for `SIGINT` and `SIGTERM`.
-        let installed = unsafe {
-            libc::sigaction(libc::SIGINT, &sa, &mut prev_int) == 0
-                && libc::sigaction(libc::SIGTERM, &sa, &mut prev_term) == 0
-        };
-        if !installed {
-            let err = io::Error::last_os_error();
-            SIGNAL_PIPE_WR.store(INVALID_FD, Ordering::Release);
-            // SAFETY: closing pipe fds after `sigaction` failure.
-            unsafe {
-                libc::close(rd_fd);
-                libc::close(wr_fd);
-            }
-            return Err(err);
-        }
-
-        let worker = std::thread::Builder::new().name("apack-signals".to_owned()).spawn(move || {
+        // Spawn the reader thread BEFORE installing signal handlers so a spawn failure rolls back
+        // cleanly without ever modifying process signal dispositions.
+        let worker = match std::thread::Builder::new().name("apack-signals".to_owned()).spawn(move || {
             let mut buf = [0u8; 16];
             loop {
                 // SAFETY: `rd_fd` is owned exclusively by this thread and `buf` is valid for 16 bytes.
@@ -434,7 +431,51 @@ mod unix_signals {
             unsafe {
                 libc::close(rd_fd);
             }
-        })?;
+        }) {
+            Ok(w) => w,
+            Err(err) => {
+                SIGNAL_PIPE_WR.store(INVALID_FD, Ordering::Release);
+                // SAFETY: closing unused pipe fds on thread spawn failure.
+                unsafe {
+                    libc::close(rd_fd);
+                    libc::close(wr_fd);
+                }
+                return Err(err);
+            }
+        };
+
+        // SAFETY: zero-initialized `libc::sigaction` is valid before setting `sa_sigaction`/`sa_mask`/`sa_flags`.
+        let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+        sa.sa_sigaction = handle_shutdown_signal as *const () as usize;
+        sa.sa_flags = libc::SA_RESTART;
+        // SAFETY: `sigemptyset` initializes `sa.sa_mask`.
+        unsafe {
+            libc::sigemptyset(&raw mut sa.sa_mask);
+        }
+        // SAFETY: out-buffer populated by `sigaction`.
+        let mut prev_int: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: out-buffer populated by `sigaction`.
+        let mut prev_term: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: installing async-signal-safe handler for `SIGINT`.
+        let int_ok = unsafe { libc::sigaction(libc::SIGINT, &sa, &mut prev_int) } == 0;
+        // SAFETY: installing async-signal-safe handler for `SIGTERM`, rolling back `SIGINT` on error.
+        let term_ok = int_ok && unsafe { libc::sigaction(libc::SIGTERM, &sa, &mut prev_term) } == 0;
+        if !term_ok {
+            let err = io::Error::last_os_error();
+            if int_ok {
+                // SAFETY: restoring `SIGINT` disposition saved above.
+                unsafe {
+                    libc::sigaction(libc::SIGINT, &prev_int, std::ptr::null_mut());
+                }
+            }
+            SIGNAL_PIPE_WR.store(INVALID_FD, Ordering::Release);
+            // SAFETY: closing write end unblocks `worker` with EOF before joining.
+            unsafe {
+                libc::close(wr_fd);
+            }
+            let _ = worker.join();
+            return Err(err);
+        }
 
         Ok(ShutdownSignalGuard { prev_int, prev_term, wr_fd, worker: Some(worker) })
     }
@@ -652,6 +693,12 @@ mod tests {
         let hold = acquire_socket_hold(&sock_str).expect("first hold");
         assert!(matches!(acquire_socket_hold(&sock_str), Err(OsError::AlreadyHeld)));
         let dup_lock_fd = hold.lock.try_clone().expect("dup lock fd");
+
+        // A readerless FIFO at `{socket}.lock` must fail promptly (O_NONBLOCK + is_file()) without hanging!
+        let fifo_sock = nested.parent().expect("parent").join("fifo-hold.sock");
+        let fifo_lock = nested.parent().expect("parent").join("fifo-hold.sock.lock");
+        assert!(std::process::Command::new("mkfifo").arg(&fifo_lock).status().expect("mkfifo").success());
+        assert!(acquire_socket_hold(&fifo_sock.to_string_lossy()).is_err());
 
         let listener = bind_local_listener(&sock_str).expect("bind listener");
         // Verify `UmaskGuard::drop` restored the process umask (not left stuck at 0o077).

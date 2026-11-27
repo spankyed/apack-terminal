@@ -1057,6 +1057,8 @@ impl<V: VtEngine> SessionMachine<V> {
             if full_sync { (0..meta.size.rows.get()).collect() } else { sub.dirty_rows.iter().copied().collect() };
         let mut rows: Vec<PackedRow> = Vec::new();
         self.vt.extract_viewport_rows(&row_indices, &mut rows);
+        let deferred_rows =
+            budget_frame_rows(&mut rows, meta.first_active_line, apack_proto::MAX_FRAME_PAYLOAD.saturating_sub(16_384));
         let palette = if palette_changed { Some(self.vt.palette_overrides()) } else { None };
         let frame = Box::new(FrameUpdate {
             seq: 0,
@@ -1088,6 +1090,9 @@ impl<V: VtEngine> SessionMachine<V> {
             sub.last_modes = Some(meta.modes);
             sub.needs_full_sync = false;
             sub.dirty_rows.clear();
+            for row_idx in deferred_rows {
+                sub.dirty_rows.insert(row_idx);
+            }
             sub.scroll_delta = 0;
         }
         // A view actually flushed outside a sync hold -> reset anti-starvation clock for future holds.
@@ -1505,6 +1510,25 @@ pub(crate) fn estimate_packed_row_bytes(row: &PackedRow) -> usize {
     let mut w = apack_proto::codec::Writer::new();
     row.encode(&mut w);
     w.as_slice().len()
+}
+
+pub(crate) fn budget_frame_rows(rows: &mut Vec<PackedRow>, first_active_line: u64, max_rows_bytes: usize) -> Vec<u16> {
+    let mut used_bytes = 32usize;
+    let mut keep_count = 0usize;
+    for row in rows.iter() {
+        let row_bytes = estimate_packed_row_bytes(row);
+        if keep_count > 0 && used_bytes.saturating_add(row_bytes) > max_rows_bytes {
+            break;
+        }
+        used_bytes = used_bytes.saturating_add(row_bytes);
+        keep_count += 1;
+    }
+    let deferred: Vec<u16> = rows[keep_count..]
+        .iter()
+        .filter_map(|r| r.line.checked_sub(first_active_line).and_then(|d| u16::try_from(d).ok()))
+        .collect();
+    rows.truncate(keep_count);
+    deferred
 }
 
 pub(crate) fn truncate_rows_to_budget(rows: &mut Vec<PackedRow>, max_rows_bytes: usize) {

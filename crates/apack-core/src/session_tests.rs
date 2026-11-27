@@ -2042,4 +2042,30 @@ fn review_mutants_rows_budget_clamp_rect_and_logical_line_expansion() {
     assert_eq!(s.expand_to_logical_lines(2, 2, 0, 4), (2, 2));
     assert_eq!(s.expand_to_logical_lines(1, 2, 0, 4), (1, 3));
     assert_eq!(s.expand_to_logical_lines(2, 3, 0, 4), (1, 3));
+
+    // 4. budget_frame_rows keeps at least 1 row even when budget < row0, keeps exact-boundary rows,
+    //    and returns deferred viewport row offsets when over budget!
+    let make_row = |line: u64, n: usize| PackedRow {
+        line,
+        flags: 0,
+        text: "a".repeat(n),
+        runs: Vec::new(),
+        styles: Vec::new(),
+        links: Vec::new(),
+        pieces: Vec::new(),
+    };
+    let r10 = make_row(10, 40);
+    let r11 = make_row(11, 40);
+    let r13 = make_row(13, 40);
+    let exact_two =
+        32 + crate::session::estimate_packed_row_bytes(&r10) + crate::session::estimate_packed_row_bytes(&r11);
+    let mut f_rows_tiny = vec![r10.clone(), r11.clone()];
+    assert_eq!(crate::session::budget_frame_rows(&mut f_rows_tiny, 10, 1), vec![1]);
+    assert_eq!(f_rows_tiny.len(), 1);
+    let mut f_rows_exact = vec![r10.clone(), r11.clone(), r13.clone()];
+    assert_eq!(crate::session::budget_frame_rows(&mut f_rows_exact, 10, exact_two), vec![3]);
+    assert_eq!(f_rows_exact.len(), 2);
+    let mut f_rows_over = vec![r10, r11, r13];
+    assert_eq!(crate::session::budget_frame_rows(&mut f_rows_over, 10, exact_two - 1), vec![1, 3]);
+    assert_eq!(f_rows_over.len(), 1);
 }

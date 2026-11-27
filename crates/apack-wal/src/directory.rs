@@ -194,6 +194,22 @@ impl RecordingRegistry {
     }
 
     /// Atomically checks whether `(canonical_dir, seg_id)` is pinned and, if unpinned, runs
+    /// `mutate` while holding the registry lock so no `discover_and_pin` can observe a half-mutated
+    /// or half-deleted segment. Returns `Ok(None)` when pinned.
+    pub(crate) fn try_mutate_if_unpinned<T>(
+        &self,
+        canonical_dir: &Path,
+        seg_id: u64,
+        mutate: impl FnOnce() -> Result<T, WalError>,
+    ) -> Result<Option<T>, WalError> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.pinned_segments.contains_key(&(canonical_dir.to_path_buf(), seg_id)) {
+            return Ok(None);
+        }
+        mutate().map(Some)
+    }
+
+    /// Atomically checks whether `(canonical_dir, seg_id)` is pinned and, if unpinned, runs
     /// `unlink` while holding the registry lock so no `discover_and_pin` can observe a half-deleted segment.
     pub(crate) fn try_unlink_if_unpinned(
         &self,
@@ -201,12 +217,7 @@ impl RecordingRegistry {
         seg_id: u64,
         unlink: impl FnOnce() -> Result<(), WalError>,
     ) -> Result<bool, WalError> {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.pinned_segments.contains_key(&(canonical_dir.to_path_buf(), seg_id)) {
-            return Ok(false);
-        }
-        unlink()?;
-        Ok(true)
+        Ok(self.try_mutate_if_unpinned(canonical_dir, seg_id, unlink)?.is_some())
     }
 
     /// Returns `true` if any active reader currently pins `(canonical_dir, seg_id)`.

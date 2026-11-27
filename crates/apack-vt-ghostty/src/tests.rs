@@ -1321,4 +1321,10 @@ fn review_mutants_batched_text_cell_px_resize_placeholder_bg_long_grapheme_and_s
     found.clear();
     assert!(s_vt.search_lines_bounded(0, s_vt.meta().total_lines(), "x", false, 100, 100, 49, &mut found));
     assert!(found.is_empty());
+
+    // 6. text_of_batched preserves separating '\n' when the first batch formats to empty string!
+    let mut b_vt = GhosttyEngine::new(GhosttyConfig::new(grid(20, 4))).unwrap();
+    b_vt.feed(b"\r\nhello", &mut ev);
+    let b_span = CellSpan { start: CellPos { line: 0, col: 0 }, end: CellPos { line: 1, col: 19 } };
+    assert_eq!(b_vt.text_of_batched(b_span, 1024, 1), "\nhello");
 }

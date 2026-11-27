@@ -635,7 +635,7 @@ export function encodeClientPayload(msg: ClientMsg): Uint8Array {
       encodeCellSpan(w, msg.span)
       break
     case 'setSearch':
-      w.str(msg.query)
+      w.strBounded(msg.query, MAX_SEARCH_NEEDLE_BYTES, 'search query')
       w.bool(msg.caseSensitive)
       break
     case 'commandOutput':

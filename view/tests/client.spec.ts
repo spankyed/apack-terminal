@@ -296,6 +296,23 @@ describe('TerminalClient & BrokerSessionSource', () => {
     // programStatusCleared forwards cleanly as a SessionEvent
     pipe.pushBroker(hiddenSource.streamId, PUSH_REQ_ID, { kind: 'programStatusCleared', id: 'agent-1' })
     expect(hiddenEvents).toContain('programStatusCleared')
+
+    // Unsolicited stream-scoped Error push (e.g., PTY write rejected on exited/rewound session)
+    // must NOT dispose the stream or close the multiplexed connection!
+    pipe.pushBroker(hiddenSource.streamId, PUSH_REQ_ID, { kind: 'error', code: 'pty', message: 'PTY write rejected' })
+    expect(client.isClosed).toBe(false)
+    expect(hiddenEvents).not.toContain('streamClosed')
+    pipe.pushBroker(hiddenSource.streamId, PUSH_REQ_ID, { kind: 'bell' })
+    expect(hiddenEvents).toContain('bell')
+
+    // Oversized search / wait needles (> 4 KiB) reject locally BEFORE sending any frame to the broker!
+    const sentBeforeOversized = pipe.sentToBroker.length
+    const hugeNeedle = 'x'.repeat(4097)
+    await expect(hiddenSource.setSearch(hugeNeedle, false)).rejects.toThrow(/limit exceeded/i)
+    await expect(client.wait(30, { kind: 'text', needle: hugeNeedle }, 1000)).rejects.toThrow(/limit exceeded/i)
+    expect(pipe.sentToBroker.length).toBe(sentBeforeOversized)
+    expect(client.isClosed).toBe(false)
+
     hiddenSource.dispose()
 
     // Pipelined 64 KiB image blob reassembly

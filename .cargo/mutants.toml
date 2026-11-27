@@ -46,7 +46,6 @@ exclude_re = [
     "crates/apack-os/src/transport.rs:.*replace verify_peer_is_current_user -> io::Result<bool> with Ok\\(true\\)",
     "crates/apack-os/src/transport.rs:.*replace verify_client_is_current_user -> io::Result<bool> with Ok\\(true\\)",
     "crates/apack-os/src/transport_windows.rs:.*replace owned_by_this_user -> io::Result<bool> with Ok\\(true\\)",
-    "crates/apack-os/src/transport_windows.rs:.*replace client_is_this_user -> io::Result<bool> with Ok\\(true\\)",
     "crates/apack-os/src/security_windows.rs:.*replace owner_only_security_descriptor -> io::Result<SecurityDescriptor> with Ok\\(Default::default\\(\\)\\)",
     # 4. macOS half-closed socket fallback (`Shutdown::Both || Shutdown::Write`) is unobservable on Linux
     #    where `Shutdown::Both` always succeeds.

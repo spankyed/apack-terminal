@@ -487,7 +487,7 @@ export class TerminalView {
   }
 
   private applySearchSnapshot(snapshot: SearchSnapshot, resetCurrent: boolean): void {
-    if (this.needle === '') return
+    if (this.needle === '' || this.searchPending) return
     if (this.store.epoch >= 0 && snapshot.epoch !== this.store.epoch) return
     const prev = this.matches[this.currentMatch]
     const sorted = sortMatchesNewestFirst(snapshot.matches)

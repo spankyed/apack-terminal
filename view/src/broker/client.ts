@@ -697,7 +697,9 @@ export class BrokerSessionSource implements TerminalSource {
         this.markClosed(msg.reason)
         break
       case 'error':
-        this.markClosed(`${msg.code}: ${msg.message}`)
+        // Unsolicited stream-scoped errors (reqId === 0, e.g., fire-and-forget Key/Text/Pointer
+        // writes rejected on an exited/rewound session or transient PTY stdin backpressure) are
+        // non-fatal: the broker keeps the stream attached until an explicit `streamClosed`.
         break
       default:
         break

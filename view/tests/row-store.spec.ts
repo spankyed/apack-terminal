@@ -183,5 +183,60 @@ describe('page-chunked RowStore', () => {
     expect(store.row(12)).toBeUndefined()
     expect(store.row(14)).toBeUndefined()
     expect(store.row(15)?.text).toBe('fresh-15')
+
+    // Huge same-epoch fullSync jump (10M lines) stays O(screenRows + pages) and finishes promptly
+    const t0 = performance.now()
+    store.apply(
+      frame({
+        seq: 4,
+        epoch: 1,
+        firstActiveLine: 10_000_000,
+        scrollbackLines: 10_000_000,
+        size: { cols: 20, rows: 4 },
+        fullSync: true,
+        rows: [row(10_000_000, 'far-future')],
+      }),
+    )
+    expect(performance.now() - t0).toBeLessThan(100)
+    expect(store.row(15)).toBeUndefined()
+    expect(store.row(10_000_000)?.text).toBe('far-future')
+  })
+
+  it('clears doubted on uncached stale-image placeholder row that turns blank in absorb()', () => {
+    const store = new RowStore()
+    store.apply(
+      frame({
+        seq: 1,
+        epoch: 1,
+        firstActiveLine: 10,
+        scrollbackLines: 10,
+        size: { cols: 20, rows: 4 },
+        imagesGen: 1,
+        fullSync: true,
+        rows: [row(10, 'active')],
+      }),
+    )
+    const atGen = store.imagesChanged
+    // imagesGen bumps while fetchRows for line 5 is in flight
+    store.apply(
+      frame({
+        seq: 2,
+        epoch: 1,
+        firstActiveLine: 10,
+        scrollbackLines: 10,
+        size: { cols: 20, rows: 4 },
+        imagesGen: 2,
+        rows: [],
+      }),
+    )
+    // Stale fetch returns an uncached row 5 carrying HAS_PLACEHOLDER -> marks doubted without caching
+    store.absorb(1, 5, 1, [{ ...row(5, 'img'), flags: RowFlag.HAS_PLACEHOLDER }], 5, atGen)
+    expect(store.row(5)).toBeUndefined()
+    expect(store.missing(5, 1)).toEqual([{ from: 5, count: 1 }])
+
+    // Fresh refetch omits line 5 (now blank) -> must clear doubted and mark absent so missing() stops!
+    const absorbed = store.absorb(1, 5, 1, [], 5, store.imagesChanged)
+    expect(absorbed).toEqual([5])
+    expect(store.missing(5, 1)).toEqual([])
   })
 })

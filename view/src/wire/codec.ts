@@ -173,6 +173,15 @@ export class WireWriter {
     this.bytes(encoded)
   }
 
+  strBounded(text: string, maxLen: number, label: string): void {
+    const encoded = textEncoder.encode(text)
+    const cap = Math.min(maxLen, MAX_STRING_BYTES)
+    if (encoded.length > cap) {
+      throw new WireError('LimitExceeded', `wire limit exceeded: ${label}`)
+    }
+    this.bytes(encoded)
+  }
+
   opt<T>(value: T | null | undefined, encode: (w: WireWriter, inner: T) => void): void {
     if (value === null || value === undefined) {
       this.u8(0)
@@ -324,7 +333,7 @@ export class WireReader {
   }
 
   strBounded(maxLen: number, label: string): string {
-    const raw = this.bytesBounded(maxLen, label)
+    const raw = this.bytesBounded(Math.min(maxLen, MAX_STRING_BYTES), label)
     try {
       return textDecoder.decode(raw)
     } catch {

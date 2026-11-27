@@ -249,7 +249,8 @@ impl ReactorState {
     pub(crate) fn handle_win_transport_event(&mut self, ev: WinTransportEvent) {
         match ev {
             WinTransportEvent::Accepted(stream) => {
-                if !can_accept_win_conn(self.shutting_down, self.conns.len()) {
+                let active_total = self.conns.len().saturating_add(self.draining_win.len());
+                if !can_accept_win_conn(self.shutting_down, active_total) {
                     let _ = hang_up(&stream);
                     return;
                 }

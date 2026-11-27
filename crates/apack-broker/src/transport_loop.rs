@@ -464,6 +464,11 @@ pub(crate) fn run_control_reactor(
         wait_for_win_wake(&win_cond, wait_for);
     }
 
+    // Drop `win_ev_rx` BEFORE shard teardown and `accept_thread.join()` so any Windows accept,
+    // reader, or writer thread blocked in `ev_tx.send(...)` on a full channel unblocks immediately.
+    #[cfg(windows)]
+    drop(win_ev_rx);
+
     // Tear down all shards cleanly (sealing recordings and terminating remaining trees).
     for mut shard in state.shards.drain(..) {
         shard.shutdown();
@@ -671,8 +676,9 @@ impl ReactorState {
             match self.listener.accept() {
                 Ok(stream) => {
                     let peer_ok = matches!(verify_peer_is_current_user(&stream), Ok(true));
-                    let nonblock_ok = peer_ok && set_stream_nonblocking(&stream, true).is_ok();
-                    if !can_accept_unix_conn(self.shutting_down, self.conns.len(), peer_ok, nonblock_ok) {
+                    let nonblock_ok = set_stream_nonblocking(&stream, true).is_ok();
+                    let active_total = self.conns.len().saturating_add(self.draining_unix.len());
+                    if !can_accept_unix_conn(self.shutting_down, active_total, peer_ok, nonblock_ok) {
                         let _ = hang_up(&stream);
                         continue;
                     }
