@@ -706,6 +706,27 @@ fn e2e_stream_attachment_isolation_no_redundant_stream_closed_and_prehello_size_
             FrameCredit { max_frames: 4, max_bytes: 262_144 },
         )
         .unwrap();
+    // Wait for the initial attach frame (and ack it) before unblocking the shell so `ViewSlotFree`
+    // is guaranteed ahead of `Write("go\r\n")` on the shard's FIFO command channel.
+    let init_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut got_init_frame = false;
+    while std::time::Instant::now() < init_deadline {
+        let frame = client.recv_frame().unwrap();
+        if frame.stream_id == st_exit.as_stream_id()
+            && let BrokerMsg::Frame(upd) = frame.msg
+        {
+            client
+                .send_raw(
+                    st_exit.as_stream_id(),
+                    RequestId::PUSH,
+                    &ClientMsg::FrameAck { seq: upd.seq, credit: FrameCredit { max_frames: 4, max_bytes: 262_144 } },
+                )
+                .unwrap();
+            got_init_frame = true;
+            break;
+        }
+    }
+    assert!(got_init_frame, "expected initial frame on VIEW | EVENTS attach");
     client.send_raw(st_exit.as_stream_id(), RequestId::PUSH, &ClientMsg::Write { data: b"go\r\n".to_vec() }).unwrap();
     let mut saw_exited = false;
     let mut saw_stream_closed = false;
