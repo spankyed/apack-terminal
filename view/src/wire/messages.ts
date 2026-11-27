@@ -321,7 +321,7 @@ function decodeFrameUpdate(r: WireReader): FrameUpdate {
   const firstActiveLine = r.varU64()
   const scrollbackLines = r.varU64()
   if (scrollbackLines > firstActiveLine) {
-  throw new WireError('InvalidValue', 'FrameUpdate.scrollback_lines > first_active_line')
+    throw new WireError('InvalidValue', 'FrameUpdate.scrollback_lines > first_active_line')
   }
   const scrollDelta = r.i32()
   const cursor = decodeCursorState(r)
@@ -1113,7 +1113,7 @@ export function decodeBrokerMsg(msgType: number, payload: Uint8Array): BrokerMsg
       const firstActiveLine = r.varU64()
       const scrollbackLines = r.varU64()
       if (scrollbackLines > firstActiveLine) {
-      throw new WireError('InvalidValue', 'Attached.scrollback_lines > first_active_line')
+        throw new WireError('InvalidValue', 'Attached.scrollback_lines > first_active_line')
       }
       const foreground = r.opt(decodeForegroundProcess)
       msg = { kind: 'attached', session, streamId, size, epoch, firstActiveLine, scrollbackLines, foreground }
@@ -1178,9 +1178,9 @@ export function decodeBrokerMsg(msgType: number, payload: Uint8Array): BrokerMsg
       if (toLine < fromLine) throw new WireError('InvalidValue', 'search delta to_line < from_line')
       const added = r.vecBounded(MAX_SEARCH_MATCHES, 'search delta', decodeCellSpan)
       for (const span of added) {
-      if (span.start.line < fromLine || span.end.line >= toLine) {
-      throw new WireError('InvalidValue', 'search delta span outside [from_line, to_line)')
-      }
+        if (span.start.line < fromLine || span.end.line >= toLine) {
+          throw new WireError('InvalidValue', 'search delta span outside [from_line, to_line)')
+        }
       }
       const truncated = r.bool()
       msg = { kind: 'searchDelta', epoch, fromLine, toLine, added, truncated }
@@ -1215,7 +1215,7 @@ export function decodeBrokerMsg(msgType: number, payload: Uint8Array): BrokerMsg
       const offset = r.varU32()
       const data = r.bytesBounded(BULK_CHUNK_BYTES, 'image blob chunk').slice()
       if (offset + data.length > totalBytes) {
-      throw new WireError('InvalidValue', 'image blob chunk exceeds total_bytes')
+        throw new WireError('InvalidValue', 'image blob chunk exceeds total_bytes')
       }
       msg = { kind: 'imageBlobChunk', blob, encoding, totalBytes, offset, data }
       break
@@ -1251,7 +1251,7 @@ export function decodeBrokerMsg(msgType: number, payload: Uint8Array): BrokerMsg
       const state = decodeProgressState(r)
       const percent = r.opt((rd) => ((p) => { if (p > MAX_PROGRESS_PERCENT) throw new WireError('InvalidValue', 'progress percent > 100'); return p })(rd.u8()))
       if (percent !== null && (state === 'none' || state === 'indeterminate')) {
-      throw new WireError('InvalidValue', 'progress percent invalid for state')
+        throw new WireError('InvalidValue', 'progress percent invalid for state')
       }
       msg = { kind: 'progress', state, percent }
       break
@@ -1333,4 +1333,3 @@ export function decodeBrokerMsg(msgType: number, payload: Uint8Array): BrokerMsg
   r.finish()
   return msg
 }
-

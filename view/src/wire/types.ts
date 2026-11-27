@@ -5,24 +5,24 @@
  * generated directly from `crates/apack-proto/src/types.rs`.
  */
 import {
-MAX_GRID_COLS,
-MAX_GRID_ROWS,
-MAX_LEASE_GRACE_MS,
-MAX_PACKED_LINKS,
-MAX_PACKED_PIECES,
-MAX_PACKED_RUNS,
-MAX_PACKED_STYLES,
-MAX_PALETTE_OVERRIDES,
-MAX_PROGRESS_PERCENT,
-MAX_SEARCH_NEEDLE_BYTES,
-MAX_WAIT_STATUSES,
+  MAX_GRID_COLS,
+  MAX_GRID_ROWS,
+  MAX_LEASE_GRACE_MS,
+  MAX_PACKED_LINKS,
+  MAX_PACKED_PIECES,
+  MAX_PACKED_RUNS,
+  MAX_PACKED_STYLES,
+  MAX_PALETTE_OVERRIDES,
+  MAX_PROGRESS_PERCENT,
+  MAX_SEARCH_NEEDLE_BYTES,
+  MAX_WAIT_STATUSES,
 } from './constants.ts'
 import {
-WireError,
-decodeUtf8Strict,
-encodeUtf8,
-type WireReader,
-type WireWriter,
+  WireError,
+  decodeUtf8Strict,
+  encodeUtf8,
+  type WireReader,
+  type WireWriter,
 } from './codec.ts'
 
 export const CONTROL_STREAM_ID = 0
@@ -76,12 +76,12 @@ export type UnderlineKind = 'none' | 'single' | 'double' | 'curly' | 'dotted' | 
 const UNDERLINE_NAMES: readonly UnderlineKind[] = ['none', 'single', 'double', 'curly', 'dotted', 'dashed']
 
 export function underlineOfStyleFlags(flags: number): UnderlineKind {
-return UNDERLINE_NAMES[(flags & PackedStyleFlag.UNDERLINE_MASK) >> 2] ?? 'none'
+  return UNDERLINE_NAMES[(flags & PackedStyleFlag.UNDERLINE_MASK) >> 2] ?? 'none'
 }
 
 export function isValidPackedColor(color: number): boolean {
-const c = color >>> 0
-return c <= 256 || (c >= 0x01000000 && c <= 0x01ffffff)
+  const c = color >>> 0
+  return c <= 256 || (c >= 0x01000000 && c <= 0x01ffffff)
 }
 
 export type SignalKind = 'hup' | 'int' | 'quit' | 'term' | 'kill' | 'usr1' | 'usr2' | 'stop' | 'cont'
@@ -356,91 +356,103 @@ const POINTER_BUTTON_NONE = 255
 export type Rgb24 = number
 
 export function encodeRgb24(w: WireWriter, rgb: Rgb24): void {
-w.u8((rgb >>> 16) & 0xff)
-w.u8((rgb >>> 8) & 0xff)
-w.u8(rgb & 0xff)
+  w.u8((rgb >>> 16) & 0xff)
+  w.u8((rgb >>> 8) & 0xff)
+  w.u8(rgb & 0xff)
 }
 export function decodeRgb24(r: WireReader): Rgb24 {
-const red = r.u8()
-const green = r.u8()
-const blue = r.u8()
-return ((red << 16) | (green << 8) | blue) >>> 0
+  const red = r.u8()
+  const green = r.u8()
+  const blue = r.u8()
+  return ((red << 16) | (green << 8) | blue) >>> 0
 }
 
 export function encodeSessionId(w: WireWriter, id: number): void {
-if (!Number.isInteger(id) || id < 1) throw new WireError('InvalidValue', 'zero session id')
-w.varU64(id)
+  if (!Number.isInteger(id) || id < 1) throw new WireError('InvalidValue', 'zero session id')
+  w.varU64(id)
 }
 export function decodeSessionId(r: WireReader): number {
-const id = r.varU64()
-if (id === 0) throw new WireError('InvalidValue', 'zero session id')
-return id
+  const id = r.varU64()
+  if (id === 0) throw new WireError('InvalidValue', 'zero session id')
+  return id
 }
 
 export function encodeNonZeroStreamId(w: WireWriter, id: number): void {
-if (!Number.isInteger(id) || id < 1 || id > 0xffff_ffff) {
-throw new WireError('InvalidValue', 'stream id must be non-zero')
-}
-w.u32(id)
+  if (!Number.isInteger(id) || id < 1 || id > 0xffff_ffff) {
+    throw new WireError('InvalidValue', 'stream id must be non-zero')
+  }
+  w.u32(id)
 }
 export function decodeNonZeroStreamId(r: WireReader): number {
-const id = r.u32()
-if (id === 0) throw new WireError('InvalidValue', 'stream id must be non-zero')
-return id
+  const id = r.u32()
+  if (id === 0) throw new WireError('InvalidValue', 'stream id must be non-zero')
+  return id
 }
 
 export function encodeSignalTarget(w: WireWriter, pid: number): void {
-if (!Number.isInteger(pid) || pid < 1 || pid > 0x7fff_ffff) {
-throw new WireError('InvalidValue', 'signal target pid must be > 0')
-}
-w.i32(pid)
+  if (!Number.isInteger(pid) || pid < 1 || pid > 0x7fff_ffff) {
+    throw new WireError('InvalidValue', 'signal target pid must be > 0')
+  }
+  w.i32(pid)
 }
 export function decodeSignalTarget(r: WireReader): number {
-const pid = r.i32()
-if (pid < 1) throw new WireError('InvalidValue', 'signal target pid must be > 0')
-return pid
+  const pid = r.i32()
+  if (pid < 1) throw new WireError('InvalidValue', 'signal target pid must be > 0')
+  return pid
 }
 
 export function encodeSubFlags(w: WireWriter, flags: number): void {
-if ((flags & ~SubFlags.ALL_MASK) !== 0) throw new WireError('InvalidValue', 'unknown SubFlags bits')
-w.u8(flags)
+  if (
+    !Number.isInteger(flags) ||
+    flags < 0 ||
+    flags > SubFlags.ALL_MASK ||
+    ((flags & SubFlags.BACKPRESSURE_PTY) !== 0 && (flags & SubFlags.RAW_OUTPUT) === 0)
+  ) {
+    throw new WireError('InvalidValue', 'invalid SubFlags bits')
+  }
+  w.u8(flags)
 }
 export function decodeSubFlags(r: WireReader): number {
-const flags = r.u8()
-if ((flags & ~SubFlags.ALL_MASK) !== 0) throw new WireError('InvalidValue', 'unknown SubFlags bits')
-return flags
+  const flags = r.u8()
+  if (
+    flags > SubFlags.ALL_MASK ||
+    ((flags & SubFlags.BACKPRESSURE_PTY) !== 0 && (flags & SubFlags.RAW_OUTPUT) === 0)
+  ) {
+    throw new WireError('InvalidValue', 'invalid SubFlags bits')
+  }
+  return flags
 }
 
 const HEX_MARKS_KEY = new RegExp(`^[0-9a-f]{${MARKS_KEY_LEN}}$`)
 export function encodeMarksKey(w: WireWriter, key: string): void {
-if (!HEX_MARKS_KEY.test(key)) throw new WireError('InvalidValue', 'marks key must be 32 lowercase hex chars')
-w.raw(encodeUtf8(key))
+  if (!HEX_MARKS_KEY.test(key)) throw new WireError('InvalidValue', 'marks key must be 32 lowercase hex chars')
+  w.raw(encodeUtf8(key))
 }
 export function decodeMarksKey(r: WireReader): string {
-const bytes = r.take(MARKS_KEY_LEN)
-for (let i = 0; i < bytes.length; i += 1) {
-const b = bytes[i]!
-if (!((b >= 0x30 && b <= 0x39) || (b >= 0x61 && b <= 0x66))) {
-throw new WireError('InvalidValue', 'marks key must be 32 lowercase hex chars')
-}
-}
-return decodeUtf8Strict(bytes)
+  const bytes = r.take(MARKS_KEY_LEN)
+  for (let i = 0; i < bytes.length; i += 1) {
+    const b = bytes[i]!
+    if (!((b >= 0x30 && b <= 0x39) || (b >= 0x61 && b <= 0x66))) {
+      throw new WireError('InvalidValue', 'marks key must be 32 lowercase hex chars')
+    }
+  }
+  return decodeUtf8Strict(bytes)
 }
 
 export function encodeBlobHash(w: WireWriter, hash: Uint8Array): void {
-if (hash.length !== BLOB_HASH_LEN) throw new WireError('InvalidValue', 'blob hash must be 32 bytes')
-w.raw(hash)
+  if (hash.length !== BLOB_HASH_LEN) throw new WireError('InvalidValue', 'blob hash must be 32 bytes')
+  w.raw(hash)
 }
 export function decodeBlobHash(r: WireReader): Uint8Array {
-return r.fixedCopy(BLOB_HASH_LEN)
+  return r.fixedCopy(BLOB_HASH_LEN)
 }
 
 export function blobHashToHex(hash: Uint8Array): string {
-let out = ''
-for (let i = 0; i < hash.length; i += 1) {
-out += hash[i]!.toString(16).padStart(2, '0')
-}
-return out
+  let out = ''
+  for (let i = 0; i < hash.length; i += 1) {
+    out += hash[i]!.toString(16).padStart(2, '0')
+  }
+  return out
 }
 
 export type SignalScope =
@@ -540,6 +552,7 @@ export function encodeLeaseKind(w: WireWriter, v: LeaseKind): void {
       return
     case 'brokerGrace':
       if (!Number.isInteger(v.graceMs) || v.graceMs < 1 || v.graceMs > MAX_LEASE_GRACE_MS) throw new WireError('LimitExceeded', 'lease grace_ms')
+      if (v.resumeToken.length !== RESUME_TOKEN_LEN) throw new WireError('InvalidValue', 'resumeToken must be 32 bytes')
       w.u8(1)
       w.varU32(v.graceMs)
       if (v.resumeToken.length !== RESUME_TOKEN_LEN) throw new WireError('InvalidValue', 'resumeToken must be 32 bytes')
@@ -623,47 +636,47 @@ export function decodeWaitCondition(r: WireReader): WaitCondition {
 }
 
 export interface CursorState {
-readonly col: number
-readonly row: number
-readonly shape: CursorShape
-readonly blinking: boolean
-readonly hidden: boolean
+  readonly col: number
+  readonly row: number
+  readonly shape: CursorShape
+  readonly blinking: boolean
+  readonly hidden: boolean
 }
 
 export function encodeCursorState(w: WireWriter, state: CursorState): void {
-w.u16(state.col)
-w.u16(state.row)
-encodeCursorShape(w, state.shape)
-w.u8((state.blinking ? 1 : 0) | (state.hidden ? 2 : 0))
+  w.u16(state.col)
+  w.u16(state.row)
+  encodeCursorShape(w, state.shape)
+  w.u8((state.blinking ? 1 : 0) | (state.hidden ? 2 : 0))
 }
 export function decodeCursorState(r: WireReader): CursorState {
-const col = r.u16()
-const row = r.u16()
-const shape = decodeCursorShape(r)
-const flags = r.u8()
-if (flags > CURSOR_ALL_FLAGS_MASK) throw new WireError('InvalidValue', 'unknown CursorState flag bits')
-return { col, row, shape, blinking: (flags & 1) !== 0, hidden: (flags & 2) !== 0 }
+  const col = r.u16()
+  const row = r.u16()
+  const shape = decodeCursorShape(r)
+  const flags = r.u8()
+  if (flags > CURSOR_ALL_FLAGS_MASK) throw new WireError('InvalidValue', 'unknown CursorState flag bits')
+  return { col, row, shape, blinking: (flags & 1) !== 0, hidden: (flags & 2) !== 0 }
 }
 
 export interface ViewModes {
-readonly altScreen: boolean
-readonly mouse: boolean
-readonly reverseVideo: boolean
-readonly bracketedPaste: boolean
+  readonly altScreen: boolean
+  readonly mouse: boolean
+  readonly reverseVideo: boolean
+  readonly bracketedPaste: boolean
 }
 
 export function encodeViewModes(w: WireWriter, m: ViewModes): void {
-w.u8((m.altScreen ? 1 : 0) | (m.mouse ? 2 : 0) | (m.reverseVideo ? 4 : 0) | (m.bracketedPaste ? 8 : 0))
+  w.u8((m.altScreen ? 1 : 0) | (m.mouse ? 2 : 0) | (m.reverseVideo ? 4 : 0) | (m.bracketedPaste ? 8 : 0))
 }
 export function decodeViewModes(r: WireReader): ViewModes {
-const bits = r.u8()
-if (bits > VIEW_MODES_ALL_FLAGS_MASK) throw new WireError('InvalidValue', 'unknown ViewModes flag bits')
-return {
-altScreen: (bits & 1) !== 0,
-mouse: (bits & 2) !== 0,
-reverseVideo: (bits & 4) !== 0,
-bracketedPaste: (bits & 8) !== 0,
-}
+  const bits = r.u8()
+  if (bits > VIEW_MODES_ALL_FLAGS_MASK) throw new WireError('InvalidValue', 'unknown ViewModes flag bits')
+  return {
+    altScreen: (bits & 1) !== 0,
+    mouse: (bits & 2) !== 0,
+    reverseVideo: (bits & 4) !== 0,
+    bracketedPaste: (bits & 8) !== 0,
+  }
 }
 
 export interface GridSize {
@@ -672,17 +685,17 @@ export interface GridSize {
 }
 
 export function encodeGridSize(w: WireWriter, v: GridSize): void {
-  w.u16(v.cols)
-  if (v.cols < 1 || v.cols > MAX_GRID_COLS || v.rows < 1 || v.rows > MAX_GRID_ROWS) {
-  throw new WireError('InvalidValue', 'grid dimensions out of range')
+  if (!Number.isInteger(v.cols) || !Number.isInteger(v.rows) || v.cols < 1 || v.cols > MAX_GRID_COLS || v.rows < 1 || v.rows > MAX_GRID_ROWS) {
+    throw new WireError('InvalidValue', 'grid dimensions out of range')
   }
+  w.u16(v.cols)
   w.u16(v.rows)
 }
 export function decodeGridSize(r: WireReader): GridSize {
   const cols = r.u16()
   const rows = r.u16()
   if (cols < 1 || cols > MAX_GRID_COLS || rows < 1 || rows > MAX_GRID_ROWS) {
-  throw new WireError('InvalidValue', 'grid dimensions out of range')
+    throw new WireError('InvalidValue', 'grid dimensions out of range')
   }
   return { cols, rows }
 }
@@ -787,11 +800,11 @@ export function decodeImagePiece(r: WireReader): ImagePiece {
   const colStart = r.u16()
   const colLen = r.u16()
   if (colLen === 0 || colStart + colLen > 0xffff) {
-  throw new WireError('InvalidValue', 'invalid ImagePiece column span')
+    throw new WireError('InvalidValue', 'invalid ImagePiece column span')
   }
   const srcRect = [r.varU32(), r.varU32(), r.varU32(), r.varU32()] as const
   if (srcRect[2] === 0 || srcRect[3] === 0 || srcRect[0] + srcRect[2] > 0xffff_ffff || srcRect[1] + srcRect[3] > 0xffff_ffff) {
-  throw new WireError('InvalidValue', 'invalid ImagePiece src_rect')
+    throw new WireError('InvalidValue', 'invalid ImagePiece src_rect')
   }
   const dstPx = [r.varU32(), r.varU32()] as const
   if (dstPx[0] === 0 || dstPx[1] === 0) throw new WireError('InvalidValue', 'invalid ImagePiece dst_px')
@@ -827,7 +840,7 @@ export function decodeCellSpan(r: WireReader): CellSpan {
   const start = decodeCellPos(r)
   const end = decodeCellPos(r)
   if (end.line < start.line || (end.line === start.line && end.col < start.col)) {
-  throw new WireError('InvalidValue', 'CellSpan end before start')
+    throw new WireError('InvalidValue', 'CellSpan end before start')
   }
   return { start, end }
 }
@@ -915,7 +928,7 @@ export function decodeStatusRecord(r: WireReader): StatusRecord {
   const state = decodeStatusState(r)
   const kind = r.opt(decodeBlockedKind)
   if (state !== 'blocked' && kind !== null) {
-  throw new WireError('InvalidValue', 'status kind requires Blocked state')
+    throw new WireError('InvalidValue', 'status kind requires Blocked state')
   }
   const progress = r.opt((rd) => ((p) => { if (p > MAX_PROGRESS_PERCENT) throw new WireError('InvalidValue', 'progress must be 0..=100'); return p })(rd.u8()))
   const app = r.opt((rd) => rd.str())
@@ -952,7 +965,7 @@ export function decodeKeyInput(r: WireReader): KeyInput {
   const text = r.str()
   const unshiftedCodepoint = r.varU32()
   if (unshiftedCodepoint > 0x10_ffff || (unshiftedCodepoint >= 0xd800 && unshiftedCodepoint <= 0xdfff)) {
-  throw new WireError('InvalidValue', 'invalid Unicode scalar codepoint')
+    throw new WireError('InvalidValue', 'invalid Unicode scalar codepoint')
   }
   const composed = r.bool()
   return { code, action, modifiers, text, unshiftedCodepoint, composed }
@@ -979,7 +992,7 @@ export function decodePointerInput(r: WireReader): PointerInput {
   const action = decodePointerAction(r)
   const button = r.u8()
   if (button > POINTER_MAX_BUTTON && button !== POINTER_BUTTON_NONE) {
-  throw new WireError('InvalidValue', 'invalid PointerInput button')
+    throw new WireError('InvalidValue', 'invalid PointerInput button')
   }
   const modifiers = r.u8()
   if (modifiers > MODIFIER_ALL_MASK) throw new WireError('InvalidValue', 'unknown PointerInput modifier bits')
@@ -1054,217 +1067,219 @@ export function decodeMetricsSnapshot(r: WireReader): MetricsSnapshot {
 }
 
 /**
-* Self-contained, zero-per-cell-object style-run encoded terminal row.
-*/
+ * Self-contained, zero-per-cell-object style-run encoded terminal row.
+ */
 export interface PackedRow {
-readonly line: number
-readonly flags: number
-readonly text: string
-readonly runs: Uint32Array
-readonly styles: Uint32Array
-readonly links: readonly string[]
-readonly pieces?: readonly ImagePiece[]
+  readonly line: number
+  readonly flags: number
+  readonly text: string
+  readonly runs: Uint32Array
+  readonly styles: Uint32Array
+  readonly links: readonly string[]
+  readonly pieces?: readonly ImagePiece[]
 }
 
 function buildUtf8ToUtf16Map(utf8: Uint8Array): Int32Array {
-const map = new Int32Array(utf8.length + 1)
-map.fill(-1)
-let bytePos = 0
-let utf16Pos = 0
-while (bytePos < utf8.length) {
-map[bytePos] = utf16Pos
-const b0 = utf8[bytePos]!
-if (b0 < 0x80) {
-bytePos += 1
-utf16Pos += 1
-} else if (b0 < 0xe0) {
-bytePos += 2
-utf16Pos += 1
-} else if (b0 < 0xf0) {
-bytePos += 3
-utf16Pos += 1
-} else {
-bytePos += 4
-utf16Pos += 2
-}
-}
-map[utf8.length] = utf16Pos
-return map
+  const map = new Int32Array(utf8.length + 1)
+  map.fill(-1)
+  let bytePos = 0
+  let utf16Pos = 0
+  while (bytePos < utf8.length) {
+    map[bytePos] = utf16Pos
+    const b0 = utf8[bytePos]!
+    if (b0 < 0x80) {
+      bytePos += 1
+      utf16Pos += 1
+    } else if (b0 < 0xe0) {
+      bytePos += 2
+      utf16Pos += 1
+    } else if (b0 < 0xf0) {
+      bytePos += 3
+      utf16Pos += 1
+    } else {
+      bytePos += 4
+      utf16Pos += 2
+    }
+  }
+  map[utf8.length] = utf16Pos
+  return map
 }
 
 function buildUtf16ToUtf8Map(text: string): Uint32Array {
-const map = new Uint32Array(text.length + 1)
-let bytePos = 0
-let i = 0
-while (i < text.length) {
-map[i] = bytePos
-const cp = text.codePointAt(i)!
-if (cp <= 0x7f) {
-bytePos += 1
-i += 1
-} else if (cp <= 0x7ff) {
-bytePos += 2
-i += 1
-} else if (cp <= 0xffff) {
-bytePos += 3
-i += 1
-} else {
-bytePos += 4
-map[i + 1] = bytePos
-i += 2
-}
-}
-map[text.length] = bytePos
-return map
+  const map = new Uint32Array(text.length + 1)
+  let bytePos = 0
+  let i = 0
+  while (i < text.length) {
+    map[i] = bytePos
+    const cp = text.codePointAt(i)!
+    if (cp <= 0x7f) {
+      bytePos += 1
+      i += 1
+    } else if (cp <= 0x7ff) {
+      bytePos += 2
+      i += 1
+    } else if (cp <= 0xffff) {
+      bytePos += 3
+      i += 1
+    } else {
+      bytePos += 4
+      map[i + 1] = bytePos
+      i += 2
+    }
+  }
+  map[text.length] = bytePos
+  return map
 }
 
 export function encodePackedRow(w: WireWriter, row: PackedRow): void {
-w.varU64(row.line)
-w.u8(row.flags)
-const utf8 = encodeUtf8(row.text)
-w.bytes(utf8)
-const isAscii = utf8.length === row.text.length
-const utf16ToUtf8 = isAscii ? null : buildUtf16ToUtf8Map(row.text)
+  w.varU64(row.line)
+  w.u8(row.flags)
+  const utf8 = encodeUtf8(row.text)
+  w.bytes(utf8)
+  const isAscii = utf8.length === row.text.length
+  const utf16ToUtf8 = isAscii ? null : buildUtf16ToUtf8Map(row.text)
 
-const runCount = row.runs.length >>> 2
-w.varU32(runCount)
-for (let i = 0; i < row.runs.length; i += 4) {
-const colWord = row.runs[i]!
-const txtWord = row.runs[i + 1]!
-const slWord = row.runs[i + 2]!
-const runFlags = row.runs[i + 3]!
-const colStart = colWord & 0xffff
-const colLen = colWord >>> 16
-const u16Off = txtWord & 0xffff
-const u16Len = txtWord >>> 16
-const byteOffset = utf16ToUtf8 ? utf16ToUtf8[u16Off]! : u16Off
-const byteEnd = utf16ToUtf8 ? utf16ToUtf8[u16Off + u16Len]! : u16Off + u16Len
-const styleIdx = slWord & 0xffff
-const linkIdx = slWord >>> 16
-w.u16(colStart)
-w.u16(colLen)
-w.varU32(byteOffset)
-w.varU32(byteEnd - byteOffset)
-w.u16(styleIdx)
-w.u16(linkIdx)
-w.u8(runFlags)
-}
+  const runCount = row.runs.length >>> 2
+  w.varU32(runCount)
+  for (let i = 0; i < row.runs.length; i += 4) {
+    const colWord = row.runs[i]!
+    const txtWord = row.runs[i + 1]!
+    const slWord = row.runs[i + 2]!
+    const runFlags = row.runs[i + 3]!
+    const colStart = colWord & 0xffff
+    const colLen = colWord >>> 16
+    const u16Off = txtWord & 0xffff
+    const u16Len = txtWord >>> 16
+    const byteOffset = utf16ToUtf8 ? utf16ToUtf8[u16Off]! : u16Off
+    const byteEnd = utf16ToUtf8 ? utf16ToUtf8[u16Off + u16Len]! : u16Off + u16Len
+    const styleIdx = slWord & 0xffff
+    const linkIdx = slWord >>> 16
+    w.u16(colStart)
+    w.u16(colLen)
+    w.varU32(byteOffset)
+    w.varU32(byteEnd - byteOffset)
+    w.u16(styleIdx)
+    w.u16(linkIdx)
+    w.u8(runFlags)
+  }
 
-const styleCount = row.styles.length >>> 2
-w.varU32(styleCount)
-for (let i = 0; i < row.styles.length; i += 4) {
-w.u32(row.styles[i]!)
-w.u32(row.styles[i + 1]!)
-w.u32(row.styles[i + 2]!)
-w.u32(row.styles[i + 3]!)
-}
+  const styleCount = row.styles.length >>> 2
+  w.varU32(styleCount)
+  for (let i = 0; i < row.styles.length; i += 4) {
+    w.u32(row.styles[i]!)
+    w.u32(row.styles[i + 1]!)
+    w.u32(row.styles[i + 2]!)
+    w.u32(row.styles[i + 3]!)
+  }
 
-w.slice(row.links, (wr, link) => wr.str(link))
-const pieces = row.pieces ?? []
-w.slice(pieces, encodeImagePiece)
+  w.slice(row.links, (wr, link) => wr.str(link))
+  const pieces = row.pieces ?? []
+  w.slice(pieces, encodeImagePiece)
 }
 
 export function decodePackedRow(r: WireReader): PackedRow {
-const line = r.varU64()
-const flags = r.u8()
-if (flags > RowFlag.ALL_MASK) throw new WireError('InvalidValue', 'unknown PackedRow flag bits')
+  const line = r.varU64()
+  const flags = r.u8()
+  if (flags > RowFlag.ALL_MASK) throw new WireError('InvalidValue', 'unknown PackedRow flag bits')
 
-const textBytes = r.strBytes()
-const text = decodeUtf8Strict(textBytes)
-const isAscii = textBytes.length === text.length
-const byteToUtf16 = isAscii ? null : buildUtf8ToUtf16Map(textBytes)
+  const textBytes = r.strBytes()
+  const text = decodeUtf8Strict(textBytes)
+  const isAscii = textBytes.length === text.length
+  const byteToUtf16 = isAscii ? null : buildUtf8ToUtf16Map(textBytes)
 
-const runCount = r.varU32()
-if (runCount > MAX_PACKED_RUNS) throw new WireError('LimitExceeded', 'wire limit exceeded: packed runs')
-if (runCount * 11 > r.remaining) throw new WireError('UnexpectedEof', 'truncated packed runs')
-const runs = new Uint32Array(runCount * 4)
-for (let i = 0; i < runCount; i += 1) {
-const colStart = r.u16()
-const colLen = r.u16()
-if (colLen === 0 || colStart + colLen > 0xffff) {
-throw new WireError('InvalidValue', 'invalid PackedRun column span')
-}
-const byteOffset = r.varU32()
-const byteLen = r.varU32()
-const styleIdx = r.u16()
-const linkIdx = r.u16()
-const runFlags = r.u8()
-if (runFlags > RunFlag.ALL_MASK) throw new WireError('InvalidValue', 'unknown PackedRun flag bits')
+  const runCount = r.varU32()
+  if (runCount > MAX_PACKED_RUNS) throw new WireError('LimitExceeded', 'wire limit exceeded: packed runs')
+  if (runCount * 11 > r.remaining) throw new WireError('UnexpectedEof', 'truncated packed runs')
+  const runs = new Uint32Array(runCount * 4)
+  for (let i = 0; i < runCount; i += 1) {
+    const colStart = r.u16()
+    const colLen = r.u16()
+    if (colLen === 0 || colStart + colLen > 0xffff) {
+      throw new WireError('InvalidValue', 'invalid PackedRun column span')
+    }
+    const byteOffset = r.varU32()
+    const byteLen = r.varU32()
+    const styleIdx = r.u16()
+    const linkIdx = r.u16()
+    const runFlags = r.u8()
+    if (runFlags > RunFlag.ALL_MASK) throw new WireError('InvalidValue', 'unknown PackedRun flag bits')
 
-const byteEnd = byteOffset + byteLen
-if (byteEnd > textBytes.length) {
-throw new WireError('InvalidValue', 'run byte range out of bounds or mid-UTF-8')
-}
-let u16Start: number
-let u16End: number
-if (byteToUtf16 === null) {
-u16Start = byteOffset
-u16End = byteEnd
-} else {
-u16Start = byteToUtf16[byteOffset]!
-u16End = byteToUtf16[byteEnd]!
-if (u16Start < 0 || u16End < 0) {
-throw new WireError('InvalidValue', 'run byte range out of bounds or mid-UTF-8')
-}
-}
-const u16Len = u16End - u16Start
-const base = i << 2
-runs[base] = (colStart | (colLen << 16)) >>> 0
-runs[base + 1] = (u16Start | (u16Len << 16)) >>> 0
-runs[base + 2] = (styleIdx | (linkIdx << 16)) >>> 0
-runs[base + 3] = runFlags
-}
+    const byteEnd = byteOffset + byteLen
+    if (byteEnd > textBytes.length) {
+      throw new WireError('InvalidValue', 'run byte range out of bounds or mid-UTF-8')
+    }
+    let u16Start: number
+    let u16End: number
+    if (byteToUtf16 === null) {
+      u16Start = byteOffset
+      u16End = byteEnd
+    } else {
+      u16Start = byteToUtf16[byteOffset]!
+      u16End = byteToUtf16[byteEnd]!
+      if (u16Start < 0 || u16End < 0) {
+        throw new WireError('InvalidValue', 'run byte range out of bounds or mid-UTF-8')
+      }
+    }
+    const u16Len = u16End - u16Start
+    if (u16Start > 0xffff || u16Len > 0xffff) {
+      throw new WireError('LimitExceeded', 'packed row text offset exceeds u16')
+    }
+    const base = i << 2
+    runs[base] = (colStart | (colLen << 16)) >>> 0
+    runs[base + 1] = (u16Start | (u16Len << 16)) >>> 0
+    runs[base + 2] = (styleIdx | (linkIdx << 16)) >>> 0
+    runs[base + 3] = runFlags
+  }
 
-const styleCount = r.varU32()
-if (styleCount > MAX_PACKED_STYLES) throw new WireError('LimitExceeded', 'wire limit exceeded: packed styles')
-if (styleCount * 16 > r.remaining) throw new WireError('UnexpectedEof', 'truncated packed styles')
-const styles = new Uint32Array(styleCount * 4)
-for (let i = 0; i < styleCount; i += 1) {
-const fg = r.u32()
-const bg = r.u32()
-const ul = r.u32()
-const sf = r.u32()
-if (!isValidPackedColor(fg) || !isValidPackedColor(bg) || !isValidPackedColor(ul)) {
-throw new WireError('InvalidValue', 'invalid PackedStyle colour encoding')
-}
-if (
-(sf & ~PackedStyleFlag.ALL_MASK) !== 0 ||
-(sf & PackedStyleFlag.UNDERLINE_MASK) > PackedStyleFlag.UNDERLINE_MAX
-) {
-throw new WireError('InvalidValue', 'invalid PackedStyle flags')
-}
-if (i === 0 && (fg !== 0 || bg !== 0 || ul !== 0 || sf !== 0)) {
-throw new WireError('InvalidValue', 'styles[0] must be default style')
-}
-const base = i << 2
-styles[base] = fg
-styles[base + 1] = bg
-styles[base + 2] = ul
-styles[base + 3] = sf
-}
+  const styleCount = r.varU32()
+  if (styleCount > MAX_PACKED_STYLES) throw new WireError('LimitExceeded', 'wire limit exceeded: packed styles')
+  if (styleCount * 16 > r.remaining) throw new WireError('UnexpectedEof', 'truncated packed styles')
+  const styles = new Uint32Array(styleCount * 4)
+  for (let i = 0; i < styleCount; i += 1) {
+    const fg = r.u32()
+    const bg = r.u32()
+    const ul = r.u32()
+    const sf = r.u32()
+    if (!isValidPackedColor(fg) || !isValidPackedColor(bg) || !isValidPackedColor(ul)) {
+      throw new WireError('InvalidValue', 'invalid PackedStyle colour encoding')
+    }
+    if (
+      (sf & ~PackedStyleFlag.ALL_MASK) !== 0 ||
+      (sf & PackedStyleFlag.UNDERLINE_MASK) > PackedStyleFlag.UNDERLINE_MAX
+    ) {
+      throw new WireError('InvalidValue', 'invalid PackedStyle flags')
+    }
+    if (i === 0 && (fg !== 0 || bg !== 0 || ul !== 0 || sf !== 0)) {
+      throw new WireError('InvalidValue', 'styles[0] must be default style')
+    }
+    const base = i << 2
+    styles[base] = fg
+    styles[base + 1] = bg
+    styles[base + 2] = ul
+    styles[base + 3] = sf
+  }
 
-const links = r.vecBounded(MAX_PACKED_LINKS, 'packed links', (rd) => rd.str())
-if (links.length > 0 && links[0] !== '') {
-throw new WireError('InvalidValue', 'links[0] must be empty')
-}
+  const links = r.vecBounded(MAX_PACKED_LINKS, 'packed links', (rd) => rd.str())
+  if (links.length > 0 && links[0] !== '') {
+    throw new WireError('InvalidValue', 'links[0] must be empty')
+  }
 
-const pieces = r.vecBounded(MAX_PACKED_PIECES, 'image pieces', decodeImagePiece)
-if (pieces.length > 0 && (flags & RowFlag.HAS_PLACEHOLDER) === 0) {
-throw new WireError('InvalidValue', 'pieces require FLAG_HAS_PLACEHOLDER')
-}
+  const pieces = r.vecBounded(MAX_PACKED_PIECES, 'image pieces', decodeImagePiece)
+  if (pieces.length > 0 && (flags & RowFlag.HAS_PLACEHOLDER) === 0) {
+    throw new WireError('InvalidValue', 'pieces require FLAG_HAS_PLACEHOLDER')
+  }
 
-for (let i = 0; i < runCount; i += 1) {
-const slWord = runs[(i << 2) + 2]!
-const styleIdx = slWord & 0xffff
-const linkIdx = slWord >>> 16
-if (styleIdx >= styleCount && styleIdx !== 0) {
-throw new WireError('InvalidValue', 'run style_idx out of bounds')
-}
-if (linkIdx >= links.length && linkIdx !== 0) {
-throw new WireError('InvalidValue', 'run link_idx out of bounds')
-}
-}
+  for (let i = 0; i < runCount; i += 1) {
+    const slWord = runs[(i << 2) + 2]!
+    const styleIdx = slWord & 0xffff
+    const linkIdx = slWord >>> 16
+    if (styleIdx >= styleCount && styleIdx !== 0) {
+      throw new WireError('InvalidValue', 'run style_idx out of bounds')
+    }
+    if (linkIdx >= links.length && linkIdx !== 0) {
+      throw new WireError('InvalidValue', 'run link_idx out of bounds')
+    }
+  }
 
-return pieces.length > 0 ? { line, flags, text, runs, styles, links, pieces } : { line, flags, text, runs, styles, links }
+  return pieces.length > 0 ? { line, flags, text, runs, styles, links, pieces } : { line, flags, text, runs, styles, links }
 }
-

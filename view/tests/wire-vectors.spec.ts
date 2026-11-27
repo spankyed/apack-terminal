@@ -3,15 +3,27 @@ import goldenRaw from '../../node/wire-vectors-v2.json'
 import {
   FIN_FRAME,
   FrameDecoder,
+  MsgType,
   WireError,
+  WireReader,
+  WireWriter,
   computeClientProof,
   computeServerProof,
   decodeBrokerMsg,
   decodeClientMsg,
+  decodePackedRow,
   encodeBrokerFrame,
   encodeClientFrame,
   verifyServerProof,
 } from '../src/index.ts'
+import {
+  SubFlags,
+  decodeMarksKey,
+  decodeSubFlags,
+  encodeGridSize,
+  encodeLeaseKind,
+  encodeSubFlags,
+} from '../src/wire/types.ts'
 
 interface GoldenFrame {
   readonly name: string
@@ -185,5 +197,86 @@ describe('v2 golden wire vectors (Rust <-> TypeScript parity)', () => {
         expect(toHex(b.payload)).toBe(toHex(a.payload))
       }
     }
+  })
+
+  it('enforces generated wire invariants: SubFlags, GridSize, MarksKey, PackedRow u16, and fail-fast headers', () => {
+    const expectWireErr = (fn: () => void, kind: WireError['kind']) => {
+      let caught: unknown
+      try {
+        fn()
+      } catch (e) {
+        caught = e
+      }
+      expect(caught).toBeInstanceOf(WireError)
+      expect((caught as WireError).kind).toBe(kind)
+    }
+
+    // 1. SubFlags rejects BACKPRESSURE_PTY without RAW_OUTPUT on both encode and decode, and rejects floats.
+    const wSub = new WireWriter()
+    expectWireErr(() => encodeSubFlags(wSub, SubFlags.BACKPRESSURE_PTY), 'InvalidValue')
+    expectWireErr(() => encodeSubFlags(wSub, 1.5), 'InvalidValue')
+    expect(wSub.length).toBe(0)
+    expectWireErr(() => decodeSubFlags(new WireReader(new Uint8Array([SubFlags.BACKPRESSURE_PTY]))), 'InvalidValue')
+    encodeSubFlags(wSub, SubFlags.RAW_OUTPUT | SubFlags.BACKPRESSURE_PTY)
+    expect(decodeSubFlags(new WireReader(wSub.toBytes()))).toBe(SubFlags.RAW_OUTPUT | SubFlags.BACKPRESSURE_PTY)
+
+    // 2. encodeGridSize validates integer + bounds BEFORE mutating WireWriter.
+    const wGrid = new WireWriter()
+    expectWireErr(() => encodeGridSize(wGrid, { cols: 80, rows: 0 }), 'InvalidValue')
+    expectWireErr(() => encodeGridSize(wGrid, { cols: 80.5, rows: 24 }), 'InvalidValue')
+    expect(wGrid.length).toBe(0)
+
+    // 3. encodeLeaseKind brokerGrace validates resumeToken length before writing tag/graceMs.
+    const wLease = new WireWriter()
+    expectWireErr(
+      () => encodeLeaseKind(wLease, { kind: 'brokerGrace', graceMs: 1000, resumeToken: new Uint8Array(4) }),
+      'InvalidValue',
+    )
+    expect(wLease.length).toBe(0)
+
+    // 4. decodeMarksKey throws InvalidValue (not InvalidUtf8) on non-UTF-8 bytes, matching Rust.
+    const badUtf8 = new Uint8Array(32).fill(0xff)
+    expectWireErr(() => decodeMarksKey(new WireReader(badUtf8)), 'InvalidValue')
+
+    // 5. decodePackedRow rejects UTF-16 run offset/length > 0xffff with LimitExceeded.
+    const bigRow = new WireWriter()
+    bigRow.varU64(0) // line
+    bigRow.u8(0) // flags
+    bigRow.bytes(new Uint8Array(70_000).fill(0x61)) // 70k ASCII 'a'
+    bigRow.varU32(1) // 1 run
+    bigRow.u16(0) // colStart
+    bigRow.u16(1) // colLen
+    bigRow.varU32(66_000) // byteOffset > 0xffff
+    bigRow.varU32(1) // byteLen
+    bigRow.u16(0) // styleIdx
+    bigRow.u16(0) // linkIdx
+    bigRow.u8(0) // runFlags
+    expectWireErr(() => decodePackedRow(new WireReader(bigRow.toBytes())), 'LimitExceeded')
+
+    // 6. Fail-fast header validation throws InvalidValue even on truncated trailing payloads.
+    const badFrame = new WireWriter()
+    badFrame.varU64(1) // seq
+    badFrame.varU64(1) // epoch
+    badFrame.u16(80)
+    badFrame.u16(24)
+    badFrame.varU64(10) // firstActiveLine
+    badFrame.varU64(11) // scrollbackLines > firstActiveLine (truncated immediately after!)
+    expectWireErr(() => decodeBrokerMsg(MsgType.FRAME, badFrame.toBytes()), 'InvalidValue')
+
+    const badAttached = new WireWriter()
+    badAttached.varU64(1) // session
+    badAttached.u32(1) // streamId
+    badAttached.u16(80)
+    badAttached.u16(24)
+    badAttached.varU64(1) // epoch
+    badAttached.varU64(5) // firstActiveLine
+    badAttached.varU64(6) // scrollbackLines > firstActiveLine (truncated before foreground!)
+    expectWireErr(() => decodeBrokerMsg(MsgType.ATTACHED, badAttached.toBytes()), 'InvalidValue')
+
+    const badDelta = new WireWriter()
+    badDelta.varU64(1) // epoch
+    badDelta.varU64(10) // fromLine
+    badDelta.varU64(9) // toLine < fromLine (truncated before added!)
+    expectWireErr(() => decodeBrokerMsg(MsgType.SEARCH_DELTA, badDelta.toBytes()), 'InvalidValue')
   })
 })
