@@ -7,7 +7,7 @@ use apack_core::time::TimestampMs;
 use apack_core::vt::VtEngine;
 use apack_os::image_sources::Scanner as ImageScanner;
 #[cfg(unix)]
-use apack_os::signal::hang_up_session_descendants;
+use apack_os::signal::{ChildExitProbe, hang_up_session_descendants, probe_child_exit_unreaped};
 use apack_os::signal::{deliver_signal, kill_session_descendants, signal_name_from_description};
 use apack_proto::types::{SessionId, SignalKind, SignalScope};
 
@@ -83,6 +83,7 @@ impl ShardRunner {
     }
 
     pub(crate) fn try_reap_session(&mut self, session_id: SessionId) {
+        let now_instant = Instant::now();
         let exit_opt = {
             let Some(sess) = self.sessions.get_mut(&session_id) else {
                 return;
@@ -92,28 +93,58 @@ impl ShardRunner {
             if sess.pending_image.is_some() {
                 return;
             }
-            if let Some(exit) = sess.reaped_exit.take() {
+            if sess.exit_drain.is_some() {
+                let pty_at_eof = match &sess.pty {
+                    #[cfg(unix)]
+                    Some(LivePty::Unix { eof, .. }) => *eof,
+                    #[cfg(windows)]
+                    Some(LivePty::Windows { eof, .. }) => *eof,
+                    None => true,
+                };
+                match take_ready_exit_drain(&mut sess.exit_drain, pty_at_eof, now_instant) {
+                    Some(exit) => Some(exit),
+                    None => return,
+                }
+            } else if let Some(exit) = sess.reaped_exit.take() {
                 Some(exit)
             } else {
+                // On Unix explicit teardown, probe leader exit via `waitid(..., WNOHANG | WNOWAIT)`
+                // FIRST so the zombie leader pins its PID while we `SIGKILL` any surviving session
+                // or `setsid()` descendants, then reap and clear `sess.pid = None` immediately.
+                #[cfg(unix)]
+                if sess.terminating_since.is_some()
+                    && let Some(pid) = sess.pid
+                {
+                    let raw = pid.pid() as u32;
+                    match probe_child_exit_unreaped(raw) {
+                        ChildExitProbe::StillRunning => return,
+                        ChildExitProbe::ExitedZombie => {
+                            kill_session_descendants(&[raw]);
+                        }
+                        ChildExitProbe::NotChild => {}
+                    }
+                }
                 let Some(child) = sess.child.as_mut() else {
                     return;
                 };
                 match child.try_wait() {
                     Ok(Some(status)) => {
                         let parsed = parse_exit_status(&status);
-                        // Clear reaped child handles immediately; on natural exit also clear `pid`
-                        // right away so a PID recycled by the OS during a deferred `pending_image`
-                        // load can never be signalled by a late `Kill`/`Signal`/shutdown.
+                        // Clear reaped child handles and PID immediately so a PID recycled by the OS
+                        // can never be signalled by a late `Kill`/`Signal`/shutdown.
                         sess.child = None;
                         sess.killer = None;
-                        if sess.terminating_since.is_none() {
-                            sess.pid = None;
-                            #[cfg(unix)]
-                            {
-                                sess.tree = None;
-                            }
+                        sess.pid = None;
+                        #[cfg(unix)]
+                        {
+                            sess.tree = None;
                         }
-                        Some(parsed)
+                        #[cfg(windows)]
+                        let ready_exit =
+                            crate::shard_windows::finish_or_begin_win_exit_drain(sess, parsed, now_instant);
+                        #[cfg(unix)]
+                        let ready_exit = Some(parsed);
+                        ready_exit
                     }
                     _ => None,
                 }
@@ -184,14 +215,6 @@ impl ShardRunner {
                 if let Some(LivePty::Unix { token, .. }) = sess.pty {
                     let _ = self.poller.deregister(token);
                     self.token_to_session.remove(&token);
-                }
-                // If this session was explicitly terminated (Kill / teardown) and the leader exited
-                // on SIGHUP before `kill_escalate_after`, SIGKILL any remaining HUP-ignoring
-                // background jobs in separate process groups belonging to the same POSIX session.
-                if sess.terminating_since.is_some()
-                    && let Some(pid) = sess.pid
-                {
-                    kill_session_descendants(&[pid.pid() as u32]);
                 }
             }
             #[cfg(windows)]
@@ -278,7 +301,10 @@ impl ShardRunner {
 
             // 1. Child reap & 2-second SIGKILL escalation BEFORE firing timers so tail PTY bytes
             //    from an exited child satisfy pending `Wait` conditions before any deadline expires.
-            let is_live = self.sessions.get(&id).is_some_and(|s| s.child.is_some() || s.reaped_exit.is_some());
+            let is_live = self
+                .sessions
+                .get(&id)
+                .is_some_and(|s| s.child.is_some() || s.reaped_exit.is_some() || s.exit_drain.is_some());
             if is_live {
                 if let Some(sess) = self.sessions.get_mut(&id)
                     && let Some(since) = sess.terminating_since
@@ -363,6 +389,15 @@ pub(crate) fn shard_session_wait_timeout(
         }
     }
     timeout
+}
+
+pub(crate) fn take_ready_exit_drain(
+    exit_drain: &mut Option<super::ExitDrainState>,
+    pty_at_eof: bool,
+    now: Instant,
+) -> Option<(Option<i32>, Option<String>)> {
+    let ready = exit_drain.as_ref().is_some_and(|d| pty_at_eof || now >= d.deadline);
+    if ready { exit_drain.take().map(|d| (d.code, d.signal)) } else { None }
 }
 
 pub(crate) fn parse_exit_status(status: &portable_pty::ExitStatus) -> (Option<i32>, Option<String>) {

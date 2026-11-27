@@ -40,6 +40,7 @@ impl BrokerServer {
 
     /// Runs the broker reactor loop on the calling thread until shutdown or idle exit.
     pub fn run(self) -> Result<(), OsError> {
+        apack_os::transport::ignore_sighup_if_detached();
         let shutdown = Arc::new(AtomicBool::new(false));
         let sig_shutdown = Arc::clone(&shutdown);
         let mut sig_guard: Option<ShutdownSignalGuard> = None;

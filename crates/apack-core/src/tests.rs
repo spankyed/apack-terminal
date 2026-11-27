@@ -860,15 +860,14 @@ fn broker_handshake_mutual_auth_timeout_duplicate_conn_and_framing_errors() {
 fn broker_multiplexing_frame_pacing_exit_ordering_and_slow_reader() {
     let mut broker = BrokerCore::with_queue_cap(AuthConfig::None, 512);
     handshake_ready(&mut broker, conn(1), ts(100));
-    broker.register_session(sid(1), false, false);
-    broker.register_session(sid(2), true, false);
+    let mut actions = Vec::new();
+    broker.register_session(sid(1), crate::broker::SessionLifetime::LeaseBound, false, &mut actions);
+    broker.register_session(sid(2), crate::broker::SessionLifetime::ConnBound(conn(1)), true, &mut actions);
     broker.update_shard_telemetry(ShardTelemetry {
         scrollback_bytes: 1_000,
         image_store_bytes: 2_000,
         total_pty_bytes: 3_000,
     });
-
-    let mut actions = Vec::new();
 
     // Control messages + NoSuchSession checks + stream message on control stream
     let mut batch = Vec::new();
@@ -1159,8 +1158,8 @@ fn broker_leases_grace_expiry_multi_stream_backpressure_and_limits() {
     let mut broker = BrokerCore::new(AuthConfig::None);
     handshake_ready(&mut broker, conn(1), ts(10));
     handshake_ready(&mut broker, conn(2), ts(10));
-    broker.register_session(sid(1), false, false);
     let mut actions = Vec::new();
+    broker.register_session(sid(1), crate::broker::SessionLifetime::LeaseBound, false, &mut actions);
 
     // AcquireLease for non-existent SessionId returns NoSuchSession
     broker.feed_bytes(
@@ -1402,9 +1401,9 @@ fn broker_leases_grace_expiry_multi_stream_backpressure_and_limits() {
 
     // try_publish_frame returns Err(frame) when queue cap is exceeded on a live attached stream
     let mut tight = BrokerCore::with_queue_cap(AuthConfig::None, 80);
-    tight.register_session(sid(1), false, false);
-    tight.open_connection(conn(1), [0; 32], ts(0)).unwrap();
     let mut a2 = Vec::new();
+    tight.open_connection(conn(1), [0; 32], ts(0)).unwrap();
+    tight.register_session(sid(1), crate::broker::SessionLifetime::LeaseBound, false, &mut a2);
     tight.feed_bytes(
         conn(1),
         &encode_client(
@@ -1453,9 +1452,9 @@ fn broker_fin_drain_filters_frames_and_oversized_messages_enforced() {
     use crate::broker::MAX_WIRE_FRAME_BYTES;
 
     let mut broker = BrokerCore::with_queue_cap(AuthConfig::None, 32 * 1024 * 1024);
-    broker.register_session(sid(1), false, false);
     let mut actions = Vec::new();
     broker.open_connection(conn(1), [1; 32], ts(0)).unwrap();
+    broker.register_session(sid(1), crate::broker::SessionLifetime::LeaseBound, false, &mut actions);
     broker.feed_bytes(
         conn(1),
         &encode_client(
@@ -1712,9 +1711,9 @@ fn pr4_stream_attachment_phase_decoders_unified_budget_and_exited_suppression() 
 
     // 2. Monotonic StreamAttachmentId, stale frame rejection on same-session re-attach, and abort_attach (`B2`):
     let mut broker = BrokerCore::with_queue_cap(AuthConfig::None, 400);
-    broker.register_session(sid(1), false, false);
-    broker.register_session(sid(2), false, false);
     handshake_ready(&mut broker, conn(1), ts(20));
+    broker.register_session(sid(1), crate::broker::SessionLifetime::LeaseBound, false, &mut actions);
+    broker.register_session(sid(2), crate::broker::SessionLifetime::LeaseBound, false, &mut actions);
 
     let attach_s1 = |req: u32, flags: u8, credit: u32| {
         encode_client(
@@ -1893,7 +1892,7 @@ fn pr4_stream_attachment_phase_decoders_unified_budget_and_exited_suppression() 
     let small_budget = MemoryBudget::new(400);
     assert_eq!(small_budget.pending_raw_room(), 300);
 
-    broker.register_session(sid(3), false, false);
+    broker.register_session(sid(3), crate::broker::SessionLifetime::LeaseBound, false, &mut actions);
     let attach_raw = |req: u32, session: SessionId, stream: u32| {
         encode_client(
             StreamId::CONTROL,
@@ -1982,4 +1981,101 @@ fn pr4_stream_attachment_phase_decoders_unified_budget_and_exited_suppression() 
     );
     assert!(matches!(actions.last(), Some(BrokerAction::CloseConn { reason: CloseReason::SlowReader, .. })));
     assert_eq!(broker.connection_count(), 0);
+}
+
+#[test]
+fn pr6_explicit_session_lifetime_and_disconnect_teardown() {
+    use crate::broker::SessionLifetime;
+
+    let mut broker = BrokerCore::new(AuthConfig::None);
+    let mut actions = Vec::new();
+
+    // 1. Registering already-orphaned ConnBound or LeaseBound sessions (e.g. client left mid-spawn)
+    //    immediately emits `TeardownSession`; `Kept` never orphans!
+    broker.register_session(sid(10), SessionLifetime::ConnBound(conn(99)), true, &mut actions);
+    assert!(actions.contains(&BrokerAction::TeardownSession(sid(10))));
+    actions.clear();
+    broker.register_session(sid(11), SessionLifetime::LeaseBound, false, &mut actions);
+    assert!(actions.contains(&BrokerAction::TeardownSession(sid(11))));
+    actions.clear();
+    broker.register_session(sid(12), SessionLifetime::Kept, false, &mut actions);
+    assert!(actions.is_empty());
+    assert_eq!(broker.session_lifetime(sid(12)), Some(SessionLifetime::Kept));
+    assert!(broker.is_session_kept(sid(12)));
+
+    // 2. Two unleased clients: conn(1) owns rewound sid(1) (`ConnBound(1)`), rewound sid(2)
+    //    (`ConnBound(1)`, pinned by conn(2)), and live sid(3) (`LeaseBound`).
+    handshake_ready(&mut broker, conn(1), ts(1));
+    handshake_ready(&mut broker, conn(2), ts(2));
+    actions.clear();
+    broker.register_session(sid(1), SessionLifetime::ConnBound(conn(1)), true, &mut actions);
+    broker.register_session(sid(2), SessionLifetime::ConnBound(conn(1)), true, &mut actions);
+    broker.register_session(sid(3), SessionLifetime::LeaseBound, false, &mut actions);
+    assert!(actions.is_empty());
+
+    // set_session_kept must NOT promote a rewound ConnBound session to Kept!
+    broker.set_session_kept(sid(1), true);
+    assert_eq!(broker.session_lifetime(sid(1)), Some(SessionLifetime::ConnBound(conn(1))));
+    // set_session_kept toggles non-rewound sessions between Kept and LeaseBound.
+    broker.set_session_kept(sid(3), true);
+    assert_eq!(broker.session_lifetime(sid(3)), Some(SessionLifetime::Kept));
+    broker.set_session_kept(sid(3), false);
+    assert_eq!(broker.session_lifetime(sid(3)), Some(SessionLifetime::LeaseBound));
+
+    // conn(2) pins sid(2) with LeaseKind::Session(sid(2)) and also pins sid(1), then releases sid(1)
+    // while conn(1) is STILL connected -> releasing sid(1) must NOT tear down sid(1)!
+    broker.feed_bytes(
+        conn(2),
+        &encode_client(StreamId::CONTROL, 1, &ClientMsg::AcquireLease { kind: LeaseKind::Session(sid(1)) }),
+        ts(3),
+        &mut actions,
+    );
+    let BrokerMsg::LeaseAck { lease_id: l1, .. } = broker.pop_outbound(conn(2)).unwrap().msg else {
+        panic!("expected LeaseAck");
+    };
+    broker.feed_bytes(
+        conn(2),
+        &encode_client(StreamId::CONTROL, 2, &ClientMsg::AcquireLease { kind: LeaseKind::Session(sid(2)) }),
+        ts(4),
+        &mut actions,
+    );
+    let BrokerMsg::LeaseAck { lease_id: l2, .. } = broker.pop_outbound(conn(2)).unwrap().msg else {
+        panic!("expected LeaseAck");
+    };
+    actions.clear();
+    broker.feed_bytes(
+        conn(2),
+        &encode_client(StreamId::CONTROL, 3, &ClientMsg::ReleaseLease { lease_id: l1 }),
+        ts(5),
+        &mut actions,
+    );
+    assert!(!actions.contains(&BrokerAction::TeardownSession(sid(1))), "ConnBound owner conn(1) is still connected");
+    assert!(!actions.contains(&BrokerAction::SessionUnpinned(sid(1))));
+    let _ = broker.pop_outbound(conn(2));
+
+    // conn(1) disconnects while conn(2) stays connected:
+    // - unpinned ConnBound sid(1) tears down immediately (`TeardownSession(1)`)
+    // - pinned ConnBound sid(2) stays alive until conn(2) unpins it
+    // - LeaseBound sid(3) stays alive because conn(2) is still connected!
+    actions.clear();
+    broker.close_connection(conn(1), CloseReason::TransportClosed, ts(6), &mut actions);
+    assert!(actions.contains(&BrokerAction::TeardownSession(sid(1))));
+    assert!(!actions.contains(&BrokerAction::TeardownSession(sid(2))));
+    assert!(!actions.contains(&BrokerAction::TeardownNonKeptSessions));
+
+    // conn(2) releases pin l2 on sid(2) while owner conn(1) is already gone -> TeardownSession(2)!
+    actions.clear();
+    broker.feed_bytes(
+        conn(2),
+        &encode_client(StreamId::CONTROL, 4, &ClientMsg::ReleaseLease { lease_id: l2 }),
+        ts(7),
+        &mut actions,
+    );
+    assert!(actions.contains(&BrokerAction::TeardownSession(sid(2))));
+    let _ = broker.pop_outbound(conn(2));
+
+    // conn(2) (last unleased client!) disconnects -> TeardownNonKeptSessions fires immediately!
+    actions.clear();
+    broker.close_connection(conn(2), CloseReason::TransportClosed, ts(8), &mut actions);
+    assert!(actions.contains(&BrokerAction::TeardownNonKeptSessions));
 }

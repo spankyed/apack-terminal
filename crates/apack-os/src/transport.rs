@@ -641,6 +641,58 @@ mod unix_signals {
 #[cfg(unix)]
 pub use unix_signals::{ShutdownSignalGuard, install_shutdown_signals};
 
+/// Configures a spawned background broker [`std::process::Command`] to detach from the caller's
+/// controlling session/console (`setsid(2)` on Unix, `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+/// | CREATE_NO_WINDOW` on Windows) so closing the proxy/SSH PTY cannot `SIGHUP` the broker.
+pub fn configure_detached_command(cmd: &mut std::process::Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: `setsid(2)` is async-signal-safe per POSIX and runs in the child between
+        // `fork` and `exec` without touching any parent heap state.
+        unsafe {
+            cmd.pre_exec(|| {
+                let _ = libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    #[cfg(windows)]
+    {
+        crate::transport_windows::configure_detached_command(cmd);
+    }
+}
+
+/// Ignores `SIGHUP` when running detached (non-TTY stdin) on Unix so an autostarted background
+/// broker cannot be terminated by a terminal hangup.
+pub fn ignore_sighup_if_detached() {
+    #[cfg(unix)]
+    {
+        // SAFETY: `isatty(STDIN_FILENO)` queries whether fd 0 is a terminal; safe with any fd.
+        if unsafe { libc::isatty(libc::STDIN_FILENO) } == 0 {
+            // SAFETY: zeroed `sigaction` with `SIG_IGN` is valid and async-signal-safe.
+            unsafe {
+                let mut sa: libc::sigaction = std::mem::zeroed();
+                sa.sa_sigaction = libc::SIG_IGN;
+                libc::sigemptyset(&raw mut sa.sa_mask);
+                libc::sigaction(libc::SIGHUP, &sa, std::ptr::null_mut());
+            }
+        }
+    }
+}
+
+/// Reads and removes a secret environment variable strictly during single-threaded process startup
+/// (before spawning any worker, signal, or transport threads) so child shells and `/proc/<pid>/environ`
+/// never retain the broker authentication secret.
+pub fn take_secret_env_at_startup(name: &str) -> Option<String> {
+    let val = std::env::var(name).ok();
+    if val.is_some() {
+        // SAFETY: invoked strictly at single-threaded `serve` startup before any threads exist.
+        unsafe { std::env::remove_var(name) };
+    }
+    val
+}
+
 /// Abruptly shuts down a stream in both directions, unblocking parked reads/writes.
 ///
 /// On macOS a socket whose peer already half-closed its write side returns `ENOTCONN` for
@@ -1155,5 +1207,52 @@ mod tests {
         let guard2 = install_shutdown_signals(Arc::new(AtomicBool::new(false)), || {})
             .expect("reinstall after drop must succeed");
         drop(guard2);
+    }
+
+    #[test]
+    fn detached_command_and_take_secret_env_helpers() {
+        const SECRET_VAR: &str = "APACK_TEST_PR6_SECRET_HELPER";
+        // SAFETY: unique test-only env var accessed exclusively by this unit test.
+        unsafe { std::env::set_var(SECRET_VAR, "top-secret-42") };
+        assert_eq!(take_secret_env_at_startup(SECRET_VAR).as_deref(), Some("top-secret-42"));
+        assert!(std::env::var_os(SECRET_VAR).is_none());
+        assert_eq!(take_secret_env_at_startup(SECRET_VAR), None);
+
+        #[cfg(unix)]
+        {
+            const SIGHUP_CHILD_ENV: &str = "APACK_TEST_PR6_SIGHUP_CHILD";
+            if std::env::var_os(SIGHUP_CHILD_ENV).is_some() {
+                ignore_sighup_if_detached();
+                // SAFETY: raising SIGHUP to self inside the isolated child test process verifies
+                // `ignore_sighup_if_detached` installed `SIG_IGN` when stdin is `/dev/null`.
+                assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
+                return;
+            }
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.args(["-c", "ps -o pgid= -p $$"]).stdout(std::process::Stdio::piped());
+            configure_detached_command(&mut cmd);
+            let child = cmd.spawn().expect("spawn detached sh");
+            let pid = child.id().to_string();
+            let out = child.wait_with_output().expect("wait detached sh");
+            assert!(out.status.success());
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                pid,
+                "configure_detached_command must create a new POSIX session via setsid()"
+            );
+
+            let exe = std::env::current_exe().expect("current_exe");
+            let hup_out = std::process::Command::new(exe)
+                .args(["--exact", "transport::tests::detached_command_and_take_secret_env_helpers"])
+                .env(SIGHUP_CHILD_ENV, "1")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("spawn sighup child");
+            assert!(
+                hup_out.status.success(),
+                "detached child must survive SIGHUP after ignore_sighup_if_detached(): {:?}",
+                hup_out.status
+            );
+        }
     }
 }

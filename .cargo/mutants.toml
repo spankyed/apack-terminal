@@ -30,12 +30,11 @@ exclude_re = [
     "crates/apack-vt-ghostty/src/image_store.rs:.*replace match guard frame.buffer_size\\(\\) == pixels \\* (4|2) with true in decode_png_into",
 
     # **`apack-os` lethal-broadcast safety & proven-equivalent exclusions:**
-    # 1. Mutating comparisons inside `KillTarget::at` allows `kill(0)`/`kill(-1)` broadcasts; mutating
-    #    process selection inside `signal_session_descendants` sends SIGHUP/SIGKILL to unrelated host processes.
+    # 1. Mutating comparisons inside `KillTarget::at` allows `kill(0)`/`kill(-1)` broadcasts.
     "crates/apack-os/src/signal.rs:.*in KillTarget::at",
-    "crates/apack-os/src/signal.rs:.*in signal_session_descendants",
     # 2. Disjoint single-bit POSIX/Win32/Ghostty flags produce identical bitmasks under `|` and `^`.
     "crates/apack-vt-ghostty/src/engine/render.rs:.*replace \\| with \\^ in GhosttyEngine::feed_inner",
+    "crates/apack-os/src/signal.rs:.*replace \\| with \\^ in probe_child_exit_unreaped",
     "crates/apack-os/src/transport.rs:.*replace \\| with \\^ in acquire_socket_hold",
     "crates/apack-os/src/image_sources/posix.rs:.*replace \\| with \\^$",
     "crates/apack-os/src/image_sources/windows.rs:.*replace \\| with \\^$",

@@ -4,12 +4,12 @@
 
 use std::process::ExitCode;
 
-use apack_broker::config::{BrokerConfig, CliCommand, clamp_shard_count, parse_cli, resolve_socket_path};
+use apack_broker::config::{AUTH_KEY_ENV, BrokerConfig, CliCommand, clamp_shard_count, parse_cli, resolve_socket_path};
 use apack_broker::inspect::{collect_report, format_report};
 use apack_broker::proxy::run_stdio_proxy;
 use apack_broker::runtime::BrokerServer;
 use apack_os::OsError;
-use apack_os::transport::HELD_EXIT;
+use apack_os::transport::{HELD_EXIT, START_GRACE_ENV, take_secret_env_at_startup};
 use apack_proto::PROTOCOL_VERSION;
 
 fn main() -> ExitCode {
@@ -23,6 +23,10 @@ fn main() -> ExitCode {
     };
 
     match cmd {
+        CliCommand::Help(text) => {
+            print!("{text}");
+            ExitCode::SUCCESS
+        }
         CliCommand::Version => {
             println!("apack-terminal {} (protocol v{PROTOCOL_VERSION})", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -35,7 +39,12 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
-            let mut cfg = BrokerConfig::for_socket(socket_path).with_env_overrides();
+            // Read and strip `APACK_TERMINAL_AUTH_KEY` from the broker process environment while
+            // still strictly single-threaded so neither `/proc/<pid>/environ` nor child shells see it.
+            let grace_env = std::env::var(START_GRACE_ENV).ok();
+            let auth_key = take_secret_env_at_startup(AUTH_KEY_ENV);
+            let mut cfg =
+                BrokerConfig::for_socket(socket_path).apply_env_overrides(grace_env.as_deref(), auth_key.as_deref());
             if let Some(n) = shards {
                 cfg.shard_count = clamp_shard_count(n);
             }

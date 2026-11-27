@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use apack_core::broker::{BrokerAction, BrokerCore, CloseReason, ShardTelemetry, StreamAttachmentId};
+use apack_core::broker::{BrokerAction, BrokerCore, CloseReason, SessionLifetime, ShardTelemetry, StreamAttachmentId};
 use apack_core::flow::OutboundPriority;
 use apack_core::lease::ConnId;
 use apack_core::time::TimestampMs;
@@ -1035,11 +1035,20 @@ impl ReactorState {
                     self.shards[shard_idx].send(ShardCmd::RawOutputDrained);
                 }
             }
-            ReactorEvent::SessionRegistered { session, shard_idx, rewound, kept } => {
+            ReactorEvent::SessionRegistered { session, owner, shard_idx, rewound, kept } => {
                 self.pending_spawns = self.pending_spawns.saturating_sub(1);
                 self.session_shard.insert(session, shard_idx);
                 self.session_kept.insert(session, kept);
-                self.core.register_session(session, rewound, kept);
+                let lifetime = if rewound {
+                    SessionLifetime::ConnBound(owner)
+                } else if kept {
+                    SessionLifetime::Kept
+                } else {
+                    SessionLifetime::LeaseBound
+                };
+                let mut actions = Vec::new();
+                self.core.register_session(session, lifetime, rewound, &mut actions);
+                self.execute_actions(actions, now);
             }
             ReactorEvent::SpawnOrRewindFailed => {
                 self.pending_spawns = self.pending_spawns.saturating_sub(1);
@@ -1314,6 +1323,11 @@ impl ReactorState {
                     if let Some(&shard_idx) = self.session_shard.get(&session) {
                         self.shards[shard_idx]
                             .send(ShardCmd::SessionUnpinned { session_id: session, broker_lease_active });
+                    }
+                }
+                BrokerAction::TeardownSession(session) => {
+                    if let Some(&shard_idx) = self.session_shard.get(&session) {
+                        self.shards[shard_idx].send(ShardCmd::TeardownSession { session_id: session });
                     }
                 }
             }

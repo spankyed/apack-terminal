@@ -18,6 +18,14 @@ use windows_sys::Win32::System::IO::CancelIoEx;
 use windows_sys::Win32::System::Pipes::{DisconnectNamedPipe, GetNamedPipeClientProcessId};
 use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
+/// Configures a spawned broker [`std::process::Command`] to run detached from the caller's console.
+pub fn configure_detached_command(cmd: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    // DETACHED_PROCESS (0x0000_0008) | CREATE_NEW_PROCESS_GROUP (0x0000_0200) | CREATE_NO_WINDOW (0x0800_0000)
+    const WINDOWS_DETACHED_FLAGS: u32 = 0x0800_0208;
+    cmd.creation_flags(WINDOWS_DETACHED_FLAGS);
+}
+
 /// Maps Windows named-pipe bind errors indicating an existing instance to [`crate::OsError::AlreadyHeld`].
 pub fn map_bind_error(err: io::Error) -> crate::OsError {
     if matches!(err.kind(), io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied) {
@@ -304,5 +312,29 @@ mod tests {
         drop(guard);
         // SAFETY: after dropping the guard, CTRL_HOOK is cleared and the callback returns 0.
         assert_eq!(unsafe { console_ctrl_handler(0) }, 0);
+    }
+
+    #[test]
+    fn configure_detached_command_detaches_child_from_console() {
+        const CHILD_ENV: &str = "APACK_TEST_CHECK_DETACHED_CONSOLE";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            // SAFETY: `GetConsoleCP` queries the attached console code page (0 when detached).
+            let cp = unsafe { windows_sys::Win32::System::Console::GetConsoleCP() };
+            println!("CONSOLE_CP={cp}");
+            return;
+        }
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args([
+            "--exact",
+            "transport_windows::tests::configure_detached_command_detaches_child_from_console",
+            "--nocapture",
+        ])
+        .env(CHILD_ENV, "1");
+        configure_detached_command(&mut cmd);
+        let out = cmd.output().expect("spawn detached test helper");
+        assert!(out.status.success(), "helper failed: {}", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("CONSOLE_CP=0"), "expected detached child with no console, got: {stdout:?}");
     }
 }

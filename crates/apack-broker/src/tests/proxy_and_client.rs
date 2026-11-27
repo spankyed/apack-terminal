@@ -109,7 +109,7 @@ fn e2e_dumb_single_channel_proxy_splices_live_client() {
             scfg.shard_count = 1;
             let _ = tx.send(BrokerServer::bind(scfg).unwrap().spawn().unwrap());
         });
-        Ok(())
+        Ok(None)
     })
     .unwrap();
     assert_eq!(spawned_count, 1);
@@ -122,7 +122,7 @@ fn e2e_dumb_single_channel_proxy_splices_live_client() {
     assert!(
         connect_or_autostart_with(&auto_timeout_sock, false, Duration::from_secs(1), |_| {
             noauto_spawns += 1;
-            Ok(())
+            Ok(None)
         })
         .is_err()
     );
@@ -132,11 +132,66 @@ fn e2e_dumb_single_channel_proxy_splices_live_client() {
     assert!(
         connect_or_autostart_with(&auto_timeout_sock, true, Duration::from_millis(35), |_| {
             noop_spawns += 1;
-            Ok(())
+            Ok(None)
         })
         .is_err()
     );
     assert_eq!(noop_spawns, 1);
+
+    // Fast-fail autostart (`M9`): when the spawned child exits immediately with stderr,
+    // `connect_or_autostart_with` returns promptly (NOT waiting the 5s timeout) and includes stderr!
+    let auto_fail_sock = unique_endpoint(tmp.path(), "e2e-auto-fail");
+    let fail_started = std::time::Instant::now();
+    let fail_err = connect_or_autostart_with(&auto_fail_sock, true, Duration::from_secs(5), |_| {
+        let mut cmd = if cfg!(windows) {
+            let mut c = std::process::Command::new("cmd.exe");
+            c.args(["/C", "echo BROKER_BOOT_FAIL_DIAG 1>&2 & exit /B 1"]);
+            c
+        } else {
+            let mut c = std::process::Command::new("/bin/sh");
+            c.args(["-c", "echo BROKER_BOOT_FAIL_DIAG >&2; exit 1"]);
+            c
+        };
+        cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
+        Ok(Some(cmd.spawn()?))
+    })
+    .unwrap_err();
+    assert!(fail_started.elapsed() < Duration::from_secs(2), "must fail fast on child exit, not wait 5s");
+    assert!(
+        fail_err.to_string().contains("BROKER_BOOT_FAIL_DIAG"),
+        "must surface captured stderr on startup failure: {fail_err}"
+    );
+
+    // Concurrent autostart bind race (`HELD_EXIT`): if spawned child exits with HELD_EXIT while
+    // the winning broker binds the socket, `connect_or_autostart_with` still connects cleanly!
+    let auto_held_sock = unique_endpoint(tmp.path(), "e2e-auto-held");
+    let (held_tx, held_rx) = std::sync::mpsc::sync_channel::<crate::BrokerHandle>(1);
+    let stream_held = connect_or_autostart_with(&auto_held_sock, true, Duration::from_secs(2), |path| {
+        let p = path.to_owned();
+        let tx = held_tx.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            let mut scfg = BrokerConfig::for_socket(&p);
+            scfg.shard_count = 1;
+            let _ = tx.send(BrokerServer::bind(scfg).unwrap().spawn().unwrap());
+        });
+        let held_code = apack_os::transport::HELD_EXIT;
+        let mut cmd = if cfg!(windows) {
+            let mut c = std::process::Command::new("cmd.exe");
+            c.args(["/C", &format!("exit /B {held_code}")]);
+            c
+        } else {
+            let mut c = std::process::Command::new("/bin/sh");
+            c.args(["-c", &format!("exit {held_code}")]);
+            c
+        };
+        cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
+        Ok(Some(cmd.spawn()?))
+    })
+    .unwrap();
+    drop(stream_held);
+    let mut held_handle = held_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    held_handle.shutdown().unwrap();
 
     // Dropping BrokerHandle shuts down the broker and releases its SocketHold so re-binding succeeds!
     let sock_drop = unique_endpoint(tmp.path(), "e2e-drop");
@@ -714,4 +769,114 @@ fn shard_keyframe_seek_fallback_and_exit_status_unit() {
     assert!(alt_fb_rows[0].text.contains("ALT_SCREEN_BODY"));
     assert_eq!(lines[4], "VP_LINE_B", "row 4 must follow row 3: {lines:?}");
     assert_eq!(lines[5], "VP_LINE_C", "row 5 must follow row 4: {lines:?}");
+
+    // 4. CLI `-h`/`--help` (`M16`) and `inspect --json` trailing newline:
+    use crate::config::{CLI_HELP, CliCommand, INSPECT_HELP, PROXY_HELP, SERVE_HELP, VERSION_HELP, parse_cli};
+    assert_eq!(parse_cli(&["-h".into()]), Ok(CliCommand::Help(CLI_HELP)));
+    assert_eq!(parse_cli(&["--help".into()]), Ok(CliCommand::Help(CLI_HELP)));
+    assert_eq!(parse_cli(&["help".into()]), Ok(CliCommand::Help(CLI_HELP)));
+    assert_eq!(parse_cli(&["serve".into(), "--help".into()]), Ok(CliCommand::Help(SERVE_HELP)));
+    assert_eq!(parse_cli(&["serve".into(), "-h".into()]), Ok(CliCommand::Help(SERVE_HELP)));
+    assert_eq!(parse_cli(&["proxy".into(), "--help".into()]), Ok(CliCommand::Help(PROXY_HELP)));
+    assert_eq!(parse_cli(&["inspect".into(), "-h".into()]), Ok(CliCommand::Help(INSPECT_HELP)));
+    assert_eq!(parse_cli(&["version".into(), "--help".into()]), Ok(CliCommand::Help(VERSION_HELP)));
+    let sample_report = crate::inspect::build_report(&[], apack_proto::types::MetricsSnapshot::default());
+    assert!(crate::inspect::format_report(&sample_report, true).ends_with('\n'));
+
+    // `reap_child_in_background` must actually wait/reap an exited child so it never lingers as a zombie.
+    #[cfg(unix)]
+    {
+        let child = std::process::Command::new("/bin/sh").args(["-c", "exit 0"]).spawn().expect("spawn short child");
+        let pid = child.id();
+        crate::proxy::reap_child_in_background(child);
+        let dl = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < dl {
+            if apack_os::signal::probe_child_exit_unreaped(pid) == apack_os::signal::ChildExitProbe::NotChild {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            apack_os::signal::probe_child_exit_unreaped(pid),
+            apack_os::signal::ChildExitProbe::NotChild,
+            "reap_child_in_background must reap the child process"
+        );
+    }
+}
+
+#[test]
+fn pr6_proxy_large_full_duplex_reconnect_replay_never_deadlocks() {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let tmp = tempdir().unwrap();
+    let sock1 = unique_endpoint(tmp.path(), "pr6-dead-1");
+    let sock2 = unique_endpoint(tmp.path(), "pr6-duplex-2");
+    #[cfg(unix)]
+    {
+        if let Some(p) = std::path::Path::new(&sock1).parent() {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        if let Some(p) = std::path::Path::new(&sock2).parent() {
+            std::fs::create_dir_all(p).unwrap();
+        }
+    }
+
+    // Listener 1 accepts and immediately closes without sending a single byte (simulating idle broker exit).
+    let l1 = apack_os::transport::bind_local_listener(&sock1).unwrap();
+    let t1 = std::thread::spawn(move || {
+        use interprocess::local_socket::traits::Listener as _;
+        if let Ok(s) = l1.accept() {
+            drop(s);
+        }
+    });
+
+    // Listener 2 echoes back 256 KiB of responses concurrently while reading 512 KiB of replayed client bytes!
+    // If the proxy wrote the 512 KiB replay synchronously on the sole reader thread, socket buffers would deadlock.
+    let l2 = apack_os::transport::bind_local_listener(&sock2).unwrap();
+    let total_payload = 512 * 1024;
+    let t2 = std::thread::spawn(move || {
+        use interprocess::local_socket::traits::Listener as _;
+        use std::io::Read;
+        let s = std::sync::Arc::new(l2.accept().expect("accept l2"));
+        let sw = std::sync::Arc::clone(&s);
+        let reply_thread = std::thread::spawn(move || {
+            let mut tx: &interprocess::local_socket::Stream = &sw;
+            tx.write_all(&vec![b'R'; 256 * 1024]).expect("write 256 KiB concurrently");
+            tx.flush().expect("flush");
+        });
+        let mut rx: &interprocess::local_socket::Stream = &s;
+        let mut received = Vec::with_capacity(total_payload + 4);
+        let mut buf = [0u8; 16_384];
+        while received.len() < total_payload + 4 {
+            let n = rx.read(&mut buf).expect("read replayed bytes");
+            if n == 0 {
+                break;
+            }
+            received.extend_from_slice(&buf[..n]);
+        }
+        reply_thread.join().expect("reply thread");
+        received
+    });
+
+    let input_bytes = vec![b'C'; total_payload];
+    let attempts = AtomicUsize::new(0);
+    let mut stdout_buf = Vec::new();
+    let s1_clone = sock1.clone();
+    let s2_clone = sock2.clone();
+    run_proxy_over(std::io::Cursor::new(input_bytes.clone()), &mut stdout_buf, move || {
+        if attempts.fetch_add(1, Ordering::AcqRel) == 0 {
+            apack_os::transport::connect_local_stream(&s1_clone)
+        } else {
+            apack_os::transport::connect_local_stream(&s2_clone)
+        }
+    })
+    .expect("512 KiB full-duplex reconnect replay must succeed without deadlock");
+
+    let _ = t1.join();
+    let server_got = t2.join().expect("l2 thread");
+    assert_eq!(stdout_buf.len(), 256 * 1024);
+    assert!(stdout_buf.iter().all(|&b| b == b'R'));
+    assert_eq!(&server_got[..total_payload], input_bytes.as_slice());
+    assert_eq!(&server_got[total_payload..], &apack_proto::FIN_FRAME);
 }

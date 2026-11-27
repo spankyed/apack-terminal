@@ -1,14 +1,36 @@
 //! Windows ConPTY shard I/O edge (`#[cfg(windows)]`-only; mutated on Windows CI).
 
 use std::sync::{Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use apack_os::pty_windows::{ConPtyBridge, ConPtyOutput};
 use apack_proto::types::SessionId;
 
-use crate::shard::{LivePty, LiveSession, ShardMailboxState, ShardRunner};
+use crate::shard::{ExitDrainState, LivePty, LiveSession, ShardMailboxState, ShardRunner};
 
 const WIN_PTY_WRITE_CHUNK_BYTES: usize = 65_536;
+
+/// Maximum wall-clock duration to drain trailing ConPTY bytes after child process exit and
+/// `close_master_async()` before emitting `BrokerMsg::Exited`.
+pub(crate) const WIN_CONPTY_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Transitions a naturally exited Windows session into `DrainingConPtyToEof(deadline)` by closing
+/// the ConPTY master off-shard so `conhost.exe` flushes all trailing output through EOF before
+/// `BrokerMsg::Exited` is emitted. Returns `None` when exit finalization should wait for EOF, or
+/// `Some(parsed)` when the PTY is already at EOF / absent.
+pub(crate) fn finish_or_begin_win_exit_drain(
+    sess: &mut LiveSession,
+    parsed: (Option<i32>, Option<String>),
+    now: Instant,
+) -> Option<(Option<i32>, Option<String>)> {
+    if let Some(LivePty::Windows { bridge, eof: false }) = &sess.pty {
+        bridge.close_master_async();
+        sess.exit_drain =
+            Some(ExitDrainState { code: parsed.0, signal: parsed.1, deadline: now + WIN_CONPTY_DRAIN_TIMEOUT });
+        return None;
+    }
+    Some(parsed)
+}
 
 /// Drains up to `budget` bytes of ready ConPTY output from `bridge`, invoking `on_bytes` for each
 /// chunk. Returns `(hit_eof, exhausted_quantum)`.

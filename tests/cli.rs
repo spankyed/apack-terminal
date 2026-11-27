@@ -17,6 +17,21 @@ fn cli_binary_usage_version_serve_inspect_and_proxy() {
     let no_args_err = String::from_utf8_lossy(&no_args.stderr);
     assert!(no_args_err.contains("usage: apack-terminal"), "unexpected stderr: {no_args_err}");
 
+    // Top-level & per-subcommand `-h` / `--help` print usage to stdout and exit 0 (`M16`)!
+    for help_args in [
+        &["-h"][..],
+        &["--help"][..],
+        &["serve", "--help"][..],
+        &["proxy", "-h"][..],
+        &["inspect", "--help"][..],
+        &["version", "--help"][..],
+    ] {
+        let h = Command::new(bin).args(help_args).output().expect("spawn help");
+        assert!(h.status.success(), "{help_args:?} must exit 0");
+        let h_out = String::from_utf8_lossy(&h.stdout);
+        assert!(h_out.contains("usage: apack-terminal"), "unexpected help stdout for {help_args:?}: {h_out}");
+    }
+
     let ok = Command::new(bin).arg("--version").output().expect("spawn apack-terminal --version");
     assert!(ok.status.success());
     let stdout = String::from_utf8_lossy(&ok.stdout);
@@ -50,6 +65,7 @@ fn cli_binary_usage_version_serve_inspect_and_proxy() {
     assert!(insp.status.success(), "inspect stderr: {}", String::from_utf8_lossy(&insp.stderr));
     let insp_out = String::from_utf8_lossy(&insp.stdout);
     assert!(insp_out.contains("\"live_sessions\": 0"), "unexpected inspect output: {insp_out}");
+    assert!(insp_out.ends_with('\n'), "inspect --json must terminate with a trailing newline");
 
     // Duplicate `serve` on held socket exits with HELD_EXIT (3)!
     let held = Command::new(bin).args(["serve", "--socket", &sock]).output().expect("spawn duplicate serve");
@@ -121,4 +137,74 @@ fn cli_binary_usage_version_serve_inspect_and_proxy() {
         .output()
         .expect("spawn grace serve");
     assert!(grace.status.success(), "grace serve failed: {}", String::from_utf8_lossy(&grace.stderr));
+
+    // `serve` with `APACK_TERMINAL_AUTH_KEY` enforces auth AND strips the secret from broker env
+    // before spawning threads/shells (`L10`)!
+    #[cfg(unix)]
+    let auth_sock = tmp.path().join("p/cli-auth.sock").to_string_lossy().into_owned();
+    #[cfg(windows)]
+    let auth_sock = format!(r"\\.\pipe\apack-v2-cli-auth-{}", std::process::id());
+    let auth_secret = "pr6-super-secret-broker-key";
+    let mut auth_srv = Command::new(bin)
+        .args(["serve", "--socket", &auth_sock, "--shards", "1"])
+        .env(apack_broker::config::AUTH_KEY_ENV, auth_secret)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn auth serve");
+    let auth_cfg = AuthConfig::Required(apack_broker::config::derive_auth_secret(auth_secret.as_bytes()));
+    let mut auth_client = None;
+    let auth_dl = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < auth_dl {
+        if let Ok(c) = BrokerClient::connect(&auth_sock, &auth_cfg, "cli-auth-client") {
+            auth_client = Some(c);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let mut auth_client = auth_client.expect("connect to authenticated serve subprocess");
+    // Detached (`Stdio::null()` stdin) `serve` must ignore SIGHUP (`H11`) and keep serving clients.
+    #[cfg(unix)]
+    {
+        let hup = Command::new("kill")
+            .args(["-HUP", &auth_srv.id().to_string()])
+            .status()
+            .expect("send SIGHUP to detached serve");
+        assert!(hup.success(), "kill -HUP failed");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(auth_srv.try_wait().expect("try_wait after SIGHUP").is_none(), "detached serve died on SIGHUP!");
+    }
+    let shell_spec = apack_proto::messages::SpawnSpec {
+        argv: if cfg!(windows) {
+            vec![String::from("cmd.exe"), String::from("/C"), String::from("echo KEY=[%APACK_TERMINAL_AUTH_KEY%]")]
+        } else {
+            vec![
+                String::from("/bin/sh"),
+                String::from("-c"),
+                String::from("printf 'KEY=[%s]\\r\\n' \"$APACK_TERMINAL_AUTH_KEY\""),
+            ]
+        },
+        cwd: None,
+        env: Vec::new(),
+        size: apack_proto::types::GridSize::new(80, 24).unwrap(),
+        cell_px: apack_proto::types::CellPx { width: 8, height: 16 },
+        scrollback_limit: 100,
+        marks_key: None,
+        resize_policy: apack_proto::types::ResizePolicy::LatestActive,
+        record_dir: None,
+        restore_from: None,
+        image_files: false,
+        kept: false,
+    };
+    let (auth_sid, _) = auth_client.spawn(shell_spec).unwrap();
+    let expected_key = if cfg!(windows) { "KEY=[%APACK_TERMINAL_AUTH_KEY%]" } else { "KEY=[]" };
+    assert_eq!(
+        auth_client.wait(auth_sid, apack_proto::types::WaitCondition::Text(String::from(expected_key)), 5_000).unwrap(),
+        apack_proto::types::WaitOutcome::Met
+    );
+    let _ = auth_client.send_fin();
+    drop(auth_client);
+    let _ = auth_srv.kill();
+    let _ = auth_srv.wait();
 }

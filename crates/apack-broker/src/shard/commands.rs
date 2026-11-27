@@ -219,6 +219,7 @@ impl ShardRunner {
             pending_image: None,
             pending_image_tail: Vec::new(),
             reaped_exit: None,
+            exit_drain: None,
         };
 
         // Persist any restored image blobs BEFORE capturing initial KeyframeV2 as record 0.
@@ -235,6 +236,7 @@ impl ShardRunner {
 
         self.emit(ReactorEvent::SessionRegistered {
             session: session_id,
+            owner: conn,
             shard_idx: self.shard_idx,
             rewound: false,
             kept,
@@ -345,12 +347,14 @@ impl ShardRunner {
                 pending_image: None,
                 pending_image_tail: Vec::new(),
                 reaped_exit: None,
+                exit_drain: None,
             },
         );
         self.load.store(self.sessions.len(), Ordering::Relaxed);
 
         self.emit(ReactorEvent::SessionRegistered {
             session: session_id,
+            owner: conn,
             shard_idx: self.shard_idx,
             rewound: true,
             kept: false,

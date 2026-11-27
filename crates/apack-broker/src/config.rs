@@ -120,10 +120,64 @@ pub enum CliCommand {
     },
     /// Print version and protocol version.
     Version,
+    /// Print top-level or per-subcommand usage help to stdout and exit 0.
+    Help(&'static str),
 }
 
 /// Usage banner returned when `apack-terminal` is invoked with no subcommand.
 pub const CLI_USAGE: &str = "usage: apack-terminal <serve | proxy | inspect | version> [options]";
+
+/// Full top-level `--help` text.
+pub const CLI_HELP: &str = "\
+usage: apack-terminal <command> [options]
+
+commands:
+  serve [--socket <path>] [--shards <1..=8>]   Run the terminal broker daemon
+  proxy [--socket <path>] [--no-autostart]     Bridge stdio to a local broker
+  inspect [--socket <path>] [--json]           Inspect live sessions and metrics
+  version                                      Print version and protocol version
+
+options:
+  -h, --help                                   Print help information
+  -V, --version                                Print version and protocol version
+";
+
+/// Help text for `apack-terminal serve --help`.
+pub const SERVE_HELP: &str = "\
+usage: apack-terminal serve [--socket <path>] [--shards <1..=8>]
+
+options:
+  --socket <path>   Explicit Unix socket or Windows named pipe path
+  --shards <1..=8>  Number of session shard threads
+  -h, --help        Print help information
+";
+
+/// Help text for `apack-terminal proxy --help`.
+pub const PROXY_HELP: &str = "\
+usage: apack-terminal proxy [--socket <path>] [--no-autostart]
+
+options:
+  --socket <path>   Explicit Unix socket or Windows named pipe path
+  --no-autostart    Fail instead of auto-starting a detached broker
+  -h, --help        Print help information
+";
+
+/// Help text for `apack-terminal inspect --help`.
+pub const INSPECT_HELP: &str = "\
+usage: apack-terminal inspect [--socket <path>] [--json]
+
+options:
+  --socket <path>   Explicit Unix socket or Windows named pipe path
+  --json            Emit machine-readable JSON output
+  -h, --help        Print help information
+";
+
+/// Help text for `apack-terminal version --help`.
+pub const VERSION_HELP: &str = "\
+usage: apack-terminal version
+
+Print the binary version and wire protocol version.
+";
 
 /// Parses CLI arguments (excluding `argv[0]`) into a [`CliCommand`].
 pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
@@ -131,12 +185,14 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
         return Err(String::from(CLI_USAGE));
     };
     match cmd.as_str() {
+        "-h" | "--help" | "help" => Ok(CliCommand::Help(CLI_HELP)),
         "serve" => {
             let mut socket = None;
             let mut shards = None;
             let mut iter = rest.iter();
             while let Some(arg) = iter.next() {
                 match arg.as_str() {
+                    "-h" | "--help" => return Ok(CliCommand::Help(SERVE_HELP)),
                     "--socket" => {
                         let val = iter.next().ok_or_else(|| String::from("--socket requires a value"))?;
                         socket = Some(val.clone());
@@ -160,6 +216,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
             let mut iter = rest.iter();
             while let Some(arg) = iter.next() {
                 match arg.as_str() {
+                    "-h" | "--help" => return Ok(CliCommand::Help(PROXY_HELP)),
                     "--socket" => {
                         let val = iter.next().ok_or_else(|| String::from("--socket requires a value"))?;
                         socket = Some(val.clone());
@@ -178,6 +235,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
             let mut iter = rest.iter();
             while let Some(arg) = iter.next() {
                 match arg.as_str() {
+                    "-h" | "--help" => return Ok(CliCommand::Help(INSPECT_HELP)),
                     "--socket" => {
                         let val = iter.next().ok_or_else(|| String::from("--socket requires a value"))?;
                         socket = Some(val.clone());
@@ -191,6 +249,9 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
             Ok(CliCommand::Inspect { socket, json })
         }
         "--version" | "-V" | "version" => {
+            if rest.iter().any(|a| a == "-h" || a == "--help") {
+                return Ok(CliCommand::Help(VERSION_HELP));
+            }
             if !rest.is_empty() {
                 return Err(format!("unexpected arguments to version: {}", rest.join(" ")));
             }

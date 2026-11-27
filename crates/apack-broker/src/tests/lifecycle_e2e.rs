@@ -663,3 +663,91 @@ fn windows_edge_helpers_and_natural_child_exit() {
     assert_eq!(small_frames, 1, "reap_draining_win_conns must preserve unread reply when writer_done is true");
     srv_small.shutdown().unwrap();
 }
+
+#[test]
+fn pr6_session_lifetime_conn_bound_rewind_and_unleased_disconnect_e2e() {
+    let tmp = tempdir().unwrap();
+    let sock = unique_endpoint(tmp.path(), "pr6-lifetime");
+    let rec_dir = tmp.path().join("rec-rewind");
+
+    let mut cfg = BrokerConfig::for_socket(&sock);
+    cfg.shard_count = 1;
+    cfg.kill_escalate_after = Duration::from_millis(250);
+    let mut handle = BrokerServer::bind(cfg).unwrap().spawn().unwrap();
+
+    // 1. Record a short session to WAL so we have a valid recording to open in `Rewind` mode.
+    let mut rec_client = BrokerClient::connect(handle.socket_path(), &AuthConfig::None, "recorder").unwrap();
+    let rec_dir_str = rec_dir.to_string_lossy().into_owned();
+    let (rec_sid, _) = rec_client.spawn(echo_command_spec("PR6_REWIND_DATA", Some(rec_dir_str.clone()), None)).unwrap();
+    assert_eq!(
+        rec_client.wait(rec_sid, WaitCondition::Text(String::from("PR6_REWIND_DATA")), 5_000).unwrap(),
+        WaitOutcome::Met
+    );
+    rec_client.kill(rec_sid).unwrap();
+    for _ in 0..100 {
+        if rec_client.list_sessions().unwrap().is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(rec_client.list_sessions().unwrap().is_empty());
+
+    // 2. Two unleased clients connect:
+    //    - `owner` opens a `Rewind` session (`ConnBound(owner)`), a live `LeaseBound` session,
+    //      and a `Kept` session.
+    //    - `observer` stays connected without any broker lease.
+    let mut owner = BrokerClient::connect(handle.socket_path(), &AuthConfig::None, "owner").unwrap();
+    let mut observer = BrokerClient::connect(handle.socket_path(), &AuthConfig::None, "observer").unwrap();
+    drop(rec_client);
+
+    let mut spec_kept = echo_command_spec("PR6_KEPT", None, None);
+    spec_kept.kept = true;
+    let (s_kept, _) = owner.spawn(spec_kept).unwrap();
+    let (s_lease_bound, _) = owner.spawn(echo_command_spec("PR6_LEASE_BOUND", None, None)).unwrap();
+    let (s_rewind, _, _) = owner.rewind(rec_dir_str, None).unwrap();
+    assert_eq!(
+        owner.wait(s_lease_bound, WaitCondition::Text(String::from("PR6_LEASE_BOUND")), 5_000).unwrap(),
+        WaitOutcome::Met
+    );
+
+    // 3. `owner` disconnects while `observer` stays connected:
+    //    - `s_rewind` (`ConnBound(owner)`) MUST be torn down immediately!
+    //    - `s_lease_bound` (`LeaseBound`) and `s_kept` (`Kept`) MUST stay alive while `observer` is connected!
+    drop(owner);
+    for _ in 0..100 {
+        let ids: Vec<SessionId> = observer.list_sessions().unwrap().into_iter().map(|s| s.id).collect();
+        if !ids.contains(&s_rewind) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let after_owner_drop: Vec<SessionId> = observer.list_sessions().unwrap().into_iter().map(|s| s.id).collect();
+    assert!(!after_owner_drop.contains(&s_rewind), "ConnBound Rewind session must close when its owner disconnects");
+    assert!(
+        after_owner_drop.contains(&s_lease_bound),
+        "LeaseBound session must survive while another client is connected"
+    );
+    assert!(after_owner_drop.contains(&s_kept), "Kept session must survive");
+
+    // 4. Last unleased client (`observer`) disconnects:
+    //    - `s_lease_bound` (`LeaseBound`) MUST tear down immediately (`TeardownNonKeptSessions`),
+    //      while `s_kept` keeps the broker alive and survives for a fresh client to inspect!
+    drop(observer);
+    let mut inspector = BrokerClient::connect(handle.socket_path(), &AuthConfig::None, "inspector").unwrap();
+    for _ in 0..150 {
+        let ids: Vec<SessionId> = inspector.list_sessions().unwrap().into_iter().map(|s| s.id).collect();
+        if !ids.contains(&s_lease_bound) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let after_last_drop: Vec<SessionId> = inspector.list_sessions().unwrap().into_iter().map(|s| s.id).collect();
+    assert!(
+        !after_last_drop.contains(&s_lease_bound),
+        "non-kept LeaseBound session must tear down when the last unleased client disconnects"
+    );
+    assert!(after_last_drop.contains(&s_kept), "Kept session must survive last unleased client disconnect");
+
+    drop(inspector);
+    handle.shutdown().unwrap();
+}

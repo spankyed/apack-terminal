@@ -171,7 +171,7 @@ pub fn spawn_pty(config: &PtySpawnConfig) -> Result<SpawnedPty, OsError> {
     drop(pair.slave);
 
     let pid = child.process_id().unwrap_or(0);
-    let tree = TreeGuard::attach(pid);
+    let tree = TreeGuard::attach_child(child.as_ref(), pid);
     let killer = child.clone_killer();
 
     #[cfg(unix)]
