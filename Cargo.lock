@@ -75,6 +75,8 @@ dependencies = [
  "apack-core",
  "apack-os",
  "apack-proto",
+ "apack-vt-ghostty",
+ "apack-wal",
  "tempfile",
 ]
 
