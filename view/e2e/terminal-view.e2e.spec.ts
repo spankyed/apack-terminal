@@ -30,6 +30,10 @@ interface E2EHarnessApi {
     isContextLost: boolean
     atlasEntryCount: number
     imageTextureCount: number
+    decodedImageCount: number
+    canvasWidth: number
+    canvasHeight: number
+    storeEpoch: number
     contextLostCount: number
     lastFit: { columns: number; rows: number; cellWidth: number; cellHeight: number } | null
     lastFound: { current: number; total: number; more: boolean } | null
@@ -82,8 +86,14 @@ test.beforeEach(async () => {
 })
 
 test.afterEach(async ({ page }) => {
-  await page.evaluate(() => window.__apackE2E?.teardown()).catch(() => {})
-  await bridge?.close()
+  try {
+    await Promise.race([
+      page.evaluate(() => window.__apackE2E?.teardown()).catch(() => {}),
+      new Promise((r) => setTimeout(r, 3000)),
+    ])
+  } finally {
+    await bridge?.close()
+  }
 })
 
 for (const mode of ['webgl2', 'canvas2d'] as const) {
@@ -114,7 +124,7 @@ for (const mode of ['webgl2', 'canvas2d'] as const) {
         ({ m, file }) =>
           window.__apackE2E.mountLiveSession({
             mode: m,
-            argv: ['/bin/sh', '-c', `cat '${file}'; sleep 15`],
+            argv: ['/bin/sh', '-c', 'cat "$1"; sleep 60', 'sh', file],
             cols: 80,
             rows: 20,
             widthPx: 720,
@@ -129,15 +139,22 @@ for (const mode of ['webgl2', 'canvas2d'] as const) {
 
       expect(await page.evaluate(() => window.__apackE2E.waitForText('RENDER_READY_OK', 8000))).toBe('met')
 
-      // Wait until the Kitty inline image blob has been fetched, decoded, and painted.
+      // Deterministically wait for the browser-side TerminalView to receive the final text AND decode
+      // the Kitty inline image blob (no fixed sleeps!).
+      await expect
+        .poll(async () => page.evaluate(() => window.__apackE2E.mirrorText()), { timeout: 8000 })
+        .toContain('RENDER_READY_OK')
+      await expect
+        .poll(async () => (await page.evaluate(() => window.__apackE2E.painterStats()))?.decodedImageCount ?? 0, {
+          timeout: 8000,
+        })
+        .toBeGreaterThan(0)
       if (mode === 'webgl2') {
         await expect
           .poll(async () => (await page.evaluate(() => window.__apackE2E.painterStats()))?.imageTextureCount ?? 0, {
             timeout: 8000,
           })
           .toBeGreaterThan(0)
-      } else {
-        await page.waitForTimeout(300)
       }
       await page.evaluate(async () => {
         window.__apackE2E.redraw()
@@ -227,18 +244,20 @@ for (const mode of ['webgl2', 'canvas2d'] as const) {
       const pageErrors: string[] = []
       page.on('pageerror', (err) => pageErrors.push(err.message))
 
-      // Emit 120 lines so early lines scroll well into broker scrollback; include known selection
-      // and search targets near the bottom viewport.
+      // Emit 120 lines so early lines scroll well into broker scrollback; include known selection,
+      // search, and 70-column reflow targets near the bottom viewport.
+      const reflowLong = 'REFLOW_START_0123456789_ABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789_REFLOW_END'
       const script = [
         'i=1',
         'while [ $i -le 120 ]; do',
         '  if [ $i -eq 112 ]; then printf "HIST_LINE_%04d FIND_ME_99 ALPHA\\r\\n" $i;',
         '  elif [ $i -eq 115 ]; then printf "HIST_LINE_%04d COPY_TARGET_42 BETA\\r\\n" $i;',
         '  elif [ $i -eq 117 ]; then printf "HIST_LINE_%04d FIND_ME_99 GAMMA\\r\\n" $i;',
+        `  elif [ $i -eq 118 ]; then printf "${reflowLong}\\r\\n";`,
         '  else printf "HIST_LINE_%04d_PADDING_TEXT\\r\\n" $i; fi',
         '  i=$((i+1))',
         'done',
-        'sleep 15',
+        'sleep 60',
       ].join('\n')
 
       await page.goto(bridge.baseUrl)
@@ -256,6 +275,9 @@ for (const mode of ['webgl2', 'canvas2d'] as const) {
       )
       expect(mounted.painterKind).toBe(mode)
       expect(await page.evaluate(() => window.__apackE2E.waitForText('HIST_LINE_0120', 8000))).toBe('met')
+      await expect
+        .poll(async () => page.evaluate(() => window.__apackE2E.mirrorText()), { timeout: 8000 })
+        .toContain('HIST_LINE_0120')
       await page.evaluate(() => window.__apackE2E.waitAnimationFrames(4))
 
       const canvas = page.locator('#terminal-host canvas').first()
@@ -321,16 +343,32 @@ for (const mode of ['webgl2', 'canvas2d'] as const) {
       )
       expect(highlightPixels).toBeGreaterThan(100)
 
-      // 4. Resize / reflow: shrink container and verify fit updates + non-blank canvas.
-      const fitBefore = (await page.evaluate(() => window.__apackE2E.painterStats()))?.lastFit
-      expect(fitBefore).not.toBeNull()
-      await page.evaluate(() => window.__apackE2E.resizeHost(420, 220))
+      // 4. Resize / reflow: confirm the 72-char line is unwrapped before resize, then shrink the
+      //    container, poll until the broker's resized FrameUpdate actually resizes the painter canvas
+      //    and bumps epoch, and verify the 72-char line reflowed across two consecutive rows!
+      const beforeLines = await page.evaluate(() => window.__apackE2E.visibleLines())
+      const unwrappedRow = beforeLines.findIndex((l) => l.includes('REFLOW_START_') && l.includes('_REFLOW_END'))
+      expect(unwrappedRow).toBeGreaterThanOrEqual(0)
+
+      const statsBefore = await page.evaluate(() => window.__apackE2E.painterStats())
+      expect(statsBefore).not.toBeNull()
+      await page.evaluate(() => window.__apackE2E.resizeHost(360, 220))
       await expect
-        .poll(async () => (await page.evaluate(() => window.__apackE2E.painterStats()))?.lastFit?.columns ?? 999, {
-          timeout: 5000,
-        })
-        .toBeLessThan(fitBefore!.columns)
+        .poll(
+          async () => {
+            const st = await page.evaluate(() => window.__apackE2E.painterStats())
+            return st !== null && st.canvasWidth < statsBefore!.canvasWidth && st.storeEpoch > statsBefore!.storeEpoch
+          },
+          { timeout: 8000 },
+        )
+        .toBe(true)
       await page.evaluate(() => window.__apackE2E.waitAnimationFrames(3))
+      const afterLines = await page.evaluate(() => window.__apackE2E.visibleLines())
+      const startIdx = afterLines.findIndex((l) => l.includes('REFLOW_START_'))
+      const endIdx = afterLines.findIndex((l) => l.includes('_REFLOW_END'))
+      expect(startIdx).toBeGreaterThanOrEqual(0)
+      expect(endIdx).toBe(startIdx + 1)
+
       const resizedPng = decodePng(await canvas.screenshot())
       expect(resizedPng.width).toBeLessThan(bottomPng.width)
       expect(
@@ -360,7 +398,7 @@ test('WebGL2AtlasPainter recovers cleanly from WEBGL_lose_context -> webglcontex
     ({ file }) =>
       window.__apackE2E.mountLiveSession({
         mode: 'webgl2',
-        argv: ['/bin/sh', '-c', `cat '${file}'; sleep 15`],
+        argv: ['/bin/sh', '-c', 'cat "$1"; sleep 60', 'sh', file],
         cols: 80,
         rows: 20,
         widthPx: 720,
@@ -370,6 +408,9 @@ test('WebGL2AtlasPainter recovers cleanly from WEBGL_lose_context -> webglcontex
   )
   expect(mounted.painterKind).toBe('webgl2')
   expect(await page.evaluate(() => window.__apackE2E.waitForText('CTX_READY', 8000))).toBe('met')
+  await expect
+    .poll(async () => page.evaluate(() => window.__apackE2E.mirrorText()), { timeout: 8000 })
+    .toContain('CTX_READY')
   await expect
     .poll(async () => (await page.evaluate(() => window.__apackE2E.painterStats()))?.imageTextureCount ?? 0, {
       timeout: 8000,

@@ -87,7 +87,12 @@ function attachWsBrokerBridge(req: IncomingMessage, wsSocket: Socket, head: Buff
 
   broker.on('data', (chunk: Buffer) => {
     if (!closed && wsSocket.writable) {
-      wsSocket.write(encodeWsFrame(0x2, chunk))
+      if (!wsSocket.write(encodeWsFrame(0x2, chunk))) {
+        broker.pause()
+        wsSocket.once('drain', () => {
+          if (!closed) broker.resume()
+        })
+      }
     }
   })
   broker.on('close', () => {
@@ -141,8 +146,12 @@ function attachWsBrokerBridge(req: IncomingMessage, wsSocket: Socket, head: Buff
       buf = buf.subarray(offset + maskLen + payloadLen)
 
       if (opcode === 0x8) {
-        // Close frame
-        closeBoth()
+        // RFC 6455 §5.5.1: echo Close frame cleanly before closing transport.
+        if (!closed && wsSocket.writable) {
+          wsSocket.end(encodeWsFrame(0x8, Buffer.alloc(0)))
+        }
+        closed = true
+        broker.destroy()
         return
       }
       if (opcode === 0x9) {
@@ -159,7 +168,12 @@ function attachWsBrokerBridge(req: IncomingMessage, wsSocket: Socket, head: Buff
           const message = fragChunks.length === 1 ? fragChunks[0]! : Buffer.concat(fragChunks)
           fragChunks = []
           if (!closed && broker.writable) {
-            broker.write(message)
+            if (!broker.write(message)) {
+              wsSocket.pause()
+              broker.once('drain', () => {
+                if (!closed) wsSocket.resume()
+              })
+            }
           }
         }
       }
@@ -203,6 +217,7 @@ const HARNESS_HTML = `<!doctype html>
   <script type="module">
     import {
       CanvasPainter,
+      ImageCache,
       TerminalClient,
       TerminalView,
       WebGL2AtlasPainter,
@@ -307,6 +322,7 @@ const HARNESS_HTML = `<!doctype html>
         })
 
         const source = await client.attachSession(session)
+        const imageCache = new ImageCache()
         let painterInstance = null
         let contextLostCount = 0
         let lastFit = null
@@ -320,6 +336,7 @@ const HARNESS_HTML = `<!doctype html>
             lineHeight: 1.25,
           },
           theme: E2E_THEME,
+          imageCache,
           painter: (font) => {
             painterInstance = createPainter(font, {
               preferWebGL: opts.mode === 'webgl2',
@@ -348,6 +365,7 @@ const HARNESS_HTML = `<!doctype html>
           client,
           session,
           source,
+          imageCache,
           view,
           get painter() {
             return painterInstance
@@ -419,6 +437,10 @@ const HARNESS_HTML = `<!doctype html>
           isContextLost: isGl ? p.isContextLost : false,
           atlasEntryCount: isGl ? p.atlasEntryCount : 0,
           imageTextureCount: isGl ? p.imageTextureCount : 0,
+          decodedImageCount: state.imageCache.size,
+          canvasWidth: p.canvas.width,
+          canvasHeight: p.canvas.height,
+          storeEpoch: state.view.store.epoch,
           contextLostCount: state.contextLostCount,
           lastFit: state.lastFit,
           lastFound: state.lastFound,
@@ -488,7 +510,8 @@ const HARNESS_HTML = `<!doctype html>
         })
         ext.restoreContext()
         await restoredPromise
-        state.view.redraw()
+        // Do NOT call state.view.redraw() manually: verify WebGL2AtlasPainter.handleContextRestored
+        // drives automatic repaint via TerminalView whenCleared callback!
         await window.__apackE2E.waitAnimationFrames(4)
 
         return {
@@ -524,11 +547,25 @@ const HARNESS_HTML = `<!doctype html>
 </html>
 `
 
+function isChildAlive(child: ChildProcess): boolean {
+  return child.exitCode === null && child.signalCode === null
+}
+
+function makeShortSocketTmpDir(): string {
+  let base = tmpdir()
+  if (process.platform !== 'win32' && Buffer.byteLength(join(base, 'apack-e2e-XXXXXX', 'b.sock')) >= 100) {
+    base = '/tmp'
+  }
+  return mkdtempSync(join(base, 'apack-e2e-'))
+}
+
 async function waitForSocket(socketPath: string, child: ChildProcess, stderrChunks: string[]): Promise<void> {
   const deadline = Date.now() + 10_000
   while (Date.now() < deadline) {
-    if (child.exitCode !== null) {
-      throw new Error(`apack-terminal broker exited early (${child.exitCode}): ${stderrChunks.join('')}`)
+    if (!isChildAlive(child)) {
+      throw new Error(
+        `apack-terminal broker exited early (code=${child.exitCode}, signal=${child.signalCode}): ${stderrChunks.join('')}`,
+      )
     }
     if (existsSync(socketPath)) {
       // Confirm listener accepts connections cleanly.
@@ -555,8 +592,8 @@ export async function startLiveBrokerBridge(): Promise<LiveBrokerBridge> {
     throw new Error(`Missing built view bundle at ${DIST_INDEX}. Run \`npm run build\` in view/ first.`)
   }
   const binary = resolveBrokerBinary()
-  const tmpDir = mkdtempSync(join(tmpdir(), 'apack-view-e2e-'))
-  const socketPath = join(tmpDir, 'broker.sock')
+  const tmpDir = makeShortSocketTmpDir()
+  const socketPath = join(tmpDir, 'b.sock')
 
   const childEnv: NodeJS.ProcessEnv = { ...process.env }
   delete childEnv.APACK_TERMINAL_AUTH_KEY
@@ -567,75 +604,97 @@ export async function startLiveBrokerBridge(): Promise<LiveBrokerBridge> {
   })
   brokerChild.stderr?.on('data', (d: Buffer) => stderrChunks.push(d.toString('utf8')))
 
-  try {
-    await waitForSocket(socketPath, brokerChild, stderrChunks)
-  } catch (err) {
-    brokerChild.kill('SIGKILL')
-    rmSync(tmpDir, { recursive: true, force: true })
-    throw err
+  const onProcessExit = () => {
+    if (isChildAlive(brokerChild)) {
+      try {
+        brokerChild.kill('SIGKILL')
+      } catch {}
+    }
+    try {
+      rmSync(tmpDir, { recursive: true, force: true })
+    } catch {}
   }
+  process.once('exit', onProcessExit)
 
-  const distBundle = readFileSync(DIST_INDEX)
+  let server: Server | null = null
   const openSockets = new Set<Socket>()
 
-  const server: Server = createServer((req, res) => {
-    if (req.url === '/' || req.url === '/index.html') {
-      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
-      res.end(HARNESS_HTML)
-      return
-    }
-    if (req.url === '/dist/index.js') {
-      res.writeHead(200, { 'content-type': 'application/javascript; charset=utf-8' })
-      res.end(distBundle)
-      return
-    }
-    res.writeHead(404)
-    res.end('not found')
-  })
+  try {
+    await waitForSocket(socketPath, brokerChild, stderrChunks)
+    const distBundle = readFileSync(DIST_INDEX)
 
-  server.on('upgrade', (req, socket, head) => {
-    const netSock = socket as Socket
-    if (req.url !== '/ws') {
-      netSock.destroy()
-      return
-    }
-    openSockets.add(netSock)
-    netSock.on('close', () => openSockets.delete(netSock))
-    attachWsBrokerBridge(req, netSock, head, socketPath)
-  })
-
-  await new Promise<void>((resolveListen, rejectListen) => {
-    server.once('error', rejectListen)
-    server.listen(0, '127.0.0.1', () => resolveListen())
-  })
-  const addr = server.address()
-  if (!addr || typeof addr === 'string') {
-    throw new Error('Failed to bind HTTP bridge port')
-  }
-  const baseUrl = `http://127.0.0.1:${addr.port}`
-
-  return {
-    baseUrl,
-    socketPath,
-    tmpDir,
-    async close() {
-      for (const s of openSockets) s.destroy()
-      openSockets.clear()
-      await new Promise<void>((r) => server.close(() => r()))
-      if (brokerChild.exitCode === null) {
-        brokerChild.kill('SIGTERM')
-        await new Promise<void>((r) => {
-          const timer = setTimeout(() => {
-            if (brokerChild.exitCode === null) brokerChild.kill('SIGKILL')
-            r()
-          }, 1500)
-          brokerChild.once('exit', () => {
-            clearTimeout(timer)
-            r()
-          })
-        })
+    server = createServer((req, res) => {
+      if (req.url === '/' || req.url === '/index.html') {
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+        res.end(HARNESS_HTML)
+        return
       }
-      rmSync(tmpDir, { recursive: true, force: true })
-    },
+      if (req.url === '/dist/index.js') {
+        res.writeHead(200, { 'content-type': 'application/javascript; charset=utf-8' })
+        res.end(distBundle)
+        return
+      }
+      res.writeHead(404)
+      res.end('not found')
+    })
+
+    server.on('upgrade', (req, socket, head) => {
+      const netSock = socket as Socket
+      if (req.url !== '/ws') {
+        netSock.destroy()
+        return
+      }
+      openSockets.add(netSock)
+      netSock.on('close', () => openSockets.delete(netSock))
+      attachWsBrokerBridge(req, netSock, head, socketPath)
+    })
+
+    await new Promise<void>((resolveListen, rejectListen) => {
+      server!.once('error', rejectListen)
+      server!.listen(0, '127.0.0.1', () => resolveListen())
+    })
+    const addr = server.address()
+    if (!addr || typeof addr === 'string') {
+      throw new Error('Failed to bind HTTP bridge port')
+    }
+    const baseUrl = `http://127.0.0.1:${addr.port}`
+    const liveServer = server
+
+    return {
+      baseUrl,
+      socketPath,
+      tmpDir,
+      async close() {
+        process.off('exit', onProcessExit)
+        for (const s of openSockets) s.destroy()
+        openSockets.clear()
+        await new Promise<void>((r) => liveServer.close(() => r()))
+        if (isChildAlive(brokerChild)) {
+          brokerChild.kill('SIGTERM')
+          await new Promise<void>((r) => {
+            const timer = setTimeout(() => {
+              if (isChildAlive(brokerChild)) brokerChild.kill('SIGKILL')
+              r()
+            }, 1500)
+            brokerChild.once('exit', () => {
+              clearTimeout(timer)
+              r()
+            })
+          })
+        }
+        rmSync(tmpDir, { recursive: true, force: true })
+      },
+    }
+  } catch (err) {
+    process.off('exit', onProcessExit)
+    for (const s of openSockets) s.destroy()
+    if (server) {
+      await new Promise<void>((r) => server!.close(() => r()))
+    }
+    if (isChildAlive(brokerChild)) {
+      brokerChild.kill('SIGKILL')
+    }
+    rmSync(tmpDir, { recursive: true, force: true })
+    throw err
   }
 }

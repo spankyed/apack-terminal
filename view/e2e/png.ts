@@ -51,13 +51,26 @@ export function decodePng(buf: Buffer): DecodedPng {
     }
     const chunk = buf.subarray(dataStart, dataEnd)
     if (type === 'IHDR') {
+      if (chunk.length !== 13) {
+        throw new Error(`Invalid IHDR length: ${chunk.length}`)
+      }
       width = chunk.readUInt32BE(0)
       height = chunk.readUInt32BE(4)
       bitDepth = chunk[8] ?? 0
       colorType = chunk[9] ?? 0
+      const compression = chunk[10] ?? 0
+      const filterMethod = chunk[11] ?? 0
       const interlace = chunk[12] ?? 0
-      if (bitDepth !== 8 || (colorType !== 2 && colorType !== 6) || interlace !== 0) {
-        throw new Error(`Unsupported PNG format: bitDepth=${bitDepth} colorType=${colorType} interlace=${interlace}`)
+      if (
+        bitDepth !== 8
+        || (colorType !== 2 && colorType !== 6)
+        || compression !== 0
+        || filterMethod !== 0
+        || interlace !== 0
+      ) {
+        throw new Error(
+          `Unsupported PNG format: bitDepth=${bitDepth} colorType=${colorType} compression=${compression} filter=${filterMethod} interlace=${interlace}`,
+        )
       }
     } else if (type === 'IDAT') {
       idatParts.push(chunk)
