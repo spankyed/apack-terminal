@@ -108,10 +108,31 @@ pub fn acquire_socket_hold(socket: &str) -> Result<SocketHold, OsError> {
 }
 
 #[cfg(unix)]
-fn socket_parent_dir(socket: &str) -> &Path {
-    match Path::new(socket).parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
+fn socket_parent_dir(socket: &str) -> Result<&Path, OsError> {
+    use std::path::Component;
+
+    if Path::new(socket).components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(OsError::UnsafePath(format!("{socket} contains parent traversal (`..`)")));
+    }
+    let (parent, file) = match socket.rsplit_once('/') {
+        Some(("", file)) => ("/", file),
+        Some((parent, file)) => (parent, file),
+        None => (".", socket),
+    };
+    if file.is_empty() || file == "." {
+        return Err(OsError::UnsafePath(format!("{socket} does not name a socket file")));
+    }
+    Ok(Path::new(parent))
+}
+
+#[cfg(unix)]
+fn create_private_dir_allow_race(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    match std::fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(err) => Err(err),
     }
 }
 
@@ -173,13 +194,10 @@ pub fn ensure_private_directory(socket: &str) -> Result<(), OsError> {
     #[cfg(unix)]
     {
         use std::collections::VecDeque;
-        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-        use std::path::{Component, PathBuf};
+        use std::os::unix::fs::MetadataExt;
+        use std::path::PathBuf;
 
-        let dir = socket_parent_dir(socket);
-        if dir.components().any(|c| matches!(c, Component::ParentDir)) {
-            return Err(OsError::UnsafePath(format!("{} contains parent traversal (`..`)", dir.display())));
-        }
+        let dir = socket_parent_dir(socket)?;
         let abs = if dir.is_absolute() {
             dir.to_path_buf()
         } else {
@@ -259,10 +277,15 @@ pub fn ensure_private_directory(socket: &str) -> Result<(), OsError> {
                     cur = next;
                 }
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    if pending.iter().any(|s| matches!(s, WalkSegment::Parent)) {
+                        return Err(OsError::UnsafePath(format!(
+                            "{} traverses `..` across a missing path component",
+                            dir.display()
+                        )));
+                    }
                     // `cur` is already a verified real safe directory; create strictly one component at a time.
-                    std::fs::DirBuilder::new()
-                        .mode(0o700)
-                        .create(&next)
+                    // Tolerate `AlreadyExists` from a concurrent broker startup and verify the entry below.
+                    create_private_dir_allow_race(&next)
                         .map_err(|e| OsError::io("creating private socket directory", e))?;
                     let created = std::fs::symlink_metadata(&next)
                         .map_err(|e| OsError::io("inspecting created socket directory", e))?;
@@ -782,8 +805,16 @@ mod tests {
         use std::os::fd::AsRawFd;
         use std::os::unix::fs::PermissionsExt;
 
-        assert_eq!(socket_parent_dir("bare.sock"), Path::new("."));
-        assert_eq!(socket_parent_dir("/tmp/sub/broker.sock"), Path::new("/tmp/sub"));
+        assert_eq!(socket_parent_dir("bare.sock").expect("bare"), Path::new("."));
+        assert_eq!(socket_parent_dir("/broker.sock").expect("root parent"), Path::new("/"));
+        assert_eq!(socket_parent_dir("/tmp/sub/broker.sock").expect("nested"), Path::new("/tmp/sub"));
+        assert!(matches!(socket_parent_dir(""), Err(OsError::UnsafePath(_))));
+        assert!(matches!(socket_parent_dir("/"), Err(OsError::UnsafePath(_))));
+        assert!(matches!(socket_parent_dir("."), Err(OsError::UnsafePath(_))));
+        assert!(matches!(socket_parent_dir(".."), Err(OsError::UnsafePath(_))));
+        assert!(matches!(socket_parent_dir("/safe/unsafe_dir/"), Err(OsError::UnsafePath(_))));
+        assert!(matches!(socket_parent_dir("/safe/unsafe_dir/."), Err(OsError::UnsafePath(_))));
+        assert!(matches!(socket_parent_dir("/safe/priv/.."), Err(OsError::UnsafePath(_))));
 
         let base = tempfile::tempdir().expect("tempdir");
         let nested = base.path().join("private/broker.sock");
@@ -802,6 +833,21 @@ mod tests {
         assert!(matches!(ensure_private_directory(&wide_sock.to_string_lossy()), Err(OsError::UnsafePath(_))));
         std::fs::set_permissions(&wide_dir, std::fs::Permissions::from_mode(0o755)).expect("chmod 0755");
         assert!(matches!(ensure_private_directory(&wide_sock.to_string_lossy()), Err(OsError::UnsafePath(_))));
+
+        // Trailing `/` or `/.` on a wide directory must NOT bypass leaf verification via `Path::parent()`.
+        assert!(matches!(ensure_private_directory(&format!("{}/", wide_dir.display())), Err(OsError::UnsafePath(_))));
+        assert!(matches!(ensure_private_directory(&format!("{}/.", wide_dir.display())), Err(OsError::UnsafePath(_))));
+        // Concurrent startup race helper creates 0o700 dir, tolerates AlreadyExists, and propagates other errors.
+        let race_dir = base.path().join("race-dir");
+        create_private_dir_allow_race(&race_dir).expect("create race dir");
+        assert_eq!(std::fs::symlink_metadata(&race_dir).unwrap().permissions().mode() & 0o777, 0o700);
+        create_private_dir_allow_race(&race_dir).expect("AlreadyExists tolerated for concurrent startup");
+        assert_eq!(
+            create_private_dir_allow_race(&base.path().join("no-such-parent/child"))
+                .expect_err("missing parent error")
+                .kind(),
+            io::ErrorKind::NotFound
+        );
 
         // Ancestor safety rules: root or euid, non-writable or sticky; ancestor symlinks owned by root or euid.
         assert!(ancestor_is_safe(0, 0o755, 1000));
@@ -874,6 +920,25 @@ mod tests {
         assert!(matches!(ensure_private_directory(&nonexist_escape.to_string_lossy()), Err(OsError::UnsafePath(_))));
         assert!(!base.path().join("nonexist").exists());
         assert!(!unsafe_parent.join("priv-escape").exists());
+        // Dangling ancestor symlink containing `missing/..` must fail closed WITHOUT creating `missing`.
+        let dangling_parent = base.path().join("dangling-parent-sym");
+        std::os::unix::fs::symlink("missing_hop/../private", &dangling_parent).expect("dangling parent symlink");
+        assert!(matches!(
+            ensure_private_directory(&dangling_parent.join("sub/broker.sock").to_string_lossy()),
+            Err(OsError::UnsafePath(_))
+        ));
+        assert!(!base.path().join("missing_hop").exists(), "must not create missing hop before `..`");
+        // Relative ancestor symlink with `..` across an EXISTING safe directory still works cleanly.
+        let rel_holder = base.path().join("rel-holder");
+        std::fs::create_dir(&rel_holder).expect("mkdir rel-holder");
+        std::fs::set_permissions(&rel_holder, std::fs::Permissions::from_mode(0o700)).expect("chmod rel-holder");
+        let rel_sym = rel_holder.join("up-to-priv");
+        std::os::unix::fs::symlink("../private", &rel_sym).expect("rel symlink");
+        ensure_private_directory(&rel_sym.join("child/broker.sock").to_string_lossy()).expect("valid rel symlink ok");
+        assert_eq!(
+            std::fs::symlink_metadata(base.path().join("private/child")).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         // Symlink loop in ancestor chain fails closed cleanly.
         let loop1 = base.path().join("loop1");
         let loop2 = base.path().join("loop2");
