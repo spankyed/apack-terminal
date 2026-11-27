@@ -67,7 +67,13 @@ export class ImageCache {
   }
 
   private notifyEvict(key: string): void {
-    for (const listener of this.evictListeners) listener(key)
+    for (const listener of [...this.evictListeners]) {
+      try {
+        listener(key)
+      } catch {
+        // Isolate listener failures so sibling views still release GPU textures and ImageBitmaps always close.
+      }
+    }
   }
 
   get bytesUsed(): number {

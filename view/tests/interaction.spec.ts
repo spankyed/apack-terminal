@@ -133,7 +133,7 @@ describe('pointer, selection, wheel, links, and layout caching', () => {
   })
 
   it('tracks pointerId on Pressed and ignores mismatched pointer events during drag/reporting', () => {
-    const { source, view, painted, point } = mountedView()
+    const { source, view, host, painted, point } = mountedView()
     source.send(
       frame({
         size: { cols: 20, rows: 2 },
@@ -173,5 +173,43 @@ describe('pointer, selection, wheel, links, and layout caching', () => {
       ['press', 25, 10],
       ['release', 35, 10],
     ])
+
+    // Same pointerId isolation for scrollbar thumb drag (ignores mismatched pointerId & secondary pointerdown)
+    Object.defineProperty(view.element, 'clientHeight', { value: 200, configurable: true })
+    Object.defineProperty(host, 'clientWidth', { value: 200, configurable: true })
+    Object.defineProperty(host, 'clientHeight', { value: 200, configurable: true })
+    view.fit()
+    source.send(
+      frame({
+        seq: 3,
+        size: { cols: 20, rows: 10 },
+        firstActiveLine: 90,
+        scrollbackLines: 90,
+        modes: { altScreen: false, mouse: false, reverseVideo: false, bracketedPaste: false },
+        rows: [row(90, 'tail')],
+      }),
+    )
+    painted()
+    const thumb = view.element.lastElementChild as HTMLDivElement
+    const dispatchPointer = (target: EventTarget, type: string, clientY: number, pointerId: number, button = 0) => {
+      const ev = new MouseEvent(type, { bubbles: true, cancelable: true, clientY, button })
+      Object.defineProperty(ev, 'pointerId', { value: pointerId })
+      target.dispatchEvent(ev)
+    }
+    const startPos = view.viewport.extent.position
+    dispatchPointer(thumb, 'pointerdown', 180, 20, 0)
+    // Secondary pointerdown and mismatched pointermove/pointerup MUST be ignored!
+    dispatchPointer(thumb, 'pointerdown', 100, 21, 0)
+    dispatchPointer(window, 'pointermove', 20, 21, 0)
+    dispatchPointer(window, 'pointerup', 20, 21, 0)
+    expect(view.viewport.extent.position).toBe(startPos)
+    // Matching pointerId 20 drags the scrollbar up cleanly and ends on matching pointerup
+    dispatchPointer(window, 'pointermove', 90, 20, 0)
+    const draggedPos = view.viewport.extent.position
+    expect(draggedPos).toBeLessThan(startPos)
+    dispatchPointer(window, 'pointerup', 90, 20, 0)
+    // Subsequent move after release does not scroll further
+    dispatchPointer(window, 'pointermove', 10, 20, 0)
+    expect(view.viewport.extent.position).toBe(draggedPos)
   })
 })

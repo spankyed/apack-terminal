@@ -3,7 +3,7 @@ import { ImageCache, blobHashToHex } from '../src/index.ts'
 import { FakeSource } from './_source.ts'
 import { frame, row } from './_support.ts'
 import { mountedView, settled } from './_view.ts'
-import { installFrames } from './_frames.ts'
+import { framesWaiting, installFrames } from './_frames.ts'
 
 function fakeBitmap(width: number, height: number) {
   let closed = false
@@ -175,7 +175,7 @@ describe('ImageCache and TerminalView image placements', () => {
       maxBytes: 2048,
       decode: async () => {
         const pic = document.createElement('canvas')
-        pic.width = 32
+        pic.width = 16
         pic.height = 16
         return { source: pic, width: 16, height: 16 }
       },
@@ -197,9 +197,49 @@ describe('ImageCache and TerminalView image placements', () => {
     expect(img.height).toBe(10)
     expect(img.source).toEqual({ x: 4, y: 2, width: 12, height: 10 })
 
+    // H10 edge cases: oversized cellOffset clamps inside the cell (max cellWidth-1 / cellHeight-1),
+    // destination width/height never overflow spanCols*cellWidth - offX / spanRows*cellHeight - offY,
+    // and NaN/zero-sized placements are safely skipped!
+    source.imagesGen = 2
+    source.imagePlacements = [
+      {
+        blob: b1,
+        line: 0,
+        col: 0,
+        sourceRect: [0, 0, 16, 16],
+        cellOffset: [999, -5],
+        pixelSize: [500, 500],
+        cellSpan: [2, 1],
+        zIndex: 0,
+      },
+      {
+        blob: b1,
+        line: 0,
+        col: 2,
+        sourceRect: [Number.NaN, 0, 16, 16],
+        cellOffset: [0, 0],
+        pixelSize: [0, 0],
+        cellSpan: [0, 0],
+        zIndex: 0,
+      },
+    ]
+    source.send(frame({ seq: 2, imagesGen: 2, rows: [row(0, 'anchored'), row(1, 'below')] }))
+    painted()
+    await settled()
+    const clampedScene = painted()
+    expect(clampedScene.images).toHaveLength(1)
+    // cellWidth=10 -> offX clamped to 9, maxW = 2*10 - 9 = 11; cellHeight=20 -> offY clamped to 0, maxH = 1*20 - 0 = 20
+    expect(clampedScene.images![0]!.x).toBe(9)
+    expect(clampedScene.images![0]!.y).toBe(0)
+    expect(clampedScene.images![0]!.width).toBe(11)
+    expect(clampedScene.images![0]!.height).toBe(20)
+
     // H14: evicting b1 from ImageCache immediately calls painter.releaseImage(hex(b1))
+    // even when another onEvict listener throws (error isolation prevents bitmap/texture leaks)!
+    const unsubThrow = cache.onEvict(() => { throw new Error('boom') })
     await cache.ensure(source, b2)
     await cache.ensure(source, b3)
+    unsubThrow()
     expect(painter.releasedImages).toEqual([blobHashToHex(b1)])
 
     // M13: when store.imagesChanged increments while fetchRows is in flight, askPage reschedules
@@ -220,21 +260,6 @@ describe('ImageCache and TerminalView image placements', () => {
     source.history.set(0, row(0, 'fresh-placeholder'))
     source.send(
       frame({
-        seq: 2,
-        epoch: 2,
-        imagesGen: 1,
-        firstActiveLine: 5,
-        scrollbackLines: 5,
-        size: { cols: 20, rows: 2 },
-        rows: [row(5, 'bottom0'), row(6, 'bottom1')],
-      }),
-    )
-    view.scrollTo(0)
-    painted()
-    expect(fetchCalls).toBe(1)
-    // Bump imagesGen while fetchRows #1 is still in flight
-    source.send(
-      frame({
         seq: 3,
         epoch: 2,
         imagesGen: 2,
@@ -244,15 +269,67 @@ describe('ImageCache and TerminalView image placements', () => {
         rows: [row(5, 'bottom0'), row(6, 'bottom1')],
       }),
     )
+    view.scrollTo(0)
     painted()
+    expect(fetchCalls).toBe(1)
+    // Bump imagesGen while fetchRows #1 is still in flight, then drain syncFrameImages + pending frames
+    // BEFORE resolving fetch #1 so the ONLY trigger for refetch #2 is askPage's M13 reschedule!
+    source.send(
+      frame({
+        seq: 4,
+        epoch: 2,
+        imagesGen: 3,
+        firstActiveLine: 5,
+        scrollbackLines: 5,
+        size: { cols: 20, rows: 2 },
+        rows: [row(5, 'bottom0'), row(6, 'bottom1')],
+      }),
+    )
+    painted()
+    await settled()
+    painted()
+    expect(fetchCalls).toBe(1)
+    expect(framesWaiting()).toBe(0)
+
     // Complete stale fetch #1 returning a placeholder row (doubted/discarded by RowStore.absorb -> absorbed = [])
     resolveFetch([pieceRow])
     await settled()
+    expect(framesWaiting()).toBeGreaterThan(0)
     painted()
     await settled()
-    expect(fetchCalls).toBeGreaterThanOrEqual(2)
+    expect(fetchCalls).toBe(2)
+    const refetchedScene = painted()
+    expect(refetchedScene.rows[0]?.glyphs.map((g) => g.text).join('')).toBe('fresh-placeholder')
 
     view.dispose()
     cache.dispose()
+  })
+
+  it('isolates throwing onEvict listeners so dispose closes every ImageBitmap and notifies siblings', async () => {
+    const bitmaps: Array<ReturnType<typeof fakeBitmap>> = []
+    const cache = new ImageCache({
+      maxBytes: 4096,
+      decode: async () => {
+        const bm = fakeBitmap(8, 8)
+        bitmaps.push(bm)
+        return { source: bm as unknown as CanvasImageSource, width: 8, height: 8 }
+      },
+    })
+    const source = new FakeSource()
+    const b1 = new Uint8Array(32).fill(0x51)
+    const b2 = new Uint8Array(32).fill(0x52)
+    source.blobs.set(blobHashToHex(b1), { blob: b1, encoding: 'png', bytes: new Uint8Array([1]) })
+    source.blobs.set(blobHashToHex(b2), { blob: b2, encoding: 'png', bytes: new Uint8Array([2]) })
+    await cache.ensure(source, b1)
+    await cache.ensure(source, b2)
+
+    const seen: string[] = []
+    cache.onEvict(() => { throw new Error('listener-failure') })
+    cache.onEvict((key) => seen.push(key))
+    cache.dispose()
+
+    expect(seen).toEqual([blobHashToHex(b1), blobHashToHex(b2)])
+    expect(bitmaps.every((bm) => bm.closed)).toBe(true)
+    expect(cache.size).toBe(0)
   })
 })

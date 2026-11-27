@@ -281,6 +281,7 @@ export class TerminalView {
     this.blink.syncActive()
     this.display.pushViewportHint()
     if (!visible) {
+      this.renderer.cancelMirrorTimer()
       if (this.unacknowledgedSeq !== null && !this.ended) {
         this.source.ackFrame?.(this.unacknowledgedSeq)
         this.unacknowledgedSeq = null

@@ -69,6 +69,7 @@ export class CanvasPainter implements Painter {
   private repaint: (() => void) | null = null
 
   whenCleared(repaint: () => void): void {
+    if (this.disposed) return
     this.repaint = repaint
   }
 

@@ -235,17 +235,26 @@ export class ViewRenderer {
       const decoded = this.host.imageCache.get(placement.blob)
       if (!decoded) continue
       const [rawSx, rawSy, rawSw, rawSh] = placement.sourceRect
-      const sx = Math.min(Math.max(0, rawSx), decoded.width)
-      const sy = Math.min(Math.max(0, rawSy), decoded.height)
-      const sw = Math.min(rawSw > 0 ? rawSw : decoded.width - sx, decoded.width - sx)
-      const sh = Math.min(rawSh > 0 ? rawSh : decoded.height - sy, decoded.height - sy)
-      if (sw <= 0 || sh <= 0) continue
-      const [offX, offY] = placement.cellOffset
-      const [pxW, pxH] = placement.pixelSize
-      const maxW = spanCols > 0 ? spanCols * cellWidth : pxW
-      const maxH = spanRows > 0 ? spanRows * cellHeight : pxH
-      const width = pxW > 0 && maxW > 0 ? Math.min(pxW, maxW) : (pxW > 0 ? pxW : maxW)
-      const height = pxH > 0 && maxH > 0 ? Math.min(pxH, maxH) : (pxH > 0 ? pxH : maxH)
+      const sx = Number.isFinite(rawSx) ? Math.min(Math.max(0, rawSx), decoded.width) : 0
+      const sy = Number.isFinite(rawSy) ? Math.min(Math.max(0, rawSy), decoded.height) : 0
+      const availW = decoded.width - sx
+      const availH = decoded.height - sy
+      const sw = Number.isFinite(rawSw) && rawSw > 0 ? Math.min(rawSw, availW) : availW
+      const sh = Number.isFinite(rawSh) && rawSh > 0 ? Math.min(rawSh, availH) : availH
+      if (!(sw > 0) || !(sh > 0)) continue
+      const [rawOffX, rawOffY] = placement.cellOffset
+      const maxOffX = Math.max(0, cellWidth - 1)
+      const maxOffY = Math.max(0, cellHeight - 1)
+      const offX = Number.isFinite(rawOffX) ? Math.min(Math.max(0, rawOffX), maxOffX) : 0
+      const offY = Number.isFinite(rawOffY) ? Math.min(Math.max(0, rawOffY), maxOffY) : 0
+      const [rawPxW, rawPxH] = placement.pixelSize
+      const pxW = Number.isFinite(rawPxW) && rawPxW > 0 ? rawPxW : 0
+      const pxH = Number.isFinite(rawPxH) && rawPxH > 0 ? rawPxH : 0
+      const maxW = spanCols > 0 ? Math.max(0, spanCols * cellWidth - offX) : pxW
+      const maxH = spanRows > 0 ? Math.max(0, spanRows * cellHeight - offY) : pxH
+      const width = spanCols > 0 ? (pxW > 0 ? Math.min(pxW, maxW) : maxW) : pxW
+      const height = spanRows > 0 ? (pxH > 0 ? Math.min(pxH, maxH) : maxH) : pxH
+      if (!(width > 0) || !(height > 0)) continue
       images.push({
         key: decoded.key,
         picture: decoded.source,

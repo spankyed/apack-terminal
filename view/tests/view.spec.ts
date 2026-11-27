@@ -222,10 +222,16 @@ describe('TerminalView v2 core lifecycle', () => {
     painted()
     expect(clock.pending).toBeGreaterThan(0)
 
-    // M12: hiding cancels both cursor and text blink timers immediately, and neither focus changes
-    // nor incoming frames re-arm blink timers while hidden!
+    // Advance to mid-blink-off so we also verify hiding resets both cursor & text blink back to visible!
+    clock.advance(BLINK_MS)
+    const midBlinkOff = painted()
+    expect(midBlinkOff.cursor).toBeUndefined()
+    expect(midBlinkOff.rows[1]!.glyphs).toHaveLength(0)
+
+    // M12: hiding cancels both cursor and text blink timers immediately (clock.pending === 0),
+    // and neither focus changes nor incoming frames re-arm blink timers while hidden!
     view.setVisible(false)
-    const pendingWhenHidden = clock.pending
+    expect(clock.pending).toBe(0)
     source.send(
       frame({
         seq: 2,
@@ -241,15 +247,18 @@ describe('TerminalView v2 core lifecycle', () => {
     view.setFocused(true)
     const paintsWhileHidden = painter.scenes.length
     clock.advance(BLINK_MS * 5)
-    expect(clock.pending).toBe(pendingWhenHidden)
+    expect(clock.pending).toBe(0)
     expect(painter.scenes.length).toBe(paintsWhileHidden)
 
-    // Showing again resumes blinking cleanly
+    // Showing again resets both cursor and blinking text to visible, then resumes both blink timers cleanly
     view.setVisible(true)
     const sShown = painted()
     expect(sShown.cursor?.shape).toBe('bar')
+    expect(sShown.rows[1]!.glyphs.length).toBeGreaterThan(0)
     clock.advance(BLINK_MS)
-    expect(painted().cursor).toBeUndefined()
+    const sBlinked = painted()
+    expect(sBlinked.cursor).toBeUndefined()
+    expect(sBlinked.rows[1]!.glyphs).toHaveLength(0)
 
     // M11: receiving both exited and streamClosed invokes onEnded at most once
     source.pushEvent({ kind: 'exited', exitCode: 0, signal: null })

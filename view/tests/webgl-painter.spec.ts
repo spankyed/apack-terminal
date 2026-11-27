@@ -532,23 +532,33 @@ describe('WebGL2AtlasPainter & createPainter', () => {
     painter.releaseImage('hash-missing')
     expect(mock.stats().deletedTextures).toBe(1)
 
-    // Externally closed bitmap (width/height drop to 0) is swept automatically on next texture upload
+    // Externally closed bitmap (width/height drop to 0) is swept automatically on next paint even with NO new image upload
     p2.width = 0
     p2.height = 0
+    painter.paint({ theme, rows: [null, null], offset: 0 })
+    expect(painter.imageTextureCount).toBe(0)
+    expect(painter.imageTextureBytes).toBe(0)
+    expect(mock.stats().deletedTextures).toBe(2)
+
+    // Empty-string key falls back to per-source anonymous tokens instead of colliding under ''
+    const p4 = document.createElement('canvas')
+    p4.width = 16
+    p4.height = 16
     painter.paint({
       theme,
       rows: [null, null],
       offset: 0,
       images: [
-        { key: 'hash-c', picture: p3, x: 0, y: 0, width: 16, height: 16, source: { x: 0, y: 0, width: 16, height: 16 }, above: false },
+        { key: '', picture: p3, x: 0, y: 0, width: 16, height: 16, source: { x: 0, y: 0, width: 16, height: 16 }, above: false },
+        { key: '', picture: p4, x: 20, y: 0, width: 16, height: 16, source: { x: 0, y: 0, width: 16, height: 16 }, above: false },
       ],
     })
-    expect(painter.imageTextureCount).toBe(1)
-    expect(painter.imageTextureBytes).toBe(1024)
-    expect(mock.stats().deletedTextures).toBe(2)
+    expect(painter.imageTextureCount).toBe(2)
+    expect(painter.imageTextureBytes).toBe(2048)
 
     painter.dispose()
-    // Calling releaseImage after dispose is a safe no-op
+    // Calling releaseImage / whenCleared after dispose is a safe no-op
     painter.releaseImage('hash-c')
+    painter.whenCleared(() => {})
   })
 })

@@ -384,6 +384,7 @@ export class WebGL2AtlasPainter implements Painter {
   }
 
   whenCleared(repaint: () => void): void {
+    if (this.disposed) return
     this.repaint = repaint
   }
 
@@ -471,6 +472,7 @@ export class WebGL2AtlasPainter implements Painter {
     gl.uniform1i(this.uAtlas, 0)
 
     this.ensureSceneGlyphs(scene)
+    if (this.imageTextures.size > 0) this.sweepDeadImageTextures()
 
     // --- Pass 1: Backgrounds + gutter marks ---
     this.instanceCount = 0
@@ -993,7 +995,7 @@ export class WebGL2AtlasPainter implements Painter {
   }
 
   private imageKeyOf(explicitKey: string | undefined, picture: CanvasImageSource): string {
-    if (explicitKey !== undefined) return explicitKey
+    if (explicitKey) return explicitKey
     let token = this.fallbackImageKeys.get(picture)
     if (token === undefined) {
       token = `__anon_${this.nextFallbackImageKey}`

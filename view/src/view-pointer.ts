@@ -459,10 +459,15 @@ export class PointerController {
   }
 
   private readonly thumbDown = (event: PointerEvent) => {
+    if (event.button !== 0 || this.thumbRelease !== null) return
     event.preventDefault()
     event.stopPropagation()
-    this.thumbRelease?.()
     const pointerId = event.pointerId
+    try {
+      this.host.thumb.setPointerCapture?.(pointerId)
+    } catch {
+      // Synthetic pointer events in unit tests do not register active browser pointer IDs.
+    }
     const start = { y: event.clientY, position: this.host.viewport.extent.position }
     const move = (moved: PointerEvent) => {
       if (moved.pointerId !== pointerId) return
@@ -475,11 +480,13 @@ export class PointerController {
       window.removeEventListener('pointermove', move)
       window.removeEventListener('pointerup', up)
       window.removeEventListener('pointercancel', up)
+      this.host.thumb.removeEventListener('lostpointercapture', up)
       this.thumbRelease = null
     }
     window.addEventListener('pointermove', move)
     window.addEventListener('pointerup', up)
     window.addEventListener('pointercancel', up)
+    this.host.thumb.addEventListener('lostpointercapture', up)
     this.thumbRelease = () => up()
   }
 }
