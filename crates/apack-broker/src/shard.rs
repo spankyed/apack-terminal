@@ -1376,6 +1376,10 @@ impl ShardRunner {
     }
 
     fn apply_effects(&mut self, session_id: SessionId, effects: Vec<SessionEffect>) {
+        self.apply_effects_inner(session_id, effects, true);
+    }
+
+    fn apply_effects_inner(&mut self, session_id: SessionId, effects: Vec<SessionEffect>, sync_and_reap: bool) {
         let mut views_dirty = false;
         let mut write_ready = false;
 
@@ -1447,7 +1451,7 @@ impl ShardRunner {
         }
 
         if write_ready {
-            self.drain_pty_writes_for(session_id);
+            self.drain_pty_writes_for(session_id, sync_and_reap);
         }
         if views_dirty {
             self.try_publish_dirty_views(session_id);
@@ -1501,7 +1505,7 @@ impl ShardRunner {
                 continue;
             };
             if ev.writable {
-                self.drain_pty_writes_for(session_id);
+                self.drain_pty_writes_for(session_id, true);
             }
             if ev.readable || ev.hangup {
                 self.read_unix_pty_quantum(session_id);
@@ -1630,10 +1634,10 @@ impl ShardRunner {
         if has_raw_subs && !committed.is_empty() {
             self.emit(ReactorEvent::PublishRawOutput { session: session_id, bytes: committed.to_vec() });
         }
-        self.apply_effects(session_id, effects);
         if let Some((load, refusal, tail)) = dispatch {
             self.dispatch_image_load(session_id, load, refusal, &tail);
         }
+        self.apply_effects(session_id, effects);
     }
 
     fn dispatch_image_load(&mut self, session_id: SessionId, load: Load, refusal: ImageRefusal, tail: &[u8]) {
@@ -1725,7 +1729,7 @@ impl ShardRunner {
             std::mem::take(&mut sess.pending_image_tail)
         };
 
-        self.apply_effects(session_id, effects);
+        self.apply_effects_inner(session_id, effects, false);
         if !tail.is_empty() {
             self.ingest_pty_bytes(session_id, &tail);
         }
@@ -1733,7 +1737,7 @@ impl ShardRunner {
         self.try_reap_session(session_id);
     }
 
-    fn drain_pty_writes_for(&mut self, session_id: SessionId) {
+    fn drain_pty_writes_for(&mut self, session_id: SessionId, sync_and_reap: bool) {
         let Some(sess) = self.sessions.get_mut(&session_id) else {
             return;
         };
@@ -1760,13 +1764,18 @@ impl ShardRunner {
                     }
                 }
             }
-            self.sync_pty_interest(session_id);
-            if hit_write_err {
-                self.try_reap_session(session_id);
+            if sync_and_reap {
+                self.sync_pty_interest(session_id);
+                if hit_write_err {
+                    self.try_reap_session(session_id);
+                }
             }
         }
         #[cfg(windows)]
-        drain_windows_pty_writes(sess);
+        {
+            let _ = sync_and_reap;
+            drain_windows_pty_writes(sess);
+        }
     }
 
     fn sync_pty_interest(&mut self, session_id: SessionId) {
@@ -1875,6 +1884,10 @@ impl ShardRunner {
                         sess.killer = None;
                         if sess.terminating_since.is_none() {
                             sess.pid = None;
+                            #[cfg(unix)]
+                            {
+                                sess.tree = None;
+                            }
                         }
                         Some(parsed)
                     }

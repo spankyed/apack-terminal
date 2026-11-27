@@ -2774,12 +2774,23 @@ fn kitty_image_sources_e2e_file_shm_security_and_teardown() {
         client.kill(s_ok).unwrap();
         assert!(t_kill.elapsed() < Duration::from_secs(2));
 
-        // 4. Short-lived child printing `t=f` and exiting IMMEDIATELY still completes off-shard
-        //    load and ingests trailing text before `Exited` (pipelined `Wait(Text)` MUST return
-        //    `WaitOutcome::Met`, not `WaitOutcome::Exited`, because `FAST_EXIT_OK` sits behind `t=f`
-        //    in `pending_image_tail`!).
+        // 4. Short-lived child printing a DSR reply-trigger + refused `t=f` (which triggers a
+        //    PTY refusal reply on completion -> Unix `EIO` after exit) + valid `t=f` + trailing
+        //    text and exiting IMMEDIATELY still completes both off-shard loads and drains
+        //    `FAST_EXIT_OK` before `Exited` (pipelined `Wait(Text)` MUST return `WaitOutcome::Met`).
+        let b64_missing =
+            String::from_utf8(encoded(tmp.path().join("no-such-img.rgba").as_os_str().as_bytes())).unwrap();
         let seq_fast = tmp.path().join("seq-fast.bin");
-        std::fs::write(&seq_fast, format!("\x1b_Ga=T,f=32,s=2,v=2,i=31,t=f;{b64_ok}\x1b\\FAST_EXIT_OK\r\n")).unwrap();
+        std::fs::write(
+            &seq_fast,
+            format!(
+                "\x1b[6n\
+                 \x1b_Ga=T,f=32,s=2,v=2,i=30,q=0,t=f;{b64_missing}\x1b\\\
+                 \x1b_Ga=T,f=32,s=2,v=2,i=31,t=f;{b64_ok}\x1b\\\
+                 FAST_EXIT_OK\r\n"
+            ),
+        )
+        .unwrap();
         let mut spec_fast = echo_command_spec("x", None, None);
         spec_fast.argv = vec![
             String::from("/bin/sh"),
