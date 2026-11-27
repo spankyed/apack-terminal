@@ -13,9 +13,13 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-const project = path.resolve(process.argv[2] ?? '.');
-const required = createRequire(path.join(project, 'package.json'))('@apackdev/terminal');
-const imported = await import(pathToFileURL(createRequire(path.join(project, 'package.json')).resolve('@apackdev/terminal')));
+const args = process.argv.slice(2);
+const requireView = args.includes('--require-view');
+const positional = args.filter((arg) => arg !== '--require-view');
+const project = path.resolve(positional[0] ?? '.');
+const projectRequire = createRequire(path.join(project, 'package.json'));
+const required = projectRequire('@apackdev/terminal');
+const imported = await import(pathToFileURL(projectRequire.resolve('@apackdev/terminal')));
 
 const fail = (message) => {
   console.error(`smoke: ${message}`);
@@ -40,3 +44,24 @@ if (ran.status !== 2 || !/usage: apack-terminal/.test(ran.stderr ?? '')) {
   fail(`apack-terminal answered ${ran.status} and ${JSON.stringify(ran.stderr)}, not its usage`);
 }
 console.log('smoke: the broker binary runs');
+
+const viewPkgPath = path.join(scope, 'terminal-view', 'package.json');
+if (requireView || fs.existsSync(viewPkgPath)) {
+  if (!fs.existsSync(viewPkgPath)) fail('@apackdev/terminal-view is not installed');
+  const viewManifest = JSON.parse(fs.readFileSync(viewPkgPath, 'utf8'));
+  if (typeof viewManifest.gitHead !== 'string' || !/^[0-9a-f]{40}$/.test(viewManifest.gitHead)) {
+    fail(`@apackdev/terminal-view package.json has invalid gitHead: ${JSON.stringify(viewManifest.gitHead)}`);
+  }
+  if (required.commit && viewManifest.gitHead !== required.commit) {
+    fail(`@apackdev/terminal-view gitHead (${viewManifest.gitHead}) != @apackdev/terminal commit (${required.commit})`);
+  }
+  const viewEntry = path.join(scope, 'terminal-view', 'dist', 'index.js');
+  if (!fs.existsSync(viewEntry)) fail(`@apackdev/terminal-view is missing ${viewEntry}`);
+  const viewMod = await import(pathToFileURL(viewEntry).href);
+  for (const symbol of ['TerminalView', 'TerminalClient', 'WebGL2AtlasPainter', 'CanvasPainter', 'createPainter']) {
+    if (typeof viewMod[symbol] !== 'function') {
+      fail(`@apackdev/terminal-view missing expected export ${symbol}`);
+    }
+  }
+  console.log(`smoke: @apackdev/terminal-view@${viewManifest.version} imports cleanly (gitHead ${viewManifest.gitHead})`);
+}

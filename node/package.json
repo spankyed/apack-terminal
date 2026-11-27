@@ -1,6 +1,6 @@
 {
   "name": "@apackdev/terminal",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "The apack-terminal v2 broker: one sharded process that owns the PTYs, libghostty-vt core, segmented WAL recordings, and unified binary protocol.",
   "license": "MIT OR Apache-2.0",
   "sideEffects": false,
@@ -27,9 +27,9 @@
     "LICENSE-APACHE"
   ],
   "optionalDependencies": {
-    "@apackdev/terminal-darwin-arm64": "0.1.0",
-    "@apackdev/terminal-linux-x64": "0.1.0",
-    "@apackdev/terminal-win32-x64": "0.1.0"
+    "@apackdev/terminal-darwin-arm64": "0.2.0",
+    "@apackdev/terminal-linux-x64": "0.2.0",
+    "@apackdev/terminal-win32-x64": "0.2.0"
   },
   "scripts": {
     "test": "node --test",

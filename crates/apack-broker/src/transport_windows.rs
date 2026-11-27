@@ -18,7 +18,7 @@ use interprocess::local_socket::traits::Listener as _;
 use interprocess::local_socket::{Listener, Stream};
 
 use crate::transport_loop::{
-    ConnState, GRACEFUL_DRAIN_TIMEOUT, MAX_CONNECTIONS, ReactorState, drain_deadline_expired, ready_stalled_attachments,
+    ConnState, MAX_CONNECTIONS, ReactorState, drain_deadline_expired, ready_stalled_attachments,
 };
 use crate::{fill_random, now_unix_ms};
 
@@ -360,7 +360,12 @@ impl ReactorState {
         }
         self.draining_win.insert(
             conn,
-            DrainingWinConn { win, tail_chunks, close_sent: false, deadline: Instant::now() + GRACEFUL_DRAIN_TIMEOUT },
+            DrainingWinConn {
+                win,
+                tail_chunks,
+                close_sent: false,
+                deadline: Instant::now() + self.graceful_drain_timeout,
+            },
         );
         self.pump_draining_win(conn);
     }

@@ -16,12 +16,13 @@ use apack_core::marks::MarksMode;
 use apack_core::session::SessionMachine;
 use apack_core::vt::VtEngine;
 use apack_proto::messages::{BrokerMsg, ClientMsg, SpawnSpec};
+#[cfg(unix)]
+use apack_proto::types::Confirmed;
 use apack_proto::types::{
     CellPos, CellPx, CellSpan, ErrorCode, FrameCredit, GridSize, LeaseGraceMs, LeaseKind, NonZeroStreamId, RequestId,
-    ResizePolicy, ResumeToken, SessionId, SignalTarget, SubFlags, ViewportHint, WaitCondition, WaitOutcome,
+    ResizePolicy, ResumeToken, SessionId, SignalKind, SignalScope, SignalTarget, SubFlags, ViewportHint, WaitCondition,
+    WaitOutcome,
 };
-#[cfg(unix)]
-use apack_proto::types::{Confirmed, SignalKind, SignalScope};
 use apack_proto::{FIN_FRAME, PROTOCOL_VERSION};
 use apack_vt_ghostty::{GhosttyConfig, GhosttyEngine};
 use tempfile::tempdir;

@@ -1,4 +1,4 @@
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 
 use apack_broker::client::BrokerClient;
 use apack_broker::config::BrokerConfig;
@@ -6,6 +6,32 @@ use apack_broker::runtime::BrokerServer;
 use apack_core::auth::AuthConfig;
 #[cfg(unix)]
 use tempfile::tempdir;
+
+/// RAII subprocess guard so an early test assertion panic never leaks broker/proxy child processes.
+struct KillOnDrop(Option<Child>);
+
+impl KillOnDrop {
+    fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn inner_mut(&mut self) -> &mut Child {
+        self.0.as_mut().expect("child still armed")
+    }
+
+    fn wait_and_disarm(mut self) -> std::io::Result<ExitStatus> {
+        self.0.take().expect("child still armed").wait()
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
 
 #[test]
 fn cli_binary_usage_version_serve_inspect_and_proxy() {
@@ -72,16 +98,18 @@ fn cli_binary_usage_version_serve_inspect_and_proxy() {
     assert_eq!(held.status.code(), Some(apack_os::transport::HELD_EXIT));
 
     // `proxy --socket <sock> --no-autostart` over stdin/stdout pipes!
-    let mut proxy_child = Command::new(bin)
-        .args(["proxy", "--socket", &sock, "--no-autostart"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn apack-terminal proxy");
+    let mut proxy_child = KillOnDrop::new(
+        Command::new(bin)
+            .args(["proxy", "--socket", &sock, "--no-autostart"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn apack-terminal proxy"),
+    );
 
-    let proxy_in = proxy_child.stdin.take().unwrap();
-    let proxy_out = proxy_child.stdout.take().unwrap();
+    let proxy_in = proxy_child.inner_mut().stdin.take().unwrap();
+    let proxy_out = proxy_child.inner_mut().stdout.take().unwrap();
     struct ChildDuplex(std::process::ChildStdout, std::process::ChildStdin);
     impl std::io::Read for ChildDuplex {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -99,7 +127,7 @@ fn cli_binary_usage_version_serve_inspect_and_proxy() {
     let mut client = BrokerClient::handshake(ChildDuplex(proxy_out, proxy_in), &AuthConfig::None, "cli-proxy").unwrap();
     assert!(client.list_sessions().unwrap().is_empty());
     drop(client);
-    let proxy_status = proxy_child.wait().expect("wait proxy");
+    let proxy_status = proxy_child.wait_and_disarm().expect("wait proxy");
     assert!(proxy_status.success());
 
     drop(holder);
@@ -110,21 +138,33 @@ fn cli_binary_usage_version_serve_inspect_and_proxy() {
     let auto_sock = tmp.path().join("p/cli-autostart.sock").to_string_lossy().into_owned();
     #[cfg(windows)]
     let auto_sock = format!(r"\\.\pipe\apack-v2-cli-auto-{}", std::process::id());
-    let mut auto_proxy = Command::new(bin)
-        .args(["proxy", "--socket", &auto_sock])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn apack-terminal autostart proxy");
-    let ap_in = auto_proxy.stdin.take().unwrap();
-    let ap_out = auto_proxy.stdout.take().unwrap();
+    let mut auto_proxy = KillOnDrop::new(
+        Command::new(bin)
+            .args(["proxy", "--socket", &auto_sock])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn apack-terminal autostart proxy"),
+    );
+    let ap_in = auto_proxy.inner_mut().stdin.take().unwrap();
+    let ap_out = auto_proxy.inner_mut().stdout.take().unwrap();
     let mut auto_client =
         BrokerClient::handshake(ChildDuplex(ap_out, ap_in), &AuthConfig::None, "cli-autostart").unwrap();
     assert!(auto_client.list_sessions().unwrap().is_empty());
     auto_client.send_fin().unwrap();
     drop(auto_client);
-    assert!(auto_proxy.wait().expect("wait autostart proxy").success());
+    assert!(auto_proxy.wait_and_disarm().expect("wait autostart proxy").success());
+    // Wait for the detached autostarted broker to finish shutting down and unlink its socket
+    // before `tmp` drops so no daemon lingers after the test exits.
+    #[cfg(unix)]
+    {
+        let unlink_dl = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::path::Path::new(&auto_sock).exists() && std::time::Instant::now() < unlink_dl {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!std::path::Path::new(&auto_sock).exists(), "autostarted broker must unlink {auto_sock} on exit");
+    }
 
     // `serve --socket <fresh>` with short APACK_TERMINAL_START_GRACE_MS exits cleanly on grace timeout!
     #[cfg(unix)]
@@ -145,14 +185,16 @@ fn cli_binary_usage_version_serve_inspect_and_proxy() {
     #[cfg(windows)]
     let auth_sock = format!(r"\\.\pipe\apack-v2-cli-auth-{}", std::process::id());
     let auth_secret = "pr6-super-secret-broker-key";
-    let mut auth_srv = Command::new(bin)
-        .args(["serve", "--socket", &auth_sock, "--shards", "1"])
-        .env(apack_broker::config::AUTH_KEY_ENV, auth_secret)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn auth serve");
+    let mut auth_srv = KillOnDrop::new(
+        Command::new(bin)
+            .args(["serve", "--socket", &auth_sock, "--shards", "1"])
+            .env(apack_broker::config::AUTH_KEY_ENV, auth_secret)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn auth serve"),
+    );
     let auth_cfg = AuthConfig::Required(apack_broker::config::derive_auth_secret(auth_secret.as_bytes()));
     let mut auth_client = None;
     let auth_dl = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -168,12 +210,16 @@ fn cli_binary_usage_version_serve_inspect_and_proxy() {
     #[cfg(unix)]
     {
         let hup = Command::new("kill")
-            .args(["-HUP", &auth_srv.id().to_string()])
+            .args(["-HUP", &auth_srv.inner_mut().id().to_string()])
             .status()
             .expect("send SIGHUP to detached serve");
         assert!(hup.success(), "kill -HUP failed");
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        assert!(auth_srv.try_wait().expect("try_wait after SIGHUP").is_none(), "detached serve died on SIGHUP!");
+        // Verify broker stays responsive after SIGHUP via an RPC roundtrip rather than a blind sleep.
+        let _ = auth_client.list_sessions().expect("detached serve must keep serving after SIGHUP");
+        assert!(
+            auth_srv.inner_mut().try_wait().expect("try_wait after SIGHUP").is_none(),
+            "detached serve died on SIGHUP!"
+        );
     }
     let shell_spec = apack_proto::messages::SpawnSpec {
         argv: if cfg!(windows) {
@@ -205,6 +251,28 @@ fn cli_binary_usage_version_serve_inspect_and_proxy() {
     );
     let _ = auth_client.send_fin();
     drop(auth_client);
-    let _ = auth_srv.kill();
-    let _ = auth_srv.wait();
+    // Let `auth_srv` exit cleanly after its sole client disconnects (tearing down session & unlinking socket);
+    // `KillOnDrop` still guarantees cleanup on panic or unexpected hang.
+    let auth_exit_dl = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut auth_exited = false;
+    while std::time::Instant::now() < auth_exit_dl {
+        if auth_srv.inner_mut().try_wait().expect("try_wait auth_srv").is_some() {
+            auth_exited = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if auth_exited {
+        let _ = auth_srv.wait_and_disarm();
+    } else {
+        drop(auth_srv);
+    }
+    #[cfg(unix)]
+    {
+        let unlink_dl = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::path::Path::new(&auth_sock).exists() && std::time::Instant::now() < unlink_dl {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!std::path::Path::new(&auth_sock).exists(), "auth serve must unlink {auth_sock} on exit");
+    }
 }

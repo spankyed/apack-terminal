@@ -109,8 +109,36 @@ function stage(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), `apack-terminal-${prefix}-`));
 }
 
-/** Packs every platform's package and `@apackdev/terminal` into `out`, and answers the tarballs' paths */
-export function packAll({ commit, files, out, repo }) {
+/** `@apackdev/terminal-view`'s manifest as the release packs it: stamped with `gitHead`, no dev/build scripts. */
+export function releasedViewManifest(viewManifest, commit) {
+  const { scripts: _scripts, devDependencies: _devDeps, ...rest } = viewManifest;
+  return { ...rest, gitHead: commit };
+}
+
+/** Packs `@apackdev/terminal-view` from a built `view/` directory with `gitHead` stamped on its manifest. */
+export function packView({ commit, viewDir, out }) {
+  const viewManifest = JSON.parse(fs.readFileSync(path.join(viewDir, 'package.json'), 'utf8'));
+  const released = releasedViewManifest(viewManifest, commit);
+  fs.mkdirSync(out, { recursive: true });
+  const directory = stage('view');
+  try {
+    for (const entry of viewManifest.files ?? []) {
+      const src = path.join(viewDir, entry);
+      if (!fs.existsSync(src)) throw new Error(`${viewDir} is missing required release entry ${entry}`);
+      fs.cpSync(src, path.join(directory, entry), { recursive: true });
+    }
+    if (!fs.existsSync(path.join(directory, 'dist', 'index.js'))) {
+      throw new Error(`${viewDir} has no built dist/index.js (run npm --prefix view run build first)`);
+    }
+    fs.writeFileSync(path.join(directory, 'package.json'), `${JSON.stringify(released, null, 2)}\n`);
+    return npmPack(directory, out);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+/** Packs every platform's package, `@apackdev/terminal`, and optionally `@apackdev/terminal-view` into `out`. */
+export function packAll({ commit, files, out, repo, viewDir }) {
   const main = JSON.parse(fs.readFileSync(path.join(NODE_DIR, 'package.json'), 'utf8'));
   const released = releasedMainManifest(main, repo, commit);
   fs.mkdirSync(out, { recursive: true });
@@ -127,18 +155,34 @@ export function packAll({ commit, files, out, repo }) {
     }
     const ordered = [target.binary, ...names.filter((name) => name !== target.binary).sort()];
     const directory = stage(target.platform);
-    for (const name of ordered) fs.copyFileSync(path.join(files, prefix + name), path.join(directory, name));
-    // A download from a workflow's artifacts loses the mode it was built with; the tarball carries this one
-    fs.chmodSync(path.join(directory, target.binary), 0o755);
-    const manifest = platformManifest(main, target, ordered, commit);
-    fs.writeFileSync(path.join(directory, 'package.json'), `${JSON.stringify(manifest, null, 2)}\n`);
-    tarballs.push(npmPack(directory, out));
+    try {
+      for (const name of ordered) fs.copyFileSync(path.join(files, prefix + name), path.join(directory, name));
+      // A download from a workflow's artifacts loses the mode it was built with; the tarball carries this one
+      fs.chmodSync(path.join(directory, target.binary), 0o755);
+      const manifest = platformManifest(main, target, ordered, commit);
+      fs.writeFileSync(path.join(directory, 'package.json'), `${JSON.stringify(manifest, null, 2)}\n`);
+      tarballs.push(npmPack(directory, out));
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
   }
 
   const directory = stage('main');
-  for (const name of main.files) fs.copyFileSync(path.join(NODE_DIR, name), path.join(directory, name));
-  fs.writeFileSync(path.join(directory, 'package.json'), `${JSON.stringify(released, null, 2)}\n`);
-  tarballs.push(npmPack(directory, out));
+  try {
+    for (const name of main.files) fs.copyFileSync(path.join(NODE_DIR, name), path.join(directory, name));
+    fs.writeFileSync(path.join(directory, 'package.json'), `${JSON.stringify(released, null, 2)}\n`);
+    tarballs.push(npmPack(directory, out));
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+
+  if (viewDir) {
+    const viewPkg = JSON.parse(fs.readFileSync(path.join(viewDir, 'package.json'), 'utf8'));
+    if (viewPkg.version !== main.version) {
+      throw new Error(`view/package.json is at ${viewPkg.version}, not ${main.version}`);
+    }
+    tarballs.push(packView({ commit, viewDir, out }));
+  }
   return tarballs;
 }
 
@@ -148,16 +192,20 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
       commit: { type: 'string' },
       files: { type: 'string' },
       out: { type: 'string' },
+      view: { type: 'string' },
       repo: { type: 'string', default: 'spankyed/apack-terminal' },
     },
   });
   for (const option of ['commit', 'files', 'out']) {
     if (!values[option]) {
-      console.error(`usage: node node/release/pack.mjs --commit <sha> --files <dir> --out <dir> [--repo <owner/name>]`);
+      console.error(
+        `usage: node node/release/pack.mjs --commit <sha> --files <dir> --out <dir> [--view <dir>] [--repo <owner/name>]`,
+      );
       process.exit(2);
     }
   }
-  for (const tarball of packAll({ ...values, files: path.resolve(values.files), out: path.resolve(values.out) })) {
+  const viewDir = values.view ? path.resolve(values.view) : undefined;
+  for (const tarball of packAll({ ...values, files: path.resolve(values.files), out: path.resolve(values.out), viewDir })) {
     console.log(tarball);
   }
 }

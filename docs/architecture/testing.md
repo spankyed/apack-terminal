@@ -30,9 +30,11 @@ wire codec and cross-language test vectors directly from `apack-proto`:
   `MAX_SEARCH_NEEDLE_BYTES`), tags, and declarative wire schemas.
 - **Golden wire vectors:** `crates/apack-broker/tests/wire_vectors_v2.rs` encodes every `ClientMsg` and
   `BrokerMsg` variant (plus mutual HMAC-SHA256 proofs) into `node/wire-vectors-v2.json`.
-- **Drift gate:** `cargo xtask check-generated` fails CI if generated TS wire files or `node/wire-vectors-v2.json`
-  drift from Rust. `view/tests/wire-vectors.spec.ts` decodes every broker vector and re-encodes every client
-  vector byte-for-byte in TypeScript on every CI run.
+- **Drift & release lockstep gates:** `cargo xtask check-generated` fails CI if generated TS wire files or
+  `node/wire-vectors-v2.json` drift from Rust, and `cargo xtask check-versions` fails CI if root `Cargo.toml`,
+  workspace crates, `node/package.json` (plus platform `optionalDependencies`), `view/package.json`, or
+  `view/package-lock.json` drift out of lockstep. `view/tests/wire-vectors.spec.ts` decodes every broker vector
+  and re-encodes every client vector byte-for-byte in TypeScript on every CI run.
 
 ## 3. Unit, Integration, Cross-Platform & Real-Chromium E2E Suites
 
@@ -46,22 +48,30 @@ deadlines so a lost wake or signal fails fast instead of hanging):
   Windows Job Objects (`tree_windows.rs`), socket `0o700`/`0o600` + peer UID checks (`transport.rs`), Windows
   SDDL pipe ACLs and owner SID verification (`security.rs`, `security_windows.rs`, `transport_windows.rs`),
   and off-shard Kitty named-source (`t=f` / `t=s`) security enforcement (`image_sources/`).
-- **`apack-wal`:** CRC32C framing, dual-layer `KeyframeV2`, torn-tail crash recovery, $O(1)$ budget eviction,
-  blob sweeping, symlink/foreign-directory refusal, zlib bomb caps, async worker flush barriers.
-- **`apack-broker` & root `tests/cli.rs`:** End-to-end sharded broker, `serve` single-instance locking,
-  `proxy` autostart & `--no-autostart`, `inspect --json`, lease grace expiry, Kitty `t=f`/`t=s` broker wiring,
-  and real shell integration.
+- **`apack-wal`:** CRC32C framing, SHA-256 `SegmentFooter` authenticity & live-dir verification, `safe_fs`
+  regular-file opens, dual-layer `KeyframeV2`, torn-tail crash recovery, $O(1)$ budget eviction, live blob
+  persistence/sweeping, symlink/foreign-directory refusal, zlib bomb caps, async worker flush barriers.
+- **`apack-broker` & root `tests/cli.rs`:** End-to-end sharded broker, `StreamAttachmentId` isolation,
+  phase-typed pre-Hello size caps, `SessionLifetime` (`Kept`/`LeaseBound`/`ConnBound`), transactional
+  `Rewind`/`Seek` + WAL blob/marks/status hydration, cross-platform WAL rollover & idle compression, `serve`
+  single-instance locking & `-h`/`--help`, `proxy` detached autostart & `--no-autostart`, `inspect --json`,
+  lease grace expiry, Kitty `t=f`/`t=s` broker wiring (including Unix symlinks/FIFOs and Windows NTFS
+  junction/UNC/named-pipe refusal), and real shell integration.
 - **View unit suite (`view/`):** Vitest suite covering `src/wire/*` (`wire-vectors.spec.ts`), `client.ts`,
-  `row-store.ts`, `viewport.ts`, `local-query.ts`, `input.ts`, `selection.ts`, `links.ts`, `draw.ts`, `images.ts`,
-  `canvas-painter.ts`, `webgl-painter.ts` (including `ShelfPacker` & `createPainter`), and `view.ts`, plus
-  strict DOM-only `tsc --noEmit` and Vite bundle build.
+  `row-store.ts`, `viewport.ts`, `local-query.ts`, `input.ts`, `selection.ts`, `links.ts`, `draw.ts`, `images.ts`
+  (including `onEvict` GPU release & isolation), `canvas-painter.ts`, `webgl-painter.ts` (content-addressed
+  texture keys, `releaseImage`, closed-bitmap sweeping, `ShelfPacker`, `createPainter`), and `view.ts`
+  (centralized `isActive()` blink/timer suppression, one-shot `onEnded`, `pointerId` isolation), plus strict
+  DOM-only `tsc --noEmit` and Vite bundle build.
 - **Real-Chromium Playwright E2E suite (`view/e2e/`):** Boots a real `apack-terminal serve` v2 broker binary
   over a local WebSocket bridge and mounts `TerminalView` in real Chromium for both `WebGL2AtlasPainter` and
   `CanvasPainter`, asserting real rendered pixels (non-blank glyphs, RGB colors, cursor), color emoji vs
-  monochrome tinting, Kitty inline image texture compositing, scrollback `FetchRows`, mouse-drag selection/copy,
-  live search highlights, resize/reflow, and `WEBGL_lose_context` → `webglcontextrestored` recovery. Run
-  locally with `npm --prefix view run test:e2e` and enforced in CI (`view-e2e (Linux x64)`).
-- **Node (`node/`):** `brokerBinary()` resolution and release tarball packing/smoke verification.
+  monochrome tinting, Kitty inline + cropped/cell-offset (`sourceRect`/`cellOffset`/`pixelSize`) image
+  compositing, scrollback `FetchRows`, mouse-drag selection/copy, live search highlights, resize/reflow, and
+  `WEBGL_lose_context` → `webglcontextrestored` recovery. Run locally with `npm --prefix view run test:e2e`
+  and enforced in CI (`view-e2e (Linux x64)`).
+- **Node (`node/`):** `brokerBinary()` resolution, version-locked `packAll`/`packView` (`gitHead`-stamped
+  `@apackdev/terminal-view` tarball), and release smoke verification (`smoke.mjs --require-view`).
 
 CI (`.github/workflows/ci.yml`) runs the full suite on **Linux x64**, **macOS arm64**, and **Windows x64**
 (with `cargo clippy` also run on Windows to catch `cfg(windows)` lint issues).
@@ -117,6 +127,7 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo xtask check-generated
 cargo xtask check-safety
 cargo xtask check-cfg-hygiene
+cargo xtask check-versions
 cargo xtask check-windows                             # local Windows clippy cross-check
 cargo xtask check-notices
 cargo xtask check-exclusions

@@ -1,6 +1,6 @@
 {
   "name": "@apackdev/terminal-view",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Draws a terminal from rows something else interpreted: painting, scrolling, selection and input, with no terminal core of its own.",
   "license": "MIT OR Apache-2.0",
   "type": "module",

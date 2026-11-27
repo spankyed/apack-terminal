@@ -100,23 +100,29 @@ fn e2e_leases_kept_pinning_tier2_compression_foreground_verify_and_kill_escalati
     );
     assert!(matches!(c2.spawn(bad_restore_spec), Err(ClientError::Broker { code: ErrorCode::Pty, .. })));
 
-    // 2. WAL rollover (> 64 KiB output) + idle compression (25 ms) + Unix foreground verify + SIGKILL escalation!
-    #[cfg(unix)]
+    // 2. Cross-platform WAL rollover (> 64 KiB output -> >= 2 segments), cooperative idle scrollback
+    //    compression, and Rewind `Signal` rejection (`ErrorCode::Malformed`) on Unix AND Windows!
     {
-        let rec_dir = tmp.path().join("wal-roll");
-        // Emit > 80 KiB output (exceeding MIN_SEGMENT_TARGET_BYTES = 64 KiB for deterministic WAL
-        // rollover + scrollback lines for idle compression), then wait for stdin before OSC 7501!
-        let script = concat!(
-            "i=0; while [ $i -lt 1400 ]; do ",
-            "printf 'ROLLOVER_LINE_%04d_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\\r\\n' $i; ",
-            "i=$((i+1)); done; ",
-            "read _go; ",
-            "printf '\\033]7501;id=st_ok:app=sh:state=working\\007'; ",
-            "printf '\\033]7501;id=st_bad:app=nonexistent_app_xyz:state=working\\007'; ",
-            "trap '' HUP; sleep 10"
-        );
+        let rec_dir = tmp.path().join("wal-roll-xplat");
+        let roll_file = tmp.path().join("rollover-lines.txt");
+        let mut roll_buf = String::with_capacity(1400 * 64);
+        for i in 0..1400u32 {
+            roll_buf.push_str(&format!("ROLLOVER_LINE_{i:04}_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n"));
+        }
+        std::fs::write(&roll_file, &roll_buf).unwrap();
+
+        #[cfg(unix)]
+        let roll_argv =
+            vec![String::from("/bin/sh"), String::from("-c"), format!("cat '{}'; sleep 10", roll_file.display())];
+        #[cfg(windows)]
+        let roll_argv = vec![
+            String::from("cmd.exe"),
+            String::from("/C"),
+            format!("type \"{}\" & ping -n 10 127.0.0.1 >nul", roll_file.display()),
+        ];
+
         let spec_roll = SpawnSpec {
-            argv: vec![String::from("/bin/sh"), String::from("-c"), String::from(script)],
+            argv: roll_argv,
             cwd: None,
             env: Vec::new(),
             size: GridSize::new(80, 10).unwrap(),
@@ -131,13 +137,77 @@ fn e2e_leases_kept_pinning_tier2_compression_foreground_verify_and_kill_escalati
         };
         let (s_roll, _) = c2.spawn(spec_roll).unwrap();
         assert_eq!(
-            c2.wait(s_roll, WaitCondition::Text(String::from("ROLLOVER_LINE_1399")), 5_000).unwrap(),
+            c2.wait(s_roll, WaitCondition::Text(String::from("ROLLOVER_LINE_1399")), 8_000).unwrap(),
             WaitOutcome::Met
         );
-        std::thread::sleep(Duration::from_millis(30));
+
+        // Let idle compression (25 ms) run cooperatively on the 500 scrollback lines.
+        let mut compressed_ok = false;
+        let idle_dl = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < idle_dl {
+            if c2.metrics().unwrap().scrollback_bytes > 0 {
+                compressed_ok = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(compressed_ok, "expected scrollback_bytes > 0 after rollover output & idle compression");
+
+        c2.kill(s_roll).unwrap();
+        for _ in 0..150 {
+            if !c2.list_sessions().unwrap().iter().any(|s| s.id == s_roll) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!c2.list_sessions().unwrap().iter().any(|s| s.id == s_roll));
+
+        let reg_check = apack_wal::RecordingRegistry::new();
+        let wal_check = apack_wal::WalReader::open(&rec_dir, &reg_check).unwrap();
+        assert!(
+            wal_check.segments().len() >= 2,
+            "expected WAL segment rollover (>=2 segments), found {}",
+            wal_check.segments().len()
+        );
+        drop(wal_check);
+
+        let (rew_sid, _, _) = c2.rewind(rec_dir.to_string_lossy().into_owned(), Some(0)).unwrap();
+        assert!(matches!(
+            c2.signal(rew_sid, SignalKind::Term, SignalScope::Group),
+            Err(ClientError::Broker { code: ErrorCode::Malformed, .. })
+        ));
+        c2.kill(rew_sid).unwrap();
+    }
+
+    // 2b. Unix foreground verify (OSC 7501) + SIGKILL escalation + graceful SIGHUP + paused-PTY kill!
+    #[cfg(unix)]
+    {
+        let script = concat!(
+            "printf 'FG_READY\\r\\n'; ",
+            "read _go; ",
+            "printf '\\033]7501;id=st_ok:app=sh:state=working\\007'; ",
+            "printf '\\033]7501;id=st_bad:app=nonexistent_app_xyz:state=working\\007'; ",
+            "trap '' HUP; sleep 10"
+        );
+        let spec_fg = SpawnSpec {
+            argv: vec![String::from("/bin/sh"), String::from("-c"), String::from(script)],
+            cwd: None,
+            env: Vec::new(),
+            size: GridSize::new(80, 10).unwrap(),
+            cell_px: CellPx { width: 8, height: 16 },
+            scrollback_limit: 200,
+            marks_key: None,
+            resize_policy: ResizePolicy::LatestActive,
+            record_dir: None,
+            restore_from: None,
+            image_files: false,
+            kept: false,
+        };
+        let (s_fg, _) = c2.spawn(spec_fg).unwrap();
+        assert_eq!(c2.wait(s_fg, WaitCondition::Text(String::from("FG_READY")), 5_000).unwrap(), WaitOutcome::Met);
         let st = NonZeroStreamId::new(1).unwrap();
         c2.attach(
-            s_roll,
+            s_fg,
             st,
             SubFlags::from_bits(SubFlags::EVENTS).unwrap(),
             None,
@@ -167,38 +237,16 @@ fn e2e_leases_kept_pinning_tier2_compression_foreground_verify_and_kill_escalati
         assert!(saw_matched, "verify_foreground must confirm Matched for sh");
         assert!(saw_mismatched, "verify_foreground must confirm Mismatched for nonexistent_app_xyz");
 
-        // Let idle compression (25 ms) run cooperatively on the 50+ scrollback lines.
-        std::thread::sleep(Duration::from_millis(80));
-        let metrics = c2.metrics().unwrap();
-        assert!(metrics.scrollback_bytes > 0);
-
-        // Kill s_roll (which traps SIGHUP) -> Tier 2 escalates to SIGKILL after 200 ms and reaps!
-        c2.kill(s_roll).unwrap();
-        for _ in 0..100 {
+        // Kill s_fg (which traps SIGHUP) -> escalates to SIGKILL after `kill_escalate_after` and reaps!
+        c2.kill(s_fg).unwrap();
+        for _ in 0..150 {
             let ids: Vec<SessionId> = c2.list_sessions().unwrap().into_iter().map(|s| s.id).collect();
-            if !ids.contains(&s_roll) {
+            if !ids.contains(&s_fg) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(!c2.list_sessions().unwrap().iter().any(|s| s.id == s_roll));
-
-        // Verify WAL rolled over into >= 2 segments and Rewind rejects Signal with Malformed!
-        let reg_check = apack_wal::RecordingRegistry::new();
-        let wal_check = apack_wal::WalReader::open(&rec_dir, &reg_check).unwrap();
-        assert!(
-            wal_check.segments().len() >= 2,
-            "expected WAL segment rollover (>=2 segments), found {}",
-            wal_check.segments().len()
-        );
-        drop(wal_check);
-
-        let (rew_sid, _, _) = c2.rewind(rec_dir.to_string_lossy().into_owned(), Some(0)).unwrap();
-        assert!(matches!(
-            c2.signal(rew_sid, SignalKind::Term, SignalScope::Group),
-            Err(ClientError::Broker { code: ErrorCode::Malformed, .. })
-        ));
-        c2.kill(rew_sid).unwrap();
+        assert!(!c2.list_sessions().unwrap().iter().any(|s| s.id == s_fg));
 
         // Verify graceful SIGHUP runs BEFORE SIGKILL escalation (`kill_escalate_after = 120ms`):
         // a shell trapping SIGHUP and exiting with code 7 must exit cleanly with Some(7) (not SIGKILL)!
@@ -327,11 +375,15 @@ fn e2e_leases_kept_pinning_tier2_compression_foreground_verify_and_kill_escalati
 
         // Verify `kill()` on a Paused session with buffered output unpauses reads so macOS/BSD
         // `ttydrain()` does not wedge the exiting child, AND unit-test `drain_unix_pty_nonblocking`!
+        let tail_written_flag = tmp.path().join("tail-written.flag");
         let tail_spec = SpawnSpec {
             argv: vec![
                 String::from("/bin/sh"),
                 String::from("-c"),
-                String::from("printf 'TAIL_ARMED\\r\\n'; read _go; printf 'TAIL_BEFORE_EXIT_99\\r\\n'; sleep 10"),
+                format!(
+                    "printf 'TAIL_ARMED\\r\\n'; read _go; printf 'TAIL_BEFORE_EXIT_99\\r\\n'; : > '{}'; sleep 10",
+                    tail_written_flag.display()
+                ),
             ],
             cwd: None,
             env: Vec::new(),
@@ -373,7 +425,12 @@ fn e2e_leases_kept_pinning_tier2_compression_foreground_verify_and_kill_escalati
         // Barrier: `list_sessions` roundtrips through the shard, ensuring `Pause` is active first.
         let _ = c2.list_sessions().unwrap();
         c2.send_raw(st_tail.as_stream_id(), RequestId::PUSH, &ClientMsg::Write { data: b"go\n".to_vec() }).unwrap();
-        std::thread::sleep(Duration::from_millis(60));
+        // Deterministic barrier: wait for the child to create `tail_written_flag` after writing to PTY stdout.
+        let flag_dl = std::time::Instant::now() + Duration::from_secs(3);
+        while !tail_written_flag.exists() && std::time::Instant::now() < flag_dl {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(tail_written_flag.exists(), "child must write buffered tail before kill()");
         c2.kill(s_tail).unwrap();
         let mut saw_tail = false;
         let mut saw_exited = false;
@@ -571,17 +628,23 @@ fn windows_edge_helpers_and_natural_child_exit() {
     batch.extend_from_slice(&apack_proto::FIN_FRAME);
 
     // 4a. Sole client pipelines 1,500 Metrics (>> WIN_WRITE_WINDOW) + FIN_FRAME.
+    //     Use a 5s configured drain timeout and assert prompt auto-exit (< 2s) so noisy Windows CI
+    //     cannot flake while still proving `writer_done` short-circuits `graceful_drain_timeout`!
     let dir_solo = tempdir().unwrap();
     let ep_solo = unique_endpoint(dir_solo.path(), "win-drain-solo");
     let mut cfg_solo = BrokerConfig::for_socket(&ep_solo);
     cfg_solo.shard_count = 1;
+    cfg_solo.graceful_drain_timeout = Duration::from_secs(5);
     let mut srv_solo = BrokerServer::bind(cfg_solo).unwrap().spawn().unwrap();
     let mut burst = apack_os::transport::connect_local_stream(srv_solo.socket_path()).unwrap();
     do_hello(&mut burst);
     let t_fin = std::time::Instant::now();
     burst.write_all(&batch).unwrap();
     burst.flush().unwrap();
-    std::thread::sleep(Duration::from_millis(50));
+    // Wait 100ms (<< 5s configured graceful_drain_timeout): broker MUST stay alive while replies
+    // wait to drain (kills `Instant::now() - graceful_drain_timeout` mutant cleanly!).
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(!srv_solo.is_finished(), "draining_win must keep broker alive before graceful_drain_timeout expires");
     let mut all_replies = Vec::new();
     let _ = burst.read_to_end(&mut all_replies);
     let mut dec = apack_proto::frame::FrameDecoder::new();
@@ -595,32 +658,36 @@ fn windows_edge_helpers_and_natural_child_exit() {
         }
     }
     assert_eq!(got_replies, WIN_BURST_N, "draining_win must keep broker alive and deliver all replies");
-    while !srv_solo.is_finished() && t_fin.elapsed() < Duration::from_millis(1_000) {
+    while !srv_solo.is_finished() && t_fin.elapsed() < Duration::from_secs(3) {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(
-        srv_solo.is_finished() && t_fin.elapsed() < Duration::from_millis(450),
-        "broker must auto-exit promptly once writer_done is true (before 500ms timeout): elapsed={:?}",
+        srv_solo.is_finished() && t_fin.elapsed() < Duration::from_secs(2),
+        "broker must auto-exit promptly once writer_done is true (before 5s timeout): elapsed={:?}",
         t_fin.elapsed()
     );
     srv_solo.shutdown().unwrap();
 
     // 4b. Sole stalled peer pipelines WIN_BURST_N Metrics + FIN_FRAME and never reads ->
-    //     reap_draining_win_conns must forcibly close_abrupt after 500ms so broker auto-exits!
+    //     reap_draining_win_conns must forcibly close_abrupt after 250ms so broker auto-exits!
     let dir_reap = tempdir().unwrap();
     let ep_reap = unique_endpoint(dir_reap.path(), "win-drain-reap");
     let mut cfg_reap = BrokerConfig::for_socket(&ep_reap);
     cfg_reap.shard_count = 1;
+    cfg_reap.graceful_drain_timeout = Duration::from_millis(250);
     let mut srv_reap = BrokerServer::bind(cfg_reap).unwrap().spawn().unwrap();
     let mut stalled = apack_os::transport::connect_local_stream(srv_reap.socket_path()).unwrap();
     do_hello(&mut stalled);
     stalled.write_all(&batch).unwrap();
     stalled.flush().unwrap();
     let reap_wait = std::time::Instant::now();
-    while !srv_reap.is_finished() && reap_wait.elapsed() < Duration::from_millis(2_000) {
+    while !srv_reap.is_finished() && reap_wait.elapsed() < Duration::from_secs(5) {
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(srv_reap.is_finished(), "reap_draining_win_conns must drop stalled peer after 500ms so broker auto-exits");
+    assert!(
+        srv_reap.is_finished(),
+        "reap_draining_win_conns must drop stalled peer after graceful_drain_timeout so broker auto-exits"
+    );
     let mut discard = Vec::new();
     let _ = stalled.read_to_end(&mut discard);
     assert!(discard.len() < all_replies.len());
