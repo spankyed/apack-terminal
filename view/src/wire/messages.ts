@@ -7,6 +7,7 @@
 import {
   AUTH_TOKEN_LEN,
   BULK_CHUNK_BYTES,
+  MAX_CLIENT_NAME_BYTES,
   MAX_COMMANDS,
   MAX_IMAGES_REPLY,
   MAX_PROGRESS_PERCENT,
@@ -434,7 +435,7 @@ export function encodeClientPayload(msg: ClientMsg): { readonly msgType: number;
       if (msg.clientNonce.length !== AUTH_TOKEN_LEN) throw new WireError('InvalidValue', 'clientNonce must be 32 bytes')
       w.u16(msg.protocolVersion)
       w.raw(msg.clientNonce)
-      w.str(msg.clientName)
+      w.strBounded(msg.clientName, MAX_CLIENT_NAME_BYTES, 'Hello.client_name')
       return { msgType: MsgType.HELLO, payload: w.toBytes() }
     case 'authProof':
       if (msg.hmac.length !== AUTH_TOKEN_LEN) throw new WireError('InvalidValue', 'hmac must be 32 bytes')
@@ -590,7 +591,7 @@ export function decodeClientMsg(msgType: number, payload: Uint8Array): ClientMsg
         kind: 'hello',
         protocolVersion: r.u16(),
         clientNonce: r.fixedCopy(AUTH_TOKEN_LEN),
-        clientName: r.str(),
+        clientName: r.strBounded(MAX_CLIENT_NAME_BYTES, 'Hello.client_name'),
       }
       break
     }

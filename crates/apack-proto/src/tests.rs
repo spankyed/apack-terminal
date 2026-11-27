@@ -16,8 +16,9 @@ use crate::types::{
     UnknownReason, ViewModes, ViewportHint, VouchedExitCode, WaitCondition, WaitOutcome,
 };
 use crate::{
-    BULK_CHUNK_BYTES, FIN_FRAME, FRAME_HEADER_LEN, MAX_BLOB_BYTES, MAX_FRAME_PAYLOAD, MAX_GRID_COLS, MAX_GRID_ROWS,
-    MAX_LEASE_GRACE_MS, MAX_ROWS_PER_FETCH, MAX_STRING_BYTES, MAX_VEC_ITEMS, PROTOCOL_VERSION,
+    BULK_CHUNK_BYTES, FIN_FRAME, FRAME_HEADER_LEN, MAX_BLOB_BYTES, MAX_CLIENT_NAME_BYTES, MAX_FRAME_PAYLOAD,
+    MAX_GRID_COLS, MAX_GRID_ROWS, MAX_LEASE_GRACE_MS, MAX_ROWS_PER_FETCH, MAX_STRING_BYTES, MAX_VEC_ITEMS,
+    PROTOCOL_VERSION,
 };
 
 fn sample_key() -> MarksKey {
@@ -493,6 +494,40 @@ fn frame_decoder_splits_multi_frames_fin_and_bounds() {
     assert_eq!(fin_dec.step(&FIN_FRAME), Ok((4, Some(DecodedFrame::Fin))));
     assert!(fin_dec.is_closed());
     assert_eq!(INNER_HEADER_LEN, 10);
+
+    // Custom bounded FrameDecoder (used for AwaitingHello 4 KiB / AwaitingAuth 64 B phases)
+    let mut small = FrameDecoder::with_max_payload(64);
+    assert_eq!(small.max_payload_len(), 64);
+    assert_eq!(FrameDecoder::with_max_payload(MAX_FRAME_PAYLOAD + 1024).max_payload_len(), MAX_FRAME_PAYLOAD);
+    let mut ok_64 = Vec::new();
+    encode_frame(StreamId::CONTROL, msg_type::AUTH_PROOF, RequestId::PUSH, &[0xAB; 64], &mut ok_64).unwrap();
+    let (used, decoded) = small.step(&ok_64).expect("64B payload accepted");
+    assert_eq!(used, ok_64.len());
+    assert!(matches!(decoded, Some(DecodedFrame::Frame { header, .. }) if header.payload_len == 64));
+
+    let mut small_over = FrameDecoder::with_max_payload(64);
+    let over_body_len = (INNER_HEADER_LEN + 65) as u32;
+    assert_eq!(small_over.step(&over_body_len.to_le_bytes()), Err(WireError::FrameTooLarge(65)));
+    assert!(small_over.is_closed());
+
+    // Hello.client_name is bounded to MAX_CLIENT_NAME_BYTES (256)
+    let ok_hello = ClientMsg::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        client_nonce: [1u8; 32],
+        client_name: "a".repeat(MAX_CLIENT_NAME_BYTES),
+    };
+    let mut w = Writer::new();
+    ok_hello.encode(&mut w);
+    assert_eq!(ClientMsg::decode(msg_type::HELLO, w.as_slice()), Ok(ok_hello));
+
+    let bad_hello = ClientMsg::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        client_nonce: [1u8; 32],
+        client_name: "a".repeat(MAX_CLIENT_NAME_BYTES + 1),
+    };
+    let mut w_bad = Writer::new();
+    bad_hello.encode(&mut w_bad);
+    assert!(matches!(ClientMsg::decode(msg_type::HELLO, w_bad.as_slice()), Err(WireError::LimitExceeded { .. })));
 }
 
 #[test]

@@ -108,6 +108,7 @@ interface PendingRpc {
 }
 
 interface AttachedStream {
+  readonly hasRawOutput: boolean
   onMessage(msg: BrokerMsg): void
   onClosed(reason: string): void
 }
@@ -413,6 +414,10 @@ export class TerminalClient {
         if (msg.kind === 'streamClosed') {
           this.streams.delete(streamId)
           this.rejectPendingForStream(streamId, new DisconnectedError(msg.reason))
+        } else if (msg.kind === 'exited' && !st.hasRawOutput) {
+          this.streams.delete(streamId)
+          const reason = msg.signal ?? (msg.exitCode !== null ? `exited (${msg.exitCode})` : 'session ended')
+          this.rejectPendingForStream(streamId, new DisconnectedError(reason))
         }
       }
       return
@@ -544,7 +549,7 @@ export class TerminalClient {
       visible,
       this.nowMs,
     )
-    this.streams.set(streamId, source.handler())
+    this.streams.set(streamId, source.handler((flags & SubFlags.RAW_OUTPUT) !== 0))
 
     try {
       const reply = await this.request(CONTROL_STREAM_ID, {
@@ -622,24 +627,30 @@ export class BrokerSessionSource implements TerminalSource {
     return { maxFrames: desiredFrames, maxBytes: this.maxBytes }
   }
 
-  private markClosed(reason: string): void {
-    if (this.disposed) return
+  private disposeLocal(): SourceSink[] {
+    if (this.disposed) return []
     this.disposed = true
     const currentSinks = [...this.sinks]
     this.sinks.clear()
     this.manualAckSinks.clear()
     this.bufferedFrames.length = 0
+    return currentSinks
+  }
+
+  private markClosed(reason: string): void {
+    const currentSinks = this.disposeLocal()
     for (const sink of currentSinks) sink.onEvent?.({ kind: 'streamClosed', reason })
   }
 
-  handler(): AttachedStream {
+  handler(hasRawOutput: boolean): AttachedStream {
     return {
-      onMessage: (msg) => this.handleStreamMessage(msg),
+      hasRawOutput,
+      onMessage: (msg) => this.handleStreamMessage(msg, hasRawOutput),
       onClosed: (reason) => this.markClosed(reason),
     }
   }
 
-  private handleStreamMessage(msg: BrokerMsg): void {
+  private handleStreamMessage(msg: BrokerMsg, hasRawOutput: boolean): void {
     switch (msg.kind) {
       case 'frame': {
         const now = this.nowMs()
@@ -690,9 +701,16 @@ export class BrokerSessionSource implements TerminalSource {
       case 'commandStarted':
       case 'commandFinished':
       case 'cwdChanged':
-      case 'exited':
         for (const sink of this.sinks) sink.onEvent?.(msg as SessionEvent)
         break
+      case 'exited': {
+        // Without SUB_RAW_OUTPUT, `exited` is the final frame on this stream (no trailing
+        // `streamClosed` follows): dispose locally so subsequent API calls reject cleanly and
+        // sinks/buffers do not leak, without emitting a duplicate synthetic `streamClosed`.
+        const currentSinks = hasRawOutput ? [...this.sinks] : this.disposeLocal()
+        for (const sink of currentSinks) sink.onEvent?.(msg as SessionEvent)
+        break
+      }
       case 'streamClosed':
         this.markClosed(msg.reason)
         break

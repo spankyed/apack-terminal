@@ -47,8 +47,9 @@ use crate::transport_loop::{
     NonBlockErr, advance_write_queue, can_accept_unix_conn, classify_nonblocking_err, write_queue_can_pull,
 };
 use crate::transport_loop::{
-    PendingList, compute_shutdown_deadline, pick_least_loaded_shard, prune_pending_lists_for_conn, reactor_should_exit,
-    reactor_wait_timeout, ready_stalled_stream_ids,
+    PendingList, clamp_reactor_wait, compute_shutdown_deadline, drain_events_bounded, pick_least_loaded_shard,
+    prune_ended_session_frames, prune_pending_lists_for_conn, reactor_should_exit, reactor_wait_timeout,
+    ready_stalled_attachments,
 };
 use crate::{abi_hash_for_features, engine_abi_hash, fill_random, now_unix_ms, read_retry_eintr};
 

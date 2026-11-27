@@ -3,13 +3,13 @@
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use apack_core::flow::OutboundPriority;
 use apack_core::lease::ConnId;
 use apack_core::marks::MarksMode;
-use apack_core::session::SessionMachine;
+use apack_core::session::{SessionMachine, StreamAttachmentId};
 use apack_core::vt::VtEngine;
 use apack_os::image_sources::{Scanner as ImageScanner, Worker as ImageWorker};
 use apack_os::pty::{PtySpawnConfig, spawn_pty};
@@ -212,6 +212,8 @@ impl ShardRunner {
                 compressed_idle: false,
                 paused_by_stream: false,
                 paused_by_raw_flow: false,
+                paused_by_raw_inflight: false,
+                raw_output_inflight: Arc::new(AtomicUsize::new(0)),
                 terminating_since: None,
                 escalated_sigkill: false,
                 view_slot_free: HashSet::new(),
@@ -235,6 +237,7 @@ impl ShardRunner {
         self.emit(ReactorEvent::SendMsg {
             conn,
             stream_id: StreamId::CONTROL,
+            attachment: None,
             req_id,
             priority: OutboundPriority::Control,
             msg: BrokerMsg::Spawned { session: session_id, pid: pid_target },
@@ -326,6 +329,8 @@ impl ShardRunner {
                 compressed_idle: false,
                 paused_by_stream: false,
                 paused_by_raw_flow: false,
+                paused_by_raw_inflight: false,
+                raw_output_inflight: Arc::new(AtomicUsize::new(0)),
                 terminating_since: None,
                 escalated_sigkill: false,
                 view_slot_free: HashSet::new(),
@@ -349,6 +354,7 @@ impl ShardRunner {
         self.emit(ReactorEvent::SendMsg {
             conn,
             stream_id: StreamId::CONTROL,
+            attachment: None,
             req_id,
             priority: OutboundPriority::Control,
             msg: BrokerMsg::Rewound { session: session_id, duration_ms, at_ms: actual_offset_ms },
@@ -408,6 +414,7 @@ impl ShardRunner {
         self.emit(ReactorEvent::SendMsg {
             conn,
             stream_id: StreamId::CONTROL,
+            attachment: None,
             req_id,
             priority: OutboundPriority::Control,
             msg: BrokerMsg::Sought { at_ms: actual_offset_ms },
@@ -464,18 +471,21 @@ impl ShardRunner {
         self.emit(ReactorEvent::SendMsg {
             conn,
             stream_id: StreamId::CONTROL,
+            attachment: None,
             req_id,
             priority: OutboundPriority::Control,
             msg: BrokerMsg::OwnsReply { owned },
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn handle_attach(
         &mut self,
         session_id: SessionId,
         conn: ConnId,
         req_id: RequestId,
         stream_id: NonZeroStreamId,
+        attachment_id: StreamAttachmentId,
         flags: SubFlags,
         initial_viewport: Option<ViewportHint>,
     ) {
@@ -485,12 +495,12 @@ impl ShardRunner {
                 self.send_no_such_session(conn, req_id);
                 return;
             };
-            sess.machine.attach_stream((conn, stream_id), flags, initial_viewport, &mut effects);
+            sess.machine.attach_stream((conn, stream_id), attachment_id, flags, initial_viewport, &mut effects);
             if flags.contains(SubFlags::VIEW) {
-                sess.view_slot_free.insert((conn, stream_id));
+                sess.view_slot_free.insert(attachment_id);
             }
             if flags.contains(SubFlags::RAW_OUTPUT) {
-                sess.raw_output_subs.insert((conn, stream_id));
+                sess.raw_output_subs.insert(attachment_id);
             }
             let meta = sess.machine.vt().meta();
             let foreground = match &sess.pty {
@@ -511,6 +521,7 @@ impl ShardRunner {
         self.emit(ReactorEvent::SendMsg {
             conn,
             stream_id: StreamId::CONTROL,
+            attachment: None,
             req_id,
             priority: OutboundPriority::Control,
             msg: reply,

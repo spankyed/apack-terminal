@@ -18,8 +18,9 @@ use apack_proto::BULK_CHUNK_BYTES;
 use apack_proto::messages::{BrokerMsg, FrameUpdate};
 use apack_proto::types::{FrameCredit, RequestId, StreamId};
 
+use crate::session::StreamAttachmentId;
 use crate::time::TimestampMs;
-use crate::{MAX_BDP_FRAME_BYTES, MAX_CONTROL_QUEUE_BYTES, MAX_RAW_OUTPUT_CREDIT, MIN_BDP_FRAME_BYTES};
+use crate::{MAX_BDP_FRAME_BYTES, MAX_RAW_OUTPUT_CREDIT, MIN_BDP_FRAME_BYTES};
 
 /// Error returned when a client violates a flow-control contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,9 +29,83 @@ pub enum FlowError {
     InvalidAckSeq,
 }
 
-/// Error returned when pushing to an [`OutboundQueue`] would exceed its hard byte budget.
+/// Error returned when pushing to an [`OutboundQueue`] or reserving in [`MemoryBudget`] would exceed the hard byte cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueueOverflow;
+
+/// Headroom reserved in [`MemoryBudget`] so `RawOutputFlow::pending_utf8` never starves outbound
+/// framing overhead, `OutputDropped`/`Throttled` notices, or control replies.
+pub const RAW_PENDING_BUDGET_HEADROOM: usize = 262_144;
+
+/// Single per-connection hard byte budget shared by [`OutboundQueue`] tiers and all attached
+/// streams' [`RawOutputFlow`] pending UTF-8 buffers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryBudget {
+    max_bytes: usize,
+    used_bytes: usize,
+}
+
+impl MemoryBudget {
+    /// Creates a new memory budget capped at `max_bytes`.
+    pub const fn new(max_bytes: usize) -> Self {
+        Self { max_bytes, used_bytes: 0 }
+    }
+
+    /// Maximum bytes allowed across all accounted buffers for this connection.
+    pub const fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
+    /// Bytes currently accounted against this budget.
+    pub const fn used_bytes(&self) -> usize {
+        self.used_bytes
+    }
+
+    /// Remaining byte headroom before reaching `max_bytes`.
+    pub const fn remaining_bytes(&self) -> usize {
+        self.max_bytes.saturating_sub(self.used_bytes)
+    }
+
+    /// Remaining headroom usable by `RawOutputFlow::pending_utf8`, preserving a framing/control reserve.
+    pub fn pending_raw_room(&self) -> usize {
+        let reserve = (self.max_bytes / 4).min(RAW_PENDING_BUDGET_HEADROOM);
+        self.remaining_bytes().saturating_sub(reserve)
+    }
+
+    /// Returns `true` if replacing `freed` bytes with `added` bytes stays within `max_bytes`.
+    pub const fn can_replace(&self, freed: usize, added: usize) -> bool {
+        match self.used_bytes.saturating_sub(freed).checked_add(added) {
+            Some(next) => next <= self.max_bytes,
+            None => false,
+        }
+    }
+
+    /// Charges `delta` additional bytes, returning `Err(QueueOverflow)` if it would exceed `max_bytes`.
+    pub fn reserve(&mut self, delta: usize) -> Result<(), QueueOverflow> {
+        let next = self.used_bytes.checked_add(delta).ok_or(QueueOverflow)?;
+        if next > self.max_bytes {
+            return Err(QueueOverflow);
+        }
+        self.used_bytes = next;
+        Ok(())
+    }
+
+    /// Atomically replaces `freed` previously charged bytes with `added` bytes.
+    pub fn replace(&mut self, freed: usize, added: usize) -> Result<(), QueueOverflow> {
+        let next = self.used_bytes.saturating_sub(freed).checked_add(added).ok_or(QueueOverflow)?;
+        if next > self.max_bytes {
+            return Err(QueueOverflow);
+        }
+        self.used_bytes = next;
+        Ok(())
+    }
+
+    /// Releases `delta` previously charged bytes.
+    pub fn release(&mut self, delta: usize) {
+        debug_assert!(self.used_bytes >= delta);
+        self.used_bytes = self.used_bytes.saturating_sub(delta);
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct InFlightFrame {
@@ -227,15 +302,29 @@ impl RawOutputFlow {
         self.total_throttled_us
     }
 
+    /// Bytes currently buffered in `pending_utf8` and charged to the connection's [`MemoryBudget`].
+    pub fn pending_bytes(&self) -> usize {
+        self.pending_utf8.len()
+    }
+
+    /// Releases all buffered `pending_utf8` bytes back to `budget` (called on detach/close).
+    pub fn clear_pending(&mut self, budget: &mut MemoryBudget) {
+        let len = self.pending_utf8.len();
+        if len != 0 {
+            self.pending_utf8.clear();
+            budget.release(len);
+        }
+    }
+
     /// Replenishes byte credit (paying down any `0..=3` UTF-8 boundary debt first) and drains buffered output.
-    pub fn grant_credit(&mut self, bytes: u32, now: TimestampMs) -> RawOutputDelta {
+    pub fn grant_credit(&mut self, bytes: u32, now: TimestampMs, budget: &mut MemoryBudget) -> RawOutputDelta {
         let paid = bytes.min(u32::from(self.credit_debt));
         self.credit_debt -= paid as u8;
         let rem = bytes - paid;
         self.credit_bytes = self.credit_bytes.saturating_add(rem).min(MAX_RAW_OUTPUT_CREDIT);
 
         let mut delta = RawOutputDelta::default();
-        self.drain_pending_chunks(&mut delta.emit_chunks);
+        self.drain_pending_chunks(&mut delta.emit_chunks, budget);
         if self.credit_bytes > 0
             && self.pending_utf8.is_empty()
             && let Some(since) = self.throttled_since.take()
@@ -248,8 +337,9 @@ impl RawOutputFlow {
         delta
     }
 
-    /// Ingests raw PTY bytes, preserving split UTF-8 sequences and enforcing credit/backpressure.
-    pub fn ingest(&mut self, raw: &[u8], now: TimestampMs) -> RawOutputDelta {
+    /// Ingests raw PTY bytes, preserving split UTF-8 sequences and enforcing both per-stream
+    /// credit/backpressure and the shared per-connection [`MemoryBudget`].
+    pub fn ingest(&mut self, raw: &[u8], now: TimestampMs, budget: &mut MemoryBudget) -> RawOutputDelta {
         let mut delta = RawOutputDelta::default();
         if raw.is_empty() {
             delta.pty_paused = self.is_pty_paused();
@@ -279,9 +369,13 @@ impl RawOutputFlow {
                 }
             }
             let rest = &decoded[offset..];
-            let room = self.max_pending_bytes.saturating_sub(self.pending_utf8.len());
+            let stream_room = self.max_pending_bytes.saturating_sub(self.pending_utf8.len());
+            let room = stream_room.min(budget.pending_raw_room().saturating_sub(offset));
             let keep = floor_char_boundary(rest, room);
-            self.pending_utf8.extend_from_slice(&rest.as_bytes()[..keep]);
+            if keep != 0 {
+                self.pending_utf8.extend_from_slice(&rest.as_bytes()[..keep]);
+                budget.reserve(keep).expect("keep <= budget.pending_raw_room() <= budget.remaining_bytes()");
+            }
             delta.dropped_bytes = (rest.len() - keep) as u64;
             if (!self.pending_utf8.is_empty() || self.credit_bytes == 0) && self.throttled_since.is_none() {
                 self.throttled_since = Some(now);
@@ -299,12 +393,13 @@ impl RawOutputFlow {
         delta
     }
 
-    fn drain_pending_chunks(&mut self, out: &mut Vec<String>) {
+    fn drain_pending_chunks(&mut self, out: &mut Vec<String>, budget: &mut MemoryBudget) {
         while !self.pending_utf8.is_empty() && self.credit_bytes > 0 {
             let text = core::str::from_utf8(&self.pending_utf8).expect("pending_utf8 always holds valid UTF-8");
             let take = take_chunk_len(&mut self.credit_bytes, &mut self.credit_debt, self.max_chunk_bytes, text).get();
             out.push(String::from(&text[..take]));
             self.pending_utf8.drain(..take);
+            budget.release(take);
         }
     }
 
@@ -391,6 +486,8 @@ pub enum OutboundPriority {
 pub struct QueuedMessage {
     /// Target stream (`StreamId::CONTROL` or attached session stream).
     pub stream_id: StreamId,
+    /// Monotonic attachment ID for Priority 1 view frames (`None` for ordered messages).
+    pub attachment_id: Option<StreamAttachmentId>,
     /// Request correlation ID (`RequestId::PUSH` for unsolicited pushes).
     pub req_id: RequestId,
     /// Message to send.
@@ -431,6 +528,10 @@ impl WfqQueues {
         None
     }
 
+    fn contains_stream(&self, sid: StreamId) -> bool {
+        self.by_stream.contains_key(&sid)
+    }
+
     fn remove_stream(&mut self, sid: StreamId) -> usize {
         let mut freed = 0usize;
         if let Some(q) = self.by_stream.remove(&sid) {
@@ -443,10 +544,9 @@ impl WfqQueues {
     }
 }
 
-/// Class C: 5-tier strict-priority + WFQ outbound queue enforcing a hard total byte cap per connection.
-#[derive(Debug)]
+/// Class C: 5-tier strict-priority + WFQ outbound queue enforcing a shared per-connection [`MemoryBudget`].
+#[derive(Debug, Default)]
 pub struct OutboundQueue {
-    max_total_bytes: usize,
     ordered_bytes: usize,
     frame_bytes: usize,
     p0_control: VecDeque<QueuedMessage>,
@@ -457,26 +557,10 @@ pub struct OutboundQueue {
     p4_raw: WfqQueues,
 }
 
-impl Default for OutboundQueue {
-    fn default() -> Self {
-        Self::new(MAX_CONTROL_QUEUE_BYTES)
-    }
-}
-
 impl OutboundQueue {
-    /// Creates an outbound queue capped at `max_total_bytes` across ordered and frame tiers.
-    pub fn new(max_total_bytes: usize) -> Self {
-        Self {
-            max_total_bytes,
-            ordered_bytes: 0,
-            frame_bytes: 0,
-            p0_control: VecDeque::new(),
-            p1_frame_order: VecDeque::new(),
-            p1_frames: BTreeMap::new(),
-            p2_events: VecDeque::new(),
-            p3_bulk: WfqQueues::default(),
-            p4_raw: WfqQueues::default(),
-        }
+    /// Creates an empty outbound queue whose bytes are accounted against the connection's [`MemoryBudget`].
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Returns bytes currently buffered across all non-conflatable ordered tiers.
@@ -504,6 +588,15 @@ impl OutboundQueue {
         self.p1_frames.contains_key(&stream_id)
     }
 
+    /// Returns `true` if any tier currently holds a queued message for `stream_id`.
+    pub fn has_stream_messages(&self, stream_id: StreamId) -> bool {
+        self.p1_frames.contains_key(&stream_id)
+            || self.p0_control.iter().any(|m| m.stream_id == stream_id)
+            || self.p2_events.iter().any(|m| m.stream_id == stream_id)
+            || self.p3_bulk.contains_stream(stream_id)
+            || self.p4_raw.contains_stream(stream_id)
+    }
+
     /// Returns `true` when no messages are queued in any tier.
     pub fn is_empty(&self) -> bool {
         self.p0_control.is_empty()
@@ -513,33 +606,38 @@ impl OutboundQueue {
             && self.p4_raw.by_stream.is_empty()
     }
 
-    /// Returns `true` if inserting/replacing a frame of `encoded_bytes` on `stream_id` fits in the budget.
-    pub fn can_fit_frame(&self, stream_id: StreamId, encoded_bytes: usize) -> bool {
+    /// Returns `true` if inserting/replacing a frame of `encoded_bytes` on `stream_id` fits in `budget`.
+    pub fn can_fit_frame(&self, stream_id: StreamId, encoded_bytes: usize, budget: &MemoryBudget) -> bool {
         let prev_bytes = self.p1_frames.get(&stream_id).map_or(0, |m| m.encoded_bytes);
-        (self.total_bytes() - prev_bytes).checked_add(encoded_bytes).is_some_and(|n| n <= self.max_total_bytes)
+        budget.can_replace(prev_bytes, encoded_bytes)
     }
 
-    /// Enqueues a Priority 1 view frame for `stream_id`, enforcing the total per-connection byte cap.
+    /// Enqueues a Priority 1 view frame for `stream_id`, enforcing the connection's [`MemoryBudget`].
     pub fn push_frame(
         &mut self,
         stream_id: StreamId,
+        attachment_id: StreamAttachmentId,
         frame: Box<FrameUpdate>,
         encoded_bytes: usize,
+        budget: &mut MemoryBudget,
     ) -> Result<(), QueueOverflow> {
         let prev_bytes = self.p1_frames.get(&stream_id).map_or(0, |m| m.encoded_bytes);
-        let next_total = (self.total_bytes() - prev_bytes).checked_add(encoded_bytes).ok_or(QueueOverflow)?;
-        if next_total > self.max_total_bytes {
-            return Err(QueueOverflow);
-        }
+        budget.replace(prev_bytes, encoded_bytes)?;
         self.frame_bytes = self.frame_bytes - prev_bytes + encoded_bytes;
-        let item = QueuedMessage { stream_id, req_id: RequestId::PUSH, msg: BrokerMsg::Frame(frame), encoded_bytes };
+        let item = QueuedMessage {
+            stream_id,
+            attachment_id: Some(attachment_id),
+            req_id: RequestId::PUSH,
+            msg: BrokerMsg::Frame(frame),
+            encoded_bytes,
+        };
         if self.p1_frames.insert(stream_id, item).is_none() {
             self.p1_frame_order.push_back(stream_id);
         }
         Ok(())
     }
 
-    /// Enqueues a non-conflatable ordered message, returning [`QueueOverflow`] if the hard byte cap would be exceeded.
+    /// Enqueues a non-conflatable ordered message, returning [`QueueOverflow`] if `budget` would be exceeded.
     pub fn push_ordered(
         &mut self,
         priority: OutboundPriority,
@@ -547,13 +645,11 @@ impl OutboundQueue {
         req_id: RequestId,
         msg: BrokerMsg,
         encoded_bytes: usize,
+        budget: &mut MemoryBudget,
     ) -> Result<(), QueueOverflow> {
-        let next_total = self.total_bytes().checked_add(encoded_bytes).ok_or(QueueOverflow)?;
-        if next_total > self.max_total_bytes {
-            return Err(QueueOverflow);
-        }
+        budget.reserve(encoded_bytes)?;
         self.ordered_bytes += encoded_bytes;
-        let item = QueuedMessage { stream_id, req_id, msg, encoded_bytes };
+        let item = QueuedMessage { stream_id, attachment_id: None, req_id, msg, encoded_bytes };
         match priority {
             OutboundPriority::Control => self.p0_control.push_back(item),
             OutboundPriority::Event => self.p2_events.push_back(item),
@@ -564,43 +660,49 @@ impl OutboundQueue {
     }
 
     /// Pops the next message in strict priority order: `Control > Frame > Event > Bulk (WFQ) > RawOutput (WFQ)`.
-    pub fn pop_next(&mut self) -> Option<QueuedMessage> {
+    pub fn pop_next(&mut self, budget: &mut MemoryBudget) -> Option<QueuedMessage> {
         if let Some(item) = self.p0_control.pop_front() {
             self.ordered_bytes -= item.encoded_bytes;
+            budget.release(item.encoded_bytes);
             return Some(item);
         }
         while let Some(sid) = self.p1_frame_order.pop_front() {
             if let Some(item) = self.p1_frames.remove(&sid) {
                 self.frame_bytes -= item.encoded_bytes;
+                budget.release(item.encoded_bytes);
                 return Some(item);
             }
         }
         if let Some(item) = self.p2_events.pop_front() {
             self.ordered_bytes -= item.encoded_bytes;
+            budget.release(item.encoded_bytes);
             return Some(item);
         }
         if let Some(item) = self.p3_bulk.pop() {
             self.ordered_bytes -= item.encoded_bytes;
+            budget.release(item.encoded_bytes);
             return Some(item);
         }
         if let Some(item) = self.p4_raw.pop() {
             self.ordered_bytes -= item.encoded_bytes;
+            budget.release(item.encoded_bytes);
             return Some(item);
         }
         None
     }
 
     /// Removes only pending Priority 1 frames for `stream_id` (preserving queued `Exited` / final `Output`).
-    pub fn remove_stream_frames(&mut self, stream_id: StreamId) {
+    pub fn remove_stream_frames(&mut self, stream_id: StreamId, budget: &mut MemoryBudget) {
         if let Some(item) = self.p1_frames.remove(&stream_id) {
             self.frame_bytes -= item.encoded_bytes;
+            budget.release(item.encoded_bytes);
             self.p1_frame_order.retain(|s| *s != stream_id);
         }
     }
 
     /// Removes all pending frames, events, bulk chunks, and raw output queued for a detached stream.
-    pub fn remove_stream(&mut self, stream_id: StreamId) {
-        self.remove_stream_frames(stream_id);
+    pub fn remove_stream(&mut self, stream_id: StreamId, budget: &mut MemoryBudget) {
+        self.remove_stream_frames(stream_id, budget);
         let mut freed = 0usize;
         self.p2_events.retain(|item| {
             if item.stream_id == stream_id {
@@ -613,5 +715,6 @@ impl OutboundQueue {
         freed += self.p3_bulk.remove_stream(stream_id);
         freed += self.p4_raw.remove_stream(stream_id);
         self.ordered_bytes -= freed;
+        budget.release(freed);
     }
 }

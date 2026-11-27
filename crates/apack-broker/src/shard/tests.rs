@@ -54,6 +54,8 @@ mod win_shard_tests {
             fg_tx: None,
             fg_worker: None,
             fg_inflight: HashSet::new(),
+            fg_pending: HashMap::new(),
+            raw_output_inflight: Arc::new(AtomicUsize::new(0)),
             sessions: HashMap::new(),
             cond: Arc::clone(&cv),
             total_pty_bytes: 0,
@@ -98,6 +100,8 @@ mod win_shard_tests {
                 compressed_idle: false,
                 paused_by_stream: paused,
                 paused_by_raw_flow: false,
+                paused_by_raw_inflight: false,
+                raw_output_inflight: Arc::new(AtomicUsize::new(0)),
                 terminating_since: None,
                 escalated_sigkill: false,
                 view_slot_free: HashSet::new(),
@@ -233,6 +237,8 @@ mod image_source_shard_tests {
             fg_tx: None,
             fg_worker: None,
             fg_inflight: HashSet::new(),
+            fg_pending: HashMap::new(),
+            raw_output_inflight: Arc::new(AtomicUsize::new(0)),
             sessions: HashMap::new(),
             #[cfg(unix)]
             poller,
@@ -285,6 +291,8 @@ mod image_source_shard_tests {
                 compressed_idle: false,
                 paused_by_stream: false,
                 paused_by_raw_flow: false,
+                paused_by_raw_inflight: false,
+                raw_output_inflight: Arc::new(AtomicUsize::new(0)),
                 terminating_since: None,
                 escalated_sigkill: false,
                 view_slot_free: HashSet::new(),
@@ -557,5 +565,191 @@ mod image_source_shard_tests {
             runner.sessions.get_mut(&sid3).unwrap().pty = None;
             let _ = spawned.child.wait();
         }
+    }
+
+    #[test]
+    fn shard_fg_inflight_gating_attachment_isolation_and_raw_inflight_backpressure() {
+        let (mut runner, rrx) = make_test_runner();
+        let sid = SessionId::new(10).unwrap();
+        insert_image_session(&mut runner, sid, false);
+
+        // 1. fg_inflight single-flight gating + 1-slot coalescing (`L7`):
+        let (fg_tx, fg_rx) = mpsc::sync_channel::<FgVerifyReq>(4);
+        runner.fg_tx = Some(fg_tx);
+        for i in 1..=10u64 {
+            runner.dispatch_verify_foreground(sid, format!("slot-{i}"), i, format!("app-{i}"));
+        }
+        // Only the 1st request enters fg_tx; the 10th coalesces into fg_pending!
+        let first = fg_rx.try_recv().expect("first fg verify queued");
+        assert_eq!(first.id, "slot-1");
+        assert_eq!(first.changed, 1);
+        assert!(fg_rx.try_recv().is_err(), "fg_inflight must prevent flooding fg_tx");
+        assert!(runner.fg_inflight.contains(&sid));
+
+        // Completing slot-1 clears fg_inflight and immediately dispatches coalesced slot-10!
+        runner.handle_cmd(ShardCmd::ForegroundVerified {
+            session_id: sid,
+            id: first.id,
+            changed: first.changed,
+            confirmed: Confirmed::Unknown,
+        });
+        let second = fg_rx.try_recv().expect("coalesced slot-10 dispatched");
+        assert_eq!(second.id, "slot-10");
+        assert_eq!(second.changed, 10);
+        assert!(fg_rx.try_recv().is_err());
+
+        // Completing slot-10 leaves fg_inflight empty.
+        runner.handle_cmd(ShardCmd::ForegroundVerified {
+            session_id: sid,
+            id: second.id,
+            changed: second.changed,
+            confirmed: Confirmed::Unknown,
+        });
+        assert!(!runner.fg_inflight.contains(&sid));
+
+        // 2. Stale StreamAttachmentId on Detach / ViewSlotFree / StreamMsg cannot affect newer attachment (`B2`):
+        let conn = ConnId::new(1).unwrap();
+        let st = apack_proto::types::NonZeroStreamId::new(1).unwrap();
+        let a1 = StreamAttachmentId::new(1).unwrap();
+        let a2 = StreamAttachmentId::new(2).unwrap();
+        runner.handle_cmd(ShardCmd::Attach {
+            session_id: sid,
+            conn,
+            req_id: RequestId::from_raw(1),
+            stream_id: st,
+            attachment_id: a1,
+            flags: apack_proto::types::SubFlags::from_bits(
+                apack_proto::types::SubFlags::VIEW | apack_proto::types::SubFlags::RAW_OUTPUT,
+            )
+            .unwrap(),
+            initial_viewport: None,
+        });
+        // Re-attach same (conn, st) with a2 (simulating Detach + Re-Attach on same session)
+        runner.handle_cmd(ShardCmd::Attach {
+            session_id: sid,
+            conn,
+            req_id: RequestId::from_raw(2),
+            stream_id: st,
+            attachment_id: a2,
+            flags: apack_proto::types::SubFlags::from_bits(
+                apack_proto::types::SubFlags::VIEW | apack_proto::types::SubFlags::RAW_OUTPUT,
+            )
+            .unwrap(),
+            initial_viewport: None,
+        });
+        // Consume a2's initial view slot, then send stale ViewSlotFree(a1) and stale Detach(a1)
+        runner.sessions.get_mut(&sid).unwrap().view_slot_free.remove(&a2);
+        runner.handle_cmd(ShardCmd::ViewSlotFree { session_id: sid, conn, stream_id: st, attachment_id: a1 });
+        assert!(!runner.sessions[&sid].view_slot_free.contains(&a1));
+        assert!(!runner.sessions[&sid].view_slot_free.contains(&a2));
+        runner.handle_cmd(ShardCmd::Detach { session_id: sid, conn, stream_id: st, attachment_id: a1 });
+        assert_eq!(runner.sessions[&sid].machine.attachment_of((conn, st)), Some(a2));
+
+        // Matching ViewSlotFree(a2) re-arms a2!
+        runner.handle_cmd(ShardCmd::ViewSlotFree { session_id: sid, conn, stream_id: st, attachment_id: a2 });
+        assert!(runner.sessions[&sid].view_slot_free.contains(&a2));
+
+        // 3. PublishRawOutput in-flight backpressure pauses PTY at high-water and resumes via RawOutputDrained / Tier 2 (`H6`):
+        while rrx.try_recv().is_ok() {}
+        // Small chunk below high-water must NOT pause PTY!
+        runner.ingest_pty_bytes(sid, b"small");
+        assert!(!runner.sessions[&sid].paused_by_raw_inflight, "small chunk must not pause PTY");
+        while let Ok(ev) = rrx.try_recv() {
+            if let ReactorEvent::PublishRawOutput { bytes, session_inflight, shard_inflight, .. } = ev {
+                session_inflight.fetch_sub(bytes.len(), Ordering::AcqRel);
+                shard_inflight.fetch_sub(bytes.len(), Ordering::AcqRel);
+            }
+        }
+        // High-water chunk during termination must NOT pause PTY (prevents ttydrain deadlock)!
+        runner.sessions.get_mut(&sid).unwrap().terminating_since = Some(Instant::now());
+        let big_chunk = vec![b'X'; protocol::RAW_OUTPUT_SESSION_HIGH_WATER];
+        runner.ingest_pty_bytes(sid, &big_chunk);
+        assert!(!runner.sessions[&sid].paused_by_raw_inflight, "terminating session must not pause PTY");
+        while let Ok(ev) = rrx.try_recv() {
+            if let ReactorEvent::PublishRawOutput { bytes, session_inflight, shard_inflight, .. } = ev {
+                session_inflight.fetch_sub(bytes.len(), Ordering::AcqRel);
+                shard_inflight.fetch_sub(bytes.len(), Ordering::AcqRel);
+            }
+        }
+        runner.sessions.get_mut(&sid).unwrap().terminating_since = None;
+
+        // Live session hitting high-water pauses PTY, stays paused under RawOutputDrained & Tier 2 while still >= high-water,
+        // and resumes once counters drop below cap!
+        runner.ingest_pty_bytes(sid, &big_chunk);
+        assert!(runner.sessions[&sid].paused_by_raw_inflight, "must pause PTY at raw high-water");
+        assert!(runner.sessions[&sid].is_pty_paused());
+        runner.handle_cmd(ShardCmd::RawOutputDrained);
+        assert!(runner.sessions[&sid].paused_by_raw_inflight, "must stay paused while inflight >= high-water");
+        runner.run_tier2(TimestampMs::from_millis(5));
+        assert!(runner.sessions[&sid].paused_by_raw_inflight, "Tier 2 must not unpause while inflight >= high-water");
+
+        let mut saw_raw = false;
+        while let Ok(ev) = rrx.try_recv() {
+            if let ReactorEvent::PublishRawOutput { session, bytes, session_inflight, shard_inflight } = ev {
+                assert_eq!(session, sid);
+                assert_eq!(bytes.len(), big_chunk.len());
+                session_inflight.fetch_sub(bytes.len(), Ordering::AcqRel);
+                shard_inflight.fetch_sub(bytes.len(), Ordering::AcqRel);
+                saw_raw = true;
+            }
+        }
+        assert!(saw_raw);
+        runner.handle_cmd(ShardCmd::RawOutputDrained);
+        assert!(!runner.sessions[&sid].paused_by_raw_inflight, "RawOutputDrained must unpause PTY");
+
+        // Also verify Tier 2 safety net unpauses if counter dropped below cap.
+        runner.sessions.get_mut(&sid).unwrap().paused_by_raw_inflight = true;
+        runner.run_tier2(TimestampMs::from_millis(10));
+        assert!(!runner.sessions[&sid].paused_by_raw_inflight, "Tier 2 must unpause drained raw inflight");
+    }
+
+    #[test]
+    fn exit_flush_forces_full_sync_when_view_slot_inflight_while_live_respects_slot() {
+        use apack_proto::types::{NonZeroStreamId, SubFlags};
+
+        let (mut runner, rrx) = make_test_runner();
+        let sid = SessionId::new(100).unwrap();
+        let conn = ConnId::new(1).unwrap();
+        let stream_id = NonZeroStreamId::new(1).unwrap();
+        let att = StreamAttachmentId::new(77).unwrap();
+        insert_image_session(&mut runner, sid, false);
+        runner.handle_cmd(ShardCmd::Attach {
+            session_id: sid,
+            conn,
+            req_id: RequestId::from_raw(1),
+            stream_id,
+            attachment_id: att,
+            flags: SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(),
+            initial_viewport: None,
+        });
+        // Drain initial Attached + Frame(seq=1); `view_slot_free` is now EMPTY (simulating in-flight token).
+        let mut init_frames = 0usize;
+        while let Ok(ev) = rrx.try_recv() {
+            if matches!(ev, ReactorEvent::PublishFrame { .. }) {
+                init_frames += 1;
+            }
+        }
+        assert_eq!(init_frames, 1);
+        assert!(!runner.sessions[&sid].view_slot_free.contains(&att));
+
+        // While live, new PTY output must NOT bypass `view_slot_free` (no duplicate in-flight frame).
+        runner.ingest_pty_bytes(sid, b"LIVE_HELD\r\n");
+        let live_frames: Vec<_> = std::iter::from_fn(|| rrx.try_recv().ok())
+            .filter(|e| matches!(e, ReactorEvent::PublishFrame { .. }))
+            .collect();
+        assert!(live_frames.is_empty(), "live session must respect view_slot_free");
+
+        // On exit, final dirty view MUST flush strictly BEFORE Exited as a self-contained full_sync=true frame!
+        runner.ingest_pty_bytes(sid, b"\x1b[?2026hEXIT_FINAL\r\n");
+        runner.finish_and_remove_session(sid, Some(0), None);
+        let events: Vec<_> = std::iter::from_fn(|| rrx.try_recv().ok()).collect();
+        let frame_pos = events
+            .iter()
+            .position(|e| matches!(e, ReactorEvent::PublishFrame { frame, .. } if frame.full_sync && frame.rows.iter().any(|r| r.text.contains("EXIT_FINAL"))));
+        let exit_pos =
+            events.iter().position(|e| matches!(e, ReactorEvent::SendMsg { msg: BrokerMsg::Exited { .. }, .. }));
+        assert!(frame_pos.is_some(), "expected full_sync final frame containing EXIT_FINAL");
+        assert!(exit_pos.is_some(), "expected Exited message");
+        assert!(frame_pos.unwrap() < exit_pos.unwrap(), "final frame must precede Exited");
     }
 }

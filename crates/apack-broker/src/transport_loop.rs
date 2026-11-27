@@ -15,11 +15,11 @@ use std::io;
 use std::io::{IoSlice, Read};
 #[cfg(windows)]
 use std::sync::Condvar;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use apack_core::broker::{BrokerAction, BrokerCore, CloseReason, ShardTelemetry};
+use apack_core::broker::{BrokerAction, BrokerCore, CloseReason, ShardTelemetry, StreamAttachmentId};
 use apack_core::flow::OutboundPriority;
 use apack_core::lease::ConnId;
 use apack_core::time::TimestampMs;
@@ -31,7 +31,7 @@ use apack_os::transport::{
     write_vectored_some,
 };
 use apack_proto::messages::{BrokerMsg, FrameUpdate, SessionSummary};
-use apack_proto::types::{NonZeroStreamId, RequestId, SessionId, StreamId};
+use apack_proto::types::{ErrorCode, NonZeroStreamId, RequestId, SessionId, StreamId};
 use apack_vt_ghostty::ImageStore;
 use interprocess::local_socket::Listener;
 #[cfg(unix)]
@@ -42,7 +42,9 @@ use interprocess::local_socket::traits::Listener as _;
 use crate::config::BrokerConfig;
 #[cfg(unix)]
 use crate::fill_random;
-use crate::shard::{ReactorEvent, ShardCmd, ShardHandle, ShardShared, spawn_shard};
+use crate::shard::{
+    ReactorEvent, ShardCmd, ShardCmdPermit, ShardHandle, ShardShared, should_notify_raw_drained, spawn_shard,
+};
 #[cfg(windows)]
 use crate::transport_windows::{
     DrainingWinConn, MAX_WIN_EVENTS_PER_TURN, WIN_EVENT_CHANNEL_CAP, WinConnHandle, WinTransportEvent, clamp_win_wait,
@@ -52,6 +54,12 @@ use crate::{engine_abi_hash, now_unix_ms};
 
 /// Hard cap on simultaneous client connections accepted by the broker.
 pub(crate) const MAX_CONNECTIONS: usize = 1024;
+
+/// Maximum shard events drained from `reactor_rx` per reactor turn before servicing sockets & timers.
+pub(crate) const MAX_SHARD_EVENTS_PER_TURN: usize = 256;
+
+/// Maximum client-initiated commands one connection may have queued/executing in shard mailboxes at once.
+pub(crate) const MAX_INFLIGHT_SHARD_CMDS_PER_CONN: usize = 1_024;
 
 /// Maximum wall-clock duration a closing connection may remain in the non-blocking tail drain
 /// set while flushing final replies before being forcibly closed.
@@ -188,12 +196,43 @@ pub(crate) fn prune_pending_lists_for_conn(pending_lists: &mut HashMap<u64, Pend
     pending_lists.retain(|_, pending| pending.conn != conn);
 }
 
-/// Selects stalled view streams whose outbound queue slot is currently free.
-pub(crate) fn ready_stalled_stream_ids(
-    stalled: &HashMap<NonZeroStreamId, (SessionId, Box<FrameUpdate>)>,
-    queued: &HashMap<NonZeroStreamId, SessionId>,
-) -> Vec<NonZeroStreamId> {
-    stalled.keys().copied().filter(|sid| !queued.contains_key(sid)).collect()
+/// Drains up to `limit` queued events from `rx`, returning `true` when the cap was hit so the
+/// caller clamps the next poll/condvar wait to `Duration::ZERO` without starving sockets or timers.
+pub(crate) fn drain_events_bounded<T>(rx: &mpsc::Receiver<T>, limit: usize, mut handle: impl FnMut(T)) -> bool {
+    let mut count = 0usize;
+    while count < limit {
+        match rx.try_recv() {
+            Ok(ev) => {
+                handle(ev);
+                count += 1;
+            }
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+/// Clamps the reactor poll wait to `Duration::ZERO` when a bounded channel drain hit its per-turn cap.
+pub(crate) fn clamp_reactor_wait(wait_for: Duration, hit_cap: bool) -> Duration {
+    if hit_cap { Duration::ZERO } else { wait_for }
+}
+
+/// Removes any stalled or queued view frames belonging to `ended_session` from a connection.
+pub(crate) fn prune_ended_session_frames(
+    stalled: &mut HashMap<StreamAttachmentId, (NonZeroStreamId, SessionId, Box<FrameUpdate>)>,
+    queued: &mut HashMap<StreamAttachmentId, (NonZeroStreamId, SessionId)>,
+    ended_session: SessionId,
+) {
+    stalled.retain(|_, (_, sid, _)| *sid != ended_session);
+    queued.retain(|_, (_, sid)| *sid != ended_session);
+}
+
+/// Selects stalled view attachments whose outbound queue slot is currently free.
+pub(crate) fn ready_stalled_attachments(
+    stalled: &HashMap<StreamAttachmentId, (NonZeroStreamId, SessionId, Box<FrameUpdate>)>,
+    queued: &HashMap<StreamAttachmentId, (NonZeroStreamId, SessionId)>,
+) -> Vec<StreamAttachmentId> {
+    stalled.keys().copied().filter(|att| !queued.contains_key(att)).collect()
 }
 
 /// In-flight `ListSessions` aggregation across all $K$ shards keyed by broker-allocated `list_id`.
@@ -238,8 +277,8 @@ fn drain_unix_queue_nonblocking(stream: &mut Stream, queue: &mut VecDeque<(Vec<u
     }
 }
 
-/// Per-connection stalled view frames awaiting `FramePacer` credit or outbound queue clearance
-/// (at most 1 frame per stream — guarantees zero lost differential frames!).
+/// Per-connection transport state, stalled view frames (keyed by [`StreamAttachmentId`]),
+/// and bounded in-flight shard mailbox command counter.
 pub(crate) struct ConnState {
     #[cfg(unix)]
     stream: Stream,
@@ -251,9 +290,11 @@ pub(crate) struct ConnState {
     write_queue_bytes: usize,
     #[cfg(windows)]
     pub(crate) win: WinConnHandle,
-    pub(crate) stalled_frames: HashMap<NonZeroStreamId, (SessionId, Box<FrameUpdate>)>,
-    /// Set of `(stream_id, session_id)` whose view frame is currently queued in `BrokerCore::outbound`.
-    pub(crate) queued_frame_streams: HashMap<NonZeroStreamId, SessionId>,
+    pub(crate) stalled_frames: HashMap<StreamAttachmentId, (NonZeroStreamId, SessionId, Box<FrameUpdate>)>,
+    /// Set of active view attachments whose frame is currently queued in `BrokerCore::outbound`.
+    pub(crate) queued_frame_streams: HashMap<StreamAttachmentId, (NonZeroStreamId, SessionId)>,
+    /// Number of client-initiated commands from this connection currently queued/executing in shards.
+    pub(crate) inflight_shard_cmds: Arc<AtomicUsize>,
 }
 
 /// Cross-thread wakeup handle for the Control Reactor (used by shards and external shutdown).
@@ -387,10 +428,10 @@ pub(crate) fn run_control_reactor(
             state.begin_shutdown();
         }
 
-        // 1. Drain all shard events first so replies & frames flush promptly.
-        while let Ok(ev) = reactor_rx.try_recv() {
+        // 1. Drain a bounded batch of shard events so floods cannot starve sockets, timers, or shutdown.
+        let hit_shard_event_cap = drain_events_bounded(&reactor_rx, MAX_SHARD_EVENTS_PER_TURN, |ev| {
             state.handle_shard_event(ev);
-        }
+        });
 
         // 2. Drain bounded Windows transport events (if Windows).
         #[cfg(windows)]
@@ -433,6 +474,7 @@ pub(crate) fn run_control_reactor(
             state.start_grace.saturating_sub(state.started_at.elapsed()),
             should_fast_poll(state.shutting_down, state.has_draining_conns()),
         );
+        let wait_for = clamp_reactor_wait(wait_for, hit_shard_event_cap);
         #[cfg(windows)]
         let wait_for = clamp_win_wait(wait_for, hit_win_event_cap);
 
@@ -689,6 +731,7 @@ impl ReactorState {
                             write_queue_bytes: 0,
                             stalled_frames: HashMap::new(),
                             queued_frame_streams: HashMap::new(),
+                            inflight_shard_cmds: Arc::new(AtomicUsize::new(0)),
                         },
                     );
                 }
@@ -764,10 +807,11 @@ impl ReactorState {
                 };
                 let is_frame = matches!(queued.msg, BrokerMsg::Frame(_));
                 let drained_frame = if is_frame
-                    && let Some(nz) = NonZeroStreamId::new(queued.stream_id.raw())
-                    && let Some(session_id) = self.conns.get_mut(&conn).and_then(|c| c.queued_frame_streams.remove(&nz))
+                    && let Some(att) = queued.attachment_id
+                    && let Some((nz, session_id)) =
+                        self.conns.get_mut(&conn).and_then(|c| c.queued_frame_streams.remove(&att))
                 {
-                    Some((nz, session_id))
+                    Some((att, nz, session_id))
                 } else {
                     None
                 };
@@ -780,21 +824,22 @@ impl ReactorState {
                 }
                 // Release the frame slot and retry stalled frames STRICTLY AFTER pushing `encoded`
                 // onto `c.write_queue` so subsequent frames can never overtake this one.
-                if let Some((nz, session_id)) = drained_frame {
-                    self.on_outbound_frame_drained(conn, nz, session_id);
+                if let Some((att, nz, session_id)) = drained_frame {
+                    self.on_outbound_frame_drained(conn, nz, att, session_id);
                 }
                 let ready_stalled = self
                     .conns
                     .get(&conn)
-                    .map(|c| ready_stalled_stream_ids(&c.stalled_frames, &c.queued_frame_streams))
+                    .map(|c| ready_stalled_attachments(&c.stalled_frames, &c.queued_frame_streams))
                     .unwrap_or_default();
-                for stream_id in ready_stalled {
-                    if let Some((sid, frame)) =
-                        self.conns.get_mut(&conn).and_then(|c| c.stalled_frames.remove(&stream_id))
+                for att in ready_stalled {
+                    if let Some((stream_id, sid, frame)) =
+                        self.conns.get_mut(&conn).and_then(|c| c.stalled_frames.remove(&att))
                     {
                         self.try_publish_or_stall_frame(
                             conn,
                             stream_id,
+                            att,
                             sid,
                             frame,
                             TimestampMs::from_millis(now_unix_ms()),
@@ -849,15 +894,18 @@ impl ReactorState {
         &mut self,
         conn: ConnId,
         stream_id: NonZeroStreamId,
+        attachment_id: StreamAttachmentId,
         session_id: SessionId,
     ) {
-        // First retry any stalled frame held on the reactor for this stream.
-        let stalled = self.conns.get_mut(&conn).and_then(|c| c.stalled_frames.remove(&stream_id));
-        if let Some((sid, frame)) = stalled {
+        // First retry any stalled frame held on the reactor for this exact attachment.
+        let stalled = self.conns.get_mut(&conn).and_then(|c| c.stalled_frames.remove(&attachment_id));
+        if let Some((nz, sid, frame)) = stalled {
             let now = TimestampMs::from_millis(now_unix_ms());
-            self.try_publish_or_stall_frame(conn, stream_id, sid, frame, now);
-        } else if let Some(&shard_idx) = self.session_shard.get(&session_id) {
-            self.shards[shard_idx].send(ShardCmd::ViewSlotFree { session_id, conn, stream_id });
+            self.try_publish_or_stall_frame(conn, nz, attachment_id, sid, frame, now);
+        } else if self.core.is_attachment_active(conn, stream_id, attachment_id)
+            && let Some(&shard_idx) = self.session_shard.get(&session_id)
+        {
+            self.shards[shard_idx].send(ShardCmd::ViewSlotFree { session_id, conn, stream_id, attachment_id });
         }
     }
 
@@ -865,28 +913,59 @@ impl ReactorState {
         &mut self,
         conn: ConnId,
         stream_id: NonZeroStreamId,
+        attachment_id: StreamAttachmentId,
         session: SessionId,
         frame: Box<FrameUpdate>,
         now: TimestampMs,
     ) {
-        // Verify `(conn, stream_id)` is still attached to the exact same `session` (prevents
-        // stale cross-session frame injection after Detach + Re-Attach reuse of `stream_id`).
-        if self.core.stream_session(conn, stream_id) != Some(session) {
+        // Verify `(conn, stream_id)` is still bound to the exact `attachment_id`
+        // (globally unique across sessions, eliminating cross-session and same-session stale frames).
+        if !self.core.is_attachment_active(conn, stream_id, attachment_id) {
             return;
         }
         let mut actions = Vec::new();
-        match self.core.try_publish_frame(conn, stream_id, frame, now, &mut actions) {
+        match self.core.try_publish_frame(conn, stream_id, attachment_id, frame, now, &mut actions) {
             Ok(()) => {
                 if let Some(c) = self.conns.get_mut(&conn) {
-                    c.queued_frame_streams.insert(stream_id, session);
+                    c.queued_frame_streams.insert(attachment_id, (stream_id, session));
                 }
                 self.execute_actions(actions, now);
             }
             Err(frame) => {
                 if let Some(c) = self.conns.get_mut(&conn) {
                     // Park this single frame until FrameAck or outbound drain frees space/credit.
-                    c.stalled_frames.insert(stream_id, (session, frame));
+                    c.stalled_frames.insert(attachment_id, (stream_id, session, frame));
                 }
+            }
+        }
+    }
+
+    fn try_acquire_shard_permit(
+        &mut self,
+        conn: ConnId,
+        stream_id: StreamId,
+        req_id: RequestId,
+        now: TimestampMs,
+    ) -> Option<Arc<ShardCmdPermit>> {
+        let counter = self.conns.get(&conn).map(|c| Arc::clone(&c.inflight_shard_cmds))?;
+        match ShardCmdPermit::try_acquire(&counter, MAX_INFLIGHT_SHARD_CMDS_PER_CONN) {
+            Some(permit) => Some(Arc::new(permit)),
+            None => {
+                let mut actions = Vec::new();
+                self.core.enqueue_message(
+                    conn,
+                    stream_id,
+                    req_id,
+                    OutboundPriority::Control,
+                    BrokerMsg::Error {
+                        code: ErrorCode::Busy,
+                        message: String::from("too many in-flight shard commands"),
+                    },
+                    now,
+                    &mut actions,
+                );
+                self.execute_actions(actions, now);
+                None
             }
         }
     }
@@ -923,18 +1002,38 @@ impl ReactorState {
     fn handle_shard_event(&mut self, event: ReactorEvent) {
         let now = TimestampMs::from_millis(now_unix_ms());
         match event {
-            ReactorEvent::SendMsg { conn, stream_id, req_id, priority, msg } => {
+            ReactorEvent::SendMsg { conn, stream_id, attachment, req_id, priority, msg } => {
+                if let Some(att) = attachment {
+                    let Some(nz) = NonZeroStreamId::new(stream_id.raw()) else {
+                        return;
+                    };
+                    if !self.core.is_attachment_active(conn, nz, att) {
+                        return;
+                    }
+                }
                 let mut actions = Vec::new();
                 self.core.enqueue_message(conn, stream_id, req_id, priority, msg, now, &mut actions);
                 self.execute_actions(actions, now);
             }
-            ReactorEvent::PublishFrame { conn, stream_id, session, frame } => {
-                self.try_publish_or_stall_frame(conn, stream_id, session, frame, now);
+            ReactorEvent::PublishFrame { conn, stream_id, attachment_id, session, frame } => {
+                self.try_publish_or_stall_frame(conn, stream_id, attachment_id, session, frame, now);
             }
-            ReactorEvent::PublishRawOutput { session, bytes } => {
+            ReactorEvent::PublishRawOutput { session, bytes, session_inflight, shard_inflight } => {
+                let len = bytes.len();
                 let mut actions = Vec::new();
                 self.core.publish_raw_output(session, &bytes, now, &mut actions);
                 self.execute_actions(actions, now);
+                let prev_sess = session_inflight.fetch_sub(len, Ordering::AcqRel);
+                let prev_shard = shard_inflight.fetch_sub(len, Ordering::AcqRel);
+                if should_notify_raw_drained(
+                    prev_sess,
+                    prev_sess.saturating_sub(len),
+                    prev_shard,
+                    prev_shard.saturating_sub(len),
+                ) && let Some(&shard_idx) = self.session_shard.get(&session)
+                {
+                    self.shards[shard_idx].send(ShardCmd::RawOutputDrained);
+                }
             }
             ReactorEvent::SessionRegistered { session, shard_idx, rewound, kept } => {
                 self.pending_spawns = self.pending_spawns.saturating_sub(1);
@@ -952,6 +1051,9 @@ impl ReactorState {
             ReactorEvent::SessionEnded { session } => {
                 self.session_shard.remove(&session);
                 self.session_kept.remove(&session);
+                for c in self.conns.values_mut() {
+                    prune_ended_session_frames(&mut c.stalled_frames, &mut c.queued_frame_streams, session);
+                }
                 let mut actions = Vec::new();
                 self.core.unregister_session(session, "session ended", now, &mut actions);
                 self.execute_actions(actions, now);
@@ -1039,109 +1141,160 @@ impl ReactorState {
                     self.execute_actions(close_actions, now);
                 }
                 BrokerAction::SpawnSession { conn, req_id, spec } => {
+                    let Some(permit) = self.try_acquire_shard_permit(conn, StreamId::CONTROL, req_id, now) else {
+                        continue;
+                    };
                     let session_id = self.alloc_session_id();
                     let shard_idx = pick_least_loaded_shard(&self.shards);
                     self.pending_spawns = self.pending_spawns.saturating_add(1);
-                    self.shards[shard_idx].send(ShardCmd::Spawn { session_id, conn, req_id, spec });
+                    self.shards[shard_idx]
+                        .send_with_permit(ShardCmd::Spawn { session_id, conn, req_id, spec }, Some(permit));
                 }
                 BrokerAction::KillSession { conn, req_id, session } => {
-                    if let Some(&shard_idx) = self.session_shard.get(&session) {
-                        self.shards[shard_idx].send(ShardCmd::Kill { session_id: session, conn, req_id });
+                    if let Some(&shard_idx) = self.session_shard.get(&session)
+                        && let Some(permit) = self.try_acquire_shard_permit(conn, StreamId::CONTROL, req_id, now)
+                    {
+                        self.shards[shard_idx]
+                            .send_with_permit(ShardCmd::Kill { session_id: session, conn, req_id }, Some(permit));
                     }
                 }
                 BrokerAction::SignalSession { conn, req_id, session, signal, scope } => {
-                    if let Some(&shard_idx) = self.session_shard.get(&session) {
-                        self.shards[shard_idx].send(ShardCmd::Signal {
-                            session_id: session,
-                            conn,
-                            req_id,
-                            signal,
-                            scope,
-                        });
+                    if let Some(&shard_idx) = self.session_shard.get(&session)
+                        && let Some(permit) = self.try_acquire_shard_permit(conn, StreamId::CONTROL, req_id, now)
+                    {
+                        self.shards[shard_idx].send_with_permit(
+                            ShardCmd::Signal { session_id: session, conn, req_id, signal, scope },
+                            Some(permit),
+                        );
                     }
                 }
                 BrokerAction::QueryOwns { conn, req_id, session, pid } => {
-                    if let Some(&shard_idx) = self.session_shard.get(&session) {
-                        self.shards[shard_idx].send(ShardCmd::Owns { session_id: session, conn, req_id, pid });
+                    if let Some(&shard_idx) = self.session_shard.get(&session)
+                        && let Some(permit) = self.try_acquire_shard_permit(conn, StreamId::CONTROL, req_id, now)
+                    {
+                        self.shards[shard_idx]
+                            .send_with_permit(ShardCmd::Owns { session_id: session, conn, req_id, pid }, Some(permit));
                     }
                 }
                 BrokerAction::ListSessions { conn, req_id } => {
+                    let Some(permit) = self.try_acquire_shard_permit(conn, StreamId::CONTROL, req_id, now) else {
+                        continue;
+                    };
                     let list_id = self.alloc_list_id();
                     self.pending_lists.insert(
                         list_id,
                         PendingList { conn, req_id, remaining_shards: self.shards.len(), collected: Vec::new() },
                     );
                     for shard in &self.shards {
-                        shard.send(ShardCmd::ListSessions { list_id });
+                        shard.send_with_permit(ShardCmd::ListSessions { list_id }, Some(Arc::clone(&permit)));
                     }
                 }
                 BrokerAction::RewindRecording { conn, req_id, record_dir, at_ms } => {
+                    let Some(permit) = self.try_acquire_shard_permit(conn, StreamId::CONTROL, req_id, now) else {
+                        continue;
+                    };
                     let session_id = self.alloc_session_id();
                     let shard_idx = pick_least_loaded_shard(&self.shards);
                     self.pending_spawns = self.pending_spawns.saturating_add(1);
-                    self.shards[shard_idx].send(ShardCmd::Rewind { session_id, conn, req_id, record_dir, at_ms });
+                    self.shards[shard_idx].send_with_permit(
+                        ShardCmd::Rewind { session_id, conn, req_id, record_dir, at_ms },
+                        Some(permit),
+                    );
                 }
                 BrokerAction::SeekRecording { conn, req_id, session, at_ms } => {
-                    if let Some(&shard_idx) = self.session_shard.get(&session) {
-                        self.shards[shard_idx].send(ShardCmd::Seek { session_id: session, conn, req_id, at_ms });
+                    if let Some(&shard_idx) = self.session_shard.get(&session)
+                        && let Some(permit) = self.try_acquire_shard_permit(conn, StreamId::CONTROL, req_id, now)
+                    {
+                        self.shards[shard_idx].send_with_permit(
+                            ShardCmd::Seek { session_id: session, conn, req_id, at_ms },
+                            Some(permit),
+                        );
                     }
                 }
                 BrokerAction::SetSessionKept { conn, req_id, session, kept } => {
                     if let Some(&shard_idx) = self.session_shard.get(&session) {
-                        self.shards[shard_idx].send(ShardCmd::SetKept { session_id: session, conn, req_id, kept });
+                        if let Some(permit) = self.try_acquire_shard_permit(conn, StreamId::CONTROL, req_id, now) {
+                            self.shards[shard_idx].send_with_permit(
+                                ShardCmd::SetKept { session_id: session, conn, req_id, kept },
+                                Some(permit),
+                            );
+                        } else if let Some(&prev) = self.session_kept.get(&session) {
+                            self.core.set_session_kept(session, prev);
+                        }
                     }
                 }
                 BrokerAction::WaitSession { conn, req_id, session, condition, timeout_ms } => {
-                    if let Some(&shard_idx) = self.session_shard.get(&session) {
-                        self.shards[shard_idx].send(ShardCmd::Wait {
-                            session_id: session,
-                            conn,
-                            req_id,
-                            condition,
-                            timeout_ms,
-                        });
+                    if let Some(&shard_idx) = self.session_shard.get(&session)
+                        && let Some(permit) = self.try_acquire_shard_permit(conn, StreamId::CONTROL, req_id, now)
+                    {
+                        self.shards[shard_idx].send_with_permit(
+                            ShardCmd::Wait { session_id: session, conn, req_id, condition, timeout_ms },
+                            Some(permit),
+                        );
                     }
                 }
-                BrokerAction::StreamAttached { conn, req_id, stream_id, session, flags, initial_viewport } => {
-                    if let Some(&shard_idx) = self.session_shard.get(&session) {
-                        self.shards[shard_idx].send(ShardCmd::Attach {
+                BrokerAction::StreamAttached {
+                    conn,
+                    req_id,
+                    stream_id,
+                    attachment_id,
+                    session,
+                    flags,
+                    initial_viewport,
+                } => {
+                    let Some(&shard_idx) = self.session_shard.get(&session) else {
+                        self.core.abort_attach(conn, stream_id, attachment_id);
+                        continue;
+                    };
+                    let Some(permit) = self.try_acquire_shard_permit(conn, StreamId::CONTROL, req_id, now) else {
+                        self.core.abort_attach(conn, stream_id, attachment_id);
+                        continue;
+                    };
+                    self.shards[shard_idx].send_with_permit(
+                        ShardCmd::Attach {
                             session_id: session,
                             conn,
                             req_id,
                             stream_id,
+                            attachment_id,
                             flags,
                             initial_viewport,
-                        });
-                    }
+                        },
+                        Some(permit),
+                    );
                 }
-                BrokerAction::StreamDetached { conn, stream_id, session } => {
+                BrokerAction::StreamDetached { conn, stream_id, attachment_id, session } => {
                     if let Some(c) = self.conns.get_mut(&conn) {
-                        c.stalled_frames.remove(&stream_id);
-                        c.queued_frame_streams.remove(&stream_id);
+                        c.stalled_frames.remove(&attachment_id);
+                        c.queued_frame_streams.remove(&attachment_id);
                     }
                     if let Some(&shard_idx) = self.session_shard.get(&session) {
-                        self.shards[shard_idx].send(ShardCmd::Detach { session_id: session, conn, stream_id });
-                    }
-                }
-                BrokerAction::DispatchToSession { conn, stream_id, req_id, session, msg } => {
-                    if let Some(&shard_idx) = self.session_shard.get(&session) {
-                        self.shards[shard_idx].send(ShardCmd::StreamMsg {
+                        self.shards[shard_idx].send(ShardCmd::Detach {
                             session_id: session,
                             conn,
                             stream_id,
-                            req_id,
-                            msg,
+                            attachment_id,
                         });
                     }
                 }
-                BrokerAction::FrameCreditUpdated { conn, stream_id, .. } => {
-                    // Retry any stalled frame parked on the reactor for `(conn, stream_id)`.
+                BrokerAction::DispatchToSession { conn, stream_id, attachment_id, req_id, session, msg } => {
+                    if let Some(&shard_idx) = self.session_shard.get(&session)
+                        && let Some(permit) = self.try_acquire_shard_permit(conn, stream_id.as_stream_id(), req_id, now)
+                    {
+                        self.shards[shard_idx].send_with_permit(
+                            ShardCmd::StreamMsg { session_id: session, conn, stream_id, attachment_id, req_id, msg },
+                            Some(permit),
+                        );
+                    }
+                }
+                BrokerAction::FrameCreditUpdated { conn, attachment_id, .. } => {
+                    // Retry any stalled frame parked on the reactor for `attachment_id`.
                     // Never mint a `ViewSlotFree` token here: the shard's 1-slot token is
                     // released strictly when an outbound frame drains in `on_outbound_frame_drained`
                     // (or on initial `Attach`), preventing duplicate in-flight frames!
-                    let stalled = self.conns.get_mut(&conn).and_then(|c| c.stalled_frames.remove(&stream_id));
-                    if let Some((sid, frame)) = stalled {
-                        self.try_publish_or_stall_frame(conn, stream_id, sid, frame, now);
+                    let stalled = self.conns.get_mut(&conn).and_then(|c| c.stalled_frames.remove(&attachment_id));
+                    if let Some((nz, sid, frame)) = stalled {
+                        self.try_publish_or_stall_frame(conn, nz, attachment_id, sid, frame, now);
                     }
                 }
                 BrokerAction::SetPtyPaused { session, paused } => {

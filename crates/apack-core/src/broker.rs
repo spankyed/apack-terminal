@@ -10,17 +10,18 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use apack_proto::codec::Writer;
-use apack_proto::frame::{DecodedFrame, FrameDecoder};
-use apack_proto::messages::{BrokerMsg, ClientMsg, FrameUpdate, SpawnSpec};
+use apack_proto::frame::{DecodedFrame, FrameDecoder, FrameHeader};
+use apack_proto::messages::{BrokerMsg, ClientMsg, FrameUpdate, SpawnSpec, msg_type};
 use apack_proto::types::{
     ErrorCode, FrameCredit, LeaseKind, MetricsSnapshot, NonZeroStreamId, RequestId, SessionId, SignalKind, SignalScope,
     SignalTarget, StreamId, SubFlags, ViewportHint, WaitCondition,
 };
-use apack_proto::{FRAME_HEADER_LEN, PROTOCOL_VERSION};
+use apack_proto::{FRAME_HEADER_LEN, MAX_AUTH_FRAME_PAYLOAD, MAX_HELLO_FRAME_PAYLOAD, PROTOCOL_VERSION};
 
 use crate::auth::{AuthConfig, compute_server_proof, verify_client_proof};
-use crate::flow::{FramePacer, OutboundPriority, OutboundQueue, QueuedMessage, RawOutputFlow};
+use crate::flow::{FramePacer, MemoryBudget, OutboundPriority, OutboundQueue, QueuedMessage, RawOutputFlow};
 use crate::lease::{ConnId, LeaseError, LeaseId, LeaseTable};
+pub use crate::session::StreamAttachmentId;
 use crate::time::{TimerId, TimerWheel, TimestampMs};
 use crate::{
     AUTH_HANDSHAKE_TIMEOUT_MS, BROKER_CAPABILITIES, DEFAULT_WORD_DELIMITERS, MAX_CONTROL_QUEUE_BYTES,
@@ -172,6 +173,8 @@ pub enum BrokerAction {
         req_id: RequestId,
         /// Attached stream ID.
         stream_id: NonZeroStreamId,
+        /// Monotonic attachment lifecycle ID minted by `BrokerCore`.
+        attachment_id: StreamAttachmentId,
         /// Target session.
         session: SessionId,
         /// Subscription flags.
@@ -185,6 +188,8 @@ pub enum BrokerAction {
         conn: ConnId,
         /// Detached stream ID.
         stream_id: NonZeroStreamId,
+        /// Monotonic attachment lifecycle ID that ended.
+        attachment_id: StreamAttachmentId,
         /// Target session.
         session: SessionId,
     },
@@ -194,6 +199,8 @@ pub enum BrokerAction {
         conn: ConnId,
         /// Attached non-zero stream ID.
         stream_id: NonZeroStreamId,
+        /// Active attachment lifecycle ID.
+        attachment_id: StreamAttachmentId,
         /// Request correlation ID.
         req_id: RequestId,
         /// Bound session ID.
@@ -207,6 +214,8 @@ pub enum BrokerAction {
         conn: ConnId,
         /// Stream ID.
         stream_id: NonZeroStreamId,
+        /// Active attachment lifecycle ID.
+        attachment_id: StreamAttachmentId,
         /// Bound session ID.
         session: SessionId,
         /// Updated credit window.
@@ -242,15 +251,26 @@ enum BrokerTimer {
     LeaseGrace(LeaseId),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 enum ConnPhase {
-    AwaitingHello { server_nonce: [u8; 32], timeout: TimerId },
-    AwaitingAuth { client_nonce: [u8; 32], server_nonce: [u8; 32], timeout: TimerId },
-    Ready,
+    AwaitingHello { decoder: FrameDecoder, server_nonce: [u8; 32], timeout: TimerId },
+    AwaitingAuth { decoder: FrameDecoder, client_nonce: [u8; 32], server_nonce: [u8; 32], timeout: TimerId },
+    Ready { decoder: FrameDecoder },
+}
+
+impl ConnPhase {
+    fn decoder_mut(&mut self) -> &mut FrameDecoder {
+        match self {
+            Self::AwaitingHello { decoder, .. } | Self::AwaitingAuth { decoder, .. } | Self::Ready { decoder } => {
+                decoder
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
 struct AttachedStream {
+    attachment_id: StreamAttachmentId,
     session: SessionId,
     flags: SubFlags,
     frame_pacer: Option<FramePacer>,
@@ -260,10 +280,10 @@ struct AttachedStream {
 #[derive(Debug)]
 struct ConnState {
     phase: ConnPhase,
-    decoder: FrameDecoder,
+    budget: MemoryBudget,
     outbound: OutboundQueue,
     streams: BTreeMap<NonZeroStreamId, AttachedStream>,
-    /// Stream IDs whose `StreamClosed` marker is still queued in `outbound` and not yet popped.
+    /// Stream IDs whose exit/close messages are still queued in `outbound` and not yet popped.
     closing_streams: BTreeSet<NonZeroStreamId>,
 }
 
@@ -280,6 +300,7 @@ pub struct BrokerCore {
     auth: AuthConfig,
     word_delimiters: String,
     max_queue_bytes: usize,
+    next_attachment_id: u64,
     timers: TimerWheel<BrokerTimer>,
     leases: LeaseTable,
     conns: BTreeMap<ConnId, ConnState>,
@@ -289,17 +310,18 @@ pub struct BrokerCore {
 }
 
 impl BrokerCore {
-    /// Creates a new `BrokerCore` with the default `16 MiB` per-connection total outbound queue cap.
+    /// Creates a new `BrokerCore` with the default `16 MiB` per-connection total memory budget.
     pub fn new(auth: AuthConfig) -> Self {
         Self::with_queue_cap(auth, MAX_CONTROL_QUEUE_BYTES)
     }
 
-    /// Creates a new `BrokerCore` with a custom per-connection outbound queue byte cap (useful in tests/sim).
+    /// Creates a new `BrokerCore` with a custom per-connection total memory budget (useful in tests/sim).
     pub fn with_queue_cap(auth: AuthConfig, max_queue_bytes: usize) -> Self {
         Self {
             auth,
             word_delimiters: String::from(DEFAULT_WORD_DELIMITERS),
             max_queue_bytes,
+            next_attachment_id: 1,
             timers: TimerWheel::new(),
             leases: LeaseTable::new(),
             conns: BTreeMap::new(),
@@ -307,6 +329,12 @@ impl BrokerCore {
             shard_telemetry: ShardTelemetry::default(),
             total_throttled_us: 0,
         }
+    }
+
+    fn alloc_attachment_id(&mut self) -> StreamAttachmentId {
+        let id = self.next_attachment_id;
+        self.next_attachment_id = self.next_attachment_id.checked_add(1).expect("attachment id space exhausted");
+        StreamAttachmentId::new(id).expect("non-zero attachment id")
     }
 
     /// Earliest pending timer deadline across all connections and grace leases.
@@ -319,9 +347,15 @@ impl BrokerCore {
         self.conns.len()
     }
 
+    /// Returns total bytes currently charged against `conn`'s shared [`MemoryBudget`]
+    /// (`OutboundQueue` + all `RawOutputFlow::pending_utf8` buffers).
+    pub fn connection_budget_used(&self, conn: ConnId) -> Option<usize> {
+        self.conns.get(&conn).map(|c| c.budget.used_bytes())
+    }
+
     /// Returns `true` iff `conn` has completed `Hello` (and mutual HMAC `AuthProof` when required).
     pub fn is_connection_ready(&self, conn: ConnId) -> bool {
-        matches!(self.conns.get(&conn).map(|c| c.phase), Some(ConnPhase::Ready))
+        matches!(self.conns.get(&conn).map(|c| &c.phase), Some(ConnPhase::Ready { .. }))
     }
 
     /// Returns `true` when at least one live or in-grace broker-wide lease is active.
@@ -352,7 +386,8 @@ impl BrokerCore {
     }
 
     /// Removes a session, cleans up its session leases, drops unsent frames, and enqueues
-    /// `BrokerMsg::StreamClosed` behind any queued `Exited` / final `Output` on every attached stream.
+    /// `BrokerMsg::StreamClosed` behind any queued `Exited` / final `Output` on attached streams
+    /// that have not already been terminated by `BrokerMsg::Exited` without `SUB_RAW_OUTPUT`.
     pub fn unregister_session(
         &mut self,
         session: SessionId,
@@ -371,11 +406,15 @@ impl BrokerCore {
             }
         }
         for (conn_id, stream_id) in to_close {
-            if let Some(conn) = self.conns.get_mut(&conn_id) {
-                conn.streams.remove(&stream_id);
-                conn.closing_streams.insert(stream_id);
+            if let Some(conn) = self.conns.get_mut(&conn_id)
+                && let Some(mut st) = conn.streams.remove(&stream_id)
+            {
+                if let Some(flow) = st.raw_output.as_mut() {
+                    flow.clear_pending(&mut conn.budget);
+                }
                 // Preserve already-queued `Exited` events and final `Output` chunks; drop only unsent frames.
-                conn.outbound.remove_stream_frames(stream_id.as_stream_id());
+                conn.outbound.remove_stream_frames(stream_id.as_stream_id(), &mut conn.budget);
+                conn.closing_streams.insert(stream_id);
             }
             let msg = BrokerMsg::StreamClosed { reason: String::from(reason) };
             // Enqueued at `RawOutput` priority so it drains strictly after `Exited` (Event) and
@@ -437,9 +476,13 @@ impl BrokerCore {
         self.conns.insert(
             conn,
             ConnState {
-                phase: ConnPhase::AwaitingHello { server_nonce, timeout },
-                decoder: FrameDecoder::new(),
-                outbound: OutboundQueue::new(self.max_queue_bytes),
+                phase: ConnPhase::AwaitingHello {
+                    decoder: FrameDecoder::with_max_payload(MAX_HELLO_FRAME_PAYLOAD),
+                    server_nonce,
+                    timeout,
+                },
+                budget: MemoryBudget::new(self.max_queue_bytes),
+                outbound: OutboundQueue::new(),
                 streams: BTreeMap::new(),
                 closing_streams: BTreeSet::new(),
             },
@@ -447,14 +490,14 @@ impl BrokerCore {
         Ok(())
     }
 
-    /// Feeds raw inbound bytes from `conn` into its streaming [`FrameDecoder`] and processes complete frames.
+    /// Feeds raw inbound bytes from `conn` into its phase-typed [`FrameDecoder`] and processes complete frames.
     pub fn feed_bytes(&mut self, conn: ConnId, mut bytes: &[u8], now: TimestampMs, actions: &mut Vec<BrokerAction>) {
         while !bytes.is_empty() {
             let step = {
                 let Some(state) = self.conns.get_mut(&conn) else {
                     return;
                 };
-                state.decoder.step(bytes)
+                state.phase.decoder_mut().step(bytes)
             };
             match step {
                 Ok((consumed, None)) => {
@@ -466,24 +509,7 @@ impl BrokerCore {
                 }
                 Ok((consumed, Some(DecodedFrame::Frame { header, payload }))) => {
                     bytes = &bytes[consumed..];
-                    match ClientMsg::decode(header.msg_type, &payload) {
-                        Ok(msg) => {
-                            self.handle_client_msg(conn, header.stream_id, header.req_id, msg, now, actions);
-                        }
-                        Err(_) => {
-                            self.fail_and_close(
-                                conn,
-                                header.stream_id,
-                                header.req_id,
-                                ErrorCode::Malformed,
-                                "malformed client message",
-                                CloseReason::ProtocolError,
-                                now,
-                                actions,
-                            );
-                            return;
-                        }
-                    }
+                    self.handle_decoded_frame(conn, header, &payload, now, actions);
                 }
                 Err(_) => {
                     self.fail_and_close(
@@ -528,14 +554,14 @@ impl BrokerCore {
             ConnPhase::AwaitingHello { timeout, .. } | ConnPhase::AwaitingAuth { timeout, .. } => {
                 self.timers.cancel(timeout);
             }
-            ConnPhase::Ready => {}
+            ConnPhase::Ready { .. } => {}
         }
 
         let mut drained = Vec::new();
         if reason == CloseReason::ClientFin {
             // Preserve already-queued ordered replies (e.g. pipelined RPC + FIN_FRAME in one read),
             // dropping conflatable view frames since the peer is closing.
-            while let Some(msg) = state.outbound.pop_next() {
+            while let Some(msg) = state.outbound.pop_next(&mut state.budget) {
                 if !matches!(msg.msg, BrokerMsg::Frame(_)) {
                     drained.push(msg);
                 }
@@ -544,7 +570,12 @@ impl BrokerCore {
 
         let mut affected_sessions = BTreeSet::new();
         for (stream_id, st) in state.streams {
-            actions.push(BrokerAction::StreamDetached { conn, stream_id, session: st.session });
+            actions.push(BrokerAction::StreamDetached {
+                conn,
+                stream_id,
+                attachment_id: st.attachment_id,
+                session: st.session,
+            });
             affected_sessions.insert(st.session);
         }
         for session in affected_sessions {
@@ -574,7 +605,7 @@ impl BrokerCore {
                         ConnPhase::AwaitingHello { timeout, .. } | ConnPhase::AwaitingAuth { timeout, .. } => {
                             timeout == timer_id
                         }
-                        ConnPhase::Ready => false,
+                        ConnPhase::Ready { .. } => false,
                     });
                     if matches_timer {
                         self.fail_and_close(
@@ -602,16 +633,17 @@ impl BrokerCore {
     /// Pops the highest-priority pending outbound message for `conn`.
     pub fn pop_outbound(&mut self, conn: ConnId) -> Option<QueuedMessage> {
         let state = self.conns.get_mut(&conn)?;
-        let popped = state.outbound.pop_next()?;
-        if matches!(popped.msg, BrokerMsg::StreamClosed { .. })
-            && let Some(nz) = NonZeroStreamId::new(popped.stream_id.raw())
+        let popped = state.outbound.pop_next(&mut state.budget)?;
+        if let Some(nz) = NonZeroStreamId::new(popped.stream_id.raw())
+            && state.closing_streams.contains(&nz)
+            && !state.outbound.has_stream_messages(popped.stream_id)
         {
             state.closing_streams.remove(&nz);
         }
         Some(popped)
     }
 
-    /// Enqueues a reply or event on `conn`, closing the connection as a slow reader on queue overflow.
+    /// Enqueues a reply or event on `conn`, closing the connection as a slow reader on budget overflow.
     #[allow(clippy::too_many_arguments)]
     pub fn enqueue_message(
         &mut self,
@@ -634,8 +666,37 @@ impl BrokerCore {
             };
             encoded_bytes = estimate_encoded_bytes(&msg);
         }
+        // For streams without `SUB_RAW_OUTPUT`, `Exited` is the terminal stream message (no trailing
+        // `Output` or redundant `StreamClosed` follows): enqueue at P4 (`RawOutput`) so any already-queued
+        // P1 Frame / P2 Event / P3 Bulk messages strictly drain first, and immediately move the stream into
+        // `closing_streams` so `stream_id` becomes reusable the instant `Exited` is popped onto the wire.
+        let closes_on_exit = matches!(msg, BrokerMsg::Exited { .. })
+            && NonZeroStreamId::new(stream_id.raw()).is_some_and(|nz| {
+                self.conns
+                    .get(&conn)
+                    .and_then(|s| s.streams.get(&nz))
+                    .is_some_and(|st| !st.flags.contains(SubFlags::RAW_OUTPUT))
+            });
+        let effective_priority = if closes_on_exit { OutboundPriority::RawOutput } else { priority };
         let overflowed = match self.conns.get_mut(&conn) {
-            Some(state) => state.outbound.push_ordered(priority, stream_id, req_id, msg, encoded_bytes).is_err(),
+            Some(state) => {
+                let res = state.outbound.push_ordered(
+                    effective_priority,
+                    stream_id,
+                    req_id,
+                    msg,
+                    encoded_bytes,
+                    &mut state.budget,
+                );
+                if res.is_ok()
+                    && closes_on_exit
+                    && let Some(nz) = NonZeroStreamId::new(stream_id.raw())
+                {
+                    state.streams.remove(&nz);
+                    state.closing_streams.insert(nz);
+                }
+                res.is_err()
+            }
             None => return,
         };
         if overflowed {
@@ -650,12 +711,42 @@ impl BrokerCore {
         self.conns.get(&conn)?.streams.get(&stream_id).map(|s| s.session)
     }
 
-    /// Attempts to publish a `FrameUpdate` on `(conn, stream_id)` respecting BDP `FramePacer` and
-    /// per-connection outbound queue bounds, returning `Err(frame)` without cloning if deferred.
+    /// Returns the active [`StreamAttachmentId`] bound to `(conn, stream_id)`, if attached.
+    pub fn stream_attachment(&self, conn: ConnId, stream_id: NonZeroStreamId) -> Option<StreamAttachmentId> {
+        self.conns.get(&conn)?.streams.get(&stream_id).map(|s| s.attachment_id)
+    }
+
+    /// Returns `true` iff `(conn, stream_id)` is currently attached with the exact `attachment_id`.
+    pub fn is_attachment_active(
+        &self,
+        conn: ConnId,
+        stream_id: NonZeroStreamId,
+        attachment_id: StreamAttachmentId,
+    ) -> bool {
+        self.stream_attachment(conn, stream_id) == Some(attachment_id)
+    }
+
+    /// Rolls back a newly inserted stream attachment if the reactor could not dispatch `Attach` to a shard.
+    pub fn abort_attach(&mut self, conn: ConnId, stream_id: NonZeroStreamId, attachment_id: StreamAttachmentId) {
+        if let Some(state) = self.conns.get_mut(&conn)
+            && state.streams.get(&stream_id).is_some_and(|st| st.attachment_id == attachment_id)
+            && let Some(mut st) = state.streams.remove(&stream_id)
+        {
+            if let Some(flow) = st.raw_output.as_mut() {
+                flow.clear_pending(&mut state.budget);
+            }
+            state.outbound.remove_stream(stream_id.as_stream_id(), &mut state.budget);
+        }
+    }
+
+    /// Attempts to publish a `FrameUpdate` on `(conn, stream_id)` for `attachment_id` respecting
+    /// BDP `FramePacer` and the shared per-connection [`MemoryBudget`], returning `Err(frame)`
+    /// without cloning if deferred or stale.
     pub fn try_publish_frame(
         &mut self,
         conn: ConnId,
         stream_id: NonZeroStreamId,
+        attachment_id: StreamAttachmentId,
         mut frame: Box<FrameUpdate>,
         now: TimestampMs,
         actions: &mut Vec<BrokerAction>,
@@ -669,6 +760,9 @@ impl BrokerCore {
         let Some(stream) = state.streams.get_mut(&stream_id) else {
             return Err(frame);
         };
+        if stream.attachment_id != attachment_id {
+            return Err(frame);
+        }
         let Some(pacer) = stream.frame_pacer.as_mut() else {
             return Err(frame);
         };
@@ -682,31 +776,29 @@ impl BrokerCore {
         let frame_u32 = u32::try_from(encoded_bytes).unwrap_or(u32::MAX);
         if encoded_bytes > MAX_WIRE_FRAME_BYTES
             || !pacer.can_send(frame_u32)
-            || !state.outbound.can_fit_frame(stream_id.as_stream_id(), encoded_bytes)
+            || !state.outbound.can_fit_frame(stream_id.as_stream_id(), encoded_bytes, &state.budget)
         {
             return Err(frame);
         }
-        let _ = state.outbound.push_frame(stream_id.as_stream_id(), frame, encoded_bytes);
+        let _ =
+            state.outbound.push_frame(stream_id.as_stream_id(), attachment_id, frame, encoded_bytes, &mut state.budget);
         let _ = pacer.on_send(frame_u32, now);
         actions.push(BrokerAction::OutboundReady(conn));
         Ok(())
     }
 
-    /// Attempts to publish a `FrameUpdate` on `(conn, stream_id)` respecting BDP `FramePacer` and
-    /// per-connection outbound queue bounds.
-    ///
-    /// Returns `false` if a frame is already queued in `OutboundQueue` for `stream_id` (preventing
-    /// silent drop of an unsent differential frame and phantom in-flight BDP accounting), if `FramePacer`
-    /// is out of credit/paused, or if the connection's total queue budget would be exceeded.
+    /// Attempts to publish a `FrameUpdate` on `(conn, stream_id)` for `attachment_id` respecting
+    /// BDP `FramePacer` and per-connection [`MemoryBudget`] bounds.
     pub fn publish_frame(
         &mut self,
         conn: ConnId,
         stream_id: NonZeroStreamId,
+        attachment_id: StreamAttachmentId,
         frame: Box<FrameUpdate>,
         now: TimestampMs,
         actions: &mut Vec<BrokerAction>,
     ) -> bool {
-        self.try_publish_frame(conn, stream_id, frame, now, actions).is_ok()
+        self.try_publish_frame(conn, stream_id, attachment_id, frame, now, actions).is_ok()
     }
 
     /// Returns the measured RTT EWMA in milliseconds for a `SUB_VIEW` stream, if available.
@@ -734,13 +826,16 @@ impl BrokerCore {
 
         for (cid, sid) in targets {
             let delta = {
-                let Some(st) = self.conns.get_mut(&cid).and_then(|c| c.streams.get_mut(&sid)) else {
+                let Some(conn_state) = self.conns.get_mut(&cid) else {
+                    continue;
+                };
+                let Some(st) = conn_state.streams.get_mut(&sid) else {
                     continue;
                 };
                 let Some(flow) = st.raw_output.as_mut() else {
                     continue;
                 };
-                flow.ingest(raw, now)
+                flow.ingest(raw, now, &mut conn_state.budget)
             };
             for text in delta.emit_chunks {
                 self.enqueue_message(
@@ -768,22 +863,27 @@ impl BrokerCore {
         self.reconcile_pty_pause(session, actions);
     }
 
-    fn handle_client_msg(
+    fn handle_decoded_frame(
         &mut self,
         conn: ConnId,
-        stream_id: StreamId,
-        req_id: RequestId,
-        msg: ClientMsg,
+        header: FrameHeader,
+        payload: &[u8],
         now: TimestampMs,
         actions: &mut Vec<BrokerAction>,
     ) {
-        let phase = match self.conns.get(&conn) {
-            Some(c) => c.phase,
+        let stream_id = header.stream_id;
+        let req_id = header.req_id;
+        let phase_info = match self.conns.get(&conn).map(|c| &c.phase) {
+            Some(ConnPhase::AwaitingHello { server_nonce, timeout, .. }) => Ok((*server_nonce, *timeout, None)),
+            Some(ConnPhase::AwaitingAuth { client_nonce, server_nonce, timeout, .. }) => {
+                Ok((*server_nonce, *timeout, Some(*client_nonce)))
+            }
+            Some(ConnPhase::Ready { .. }) => Err(()),
             None => return,
         };
 
-        match phase {
-            ConnPhase::AwaitingHello { server_nonce, timeout } => {
+        match phase_info {
+            Ok((server_nonce, timeout, None)) => {
                 if !stream_id.is_control() {
                     self.fail_and_close(
                         conn,
@@ -797,7 +897,7 @@ impl BrokerCore {
                     );
                     return;
                 }
-                let ClientMsg::Hello { protocol_version, client_nonce, .. } = msg else {
+                if header.msg_type != msg_type::HELLO {
                     self.fail_and_close(
                         conn,
                         stream_id,
@@ -805,6 +905,21 @@ impl BrokerCore {
                         ErrorCode::Handshake,
                         "expected Hello as first message",
                         CloseReason::HandshakeFailed,
+                        now,
+                        actions,
+                    );
+                    return;
+                }
+                let Ok(ClientMsg::Hello { protocol_version, client_nonce, .. }) =
+                    ClientMsg::decode(msg_type::HELLO, payload)
+                else {
+                    self.fail_and_close(
+                        conn,
+                        stream_id,
+                        req_id,
+                        ErrorCode::Malformed,
+                        "malformed client message",
+                        CloseReason::ProtocolError,
                         now,
                         actions,
                     );
@@ -826,10 +941,15 @@ impl BrokerCore {
                 let auth_required = self.auth.is_required();
                 if let Some(state) = self.conns.get_mut(&conn) {
                     if auth_required {
-                        state.phase = ConnPhase::AwaitingAuth { client_nonce, server_nonce, timeout };
+                        state.phase = ConnPhase::AwaitingAuth {
+                            decoder: FrameDecoder::with_max_payload(MAX_AUTH_FRAME_PAYLOAD),
+                            client_nonce,
+                            server_nonce,
+                            timeout,
+                        };
                     } else {
                         self.timers.cancel(timeout);
-                        state.phase = ConnPhase::Ready;
+                        state.phase = ConnPhase::Ready { decoder: FrameDecoder::new() };
                     }
                 }
                 let reply = BrokerMsg::HelloOk {
@@ -841,7 +961,7 @@ impl BrokerCore {
                 };
                 self.enqueue_message(conn, StreamId::CONTROL, req_id, OutboundPriority::Control, reply, now, actions);
             }
-            ConnPhase::AwaitingAuth { client_nonce, server_nonce, timeout } => {
+            Ok((server_nonce, timeout, Some(client_nonce))) => {
                 if !stream_id.is_control() {
                     self.fail_and_close(
                         conn,
@@ -855,7 +975,7 @@ impl BrokerCore {
                     );
                     return;
                 }
-                let ClientMsg::AuthProof { hmac } = msg else {
+                if header.msg_type != msg_type::AUTH_PROOF {
                     self.fail_and_close(
                         conn,
                         stream_id,
@@ -863,6 +983,19 @@ impl BrokerCore {
                         ErrorCode::Unauthorized,
                         "expected AuthProof",
                         CloseReason::Unauthorized,
+                        now,
+                        actions,
+                    );
+                    return;
+                }
+                let Ok(ClientMsg::AuthProof { hmac }) = ClientMsg::decode(msg_type::AUTH_PROOF, payload) else {
+                    self.fail_and_close(
+                        conn,
+                        stream_id,
+                        req_id,
+                        ErrorCode::Malformed,
+                        "malformed client message",
+                        CloseReason::ProtocolError,
                         now,
                         actions,
                     );
@@ -887,7 +1020,7 @@ impl BrokerCore {
                 let server_hmac = compute_server_proof(secret, &server_nonce, &client_nonce);
                 self.timers.cancel(timeout);
                 if let Some(state) = self.conns.get_mut(&conn) {
-                    state.phase = ConnPhase::Ready;
+                    state.phase = ConnPhase::Ready { decoder: FrameDecoder::new() };
                 }
                 self.enqueue_message(
                     conn,
@@ -899,14 +1032,28 @@ impl BrokerCore {
                     actions,
                 );
             }
-            ConnPhase::Ready => {
-                if stream_id.is_control() {
-                    self.handle_control_msg(conn, req_id, msg, now, actions);
-                } else {
-                    let nz = NonZeroStreamId::new(stream_id.raw()).expect("non-control stream_id is non-zero");
-                    self.handle_stream_msg(conn, nz, req_id, msg, now, actions);
+            Err(()) => match ClientMsg::decode(header.msg_type, payload) {
+                Ok(msg) => {
+                    if stream_id.is_control() {
+                        self.handle_control_msg(conn, req_id, msg, now, actions);
+                    } else {
+                        let nz = NonZeroStreamId::new(stream_id.raw()).expect("non-control stream_id is non-zero");
+                        self.handle_stream_msg(conn, nz, req_id, msg, now, actions);
+                    }
                 }
-            }
+                Err(_) => {
+                    self.fail_and_close(
+                        conn,
+                        stream_id,
+                        req_id,
+                        ErrorCode::Malformed,
+                        "malformed client message",
+                        CloseReason::ProtocolError,
+                        now,
+                        actions,
+                    );
+                }
+            },
         }
     }
 
@@ -1178,6 +1325,7 @@ impl BrokerCore {
                     );
                     return;
                 }
+                let attachment_id = self.alloc_attachment_id();
                 let frame_pacer =
                     if flags.contains(SubFlags::VIEW) { Some(FramePacer::new(initial_frame_credit)) } else { None };
                 let raw_output = if flags.contains(SubFlags::RAW_OUTPUT) {
@@ -1185,23 +1333,31 @@ impl BrokerCore {
                 } else {
                     None
                 };
-                state.streams.insert(stream_id, AttachedStream { session, flags, frame_pacer, raw_output });
+                if let Some(state) = self.conns.get_mut(&conn) {
+                    state
+                        .streams
+                        .insert(stream_id, AttachedStream { attachment_id, session, flags, frame_pacer, raw_output });
+                }
                 actions.push(BrokerAction::StreamAttached {
                     conn,
                     req_id,
                     stream_id,
+                    attachment_id,
                     session,
                     flags,
                     initial_viewport,
                 });
             }
             ClientMsg::Detach { stream_id } => {
-                let detached_session = self.conns.get_mut(&conn).and_then(|c| {
-                    let st = c.streams.remove(&stream_id)?;
-                    c.outbound.remove_stream(stream_id.as_stream_id());
-                    Some(st.session)
+                let detached = self.conns.get_mut(&conn).and_then(|c| {
+                    let mut st = c.streams.remove(&stream_id)?;
+                    if let Some(flow) = st.raw_output.as_mut() {
+                        flow.clear_pending(&mut c.budget);
+                    }
+                    c.outbound.remove_stream(stream_id.as_stream_id(), &mut c.budget);
+                    Some((st.session, st.attachment_id))
                 });
-                let Some(session) = detached_session else {
+                let Some((session, attachment_id)) = detached else {
                     self.send_error(
                         conn,
                         StreamId::CONTROL,
@@ -1213,7 +1369,7 @@ impl BrokerCore {
                     );
                     return;
                 };
-                actions.push(BrokerAction::StreamDetached { conn, stream_id, session });
+                actions.push(BrokerAction::StreamDetached { conn, stream_id, attachment_id, session });
                 self.reconcile_pty_pause(session, actions);
                 self.enqueue_message(
                     conn,
@@ -1291,8 +1447,11 @@ impl BrokerCore {
         now: TimestampMs,
         actions: &mut Vec<BrokerAction>,
     ) {
-        let Some((session, flags)) =
-            self.conns.get(&conn).and_then(|c| c.streams.get(&stream_id)).map(|st| (st.session, st.flags))
+        let Some((attachment_id, session, flags)) = self
+            .conns
+            .get(&conn)
+            .and_then(|c| c.streams.get(&stream_id))
+            .map(|st| (st.attachment_id, st.session, st.flags))
         else {
             self.send_error(
                 conn,
@@ -1328,7 +1487,13 @@ impl BrokerCore {
                     .map(|p| p.on_ack(seq, credit, now));
                 match ack_result {
                     Some(Ok(())) => {
-                        actions.push(BrokerAction::FrameCreditUpdated { conn, stream_id, session, credit });
+                        actions.push(BrokerAction::FrameCreditUpdated {
+                            conn,
+                            stream_id,
+                            attachment_id,
+                            session,
+                            credit,
+                        });
                     }
                     Some(Err(_)) | None => {
                         self.send_error(
@@ -1356,12 +1521,11 @@ impl BrokerCore {
                     );
                     return;
                 }
-                let delta = self
-                    .conns
-                    .get_mut(&conn)
-                    .and_then(|c| c.streams.get_mut(&stream_id))
-                    .and_then(|st| st.raw_output.as_mut())
-                    .map(|flow| flow.grant_credit(bytes, now));
+                let delta = self.conns.get_mut(&conn).and_then(|c| {
+                    let st = c.streams.get_mut(&stream_id)?;
+                    let flow = st.raw_output.as_mut()?;
+                    Some(flow.grant_credit(bytes, now, &mut c.budget))
+                });
                 if let Some(delta) = delta {
                     for text in delta.emit_chunks {
                         self.enqueue_message(
@@ -1421,7 +1585,7 @@ impl BrokerCore {
             | ClientMsg::CommandOutput { .. }
             | ClientMsg::Images
             | ClientMsg::GetImageBlob { .. } => {
-                actions.push(BrokerAction::DispatchToSession { conn, stream_id, req_id, session, msg });
+                actions.push(BrokerAction::DispatchToSession { conn, stream_id, attachment_id, req_id, session, msg });
             }
             _ => {
                 self.send_error(

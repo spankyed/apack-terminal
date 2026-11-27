@@ -1,9 +1,11 @@
 //! Session effect dispatch, PTY read/write pumps, and Unix poller interest management.
 
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use apack_core::flow::OutboundPriority;
-use apack_core::session::{SessionEffect, StreamKey};
+use apack_core::session::{SessionEffect, StreamAttachmentId, StreamKey};
 use apack_core::time::TimestampMs;
 use apack_core::vt::VtEngine;
 use apack_os::image_sources::Load;
@@ -41,8 +43,12 @@ impl ShardRunner {
 
         for effect in effects {
             match effect {
-                SessionEffect::Send { conn, stream_id, req_id, priority, msg } => {
-                    self.emit(ReactorEvent::SendMsg { conn, stream_id, req_id, priority, msg });
+                SessionEffect::Send { conn, stream_id, attachment, req_id, priority, msg } => {
+                    if let (BrokerMsg::Exited { .. }, true) = (&msg, views_dirty) {
+                        views_dirty = false;
+                        self.try_publish_dirty_views(session_id);
+                    }
+                    self.emit(ReactorEvent::SendMsg { conn, stream_id, attachment, req_id, priority, msg });
                 }
                 SessionEffect::ResizePty { size, cell_px } => {
                     if let Some(sess) = self.sessions.get_mut(&session_id) {
@@ -71,7 +77,7 @@ impl ShardRunner {
                 SessionEffect::VerifyForeground { id, changed, app } => {
                     self.dispatch_verify_foreground(session_id, id, changed, app);
                 }
-                SessionEffect::FetchImageBlob { conn, stream_id, req_id, blob, offset, max_bytes } => {
+                SessionEffect::FetchImageBlob { conn, stream_id, attachment, req_id, blob, offset, max_bytes } => {
                     let mut chunk_opt = {
                         let mut store = self.shared.image_store.lock().unwrap_or_else(|e| e.into_inner());
                         store.get_chunk(blob, offset, max_bytes)
@@ -99,6 +105,7 @@ impl ShardRunner {
                     self.emit(ReactorEvent::SendMsg {
                         conn,
                         stream_id: stream_id.as_stream_id(),
+                        attachment: Some(attachment),
                         req_id,
                         priority: OutboundPriority::Bulk,
                         msg,
@@ -127,9 +134,13 @@ impl ShardRunner {
             Some(LivePty::Unix { master, .. }) => master.foreground_pgid(),
             _ => None,
         };
-        // Dispatch off-shard onto the bounded foreground worker (never block hot shard on sysinfo!).
+        // Dispatch off-shard onto the bounded foreground worker (never block hot shard on sysinfo!),
+        // allowing at most one in-flight verification per session (coalescing any newer update).
         if let Some(tx) = &self.fg_tx {
-            self.fg_inflight.insert(session_id);
+            if !self.fg_inflight.insert(session_id) {
+                self.fg_pending.insert(session_id, (id, changed, app));
+                return;
+            }
             if tx.try_send(FgVerifyReq { session_id, pgid, id, changed, app }).is_err() {
                 self.fg_inflight.remove(&session_id);
             }
@@ -137,26 +148,48 @@ impl ShardRunner {
     }
 
     pub(super) fn try_publish_dirty_views(&mut self, session_id: SessionId) {
-        let keys: Vec<StreamKey> = match self.sessions.get(&session_id) {
+        let targets: Vec<(StreamKey, StreamAttachmentId, bool)> = match self.sessions.get(&session_id) {
             Some(sess) => {
-                sess.machine.view_subscribers().into_iter().filter(|k| sess.view_slot_free.contains(k)).collect()
+                let force_final = !sess.machine.is_alive();
+                sess.machine
+                    .view_subscribers()
+                    .into_iter()
+                    .filter_map(|(key, att)| {
+                        let slot_free = sess.view_slot_free.contains(&att);
+                        (slot_free || force_final).then_some((key, att, slot_free))
+                    })
+                    .collect()
             }
             None => return,
         };
-        for key in keys {
+        for (key, attachment_id, slot_free) in targets {
             let mut emitted_frame: Option<Box<FrameUpdate>> = None;
             let published = match self.sessions.get_mut(&session_id) {
-                Some(sess) => sess.machine.try_publish_view(key, |frame| {
-                    emitted_frame = Some(frame);
-                    true
-                }),
+                Some(sess) => {
+                    if !slot_free {
+                        // Force a self-contained `full_sync` when publishing while a previous frame's
+                        // `ViewSlotFree` token is still in flight, so overwriting an unsent or stalled
+                        // frame on the reactor can never leave the client with an orphaned delta.
+                        sess.machine.mark_view_full_sync(key);
+                    }
+                    sess.machine.try_publish_view(key, |frame| {
+                        emitted_frame = Some(frame);
+                        true
+                    })
+                }
                 None => return,
             };
             if published && let Some(frame) = emitted_frame {
                 if let Some(sess) = self.sessions.get_mut(&session_id) {
-                    sess.view_slot_free.remove(&key);
+                    sess.view_slot_free.remove(&attachment_id);
                 }
-                self.emit(ReactorEvent::PublishFrame { conn: key.0, stream_id: key.1, session: session_id, frame });
+                self.emit(ReactorEvent::PublishFrame {
+                    conn: key.0,
+                    stream_id: key.1,
+                    attachment_id,
+                    session: session_id,
+                    frame,
+                });
             }
         }
     }
@@ -295,7 +328,31 @@ impl ShardRunner {
         let committed = &bytes[..consumed];
         self.total_pty_bytes = self.total_pty_bytes.saturating_add(committed.len() as u64);
         if has_raw_subs && !committed.is_empty() {
-            self.emit(ReactorEvent::PublishRawOutput { session: session_id, bytes: committed.to_vec() });
+            let mut raw_event = None;
+            let mut need_sync_interest = false;
+            if let Some(sess) = self.sessions.get_mut(&session_id) {
+                let len = committed.len();
+                let sess_after = sess.raw_output_inflight.fetch_add(len, Ordering::AcqRel).saturating_add(len);
+                let shard_after = self.raw_output_inflight.fetch_add(len, Ordering::AcqRel).saturating_add(len);
+                if sess.terminating_since.is_none()
+                    && super::protocol::should_pause_raw_inflight(sess_after, shard_after)
+                {
+                    sess.paused_by_raw_inflight = true;
+                    need_sync_interest = true;
+                }
+                raw_event = Some(ReactorEvent::PublishRawOutput {
+                    session: session_id,
+                    bytes: committed.to_vec(),
+                    session_inflight: Arc::clone(&sess.raw_output_inflight),
+                    shard_inflight: Arc::clone(&self.raw_output_inflight),
+                });
+            }
+            if need_sync_interest {
+                self.sync_pty_interest(session_id);
+            }
+            if let Some(ev) = raw_event {
+                self.emit(ev);
+            }
         }
         if let Some((load, refusal, tail)) = dispatch {
             self.dispatch_image_load(session_id, load, refusal, &tail);

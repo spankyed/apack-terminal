@@ -468,11 +468,58 @@ fn timeout_and_idle_compression_helpers_unit() {
         images_gen: 0,
         full_sync: true,
     });
-    stalled.insert(s1, (SessionId::new(1).unwrap(), dummy_frame.clone()));
-    stalled.insert(s2, (SessionId::new(1).unwrap(), dummy_frame));
+    let a1 = apack_core::broker::StreamAttachmentId::new(10).unwrap();
+    let a2 = apack_core::broker::StreamAttachmentId::new(11).unwrap();
+    stalled.insert(a1, (s1, SessionId::new(1).unwrap(), dummy_frame.clone()));
+    stalled.insert(a2, (s2, SessionId::new(2).unwrap(), dummy_frame));
     let mut queued = std::collections::HashMap::new();
-    queued.insert(s1, SessionId::new(1).unwrap());
-    assert_eq!(ready_stalled_stream_ids(&stalled, &queued), vec![s2]);
+    queued.insert(a1, (s1, SessionId::new(1).unwrap()));
+    assert_eq!(ready_stalled_attachments(&stalled, &queued), vec![a2]);
+    queued.insert(a2, (s2, SessionId::new(2).unwrap()));
+    prune_ended_session_frames(&mut stalled, &mut queued, SessionId::new(1).unwrap());
+    assert!(!stalled.contains_key(&a1) && stalled.contains_key(&a2));
+    assert!(!queued.contains_key(&a1) && queued.contains_key(&a2));
+
+    // Bounded shard event draining + wait clamping (`H6`)
+    let (tx, rx) = std::sync::mpsc::channel::<u32>();
+    tx.send(1).unwrap();
+    tx.send(2).unwrap();
+    tx.send(3).unwrap();
+    let mut seen = Vec::new();
+    assert!(drain_events_bounded(&rx, 2, |v| seen.push(v)));
+    assert_eq!(seen, vec![1, 2]);
+    assert_eq!(clamp_reactor_wait(Duration::from_secs(1), true), Duration::ZERO);
+    assert_eq!(clamp_reactor_wait(Duration::from_secs(1), false), Duration::from_secs(1));
+    assert!(!drain_events_bounded(&rx, 2, |v| seen.push(v)));
+    assert_eq!(seen, vec![1, 2, 3]);
+
+    // RAII per-connection ShardCmdPermit (`L7`)
+    let inflight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let p1 = crate::shard::ShardCmdPermit::try_acquire(&inflight, 2).expect("permit 1");
+    let p2 = crate::shard::ShardCmdPermit::try_acquire(&inflight, 2).expect("permit 2");
+    assert!(crate::shard::ShardCmdPermit::try_acquire(&inflight, 2).is_none());
+    assert_eq!(inflight.load(std::sync::atomic::Ordering::Acquire), 2);
+    drop(p1);
+    assert_eq!(inflight.load(std::sync::atomic::Ordering::Acquire), 1);
+    let p3 = crate::shard::ShardCmdPermit::try_acquire(&inflight, 2).expect("permit 3 after drop");
+    drop((p2, p3));
+    assert_eq!(inflight.load(std::sync::atomic::Ordering::Acquire), 0);
+
+    // Raw-output in-flight high/low-water backpressure helpers (`H6`)
+    let sess_lo = crate::shard::RAW_OUTPUT_SESSION_LOW_WATER;
+    let shard_lo = crate::shard::RAW_OUTPUT_SHARD_LOW_WATER;
+    assert_eq!(sess_lo, 1_048_576);
+    assert_eq!(shard_lo, 4_194_304);
+    assert!(!crate::shard::should_pause_raw_inflight(0, 0));
+    assert!(!crate::shard::should_pause_raw_inflight(2 * 1024 * 1024 - 1, 8 * 1024 * 1024 - 1));
+    assert!(crate::shard::should_pause_raw_inflight(2 * 1024 * 1024, 0));
+    assert!(crate::shard::should_pause_raw_inflight(0, 8 * 1024 * 1024));
+    assert!(crate::shard::crossed_raw_low_water(100, 99, 100));
+    assert!(!crate::shard::crossed_raw_low_water(100, 100, 100));
+    assert!(!crate::shard::crossed_raw_low_water(99, 50, 100));
+    assert!(crate::shard::should_notify_raw_drained(sess_lo, sess_lo - 1, 0, 0));
+    assert!(crate::shard::should_notify_raw_drained(0, 0, shard_lo, shard_lo - 1));
+    assert!(!crate::shard::should_notify_raw_drained(sess_lo, sess_lo, shard_lo, shard_lo));
 }
 
 #[cfg(unix)]

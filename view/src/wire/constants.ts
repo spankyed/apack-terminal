@@ -37,3 +37,4 @@ export const MAX_PACKED_LINKS = 1024
 export const MAX_PACKED_PIECES = 1024
 export const MAX_WAIT_STATUSES = 8
 export const AUTH_TOKEN_LEN = 32
+export const MAX_CLIENT_NAME_BYTES = 256

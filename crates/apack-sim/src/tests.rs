@@ -215,13 +215,15 @@ fn session_machine_direct_rpcs_and_wait_outcomes() {
     );
     let c1 = ConnId::new(1).unwrap();
     let st1 = NonZeroStreamId::new(1).unwrap();
+    let att1 = apack_core::session::StreamAttachmentId::new(1).unwrap();
     let mut fx = Vec::new();
-    sess.attach_stream((c1, st1), SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
+    sess.attach_stream((c1, st1), att1, SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
 
     // ExplicitResize updates size even under ExplicitOverride
     fx.clear();
     sess.handle_stream_msg(
         (c1, st1),
+        att1,
         RequestId::from_raw(1),
         ClientMsg::ExplicitResize { size: GridSize::new(50, 8).unwrap(), cell_px: CellPx { width: 9, height: 18 } },
         &mut fx,
@@ -233,6 +235,7 @@ fn session_machine_direct_rpcs_and_wait_outcomes() {
     fx.clear();
     sess.handle_stream_msg(
         (c1, st1),
+        att1,
         RequestId::from_raw(2),
         ClientMsg::Write { data: b"123456789".to_vec() },
         &mut fx,
@@ -241,7 +244,13 @@ fn session_machine_direct_rpcs_and_wait_outcomes() {
         e,
         SessionEffect::Send { msg: BrokerMsg::Error { code: apack_proto::types::ErrorCode::Pty, .. }, .. }
     )));
-    sess.handle_stream_msg((c1, st1), RequestId::from_raw(3), ClientMsg::Write { data: b"abcd".to_vec() }, &mut fx);
+    sess.handle_stream_msg(
+        (c1, st1),
+        att1,
+        RequestId::from_raw(3),
+        ClientMsg::Write { data: b"abcd".to_vec() },
+        &mut fx,
+    );
     assert_eq!(sess.pty_write_len(), 4);
     assert_eq!(sess.drain_pty_write(2), b"ab");
     assert_eq!(sess.drain_pty_write(10), b"cd");
@@ -250,6 +259,7 @@ fn session_machine_direct_rpcs_and_wait_outcomes() {
     fx.clear();
     sess.handle_stream_msg(
         (c1, st1),
+        att1,
         RequestId::from_raw(4),
         ClientMsg::Paste { text: "rm -rf /\n".into(), allow_unsafe: false },
         &mut fx,
@@ -321,5 +331,34 @@ fn session_machine_direct_rpcs_and_wait_outcomes() {
             usize::MAX,
         ),
         "\n\n\n\n\n\n\n"
+    );
+
+    // SimWorld exit flushes final dirty view (including released DEC 2026 sync hold) strictly BEFORE Exited
+    // detaches a !RAW_OUTPUT stream.
+    let mut world = SimWorld::new(77);
+    let sid = SessionId::new(1).unwrap();
+    let conn = ConnId::new(1).unwrap();
+    let st = NonZeroStreamId::new(1).unwrap();
+    world.add_session(sid, GridSize::new(40, 6).unwrap(), ResizePolicy::ExplicitOverride, MarksMode::Keyed(key));
+    world.connect_client(conn);
+    world.send_client_msg(
+        conn,
+        StreamId::CONTROL,
+        RequestId::from_raw(1),
+        &ClientMsg::Attach {
+            session: sid,
+            stream_id: st,
+            flags: SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(),
+            initial_viewport: None,
+            initial_output_credit: 0,
+            initial_frame_credit: FrameCredit { max_frames: 4, max_bytes: 262_144 },
+        },
+    );
+    world.feed_pty(sid, b"\x1b[?2026hSIM_FINAL_SYNC");
+    world.exit_session(sid, Some(0), None);
+    let view = world.client_view(conn, st).expect("client view");
+    assert!(
+        view.rows.iter().any(|r| r.contains("SIM_FINAL_SYNC")),
+        "final frame held under DEC 2026 sync hold must flush before Exited on !RAW_OUTPUT stream"
     );
 }

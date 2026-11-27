@@ -58,7 +58,7 @@ impl ShardRunner {
             let loaded = worker.run(IMAGE_SOURCE_QUIET, move |progress| load.read_with(progress));
             {
                 let mut state = mailbox.lock().unwrap_or_else(|e| e.into_inner());
-                state.queue.push_back(ShardCmd::ImageSourceLoaded { session_id, ticket, loaded });
+                state.queue.push_back((ShardCmd::ImageSourceLoaded { session_id, ticket, loaded }, None));
                 state.woken = true;
             }
             wake.wake();
@@ -68,7 +68,7 @@ impl ShardRunner {
             // exhaustion cannot overflow the shard stack on consecutive named-source commands.
             {
                 let mut state = self.mailbox.lock().unwrap_or_else(|e| e.into_inner());
-                state.queue.push_back(ShardCmd::ImageSourceLoaded { session_id, ticket, loaded: None });
+                state.queue.push_back((ShardCmd::ImageSourceLoaded { session_id, ticket, loaded: None }, None));
                 state.woken = true;
             }
             self.self_wake.wake();

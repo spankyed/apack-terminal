@@ -115,6 +115,7 @@ fn fill_fixed(dst: &mut [u8], have: &mut usize, input: &[u8], offset: &mut usize
 #[derive(Debug)]
 pub struct FrameDecoder {
     state: State,
+    max_payload_len: usize,
 }
 
 impl Default for FrameDecoder {
@@ -124,9 +125,19 @@ impl Default for FrameDecoder {
 }
 
 impl FrameDecoder {
-    /// Creates a new frame decoder at the start of a stream.
+    /// Creates a new frame decoder allowing payloads up to [`MAX_FRAME_PAYLOAD`] (8 MiB).
     pub fn new() -> Self {
-        Self { state: State::Length { buf: [0; 4], have: 0 } }
+        Self::with_max_payload(MAX_FRAME_PAYLOAD)
+    }
+
+    /// Creates a new frame decoder capped at `max_payload_len` bytes (clamped to [`MAX_FRAME_PAYLOAD`]).
+    pub fn with_max_payload(max_payload_len: usize) -> Self {
+        Self { state: State::Length { buf: [0; 4], have: 0 }, max_payload_len: max_payload_len.min(MAX_FRAME_PAYLOAD) }
+    }
+
+    /// Returns the maximum frame payload size accepted by this decoder.
+    pub fn max_payload_len(&self) -> usize {
+        self.max_payload_len
     }
 
     /// Feeds bytes from `input` into the decoder, returning either:
@@ -155,7 +166,7 @@ impl FrameDecoder {
                             self.state = State::Closed;
                             return Err(WireError::InvalidValue("frame shorter than header"));
                         }
-                        if expected > MAX_BODY_LEN {
+                        if expected > INNER_HEADER_LEN + self.max_payload_len {
                             self.state = State::Closed;
                             return Err(WireError::FrameTooLarge(body_len - INNER_HEADER_LEN as u32));
                         }

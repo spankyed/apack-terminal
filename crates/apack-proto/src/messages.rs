@@ -17,7 +17,7 @@ use crate::types::{
     SessionId, SignalKind, SignalScope, SignalTarget, StatusRecord, StreamId, SubFlags, ViewModes, ViewportHint,
     WaitCondition, WaitOutcome,
 };
-use crate::{BULK_CHUNK_BYTES, MAX_COMMANDS, MAX_ROWS_PER_FETCH, MAX_SEARCH_MATCHES};
+use crate::{BULK_CHUNK_BYTES, MAX_CLIENT_NAME_BYTES, MAX_COMMANDS, MAX_ROWS_PER_FETCH, MAX_SEARCH_MATCHES};
 
 /// Explicit `u16` wire discriminants shared between Rust and TypeScript codecs.
 #[allow(missing_docs)]
@@ -693,9 +693,11 @@ impl ClientMsg {
     pub fn decode(msg_type: u16, payload: &[u8]) -> Result<Self, WireError> {
         let mut r = Reader::new(payload);
         let msg = match msg_type {
-            msg_type::HELLO => {
-                Self::Hello { protocol_version: r.u16()?, client_nonce: r.fixed::<32>()?, client_name: r.str()? }
-            }
+            msg_type::HELLO => Self::Hello {
+                protocol_version: r.u16()?,
+                client_nonce: r.fixed::<32>()?,
+                client_name: r.str_bounded(MAX_CLIENT_NAME_BYTES, "Hello.client_name")?,
+            },
             msg_type::AUTH_PROOF => Self::AuthProof { hmac: r.fixed::<32>()? },
             msg_type::ACQUIRE_LEASE => Self::AcquireLease { kind: LeaseKind::decode(&mut r)? },
             msg_type::RELEASE_LEASE => Self::ReleaseLease { lease_id: r.var_u64()? },

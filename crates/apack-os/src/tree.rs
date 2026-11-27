@@ -55,8 +55,58 @@ impl TreeGuard {
     }
 }
 
+#[cfg(unix)]
+fn parse_proc_comm(raw: &str) -> Option<String> {
+    let trimmed = raw.trim_end_matches(['\r', '\n']);
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+/// Decodes a NUL-terminated UTF-8-lossy buffer returned by `libc::proc_name`.
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn decode_proc_name_buf(buf: &[u8], len: i32) -> Option<String> {
+    let used = usize::try_from(len).ok()?.min(buf.len());
+    let nul = buf[..used].iter().position(|&b| b == 0).unwrap_or(used);
+    let name = String::from_utf8_lossy(&buf[..nul]);
+    parse_proc_comm(&name)
+}
+
+/// Reads the short executable name for a single Unix PID without constructing a `sysinfo::System`.
+#[cfg(unix)]
+pub fn process_name_for_pid(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+        parse_proc_comm(&comm)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let pid_i32 = i32::try_from(pid).ok()?;
+        let mut buf = [0u8; 256];
+        // SAFETY: `buf` is a live writable stack buffer of length `buf.len()`; `proc_name` writes
+        // at most `buffersize` bytes and returns the positive byte length on success or `<= 0` on error.
+        let len = unsafe { libc::proc_name(pid_i32, buf.as_mut_ptr().cast(), buf.len() as u32) };
+        decode_proc_name_buf(&buf, len)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+
+        let of = Pid::from_u32(pid);
+        let mut system = System::new().ok()?;
+        system.refresh_processes_specifics(ProcessesToUpdate::Some(&[of]), true, ProcessRefreshKind::nothing());
+        let name = system.process(of)?.name().to_string_lossy().into_owned();
+        parse_proc_comm(&name)
+    }
+}
+
 /// Reads the foreground process group leader (PID and executable name) of a PTY master.
 ///
+/// Uses an O(1) single-PID OS query (`/proc/<pid>/comm` on Linux, `proc_name` on macOS) without
+/// constructing `sysinfo::System` so callers on hot shard threads never scan the process table.
 /// Returns `None` on Windows (ConPTY has no POSIX foreground process group) or if `tcgetpgrp`
 /// reports no leader.
 pub fn foreground_process(master: &(dyn MasterPty + Send)) -> Option<ForegroundProcess> {
@@ -67,14 +117,9 @@ pub fn foreground_process(master: &(dyn MasterPty + Send)) -> Option<ForegroundP
     }
     #[cfg(unix)]
     {
-        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
-
         let pid: i32 = master.process_group_leader()?;
         let target = apack_proto::types::SignalTarget::new(pid)?;
-        let of = Pid::from_u32(u32::try_from(pid).ok()?);
-        let mut system = System::new().ok()?;
-        system.refresh_processes_specifics(ProcessesToUpdate::Some(&[of]), true, ProcessRefreshKind::nothing());
-        let name = system.process(of).map(|p| p.name().to_string_lossy().into_owned());
+        let name = process_name_for_pid(u32::try_from(pid).ok()?);
         Some(ForegroundProcess { pid: target, name })
     }
 }
@@ -136,6 +181,16 @@ mod tests {
     #[test]
     fn unix_tree_guard_owns_self_and_child() {
         let me = std::process::id();
+        assert_eq!(parse_proc_comm("zsh\n"), Some(String::from("zsh")));
+        assert_eq!(parse_proc_comm("\r\n"), None);
+        assert_eq!(decode_proc_name_buf(b"zsh\0trailing", 12), Some(String::from("zsh")));
+        assert_eq!(decode_proc_name_buf(b"bash", 99), Some(String::from("bash")));
+        assert_eq!(decode_proc_name_buf(b"bash", 0), None);
+        assert_eq!(decode_proc_name_buf(b"bash", -1), None);
+        assert!(process_name_for_pid(0).is_none());
+        assert!(process_name_for_pid(u32::MAX).is_none());
+        let my_name = process_name_for_pid(me).expect("current process name");
+        assert!(!my_name.is_empty());
         let guard = TreeGuard::attach(me).expect("attach self");
         assert!(guard.owns(me).expect("owns self"));
         assert!(!guard.owns(1).expect("does not own init"));

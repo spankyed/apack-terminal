@@ -144,6 +144,7 @@ fn render_constants_ts() -> String {
     writeln!(out, "export const MAX_PACKED_PIECES = {}", apack_proto::MAX_PACKED_PIECES).unwrap();
     writeln!(out, "export const MAX_WAIT_STATUSES = {}", apack_proto::MAX_WAIT_STATUSES).unwrap();
     writeln!(out, "export const AUTH_TOKEN_LEN = {}", apack_proto::AUTH_TOKEN_LEN).unwrap();
+    writeln!(out, "export const MAX_CLIENT_NAME_BYTES = {}", apack_proto::MAX_CLIENT_NAME_BYTES).unwrap();
     out
 }
 
@@ -1983,7 +1984,7 @@ fn client_msg_variants() -> Vec<MsgVariant> {
                         label: "clientNonce",
                     },
                 ),
-                f("clientName", FieldCodec::Str),
+                f("clientName", FieldCodec::StrBounded("MAX_CLIENT_NAME_BYTES", "Hello.client_name")),
             ],
         },
         MsgVariant {

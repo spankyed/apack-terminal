@@ -633,8 +633,9 @@ fn callbacks_injection_safe_status_clear_osc133_escaping_coalescing_and_session_
         CellPx::default(),
     );
     let k1 = (apack_core::lease::ConnId::new(1).unwrap(), NonZeroStreamId::new(1).unwrap());
+    let att1 = apack_core::session::StreamAttachmentId::new(1).unwrap();
     let mut fx = Vec::new();
-    sess.attach_stream(k1, SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
+    sess.attach_stream(k1, att1, SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
     fx.clear();
 
     let chunk = format!(
@@ -646,6 +647,7 @@ fn callbacks_injection_safe_status_clear_osc133_escaping_coalescing_and_session_
     let mut out_fx = Vec::new();
     sess.handle_stream_msg(
         k1,
+        att1,
         RequestId::from_raw(1),
         apack_proto::messages::ClientMsg::CommandOutput { command_id: 1 },
         &mut out_fx,

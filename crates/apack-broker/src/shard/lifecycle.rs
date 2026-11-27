@@ -52,6 +52,7 @@ impl ShardRunner {
         // exiting child in `?Es` state waiting for unread master PTY bytes!
         sess.paused_by_stream = false;
         sess.paused_by_raw_flow = false;
+        sess.paused_by_raw_inflight = false;
         #[cfg(unix)]
         let raw_pid = sess.pid.map(|p| p.pid() as u32);
         self.sync_pty_interest(session_id);
@@ -139,37 +140,33 @@ impl ShardRunner {
     }
 
     pub(super) fn drain_tail_pty_bytes(&mut self, session_id: SessionId) {
+        let mut tail = Vec::new();
         #[cfg(unix)]
         {
             // Use a fresh buffer instead of taking `self.read_buf` so re-entrant calls from
             // `read_unix_pty_quantum -> apply_effects -> drain_pty_writes_for -> try_reap_session`
             // never see a 0-length `self.read_buf`.
             let mut buf = vec![0u8; PTY_READ_BUF_BYTES];
-            let mut chunks = Vec::new();
             if let Some(LivePty::Unix { master, eof: false, .. }) =
                 self.sessions.get(&session_id).and_then(|s| s.pty.as_ref())
             {
                 drain_unix_pty_nonblocking(master, &mut buf, PTY_READ_QUANTUM_BYTES, |chunk| {
-                    chunks.push(chunk.to_vec());
+                    tail.extend_from_slice(chunk);
                 });
-            }
-            for chunk in chunks {
-                self.ingest_pty_bytes(session_id, &chunk);
             }
         }
         #[cfg(windows)]
         {
-            let mut chunks = Vec::new();
             if let Some(LivePty::Windows { bridge, eof: false }) =
                 self.sessions.get(&session_id).and_then(|s| s.pty.as_ref())
             {
                 let _ = crate::shard_windows::drain_conpty_quantum(bridge, PTY_READ_QUANTUM_BYTES, |b| {
-                    chunks.push(b.to_vec())
+                    tail.extend_from_slice(b);
                 });
             }
-            for chunk in chunks {
-                self.ingest_pty_bytes(session_id, &chunk);
-            }
+        }
+        if !tail.is_empty() {
+            self.ingest_pty_bytes(session_id, &tail);
         }
     }
 
@@ -179,8 +176,9 @@ impl ShardRunner {
         code: Option<i32>,
         signal: Option<String>,
     ) {
+        self.fg_pending.remove(&session_id);
         let mut effects = Vec::new();
-        if let Some(mut sess) = self.sessions.remove(&session_id) {
+        if let Some(sess) = self.sessions.get_mut(&session_id) {
             #[cfg(unix)]
             {
                 if let Some(LivePty::Unix { token, .. }) = sess.pty {
@@ -200,6 +198,7 @@ impl ShardRunner {
             if let Some(LivePty::Windows { ref bridge, .. }) = sess.pty {
                 bridge.close_master_async();
             }
+            sess.pty = None;
             if let Some(wal) = sess.wal.take() {
                 let _ = wal.seal();
                 let _ = wal.shutdown();
@@ -208,14 +207,17 @@ impl ShardRunner {
             if !sess.rewound {
                 sess.machine.on_process_exit(code, signal, now, &mut effects);
             }
-            drop(sess);
         }
-        self.load.store(self.sessions.len(), Ordering::Relaxed);
+        // Apply exit effects while `sess` is still in `self.sessions` (after WAL seal/shutdown and
+        // descendant teardown) so final dirty views flush strictly before `Exited` / `Waited`.
         self.apply_effects(session_id, effects);
+        self.sessions.remove(&session_id);
+        self.load.store(self.sessions.len(), Ordering::Relaxed);
         self.emit(ReactorEvent::SessionEnded { session: session_id });
     }
 
     pub(super) fn force_drop_session(&mut self, session_id: SessionId) {
+        self.fg_pending.remove(&session_id);
         if let Some(mut sess) = self.sessions.remove(&session_id) {
             #[cfg(unix)]
             {
@@ -258,6 +260,21 @@ impl ShardRunner {
         let now_instant = Instant::now();
 
         for id in ids {
+            // 0. Liveness safety check: if in-flight raw-output bytes drained below caps, unpause PTY.
+            let should_resume_raw = self.sessions.get(&id).is_some_and(|s| {
+                s.paused_by_raw_inflight
+                    && !super::protocol::should_pause_raw_inflight(
+                        s.raw_output_inflight.load(Ordering::Acquire),
+                        self.raw_output_inflight.load(Ordering::Acquire),
+                    )
+            });
+            if should_resume_raw {
+                if let Some(sess) = self.sessions.get_mut(&id) {
+                    sess.paused_by_raw_inflight = false;
+                }
+                self.sync_pty_interest(id);
+            }
+
             // 1. Child reap & 2-second SIGKILL escalation BEFORE firing timers so tail PTY bytes
             //    from an exited child satisfy pending `Wait` conditions before any deadline expires.
             let is_live = self.sessions.get(&id).is_some_and(|s| s.child.is_some() || s.reaped_exit.is_some());
