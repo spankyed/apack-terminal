@@ -28,7 +28,13 @@ apack-proto = { path = "crates/apack-proto" }
 
 [dev-dependencies]
 apack-core = { path = "crates/apack-core" }
+apack-vt-ghostty = { path = "crates/apack-vt-ghostty" }
+apack-wal = { path = "crates/apack-wal" }
 tempfile = "3.27.0"
+
+[[bench]]
+name = "v2_bench"
+harness = false
 
 # **The PNG decoder and memchr are built optimised in debug/test builds too**: they are pure
 # dependencies compiled once and never mutated, keeping test & mutation runs fast.

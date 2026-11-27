@@ -55,6 +55,8 @@ structural invariants:
 ```
 
 `crates/apack-sim` sits alongside `apack-core` for deterministic discrete-event simulation without OS I/O.
+Repeatable throughput, frame-budget, scrollback, WAL, and proxy-RTT benchmarks live in `benches/v2_bench.rs`
+(`cargo xtask bench`), with measured baseline numbers recorded in [benchmarks.md](benchmarks.md).
 
 ## Concurrency & Sharded Runtime (`apack-broker`)
 

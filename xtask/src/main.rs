@@ -10,18 +10,20 @@
 //! - `clear-mutants`: removes working copies left behind by an interrupted mutation pass.
 //! - `pre-push`: every check CI runs on a change, the change's mutants included, cheapest first, stopping at
 //!   the first that fails: what to run before a push.
+//! - `bench`: builds the release broker binary and runs the reproducible `v2_bench` suite.
 //! - `vt-prebuilt`: fetches and verifies the prebuilt `libghostty-vt` archive `ghostty-vt-rs-sys` links, so the
 //!   build itself reaches no network.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use xtask::{generate, leftovers, mutants, notices, pre_push, safety, vt_prebuilt};
+use xtask::{bench, generate, leftovers, mutants, notices, pre_push, safety, vt_prebuilt};
 
 fn main() -> ExitCode {
     let task = std::env::args().nth(1);
     let root = workspace_root();
     let result = match task.as_deref() {
+        Some("bench") => bench::run(&root, &std::env::args().skip(2).collect::<Vec<_>>()),
         Some("generate") => generate::update(&root),
         Some("check-generated") => generate::check(&root),
         Some("notices") => notices::write(&root),
@@ -41,7 +43,7 @@ fn main() -> ExitCode {
             ],
         ),
         _ => {
-            Err("usage: cargo xtask <generate | check-generated | notices | check-notices | check-exclusions | check-safety | clear-mutants | vt-prebuilt | pre-push>"
+            Err("usage: cargo xtask <bench | generate | check-generated | notices | check-notices | check-exclusions | check-safety | clear-mutants | vt-prebuilt | pre-push>"
                 .to_owned())
         }
     };
