@@ -864,6 +864,7 @@ dependencies = [
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "apack-proto",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",

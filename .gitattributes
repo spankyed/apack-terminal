@@ -1,6 +1,9 @@
 # What is generated here and read byte for byte elsewhere keeps the line endings it was written with,
 # whatever a checkout's platform would make of them, as do the license files every platform's release publishes
 node/wire-vectors-v2.json text eol=lf
+view/src/wire/constants.ts text eol=lf
+view/src/wire/types.ts text eol=lf
+view/src/wire/messages.ts text eol=lf
 THIRD-PARTY-NOTICES text eol=lf
 LICENSE-MIT text eol=lf
 LICENSE-APACHE text eol=lf

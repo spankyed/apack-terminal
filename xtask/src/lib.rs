@@ -7,3 +7,4 @@ pub mod notices;
 pub mod pre_push;
 pub mod safety;
 pub mod vt_prebuilt;
+pub mod wire_codegen;
