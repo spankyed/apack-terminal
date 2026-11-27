@@ -131,4 +131,85 @@ describe('pointer, selection, wheel, links, and layout caching', () => {
     view.element.dispatchEvent(new WheelEvent('wheel', { deltaY: -2, deltaMode: 1, cancelable: true }))
     expect(source.keys.map((k) => k.code)).toEqual(['ArrowUp', 'ArrowUp'])
   })
+
+  it('tracks pointerId on Pressed and ignores mismatched pointer events during drag/reporting', () => {
+    const { source, view, host, painted, point } = mountedView()
+    source.send(
+      frame({
+        size: { cols: 20, rows: 2 },
+        rows: [row(0, 'abcdefghij'), row(1, 'klmnopqrst')],
+      }),
+    )
+    painted()
+
+    // Start drag selection with pointerId 1 at col 1, row 0
+    point('pointerdown', 1, 0, { button: 0, pointerId: 1, at: 100 })
+    // Mismatched pointerId 2 move/up/cancel MUST be completely ignored!
+    point('pointermove', 9, 1, { button: 0, pointerId: 2, at: 120 })
+    point('pointerup', 9, 1, { button: 0, pointerId: 2, at: 130 })
+    point('pointercancel', 9, 1, { button: 0, pointerId: 2, at: 140 })
+    expect(view.selection.span).toBeNull()
+
+    // Matching pointerId 1 continues and completes the drag cleanly
+    point('pointermove', 4, 0, { button: 0, pointerId: 1, at: 150 })
+    point('pointerup', 4, 0, { button: 0, pointerId: 1, at: 160 })
+    expect(view.selection.span).toEqual({ start: { line: 0, col: 1 }, end: { line: 0, col: 4 } })
+
+    // Same isolation in PTY mouse-reporting mode
+    source.send(
+      frame({
+        seq: 2,
+        size: { cols: 20, rows: 2 },
+        modes: { altScreen: false, mouse: true, reverseVideo: false, bracketedPaste: false },
+        rows: [row(0, 'mouse')],
+      }),
+    )
+    painted()
+    point('pointerdown', 2, 0, { button: 0, pointerId: 10, at: 500 })
+    point('pointermove', 8, 1, { button: 0, pointerId: 11, at: 520 })
+    point('pointerup', 8, 1, { button: 0, pointerId: 11, at: 530 })
+    point('pointerup', 3, 0, { button: 0, pointerId: 10, at: 540 })
+    expect(source.pointers.map((p) => [p.action, p.xPx, p.yPx])).toEqual([
+      ['press', 25, 10],
+      ['release', 35, 10],
+    ])
+
+    // Same pointerId isolation for scrollbar thumb drag (ignores mismatched pointerId & secondary pointerdown)
+    Object.defineProperty(view.element, 'clientHeight', { value: 200, configurable: true })
+    Object.defineProperty(host, 'clientWidth', { value: 200, configurable: true })
+    Object.defineProperty(host, 'clientHeight', { value: 200, configurable: true })
+    view.fit()
+    source.send(
+      frame({
+        seq: 3,
+        size: { cols: 20, rows: 10 },
+        firstActiveLine: 90,
+        scrollbackLines: 90,
+        modes: { altScreen: false, mouse: false, reverseVideo: false, bracketedPaste: false },
+        rows: [row(90, 'tail')],
+      }),
+    )
+    painted()
+    const thumb = view.element.lastElementChild as HTMLDivElement
+    const dispatchPointer = (target: EventTarget, type: string, clientY: number, pointerId: number, button = 0) => {
+      const ev = new MouseEvent(type, { bubbles: true, cancelable: true, clientY, button })
+      Object.defineProperty(ev, 'pointerId', { value: pointerId })
+      target.dispatchEvent(ev)
+    }
+    const startPos = view.viewport.extent.position
+    dispatchPointer(thumb, 'pointerdown', 180, 20, 0)
+    // Secondary pointerdown and mismatched pointermove/pointerup MUST be ignored!
+    dispatchPointer(thumb, 'pointerdown', 100, 21, 0)
+    dispatchPointer(window, 'pointermove', 20, 21, 0)
+    dispatchPointer(window, 'pointerup', 20, 21, 0)
+    expect(view.viewport.extent.position).toBe(startPos)
+    // Matching pointerId 20 drags the scrollbar up cleanly and ends on matching pointerup
+    dispatchPointer(window, 'pointermove', 90, 20, 0)
+    const draggedPos = view.viewport.extent.position
+    expect(draggedPos).toBeLessThan(startPos)
+    dispatchPointer(window, 'pointerup', 90, 20, 0)
+    // Subsequent move after release does not scroll further
+    dispatchPointer(window, 'pointermove', 10, 20, 0)
+    expect(view.viewport.extent.position).toBe(draggedPos)
+  })
 })

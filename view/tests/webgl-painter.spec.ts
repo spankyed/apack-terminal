@@ -492,4 +492,73 @@ describe('WebGL2AtlasPainter & createPainter', () => {
       document.createElement = prevCreate
     }
   })
+
+  it('keys GPU image textures by content hash, deletes on releaseImage(key), and sweeps closed bitmaps', () => {
+    const mock = mockWebGL2Canvas()
+    const painter = new WebGL2AtlasPainter(
+      { family: 'monospace', size: 14 },
+      { canvas: mock.canvas, pixelRatio: 1, scratchCanvas: () => makeScratchCanvas('white').canvas },
+    )
+    painter.resize(10, 2, 1)
+
+    const p1 = document.createElement('canvas')
+    p1.width = 16
+    p1.height = 16
+    const p2 = document.createElement('canvas')
+    p2.width = 16
+    p2.height = 16
+    const p3 = document.createElement('canvas')
+    p3.width = 16
+    p3.height = 16
+
+    painter.paint({
+      theme,
+      rows: [null, null],
+      offset: 0,
+      images: [
+        { key: 'hash-a', picture: p1, x: 0, y: 0, width: 16, height: 16, source: { x: 0, y: 0, width: 16, height: 16 }, above: false },
+        { key: 'hash-b', picture: p2, x: 20, y: 0, width: 16, height: 16, source: { x: 0, y: 0, width: 16, height: 16 }, above: false },
+      ],
+    })
+    expect(painter.imageTextureCount).toBe(2)
+    expect(painter.imageTextureBytes).toBe(2048)
+
+    // Explicit releaseImage(key) immediately deletes GPU texture and reclaims bytes
+    painter.releaseImage('hash-a')
+    expect(painter.imageTextureCount).toBe(1)
+    expect(painter.imageTextureBytes).toBe(1024)
+    expect(mock.stats().deletedTextures).toBe(1)
+    // Unknown key is a safe no-op
+    painter.releaseImage('hash-missing')
+    expect(mock.stats().deletedTextures).toBe(1)
+
+    // Externally closed bitmap (width/height drop to 0) is swept automatically on next paint even with NO new image upload
+    p2.width = 0
+    p2.height = 0
+    painter.paint({ theme, rows: [null, null], offset: 0 })
+    expect(painter.imageTextureCount).toBe(0)
+    expect(painter.imageTextureBytes).toBe(0)
+    expect(mock.stats().deletedTextures).toBe(2)
+
+    // Empty-string key falls back to per-source anonymous tokens instead of colliding under ''
+    const p4 = document.createElement('canvas')
+    p4.width = 16
+    p4.height = 16
+    painter.paint({
+      theme,
+      rows: [null, null],
+      offset: 0,
+      images: [
+        { key: '', picture: p3, x: 0, y: 0, width: 16, height: 16, source: { x: 0, y: 0, width: 16, height: 16 }, above: false },
+        { key: '', picture: p4, x: 20, y: 0, width: 16, height: 16, source: { x: 0, y: 0, width: 16, height: 16 }, above: false },
+      ],
+    })
+    expect(painter.imageTextureCount).toBe(2)
+    expect(painter.imageTextureBytes).toBe(2048)
+
+    painter.dispose()
+    // Calling releaseImage / whenCleared after dispose is a safe no-op
+    painter.releaseImage('hash-c')
+    painter.whenCleared(() => {})
+  })
 })

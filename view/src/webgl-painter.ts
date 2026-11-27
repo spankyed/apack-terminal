@@ -257,6 +257,8 @@ interface ImageTextureEntry {
   readonly width: number
   readonly height: number
   readonly byteSize: number
+  /** Weak reference to the uploaded source so closed/GC'd bitmaps can be swept without pinning them. */
+  readonly sourceRef: WeakRef<CanvasImageSource> | null
 }
 
 export class WebGL2AtlasPainter implements Painter {
@@ -292,8 +294,11 @@ export class WebGL2AtlasPainter implements Painter {
   private uCellWidth: WebGLUniformLocation | null = null
   private uPixelRatio: WebGLUniformLocation | null = null
 
-  // Bounded LRU cache of image placement textures (deleted via gl.deleteTexture on eviction)
-  private readonly imageTextures = new Map<CanvasImageSource, ImageTextureEntry>()
+  // Bounded LRU cache of image placement textures keyed by content-addressed string key (never pinning
+  // `CanvasImageSource` / closed `ImageBitmap`s in a strong Map); unkeyed callers get a WeakMap token.
+  private readonly imageTextures = new Map<string, ImageTextureEntry>()
+  private readonly fallbackImageKeys = new WeakMap<CanvasImageSource, string>()
+  private nextFallbackImageKey = 1
   private imageTexBytes = 0
 
   // Reusable growable instanced CPU scratch buffer (zero per-frame allocations)
@@ -379,7 +384,20 @@ export class WebGL2AtlasPainter implements Painter {
   }
 
   whenCleared(repaint: () => void): void {
+    if (this.disposed) return
     this.repaint = repaint
+  }
+
+  /** Explicitly deletes any GPU texture cached for content-addressed image `key` (`H14`). */
+  releaseImage(key: string): void {
+    if (this.disposed) return
+    const entry = this.imageTextures.get(key)
+    if (!entry) return
+    this.imageTextures.delete(key)
+    this.imageTexBytes -= entry.byteSize
+    if (!this.contextLost) {
+      this.gl.deleteTexture(entry.texture)
+    }
   }
 
   resize(columns: number, rows: number, pixelRatio: number, gutter = 0): void {
@@ -454,6 +472,7 @@ export class WebGL2AtlasPainter implements Painter {
     gl.uniform1i(this.uAtlas, 0)
 
     this.ensureSceneGlyphs(scene)
+    if (this.imageTextures.size > 0) this.sweepDeadImageTextures()
 
     // --- Pass 1: Backgrounds + gutter marks ---
     this.instanceCount = 0
@@ -927,27 +946,31 @@ export class WebGL2AtlasPainter implements Painter {
     const list = scene.images
     if (!list || list.length === 0) return
 
-    // Batch consecutive slices sharing the same picture/WebGLTexture into 1 draw call.
-    // Flush BEFORE calling `ensureImageTexture` on a new picture so LRU eviction inside
+    // Batch consecutive slices sharing the same content-addressed texture key into 1 draw call.
+    // Flush BEFORE calling `ensureImageTexture` on a new key so LRU eviction inside
     // `ensureImageTexture` can never delete `currentTex` while its quads are still queued.
+    let currentKey: string | null = null
     let currentPicture: CanvasImageSource | null = null
     let currentTex: WebGLTexture | null = null
     this.instanceCount = 0
 
     for (const img of list) {
       if (img.above !== above || img.source.width <= 0 || img.source.height <= 0) continue
-      if (img.picture !== currentPicture && currentTex !== null && this.instanceCount > 0) {
+      const texKey = this.imageKeyOf(img.key, img.picture)
+      if ((texKey !== currentKey || img.picture !== currentPicture) && currentTex !== null && this.instanceCount > 0) {
         this.flushBatch(currentTex)
         this.instanceCount = 0
         currentTex = null
+        currentKey = null
         currentPicture = null
       }
-      const texEntry = this.ensureImageTexture(img.picture)
+      const texEntry = this.ensureImageTexture(texKey, img.picture)
       if (!texEntry || texEntry.width <= 0 || texEntry.height <= 0) continue
       if (currentTex !== null && currentTex !== texEntry.texture && this.instanceCount > 0) {
         this.flushBatch(currentTex)
         this.instanceCount = 0
       }
+      currentKey = texKey
       currentPicture = img.picture
       currentTex = texEntry.texture
       const u0 = img.source.x / texEntry.width
@@ -971,24 +994,67 @@ export class WebGL2AtlasPainter implements Painter {
     }
   }
 
-  private ensureImageTexture(picture: CanvasImageSource): ImageTextureEntry | null {
+  private imageKeyOf(explicitKey: string | undefined, picture: CanvasImageSource): string {
+    if (explicitKey) return explicitKey
+    let token = this.fallbackImageKeys.get(picture)
+    if (token === undefined) {
+      token = `__anon_${this.nextFallbackImageKey}`
+      this.nextFallbackImageKey += 1
+      this.fallbackImageKeys.set(picture, token)
+    }
+    return token
+  }
+
+  private sweepDeadImageTextures(): void {
+    for (const [key, entry] of this.imageTextures) {
+      if (!entry.sourceRef) continue
+      const src = entry.sourceRef.deref()
+      if (src === undefined) {
+        this.imageTextures.delete(key)
+        this.imageTexBytes -= entry.byteSize
+        this.gl.deleteTexture(entry.texture)
+        continue
+      }
+      const dims = sourceDimensions(src)
+      if (dims.width <= 0 || dims.height <= 0) {
+        this.imageTextures.delete(key)
+        this.imageTexBytes -= entry.byteSize
+        this.gl.deleteTexture(entry.texture)
+      }
+    }
+  }
+
+  private ensureImageTexture(key: string, picture: CanvasImageSource): ImageTextureEntry | null {
     const dims = sourceDimensions(picture)
-    const cached = this.imageTextures.get(picture)
+    const cached = this.imageTextures.get(key)
     if (cached) {
       if (dims.width <= 0 || dims.height <= 0) {
         // Source bitmap was closed externally; delete GPU texture immediately
         this.gl.deleteTexture(cached.texture)
-        this.imageTextures.delete(picture)
+        this.imageTextures.delete(key)
         this.imageTexBytes -= cached.byteSize
         return null
       }
-      // Refresh LRU recency
-      this.imageTextures.delete(picture)
-      this.imageTextures.set(picture, cached)
-      return cached
+      if (
+        cached.width === dims.width
+        && cached.height === dims.height
+        && (cached.sourceRef === null || cached.sourceRef.deref() === picture)
+      ) {
+        // Refresh LRU recency
+        this.imageTextures.delete(key)
+        this.imageTextures.set(key, cached)
+        return cached
+      }
+      // Same key re-used with a different bitmap/dimensions: replace the stale GPU texture cleanly.
+      this.gl.deleteTexture(cached.texture)
+      this.imageTextures.delete(key)
+      this.imageTexBytes -= cached.byteSize
     }
     if (typeof SVGImageElement !== 'undefined' && picture instanceof SVGImageElement) return null
     if (dims.width <= 0 || dims.height <= 0) return null
+
+    // Reclaim any closed or GC'd image textures before allocating/evicting live GPU textures.
+    this.sweepDeadImageTextures()
 
     const gl = this.gl
     const tex = gl.createTexture()
@@ -1008,8 +1074,9 @@ export class WebGL2AtlasPainter implements Painter {
     }
 
     const byteSize = Math.max(4, dims.width * dims.height * 4)
-    const entry: ImageTextureEntry = { texture: tex, width: dims.width, height: dims.height, byteSize }
-    this.imageTextures.set(picture, entry)
+    const sourceRef = typeof WeakRef === 'function' ? new WeakRef(picture) : null
+    const entry: ImageTextureEntry = { texture: tex, width: dims.width, height: dims.height, byteSize, sourceRef }
+    this.imageTextures.set(key, entry)
     this.imageTexBytes += byteSize
     while (this.imageTexBytes > this.maxImageTexBytes && this.imageTextures.size > 1) {
       const oldestKey = this.imageTextures.keys().next().value

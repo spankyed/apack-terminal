@@ -199,4 +199,72 @@ describe('TerminalView v2 core lifecycle', () => {
 
     view.dispose()
   })
+
+  it('cancels and suppresses blink timers while setVisible(false) and fires onEnded at most once', () => {
+    const clock = new TestClock()
+    const endedReasons: Array<string | undefined> = []
+    const { source, view, painted, painter } = mountedView(
+      { clock, onEnded: (reason) => endedReasons.push(reason) },
+      undefined,
+    )
+    view.setFocused(true)
+    source.send(
+      frame({
+        seq: 1,
+        size: { cols: 20, rows: 2 },
+        cursor: { col: 0, row: 0, shape: 'bar', blinking: true, hidden: false },
+        rows: [
+          row(0, 'steady'),
+          row(1, 'blink', { style: 1, hasBlink: true, styles: [{ flags: PackedStyleFlag.BLINK }] }),
+        ],
+      }),
+    )
+    painted()
+    expect(clock.pending).toBeGreaterThan(0)
+
+    // Advance to mid-blink-off so we also verify hiding resets both cursor & text blink back to visible!
+    clock.advance(BLINK_MS)
+    const midBlinkOff = painted()
+    expect(midBlinkOff.cursor).toBeUndefined()
+    expect(midBlinkOff.rows[1]!.glyphs).toHaveLength(0)
+
+    // M12: hiding cancels both cursor and text blink timers immediately (clock.pending === 0),
+    // and neither focus changes nor incoming frames re-arm blink timers while hidden!
+    view.setVisible(false)
+    expect(clock.pending).toBe(0)
+    source.send(
+      frame({
+        seq: 2,
+        size: { cols: 20, rows: 2 },
+        cursor: { col: 1, row: 0, shape: 'bar', blinking: true, hidden: false },
+        rows: [
+          row(0, 'steady2'),
+          row(1, 'blink2', { style: 1, hasBlink: true, styles: [{ flags: PackedStyleFlag.BLINK }] }),
+        ],
+      }),
+    )
+    view.setFocused(false)
+    view.setFocused(true)
+    const paintsWhileHidden = painter.scenes.length
+    clock.advance(BLINK_MS * 5)
+    expect(clock.pending).toBe(0)
+    expect(painter.scenes.length).toBe(paintsWhileHidden)
+
+    // Showing again resets both cursor and blinking text to visible, then resumes both blink timers cleanly
+    view.setVisible(true)
+    const sShown = painted()
+    expect(sShown.cursor?.shape).toBe('bar')
+    expect(sShown.rows[1]!.glyphs.length).toBeGreaterThan(0)
+    clock.advance(BLINK_MS)
+    const sBlinked = painted()
+    expect(sBlinked.cursor).toBeUndefined()
+    expect(sBlinked.rows[1]!.glyphs).toHaveLength(0)
+
+    // M11: receiving both exited and streamClosed invokes onEnded at most once
+    source.pushEvent({ kind: 'exited', exitCode: 0, signal: null })
+    source.pushEvent({ kind: 'streamClosed', reason: 'session ended' })
+    expect(endedReasons).toEqual(['exited (0)'])
+
+    view.dispose()
+  })
 })

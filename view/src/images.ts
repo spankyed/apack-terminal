@@ -47,6 +47,7 @@ export class ImageCache {
   private readonly entries = new Map<string, DecodedImage>()
   private readonly inflight = new Map<string, Promise<DecodedImage | null>>()
   private readonly inflightCallbacks = new Map<string, Set<() => void>>()
+  private readonly evictListeners = new Set<(key: string) => void>()
   private readonly maxBytes: number
   private readonly decode: NonNullable<ImageCacheOptions['decode']>
   private usedBytes = 0
@@ -55,6 +56,24 @@ export class ImageCache {
   constructor(options: ImageCacheOptions = {}) {
     this.maxBytes = Math.max(1024, options.maxBytes ?? DEFAULT_MAX_BYTES)
     this.decode = options.decode ?? defaultDecodeBlob
+  }
+
+  /** Subscribes to key evictions, replacements, and cache disposal so painters can free GPU textures. */
+  onEvict(listener: (key: string) => void): () => void {
+    this.evictListeners.add(listener)
+    return () => {
+      this.evictListeners.delete(listener)
+    }
+  }
+
+  private notifyEvict(key: string): void {
+    for (const listener of [...this.evictListeners]) {
+      try {
+        listener(key)
+      } catch {
+        // Isolate listener failures so sibling views still release GPU textures and ImageBitmaps always close.
+      }
+    }
   }
 
   get bytesUsed(): number {
@@ -132,8 +151,9 @@ export class ImageCache {
     const prev = this.entries.get(entry.key)
     if (prev) {
       this.usedBytes -= prev.byteSize
-      closeIfBitmap(prev.source)
       this.entries.delete(entry.key)
+      this.notifyEvict(entry.key)
+      closeIfBitmap(prev.source)
     }
     this.entries.set(entry.key, entry)
     this.usedBytes += entry.byteSize
@@ -143,19 +163,22 @@ export class ImageCache {
       const oldest = this.entries.get(oldestKey)!
       this.entries.delete(oldestKey)
       this.usedBytes -= oldest.byteSize
+      this.notifyEvict(oldestKey)
       closeIfBitmap(oldest.source)
     }
   }
 
   dispose(): void {
     this.disposed = true
-    for (const entry of this.entries.values()) {
-      closeIfBitmap(entry.source)
-    }
+    const keys = [...this.entries.keys()]
+    const sources = [...this.entries.values()].map((e) => e.source)
     this.entries.clear()
     this.inflight.clear()
     this.inflightCallbacks.clear()
     this.usedBytes = 0
+    for (const key of keys) this.notifyEvict(key)
+    for (const source of sources) closeIfBitmap(source)
+    this.evictListeners.clear()
   }
 }
 

@@ -57,6 +57,7 @@ export class TerminalView {
   private readonly painter: Painter
   private readonly imageCache: ImageCache
   private readonly ownsImageCache: boolean
+  private readonly unsubImageEvict: () => void
   private readonly gutter: number
   private readonly mac: boolean
   private readonly detectors: readonly Detector[]
@@ -118,6 +119,7 @@ export class TerminalView {
     this.painter = (options.painter ?? ((font) => new CanvasPainter(font)))(options.font)
     this.painter.canvas.style.display = 'block'
     this.painter.whenCleared?.(() => this.schedule())
+    this.unsubImageEvict = this.imageCache.onEvict((key) => this.painter.releaseImage?.(key))
     this.element.appendChild(this.painter.canvas)
 
     this.selection = new Selection(source, this.store, () => {
@@ -212,9 +214,8 @@ export class TerminalView {
     })
     this.blink = new BlinkController(
       {
+        isActive: () => this.isActive(),
         isFocused: () => this.focused,
-        isListening: () => this.listening,
-        isDisposed: () => this.disposed,
         cursorBlinks: () => this.cursorBlinks(),
         schedule: () => this.schedule(),
       },
@@ -277,8 +278,10 @@ export class TerminalView {
       cancelAnimationFrame(this.scheduled)
       this.scheduled = null
     }
+    this.blink.syncActive()
     this.display.pushViewportHint()
     if (!visible) {
+      this.renderer.cancelMirrorTimer()
       if (this.unacknowledgedSeq !== null && !this.ended) {
         this.source.ackFrame?.(this.unacknowledgedSeq)
         this.unacknowledgedSeq = null
@@ -509,6 +512,7 @@ export class TerminalView {
     if (this.disposed) return
     this.unmount()
     this.disposed = true
+    this.unsubImageEvict()
     this.pointer.dispose()
     if (this.ownsImageCache) this.imageCache.dispose()
     this.input.dispose()
@@ -561,12 +565,16 @@ export class TerminalView {
         this.schedule()
         break
       case 'exited':
-        this.ended = true
-        this.options.onEnded?.(event.signal ?? (event.exitCode !== null ? `exited (${event.exitCode})` : undefined))
+        if (!this.ended) {
+          this.ended = true
+          this.options.onEnded?.(event.signal ?? (event.exitCode !== null ? `exited (${event.exitCode})` : undefined))
+        }
         break
       case 'streamClosed':
-        this.ended = true
-        this.options.onEnded?.(event.reason)
+        if (!this.ended) {
+          this.ended = true
+          this.options.onEnded?.(event.reason)
+        }
         break
       default:
         break
@@ -650,8 +658,12 @@ export class TerminalView {
     this.options.onFollowingChange?.(following)
   }
 
+  private isActive(): boolean {
+    return this.visible && this.listening && !this.disposed
+  }
+
   private schedule(): void {
-    if (this.scheduled !== null || this.disposed || !this.frame || !this.listening || !this.visible) return
+    if (this.scheduled !== null || !this.frame || !this.isActive()) return
     this.scheduled = requestAnimationFrame(() => {
       this.scheduled = null
       this.paint()

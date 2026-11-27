@@ -208,6 +208,7 @@ export class ViewRenderer {
         const [sx, sy, sw, sh] = piece.srcRect
         const [dstW, dstH] = piece.dstPx
         images.push({
+          key: decoded.key,
           picture: decoded.source,
           x: piece.colStart * cellWidth,
           y: top,
@@ -233,14 +234,35 @@ export class ViewRenderer {
       if (this.host.commands.hiddenIn(placement.line)) continue
       const decoded = this.host.imageCache.get(placement.blob)
       if (!decoded) continue
-      const [pxW, pxH] = placement.pixelSize
+      const [rawSx, rawSy, rawSw, rawSh] = placement.sourceRect
+      const sx = Number.isFinite(rawSx) ? Math.min(Math.max(0, rawSx), decoded.width) : 0
+      const sy = Number.isFinite(rawSy) ? Math.min(Math.max(0, rawSy), decoded.height) : 0
+      const availW = decoded.width - sx
+      const availH = decoded.height - sy
+      const sw = Number.isFinite(rawSw) && rawSw > 0 ? Math.min(rawSw, availW) : availW
+      const sh = Number.isFinite(rawSh) && rawSh > 0 ? Math.min(rawSh, availH) : availH
+      if (!(sw > 0) || !(sh > 0)) continue
+      const [rawOffX, rawOffY] = placement.cellOffset
+      const maxOffX = Math.max(0, cellWidth - 1)
+      const maxOffY = Math.max(0, cellHeight - 1)
+      const offX = Number.isFinite(rawOffX) ? Math.min(Math.max(0, rawOffX), maxOffX) : 0
+      const offY = Number.isFinite(rawOffY) ? Math.min(Math.max(0, rawOffY), maxOffY) : 0
+      const [rawPxW, rawPxH] = placement.pixelSize
+      const pxW = Number.isFinite(rawPxW) && rawPxW > 0 ? rawPxW : 0
+      const pxH = Number.isFinite(rawPxH) && rawPxH > 0 ? rawPxH : 0
+      const maxW = spanCols > 0 ? Math.max(0, spanCols * cellWidth - offX) : pxW
+      const maxH = spanRows > 0 ? Math.max(0, spanRows * cellHeight - offY) : pxH
+      const width = spanCols > 0 ? (pxW > 0 ? Math.min(pxW, maxW) : maxW) : pxW
+      const height = spanRows > 0 ? (pxH > 0 ? Math.min(pxH, maxH) : maxH) : pxH
+      if (!(width > 0) || !(height > 0)) continue
       images.push({
+        key: decoded.key,
         picture: decoded.source,
-        x: placement.col * cellWidth,
-        y: this.host.viewport.rowsBetween(first, placement.line) * cellHeight,
-        width: spanCols > 0 ? spanCols * cellWidth : pxW,
-        height: spanRows > 0 ? spanRows * cellHeight : pxH,
-        source: { x: 0, y: 0, width: decoded.width, height: decoded.height },
+        x: placement.col * cellWidth + offX,
+        y: this.host.viewport.rowsBetween(first, placement.line) * cellHeight + offY,
+        width,
+        height,
+        source: { x: sx, y: sy, width: sw, height: sh },
         above: placement.zIndex >= 0,
         z: placement.zIndex,
       })
@@ -353,7 +375,7 @@ export class ViewRenderer {
       this.asking.delete(page)
       const absorbed = this.host.store.absorb(epoch, from, to - from, fetched, this.host.viewport.top, atImagesChanged)
       for (const line of absorbed) this.drawings.delete(line)
-      if (absorbed.length > 0) this.host.schedule()
+      if (absorbed.length > 0 || atImagesChanged !== this.host.store.imagesChanged) this.host.schedule()
     }, () => {
       if (epoch === this.host.store.epoch) this.asking.delete(page)
     })

@@ -171,5 +171,16 @@ describe('CanvasPainter v2', () => {
     rec.canvas.dispatchEvent(new Event('contextrestored'))
     expect(cleared).toBe(1)
     painter.dispose()
+
+    // L9: all methods after dispose() are safe no-ops
+    rec.drawn.length = 0
+    painter.resize(30, 10, 2)
+    painter.setFont({ family: 'serif', size: 18 })
+    painter.paint({ theme, rows: r, offset: 0 })
+    rec.canvas.dispatchEvent(new Event('contextrestored'))
+    painter.dispose()
+    expect(rec.drawn).toHaveLength(0)
+    expect(cleared).toBe(1)
+    expect(rec.canvas.width).toBe(0)
   })
 })
