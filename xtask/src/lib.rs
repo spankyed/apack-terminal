@@ -1,6 +1,7 @@
 //! The repository's own tasks, as a library so each can be driven without the binary.
 
 pub mod bench;
+pub mod fuzz_smoke;
 pub mod generate;
 pub mod leftovers;
 pub mod mutants;
