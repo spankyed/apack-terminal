@@ -182,7 +182,7 @@ fn build_client_vectors() -> Vec<ClientVector> {
             msg: ClientMsg::AcquireLease {
                 kind: LeaseKind::BrokerGrace {
                     grace_ms: LeaseGraceMs::new(30_000).unwrap(),
-                    resume_token: ResumeToken::new([0x33; 32]),
+                    resume_token: ResumeToken::new([0x33; 32]).unwrap(),
                 },
             },
         },
@@ -658,6 +658,8 @@ fn build_broker_vectors() -> Vec<BrokerVector> {
                     blob: BlobHash([0xAB; 32]),
                     line: 42,
                     col: 10,
+                    source_rect: [4, 2, 60, 30],
+                    cell_offset: [1, 2],
                     pixel_size: [64, 32],
                     cell_span: [8, 2],
                     z_index: -1,
@@ -944,6 +946,68 @@ fn build_malformed_vectors() -> Vec<MalformedVector> {
         reason: "overlong LEB128 varint must be rejected",
     });
 
+    // 13. LeaseKind::BrokerGrace with all-zero resume_token
+    let mut w = Writer::new();
+    w.u8(LeaseKind::TAG_BROKER_GRACE);
+    w.var_u32(1_000);
+    w.raw(&[0u8; 32]);
+    buf.clear();
+    encode_frame(StreamId::CONTROL, msg_type::ACQUIRE_LEASE, RequestId::from_raw(1), w.as_slice(), &mut buf).unwrap();
+    out.push(MalformedVector {
+        name: "lease_zero_resume_token",
+        direction: "client",
+        hex: to_hex(&buf),
+        reason: "all-zero resume_token must be rejected",
+    });
+
+    // 14. PackedRow with empty non-zero link entry
+    let bad_link_row = PackedRow {
+        line: 0,
+        flags: 0,
+        text: String::new(),
+        runs: vec![],
+        styles: vec![],
+        links: vec![String::new(), String::new()],
+        pieces: vec![],
+    };
+    let mut w = Writer::new();
+    w.var_u64(1);
+    w.var_u32(1);
+    bad_link_row.encode(&mut w);
+    buf.clear();
+    encode_frame(StreamId::from_raw(1), msg_type::ROWS, RequestId::from_raw(1), w.as_slice(), &mut buf).unwrap();
+    out.push(MalformedVector {
+        name: "packed_row_empty_nonzero_link",
+        direction: "broker",
+        hex: to_hex(&buf),
+        reason: "empty non-zero link entry in PackedRow.links[1..] must be rejected",
+    });
+
+    // 15. ImagePlacement with zero pixel_size
+    let mut w = Writer::new();
+    w.var_u64(1); // images_gen
+    w.var_u32(1); // 1 placement
+    ImagePlacement {
+        blob: BlobHash([0xAB; 32]),
+        line: 0,
+        col: 0,
+        source_rect: [0, 0, 10, 10],
+        cell_offset: [0, 0],
+        pixel_size: [0, 10],
+        cell_span: [1, 1],
+        z_index: 0,
+    }
+    .encode(&mut w);
+    buf.clear();
+    encode_frame(StreamId::from_raw(1), msg_type::IMAGES_REPLY, RequestId::from_raw(1), w.as_slice(), &mut buf)
+        .unwrap();
+    out.push(MalformedVector {
+        name: "image_placement_zero_pixel_size",
+        direction: "broker",
+        hex: to_hex(&buf),
+        reason: "ImagePlacement with zero pixel_size must be rejected",
+    });
+
     out
 }
 
@@ -989,6 +1053,12 @@ fn generate_vectors_json() -> String {
         let mut dec = FrameDecoder::new();
         match v.direction {
             "frame" => assert!(dec.step(&raw).is_err(), "malformed frame {} must fail", v.name),
+            "client" => {
+                let (_, Some(DecodedFrame::Frame { header, payload })) = dec.step(&raw).unwrap() else {
+                    panic!("expected framed payload for {}", v.name);
+                };
+                assert!(ClientMsg::decode(header.msg_type, &payload).is_err(), "malformed client {} must fail", v.name);
+            }
             "broker" => {
                 let (_, Some(DecodedFrame::Frame { header, payload })) = dec.step(&raw).unwrap() else {
                     panic!("expected framed payload for {}", v.name);

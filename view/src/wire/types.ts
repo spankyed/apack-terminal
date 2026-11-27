@@ -10,6 +10,7 @@ import {
   MAX_LEASE_GRACE_MS,
   MAX_PACKED_LINKS,
   MAX_PACKED_PIECES,
+  MAX_PACKED_ROW_TEXT_BYTES,
   MAX_PACKED_RUNS,
   MAX_PACKED_STYLES,
   MAX_PALETTE_OVERRIDES,
@@ -553,9 +554,9 @@ export function encodeLeaseKind(w: WireWriter, v: LeaseKind): void {
     case 'brokerGrace':
       if (!Number.isInteger(v.graceMs) || v.graceMs < 1 || v.graceMs > MAX_LEASE_GRACE_MS) throw new WireError('LimitExceeded', 'lease grace_ms')
       if (v.resumeToken.length !== RESUME_TOKEN_LEN) throw new WireError('InvalidValue', 'resumeToken must be 32 bytes')
+      if (v.resumeToken.every((b) => b === 0)) throw new WireError('InvalidValue', 'resumeToken must be non-zero')
       w.u8(1)
       w.varU32(v.graceMs)
-      if (v.resumeToken.length !== RESUME_TOKEN_LEN) throw new WireError('InvalidValue', 'resumeToken must be 32 bytes')
       w.raw(v.resumeToken)
       return
     case 'session':
@@ -574,6 +575,7 @@ export function decodeLeaseKind(r: WireReader): LeaseKind {
       const graceMs = r.varU32()
       if (graceMs < 1 || graceMs > MAX_LEASE_GRACE_MS) throw new WireError('LimitExceeded', 'lease grace_ms')
       const resumeToken = r.fixedCopy(RESUME_TOKEN_LEN)
+      if (resumeToken.every((b) => b === 0)) throw new WireError('InvalidValue', 'resumeToken must be non-zero')
       return { kind: 'brokerGrace', graceMs, resumeToken }
     }
     case 2: {
@@ -602,6 +604,7 @@ export function encodeWaitCondition(w: WireWriter, v: WaitCondition): void {
       w.strBounded(v.needle, MAX_SEARCH_NEEDLE_BYTES, 'wait text needle')
       return
     case 'status':
+      if (v.states.length > MAX_WAIT_STATUSES) throw new WireError('LimitExceeded', 'wire limit exceeded: wait states')
       if (v.states.length === 0) throw new WireError('InvalidValue', 'wait status list must be non-empty')
       w.u8(2)
       w.slice(v.states, encodeStatusState)
@@ -762,6 +765,7 @@ export interface PaletteOverrides {
 }
 
 export function encodePaletteOverrides(w: WireWriter, v: PaletteOverrides): void {
+  if (v.palette.length > MAX_PALETTE_OVERRIDES) throw new WireError('LimitExceeded', 'wire limit exceeded: palette overrides')
   w.opt(v.fg, encodeRgb24)
   w.opt(v.bg, encodeRgb24)
   w.opt(v.cursor, encodeRgb24)
@@ -785,6 +789,13 @@ export interface ImagePiece {
 }
 
 export function encodeImagePiece(w: WireWriter, v: ImagePiece): void {
+  if (!Number.isInteger(v.colStart) || !Number.isInteger(v.colLen) || v.colStart < 0 || v.colLen === 0 || v.colStart + v.colLen > 0xffff) {
+    throw new WireError('InvalidValue', 'invalid ImagePiece column span')
+  }
+  if (v.srcRect[2] === 0 || v.srcRect[3] === 0 || v.srcRect[0] + v.srcRect[2] > 0xffff_ffff || v.srcRect[1] + v.srcRect[3] > 0xffff_ffff) {
+    throw new WireError('InvalidValue', 'invalid ImagePiece src_rect')
+  }
+  if (v.dstPx[0] === 0 || v.dstPx[1] === 0) throw new WireError('InvalidValue', 'invalid ImagePiece dst_px')
   encodeBlobHash(w, v.blob)
   w.u16(v.colStart)
   w.u16(v.colLen)
@@ -833,6 +844,9 @@ export interface CellSpan {
 }
 
 export function encodeCellSpan(w: WireWriter, v: CellSpan): void {
+  if (v.end.line < v.start.line || (v.end.line === v.start.line && v.end.col < v.start.col)) {
+    throw new WireError('InvalidValue', 'CellSpan end before start')
+  }
   encodeCellPos(w, v.start)
   encodeCellPos(w, v.end)
 }
@@ -912,6 +926,10 @@ export interface StatusRecord {
 }
 
 export function encodeStatusRecord(w: WireWriter, v: StatusRecord): void {
+  if (v.state !== 'blocked' && v.kind !== null) {
+    throw new WireError('InvalidValue', 'status kind requires Blocked state')
+  }
+  if (v.progress !== null) { if (!Number.isInteger(v.progress) || v.progress < 0 || v.progress > MAX_PROGRESS_PERCENT) throw new WireError('InvalidValue', 'progress must be 0..=100') }
   w.str(v.id)
   encodeStatusState(w, v.state)
   w.opt(v.kind, encodeBlockedKind)
@@ -950,6 +968,10 @@ export interface KeyInput {
 }
 
 export function encodeKeyInput(w: WireWriter, v: KeyInput): void {
+  if (!Number.isInteger(v.modifiers) || v.modifiers < 0 || v.modifiers > MODIFIER_ALL_MASK) throw new WireError('InvalidValue', 'unknown KeyInput modifier bits')
+  if (!Number.isInteger(v.unshiftedCodepoint) || v.unshiftedCodepoint < 0 || v.unshiftedCodepoint > 0x10_ffff || (v.unshiftedCodepoint >= 0xd800 && v.unshiftedCodepoint <= 0xdfff)) {
+    throw new WireError('InvalidValue', 'invalid Unicode scalar codepoint')
+  }
   w.str(v.code)
   encodeKeyAction(w, v.action)
   w.u8(v.modifiers)
@@ -981,6 +1003,10 @@ export interface PointerInput {
 }
 
 export function encodePointerInput(w: WireWriter, v: PointerInput): void {
+  if (!Number.isInteger(v.button) || v.button < 0 || (v.button > POINTER_MAX_BUTTON && v.button !== POINTER_BUTTON_NONE)) {
+    throw new WireError('InvalidValue', 'invalid PointerInput button')
+  }
+  if (!Number.isInteger(v.modifiers) || v.modifiers < 0 || v.modifiers > MODIFIER_ALL_MASK) throw new WireError('InvalidValue', 'unknown PointerInput modifier bits')
   encodePointerAction(w, v.action)
   w.u8(v.button)
   w.u8(v.modifiers)
@@ -1006,15 +1032,28 @@ export interface ImagePlacement {
   readonly blob: Uint8Array
   readonly line: number
   readonly col: number
+  readonly sourceRect: readonly [number, number, number, number]
+  readonly cellOffset: readonly [number, number]
   readonly pixelSize: readonly [number, number]
   readonly cellSpan: readonly [number, number]
   readonly zIndex: number
 }
 
 export function encodeImagePlacement(w: WireWriter, v: ImagePlacement): void {
+  if (v.sourceRect[2] === 0 || v.sourceRect[3] === 0 || v.sourceRect[0] + v.sourceRect[2] > 0xffff_ffff || v.sourceRect[1] + v.sourceRect[3] > 0xffff_ffff) {
+    throw new WireError('InvalidValue', 'invalid ImagePlacement source_rect')
+  }
+  if (v.pixelSize[0] === 0 || v.pixelSize[1] === 0) throw new WireError('InvalidValue', 'invalid ImagePlacement pixel_size')
+  if (v.cellSpan[0] === 0 || v.cellSpan[1] === 0) throw new WireError('InvalidValue', 'invalid ImagePlacement cell_span')
   encodeBlobHash(w, v.blob)
   w.varU64(v.line)
   w.i32(v.col)
+  w.varU32(v.sourceRect[0])
+  w.varU32(v.sourceRect[1])
+  w.varU32(v.sourceRect[2])
+  w.varU32(v.sourceRect[3])
+  w.varU32(v.cellOffset[0])
+  w.varU32(v.cellOffset[1])
   w.varU32(v.pixelSize[0])
   w.varU32(v.pixelSize[1])
   w.u16(v.cellSpan[0])
@@ -1022,14 +1061,20 @@ export function encodeImagePlacement(w: WireWriter, v: ImagePlacement): void {
   w.i32(v.zIndex)
 }
 export function decodeImagePlacement(r: WireReader): ImagePlacement {
-  return {
-    blob: decodeBlobHash(r),
-    line: r.varU64(),
-    col: r.i32(),
-    pixelSize: [r.varU32(), r.varU32()] as const,
-    cellSpan: [r.u16(), r.u16()] as const,
-    zIndex: r.i32(),
+  const blob = decodeBlobHash(r)
+  const line = r.varU64()
+  const col = r.i32()
+  const sourceRect = [r.varU32(), r.varU32(), r.varU32(), r.varU32()] as const
+  if (sourceRect[2] === 0 || sourceRect[3] === 0 || sourceRect[0] + sourceRect[2] > 0xffff_ffff || sourceRect[1] + sourceRect[3] > 0xffff_ffff) {
+    throw new WireError('InvalidValue', 'invalid ImagePlacement source_rect')
   }
+  const cellOffset = [r.varU32(), r.varU32()] as const
+  const pixelSize = [r.varU32(), r.varU32()] as const
+  if (pixelSize[0] === 0 || pixelSize[1] === 0) throw new WireError('InvalidValue', 'invalid ImagePlacement pixel_size')
+  const cellSpan = [r.u16(), r.u16()] as const
+  if (cellSpan[0] === 0 || cellSpan[1] === 0) throw new WireError('InvalidValue', 'invalid ImagePlacement cell_span')
+  const zIndex = r.i32()
+  return { blob, line, col, sourceRect, cellOffset, pixelSize, cellSpan, zIndex }
 }
 
 export interface MetricsSnapshot {
@@ -1132,14 +1177,52 @@ function buildUtf16ToUtf8Map(text: string): Uint32Array {
 }
 
 export function encodePackedRow(w: WireWriter, row: PackedRow): void {
+  if (!Number.isInteger(row.flags) || row.flags < 0 || row.flags > RowFlag.ALL_MASK) {
+    throw new WireError('InvalidValue', 'unknown PackedRow flag bits')
+  }
+  const utf8 = encodeUtf8(row.text)
+  if (utf8.length > MAX_PACKED_ROW_TEXT_BYTES) {
+    throw new WireError('LimitExceeded', 'wire limit exceeded: packed row text')
+  }
+  if (row.runs.length % 4 !== 0) {
+    throw new WireError('InvalidValue', 'PackedRow.runs length must be a multiple of 4')
+  }
+  const runCount = row.runs.length >>> 2
+  if (runCount > MAX_PACKED_RUNS) {
+    throw new WireError('LimitExceeded', 'wire limit exceeded: packed runs')
+  }
+  if (row.styles.length % 4 !== 0) {
+    throw new WireError('InvalidValue', 'PackedRow.styles length must be a multiple of 4')
+  }
+  const styleCount = row.styles.length >>> 2
+  if (styleCount > MAX_PACKED_STYLES) {
+    throw new WireError('LimitExceeded', 'wire limit exceeded: packed styles')
+  }
+  if (row.links.length > MAX_PACKED_LINKS) {
+    throw new WireError('LimitExceeded', 'wire limit exceeded: packed links')
+  }
+  if (row.links.length > 0 && row.links[0] !== '') {
+    throw new WireError('InvalidValue', 'links[0] must be empty')
+  }
+  for (let i = 1; i < row.links.length; i += 1) {
+    if (row.links[i] === '') {
+      throw new WireError('InvalidValue', 'non-zero link entry must be non-empty')
+    }
+  }
+  const pieces = row.pieces ?? []
+  if (pieces.length > MAX_PACKED_PIECES) {
+    throw new WireError('LimitExceeded', 'wire limit exceeded: image pieces')
+  }
+  if (pieces.length > 0 && (row.flags & RowFlag.HAS_PLACEHOLDER) === 0) {
+    throw new WireError('InvalidValue', 'pieces require FLAG_HAS_PLACEHOLDER')
+  }
+
   w.varU64(row.line)
   w.u8(row.flags)
-  const utf8 = encodeUtf8(row.text)
   w.bytes(utf8)
   const isAscii = utf8.length === row.text.length
   const utf16ToUtf8 = isAscii ? null : buildUtf16ToUtf8Map(row.text)
 
-  const runCount = row.runs.length >>> 2
   w.varU32(runCount)
   for (let i = 0; i < row.runs.length; i += 4) {
     const colWord = row.runs[i]!
@@ -1148,12 +1231,27 @@ export function encodePackedRow(w: WireWriter, row: PackedRow): void {
     const runFlags = row.runs[i + 3]!
     const colStart = colWord & 0xffff
     const colLen = colWord >>> 16
+    if (colLen === 0 || colStart + colLen > 0xffff) {
+      throw new WireError('InvalidValue', 'invalid PackedRun column span')
+    }
+    if (runFlags > RunFlag.ALL_MASK) {
+      throw new WireError('InvalidValue', 'unknown PackedRun flag bits')
+    }
     const u16Off = txtWord & 0xffff
     const u16Len = txtWord >>> 16
+    if (u16Off + u16Len > row.text.length) {
+      throw new WireError('InvalidValue', 'run text range out of bounds')
+    }
     const byteOffset = utf16ToUtf8 ? utf16ToUtf8[u16Off]! : u16Off
     const byteEnd = utf16ToUtf8 ? utf16ToUtf8[u16Off + u16Len]! : u16Off + u16Len
     const styleIdx = slWord & 0xffff
     const linkIdx = slWord >>> 16
+    if (styleIdx >= styleCount && styleIdx !== 0) {
+      throw new WireError('InvalidValue', 'run style_idx out of bounds')
+    }
+    if (linkIdx >= row.links.length && linkIdx !== 0) {
+      throw new WireError('InvalidValue', 'run link_idx out of bounds')
+    }
     w.u16(colStart)
     w.u16(colLen)
     w.varU32(byteOffset)
@@ -1163,17 +1261,31 @@ export function encodePackedRow(w: WireWriter, row: PackedRow): void {
     w.u8(runFlags)
   }
 
-  const styleCount = row.styles.length >>> 2
   w.varU32(styleCount)
   for (let i = 0; i < row.styles.length; i += 4) {
-    w.u32(row.styles[i]!)
-    w.u32(row.styles[i + 1]!)
-    w.u32(row.styles[i + 2]!)
-    w.u32(row.styles[i + 3]!)
+    const fg = row.styles[i]!
+    const bg = row.styles[i + 1]!
+    const ul = row.styles[i + 2]!
+    const sf = row.styles[i + 3]!
+    if (!isValidPackedColor(fg) || !isValidPackedColor(bg) || !isValidPackedColor(ul)) {
+      throw new WireError('InvalidValue', 'invalid PackedStyle colour encoding')
+    }
+    if (
+      (sf & ~PackedStyleFlag.ALL_MASK) !== 0 ||
+      (sf & PackedStyleFlag.UNDERLINE_MASK) > PackedStyleFlag.UNDERLINE_MAX
+    ) {
+      throw new WireError('InvalidValue', 'invalid PackedStyle flags')
+    }
+    if (i === 0 && (fg !== 0 || bg !== 0 || ul !== 0 || sf !== 0)) {
+      throw new WireError('InvalidValue', 'styles[0] must be default style')
+    }
+    w.u32(fg)
+    w.u32(bg)
+    w.u32(ul)
+    w.u32(sf)
   }
 
   w.slice(row.links, (wr, link) => wr.str(link))
-  const pieces = row.pieces ?? []
   w.slice(pieces, encodeImagePiece)
 }
 
@@ -1182,7 +1294,7 @@ export function decodePackedRow(r: WireReader): PackedRow {
   const flags = r.u8()
   if (flags > RowFlag.ALL_MASK) throw new WireError('InvalidValue', 'unknown PackedRow flag bits')
 
-  const textBytes = r.strBytes()
+  const textBytes = r.bytesBounded(MAX_PACKED_ROW_TEXT_BYTES, 'packed row text')
   const text = decodeUtf8Strict(textBytes)
   const isAscii = textBytes.length === text.length
   const byteToUtf16 = isAscii ? null : buildUtf8ToUtf16Map(textBytes)
@@ -1221,9 +1333,6 @@ export function decodePackedRow(r: WireReader): PackedRow {
       }
     }
     const u16Len = u16End - u16Start
-    if (u16Start > 0xffff || u16Len > 0xffff) {
-      throw new WireError('LimitExceeded', 'packed row text offset exceeds u16')
-    }
     const base = i << 2
     runs[base] = (colStart | (colLen << 16)) >>> 0
     runs[base + 1] = (u16Start | (u16Len << 16)) >>> 0
@@ -1262,6 +1371,11 @@ export function decodePackedRow(r: WireReader): PackedRow {
   const links = r.vecBounded(MAX_PACKED_LINKS, 'packed links', (rd) => rd.str())
   if (links.length > 0 && links[0] !== '') {
     throw new WireError('InvalidValue', 'links[0] must be empty')
+  }
+  for (let i = 1; i < links.length; i += 1) {
+    if (links[i] === '') {
+      throw new WireError('InvalidValue', 'non-zero link entry must be non-empty')
+    }
   }
 
   const pieces = r.vecBounded(MAX_PACKED_PIECES, 'image pieces', decodeImagePiece)

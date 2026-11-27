@@ -118,7 +118,7 @@ fn all_client_messages() -> Vec<ClientMsg> {
         ClientMsg::AcquireLease {
             kind: LeaseKind::BrokerGrace {
                 grace_ms: LeaseGraceMs::new(30_000).unwrap(),
-                resume_token: ResumeToken::new([0x11; 32]),
+                resume_token: ResumeToken::new([0x11; 32]).unwrap(),
             },
         },
         ClientMsg::ReleaseLease { lease_id: 55 },
@@ -295,6 +295,8 @@ fn all_broker_messages() -> Vec<BrokerMsg> {
                 blob: sample_blob(9),
                 line: 20,
                 col: -2,
+                source_rect: [4, 8, 320, 240],
+                cell_offset: [2, 3],
                 pixel_size: [640, 480],
                 cell_span: [40, 15],
                 z_index: -1,
@@ -725,7 +727,8 @@ fn domain_invariants_reject_illegal_values() {
     assert_eq!(LeaseGraceMs::new(1).unwrap().get(), 1);
     assert_eq!(LeaseGraceMs::new(MAX_LEASE_GRACE_MS).unwrap().get(), MAX_LEASE_GRACE_MS);
     assert!(LeaseGraceMs::new(MAX_LEASE_GRACE_MS + 1).is_none());
-    let tok = ResumeToken::new([0x5A; 32]);
+    assert_eq!(ResumeToken::new([0u8; 32]), None);
+    let tok = ResumeToken::new([0x5A; 32]).unwrap();
     assert_eq!(tok.as_bytes(), &[0x5A; 32]);
     assert_eq!(format!("{tok:?}"), "ResumeToken([REDACTED])");
 
@@ -1509,4 +1512,105 @@ fn enum_variant_and_flag_exhaustiveness() {
     let mut w = Writer::new();
     bad_frame.encode(&mut w);
     assert!(BrokerMsg::decode(msg_type::FRAME, w.as_slice()).is_err());
+}
+
+#[test]
+fn packed_row_text_cap_links_resume_token_and_image_placement_validation() {
+    // 1. PackedRow text exact boundary: MAX_PACKED_ROW_TEXT_BYTES passes, +1 fails with LimitExceeded.
+    let exact_text = "a".repeat(crate::MAX_PACKED_ROW_TEXT_BYTES);
+    let exact_row = PackedRow {
+        line: 0,
+        flags: 0,
+        text: exact_text,
+        runs: vec![PackedRun {
+            col_start: 0,
+            col_len: 1,
+            byte_offset: (crate::MAX_PACKED_ROW_TEXT_BYTES - 1) as u32,
+            byte_len: 1,
+            style_idx: 0,
+            link_idx: 0,
+            flags: 0,
+        }],
+        styles: vec![],
+        links: vec![],
+        pieces: vec![],
+    };
+    let mut w = Writer::new();
+    exact_row.encode(&mut w);
+    let mut r = Reader::new(w.as_slice());
+    assert_eq!(PackedRow::decode(&mut r).unwrap(), exact_row);
+
+    let over_row = PackedRow {
+        line: 0,
+        flags: 0,
+        text: "a".repeat(crate::MAX_PACKED_ROW_TEXT_BYTES + 1),
+        runs: vec![],
+        styles: vec![],
+        links: vec![],
+        pieces: vec![],
+    };
+    let mut w = Writer::new();
+    over_row.encode(&mut w);
+    let mut r = Reader::new(w.as_slice());
+    assert_eq!(PackedRow::decode(&mut r), Err(WireError::LimitExceeded("packed row text")));
+
+    // 2. PackedRow links[1..] rejects empty non-zero entries.
+    for bad_links in
+        [vec![String::new(), String::new()], vec![String::new(), "https://a.test".to_owned(), String::new()]]
+    {
+        let bad_row = PackedRow {
+            line: 0,
+            flags: 0,
+            text: String::new(),
+            runs: vec![],
+            styles: vec![],
+            links: bad_links,
+            pieces: vec![],
+        };
+        let mut w = Writer::new();
+        bad_row.encode(&mut w);
+        let mut r = Reader::new(w.as_slice());
+        assert_eq!(PackedRow::decode(&mut r), Err(WireError::InvalidValue("non-zero link entry must be non-empty")));
+    }
+
+    // 3. LeaseKind::BrokerGrace rejects all-zero resume token on decode.
+    let mut w = Writer::new();
+    w.u8(LeaseKind::TAG_BROKER_GRACE);
+    w.var_u32(1_000);
+    w.raw(&[0u8; 32]);
+    let mut r = Reader::new(w.as_slice());
+    assert_eq!(LeaseKind::decode(&mut r), Err(WireError::InvalidValue("resume_token must be non-zero")));
+
+    // 4. ImagePlacement validation: source_rect zero/overflow, pixel_size zero, cell_span zero.
+    let valid_placement = ImagePlacement {
+        blob: sample_blob(3),
+        line: 10,
+        col: -1,
+        source_rect: [4, 8, 64, 32],
+        cell_offset: [3, 5],
+        pixel_size: [128, 64],
+        cell_span: [8, 4],
+        z_index: 2,
+    };
+    let mut w = Writer::new();
+    valid_placement.encode(&mut w);
+    let mut r = Reader::new(w.as_slice());
+    assert_eq!(ImagePlacement::decode(&mut r).unwrap(), valid_placement);
+
+    let invalid_placements = [
+        (ImagePlacement { source_rect: [0, 0, 0, 10], ..valid_placement }, "invalid ImagePlacement source_rect"),
+        (ImagePlacement { source_rect: [0, 0, 10, 0], ..valid_placement }, "invalid ImagePlacement source_rect"),
+        (ImagePlacement { source_rect: [u32::MAX, 0, 1, 10], ..valid_placement }, "invalid ImagePlacement source_rect"),
+        (ImagePlacement { source_rect: [0, u32::MAX, 10, 1], ..valid_placement }, "invalid ImagePlacement source_rect"),
+        (ImagePlacement { pixel_size: [0, 10], ..valid_placement }, "invalid ImagePlacement pixel_size"),
+        (ImagePlacement { pixel_size: [10, 0], ..valid_placement }, "invalid ImagePlacement pixel_size"),
+        (ImagePlacement { cell_span: [0, 4], ..valid_placement }, "invalid ImagePlacement cell_span"),
+        (ImagePlacement { cell_span: [8, 0], ..valid_placement }, "invalid ImagePlacement cell_span"),
+    ];
+    for (bad, reason) in invalid_placements {
+        let mut w = Writer::new();
+        bad.encode(&mut w);
+        let mut r = Reader::new(w.as_slice());
+        assert_eq!(ImagePlacement::decode(&mut r), Err(WireError::InvalidValue(reason)));
+    }
 }

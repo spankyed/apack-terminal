@@ -165,6 +165,7 @@ pub(crate) fn extract_row(
         }
 
         let before = text.len();
+        let max_text = apack_proto::MAX_PACKED_ROW_TEXT_BYTES;
         let mut is_grapheme = false;
         match content {
             sys::CellContentTag::CODEPOINT if codepoint == u32::from(PLACEHOLDER) => {
@@ -190,16 +191,24 @@ pub(crate) fn extract_row(
                 style = PackedStyle { bg: style.bg, ..PackedStyle::default() };
             }
             sys::CellContentTag::CODEPOINT => {
-                if let Some(ch) = char::from_u32(codepoint).filter(|&c| c != '\0') {
+                if let Some(ch) = char::from_u32(codepoint).filter(|&c| c != '\0')
+                    && fits_row_text(text.len(), ch.len_utf8(), max_text)
+                {
                     text.push(ch);
                 }
             }
             sys::CellContentTag::CODEPOINT_GRAPHEME => {
-                is_grapheme = true;
                 let mut cps = Vec::new();
                 if crate::engine::read_grapheme_codepoints(&grid_ref, &mut cps) {
-                    text.extend(cps.iter().filter_map(|&c| char::from_u32(c)));
-                } else if let Some(ch) = char::from_u32(codepoint) {
+                    let needed: usize = cps.iter().filter_map(|&c| char::from_u32(c)).map(char::len_utf8).sum();
+                    if fits_row_text(text.len(), needed, max_text) {
+                        is_grapheme = true;
+                        text.extend(cps.iter().filter_map(|&c| char::from_u32(c)));
+                    }
+                } else if let Some(ch) = char::from_u32(codepoint)
+                    && fits_row_text(text.len(), ch.len_utf8(), max_text)
+                {
+                    is_grapheme = true;
                     text.push(ch);
                 }
             }
@@ -231,8 +240,9 @@ pub(crate) fn extract_row(
         };
 
         // Blank cell with default style and no hyperlink is omitted completely.
+        // Also drop cells if `text` has reached the protocol row-text byte cap.
         if text.len() == before {
-            if style == PackedStyle::default() && link_idx == 0 {
+            if (style == PackedStyle::default() && link_idx == 0) || !fits_row_text(text.len(), 1, max_text) {
                 continue;
             }
             text.push(' ');
@@ -289,6 +299,12 @@ pub(crate) fn extract_row(
     }
 
     Some(PackedRow { line: abs_line, flags: row_flags, text, runs, styles, links, pieces })
+}
+
+/// Returns `true` when appending `add_bytes` to `current_bytes` stays within `max_bytes`.
+#[inline]
+pub(crate) fn fits_row_text(current_bytes: usize, add_bytes: usize, max_bytes: usize) -> bool {
+    current_bytes.saturating_add(add_bytes) <= max_bytes
 }
 
 fn push_placeholder(runs: &mut Vec<PlaceholderRun>, col: u16, said: Said) {

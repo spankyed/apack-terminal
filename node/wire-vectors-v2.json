@@ -74,7 +74,7 @@
     { "name": "search_delta", "streamId": 3, "msgType": 774, "reqId": 0, "hex": "150000000300000006030000000004282d012a00002a010001" },
     { "name": "commands_reply", "streamId": 3, "msgType": 775, "reqId": 27, "hex": "540000000300000007031b000000030c010a636172676f207465737401052f7265706f0180d095ffbc3101c4e395ffbc310100000000010a010b012a0d0000000002010000000e01026c73000000030101000000012b0000" },
     { "name": "command_output_reply", "streamId": 3, "msgType": 776, "reqId": 28, "hex": "0f0000000300000008031c00000001036f6b0a" },
-    { "name": "images_reply", "streamId": 3, "msgType": 777, "reqId": 29, "hex": "3b0000000300000009031d0000000901abababababababababababababababababababababababababababababababab2a0a000000402008000200ffffffff" },
+    { "name": "images_reply", "streamId": 3, "msgType": 777, "reqId": 29, "hex": "410000000300000009031d0000000901abababababababababababababababababababababababababababababababab2a0a00000004023c1e0102402008000200ffffffff" },
     { "name": "image_blob_chunk", "streamId": 3, "msgType": 778, "reqId": 30, "hex": "36000000030000000a031e000000abababababababababababababababababababababababababababababababab0010000889504e470d0a1a0a" },
     { "name": "title", "streamId": 3, "msgType": 784, "reqId": 0, "hex": "0e000000030000001003000000000376696d" },
     { "name": "bell", "streamId": 3, "msgType": 785, "reqId": 0, "hex": "0a00000003000000110300000000" },
@@ -104,6 +104,9 @@
     { "name": "row_pieces_without_placeholder_flag", "direction": "broker", "hex": "3e0000000100000001030100000001010000016100000001111111111111111111111111111111111111111111111111111111111111111100000100000008080808", "reason": "non-empty pieces without FLAG_HAS_PLACEHOLDER must be rejected" },
     { "name": "search_delta_inverted_range", "direction": "broker", "hex": "0f0000000100000006030000000001140a0000", "reason": "to_line < from_line must be rejected" },
     { "name": "image_blob_chunk_overflow", "direction": "broker", "hex": "31000000010000000a0301000000abababababababababababababababababababababababababababababababab00040203010203", "reason": "offset + len > total_bytes must be rejected" },
-    { "name": "non_canonical_varint", "direction": "broker", "hex": "0c000000000000000902010000008000", "reason": "overlong LEB128 varint must be rejected" }
+    { "name": "non_canonical_varint", "direction": "broker", "hex": "0c000000000000000902010000008000", "reason": "overlong LEB128 varint must be rejected" },
+    { "name": "lease_zero_resume_token", "direction": "client", "hex": "2d0000000000000003000100000001e8070000000000000000000000000000000000000000000000000000000000000000", "reason": "all-zero resume_token must be rejected" },
+    { "name": "packed_row_empty_nonzero_link", "direction": "broker", "hex": "15000000010000000103010000000101000000000002000000", "reason": "empty non-zero link entry in PackedRow.links[1..] must be rejected" },
+    { "name": "image_placement_zero_pixel_size", "direction": "broker", "hex": "41000000010000000903010000000101abababababababababababababababababababababababababababababababab000000000000000a0a0000000a0100010000000000", "reason": "ImagePlacement with zero pixel_size must be rejected" }
   ]
 }

@@ -13,14 +13,14 @@ use apack_proto::types::{
 };
 
 use crate::engine::{
-    GhosttyConfig, GhosttyEngine, coalesce_feed_events, decode_osc7_cwd, escape_osc633_field, features,
-    last_snapshot_record_end, sanitize_osc633_body,
+    GhosttyConfig, GhosttyEngine, checked_image_placement, coalesce_feed_events, decode_osc7_cwd, escape_osc633_field,
+    features, last_snapshot_record_end, sanitize_osc633_body,
 };
 use crate::error::GhosttyError;
 use crate::image_store::{ImageStore, decode_png_rgba, encode_png_pixels, encode_png_rgba, png_rgba_pixel_count};
 use crate::input::consumed;
 use crate::placeholders::{PLACEHOLDER, PlaceholderRun, Said, fit};
-use crate::rows::{ROW_LINK_BYTES, intern_link};
+use crate::rows::{ROW_LINK_BYTES, fits_row_text, intern_link};
 use crate::{
     GLOBAL_IMAGE_STORE_BYTES, GLOBAL_SCROLLBACK_PRESSURE_BYTES, SESSION_IMAGE_STORAGE_BYTES, UNKNOWN_OSC_MAX_BYTES,
 };
@@ -1408,4 +1408,66 @@ fn review_mutants_batched_text_cell_px_resize_placeholder_bg_long_grapheme_and_s
         !ev.iter().any(|e| matches!(e, VtEvent::DeviceResponse(b) if b.ends_with(b";EINVAL: invalid data\x1b\\"))),
         "shared-memory medium must remain disabled after feed_named_probe"
     );
+}
+
+#[test]
+fn packed_row_text_cap_and_checked_image_placement_bounds() {
+    use apack_proto::codec::{Reader, Writer};
+    use apack_proto::types::BlobHash;
+
+    // 1. Exact boundary unit tests for `fits_row_text`.
+    assert!(fits_row_text(0, 0, 0));
+    assert!(!fits_row_text(0, 1, 0));
+    assert!(fits_row_text(65_534, 1, 65_535));
+    assert!(!fits_row_text(65_535, 1, 65_535));
+    assert!(fits_row_text(65_533, 2, 65_535));
+    assert!(!fits_row_text(65_534, 2, 65_535));
+
+    // 2. Real `GhosttyEngine` row extraction caps `PackedRow.text` at `MAX_PACKED_ROW_TEXT_BYTES`
+    //    even under hostile combining-mark grapheme amplification + trailing ASCII + styled blank cells.
+    let mut vt = GhosttyEngine::new(GhosttyConfig::new(grid(1000, 2))).unwrap();
+    let mut ev = Vec::new();
+    // 1 ASCII base + 64 3-byte combining marks (`U+20D0`) = 193 bytes/cell; 500 cells = 96.5 KiB > 65,535.
+    let mut cluster = String::from("a");
+    for _ in 0..64 {
+        cluster.push('\u{20D0}');
+    }
+    let mut hostile = String::with_capacity(500 * cluster.len() + 300);
+    for _ in 0..500 {
+        hostile.push_str(&cluster);
+    }
+    // 250 plain ASCII 'Z' fills the remaining <193 bytes to hit the exact 65,535-byte cap on CODEPOINT,
+    // followed by 250 ECH styled blank cells (`BG_COLOR_PALETTE`) that must be dropped at the cap.
+    hostile.push_str(&"Z".repeat(250));
+    hostile.push_str("\x1b[41m\x1b[250X\x1b[0m");
+    vt.feed(hostile.as_bytes(), &mut ev);
+
+    let mut rows = Vec::new();
+    vt.extract_viewport_rows(&[0], &mut rows);
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(
+        row.text.len(),
+        apack_proto::MAX_PACKED_ROW_TEXT_BYTES,
+        "extracted row text must saturate at exact MAX_PACKED_ROW_TEXT_BYTES"
+    );
+    assert!(row.text.ends_with('Z'), "ASCII tail must fill up to exact cap while trailing styled blanks are dropped");
+    // Must round-trip cleanly through strict `apack-proto` wire validation.
+    let mut w = Writer::new();
+    row.encode(&mut w);
+    let mut r = Reader::new(w.as_slice());
+    assert_eq!(PackedRow::decode(&mut r).unwrap(), *row);
+
+    // 3. `checked_image_placement` rejects any zero dimension and clamps oversized spans.
+    let blob = BlobHash([0x22; 32]);
+    assert!(checked_image_placement(blob, 1, 2, 0, 10, 2, 2, 0).is_none());
+    assert!(checked_image_placement(blob, 1, 2, 10, 0, 2, 2, 0).is_none());
+    assert!(checked_image_placement(blob, 1, 2, 10, 10, 0, 2, 0).is_none());
+    assert!(checked_image_placement(blob, 1, 2, 10, 10, 2, 0, 0).is_none());
+    let ok = checked_image_placement(blob, 5, -1, 120, 80, u32::MAX, 70_000, -3).unwrap();
+    assert_eq!(ok.source_rect, [0, 0, 120, 80]);
+    assert_eq!(ok.cell_offset, [0, 0]);
+    assert_eq!(ok.pixel_size, [120, 80]);
+    assert_eq!(ok.cell_span, [u16::MAX, u16::MAX]);
+    assert_eq!(ok.z_index, -3);
 }

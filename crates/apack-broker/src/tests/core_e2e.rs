@@ -351,7 +351,7 @@ fn e2e_remote_lease_grace_resume_and_recording_rewind_seek_restore() {
     let mut handle = BrokerServer::bind(cfg).unwrap().spawn().unwrap();
 
     // 1. Acquire a grace-windowed remote lease, spawn a recorded session, disconnect, and resume!
-    let token = ResumeToken::new([0x7A; 32]);
+    let token = ResumeToken::new([0x7A; 32]).unwrap();
     let grace = LeaseGraceMs::new(15_000).unwrap();
     let sid = {
         let mut c1 = BrokerClient::connect(handle.socket_path(), &AuthConfig::None, "ssh-1").unwrap();

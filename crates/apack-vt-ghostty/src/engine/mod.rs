@@ -27,7 +27,7 @@ pub(crate) use ffi_queries::read_grapheme_codepoints;
 #[cfg(test)]
 pub(crate) use snapshot::last_snapshot_record_end;
 #[cfg(test)]
-pub(crate) use vt_impl::coalesce_feed_events;
+pub(crate) use vt_impl::{checked_image_placement, coalesce_feed_events};
 
 use ffi_queries::{handle_at_ground, track_active_top};
 

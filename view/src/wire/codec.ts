@@ -17,6 +17,7 @@ export {
   MAX_GRID_COLS,
   MAX_GRID_ROWS,
   MAX_LEASE_GRACE_MS,
+  MAX_PACKED_ROW_TEXT_BYTES,
   MAX_ROWS_PER_FETCH,
   MAX_SEARCH_MATCHES,
   MAX_SEARCH_NEEDLE_BYTES,
@@ -315,8 +316,9 @@ export class WireReader {
   }
 
   bytesBounded(maxLen: number, label: string): Uint8Array {
+    const cap = Math.min(maxLen, MAX_BLOB_BYTES)
     const len = this.varU32()
-    if (len > maxLen) {
+    if (len > cap) {
       throw new WireError('LimitExceeded', `wire limit exceeded: ${label}`)
     }
     return this.take(len)

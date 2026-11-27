@@ -94,6 +94,10 @@ pub const MAX_IMAGES_REPLY: usize = 4_096;
 /// Maximum dynamic palette overrides in a `PaletteOverrides` table.
 pub const MAX_PALETTE_OVERRIDES: usize = 256;
 
+/// Maximum length in bytes of a single `PackedRow.text` field (`u16::MAX`, guaranteeing UTF-16 run
+/// offsets fit in `u16` across Rust and TypeScript codecs).
+pub const MAX_PACKED_ROW_TEXT_BYTES: usize = u16::MAX as usize;
+
 /// Maximum style runs in a single `PackedRow`.
 pub const MAX_PACKED_RUNS: usize = 4_096;
 
