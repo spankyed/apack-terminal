@@ -162,6 +162,42 @@ jobs:
       - run: npm test
       - run: npm run build
 
+  # Real-Chromium Playwright E2E suite mounting TerminalView (WebGL2AtlasPainter & CanvasPainter)
+  # against a live apack-terminal v2 broker binary over a local WebSocket bridge.
+  view-e2e:
+    name: view-e2e (Linux x64)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - shell: bash
+        run: echo "GHOSTTY_VT_RS_SYS_OPTIMIZE=fast" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - run: cargo build --locked --bin apack-terminal
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install color emoji font for Chromium WebGL2 emoji verification
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends fonts-noto-color-emoji && fc-cache -f
+      - working-directory: view
+        run: npm ci --no-audit --no-fund
+      - working-directory: view
+        run: npx playwright install --with-deps chromium
+      - working-directory: view
+        run: npm run build
+      - working-directory: view
+        env:
+          APACK_TERMINAL_BIN: ${{ github.workspace }}/target/debug/apack-terminal
+        run: npm run test:e2e
+
   # The broker's npm package (`node/`): its runtime entry, which finds the binary in the platform package
   # installed beside it, and the release's packing of the platform packages, whose versions must be its own
   node:
@@ -183,7 +219,7 @@ jobs:
   # The one check a merge waits on: every job above passed or was skipped (a documentation-only change)
   ci-pass:
     if: always()
-    needs: [changes, checks, platforms, view, node]
+    needs: [changes, checks, platforms, view, view-e2e, node]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
