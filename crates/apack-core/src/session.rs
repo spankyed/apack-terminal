@@ -724,6 +724,7 @@ impl<V: VtEngine> SessionMachine<V> {
         self.marks.on_session_exit(now, &mut mark_effects);
         self.apply_mark_effects(mark_effects, effects);
 
+        self.notify_views_dirty(effects);
         self.broadcast_event(BrokerMsg::Exited { exit_code, signal }, effects);
 
         for w in self.waiters.drain(..) {
@@ -741,7 +742,6 @@ impl<V: VtEngine> SessionMachine<V> {
                 msg: BrokerMsg::Waited { outcome },
             });
         }
-        self.notify_views_dirty(effects);
     }
 
     /// Fires all expired session timers (`SyncHold`, `SearchFlush`, `WaitTimeout`) at `now`.

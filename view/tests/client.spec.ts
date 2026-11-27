@@ -446,15 +446,43 @@ describe('TerminalClient & BrokerSessionSource', () => {
     const rawAlso = await client.attachSession(2, { flags: SubFlags.VIEW | SubFlags.EVENTS | SubFlags.RAW_OUTPUT })
 
     // Pending RPC on non-RAW_OUTPUT stream rejects immediately on Exited (broker suppresses redundant StreamClosed)
+    // and marks BrokerSessionSource locally disposed without emitting a synthetic streamClosed.
+    const viewEvents: string[] = []
+    viewOnly.subscribe({
+      onFrame: () => {},
+      onSearchMatches: () => {},
+      onSearchDelta: () => {},
+      onEvent: (ev) => viewEvents.push(ev.kind),
+    })
     const pendingView = viewOnly.fetchRows(1, 0, 10)
     pipe.pushBroker(viewOnly.streamId, PUSH_REQ_ID, { kind: 'exited', exitCode: 0, signal: null })
     await expect(pendingView).rejects.toBeInstanceOf(DisconnectedError)
+    expect(viewEvents).toEqual(['exited'])
+    const sentAfterExit = pipe.sentToBroker.length
+    await expect(viewOnly.fetchRows(1, 0, 10)).rejects.toBeInstanceOf(DisconnectedError)
+    viewOnly.sendKey({
+      code: 'KeyA',
+      action: 'press',
+      modifiers: 0,
+      text: 'a',
+      unshiftedCodepoint: 97,
+      composed: false,
+    })
+    expect(pipe.sentToBroker.length).toBe(sentAfterExit)
 
     // Pending RPC on RAW_OUTPUT stream stays alive across Exited until trailing StreamClosed arrives
+    const rawEvents: string[] = []
+    rawAlso.subscribe({
+      onFrame: () => {},
+      onSearchMatches: () => {},
+      onSearchDelta: () => {},
+      onEvent: (ev) => rawEvents.push(ev.kind),
+    })
     const pendingRaw = rawAlso.fetchRows(1, 0, 10)
     pipe.pushBroker(rawAlso.streamId, PUSH_REQ_ID, { kind: 'exited', exitCode: 0, signal: null })
     pipe.pushBroker(rawAlso.streamId, PUSH_REQ_ID, { kind: 'streamClosed', reason: 'session ended' })
     await expect(pendingRaw).rejects.toBeInstanceOf(DisconnectedError)
+    expect(rawEvents).toEqual(['exited', 'streamClosed'])
 
     client.close()
   })

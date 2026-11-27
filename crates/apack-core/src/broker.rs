@@ -275,7 +275,6 @@ struct AttachedStream {
     flags: SubFlags,
     frame_pacer: Option<FramePacer>,
     raw_output: Option<RawOutputFlow>,
-    exited_sent: bool,
 }
 
 #[derive(Debug)]
@@ -407,7 +406,6 @@ impl BrokerCore {
             }
         }
         for (conn_id, stream_id) in to_close {
-            let mut emit_stream_closed = true;
             if let Some(conn) = self.conns.get_mut(&conn_id)
                 && let Some(mut st) = conn.streams.remove(&stream_id)
             {
@@ -416,31 +414,20 @@ impl BrokerCore {
                 }
                 // Preserve already-queued `Exited` events and final `Output` chunks; drop only unsent frames.
                 conn.outbound.remove_stream_frames(stream_id.as_stream_id(), &mut conn.budget);
-                // Suppress redundant `StreamClosed` when `Exited` was already queued and no trailing
-                // `SUB_RAW_OUTPUT` chunks can follow; keep `closing_streams` until queued messages drain.
-                if st.exited_sent && !st.flags.contains(SubFlags::RAW_OUTPUT) {
-                    emit_stream_closed = false;
-                    if conn.outbound.has_stream_messages(stream_id.as_stream_id()) {
-                        conn.closing_streams.insert(stream_id);
-                    }
-                } else {
-                    conn.closing_streams.insert(stream_id);
-                }
+                conn.closing_streams.insert(stream_id);
             }
-            if emit_stream_closed {
-                let msg = BrokerMsg::StreamClosed { reason: String::from(reason) };
-                // Enqueued at `RawOutput` priority so it drains strictly after `Exited` (Event) and
-                // FIFO behind any already-queued final `Output` chunks for this stream.
-                self.enqueue_message(
-                    conn_id,
-                    stream_id.as_stream_id(),
-                    RequestId::PUSH,
-                    OutboundPriority::RawOutput,
-                    msg,
-                    now,
-                    actions,
-                );
-            }
+            let msg = BrokerMsg::StreamClosed { reason: String::from(reason) };
+            // Enqueued at `RawOutput` priority so it drains strictly after `Exited` (Event) and
+            // FIFO behind any already-queued final `Output` chunks for this stream.
+            self.enqueue_message(
+                conn_id,
+                stream_id.as_stream_id(),
+                RequestId::PUSH,
+                OutboundPriority::RawOutput,
+                msg,
+                now,
+                actions,
+            );
         }
     }
 
@@ -679,17 +666,34 @@ impl BrokerCore {
             };
             encoded_bytes = estimate_encoded_bytes(&msg);
         }
-        let is_exited = matches!(msg, BrokerMsg::Exited { .. });
+        // For streams without `SUB_RAW_OUTPUT`, `Exited` is the terminal stream message (no trailing
+        // `Output` or redundant `StreamClosed` follows): enqueue at P4 (`RawOutput`) so any already-queued
+        // P1 Frame / P2 Event / P3 Bulk messages strictly drain first, and immediately move the stream into
+        // `closing_streams` so `stream_id` becomes reusable the instant `Exited` is popped onto the wire.
+        let closes_on_exit = matches!(msg, BrokerMsg::Exited { .. })
+            && NonZeroStreamId::new(stream_id.raw()).is_some_and(|nz| {
+                self.conns
+                    .get(&conn)
+                    .and_then(|s| s.streams.get(&nz))
+                    .is_some_and(|st| !st.flags.contains(SubFlags::RAW_OUTPUT))
+            });
+        let effective_priority = if closes_on_exit { OutboundPriority::RawOutput } else { priority };
         let overflowed = match self.conns.get_mut(&conn) {
             Some(state) => {
-                let res =
-                    state.outbound.push_ordered(priority, stream_id, req_id, msg, encoded_bytes, &mut state.budget);
+                let res = state.outbound.push_ordered(
+                    effective_priority,
+                    stream_id,
+                    req_id,
+                    msg,
+                    encoded_bytes,
+                    &mut state.budget,
+                );
                 if res.is_ok()
-                    && is_exited
+                    && closes_on_exit
                     && let Some(nz) = NonZeroStreamId::new(stream_id.raw())
-                    && let Some(st) = state.streams.get_mut(&nz)
                 {
-                    st.exited_sent = true;
+                    state.streams.remove(&nz);
+                    state.closing_streams.insert(nz);
                 }
                 res.is_err()
             }
@@ -1330,10 +1334,9 @@ impl BrokerCore {
                     None
                 };
                 if let Some(state) = self.conns.get_mut(&conn) {
-                    state.streams.insert(
-                        stream_id,
-                        AttachedStream { attachment_id, session, flags, frame_pacer, raw_output, exited_sent: false },
-                    );
+                    state
+                        .streams
+                        .insert(stream_id, AttachedStream { attachment_id, session, flags, frame_pacer, raw_output });
                 }
                 actions.push(BrokerAction::StreamAttached {
                     conn,

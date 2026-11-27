@@ -33,6 +33,10 @@ pub enum FlowError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueueOverflow;
 
+/// Headroom reserved in [`MemoryBudget`] so `RawOutputFlow::pending_utf8` never starves outbound
+/// framing overhead, `OutputDropped`/`Throttled` notices, or control replies.
+pub const RAW_PENDING_BUDGET_HEADROOM: usize = 262_144;
+
 /// Single per-connection hard byte budget shared by [`OutboundQueue`] tiers and all attached
 /// streams' [`RawOutputFlow`] pending UTF-8 buffers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +64,12 @@ impl MemoryBudget {
     /// Remaining byte headroom before reaching `max_bytes`.
     pub const fn remaining_bytes(&self) -> usize {
         self.max_bytes.saturating_sub(self.used_bytes)
+    }
+
+    /// Remaining headroom usable by `RawOutputFlow::pending_utf8`, preserving a framing/control reserve.
+    pub fn pending_raw_room(&self) -> usize {
+        let reserve = (self.max_bytes / 4).min(RAW_PENDING_BUDGET_HEADROOM);
+        self.remaining_bytes().saturating_sub(reserve)
     }
 
     /// Returns `true` if replacing `freed` bytes with `added` bytes stays within `max_bytes`.
@@ -360,11 +370,11 @@ impl RawOutputFlow {
             }
             let rest = &decoded[offset..];
             let stream_room = self.max_pending_bytes.saturating_sub(self.pending_utf8.len());
-            let room = stream_room.min(budget.remaining_bytes());
+            let room = stream_room.min(budget.pending_raw_room());
             let keep = floor_char_boundary(rest, room);
             if keep != 0 {
                 self.pending_utf8.extend_from_slice(&rest.as_bytes()[..keep]);
-                budget.reserve(keep).expect("keep <= budget.remaining_bytes()");
+                budget.reserve(keep).expect("keep <= budget.pending_raw_room() <= budget.remaining_bytes()");
             }
             delta.dropped_bytes = (rest.len() - keep) as u64;
             if (!self.pending_utf8.is_empty() || self.credit_bytes == 0) && self.throttled_since.is_none() {

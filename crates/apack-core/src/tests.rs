@@ -1762,7 +1762,7 @@ fn pr4_stream_attachment_phase_decoders_unified_budget_and_exited_suppression() 
     broker.abort_attach(conn(1), nz_stream(1), att2);
     assert!(broker.stream_attachment(conn(1), nz_stream(1)).is_none());
 
-    // 3. Redundant StreamClosed suppression after Exited when !RAW_OUTPUT (`M11` broker):
+    // 3. Redundant StreamClosed suppression, P3 Bulk ordering, and immediate stream reuse on Exited (!RAW_OUTPUT):
     actions.clear();
     broker.feed_bytes(conn(1), &attach_s1(13, SubFlags::VIEW | SubFlags::EVENTS, 0), ts(25), &mut actions);
     broker.feed_bytes(
@@ -1782,6 +1782,17 @@ fn pr4_stream_attachment_phase_decoders_unified_budget_and_exited_suppression() 
         ts(26),
         &mut actions,
     );
+    // Queue a P3 Bulk reply BEFORE Exited on stream 1 -> Exited (demoted to P4 for !RAW_OUTPUT)
+    // must drain strictly AFTER P3 Bulk so the client never sees Exited overtake an in-flight RPC reply!
+    broker.enqueue_message(
+        conn(1),
+        nz_stream(1).as_stream_id(),
+        RequestId::from_raw(77),
+        OutboundPriority::Bulk,
+        BrokerMsg::TextReply { text: String::from("bulk-before-exit") },
+        ts(27),
+        &mut actions,
+    );
     broker.enqueue_message(
         conn(1),
         nz_stream(1).as_stream_id(),
@@ -1791,8 +1802,7 @@ fn pr4_stream_attachment_phase_decoders_unified_budget_and_exited_suppression() 
         ts(27),
         &mut actions,
     );
-    broker.unregister_session(sid(1), "session ended", ts(28), &mut actions);
-    // While Exited is still queued on stream 1, stream 1 stays in closing_streams -> Busy on re-attach!
+    // While Bulk + Exited are still queued on stream 1, stream 1 is already in closing_streams -> Busy on re-attach!
     broker.feed_bytes(
         conn(1),
         &encode_client(
@@ -1807,21 +1817,82 @@ fn pr4_stream_attachment_phase_decoders_unified_budget_and_exited_suppression() 
                 initial_frame_credit: FrameCredit { max_frames: 1, max_bytes: 65_536 },
             },
         ),
-        ts(29),
+        ts(28),
         &mut actions,
     );
     assert!(matches!(broker.pop_outbound(conn(1)).unwrap().msg, BrokerMsg::Error { code: ErrorCode::Busy, .. }));
-    // Pop Exited (stream 1) -> NO StreamClosed on stream 1! Stream 2 (VIEW-only) gets StreamClosed!
+    // P3 Bulk drains strictly BEFORE P4 Exited!
+    let bulk_msg = broker.pop_outbound(conn(1)).unwrap();
+    assert_eq!(bulk_msg.stream_id, nz_stream(1).as_stream_id());
+    assert_eq!(bulk_msg.msg, BrokerMsg::TextReply { text: String::from("bulk-before-exit") });
+    // Still in closing_streams while Exited remains queued:
+    broker.feed_bytes(
+        conn(1),
+        &encode_client(
+            StreamId::CONTROL,
+            16,
+            &ClientMsg::Attach {
+                session: sid(2),
+                stream_id: nz_stream(1),
+                flags: SubFlags::from_bits(SubFlags::VIEW).unwrap(),
+                initial_viewport: None,
+                initial_output_credit: 0,
+                initial_frame_credit: FrameCredit { max_frames: 1, max_bytes: 65_536 },
+            },
+        ),
+        ts(28),
+        &mut actions,
+    );
+    assert!(matches!(broker.pop_outbound(conn(1)).unwrap().msg, BrokerMsg::Error { code: ErrorCode::Busy, .. }));
+    // Pop Exited (stream 1) -> clears closing_streams immediately EVEN BEFORE unregister_session runs!
     let m1 = broker.pop_outbound(conn(1)).unwrap();
     assert_eq!(m1.stream_id, nz_stream(1).as_stream_id());
     assert_eq!(m1.msg, BrokerMsg::Exited { exit_code: Some(0), signal: None });
+    // Immediate reuse of stream_id 1 for sid(2) BEFORE unregister_session(sid(1)) succeeds cleanly!
+    actions.clear();
+    broker.feed_bytes(
+        conn(1),
+        &encode_client(
+            StreamId::CONTROL,
+            17,
+            &ClientMsg::Attach {
+                session: sid(2),
+                stream_id: nz_stream(1),
+                flags: SubFlags::from_bits(SubFlags::VIEW).unwrap(),
+                initial_viewport: None,
+                initial_output_credit: 0,
+                initial_frame_credit: FrameCredit { max_frames: 1, max_bytes: 65_536 },
+            },
+        ),
+        ts(28),
+        &mut actions,
+    );
+    let reused_att = broker.stream_attachment(conn(1), nz_stream(1)).expect("reused stream 1");
+    assert_eq!(broker.stream_session(conn(1), nz_stream(1)), Some(sid(2)));
+    // Now unregister_session(sid(1)) runs on Turn 2: emits StreamClosed ONLY for stream 2 (VIEW-only),
+    // leaves reused stream 1 untouched, and emits NO duplicate StreamClosed for stream 1!
+    broker.unregister_session(sid(1), "session ended", ts(29), &mut actions);
+    assert!(broker.is_attachment_active(conn(1), nz_stream(1), reused_att));
     let m2 = broker.pop_outbound(conn(1)).unwrap();
     assert_eq!(m2.stream_id, nz_stream(2).as_stream_id());
     assert_eq!(m2.msg, BrokerMsg::StreamClosed { reason: "session ended".into() });
     assert_eq!(broker.pop_outbound(conn(1)), None);
     assert_eq!(broker.connection_budget_used(conn(1)), Some(0));
+    // Detach reused stream 1 before next section.
+    broker.feed_bytes(
+        conn(1),
+        &encode_client(StreamId::CONTROL, 18, &ClientMsg::Detach { stream_id: nz_stream(1) }),
+        ts(29),
+        &mut actions,
+    );
+    assert_eq!(broker.pop_outbound(conn(1)).unwrap().msg, BrokerMsg::Ok);
 
-    // 4. Unified MemoryBudget across OutboundQueue + multiple RawOutputFlow::pending_utf8 (`M1`):
+    // 4. Unified MemoryBudget headroom & OutputCredit drain (`M1`):
+    let large_budget = MemoryBudget::new(2 * 1024 * 1024);
+    assert_eq!(large_budget.pending_raw_room(), 2 * 1024 * 1024 - crate::flow::RAW_PENDING_BUDGET_HEADROOM);
+    let small_budget = MemoryBudget::new(400);
+    assert_eq!(small_budget.pending_raw_room(), 300);
+
     broker.register_session(sid(3), false, false);
     let attach_raw = |req: u32, session: SessionId, stream: u32| {
         encode_client(
@@ -1839,31 +1910,49 @@ fn pr4_stream_attachment_phase_decoders_unified_budget_and_exited_suppression() 
     };
     broker.feed_bytes(conn(1), &attach_raw(20, sid(2), 1), ts(30), &mut actions);
     broker.feed_bytes(conn(1), &attach_raw(21, sid(3), 2), ts(31), &mut actions);
-    // Buffer 200B on stream 1 and 150B on stream 2 -> total 350B / 400B budget used!
+    // With 400B cap, pending_raw_room reserves 100B headroom (cap = 300B for pending_utf8).
+    // Buffer 200B on stream 1 and 150B on stream 2 -> stream 2 keeps 100B and drops 50B without SlowReader!
+    actions.clear();
     broker.publish_raw_output(sid(2), &[b'a'; 200], ts(32), &mut actions);
     broker.publish_raw_output(sid(3), &[b'b'; 150], ts(33), &mut actions);
-    assert_eq!(broker.connection_budget_used(conn(1)), Some(350));
-    // Detaching stream 1 releases its 200B pending_utf8 immediately!
+    assert_eq!(broker.connection_count(), 1);
+    let dropped_msg = broker.pop_outbound(conn(1)).unwrap();
+    assert_eq!(dropped_msg.msg, BrokerMsg::OutputDropped { bytes: 50 });
+    assert_eq!(broker.connection_budget_used(conn(1)), Some(300));
+    // Draining full pending_utf8 via OutputCredit (releasing 200B, enqueuing Output + Throttled with framing
+    // overhead) MUST succeed using the reserved headroom without tripping CloseReason::SlowReader!
+    actions.clear();
     broker.feed_bytes(
         conn(1),
-        &encode_client(StreamId::CONTROL, 22, &ClientMsg::Detach { stream_id: nz_stream(1) }),
+        &encode_client(nz_stream(1).as_stream_id(), 22, &ClientMsg::OutputCredit { bytes: 250 }),
         ts(34),
         &mut actions,
     );
+    assert_eq!(broker.connection_count(), 1);
+    assert_eq!(broker.pop_outbound(conn(1)).unwrap().msg, BrokerMsg::Output { text: "a".repeat(200) });
+    assert!(matches!(broker.pop_outbound(conn(1)).unwrap().msg, BrokerMsg::Throttled { .. }));
+    assert_eq!(broker.connection_budget_used(conn(1)), Some(100));
+    // Detaching stream 2 releases its 100B pending_utf8 immediately!
+    broker.feed_bytes(
+        conn(1),
+        &encode_client(StreamId::CONTROL, 23, &ClientMsg::Detach { stream_id: nz_stream(2) }),
+        ts(35),
+        &mut actions,
+    );
     assert_eq!(broker.pop_outbound(conn(1)).unwrap().msg, BrokerMsg::Ok);
-    assert_eq!(broker.connection_budget_used(conn(1)), Some(150));
-    // Re-attach stream 1 and fill up to 350B again, then push an 80B outbound message -> 350 + 80 > 400 -> SlowReader!
-    broker.feed_bytes(conn(1), &attach_raw(23, sid(2), 1), ts(35), &mut actions);
-    broker.publish_raw_output(sid(2), &[b'c'; 200], ts(36), &mut actions);
-    assert_eq!(broker.connection_budget_used(conn(1)), Some(350));
+    assert_eq!(broker.connection_budget_used(conn(1)), Some(0));
+    // Re-attach stream 2, refill pending_utf8 to 300B, then push a 120B outbound message -> 300 + ~136 > 400 -> SlowReader!
+    broker.feed_bytes(conn(1), &attach_raw(24, sid(3), 2), ts(36), &mut actions);
+    broker.publish_raw_output(sid(3), &[b'c'; 300], ts(37), &mut actions);
+    assert_eq!(broker.connection_budget_used(conn(1)), Some(300));
     actions.clear();
     broker.enqueue_message(
         conn(1),
         StreamId::CONTROL,
         RequestId::PUSH,
         OutboundPriority::Event,
-        BrokerMsg::Title { title: "z".repeat(80) },
-        ts(37),
+        BrokerMsg::Title { title: "z".repeat(120) },
+        ts(38),
         &mut actions,
     );
     assert!(matches!(actions.last(), Some(BrokerAction::CloseConn { reason: CloseReason::SlowReader, .. })));

@@ -1212,13 +1212,15 @@ impl ReactorState {
                     }
                 }
                 BrokerAction::SetSessionKept { conn, req_id, session, kept } => {
-                    if let Some(&shard_idx) = self.session_shard.get(&session)
-                        && let Some(permit) = self.try_acquire_shard_permit(conn, StreamId::CONTROL, req_id, now)
-                    {
-                        self.shards[shard_idx].send_with_permit(
-                            ShardCmd::SetKept { session_id: session, conn, req_id, kept },
-                            Some(permit),
-                        );
+                    if let Some(&shard_idx) = self.session_shard.get(&session) {
+                        if let Some(permit) = self.try_acquire_shard_permit(conn, StreamId::CONTROL, req_id, now) {
+                            self.shards[shard_idx].send_with_permit(
+                                ShardCmd::SetKept { session_id: session, conn, req_id, kept },
+                                Some(permit),
+                            );
+                        } else if let Some(&prev) = self.session_kept.get(&session) {
+                            self.core.set_session_kept(session, prev);
+                        }
                     }
                 }
                 BrokerAction::WaitSession { conn, req_id, session, condition, timeout_ms } => {

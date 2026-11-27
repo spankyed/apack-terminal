@@ -61,6 +61,15 @@ fn parse_proc_comm(raw: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
+/// Decodes a NUL-terminated UTF-8-lossy buffer returned by `libc::proc_name`.
+#[cfg(unix)]
+fn decode_proc_name_buf(buf: &[u8], len: i32) -> Option<String> {
+    let used = usize::try_from(len).ok()?.min(buf.len());
+    let nul = buf[..used].iter().position(|&b| b == 0).unwrap_or(used);
+    let name = String::from_utf8_lossy(&buf[..nul]);
+    parse_proc_comm(&name)
+}
+
 /// Reads the short executable name for a single Unix PID without constructing a `sysinfo::System`.
 #[cfg(unix)]
 pub fn process_name_for_pid(pid: u32) -> Option<String> {
@@ -79,13 +88,7 @@ pub fn process_name_for_pid(pid: u32) -> Option<String> {
         // SAFETY: `buf` is a live writable stack buffer of length `buf.len()`; `proc_name` writes
         // at most `buffersize` bytes and returns the positive byte length on success or `<= 0` on error.
         let len = unsafe { libc::proc_name(pid_i32, buf.as_mut_ptr().cast(), buf.len() as u32) };
-        if len <= 0 {
-            return None;
-        }
-        let used = (len as usize).min(buf.len());
-        let nul = buf[..used].iter().position(|&b| b == 0).unwrap_or(used);
-        let name = String::from_utf8_lossy(&buf[..nul]);
-        parse_proc_comm(&name)
+        decode_proc_name_buf(&buf, len)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -179,6 +182,10 @@ mod tests {
         let me = std::process::id();
         assert_eq!(parse_proc_comm("zsh\n"), Some(String::from("zsh")));
         assert_eq!(parse_proc_comm("\r\n"), None);
+        assert_eq!(decode_proc_name_buf(b"zsh\0trailing", 12), Some(String::from("zsh")));
+        assert_eq!(decode_proc_name_buf(b"bash", 99), Some(String::from("bash")));
+        assert_eq!(decode_proc_name_buf(b"bash", 0), None);
+        assert_eq!(decode_proc_name_buf(b"bash", -1), None);
         assert!(process_name_for_pid(0).is_none());
         assert!(process_name_for_pid(u32::MAX).is_none());
         let my_name = process_name_for_pid(me).expect("current process name");
