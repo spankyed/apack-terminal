@@ -175,22 +175,27 @@ pub(super) fn tokenize(source: &str) -> Vec<Tok> {
 
         // Number literal (including decimal fraction and scientific exponent like `1e-5` / `1.0e+5`)
         if b.is_ascii_digit() {
+            let num_start = i;
+            let is_decimal = !(b == b'0'
+                && bytes.get(num_start + 1).is_some_and(|c| matches!(c, b'x' | b'X' | b'b' | b'B' | b'o' | b'O')));
             while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                 i += 1;
             }
-            if bytes.get(i) == Some(&b'.') && bytes.get(i + 1).is_some_and(u8::is_ascii_digit) {
-                i += 1;
-                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            if is_decimal {
+                if bytes.get(i) == Some(&b'.') && bytes.get(i + 1).is_some_and(u8::is_ascii_digit) {
                     i += 1;
+                    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                        i += 1;
+                    }
                 }
-            }
-            if bytes.get(i.saturating_sub(1)).is_some_and(|&c| c == b'e' || c == b'E')
-                && bytes.get(i).is_some_and(|&c| c == b'+' || c == b'-')
-                && bytes.get(i + 1).is_some_and(u8::is_ascii_digit)
-            {
-                i += 1;
-                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                if bytes.get(i.saturating_sub(1)).is_some_and(|&c| c == b'e' || c == b'E')
+                    && bytes.get(i).is_some_and(|&c| c == b'+' || c == b'-')
+                    && bytes.get(i + 1).is_some_and(u8::is_ascii_digit)
+                {
                     i += 1;
+                    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                        i += 1;
+                    }
                 }
             }
             out.push(Tok { line, kind: TokKind::NumberLit });

@@ -394,25 +394,29 @@ fn find_mutable_logic_reason(tokens: &[Tok]) -> Option<&'static str> {
     while i < tokens.len() {
         let tok = &tokens[i];
 
-        // Skip turbofish `::<Type>` and generic type arguments `UpperIdent<Type>`.
-        if tok.is_punct("::") && tokens.get(i + 1).is_some_and(|t| t.is_punct("<")) {
-            i = skip_angle_group(tokens, i + 1);
+        // Skip turbofish `::<Type>` and CamelCase generic type arguments `Vec<Type>` (not SCREAMING_CASE constants).
+        if tok.is_punct("::")
+            && tokens.get(i + 1).is_some_and(|t| t.is_punct("<"))
+            && let Some(end) = try_skip_type_angle_group(tokens, i + 1)
+        {
+            i = end;
             continue;
         }
-        if matches!(&tok.kind, TokKind::Ident(n) if n.chars().next().is_some_and(char::is_uppercase))
+        if matches!(&tok.kind, TokKind::Ident(n) if is_camel_type_ident(n))
             && tokens.get(i + 1).is_some_and(|t| t.is_punct("<"))
+            && let Some(end) = try_skip_type_angle_group(tokens, i + 1)
         {
-            i = skip_angle_group(tokens, i + 1);
+            i = end;
             continue;
         }
 
-        // Skip type expressions after `as` or closure return `-> Type {`.
+        // Skip type expressions after `as` (without infix `+`/`*`/`&`!) or closure return `-> Type {`.
         if tok.is_ident("as") {
-            i = skip_type_expr(tokens, i + 1);
+            i = skip_type_expr(tokens, i + 1, false);
             continue;
         }
         if tok.is_punct("->") {
-            i = skip_type_expr(tokens, i + 1);
+            i = skip_type_expr(tokens, i + 1, true);
             continue;
         }
 
@@ -515,14 +519,24 @@ fn find_mutable_logic_reason(tokens: &[Tok]) -> Option<&'static str> {
     None
 }
 
-/// Skips from an opening closure `|` across its parameter list (including typed generics) past the closing `|`.
+/// Returns true for CamelCase type names (`Vec`, `Option`, `Arc`), excluding `SCREAMING_SNAKE_CASE` constants.
+fn is_camel_type_ident(name: &str) -> bool {
+    name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) && name.chars().any(|c| c.is_ascii_lowercase())
+}
+
+/// Skips from an opening closure `|` across its parameter list (including struct patterns and typed generics)
+/// past the closing `|`.
 fn skip_closure_params(tokens: &[Tok], open_bar: usize) -> Option<usize> {
     let mut i = open_bar + 1;
     let mut paren = 0usize;
     let mut bracket = 0usize;
+    let mut brace = 0usize;
     let mut angle = 0usize;
     while i < tokens.len() {
         let t = &tokens[i];
+        if t.is_punct(";") {
+            return None;
+        }
         if t.is_punct("(") {
             paren += 1;
         } else if t.is_punct(")") {
@@ -537,91 +551,129 @@ fn skip_closure_params(tokens: &[Tok], open_bar: usize) -> Option<usize> {
                 return None;
             }
             bracket -= 1;
+        } else if t.is_punct("{") {
+            brace += 1;
+        } else if t.is_punct("}") {
+            if brace == 0 {
+                return None;
+            }
+            brace -= 1;
         } else if t.is_punct("<") {
             angle += 1;
         } else if t.is_punct(">") {
             angle = angle.saturating_sub(1);
         } else if t.is_punct(">>") {
             angle = angle.saturating_sub(2);
-        } else if paren == 0 && bracket == 0 && angle == 0 {
-            if t.is_punct("|") {
-                return Some(i + 1);
-            }
-            if t.is_punct(";") || t.is_punct("{") {
-                return None;
-            }
+        } else if paren == 0 && bracket == 0 && brace == 0 && angle == 0 && t.is_punct("|") {
+            return Some(i + 1);
         }
         i += 1;
     }
     None
 }
 
-/// Skips a type expression after `as` or `->` so generic `<...>` / `+` bounds are not misread as operators.
-fn skip_type_expr(tokens: &[Tok], mut i: usize) -> usize {
-    let mut paren = 0usize;
-    let mut bracket = 0usize;
-    let mut angle = 0usize;
-    while i < tokens.len() {
-        let t = &tokens[i];
-        if t.is_punct("(") {
-            paren += 1;
-        } else if t.is_punct(")") {
-            if paren == 0 {
-                return i;
-            }
-            paren -= 1;
-        } else if t.is_punct("[") {
-            bracket += 1;
-        } else if t.is_punct("]") {
-            if bracket == 0 {
-                return i;
-            }
-            bracket -= 1;
-        } else if t.is_punct("<") {
-            angle += 1;
-        } else if t.is_punct(">") {
-            if angle == 0 {
-                return i;
-            }
-            angle -= 1;
-        } else if t.is_punct(">>") {
-            if angle == 0 {
-                return i;
-            }
-            angle = angle.saturating_sub(2);
-        } else if paren == 0 && bracket == 0 && angle == 0 {
-            let still_type = matches!(t.kind, TokKind::Ident(_))
-                || matches!(
-                    &t.kind,
-                    TokKind::Punct(p) if matches!(p.as_str(), "::" | "&" | "*" | "+" | "!" | "_")
-                );
-            if !still_type {
-                return i;
+/// Skips one Rust type expression (after `as` or `->`) without swallowing trailing binary operators
+/// (`+`, `*`, `&`, `<`, `>`, etc.). `allow_plus_bounds` permits `+ Trait` bounds in `->` / `dyn` / `impl` types.
+fn skip_type_expr(tokens: &[Tok], mut i: usize, mut allow_plus_bounds: bool) -> usize {
+    loop {
+        // Leading prefixes: `&`, `mut`, `*`, `const`, `dyn`, `impl`
+        while let Some(t) = tokens.get(i) {
+            if t.is_punct("&") || t.is_punct("*") || t.is_ident("mut") || t.is_ident("const") {
+                i += 1;
+            } else if t.is_ident("dyn") || t.is_ident("impl") {
+                allow_plus_bounds = true;
+                i += 1;
+            } else {
+                break;
             }
         }
-        i += 1;
+
+        let Some(t) = tokens.get(i) else {
+            return i;
+        };
+
+        if t.is_punct("(") {
+            i = find_matching_delim(tokens, i, "(", ")").map_or(i + 1, |c| c + 1);
+        } else if t.is_punct("[") {
+            i = find_matching_delim(tokens, i, "[", "]").map_or(i + 1, |c| c + 1);
+        } else if t.is_punct("!") || t.is_ident("_") {
+            i += 1;
+        } else if matches!(t.kind, TokKind::Ident(_)) || t.is_punct("::") {
+            // Path with optional generic args on segments: `[::] ident [<...>] (:: ident [<...>])*`
+            if t.is_punct("::") {
+                i += 1;
+            }
+            while let Some(seg) = tokens.get(i) {
+                if !matches!(seg.kind, TokKind::Ident(_)) {
+                    break;
+                }
+                i += 1;
+                if tokens.get(i).is_some_and(|n| n.is_punct("<"))
+                    && let Some(end) = try_skip_type_angle_group(tokens, i)
+                {
+                    i = end;
+                }
+                if tokens.get(i).is_some_and(|n| n.is_punct("::")) {
+                    i += 1;
+                    continue;
+                }
+                break;
+            }
+        } else {
+            return i;
+        }
+
+        if allow_plus_bounds && tokens.get(i).is_some_and(|n| n.is_punct("+")) {
+            i += 1;
+            continue;
+        }
+        return i;
     }
-    tokens.len()
 }
 
-fn skip_angle_group(tokens: &[Tok], open_idx: usize) -> usize {
+/// Attempts to skip a balanced generic argument list `<...>` that contains only type-valid tokens
+/// (never crossing `;`, `{`, `}`, or expression operators like `&&`, `||`, `==`, `!=`, `<=`, `>=`).
+fn try_skip_type_angle_group(tokens: &[Tok], open_idx: usize) -> Option<usize> {
     let mut depth = 0usize;
+    let mut paren = 0usize;
+    let mut bracket = 0usize;
     for (idx, tok) in tokens.iter().enumerate().skip(open_idx) {
-        if tok.is_punct("<") {
+        if tok.is_punct("(") {
+            paren += 1;
+        } else if tok.is_punct(")") {
+            if paren == 0 {
+                return None;
+            }
+            paren -= 1;
+        } else if tok.is_punct("[") {
+            bracket += 1;
+        } else if tok.is_punct("]") {
+            if bracket == 0 {
+                return None;
+            }
+            bracket -= 1;
+        } else if tok.is_punct("<") {
             depth += 1;
         } else if tok.is_punct(">") {
             depth = depth.saturating_sub(1);
-            if depth == 0 {
-                return idx + 1;
+            if depth == 0 && paren == 0 && bracket == 0 {
+                return Some(idx + 1);
             }
         } else if tok.is_punct(">>") {
             depth = depth.saturating_sub(2);
-            if depth == 0 {
-                return idx + 1;
+            if depth == 0 && paren == 0 && bracket == 0 {
+                return Some(idx + 1);
             }
-        } else if tok.is_punct(";") || tok.is_punct("{") {
-            return idx;
+        } else if matches!(
+            &tok.kind,
+            TokKind::Punct(p)
+                if matches!(
+                    p.as_str(),
+                    ";" | "{" | "}" | "&&" | "||" | "==" | "!=" | "<=" | ">=" | "+=" | "-=" | "*=" | "/=" | "%="
+                )
+        ) {
+            return None;
         }
     }
-    tokens.len()
+    None
 }
