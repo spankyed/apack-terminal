@@ -751,7 +751,9 @@ fn kitty_image_sources_e2e_file_shm_security_and_teardown() {
         assert_eq!(encoding, apack_proto::types::ImageEncoding::Png);
         assert!(total_bytes > 8 && data.starts_with(b"\x89PNG\r\n\x1a\n"));
         // Cryptographically verify the loaded blob hash matches `ok.rgba` (not `junc_secret`).
-        let mut ref_vt = GhosttyEngine::new(GhosttyConfig::new(GridSize::new(80, 24).unwrap())).unwrap();
+        let mut ref_cfg = GhosttyConfig::new(GridSize::new(80, 24).unwrap());
+        ref_cfg.cell_px = CellPx { width: 8, height: 16 };
+        let mut ref_vt = GhosttyEngine::new(ref_cfg).unwrap();
         let mut ref_ev = Vec::new();
         let b64_pixels = String::from_utf8(encoded(&pixels)).unwrap();
         ref_vt.feed(format!("\x1b_Ga=T,f=32,s=2,v=2,i=9,t=d;{b64_pixels}\x1b\\").as_bytes(), &mut ref_ev);
