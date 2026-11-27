@@ -1295,7 +1295,11 @@ fn review_mutants_wal_hard_cap_coalesce_control_slot_and_fifo_rejection() {
     assert_eq!(w.active_segment_size().unwrap(), after_gap + gap_len);
     drop(w);
 
-    // 4. On Unix, open_regular_read_only refuses a FIFO (O_NONBLOCK avoids blocking) and symlinks (ELOOP).
+    // 4. Cross-platform lstat classification + Unix FIFO/symlink refusal in open_regular_read_only.
+    assert!(matches!(crate::blobs::validate_lstat(true, false, "x"), Err(WalError::SymlinkRefused)));
+    assert!(matches!(crate::blobs::validate_lstat(false, true, "dir"), Err(WalError::InvalidFormat("dir"))));
+    assert!(crate::blobs::validate_lstat(false, false, "reg").is_ok());
+
     #[cfg(unix)]
     {
         let fifo_path = tmp.path().join("named.fifo");

@@ -6,6 +6,8 @@
 //!   `COPYRIGHT-rust-library.html`, at the repository's root (`src/notices.rs`).
 //! - `check-notices`: fails when what `notices` would write differs from what is committed.
 //! - `check-exclusions`: fails when a `.cargo/mutants.toml` exclusion matches no mutant or a Windows-only file is missing.
+//! - `check-cfg-hygiene`: fails when mutable `#[cfg(windows)]` / `#[cfg(not(unix))]` logic appears outside `.cargo/windows-only`.
+//! - `check-windows`: runs a fast local Windows clippy/type cross-check (`x86_64-pc-windows-msvc` by default).
 //! - `check-safety`: fails when any `unsafe` site lacks a `SAFETY:` comment above it.
 //! - `clear-mutants`: removes working copies left behind by an interrupted mutation pass.
 //! - `pre-push`: every check CI runs on a change, the change's mutants included, cheapest first, stopping at
@@ -18,7 +20,9 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use xtask::{bench, fuzz_smoke, generate, leftovers, mutants, notices, pre_push, safety, vt_prebuilt};
+use xtask::{
+    bench, cfg_hygiene, fuzz_smoke, generate, leftovers, mutants, notices, pre_push, safety, vt_prebuilt, windows_check,
+};
 
 fn main() -> ExitCode {
     let task = std::env::args().nth(1);
@@ -31,6 +35,8 @@ fn main() -> ExitCode {
         Some("notices") => notices::write(&root),
         Some("check-notices") => notices::check(&root),
         Some("check-exclusions") => mutants::check_exclusions(&root),
+        Some("check-cfg-hygiene") => cfg_hygiene::check(&root),
+        Some("check-windows") => windows_check::run(&root, &std::env::args().skip(2).collect::<Vec<_>>()),
         Some("check-safety") => safety::check(&root),
         Some("clear-mutants") => leftovers::clear(&root),
         Some("vt-prebuilt") => vt_prebuilt::fetch(&root),
@@ -40,12 +46,13 @@ fn main() -> ExitCode {
             &[
                 ("generated protocol", &|| generate::check(&root)),
                 ("mutant exclusions", &|| mutants::check_exclusions(&root)),
+                ("windows cfg hygiene", &|| cfg_hygiene::check(&root)),
                 ("unsafe justifications", &|| safety::check(&root)),
                 ("third-party notices", &|| notices::check(&root)),
             ],
         ),
         _ => {
-            Err("usage: cargo xtask <bench | fuzz-smoke | generate | check-generated | notices | check-notices | check-exclusions | check-safety | clear-mutants | vt-prebuilt | pre-push>"
+            Err("usage: cargo xtask <bench | fuzz-smoke | generate | check-generated | notices | check-notices | check-exclusions | check-cfg-hygiene | check-windows | check-safety | clear-mutants | vt-prebuilt | pre-push>"
                 .to_owned())
         }
     };

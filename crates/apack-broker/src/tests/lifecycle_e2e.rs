@@ -485,6 +485,25 @@ fn windows_edge_helpers_and_natural_child_exit() {
     drop(wrx);
     assert_eq!(crate::transport_windows::try_push_win_write(&wtx, &mut pending, vec![5]), Err(()));
 
+    // 2c. drain_win_events_bounded + clamp_win_wait
+    let (ev_tx, ev_rx) = std::sync::mpsc::channel::<u32>();
+    let mut seen = Vec::new();
+    assert!(!crate::transport_windows::drain_win_events_bounded(&ev_rx, 2, |v| seen.push(v)));
+    assert!(seen.is_empty());
+    ev_tx.send(10).unwrap();
+    ev_tx.send(20).unwrap();
+    assert!(!crate::transport_windows::drain_win_events_bounded(&ev_rx, 2, |v| seen.push(v)));
+    assert_eq!(seen, vec![10, 20]);
+    seen.clear();
+    for v in [1, 2, 3, 4] {
+        ev_tx.send(v).unwrap();
+    }
+    assert!(crate::transport_windows::drain_win_events_bounded(&ev_rx, 2, |v| seen.push(v)));
+    assert_eq!(seen, vec![1, 2, 3]);
+    assert_eq!(ev_rx.try_recv().unwrap(), 4);
+    assert_eq!(crate::transport_windows::clamp_win_wait(Duration::from_secs(1), false), Duration::from_secs(1));
+    assert_eq!(crate::transport_windows::clamp_win_wait(Duration::from_secs(1), true), Duration::ZERO);
+
     // 3. Naturally-exiting Windows child is reaped cleanly without kill(), emitting Exited!
     let tmp = tempdir().unwrap();
     let sock = unique_endpoint(tmp.path(), "win-nat-exit");

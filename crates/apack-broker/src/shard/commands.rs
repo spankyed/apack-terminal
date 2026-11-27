@@ -148,39 +148,40 @@ impl ShardRunner {
 
         // Register PTY with shard multiplexer; kill & reap child if registration fails.
         #[cfg(unix)]
-        let live_pty = {
+        let live_pty: Result<LivePty, (ErrorCode, String)> = {
             let token = PollToken(session_id.get());
-            if let Err(err) = self.poller.register(token, spawned.master.raw_fd(), Interest::READ) {
+            self.poller
+                .register(token, spawned.master.raw_fd(), Interest::READ)
+                .map_err(|err| (ErrorCode::Pty, err.to_string()))
+                .map(|()| {
+                    self.token_to_session.insert(token, session_id);
+                    LivePty::Unix { master: spawned.master, token, eof: false, write_broken: false }
+                })
+        };
+
+        #[cfg(windows)]
+        let live_pty: Result<LivePty, (ErrorCode, String)> = {
+            let wake = self.self_wake.clone();
+            ConPtyBridge::start(spawned.master, move || wake.wake())
+                .map(|bridge| LivePty::Windows { bridge, eof: false })
+                .map_err(|err| (err.error_code(), err.to_string()))
+        };
+
+        let live_pty = match live_pty {
+            Ok(pty) => pty,
+            Err((code, msg)) => {
                 if let Some(w) = wal {
                     let _ = w.shutdown();
                 }
+                #[cfg(windows)]
+                drop(spawned.tree);
+                #[cfg(unix)]
                 let _ = deliver_signal(spawned.pid, SignalKind::Kill, SignalScope::Group);
                 let _ = spawned.killer.kill();
                 let _ = spawned.child.wait();
                 self.emit(ReactorEvent::SpawnOrRewindFailed);
-                self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Pty, &err.to_string());
+                self.send_error(conn, StreamId::CONTROL, req_id, code, &msg);
                 return;
-            }
-            self.token_to_session.insert(token, session_id);
-            LivePty::Unix { master: spawned.master, token, eof: false, write_broken: false }
-        };
-
-        #[cfg(windows)]
-        let live_pty = {
-            let wake = self.self_wake.clone();
-            match ConPtyBridge::start(spawned.master, move || wake.wake()) {
-                Ok(bridge) => LivePty::Windows { bridge, eof: false },
-                Err(err) => {
-                    if let Some(w) = wal {
-                        let _ = w.shutdown();
-                    }
-                    drop(spawned.tree);
-                    let _ = spawned.killer.kill();
-                    let _ = spawned.child.wait();
-                    self.emit(ReactorEvent::SpawnOrRewindFailed);
-                    self.send_error(conn, StreamId::CONTROL, req_id, err.error_code(), &err.to_string());
-                    return;
-                }
             }
         };
 

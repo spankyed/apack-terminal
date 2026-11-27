@@ -45,8 +45,8 @@ use crate::fill_random;
 use crate::shard::{ReactorEvent, ShardCmd, ShardHandle, ShardShared, spawn_shard};
 #[cfg(windows)]
 use crate::transport_windows::{
-    DrainingWinConn, MAX_WIN_EVENTS_PER_TURN, WIN_EVENT_CHANNEL_CAP, WinConnHandle, WinTransportEvent,
-    spawn_win_accept_thread, wait_for_win_wake,
+    DrainingWinConn, MAX_WIN_EVENTS_PER_TURN, WIN_EVENT_CHANNEL_CAP, WinConnHandle, WinTransportEvent, clamp_win_wait,
+    drain_win_events_bounded, spawn_win_accept_thread, wait_for_win_wake,
 };
 use crate::{engine_abi_hash, now_unix_ms};
 
@@ -394,22 +394,9 @@ pub(crate) fn run_control_reactor(
 
         // 2. Drain bounded Windows transport events (if Windows).
         #[cfg(windows)]
-        let mut hit_win_event_cap = false;
-        #[cfg(windows)]
-        {
-            for _ in 0..MAX_WIN_EVENTS_PER_TURN {
-                match win_ev_rx.try_recv() {
-                    Ok(ev) => state.handle_win_transport_event(ev),
-                    Err(_) => break,
-                }
-            }
-            // If more transport events remain queued, spin immediately on the next turn without
-            // sleeping while still letting shard events and timers run first.
-            if let Ok(ev) = win_ev_rx.try_recv() {
-                state.handle_win_transport_event(ev);
-                hit_win_event_cap = true;
-            }
-        }
+        let hit_win_event_cap = drain_win_events_bounded(&win_ev_rx, MAX_WIN_EVENTS_PER_TURN, |ev| {
+            state.handle_win_transport_event(ev);
+        });
 
         // 3. Fire due BrokerCore timers and reap expired draining connections.
         state.reap_draining_conns();
@@ -439,8 +426,7 @@ pub(crate) fn run_control_reactor(
             break;
         }
 
-        #[cfg_attr(unix, allow(unused_mut))]
-        let mut wait_for = reactor_wait_timeout(
+        let wait_for = reactor_wait_timeout(
             state.core.next_deadline(),
             now,
             state.ever_connected,
@@ -448,9 +434,7 @@ pub(crate) fn run_control_reactor(
             should_fast_poll(state.shutting_down, state.has_draining_conns()),
         );
         #[cfg(windows)]
-        if hit_win_event_cap {
-            wait_for = Duration::ZERO;
-        }
+        let wait_for = clamp_win_wait(wait_for, hit_win_event_cap);
 
         #[cfg(unix)]
         {

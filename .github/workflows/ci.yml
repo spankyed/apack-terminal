@@ -75,6 +75,7 @@ jobs:
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo xtask check-generated
       - run: cargo xtask check-safety
+      - run: cargo xtask check-cfg-hygiene
       # The release's third-party notices, held to the lockfile, libghostty-vt's licenses and the toolchain
       - uses: taiki-e/install-action@v2
         with:

@@ -26,10 +26,17 @@ fn connected_client_stays_alive_past_start_grace_and_marks_env_is_distinct_from_
     // Spawn a session with an explicit `APACK_TERMINAL_KEY` in `spec.env` and verify the broker
     // does not strip it when stripping `AUTH_KEY_ENV`.
     #[cfg(unix)]
-    let argv =
-        vec![String::from("/bin/sh"), String::from("-c"), String::from("printf 'MK=%s\\r\\n' \"$APACK_TERMINAL_KEY\"")];
+    let argv = vec![
+        String::from("/bin/sh"),
+        String::from("-c"),
+        String::from("printf 'MK=%s\\r\\n' \"$APACK_TERMINAL_KEY\"; sleep 10"),
+    ];
     #[cfg(windows)]
-    let argv = vec![String::from("cmd.exe"), String::from("/C"), String::from("echo MK=%APACK_TERMINAL_KEY%")];
+    let argv = vec![
+        String::from("cmd.exe"),
+        String::from("/C"),
+        String::from("echo MK=%APACK_TERMINAL_KEY% & ping -n 10 127.0.0.1 >nul"),
+    ];
     let spec = SpawnSpec {
         argv,
         cwd: None,
