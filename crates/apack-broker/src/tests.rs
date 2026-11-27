@@ -2601,7 +2601,7 @@ fn review_regressions_env_grace_pipelined_fin_teardown_spawn_and_seek_cell_px() 
 
 #[test]
 fn kitty_image_sources_e2e_file_shm_security_and_teardown() {
-    use apack_os::image_sources::{Quiet as ImageQuiet, encoded};
+    use apack_os::image_sources::Quiet as ImageQuiet;
 
     assert!(should_forward_probe_reply("\x1b_Gi=1;OK\x1b\\", ImageQuiet::No));
     assert!(!should_forward_probe_reply("\x1b_Gi=1;OK\x1b\\", ImageQuiet::Ok));
@@ -2617,6 +2617,7 @@ fn kitty_image_sources_e2e_file_shm_security_and_teardown() {
 
     #[cfg(unix)]
     {
+        use apack_os::image_sources::encoded;
         use std::os::unix::ffi::OsStrExt;
         use std::process::Command;
 
@@ -2773,13 +2774,53 @@ fn kitty_image_sources_e2e_file_shm_security_and_teardown() {
         client.kill(s_ok).unwrap();
         assert!(t_kill.elapsed() < Duration::from_secs(2));
 
-        // 4. Short-lived child printing `t=f` and exiting IMMEDIATELY still completes off-shard load!
+        // 4. Short-lived child printing `t=f` and exiting IMMEDIATELY still completes off-shard
+        //    load and ingests trailing text before `Exited` (pipelined `Wait(Text)` MUST return
+        //    `WaitOutcome::Met`, not `WaitOutcome::Exited`, because `FAST_EXIT_OK` sits behind `t=f`
+        //    in `pending_image_tail`!).
         let seq_fast = tmp.path().join("seq-fast.bin");
         std::fs::write(&seq_fast, format!("\x1b_Ga=T,f=32,s=2,v=2,i=31,t=f;{b64_ok}\x1b\\FAST_EXIT_OK\r\n")).unwrap();
         let mut spec_fast = echo_command_spec("x", None, None);
-        spec_fast.argv = vec![String::from("/bin/sh"), String::from("-c"), format!("cat '{}'", seq_fast.display())];
+        spec_fast.argv = vec![
+            String::from("/bin/sh"),
+            String::from("-c"),
+            format!("printf 'FAST_READY\\r\\n'; read _go; cat '{}'", seq_fast.display()),
+        ];
         spec_fast.image_files = true;
         let (s_fast, _) = client.spawn(spec_fast).unwrap();
+        assert_eq!(
+            client.wait(s_fast, WaitCondition::Text(String::from("FAST_READY")), 5_000).unwrap(),
+            WaitOutcome::Met
+        );
+        let st_fast = NonZeroStreamId::new(3).unwrap();
+        client
+            .attach(
+                s_fast,
+                st_fast,
+                SubFlags::from_bits(SubFlags::EVENTS).unwrap(),
+                None,
+                0,
+                FrameCredit { max_frames: 16, max_bytes: 1 << 20 },
+            )
+            .unwrap();
+        let wait_req = client.alloc_req_id();
+        client
+            .send_raw(
+                apack_proto::types::StreamId::CONTROL,
+                wait_req,
+                &ClientMsg::Wait {
+                    session: s_fast,
+                    condition: WaitCondition::Text(String::from("FAST_EXIT_OK")),
+                    timeout_ms: 5_000,
+                },
+            )
+            .unwrap();
+        client.send_raw(st_fast.as_stream_id(), RequestId::PUSH, &ClientMsg::Write { data: b"go\n".to_vec() }).unwrap();
+        assert_eq!(
+            client.wait_reply(wait_req).unwrap(),
+            BrokerMsg::Waited { outcome: WaitOutcome::Met },
+            "deferred natural exit must complete off-shard t=f load and drain FAST_EXIT_OK before Exited"
+        );
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
             if !client.list_sessions().unwrap().iter().any(|s| s.id == s_fast) {
@@ -2789,7 +2830,7 @@ fn kitty_image_sources_e2e_file_shm_security_and_teardown() {
         }
         assert!(
             !client.list_sessions().unwrap().iter().any(|s| s.id == s_fast),
-            "short-lived image_files session must exit cleanly without hanging"
+            "short-lived image_files session must exit cleanly after deferred load completes"
         );
     }
 

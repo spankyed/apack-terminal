@@ -1663,10 +1663,16 @@ impl ShardRunner {
             wake.wake();
         });
         if spawned.is_err() {
-            self.handle_image_source_loaded(session_id, ticket, None);
-        } else {
-            self.sync_pty_interest(session_id);
+            // Queue the failure via the mailbox instead of recursing synchronously so thread
+            // exhaustion cannot overflow the shard stack on consecutive named-source commands.
+            {
+                let mut state = self.mailbox.lock().unwrap_or_else(|e| e.into_inner());
+                state.queue.push_back(ShardCmd::ImageSourceLoaded { session_id, ticket, loaded: None });
+                state.woken = true;
+            }
+            self.self_wake.wake();
         }
+        self.sync_pty_interest(session_id);
     }
 
     fn handle_image_source_loaded(&mut self, session_id: SessionId, ticket: u64, loaded: Option<Loaded>) {
@@ -1720,10 +1726,10 @@ impl ShardRunner {
         };
 
         self.apply_effects(session_id, effects);
-        self.sync_pty_interest(session_id);
         if !tail.is_empty() {
             self.ingest_pty_bytes(session_id, &tail);
         }
+        self.sync_pty_interest(session_id);
         self.try_reap_session(session_id);
     }
 
@@ -1796,6 +1802,13 @@ impl ShardRunner {
             return;
         }
         sess.terminating_since = Some(Instant::now());
+        // If `libghostty-vt` is currently sitting inside an open APC (either awaiting an off-shard
+        // image load or mid-scan), abort it with CAN (0x18) so subsequent teardown output is not
+        // swallowed inside the unclosed APC string.
+        if sess.pending_image.is_some() || sess.image_scanner.as_ref().is_some_and(ImageScanner::reading) {
+            let mut evs = Vec::new();
+            sess.machine.vt_mut().feed(&[0x18], &mut evs);
+        }
         // Cancel any in-flight named-source read immediately so Kill / teardown never stalls on a
         // stuck mount, and stop scanning new named sources while draining teardown bytes.
         sess.image_scanner = None;
@@ -1853,7 +1866,18 @@ impl ShardRunner {
                     return;
                 };
                 match child.try_wait() {
-                    Ok(Some(status)) => Some(parse_exit_status(&status)),
+                    Ok(Some(status)) => {
+                        let parsed = parse_exit_status(&status);
+                        // Clear reaped child handles immediately; on natural exit also clear `pid`
+                        // right away so a PID recycled by the OS during a deferred `pending_image`
+                        // load can never be signalled by a late `Kill`/`Signal`/shutdown.
+                        sess.child = None;
+                        sess.killer = None;
+                        if sess.terminating_since.is_none() {
+                            sess.pid = None;
+                        }
+                        Some(parsed)
+                    }
                     _ => None,
                 }
             }
@@ -1992,7 +2016,7 @@ impl ShardRunner {
         for id in ids {
             // 1. Child reap & 2-second SIGKILL escalation BEFORE firing timers so tail PTY bytes
             //    from an exited child satisfy pending `Wait` conditions before any deadline expires.
-            let is_live = self.sessions.get(&id).is_some_and(|s| s.child.is_some());
+            let is_live = self.sessions.get(&id).is_some_and(|s| s.child.is_some() || s.reaped_exit.is_some());
             if is_live {
                 if let Some(sess) = self.sessions.get_mut(&id)
                     && let Some(since) = sess.terminating_since
@@ -2757,9 +2781,27 @@ mod image_source_shard_tests {
         assert!(timeout_reply.contains("i=77;EINVAL: invalid data"), "got {timeout_reply:?}");
         assert!(runner.sessions[&sid].machine.vt().text_of(full_span, 4096).contains("AFTER_TIMEOUT"));
 
-        // Explicit termination clears pending_image, image_scanner, and tail immediately.
+        // Explicit termination clears pending_image, image_scanner, and tail immediately AND aborts
+        // any open APC in `libghostty-vt` via CAN (0x18) so subsequent teardown text still renders!
+        runner.ingest_pty_bytes(sid, b"\x1b_Ga=T,f=32,s=2,v=2,t=f;L2E=");
+        assert!(runner.sessions[&sid].image_scanner.as_ref().is_some_and(ImageScanner::reading));
+        runner.initiate_session_termination(sid);
         {
-            let sess = runner.sessions.get_mut(&sid).unwrap();
+            let sess = &runner.sessions[&sid];
+            assert!(sess.pending_image.is_none());
+            assert!(sess.image_scanner.is_none());
+            assert!(sess.pending_image_tail.is_empty());
+        }
+        runner.ingest_pty_bytes(sid, b"TEARDOWN_AFTER_SCAN");
+        assert!(runner.sessions[&sid].machine.vt().text_of(full_span, 4096).contains("TEARDOWN_AFTER_SCAN"));
+
+        // Also verify CAN abort when `pending_image.is_some()` (with scanner NOT mid-read).
+        let sid2 = SessionId::new(2).unwrap();
+        insert_image_session(&mut runner, sid2, true);
+        {
+            let sess = runner.sessions.get_mut(&sid2).unwrap();
+            let mut evs = Vec::new();
+            sess.machine.vt_mut().feed(b"\x1b_", &mut evs);
             sess.image_ticket = 600;
             sess.pending_image = Some(PendingImageLoad {
                 ticket: 600,
@@ -2770,11 +2812,15 @@ mod image_source_shard_tests {
             });
             sess.pending_image_tail = b"DROPPED".to_vec();
         }
-        runner.initiate_session_termination(sid);
-        let sess = &runner.sessions[&sid];
-        assert!(sess.pending_image.is_none());
-        assert!(sess.image_scanner.is_none());
-        assert!(sess.pending_image_tail.is_empty());
-        assert_ne!(sess.image_ticket, 600);
+        runner.initiate_session_termination(sid2);
+        {
+            let sess = &runner.sessions[&sid2];
+            assert!(sess.pending_image.is_none());
+            assert!(sess.image_scanner.is_none());
+            assert!(sess.pending_image_tail.is_empty());
+            assert_ne!(sess.image_ticket, 600);
+        }
+        runner.ingest_pty_bytes(sid2, b"TEARDOWN_AFTER_PENDING");
+        assert!(runner.sessions[&sid2].machine.vt().text_of(full_span, 4096).contains("TEARDOWN_AFTER_PENDING"));
     }
 }

@@ -1205,7 +1205,11 @@ impl GhosttyEngine {
             }
             raw_events.extend(pending);
 
-            if stop_on_apc && res == sys::Result::SUCCESS && (stop.reached & sys::TerminalBoundary::APC_START) != 0 {
+            if stop_on_apc
+                && res == sys::Result::SUCCESS
+                && stop.reached == sys::TerminalBoundary::APC_START
+                && matches!(stop.byte, b'_' | 0x9f)
+            {
                 entered_apc = true;
                 break;
             }

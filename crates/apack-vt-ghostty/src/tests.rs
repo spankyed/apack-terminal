@@ -1334,8 +1334,16 @@ fn review_mutants_batched_text_cell_px_resize_placeholder_bg_long_grapheme_and_s
     let mut a_vt = GhosttyEngine::new(a_cfg).unwrap();
     ev.clear();
     assert_eq!(a_vt.feed_until_apc(b"hello", &mut ev), (5, false));
-    // OSC boundary must NOT be mistaken for APC_START!
+    // OSC, SOS (ESC X), and PM (ESC ^) boundaries must NOT be mistaken for APC_START!
     assert_eq!(a_vt.feed_until_apc(b"\x1b]0;hi\x07ok", &mut ev), (9, false));
+    assert_eq!(a_vt.feed_until_apc(b"\x1bXGa=T,f=32,s=1,v=1,t=f;L2E=\x1b\\ok", &mut ev), (32, false));
+    assert_eq!(a_vt.feed_until_apc(b"\x1b^Ga=T,f=32,s=1,v=1,t=f;L2E=\x1b\\ok", &mut ev), (32, false));
+    // C1 8-bit APC (0x9f) mid-sequence must ALSO trigger APC_START, then close cleanly with ST.
+    let c1_stream = b"\x1b[1\x9fG\x1b\\";
+    let (used_c1, c1_hit) = a_vt.feed_until_apc(c1_stream, &mut ev);
+    assert!(c1_hit, "feed_until_apc must stop at mid-sequence C1 0x9f APC");
+    assert_eq!(&c1_stream[..used_c1], b"\x1b[1\x9f");
+    a_vt.feed(b"\x1b\\", &mut ev);
     let stream = b"AB\x1b_Ga=t,f=32,s=1,v=1,i=7,t=f;L2E=\x1b\\CD";
     let (used_apc, apc_hit) = a_vt.feed_until_apc(stream, &mut ev);
     assert!(apc_hit, "feed_until_apc must stop at ESC _");
