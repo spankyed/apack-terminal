@@ -36,10 +36,13 @@
     "build": "vite build && tsc -p tsconfig.build.json && node scripts/rewrite-dts.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:e2e": "playwright test",
     "test:watch": "vitest",
     "prepublishOnly": "npm run typecheck && npm test && npm run build"
   },
   "devDependencies": {
+    "@playwright/test": "^1.65.1",
+    "@types/node": "^26.6.11",
     "jsdom": "^26.1.0",
     "typescript": "^5.9.3",
     "vite": "^7.0.0",
