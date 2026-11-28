@@ -250,11 +250,15 @@ fn e2e_leases_kept_pinning_tier2_compression_foreground_verify_and_kill_escalati
 
         // Verify graceful SIGHUP runs BEFORE SIGKILL escalation (`kill_escalate_after = 400ms`):
         // a shell trapping SIGHUP and exiting with code 7 must exit cleanly with Some(7) (not SIGKILL)!
+        // Use a bounded loop with a HUP-ignoring subshell so Ubuntu `dash` never exits 129 (`128+HUP`)
+        // from reaping a HUP-killed background `sleep` as the final command before running the trap.
         let hup_spec = SpawnSpec {
             argv: vec![
                 String::from("/bin/sh"),
                 String::from("-c"),
-                String::from("trap 'sleep 0.04; exit 7' HUP; printf 'HUP_TRAP_READY\\r\\n'; sleep 10 & wait $!"),
+                String::from(
+                    "trap 'sleep 0.04; exit 7' HUP; printf 'HUP_TRAP_READY\\r\\n'; i=0; while [ $i -lt 10 ]; do i=$((i+1)); (trap '' HUP; exec sleep 1) & wait $!; done",
+                ),
             ],
             cwd: None,
             env: Vec::new(),
