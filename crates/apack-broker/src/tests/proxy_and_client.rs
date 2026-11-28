@@ -1005,7 +1005,10 @@ fn pr3_proxy_autostart_retries_held_exit_clean_exit_timeout_stderr_and_stdin_err
     let (spawned_tx, spawned_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let winner_thread = std::thread::spawn(move || {
         let _ = spawned_rx.recv();
-        std::thread::sleep(Duration::from_millis(15));
+        // Wait long enough for the first `exit HELD_EXIT` attempt to be observed and enter the
+        // `held_polls_left > 0` backoff loop (~15ms), while still binding well before the 4*15ms
+        // `HELD_CONNECT_POLLS` window expires (~60ms).
+        std::thread::sleep(Duration::from_millis(35));
         let l = apack_os::transport::bind_local_listener(&sock_winner_bg).expect("winner bind");
         use interprocess::local_socket::traits::Listener as _;
         let _ = l.accept();

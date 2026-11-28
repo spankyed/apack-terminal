@@ -2149,5 +2149,27 @@ mod reactor_unit_tests {
         let dispatched_bulk = mailbox.lock().unwrap().queue.pop_front().expect("bulk RPC admitted").0;
         assert!(matches!(dispatched_bulk, ShardCmd::StreamMsg { msg: ClientMsg::Commands, .. }));
         assert!(mailbox.lock().unwrap().queue.is_empty(), "saturated interactive input must not be dispatched");
+
+        // 7. `poll_draining_unix` flushes queued tail bytes to peer and removes the draining entry.
+        let mut drain_peer = connect_local_stream(&sock).unwrap();
+        let drain_server = state.listener.accept().unwrap();
+        set_stream_nonblocking(&drain_server, true).unwrap();
+        let drain_tok = PollToken(9001);
+        state.poller.register(drain_tok, stream_fd(&drain_server), Interest::WRITE).unwrap();
+        let mut dq = VecDeque::new();
+        dq.push_back((b"DRAIN".to_vec(), 0));
+        state.draining_unix.insert(
+            drain_tok,
+            DrainingUnixConn {
+                stream: drain_server,
+                write_queue: dq,
+                deadline: Instant::now() + Duration::from_secs(5),
+            },
+        );
+        state.poll_draining_unix(drain_tok);
+        assert!(!state.draining_unix.contains_key(&drain_tok), "poll_draining_unix must remove flushed entry");
+        let mut got_drain = [0u8; 5];
+        drain_peer.read_exact(&mut got_drain).expect("peer must receive drained tail bytes");
+        assert_eq!(&got_drain, b"DRAIN");
     }
 }
