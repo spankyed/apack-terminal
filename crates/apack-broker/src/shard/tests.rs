@@ -177,6 +177,17 @@ mod win_shard_tests {
         // (false, false) empty using live_id's already-active bridge (no 3rd ConPTY spawn or DSR wait).
         let mut live_sess = runner.sessions.remove(&live_id).expect("live session");
         assert!(live_sess.tree.is_some(), "Windows PTY spawn must attach JobGuard via pinned handle");
+        // Verify `drain_windows_pty_writes` loops across multiple 64 KiB chunks in a single call
+        // while staying below `ConPtyBridge::MAX_INPUT_QUEUE_BYTES` (256 KiB).
+        let multi_chunk = vec![b'a'; 70_000];
+        live_sess.machine.enqueue_pty_reply(&multi_chunk, &mut Vec::new());
+        assert_eq!(live_sess.machine.pty_write_len(), multi_chunk.len());
+        drain_windows_pty_writes(&mut live_sess);
+        assert_eq!(
+            live_sess.machine.pty_write_len(),
+            0,
+            "drain_windows_pty_writes must drain multiple 64 KiB chunks in one call"
+        );
         if let Some(mut killer) = live_sess.killer.take() {
             let _ = killer.kill();
         }
