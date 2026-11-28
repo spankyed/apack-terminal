@@ -1288,3 +1288,87 @@ fn e2e_pr5_wal_blobs_marks_rewind_seek_epoch_search_and_attached_statuses() {
     drop(c2);
     srv2.shutdown().unwrap();
 }
+
+#[test]
+fn resolve_scrollback_lines_clamps_to_proto_max_and_osc7501_rejects_unverified_wait() {
+    use apack_proto::MAX_SCROLLBACK_LINES;
+
+    // 1. B1: `resolve_scrollback_lines` maps 0 -> default (10_000) and clamps > MAX_SCROLLBACK_LINES.
+    assert_eq!(resolve_scrollback_lines(0), 10_000);
+    assert_eq!(resolve_scrollback_lines(500), 500);
+    assert_eq!(resolve_scrollback_lines(MAX_SCROLLBACK_LINES), MAX_SCROLLBACK_LINES as usize);
+    assert_eq!(resolve_scrollback_lines(u32::MAX), MAX_SCROLLBACK_LINES as usize);
+
+    // 2. M1 (hostile PTY): `OSC 7501` without `app=` or with mismatched `app=` MUST NOT wake `WaitCondition::Status`;
+    //    only a matching foreground `app=sh` wakes `WaitCondition::Status`.
+    #[cfg(unix)]
+    {
+        let dir = tempdir().unwrap();
+        let sock = unique_endpoint(dir.path(), "osc7501-spoof");
+        let mut cfg = BrokerConfig::for_socket(&sock);
+        cfg.auth = AuthConfig::None;
+        let mut srv = BrokerServer::bind(cfg.clone()).unwrap().spawn().unwrap();
+        let mut client = BrokerClient::connect(srv.socket_path(), &cfg.auth, "spoof-tester").unwrap();
+
+        let mut spec = echo_command_spec("x", None, None);
+        spec.argv = vec![
+            String::from("/bin/sh"),
+            String::from("-c"),
+            String::from(
+                "printf '\\033]7501;state=done\\007SPOOF_NO_APP\\r\\n'; \
+                 read _go1; \
+                 printf '\\033]7501;state=done:app=claude\\007SPOOF_WRONG_APP\\r\\n'; \
+                 read _go2; \
+                 printf '\\033]7501;state=done:app=sh\\007REAL_SH_APP\\r\\n'; \
+                 read _go3",
+            ),
+        ];
+        let (sid, _) = client.spawn(spec).unwrap();
+        assert_eq!(
+            client.wait(sid, WaitCondition::Text(String::from("SPOOF_NO_APP")), 5_000).unwrap(),
+            WaitOutcome::Met
+        );
+        assert_eq!(
+            client.wait(sid, WaitCondition::Status(vec![apack_proto::types::StatusState::Done]), 300).unwrap(),
+            WaitOutcome::Timeout,
+            "app-less OSC 7501 must NOT wake WaitCondition::Status"
+        );
+
+        let st = NonZeroStreamId::new(1).unwrap();
+        let _ = client
+            .attach(
+                sid,
+                st,
+                SubFlags::from_bits(SubFlags::EVENTS).unwrap(),
+                None,
+                0,
+                FrameCredit { max_frames: 4, max_bytes: 65_536 },
+            )
+            .unwrap();
+        client.send_raw(st.as_stream_id(), RequestId::PUSH, &ClientMsg::Text { text: String::from("\n") }).unwrap();
+        assert_eq!(
+            client.wait(sid, WaitCondition::Text(String::from("SPOOF_WRONG_APP")), 5_000).unwrap(),
+            WaitOutcome::Met
+        );
+        assert_eq!(
+            client.wait(sid, WaitCondition::Status(vec![apack_proto::types::StatusState::Done]), 300).unwrap(),
+            WaitOutcome::Timeout,
+            "mismatched app=claude OSC 7501 must NOT wake WaitCondition::Status"
+        );
+
+        client.send_raw(st.as_stream_id(), RequestId::PUSH, &ClientMsg::Text { text: String::from("\n") }).unwrap();
+        assert_eq!(
+            client.wait(sid, WaitCondition::Text(String::from("REAL_SH_APP")), 5_000).unwrap(),
+            WaitOutcome::Met
+        );
+        assert_eq!(
+            client.wait(sid, WaitCondition::Status(vec![apack_proto::types::StatusState::Done]), 5_000).unwrap(),
+            WaitOutcome::Met,
+            "matching foreground app=sh OSC 7501 MUST wake WaitCondition::Status"
+        );
+
+        client.kill(sid).unwrap();
+        drop(client);
+        srv.shutdown().unwrap();
+    }
+}

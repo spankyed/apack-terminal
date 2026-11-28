@@ -141,7 +141,7 @@ pub fn fuzz_v2_vt(data: &[u8]) {
     if meta.scrollback_lines > 0 {
         let mut sb_rows = Vec::new();
         let count = meta.scrollback_lines.min(8) as u32;
-        vt.extract_history_rows(0, count, &mut sb_rows);
+        vt.extract_history_rows(0, count, apack_proto::MAX_FRAME_PAYLOAD, &mut sb_rows);
         assert!(sb_rows.len() <= count as usize);
     }
 }

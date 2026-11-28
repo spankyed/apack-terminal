@@ -734,7 +734,7 @@ fn shard_keyframe_seek_fallback_and_exit_status_unit() {
     let eng_fallback = build_keyframe_engine(&slice, &wrong_abi, &img_store, 100).unwrap();
     let m2 = eng_fallback.meta();
     let mut fb_rows = Vec::new();
-    eng_fallback.extract_history_rows(0, m2.first_active_line as u32, &mut fb_rows);
+    eng_fallback.extract_history_rows(0, m2.first_active_line as u32, usize::MAX, &mut fb_rows);
     let vp_idx: Vec<u16> = (0..m2.size.rows.get()).collect();
     eng_fallback.extract_viewport_rows(&vp_idx, &mut fb_rows);
     let lines: Vec<&str> = fb_rows.iter().map(|r| r.text.as_str()).collect();

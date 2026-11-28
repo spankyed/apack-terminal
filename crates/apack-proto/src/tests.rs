@@ -1662,4 +1662,34 @@ fn packed_row_text_cap_links_resume_token_and_image_placement_validation() {
         let mut r = Reader::new(w.as_slice());
         assert_eq!(ImagePlacement::decode(&mut r), Err(WireError::InvalidValue(reason)));
     }
+
+    // 5. SpawnSpec::scrollback_limit exact boundary: 0 and MAX_SCROLLBACK_LINES accepted; +1 rejected.
+    let base_spawn = |limit: u32| {
+        ClientMsg::Spawn(Box::new(SpawnSpec {
+            argv: vec![],
+            cwd: None,
+            env: vec![],
+            size: GridSize::new(80, 24).unwrap(),
+            cell_px: CellPx::default(),
+            scrollback_limit: limit,
+            marks_key: None,
+            resize_policy: ResizePolicy::ExplicitOverride,
+            record_dir: None,
+            restore_from: None,
+            image_files: false,
+            kept: false,
+        }))
+    };
+    for ok_limit in [0u32, crate::MAX_SCROLLBACK_LINES] {
+        let msg = base_spawn(ok_limit);
+        let mut w = Writer::new();
+        msg.encode(&mut w);
+        assert_eq!(ClientMsg::decode(msg_type::SPAWN, w.as_slice()), Ok(msg));
+    }
+    let mut w = Writer::new();
+    base_spawn(crate::MAX_SCROLLBACK_LINES + 1).encode(&mut w);
+    assert_eq!(
+        ClientMsg::decode(msg_type::SPAWN, w.as_slice()),
+        Err(WireError::LimitExceeded("spawn scrollback_limit"))
+    );
 }

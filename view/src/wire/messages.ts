@@ -12,6 +12,7 @@ import {
   MAX_IMAGES_REPLY,
   MAX_PROGRESS_PERCENT,
   MAX_ROWS_PER_FETCH,
+  MAX_SCROLLBACK_LINES,
   MAX_SEARCH_MATCHES,
   MAX_SEARCH_NEEDLE_BYTES,
   MAX_SESSIONS_LIST,
@@ -220,6 +221,9 @@ function encodeSpawnSpec(w: WireWriter, v: SpawnSpec): void {
   w.atomic((w) => {
     if (v.argv.length > MAX_SPAWN_ARGV) throw new WireError('LimitExceeded', 'wire limit exceeded: spawn argv')
     if (v.env.length > MAX_SPAWN_ENV) throw new WireError('LimitExceeded', 'wire limit exceeded: spawn env')
+    if (!Number.isInteger(v.scrollbackLimit) || v.scrollbackLimit < 0 || v.scrollbackLimit > MAX_SCROLLBACK_LINES) {
+      throw new WireError('LimitExceeded', 'spawn scrollback_limit')
+    }
     w.slice(v.argv, (wr, item) => { wr.str(item) })
     w.opt(v.cwd, (wr, item) => { wr.str(item) })
     w.slice(v.env, (wr, [k, val]) => { wr.str(k); wr.str(val) })
@@ -235,20 +239,22 @@ function encodeSpawnSpec(w: WireWriter, v: SpawnSpec): void {
   })
 }
 function decodeSpawnSpec(r: WireReader): SpawnSpec {
-  return {
-    argv: r.vecBounded(MAX_SPAWN_ARGV, 'spawn argv', (rd) => rd.str()),
-    cwd: r.opt((rd) => rd.str()),
-    env: r.vecBounded(MAX_SPAWN_ENV, 'spawn env', (rd) => [rd.str(), rd.str()] as const),
-    size: decodeGridSize(r),
-    cellPx: decodeCellPx(r),
-    scrollbackLimit: r.varU32(),
-    marksKey: r.opt(decodeMarksKey),
-    resizePolicy: decodeResizePolicy(r),
-    recordDir: r.opt((rd) => rd.str()),
-    restoreFrom: r.opt((rd) => rd.str()),
-    imageFiles: r.bool(),
-    kept: r.bool(),
+  const argv = r.vecBounded(MAX_SPAWN_ARGV, 'spawn argv', (rd) => rd.str())
+  const cwd = r.opt((rd) => rd.str())
+  const env = r.vecBounded(MAX_SPAWN_ENV, 'spawn env', (rd) => [rd.str(), rd.str()] as const)
+  const size = decodeGridSize(r)
+  const cellPx = decodeCellPx(r)
+  const scrollbackLimit = r.varU32()
+  if (scrollbackLimit > MAX_SCROLLBACK_LINES) {
+    throw new WireError('LimitExceeded', 'spawn scrollback_limit')
   }
+  const marksKey = r.opt(decodeMarksKey)
+  const resizePolicy = decodeResizePolicy(r)
+  const recordDir = r.opt((rd) => rd.str())
+  const restoreFrom = r.opt((rd) => rd.str())
+  const imageFiles = r.bool()
+  const kept = r.bool()
+  return { argv, cwd, env, size, cellPx, scrollbackLimit, marksKey, resizePolicy, recordDir, restoreFrom, imageFiles, kept }
 }
 
 export interface SessionSummary {

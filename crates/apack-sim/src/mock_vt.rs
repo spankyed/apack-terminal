@@ -291,9 +291,9 @@ impl VtEngine for MockVt {
         }
     }
 
-    fn resize(&mut self, size: GridSize, _cell_px: CellPx, _events: &mut Vec<VtEvent>) {
+    fn resize(&mut self, size: GridSize, _cell_px: CellPx, _events: &mut Vec<VtEvent>) -> bool {
         if size == self.size {
-            return;
+            return true;
         }
         self.size = size;
         self.epoch += 1;
@@ -306,6 +306,7 @@ impl VtEngine for MockVt {
         self.dirty_rows.clear();
         self.scroll_delta = 0;
         self.gens.grid += 1;
+        true
     }
 
     fn meta(&self) -> VtSnapshotMeta {
@@ -348,13 +349,24 @@ impl VtEngine for MockVt {
         }
     }
 
-    fn extract_history_rows(&self, from_line: u64, count: u32, out: &mut Vec<PackedRow>) {
+    fn extract_history_rows(&self, from_line: u64, count: u32, max_bytes: usize, out: &mut Vec<PackedRow>) {
+        let mut used_bytes = 32usize;
+        let initial_len = out.len();
+        let mut scratch = apack_proto::codec::Writer::new();
         for offset in 0..u64::from(count) {
             let abs = from_line.saturating_add(offset);
             let Some(text) = self.line_text(abs) else {
                 break;
             };
-            out.push(self.pack_row(abs, text));
+            let packed = self.pack_row(abs, text);
+            scratch.clear();
+            packed.encode(&mut scratch);
+            let row_bytes = scratch.as_slice().len();
+            if out.len() > initial_len && used_bytes.saturating_add(row_bytes) > max_bytes {
+                break;
+            }
+            used_bytes = used_bytes.saturating_add(row_bytes);
+            out.push(packed);
         }
     }
 

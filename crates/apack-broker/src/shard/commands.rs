@@ -544,7 +544,9 @@ impl ShardRunner {
     }
 }
 
-/// Resolves `SpawnSpec::scrollback_limit` (`0` selects [`DEFAULT_SCROLLBACK_LINES`]).
+/// Resolves `SpawnSpec::scrollback_limit` (`0` selects [`DEFAULT_SCROLLBACK_LINES`], clamped to
+/// [`apack_proto::MAX_SCROLLBACK_LINES`]).
 pub(crate) fn resolve_scrollback_lines(limit: u32) -> usize {
-    if limit == 0 { DEFAULT_SCROLLBACK_LINES } else { limit as usize }
+    let requested = if limit == 0 { DEFAULT_SCROLLBACK_LINES } else { limit as usize };
+    requested.min(apack_proto::MAX_SCROLLBACK_LINES as usize)
 }

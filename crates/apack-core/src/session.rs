@@ -565,11 +565,12 @@ impl<V: VtEngine> SessionMachine<V> {
                 }
                 ReplayRecord::Resize { size, cell_px } => {
                     let before_epoch = self.vt.meta().epoch;
-                    self.current_size = *size;
-                    self.current_cell_px = *cell_px;
-                    self.vt.resize(*size, *cell_px, &mut vt_events);
-                    if self.vt.meta().epoch != before_epoch {
-                        self.marks.on_epoch_change();
+                    if self.vt.resize(*size, *cell_px, &mut vt_events) {
+                        self.current_size = *size;
+                        self.current_cell_px = *cell_px;
+                        if self.vt.meta().epoch != before_epoch {
+                            self.marks.on_epoch_change();
+                        }
                     }
                 }
                 ReplayRecord::Marks { key, last_seq } => {
@@ -1046,15 +1047,26 @@ impl<V: VtEngine> SessionMachine<V> {
                 self.recompute_viewport_geometry(effects);
             }
             ClientMsg::ExplicitResize { size, cell_px } => {
-                self.apply_resize(size, cell_px, effects);
-                effects.push(SessionEffect::Send {
-                    conn,
-                    stream_id: wire_stream,
-                    attachment: att,
-                    req_id,
-                    priority: OutboundPriority::Control,
-                    msg: BrokerMsg::Ok,
-                });
+                if self.apply_resize(size, cell_px, effects) {
+                    effects.push(SessionEffect::Send {
+                        conn,
+                        stream_id: wire_stream,
+                        attachment: att,
+                        req_id,
+                        priority: OutboundPriority::Control,
+                        msg: BrokerMsg::Ok,
+                    });
+                } else {
+                    send_stream_error(
+                        conn,
+                        wire_stream,
+                        att,
+                        req_id,
+                        ErrorCode::ResourceLimit,
+                        "terminal resize failed",
+                        effects,
+                    );
+                }
             }
             ClientMsg::SetCursorDefaults { shape, blinking } => {
                 self.vt.set_cursor_defaults(shape, blinking);
@@ -1169,11 +1181,11 @@ impl<V: VtEngine> SessionMachine<V> {
                     send_stream_error(conn, wire_stream, att, req_id, ErrorCode::StaleEpoch, "stale epoch", effects);
                     return;
                 }
+                let max_rows_bytes = apack_proto::MAX_FRAME_PAYLOAD.saturating_sub(4_096);
                 let mut rows = Vec::new();
-                self.vt.extract_history_rows(from_line, count.min(MAX_ROWS_PER_FETCH), &mut rows);
-                // Enforce the wire frame payload cap so heavily styled/hyperlinked rows never
-                // exceed `MAX_FRAME_PAYLOAD` when serialized into `BrokerMsg::Rows`.
-                truncate_rows_to_budget(&mut rows, apack_proto::MAX_FRAME_PAYLOAD.saturating_sub(4_096));
+                self.vt.extract_history_rows(from_line, count.min(MAX_ROWS_PER_FETCH), max_rows_bytes, &mut rows);
+                // Enforce the wire frame payload cap as defense-in-depth for custom `VtEngine` impls.
+                truncate_rows_to_budget(&mut rows, max_rows_bytes);
                 effects.push(SessionEffect::Send {
                     conn,
                     stream_id: wire_stream,
@@ -1499,18 +1511,20 @@ impl<V: VtEngine> SessionMachine<V> {
             }
             ResizePolicy::ExplicitOverride => return,
         };
-        self.apply_resize(target_size, target_cell_px, effects);
+        let _ = self.apply_resize(target_size, target_cell_px, effects);
     }
 
-    fn apply_resize(&mut self, size: GridSize, cell_px: CellPx, effects: &mut Vec<SessionEffect>) {
+    fn apply_resize(&mut self, size: GridSize, cell_px: CellPx, effects: &mut Vec<SessionEffect>) -> bool {
         if size == self.current_size && cell_px == self.current_cell_px {
-            return;
+            return true;
         }
         let prev_epoch = self.vt.meta().epoch;
+        let mut vt_events = Vec::new();
+        if !self.vt.resize(size, cell_px, &mut vt_events) {
+            return false;
+        }
         self.current_size = size;
         self.current_cell_px = cell_px;
-        let mut vt_events = Vec::new();
-        self.vt.resize(size, cell_px, &mut vt_events);
         for ev in vt_events {
             match ev {
                 VtEvent::SyncOutput(false) => {
@@ -1548,6 +1562,7 @@ impl<V: VtEngine> SessionMachine<V> {
         }
         effects.push(SessionEffect::ResizePty { size, cell_px });
         self.notify_views_dirty(effects);
+        true
     }
 
     fn apply_mark_effects(
@@ -1864,8 +1879,9 @@ pub(crate) fn text_matches_in_range_chunked<V: VtEngine>(
     let mut carry = String::new();
     let mut prev_wrapped = false;
     let mut cur = from_line;
+    let mut cur_step = step;
     while cur <= end_line {
-        let chunk_end = cur.saturating_add(step.saturating_sub(1)).min(end_line);
+        let chunk_end = cur.saturating_add(cur_step.saturating_sub(1)).min(end_line);
         let span = CellSpan { start: CellPos { line: cur, col: 0 }, end: CellPos { line: chunk_end, col: max_col } };
         let chunk = vt.text_of(span, MAX_STRING_BYTES);
         let mut combined = String::with_capacity(carry.len() + 1 + chunk.len());
@@ -1877,6 +1893,14 @@ pub(crate) fn text_matches_in_range_chunked<V: VtEngine>(
         if combined.contains(needle) {
             return true;
         }
+        // If a multi-row chunk hit `MAX_STRING_BYTES` (accounting for up to 3 bytes dropped at a
+        // UTF-8 char boundary), halve the actual clamped span length and retry from `cur` so
+        // trailing rows are never silently skipped and near-`end_line` spans shrink immediately.
+        if chunk_end > cur && chunk.len() >= MAX_STRING_BYTES.saturating_sub(3) {
+            let span_len = chunk_end.saturating_sub(cur).saturating_add(1);
+            cur_step = (span_len / 2).max(1);
+            continue;
+        }
         if chunk_end >= end_line {
             break;
         }
@@ -1885,6 +1909,7 @@ pub(crate) fn text_matches_in_range_chunked<V: VtEngine>(
         carry.clear();
         carry.push_str(&combined[start..]);
         cur = chunk_end.saturating_add(1);
+        cur_step = step;
     }
     false
 }

@@ -439,7 +439,7 @@ fn scrollback_eviction_compression_word_delimiters_rect_wide_grapheme_and_search
     assert!(vt.line_at(oldest - 1).is_none());
     assert!(vt.line_at(meta.total_lines()).is_none());
     let mut hist = Vec::new();
-    vt.extract_history_rows(oldest, 2, &mut hist);
+    vt.extract_history_rows(oldest, 2, usize::MAX, &mut hist);
     assert_eq!(hist.len(), 2);
     assert_eq!(hist[0].line, oldest);
     assert_eq!(hist[1].line, oldest + 1);
@@ -1200,7 +1200,7 @@ fn snapshot_export_mid_sequence_at_ground_corrupt_rejection_and_blink_preservati
         "mid-CSI continuation must not be broken by injected DEC mode 12 bytes: {active:?}"
     );
     let mut hist = Vec::new();
-    dst.extract_history_rows(0, 2, &mut hist);
+    dst.extract_history_rows(0, 2, usize::MAX, &mut hist);
     assert!(hist[0].text.starts_with("snap-line-0000"));
     assert!(hist[1].text.starts_with("snap-line-0001"));
 
@@ -1725,4 +1725,62 @@ fn vt_ghostty_seams_placement_geometry_bounded_batch_ffi_guard_poison_and_sealed
     let active_blobs = blob_vt.active_image_blobs();
     assert_eq!(active_blobs.len(), 1, "identical blobs across direct + virtual images must be deduplicated");
     assert_eq!(active_blobs[0], crate::image_store::hash_bytes(&dup_png));
+}
+
+#[test]
+fn pr114_round2_scrollback_caps_resize_rollback_and_history_budget() {
+    use crate::engine::{cols_aware_batch_rows, commit_resize_state};
+    use ghostty_vt_rs_sys as sys;
+
+    // 1. B1: Per-session scrollback byte cap is 256 MiB (matching v1 HISTORY_BYTES) and
+    //    `GhosttyEngine::new` clamps oversized `scrollback_lines` cleanly.
+    assert_eq!(crate::SCROLLBACK_MAX_BYTES, 256 << 20);
+    let mut big_cfg = GhosttyConfig::new(grid(80, 10));
+    big_cfg.scrollback_lines = usize::MAX;
+    let mut vt = GhosttyEngine::new(big_cfg).unwrap();
+    let mut ev = Vec::new();
+    for i in 0..30u32 {
+        vt.feed(format!("history-line-{i:02}-payload\r\n").as_bytes(), &mut ev);
+    }
+    let meta = vt.meta();
+    assert!(meta.scrollback_lines >= 20);
+
+    // 2. Budget-aware `extract_history_rows`: always returns at least 1 row even with `max_bytes = 1`,
+    //    stops strictly within `max_bytes`, and returns all requested rows when budget permits.
+    let mut all_hist = Vec::new();
+    vt.extract_history_rows(0, 10, usize::MAX, &mut all_hist);
+    assert_eq!(all_hist.len(), 10);
+
+    let mut min_one = Vec::new();
+    vt.extract_history_rows(0, 10, 1, &mut min_one);
+    assert_eq!(min_one.len(), 1, "tight budget must still return first row");
+
+    let mut w0 = apack_proto::codec::Writer::new();
+    all_hist[0].encode(&mut w0);
+    let r0 = w0.as_slice().len();
+    let mut w1 = apack_proto::codec::Writer::new();
+    all_hist[1].encode(&mut w1);
+    let r1 = w1.as_slice().len();
+    let mut exact_two = Vec::new();
+    vt.extract_history_rows(0, 10, 32 + r0 + r1, &mut exact_two);
+    assert_eq!(exact_two.len(), 2, "exact 2-row budget must emit 2 rows");
+    let mut under_two = Vec::new();
+    vt.extract_history_rows(0, 10, 32 + r0 + r1 - 1, &mut under_two);
+    assert_eq!(under_two.len(), 1, "1 byte under 2-row budget must stop at 1 row");
+
+    // 3. M11: `commit_resize_state` commits only on SUCCESS and rolls back on failure.
+    let next_sz = grid(120, 40);
+    let next_px = CellPx { width: 9, height: 18 };
+    assert_eq!(commit_resize_state(sys::Result::SUCCESS, next_sz, next_px), Some((next_sz, next_px)));
+    assert_eq!(commit_resize_state(sys::Result::OUT_OF_MEMORY, next_sz, next_px), None);
+    assert_eq!(commit_resize_state(sys::Result::INVALID_VALUE, next_sz, next_px), None);
+
+    // 4. `cols_aware_batch_rows` bounds wide terminals inversely by column width.
+    assert_eq!(cols_aware_batch_rows(80, 64), 64);
+    assert_eq!(cols_aware_batch_rows(80, 256), 64);
+    assert_eq!(cols_aware_batch_rows(80, 2), 2);
+    assert_eq!(cols_aware_batch_rows(80, 0), 1);
+    assert_eq!(cols_aware_batch_rows(1_000, 256), 5);
+    assert_eq!(cols_aware_batch_rows(1_000, 2), 2);
+    assert_eq!(cols_aware_batch_rows(0, 64), 64);
 }

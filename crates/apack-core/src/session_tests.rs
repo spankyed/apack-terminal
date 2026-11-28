@@ -55,6 +55,7 @@ struct StubVt {
     last_search_range: core::cell::Cell<(u64, u64)>,
     use_row_text_of: bool,
     text_of_spans: core::cell::RefCell<Vec<(u64, u64)>>,
+    fail_next_resize: bool,
 }
 
 impl StubVt {
@@ -74,6 +75,7 @@ impl StubVt {
             last_search_range: core::cell::Cell::new((0, 0)),
             use_row_text_of: false,
             text_of_spans: core::cell::RefCell::new(Vec::new()),
+            fail_next_resize: false,
         }
     }
 }
@@ -171,9 +173,13 @@ impl VtEngine for StubVt {
         }
     }
 
-    fn resize(&mut self, size: GridSize, _cell_px: CellPx, events: &mut Vec<VtEvent>) {
+    fn resize(&mut self, size: GridSize, _cell_px: CellPx, events: &mut Vec<VtEvent>) -> bool {
+        if self.fail_next_resize {
+            self.fail_next_resize = false;
+            return false;
+        }
         if size == self.size {
-            return;
+            return true;
         }
         self.size = size;
         self.epoch += 1;
@@ -181,6 +187,7 @@ impl VtEngine for StubVt {
         events.push(VtEvent::DeviceResponse(b"\x1b[48;10;20t".to_vec()));
         self.rows.resize(usize::from(size.rows.get()), String::new());
         self.dirty.full_dirty = true;
+        true
     }
 
     fn meta(&self) -> VtSnapshotMeta {
@@ -236,7 +243,7 @@ impl VtEngine for StubVt {
         }
     }
 
-    fn extract_history_rows(&self, from_line: u64, count: u32, out: &mut Vec<PackedRow>) {
+    fn extract_history_rows(&self, from_line: u64, count: u32, _max_bytes: usize, out: &mut Vec<PackedRow>) {
         for i in 0..u64::from(count) {
             let line = from_line + i;
             if line >= self.first_active_line && (line - self.first_active_line) < self.rows.len() as u64 {
@@ -1140,6 +1147,22 @@ fn session_machine_marks_search_waiters_command_output_and_exit() {
     fx.clear();
     s3.on_pty_output(b"done", ts(2_010), &mut fx);
     assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. } if *req_id == RequestId::from_raw(90))));
+    // Hostile/unattributed `state=done` without `app=` stays Confirmed::Unknown and MUST NOT wake WaitCondition::Status!
+    assert!(!fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Waited { .. }, .. } if *req_id == RequestId::from_raw(91))));
+    // Verified `state=done;app=agent` confirmed Matched DOES wake the waiting client!
+    fx.clear();
+    s3.vt_mut().next_events =
+        vec![VtEvent::ProgramStatus(crate::status::parse_osc7501("state=done;app=agent").unwrap())];
+    s3.on_pty_output(b"v", ts(2_015), &mut fx);
+    let ch_s3 = fx
+        .iter()
+        .find_map(|e| match e {
+            SessionEffect::VerifyForeground { changed, .. } => Some(*changed),
+            _ => None,
+        })
+        .expect("expected VerifyForeground");
+    fx.clear();
+    s3.apply_status_confirmation("", ch_s3, Confirmed::Matched, &mut fx);
     assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. } if *req_id == RequestId::from_raw(91))));
 
     // Detach cleans up views
@@ -2628,8 +2651,15 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
             &mut lfx,
         );
         assert!(lfx.is_empty(), "late waiter must stay gated until foreground verification completes");
-        // When fg_worker resolves as Confirmed::Unknown (Windows / fast-exit POSIX), BOTH waiters MUST wake!
+        // When fg_worker resolves as Confirmed::Unknown, waiters MUST NOT wake (only Confirmed::Matched wakes)!
         live_sess.apply_status_confirmation("", done_changed, Confirmed::Unknown, &mut lfx);
+        assert!(
+            !lfx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Waited { .. }, .. })),
+            "Confirmed::Unknown must NOT wake WaitCondition::Status"
+        );
+        // When fg_worker positively confirms Matched, BOTH waiters wake immediately!
+        lfx.clear();
+        live_sess.apply_status_confirmation("", done_changed, Confirmed::Matched, &mut lfx);
         assert!(lfx.iter().any(|e| matches!(
             e,
             SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. }
@@ -2727,7 +2757,7 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
         .count();
     assert_eq!(woken, 3);
 
-    // Unknown confirmation (e.g. Windows / no foreground pgid) also unblocks deferred waiter!
+    // Unknown confirmation (e.g. unverified / no foreground pgid) MUST NOT wake WaitCondition::Status!
     fx.clear();
     sess.register_wait(
         conn(1),
@@ -2750,7 +2780,25 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
     assert!(!fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Waited { .. }, .. })));
     fx.clear();
     sess.apply_status_confirmation("", changed3, Confirmed::Unknown, &mut fx);
-    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. } if *req_id == RequestId::from_raw(4))));
+    assert!(
+        !fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Waited { .. }, .. })),
+        "Confirmed::Unknown must NOT wake WaitCondition::Status"
+    );
+    // Late waiter registered against an app-less status (`Confirmed::Unknown`) must also NOT wake!
+    fx.clear();
+    sess.vt_mut().next_events = vec![VtEvent::ProgramStatus(crate::status::parse_osc7501("state=done").unwrap())];
+    sess.on_pty_output(b"w", ts(7), &mut fx);
+    assert!(!fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Waited { .. }, .. })));
+    fx.clear();
+    sess.register_wait(
+        conn(1),
+        RequestId::from_raw(5),
+        WaitCondition::Status(vec![StatusState::Done]),
+        5_000,
+        ts(7),
+        &mut fx,
+    );
+    assert!(fx.is_empty(), "app-less OSC 7501 must never satisfy WaitCondition::Status");
 
     // 4. Transactional restore_from_replay: monotonic epoch, marks hydration, status reset/replay, SearchWatch refresh, full_sync!
     let k1 = (conn(1), nz_stream(1));
@@ -2837,7 +2885,8 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
     );
     assert_eq!(sess.active_statuses().len(), 2);
     assert!(sess.active_statuses().iter().any(|r| r.id == "sub"));
-    // Replay verification finished: WaitCondition::Status(Working) wakes immediately without pending_verify!
+    // Replayed statuses have Confirmed::Unknown (no live process to verify against), so
+    // WaitCondition::Status does not spuriously wake on replayed unverified statuses!
     fx.clear();
     sess.register_wait(
         conn(1),
@@ -2847,11 +2896,10 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
         ts(101),
         &mut fx,
     );
-    assert!(fx.iter().any(|e| matches!(
-        e,
-        SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. }
-        if *req_id == RequestId::from_raw(12)
-    )));
+    assert!(
+        !fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, .. } if *req_id == RequestId::from_raw(12))),
+        "replayed unverified status must not wake WaitCondition::Status"
+    );
     // Second seek clearing title (no Title event in tail) broadcasts empty Title when emit_status_events == true (`M3`),
     // AND CommandFinished during replay clears active statuses (`M1`)!
     let new_epoch = sess.vt().meta().epoch;
@@ -3105,4 +3153,215 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
     );
     zero_seq_mt.on_osc633(&format!("V;F;5;{};0;/bad", key.as_str()), 0, ts(31), &mut rmt_fx);
     assert_eq!(zero_seq_mt.refused(), 1);
+}
+
+#[test]
+fn text_matches_in_range_chunked_halves_on_max_string_truncation() {
+    use crate::session::{ReplayRecord, RestoreKeyframe, text_matches_in_range_chunked};
+    use apack_proto::MAX_STRING_BYTES;
+
+    // A VT whose line 0 holds nearly `MAX_STRING_BYTES` and line 1 holds the target needle:
+    // asking for lines 0..=1 truncates at `MAX_STRING_BYTES` and drops line 1, so adaptive
+    // halving MUST retry line 0 alone and then scan line 1 without skipping it!
+    struct TruncatingVt {
+        inner: StubVt,
+        spans_requested: core::cell::RefCell<Vec<(u64, u64)>>,
+    }
+    impl VtEngine for TruncatingVt {
+        fn feed(&mut self, bytes: &[u8], events: &mut Vec<VtEvent>) {
+            self.inner.feed(bytes, events);
+        }
+        fn resize(&mut self, size: GridSize, cell_px: CellPx, events: &mut Vec<VtEvent>) -> bool {
+            self.inner.resize(size, cell_px, events)
+        }
+        fn meta(&self) -> VtSnapshotMeta {
+            self.inner.meta()
+        }
+        fn generations(&self) -> VtGenerations {
+            self.inner.generations()
+        }
+        fn palette_overrides(&self) -> PaletteOverrides {
+            self.inner.palette_overrides()
+        }
+        fn take_dirty_viewport(&mut self) -> DirtyViewport {
+            self.inner.take_dirty_viewport()
+        }
+        fn extract_viewport_rows(&self, rows: &[u16], out: &mut Vec<PackedRow>) {
+            self.inner.extract_viewport_rows(rows, out);
+        }
+        fn extract_history_rows(&self, from_line: u64, count: u32, max_bytes: usize, out: &mut Vec<PackedRow>) {
+            self.inner.extract_history_rows(from_line, count, max_bytes, out);
+        }
+        fn word_at(&self, pos: CellPos, delimiters: &str) -> Option<CellSpan> {
+            self.inner.word_at(pos, delimiters)
+        }
+        fn line_at(&self, line: u64) -> Option<CellSpan> {
+            self.inner.line_at(line)
+        }
+        fn text_of(&self, span: CellSpan, max_bytes: usize) -> String {
+            self.spans_requested.borrow_mut().push((span.start.line, span.end.line));
+            let mut full = String::new();
+            for line in span.start.line..=span.end.line {
+                if line > span.start.line {
+                    full.push('\n');
+                }
+                if line == 0 {
+                    full.push_str(&"x".repeat(MAX_STRING_BYTES - 1));
+                } else if line == 1 {
+                    full.push_str("NEEDLE_ON_ROW_1");
+                }
+            }
+            full.truncate(full.floor_char_boundary(max_bytes));
+            full
+        }
+        fn text_of_rect(&self, span: CellSpan, max_bytes: usize) -> String {
+            self.inner.text_of_rect(span, max_bytes)
+        }
+        fn search_lines(
+            &self,
+            _from_line: u64,
+            _to_line: u64,
+            _needle: &str,
+            _case_sensitive: bool,
+            _limit: usize,
+            _out: &mut Vec<CellSpan>,
+        ) -> bool {
+            true // force fallback into `text_matches_in_range_chunked`
+        }
+        fn images(&self) -> Vec<ImagePlacement> {
+            vec![]
+        }
+        fn encode_key(&mut self, key: &KeyInput, out: &mut Vec<u8>) {
+            self.inner.encode_key(key, out);
+        }
+        fn encode_pointer(&mut self, ev: &PointerInput, held_buttons: &mut u8, out: &mut Vec<u8>) {
+            self.inner.encode_pointer(ev, held_buttons, out);
+        }
+        fn encode_focus(&mut self, focused: bool, out: &mut Vec<u8>) {
+            self.inner.encode_focus(focused, out);
+        }
+        fn encode_paste(&mut self, text: &str, allow_unsafe: bool) -> PasteEncode {
+            self.inner.encode_paste(text, allow_unsafe)
+        }
+        fn set_cursor_defaults(&mut self, shape: CursorShape, blinking: bool) {
+            self.inner.set_cursor_defaults(shape, blinking);
+        }
+        fn compress_step(&mut self, max_pages: usize) -> CompressStep {
+            self.inner.compress_step(max_pages)
+        }
+        fn ensure_min_epoch(&mut self, min_epoch: u64) {
+            self.inner.ensure_min_epoch(min_epoch);
+        }
+        fn scrollback_bytes(&self) -> u64 {
+            self.inner.scrollback_bytes()
+        }
+    }
+
+    let vt = TruncatingVt { inner: StubVt::new(80, 4), spans_requested: core::cell::RefCell::new(Vec::new()) };
+    assert!(
+        text_matches_in_range_chunked(&vt, 0, 4, "NEEDLE_ON_ROW_1", 4),
+        "adaptive halving must not skip row 1 when multi-row chunk saturates MAX_STRING_BYTES"
+    );
+    // Step 4 -> halves to 2 (lines 0..=1) -> halves to 1 (line 0), then line 1 matches:
+    assert_eq!(
+        *vt.spans_requested.borrow(),
+        vec![(0, 3), (0, 1), (0, 0), (1, 3)],
+        "halving must shrink step 4 -> 2 -> 1 instead of jumping via modulo"
+    );
+    // Near `end_line` with large `step = 128` over 2 rows: must halve clamped span length immediately (3 calls, not 8).
+    vt.spans_requested.borrow_mut().clear();
+    assert!(text_matches_in_range_chunked(&vt, 0, 2, "NEEDLE_ON_ROW_1", 128));
+    assert_eq!(*vt.spans_requested.borrow(), vec![(0, 1), (0, 0), (1, 1)]);
+    assert!(!text_matches_in_range_chunked(&vt, 0, 2, "ABSENT_NEEDLE", 4));
+
+    // Failed `VtEngine::resize` rollback: `SessionMachine::apply_resize` and `restore_from_replay`
+    // must NOT commit `current_size`/`current_cell_px` or emit `ResizePty`/`ViewsDirty`, and a
+    // subsequent retry with the same target size must succeed once VT resize succeeds.
+    let orig_size = GridSize::new(80, 24).unwrap();
+    let target_size = GridSize::new(120, 40).unwrap();
+    let orig_px = CellPx { width: 8, height: 16 };
+    let target_px = CellPx { width: 9, height: 18 };
+    let mut sess =
+        SessionMachine::new(sid(77), StubVt::new(80, 24), ResizePolicy::ExplicitOverride, MarksMode::Claimed, orig_px);
+    let k1 = (conn(1), nz_stream(1));
+    let mut fx = Vec::new();
+    sess.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, &mut fx);
+    let _ = sess.try_publish_view(k1, |_| true);
+    fx.clear();
+
+    sess.vt_mut().fail_next_resize = true;
+    sess.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(1),
+        ClientMsg::ExplicitResize { size: target_size, cell_px: target_px },
+        &mut fx,
+    );
+    assert_eq!(sess.current_size(), orig_size, "failed VT resize must not update current_size");
+    assert_eq!(sess.current_cell_px(), orig_px, "failed VT resize must not update current_cell_px");
+    assert!(!fx.iter().any(|e| matches!(e, SessionEffect::ResizePty { .. })), "must not resize OS PTY on VT rollback");
+    assert!(!fx.contains(&SessionEffect::ViewsDirty), "must not dirty views on VT rollback");
+    assert!(
+        fx.iter().any(|e| matches!(
+            e,
+            SessionEffect::Send {
+                req_id,
+                msg: BrokerMsg::Error { code: ErrorCode::ResourceLimit, .. },
+                ..
+            } if *req_id == RequestId::from_raw(1)
+        )),
+        "failed ExplicitResize must return ResourceLimit error, not Ok"
+    );
+
+    // Retrying the exact same target size now succeeds cleanly!
+    fx.clear();
+    sess.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(2),
+        ClientMsg::ExplicitResize { size: target_size, cell_px: target_px },
+        &mut fx,
+    );
+    assert_eq!(sess.current_size(), target_size);
+    assert_eq!(sess.current_cell_px(), target_px);
+    assert!(fx.iter().any(
+        |e| matches!(e, SessionEffect::ResizePty { size, cell_px } if *size == target_size && *cell_px == target_px)
+    ));
+    assert!(fx.iter().any(
+        |e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Ok, .. } if *req_id == RequestId::from_raw(2))
+    ));
+
+    // Same rollback guard inside `restore_from_replay` (`ReplayRecord::Resize`):
+    let mut fresh = StubVt::new(80, 24);
+    fresh.fail_next_resize = true;
+    fx.clear();
+    sess.restore_from_replay(
+        fresh,
+        RestoreKeyframe {
+            cell_px: orig_px,
+            marks_mode: MarksMode::Claimed,
+            marks_last_seq: 0,
+            marks_refused: 0,
+            commands: vec![],
+        },
+        &[ReplayRecord::Resize { size: target_size, cell_px: target_px }],
+        false,
+        &mut fx,
+    );
+    assert_eq!(sess.current_size(), orig_size, "failed ReplayRecord::Resize must not update current_size");
+    assert_eq!(sess.current_cell_px(), orig_px, "failed ReplayRecord::Resize must not update current_cell_px");
+
+    // Direct return-value contract of `StatusTable::apply_confirmation`:
+    // returns `true` iff `id == ""` AND `confirmed == Confirmed::Matched`.
+    let mut table = crate::status::StatusTable::new();
+    let mut sfx = Vec::new();
+    table.ingest("state=working;app=claude", ts(1), &mut sfx);
+    table.ingest("id=sub;state=working;app=claude", ts(2), &mut sfx);
+    let root_ch = table.get("").unwrap().changed;
+    let sub_ch = table.get("sub").unwrap().changed;
+    sfx.clear();
+    assert!(!table.apply_confirmation("sub", sub_ch, Confirmed::Matched, &mut sfx), "non-root Matched -> false");
+    assert!(!table.apply_confirmation("", root_ch, Confirmed::Unknown, &mut sfx), "root Unknown -> false");
+    assert!(!table.apply_confirmation("", root_ch, Confirmed::Mismatched, &mut sfx), "root Mismatched -> false");
+    assert!(table.apply_confirmation("", root_ch, Confirmed::Matched, &mut sfx), "root Matched -> true");
 }

@@ -85,6 +85,9 @@ pub const MAX_SPAWN_ARGV: usize = 1_024;
 /// Maximum `env` pairs in a `SpawnSpec`.
 pub const MAX_SPAWN_ENV: usize = 1_024;
 
+/// Maximum `scrollback_limit` lines accepted in a `SpawnSpec` (`0` selects broker default).
+pub const MAX_SCROLLBACK_LINES: u32 = 1_000_000;
+
 /// Maximum session summaries returned in `SessionsList`.
 pub const MAX_SESSIONS_LIST: usize = 4_096;
 
