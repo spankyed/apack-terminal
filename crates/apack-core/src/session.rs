@@ -1169,11 +1169,11 @@ impl<V: VtEngine> SessionMachine<V> {
                     send_stream_error(conn, wire_stream, att, req_id, ErrorCode::StaleEpoch, "stale epoch", effects);
                     return;
                 }
+                let max_rows_bytes = apack_proto::MAX_FRAME_PAYLOAD.saturating_sub(4_096);
                 let mut rows = Vec::new();
-                self.vt.extract_history_rows(from_line, count.min(MAX_ROWS_PER_FETCH), &mut rows);
-                // Enforce the wire frame payload cap so heavily styled/hyperlinked rows never
-                // exceed `MAX_FRAME_PAYLOAD` when serialized into `BrokerMsg::Rows`.
-                truncate_rows_to_budget(&mut rows, apack_proto::MAX_FRAME_PAYLOAD.saturating_sub(4_096));
+                self.vt.extract_history_rows(from_line, count.min(MAX_ROWS_PER_FETCH), max_rows_bytes, &mut rows);
+                // Enforce the wire frame payload cap as defense-in-depth for custom `VtEngine` impls.
+                truncate_rows_to_budget(&mut rows, max_rows_bytes);
                 effects.push(SessionEffect::Send {
                     conn,
                     stream_id: wire_stream,
@@ -1864,8 +1864,9 @@ pub(crate) fn text_matches_in_range_chunked<V: VtEngine>(
     let mut carry = String::new();
     let mut prev_wrapped = false;
     let mut cur = from_line;
+    let mut cur_step = step;
     while cur <= end_line {
-        let chunk_end = cur.saturating_add(step.saturating_sub(1)).min(end_line);
+        let chunk_end = cur.saturating_add(cur_step.saturating_sub(1)).min(end_line);
         let span = CellSpan { start: CellPos { line: cur, col: 0 }, end: CellPos { line: chunk_end, col: max_col } };
         let chunk = vt.text_of(span, MAX_STRING_BYTES);
         let mut combined = String::with_capacity(carry.len() + 1 + chunk.len());
@@ -1877,6 +1878,13 @@ pub(crate) fn text_matches_in_range_chunked<V: VtEngine>(
         if combined.contains(needle) {
             return true;
         }
+        // If a multi-row chunk hit `MAX_STRING_BYTES` (accounting for up to 3 bytes dropped at a
+        // UTF-8 char boundary), halve `cur_step` and retry from `cur` so trailing rows in the
+        // chunk are never silently skipped.
+        if chunk_end > cur && chunk.len() >= MAX_STRING_BYTES.saturating_sub(3) {
+            cur_step = (cur_step / 2).max(1);
+            continue;
+        }
         if chunk_end >= end_line {
             break;
         }
@@ -1885,6 +1893,7 @@ pub(crate) fn text_matches_in_range_chunked<V: VtEngine>(
         carry.clear();
         carry.push_str(&combined[start..]);
         cur = chunk_end.saturating_add(1);
+        cur_step = step;
     }
     false
 }

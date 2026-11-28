@@ -192,8 +192,10 @@ pub trait VtEngine {
     /// Extracts packed rows for the given 0-based viewport row indices into `out`.
     fn extract_viewport_rows(&self, rows: &[u16], out: &mut Vec<PackedRow>);
 
-    /// Extracts up to `count` packed rows starting at absolute epoch line `from_line`.
-    fn extract_history_rows(&self, from_line: u64, count: u32, out: &mut Vec<PackedRow>);
+    /// Extracts up to `count` packed rows starting at absolute epoch line `from_line`, stopping
+    /// early once encoded row bytes would exceed `max_bytes` (always emitting at least one row
+    /// when `from_line` exists).
+    fn extract_history_rows(&self, from_line: u64, count: u32, max_bytes: usize, out: &mut Vec<PackedRow>);
 
     /// Resolves word boundaries at `pos` using `delimiters`.
     fn word_at(&self, pos: CellPos, delimiters: &str) -> Option<CellSpan>;

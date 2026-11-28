@@ -424,3 +424,51 @@ pub(crate) fn checked_image_placement(
         z_index,
     })
 }
+
+/// Maximum physical rows formatted in a single `libghostty-vt` formatter call on an 80-column grid.
+pub(super) const MAX_FORMAT_BATCH_ROWS: u64 = 64;
+
+/// Computes a bounded formatter batch height scaled inversely by terminal column width so wide
+/// (e.g. 1000-column) hostile grids cannot spike C formatter allocations to hundreds of MiB.
+pub(crate) fn cols_aware_batch_rows(cols: u16, requested: u64) -> u64 {
+    let cols_cap = (MAX_FORMAT_BATCH_ROWS * 80 / u64::from(cols.max(1))).clamp(1, MAX_FORMAT_BATCH_ROWS);
+    requested.clamp(1, cols_cap)
+}
+
+/// Validates a `ghostty_terminal_resize` return code and resolves the `(size, cell_px)` to commit
+/// (or `None` to roll back on failure so `self.size` never diverges from the underlying Zig grid).
+pub(crate) fn commit_resize_state(
+    res: sys::Result::Type,
+    next_size: apack_proto::types::GridSize,
+    next_cell_px: apack_proto::types::CellPx,
+) -> Option<(apack_proto::types::GridSize, apack_proto::types::CellPx)> {
+    (res == sys::Result::SUCCESS).then_some((next_size, next_cell_px))
+}
+
+/// Returns the exact wire-encoded byte length of `row` using a reusable scratch writer.
+pub(super) fn packed_row_wire_bytes(
+    row: &apack_proto::types::PackedRow,
+    scratch: &mut apack_proto::codec::Writer,
+) -> usize {
+    scratch.clear();
+    row.encode(scratch);
+    scratch.as_slice().len()
+}
+
+/// Appends `packed` to `out` iff it is the first emitted row or fits within `max_bytes`.
+pub(super) fn push_row_within_budget(
+    packed: apack_proto::types::PackedRow,
+    initial_len: usize,
+    used_bytes: &mut usize,
+    max_bytes: usize,
+    scratch: &mut apack_proto::codec::Writer,
+    out: &mut Vec<apack_proto::types::PackedRow>,
+) -> bool {
+    let row_bytes = packed_row_wire_bytes(&packed, scratch);
+    if out.len() > initial_len && used_bytes.saturating_add(row_bytes) > max_bytes {
+        return false;
+    }
+    *used_bytes = used_bytes.saturating_add(row_bytes);
+    out.push(packed);
+    true
+}

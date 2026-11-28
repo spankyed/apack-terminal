@@ -239,8 +239,8 @@ impl GhosttyEngine {
             GhosttyError::check(name, unsafe { sys::ghostty_terminal_set(handle, opt, func) })?;
         }
 
-        let sb_lines = self.scrollback_lines_limit;
-        let sb_bytes = usize::MAX;
+        let sb_lines = self.scrollback_lines_limit.min(apack_proto::MAX_SCROLLBACK_LINES as usize);
+        let sb_bytes = crate::SCROLLBACK_MAX_BYTES;
         let unknown_cap = UNKNOWN_OSC_MAX_BYTES;
         let clipboard_cap = MAX_STRING_BYTES;
         let continuation_cap = CONTINUATION_MAX_BYTES;

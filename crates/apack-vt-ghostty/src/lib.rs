@@ -28,6 +28,9 @@ pub const GLOBAL_IMAGE_STORE_BYTES: usize = 256 << 20;
 /// Per-session `libghostty-vt` Kitty graphics storage limit (`64 MiB`).
 pub const SESSION_IMAGE_STORAGE_BYTES: u64 = 64 << 20;
 
+/// Per-session `libghostty-vt` scrollback memory cap (`256 MiB`, matching v1 `HISTORY_BYTES`).
+pub const SCROLLBACK_MAX_BYTES: usize = 256 << 20;
+
 /// Global scrollback memory pressure threshold (`512 MiB`) triggering eager compression across sessions.
 pub const GLOBAL_SCROLLBACK_PRESSURE_BYTES: u64 = 512 << 20;
 

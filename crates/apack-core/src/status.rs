@@ -195,10 +195,10 @@ impl StatusTable {
     }
 
     /// Returns the root status state only when it is eligible to wake `WaitCondition::Status`:
-    /// not awaiting an in-flight `VerifyForeground` check and not `Confirmed::Mismatched`.
+    /// foreground verification has completed and positively matched (`Confirmed::Matched`).
     pub fn root_ready_for_wait(&self) -> Option<StatusState> {
         let entry = self.records.get("")?;
-        if entry.pending_verify || entry.record.confirmed == Confirmed::Mismatched {
+        if entry.pending_verify || entry.record.confirmed != Confirmed::Matched {
             return None;
         }
         Some(entry.record.state)
@@ -317,9 +317,8 @@ impl StatusTable {
 
     /// Applies an asynchronous foreground-process verification result iff `changed` still matches.
     ///
-    /// Returns `true` when the root record (`id == ""`) completed verification (even if `confirmed`
-    /// remained `Confirmed::Unknown`, e.g. on Windows) so deferred `WaitCondition::Status` waiters
-    /// can be re-evaluated immediately.
+    /// Returns `true` when the root record (`id == ""`) is now positively confirmed
+    /// (`Confirmed::Matched`) so deferred `WaitCondition::Status` waiters can be woken immediately.
     pub fn apply_confirmation(
         &mut self,
         id: &str,
@@ -333,14 +332,12 @@ impl StatusTable {
         if entry.record.changed != changed {
             return false;
         }
-        let was_pending = entry.pending_verify;
         entry.pending_verify = false;
         if entry.record.confirmed != confirmed {
             entry.record.confirmed = confirmed;
             effects.push(StatusEffect::Updated(entry.record.clone()));
-            return id.is_empty();
         }
-        id.is_empty() && was_pending
+        id.is_empty() && entry.record.confirmed == Confirmed::Matched
     }
 
     /// Clears active/in-progress statuses (`Idle`, `Working`, `Blocked`) when a live foreground

@@ -22,7 +22,9 @@ use crate::input::InputEncoders;
 pub(crate) use callbacks::{escape_osc633_field, ffi_guard, sanitize_osc633_body};
 pub(crate) use ffi_queries::read_grapheme_codepoints;
 #[cfg(test)]
-pub(crate) use ffi_queries::{checked_image_placement, decode_osc7_cwd, resolve_drawn_pixel_size};
+pub(crate) use ffi_queries::{
+    checked_image_placement, cols_aware_batch_rows, commit_resize_state, decode_osc7_cwd, resolve_drawn_pixel_size,
+};
 #[cfg(test)]
 pub(crate) use snapshot::{check_decode_loop_outcome, last_snapshot_record_end};
 #[cfg(test)]

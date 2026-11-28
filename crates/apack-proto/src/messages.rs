@@ -160,13 +160,22 @@ impl SpawnSpec {
     }
 
     fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
+        let argv = r.vec_bounded(crate::MAX_SPAWN_ARGV, "spawn argv", Reader::str)?;
+        let cwd = r.opt(Reader::str)?;
+        let env = r.vec_bounded(crate::MAX_SPAWN_ENV, "spawn env", |r| Ok((r.str()?, r.str()?)))?;
+        let size = GridSize::decode(r)?;
+        let cell_px = CellPx::decode(r)?;
+        let scrollback_limit = r.var_u32()?;
+        if scrollback_limit > crate::MAX_SCROLLBACK_LINES {
+            return Err(WireError::LimitExceeded("spawn scrollback_limit"));
+        }
         Ok(Self {
-            argv: r.vec_bounded(crate::MAX_SPAWN_ARGV, "spawn argv", Reader::str)?,
-            cwd: r.opt(Reader::str)?,
-            env: r.vec_bounded(crate::MAX_SPAWN_ENV, "spawn env", |r| Ok((r.str()?, r.str()?)))?,
-            size: GridSize::decode(r)?,
-            cell_px: CellPx::decode(r)?,
-            scrollback_limit: r.var_u32()?,
+            argv,
+            cwd,
+            env,
+            size,
+            cell_px,
+            scrollback_limit,
             marks_key: r.opt(MarksKey::decode)?,
             resize_policy: ResizePolicy::decode(r)?,
             record_dir: r.opt(Reader::str)?,

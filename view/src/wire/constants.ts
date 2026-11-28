@@ -27,6 +27,7 @@ export const MAX_BLOB_BYTES = 8388608
 export const MAX_PROGRESS_PERCENT = 100
 export const MAX_SPAWN_ARGV = 1024
 export const MAX_SPAWN_ENV = 1024
+export const MAX_SCROLLBACK_LINES = 1000000
 export const MAX_SESSIONS_LIST = 4096
 export const MAX_IMAGES_REPLY = 4096
 export const MAX_PALETTE_OVERRIDES = 256

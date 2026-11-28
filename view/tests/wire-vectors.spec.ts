@@ -22,6 +22,7 @@ import {
   MAX_BLOB_BYTES,
   MAX_PACKED_ROW_TEXT_BYTES,
   MAX_ROWS_PER_FETCH,
+  MAX_SCROLLBACK_LINES,
   MAX_SEARCH_NEEDLE_BYTES,
   MAX_STRING_BYTES,
   MAX_WAIT_STATUSES,
@@ -723,5 +724,30 @@ describe('v2 golden wire vectors (Rust <-> TypeScript parity)', () => {
         }),
       'InvalidValue',
     )
+
+    // SpawnSpec.scrollbackLimit enforces 0..=MAX_SCROLLBACK_LINES on both encode and decode.
+    const spawnBase = (scrollbackLimit: number) => ({
+      kind: 'spawn' as const,
+      spec: {
+        argv: [],
+        cwd: null,
+        env: [],
+        size: { cols: 80, rows: 24 },
+        cellPx: { width: 0, height: 0 },
+        scrollbackLimit,
+        marksKey: null,
+        resizePolicy: 'explicitOverride' as const,
+        recordDir: null,
+        restoreFrom: null,
+        imageFiles: false,
+        kept: false,
+      },
+    })
+    const okSpawn = encodeClientPayload(spawnBase(MAX_SCROLLBACK_LINES))
+    const decodedSpawn = decodeClientMsg(okSpawn.msgType, okSpawn.payload)
+    expect(decodedSpawn.kind).toBe('spawn')
+    if (decodedSpawn.kind === 'spawn') expect(decodedSpawn.spec.scrollbackLimit).toBe(MAX_SCROLLBACK_LINES)
+    expectWireErr(() => encodeClientPayload(spawnBase(MAX_SCROLLBACK_LINES + 1)), 'LimitExceeded')
+    expectWireErr(() => encodeClientPayload(spawnBase(-1)), 'LimitExceeded')
   })
 })

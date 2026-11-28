@@ -76,6 +76,9 @@ pub(super) fn maybe_rollover_wal(sess: &mut LiveSession, now_ms: u64, at_ground:
     }
 }
 
+/// Hard wire-byte budget for history rows extracted into a single WAL `VisualKeyframe` (`16 MiB`).
+const MAX_KEYFRAME_HISTORY_BYTES: usize = 16 << 20;
+
 /// Captures a dual-layer [`KeyframeV2`] (broker-owned [`VisualKeyframe`] + ABI-hashed Ghostty snapshot).
 pub(crate) fn capture_keyframe(machine: &SessionMachine<GhosttyEngine>, abi_hash: &[u8; 32]) -> KeyframeV2 {
     let vt = machine.vt();
@@ -89,7 +92,7 @@ pub(crate) fn capture_keyframe(machine: &SessionMachine<GhosttyEngine>, abi_hash
         let hist_take = meta.scrollback_lines.min(MAX_KEYFRAME_HISTORY_ROWS as u64);
         if hist_take != 0 {
             let from_line = meta.first_active_line.saturating_sub(hist_take);
-            vt.extract_history_rows(from_line, hist_take as u32, &mut primary_rows);
+            vt.extract_history_rows(from_line, hist_take as u32, MAX_KEYFRAME_HISTORY_BYTES, &mut primary_rows);
         }
         vt.extract_viewport_rows(&vp_indices, &mut primary_rows);
     }

@@ -14,15 +14,14 @@ use crate::rows::extract_row;
 
 use super::GhosttyEngine;
 use super::ffi_queries::{
-    checked_image_placement, query_graphics, query_image_generation, query_scrollback_rows, read_grapheme_codepoints,
-    read_placement_u32, resolve_drawn_pixel_size, selection_matches_exact, viewport_row_has_placeholder,
+    MAX_FORMAT_BATCH_ROWS, checked_image_placement, cols_aware_batch_rows, commit_resize_state, push_row_within_budget,
+    query_graphics, query_image_generation, query_scrollback_rows, read_grapheme_codepoints, read_placement_u32,
+    resolve_drawn_pixel_size, selection_matches_exact, viewport_row_has_placeholder,
 };
 
 /// Hard cap on `ghostty_search_get(MATCHES)` allocation (~3 MiB) to prevent OOM on dense single-page bursts.
 const MAX_SEARCH_ALLOC: usize = 65_536;
 const SEARCH_CANDIDATES: usize = 20_000;
-/// Maximum physical rows formatted in a single `libghostty-vt` formatter call so a 100k-row wrapped line cannot OOM.
-const MAX_FORMAT_BATCH_ROWS: u64 = 512;
 
 impl VtEngine for GhosttyEngine {
     fn feed(&mut self, bytes: &[u8], events: &mut Vec<VtEvent>) {
@@ -34,15 +33,15 @@ impl VtEngine for GhosttyEngine {
         if !grid_changed && cell_px == self.cell_px {
             return;
         }
-        self.size = size;
-        self.cell_px = cell_px;
+        let prev_size = self.size;
+        let prev_cell_px = self.cell_px;
         self.callbacks.with_mut(|cb| {
             cb.cols = size.cols.get();
             cb.rows = size.rows.get();
             cb.cell_px = cell_px;
         });
         // SAFETY: `self.handle` is live for `&mut self`; may invoke `cb_write_pty` (mode 2048) or `cb_render_hold`.
-        let _ = unsafe {
+        let res = unsafe {
             sys::ghostty_terminal_resize(
                 self.handle,
                 size.cols.get(),
@@ -52,6 +51,16 @@ impl VtEngine for GhosttyEngine {
             )
         };
         let pending = self.callbacks.with_mut(|cb| std::mem::take(&mut cb.events));
+        let Some((committed_size, committed_cell_px)) = commit_resize_state(res, size, cell_px) else {
+            self.callbacks.with_mut(|cb| {
+                cb.cols = prev_size.cols.get();
+                cb.rows = prev_size.rows.get();
+                cb.cell_px = prev_cell_px;
+            });
+            return;
+        };
+        self.size = committed_size;
+        self.cell_px = committed_cell_px;
         events.extend(pending);
         if grid_changed {
             self.epoch += 1;
@@ -130,9 +139,10 @@ impl VtEngine for GhosttyEngine {
         }
     }
 
-    fn extract_history_rows(&self, from_line: u64, count: u32, out: &mut Vec<PackedRow>) {
+    fn extract_history_rows(&self, from_line: u64, count: u32, max_bytes: usize, out: &mut Vec<PackedRow>) {
         let cols = self.size.cols.get();
         let mut resolver = |img_id, pid| self.resolve_virtual(img_id, pid);
+        let (mut scratch, mut used_bytes, initial_len) = (apack_proto::codec::Writer::new(), 32usize, out.len());
         for offset in 0..u64::from(count) {
             let abs = from_line.saturating_add(offset);
             let Some(screen_y) = self.epoch_to_screen_row(abs) else {
@@ -140,8 +150,9 @@ impl VtEngine for GhosttyEngine {
             };
             if let Some(packed) =
                 extract_row(self.handle, sys::PointTag::SCREEN, screen_y, cols, abs, self.cell_px, &mut resolver)
+                && !push_row_within_budget(packed, initial_len, &mut used_bytes, max_bytes, &mut scratch, out)
             {
-                out.push(packed);
+                break;
             }
         }
     }
@@ -175,7 +186,7 @@ impl VtEngine for GhosttyEngine {
     }
 
     fn text_of(&self, span: CellSpan, max_bytes: usize) -> String {
-        self.text_of_batched(span, max_bytes, 256)
+        self.text_of_batched(span, max_bytes, MAX_FORMAT_BATCH_ROWS)
     }
 
     fn text_of_rect(&self, span: CellSpan, max_bytes: usize) -> String {
@@ -509,7 +520,7 @@ impl GhosttyEngine {
     }
 
     pub(crate) fn text_of_batched(&self, span: CellSpan, max_bytes: usize, batch_lines: u64) -> String {
-        let step = batch_lines.clamp(1, MAX_FORMAT_BATCH_ROWS);
+        let step = cols_aware_batch_rows(self.size.cols.get(), batch_lines);
         let max_batch_rows = step.saturating_mul(2).min(MAX_FORMAT_BATCH_ROWS);
         let max_col = self.size.cols.get().saturating_sub(1);
         let mut out = String::new();

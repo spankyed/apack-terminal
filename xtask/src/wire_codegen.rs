@@ -134,6 +134,7 @@ fn render_constants_ts() -> String {
     writeln!(out, "export const MAX_PROGRESS_PERCENT = {}", apack_proto::MAX_PROGRESS_PERCENT).unwrap();
     writeln!(out, "export const MAX_SPAWN_ARGV = {}", apack_proto::MAX_SPAWN_ARGV).unwrap();
     writeln!(out, "export const MAX_SPAWN_ENV = {}", apack_proto::MAX_SPAWN_ENV).unwrap();
+    writeln!(out, "export const MAX_SCROLLBACK_LINES = {}", apack_proto::MAX_SCROLLBACK_LINES).unwrap();
     writeln!(out, "export const MAX_SESSIONS_LIST = {}", apack_proto::MAX_SESSIONS_LIST).unwrap();
     writeln!(out, "export const MAX_IMAGES_REPLY = {}", apack_proto::MAX_IMAGES_REPLY).unwrap();
     writeln!(out, "export const MAX_PALETTE_OVERRIDES = {}", apack_proto::MAX_PALETTE_OVERRIDES).unwrap();
@@ -1878,7 +1879,12 @@ fn message_structs() -> Vec<StructSchema> {
                 f("env", FieldCodec::EnvPairs { max_expr: "MAX_SPAWN_ENV", label: "spawn env" }),
                 f_custom("size", "GridSize", "encodeGridSize", "decodeGridSize"),
                 f_custom("cellPx", "CellPx", "encodeCellPx", "decodeCellPx"),
-                f("scrollbackLimit", FieldCodec::VarU32),
+                f_encode_decode_check(
+                    "scrollbackLimit",
+                    FieldCodec::VarU32,
+                    "if (!Number.isInteger(v.scrollbackLimit) || v.scrollbackLimit < 0 || v.scrollbackLimit > MAX_SCROLLBACK_LINES) {\n  throw new WireError('LimitExceeded', 'spawn scrollback_limit')\n}",
+                    "if (scrollbackLimit > MAX_SCROLLBACK_LINES) {\n  throw new WireError('LimitExceeded', 'spawn scrollback_limit')\n}",
+                ),
                 f(
                     "marksKey",
                     FieldCodec::Opt(Box::new(FieldCodec::Custom {
@@ -2686,6 +2692,7 @@ fn render_messages_ts() -> String {
     let mut types_vals = BTreeSet::new();
     let mut types_only = BTreeSet::new();
     let mut consts = BTreeSet::new();
+    consts.insert("MAX_SCROLLBACK_LINES");
 
     for s in &structs {
         for field in &s.fields {
