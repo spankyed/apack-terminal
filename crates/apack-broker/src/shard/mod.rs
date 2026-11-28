@@ -47,7 +47,7 @@ use apack_wal::{WalHandle, WalReader};
 
 use crate::now_monotonic_ms;
 #[cfg(windows)]
-use crate::shard_windows::{clamp_win_write_timeout, maybe_wait_win_mailbox};
+use crate::shard_windows::{clamp_win_session_write_timeout, maybe_wait_win_mailbox};
 
 #[cfg(test)]
 pub(crate) use commands::resolve_scrollback_lines;
@@ -186,7 +186,7 @@ pub(crate) enum LivePty {
     #[cfg(unix)]
     Unix { master: PtyMaster, token: PollToken, eof: bool, write_broken: bool },
     #[cfg(windows)]
-    Windows { bridge: ConPtyBridge, eof: bool },
+    Windows { bridge: ConPtyBridge, eof: bool, write_broken: bool },
 }
 
 /// 2-phase exit drain state (used on Windows after child exit + `close_master_async()` to flush
@@ -381,7 +381,7 @@ impl ShardRunner {
             ));
             #[cfg(windows)]
             {
-                timeout = clamp_win_write_timeout(timeout, sess.machine.pty_write_len());
+                timeout = clamp_win_session_write_timeout(timeout, sess);
             }
         }
         timeout
@@ -393,32 +393,32 @@ impl ShardRunner {
                 let mut state = self.mailbox.lock().unwrap_or_else(|e| e.into_inner());
                 state.queue.pop_front()
             };
-            let Some((cmd, _permit)) = entry else {
+            let Some((cmd, permit)) = entry else {
                 break;
             };
-            self.handle_cmd(cmd);
+            self.handle_cmd(cmd, permit);
         }
     }
 
-    fn handle_cmd(&mut self, cmd: ShardCmd) {
+    fn handle_cmd(&mut self, cmd: ShardCmd, permit: Option<Arc<ShardCmdPermit>>) {
         match cmd {
             ShardCmd::Spawn { session_id, conn, req_id, spec } => {
-                self.handle_spawn(session_id, conn, req_id, *spec);
+                self.handle_spawn(session_id, conn, req_id, *spec, permit);
             }
             ShardCmd::Rewind { session_id, conn, req_id, record_dir, at_ms } => {
-                self.handle_rewind(session_id, conn, req_id, &record_dir, at_ms);
+                self.handle_rewind(session_id, conn, req_id, &record_dir, at_ms, permit);
             }
             ShardCmd::Seek { session_id, conn, req_id, at_ms } => {
-                self.handle_seek(session_id, conn, req_id, at_ms);
+                self.handle_seek(session_id, conn, req_id, at_ms, permit);
             }
             ShardCmd::Kill { session_id, conn, req_id } => {
-                self.handle_kill(session_id, conn, req_id);
+                self.handle_kill(session_id, conn, req_id, permit);
             }
             ShardCmd::Signal { session_id, conn, req_id, signal, scope } => {
-                self.handle_signal(session_id, conn, req_id, signal, scope);
+                self.handle_signal(session_id, conn, req_id, signal, scope, permit);
             }
             ShardCmd::Owns { session_id, conn, req_id, pid } => {
-                self.handle_owns(session_id, conn, req_id, pid);
+                self.handle_owns(session_id, conn, req_id, pid, permit);
             }
             ShardCmd::SetKept { session_id, conn, req_id, kept } => {
                 if let Some(sess) = self.sessions.get_mut(&session_id) {
@@ -429,14 +429,15 @@ impl ShardRunner {
                             req_id,
                             ErrorCode::Malformed,
                             "cannot keep rewound session",
+                            permit,
                         );
                     } else {
                         sess.kept = kept;
                         self.emit(ReactorEvent::SessionKeptUpdated { session: session_id, kept });
-                        self.send_ok(conn, StreamId::CONTROL, req_id);
+                        self.send_ok(conn, StreamId::CONTROL, req_id, permit);
                     }
                 } else {
-                    self.send_no_such_session(conn, req_id);
+                    self.send_no_such_session(conn, req_id, permit);
                 }
             }
             ShardCmd::Wait { session_id, conn, req_id, condition, timeout_ms } => {
@@ -444,13 +445,13 @@ impl ShardRunner {
                 let mut effects = Vec::new();
                 if let Some(sess) = self.sessions.get_mut(&session_id) {
                     sess.machine.register_wait(conn, req_id, condition, timeout_ms, now, &mut effects);
-                    self.apply_effects(session_id, effects);
+                    self.apply_effects_with_permit(session_id, effects, permit);
                 } else {
-                    self.send_no_such_session(conn, req_id);
+                    self.send_no_such_session(conn, req_id, permit);
                 }
             }
             ShardCmd::Attach { session_id, conn, req_id, stream_id, attachment_id, flags, initial_viewport } => {
-                self.handle_attach(session_id, conn, req_id, stream_id, attachment_id, flags, initial_viewport);
+                self.handle_attach(session_id, conn, req_id, stream_id, attachment_id, flags, initial_viewport, permit);
             }
             ShardCmd::Detach { session_id, conn, stream_id, attachment_id } => {
                 let key = (conn, stream_id);
@@ -473,7 +474,7 @@ impl ShardRunner {
                 let mut effects = Vec::new();
                 if let Some(sess) = self.sessions.get_mut(&session_id) {
                     sess.machine.handle_stream_msg((conn, stream_id), attachment_id, req_id, msg, &mut effects);
-                    self.apply_effects(session_id, effects);
+                    self.apply_effects_with_permit(session_id, effects, permit);
                 } else {
                     self.send_stream_error(
                         conn,
@@ -482,13 +483,17 @@ impl ShardRunner {
                         req_id,
                         ErrorCode::NoSuchSession,
                         "no such session",
+                        permit,
                     );
                 }
             }
-            ShardCmd::ViewSlotFree { session_id, conn, stream_id, attachment_id } => {
+            ShardCmd::ViewSlotFree { session_id, conn, stream_id, attachment_id, force_full_sync } => {
                 if let Some(sess) = self.sessions.get_mut(&session_id)
                     && sess.machine.attachment_of((conn, stream_id)) == Some(attachment_id)
                 {
+                    if force_full_sync {
+                        sess.machine.mark_view_full_sync((conn, stream_id));
+                    }
                     sess.view_slot_free.insert(attachment_id);
                     self.try_publish_dirty_views(session_id);
                 }
@@ -519,7 +524,7 @@ impl ShardRunner {
             }
             ShardCmd::ListSessions { list_id } => {
                 let sessions = self.sessions.values().map(LiveSession::summary).collect();
-                self.emit(ReactorEvent::SessionListPart { list_id, sessions });
+                self.emit(ReactorEvent::SessionListPart { list_id, sessions, permit });
             }
             ShardCmd::TeardownNonKept { pinned } => {
                 let victims: Vec<SessionId> = self
@@ -575,7 +580,7 @@ impl ShardRunner {
         }
     }
 
-    fn send_ok(&self, conn: ConnId, stream_id: StreamId, req_id: RequestId) {
+    fn send_ok(&self, conn: ConnId, stream_id: StreamId, req_id: RequestId, permit: Option<Arc<ShardCmdPermit>>) {
         self.emit(ReactorEvent::SendMsg {
             conn,
             stream_id,
@@ -583,17 +588,27 @@ impl ShardRunner {
             req_id,
             priority: OutboundPriority::Control,
             msg: BrokerMsg::Ok,
+            permit,
         });
     }
 
-    fn send_no_such_session(&self, conn: ConnId, req_id: RequestId) {
-        self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::NoSuchSession, "no such session");
+    fn send_no_such_session(&self, conn: ConnId, req_id: RequestId, permit: Option<Arc<ShardCmdPermit>>) {
+        self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::NoSuchSession, "no such session", permit);
     }
 
-    fn send_error(&self, conn: ConnId, stream_id: StreamId, req_id: RequestId, code: ErrorCode, message: &str) {
-        self.send_stream_error(conn, stream_id, None, req_id, code, message);
+    fn send_error(
+        &self,
+        conn: ConnId,
+        stream_id: StreamId,
+        req_id: RequestId,
+        code: ErrorCode,
+        message: &str,
+        permit: Option<Arc<ShardCmdPermit>>,
+    ) {
+        self.send_stream_error(conn, stream_id, None, req_id, code, message, permit);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn send_stream_error(
         &self,
         conn: ConnId,
@@ -602,6 +617,7 @@ impl ShardRunner {
         req_id: RequestId,
         code: ErrorCode,
         message: &str,
+        permit: Option<Arc<ShardCmdPermit>>,
     ) {
         self.emit(ReactorEvent::SendMsg {
             conn,
@@ -610,6 +626,7 @@ impl ShardRunner {
             req_id,
             priority: OutboundPriority::Control,
             msg: BrokerMsg::Error { code, message: message.to_owned() },
+            permit,
         });
     }
 }

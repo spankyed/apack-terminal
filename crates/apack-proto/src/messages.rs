@@ -276,7 +276,8 @@ pub struct FrameUpdate {
 }
 
 impl FrameUpdate {
-    fn encode(&self, w: &mut Writer) {
+    /// Encodes the frame payload into `w` (without the outer wire frame header).
+    pub fn encode(&self, w: &mut Writer) {
         w.var_u64(self.seq);
         w.var_u64(self.epoch);
         self.size.encode(w);

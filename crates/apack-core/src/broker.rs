@@ -31,6 +31,21 @@ use crate::{
 /// Maximum wire-encoded size of any single protocol frame (14-byte header + 8 MiB payload).
 pub(crate) const MAX_WIRE_FRAME_BYTES: usize = apack_proto::FRAME_HEADER_LEN + apack_proto::MAX_FRAME_PAYLOAD;
 
+/// Client name reported by `apack-terminal inspect` so read-only diagnostic probes do not flip
+/// idle broker lifecycle tracking (`ever_connected`) or pin `LeaseBound` sessions.
+pub const INSPECT_CLIENT_NAME: &str = "apack-inspect";
+
+/// Reason why [`BrokerCore::try_publish_frame`] deferred or declined a `FrameUpdate`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameStallReason {
+    /// Stream already has an unsent Priority 1 frame or `MemoryBudget` is temporarily full.
+    OutboundOrBudget,
+    /// `FramePacer` window (`max_frames` or `max_bytes`) cannot admit this frame until `FrameAck`.
+    Pacer,
+    /// Connection, stream, or attachment is no longer active; caller should drop the frame.
+    Stale,
+}
+
 /// Error returned by [`BrokerCore::open_connection`] if `conn` is already registered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DuplicateConnId;
@@ -59,6 +74,10 @@ pub enum CloseReason {
 pub enum BrokerAction {
     /// One or more frames are queued in `conn`'s [`OutboundQueue`] ready for `writev`.
     OutboundReady(ConnId),
+    /// Client sent the universal `[0, 0, 0, 0]` `FIN` frame; reactor should half-close reads and
+    /// call [`BrokerCore::close_connection`] with [`CloseReason::ClientFin`] once in-flight shard
+    /// commands for `conn` finish draining.
+    ClientFin(ConnId),
     /// Close the connection's socket/pipe (flushing `drained` and `final_error` beforehand if present).
     CloseConn {
         /// Connection to close.
@@ -295,6 +314,8 @@ struct AttachedStream {
 #[derive(Debug)]
 struct ConnState {
     phase: ConnPhase,
+    is_inspect: bool,
+    fin_received: bool,
     budget: MemoryBudget,
     outbound: OutboundQueue,
     streams: BTreeMap<NonZeroStreamId, AttachedStream>,
@@ -363,14 +384,42 @@ impl BrokerCore {
     }
 
     /// Returns total bytes currently charged against `conn`'s shared [`MemoryBudget`]
-    /// (`OutboundQueue` + all `RawOutputFlow::pending_utf8` buffers).
+    /// (`OutboundQueue` + all `RawOutputFlow::pending_utf8` buffers + reactor-parked stalled frames).
     pub fn connection_budget_used(&self, conn: ConnId) -> Option<usize> {
         self.conns.get(&conn).map(|c| c.budget.used_bytes())
+    }
+
+    /// Returns the hard per-connection [`MemoryBudget`] cap in bytes.
+    pub fn max_queue_bytes(&self) -> usize {
+        self.max_queue_bytes
+    }
+
+    /// Returns remaining byte headroom in `conn`'s [`MemoryBudget`], or `0` if closed.
+    pub fn connection_budget_remaining(&self, conn: ConnId) -> usize {
+        self.conns.get(&conn).map_or(0, |c| c.budget.remaining_bytes())
+    }
+
+    /// Charges `bytes` for a reactor-parked stalled view frame against `conn`'s [`MemoryBudget`].
+    /// Returns `false` if `conn` is closed or reserving `bytes` would exceed the budget cap.
+    pub fn reserve_stalled_frame_bytes(&mut self, conn: ConnId, bytes: usize) -> bool {
+        self.conns.get_mut(&conn).is_some_and(|c| c.budget.reserve(bytes).is_ok())
+    }
+
+    /// Releases `bytes` previously reserved for a reactor-parked stalled view frame.
+    pub fn release_stalled_frame_bytes(&mut self, conn: ConnId, bytes: usize) {
+        if let Some(c) = self.conns.get_mut(&conn) {
+            c.budget.release(bytes);
+        }
     }
 
     /// Returns `true` iff `conn` has completed `Hello` (and mutual HMAC `AuthProof` when required).
     pub fn is_connection_ready(&self, conn: ConnId) -> bool {
         matches!(self.conns.get(&conn).map(|c| &c.phase), Some(ConnPhase::Ready { .. }))
+    }
+
+    /// Returns `true` iff `conn` is authenticated and is a normal lifecycle client (not `apack-inspect`).
+    pub fn is_lifecycle_client_ready(&self, conn: ConnId) -> bool {
+        self.conns.get(&conn).is_some_and(|c| matches!(c.phase, ConnPhase::Ready { .. }) && !c.is_inspect)
     }
 
     /// Returns `true` when at least one live or in-grace broker-wide lease is active.
@@ -384,7 +433,7 @@ impl BrokerCore {
     }
 
     fn has_ready_connections(&self) -> bool {
-        self.conns.values().any(|c| matches!(c.phase, ConnPhase::Ready { .. }))
+        self.conns.values().any(|c| matches!(c.phase, ConnPhase::Ready { .. }) && !c.is_inspect)
     }
 
     fn has_attached_streams(&self, session: SessionId) -> bool {
@@ -563,6 +612,8 @@ impl BrokerCore {
                     server_nonce,
                     timeout,
                 },
+                is_inspect: false,
+                fin_received: false,
                 budget: MemoryBudget::new(self.max_queue_bytes),
                 outbound: OutboundQueue::new(),
                 streams: BTreeMap::new(),
@@ -579,6 +630,9 @@ impl BrokerCore {
                 let Some(state) = self.conns.get_mut(&conn) else {
                     return;
                 };
+                if state.fin_received {
+                    return;
+                }
                 state.phase.decoder_mut().step(bytes)
             };
             match step {
@@ -586,7 +640,10 @@ impl BrokerCore {
                     bytes = &bytes[consumed..];
                 }
                 Ok((_, Some(DecodedFrame::Fin))) => {
-                    self.close_connection(conn, CloseReason::ClientFin, now, actions);
+                    if let Some(state) = self.conns.get_mut(&conn) {
+                        state.fin_received = true;
+                    }
+                    actions.push(BrokerAction::ClientFin(conn));
                     return;
                 }
                 Ok((consumed, Some(DecodedFrame::Frame { header, payload }))) => {
@@ -831,9 +888,35 @@ impl BrokerCore {
         }
     }
 
+    /// Returns `true` iff `(conn, stream_id)` is bound to `attachment_id`, has no unsent Priority 1
+    /// frame waiting, and its `FramePacer` currently permits at least one more frame.
+    pub fn can_publish_frame_now(
+        &self,
+        conn: ConnId,
+        stream_id: NonZeroStreamId,
+        attachment_id: StreamAttachmentId,
+    ) -> bool {
+        let Some(state) = self.conns.get(&conn) else {
+            return false;
+        };
+        if state.outbound.has_pending_frame(stream_id.as_stream_id()) {
+            return false;
+        }
+        let Some(stream) = state.streams.get(&stream_id) else {
+            return false;
+        };
+        if stream.attachment_id != attachment_id {
+            return false;
+        }
+        stream.frame_pacer.as_ref().is_some_and(FramePacer::can_send_any)
+    }
+
     /// Attempts to publish a `FrameUpdate` on `(conn, stream_id)` for `attachment_id` respecting
-    /// BDP `FramePacer` and the shared per-connection [`MemoryBudget`], returning `Err(frame)`
-    /// without cloning if deferred or stale.
+    /// BDP `FramePacer` and the shared per-connection [`MemoryBudget`], returning
+    /// `Err((frame, reason, encoded_bytes))` without cloning if deferred or stale.
+    ///
+    /// Oversized frames exceeding [`MAX_WIRE_FRAME_BYTES`] are degraded (marked `full_sync = true`
+    /// and trimmed to fit) instead of stalling indefinitely.
     pub fn try_publish_frame(
         &mut self,
         conn: ConnId,
@@ -842,41 +925,92 @@ impl BrokerCore {
         mut frame: Box<FrameUpdate>,
         now: TimestampMs,
         actions: &mut Vec<BrokerAction>,
-    ) -> Result<(), Box<FrameUpdate>> {
+    ) -> Result<(), (Box<FrameUpdate>, FrameStallReason, usize)> {
         let Some(state) = self.conns.get_mut(&conn) else {
-            return Err(frame);
+            return Err((frame, FrameStallReason::Stale, 0));
         };
-        if state.outbound.has_pending_frame(stream_id.as_stream_id()) {
-            return Err(frame);
-        }
         let Some(stream) = state.streams.get_mut(&stream_id) else {
-            return Err(frame);
+            return Err((frame, FrameStallReason::Stale, 0));
         };
         if stream.attachment_id != attachment_id {
-            return Err(frame);
+            return Err((frame, FrameStallReason::Stale, 0));
         }
         let Some(pacer) = stream.frame_pacer.as_mut() else {
-            return Err(frame);
+            return Err((frame, FrameStallReason::Stale, 0));
         };
+        if state.outbound.has_pending_frame(stream_id.as_stream_id()) {
+            return Err((frame, FrameStallReason::OutboundOrBudget, 0));
+        }
+        // Fast pre-check before measuring/encoding payload bytes.
+        if !pacer.can_send_any() {
+            return Err((frame, FrameStallReason::Pacer, 0));
+        }
         // Assign the real monotonic sequence before measuring encoded bytes so varint length is exact.
         frame.seq = pacer.peek_next_seq();
-        let msg = BrokerMsg::Frame(frame);
-        let encoded_bytes = estimate_encoded_bytes(&msg);
-        let BrokerMsg::Frame(frame) = msg else {
-            unreachable!();
-        };
+        let encoded_bytes = degrade_frame_to_wire_cap(&mut frame);
         let frame_u32 = u32::try_from(encoded_bytes).unwrap_or(u32::MAX);
-        if encoded_bytes > MAX_WIRE_FRAME_BYTES
-            || !pacer.can_send(frame_u32)
-            || !state.outbound.can_fit_frame(stream_id.as_stream_id(), encoded_bytes, &state.budget)
-        {
-            return Err(frame);
+        if !pacer.can_send(frame_u32) {
+            return Err((frame, FrameStallReason::Pacer, encoded_bytes));
+        }
+        if !state.outbound.can_fit_frame(stream_id.as_stream_id(), encoded_bytes, &state.budget) {
+            return Err((frame, FrameStallReason::OutboundOrBudget, encoded_bytes));
         }
         let _ =
             state.outbound.push_frame(stream_id.as_stream_id(), attachment_id, frame, encoded_bytes, &mut state.budget);
         let _ = pacer.on_send(frame_u32, now);
         actions.push(BrokerAction::OutboundReady(conn));
         Ok(())
+    }
+
+    /// Publishes a non-droppable final exit `FrameUpdate` on the ordered `Event` (P2) lane so it
+    /// is never discarded by pacer backpressure, `SessionEnded` P1 cleanup, or `Exited` ordering,
+    /// draining strictly ahead of `Exited` and `StreamClosed`.
+    pub fn publish_final_frame(
+        &mut self,
+        conn: ConnId,
+        stream_id: NonZeroStreamId,
+        attachment_id: StreamAttachmentId,
+        mut frame: Box<FrameUpdate>,
+        now: TimestampMs,
+        actions: &mut Vec<BrokerAction>,
+    ) {
+        let overflowed = {
+            let Some(state) = self.conns.get_mut(&conn) else {
+                return;
+            };
+            let Some(stream) = state.streams.get_mut(&stream_id) else {
+                return;
+            };
+            if stream.attachment_id != attachment_id {
+                return;
+            }
+            let Some(pacer) = stream.frame_pacer.as_mut() else {
+                return;
+            };
+            // Drop any stale conflatable P1 frame for this stream before enqueueing the ordered final snapshot.
+            state.outbound.remove_stream_frames(stream_id.as_stream_id(), &mut state.budget);
+            frame.full_sync = true;
+            frame.seq = pacer.peek_next_seq();
+            let encoded_bytes = degrade_frame_to_wire_cap(&mut frame);
+            let frame_u32 = u32::try_from(encoded_bytes).unwrap_or(u32::MAX);
+            let res = state.outbound.push_ordered(
+                OutboundPriority::Event,
+                stream_id.as_stream_id(),
+                RequestId::PUSH,
+                BrokerMsg::Frame(frame),
+                encoded_bytes,
+                &mut state.budget,
+            );
+            if res.is_ok() {
+                let _ = pacer.on_send(frame_u32, now);
+            }
+            res.is_err()
+        };
+        if overflowed {
+            self.close_connection(conn, CloseReason::SlowReader, now, actions);
+        } else {
+            actions.push(BrokerAction::OutboundReady(conn));
+        }
     }
 
     /// Attempts to publish a `FrameUpdate` on `(conn, stream_id)` for `attachment_id` respecting
@@ -1002,7 +1136,7 @@ impl BrokerCore {
                     );
                     return;
                 }
-                let Ok(ClientMsg::Hello { protocol_version, client_nonce, .. }) =
+                let Ok(ClientMsg::Hello { protocol_version, client_nonce, client_name }) =
                     ClientMsg::decode(msg_type::HELLO, payload)
                 else {
                     self.fail_and_close(
@@ -1032,6 +1166,7 @@ impl BrokerCore {
                 }
                 let auth_required = self.auth.is_required();
                 if let Some(state) = self.conns.get_mut(&conn) {
+                    state.is_inspect = client_name == INSPECT_CLIENT_NAME;
                     if auth_required {
                         state.phase = ConnPhase::AwaitingAuth {
                             decoder: FrameDecoder::with_max_payload(MAX_AUTH_FRAME_PAYLOAD),
@@ -1748,4 +1883,65 @@ fn estimate_encoded_bytes(msg: &BrokerMsg) -> usize {
     let mut w = Writer::new();
     msg.encode(&mut w);
     FRAME_HEADER_LEN + w.as_slice().len()
+}
+
+fn estimate_frame_encoded_bytes(frame: &FrameUpdate) -> usize {
+    let mut w = Writer::new();
+    frame.encode(&mut w);
+    FRAME_HEADER_LEN + w.as_slice().len()
+}
+
+/// Fast zero-allocation approximate wire size of `frame` for charging reactor-parked stalled frames
+/// against [`MemoryBudget`] without serializing the full payload while the pacer is closed.
+pub fn estimate_frame_approx_bytes(frame: &FrameUpdate) -> usize {
+    let mut total = FRAME_HEADER_LEN + 64;
+    for row in &frame.rows {
+        let links_bytes: usize = row.links.iter().map(|s| s.len().saturating_add(4)).sum();
+        total = total
+            .saturating_add(32)
+            .saturating_add(row.text.len())
+            .saturating_add(row.runs.len().saturating_mul(12))
+            .saturating_add(row.styles.len().saturating_mul(16))
+            .saturating_add(links_bytes)
+            .saturating_add(row.pieces.len().saturating_mul(32));
+    }
+    if frame.palette.is_some() {
+        total = total.saturating_add(1024);
+    }
+    total
+}
+
+fn varint_extra_bytes(len: usize) -> usize {
+    let mut w = Writer::new();
+    w.var_u64(len as u64);
+    w.as_slice().len() - 1
+}
+
+/// Ensures `frame` encodes within [`MAX_WIRE_FRAME_BYTES`] by degrading oversized frames to a
+/// truncated `full_sync` prefix so they can never stall a stream indefinitely.
+fn degrade_frame_to_wire_cap(frame: &mut FrameUpdate) -> usize {
+    let encoded = estimate_frame_encoded_bytes(frame);
+    if encoded <= MAX_WIRE_FRAME_BYTES {
+        return encoded;
+    }
+    frame.full_sync = true;
+    let all_rows = core::mem::take(&mut frame.rows);
+    let base_bytes = estimate_frame_encoded_bytes(frame);
+    let mut used = 0usize;
+    let mut scratch = Writer::new();
+    for row in all_rows {
+        scratch.clear();
+        row.encode(&mut scratch);
+        let row_len = scratch.as_slice().len();
+        let next_total = base_bytes
+            .saturating_add(varint_extra_bytes(frame.rows.len() + 1))
+            .saturating_add(used)
+            .saturating_add(row_len);
+        if next_total > MAX_WIRE_FRAME_BYTES {
+            break;
+        }
+        used += row_len;
+        frame.rows.push(row);
+    }
+    estimate_frame_encoded_bytes(frame)
 }

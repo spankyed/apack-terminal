@@ -19,7 +19,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use apack_core::broker::{BrokerAction, BrokerCore, CloseReason, SessionLifetime, ShardTelemetry, StreamAttachmentId};
+use apack_core::broker::{
+    BrokerAction, BrokerCore, CloseReason, FrameStallReason, SessionLifetime, ShardTelemetry, StreamAttachmentId,
+    estimate_frame_approx_bytes,
+};
 use apack_core::flow::OutboundPriority;
 use apack_core::lease::ConnId;
 use apack_core::time::TimestampMs;
@@ -27,10 +30,10 @@ use apack_core::time::TimestampMs;
 use apack_os::pty_poller::{Interest, PollEvent, PollToken, PtyPoller};
 #[cfg(unix)]
 use apack_os::transport::{
-    hang_up, listener_fd, set_listener_nonblocking, set_stream_nonblocking, stream_fd, verify_peer_is_current_user,
-    write_vectored_some,
+    hang_up, is_fd_exhaustion_error, listener_fd, set_listener_nonblocking, set_stream_nonblocking, stream_fd,
+    verify_peer_is_current_user, write_vectored_some,
 };
-use apack_proto::messages::{BrokerMsg, FrameUpdate, SessionSummary};
+use apack_proto::messages::{BrokerMsg, ClientMsg, FrameUpdate, SessionSummary};
 use apack_proto::types::{ErrorCode, NonZeroStreamId, RequestId, SessionId, StreamId};
 use apack_vt_ghostty::ImageStore;
 use interprocess::local_socket::Listener;
@@ -58,8 +61,35 @@ pub(crate) const MAX_CONNECTIONS: usize = 1024;
 /// Maximum shard events drained from `reactor_rx` per reactor turn before servicing sockets & timers.
 pub(crate) const MAX_SHARD_EVENTS_PER_TURN: usize = 256;
 
-/// Maximum client-initiated commands one connection may have queued/executing in shard mailboxes at once.
+/// Maximum client-initiated bulk/control commands one connection may have queued/executing in shards
+/// (and shard->reactor replies) at once.
 pub(crate) const MAX_INFLIGHT_SHARD_CMDS_PER_CONN: usize = 1_024;
+
+/// Dedicated in-flight permit cap for interactive input (`Key`/`Text`/`Pointer`/`Focus`/`ViewportHint`)
+/// so bulk RPC bursts (`FetchRows`, `GetImageBlob`, etc.) can never reject typing with `Busy`.
+pub(crate) const MAX_INFLIGHT_INPUT_CMDS_PER_CONN: usize = 1_024;
+
+/// Backoff duration after `accept()` hits `EMFILE`/`ENFILE` before re-arming the Unix listener.
+#[cfg(unix)]
+const ACCEPT_EMFILE_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Computes the next `EMFILE`/`ENFILE` listener re-arm deadline.
+#[cfg(unix)]
+pub(crate) fn compute_accept_backoff_deadline(now: Instant) -> Instant {
+    now + ACCEPT_EMFILE_BACKOFF
+}
+
+/// Returns `true` iff `msg` is a fire-and-forget interactive UI input message isolated from bulk RPC permits.
+pub(crate) fn is_interactive_input_msg(msg: &ClientMsg) -> bool {
+    matches!(
+        msg,
+        ClientMsg::Key(_)
+            | ClientMsg::Text { .. }
+            | ClientMsg::Pointer(_)
+            | ClientMsg::Focus { .. }
+            | ClientMsg::ViewportHint(_)
+    )
+}
 
 #[cfg(unix)]
 const LISTENER_TOKEN: PollToken = PollToken(0);
@@ -213,22 +243,74 @@ pub(crate) fn clamp_reactor_wait(wait_for: Duration, hit_cap: bool) -> Duration 
     if hit_cap { Duration::ZERO } else { wait_for }
 }
 
-/// Removes any stalled or queued view frames belonging to `ended_session` from a connection.
-pub(crate) fn prune_ended_session_frames(
-    stalled: &mut HashMap<StreamAttachmentId, (NonZeroStreamId, SessionId, Box<FrameUpdate>)>,
-    queued: &mut HashMap<StreamAttachmentId, (NonZeroStreamId, SessionId)>,
-    ended_session: SessionId,
-) {
-    stalled.retain(|_, (_, sid, _)| *sid != ended_session);
-    queued.retain(|_, (_, sid)| *sid != ended_session);
+/// Reactor-parked stalled view frame for one attachment, bounded by `BrokerCore`'s `MemoryBudget`.
+pub(crate) enum StalledFrame {
+    /// Frame payload retained on the reactor with `charged_bytes` accounted in `BrokerCore::budget`.
+    Buffered {
+        stream_id: NonZeroStreamId,
+        session: SessionId,
+        frame: Box<FrameUpdate>,
+        charged_bytes: usize,
+        reason: FrameStallReason,
+    },
+    /// `MemoryBudget` was too full to park the frame payload; wait until `reason` clears and
+    /// `needed_bytes` of budget headroom opens, then request a fresh `full_sync` via `ViewSlotFree`.
+    DeferredResync { stream_id: NonZeroStreamId, session: SessionId, reason: FrameStallReason, needed_bytes: usize },
 }
 
-/// Selects stalled view attachments whose outbound queue slot is currently free.
+impl StalledFrame {
+    pub(crate) fn session(&self) -> SessionId {
+        match self {
+            Self::Buffered { session, .. } | Self::DeferredResync { session, .. } => *session,
+        }
+    }
+
+    pub(crate) fn reason(&self) -> FrameStallReason {
+        match self {
+            Self::Buffered { reason, .. } | Self::DeferredResync { reason, .. } => *reason,
+        }
+    }
+
+    pub(crate) fn charged_bytes(&self) -> usize {
+        match self {
+            Self::Buffered { charged_bytes, .. } => *charged_bytes,
+            Self::DeferredResync { .. } => 0,
+        }
+    }
+}
+
+/// Removes any stalled or queued view frames belonging to `ended_session` from a connection,
+/// returning total `MemoryBudget` bytes that must be released for the pruned stalled frames.
+pub(crate) fn prune_ended_session_frames(
+    stalled: &mut HashMap<StreamAttachmentId, StalledFrame>,
+    queued: &mut HashMap<StreamAttachmentId, (NonZeroStreamId, SessionId)>,
+    ended_session: SessionId,
+) -> usize {
+    let mut freed_bytes = 0usize;
+    stalled.retain(|_, entry| {
+        if entry.session() == ended_session {
+            freed_bytes = freed_bytes.saturating_add(entry.charged_bytes());
+            false
+        } else {
+            true
+        }
+    });
+    queued.retain(|_, (_, sid)| *sid != ended_session);
+    freed_bytes
+}
+
+/// Selects stalled view attachments waiting on outbound/budget space (skipping pacer-stalled frames
+/// that can only unblock on `FrameAck`) whose outbound Priority 1 slot is currently free.
 pub(crate) fn ready_stalled_attachments(
-    stalled: &HashMap<StreamAttachmentId, (NonZeroStreamId, SessionId, Box<FrameUpdate>)>,
+    stalled: &HashMap<StreamAttachmentId, StalledFrame>,
     queued: &HashMap<StreamAttachmentId, (NonZeroStreamId, SessionId)>,
 ) -> Vec<StreamAttachmentId> {
-    stalled.keys().copied().filter(|att| !queued.contains_key(att)).collect()
+    stalled
+        .iter()
+        .filter_map(|(&att, entry)| {
+            (entry.reason() == FrameStallReason::OutboundOrBudget && !queued.contains_key(&att)).then_some(att)
+        })
+        .collect()
 }
 
 /// In-flight `ListSessions` aggregation across all $K$ shards keyed by broker-allocated `list_id`.
@@ -274,7 +356,7 @@ fn drain_unix_queue_nonblocking(stream: &mut Stream, queue: &mut VecDeque<(Vec<u
 }
 
 /// Per-connection transport state, stalled view frames (keyed by [`StreamAttachmentId`]),
-/// and bounded in-flight shard mailbox command counter.
+/// and bounded in-flight shard mailbox command counters.
 pub(crate) struct ConnState {
     #[cfg(unix)]
     stream: Stream,
@@ -286,11 +368,21 @@ pub(crate) struct ConnState {
     write_queue_bytes: usize,
     #[cfg(windows)]
     pub(crate) win: WinConnHandle,
-    pub(crate) stalled_frames: HashMap<StreamAttachmentId, (NonZeroStreamId, SessionId, Box<FrameUpdate>)>,
-    /// Set of active view attachments whose frame is currently queued in `BrokerCore::outbound`.
+    pub(crate) stalled_frames: HashMap<StreamAttachmentId, StalledFrame>,
+    /// Set of active view attachments whose Priority 1 frame is currently queued in `BrokerCore::outbound`.
     pub(crate) queued_frame_streams: HashMap<StreamAttachmentId, (NonZeroStreamId, SessionId)>,
-    /// Number of client-initiated commands from this connection currently queued/executing in shards.
+    /// Number of client-initiated bulk/control commands from this connection currently in flight.
     pub(crate) inflight_shard_cmds: Arc<AtomicUsize>,
+    /// Number of interactive UI input commands (`Key`/`Text`/`Pointer`/`Focus`/`ViewportHint`) in flight.
+    pub(crate) inflight_input_cmds: Arc<AtomicUsize>,
+    /// Set once `ClientFin` arrived while in-flight shard commands were still pending.
+    pub(crate) fin_pending: Arc<AtomicBool>,
+}
+
+impl ConnState {
+    pub(crate) fn has_inflight_cmds(&self) -> bool {
+        self.inflight_shard_cmds.load(Ordering::Acquire) != 0 || self.inflight_input_cmds.load(Ordering::Acquire) != 0
+    }
 }
 
 /// Cross-thread wakeup handle for the Control Reactor (used by shards and external shutdown).
@@ -399,6 +491,7 @@ pub(crate) fn run_control_reactor(
         shutting_down: false,
         shutdown_deadline: None,
         shutdown_flag,
+        wake_reactor: Arc::clone(&wake_fn),
         #[cfg(unix)]
         listener,
         #[cfg(unix)]
@@ -409,6 +502,8 @@ pub(crate) fn run_control_reactor(
         draining_unix: HashMap::new(),
         #[cfg(unix)]
         read_buf: vec![0u8; CONN_READ_BUF_BYTES],
+        #[cfg(unix)]
+        accept_backoff_until: None,
         #[cfg(windows)]
         win_ev_tx,
         #[cfg(windows)]
@@ -436,9 +531,13 @@ pub(crate) fn run_control_reactor(
             state.handle_win_transport_event(ev);
         });
 
-        // 3. Fire due BrokerCore timers and reap expired draining connections.
+        // 3. Fire due BrokerCore timers, finish half-closed `ClientFin` conns whose in-flight
+        //    shard commands drained, resume any EMFILE-paused listener, and reap draining conns.
         state.reap_draining_conns();
+        #[cfg(unix)]
+        state.maybe_resume_unix_accept(false, Instant::now());
         let now = now_monotonic_ms();
+        state.reap_pending_fin_conns(now);
         let mut actions = Vec::new();
         state.core.poll_timers(now, &mut actions);
         state.execute_actions(actions, now);
@@ -471,6 +570,11 @@ pub(crate) fn run_control_reactor(
             state.start_grace.saturating_sub(state.started_at.elapsed()),
             should_fast_poll(state.shutting_down, state.has_draining_conns()),
         );
+        #[cfg(unix)]
+        let wait_for = match state.accept_backoff_until {
+            Some(until) => wait_for.min(until.saturating_duration_since(Instant::now())),
+            None => wait_for,
+        };
         let wait_for = clamp_reactor_wait(wait_for, hit_shard_event_cap);
         #[cfg(windows)]
         let wait_for = clamp_win_wait(wait_for, hit_win_event_cap);
@@ -536,6 +640,7 @@ pub(crate) struct ReactorState {
     pub(crate) shutting_down: bool,
     shutdown_deadline: Option<Instant>,
     shutdown_flag: Arc<AtomicBool>,
+    wake_reactor: Arc<dyn Fn() + Send + Sync>,
     #[cfg(unix)]
     listener: Listener,
     #[cfg(unix)]
@@ -546,6 +651,8 @@ pub(crate) struct ReactorState {
     draining_unix: HashMap<PollToken, DrainingUnixConn>,
     #[cfg(unix)]
     read_buf: Vec<u8>,
+    #[cfg(unix)]
+    accept_backoff_until: Option<Instant>,
     #[cfg(windows)]
     pub(crate) win_ev_tx: mpsc::SyncSender<WinTransportEvent>,
     #[cfg(windows)]
@@ -588,6 +695,7 @@ impl ReactorState {
                 if let Some(d) = self.draining_unix.remove(&tok) {
                     let _ = self.poller.deregister(tok);
                     let _ = hang_up(&d.stream);
+                    self.maybe_resume_unix_accept(true, now);
                 }
             }
         }
@@ -691,6 +799,26 @@ impl ReactorState {
         if done && let Some(d) = self.draining_unix.remove(&token) {
             let _ = self.poller.deregister(token);
             drop(d.stream);
+            self.maybe_resume_unix_accept(true, Instant::now());
+        }
+    }
+
+    #[cfg(unix)]
+    fn maybe_resume_unix_accept(&mut self, force: bool, now: Instant) {
+        if self.shutting_down {
+            self.accept_backoff_until = None;
+            return;
+        }
+        let Some(until) = self.accept_backoff_until else {
+            return;
+        };
+        if !force && now < until {
+            return;
+        }
+        if self.poller.register(LISTENER_TOKEN, listener_fd(&self.listener), Interest::READ).is_ok() {
+            self.accept_backoff_until = None;
+        } else {
+            self.accept_backoff_until = Some(compute_accept_backoff_deadline(now));
         }
     }
 
@@ -730,13 +858,22 @@ impl ReactorState {
                             stalled_frames: HashMap::new(),
                             queued_frame_streams: HashMap::new(),
                             inflight_shard_cmds: Arc::new(AtomicUsize::new(0)),
+                            inflight_input_cmds: Arc::new(AtomicUsize::new(0)),
+                            fin_pending: Arc::new(AtomicBool::new(false)),
                         },
                     );
                 }
-                Err(err) => match classify_nonblocking_err(&err) {
-                    NonBlockErr::Interrupted => continue,
-                    NonBlockErr::WouldBlock | NonBlockErr::Fatal => break,
-                },
+                Err(err) => {
+                    if is_fd_exhaustion_error(&err) {
+                        let _ = self.poller.deregister(LISTENER_TOKEN);
+                        self.accept_backoff_until = Some(compute_accept_backoff_deadline(Instant::now()));
+                        break;
+                    }
+                    match classify_nonblocking_err(&err) {
+                        NonBlockErr::Interrupted => continue,
+                        NonBlockErr::WouldBlock | NonBlockErr::Fatal => break,
+                    }
+                }
             }
         }
     }
@@ -763,10 +900,13 @@ impl ReactorState {
                     let now = now_monotonic_ms();
                     let mut actions = Vec::new();
                     self.core.feed_bytes(conn, &self.read_buf[..n], now, &mut actions);
-                    if self.core.is_connection_ready(conn) {
+                    if self.core.is_lifecycle_client_ready(conn) {
                         self.ever_connected = true;
                     }
                     self.execute_actions(actions, now);
+                    if self.conns.get(&conn).is_none_or(|c| c.fin_pending.load(Ordering::Acquire)) {
+                        break;
+                    }
                 }
                 Err(err) => match classify_nonblocking_err(&err) {
                     NonBlockErr::WouldBlock => break,
@@ -820,30 +960,20 @@ impl ReactorState {
                     c.write_queue_bytes = c.write_queue_bytes.saturating_add(encoded.len());
                     c.write_queue.push_back((encoded, 0));
                 }
-                // Release the frame slot and retry stalled frames STRICTLY AFTER pushing `encoded`
-                // onto `c.write_queue` so subsequent frames can never overtake this one.
+                // Release the frame slot and retry budget-stalled frames STRICTLY AFTER pushing
+                // `encoded` onto `c.write_queue` so subsequent frames can never overtake this one.
                 if let Some((att, nz, session_id)) = drained_frame {
                     self.on_outbound_frame_drained(conn, nz, att, session_id);
                 }
-                let ready_stalled = self
-                    .conns
-                    .get(&conn)
-                    .map(|c| ready_stalled_attachments(&c.stalled_frames, &c.queued_frame_streams))
-                    .unwrap_or_default();
-                for att in ready_stalled {
-                    if let Some((stream_id, sid, frame)) =
-                        self.conns.get_mut(&conn).and_then(|c| c.stalled_frames.remove(&att))
-                    {
-                        self.try_publish_or_stall_frame(conn, stream_id, att, sid, frame, now_monotonic_ms());
-                    }
-                }
+                self.retry_budget_stalled_frames(conn, now_monotonic_ms());
             }
 
             let Some(c) = self.conns.get_mut(&conn) else {
                 return;
             };
             if c.write_queue.is_empty() {
-                let _ = self.poller.modify(c.token, Interest::READ);
+                let interest = if c.fin_pending.load(Ordering::Acquire) { Interest::NONE } else { Interest::READ };
+                let _ = self.poller.modify(c.token, interest);
                 return;
             }
 
@@ -861,7 +991,9 @@ impl ReactorState {
                 }
                 Err(err) => match classify_nonblocking_err(&err) {
                     NonBlockErr::WouldBlock => {
-                        let _ = self.poller.modify(c.token, Interest::READ_WRITE);
+                        let interest =
+                            if c.fin_pending.load(Ordering::Acquire) { Interest::WRITE } else { Interest::READ_WRITE };
+                        let _ = self.poller.modify(c.token, interest);
                         return;
                     }
                     NonBlockErr::Interrupted => continue,
@@ -881,6 +1013,62 @@ impl ReactorState {
         self.flush_win_writes(conn);
     }
 
+    fn take_stalled_frame(&mut self, conn: ConnId, attachment_id: StreamAttachmentId) -> Option<StalledFrame> {
+        let entry = self.conns.get_mut(&conn)?.stalled_frames.remove(&attachment_id)?;
+        self.core.release_stalled_frame_bytes(conn, entry.charged_bytes());
+        Some(entry)
+    }
+
+    pub(crate) fn retry_stalled_frame(&mut self, conn: ConnId, attachment_id: StreamAttachmentId, now: TimestampMs) {
+        let Some(entry) = self.take_stalled_frame(conn, attachment_id) else {
+            return;
+        };
+        match entry {
+            StalledFrame::Buffered { stream_id, session, frame, .. } => {
+                self.try_publish_or_stall_frame(conn, stream_id, attachment_id, session, frame, now);
+            }
+            StalledFrame::DeferredResync { stream_id, session, needed_bytes, .. } => {
+                if !self.core.is_attachment_active(conn, stream_id, attachment_id) {
+                    return;
+                }
+                let can_pub = self.core.can_publish_frame_now(conn, stream_id, attachment_id);
+                let has_room = self.core.connection_budget_remaining(conn) >= needed_bytes;
+                if can_pub && has_room {
+                    if let Some(&shard_idx) = self.session_shard.get(&session) {
+                        self.shards[shard_idx].send(ShardCmd::ViewSlotFree {
+                            session_id: session,
+                            conn,
+                            stream_id,
+                            attachment_id,
+                            force_full_sync: true,
+                        });
+                    }
+                } else if let Some(c) = self.conns.get_mut(&conn) {
+                    let next_reason = if !can_pub && !c.queued_frame_streams.contains_key(&attachment_id) {
+                        FrameStallReason::Pacer
+                    } else {
+                        FrameStallReason::OutboundOrBudget
+                    };
+                    c.stalled_frames.insert(
+                        attachment_id,
+                        StalledFrame::DeferredResync { stream_id, session, reason: next_reason, needed_bytes },
+                    );
+                }
+            }
+        }
+    }
+
+    pub(crate) fn retry_budget_stalled_frames(&mut self, conn: ConnId, now: TimestampMs) {
+        let ready_stalled = self
+            .conns
+            .get(&conn)
+            .map(|c| ready_stalled_attachments(&c.stalled_frames, &c.queued_frame_streams))
+            .unwrap_or_default();
+        for att in ready_stalled {
+            self.retry_stalled_frame(conn, att, now);
+        }
+    }
+
     pub(crate) fn on_outbound_frame_drained(
         &mut self,
         conn: ConnId,
@@ -888,15 +1076,28 @@ impl ReactorState {
         attachment_id: StreamAttachmentId,
         session_id: SessionId,
     ) {
-        // First retry any stalled frame held on the reactor for this exact attachment.
-        let stalled = self.conns.get_mut(&conn).and_then(|c| c.stalled_frames.remove(&attachment_id));
-        if let Some((nz, sid, frame)) = stalled {
-            let now = now_monotonic_ms();
-            self.try_publish_or_stall_frame(conn, nz, attachment_id, sid, frame, now);
-        } else if self.core.is_attachment_active(conn, stream_id, attachment_id)
-            && let Some(&shard_idx) = self.session_shard.get(&session_id)
-        {
-            self.shards[shard_idx].send(ShardCmd::ViewSlotFree { session_id, conn, stream_id, attachment_id });
+        // Retry any outbound/budget-stalled frame held on the reactor for this exact attachment;
+        // leave pacer-stalled frames parked until `FrameAck` arrives.
+        let stalled_reason =
+            self.conns.get(&conn).and_then(|c| c.stalled_frames.get(&attachment_id)).map(StalledFrame::reason);
+        match stalled_reason {
+            Some(FrameStallReason::OutboundOrBudget) => {
+                self.retry_stalled_frame(conn, attachment_id, now_monotonic_ms());
+            }
+            Some(FrameStallReason::Pacer | FrameStallReason::Stale) => {}
+            None => {
+                if self.core.is_attachment_active(conn, stream_id, attachment_id)
+                    && let Some(&shard_idx) = self.session_shard.get(&session_id)
+                {
+                    self.shards[shard_idx].send(ShardCmd::ViewSlotFree {
+                        session_id,
+                        conn,
+                        stream_id,
+                        attachment_id,
+                        force_full_sync: false,
+                    });
+                }
+            }
         }
     }
 
@@ -922,24 +1123,77 @@ impl ReactorState {
                 }
                 self.execute_actions(actions, now);
             }
-            Err(frame) => {
-                if let Some(c) = self.conns.get_mut(&conn) {
-                    // Park this single frame until FrameAck or outbound drain frees space/credit.
-                    c.stalled_frames.insert(attachment_id, (stream_id, session, frame));
+            Err((frame, reason, encoded_bytes)) => {
+                if reason == FrameStallReason::Stale {
+                    return;
+                }
+                // Release any older parked frame for this attachment before charging the replacement.
+                let _ = self.take_stalled_frame(conn, attachment_id);
+                let charge =
+                    if encoded_bytes != 0 { encoded_bytes } else { estimate_frame_approx_bytes(&frame).max(1) };
+                if self.core.reserve_stalled_frame_bytes(conn, charge) {
+                    if let Some(c) = self.conns.get_mut(&conn) {
+                        c.stalled_frames.insert(
+                            attachment_id,
+                            StalledFrame::Buffered { stream_id, session, frame, charged_bytes: charge, reason },
+                        );
+                    } else {
+                        self.core.release_stalled_frame_bytes(conn, charge);
+                    }
+                } else if let Some(c) = self.conns.get_mut(&conn) {
+                    // MemoryBudget is full: drop the frame payload immediately and defer a fresh
+                    // `full_sync` via `ViewSlotFree` once headroom opens.
+                    let needed_bytes = charge.min(self.core.max_queue_bytes());
+                    c.stalled_frames.insert(
+                        attachment_id,
+                        StalledFrame::DeferredResync { stream_id, session, reason, needed_bytes },
+                    );
                 }
             }
         }
     }
 
-    fn try_acquire_shard_permit(
+    fn publish_final_frame(
+        &mut self,
+        conn: ConnId,
+        stream_id: NonZeroStreamId,
+        attachment_id: StreamAttachmentId,
+        frame: Box<FrameUpdate>,
+        now: TimestampMs,
+    ) {
+        if !self.core.is_attachment_active(conn, stream_id, attachment_id) {
+            return;
+        }
+        let _ = self.take_stalled_frame(conn, attachment_id);
+        if let Some(c) = self.conns.get_mut(&conn) {
+            c.queued_frame_streams.remove(&attachment_id);
+        }
+        let mut actions = Vec::new();
+        self.core.publish_final_frame(conn, stream_id, attachment_id, frame, now, &mut actions);
+        self.execute_actions(actions, now);
+    }
+
+    fn try_acquire_permit_from(
         &mut self,
         conn: ConnId,
         stream_id: StreamId,
         req_id: RequestId,
         now: TimestampMs,
+        interactive_input: bool,
     ) -> Option<Arc<ShardCmdPermit>> {
-        let counter = self.conns.get(&conn).map(|c| Arc::clone(&c.inflight_shard_cmds))?;
-        match ShardCmdPermit::try_acquire(&counter, MAX_INFLIGHT_SHARD_CMDS_PER_CONN) {
+        let (counter, fin_pending, limit) = self.conns.get(&conn).map(|c| {
+            if interactive_input {
+                (Arc::clone(&c.inflight_input_cmds), Arc::clone(&c.fin_pending), MAX_INFLIGHT_INPUT_CMDS_PER_CONN)
+            } else {
+                (Arc::clone(&c.inflight_shard_cmds), Arc::clone(&c.fin_pending), MAX_INFLIGHT_SHARD_CMDS_PER_CONN)
+            }
+        })?;
+        match ShardCmdPermit::try_acquire_with_wake(
+            &counter,
+            limit,
+            Some(fin_pending),
+            Some(Arc::clone(&self.wake_reactor)),
+        ) {
             Some(permit) => Some(Arc::new(permit)),
             None => {
                 let mut actions = Vec::new();
@@ -958,6 +1212,41 @@ impl ReactorState {
                 self.execute_actions(actions, now);
                 None
             }
+        }
+    }
+
+    fn try_acquire_shard_permit(
+        &mut self,
+        conn: ConnId,
+        stream_id: StreamId,
+        req_id: RequestId,
+        now: TimestampMs,
+    ) -> Option<Arc<ShardCmdPermit>> {
+        self.try_acquire_permit_from(conn, stream_id, req_id, now, false)
+    }
+
+    fn close_pending_fin_conn(&mut self, conn: ConnId, now: TimestampMs) {
+        let mut actions = Vec::new();
+        self.core.close_connection(conn, CloseReason::ClientFin, now, &mut actions);
+        self.execute_actions(actions, now);
+    }
+
+    fn maybe_finish_pending_fin(&mut self, conn: ConnId, now: TimestampMs) {
+        let ready_to_close =
+            self.conns.get(&conn).is_some_and(|c| c.fin_pending.load(Ordering::Acquire) && !c.has_inflight_cmds());
+        if ready_to_close {
+            self.close_pending_fin_conn(conn, now);
+        }
+    }
+
+    fn reap_pending_fin_conns(&mut self, now: TimestampMs) {
+        let ready: Vec<ConnId> = self
+            .conns
+            .iter()
+            .filter_map(|(&conn, c)| (c.fin_pending.load(Ordering::Acquire) && !c.has_inflight_cmds()).then_some(conn))
+            .collect();
+        for conn in ready {
+            self.close_pending_fin_conn(conn, now);
         }
     }
 
@@ -983,6 +1272,7 @@ impl ReactorState {
             let _ = self.poller.deregister(c.token);
             self.token_to_conn.remove(&c.token);
             let _ = hang_up(&c.stream);
+            self.maybe_resume_unix_accept(true, Instant::now());
         }
         #[cfg(windows)]
         {
@@ -993,21 +1283,28 @@ impl ReactorState {
     fn handle_shard_event(&mut self, event: ReactorEvent) {
         let now = now_monotonic_ms();
         match event {
-            ReactorEvent::SendMsg { conn, stream_id, attachment, req_id, priority, msg } => {
+            ReactorEvent::SendMsg { conn, stream_id, attachment, req_id, priority, msg, permit } => {
+                let mut valid = true;
                 if let Some(att) = attachment {
-                    let Some(nz) = NonZeroStreamId::new(stream_id.raw()) else {
-                        return;
-                    };
-                    if !self.core.is_attachment_active(conn, nz, att) {
-                        return;
+                    match NonZeroStreamId::new(stream_id.raw()) {
+                        Some(nz) if self.core.is_attachment_active(conn, nz, att) => {}
+                        _ => valid = false,
                     }
                 }
-                let mut actions = Vec::new();
-                self.core.enqueue_message(conn, stream_id, req_id, priority, msg, now, &mut actions);
-                self.execute_actions(actions, now);
+                if valid {
+                    let mut actions = Vec::new();
+                    self.core.enqueue_message(conn, stream_id, req_id, priority, msg, now, &mut actions);
+                    self.execute_actions(actions, now);
+                }
+                drop(permit);
+                self.maybe_finish_pending_fin(conn, now);
             }
-            ReactorEvent::PublishFrame { conn, stream_id, attachment_id, session, frame } => {
-                self.try_publish_or_stall_frame(conn, stream_id, attachment_id, session, frame, now);
+            ReactorEvent::PublishFrame { conn, stream_id, attachment_id, session, frame, final_frame } => {
+                if final_frame {
+                    self.publish_final_frame(conn, stream_id, attachment_id, frame, now);
+                } else {
+                    self.try_publish_or_stall_frame(conn, stream_id, attachment_id, session, frame, now);
+                }
             }
             ReactorEvent::PublishRawOutput { session, bytes, session_inflight, shard_inflight } => {
                 let len = bytes.len();
@@ -1051,14 +1348,20 @@ impl ReactorState {
             ReactorEvent::SessionEnded { session } => {
                 self.session_shard.remove(&session);
                 self.session_kept.remove(&session);
-                for c in self.conns.values_mut() {
-                    prune_ended_session_frames(&mut c.stalled_frames, &mut c.queued_frame_streams, session);
+                let mut freed_by_conn = Vec::new();
+                for (&conn, c) in &mut self.conns {
+                    let freed = prune_ended_session_frames(&mut c.stalled_frames, &mut c.queued_frame_streams, session);
+                    freed_by_conn.push((conn, freed));
+                }
+                for (conn, freed) in freed_by_conn {
+                    self.core.release_stalled_frame_bytes(conn, freed);
                 }
                 let mut actions = Vec::new();
                 self.core.unregister_session(session, "session ended", now, &mut actions);
                 self.execute_actions(actions, now);
             }
-            ReactorEvent::SessionListPart { list_id, sessions } => {
+            ReactorEvent::SessionListPart { list_id, sessions, permit } => {
+                let conn_opt = self.pending_lists.get(&list_id).map(|p| p.conn);
                 let ready = if let Some(pending) = self.pending_lists.get_mut(&list_id) {
                     pending.collected.extend(sessions);
                     pending.remaining_shards = pending.remaining_shards.saturating_sub(1);
@@ -1080,6 +1383,10 @@ impl ReactorState {
                     );
                     self.execute_actions(actions, now);
                 }
+                drop(permit);
+                if let Some(conn) = conn_opt {
+                    self.maybe_finish_pending_fin(conn, now);
+                }
             }
         }
     }
@@ -1089,6 +1396,24 @@ impl ReactorState {
             match action {
                 BrokerAction::OutboundReady(conn) => {
                     self.flush_writes(conn);
+                }
+                BrokerAction::ClientFin(conn) => {
+                    let has_inflight = if let Some(c) = self.conns.get(&conn) {
+                        c.fin_pending.store(true, Ordering::Release);
+                        #[cfg(unix)]
+                        {
+                            let interest = if c.write_queue.is_empty() { Interest::NONE } else { Interest::WRITE };
+                            let _ = self.poller.modify(c.token, interest);
+                        }
+                        c.has_inflight_cmds()
+                    } else {
+                        false
+                    };
+                    if !has_inflight {
+                        let mut close_actions = Vec::new();
+                        self.core.close_connection(conn, CloseReason::ClientFin, now, &mut close_actions);
+                        self.execute_actions(close_actions, now);
+                    }
                 }
                 BrokerAction::CloseConn { conn, reason, final_error, drained } => {
                     #[cfg(unix)]
@@ -1124,10 +1449,12 @@ impl ReactorState {
                             } else {
                                 let _ = self.poller.deregister(c.token);
                                 drop(c.stream);
+                                self.maybe_resume_unix_accept(true, Instant::now());
                             }
                         } else {
                             let _ = self.poller.deregister(c.token);
                             let _ = hang_up(&c.stream);
+                            self.maybe_resume_unix_accept(true, Instant::now());
                         }
                     }
                     #[cfg(windows)]
@@ -1264,8 +1591,8 @@ impl ReactorState {
                     );
                 }
                 BrokerAction::StreamDetached { conn, stream_id, attachment_id, session } => {
+                    let _ = self.take_stalled_frame(conn, attachment_id);
                     if let Some(c) = self.conns.get_mut(&conn) {
-                        c.stalled_frames.remove(&attachment_id);
                         c.queued_frame_streams.remove(&attachment_id);
                     }
                     if let Some(&shard_idx) = self.session_shard.get(&session) {
@@ -1278,8 +1605,10 @@ impl ReactorState {
                     }
                 }
                 BrokerAction::DispatchToSession { conn, stream_id, attachment_id, req_id, session, msg } => {
+                    let interactive = is_interactive_input_msg(&msg);
                     if let Some(&shard_idx) = self.session_shard.get(&session)
-                        && let Some(permit) = self.try_acquire_shard_permit(conn, stream_id.as_stream_id(), req_id, now)
+                        && let Some(permit) =
+                            self.try_acquire_permit_from(conn, stream_id.as_stream_id(), req_id, now, interactive)
                     {
                         self.shards[shard_idx].send_with_permit(
                             ShardCmd::StreamMsg { session_id: session, conn, stream_id, attachment_id, req_id, msg },
@@ -1289,13 +1618,10 @@ impl ReactorState {
                 }
                 BrokerAction::FrameCreditUpdated { conn, attachment_id, .. } => {
                     // Retry any stalled frame parked on the reactor for `attachment_id`.
-                    // Never mint a `ViewSlotFree` token here: the shard's 1-slot token is
-                    // released strictly when an outbound frame drains in `on_outbound_frame_drained`
-                    // (or on initial `Attach`), preventing duplicate in-flight frames!
-                    let stalled = self.conns.get_mut(&conn).and_then(|c| c.stalled_frames.remove(&attachment_id));
-                    if let Some((nz, sid, frame)) = stalled {
-                        self.try_publish_or_stall_frame(conn, nz, attachment_id, sid, frame, now);
-                    }
+                    // Never mint a `ViewSlotFree` token here for buffered frames: the shard's 1-slot
+                    // token is released strictly when an outbound frame drains in `on_outbound_frame_drained`
+                    // (or when a `DeferredResync` clears under budget headroom).
+                    self.retry_stalled_frame(conn, attachment_id, now);
                 }
                 BrokerAction::SetPtyPaused { session, paused } => {
                     if let Some(&shard_idx) = self.session_shard.get(&session) {
@@ -1323,5 +1649,371 @@ impl ReactorState {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod reactor_unit_tests {
+    #[cfg(unix)]
+    use super::*;
+    #[cfg(unix)]
+    use apack_core::auth::AuthConfig;
+    #[cfg(unix)]
+    use apack_os::transport::{bind_local_listener, connect_local_stream};
+    #[cfg(unix)]
+    use apack_proto::PROTOCOL_VERSION;
+    #[cfg(unix)]
+    use apack_proto::types::{CursorShape, CursorState, FrameCredit, GridSize, SubFlags, ViewModes};
+
+    #[cfg(unix)]
+    fn make_frame(text: &str) -> Box<FrameUpdate> {
+        let mut rows = Vec::new();
+        if !text.is_empty() {
+            rows.push(apack_proto::types::PackedRow {
+                line: 0,
+                flags: 0,
+                text: text.to_owned(),
+                runs: Vec::new(),
+                styles: Vec::new(),
+                links: Vec::new(),
+                pieces: Vec::new(),
+            });
+        }
+        Box::new(FrameUpdate {
+            seq: 0,
+            epoch: 0,
+            size: GridSize::new(80, 24).unwrap(),
+            first_active_line: 0,
+            scrollback_lines: 0,
+            scroll_delta: 0,
+            cursor: CursorState { col: 0, row: 0, shape: CursorShape::Block, blinking: false, hidden: false },
+            modes: ViewModes::default(),
+            palette: None,
+            rows,
+            images_gen: 0,
+            full_sync: true,
+        })
+    }
+
+    #[cfg(unix)]
+    fn make_test_reactor(
+        max_queue_bytes: usize,
+    ) -> (tempfile::TempDir, String, ReactorState, Arc<Mutex<crate::shard::ShardMailboxState>>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("r.sock").to_string_lossy().into_owned();
+        let listener = bind_local_listener(&sock).unwrap();
+        set_listener_nonblocking(&listener, true).unwrap();
+        let mut poller = PtyPoller::new().unwrap();
+        poller.register(LISTENER_TOKEN, listener_fd(&listener), Interest::READ).unwrap();
+        let (shard, mailbox) = ShardHandle::dummy_for_test();
+        let state = ReactorState {
+            core: BrokerCore::with_queue_cap(AuthConfig::None, max_queue_bytes),
+            shards: vec![shard],
+            image_store: Arc::new(Mutex::new(ImageStore::default())),
+            conns: HashMap::new(),
+            flushing_conns: HashSet::new(),
+            next_conn_id: 1,
+            next_session_id: 1,
+            next_list_id: 1,
+            session_shard: HashMap::new(),
+            session_kept: HashMap::new(),
+            pending_spawns: 0,
+            pending_lists: HashMap::new(),
+            ever_connected: false,
+            started_at: Instant::now(),
+            start_grace: Duration::from_secs(60),
+            kill_escalate_after: Duration::from_secs(1),
+            graceful_drain_timeout: Duration::from_millis(500),
+            shutting_down: false,
+            shutdown_deadline: None,
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
+            wake_reactor: Arc::new(|| {}),
+            listener,
+            poller,
+            token_to_conn: HashMap::new(),
+            draining_unix: HashMap::new(),
+            read_buf: vec![0u8; 4096],
+            accept_backoff_until: None,
+        };
+        (tmp, sock, state, mailbox)
+    }
+
+    #[cfg(unix)]
+    fn attach_conn_stream(
+        sock: &str,
+        state: &mut ReactorState,
+        sid: SessionId,
+        credit: FrameCredit,
+    ) -> (ConnId, NonZeroStreamId, StreamAttachmentId, Stream) {
+        let client_end = connect_local_stream(sock).unwrap();
+        let server_end = state.listener.accept().unwrap();
+        set_stream_nonblocking(&server_end, true).unwrap();
+        let conn = state.alloc_conn_id();
+        let tok = PollToken(conn.get());
+        state.poller.register(tok, stream_fd(&server_end), Interest::READ).unwrap();
+        state.token_to_conn.insert(tok, conn);
+        let now = TimestampMs::from_millis(1);
+        state.core.open_connection(conn, [0u8; 32], now).unwrap();
+        state.conns.insert(
+            conn,
+            ConnState {
+                stream: server_end,
+                token: tok,
+                write_queue: VecDeque::new(),
+                write_queue_bytes: 0,
+                stalled_frames: HashMap::new(),
+                queued_frame_streams: HashMap::new(),
+                inflight_shard_cmds: Arc::new(AtomicUsize::new(0)),
+                inflight_input_cmds: Arc::new(AtomicUsize::new(0)),
+                fin_pending: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        let mut wire = Vec::new();
+        ClientMsg::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            client_nonce: [1u8; 32],
+            client_name: String::from("test"),
+        }
+        .encode_to_frame(StreamId::CONTROL, RequestId::from_raw(1), &mut wire)
+        .unwrap();
+        let st = NonZeroStreamId::new(1).unwrap();
+        ClientMsg::Attach {
+            session: sid,
+            stream_id: st,
+            flags: SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(),
+            initial_viewport: None,
+            initial_output_credit: 0,
+            initial_frame_credit: credit,
+        }
+        .encode_to_frame(StreamId::CONTROL, RequestId::from_raw(2), &mut wire)
+        .unwrap();
+        let mut actions = Vec::new();
+        state.core.feed_bytes(conn, &wire, now, &mut actions);
+        // Drain HelloOk from outbound so budget starts clean at 0.
+        while state.core.pop_outbound(conn).is_some() {}
+        let att = state.core.stream_attachment(conn, st).expect("attached");
+        (conn, st, att, client_end)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pr3_reactor_emfile_backoff_stalled_budget_resync_fin_reap_and_stale_send() {
+        let (_tmp, sock, mut state, mailbox) = make_test_reactor(512);
+        let now = TimestampMs::from_millis(10);
+
+        // 1. EMFILE backoff deadline & `maybe_resume_unix_accept` across force/deadline/exact-boundary/shutdown.
+        let t0 = Instant::now();
+        let dl = compute_accept_backoff_deadline(t0);
+        assert_eq!(dl, t0 + ACCEPT_EMFILE_BACKOFF);
+
+        let _ = state.poller.deregister(LISTENER_TOKEN);
+        state.accept_backoff_until = Some(dl);
+        state.maybe_resume_unix_accept(false, t0);
+        assert!(state.accept_backoff_until.is_some(), "must not resume before deadline when force=false");
+        state.maybe_resume_unix_accept(true, t0);
+        assert!(state.accept_backoff_until.is_none(), "force=true must resume listener immediately");
+
+        let _ = state.poller.deregister(LISTENER_TOKEN);
+        state.accept_backoff_until = Some(dl);
+        state.maybe_resume_unix_accept(false, dl);
+        assert!(state.accept_backoff_until.is_none(), "exact deadline boundary (now == until) must resume listener");
+
+        state.accept_backoff_until = Some(dl);
+        state.shutting_down = true;
+        state.maybe_resume_unix_accept(false, dl);
+        assert!(state.accept_backoff_until.is_none(), "shutting_down must clear backoff without registering");
+        state.shutting_down = false;
+
+        // 2. Stalled frame MemoryBudget charging, DeferredResync, retry_budget_stalled_frames, and SessionEnded cleanup.
+        let sid = SessionId::new(1).unwrap();
+        state.session_shard.insert(sid, 0);
+        let mut reg_actions = Vec::new();
+        state.core.register_session(sid, SessionLifetime::Kept, false, &mut reg_actions);
+        let (conn, st, att, _peer) =
+            attach_conn_stream(&sock, &mut state, sid, FrameCredit { max_frames: 0, max_bytes: 65_536 });
+
+        // Pacer-stalled frame charges approx bytes against MemoryBudget; take_stalled_frame releases it!
+        state.try_publish_or_stall_frame(conn, st, att, sid, make_frame("small"), now);
+        let used = state.core.connection_budget_used(conn).unwrap();
+        assert!(used > 0, "pacer-stalled frame must charge MemoryBudget");
+        let taken = state.take_stalled_frame(conn, att).expect("stalled present");
+        assert!(matches!(taken, StalledFrame::Buffered { reason: FrameStallReason::Pacer, .. }));
+        assert_eq!(state.core.connection_budget_used(conn).unwrap(), 0, "take_stalled_frame must release budget");
+
+        // Stalled frame exceeding 512B budget drops payload immediately into DeferredResync!
+        let (conn2, st2, att2, _peer2) =
+            attach_conn_stream(&sock, &mut state, sid, FrameCredit { max_frames: 4, max_bytes: 65_536 });
+        // Reserve 480 of 512 bytes so a ~200B frame fails both OutboundQueue and reserve_stalled_frame_bytes -> DeferredResync!
+        assert!(state.core.reserve_stalled_frame_bytes(conn2, 480));
+        state.try_publish_or_stall_frame(conn2, st2, att2, sid, make_frame(&"A".repeat(150)), now);
+        assert!(matches!(
+            state.conns[&conn2].stalled_frames.get(&att2),
+            Some(StalledFrame::DeferredResync { reason: FrameStallReason::OutboundOrBudget, .. })
+        ));
+        // Still insufficient headroom (remaining=32 < needed): retry keeps DeferredResync as OutboundOrBudget!
+        state.retry_budget_stalled_frames(conn2, now);
+        assert!(matches!(
+            state.conns[&conn2].stalled_frames.get(&att2),
+            Some(StalledFrame::DeferredResync { reason: FrameStallReason::OutboundOrBudget, .. })
+        ));
+        assert!(mailbox.lock().unwrap().queue.is_empty());
+
+        // When pacer closes (`max_frames = 0`) and not in queued_frame_streams, retry updates reason to Pacer!
+        let mut ack_wire = Vec::new();
+        ClientMsg::FrameAck { seq: 0, credit: FrameCredit { max_frames: 0, max_bytes: 65_536 } }
+            .encode_to_frame(st2.as_stream_id(), RequestId::PUSH, &mut ack_wire)
+            .unwrap();
+        let mut ack_actions = Vec::new();
+        state.core.feed_bytes(conn2, &ack_wire, now, &mut ack_actions);
+        state.retry_stalled_frame(conn2, att2, now);
+        assert!(matches!(
+            state.conns[&conn2].stalled_frames.get(&att2),
+            Some(StalledFrame::DeferredResync { reason: FrameStallReason::Pacer, .. })
+        ));
+
+        // When a P1 frame IS queued in queued_frame_streams, retry keeps reason as OutboundOrBudget!
+        state.conns.get_mut(&conn2).unwrap().queued_frame_streams.insert(att2, (st2, sid));
+        state.retry_stalled_frame(conn2, att2, now);
+        assert!(matches!(
+            state.conns[&conn2].stalled_frames.get(&att2),
+            Some(StalledFrame::DeferredResync { reason: FrameStallReason::OutboundOrBudget, .. })
+        ));
+        state.conns.get_mut(&conn2).unwrap().queued_frame_streams.remove(&att2);
+
+        // Re-open pacer + free budget -> retry_budget_stalled_frames emits ViewSlotFree { force_full_sync: true }!
+        let mut ack_open = Vec::new();
+        ClientMsg::FrameAck { seq: 0, credit: FrameCredit { max_frames: 4, max_bytes: 65_536 } }
+            .encode_to_frame(st2.as_stream_id(), RequestId::PUSH, &mut ack_open)
+            .unwrap();
+        state.core.feed_bytes(conn2, &ack_open, now, &mut ack_actions);
+        state.core.release_stalled_frame_bytes(conn2, 480);
+        state.retry_budget_stalled_frames(conn2, now);
+        assert!(!state.conns[&conn2].stalled_frames.contains_key(&att2));
+        let cmd = mailbox.lock().unwrap().queue.pop_front().expect("ViewSlotFree sent").0;
+        assert!(
+            matches!(cmd, ShardCmd::ViewSlotFree { attachment_id, force_full_sync: true, .. } if attachment_id == att2)
+        );
+
+        // DeferredResync with stale attachment drops cleanly without emitting ViewSlotFree.
+        let stale_att = StreamAttachmentId::new(999).unwrap();
+        state.conns.get_mut(&conn2).unwrap().stalled_frames.insert(
+            stale_att,
+            StalledFrame::DeferredResync {
+                stream_id: st2,
+                session: sid,
+                reason: FrameStallReason::OutboundOrBudget,
+                needed_bytes: 1,
+            },
+        );
+        state.retry_stalled_frame(conn2, stale_att, now);
+        assert!(mailbox.lock().unwrap().queue.is_empty());
+
+        // OutboundOrBudget buffered frame (P1 slot already occupied -> parks Buffered { OutboundOrBudget }),
+        // then once P1 frame pops, retry_budget_stalled_frames publishes it!
+        assert!(state.core.try_publish_frame(conn2, st2, att2, make_frame("p1"), now, &mut ack_actions).is_ok());
+        state.try_publish_or_stall_frame(conn2, st2, att2, sid, make_frame("p2-buffered"), now);
+        assert!(matches!(
+            state.conns[&conn2].stalled_frames.get(&att2),
+            Some(StalledFrame::Buffered { reason: FrameStallReason::OutboundOrBudget, charged_bytes, .. })
+                if *charged_bytes > 0
+        ));
+        assert!(state.core.pop_outbound(conn2).is_some());
+        state.retry_budget_stalled_frames(conn2, now);
+        assert!(!state.conns[&conn2].stalled_frames.contains_key(&att2));
+
+        // Pacer byte-window stall with `encoded_bytes != 0`: in-flight frame 1 consumes 65_530 of
+        // 65_536 max_bytes so `can_send_any()` is true, `degrade_frame_to_wire_cap` measures exact
+        // `encoded_bytes > 0`, `pacer.can_send` fails -> parks Buffered with exact `charged_bytes`!
+        let (conn_bw, st_bw, att_bw, _p_bw) =
+            attach_conn_stream(&sock, &mut state, sid, FrameCredit { max_frames: 4, max_bytes: 65_536 });
+        // Push frame 1 (already occupies ~100 bytes of pacer window); ack with tiny byte window?
+        // MIN_BDP_FRAME_BYTES is 65_536, so fill pacer with a 65_500-byte frame on a 128 KiB budget reactor.
+        drop((conn_bw, st_bw, att_bw, _p_bw));
+        let (_tmp_bw, sock_bw, mut state_bw, _mb_bw) = make_test_reactor(262_144);
+        state_bw.session_shard.insert(sid, 0);
+        state_bw.core.register_session(sid, SessionLifetime::Kept, false, &mut Vec::new());
+        let (cbw, sbw, abw, _pbw) =
+            attach_conn_stream(&sock_bw, &mut state_bw, sid, FrameCredit { max_frames: 4, max_bytes: 65_536 });
+        assert!(
+            state_bw
+                .core
+                .try_publish_frame(cbw, sbw, abw, make_frame(&"Z".repeat(65_450)), now, &mut Vec::new())
+                .is_ok()
+        );
+        assert!(state_bw.core.pop_outbound(cbw).is_some());
+        state_bw.try_publish_or_stall_frame(cbw, sbw, abw, sid, make_frame("exact-charged"), now);
+        let expected_exact = {
+            let mut f = make_frame("exact-charged");
+            f.seq = 2;
+            let mut w = apack_proto::codec::Writer::new();
+            f.encode(&mut w);
+            apack_proto::FRAME_HEADER_LEN + w.as_slice().len()
+        };
+        assert!(matches!(
+            state_bw.conns[&cbw].stalled_frames.get(&abw),
+            Some(StalledFrame::Buffered { reason: FrameStallReason::Pacer, charged_bytes, .. })
+                if *charged_bytes == expected_exact
+        ));
+
+        // 3. Stale attachment on ReactorEvent::SendMsg skips enqueue AND drops permit to finish pending FIN.
+        //    First check on an open non-fin conn that stale SendMsg does NOT write any bytes to the socket!
+        let (conn_live_stale, st_ls, _att_ls, mut peer_ls) =
+            attach_conn_stream(&sock, &mut state, sid, FrameCredit { max_frames: 1, max_bytes: 65_536 });
+        set_stream_nonblocking(&peer_ls, true).unwrap();
+        state.handle_shard_event(ReactorEvent::SendMsg {
+            conn: conn_live_stale,
+            stream_id: st_ls.as_stream_id(),
+            attachment: Some(stale_att),
+            req_id: RequestId::from_raw(54),
+            priority: OutboundPriority::Control,
+            msg: BrokerMsg::Ok,
+            permit: None,
+        });
+        assert!(state.core.pop_outbound(conn_live_stale).is_none(), "stale attachment must not enqueue outbound msg");
+        let mut probe_buf = [0u8; 16];
+        assert!(
+            matches!(peer_ls.read(&mut probe_buf), Err(ref e) if e.kind() == io::ErrorKind::WouldBlock),
+            "stale attachment must not flush any bytes to peer"
+        );
+
+        let permit = Arc::new(ShardCmdPermit::try_acquire(&state.conns[&conn].inflight_shard_cmds, 4).expect("permit"));
+        state.conns[&conn].fin_pending.store(true, Ordering::Release);
+        state.handle_shard_event(ReactorEvent::SendMsg {
+            conn,
+            stream_id: st.as_stream_id(),
+            attachment: Some(stale_att),
+            req_id: RequestId::from_raw(55),
+            priority: OutboundPriority::Control,
+            msg: BrokerMsg::Ok,
+            permit: Some(permit),
+        });
+        assert!(!state.conns.contains_key(&conn), "dropping final permit on stale SendMsg must close fin_pending conn");
+
+        // 4. `reap_pending_fin_conns`: closes only `fin_pending && !has_inflight_cmds()`.
+        let (conn_stay, _, _, _p3) =
+            attach_conn_stream(&sock, &mut state, sid, FrameCredit { max_frames: 1, max_bytes: 65_536 });
+        let (conn_busy, _, _, _p4) =
+            attach_conn_stream(&sock, &mut state, sid, FrameCredit { max_frames: 1, max_bytes: 65_536 });
+        let (conn_fin, _, _, _p5) =
+            attach_conn_stream(&sock, &mut state, sid, FrameCredit { max_frames: 1, max_bytes: 65_536 });
+        let busy_permit = ShardCmdPermit::try_acquire(&state.conns[&conn_busy].inflight_shard_cmds, 4).unwrap();
+        state.conns[&conn_busy].fin_pending.store(true, Ordering::Release);
+        state.conns[&conn_fin].fin_pending.store(true, Ordering::Release);
+        state.reap_pending_fin_conns(now);
+        assert!(state.conns.contains_key(&conn_stay), "non-fin conn must stay open");
+        assert!(state.conns.contains_key(&conn_busy), "fin_pending with inflight permit must stay open");
+        assert!(!state.conns.contains_key(&conn_fin), "fin_pending with 0 inflight permits must close");
+        drop(busy_permit);
+        state.reap_pending_fin_conns(now);
+        assert!(!state.conns.contains_key(&conn_busy), "fin_pending closes once permit drops");
+
+        // 5. `ReactorEvent::SessionEnded` prunes stalled frames and releases charged MemoryBudget bytes.
+        let (conn_end, st_end, att_end, _p6) =
+            attach_conn_stream(&sock, &mut state, sid, FrameCredit { max_frames: 0, max_bytes: 65_536 });
+        state.try_publish_or_stall_frame(conn_end, st_end, att_end, sid, make_frame("parked"), now);
+        assert!(state.core.connection_budget_used(conn_end).unwrap() > 0);
+        state.handle_shard_event(ReactorEvent::SessionEnded { session: sid });
+        assert!(state.conns[&conn_end].stalled_frames.is_empty());
+        assert_eq!(state.core.connection_budget_used(conn_end).unwrap(), 0);
     }
 }

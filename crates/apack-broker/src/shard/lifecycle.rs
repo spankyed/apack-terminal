@@ -189,7 +189,7 @@ impl ShardRunner {
         }
         #[cfg(windows)]
         {
-            if let Some(LivePty::Windows { bridge, eof: false }) =
+            if let Some(LivePty::Windows { bridge, eof: false, .. }) =
                 self.sessions.get(&session_id).and_then(|s| s.pty.as_ref())
             {
                 let _ = crate::shard_windows::drain_conpty_quantum(bridge, PTY_READ_QUANTUM_BYTES, |b| {
@@ -300,6 +300,9 @@ impl ShardRunner {
                     sess.paused_by_raw_inflight = false;
                 }
                 self.sync_pty_interest(id);
+                // Wake the shard (crucial on Windows, where Tier 2 runs after Tier 1 ConPTY drain)
+                // so any buffered ConPTY output drains immediately instead of sleeping up to 5s.
+                self.self_wake.wake();
             }
 
             // 1. Child reap & 2-second SIGKILL escalation BEFORE firing timers so tail PTY bytes

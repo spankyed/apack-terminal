@@ -1,9 +1,10 @@
 //! Shard mailbox command/event protocol, wake primitives, and shared broker handles.
 
 use std::collections::{HashSet, VecDeque};
+use std::fmt;
 #[cfg(windows)]
 use std::sync::Condvar;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -55,28 +56,53 @@ pub(crate) const fn should_notify_raw_drained(
         || crossed_raw_low_water(prev_shard, next_shard, RAW_OUTPUT_SHARD_LOW_WATER)
 }
 
-/// RAII permit bounding concurrent in-flight shard mailbox commands per client connection.
+/// RAII permit bounding concurrent in-flight shard commands and shard->reactor replies per client.
 ///
-/// Dropping the permit (after shard command execution or on shard shutdown) releases the slot
-/// automatically, guaranteeing zero counter drift across RPCs and fire-and-forget messages alike.
-#[derive(Debug)]
+/// Dropping the last `Arc<ShardCmdPermit>` (after the Control Reactor consumes the final reply or
+/// after a fire-and-forget shard command completes) releases the slot automatically and wakes the
+/// Control Reactor when the connection is waiting on `ClientFin` half-close drain.
 pub struct ShardCmdPermit {
     counter: Arc<AtomicUsize>,
+    fin_pending: Option<Arc<AtomicBool>>,
+    wake_reactor: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl fmt::Debug for ShardCmdPermit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShardCmdPermit").field("inflight", &self.counter.load(Ordering::Relaxed)).finish()
+    }
 }
 
 impl ShardCmdPermit {
     /// Attempts to acquire one command slot below `limit`, returning `None` if already at cap.
     pub fn try_acquire(counter: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
+        Self::try_acquire_with_wake(counter, limit, None, None)
+    }
+
+    /// Attempts to acquire one command slot below `limit`, waking `wake_reactor` when the final
+    /// permit drops while `fin_pending` is set.
+    pub fn try_acquire_with_wake(
+        counter: &Arc<AtomicUsize>,
+        limit: usize,
+        fin_pending: Option<Arc<AtomicBool>>,
+        wake_reactor: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Option<Self> {
         counter
             .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| (cur < limit).then_some(cur + 1))
             .ok()
-            .map(|_| Self { counter: Arc::clone(counter) })
+            .map(|_| Self { counter: Arc::clone(counter), fin_pending, wake_reactor })
     }
 }
 
 impl Drop for ShardCmdPermit {
     fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::AcqRel);
+        let prev = self.counter.fetch_sub(1, Ordering::AcqRel);
+        if prev == 1
+            && self.fin_pending.as_ref().is_some_and(|f| f.load(Ordering::Acquire))
+            && let Some(wake) = &self.wake_reactor
+        {
+            wake();
+        }
     }
 }
 
@@ -97,6 +123,8 @@ pub enum ReactorEvent {
         priority: OutboundPriority,
         /// Encoded protocol message.
         msg: BrokerMsg,
+        /// Optional in-flight command permit released strictly after the reactor enqueues `msg`.
+        permit: Option<Arc<ShardCmdPermit>>,
     },
     /// Publish a coalesced differential or full-sync view frame for `(conn, stream_id, attachment_id)`.
     PublishFrame {
@@ -110,6 +138,9 @@ pub enum ReactorEvent {
         session: SessionId,
         /// Frame payload.
         frame: Box<FrameUpdate>,
+        /// `true` for the final exit `full_sync` frame, which is delivered as a non-droppable
+        /// ordered `Event` strictly ahead of `Exited`/`StreamClosed`.
+        final_frame: bool,
     },
     /// Publish raw PTY output bytes to all `SUB_RAW_OUTPUT` subscribers of `session`.
     PublishRawOutput {
@@ -155,6 +186,8 @@ pub enum ReactorEvent {
         list_id: u64,
         /// Shard's session summaries.
         sessions: Vec<SessionSummary>,
+        /// Shared `ListSessions` permit released after the reactor enqueues the merged reply.
+        permit: Option<Arc<ShardCmdPermit>>,
     },
 }
 
@@ -312,6 +345,9 @@ pub enum ShardCmd {
         stream_id: NonZeroStreamId,
         /// Monotonic attachment lifecycle ID.
         attachment_id: StreamAttachmentId,
+        /// When `true`, marks the subscriber for a self-contained `full_sync` frame (used when a
+        /// deferred frame had to be dropped under `MemoryBudget` pressure).
+        force_full_sync: bool,
     },
     /// Notify the shard that in-flight `PublishRawOutput` bytes drained below low-water mark.
     RawOutputDrained,
@@ -420,6 +456,20 @@ pub struct ShardHandle {
 }
 
 impl ShardHandle {
+    #[cfg(all(test, unix))]
+    pub(crate) fn dummy_for_test() -> (Self, Arc<Mutex<ShardMailboxState>>) {
+        let poller = apack_os::pty_poller::PtyPoller::new().expect("dummy poller");
+        let mailbox = Arc::new(Mutex::new(ShardMailboxState::default()));
+        let handle = Self {
+            mailbox: Arc::clone(&mailbox),
+            wake: ShardWake::Poller(poller.waker()),
+            load: Arc::new(AtomicUsize::new(0)),
+            telemetry: Arc::new(ShardTelemetryAtomics::default()),
+            thread: None,
+        };
+        (handle, mailbox)
+    }
+
     /// Current number of sessions assigned to this shard (used for least-loaded placement).
     pub fn session_load(&self) -> usize {
         self.load.load(Ordering::Relaxed)

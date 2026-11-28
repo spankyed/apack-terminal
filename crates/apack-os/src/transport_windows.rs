@@ -10,7 +10,7 @@ use std::os::windows::io::{AsHandle, AsRawHandle};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, GetSecurityInfo, SE_KERNEL_OBJECT};
 use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
 use windows_sys::Win32::System::Console::{
@@ -36,9 +36,12 @@ fn should_close_old_stderr(old: HANDLE, stdin: HANDLE, stdout: HANDLE, new_handl
 }
 
 /// Redirects `STD_ERROR_HANDLE` to `NUL` and closes the inherited startup stderr pipe write handle
-/// once a detached background broker has finished binding, so the proxy's stderr collector sees
-/// EOF cleanly and post-bind `eprintln!` calls cannot panic with `ERROR_BROKEN_PIPE`.
-pub fn prepare_detached_daemon() {
+/// once a detached background broker (`--detached`) has finished binding, so the proxy's stderr
+/// collector sees EOF cleanly and post-bind `eprintln!` calls cannot panic with `ERROR_BROKEN_PIPE`.
+pub fn prepare_detached_daemon(redirect_stderr: bool) {
+    if !redirect_stderr {
+        return;
+    }
     // SAFETY: `GetConsoleCP` queries the attached console code page (0 when detached).
     if unsafe { GetConsoleCP() } != 0 {
         return;
@@ -199,8 +202,8 @@ pub fn install_shutdown_signals(
 fn owned_by(pipe: &impl AsHandle, sid: &widestring::U16CStr) -> io::Result<bool> {
     let handle = pipe.as_handle().as_raw_handle() as HANDLE;
     // SAFETY: `handle` is borrowed from a live pipe. `GetSecurityInfo` allocates `descriptor`
-    // (freed via `LocalFree` on every path) and `ConvertSidToStringSidW` allocates `text` (freed
-    // via `LocalFree` after comparison).
+    // and `ConvertSidToStringSidW` allocates `text`; both are wrapped in `LocalMem` RAII guards
+    // immediately on success so every return or unwind path releases them via `LocalFree`.
     unsafe {
         let mut owner: PSID = std::ptr::null_mut();
         let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
@@ -217,16 +220,16 @@ fn owned_by(pipe: &impl AsHandle, sid: &widestring::U16CStr) -> io::Result<bool>
         if rc != 0 {
             return Err(io::Error::from_raw_os_error(rc as i32));
         }
+        let _descriptor_guard = crate::security_windows::LocalMem(descriptor as HLOCAL);
         let mut text: windows_sys::core::PWSTR = std::ptr::null_mut();
-        let converted = ConvertSidToStringSidW(owner, &mut text);
-        let convert_err = (converted == 0).then(io::Error::last_os_error);
-        LocalFree(descriptor as HLOCAL);
-        if let Some(err) = convert_err {
-            return Err(err);
+        if ConvertSidToStringSidW(owner, &mut text) == 0 {
+            return Err(io::Error::last_os_error());
         }
-        let matches = widestring::U16CStr::from_ptr_str(text) == sid;
-        LocalFree(text.cast::<core::ffi::c_void>() as HLOCAL);
-        Ok(matches)
+        let Some(text_nn) = std::ptr::NonNull::new(text) else {
+            return Err(io::Error::other("ConvertSidToStringSidW returned null"));
+        };
+        let _text_guard = crate::security_windows::LocalMem(text_nn.as_ptr().cast::<core::ffi::c_void>() as HLOCAL);
+        Ok(widestring::U16CStr::from_ptr_str(text_nn.as_ptr()) == sid)
     }
 }
 
@@ -358,7 +361,10 @@ mod tests {
             // SAFETY: `GetConsoleCP` queries the attached console code page (0 when detached).
             let cp = unsafe { GetConsoleCP() };
             println!("CONSOLE_CP={cp}");
-            prepare_detached_daemon();
+            prepare_detached_daemon(false);
+            let _ = std::io::stderr().write_all(b"SUPERVISED_STDERR_KEPT\n");
+            let _ = std::io::stderr().flush();
+            prepare_detached_daemon(true);
             let _ = std::io::stderr().write_all(b"POST_DETACH_MUST_GO_TO_NUL\n");
             let mut sink = Vec::new();
             let _ = std::io::stdin().read_to_end(&mut sink);
@@ -405,9 +411,9 @@ mod tests {
             }
         };
         let _ = stderr_reader.join();
-        assert!(
-            stderr_buf.is_empty(),
-            "prepare_detached_daemon must redirect stderr to NUL and close pipe write handle, got: {stderr_buf:?}"
+        assert_eq!(
+            stderr_buf, "SUPERVISED_STDERR_KEPT\n",
+            "prepare_detached_daemon(false) must keep stderr and prepare_detached_daemon(true) must redirect to NUL, got: {stderr_buf:?}"
         );
         drop(child.stdin.take());
         let out = child.wait_with_output().expect("wait detached test helper");

@@ -1372,3 +1372,160 @@ fn resolve_scrollback_lines_clamps_to_proto_max_and_osc7501_rejects_unverified_w
         srv.shutdown().unwrap();
     }
 }
+
+#[test]
+fn pr3_e2e_final_exit_frame_under_pacer_backpressure_pipelined_kill_fin_and_idle_inspect() {
+    use std::io::{Read, Write};
+
+    let tmp = tempdir().unwrap();
+    let sock = unique_endpoint(tmp.path(), "pr3-e2e");
+    let mut cfg = BrokerConfig::for_socket(sock);
+    cfg.shard_count = 2;
+    cfg.start_grace = Duration::from_secs(5);
+    let mut srv = BrokerServer::bind(cfg).unwrap().spawn().unwrap();
+
+    // 1. Running `inspect` on a fresh idle broker must NOT flip `ever_connected` or kill the broker!
+    let report = collect_report(srv.socket_path(), &AuthConfig::None).unwrap();
+    assert!(report.sessions.is_empty());
+    // Wait briefly and verify a real client can still connect after `inspect` disconnected.
+    std::thread::sleep(Duration::from_millis(60));
+    assert!(!srv.is_finished(), "inspect probe must not trigger idle broker auto-exit");
+
+    // Verify `format_report` renders `"exited"` when `!alive && !rewound`.
+    let exited_report = crate::inspect::InspectReport {
+        sessions: vec![crate::inspect::InspectSession {
+            id: 9,
+            cols: 80,
+            rows: 24,
+            alive: false,
+            kept: false,
+            rewound: false,
+            title: String::from("done"),
+            cwd: None,
+            pid: None,
+            foreground: None,
+            created_ms: 0,
+        }],
+        metrics: report.metrics,
+    };
+    let rendered = format_report(&exited_report, false);
+    assert!(rendered.contains("exited"), "exited session must be labeled 'exited', got: {rendered}");
+
+    // 2. Final exit `full_sync` frame must be delivered strictly before `Exited` even when the
+    //    client's FramePacer window is completely full (max_frames = 1, initial frame unacked!).
+    let mut client = BrokerClient::connect(srv.socket_path(), &AuthConfig::None, "pr3-view").unwrap();
+    let mut spec = echo_command_spec("x", None, None);
+    #[cfg(unix)]
+    {
+        spec.argv = vec![
+            String::from("/bin/sh"),
+            String::from("-c"),
+            String::from("read _go; printf 'FINAL_EXIT_LINE_PR3\\r\\n'"),
+        ];
+    }
+    #[cfg(windows)]
+    {
+        spec.argv =
+            vec![String::from("cmd.exe"), String::from("/C"), String::from("set /p _go= & echo FINAL_EXIT_LINE_PR3")];
+    }
+    let (sid_exit, _) = client.spawn(spec).unwrap();
+    let st_exit = NonZeroStreamId::new(1).unwrap();
+    client
+        .attach(
+            sid_exit,
+            st_exit,
+            SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(),
+            None,
+            0,
+            FrameCredit { max_frames: 1, max_bytes: 65_536 },
+        )
+        .unwrap();
+    // Consume initial Frame(seq=1) and intentionally DO NOT send FrameAck (pacer window = full!).
+    let init_f = client.recv_frame().unwrap();
+    assert!(matches!(init_f.msg, BrokerMsg::Frame(ref f) if f.seq == 1));
+
+    // Unblock the shell so it prints FINAL_EXIT_LINE_PR3 and exits while pacer has 0 free slots.
+    client.send_raw(st_exit.as_stream_id(), RequestId::PUSH, &ClientMsg::Text { text: String::from("\r") }).unwrap();
+
+    let mut saw_final_line = false;
+    let mut saw_exited = false;
+    let dl = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < dl {
+        let f = client.recv_frame().unwrap();
+        if f.stream_id == st_exit.as_stream_id() {
+            match f.msg {
+                BrokerMsg::Frame(upd) => {
+                    if upd.full_sync && upd.rows.iter().any(|r| r.text.contains("FINAL_EXIT_LINE_PR3")) {
+                        saw_final_line = true;
+                    }
+                }
+                BrokerMsg::Exited { .. } => {
+                    assert!(saw_final_line, "final exit full_sync frame MUST arrive strictly before Exited!");
+                    saw_exited = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(saw_exited && saw_final_line);
+
+    // 3. Pipelined `ListSessions + FIN_FRAME` and `Kill + FIN_FRAME` in one write must receive replies!
+    let mut sleeper = echo_command_spec("x", None, None);
+    #[cfg(unix)]
+    {
+        sleeper.argv = vec![String::from("/bin/sh"), String::from("-c"), String::from("sleep 30")];
+    }
+    #[cfg(windows)]
+    {
+        sleeper.argv = vec![String::from("cmd.exe"), String::from("/C"), String::from("ping -n 30 127.0.0.1 >nul")];
+    }
+    let (sid_kill, _) = client.spawn(sleeper).unwrap();
+
+    // Helper: send Hello + ListSessions + Kill(sid_kill) + FIN_FRAME pipelined in one write_all!
+    let mut raw_stream = apack_os::transport::connect_local_stream(srv.socket_path()).unwrap();
+    let mut wire = Vec::new();
+    ClientMsg::Hello {
+        protocol_version: apack_proto::PROTOCOL_VERSION,
+        client_nonce: [7u8; 32],
+        client_name: String::from("pr3-pipelined"),
+    }
+    .encode_to_frame(apack_proto::types::StreamId::CONTROL, RequestId::from_raw(1), &mut wire)
+    .unwrap();
+    ClientMsg::ListSessions
+        .encode_to_frame(apack_proto::types::StreamId::CONTROL, RequestId::from_raw(2), &mut wire)
+        .unwrap();
+    ClientMsg::Kill { session: sid_kill }
+        .encode_to_frame(apack_proto::types::StreamId::CONTROL, RequestId::from_raw(3), &mut wire)
+        .unwrap();
+    wire.extend_from_slice(&apack_proto::FIN_FRAME);
+    raw_stream.write_all(&wire).unwrap();
+    raw_stream.flush().unwrap();
+
+    let mut response_bytes = Vec::new();
+    raw_stream.read_to_end(&mut response_bytes).unwrap();
+    let mut dec = apack_proto::frame::FrameDecoder::new();
+    let mut off = 0usize;
+    let mut saw_list = false;
+    let mut saw_kill_ok = false;
+    while off < response_bytes.len() {
+        let (consumed, frame) = dec.step(&response_bytes[off..]).unwrap();
+        off += consumed;
+        if let Some(apack_proto::frame::DecodedFrame::Frame { header, payload }) = frame {
+            let msg = BrokerMsg::decode(header.msg_type, &payload).unwrap();
+            if header.req_id == RequestId::from_raw(2)
+                && matches!(msg, BrokerMsg::SessionsList { ref sessions } if sessions.iter().any(|s| s.id == sid_kill))
+            {
+                saw_list = true;
+            }
+            if header.req_id == RequestId::from_raw(3) && matches!(msg, BrokerMsg::Ok) {
+                saw_kill_ok = true;
+            }
+        }
+    }
+    assert!(saw_list, "pipelined ListSessions + FIN_FRAME must deliver SessionsList reply before close");
+    assert!(saw_kill_ok, "pipelined Kill + FIN_FRAME must deliver Ok reply before close");
+
+    drop(client);
+    srv.shutdown().unwrap();
+}

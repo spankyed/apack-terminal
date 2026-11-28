@@ -26,11 +26,14 @@ impl Drop for TokenHandle {
     }
 }
 
-struct LocalMem(HLOCAL);
+/// RAII guard for Win32 heap allocations freed via `LocalFree` (e.g., `GetSecurityInfo`
+/// descriptors and `ConvertSidToStringSidW` buffers).
+pub(crate) struct LocalMem(pub(crate) HLOCAL);
 
 impl Drop for LocalMem {
     fn drop(&mut self) {
-        // SAFETY: `self.0` was allocated by `ConvertSidToStringSidW` and is freed exactly once here.
+        // SAFETY: `self.0` was allocated by a Win32 API documented to require `LocalFree` (or is
+        // null, for which `LocalFree` is a documented no-op) and is freed exactly once here.
         unsafe { LocalFree(self.0) };
     }
 }

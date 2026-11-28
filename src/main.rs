@@ -31,7 +31,7 @@ fn main() -> ExitCode {
             println!("apack-terminal {} (protocol v{PROTOCOL_VERSION})", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        CliCommand::Serve { socket, shards } => {
+        CliCommand::Serve { socket, shards, detached } => {
             let socket_path = match resolve_socket_path(socket) {
                 Ok(p) => p,
                 Err(msg) => {
@@ -58,9 +58,10 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            // Still strictly single-threaded: now that bind succeeded, ignore SIGHUP and redirect
-            // piped startup stderr to /dev/null (NUL on Windows) when running detached.
-            prepare_detached_daemon();
+            // Still strictly single-threaded: ignore SIGHUP when stdin is not a TTY, and redirect
+            // piped startup stderr to /dev/null (NUL on Windows) ONLY when `--detached` was passed
+            // by `proxy` autostart so supervised `serve` invocations keep stderr intact.
+            prepare_detached_daemon(detached);
             if let Err(err) = server.run() {
                 eprintln!("apack-terminal: {err}");
                 return ExitCode::FAILURE;

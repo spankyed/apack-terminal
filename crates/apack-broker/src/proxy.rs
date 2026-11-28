@@ -17,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use apack_os::transport::{
-    HELD_EXIT, configure_detached_command, connect_local_stream, hang_up, verify_peer_is_current_user,
+    HELD_EXIT, configure_detached_command, connect_local_stream, let_go, verify_peer_is_current_user,
 };
 use apack_proto::FIN_FRAME;
 use interprocess::local_socket::Stream;
@@ -32,6 +32,13 @@ const AUTOSTART_STDERR_CAP: usize = 4_096;
 
 /// Maximum time spent waiting for an auto-started local broker to begin listening (`5 s`).
 const AUTOSTART_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum autostart spawn attempts within [`AUTOSTART_TIMEOUT`] on `HELD_EXIT` or clean exit `0`.
+const MAX_AUTOSTART_SPAWNS: usize = 5;
+
+/// Number of quick `connect_verified` polls after `HELD_EXIT` before re-spawning (in case the
+/// concurrent winner exited cleanly before we connected).
+const HELD_CONNECT_POLLS: usize = 4;
 
 /// Bounded buffer capturing client bytes written before the broker sends its first response byte.
 #[derive(Debug, Default)]
@@ -89,24 +96,45 @@ pub fn connect_or_autostart(socket_path: &str, autostart: bool) -> io::Result<St
     connect_or_autostart_with(socket_path, autostart, AUTOSTART_TIMEOUT, |path| spawn_detached_broker(path).map(Some))
 }
 
-fn spawn_stderr_collector(mut stderr: std::process::ChildStderr) -> Option<thread::JoinHandle<String>> {
-    thread::Builder::new()
-        .name(String::from("apack-proxy-stderr"))
-        .spawn(move || {
-            let mut captured = Vec::new();
-            let mut buf = [0u8; 512];
-            while let Ok(n) = stderr.read(&mut buf) {
-                if n == 0 {
-                    break;
+struct StderrCollector {
+    buf: Arc<Mutex<Vec<u8>>>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl StderrCollector {
+    fn spawn(mut stderr: std::process::ChildStderr) -> Option<Self> {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::clone(&buf);
+        let handle = thread::Builder::new()
+            .name(String::from("apack-proxy-stderr"))
+            .spawn(move || {
+                let mut chunk = [0u8; 512];
+                while let Ok(n) = stderr.read(&mut chunk) {
+                    if n == 0 {
+                        break;
+                    }
+                    let mut captured = writer.lock().unwrap_or_else(|e| e.into_inner());
+                    let room = AUTOSTART_STDERR_CAP.saturating_sub(captured.len());
+                    if room != 0 {
+                        captured.extend_from_slice(&chunk[..n.min(room)]);
+                    }
                 }
-                let room = AUTOSTART_STDERR_CAP.saturating_sub(captured.len());
-                if room != 0 {
-                    captured.extend_from_slice(&buf[..n.min(room)]);
-                }
-            }
-            String::from_utf8_lossy(&captured).trim().to_owned()
-        })
-        .ok()
+            })
+            .ok()?;
+        Some(Self { buf, handle: Some(handle) })
+    }
+
+    fn snapshot(&self) -> String {
+        let captured = self.buf.lock().unwrap_or_else(|e| e.into_inner());
+        String::from_utf8_lossy(&captured).trim().to_owned()
+    }
+
+    fn join_and_take(mut self) -> String {
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+        self.snapshot()
+    }
 }
 
 pub(crate) fn reap_child_in_background(mut child: Child) {
@@ -120,10 +148,10 @@ pub(crate) fn connect_or_autostart_with<F>(
     socket_path: &str,
     autostart: bool,
     timeout: Duration,
-    spawn_broker: F,
+    mut spawn_broker: F,
 ) -> io::Result<Stream>
 where
-    F: FnOnce(&str) -> io::Result<Option<Child>>,
+    F: FnMut(&str) -> io::Result<Option<Child>>,
 {
     match connect_verified(socket_path) {
         Ok(stream) => return Ok(stream),
@@ -131,8 +159,11 @@ where
         Err(_) => {}
     }
 
+    let mut spawns = 1usize;
     let mut child = spawn_broker(socket_path)?;
-    let mut stderr_handle = child.as_mut().and_then(|c| c.stderr.take()).and_then(spawn_stderr_collector);
+    let mut stderr_collector = child.as_mut().and_then(|c| c.stderr.take()).and_then(StderrCollector::spawn);
+    let mut needs_respawn = false;
+    let mut held_polls_left = 0usize;
     let started = Instant::now();
     let backoff = Duration::from_millis(15);
     loop {
@@ -144,26 +175,61 @@ where
                 return Ok(stream);
             }
             Err(err) => {
-                if err.kind() == io::ErrorKind::PermissionDenied || started.elapsed() >= timeout {
+                if err.kind() == io::ErrorKind::PermissionDenied {
                     if let Some(c) = child.take() {
                         reap_child_in_background(c);
                     }
                     return Err(err);
+                }
+                if started.elapsed() >= timeout {
+                    let exited = child.as_mut().is_some_and(|c| c.try_wait().ok().flatten().is_some());
+                    if let Some(c) = child.take() {
+                        reap_child_in_background(c);
+                    }
+                    let detail = stderr_collector
+                        .take()
+                        .map(|sc| if exited { sc.join_and_take() } else { sc.snapshot() })
+                        .filter(|s| !s.is_empty());
+                    return Err(match detail {
+                        Some(msg) => io::Error::new(err.kind(), format!("{err}: {msg}")),
+                        None => err,
+                    });
                 }
                 if let Some(c) = child.as_mut()
                     && let Ok(Some(status)) = c.try_wait()
                 {
                     child = None;
                     if status.code() == Some(HELD_EXIT) {
-                        // Another concurrent proxy won the bind race; connect to the winner immediately.
+                        // Another concurrent proxy won the bind race; try connecting to the winner
+                        // briefly, and re-spawn if the winner exited before we connected.
+                        needs_respawn = true;
+                        held_polls_left = HELD_CONNECT_POLLS;
                         continue;
                     }
-                    let detail = stderr_handle
+                    if status.success() {
+                        // Spawned broker exited cleanly (e.g., idle race) before we connected.
+                        needs_respawn = true;
+                        held_polls_left = 0;
+                        continue;
+                    }
+                    let detail = stderr_collector
                         .take()
-                        .and_then(|h| h.join().ok())
+                        .map(StderrCollector::join_and_take)
                         .filter(|s| !s.is_empty())
                         .map_or_else(String::new, |s| format!(": {s}"));
                     return Err(io::Error::other(format!("autostarted broker exited with {status}{detail}")));
+                }
+                if needs_respawn {
+                    if held_polls_left > 0 {
+                        held_polls_left -= 1;
+                    } else if spawns < MAX_AUTOSTART_SPAWNS {
+                        spawns += 1;
+                        needs_respawn = false;
+                        child = spawn_broker(socket_path)?;
+                        stderr_collector =
+                            child.as_mut().and_then(|c| c.stderr.take()).and_then(StderrCollector::spawn);
+                        continue;
+                    }
                 }
                 thread::sleep(backoff);
             }
@@ -185,7 +251,13 @@ fn connect_verified(socket_path: &str) -> io::Result<Stream> {
 fn spawn_detached_broker(socket_path: &str) -> io::Result<Child> {
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
-    cmd.arg("serve").arg("--socket").arg(socket_path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+    cmd.arg("serve")
+        .arg("--detached")
+        .arg("--socket")
+        .arg(socket_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
     configure_detached_command(&mut cmd);
     cmd.spawn()
 }
@@ -214,12 +286,27 @@ pub(crate) fn should_reconnect_proxy(
     first_read_eof && !overflowed && (!stdin_eof || has_replay)
 }
 
-struct ActiveLink {
-    stream: Arc<Stream>,
-    replay: ReplayBuffer,
-    stdin_eof: bool,
-    reconnected: bool,
-    replaying: bool,
+/// Returns whether the replay writer thread should follow replayed client bytes with `FIN_FRAME`.
+pub(crate) fn should_send_replay_fin(write_ok: bool, already_eof: bool, cancelled: bool) -> bool {
+    write_ok && already_eof && !cancelled
+}
+
+/// Marks the first broker byte observed and clears the replay buffer once without locking on later chunks.
+pub(crate) fn mark_broker_byte_and_clear_replay(saw_broker_byte: &AtomicBool, replay: &Mutex<ActiveLink>) -> bool {
+    if !saw_broker_byte.swap(true, Ordering::AcqRel) {
+        replay.lock().unwrap_or_else(|e| e.into_inner()).replay.clear();
+        true
+    } else {
+        false
+    }
+}
+
+pub(crate) struct ActiveLink {
+    pub(crate) stream: Arc<Stream>,
+    pub(crate) replay: ReplayBuffer,
+    pub(crate) stdin_eof: bool,
+    pub(crate) reconnected: bool,
+    pub(crate) replaying: bool,
 }
 
 /// Runs the zero-sniff single-channel byte proxy over arbitrary `stdin`/`stdout` streams, using
@@ -251,7 +338,7 @@ where
         let mut buf = [0u8; PROXY_BUF_BYTES];
         loop {
             match crate::read_retry_eintr(&mut input, &mut buf) {
-                Ok(0) => {
+                Ok(0) | Err(_) => {
                     let current = {
                         let (lock, cond) = &*writer_link;
                         let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -281,7 +368,6 @@ where
                     let mut tx: &Stream = &current;
                     let _ = tx.write_all(&buf[..n]);
                 }
-                Err(err) => return Err(err),
             }
         }
     });
@@ -293,8 +379,7 @@ where
         match crate::read_retry_eintr(&mut broker_rx, &mut out_buf) {
             Ok(0) | Err(_) => break !saw_broker_byte.load(Ordering::Acquire),
             Ok(n) => {
-                saw_broker_byte.store(true, Ordering::Release);
-                link.0.lock().unwrap_or_else(|e| e.into_inner()).replay.clear();
+                mark_broker_byte_and_clear_replay(&saw_broker_byte, &link.0);
                 output.write_all(&out_buf[..n])?;
                 output.flush()?;
             }
@@ -347,7 +432,7 @@ where
             if !replay_cancel_w.load(Ordering::Acquire) {
                 let mut tx2: &Stream = &replay_stream;
                 let write_ok = tx2.write_all(&replay_bytes).and_then(|()| tx2.flush()).is_ok();
-                if write_ok && already_eof {
+                if should_send_replay_fin(write_ok, already_eof, replay_cancel_w.load(Ordering::Acquire)) {
                     let _ = tx2.write_all(&FIN_FRAME);
                     let _ = tx2.flush();
                 }
@@ -382,8 +467,9 @@ where
             }
         };
         replay_cancel.store(true, Ordering::Release);
-        let _ = hang_up(&stream2);
-        let _ = replay_writer.join();
+        let _ = let_go(&stream2, || {
+            let _ = replay_writer.join();
+        });
         read_res?;
     }
 

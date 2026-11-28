@@ -92,7 +92,7 @@ pub fn build_report(sessions: &[SessionSummary], metrics: MetricsSnapshot) -> In
 
 /// Connects to the broker at `socket_path` and collects a live [`InspectReport`].
 pub fn collect_report(socket_path: &str, auth: &AuthConfig) -> Result<InspectReport, ClientError> {
-    let mut client = BrokerClient::connect(socket_path, auth, "apack-inspect")?;
+    let mut client = BrokerClient::connect(socket_path, auth, apack_core::broker::INSPECT_CLIENT_NAME)?;
     let sessions = client.list_sessions()?;
     let metrics = client.metrics()?;
     let _ = client.send_fin();
@@ -118,6 +118,8 @@ pub fn format_report(report: &InspectReport, json: bool) -> String {
     for s in &report.sessions {
         let mode = if s.rewound {
             "rewound"
+        } else if !s.alive {
+            "exited"
         } else if s.kept {
             "kept"
         } else {
