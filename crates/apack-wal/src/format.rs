@@ -318,10 +318,10 @@ pub struct KeyframeV2 {
     pub engine: Option<EngineCheckpoint>,
 }
 
-/// Returns `true` when `raw_len` is large enough that RFC 1950/1951 worst-case stored-block
-/// zlib overhead (6B header/trailer + 5B per 65,535B block) could exceed `max_compressed`.
+/// Returns `true` when `raw_len` is large enough that worst-case `miniz_oxide` Huffman expansion
+/// (up to +12.5% for 9-bit static Huffman symbols plus zlib framing) could exceed `max_compressed`.
 pub(crate) const fn needs_zlib_limit_check(raw_len: usize, max_compressed: usize) -> bool {
-    raw_len.saturating_add(raw_len / 8_192).saturating_add(32) > max_compressed
+    raw_len.saturating_add(raw_len / 8).saturating_add(64) > max_compressed
 }
 
 /// Returns `true` when an optional `EngineCheckpoint` snapshot exceeds [`MAX_ENGINE_SNAPSHOT_BYTES`].

@@ -1677,10 +1677,10 @@ fn pr4_async_close_reaper_panic_guard_backlog_atomic_degrade_and_security() {
     assert!(t_panic.elapsed() < Duration::from_secs(2), "DoneGuard must unblock immediately on panic");
 
     // 3. `needs_zlib_limit_check`, `estimated_memory_bytes`, `fits_limits`, structural pre-clamping, & `degrade_to_limits`.
-    assert!(!needs_zlib_limit_check(0, 32));
-    assert!(needs_zlib_limit_check(0, 31));
-    assert!(!needs_zlib_limit_check(8_192, 8_192 + 1 + 32));
-    assert!(needs_zlib_limit_check(8_192, 8_192 + 32));
+    assert!(!needs_zlib_limit_check(0, 64));
+    assert!(needs_zlib_limit_check(0, 63));
+    assert!(!needs_zlib_limit_check(80, 80 + 10 + 64));
+    assert!(needs_zlib_limit_check(80, 80 + 10 + 63));
     assert!(!is_oversized_engine_snapshot(MAX_ENGINE_SNAPSHOT_BYTES));
     assert!(is_oversized_engine_snapshot(MAX_ENGINE_SNAPSHOT_BYTES + 1));
     assert!(is_oversized_engine_snapshot(MAX_ENGINE_SNAPSHOT_BYTES + 2));

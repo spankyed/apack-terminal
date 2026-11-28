@@ -1847,8 +1847,8 @@ mod image_source_shard_tests {
         let pixels: Vec<u8> = (0..256).map(|i| (i & 0xFF) as u8).collect();
         std::fs::write(&img_path, &pixels).unwrap();
         let path_b64 = String::from_utf8(encoded(img_path.to_string_lossy().as_bytes())).unwrap();
-        // End right at `\x1b\\` (empty `rest_tail`!) to verify `handle_image_source_loaded`'s empty-tail
-        // sync + `close_session_wal`'s `start_segment_on_close` preserve the image on immediate exit!
+        // End right at `\x1b\\` (no trailing text after ST) to verify `close_session_wal`'s
+        // `start_segment_on_close` preserves the image on immediate exit without a manual flush!
         let cmd = format!("\x1b_Ga=T,f=32,s=8,v=8,i=73,t=f,q=2;{path_b64}\x1b\\");
         runner.ingest_pty_bytes(sid_tf, cmd.as_bytes());
         wait_and_drain_image(&mut runner, sid_tf);
