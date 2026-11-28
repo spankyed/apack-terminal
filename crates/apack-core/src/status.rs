@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use apack_proto::MAX_STATUSES;
 use apack_proto::types::{BlockedKind, Confirmed, StatusRecord, StatusState};
 
-use crate::time::TimestampMs;
+use crate::time::WallMs;
 use crate::truncate_utf8;
 use crate::vt::ProgramStatusUpdate;
 
@@ -217,14 +217,14 @@ impl StatusTable {
     /// Parses and ingests an `OSC 7501;<payload>` sequence.
     ///
     /// Malformed payloads or unknown states are ignored safely (total parser).
-    pub fn ingest(&mut self, payload: &str, now: TimestampMs, effects: &mut Vec<StatusEffect>) {
+    pub fn ingest(&mut self, payload: &str, now: WallMs, effects: &mut Vec<StatusEffect>) {
         if let Some(update) = parse_osc7501(payload) {
             self.ingest_update(update, now, effects);
         }
     }
 
     /// Ingests an already-parsed [`ProgramStatusUpdate`] directly (immune to delimiter injection).
-    pub fn ingest_update(&mut self, update: ProgramStatusUpdate, now: TimestampMs, effects: &mut Vec<StatusEffect>) {
+    pub fn ingest_update(&mut self, update: ProgramStatusUpdate, now: WallMs, effects: &mut Vec<StatusEffect>) {
         let (id, state, kind, progress, own_app, title, message) = match update {
             ProgramStatusUpdate::Clear { id } => {
                 let id = truncate_utf8(&id, MAX_FIELD_BYTES);

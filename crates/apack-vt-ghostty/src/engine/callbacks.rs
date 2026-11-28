@@ -337,16 +337,16 @@ pub(crate) fn sanitize_osc633_body(body: &str, truncated: bool) -> Option<String
     Some(body.to_owned())
 }
 
-/// Escapes `\` / `;` / `\n` / `\r` in an already-decoded command string so `MarksTracker`'s
-/// `OSC 133;E;<cmd>` parser recovers the exact original command verbatim.
+/// Percent-encodes `%` / `;` / `\n` / `\r` in an already-decoded command string so `MarksTracker`'s
+/// `%XX` `OSC 133;E;<cmd>` decoder recovers the exact original command verbatim (including backslashes).
 pub(crate) fn escape_osc633_field(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
         match ch {
-            '\\' => out.push_str("\\\\"),
-            ';' => out.push_str("\\x3b"),
-            '\n' => out.push_str("\\x0a"),
-            '\r' => out.push_str("\\x0d"),
+            '%' => out.push_str("%25"),
+            ';' => out.push_str("%3B"),
+            '\n' => out.push_str("%0A"),
+            '\r' => out.push_str("%0D"),
             other => out.push(other),
         }
     }

@@ -36,6 +36,26 @@ impl TimestampMs {
     }
 }
 
+/// Explicit wall-clock Unix epoch timestamp in milliseconds (used for WAL timelines and
+/// user-facing command/status metadata; never mixed with monotonic [`TimestampMs`] timers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct WallMs(u64);
+
+impl WallMs {
+    /// Zero Unix epoch timestamp.
+    pub const ZERO: Self = Self(0);
+
+    /// Wraps a raw Unix epoch millisecond timestamp.
+    pub const fn from_millis(ms: u64) -> Self {
+        Self(ms)
+    }
+
+    /// Returns the raw Unix epoch millisecond count.
+    pub const fn as_millis(self) -> u64 {
+        self.0
+    }
+}
+
 /// Opaque non-zero identifier for a scheduled timer entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TimerId(NonZeroU64);

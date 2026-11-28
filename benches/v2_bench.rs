@@ -776,6 +776,7 @@ fn capture_keyframe(engine: &GhosttyEngine, size: GridSize, cell_px: CellPx) -> 
         images: engine.images(),
         marks_key: None,
         marks_last_seq: 0,
+        marks_active_vouched_seq: None,
         marks_refused: 0,
         commands: vec![],
     };

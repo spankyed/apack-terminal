@@ -949,6 +949,7 @@ mod image_source_shard_tests {
             images: vec![],
             marks_key: None,
             marks_last_seq: 0,
+            marks_active_vouched_seq: None,
             marks_refused: 0,
             commands: vec![],
         };

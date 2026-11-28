@@ -46,6 +46,10 @@ fn cli_parsing_config_and_helpers() {
     assert!(resolve_socket_path(None).is_ok());
 
     assert!(now_unix_ms() > 1_000_000_000_000);
+    assert_eq!(crate::now_wall_ms().as_millis() / 1_000_000_000_000, now_unix_ms() / 1_000_000_000_000);
+    let m1 = crate::now_monotonic_ms();
+    let m2 = crate::now_monotonic_ms();
+    assert!(m1.as_millis() >= 1 && m2 >= m1, "monotonic clock must be >= 1 and non-decreasing");
     let mut r1 = [0u8; 32];
     let mut r2 = [0u8; 32];
     fill_random(&mut r1).unwrap();

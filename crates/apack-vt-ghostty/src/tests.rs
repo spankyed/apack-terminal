@@ -590,7 +590,7 @@ fn callbacks_injection_safe_status_clear_osc133_escaping_coalescing_and_session_
     assert_eq!(decode_osc7_cwd("/bare/100%20literal%2f"), "/bare/100%20literal%2f");
 
     // OSC 133 command escaping & truncated OSC 633 sanitization helpers
-    assert_eq!(escape_osc633_field("echo a; C:\\foo\n\r"), "echo a\\x3b C:\\\\foo\\x0a\\x0d");
+    assert_eq!(escape_osc633_field("echo 50%; C:\\foo\n\r"), "echo 50%25%3B C:\\foo%0A%0D");
     assert_eq!(sanitize_osc633_body("P;Cwd=/tmp", false).as_deref(), Some("P;Cwd=/tmp"));
     assert_eq!(sanitize_osc633_body("P;Cwd=/tmp", true), None);
     assert_eq!(
@@ -643,7 +643,12 @@ fn callbacks_injection_safe_status_clear_osc133_escaping_coalescing_and_session_
         key.as_str(),
         key.as_str()
     );
-    sess.on_pty_output(chunk.as_bytes(), TimestampMs::from_millis(100), &mut fx);
+    sess.on_pty_output(
+        chunk.as_bytes(),
+        TimestampMs::from_millis(100),
+        apack_core::time::WallMs::from_millis(100),
+        &mut fx,
+    );
     let mut out_fx = Vec::new();
     sess.handle_stream_msg(
         k1,

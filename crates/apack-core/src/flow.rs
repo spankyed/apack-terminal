@@ -316,6 +316,33 @@ impl RawOutputFlow {
         }
     }
 
+    /// Flushes all buffered `pending_utf8` bytes (and any incomplete trailing UTF-8 sequence as
+    /// U+FFFD) into `max_chunk_bytes`-bounded UTF-8 chunks when the session exits, releasing the
+    /// pending bytes from `budget` so the caller can enqueue them strictly before `StreamClosed`.
+    pub fn flush_on_exit(&mut self, budget: &mut MemoryBudget) -> Vec<String> {
+        let mut chunks = Vec::new();
+        let pending_len = self.pending_utf8.len();
+        if pending_len != 0 {
+            let buffered = core::mem::take(&mut self.pending_utf8);
+            budget.release(pending_len);
+            let text = String::from_utf8(buffered).unwrap_or_default();
+            let mut offset = 0usize;
+            while offset < text.len() {
+                // `max_chunk_bytes >= 4` guarantees at least one complete UTF-8 scalar fits.
+                let step = floor_char_boundary(&text[offset..], self.max_chunk_bytes);
+                chunks.push(String::from(&text[offset..offset + step]));
+                offset += step;
+            }
+        }
+        if self.utf8_tail_len != 0 {
+            self.utf8_tail_len = 0;
+            if self.backpressure_pty || self.credit_bytes > 0 {
+                chunks.push(String::from("\u{FFFD}"));
+            }
+        }
+        chunks
+    }
+
     /// Replenishes byte credit (paying down any `0..=3` UTF-8 boundary debt first) and drains buffered output.
     pub fn grant_credit(&mut self, bytes: u32, now: TimestampMs, budget: &mut MemoryBudget) -> RawOutputDelta {
         let paid = bytes.min(u32::from(self.credit_debt));

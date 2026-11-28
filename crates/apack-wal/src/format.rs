@@ -219,6 +219,8 @@ pub struct VisualKeyframe {
     pub marks_key: Option<MarksKey>,
     /// Last accepted monotonic vouched mark sequence number.
     pub marks_last_seq: u64,
+    /// Vouched sequence number of the currently running keyed command, if any.
+    pub marks_active_vouched_seq: Option<u64>,
     /// Total refused forged/replayed marks.
     pub marks_refused: u64,
     /// Bounded command history ring (`<= MAX_COMMANDS`).
@@ -246,6 +248,7 @@ impl VisualKeyframe {
         w.slice(&self.images, |w, img| img.encode(w));
         w.opt(self.marks_key.as_ref(), |w, key| key.encode(w));
         w.var_u64(self.marks_last_seq);
+        w.opt(self.marks_active_vouched_seq.as_ref(), |w, seq| w.var_u64(*seq));
         w.var_u64(self.marks_refused);
         w.slice(&self.commands, |w, cmd| cmd.encode(w));
     }
@@ -262,6 +265,7 @@ impl VisualKeyframe {
         let images = r.vec_bounded(MAX_VISUAL_IMAGES, "visual images", ImagePlacement::decode)?;
         let marks_key = r.opt(MarksKey::decode)?;
         let marks_last_seq = r.var_u64()?;
+        let marks_active_vouched_seq = r.opt(Reader::var_u64)?;
         let marks_refused = r.var_u64()?;
         let commands = r.vec_bounded(MAX_COMMANDS, "visual commands", CommandRecord::decode)?;
         Ok(Self {
@@ -276,6 +280,7 @@ impl VisualKeyframe {
             images,
             marks_key,
             marks_last_seq,
+            marks_active_vouched_seq,
             marks_refused,
             commands,
         })

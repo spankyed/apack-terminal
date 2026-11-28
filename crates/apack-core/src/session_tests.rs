@@ -11,12 +11,16 @@ use crate::lease::ConnId;
 use crate::marks::{MarkEffect, MarksMode, MarksTracker};
 use crate::session::{SessionEffect, SessionMachine, StreamAttachmentId};
 use crate::status::StatusTable;
-use crate::time::TimestampMs;
+use crate::time::{TimestampMs, WallMs};
 use crate::vt::{CompressStep, DirtyViewport, PasteEncode, VtEngine, VtEvent, VtGenerations, VtSnapshotMeta};
 use crate::{MAX_WAITERS_PER_SESSION, SEARCH_COALESCE_MS, SYNC_HOLD_MAX_MS};
 
 fn ts(ms: u64) -> TimestampMs {
     TimestampMs::from_millis(ms)
+}
+
+fn wall(ms: u64) -> WallMs {
+    WallMs::from_millis(ms)
 }
 
 fn sid(n: u64) -> SessionId {
@@ -411,84 +415,101 @@ fn marks_tracker_keyed_immunity_supersede_exit_ring_and_unescape() {
 
     let k = key.as_str();
     // Unvouched marks, OSC 7 CWD, bad keys, leading-zero/zero/sign seqs are ignored/refused in Keyed mode
-    keyed.on_osc133("A", 0, ts(1), &mut fx);
-    keyed.on_osc633("C", 1, ts(2), &mut fx);
-    keyed.on_osc633("D;0", 2, ts(3), &mut fx);
+    keyed.on_osc133("A", 0, wall(1), &mut fx);
+    keyed.on_osc633("C", 1, wall(2), &mut fx);
+    keyed.on_osc633("D;0", 2, wall(3), &mut fx);
     keyed.on_cwd("/untrusted-osc7");
     assert_eq!(keyed.last_cwd(), None);
 
-    keyed.on_osc633("V;S;1;ffffffffffffffffffffffffffffffff;cmd", 2, ts(4), &mut fx);
-    keyed.on_osc633("V;S;1;short;cmd", 2, ts(5), &mut fx);
-    keyed.on_osc633(&format!("V;S;0;{k};cmd"), 2, ts(6), &mut fx);
-    keyed.on_osc633(&format!("V;S;01;{k};cmd"), 2, ts(7), &mut fx);
-    keyed.on_osc633(&format!("V;S;+1;{k};cmd"), 2, ts(8), &mut fx);
-    keyed.on_osc633(&format!("V;A;1;{k};extra"), 2, ts(9), &mut fx);
-    keyed.on_osc633(&format!("V;X;1;{k};unknown"), 2, ts(9), &mut fx);
+    keyed.on_osc633("V", 2, wall(4), &mut fx);
+    keyed.on_osc633("V;S;1;ffffffffffffffffffffffffffffffff;cmd", 2, wall(4), &mut fx);
+    keyed.on_osc633("V;S;1;short;cmd", 2, wall(5), &mut fx);
+    keyed.on_osc633(&format!("V;S;0;{k};cmd"), 2, wall(6), &mut fx);
+    keyed.on_osc633(&format!("V;S;01;{k};cmd"), 2, wall(7), &mut fx);
+    keyed.on_osc633(&format!("V;S;+1;{k};cmd"), 2, wall(8), &mut fx);
+    keyed.on_osc633(&format!("V;S;{};{k};max-seq", u64::MAX), 2, wall(8), &mut fx);
+    keyed.on_osc633(&format!("V;A;1;{k};extra"), 2, wall(9), &mut fx);
+    keyed.on_osc633(&format!("V;X;1;{k};unknown"), 2, wall(9), &mut fx);
     assert!(fx.is_empty());
     assert!(keyed.commands().is_empty());
     assert!(!keyed.is_idle());
-    assert_eq!(keyed.refused(), 7);
+    assert_eq!(keyed.refused(), 9);
 
     // Valid vouched prompt arrival (seq=1) + replay rejection (seq=1 again!)
-    keyed.on_osc633(&format!("V;A;1;{k}"), 10, ts(10), &mut fx);
+    keyed.on_osc633(&format!("V;A;1;{k}"), 10, wall(10), &mut fx);
     assert!(keyed.is_idle());
     assert_eq!(fx, vec![MarkEffect::PromptArrived]);
     fx.clear();
-    keyed.on_osc633(&format!("V;A;1;{k}"), 10, ts(11), &mut fx);
+    keyed.on_osc633(&format!("V;A;1;{k}"), 10, wall(11), &mut fx);
     assert!(fx.is_empty());
-    assert_eq!(keyed.refused(), 8);
+    assert_eq!(keyed.refused(), 10);
 
-    // Valid vouched Start (seq=2) with unescaping + replay rejection (seq=2 again!) + mismatched Finish (seq=99)
-    keyed.on_osc633(&format!("V;S;2;{k};echo\\x20\\x61\\x42"), 11, ts(13), &mut fx);
+    // Valid vouched Start (seq=2) with %XX percent-decoding (preserving backslashes!) + replay rejection + mismatched Finish
+    keyed.on_osc633(&format!("V;S;2;{k};echo%20%61%42%20C:\\temp\\x41"), 11, wall(13), &mut fx);
     assert!(!keyed.is_idle());
+    assert_eq!(keyed.active_vouched_seq(), Some(2));
     assert!(matches!(
         &fx[0],
-        MarkEffect::CommandStarted(r) if r.id == 2 && r.command.as_deref() == Some("echo aB") && r.prompt_line == Some(10)
+        MarkEffect::CommandStarted(r)
+            if r.id == 2 && r.command.as_deref() == Some("echo aB C:\\temp\\x41") && r.prompt_line == Some(10)
     ));
-    assert_eq!(keyed.find_command(2).and_then(|c| c.command.as_deref()), Some("echo aB"));
+    assert_eq!(keyed.find_command(2).and_then(|c| c.command.as_deref()), Some("echo aB C:\\temp\\x41"));
     assert!(keyed.find_command(999).is_none());
     fx.clear();
-    keyed.on_osc633(&format!("V;S;2;{k};replay"), 12, ts(14), &mut fx);
-    keyed.on_osc633(&format!("V;F;99;{k};0;/tmp"), 12, ts(15), &mut fx);
-    keyed.on_osc633(&format!("V;F;2;{k};+0;/tmp"), 12, ts(16), &mut fx);
-    keyed.on_osc633(&format!("V;F;2;{k};0"), 12, ts(17), &mut fx); // missing cwd semicolon
+    keyed.on_osc633(&format!("V;S;2;{k};replay"), 12, wall(14), &mut fx);
+    keyed.on_osc633(&format!("V;F;99;{k};0;/tmp"), 12, wall(15), &mut fx);
+    keyed.on_osc633(&format!("V;F;2;{k};+0;/tmp"), 12, wall(16), &mut fx);
+    keyed.on_osc633(&format!("V;F;2;{k};0"), 12, wall(17), &mut fx); // missing cwd semicolon
     assert!(fx.is_empty());
-    assert_eq!(keyed.refused(), 12);
+    assert_eq!(keyed.refused(), 14);
 
-    // Valid vouched Finish (seq=2) with exit code -7 & unescaped CWD (all hex + invalid hex + \\ + trailing \)
-    keyed.on_osc633(&format!("V;F;2;{k};-7;/tmp/a\\x3bb\\x3fc\\x3Fd\\x4Ae\\x3g\\xg3\\\\f\\"), 15, ts(20), &mut fx);
+    // Valid vouched Finish (seq=2) with exit code -7 & %XX CWD (all hex + stray % + Windows UNC backslashes):
+    // MUST also write the finished `cwd` onto CommandRecord #2!
+    keyed.on_osc633(&format!("V;F;2;{k};-7;\\\\server\\share\\a%3bb%3fc%3Fd%4Ae%3g%g3%"), 15, wall(20), &mut fx);
     assert!(keyed.is_idle());
-    assert_eq!(keyed.last_cwd(), Some("/tmp/a;b?c?dJe\\x3g\\xg3\\f\\"));
-    assert_eq!(fx[0], MarkEffect::CwdChanged("/tmp/a;b?c?dJe\\x3g\\xg3\\f\\".into()));
+    assert_eq!(keyed.active_vouched_seq(), None);
+    let expected_cwd = "\\\\server\\share\\a;b?c?dJe%3g%g3%";
+    assert_eq!(keyed.last_cwd(), Some(expected_cwd));
+    assert_eq!(fx[0], MarkEffect::CwdChanged(expected_cwd.into()));
     assert!(matches!(
         &fx[1],
-        MarkEffect::CommandFinished(r) if r.outcome == CommandOutcome::Exited(VouchedExitCode::from_vouched(-7)) && r.end_line == Some(15)
+        MarkEffect::CommandFinished(r)
+            if r.outcome == CommandOutcome::Exited(VouchedExitCode::from_vouched(-7))
+                && r.end_line == Some(15)
+                && r.cwd.as_deref() == Some(expected_cwd)
     ));
+    assert_eq!(keyed.find_command(2).and_then(|c| c.cwd.as_deref()), Some(expected_cwd));
     assert_eq!(fx[2], MarkEffect::PromptArrived);
 
     // Finish without active command is refused
     fx.clear();
-    keyed.on_osc633(&format!("V;F;2;{k};0;/tmp"), 15, ts(20), &mut fx);
+    keyed.on_osc633(&format!("V;F;2;{k};0;/tmp"), 15, wall(20), &mut fx);
     assert!(fx.is_empty());
-    assert_eq!(keyed.refused(), 13);
+    assert_eq!(keyed.refused(), 15);
 
-    // Command 3: NoStatus (empty status field, empty cwd)
+    // Command 3: NoStatus (empty status field, same cwd -> NO duplicate CwdChanged, still records cwd)
     fx.clear();
-    keyed.on_osc633(&format!("V;S;3;{k};ls"), 16, ts(21), &mut fx);
+    keyed.on_osc633(&format!("V;S;3;{k};ls"), 16, wall(21), &mut fx);
     assert!(matches!(&fx[0], MarkEffect::CommandStarted(r) if r.id == 3));
     fx.clear();
-    keyed.on_osc633(&format!("V;F;3;{k};;"), 17, ts(22), &mut fx);
+    keyed.on_osc633(&format!("V;F;3;{k};;\\\\server\\share\\a%3bb%3fc%3Fd%4Ae%3g%g3%"), 17, wall(22), &mut fx);
+    assert!(
+        !fx.iter().any(|e| matches!(e, MarkEffect::CwdChanged(_))),
+        "unchanged CWD on V;F must not emit duplicate CwdChanged"
+    );
     assert!(matches!(
         &fx[0],
-        MarkEffect::CommandFinished(r) if r.outcome == CommandOutcome::Unknown(UnknownReason::NoStatus)
+        MarkEffect::CommandFinished(r)
+            if r.outcome == CommandOutcome::Unknown(UnknownReason::NoStatus)
+                && r.cwd.as_deref() == Some(expected_cwd)
     ));
 
     // Command 4 -> Superseded by Command 5 -> SessionEnded
     fx.clear();
-    keyed.on_osc633(&format!("V;S;4;{k};sleep"), 18, ts(23), &mut fx);
+    keyed.on_osc633(&format!("V;S;4;{k};sleep"), 18, wall(23), &mut fx);
     assert!(matches!(&fx[0], MarkEffect::CommandStarted(r) if r.id == 4));
     fx.clear();
-    keyed.on_osc633(&format!("V;S;5;{k};pwd"), 19, ts(24), &mut fx);
+    keyed.on_osc633(&format!("V;S;5;{k};pwd"), 19, wall(24), &mut fx);
     assert!(matches!(
         &fx[0],
         MarkEffect::CommandFinished(r) if r.outcome == CommandOutcome::Unknown(UnknownReason::Superseded)
@@ -499,45 +520,55 @@ fn marks_tracker_keyed_immunity_supersede_exit_ring_and_unescape() {
     assert!(
         keyed.commands().iter().all(|c| c.prompt_line.is_none() && c.output_line.is_none() && c.end_line.is_none())
     );
-    keyed.on_session_exit(ts(30), &mut fx);
+    keyed.on_session_exit(wall(30), &mut fx);
     assert!(matches!(
         &fx[0],
         MarkEffect::CommandFinished(r) if r.outcome == CommandOutcome::Unknown(UnknownReason::SessionEnded)
     ));
 
-    // Claimed mode: V;... is refused (never read as claim), OSC 7 updates cwd, E/P/A/C/D & MAX_COMMANDS ring cap
+    // Claimed mode: bare `V` and `V;...` are refused (never read as claim), OSC 7 / P;Cwd dedup, E preserves `;`
     let mut claimed = MarksTracker::new(MarksMode::Claimed);
     fx.clear();
-    claimed.on_osc633(&format!("V;S;1;{k};nope"), 0, ts(1), &mut fx);
+    claimed.on_osc633("V", 0, wall(1), &mut fx);
+    claimed.on_osc633(&format!("V;S;1;{k};nope"), 0, wall(1), &mut fx);
     assert!(fx.is_empty());
-    assert_eq!(claimed.refused(), 1);
-    claimed.on_cwd("/from-osc7");
+    assert_eq!(claimed.refused(), 2);
+    assert_eq!(claimed.on_cwd("/from-osc7"), Some(String::from("/from-osc7")));
+    assert_eq!(claimed.on_cwd("/from-osc7"), None, "unchanged OSC 7 CWD must dedup");
     assert_eq!(claimed.last_cwd(), Some("/from-osc7"));
-    claimed.on_osc633("P;Cwd=/from-633", 0, ts(2), &mut fx);
-    assert_eq!(claimed.last_cwd(), Some("/from-633"));
-    claimed.on_osc633("E;echo hi", 0, ts(3), &mut fx);
-    claimed.on_osc633("A", 0, ts(4), &mut fx);
+    fx.clear();
+    claimed.on_osc633("P;Cwd=/from-633%20dir", 0, wall(2), &mut fx);
+    assert_eq!(claimed.last_cwd(), Some("/from-633 dir"));
+    assert_eq!(fx, vec![MarkEffect::CwdChanged(String::from("/from-633 dir"))]);
+    fx.clear();
+    claimed.on_osc633("P;Cwd=/from-633%20dir", 0, wall(2), &mut fx);
+    assert!(fx.is_empty(), "unchanged P;Cwd must not emit duplicate CwdChanged");
+    claimed.on_osc633("E;echo a; echo%20b", 0, wall(3), &mut fx);
+    claimed.on_osc633("A", 0, wall(4), &mut fx);
     assert!(claimed.is_idle());
     fx.clear();
-    claimed.on_osc133("C", 1, ts(5), &mut fx);
-    assert!(matches!(&fx[0], MarkEffect::CommandStarted(r) if r.id == 1 && r.command.as_deref() == Some("echo hi")));
+    claimed.on_osc133("C", 1, wall(5), &mut fx);
+    assert!(matches!(
+        &fx[0],
+        MarkEffect::CommandStarted(r) if r.id == 1 && r.command.as_deref() == Some("echo a; echo b")
+    ));
     // Empty E; leaves pending_command None, and monotonic id advances 1 -> 2
-    claimed.on_osc633("E;", 1, ts(5), &mut fx);
+    claimed.on_osc633("E;", 1, wall(5), &mut fx);
     fx.clear();
-    claimed.on_osc133("C", 2, ts(6), &mut fx); // supersede in Claimed mode
+    claimed.on_osc133("C", 2, wall(6), &mut fx); // supersede in Claimed mode
     assert!(matches!(&fx[1], MarkEffect::CommandStarted(r) if r.id == 2 && r.command.is_none()));
     for i in 0..=(MAX_COMMANDS as u64 + 2) {
         fx.clear();
-        claimed.on_osc133("C", i, ts(i), &mut fx);
-        claimed.on_osc133("D;7", i + 1, ts(i + 1), &mut fx);
+        claimed.on_osc133("C", i, wall(i), &mut fx);
+        claimed.on_osc133("D;7", i + 1, wall(i + 1), &mut fx);
     }
     assert_eq!(claimed.commands().len(), MAX_COMMANDS);
     assert_eq!(claimed.commands().last().unwrap().outcome, CommandOutcome::Claimed(Some(7)));
 
     fx.clear();
-    claimed.on_osc133("C", 999, ts(999), &mut fx);
+    claimed.on_osc133("C", 999, wall(999), &mut fx);
     fx.clear();
-    claimed.on_session_exit(ts(1000), &mut fx);
+    claimed.on_session_exit(wall(1000), &mut fx);
     assert!(matches!(&fx[0], MarkEffect::CommandFinished(r) if r.outcome == CommandOutcome::Claimed(None)));
 }
 
@@ -550,13 +581,13 @@ fn status_table_parsing_lru_eviction_and_async_confirmation() {
     let mut fx = Vec::new();
 
     // Malformed / missing state ignored
-    table.ingest("id=x;message=hi", ts(1), &mut fx);
-    table.ingest("state=bogus", ts(2), &mut fx);
+    table.ingest("id=x;message=hi", wall(1), &mut fx);
+    table.ingest("state=bogus", wall(2), &mut fx);
     assert!(table.is_empty());
     assert!(fx.is_empty());
 
     // Root Blocked status with kind, progress, app, title, message
-    table.ingest("state=blocked;kind=permission;progress=50;app=claude;title=Run;message=Allow?", ts(10), &mut fx);
+    table.ingest("state=blocked;kind=permission;progress=50;app=claude;title=Run;message=Allow?", wall(10), &mut fx);
     assert!(!table.is_empty());
     assert_eq!(table.len(), 1);
     let root = table.root().unwrap();
@@ -582,7 +613,7 @@ fn status_table_parsing_lru_eviction_and_async_confirmation() {
 
     // Empty app/title/message stay None; question & error variants parsed
     fx.clear();
-    table.ingest("state=blocked;kind=question;app=;title=;message=;progress=101", ts(25), &mut fx);
+    table.ingest("state=blocked;kind=question;app=;title=;message=;progress=101", wall(25), &mut fx);
     let root = table.root().unwrap();
     assert_eq!(root.changed, 2);
     assert_eq!(root.since_ms, 10);
@@ -592,26 +623,26 @@ fn status_table_parsing_lru_eviction_and_async_confirmation() {
     assert_eq!(root.message, None);
     assert_eq!(root.progress, None);
 
-    table.ingest("state=blocked;kind=auth", ts(26), &mut fx);
+    table.ingest("state=blocked;kind=auth", wall(26), &mut fx);
     assert_eq!(table.root().unwrap().kind, Some(BlockedKind::Auth));
 
-    table.ingest("state=error;kind=permission", ts(30), &mut fx);
+    table.ingest("state=error;kind=permission", wall(30), &mut fx);
     assert_eq!(table.root().unwrap().state, StatusState::Error);
     assert_eq!(table.root().unwrap().since_ms, 30);
     assert_eq!(table.root().unwrap().kind, None);
 
-    table.ingest("state=working", ts(32), &mut fx);
+    table.ingest("state=working", wall(32), &mut fx);
     assert_eq!(table.root().unwrap().state, StatusState::Working);
 
     // Odd-byte overlong UTF-8 lands mid-char at byte 512 ("a" + 300*"é" -> byte 511 is valid boundary!)
     let mut long_msg = String::from("a");
     long_msg.push_str(&"é".repeat(300));
-    table.ingest(&format!("id=long;state=done;message={long_msg}"), ts(35), &mut fx);
+    table.ingest(&format!("id=long;state=done;message={long_msg}"), wall(35), &mut fx);
     assert_eq!(table.get("long").unwrap().message.as_ref().unwrap().len(), 511);
 
     // Exceeding MAX_STATUSES evicts oldest non-root entry while preserving root ""
     for i in 0..(MAX_STATUSES + 5) {
-        table.ingest(&format!("id=sub-{i};state=idle"), ts(100 + i as u64), &mut fx);
+        table.ingest(&format!("id=sub-{i};state=idle"), wall(100 + i as u64), &mut fx);
     }
     assert_eq!(table.len(), MAX_STATUSES);
     assert!(table.root().is_some());
@@ -626,7 +657,7 @@ fn session_machine_view_dirty_tracking_and_individual_publish_triggers() {
     let mut fx = Vec::new();
 
     // No views attached -> on_pty_output does NOT emit ViewsDirty
-    sess.on_pty_output(b"NOOP", ts(1), &mut fx);
+    sess.on_pty_output(b"NOOP", ts(1), wall(1), &mut fx);
     assert!(!fx.contains(&SessionEffect::ViewsDirty));
 
     sess.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
@@ -643,8 +674,8 @@ fn session_machine_view_dirty_tracking_and_individual_publish_triggers() {
     assert!(!sess.try_publish_view(k1, |_| true)); // completely clean
 
     // 1. Dirty row + scroll_up shifts dirty row index from 2 -> 1 and exposes row 3
-    sess.on_pty_output(b"DIRTY_ROW2", ts(10), &mut fx);
-    sess.on_pty_output(b"SCROLL", ts(11), &mut fx);
+    sess.on_pty_output(b"DIRTY_ROW2", ts(10), wall(10), &mut fx);
+    sess.on_pty_output(b"SCROLL", ts(11), wall(11), &mut fx);
     assert!(sess.try_publish_view(k1, |f| {
         assert!(!f.full_sync);
         assert_eq!(f.scroll_delta, 1);
@@ -655,9 +686,9 @@ fn session_machine_view_dirty_tracking_and_individual_publish_triggers() {
     }));
 
     // 2. Scroll down shifts dirty row 0 -> 1 and exposes row 0; OOB dirty row ignored
-    sess.on_pty_output(b"hello", ts(12), &mut fx); // row 0 dirty
-    sess.on_pty_output(b"SCROLL_DOWN", ts(13), &mut fx); // shifts row 0 -> row 1, marks row 0
-    sess.on_pty_output(b"DIRTY_OOB", ts(14), &mut fx); // row 4 == rows -> ignored
+    sess.on_pty_output(b"hello", ts(12), wall(12), &mut fx); // row 0 dirty
+    sess.on_pty_output(b"SCROLL_DOWN", ts(13), wall(13), &mut fx); // shifts row 0 -> row 1, marks row 0
+    sess.on_pty_output(b"DIRTY_OOB", ts(14), wall(14), &mut fx); // row 4 == rows -> ignored
     assert!(sess.try_publish_view(k1, |f| {
         assert!(!f.full_sync);
         assert_eq!(f.scroll_delta, -1);
@@ -667,7 +698,7 @@ fn session_machine_view_dirty_tracking_and_individual_publish_triggers() {
     }));
 
     // 3. Scroll >= rows triggers full_sync
-    sess.on_pty_output(b"BIG_SCROLL", ts(15), &mut fx);
+    sess.on_pty_output(b"BIG_SCROLL", ts(15), wall(15), &mut fx);
     assert!(sess.try_publish_view(k1, |f| {
         assert!(f.full_sync);
         assert_eq!(f.scroll_delta, 0);
@@ -683,7 +714,7 @@ fn session_machine_view_dirty_tracking_and_individual_publish_triggers() {
         (&b"IMAGES"[..], false),
         (&b"ALT"[..], true),
     ] {
-        sess.on_pty_output(cmd, ts(20), &mut fx);
+        sess.on_pty_output(cmd, ts(20), wall(20), &mut fx);
         assert!(
             sess.try_publish_view(k1, |f| {
                 assert_eq!(f.palette.is_some(), check_palette);
@@ -898,7 +929,7 @@ fn session_machine_marks_search_waiters_command_output_and_exit() {
 
     // Initial PTY output emits all VT events + CommandStarted (id=1) + VerifyForeground + DeviceResponse
     fx.clear();
-    sess.on_pty_output(b"hello needle", ts(100), &mut fx);
+    sess.on_pty_output(b"hello needle", ts(100), wall(100), &mut fx);
     assert_eq!(sess.title(), "t1");
     assert_eq!(sess.drain_pty_write(32), b"\x1b[1;1R");
     assert!(fx.iter().any(|e| matches!(e, SessionEffect::VerifyForeground { app, .. } if app == "tool")));
@@ -975,7 +1006,7 @@ fn session_machine_marks_search_waiters_command_output_and_exit() {
         &mut fx,
     );
     fx.clear();
-    sess.on_pty_output(b"SCROLL", ts(200), &mut fx);
+    sess.on_pty_output(b"SCROLL", ts(200), wall(200), &mut fx);
     assert!(fx.iter().any(|e| matches!(
         e,
         SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. }
@@ -990,7 +1021,7 @@ fn session_machine_marks_search_waiters_command_output_and_exit() {
 
     // Epoch change via ALT marks search for full refresh on next SearchFlush
     fx.clear();
-    sess.on_pty_output(b"ALT", ts(400), &mut fx);
+    sess.on_pty_output(b"ALT", ts(400), wall(400), &mut fx);
     sess.poll_timers(ts(400 + SEARCH_COALESCE_MS), &mut fx);
     assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::SearchMatches { .. }, .. })));
 
@@ -1084,13 +1115,13 @@ fn session_machine_marks_search_waiters_command_output_and_exit() {
     // sets is_alive = false, and calling on_process_exit a second time is a no-op!
     fx.clear();
     sess.register_wait(conn(1), RequestId::from_raw(14), WaitCondition::Exit, 500, ts(450), &mut fx);
-    sess.on_process_exit(Some(0), None, ts(460), &mut fx);
+    sess.on_process_exit(Some(0), None, wall(460), &mut fx);
     assert!(!sess.is_alive());
     assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Exited }, .. } if *req_id == RequestId::from_raw(11))));
     assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Exited }, .. } if *req_id == RequestId::from_raw(12))));
     assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. } if *req_id == RequestId::from_raw(14))));
     fx.clear();
-    sess.on_process_exit(Some(1), None, ts(465), &mut fx);
+    sess.on_process_exit(Some(1), None, wall(465), &mut fx);
     assert!(fx.is_empty());
 
     // After exit: WaitCondition::Exit resolves Met immediately; WaitCondition::Idle resolves Exited immediately
@@ -1105,7 +1136,7 @@ fn session_machine_marks_search_waiters_command_output_and_exit() {
     let mut s2 = SessionMachine::new(sid(2), vt2, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
     s2.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
     fx.clear();
-    s2.on_pty_output(b"x", ts(500), &mut fx);
+    s2.on_pty_output(b"x", ts(500), wall(500), &mut fx);
     assert!(s2.is_sync_held());
     assert!(!fx.contains(&SessionEffect::ViewsDirty)); // suppressed while sync-held!
     assert!(!s2.try_publish_view(k1, |_| true));
@@ -1145,7 +1176,7 @@ fn session_machine_marks_search_waiters_command_output_and_exit() {
         &mut fx,
     );
     fx.clear();
-    s3.on_pty_output(b"done", ts(2_010), &mut fx);
+    s3.on_pty_output(b"done", ts(2_010), wall(2_010), &mut fx);
     assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. } if *req_id == RequestId::from_raw(90))));
     // Hostile/unattributed `state=done` without `app=` stays Confirmed::Unknown and MUST NOT wake WaitCondition::Status!
     assert!(!fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Waited { .. }, .. } if *req_id == RequestId::from_raw(91))));
@@ -1153,7 +1184,7 @@ fn session_machine_marks_search_waiters_command_output_and_exit() {
     fx.clear();
     s3.vt_mut().next_events =
         vec![VtEvent::ProgramStatus(crate::status::parse_osc7501("state=done;app=agent").unwrap())];
-    s3.on_pty_output(b"v", ts(2_015), &mut fx);
+    s3.on_pty_output(b"v", ts(2_015), wall(2_015), &mut fx);
     let ch_s3 = fx
         .iter()
         .find_map(|e| match e {
@@ -1187,7 +1218,7 @@ fn session_edge_cases_and_boundary_invariants() {
     assert!(sess.try_publish_view(k1, |_| true)); // initial full sync establishes last_epoch = Some(1)
 
     // Same epoch + full_dirty=true -> full_sync frame!
-    sess.on_pty_output(b"FULL_DIRTY", ts(1), &mut fx);
+    sess.on_pty_output(b"FULL_DIRTY", ts(1), wall(1), &mut fx);
     let mut full_seen = false;
     assert!(sess.try_publish_view(k1, |f| {
         full_seen = f.full_sync;
@@ -1196,8 +1227,8 @@ fn session_edge_cases_and_boundary_invariants() {
     assert!(full_seen);
 
     // Dirty row 0 + scroll +1 -> row 0 shifts to -1 and is dropped (no rows in frame, only scroll_delta = +1)
-    sess.on_pty_output(b"DIRTY_ROW0", ts(2), &mut fx);
-    sess.on_pty_output(b"SCROLL_ONLY", ts(3), &mut fx);
+    sess.on_pty_output(b"DIRTY_ROW0", ts(2), wall(2), &mut fx);
+    sess.on_pty_output(b"SCROLL_ONLY", ts(3), wall(3), &mut fx);
     let mut frame_rows = Vec::new();
     let mut frame_delta = 0;
     assert!(sess.try_publish_view(k1, |f| {
@@ -1209,8 +1240,8 @@ fn session_edge_cases_and_boundary_invariants() {
     assert!(frame_rows.is_empty());
 
     // Dirty row 3 (rows - 1) + scroll -1 -> row 3 shifts to 4 (== rows) and is dropped!
-    sess.on_pty_output(b"DIRTY_ROW3", ts(4), &mut fx);
-    sess.on_pty_output(b"SCROLL_DOWN_ONLY", ts(5), &mut fx);
+    sess.on_pty_output(b"DIRTY_ROW3", ts(4), wall(4), &mut fx);
+    sess.on_pty_output(b"SCROLL_DOWN_ONLY", ts(5), wall(5), &mut fx);
     assert!(sess.try_publish_view(k1, |f| {
         frame_rows = f.rows.iter().map(|r| r.line).collect();
         frame_delta = f.scroll_delta;
@@ -1220,7 +1251,7 @@ fn session_edge_cases_and_boundary_invariants() {
     assert!(frame_rows.is_empty());
 
     // Dirty OOB row (r == rows) must be ignored -> frame must NOT even publish!
-    sess.on_pty_output(b"DIRTY_OOB", ts(6), &mut fx);
+    sess.on_pty_output(b"DIRTY_OOB", ts(6), wall(6), &mut fx);
     assert!(!sess.try_publish_view(k1, |_| true));
 
     // 2. attach_stream viewport_seq monotonicity: attaching 2 views with initial_viewport under LatestActive
@@ -1283,7 +1314,7 @@ fn session_edge_cases_and_boundary_invariants() {
         SessionMachine::new(sid(13), vt_st, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
     s_st.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
     fx.clear();
-    s_st.on_pty_output(b"NOOP", ts(10), &mut fx);
+    s_st.on_pty_output(b"NOOP", ts(10), wall(10), &mut fx);
     s_st.apply_status_confirmation("", 1, Confirmed::Matched, &mut fx);
     assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::ProgramStatus(r), .. } if r.confirmed == Confirmed::Matched)));
 
@@ -1311,17 +1342,17 @@ fn session_edge_cases_and_boundary_invariants() {
         &mut fx,
     );
     assert_eq!(s_srch.next_deadline(), None);
-    s_srch.on_pty_output(b"NOOP", ts(10), &mut fx);
+    s_srch.on_pty_output(b"NOOP", ts(10), wall(10), &mut fx);
     assert_eq!(s_srch.next_deadline(), None); // kills > -> >= and < -> <= in compute_dirty_abs_range and && -> ||!
 
     // Register WaitCondition::Text for "row-two" on row 2 (abs = 2): kills abs + 1 -> abs - 1 / abs * 1!
     fx.clear();
     s_srch.register_wait(conn(1), RequestId::from_raw(2), WaitCondition::Text("row-two".into()), 500, ts(20), &mut fx);
-    s_srch.on_pty_output(b"DIRTY_ROW2", ts(20), &mut fx);
+    s_srch.on_pty_output(b"DIRTY_ROW2", ts(20), wall(20), &mut fx);
     assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. } if *req_id == RequestId::from_raw(2))));
     assert_eq!(s_srch.next_deadline(), Some(ts(20 + SEARCH_COALESCE_MS)));
     // Second dirty chunk before SearchFlush deadline must preserve the original coalesce deadline!
-    s_srch.on_pty_output(b"DIRTY_ROW3", ts(100), &mut fx);
+    s_srch.on_pty_output(b"DIRTY_ROW3", ts(100), wall(100), &mut fx);
     assert_eq!(s_srch.next_deadline(), Some(ts(20 + SEARCH_COALESCE_MS)));
 
     // 6. apply_resize: cell_px-only change (new_epoch == prev_epoch) must NOT clear mark line anchors!
@@ -1334,10 +1365,10 @@ fn session_edge_cases_and_boundary_invariants() {
     let mut s_rs =
         SessionMachine::new(sid(15), vt_rs, ResizePolicy::ExplicitOverride, MarksMode::Claimed, CellPx::default());
     s_rs.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
-    s_rs.on_pty_output(b"NOOP", ts(10), &mut fx);
+    s_rs.on_pty_output(b"NOOP", ts(10), wall(10), &mut fx);
     // Single-line command output (start_line == end_line == 0): kills start_line > end_line -> >= and ==!
     // Also send a subsequent normal NOOP chunk (epoch unchanged) to prove marks are NOT wiped (kills epoch_changed != -> ==)!
-    s_rs.on_pty_output(b"NOOP", ts(11), &mut fx);
+    s_rs.on_pty_output(b"NOOP", ts(11), wall(11), &mut fx);
     fx.clear();
     s_rs.handle_stream_msg(
         k1,
@@ -1356,7 +1387,7 @@ fn session_edge_cases_and_boundary_invariants() {
         ClientMsg::SetSearch { query: "foo".into(), case_sensitive: true },
         &mut fx,
     );
-    s_rs.on_pty_output(b"DIRTY_ROW2", ts(12), &mut fx); // schedules SearchFlush timer
+    s_rs.on_pty_output(b"DIRTY_ROW2", ts(12), wall(12), &mut fx); // schedules SearchFlush timer
 
     // CellPx-only resize keeps same epoch -> mark anchors survive!
     s_rs.handle_stream_msg(
@@ -1404,8 +1435,8 @@ fn session_edge_cases_and_boundary_invariants() {
     let mut s_cmd =
         SessionMachine::new(sid(16), vt_cmd, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
     s_cmd.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
-    s_cmd.on_pty_output(b"NOOP", ts(10), &mut fx);
-    s_cmd.on_pty_output(b"CURSOR_HOME", ts(11), &mut fx);
+    s_cmd.on_pty_output(b"NOOP", ts(10), wall(10), &mut fx);
+    s_cmd.on_pty_output(b"CURSOR_HOME", ts(11), wall(11), &mut fx);
     fx.clear();
     s_cmd.handle_stream_msg(
         k1,
@@ -1423,7 +1454,7 @@ fn session_edge_cases_and_boundary_invariants() {
         SessionMachine::new(sid(17), vt_cmd2, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
     fx.clear();
     s_idle.register_wait(conn(1), RequestId::from_raw(1), WaitCondition::Idle, 500, ts(10), &mut fx);
-    s_idle.on_pty_output(b"NOOP", ts(20), &mut fx);
+    s_idle.on_pty_output(b"NOOP", ts(20), wall(20), &mut fx);
     assert!(!fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Waited { .. }, .. })));
 }
 
@@ -1439,8 +1470,8 @@ fn session_security_hardening_and_audit_fixes() {
     let mut sess = SessionMachine::new(sid(20), vt, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
     sess.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
     assert!(sess.try_publish_view(k1, |_| true));
-    sess.on_pty_output(b"SCROLL_ONLY", ts(1), &mut fx);
-    sess.on_pty_output(b"SCROLL_DOWN_ONLY", ts(2), &mut fx);
+    sess.on_pty_output(b"SCROLL_ONLY", ts(1), wall(1), &mut fx);
+    sess.on_pty_output(b"SCROLL_DOWN_ONLY", ts(2), wall(2), &mut fx);
     let mut full = false;
     assert!(sess.try_publish_view(k1, |f| {
         full = f.full_sync;
@@ -1449,15 +1480,15 @@ fn session_security_hardening_and_audit_fixes() {
     assert!(full);
 
     // Scrollback eviction + scrollback clear both trigger frame updates even without dirty viewport rows
-    sess.on_pty_output(b"SCROLL", ts(3), &mut fx);
+    sess.on_pty_output(b"SCROLL", ts(3), wall(3), &mut fx);
     assert!(sess.try_publish_view(k1, |_| true));
-    sess.on_pty_output(b"EVICT_SB", ts(4), &mut fx);
+    sess.on_pty_output(b"EVICT_SB", ts(4), wall(4), &mut fx);
     assert!(sess.try_publish_view(k1, |f| {
         assert_eq!(f.first_active_line, 2);
         assert_eq!(f.scrollback_lines, 1);
         true
     }));
-    sess.on_pty_output(b"CLEAR_SB", ts(5), &mut fx);
+    sess.on_pty_output(b"CLEAR_SB", ts(5), wall(5), &mut fx);
     assert!(sess.try_publish_view(k1, |f| {
         assert_eq!(f.scrollback_lines, 0);
         true
@@ -1520,7 +1551,7 @@ fn session_security_hardening_and_audit_fixes() {
         SessionMachine::new(sid(21), vt_ev, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
     s_ev.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
     fx.clear();
-    s_ev.on_pty_output(b"NOOP", ts(10), &mut fx);
+    s_ev.on_pty_output(b"NOOP", ts(10), wall(10), &mut fx);
     assert!(fx.iter().any(|e| matches!(
         e,
         SessionEffect::Send { msg: BrokerMsg::Progress { state: ProgressState::Indeterminate, percent: None }, .. }
@@ -1559,18 +1590,18 @@ fn session_security_hardening_and_audit_fixes() {
         None,
         &mut fx,
     );
-    s_sync.on_pty_output(b"x", ts(1_000), &mut fx);
+    s_sync.on_pty_output(b"x", ts(1_000), wall(1_000), &mut fx);
     assert_eq!(s_sync.next_deadline(), Some(ts(1_000 + SYNC_HOLD_MAX_MS)));
     // Attempt starvation at t=1900 by toggling 2026l + 2026h without publishing a frame
-    s_sync.on_pty_output(b"SYNC_REARM", ts(1_900), &mut fx);
+    s_sync.on_pty_output(b"SYNC_REARM", ts(1_900), wall(1_900), &mut fx);
     assert_eq!(s_sync.next_deadline(), Some(ts(1_000 + SYNC_HOLD_MAX_MS))); // NOT pushed to 2900!
     // After expiry at t=2000, trying to re-arm at t=2050 BEFORE publishing still does NOT hold!
     s_sync.poll_timers(ts(2_000), &mut fx);
     assert!(!s_sync.is_sync_held());
-    s_sync.on_pty_output(b"SYNC_REARM", ts(2_050), &mut fx);
+    s_sync.on_pty_output(b"SYNC_REARM", ts(2_050), wall(2_050), &mut fx);
     assert!(!s_sync.is_sync_held());
     assert!(s_sync.try_publish_view(k1, |_| true)); // publishing resets anti-starvation window!
-    s_sync.on_pty_output(b"SYNC_REARM", ts(2_100), &mut fx);
+    s_sync.on_pty_output(b"SYNC_REARM", ts(2_100), wall(2_100), &mut fx);
     assert!(s_sync.is_sync_held());
 
     // DSR sub-quota leaves half the queue free for interactive user input!
@@ -1594,7 +1625,7 @@ fn session_security_hardening_and_audit_fixes() {
         10,
     );
     s_dsr.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
-    s_dsr.on_pty_output(b"NOOP", ts(1), &mut fx);
+    s_dsr.on_pty_output(b"NOOP", ts(1), wall(1), &mut fx);
     assert_eq!(s_dsr.pty_write_len(), 0); // 6 > 10/2 rejected!
     s_dsr.handle_stream_msg(
         k1,
@@ -1607,7 +1638,7 @@ fn session_security_hardening_and_audit_fixes() {
 
     // on_process_exit releases sync hold, clears pty_write_queue, and rejects subsequent PTY writes
     fx.clear();
-    s_sync.on_process_exit(Some(0), None, ts(2_200), &mut fx);
+    s_sync.on_process_exit(Some(0), None, wall(2_200), &mut fx);
     assert!(!s_sync.is_sync_held());
     assert_eq!(s_sync.pty_write_len(), 0);
     assert!(fx.contains(&SessionEffect::ViewsDirty));
@@ -1655,14 +1686,14 @@ fn session_security_hardening_and_audit_fixes() {
         &mut fx,
     );
     // Evicting scrollback advances oldest_line -> schedules SearchFlush and emits eviction SearchDelta [0, 1)
-    s_s.on_pty_output(b"SCROLL", ts(10), &mut fx);
-    s_s.on_pty_output(b"EVICT_SB", ts(11), &mut fx);
+    s_s.on_pty_output(b"SCROLL", ts(10), wall(10), &mut fx);
+    s_s.on_pty_output(b"EVICT_SB", ts(11), wall(11), &mut fx);
     fx.clear();
     s_s.poll_timers(ts(10 + SEARCH_COALESCE_MS), &mut fx);
     assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::SearchDelta { from_line: 0, to_line: 1, added, .. }, .. } if added.is_empty())));
 
     // Clearing search cancels pending SearchFlush timer
-    s_s.on_pty_output(b"DIRTY_ROW2", ts(300), &mut fx);
+    s_s.on_pty_output(b"DIRTY_ROW2", ts(300), wall(300), &mut fx);
     assert!(s_s.next_deadline().is_some());
     s_s.handle_stream_msg(
         k1,
@@ -1723,7 +1754,7 @@ fn session_security_hardening_and_audit_fixes() {
         ClientMsg::SetSearch { query: "row".into(), case_sensitive: true },
         &mut fx,
     );
-    s_s.on_pty_output(b"DIRTY_ROW2", ts(400), &mut fx);
+    s_s.on_pty_output(b"DIRTY_ROW2", ts(400), wall(400), &mut fx);
     assert!(s_s.next_deadline().is_some());
     s_s.detach_stream(k1, &mut fx);
     assert_eq!(s_s.next_deadline(), None);
@@ -1741,7 +1772,7 @@ fn session_security_hardening_and_audit_fixes() {
     let mut s_ep =
         SessionMachine::new(sid(26), vt_ep, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
     s_ep.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
-    s_ep.on_pty_output(b"ALT", ts(1), &mut fx);
+    s_ep.on_pty_output(b"ALT", ts(1), wall(1), &mut fx);
     fx.clear();
     s_ep.handle_stream_msg(
         k1,
@@ -1766,9 +1797,9 @@ fn session_security_hardening_and_audit_fixes() {
     let mut s_sd =
         SessionMachine::new(sid(27), vt_sd, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
     s_sd.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, &mut fx);
-    s_sd.on_pty_output(b"NOOP", ts(100), &mut fx);
+    s_sd.on_pty_output(b"NOOP", ts(100), wall(100), &mut fx);
     s_sd.poll_timers(ts(100 + SYNC_HOLD_MAX_MS), &mut fx);
-    s_sd.on_pty_output(b"SYNC_REARM", ts(100 + SYNC_HOLD_MAX_MS), &mut fx);
+    s_sd.on_pty_output(b"SYNC_REARM", ts(100 + SYNC_HOLD_MAX_MS), wall(100 + SYNC_HOLD_MAX_MS), &mut fx);
     assert!(!s_sd.is_sync_held());
 
     //    - enqueue_device_response exact boundary (next == dsr_cap succeeds) & rejected when !alive!
@@ -1782,17 +1813,17 @@ fn session_security_hardening_and_audit_fixes() {
         CellPx::default(),
         10,
     );
-    s_dr.on_pty_output(b"NOOP", ts(1), &mut fx);
+    s_dr.on_pty_output(b"NOOP", ts(1), wall(1), &mut fx);
     assert_eq!(s_dr.pty_write_len(), 5); // exact dsr_cap = 10/2 = 5 succeeds!
-    s_dr.on_process_exit(Some(0), None, ts(2), &mut fx);
+    s_dr.on_process_exit(Some(0), None, wall(2), &mut fx);
     assert_eq!(s_dr.pty_write_len(), 0);
     // Feed DeviceResponse after process exit -> must be ignored!
     let mut vt_dr2 = StubVt::new(40, 4);
     vt_dr2.next_events = vec![VtEvent::DeviceResponse(b"ok".to_vec())];
     let mut s_dr2 =
         SessionMachine::new(sid(29), vt_dr2, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
-    s_dr2.on_process_exit(Some(0), None, ts(1), &mut fx);
-    s_dr2.on_pty_output(b"NOOP", ts(2), &mut fx);
+    s_dr2.on_process_exit(Some(0), None, wall(1), &mut fx);
+    s_dr2.on_pty_output(b"NOOP", ts(2), wall(2), &mut fx);
     assert_eq!(s_dr2.pty_write_len(), 0);
 
     //    - CLEAR_SB alone (no dirty rows, oldest_line advances 0 -> 1) schedules SearchFlush!
@@ -1804,7 +1835,7 @@ fn session_security_hardening_and_audit_fixes() {
     let mut s_sf =
         SessionMachine::new(sid(30), vt_sf, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
     s_sf.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
-    s_sf.on_pty_output(b"SCROLL", ts(1), &mut fx); // first_active_line=1, scrollback=1, oldest=0
+    s_sf.on_pty_output(b"SCROLL", ts(1), wall(1), &mut fx); // first_active_line=1, scrollback=1, oldest=0
     s_sf.handle_stream_msg(
         k1,
         att_for(k1),
@@ -1814,7 +1845,7 @@ fn session_security_hardening_and_audit_fixes() {
     );
     assert_eq!(s_sf.next_deadline(), None);
     // CLEAR_SB sets scrollback=0 -> oldest advances 0 -> 1 with NO dirty rows -> schedules SearchFlush!
-    s_sf.on_pty_output(b"CLEAR_SB", ts(10), &mut fx);
+    s_sf.on_pty_output(b"CLEAR_SB", ts(10), wall(10), &mut fx);
     assert_eq!(s_sf.next_deadline(), Some(ts(10 + SEARCH_COALESCE_MS)));
     fx.clear();
     s_sf.poll_timers(ts(10 + SEARCH_COALESCE_MS), &mut fx);
@@ -1824,7 +1855,7 @@ fn session_security_hardening_and_audit_fixes() {
     );
 
     // DIRTY_ROW2 on __OOB_SPAN__: retains ONLY the 1 valid span (drops start < from and end == to), emits 1 delta!
-    s_sf.on_pty_output(b"DIRTY_ROW2", ts(300), &mut fx);
+    s_sf.on_pty_output(b"DIRTY_ROW2", ts(300), wall(300), &mut fx);
     fx.clear();
     s_sf.poll_timers(ts(300 + SEARCH_COALESCE_MS), &mut fx);
     let deltas: Vec<_> = fx
@@ -1846,7 +1877,7 @@ fn session_security_hardening_and_audit_fixes() {
         ClientMsg::SetSearch { query: "__EXACT_LIMIT__".into(), case_sensitive: true },
         &mut fx,
     );
-    s_sf.on_pty_output(b"DIRTY_ROW2", ts(600), &mut fx);
+    s_sf.on_pty_output(b"DIRTY_ROW2", ts(600), wall(600), &mut fx);
     fx.clear();
     s_sf.poll_timers(ts(600 + SEARCH_COALESCE_MS), &mut fx);
     assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::SearchDelta { added, truncated: false, .. }, .. } if added.len() == MAX_SEARCH_MATCHES)));
@@ -1858,14 +1889,14 @@ fn session_security_hardening_and_audit_fixes() {
         ClientMsg::SetSearch { query: "__OVER_LIMIT__".into(), case_sensitive: true },
         &mut fx,
     );
-    s_sf.on_pty_output(b"DIRTY_ROW2", ts(900), &mut fx);
+    s_sf.on_pty_output(b"DIRTY_ROW2", ts(900), wall(900), &mut fx);
     fx.clear();
     s_sf.poll_timers(ts(900 + SEARCH_COALESCE_MS), &mut fx);
     assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::SearchDelta { added, truncated: true, .. }, .. } if added.len() == MAX_SEARCH_MATCHES)));
 
     // Dirty row 0 evicted before SearchFlush -> clamped_from == clamped_to -> only eviction delta emitted, no empty dirty delta!
-    s_sf.on_pty_output(b"DIRTY_ROW0", ts(1200), &mut fx); // dirty_range = [1, 2)
-    s_sf.on_pty_output(b"EVICT_SB", ts(1201), &mut fx); // first_active=2, scrollback=0, oldest=2!
+    s_sf.on_pty_output(b"DIRTY_ROW0", ts(1200), wall(1200), &mut fx); // dirty_range = [1, 2)
+    s_sf.on_pty_output(b"EVICT_SB", ts(1201), wall(1201), &mut fx); // first_active=2, scrollback=0, oldest=2!
     // Wait: EVICT_SB sets first_active=2 > 1 so dirty_range expands to [2, 6); instead use a fresh watch where only CLEAR_SB evicts:
     let mut vt_cl = StubVt::new(40, 4);
     vt_cl.dirty.full_dirty = false;
@@ -1879,14 +1910,14 @@ fn session_security_hardening_and_audit_fixes() {
         ClientMsg::SetSearch { query: "row".into(), case_sensitive: true },
         &mut fx,
     );
-    s_cl.on_pty_output(b"DIRTY_ROW0", ts(1), &mut fx); // dirty_range = [0, 1)
-    s_cl.on_pty_output(b"SCROLL", ts(2), &mut fx); // first_active=1, scrollback=1, oldest=0
+    s_cl.on_pty_output(b"DIRTY_ROW0", ts(1), wall(1), &mut fx); // dirty_range = [0, 1)
+    s_cl.on_pty_output(b"SCROLL", ts(2), wall(2), &mut fx); // first_active=1, scrollback=1, oldest=0
     // Flush first, then mark row 0 dirty at line 1, then advance oldest past line 1 via CLEAR_SB after another scroll:
     s_cl.poll_timers(ts(200), &mut fx);
-    s_cl.on_pty_output(b"DIRTY_ROW0", ts(300), &mut fx); // dirty_range = [1, 2)
+    s_cl.on_pty_output(b"DIRTY_ROW0", ts(300), wall(300), &mut fx); // dirty_range = [1, 2)
     // Make oldest jump to 2 without expanding dirty_range past 2: first_active=1, scrollback=1 -> SCROLL -> first_active=2, scrollback=2 -> wait, let's test clamp_span & extract_command_output < oldest directly!
-    s_cl.on_pty_output(b"SCROLL", ts(301), &mut fx); // first_active=2, scrollback=2
-    s_cl.on_pty_output(b"CLEAR_SB", ts(302), &mut fx); // oldest=2, max_line=5, cols=40 (max_col=39)!
+    s_cl.on_pty_output(b"SCROLL", ts(301), wall(301), &mut fx); // first_active=2, scrollback=2
+    s_cl.on_pty_output(b"CLEAR_SB", ts(302), wall(302), &mut fx); // oldest=2, max_line=5, cols=40 (max_col=39)!
 
     // Command started at line 0 before scrollback eviction -> start_line < oldest (0 < 2) -> None!
     // Command started at line 3 -> start_line > oldest (3 > 2) -> Some!
@@ -1900,9 +1931,9 @@ fn session_security_hardening_and_audit_fixes() {
     let mut s_co =
         SessionMachine::new(sid(32), vt_co, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
     s_co.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
-    s_co.on_pty_output(b"SCROLL", ts(1), &mut fx);
-    s_co.on_pty_output(b"SCROLL", ts(2), &mut fx);
-    s_co.on_pty_output(b"CLEAR_SB", ts(3), &mut fx); // oldest = 2, total_lines = 6
+    s_co.on_pty_output(b"SCROLL", ts(1), wall(1), &mut fx);
+    s_co.on_pty_output(b"SCROLL", ts(2), wall(2), &mut fx);
+    s_co.on_pty_output(b"CLEAR_SB", ts(3), wall(3), &mut fx); // oldest = 2, total_lines = 6
     fx.clear();
     s_co.handle_stream_msg(
         k1,
@@ -1989,9 +2020,9 @@ fn status_clear_per_stream_held_buttons_and_resize_side_effects() {
     // 1. StatusTable Clear + ingest_update invariant enforcement (progress <= 100, non-empty optional strings)
     let mut table = StatusTable::new();
     let mut sfx = Vec::new();
-    table.ingest("state=blocked;kind=permission;progress=50;app=claude", ts(10), &mut sfx);
+    table.ingest("state=blocked;kind=permission;progress=50;app=claude", wall(10), &mut sfx);
     assert!(table.root().is_some());
-    table.ingest("state=clear", ts(20), &mut sfx);
+    table.ingest("state=clear", wall(20), &mut sfx);
     assert!(table.root().is_none());
 
     table.ingest_update(
@@ -2004,7 +2035,7 @@ fn status_clear_per_stream_held_buttons_and_resize_side_effects() {
             title: Some("ok;with=sep".into()),
             message: Some("msg;state=done".into()),
         },
-        ts(30),
+        wall(30),
         &mut sfx,
     );
     let sub = table.get("sub").unwrap();
@@ -2013,7 +2044,7 @@ fn status_clear_per_stream_held_buttons_and_resize_side_effects() {
     assert_eq!(sub.app, None);
     assert_eq!(sub.title.as_deref(), Some("ok;with=sep"));
     assert_eq!(sub.message.as_deref(), Some("msg;state=done"));
-    table.ingest_update(ProgramStatusUpdate::Clear { id: "sub".into() }, ts(40), &mut sfx);
+    table.ingest_update(ProgramStatusUpdate::Clear { id: "sub".into() }, wall(40), &mut sfx);
     assert!(table.get("sub").is_none());
 
     // 2. Per-stream held_buttons isolated across streams and cleared on blur & detach
@@ -2070,7 +2101,7 @@ fn status_clear_per_stream_held_buttons_and_resize_side_effects() {
     let mut s_rs =
         SessionMachine::new(sid(41), vt_rs, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
     s_rs.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, &mut fx);
-    s_rs.on_pty_output(b"HOLD", ts(100), &mut fx);
+    s_rs.on_pty_output(b"HOLD", ts(100), wall(100), &mut fx);
     assert!(s_rs.is_sync_held());
     fx.clear();
     s_rs.handle_stream_msg(
@@ -2114,7 +2145,7 @@ fn session_machine_runtime_accessors_and_nonblocking_pty_peek_consume() {
         VtEvent::Osc633 { payload: format!("V;F;1;{};0;/home/me", key.as_str()), cursor_line: 1 },
         VtEvent::Osc633 { payload: String::from("V;S;2;ffffffffffffffffffffffffffffffff;bad"), cursor_line: 1 },
     ];
-    sess.on_pty_output(b"run", ts(10), &mut fx);
+    sess.on_pty_output(b"run", ts(10), wall(10), &mut fx);
     assert_eq!(sess.marks_last_seq(), 1);
     assert_eq!(sess.marks_refused(), 1);
     assert_eq!(sess.cwd(), Some("/home/me"));
@@ -2165,6 +2196,7 @@ fn session_machine_runtime_accessors_and_nonblocking_pty_peek_consume() {
             cell_px: new_px,
             marks_mode: MarksMode::Keyed(key),
             marks_last_seq: 5,
+            marks_active_vouched_seq: None,
             marks_refused: 2,
             commands: Vec::new(),
         },
@@ -2255,14 +2287,14 @@ fn review_mutants_rows_budget_clamp_rect_and_logical_line_expansion() {
     // Dirtying only row 1 must expand the search delta range to [1, 3) (covering wrapped row 2)!
     s.vt_mut().cursor.row = 1;
     s.vt_mut().dirty = DirtyViewport { scroll_delta: 0, dirty_rows: vec![1], full_dirty: false };
-    s.on_pty_output(b"NOOP", ts(10), &mut fx);
+    s.on_pty_output(b"NOOP", ts(10), wall(10), &mut fx);
     fx.clear();
     s.poll_timers(ts(200), &mut fx);
     assert_eq!(s.vt().last_search_range.get(), (1, 3));
     // Dirtying only row 2 must expand backward to [1, 3) as well!
     s.vt_mut().cursor.row = 2;
     s.vt_mut().dirty = DirtyViewport { scroll_delta: 0, dirty_rows: vec![2], full_dirty: false };
-    s.on_pty_output(b"NOOP", ts(300), &mut fx);
+    s.on_pty_output(b"NOOP", ts(300), wall(300), &mut fx);
     fx.clear();
     s.poll_timers(ts(500), &mut fx);
     assert_eq!(s.vt().last_search_range.get(), (1, 3));
@@ -2342,7 +2374,7 @@ fn review_mutants_rows_budget_clamp_rect_and_logical_line_expansion() {
     assert!(!fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Waited { .. }, .. })));
     s_trunc.vt_mut().rows[190] = String::from("prefix __TRUNC__LATE_MARKER suffix");
     s_trunc.vt_mut().dirty = DirtyViewport { scroll_delta: 0, dirty_rows: vec![190], full_dirty: false };
-    s_trunc.on_pty_output(b"NOOP", ts(30), &mut fx);
+    s_trunc.on_pty_output(b"NOOP", ts(30), wall(30), &mut fx);
     assert!(fx.iter().any(|e| matches!(
         e,
         SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. }
@@ -2478,18 +2510,18 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
     // 2. Prefix-based hierarchical Clear, ancestor app inheritance & propagation, identical-report dedup, on_session_exit.
     let mut table = StatusTable::new();
     let mut sfx = Vec::new();
-    table.ingest("state=working;app=claude;title=Root", ts(10), &mut sfx);
+    table.ingest("state=working;app=claude;title=Root", wall(10), &mut sfx);
     assert_eq!(table.root().unwrap().app.as_deref(), Some("claude"));
     // Identical report is deduplicated -> zero effects, revision unchanged!
     sfx.clear();
     let rev_before = table.root().unwrap().changed;
-    table.ingest("state=working;app=claude;title=Root", ts(11), &mut sfx);
+    table.ingest("state=working;app=claude;title=Root", wall(11), &mut sfx);
     assert!(sfx.is_empty(), "identical status report must be deduplicated");
     assert_eq!(table.root().unwrap().changed, rev_before);
 
     // Child without `app` inherits ancestor `app=claude` AND emits VerifyForeground!
     sfx.clear();
-    table.ingest("id=build;state=working", ts(12), &mut sfx);
+    table.ingest("id=build;state=working", wall(12), &mut sfx);
     assert_eq!(table.get("build").unwrap().app.as_deref(), Some("claude"));
     assert!(
         sfx.iter()
@@ -2498,11 +2530,11 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
 
     // Grandchild inherits from nearest ancestor; sibling with explicit own_app stays independent.
     sfx.clear();
-    table.ingest("id=build/test;state=blocked;kind=permission", ts(13), &mut sfx);
+    table.ingest("id=build/test;state=blocked;kind=permission", wall(13), &mut sfx);
     assert_eq!(table.get("build/test").unwrap().app.as_deref(), Some("claude"));
-    table.ingest("id=build/own;state=done;app=cargo", ts(14), &mut sfx);
+    table.ingest("id=build/own;state=done;app=cargo", wall(14), &mut sfx);
     assert_eq!(table.get("build/own").unwrap().app.as_deref(), Some("cargo"));
-    table.ingest("id=builder;state=error", ts(15), &mut sfx);
+    table.ingest("id=builder;state=error", wall(15), &mut sfx);
     assert_eq!(table.get("builder").unwrap().app.as_deref(), Some("claude"));
 
     // Updating root `own_app` propagates to inheriting descendants (`build`, `build/test`, `builder`) but NOT `build/own`!
@@ -2510,7 +2542,7 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
     let build_rev_before = table.get("build").unwrap().changed;
     assert!(!table.apply_confirmation("build", build_rev_before, Confirmed::Unknown, &mut sfx));
     sfx.clear();
-    table.ingest("state=working;app=codex;title=Root", ts(16), &mut sfx);
+    table.ingest("state=working;app=codex;title=Root", wall(16), &mut sfx);
     let root_rev = table.root().unwrap().changed;
     assert_eq!(table.get("build").unwrap().app.as_deref(), Some("codex"));
     assert!(table.get("build").unwrap().changed > root_rev, "descendant revision must strictly exceed ancestor");
@@ -2521,13 +2553,13 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
     // Clearing root `own_app` (app=) clears inherited app on descendants, and setting a non-root
     // ancestor `own_app` propagates ONLY to its descendants (never to unrelated siblings like `builder`)!
     sfx.clear();
-    table.ingest("state=working;title=Root", ts(17), &mut sfx);
+    table.ingest("state=working;title=Root", wall(17), &mut sfx);
     assert_eq!(table.get("build").unwrap().app, None);
     assert_eq!(table.get("build/test").unwrap().app, None);
     assert_eq!(table.get("builder").unwrap().app, None);
     assert_eq!(table.get("build/own").unwrap().app.as_deref(), Some("cargo"));
     sfx.clear();
-    table.ingest("id=build;state=working;app=make", ts(17), &mut sfx);
+    table.ingest("id=build;state=working;app=make", wall(17), &mut sfx);
     assert_eq!(table.get("build/test").unwrap().app.as_deref(), Some("make"));
     assert_eq!(
         table.get("builder").unwrap().app,
@@ -2537,7 +2569,7 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
 
     // Hierarchical Clear: `id=build` clears `build`, `build/test`, `build/own` but leaves `builder` and root intact!
     sfx.clear();
-    table.ingest("id=build;state=clear", ts(18), &mut sfx);
+    table.ingest("id=build;state=clear", wall(18), &mut sfx);
     assert!(table.get("build").is_none());
     assert!(table.get("build/test").is_none());
     assert!(table.get("build/own").is_none());
@@ -2546,8 +2578,8 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
 
     // on_session_exit clears active (`Working`/`Idle`/`Blocked`) and retains terminal (`Error`/`Done`).
     sfx.clear();
-    table.ingest("id=done1;state=done", ts(19), &mut sfx);
-    table.ingest("id=idle1;state=idle", ts(19), &mut sfx);
+    table.ingest("id=done1;state=done", wall(19), &mut sfx);
+    table.ingest("id=idle1;state=idle", wall(19), &mut sfx);
     sfx.clear();
     table.on_session_exit(&mut sfx);
     assert!(table.root().is_none(), "active root Working must clear on exit");
@@ -2557,7 +2589,7 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
 
     // Clear with empty id clears everything.
     sfx.clear();
-    table.ingest("state=clear", ts(20), &mut sfx);
+    table.ingest("state=clear", wall(20), &mut sfx);
     assert!(table.is_empty());
 
     // 2b. MAX_STATUSES LRU eviction of an ancestor with `own_app` refreshes surviving descendants (`M1`):
@@ -2565,17 +2597,17 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
         let mut ev_table = StatusTable::new();
         let mut efx = Vec::new();
         // Oldest non-root entry ("anc") declares `own_app = Some("oldapp")`.
-        ev_table.ingest("id=anc;state=working;app=oldapp", ts(1), &mut efx);
+        ev_table.ingest("id=anc;state=working;app=oldapp", wall(1), &mut efx);
         // Newer descendant ("anc/child") inherits `app = Some("oldapp")` from "anc".
-        ev_table.ingest("id=anc/child;state=working", ts(2), &mut efx);
+        ev_table.ingest("id=anc/child;state=working", wall(2), &mut efx);
         assert_eq!(ev_table.get("anc/child").unwrap().app.as_deref(), Some("oldapp"));
         // Fill remaining slots up to MAX_STATUSES, then insert a direct child of "anc" ("anc/new") to evict "anc":
         // "anc/new" MUST emit ONLY ONE Updated event with `app: None` (no transient double-Updated!).
         for i in 0..(MAX_STATUSES - 2) {
-            ev_table.ingest(&format!("id=pad{i};state=working"), ts(3 + i as u64), &mut efx);
+            ev_table.ingest(&format!("id=pad{i};state=working"), wall(3 + i as u64), &mut efx);
         }
         efx.clear();
-        ev_table.ingest("id=anc/new;state=working", ts(999), &mut efx);
+        ev_table.ingest("id=anc/new;state=working", wall(999), &mut efx);
         assert!(ev_table.get("anc").is_none(), "oldest non-root ancestor must be evicted");
         assert_eq!(
             ev_table.get("anc/child").unwrap().app,
@@ -2621,7 +2653,7 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
             VtEvent::ProgramStatus(crate::status::parse_osc7501("state=done;app=claude").unwrap()),
             VtEvent::Osc133 { payload: String::from("D;0"), cursor_line: 1 },
         ];
-        live_sess.on_pty_output(b"a", ts(2), &mut lfx);
+        live_sess.on_pty_output(b"a", ts(2), wall(2), &mut lfx);
         assert_eq!(live_sess.active_statuses().len(), 1, "CommandFinished must clear active `w` and retain `Done`");
         assert!(
             !lfx.iter().any(|e| matches!(e, SessionEffect::VerifyForeground { id, .. } if id == "w")),
@@ -2694,7 +2726,7 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
     // Claimed `app=claude` emits VerifyForeground and DEFERS WaitCondition::Status wakeup!
     sess.vt_mut().next_events =
         vec![VtEvent::ProgramStatus(crate::status::parse_osc7501("state=blocked;app=claude").unwrap())];
-    sess.on_pty_output(b"x", ts(2), &mut fx);
+    sess.on_pty_output(b"x", ts(2), wall(2), &mut fx);
     assert!(
         !fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Waited { .. }, .. })),
         "must defer while pending verify"
@@ -2741,7 +2773,7 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
     fx.clear();
     sess.vt_mut().next_events =
         vec![VtEvent::ProgramStatus(crate::status::parse_osc7501("state=blocked;kind=auth;app=claude").unwrap())];
-    sess.on_pty_output(b"y", ts(5), &mut fx);
+    sess.on_pty_output(b"y", ts(5), wall(5), &mut fx);
     let changed2 = fx
         .iter()
         .find_map(|e| match e {
@@ -2769,7 +2801,7 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
     );
     sess.vt_mut().next_events =
         vec![VtEvent::ProgramStatus(crate::status::parse_osc7501("state=working;app=tool").unwrap())];
-    sess.on_pty_output(b"z", ts(7), &mut fx);
+    sess.on_pty_output(b"z", ts(7), wall(7), &mut fx);
     let changed3 = fx
         .iter()
         .find_map(|e| match e {
@@ -2787,7 +2819,7 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
     // Late waiter registered against an app-less status (`Confirmed::Unknown`) must also NOT wake!
     fx.clear();
     sess.vt_mut().next_events = vec![VtEvent::ProgramStatus(crate::status::parse_osc7501("state=done").unwrap())];
-    sess.on_pty_output(b"w", ts(7), &mut fx);
+    sess.on_pty_output(b"w", ts(7), wall(7), &mut fx);
     assert!(!fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Waited { .. }, .. })));
     fx.clear();
     sess.register_wait(
@@ -2814,7 +2846,7 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
     );
     // Start a sync hold before seeking so we verify restore_from_replay cancels it cleanly.
     sess.vt_mut().next_events = vec![VtEvent::SyncOutput(true)];
-    sess.on_pty_output(b"h", ts(8), &mut fx);
+    sess.on_pty_output(b"h", ts(8), wall(8), &mut fx);
     assert!(sess.is_sync_held());
 
     let key = MarksKey::parse(b"abcdef0123456789abcdef0123456789").unwrap();
@@ -2841,7 +2873,7 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
         end_line: None,
     };
     let tail = [
-        ReplayRecord::Output { at_ms: ts(100), bytes: b"SEEK_TARGET row" },
+        ReplayRecord::Output { at_ms: wall(100), bytes: b"SEEK_TARGET row" },
         ReplayRecord::Resize { size: GridSize::new(60, 6).unwrap(), cell_px: CellPx { width: 9, height: 18 } },
         ReplayRecord::Marks { key: Some(key), last_seq: 15 },
     ];
@@ -2852,6 +2884,7 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
             cell_px: CellPx { width: 8, height: 16 },
             marks_mode: MarksMode::Keyed(key),
             marks_last_seq: 10,
+            marks_active_vouched_seq: None,
             marks_refused: 1,
             commands: vec![prior_cmd.clone()],
         },
@@ -2911,7 +2944,7 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
         VtEvent::Osc633 { payload: format!("V;S;12;{};echo", key.as_str()), cursor_line: 2 },
         VtEvent::Osc633 { payload: format!("V;F;12;{};0;/stay", key.as_str()), cursor_line: 2 },
     ];
-    let tail_no_epoch = [ReplayRecord::Output { at_ms: ts(102), bytes: b"SEEK_TARGET row" }];
+    let tail_no_epoch = [ReplayRecord::Output { at_ms: wall(102), bytes: b"SEEK_TARGET row" }];
     fx.clear();
     sess.restore_from_replay(
         fresh2,
@@ -2919,6 +2952,7 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
             cell_px: CellPx { width: 9, height: 18 },
             marks_mode: MarksMode::Keyed(key),
             marks_last_seq: 11,
+            marks_active_vouched_seq: None,
             marks_refused: 0,
             commands: vec![prior_cmd.clone()],
         },
@@ -2961,7 +2995,7 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
         });
     }
     let mut mt = MarksTracker::new(MarksMode::Claimed);
-    mt.restore_from_keyframe(MarksMode::Keyed(key), 99, 4, many_cmds);
+    mt.restore_from_keyframe(MarksMode::Keyed(key), 99, Some(99), 4, many_cmds);
     assert_eq!(mt.commands().len(), MAX_COMMANDS);
     assert_eq!(mt.commands()[0].id, 4);
     assert_eq!(mt.commands().last().unwrap().id, (MAX_COMMANDS + 3) as u64);
@@ -2980,6 +3014,7 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
     max_mt.restore_from_keyframe(
         MarksMode::Claimed,
         u64::MAX,
+        None,
         0,
         vec![
             CommandRecord {
@@ -3007,7 +3042,7 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
         ],
     );
     let mut mfx = Vec::new();
-    max_mt.on_osc133("C", 0, ts(1), &mut mfx);
+    max_mt.on_osc133("C", 0, wall(1), &mut mfx);
     assert_eq!(max_mt.commands().last().unwrap().id, 2, "must wrap cleanly past u64::MAX and skip existing id=1");
 
     // prepare_for_live_after_restore (`B2`): finalizes stuck Running command, clears active statuses,
@@ -3020,6 +3055,7 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
             cell_px: CellPx { width: 8, height: 16 },
             marks_mode: MarksMode::Keyed(key),
             marks_last_seq: 50,
+            marks_active_vouched_seq: None,
             marks_refused: 0,
             commands: vec![
                 CommandRecord {
@@ -3054,11 +3090,11 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
         VtEvent::ProgramStatus(crate::status::parse_osc7501("id=d;state=done").unwrap()),
     ];
     let mut rfx = Vec::new();
-    live_restore.on_pty_output(b"x", ts(10), &mut rfx);
+    live_restore.on_pty_output(b"x", ts(10), wall(10), &mut rfx);
     assert_eq!(live_restore.active_statuses().len(), 2);
 
     // Transition to live with the SAME `marks_key`:
-    live_restore.prepare_for_live_after_restore(MarksMode::Keyed(key), ts(20));
+    live_restore.prepare_for_live_after_restore(MarksMode::Keyed(key), wall(20));
     assert_eq!(live_restore.marks_last_seq(), 0, "last_seq must reset unconditionally for new live shell");
     assert_eq!(
         live_restore.commands()[1].outcome,
@@ -3072,7 +3108,7 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
     rfx.clear();
     live_restore.vt_mut().next_events =
         vec![VtEvent::Osc633 { payload: format!("V;A;1;{}", key.as_str()), cursor_line: 0 }];
-    live_restore.on_pty_output(b"p", ts(21), &mut rfx);
+    live_restore.on_pty_output(b"p", ts(21), wall(21), &mut rfx);
     rfx.clear();
     live_restore.register_wait(conn(1), RequestId::from_raw(55), WaitCondition::Idle, 5_000, ts(21), &mut rfx);
     assert!(
@@ -3089,7 +3125,7 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
         VtEvent::Osc633 { payload: format!("V;S;2;{};new_cmd", key.as_str()), cursor_line: 1 },
         VtEvent::Osc633 { payload: format!("V;F;2;{};0;/live", key.as_str()), cursor_line: 2 },
     ];
-    live_restore.on_pty_output(b"q", ts(22), &mut rfx);
+    live_restore.on_pty_output(b"q", ts(22), wall(22), &mut rfx);
     assert_eq!(live_restore.commands().len(), 3);
     let live_cmd = &live_restore.commands()[2];
     assert_eq!(live_cmd.command.as_deref(), Some("new_cmd"));
@@ -3102,6 +3138,7 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
     remapped_mt.restore_from_keyframe(
         MarksMode::Keyed(key),
         1,
+        Some(1),
         0,
         vec![
             CommandRecord {
@@ -3129,30 +3166,71 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
         ],
     );
     let mut rmt_fx = Vec::new();
-    remapped_mt.on_osc633(&format!("V;F;1;{};0;/proj", key.as_str()), 4, ts(30), &mut rmt_fx);
+    remapped_mt.on_osc633(&format!("V;F;1;{};0;/proj", key.as_str()), 4, wall(30), &mut rmt_fx);
     assert_eq!(remapped_mt.refused(), 0, "V;F;1 must match remapped running command id=11");
     assert_eq!(remapped_mt.commands()[1].outcome, CommandOutcome::Exited(VouchedExitCode::from_vouched(0)));
     assert_eq!(remapped_mt.last_cwd(), Some("/proj"));
-    // Also verify `last_seq == 0` with Running id > 0 does not invent active_vouched_seq = Some(0)!
+    // Also verify `last_seq == 0` with Running id > 0 does not invent active_vouched_seq = Some(0),
+    // and verify every boundary guard on `restore_from_keyframe`'s `active_vouched_seq`:
+    let running_cmd = |id: u64| CommandRecord {
+        id,
+        command: None,
+        cwd: None,
+        started_ms: None,
+        finished_ms: None,
+        outcome: CommandOutcome::Running,
+        prompt_line: None,
+        output_line: None,
+        end_line: None,
+    };
+    let finished_cmd = |id: u64| CommandRecord {
+        id,
+        command: None,
+        cwd: None,
+        started_ms: None,
+        finished_ms: Some(1),
+        outcome: CommandOutcome::Exited(VouchedExitCode::from_vouched(0)),
+        prompt_line: None,
+        output_line: None,
+        end_line: None,
+    };
     let mut zero_seq_mt = MarksTracker::new(MarksMode::Claimed);
-    zero_seq_mt.restore_from_keyframe(
-        MarksMode::Keyed(key),
-        0,
-        0,
-        vec![CommandRecord {
-            id: 5,
-            command: None,
-            cwd: None,
-            started_ms: None,
-            finished_ms: None,
-            outcome: CommandOutcome::Running,
-            prompt_line: None,
-            output_line: None,
-            end_line: None,
-        }],
-    );
-    zero_seq_mt.on_osc633(&format!("V;F;5;{};0;/bad", key.as_str()), 0, ts(31), &mut rmt_fx);
+    // 1. Keyed + running + active_vouched_seq = Some(0) -> rejected (None)
+    zero_seq_mt.restore_from_keyframe(MarksMode::Keyed(key), 0, Some(0), 0, vec![running_cmd(5)]);
+    assert_eq!(zero_seq_mt.active_vouched_seq(), None);
+    zero_seq_mt.on_osc633(&format!("V;F;5;{};0;/bad", key.as_str()), 0, wall(31), &mut rmt_fx);
     assert_eq!(zero_seq_mt.refused(), 1);
+    // 2. Claimed + running + Some(1) -> None
+    zero_seq_mt.restore_from_keyframe(MarksMode::Claimed, 5, Some(1), 0, vec![running_cmd(1)]);
+    assert_eq!(zero_seq_mt.active_vouched_seq(), None);
+    // 3. Keyed + NO running command + Some(1) -> None
+    zero_seq_mt.restore_from_keyframe(MarksMode::Keyed(key), 5, Some(1), 0, vec![finished_cmd(1)]);
+    assert_eq!(zero_seq_mt.active_vouched_seq(), None);
+    // 4. Keyed + running + Some(6) > last_seq(5) -> None
+    zero_seq_mt.restore_from_keyframe(MarksMode::Keyed(key), 5, Some(6), 0, vec![running_cmd(5)]);
+    assert_eq!(zero_seq_mt.active_vouched_seq(), None);
+    // 5. Keyed + running + Some(5) <= last_seq(5) -> Some(5)
+    zero_seq_mt.restore_from_keyframe(MarksMode::Keyed(key), 5, Some(5), 0, vec![running_cmd(5)]);
+    assert_eq!(zero_seq_mt.active_vouched_seq(), Some(5));
+
+    // Also cover `SessionMachine::marks_active_vouched_seq` across None -> Some(2) -> None:
+    let mut k_sess = SessionMachine::new(
+        sid(92),
+        StubVt::new(40, 4),
+        ResizePolicy::ExplicitOverride,
+        MarksMode::Keyed(key),
+        CellPx::default(),
+    );
+    assert_eq!(k_sess.marks_active_vouched_seq(), None);
+    k_sess.vt_mut().next_events =
+        vec![VtEvent::Osc633 { payload: format!("V;S;2;{};echo hi", key.as_str()), cursor_line: 0 }];
+    let mut kfx = Vec::new();
+    k_sess.on_pty_output(b"x", ts(1), wall(1), &mut kfx);
+    assert_eq!(k_sess.marks_active_vouched_seq(), Some(2));
+    k_sess.vt_mut().next_events =
+        vec![VtEvent::Osc633 { payload: format!("V;F;2;{};0;/tmp", key.as_str()), cursor_line: 1 }];
+    k_sess.on_pty_output(b"y", ts(2), wall(2), &mut kfx);
+    assert_eq!(k_sess.marks_active_vouched_seq(), None);
 }
 
 #[test]
@@ -3341,6 +3419,7 @@ fn text_matches_in_range_chunked_halves_on_max_string_truncation() {
             cell_px: orig_px,
             marks_mode: MarksMode::Claimed,
             marks_last_seq: 0,
+            marks_active_vouched_seq: None,
             marks_refused: 0,
             commands: vec![],
         },
@@ -3351,12 +3430,87 @@ fn text_matches_in_range_chunked_halves_on_max_string_truncation() {
     assert_eq!(sess.current_size(), orig_size, "failed ReplayRecord::Resize must not update current_size");
     assert_eq!(sess.current_cell_px(), orig_px, "failed ReplayRecord::Resize must not update current_cell_px");
 
+    // 1. Replay `apply_replay_tail` `saw_epoch_event`: epoch change + epoch-2 command in the SAME
+    //    WAL Output chunk must keep epoch-2 command line anchors intact, while keyframe commands
+    //    from the old numbering space have their stale anchors invalidated!
+    let mut ep_vt = StubVt::new(80, 24);
+    ep_vt.next_events = vec![
+        VtEvent::EpochChanged,
+        VtEvent::Osc133 { payload: String::from("A"), cursor_line: 1 },
+        VtEvent::Osc133 { payload: String::from("C"), cursor_line: 2 },
+        VtEvent::Osc133 { payload: String::from("D;0"), cursor_line: 3 },
+    ];
+    let stale_kf_cmd = apack_proto::types::CommandRecord {
+        id: 1,
+        command: Some(String::from("old")),
+        cwd: None,
+        started_ms: Some(1),
+        finished_ms: Some(2),
+        outcome: CommandOutcome::Claimed(Some(0)),
+        prompt_line: Some(50_000),
+        output_line: Some(50_001),
+        end_line: Some(50_002),
+    };
+    fx.clear();
+    sess.restore_from_replay(
+        ep_vt,
+        RestoreKeyframe {
+            cell_px: orig_px,
+            marks_mode: MarksMode::Claimed,
+            marks_last_seq: 0,
+            marks_active_vouched_seq: None,
+            marks_refused: 0,
+            commands: vec![stale_kf_cmd],
+        },
+        &[ReplayRecord::Output { at_ms: wall(50), bytes: b"ALT" }],
+        false,
+        &mut fx,
+    );
+    let cmds = sess.commands();
+    assert_eq!(cmds.len(), 2);
+    assert_eq!(cmds[0].prompt_line, None, "restored keyframe command stale prompt_line must be cleared");
+    assert_eq!(cmds[0].output_line, None, "restored keyframe command stale output_line must be cleared");
+    assert_eq!(cmds[0].end_line, None, "restored keyframe command stale end_line must be cleared");
+    assert_eq!(cmds[1].prompt_line, Some(1), "epoch-2 command after VtEvent::EpochChanged must keep prompt_line");
+    assert_eq!(cmds[1].output_line, Some(2), "epoch-2 command after VtEvent::EpochChanged must keep output_line");
+    assert_eq!(cmds[1].end_line, Some(3), "epoch-2 command after VtEvent::EpochChanged must keep end_line");
+
+    // 2. Rewound session close (`on_rewound_close`) resolves pending waiters cleanly without emitting BrokerMsg::Exited!
+    fx.clear();
+    sess.register_wait(
+        conn(1),
+        RequestId::from_raw(88),
+        WaitCondition::Text(String::from("never")),
+        5_000,
+        ts(1),
+        &mut fx,
+    );
+    sess.register_wait(conn(1), RequestId::from_raw(89), WaitCondition::Exit, 5_000, ts(1), &mut fx);
+    fx.clear();
+    sess.on_rewound_close(&mut fx);
+    assert!(!sess.is_alive());
+    assert!(!fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Exited { .. }, .. })));
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Exited }, .. }
+        if *req_id == RequestId::from_raw(88)
+    )));
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. }
+        if *req_id == RequestId::from_raw(89)
+    )));
+    // Idempotent second call emits nothing
+    fx.clear();
+    sess.on_rewound_close(&mut fx);
+    assert!(fx.is_empty());
+
     // Direct return-value contract of `StatusTable::apply_confirmation`:
     // returns `true` iff `id == ""` AND `confirmed == Confirmed::Matched`.
     let mut table = crate::status::StatusTable::new();
     let mut sfx = Vec::new();
-    table.ingest("state=working;app=claude", ts(1), &mut sfx);
-    table.ingest("id=sub;state=working;app=claude", ts(2), &mut sfx);
+    table.ingest("state=working;app=claude", wall(1), &mut sfx);
+    table.ingest("id=sub;state=working;app=claude", wall(2), &mut sfx);
     let root_ch = table.get("").unwrap().changed;
     let sub_ch = table.get("sub").unwrap().changed;
     sfx.clear();

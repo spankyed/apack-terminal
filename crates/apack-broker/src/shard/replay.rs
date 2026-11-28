@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use apack_core::marks::MarksMode;
 use apack_core::session::{ReplayRecord, RestoreKeyframe, SessionEffect, SessionMachine};
-use apack_core::time::TimestampMs;
+use apack_core::time::WallMs;
 use apack_core::vt::VtEngine;
 use apack_proto::types::{CellPx, GridSize, ImageEncoding, MarksKey, PackedRow, ResizePolicy, SessionId};
 use apack_vt_ghostty::{GhosttyConfig, GhosttyEngine, GhosttyError, ImageStore};
@@ -15,7 +15,7 @@ use apack_wal::{
     VisualKeyframe, WalReader, WalRecord,
 };
 
-use crate::now_unix_ms;
+use crate::now_wall_ms;
 
 use super::LiveSession;
 
@@ -109,6 +109,7 @@ pub(crate) fn capture_keyframe(machine: &SessionMachine<GhosttyEngine>, abi_hash
         images: vt.images(),
         marks_key: machine.marks_key(),
         marks_last_seq: machine.marks_last_seq(),
+        marks_active_vouched_seq: machine.marks_active_vouched_seq(),
         marks_refused: machine.marks_refused(),
         commands: machine.commands(),
     };
@@ -284,6 +285,7 @@ fn slice_to_replay_inputs(
         cell_px: visual.cell_px,
         marks_mode: visual.marks_key.map_or(MarksMode::Claimed, MarksMode::Keyed),
         marks_last_seq: visual.marks_last_seq,
+        marks_active_vouched_seq: visual.marks_active_vouched_seq,
         marks_refused: visual.marks_refused,
         commands: visual.commands.clone(),
     };
@@ -291,9 +293,7 @@ fn slice_to_replay_inputs(
         .tail_records
         .iter()
         .filter_map(|timed| match &timed.record {
-            WalRecord::Output(bytes) => {
-                Some(ReplayRecord::Output { at_ms: TimestampMs::from_millis(timed.at_ms), bytes })
-            }
+            WalRecord::Output(bytes) => Some(ReplayRecord::Output { at_ms: WallMs::from_millis(timed.at_ms), bytes }),
             WalRecord::Resize { size, cell_px } => Some(ReplayRecord::Resize { size: *size, cell_px: *cell_px }),
             WalRecord::Marks { key, last_seq } => Some(ReplayRecord::Marks { key: *key, last_seq: *last_seq }),
             WalRecord::Keyframe(_) | WalRecord::Gap { .. } => None,
@@ -348,6 +348,6 @@ pub(super) fn restore_machine_from_dir(
     let mut effects = Vec::new();
     restore_machine_from_slice(machine, fresh_engine, &slice, Some((target_size, target_cell_px)), false, &mut effects);
     let live_mode = live_marks_key.map_or(MarksMode::Claimed, MarksMode::Keyed);
-    machine.prepare_for_live_after_restore(live_mode, TimestampMs::from_millis(now_unix_ms()));
+    machine.prepare_for_live_after_restore(live_mode, now_wall_ms());
     Ok(())
 }

@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 use apack_core::broker::{CloseReason, StreamAttachmentId};
 use apack_core::flow::QueuedMessage;
 use apack_core::lease::ConnId;
-use apack_core::time::TimestampMs;
 use apack_os::transport::{hang_up, let_go, verify_client_is_current_user};
 use apack_proto::messages::BrokerMsg;
 use apack_proto::types::{NonZeroStreamId, RequestId, StreamId};
@@ -20,7 +19,7 @@ use interprocess::local_socket::{Listener, Stream};
 use crate::transport_loop::{
     ConnState, MAX_CONNECTIONS, ReactorState, drain_deadline_expired, ready_stalled_attachments,
 };
-use crate::{fill_random, now_unix_ms};
+use crate::{fill_random, now_monotonic_ms};
 
 const WIN_CONN_READ_BUF_BYTES: usize = 32_768;
 
@@ -287,7 +286,7 @@ impl ReactorState {
                     Ok(win) => win,
                     Err(_) => return,
                 };
-                let now = TimestampMs::from_millis(now_unix_ms());
+                let now = now_monotonic_ms();
                 let _ = self.core.open_connection(conn, nonce, now);
                 self.conns.insert(
                     conn,
@@ -301,7 +300,7 @@ impl ReactorState {
             }
             WinTransportEvent::Bytes(conn, bytes) => {
                 self.sync_shard_telemetry();
-                let now = TimestampMs::from_millis(now_unix_ms());
+                let now = now_monotonic_ms();
                 let mut actions = Vec::new();
                 self.core.feed_bytes(conn, &bytes, now, &mut actions);
                 if self.core.is_connection_ready(conn) {
@@ -487,14 +486,7 @@ impl ReactorState {
                 if let Some((stream_id, sid, frame)) =
                     self.conns.get_mut(&conn).and_then(|c| c.stalled_frames.remove(&att))
                 {
-                    self.try_publish_or_stall_frame(
-                        conn,
-                        stream_id,
-                        att,
-                        sid,
-                        frame,
-                        TimestampMs::from_millis(now_unix_ms()),
-                    );
+                    self.try_publish_or_stall_frame(conn, stream_id, att, sid, frame, now_monotonic_ms());
                 }
             }
         }

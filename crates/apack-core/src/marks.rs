@@ -13,7 +13,7 @@ use apack_proto::MAX_COMMANDS;
 use apack_proto::types::{CommandOutcome, CommandRecord, MarksKey, UnknownReason, VouchedExitCode};
 
 use crate::auth::ct_eq_32;
-use crate::time::TimestampMs;
+use crate::time::WallMs;
 use crate::{MAX_EVENT_STRING_BYTES, truncate_utf8};
 
 /// Shell integration trust model for a session.
@@ -73,10 +73,14 @@ impl MarksTracker {
     }
 
     /// Restores tracker state transactionally from a WAL [`KeyframeV2`](apack_wal) snapshot.
+    ///
+    /// Historical line coordinates are invalidated unconditionally because a restored VT begins a
+    /// fresh line-numbering space rather than inheriting the live session's evicted-line offset.
     pub fn restore_from_keyframe(
         &mut self,
         mode: MarksMode,
         last_seq: u64,
+        active_vouched_seq: Option<u64>,
         refused: u64,
         mut commands: Vec<CommandRecord>,
     ) {
@@ -84,6 +88,9 @@ impl MarksTracker {
         commands.drain(..drop_n);
         let active_index = commands.iter().rposition(|c| matches!(c.outcome, CommandOutcome::Running));
         for (idx, cmd) in commands.iter_mut().enumerate() {
+            cmd.prompt_line = None;
+            cmd.output_line = None;
+            cmd.end_line = None;
             if matches!(cmd.outcome, CommandOutcome::Running) && Some(idx) != active_index {
                 cmd.outcome = match mode {
                     MarksMode::Keyed(_) => CommandOutcome::Unknown(UnknownReason::Superseded),
@@ -92,20 +99,18 @@ impl MarksTracker {
             }
         }
         let max_cmd_id = commands.iter().map(|c| c.id).max().unwrap_or(0);
-        let active_vouched_seq = active_index.and_then(|idx| {
-            if !matches!(mode, MarksMode::Keyed(_)) {
-                return None;
-            }
-            let cmd_id = commands[idx].id;
-            if cmd_id <= last_seq { Some(cmd_id) } else { (last_seq != 0).then_some(last_seq) }
-        });
+        let restored_active_seq = if matches!(mode, MarksMode::Keyed(_)) && active_index.is_some() {
+            active_vouched_seq.filter(|&seq| seq > 0 && seq <= last_seq)
+        } else {
+            None
+        };
         self.mode = mode;
         self.last_seq = last_seq;
         self.refused = refused;
         self.next_id = max_cmd_id.max(last_seq).checked_add(1).unwrap_or(1);
         self.commands = commands.into();
         self.active_index = active_index;
-        self.active_vouched_seq = active_vouched_seq;
+        self.active_vouched_seq = restored_active_seq;
         self.pending_prompt_line = None;
         self.pending_command = None;
         self.last_cwd = self.commands.iter().rev().find_map(|c| c.cwd.clone());
@@ -127,7 +132,7 @@ impl MarksTracker {
     /// Transitions a historically restored tracker into a fresh live shell process:
     /// finalizes any still-running command from the dead recording, resets prompt/sequence state
     /// unconditionally for the new shell, and preserves historical commands with non-colliding IDs.
-    pub fn prepare_for_live_after_restore(&mut self, mode: MarksMode, now: TimestampMs) {
+    pub fn prepare_for_live_after_restore(&mut self, mode: MarksMode, now: WallMs) {
         if let Some(idx) = self.active_index.take()
             && let Some(cmd) = self.commands.get_mut(idx)
         {
@@ -169,6 +174,11 @@ impl MarksTracker {
         self.last_seq
     }
 
+    /// Returns the vouched sequence number of the currently running keyed command, if any.
+    pub fn active_vouched_seq(&self) -> Option<u64> {
+        self.active_vouched_seq
+    }
+
     /// Returns how many `OSC 633;V;...` marks were refused (bad key, bad/replayed sequence, or wrong mode).
     pub fn refused(&self) -> u64 {
         self.refused
@@ -191,10 +201,13 @@ impl MarksTracker {
 
     /// Records a working directory reported via OSC 7 (honoured in [`MarksMode::Claimed`] only).
     ///
-    /// Returns `Some(accepted_cwd)` iff the update was accepted (unkeyed mode and non-empty).
+    /// Returns `Some(accepted_cwd)` iff the update was accepted and changed the working directory.
     pub fn on_cwd(&mut self, cwd: &str) -> Option<String> {
         if matches!(self.mode, MarksMode::Claimed) && !cwd.is_empty() {
             let accepted = truncate_utf8(cwd, MAX_EVENT_STRING_BYTES);
+            if self.last_cwd.as_deref() == Some(accepted.as_str()) {
+                return None;
+            }
             self.last_cwd = Some(accepted.clone());
             Some(accepted)
         } else {
@@ -213,7 +226,7 @@ impl MarksTracker {
     }
 
     /// Feeds an `OSC 133;<payload>` sequence (always unvouched).
-    pub fn on_osc133(&mut self, payload: &str, cursor_line: u64, now: TimestampMs, effects: &mut Vec<MarkEffect>) {
+    pub fn on_osc133(&mut self, payload: &str, cursor_line: u64, now: WallMs, effects: &mut Vec<MarkEffect>) {
         self.handle_claimed_mark(payload, cursor_line, now, effects);
     }
 
@@ -224,8 +237,12 @@ impl MarksTracker {
     /// - `V;S;<seq>;<32-hex-key>;<command>` — command start (`seq > last_seq`)
     /// - `V;F;<seq>;<32-hex-key>;<status>;<cwd>` — command finish (`seq == active.id`)
     ///
-    /// A `V;...` mark that fails validation increments [`Self::refused`] and is NEVER read as a claim.
-    pub fn on_osc633(&mut self, payload: &str, cursor_line: u64, now: TimestampMs, effects: &mut Vec<MarkEffect>) {
+    /// A `V` / `V;...` mark that fails validation increments [`Self::refused`] and is NEVER read as a claim.
+    pub fn on_osc633(&mut self, payload: &str, cursor_line: u64, now: WallMs, effects: &mut Vec<MarkEffect>) {
+        if payload == "V" {
+            self.refused += 1;
+            return;
+        }
         if let Some(after_v) = payload.strip_prefix("V;") {
             if !self.handle_vouched_mark(after_v, cursor_line, now, effects) {
                 self.refused += 1;
@@ -236,7 +253,7 @@ impl MarksTracker {
     }
 
     /// Finalizes any currently running command when the session process exits.
-    pub fn on_session_exit(&mut self, now: TimestampMs, effects: &mut Vec<MarkEffect>) {
+    pub fn on_session_exit(&mut self, now: WallMs, effects: &mut Vec<MarkEffect>) {
         self.at_prompt = false;
         self.active_vouched_seq = None;
         let Some(idx) = self.active_index.take() else {
@@ -256,7 +273,7 @@ impl MarksTracker {
         &mut self,
         fields: &str,
         cursor_line: u64,
-        now: TimestampMs,
+        now: WallMs,
         effects: &mut Vec<MarkEffect>,
     ) -> bool {
         let MarksMode::Keyed(expected) = self.mode else {
@@ -353,7 +370,9 @@ impl MarksTracker {
                     let decoded = truncate_utf8(&unescape_osc633(raw_cwd), MAX_EVENT_STRING_BYTES);
                     (!decoded.is_empty()).then_some(decoded)
                 };
-                if let Some(cwd) = new_cwd.clone() {
+                if let Some(cwd) = new_cwd.clone()
+                    && self.last_cwd.as_deref() != Some(cwd.as_str())
+                {
                     self.last_cwd = Some(cwd.clone());
                     effects.push(MarkEffect::CwdChanged(cwd));
                 }
@@ -361,6 +380,9 @@ impl MarksTracker {
                     cmd.finished_ms = Some(now.as_millis());
                     cmd.end_line = Some(cursor_line);
                     cmd.outcome = outcome;
+                    if let Some(cwd) = new_cwd {
+                        cmd.cwd = Some(cwd);
+                    }
                     effects.push(MarkEffect::CommandFinished(cmd.clone()));
                 }
                 self.at_prompt = true;
@@ -371,22 +393,16 @@ impl MarksTracker {
         }
     }
 
-    fn handle_claimed_mark(
-        &mut self,
-        payload: &str,
-        cursor_line: u64,
-        now: TimestampMs,
-        effects: &mut Vec<MarkEffect>,
-    ) {
+    fn handle_claimed_mark(&mut self, payload: &str, cursor_line: u64, now: WallMs, effects: &mut Vec<MarkEffect>) {
         // In keyed mode, completely ignore unvouched control marks so hostile PTY output cannot
         // spoof prompts, command boundaries, or exit codes.
         if matches!(self.mode, MarksMode::Keyed(_)) {
             return;
         }
 
-        let mut parts = payload.split(';');
-        let Some(kind) = parts.next() else {
-            return;
+        let (kind, arg) = match payload.split_once(';') {
+            Some((k, rest)) => (k, Some(rest)),
+            None => (payload, None),
         };
         match kind {
             "A" => {
@@ -397,7 +413,7 @@ impl MarksTracker {
                 }
             }
             "E" => {
-                if let Some(cmd_text) = parts.next() {
+                if let Some(cmd_text) = arg {
                     let trimmed = truncate_utf8(&unescape_osc633(cmd_text), MAX_EVENT_STRING_BYTES);
                     if !trimmed.is_empty() {
                         self.pending_command = Some(trimmed);
@@ -405,12 +421,14 @@ impl MarksTracker {
                 }
             }
             "P" => {
-                for prop in parts {
-                    if let Some(cwd) = prop.strip_prefix("Cwd=") {
-                        let decoded = truncate_utf8(&unescape_osc633(cwd), MAX_EVENT_STRING_BYTES);
-                        if !decoded.is_empty() {
-                            self.last_cwd = Some(decoded.clone());
-                            effects.push(MarkEffect::CwdChanged(decoded));
+                if let Some(props) = arg {
+                    for prop in props.split(';') {
+                        if let Some(cwd) = prop.strip_prefix("Cwd=") {
+                            let decoded = truncate_utf8(&unescape_osc633(cwd), MAX_EVENT_STRING_BYTES);
+                            if !decoded.is_empty() && self.last_cwd.as_deref() != Some(decoded.as_str()) {
+                                self.last_cwd = Some(decoded.clone());
+                                effects.push(MarkEffect::CwdChanged(decoded));
+                            }
                         }
                     }
                 }
@@ -441,7 +459,8 @@ impl MarksTracker {
                 effects.push(MarkEffect::CommandStarted(record));
             }
             "D" => {
-                let parsed_code = parts.next().and_then(parse_exit_status);
+                let status_str = arg.map(|s| s.split(';').next().unwrap_or(s));
+                let parsed_code = status_str.and_then(parse_exit_status);
                 if let Some(idx) = self.active_index.take()
                     && let Some(cmd) = self.commands.get_mut(idx)
                 {
@@ -466,13 +485,16 @@ impl MarksTracker {
     }
 }
 
-/// Strictly positive canonical decimal sequence number (no leading zero, no sign).
+/// Strictly positive canonical decimal sequence number (`1..u64::MAX`, no leading zero, no sign).
+///
+/// Rejecting `u64::MAX` guarantees `last_seq + 1` never overflows and a single mark cannot wedge
+/// subsequent vouched marks for the lifetime of the session.
 fn parse_counted(text: &str) -> Option<u64> {
     let bytes = text.as_bytes();
     if bytes.is_empty() || bytes[0] == b'0' || !bytes.iter().all(u8::is_ascii_digit) {
         return None;
     }
-    text.parse().ok()
+    text.parse::<u64>().ok().filter(|&n| n < u64::MAX)
 }
 
 /// Strict decimal exit status (optional leading `-`, ASCII digits only).
@@ -490,40 +512,26 @@ fn to_32(bytes: &[u8]) -> [u8; 32] {
     out
 }
 
-/// Unescapes OSC 633 `\\`, `\x3b` (`;`), and `\x0a` (`\n`) escapes into plain UTF-8.
+/// Percent-decodes `%XX` escapes in OSC 633 fields (matching v1 `master:src/markers.rs`), leaving
+/// stray `%` and all backslashes verbatim so Windows paths (`\\server\share`, `C:\temp\x41`) are
+/// never mangled.
 fn unescape_osc633(raw: &str) -> String {
-    let mut rest = raw.as_bytes();
-    let mut out = Vec::with_capacity(rest.len());
-    loop {
-        match rest {
-            [] => break,
-            [b'\\', after_bs @ ..] => match after_bs {
-                [b'\\', tail @ ..] => {
-                    out.push(b'\\');
-                    rest = tail;
-                }
-                [b'x', hi_b, lo_b, tail @ ..] => match (hex_nibble(*hi_b), hex_nibble(*lo_b)) {
-                    (Some(hi), Some(lo)) => {
-                        out.push((hi << 4) + lo);
-                        rest = tail;
-                    }
-                    _ => {
-                        out.push(b'\\');
-                        rest = after_bs;
-                    }
-                },
-                _ => {
-                    out.push(b'\\');
-                    rest = after_bs;
-                }
-            },
-            [b, tail @ ..] => {
-                out.push(*b);
-                rest = tail;
-            }
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && let Some(&[hi_b, lo_b]) = bytes.get(index + 1..index + 3)
+            && let (Some(hi), Some(lo)) = (hex_nibble(hi_b), hex_nibble(lo_b))
+        {
+            out.push((hi << 4) + lo);
+            index += 3;
+            continue;
         }
+        out.push(bytes[index]);
+        index += 1;
     }
-    String::from_utf8(out).unwrap_or_else(|_| String::from(raw))
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 const fn hex_nibble(b: u8) -> Option<u8> {

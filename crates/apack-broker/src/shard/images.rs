@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::thread;
 
 use apack_core::session::{SessionEffect, SessionMachine};
-use apack_core::time::TimestampMs;
+use apack_core::time::WallMs;
 use apack_core::vt::{VtEngine, VtEvent};
 use apack_os::image_sources::{
     Load, Loaded, QUIET as IMAGE_SOURCE_QUIET, Quiet as ImageQuiet, Refused as ImageRefused, says_unreadable,
@@ -12,7 +12,7 @@ use apack_os::image_sources::{
 use apack_proto::types::SessionId;
 use apack_vt_ghostty::{GhosttyEngine, NamedImageProbe};
 
-use crate::now_unix_ms;
+use crate::{now_monotonic_ms, now_unix_ms};
 
 use super::{ShardCmd, ShardRunner};
 
@@ -78,7 +78,8 @@ impl ShardRunner {
 
     pub(super) fn handle_image_source_loaded(&mut self, session_id: SessionId, ticket: u64, loaded: Option<Loaded>) {
         let now_ms = now_unix_ms();
-        let now = TimestampMs::from_millis(now_ms);
+        let wall = WallMs::from_millis(now_ms);
+        let now = now_monotonic_ms();
         let mut effects = Vec::new();
         let tail = {
             let Some(sess) = self.sessions.get_mut(&session_id) else {
@@ -100,7 +101,7 @@ impl ShardRunner {
                         sess.machine.vt_mut().set_kitty_command_bytes(query_bytes);
                     }
                     for piece in body {
-                        sess.machine.on_vt_feed_with(now, &mut effects, |vt, evs| vt.feed(&piece, evs));
+                        sess.machine.on_vt_feed_with(now, wall, &mut effects, |vt, evs| vt.feed(&piece, evs));
                         if !is_query && let Some(wal) = &sess.wal {
                             // Stream chunks straight to WAL and split on each `\x1b\\` ground
                             // transition so multi-chunk >4 MiB `t=f`/`t=s` images never exceed

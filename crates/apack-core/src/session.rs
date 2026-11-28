@@ -22,7 +22,7 @@ use crate::flow::OutboundPriority;
 use crate::lease::ConnId;
 use crate::marks::{MarkEffect, MarksMode, MarksTracker};
 use crate::status::{StatusEffect, StatusTable};
-use crate::time::{TimerId, TimerWheel, TimestampMs};
+use crate::time::{TimerId, TimerWheel, TimestampMs, WallMs};
 use crate::vt::{DirtyViewport, PasteEncode, VtEngine, VtEvent, VtSnapshotMeta};
 use crate::{
     DEFAULT_WORD_DELIMITERS, MAX_EVENT_STRING_BYTES, MAX_IMAGE_PLACEMENTS, MAX_PTY_WRITE_BYTES,
@@ -226,6 +226,8 @@ pub struct RestoreKeyframe {
     pub marks_mode: MarksMode,
     /// Last accepted vouched mark sequence number at the keyframe.
     pub marks_last_seq: u64,
+    /// Vouched sequence number of the currently running keyed command at the keyframe, if any.
+    pub marks_active_vouched_seq: Option<u64>,
     /// Count of refused forged/replayed vouched marks at the keyframe.
     pub marks_refused: u64,
     /// Bounded command history ring captured at the keyframe.
@@ -237,8 +239,8 @@ pub struct RestoreKeyframe {
 pub enum ReplayRecord<'a> {
     /// Raw PTY output slice emitted at `at_ms`.
     Output {
-        /// Original record timestamp.
-        at_ms: TimestampMs,
+        /// Original wall-clock record timestamp.
+        at_ms: WallMs,
         /// Raw PTY output bytes.
         bytes: &'a [u8],
     },
@@ -385,6 +387,11 @@ impl<V: VtEngine> SessionMachine<V> {
         self.marks.last_seq()
     }
 
+    /// Returns the vouched sequence number of the currently running keyed command, if any.
+    pub fn marks_active_vouched_seq(&self) -> Option<u64> {
+        self.marks.active_vouched_seq()
+    }
+
     /// Returns the count of refused forged or replayed vouched marks.
     pub fn marks_refused(&self) -> u64 {
         self.marks.refused()
@@ -403,8 +410,8 @@ impl<V: VtEngine> SessionMachine<V> {
     /// Transitions a historically restored session into a fresh live shell process:
     /// finalizes any in-flight recorded command, resets shell sequence tracking for the new shell,
     /// and clears active (`Idle`/`Working`/`Blocked`) statuses from the dead recording.
-    pub fn prepare_for_live_after_restore(&mut self, mode: MarksMode, now: TimestampMs) {
-        self.marks.prepare_for_live_after_restore(mode, now);
+    pub fn prepare_for_live_after_restore(&mut self, mode: MarksMode, wall: WallMs) {
+        self.marks.prepare_for_live_after_restore(mode, wall);
         let mut ignored = Vec::new();
         self.statuses.on_session_exit(&mut ignored);
     }
@@ -496,6 +503,7 @@ impl<V: VtEngine> SessionMachine<V> {
         self.marks.restore_from_keyframe(
             keyframe.marks_mode,
             keyframe.marks_last_seq,
+            keyframe.marks_active_vouched_seq,
             keyframe.marks_refused,
             keyframe.commands,
         );
@@ -519,6 +527,7 @@ impl<V: VtEngine> SessionMachine<V> {
                         continue;
                     }
                     let before_epoch = self.vt.meta().epoch;
+                    let mut saw_epoch_event = false;
                     self.vt.feed(bytes, &mut vt_events);
                     for ev in vt_events.drain(..) {
                         match ev {
@@ -529,6 +538,7 @@ impl<V: VtEngine> SessionMachine<V> {
                                 let _ = self.marks.on_cwd(&raw);
                             }
                             VtEvent::EpochChanged => {
+                                saw_epoch_event = true;
                                 self.marks.on_epoch_change();
                             }
                             VtEvent::Osc133 { payload, cursor_line } => {
@@ -559,7 +569,7 @@ impl<V: VtEngine> SessionMachine<V> {
                             | VtEvent::DeviceResponse(_) => {}
                         }
                     }
-                    if self.vt.meta().epoch != before_epoch {
+                    if !saw_epoch_event && self.vt.meta().epoch != before_epoch {
                         self.marks.on_epoch_change();
                     }
                 }
@@ -735,11 +745,11 @@ impl<V: VtEngine> SessionMachine<V> {
 
     /// Feeds raw PTY output bytes into the VT engine, dispatching side effects, marks, status,
     /// incremental search dirtying, reactive waiters, and view dirty bitsets.
-    pub fn on_pty_output(&mut self, bytes: &[u8], now: TimestampMs, effects: &mut Vec<SessionEffect>) {
+    pub fn on_pty_output(&mut self, bytes: &[u8], now: TimestampMs, wall: WallMs, effects: &mut Vec<SessionEffect>) {
         if bytes.is_empty() {
             return;
         }
-        self.on_vt_feed_with(now, effects, |vt, vt_events| vt.feed(bytes, vt_events));
+        self.on_vt_feed_with(now, wall, effects, |vt, vt_events| vt.feed(bytes, vt_events));
     }
 
     /// Runs a custom VT feed closure (such as `feed_until_apc` or inline Kitty body chunks) and
@@ -748,6 +758,7 @@ impl<V: VtEngine> SessionMachine<V> {
     pub fn on_vt_feed_with<R>(
         &mut self,
         now: TimestampMs,
+        wall: WallMs,
         effects: &mut Vec<SessionEffect>,
         feed: impl FnOnce(&mut V, &mut Vec<VtEvent>) -> R,
     ) -> R {
@@ -817,17 +828,17 @@ impl<V: VtEngine> SessionMachine<V> {
                 }
                 VtEvent::Osc133 { payload, cursor_line } => {
                     let mut mark_effects = Vec::new();
-                    self.marks.on_osc133(&payload, cursor_line, now, &mut mark_effects);
+                    self.marks.on_osc133(&payload, cursor_line, wall, &mut mark_effects);
                     self.apply_mark_effects(mark_effects, Some(&mut pending_verify), effects);
                 }
                 VtEvent::Osc633 { payload, cursor_line } => {
                     let mut mark_effects = Vec::new();
-                    self.marks.on_osc633(&payload, cursor_line, now, &mut mark_effects);
+                    self.marks.on_osc633(&payload, cursor_line, wall, &mut mark_effects);
                     self.apply_mark_effects(mark_effects, Some(&mut pending_verify), effects);
                 }
                 VtEvent::ProgramStatus(update) => {
                     let mut status_effects = Vec::new();
-                    self.statuses.ingest_update(update, now, &mut status_effects);
+                    self.statuses.ingest_update(update, wall, &mut status_effects);
                     self.apply_status_effects(status_effects, Some(&mut pending_verify), effects);
                 }
                 VtEvent::DeviceResponse(reply) => {
@@ -925,7 +936,7 @@ impl<V: VtEngine> SessionMachine<V> {
         &mut self,
         exit_code: Option<i32>,
         signal: Option<String>,
-        now: TimestampMs,
+        wall: WallMs,
         effects: &mut Vec<SessionEffect>,
     ) {
         if !self.alive {
@@ -939,7 +950,7 @@ impl<V: VtEngine> SessionMachine<V> {
         self.sync_hold_started = None;
 
         let mut mark_effects = Vec::new();
-        self.marks.on_session_exit(now, &mut mark_effects);
+        self.marks.on_session_exit(wall, &mut mark_effects);
         self.apply_mark_effects(mark_effects, None, effects);
 
         let mut status_effects = Vec::new();
@@ -948,7 +959,26 @@ impl<V: VtEngine> SessionMachine<V> {
 
         self.notify_views_dirty(effects);
         self.broadcast_event(BrokerMsg::Exited { exit_code, signal }, effects);
+        self.resolve_waiters_on_exit(effects);
+    }
 
+    /// Closes a rewound (recording-playback) session cleanly, cancelling timers and answering every
+    /// pending `Wait` request (`WaitCondition::Exit` -> `Met`, others -> `Exited`) without emitting
+    /// a synthetic process `BrokerMsg::Exited`.
+    pub fn on_rewound_close(&mut self, effects: &mut Vec<SessionEffect>) {
+        if !self.alive {
+            return;
+        }
+        self.alive = false;
+        self.pty_write_queue.clear();
+        if let Some(tid) = self.sync_hold.take() {
+            self.timers.cancel(tid);
+        }
+        self.sync_hold_started = None;
+        self.resolve_waiters_on_exit(effects);
+    }
+
+    fn resolve_waiters_on_exit(&mut self, effects: &mut Vec<SessionEffect>) {
         for w in self.waiters.drain(..) {
             self.timers.cancel(w.timer);
             let outcome = match w.condition {
