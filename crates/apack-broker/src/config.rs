@@ -110,6 +110,8 @@ pub enum CliCommand {
         socket: Option<String>,
         /// Optional explicit shard count override (`1..=8`).
         shards: Option<usize>,
+        /// True when spawned detached by `proxy` autostart (redirects post-bind stderr and ignores `SIGHUP`).
+        detached: bool,
     },
     /// Run the dumb single-channel stdio-to-broker proxy (for SSH remote connections).
     Proxy {
@@ -151,11 +153,12 @@ options:
 
 /// Help text for `apack-terminal serve --help`.
 pub const SERVE_HELP: &str = "\
-usage: apack-terminal serve [--socket <path>] [--shards <1..=8>]
+usage: apack-terminal serve [--socket <path>] [--shards <1..=8>] [--detached]
 
 options:
   --socket <path>   Explicit Unix socket or Windows named pipe path
   --shards <1..=8>  Number of session shard threads
+  --detached        Detach stderr after bind (used by proxy autostart)
   -h, --help        Print help information
 ";
 
@@ -212,6 +215,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
         "serve" => {
             let mut socket = None;
             let mut shards = None;
+            let mut detached = false;
             let mut iter = rest.iter();
             while let Some(arg) = iter.next() {
                 match arg.as_str() {
@@ -228,10 +232,13 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
                         }
                         shards = Some(parsed);
                     }
+                    "--detached" => {
+                        detached = true;
+                    }
                     other => return Err(format!("unknown serve flag: {other}")),
                 }
             }
-            Ok(CliCommand::Serve { socket, shards })
+            Ok(CliCommand::Serve { socket, shards, detached })
         }
         "proxy" => {
             let mut socket = None;

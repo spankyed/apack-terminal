@@ -830,6 +830,12 @@ fn broker_handshake_mutual_auth_timeout_duplicate_conn_and_framing_errors() {
     let mut fin = Vec::new();
     encode_fin(&mut fin);
     broker.feed_bytes(conn(5), &fin, ts(5_001), &mut actions);
+    assert_eq!(actions.last(), Some(&BrokerAction::ClientFin(conn(5))));
+    // Trailing bytes after FIN are ignored while half-closed.
+    actions.clear();
+    broker.feed_bytes(conn(5), &bad_ver, ts(5_002), &mut actions);
+    assert!(actions.is_empty());
+    broker.close_connection(conn(5), CloseReason::ClientFin, ts(5_003), &mut actions);
     assert!(matches!(
         actions.last(),
         Some(BrokerAction::CloseConn { reason: CloseReason::ClientFin, final_error: None, .. })
@@ -1543,22 +1549,113 @@ fn broker_fin_drain_filters_frames_and_oversized_messages_enforced() {
     assert!(broker.pop_outbound(conn(1)).is_none(), "unsolicited oversized push must be dropped");
 
     let s1_att = broker.stream_attachment(conn(1), nz_stream(1)).expect("s1 att");
-    // 2. try_publish_frame rejects > MAX_WIRE_FRAME_BYTES and admits exact MAX_WIRE_FRAME_BYTES
-    let mut huge_frame = sample_frame();
-    huge_frame.rows.push(apack_proto::types::PackedRow {
-        line: 0,
+    // 2. try_publish_frame degrades > MAX_WIRE_FRAME_BYTES into a bounded full_sync frame (exact fit)
+    //    instead of stalling forever, and admits exact MAX_WIRE_FRAME_BYTES verbatim.
+    let mut base_probe = sample_frame();
+    base_probe.seq = 1;
+    base_probe.full_sync = true;
+    let mut base_w = apack_proto::codec::Writer::new();
+    BrokerMsg::Frame(base_probe).encode(&mut base_w);
+    let empty_frame_bytes = apack_proto::FRAME_HEADER_LEN + base_w.as_slice().len();
+
+    let make_row = |line: u64, len: usize| apack_proto::types::PackedRow {
+        line,
         flags: 0,
-        text: "x".repeat(apack_proto::MAX_FRAME_PAYLOAD),
+        text: "r".repeat(len),
         runs: Vec::new(),
         styles: Vec::new(),
         links: Vec::new(),
         pieces: Vec::new(),
-    });
-    assert!(broker.try_publish_frame(conn(1), nz_stream(1), s1_att, huge_frame, ts(6), &mut actions).is_err());
+    };
+    let row0 = make_row(0, 3_000_000);
+    let mut r0w = apack_proto::codec::Writer::new();
+    row0.encode(&mut r0w);
+    let row0_len = r0w.as_slice().len();
+
+    // Size row1 so empty_frame_bytes + row0_len + row1_len == MAX_WIRE_FRAME_BYTES exactly!
+    let probe_row1 = make_row(1, 3_000_000);
+    let mut r1w = apack_proto::codec::Writer::new();
+    probe_row1.encode(&mut r1w);
+    let row1_overhead = r1w.as_slice().len() - 3_000_000;
+    let exact_row1_text_len = MAX_WIRE_FRAME_BYTES - empty_frame_bytes - row0_len - row1_overhead;
+    let row1 = make_row(1, exact_row1_text_len);
+    let row2 = make_row(2, 1_000_000);
+
+    let mut huge_frame = sample_frame();
+    huge_frame.full_sync = false;
+    huge_frame.scroll_delta = 5;
+    huge_frame.rows.push(row0);
+    huge_frame.rows.push(row1);
+    huge_frame.rows.push(row2);
+    assert!(broker.try_publish_frame(conn(1), nz_stream(1), s1_att, huge_frame, ts(6), &mut actions).is_ok());
+    let degraded = broker.pop_outbound(conn(1)).expect("degraded frame queued");
+    assert_eq!(
+        degraded.encoded_bytes, MAX_WIRE_FRAME_BYTES,
+        "exact-fit degraded prefix must equal MAX_WIRE_FRAME_BYTES"
+    );
+    match degraded.msg {
+        BrokerMsg::Frame(f) => {
+            assert!(f.full_sync, "degraded oversized frame must force full_sync=true");
+            assert_eq!(f.scroll_delta, 0, "degraded full_sync frame must clear scroll_delta");
+            assert_eq!(f.rows.len(), 2, "must keep both exact-fit rows and drop the overflowing 3rd row");
+            assert_eq!(f.rows[0].text.len(), 3_000_000);
+            assert_eq!(f.rows[1].text.len(), exact_row1_text_len);
+        }
+        other => panic!("expected degraded Frame, got {other:?}"),
+    }
+    // Ack seq 1 so the exact-cap probe below can send into a fresh window.
+    let ack1 = encode_client(
+        nz_stream(1).as_stream_id(),
+        11,
+        &ClientMsg::FrameAck { seq: 1, credit: FrameCredit { max_frames: 4, max_bytes: 16 * 1024 * 1024 } },
+    );
+    broker.feed_bytes(conn(1), &ack1, ts(6), &mut actions);
+
+    // Also verify 128-row varint boundary (`rows.len()` crossing 127 -> 128 grows varint by +1 byte)
+    // so `degrade_frame_to_wire_cap` accounts for exact varint length and never exceeds MAX_WIRE_FRAME_BYTES!
+    let mut f128 = sample_frame();
+    f128.seq = 2;
+    f128.full_sync = true;
+    // 127 rows of equal size + 1 exact-fit 128th row + 1 extra overflowing row:
+    // Calculate exact encoded bytes for 127 rows of 65_000 bytes each (~8.25 MiB total > 8 MiB).
+    // Instead make 127 rows of 60_000 bytes (~7.62 MiB), then size row 127 (the 128th row, index 127)
+    // so that WITH varint_extra_bytes(128) == 1 it is 1 byte OVER MAX_WIRE_FRAME_BYTES (must be dropped!),
+    // proving varint growth at 128 rows is accurately budgeted!
+    let mut small_rows_bytes = 0usize;
+    for i in 0..127u64 {
+        let r = make_row(i, 60_000);
+        let mut rw = apack_proto::codec::Writer::new();
+        r.encode(&mut rw);
+        small_rows_bytes += rw.as_slice().len();
+        f128.rows.push(r);
+    }
+    let probe_128 = make_row(127, 100_000);
+    let mut r128w = apack_proto::codec::Writer::new();
+    probe_128.encode(&mut r128w);
+    let r128_overhead = r128w.as_slice().len() - 100_000;
+    // Exact budget remaining if varint didn't grow (i.e. +1 byte over when varint grows from 1 -> 2 bytes!):
+    let no_varint_exact_len = MAX_WIRE_FRAME_BYTES - empty_frame_bytes - small_rows_bytes - r128_overhead;
+    f128.rows.push(make_row(127, no_varint_exact_len));
+    f128.rows.push(make_row(128, 100));
+    assert!(broker.try_publish_frame(conn(1), nz_stream(1), s1_att, f128, ts(6), &mut actions).is_ok());
+    let deg128 = broker.pop_outbound(conn(1)).expect("degraded 128-row frame queued");
+    assert!(deg128.encoded_bytes <= MAX_WIRE_FRAME_BYTES);
+    match deg128.msg {
+        BrokerMsg::Frame(f) => {
+            assert_eq!(f.rows.len(), 127, "128th row overflows by 1 byte due to varint growth and must be excluded");
+        }
+        other => panic!("expected Frame, got {other:?}"),
+    }
+    let ack2 = encode_client(
+        nz_stream(1).as_stream_id(),
+        12,
+        &ClientMsg::FrameAck { seq: 2, credit: FrameCredit { max_frames: 4, max_bytes: 16 * 1024 * 1024 } },
+    );
+    broker.feed_bytes(conn(1), &ack2, ts(6), &mut actions);
 
     // Construct a frame whose encoded_bytes == MAX_WIRE_FRAME_BYTES
     let mut probe_f = sample_frame();
-    probe_f.seq = 1;
+    probe_f.seq = 3;
     let base_text = 8_000_000usize;
     probe_f.rows.push(apack_proto::types::PackedRow {
         line: 0,
@@ -2201,4 +2298,164 @@ fn pr2_unauth_conn_does_not_pin_attached_unpin_survives_and_backpressure_flushes
     let mut be_credit = RawOutputFlow::with_limits(4, false, 64, 4);
     let _ = be_credit.ingest(&[0xE2, 0x82], ts(1), &mut budget);
     assert_eq!(be_credit.flush_on_exit(&mut budget), vec!["\u{FFFD}"]);
+}
+
+#[test]
+fn pr3_final_frame_delivery_stalled_budget_pacer_precheck_and_inspect_client() {
+    use crate::broker::{FrameStallReason, INSPECT_CLIENT_NAME, SessionLifetime, estimate_frame_approx_bytes};
+
+    // 1. FramePacer::can_send_any fast pre-check before payload measurement
+    let pacer = FramePacer::new(FrameCredit { max_frames: 0, max_bytes: 65_536 });
+    assert!(!pacer.can_send_any());
+    let mut pacer2 = FramePacer::new(FrameCredit { max_frames: 2, max_bytes: 65_536 });
+    assert!(pacer2.can_send_any());
+    let _ = pacer2.on_send(65_536, ts(1));
+    assert!(!pacer2.can_send_any(), "in_flight_bytes >= effective_max_bytes cannot send any more");
+    pacer2.on_ack(1, FrameCredit { max_frames: 1, max_bytes: 65_536 }, ts(2)).unwrap();
+    assert!(pacer2.can_send_any());
+    let _ = pacer2.on_send(100, ts(3));
+    assert!(!pacer2.can_send_any(), "in_flight.len() == max_frames cannot send any more");
+
+    // 2. BrokerCore::publish_final_frame delivers ordered full_sync frame strictly ahead of Exited
+    //    even when pacer has max_frames == 0 and a stale P1 frame is queued.
+    let mut broker = BrokerCore::new(AuthConfig::None);
+    let mut actions = Vec::new();
+    handshake_ready(&mut broker, conn(1), ts(10));
+    broker.register_session(sid(1), SessionLifetime::LeaseBound, false, &mut actions);
+    let attach = encode_client(
+        StreamId::CONTROL,
+        1,
+        &ClientMsg::Attach {
+            session: sid(1),
+            stream_id: nz_stream(1),
+            flags: SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(),
+            initial_viewport: None,
+            initial_output_credit: 0,
+            initial_frame_credit: FrameCredit { max_frames: 0, max_bytes: 65_536 },
+        },
+    );
+    broker.feed_bytes(conn(1), &attach, ts(11), &mut actions);
+    let att1 = broker.stream_attachment(conn(1), nz_stream(1)).expect("att1");
+    assert!(!broker.can_publish_frame_now(conn(1), nz_stream(1), att1));
+
+    // Normal try_publish_frame fails fast with FrameStallReason::Pacer and encoded_bytes == 0.
+    let err = broker.try_publish_frame(conn(1), nz_stream(1), att1, sample_frame(), ts(12), &mut actions).unwrap_err();
+    assert_eq!(err.1, FrameStallReason::Pacer);
+    assert_eq!(err.2, 0, "must skip estimate_encoded_bytes when !pacer.can_send_any()");
+
+    // Reserve/release stalled frame bytes against MemoryBudget while preserving Control/Event headroom.
+    let approx = estimate_frame_approx_bytes(&err.0);
+    assert_eq!(approx, apack_proto::FRAME_HEADER_LEN + 64);
+    let used_before = broker.connection_budget_used(conn(1)).unwrap();
+    let rem_before = broker.connection_budget_remaining(conn(1));
+    assert!(broker.reserve_stalled_frame_bytes(conn(1), approx));
+    assert_eq!(broker.connection_budget_used(conn(1)).unwrap(), used_before + approx);
+    assert_eq!(broker.connection_budget_remaining(conn(1)), rem_before - approx);
+    // Attempting to encroach into the 256 KiB Control/Event reserve must fail so Control never triggers SlowReader.
+    let reserve_floor = (broker.max_queue_bytes() / 4).min(crate::flow::RAW_PENDING_BUDGET_HEADROOM);
+    let exact_room = broker.connection_budget_remaining(conn(1)).saturating_sub(reserve_floor);
+    assert!(
+        !broker.reserve_stalled_frame_bytes(conn(1), exact_room + 1),
+        "stalled frames must not encroach on Control/Event headroom reserve"
+    );
+    assert!(broker.reserve_stalled_frame_bytes(conn(1), exact_room));
+    broker.release_stalled_frame_bytes(conn(1), exact_room);
+    broker.release_stalled_frame_bytes(conn(1), approx);
+    assert_eq!(broker.connection_budget_used(conn(1)).unwrap(), used_before);
+
+    // publish_final_frame bypasses pacer, forces full_sync=true & scroll_delta=0, and queues strictly ahead of Exited!
+    let mut final_f = sample_frame();
+    final_f.full_sync = false;
+    final_f.scroll_delta = -3;
+    final_f.rows.push(apack_proto::types::PackedRow {
+        line: 0,
+        flags: 0,
+        text: String::from("EXIT_SNAPSHOT"),
+        runs: Vec::new(),
+        styles: Vec::new(),
+        links: vec![String::from("https://example.com")],
+        pieces: Vec::new(),
+    });
+    assert!(estimate_frame_approx_bytes(&final_f) > approx);
+    actions.clear();
+    broker.publish_final_frame(conn(1), nz_stream(1), att1, final_f, ts(13), &mut actions);
+    assert!(actions.contains(&BrokerAction::OutboundReady(conn(1))));
+    broker.enqueue_message(
+        conn(1),
+        nz_stream(1).as_stream_id(),
+        RequestId::PUSH,
+        OutboundPriority::Event,
+        BrokerMsg::Exited { exit_code: Some(0), signal: None },
+        ts(13),
+        &mut actions,
+    );
+    // Drain: Frame(seq=1, full_sync=true, scroll_delta=0) MUST come strictly before Exited!
+    let mut msgs = Vec::new();
+    while let Some(q) = broker.pop_outbound(conn(1)) {
+        msgs.push(q.msg);
+    }
+    assert_eq!(msgs.len(), 2);
+    assert!(
+        matches!(&msgs[0], BrokerMsg::Frame(f) if f.seq == 1 && f.full_sync && f.scroll_delta == 0 && f.rows[0].text == "EXIT_SNAPSHOT")
+    );
+    assert!(matches!(&msgs[1], BrokerMsg::Exited { exit_code: Some(0), signal: None }));
+
+    // Also verify publish_final_frame + Exited + unregister_session on SUB_VIEW | SUB_RAW_OUTPUT:
+    let attach2 = encode_client(
+        StreamId::CONTROL,
+        2,
+        &ClientMsg::Attach {
+            session: sid(1),
+            stream_id: nz_stream(2),
+            flags: SubFlags::from_bits(SubFlags::VIEW | SubFlags::RAW_OUTPUT | SubFlags::EVENTS).unwrap(),
+            initial_viewport: None,
+            initial_output_credit: 65_536,
+            initial_frame_credit: FrameCredit { max_frames: 1, max_bytes: 65_536 },
+        },
+    );
+    broker.feed_bytes(conn(1), &attach2, ts(14), &mut actions);
+    let att2 = broker.stream_attachment(conn(1), nz_stream(2)).expect("att2");
+    assert!(broker.can_publish_frame_now(conn(1), nz_stream(2), att2));
+    // Queue a stale P1 frame first, then publish_final_frame must replace/drop it and survive unregister_session.
+    assert!(broker.try_publish_frame(conn(1), nz_stream(2), att2, sample_frame(), ts(14), &mut actions).is_ok());
+    assert!(!broker.can_publish_frame_now(conn(1), nz_stream(2), att2));
+    broker.publish_final_frame(conn(1), nz_stream(2), att2, sample_frame(), ts(15), &mut actions);
+    broker.enqueue_message(
+        conn(1),
+        nz_stream(2).as_stream_id(),
+        RequestId::PUSH,
+        OutboundPriority::Event,
+        BrokerMsg::Exited { exit_code: Some(7), signal: None },
+        ts(15),
+        &mut actions,
+    );
+    broker.unregister_session(sid(1), "session ended", ts(16), &mut actions);
+    let mut seq_msgs = Vec::new();
+    while let Some(q) = broker.pop_outbound(conn(1)) {
+        seq_msgs.push(q.msg);
+    }
+    assert_eq!(seq_msgs.len(), 3, "stale P1 dropped, ordered final Frame + Exited + StreamClosed preserved");
+    assert!(matches!(&seq_msgs[0], BrokerMsg::Frame(f) if f.seq == 2 && f.full_sync));
+    assert!(matches!(&seq_msgs[1], BrokerMsg::Exited { exit_code: Some(7), signal: None }));
+    assert!(matches!(&seq_msgs[2], BrokerMsg::StreamClosed { .. }));
+
+    // 3. `apack-inspect` client is ready for RPCs but does NOT count as a lifecycle client.
+    let mut b2 = BrokerCore::new(AuthConfig::None);
+    let mut a2 = Vec::new();
+    b2.open_connection(conn(10), [1u8; 32], ts(1)).unwrap();
+    let inspect_hello = encode_client(
+        StreamId::CONTROL,
+        1,
+        &ClientMsg::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            client_nonce: [2u8; 32],
+            client_name: String::from(INSPECT_CLIENT_NAME),
+        },
+    );
+    b2.feed_bytes(conn(10), &inspect_hello, ts(2), &mut a2);
+    assert!(b2.is_connection_ready(conn(10)));
+    assert!(!b2.is_lifecycle_client_ready(conn(10)));
+
+    handshake_ready(&mut b2, conn(11), ts(3));
+    assert!(b2.is_lifecycle_client_ready(conn(11)));
 }

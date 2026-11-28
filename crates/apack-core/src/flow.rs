@@ -168,15 +168,20 @@ impl FramePacer {
         self.credit.max_frames == 0
     }
 
+    /// Returns `true` if at least one frame slot and some byte credit remain before measuring payload size.
+    pub fn can_send_any(&self) -> bool {
+        if self.credit.max_frames == 0 || self.in_flight.len() >= usize::from(self.credit.max_frames) {
+            return false;
+        }
+        self.in_flight.is_empty() || self.in_flight_bytes < self.effective_max_bytes()
+    }
+
     /// Returns `true` if a frame of `next_frame_bytes` may be sent without violating BDP bounds.
     ///
     /// When `in_flight` is empty and `max_frames >= 1`, a single frame is always permitted so a
     /// large initial full-sync frame can never deadlock the stream.
     pub fn can_send(&self, next_frame_bytes: u32) -> bool {
-        if self.credit.max_frames == 0 {
-            return false;
-        }
-        if self.in_flight.len() >= usize::from(self.credit.max_frames) {
+        if !self.can_send_any() {
             return false;
         }
         if self.in_flight.is_empty() {

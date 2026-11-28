@@ -676,6 +676,11 @@ impl SimWorld {
                 BrokerAction::FrameCreditUpdated { conn, stream_id, attachment_id, session, .. } => {
                     self.publish_dirty_view(session, (conn, stream_id), attachment_id);
                 }
+                BrokerAction::ClientFin(conn) => {
+                    let mut extra = Vec::new();
+                    self.broker.close_connection(conn, CloseReason::ClientFin, self.now, &mut extra);
+                    self.process_broker_actions(extra);
+                }
                 BrokerAction::CloseConn { conn, reason, .. } => {
                     let _ = reason;
                     self.client_decoders.remove(&conn);

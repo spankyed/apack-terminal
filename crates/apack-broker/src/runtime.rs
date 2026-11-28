@@ -108,7 +108,7 @@ impl BrokerHandle {
         self.shutdown.store(true, Ordering::Release);
         self.wake.wake();
         if let Some(handle) = self.thread.take() {
-            return handle.join().unwrap_or(Ok(()));
+            return handle.join().unwrap_or_else(|_| Err(std::io::Error::other("broker reactor thread panicked")));
         }
         Ok(())
     }

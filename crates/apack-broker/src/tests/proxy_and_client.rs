@@ -525,14 +525,45 @@ fn timeout_and_idle_compression_helpers_unit() {
     });
     let a1 = apack_core::broker::StreamAttachmentId::new(10).unwrap();
     let a2 = apack_core::broker::StreamAttachmentId::new(11).unwrap();
-    stalled.insert(a1, (s1, SessionId::new(1).unwrap(), dummy_frame.clone()));
-    stalled.insert(a2, (s2, SessionId::new(2).unwrap(), dummy_frame));
+    let a3 = apack_core::broker::StreamAttachmentId::new(12).unwrap();
+    stalled.insert(
+        a1,
+        crate::transport_loop::StalledFrame::Buffered {
+            stream_id: s1,
+            session: SessionId::new(1).unwrap(),
+            frame: dummy_frame.clone(),
+            charged_bytes: 128,
+            reason: apack_core::broker::FrameStallReason::OutboundOrBudget,
+        },
+    );
+    stalled.insert(
+        a2,
+        crate::transport_loop::StalledFrame::Buffered {
+            stream_id: s2,
+            session: SessionId::new(2).unwrap(),
+            frame: dummy_frame.clone(),
+            charged_bytes: 256,
+            reason: apack_core::broker::FrameStallReason::OutboundOrBudget,
+        },
+    );
+    stalled.insert(
+        a3,
+        crate::transport_loop::StalledFrame::Buffered {
+            stream_id: s2,
+            session: SessionId::new(2).unwrap(),
+            frame: dummy_frame,
+            charged_bytes: 64,
+            reason: apack_core::broker::FrameStallReason::Pacer,
+        },
+    );
     let mut queued = std::collections::HashMap::new();
     queued.insert(a1, (s1, SessionId::new(1).unwrap()));
+    // Only budget-stalled attachments without a queued P1 frame are returned (pacer-stalled `a3` is skipped).
     assert_eq!(ready_stalled_attachments(&stalled, &queued), vec![a2]);
     queued.insert(a2, (s2, SessionId::new(2).unwrap()));
-    prune_ended_session_frames(&mut stalled, &mut queued, SessionId::new(1).unwrap());
-    assert!(!stalled.contains_key(&a1) && stalled.contains_key(&a2));
+    let freed = prune_ended_session_frames(&mut stalled, &mut queued, SessionId::new(1).unwrap());
+    assert_eq!(freed, 128);
+    assert!(!stalled.contains_key(&a1) && stalled.contains_key(&a2) && stalled.contains_key(&a3));
     assert!(!queued.contains_key(&a1) && queued.contains_key(&a2));
 
     // Bounded shard event draining + wait clamping (`H6`)
@@ -919,4 +950,271 @@ fn pr6_proxy_large_full_duplex_reconnect_replay_never_deadlocks() {
         .expect_err("overflowed replay buffer before first broker byte must return BrokenPipe");
     assert_eq!(ovf_err.kind(), std::io::ErrorKind::BrokenPipe);
     t_ovf.join().expect("join t_ovf");
+}
+
+#[test]
+fn pr3_proxy_autostart_retries_held_exit_clean_exit_timeout_stderr_and_stdin_err() {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let tmp = tempdir().unwrap();
+
+    // 1. `connect_or_autostart_with` retries spawning when attempt 1 exits with HELD_EXIT and no winner binds.
+    let sock_held = unique_endpoint(tmp.path(), "pr3-held-retry");
+    #[cfg(unix)]
+    if let Some(p) = std::path::Path::new(&sock_held).parent() {
+        std::fs::create_dir_all(p).unwrap();
+    }
+    let held_attempts = AtomicUsize::new(0);
+    let mut held_listener: Option<interprocess::local_socket::Listener> = None;
+    let stream = crate::proxy::connect_or_autostart_with(&sock_held, true, Duration::from_secs(3), |path| {
+        let n = held_attempts.fetch_add(1, Ordering::AcqRel);
+        if n == 0 {
+            #[cfg(unix)]
+            let mut cmd = {
+                let mut c = Command::new("/bin/sh");
+                c.args(["-c", &format!("exit {}", apack_os::transport::HELD_EXIT)]);
+                c
+            };
+            #[cfg(windows)]
+            let mut cmd = {
+                let mut c = Command::new("cmd.exe");
+                c.args(["/C", &format!("exit /B {}", apack_os::transport::HELD_EXIT)]);
+                c
+            };
+            Ok(Some(cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn()?))
+        } else {
+            held_listener = Some(apack_os::transport::bind_local_listener(path).expect("bind retry listener"));
+            Ok(None)
+        }
+    })
+    .expect("autostart must retry after HELD_EXIT when winner is absent");
+    assert_eq!(held_attempts.load(Ordering::Acquire), 2);
+    drop((stream, held_listener));
+
+    // 1b. `connect_or_autostart_with` waits HELD_CONNECT_POLLS for a concurrent winner before re-spawning,
+    //     and caps retries at MAX_AUTOSTART_SPAWNS when brokers keep exiting 0.
+    let sock_winner = unique_endpoint(tmp.path(), "pr3-held-winner");
+    #[cfg(unix)]
+    if let Some(p) = std::path::Path::new(&sock_winner).parent() {
+        std::fs::create_dir_all(p).unwrap();
+    }
+    let winner_spawns = AtomicUsize::new(0);
+    let sock_winner_bg = sock_winner.clone();
+    let (spawned_tx, spawned_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let winner_thread = std::thread::spawn(move || {
+        let _ = spawned_rx.recv();
+        // Wait long enough for the first `exit HELD_EXIT` attempt to be observed and enter the
+        // `held_polls_left > 0` backoff loop (~15ms), while still binding well before the 4*15ms
+        // `HELD_CONNECT_POLLS` window expires (~60ms).
+        std::thread::sleep(Duration::from_millis(35));
+        let l = apack_os::transport::bind_local_listener(&sock_winner_bg).expect("winner bind");
+        use interprocess::local_socket::traits::Listener as _;
+        let _ = l.accept();
+    });
+    let stream_w = crate::proxy::connect_or_autostart_with(&sock_winner, true, Duration::from_secs(3), |_| {
+        winner_spawns.fetch_add(1, Ordering::AcqRel);
+        let _ = spawned_tx.try_send(());
+        #[cfg(unix)]
+        let mut cmd = {
+            let mut c = Command::new("/bin/sh");
+            c.args(["-c", &format!("exit {}", apack_os::transport::HELD_EXIT)]);
+            c
+        };
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut c = Command::new("cmd.exe");
+            c.args(["/C", &format!("exit /B {}", apack_os::transport::HELD_EXIT)]);
+            c
+        };
+        Ok(Some(cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn()?))
+    })
+    .expect("must connect to concurrent winner without re-spawning");
+    assert_eq!(
+        winner_spawns.load(Ordering::Acquire),
+        1,
+        "must poll winner during HELD_CONNECT_POLLS before re-spawning"
+    );
+    drop(stream_w);
+    winner_thread.join().unwrap();
+
+    let sock_cap = unique_endpoint(tmp.path(), "pr3-zero-cap");
+    #[cfg(unix)]
+    if let Some(p) = std::path::Path::new(&sock_cap).parent() {
+        std::fs::create_dir_all(p).unwrap();
+    }
+    let cap_spawns = AtomicUsize::new(0);
+    let _ = crate::proxy::connect_or_autostart_with(&sock_cap, true, Duration::from_millis(1500), |_| {
+        cap_spawns.fetch_add(1, Ordering::AcqRel);
+        #[cfg(unix)]
+        let mut cmd = {
+            let mut c = Command::new("/bin/sh");
+            c.args(["-c", "exit 0"]);
+            c
+        };
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut c = Command::new("cmd.exe");
+            c.args(["/C", "exit /B 0"]);
+            c
+        };
+        Ok(Some(cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn()?))
+    })
+    .expect_err("exhausting retries must fail on timeout");
+    assert_eq!(cap_spawns.load(Ordering::Acquire), 5, "autostart retries must stop at MAX_AUTOSTART_SPAWNS (5)");
+
+    // 1c. Pure proxy helpers: `should_send_replay_fin` & `mark_broker_byte_and_clear_replay`.
+    assert!(crate::proxy::should_send_replay_fin(true, true, false));
+    assert!(!crate::proxy::should_send_replay_fin(true, true, true));
+    assert!(!crate::proxy::should_send_replay_fin(false, true, false));
+    assert!(!crate::proxy::should_send_replay_fin(true, false, false));
+
+    let sock_clr = unique_endpoint(tmp.path(), "pr3-clr");
+    #[cfg(unix)]
+    if let Some(p) = std::path::Path::new(&sock_clr).parent() {
+        std::fs::create_dir_all(p).unwrap();
+    }
+    let l_clr = apack_os::transport::bind_local_listener(&sock_clr).unwrap();
+    let s_clr = std::sync::Arc::new(apack_os::transport::connect_local_stream(&sock_clr).unwrap());
+    let mut rb = crate::proxy::ReplayBuffer::new(1024);
+    rb.push(b"hello");
+    let link_clr = std::sync::Mutex::new(crate::proxy::ActiveLink {
+        stream: s_clr,
+        replay: rb,
+        stdin_eof: false,
+        reconnected: false,
+        replaying: false,
+    });
+    let saw_flag = AtomicBool::new(false);
+    assert!(crate::proxy::mark_broker_byte_and_clear_replay(&saw_flag, &link_clr));
+    assert!(link_clr.lock().unwrap().replay.replay_slice().is_none());
+    link_clr.lock().unwrap().replay.push(b"after");
+    assert!(!crate::proxy::mark_broker_byte_and_clear_replay(&saw_flag, &link_clr));
+    assert_eq!(link_clr.lock().unwrap().replay.replay_slice(), Some(&b"after"[..]));
+    drop((link_clr, l_clr));
+
+    // 2. `connect_or_autostart_with` retries spawning when attempt 1 exits cleanly with status 0.
+    let sock_zero = unique_endpoint(tmp.path(), "pr3-zero-retry");
+    #[cfg(unix)]
+    if let Some(p) = std::path::Path::new(&sock_zero).parent() {
+        std::fs::create_dir_all(p).unwrap();
+    }
+    let zero_attempts = AtomicUsize::new(0);
+    let mut zero_listener: Option<interprocess::local_socket::Listener> = None;
+    let stream = crate::proxy::connect_or_autostart_with(&sock_zero, true, Duration::from_secs(3), |path| {
+        let n = zero_attempts.fetch_add(1, Ordering::AcqRel);
+        if n == 0 {
+            #[cfg(unix)]
+            let mut cmd = {
+                let mut c = Command::new("/bin/sh");
+                c.args(["-c", "exit 0"]);
+                c
+            };
+            #[cfg(windows)]
+            let mut cmd = {
+                let mut c = Command::new("cmd.exe");
+                c.args(["/C", "exit /B 0"]);
+                c
+            };
+            Ok(Some(cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn()?))
+        } else {
+            zero_listener = Some(apack_os::transport::bind_local_listener(path).expect("bind zero retry listener"));
+            Ok(None)
+        }
+    })
+    .expect("autostart must retry after clean exit 0");
+    assert_eq!(zero_attempts.load(Ordering::Acquire), 2);
+    drop((stream, zero_listener));
+
+    // 3. `connect_or_autostart_with` attaches captured stderr on timeout without blocking on live child.
+    let sock_timeout = unique_endpoint(tmp.path(), "pr3-timeout-stderr");
+    #[cfg(unix)]
+    if let Some(p) = std::path::Path::new(&sock_timeout).parent() {
+        std::fs::create_dir_all(p).unwrap();
+    }
+    let err = crate::proxy::connect_or_autostart_with(&sock_timeout, true, Duration::from_millis(800), |_| {
+        #[cfg(unix)]
+        let mut cmd = {
+            let mut c = Command::new("/bin/sh");
+            c.args(["-c", "echo PR3_TIMEOUT_DIAG >&2; sleep 2"]);
+            c
+        };
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut c = Command::new("cmd.exe");
+            c.args(["/C", "echo PR3_TIMEOUT_DIAG 1>&2 & ping -n 3 127.0.0.1 >nul"]);
+            c
+        };
+        Ok(Some(cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn()?))
+    })
+    .expect_err("timeout without listener must fail");
+    assert!(err.to_string().contains("PR3_TIMEOUT_DIAG"), "timeout error must surface captured stderr, got: {err}");
+
+    // 4. `run_proxy_over` sends FIN_FRAME on stdin read error so broker closes cleanly without hanging.
+    struct FailingReader;
+    impl Read for FailingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("simulated stdin I/O failure"))
+        }
+    }
+    let sock_err = unique_endpoint(tmp.path(), "pr3-stdin-err");
+    #[cfg(unix)]
+    if let Some(p) = std::path::Path::new(&sock_err).parent() {
+        std::fs::create_dir_all(p).unwrap();
+    }
+    let l_err = apack_os::transport::bind_local_listener(&sock_err).unwrap();
+    let t_err = std::thread::spawn(move || {
+        use interprocess::local_socket::traits::Listener as _;
+        let mut s = l_err.accept().expect("accept err listener");
+        let mut got = [0u8; 4];
+        s.read_exact(&mut got).expect("must receive FIN_FRAME on stdin read error");
+        got
+    });
+    let mut out_err = Vec::new();
+    run_proxy_over(FailingReader, &mut out_err, move || apack_os::transport::connect_local_stream(&sock_err))
+        .expect("proxy must finish cleanly after sending FIN on stdin error");
+    assert_eq!(t_err.join().expect("join t_err"), apack_proto::FIN_FRAME);
+
+    // 5. `is_interactive_input_msg` & `ShardCmdPermit::try_acquire_with_wake` fin_pending wakeup.
+    assert!(crate::transport_loop::is_interactive_input_msg(&ClientMsg::Text { text: String::from("a") }));
+    assert!(crate::transport_loop::is_interactive_input_msg(&ClientMsg::Focus { focused: true }));
+    assert!(crate::transport_loop::is_interactive_input_msg(&ClientMsg::ViewportHint(
+        apack_proto::types::ViewportHint {
+            size: GridSize::new(80, 24).unwrap(),
+            cell_px: CellPx { width: 8, height: 16 },
+            visible: true,
+            focused: true,
+        }
+    )));
+    assert!(!crate::transport_loop::is_interactive_input_msg(&ClientMsg::Commands));
+    assert!(!crate::transport_loop::is_interactive_input_msg(&ClientMsg::Write { data: b"hi".to_vec() }));
+
+    let counter = std::sync::Arc::new(AtomicUsize::new(0));
+    let fin_pending = std::sync::Arc::new(AtomicBool::new(false));
+    let wakes = std::sync::Arc::new(AtomicUsize::new(0));
+    let wakes_cb = std::sync::Arc::clone(&wakes);
+    let wake_fn: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+        wakes_cb.fetch_add(1, Ordering::AcqRel);
+    });
+    let p1 = crate::shard::ShardCmdPermit::try_acquire_with_wake(
+        &counter,
+        2,
+        Some(std::sync::Arc::clone(&fin_pending)),
+        Some(std::sync::Arc::clone(&wake_fn)),
+    )
+    .unwrap();
+    assert!(format!("{p1:?}").contains("ShardCmdPermit"));
+    let p2 = crate::shard::ShardCmdPermit::try_acquire_with_wake(
+        &counter,
+        2,
+        Some(std::sync::Arc::clone(&fin_pending)),
+        Some(wake_fn),
+    )
+    .unwrap();
+    fin_pending.store(true, Ordering::Release);
+    drop(p1);
+    assert_eq!(wakes.load(Ordering::Acquire), 0, "must not wake until final permit drops");
+    drop(p2);
+    assert_eq!(wakes.load(Ordering::Acquire), 1, "final permit drop while fin_pending must wake reactor");
 }

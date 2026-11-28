@@ -141,7 +141,7 @@ impl ShardRunner {
             std::mem::take(&mut sess.pending_image_tail)
         };
 
-        self.apply_effects_inner(session_id, effects, false);
+        self.apply_effects_inner(session_id, effects, false, None);
         if !tail.is_empty() {
             self.ingest_pty_bytes(session_id, &tail);
         }

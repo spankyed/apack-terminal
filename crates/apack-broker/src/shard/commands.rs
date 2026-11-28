@@ -29,6 +29,7 @@ use apack_wal::{WalReader, WalWorker, WalWriter};
 use crate::config::AUTH_KEY_ENV;
 use crate::{fill_random, now_unix_ms};
 
+use super::protocol::ShardCmdPermit;
 use super::replay::{
     build_keyframe_engine, build_machine_from_slice, capture_keyframe, hydrate_slice_blobs, restore_machine_from_dir,
     restore_machine_from_slice, sync_wal_image_blobs,
@@ -36,10 +37,17 @@ use super::replay::{
 use super::{DEFAULT_SCROLLBACK_LINES, LivePty, LiveSession, ReactorEvent, ShardRunner};
 
 impl ShardRunner {
-    pub(super) fn handle_spawn(&mut self, session_id: SessionId, conn: ConnId, req_id: RequestId, spec: SpawnSpec) {
+    pub(super) fn handle_spawn(
+        &mut self,
+        session_id: SessionId,
+        conn: ConnId,
+        req_id: RequestId,
+        spec: SpawnSpec,
+        permit: Option<Arc<ShardCmdPermit>>,
+    ) {
         if self.tearing_down_all {
             self.emit(ReactorEvent::SpawnOrRewindFailed);
-            self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Busy, "broker is shutting down");
+            self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Busy, "broker is shutting down", permit);
             return;
         }
         let scrollback_lines = resolve_scrollback_lines(spec.scrollback_limit);
@@ -52,7 +60,7 @@ impl ShardRunner {
             Ok(e) => e,
             Err(err) => {
                 self.emit(ReactorEvent::SpawnOrRewindFailed);
-                self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Pty, &err.to_string());
+                self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Pty, &err.to_string(), permit);
                 return;
             }
         };
@@ -78,7 +86,7 @@ impl ShardRunner {
             )
         {
             self.emit(ReactorEvent::SpawnOrRewindFailed);
-            self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Pty, &format!("restore failed: {err}"));
+            self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Pty, &format!("restore failed: {err}"), permit);
             return;
         }
 
@@ -88,7 +96,7 @@ impl ShardRunner {
             let mut uuid = [0u8; 16];
             if let Err(err) = fill_random(&mut uuid) {
                 self.emit(ReactorEvent::SpawnOrRewindFailed);
-                self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Pty, &err);
+                self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Pty, &err, permit);
                 return;
             }
             match WalWriter::open_or_create(
@@ -107,6 +115,7 @@ impl ShardRunner {
                         req_id,
                         ErrorCode::Pty,
                         &format!("recording failed: {err}"),
+                        permit,
                     );
                     return;
                 }
@@ -136,7 +145,7 @@ impl ShardRunner {
                     let _ = w.shutdown();
                 }
                 self.emit(ReactorEvent::SpawnOrRewindFailed);
-                self.send_error(conn, StreamId::CONTROL, req_id, err.error_code(), &err.to_string());
+                self.send_error(conn, StreamId::CONTROL, req_id, err.error_code(), &err.to_string(), permit);
                 return;
             }
         };
@@ -158,7 +167,7 @@ impl ShardRunner {
         let live_pty: Result<LivePty, (ErrorCode, String)> = {
             let wake = self.self_wake.clone();
             ConPtyBridge::start(spawned.master, move || wake.wake())
-                .map(|bridge| LivePty::Windows { bridge, eof: false })
+                .map(|bridge| LivePty::Windows { bridge, eof: false, write_broken: false })
                 .map_err(|err| (err.error_code(), err.to_string()))
         };
 
@@ -175,7 +184,7 @@ impl ShardRunner {
                 let _ = spawned.killer.kill();
                 let _ = spawned.child.wait();
                 self.emit(ReactorEvent::SpawnOrRewindFailed);
-                self.send_error(conn, StreamId::CONTROL, req_id, code, &msg);
+                self.send_error(conn, StreamId::CONTROL, req_id, code, &msg, permit);
                 return;
             }
         };
@@ -248,6 +257,7 @@ impl ShardRunner {
             req_id,
             priority: OutboundPriority::Control,
             msg: BrokerMsg::Spawned { session: session_id, pid: pid_target },
+            permit,
         });
     }
 
@@ -258,23 +268,38 @@ impl ShardRunner {
         req_id: RequestId,
         record_dir: &str,
         at_ms: Option<u64>,
+        permit: Option<Arc<ShardCmdPermit>>,
     ) {
         if self.tearing_down_all {
             self.emit(ReactorEvent::SpawnOrRewindFailed);
-            self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Busy, "broker is shutting down");
+            self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Busy, "broker is shutting down", permit);
             return;
         }
         let reader = match WalReader::open(record_dir, &self.shared.wal_registry) {
             Ok(r) => r,
             Err(err) => {
                 self.emit(ReactorEvent::SpawnOrRewindFailed);
-                self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Pty, &format!("rewind failed: {err}"));
+                self.send_error(
+                    conn,
+                    StreamId::CONTROL,
+                    req_id,
+                    ErrorCode::Pty,
+                    &format!("rewind failed: {err}"),
+                    permit,
+                );
                 return;
             }
         };
         let Some((first_ms, last_ms)) = reader.span() else {
             self.emit(ReactorEvent::SpawnOrRewindFailed);
-            self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Malformed, "recording contains no segments");
+            self.send_error(
+                conn,
+                StreamId::CONTROL,
+                req_id,
+                ErrorCode::Malformed,
+                "recording contains no segments",
+                permit,
+            );
             return;
         };
         let target_ms = at_ms.map_or(last_ms, |t| first_ms.saturating_add(t).min(last_ms));
@@ -284,12 +309,26 @@ impl ShardRunner {
             Ok(Some(s)) => s,
             Ok(None) => {
                 self.emit(ReactorEvent::SpawnOrRewindFailed);
-                self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Malformed, "recording has no seek slice");
+                self.send_error(
+                    conn,
+                    StreamId::CONTROL,
+                    req_id,
+                    ErrorCode::Malformed,
+                    "recording has no seek slice",
+                    permit,
+                );
                 return;
             }
             Err(err) => {
                 self.emit(ReactorEvent::SpawnOrRewindFailed);
-                self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Pty, &format!("rewind read failed: {err}"));
+                self.send_error(
+                    conn,
+                    StreamId::CONTROL,
+                    req_id,
+                    ErrorCode::Pty,
+                    &format!("rewind read failed: {err}"),
+                    permit,
+                );
                 return;
             }
         };
@@ -305,7 +344,7 @@ impl ShardRunner {
             Ok(e) => e,
             Err(err) => {
                 self.emit(ReactorEvent::SpawnOrRewindFailed);
-                self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Pty, &err.to_string());
+                self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Pty, &err.to_string(), permit);
                 return;
             }
         };
@@ -366,14 +405,22 @@ impl ShardRunner {
             req_id,
             priority: OutboundPriority::Control,
             msg: BrokerMsg::Rewound { session: session_id, duration_ms, at_ms: actual_offset_ms },
+            permit,
         });
     }
 
-    pub(super) fn handle_seek(&mut self, session_id: SessionId, conn: ConnId, req_id: RequestId, at_ms: u64) {
+    pub(super) fn handle_seek(
+        &mut self,
+        session_id: SessionId,
+        conn: ConnId,
+        req_id: RequestId,
+        at_ms: u64,
+        permit: Option<Arc<ShardCmdPermit>>,
+    ) {
         let mut effects = Vec::new();
         let actual_offset_ms = {
             let Some(sess) = self.sessions.get_mut(&session_id) else {
-                self.send_no_such_session(conn, req_id);
+                self.send_no_such_session(conn, req_id, permit);
                 return;
             };
             let Some(reader) = &sess.rewind_reader else {
@@ -383,22 +430,37 @@ impl ShardRunner {
                     req_id,
                     ErrorCode::Malformed,
                     "session is not a rewound recording",
+                    permit,
                 );
                 return;
             };
             let Some((first_ms, last_ms)) = reader.span() else {
-                self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Malformed, "recording is empty");
+                self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Malformed, "recording is empty", permit);
                 return;
             };
             let target_ms = first_ms.saturating_add(at_ms).min(last_ms);
             let slice = match reader.records_for_moment(target_ms) {
                 Ok(Some(s)) => s,
                 Ok(None) => {
-                    self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Malformed, "seek target missing");
+                    self.send_error(
+                        conn,
+                        StreamId::CONTROL,
+                        req_id,
+                        ErrorCode::Malformed,
+                        "seek target missing",
+                        permit,
+                    );
                     return;
                 }
                 Err(err) => {
-                    self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Pty, &format!("seek failed: {err}"));
+                    self.send_error(
+                        conn,
+                        StreamId::CONTROL,
+                        req_id,
+                        ErrorCode::Pty,
+                        &format!("seek failed: {err}"),
+                        permit,
+                    );
                     return;
                 }
             };
@@ -413,7 +475,7 @@ impl ShardRunner {
             ) {
                 Ok(e) => e,
                 Err(err) => {
-                    self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Pty, &err.to_string());
+                    self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Pty, &err.to_string(), permit);
                     return;
                 }
             };
@@ -431,17 +493,24 @@ impl ShardRunner {
             req_id,
             priority: OutboundPriority::Control,
             msg: BrokerMsg::Sought { at_ms: actual_offset_ms },
+            permit: permit.clone(),
         });
-        self.apply_effects(session_id, effects);
+        self.apply_effects_with_permit(session_id, effects, permit);
     }
 
-    pub(super) fn handle_kill(&mut self, session_id: SessionId, conn: ConnId, req_id: RequestId) {
+    pub(super) fn handle_kill(
+        &mut self,
+        session_id: SessionId,
+        conn: ConnId,
+        req_id: RequestId,
+        permit: Option<Arc<ShardCmdPermit>>,
+    ) {
         if !self.sessions.contains_key(&session_id) {
-            self.send_no_such_session(conn, req_id);
+            self.send_no_such_session(conn, req_id, permit);
             return;
         }
         self.initiate_session_termination(session_id);
-        self.send_ok(conn, StreamId::CONTROL, req_id);
+        self.send_ok(conn, StreamId::CONTROL, req_id, permit);
     }
 
     pub(super) fn handle_signal(
@@ -451,31 +520,46 @@ impl ShardRunner {
         req_id: RequestId,
         signal: SignalKind,
         scope: SignalScope,
+        permit: Option<Arc<ShardCmdPermit>>,
     ) {
         let Some(sess) = self.sessions.get(&session_id) else {
-            self.send_no_such_session(conn, req_id);
+            self.send_no_such_session(conn, req_id, permit);
             return;
         };
         let Some(pid) = sess.pid else {
-            self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Malformed, "session has no live process");
+            self.send_error(
+                conn,
+                StreamId::CONTROL,
+                req_id,
+                ErrorCode::Malformed,
+                "session has no live process",
+                permit,
+            );
             return;
         };
         match deliver_signal(pid.pid() as u32, signal, scope) {
-            Ok(()) => self.send_ok(conn, StreamId::CONTROL, req_id),
-            Err(err) => self.send_error(conn, StreamId::CONTROL, req_id, err.error_code(), &err.to_string()),
+            Ok(()) => self.send_ok(conn, StreamId::CONTROL, req_id, permit),
+            Err(err) => self.send_error(conn, StreamId::CONTROL, req_id, err.error_code(), &err.to_string(), permit),
         }
     }
 
-    pub(super) fn handle_owns(&mut self, session_id: SessionId, conn: ConnId, req_id: RequestId, pid: SignalTarget) {
+    pub(super) fn handle_owns(
+        &mut self,
+        session_id: SessionId,
+        conn: ConnId,
+        req_id: RequestId,
+        pid: SignalTarget,
+        permit: Option<Arc<ShardCmdPermit>>,
+    ) {
         let Some(sess) = self.sessions.get(&session_id) else {
-            self.send_no_such_session(conn, req_id);
+            self.send_no_such_session(conn, req_id, permit);
             return;
         };
         let owned = match &sess.tree {
             Some(tree) => match tree.owns(pid.pid() as u32) {
                 Ok(v) => v,
                 Err(err) => {
-                    self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Pty, &err.to_string());
+                    self.send_error(conn, StreamId::CONTROL, req_id, ErrorCode::Pty, &err.to_string(), permit);
                     return;
                 }
             },
@@ -488,6 +572,7 @@ impl ShardRunner {
             req_id,
             priority: OutboundPriority::Control,
             msg: BrokerMsg::OwnsReply { owned },
+            permit,
         });
     }
 
@@ -501,11 +586,12 @@ impl ShardRunner {
         attachment_id: StreamAttachmentId,
         flags: SubFlags,
         initial_viewport: Option<ViewportHint>,
+        permit: Option<Arc<ShardCmdPermit>>,
     ) {
         let mut effects = Vec::new();
         let reply = {
             let Some(sess) = self.sessions.get_mut(&session_id) else {
-                self.send_no_such_session(conn, req_id);
+                self.send_no_such_session(conn, req_id, permit);
                 return;
             };
             sess.machine.attach_stream((conn, stream_id), attachment_id, flags, initial_viewport, &mut effects);
@@ -539,8 +625,9 @@ impl ShardRunner {
             req_id,
             priority: OutboundPriority::Control,
             msg: reply,
+            permit: permit.clone(),
         });
-        self.apply_effects(session_id, effects);
+        self.apply_effects_with_permit(session_id, effects, permit);
     }
 }
 

@@ -14,16 +14,26 @@ mod win_shard_tests {
 
     use super::super::*;
     use crate::shard_windows::{
-        WIN_CONPTY_DRAIN_TIMEOUT, clamp_win_write_timeout, drain_conpty_quantum, finish_or_begin_win_exit_drain,
+        WIN_CONPTY_DRAIN_TIMEOUT, apply_win_write_result, clamp_win_session_write_timeout, clamp_win_write_timeout,
+        drain_conpty_quantum, drain_windows_pty_writes, finish_or_begin_win_exit_drain, is_win_write_would_block,
         maybe_wait_win_mailbox,
     };
 
     #[test]
     fn win_shard_helpers_and_drain_windows_ptys_cover_pause_quantum_and_eof() {
-        // 1. clamp_win_write_timeout
-        assert_eq!(clamp_win_write_timeout(Duration::from_secs(1), 0), Duration::from_secs(1));
-        assert_eq!(clamp_win_write_timeout(Duration::from_secs(1), 4), Duration::from_millis(10));
-        assert_eq!(clamp_win_write_timeout(Duration::from_millis(3), 4), Duration::from_millis(3));
+        // 1. clamp_win_write_timeout & is_win_write_would_block
+        assert_eq!(clamp_win_write_timeout(Duration::from_secs(1), true, 0), Duration::from_secs(1));
+        assert_eq!(clamp_win_write_timeout(Duration::from_secs(1), false, 4), Duration::from_secs(1));
+        assert_eq!(clamp_win_write_timeout(Duration::from_secs(1), true, 4), Duration::from_millis(10));
+        assert_eq!(clamp_win_write_timeout(Duration::from_millis(3), true, 4), Duration::from_millis(3));
+        assert!(is_win_write_would_block(&apack_os::OsError::io(
+            "test",
+            std::io::Error::from(std::io::ErrorKind::WouldBlock),
+        )));
+        assert!(!is_win_write_would_block(&apack_os::OsError::io(
+            "test",
+            std::io::Error::from(std::io::ErrorKind::BrokenPipe),
+        )));
 
         // 2. maybe_wait_win_mailbox skips wait when exhausted_quantum == true, waits when false
         let mb = Arc::new(Mutex::new(ShardMailboxState { queue: VecDeque::new(), woken: false }));
@@ -87,7 +97,7 @@ mod win_shard_tests {
             let machine = SessionMachine::new(sid, engine, ResizePolicy::LatestActive, MarksMode::Claimed, cfg.cell_px);
             LiveSession {
                 machine,
-                pty: Some(LivePty::Windows { bridge, eof: false }),
+                pty: Some(LivePty::Windows { bridge, eof: false, write_broken: false }),
                 child: Some(spawned.child),
                 killer: Some(spawned.killer),
                 tree: spawned.tree,
@@ -167,6 +177,17 @@ mod win_shard_tests {
         // (false, false) empty using live_id's already-active bridge (no 3rd ConPTY spawn or DSR wait).
         let mut live_sess = runner.sessions.remove(&live_id).expect("live session");
         assert!(live_sess.tree.is_some(), "Windows PTY spawn must attach JobGuard via pinned handle");
+        // Verify `drain_windows_pty_writes` loops across multiple 64 KiB chunks in a single call
+        // while staying below `ConPtyBridge::MAX_INPUT_QUEUE_BYTES` (256 KiB).
+        let multi_chunk = vec![b'a'; 70_000];
+        live_sess.machine.enqueue_pty_reply(&multi_chunk, &mut Vec::new());
+        assert_eq!(live_sess.machine.pty_write_len(), multi_chunk.len());
+        drain_windows_pty_writes(&mut live_sess);
+        assert_eq!(
+            live_sess.machine.pty_write_len(),
+            0,
+            "drain_windows_pty_writes must drain multiple 64 KiB chunks in one call"
+        );
         if let Some(mut killer) = live_sess.killer.take() {
             let _ = killer.kill();
         }
@@ -184,6 +205,43 @@ mod win_shard_tests {
         let drain_state = live_sess.exit_drain.as_ref().expect("exit_drain set");
         assert_eq!(drain_state.code, Some(42));
         assert_eq!(drain_state.deadline, drain_now + WIN_CONPTY_DRAIN_TIMEOUT);
+        let Some(LivePty::Windows { bridge, .. }) = live_sess.pty.take() else {
+            panic!("expected Windows LivePty");
+        };
+        // Verify rewound (`pty: None`) session never clamps timeout to 10ms and does not consume queued writes.
+        live_sess.machine.on_pty_output(
+            b"\x1b[6n",
+            TimestampMs::from_millis(1),
+            apack_core::time::WallMs::from_millis(1),
+            &mut Vec::new(),
+        );
+        let rewound_pending = live_sess.machine.pty_write_len();
+        assert!(rewound_pending > 0);
+        assert_eq!(clamp_win_session_write_timeout(Duration::from_secs(1), &live_sess), Duration::from_secs(1));
+        drain_windows_pty_writes(&mut live_sess);
+        assert_eq!(live_sess.machine.pty_write_len(), rewound_pending);
+        live_sess.machine.consume_pty_write(rewound_pending);
+        // Verify WouldBlock retains bytes without latching write_broken, while closed/broken ConPTY
+        // bridge latches `write_broken = true` so timeout is no longer clamped to 10ms.
+        live_sess.pty = Some(LivePty::Windows { bridge, eof: false, write_broken: false });
+        live_sess.machine.on_pty_output(
+            b"\x1b[6n",
+            TimestampMs::from_millis(2),
+            apack_core::time::WallMs::from_millis(2),
+            &mut Vec::new(),
+        );
+        let pending_before = live_sess.machine.pty_write_len();
+        assert!(!apply_win_write_result(
+            &mut live_sess,
+            pending_before,
+            Err(apack_os::OsError::io("full", std::io::Error::from(std::io::ErrorKind::WouldBlock))),
+        ));
+        assert_eq!(live_sess.machine.pty_write_len(), pending_before);
+        assert!(matches!(live_sess.pty, Some(LivePty::Windows { write_broken: false, .. })));
+        assert_eq!(clamp_win_session_write_timeout(Duration::from_secs(1), &live_sess), Duration::from_millis(10));
+        drain_windows_pty_writes(&mut live_sess);
+        assert!(matches!(live_sess.pty, Some(LivePty::Windows { write_broken: true, .. })));
+        assert_eq!(clamp_win_session_write_timeout(Duration::from_secs(1), &live_sess), Duration::from_secs(1));
         let Some(LivePty::Windows { bridge, .. }) = live_sess.pty.take() else {
             panic!("expected Windows LivePty");
         };
@@ -628,17 +686,20 @@ mod image_source_shard_tests {
         assert_eq!(first.items, vec![(String::from("slot-a"), 1, String::from("app-a"))]);
 
         // Local fallback completion (from_worker: false) must NOT clear fg_inflight!
-        runner.handle_cmd(ShardCmd::ForegroundVerified { session_id: sid, results: vec![], from_worker: false });
+        runner.handle_cmd(ShardCmd::ForegroundVerified { session_id: sid, results: vec![], from_worker: false }, None);
         assert!(runner.fg_inflight.contains(&sid));
 
         // Worker completion (from_worker: true) frees sid's slot AND flushes BOTH sid's batched items AND sid2!
         let (fg_tx2, fg_rx2) = mpsc::sync_channel::<FgVerifyReq>(4);
         runner.fg_tx = Some(fg_tx2);
-        runner.handle_cmd(ShardCmd::ForegroundVerified {
-            session_id: sid,
-            results: vec![(String::from("slot-a"), 1, Confirmed::Unknown)],
-            from_worker: true,
-        });
+        runner.handle_cmd(
+            ShardCmd::ForegroundVerified {
+                session_id: sid,
+                results: vec![(String::from("slot-a"), 1, Confirmed::Unknown)],
+                from_worker: true,
+            },
+            None,
+        );
         let mut dispatched = Vec::new();
         while let Ok(req) = fg_rx2.try_recv() {
             dispatched.push(req);
@@ -657,8 +718,8 @@ mod image_source_shard_tests {
         assert_eq!(sid2_batch.items, vec![(String::new(), 1, String::from("codex"))]);
 
         // Complete both batches cleanly.
-        runner.handle_cmd(ShardCmd::ForegroundVerified { session_id: sid, results: vec![], from_worker: true });
-        runner.handle_cmd(ShardCmd::ForegroundVerified { session_id: sid2, results: vec![], from_worker: true });
+        runner.handle_cmd(ShardCmd::ForegroundVerified { session_id: sid, results: vec![], from_worker: true }, None);
+        runner.handle_cmd(ShardCmd::ForegroundVerified { session_id: sid2, results: vec![], from_worker: true }, None);
         assert!(!runner.fg_inflight.contains(&sid));
         assert!(!runner.fg_inflight.contains(&sid2));
 
@@ -680,41 +741,53 @@ mod image_source_shard_tests {
         let st = apack_proto::types::NonZeroStreamId::new(1).unwrap();
         let a1 = StreamAttachmentId::new(1).unwrap();
         let a2 = StreamAttachmentId::new(2).unwrap();
-        runner.handle_cmd(ShardCmd::Attach {
-            session_id: sid,
-            conn,
-            req_id: RequestId::from_raw(1),
-            stream_id: st,
-            attachment_id: a1,
-            flags: apack_proto::types::SubFlags::from_bits(
-                apack_proto::types::SubFlags::VIEW | apack_proto::types::SubFlags::RAW_OUTPUT,
-            )
-            .unwrap(),
-            initial_viewport: None,
-        });
+        runner.handle_cmd(
+            ShardCmd::Attach {
+                session_id: sid,
+                conn,
+                req_id: RequestId::from_raw(1),
+                stream_id: st,
+                attachment_id: a1,
+                flags: apack_proto::types::SubFlags::from_bits(
+                    apack_proto::types::SubFlags::VIEW | apack_proto::types::SubFlags::RAW_OUTPUT,
+                )
+                .unwrap(),
+                initial_viewport: None,
+            },
+            None,
+        );
         // Re-attach same (conn, st) with a2 (simulating Detach + Re-Attach on same session)
-        runner.handle_cmd(ShardCmd::Attach {
-            session_id: sid,
-            conn,
-            req_id: RequestId::from_raw(2),
-            stream_id: st,
-            attachment_id: a2,
-            flags: apack_proto::types::SubFlags::from_bits(
-                apack_proto::types::SubFlags::VIEW | apack_proto::types::SubFlags::RAW_OUTPUT,
-            )
-            .unwrap(),
-            initial_viewport: None,
-        });
+        runner.handle_cmd(
+            ShardCmd::Attach {
+                session_id: sid,
+                conn,
+                req_id: RequestId::from_raw(2),
+                stream_id: st,
+                attachment_id: a2,
+                flags: apack_proto::types::SubFlags::from_bits(
+                    apack_proto::types::SubFlags::VIEW | apack_proto::types::SubFlags::RAW_OUTPUT,
+                )
+                .unwrap(),
+                initial_viewport: None,
+            },
+            None,
+        );
         // Consume a2's initial view slot, then send stale ViewSlotFree(a1) and stale Detach(a1)
         runner.sessions.get_mut(&sid).unwrap().view_slot_free.remove(&a2);
-        runner.handle_cmd(ShardCmd::ViewSlotFree { session_id: sid, conn, stream_id: st, attachment_id: a1 });
+        runner.handle_cmd(
+            ShardCmd::ViewSlotFree { session_id: sid, conn, stream_id: st, attachment_id: a1, force_full_sync: false },
+            None,
+        );
         assert!(!runner.sessions[&sid].view_slot_free.contains(&a1));
         assert!(!runner.sessions[&sid].view_slot_free.contains(&a2));
-        runner.handle_cmd(ShardCmd::Detach { session_id: sid, conn, stream_id: st, attachment_id: a1 });
+        runner.handle_cmd(ShardCmd::Detach { session_id: sid, conn, stream_id: st, attachment_id: a1 }, None);
         assert_eq!(runner.sessions[&sid].machine.attachment_of((conn, st)), Some(a2));
 
         // Matching ViewSlotFree(a2) re-arms a2!
-        runner.handle_cmd(ShardCmd::ViewSlotFree { session_id: sid, conn, stream_id: st, attachment_id: a2 });
+        runner.handle_cmd(
+            ShardCmd::ViewSlotFree { session_id: sid, conn, stream_id: st, attachment_id: a2, force_full_sync: false },
+            None,
+        );
         assert!(runner.sessions[&sid].view_slot_free.contains(&a2));
 
         // 3. PublishRawOutput in-flight backpressure pauses PTY at high-water and resumes via RawOutputDrained / Tier 2 (`H6`):
@@ -746,7 +819,7 @@ mod image_source_shard_tests {
         runner.ingest_pty_bytes(sid, &big_chunk);
         assert!(runner.sessions[&sid].paused_by_raw_inflight, "must pause PTY at raw high-water");
         assert!(runner.sessions[&sid].is_pty_paused());
-        runner.handle_cmd(ShardCmd::RawOutputDrained);
+        runner.handle_cmd(ShardCmd::RawOutputDrained, None);
         assert!(runner.sessions[&sid].paused_by_raw_inflight, "must stay paused while inflight >= high-water");
         runner.run_tier2(TimestampMs::from_millis(5));
         assert!(runner.sessions[&sid].paused_by_raw_inflight, "Tier 2 must not unpause while inflight >= high-water");
@@ -762,7 +835,7 @@ mod image_source_shard_tests {
             }
         }
         assert!(saw_raw);
-        runner.handle_cmd(ShardCmd::RawOutputDrained);
+        runner.handle_cmd(ShardCmd::RawOutputDrained, None);
         assert!(!runner.sessions[&sid].paused_by_raw_inflight, "RawOutputDrained must unpause PTY");
 
         // Also verify Tier 2 safety net unpauses if counter dropped below cap.
@@ -781,19 +854,23 @@ mod image_source_shard_tests {
         let stream_id = NonZeroStreamId::new(1).unwrap();
         let att = StreamAttachmentId::new(77).unwrap();
         insert_image_session(&mut runner, sid, false);
-        runner.handle_cmd(ShardCmd::Attach {
-            session_id: sid,
-            conn,
-            req_id: RequestId::from_raw(1),
-            stream_id,
-            attachment_id: att,
-            flags: SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(),
-            initial_viewport: None,
-        });
+        runner.handle_cmd(
+            ShardCmd::Attach {
+                session_id: sid,
+                conn,
+                req_id: RequestId::from_raw(1),
+                stream_id,
+                attachment_id: att,
+                flags: SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(),
+                initial_viewport: None,
+            },
+            None,
+        );
         // Drain initial Attached + Frame(seq=1); `view_slot_free` is now EMPTY (simulating in-flight token).
         let mut init_frames = 0usize;
         while let Ok(ev) = rrx.try_recv() {
-            if matches!(ev, ReactorEvent::PublishFrame { .. }) {
+            if let ReactorEvent::PublishFrame { final_frame, .. } = ev {
+                assert!(!final_frame, "initial attach frame must not be marked final_frame");
                 init_frames += 1;
             }
         }
@@ -807,18 +884,71 @@ mod image_source_shard_tests {
             .collect();
         assert!(live_frames.is_empty(), "live session must respect view_slot_free");
 
-        // On exit, final dirty view MUST flush strictly BEFORE Exited as a self-contained full_sync=true frame!
+        // ViewSlotFree with `force_full_sync = true` must force a self-contained full_sync frame.
+        runner.handle_cmd(
+            ShardCmd::ViewSlotFree { session_id: sid, conn, stream_id, attachment_id: att, force_full_sync: true },
+            None,
+        );
+        let forced_frames: Vec<_> = std::iter::from_fn(|| rrx.try_recv().ok())
+            .filter_map(|e| match e {
+                ReactorEvent::PublishFrame { frame, final_frame, .. } => Some((frame, final_frame)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(forced_frames.len(), 1);
+        assert!(forced_frames[0].0.full_sync, "force_full_sync ViewSlotFree must emit full_sync=true");
+        assert!(!forced_frames[0].1, "live forced full_sync must not be marked final_frame");
+
+        // On exit, final dirty view MUST flush strictly BEFORE Exited as a self-contained full_sync=true final_frame!
         runner.ingest_pty_bytes(sid, b"\x1b[?2026hEXIT_FINAL\r\n");
         runner.finish_and_remove_session(sid, Some(0), None);
         let events: Vec<_> = std::iter::from_fn(|| rrx.try_recv().ok()).collect();
-        let frame_pos = events
-            .iter()
-            .position(|e| matches!(e, ReactorEvent::PublishFrame { frame, .. } if frame.full_sync && frame.rows.iter().any(|r| r.text.contains("EXIT_FINAL"))));
+        let frame_pos = events.iter().position(|e| {
+            matches!(
+                e,
+                ReactorEvent::PublishFrame { frame, final_frame: true, .. }
+                    if frame.full_sync && frame.rows.iter().any(|r| r.text.contains("EXIT_FINAL"))
+            )
+        });
         let exit_pos =
             events.iter().position(|e| matches!(e, ReactorEvent::SendMsg { msg: BrokerMsg::Exited { .. }, .. }));
         assert!(frame_pos.is_some(), "expected full_sync final frame containing EXIT_FINAL");
         assert!(exit_pos.is_some(), "expected Exited message");
         assert!(frame_pos.unwrap() < exit_pos.unwrap(), "final frame must precede Exited");
+
+        // Also verify exiting while `view_slot_free` IS free still forces `full_sync = true` & `final_frame = true`.
+        let sid2 = SessionId::new(101).unwrap();
+        let att2 = StreamAttachmentId::new(78).unwrap();
+        insert_image_session(&mut runner, sid2, false);
+        runner.handle_cmd(
+            ShardCmd::Attach {
+                session_id: sid2,
+                conn,
+                req_id: RequestId::from_raw(2),
+                stream_id,
+                attachment_id: att2,
+                flags: SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(),
+                initial_viewport: None,
+            },
+            None,
+        );
+        while rrx.try_recv().is_ok() {}
+        runner.handle_cmd(
+            ShardCmd::ViewSlotFree { session_id: sid2, conn, stream_id, attachment_id: att2, force_full_sync: false },
+            None,
+        );
+        assert!(runner.sessions[&sid2].view_slot_free.contains(&att2));
+        runner.ingest_pty_bytes(sid2, b"\x1b[?2026hFREE_SLOT_FINAL\r\n");
+        runner.finish_and_remove_session(sid2, Some(0), None);
+        let events2: Vec<_> = std::iter::from_fn(|| rrx.try_recv().ok()).collect();
+        assert!(
+            events2.iter().any(|e| matches!(
+                e,
+                ReactorEvent::PublishFrame { frame, final_frame: true, .. }
+                    if frame.full_sync && frame.rows.iter().any(|r| r.text.contains("FREE_SLOT_FINAL"))
+            )),
+            "final exit frame must force full_sync=true even when view_slot_free was free"
+        );
     }
 
     #[test]

@@ -16,9 +16,7 @@ use apack_proto::types::{NonZeroStreamId, RequestId, StreamId};
 use interprocess::local_socket::traits::Listener as _;
 use interprocess::local_socket::{Listener, Stream};
 
-use crate::transport_loop::{
-    ConnState, MAX_CONNECTIONS, ReactorState, drain_deadline_expired, ready_stalled_attachments,
-};
+use crate::transport_loop::{ConnState, MAX_CONNECTIONS, ReactorState, drain_deadline_expired};
 use crate::{fill_random, now_monotonic_ms};
 
 const WIN_CONN_READ_BUF_BYTES: usize = 32_768;
@@ -295,6 +293,8 @@ impl ReactorState {
                         stalled_frames: HashMap::new(),
                         queued_frame_streams: HashMap::new(),
                         inflight_shard_cmds: Arc::new(AtomicUsize::new(0)),
+                        inflight_input_cmds: Arc::new(AtomicUsize::new(0)),
+                        fin_pending: Arc::new(AtomicBool::new(false)),
                     },
                 );
             }
@@ -303,7 +303,7 @@ impl ReactorState {
                 let now = now_monotonic_ms();
                 let mut actions = Vec::new();
                 self.core.feed_bytes(conn, &bytes, now, &mut actions);
-                if self.core.is_connection_ready(conn) {
+                if self.core.is_lifecycle_client_ready(conn) {
                     self.ever_connected = true;
                 }
                 self.execute_actions(actions, now);
@@ -473,22 +473,14 @@ impl ReactorState {
         // Only drain the frame slot and retry stalled frames AFTER `bytes` is queued ahead of
         // `BrokerCore::outbound` (either in `c.win.tx` or `c.win.pending_chunk`), preserving strict
         // FIFO frame sequence order!
-        if let Some((att, nz, session_id)) = drained_frame {
+        let skip_att = if let Some((att, nz, session_id)) = drained_frame {
             self.on_outbound_frame_drained(conn, nz, att, session_id);
-        }
+            Some(att)
+        } else {
+            None
+        };
         if sent {
-            let ready_stalled = self
-                .conns
-                .get(&conn)
-                .map(|c| ready_stalled_attachments(&c.stalled_frames, &c.queued_frame_streams))
-                .unwrap_or_default();
-            for att in ready_stalled {
-                if let Some((stream_id, sid, frame)) =
-                    self.conns.get_mut(&conn).and_then(|c| c.stalled_frames.remove(&att))
-                {
-                    self.try_publish_or_stall_frame(conn, stream_id, att, sid, frame, now_monotonic_ms());
-                }
-            }
+            self.retry_budget_stalled_frames(conn, skip_att, now_monotonic_ms());
         }
         sent
     }

@@ -21,14 +21,23 @@ use crate::shard_windows::drain_windows_pty_writes;
 use crate::{now_monotonic_ms, now_unix_ms};
 
 use super::images::{ImageRefusal, probe_named_image_load};
-use super::protocol::FgVerifyReq;
+use super::protocol::{FgVerifyReq, ShardCmdPermit};
 use super::{LivePty, ReactorEvent, ShardRunner};
 #[cfg(unix)]
 use super::{LiveSession, PTY_READ_QUANTUM_BYTES, PTY_WRITE_CHUNK_BYTES};
 
 impl ShardRunner {
     pub(super) fn apply_effects(&mut self, session_id: SessionId, effects: Vec<SessionEffect>) {
-        self.apply_effects_inner(session_id, effects, true);
+        self.apply_effects_inner(session_id, effects, true, None);
+    }
+
+    pub(super) fn apply_effects_with_permit(
+        &mut self,
+        session_id: SessionId,
+        effects: Vec<SessionEffect>,
+        permit: Option<Arc<ShardCmdPermit>>,
+    ) {
+        self.apply_effects_inner(session_id, effects, true, permit);
     }
 
     pub(super) fn apply_effects_inner(
@@ -36,6 +45,7 @@ impl ShardRunner {
         session_id: SessionId,
         effects: Vec<SessionEffect>,
         sync_and_reap: bool,
+        permit: Option<Arc<ShardCmdPermit>>,
     ) {
         let mut views_dirty = false;
         let mut write_ready = false;
@@ -48,7 +58,15 @@ impl ShardRunner {
                         views_dirty = false;
                         self.try_publish_dirty_views(session_id);
                     }
-                    self.emit(ReactorEvent::SendMsg { conn, stream_id, attachment, req_id, priority, msg });
+                    self.emit(ReactorEvent::SendMsg {
+                        conn,
+                        stream_id,
+                        attachment,
+                        req_id,
+                        priority,
+                        msg,
+                        permit: permit.clone(),
+                    });
                 }
                 SessionEffect::ResizePty { size, cell_px } => {
                     if let Some(sess) = self.sessions.get_mut(&session_id) {
@@ -110,6 +128,7 @@ impl ShardRunner {
                         req_id,
                         priority: OutboundPriority::Bulk,
                         msg,
+                        permit: permit.clone(),
                     });
                 }
                 SessionEffect::SetPtyPaused(paused) => {
@@ -190,28 +209,27 @@ impl ShardRunner {
     }
 
     pub(super) fn try_publish_dirty_views(&mut self, session_id: SessionId) {
-        let targets: Vec<(StreamKey, StreamAttachmentId, bool)> = match self.sessions.get(&session_id) {
+        let (force_final, targets): (bool, Vec<(StreamKey, StreamAttachmentId)>) = match self.sessions.get(&session_id)
+        {
             Some(sess) => {
                 let force_final = !sess.machine.is_alive();
-                sess.machine
+                let list = sess
+                    .machine
                     .view_subscribers()
                     .into_iter()
-                    .filter_map(|(key, att)| {
-                        let slot_free = sess.view_slot_free.contains(&att);
-                        (slot_free || force_final).then_some((key, att, slot_free))
-                    })
-                    .collect()
+                    .filter(|(_, att)| sess.view_slot_free.contains(att) || force_final)
+                    .collect();
+                (force_final, list)
             }
             None => return,
         };
-        for (key, attachment_id, slot_free) in targets {
+        for (key, attachment_id) in targets {
             let mut emitted_frame: Option<Box<FrameUpdate>> = None;
             let published = match self.sessions.get_mut(&session_id) {
                 Some(sess) => {
-                    if !slot_free {
-                        // Force a self-contained `full_sync` when publishing while a previous frame's
-                        // `ViewSlotFree` token is still in flight, so overwriting an unsent or stalled
-                        // frame on the reactor can never leave the client with an orphaned delta.
+                    if force_final {
+                        // Force a self-contained `full_sync` when publishing a final exit frame so
+                        // replacing any unsent/stalled P1 frame never leaves an orphaned delta.
                         sess.machine.mark_view_full_sync(key);
                     }
                     sess.machine.try_publish_view(key, |frame| {
@@ -231,6 +249,7 @@ impl ShardRunner {
                     attachment_id,
                     session: session_id,
                     frame,
+                    final_frame: force_final,
                 });
             }
         }

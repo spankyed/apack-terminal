@@ -5,10 +5,13 @@ fn cli_parsing_config_and_helpers() {
     let args = |xs: &[&str]| xs.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
 
     assert!(parse_cli(&[]).unwrap_err().contains("usage: apack-terminal"));
-    assert_eq!(parse_cli(&args(&["serve"])).unwrap(), CliCommand::Serve { socket: None, shards: None });
     assert_eq!(
-        parse_cli(&args(&["serve", "--socket", "/tmp/a.sock", "--shards", "8"])).unwrap(),
-        CliCommand::Serve { socket: Some(String::from("/tmp/a.sock")), shards: Some(8) }
+        parse_cli(&args(&["serve"])).unwrap(),
+        CliCommand::Serve { socket: None, shards: None, detached: false }
+    );
+    assert_eq!(
+        parse_cli(&args(&["serve", "--socket", "/tmp/a.sock", "--shards", "8", "--detached"])).unwrap(),
+        CliCommand::Serve { socket: Some(String::from("/tmp/a.sock")), shards: Some(8), detached: true }
     );
     assert!(parse_cli(&args(&["serve", "--shards", "0"])).is_err());
     assert!(parse_cli(&args(&["serve", "--shards", "9"])).is_err());

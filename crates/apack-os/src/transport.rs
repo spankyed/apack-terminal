@@ -663,14 +663,14 @@ pub fn configure_detached_command(cmd: &mut std::process::Command) {
     }
 }
 
-/// Prepares an already-bound detached background broker daemon (`serve`):
+/// Prepares an already-bound background broker daemon (`serve`):
 /// - On Unix (when stdin is not a TTY): ignores `SIGHUP` so closing the caller's PTY cannot kill
-///   the daemon, and redirects non-TTY `stderr` (such as `proxy`'s startup diagnostic pipe) to
-///   `/dev/null` so the proxy's stderr collector hits EOF cleanly and post-bind `eprintln!` calls
-///   cannot panic with `EPIPE`.
-/// - On Windows (when detached with no console): redirects `STD_ERROR_HANDLE` to `NUL` and closes
-///   the inherited startup stderr pipe write handle.
-pub fn prepare_detached_daemon() {
+///   the daemon, and when `redirect_stderr` is `true` (explicit `serve --detached` from `proxy`
+///   autostart), redirects non-TTY `stderr` to `/dev/null` so the proxy's stderr collector hits
+///   EOF cleanly and post-bind `eprintln!` calls cannot panic with `EPIPE`.
+/// - On Windows (when `redirect_stderr` is `true` and detached with no console): redirects
+///   `STD_ERROR_HANDLE` to `NUL` and closes the inherited startup stderr pipe write handle.
+pub fn prepare_detached_daemon(redirect_stderr: bool) {
     #[cfg(unix)]
     {
         // SAFETY: `isatty(STDIN_FILENO)` queries whether fd 0 is a terminal; safe with any fd.
@@ -684,7 +684,8 @@ pub fn prepare_detached_daemon() {
             }
             // SAFETY: `isatty(STDERR_FILENO)` is safe on any fd; `open("/dev/null")` + `dup2`
             // atomically replaces fd 2 and closes any inherited startup stderr pipe write end.
-            if unsafe { libc::isatty(libc::STDERR_FILENO) } == 0
+            if redirect_stderr
+                && unsafe { libc::isatty(libc::STDERR_FILENO) } == 0
                 && let Ok(devnull) = std::fs::OpenOptions::new().write(true).open("/dev/null")
             {
                 use std::os::fd::IntoRawFd;
@@ -704,7 +705,7 @@ pub fn prepare_detached_daemon() {
     }
     #[cfg(windows)]
     {
-        crate::transport_windows::prepare_detached_daemon();
+        crate::transport_windows::prepare_detached_daemon(redirect_stderr);
     }
 }
 
@@ -782,6 +783,13 @@ pub fn listener_fd(listener: &Listener) -> std::os::fd::BorrowedFd<'_> {
     use std::os::fd::AsFd;
     let Listener::UdSocket(socket) = listener;
     socket.as_fd()
+}
+
+/// Returns `true` iff `err` represents OS file-descriptor exhaustion (`EMFILE` or `ENFILE`),
+/// which requires backing off from a level-triggered `accept()` loop instead of spinning at 100% CPU.
+#[cfg(unix)]
+pub fn is_fd_exhaustion_error(err: &io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
 }
 
 /// Performs a single vectored write (`writev`) of `slices`, retrying on `EINTR`.
@@ -1253,15 +1261,19 @@ mod tests {
             #[cfg(unix)]
             {
                 use std::io::Write as _;
-                prepare_detached_daemon();
-                let _ = std::io::stderr().write_all(b"POST_DETACH_MUST_GO_TO_DEVNULL\n");
+                // Supervised mode (`redirect_stderr = false`) must ignore SIGHUP while keeping stderr wired.
+                prepare_detached_daemon(false);
+                let _ = std::io::stderr().write_all(b"SUPERVISED_STDERR_KEPT\n");
                 // SAFETY: raising SIGHUP to self verifies `prepare_detached_daemon` installed SIG_IGN.
                 assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
-                // Closing fd 2 and re-running `prepare_detached_daemon` must leave fd 2 open at
+                // Detached proxy-autostart mode (`redirect_stderr = true`) redirects stderr to /dev/null.
+                prepare_detached_daemon(true);
+                let _ = std::io::stderr().write_all(b"POST_DETACH_MUST_GO_TO_DEVNULL\n");
+                // Closing fd 2 and re-running `prepare_detached_daemon(true)` must leave fd 2 open at
                 // `/dev/null` instead of closing it again via a dropped `File`.
                 // SAFETY: isolated single-threaded child process testing fd 2 reopen behavior.
                 unsafe { libc::close(libc::STDERR_FILENO) };
-                prepare_detached_daemon();
+                prepare_detached_daemon(true);
                 // SAFETY: `fcntl(F_GETFD)` queries whether fd 2 is open without mutating state.
                 assert!(unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_GETFD) } >= 0);
             }
@@ -1291,11 +1303,14 @@ mod tests {
         );
         #[cfg(unix)]
         {
-            assert!(
-                child_out.stderr.is_empty(),
-                "prepare_detached_daemon must redirect non-TTY stderr to /dev/null, got: {:?}",
-                String::from_utf8_lossy(&child_out.stderr)
+            assert_eq!(
+                String::from_utf8_lossy(&child_out.stderr),
+                "SUPERVISED_STDERR_KEPT\n",
+                "prepare_detached_daemon(false) must keep stderr and prepare_detached_daemon(true) must redirect it"
             );
+            assert!(is_fd_exhaustion_error(&io::Error::from_raw_os_error(libc::EMFILE)));
+            assert!(is_fd_exhaustion_error(&io::Error::from_raw_os_error(libc::ENFILE)));
+            assert!(!is_fd_exhaustion_error(&io::Error::from_raw_os_error(libc::EAGAIN)));
             let mut cmd = std::process::Command::new("/bin/sh");
             cmd.args(["-c", "ps -o pgid= -p $$"]).stdout(std::process::Stdio::piped());
             configure_detached_command(&mut cmd);
