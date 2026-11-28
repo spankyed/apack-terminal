@@ -273,7 +273,7 @@ fn session_machine_direct_rpcs_and_wait_outcomes() {
     fx.clear();
     sess.register_wait(c1, RequestId::from_raw(5), WaitCondition::Exit, 5_000, TimestampMs::from_millis(10), &mut fx);
     sess.register_wait(c1, RequestId::from_raw(6), WaitCondition::Idle, 5_000, TimestampMs::from_millis(10), &mut fx);
-    sess.on_process_exit(Some(0), None, TimestampMs::from_millis(20), &mut fx);
+    sess.on_process_exit(Some(0), None, apack_core::time::WallMs::from_millis(20), &mut fx);
     assert!(fx.iter().any(|e| matches!(
         e,
         SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. }

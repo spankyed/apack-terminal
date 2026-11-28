@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use apack_core::flow::OutboundPriority;
 use apack_core::session::{SessionEffect, StreamAttachmentId, StreamKey};
-use apack_core::time::TimestampMs;
+use apack_core::time::WallMs;
 use apack_core::vt::VtEngine;
 use apack_os::image_sources::Load;
 #[cfg(unix)]
@@ -16,9 +16,9 @@ use apack_os::pty_poller::{Interest, PollEvent};
 use apack_proto::messages::{BrokerMsg, FrameUpdate};
 use apack_proto::types::{ErrorCode, SessionId};
 
-use crate::now_unix_ms;
 #[cfg(windows)]
 use crate::shard_windows::drain_windows_pty_writes;
+use crate::{now_monotonic_ms, now_unix_ms};
 
 use super::images::{ImageRefusal, probe_named_image_load};
 use super::protocol::FgVerifyReq;
@@ -299,7 +299,8 @@ impl ShardRunner {
             return;
         }
         let now_ms = now_unix_ms();
-        let now = TimestampMs::from_millis(now_ms);
+        let wall = WallMs::from_millis(now_ms);
+        let now = now_monotonic_ms();
         let mut effects = Vec::new();
         let mut has_raw_subs = false;
         let mut consumed = bytes.len();
@@ -322,8 +323,9 @@ impl ShardRunner {
                 let mut fed_bytes = if sess.wal.is_some() { Vec::with_capacity(bytes.len()) } else { Vec::new() };
                 while !rest.is_empty() {
                     if !scanner.reading() {
-                        let (n, entered_apc) =
-                            sess.machine.on_vt_feed_with(now, &mut effects, |vt, evs| vt.feed_until_apc(rest, evs));
+                        let (n, entered_apc) = sess
+                            .machine
+                            .on_vt_feed_with(now, wall, &mut effects, |vt, evs| vt.feed_until_apc(rest, evs));
                         debug_assert!(n != 0 || entered_apc);
                         if sess.wal.is_some() {
                             fed_bytes.extend_from_slice(&rest[..n]);
@@ -343,7 +345,7 @@ impl ShardRunner {
                             if sess.wal.is_some() {
                                 fed_bytes.extend_from_slice(&passthrough);
                             }
-                            sess.machine.on_vt_feed_with(now, &mut effects, |vt, evs| vt.feed(&passthrough, evs));
+                            sess.machine.on_vt_feed_with(now, wall, &mut effects, |vt, evs| vt.feed(&passthrough, evs));
                         }
                         if let Some(load) = maybe_load
                             && let Some(refusal) = probe_named_image_load(&mut sess.machine, &load, &mut effects)
@@ -358,7 +360,7 @@ impl ShardRunner {
                     wal_scanner_bytes = Some(fed_bytes);
                 }
             } else {
-                sess.machine.on_pty_output(bytes, now, &mut effects);
+                sess.machine.on_pty_output(bytes, now, wall, &mut effects);
             }
 
             let committed = &bytes[..consumed];

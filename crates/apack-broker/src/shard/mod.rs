@@ -45,7 +45,7 @@ use apack_proto::types::{BlobHash, ErrorCode, RequestId, SessionId, SignalTarget
 use apack_vt_ghostty::GhosttyEngine;
 use apack_wal::{WalHandle, WalReader};
 
-use crate::now_unix_ms;
+use crate::now_monotonic_ms;
 #[cfg(windows)]
 use crate::shard_windows::{clamp_win_write_timeout, maybe_wait_win_mailbox};
 
@@ -319,7 +319,7 @@ impl ShardRunner {
             let win_exhausted_quantum = self.drain_windows_ptys(PTY_READ_QUANTUM_BYTES);
 
             // Tier 2: Session timers, child reap / kill escalation, cooperative idle compression.
-            let now_ms = TimestampMs::from_millis(now_unix_ms());
+            let now_ms = now_monotonic_ms();
             self.run_tier2(now_ms);
             self.refresh_telemetry_atomics();
 
@@ -440,7 +440,7 @@ impl ShardRunner {
                 }
             }
             ShardCmd::Wait { session_id, conn, req_id, condition, timeout_ms } => {
-                let now = TimestampMs::from_millis(now_unix_ms());
+                let now = now_monotonic_ms();
                 let mut effects = Vec::new();
                 if let Some(sess) = self.sessions.get_mut(&session_id) {
                     sess.machine.register_wait(conn, req_id, condition, timeout_ms, now, &mut effects);

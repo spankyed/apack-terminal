@@ -400,6 +400,7 @@ fn regenerate_fuzz_seeds() {
             images: Vec::new(),
             marks_key: Some(marks_key),
             marks_last_seq: 3,
+            marks_active_vouched_seq: None,
             marks_refused: 1,
             commands: Vec::new(),
         },

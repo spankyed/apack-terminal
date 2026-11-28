@@ -6,8 +6,10 @@
 
 #![forbid(unsafe_code)]
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use apack_core::time::{TimestampMs, WallMs};
 use sha2::{Digest, Sha256};
 
 pub mod client;
@@ -29,9 +31,24 @@ pub use client::{BrokerClient, ClientError, ReceivedFrame};
 pub use config::{BrokerConfig, CliCommand, parse_cli};
 pub use runtime::{BrokerHandle, BrokerServer};
 
-/// Returns the current wall-clock timestamp in milliseconds since Unix epoch.
+/// Returns the current wall-clock timestamp in milliseconds since Unix epoch (for WAL records and
+/// user-facing metadata; never used to drive core timers or deadlines).
 pub fn now_unix_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// Returns the current wall-clock timestamp wrapped as [`WallMs`].
+pub fn now_wall_ms() -> WallMs {
+    WallMs::from_millis(now_unix_ms())
+}
+
+/// Returns a strictly monotonic process-relative timestamp in milliseconds (`>= 1`) backed by
+/// [`Instant`], immune to NTP/VM wall-clock jumps, for all core timer wheels and BDP pacing.
+pub fn now_monotonic_ms() -> TimestampMs {
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    let origin = *ORIGIN.get_or_init(Instant::now);
+    let elapsed = u64::try_from(Instant::now().saturating_duration_since(origin).as_millis()).unwrap_or(u64::MAX);
+    TimestampMs::from_millis(elapsed.saturating_add(1))
 }
 
 /// Reads from `reader` into `buf`, retrying on `EINTR` (`io::ErrorKind::Interrupted`).

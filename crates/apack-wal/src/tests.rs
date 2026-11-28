@@ -99,6 +99,7 @@ fn sample_keyframe(blob_a: Option<BlobHash>, blob_b: Option<BlobHash>, abi: Opti
         images,
         marks_key: Some(sample_marks_key()),
         marks_last_seq: 7,
+        marks_active_vouched_seq: Some(7),
         marks_refused: 2,
         commands: vec![CommandRecord {
             id: 1,

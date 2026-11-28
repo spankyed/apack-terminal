@@ -11,7 +11,7 @@ use apack_os::signal::{ChildExitProbe, hang_up_session_descendants, probe_child_
 use apack_os::signal::{deliver_signal, kill_session_descendants, signal_name_from_description};
 use apack_proto::types::{SessionId, SignalKind, SignalScope};
 
-use crate::now_unix_ms;
+use crate::now_wall_ms;
 
 #[cfg(unix)]
 use super::PTY_READ_BUF_BYTES;
@@ -228,9 +228,10 @@ impl ShardRunner {
                 let _ = wal.seal();
                 let _ = wal.shutdown();
             }
-            let now = TimestampMs::from_millis(now_unix_ms());
-            if !sess.rewound {
-                sess.machine.on_process_exit(code, signal, now, &mut effects);
+            if sess.rewound {
+                sess.machine.on_rewound_close(&mut effects);
+            } else {
+                sess.machine.on_process_exit(code, signal, now_wall_ms(), &mut effects);
             }
         }
         // Apply exit effects while `sess` is still in `self.sessions` (after WAL seal/shutdown and

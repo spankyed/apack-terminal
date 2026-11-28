@@ -386,6 +386,17 @@ impl BrokerCore {
     /// Registers a live or rewound session with an explicit [`SessionLifetime`] in the broker's
     /// session table, immediately scheduling teardown if its owner or last unleased client already
     /// disconnected while creation was in flight.
+    fn has_ready_connections(&self) -> bool {
+        self.conns.values().any(|c| matches!(c.phase, ConnPhase::Ready { .. }))
+    }
+
+    fn has_attached_streams(&self, session: SessionId) -> bool {
+        self.conns
+            .values()
+            .any(|c| matches!(c.phase, ConnPhase::Ready { .. }) && c.streams.values().any(|st| st.session == session))
+    }
+
+    /// Registers a newly spawned or rewound session with its explicit [`SessionLifetime`].
     pub fn register_session(
         &mut self,
         session: SessionId,
@@ -400,7 +411,7 @@ impl BrokerCore {
                 !self.conns.contains_key(&owner) && !self.leases.is_session_pinned(session)
             }
             SessionLifetime::LeaseBound => {
-                self.conns.is_empty()
+                !self.has_ready_connections()
                     && !self.leases.has_active_broker_lease()
                     && !self.leases.is_session_pinned(session)
             }
@@ -435,7 +446,7 @@ impl BrokerCore {
                 Some(SessionLifetime::ConnBound(owner)) if !self.conns.contains_key(&owner) => {
                     actions.push(BrokerAction::TeardownSession(sid));
                 }
-                Some(SessionLifetime::LeaseBound) => {
+                Some(SessionLifetime::LeaseBound) if !self.has_attached_streams(sid) => {
                     actions.push(BrokerAction::SessionUnpinned(sid));
                 }
                 _ => {}
@@ -443,9 +454,10 @@ impl BrokerCore {
         }
     }
 
-    /// Removes a session, cleans up its session leases, drops unsent frames, and enqueues
-    /// `BrokerMsg::StreamClosed` behind any queued `Exited` / final `Output` on attached streams
-    /// that have not already been terminated by `BrokerMsg::Exited` without `SUB_RAW_OUTPUT`.
+    /// Removes a session, cleans up its session leases, flushes any pending `BACKPRESSURE_PTY`
+    /// raw output chunks, drops unsent frames, and enqueues `BrokerMsg::StreamClosed` behind any
+    /// queued `Exited` / final `Output` on attached streams that have not already been terminated
+    /// by `BrokerMsg::Exited` without `SUB_RAW_OUTPUT`.
     pub fn unregister_session(
         &mut self,
         session: SessionId,
@@ -464,19 +476,32 @@ impl BrokerCore {
             }
         }
         for (conn_id, stream_id) in to_close {
-            if let Some(conn) = self.conns.get_mut(&conn_id)
+            let flushed_raw = if let Some(conn) = self.conns.get_mut(&conn_id)
                 && let Some(mut st) = conn.streams.remove(&stream_id)
             {
-                if let Some(flow) = st.raw_output.as_mut() {
-                    flow.clear_pending(&mut conn.budget);
-                }
+                let chunks =
+                    st.raw_output.as_mut().map(|flow| flow.flush_on_exit(&mut conn.budget)).unwrap_or_default();
                 // Preserve already-queued `Exited` events and final `Output` chunks; drop only unsent frames.
                 conn.outbound.remove_stream_frames(stream_id.as_stream_id(), &mut conn.budget);
                 conn.closing_streams.insert(stream_id);
+                chunks
+            } else {
+                Vec::new()
+            };
+            for text in flushed_raw {
+                self.enqueue_message(
+                    conn_id,
+                    stream_id.as_stream_id(),
+                    RequestId::PUSH,
+                    OutboundPriority::RawOutput,
+                    BrokerMsg::Output { text },
+                    now,
+                    actions,
+                );
             }
             let msg = BrokerMsg::StreamClosed { reason: String::from(reason) };
             // Enqueued at `RawOutput` priority so it drains strictly after `Exited` (Event) and
-            // FIFO behind any already-queued final `Output` chunks for this stream.
+            // FIFO behind any already-queued or flushed final `Output` chunks for this stream.
             self.enqueue_message(
                 conn_id,
                 stream_id.as_stream_id(),
@@ -656,7 +681,7 @@ impl BrokerCore {
         let remaining_unpinned: Vec<SessionId> =
             changes.unpinned_sessions.into_iter().filter(|sid| !conn_bound_victims.contains(sid)).collect();
         self.emit_unpinned_actions(remaining_unpinned, actions);
-        if changes.teardown_non_kept || (self.conns.is_empty() && !self.leases.has_active_broker_lease()) {
+        if changes.teardown_non_kept || (!self.has_ready_connections() && !self.leases.has_active_broker_lease()) {
             actions.push(BrokerAction::TeardownNonKeptSessions);
         }
         actions.push(BrokerAction::CloseConn { conn, reason, final_error, drained });

@@ -338,7 +338,12 @@ impl SimWorld {
 
             let mut s_effects = Vec::new();
             if let Some(sess) = self.sessions.get_mut(&sid) {
-                sess.on_pty_output(chunk, self.now, &mut s_effects);
+                sess.on_pty_output(
+                    chunk,
+                    self.now,
+                    apack_core::time::WallMs::from_millis(self.now.as_millis()),
+                    &mut s_effects,
+                );
             }
             self.process_session_effects(sid, s_effects);
             self.pump_all_outbound();
@@ -355,7 +360,12 @@ impl SimWorld {
     pub fn exit_session(&mut self, sid: SessionId, exit_code: Option<i32>, signal: Option<String>) {
         let mut s_effects = Vec::new();
         if let Some(sess) = self.sessions.get_mut(&sid) {
-            sess.on_process_exit(exit_code, signal, self.now, &mut s_effects);
+            sess.on_process_exit(
+                exit_code,
+                signal,
+                apack_core::time::WallMs::from_millis(self.now.as_millis()),
+                &mut s_effects,
+            );
         }
         self.process_session_effects(sid, s_effects);
         self.sessions.remove(&sid);

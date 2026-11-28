@@ -50,7 +50,7 @@ use crate::transport_windows::{
     DrainingWinConn, MAX_WIN_EVENTS_PER_TURN, WIN_EVENT_CHANNEL_CAP, WinConnHandle, WinTransportEvent, clamp_win_wait,
     drain_win_events_bounded, spawn_win_accept_thread, wait_for_win_wake,
 };
-use crate::{engine_abi_hash, now_unix_ms};
+use crate::{engine_abi_hash, now_monotonic_ms};
 
 /// Hard cap on simultaneous client connections accepted by the broker.
 pub(crate) const MAX_CONNECTIONS: usize = 1024;
@@ -438,7 +438,7 @@ pub(crate) fn run_control_reactor(
 
         // 3. Fire due BrokerCore timers and reap expired draining connections.
         state.reap_draining_conns();
-        let now = TimestampMs::from_millis(now_unix_ms());
+        let now = now_monotonic_ms();
         let mut actions = Vec::new();
         state.core.poll_timers(now, &mut actions);
         state.execute_actions(actions, now);
@@ -717,7 +717,7 @@ impl ReactorState {
                         let _ = hang_up(&stream);
                         continue;
                     }
-                    let now = TimestampMs::from_millis(now_unix_ms());
+                    let now = now_monotonic_ms();
                     let _ = self.core.open_connection(conn, nonce, now);
                     self.token_to_conn.insert(token, conn);
                     self.conns.insert(
@@ -760,7 +760,7 @@ impl ReactorState {
                 Ok(n) => {
                     budget = budget.saturating_sub(n);
                     self.sync_shard_telemetry();
-                    let now = TimestampMs::from_millis(now_unix_ms());
+                    let now = now_monotonic_ms();
                     let mut actions = Vec::new();
                     self.core.feed_bytes(conn, &self.read_buf[..n], now, &mut actions);
                     if self.core.is_connection_ready(conn) {
@@ -834,14 +834,7 @@ impl ReactorState {
                     if let Some((stream_id, sid, frame)) =
                         self.conns.get_mut(&conn).and_then(|c| c.stalled_frames.remove(&att))
                     {
-                        self.try_publish_or_stall_frame(
-                            conn,
-                            stream_id,
-                            att,
-                            sid,
-                            frame,
-                            TimestampMs::from_millis(now_unix_ms()),
-                        );
+                        self.try_publish_or_stall_frame(conn, stream_id, att, sid, frame, now_monotonic_ms());
                     }
                 }
             }
@@ -898,7 +891,7 @@ impl ReactorState {
         // First retry any stalled frame held on the reactor for this exact attachment.
         let stalled = self.conns.get_mut(&conn).and_then(|c| c.stalled_frames.remove(&attachment_id));
         if let Some((nz, sid, frame)) = stalled {
-            let now = TimestampMs::from_millis(now_unix_ms());
+            let now = now_monotonic_ms();
             self.try_publish_or_stall_frame(conn, nz, attachment_id, sid, frame, now);
         } else if self.core.is_attachment_active(conn, stream_id, attachment_id)
             && let Some(&shard_idx) = self.session_shard.get(&session_id)
@@ -970,7 +963,7 @@ impl ReactorState {
 
     pub(crate) fn on_transport_closed(&mut self, conn: ConnId) {
         self.close_conn_transport(conn);
-        let now = TimestampMs::from_millis(now_unix_ms());
+        let now = now_monotonic_ms();
         let mut actions = Vec::new();
         self.core.close_connection(conn, CloseReason::TransportClosed, now, &mut actions);
         // Cancel any pending Wait requests owned by this connection across all shards.
@@ -998,7 +991,7 @@ impl ReactorState {
     }
 
     fn handle_shard_event(&mut self, event: ReactorEvent) {
-        let now = TimestampMs::from_millis(now_unix_ms());
+        let now = now_monotonic_ms();
         match event {
             ReactorEvent::SendMsg { conn, stream_id, attachment, req_id, priority, msg } => {
                 if let Some(att) = attachment {

@@ -2090,3 +2090,108 @@ fn pr6_explicit_session_lifetime_and_disconnect_teardown() {
     broker.close_connection(conn(2), CloseReason::TransportClosed, ts(8), &mut actions);
     assert!(actions.contains(&BrokerAction::TeardownNonKeptSessions));
 }
+
+#[test]
+fn pr2_unauth_conn_does_not_pin_attached_unpin_survives_and_backpressure_flushes_on_exit() {
+    use crate::broker::SessionLifetime;
+
+    let mut broker = BrokerCore::new(AuthConfig::None);
+    let mut actions = Vec::new();
+
+    // 1. Unauthenticated connection (`AwaitingHello`) must NOT keep unleased `LeaseBound` sessions alive!
+    broker.open_connection(conn(99), [1u8; 32], ts(1)).unwrap();
+    broker.register_session(sid(1), SessionLifetime::LeaseBound, false, &mut actions);
+    assert!(
+        actions.contains(&BrokerAction::TeardownSession(sid(1))),
+        "AwaitingHello socket must not keep newly registered LeaseBound session alive"
+    );
+
+    // Authenticated conn(1) registers LeaseBound sid(2); conn(99) stays AwaitingHello;
+    // when conn(1) disconnects, TeardownNonKeptSessions MUST fire despite unauth conn(99)!
+    handshake_ready(&mut broker, conn(1), ts(2));
+    actions.clear();
+    broker.register_session(sid(2), SessionLifetime::LeaseBound, false, &mut actions);
+    assert!(!actions.contains(&BrokerAction::TeardownSession(sid(2))));
+    broker.close_connection(conn(1), CloseReason::TransportClosed, ts(3), &mut actions);
+    assert!(
+        actions.contains(&BrokerAction::TeardownNonKeptSessions),
+        "disconnecting last Ready conn must trigger TeardownNonKeptSessions even while AwaitingHello conn(99) is open"
+    );
+
+    // 2. `SessionUnpinned` must NOT tear down a `LeaseBound` session while another Ready client is attached!
+    handshake_ready(&mut broker, conn(2), ts(4));
+    handshake_ready(&mut broker, conn(3), ts(4));
+    actions.clear();
+    broker.register_session(sid(10), SessionLifetime::LeaseBound, false, &mut actions);
+    // conn(2) attaches to sid(10) with RAW_OUTPUT + BACKPRESSURE_PTY and 0 initial credit!
+    broker.feed_bytes(
+        conn(2),
+        &encode_client(
+            StreamId::CONTROL,
+            1,
+            &ClientMsg::Attach {
+                session: sid(10),
+                stream_id: nz_stream(1),
+                flags: SubFlags::from_bits(SubFlags::RAW_OUTPUT | SubFlags::BACKPRESSURE_PTY).unwrap(),
+                initial_viewport: None,
+                initial_output_credit: 0,
+                initial_frame_credit: FrameCredit { max_frames: 4, max_bytes: 65_536 },
+            },
+        ),
+        ts(5),
+        &mut actions,
+    );
+    // conn(3) acquires and releases a Session(10) pin: sid(10) MUST NOT be torn down because conn(2) is attached!
+    broker.feed_bytes(
+        conn(3),
+        &encode_client(StreamId::CONTROL, 2, &ClientMsg::AcquireLease { kind: LeaseKind::Session(sid(10)) }),
+        ts(6),
+        &mut actions,
+    );
+    let pin_lid = match broker.pop_outbound(conn(3)).unwrap().msg {
+        BrokerMsg::LeaseAck { lease_id, .. } => lease_id,
+        other => panic!("expected LeaseAck, got {other:?}"),
+    };
+    actions.clear();
+    broker.feed_bytes(
+        conn(3),
+        &encode_client(StreamId::CONTROL, 3, &ClientMsg::ReleaseLease { lease_id: pin_lid }),
+        ts(7),
+        &mut actions,
+    );
+    assert!(
+        !actions.contains(&BrokerAction::SessionUnpinned(sid(10))),
+        "unpinning a LeaseBound session with an active attached stream must not tear it down"
+    );
+
+    // 3. `BACKPRESSURE_PTY` pending output buffered while credit == 0 MUST flush strictly before `StreamClosed` on exit!
+    actions.clear();
+    broker.publish_raw_output(sid(10), b"FINAL_BUFFERED_OUTPUT", ts(8), &mut actions);
+    broker.publish_raw_output(sid(10), &[0xE2, 0x82], ts(8), &mut actions); // trailing incomplete UTF-8
+    assert!(broker.pop_outbound(conn(2)).is_none(), "credit == 0 keeps output buffered in pending_utf8");
+
+    actions.clear();
+    broker.unregister_session(sid(10), "session ended", ts(9), &mut actions);
+    let mut drained = Vec::new();
+    while let Some(m) = broker.pop_outbound(conn(2)) {
+        drained.push(m.msg);
+    }
+    assert_eq!(
+        drained,
+        vec![
+            BrokerMsg::Output { text: String::from("FINAL_BUFFERED_OUTPUT") },
+            BrokerMsg::Output { text: String::from("\u{FFFD}") },
+            BrokerMsg::StreamClosed { reason: String::from("session ended") },
+        ],
+        "pending BACKPRESSURE_PTY bytes must flush as Output strictly before StreamClosed"
+    );
+
+    // Direct multi-chunk `RawOutputFlow::flush_on_exit` check (4-byte chunks + budget release):
+    let mut budget = MemoryBudget::new(1024);
+    let mut flow = RawOutputFlow::with_limits(0, true, 64, 4);
+    let _ = flow.ingest(b"abcdefghij", ts(1), &mut budget);
+    assert_eq!(budget.used_bytes(), 10);
+    let flushed = flow.flush_on_exit(&mut budget);
+    assert_eq!(flushed, vec!["abcd", "efgh", "ij"]);
+    assert_eq!(budget.used_bytes(), 0);
+}
