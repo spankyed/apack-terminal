@@ -3,6 +3,7 @@ name = "apack-sim"
 version = "0.2.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+publish = false
 description = "Deterministic sans-IO chaos simulator, MockVt, and continuous invariant oracles for apack-terminal v2."
 
 [dependencies]

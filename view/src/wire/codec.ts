@@ -47,7 +47,7 @@ export class WireError extends Error {
 }
 
 const textEncoder = new TextEncoder()
-const textDecoder = new TextDecoder('utf-8', { fatal: true })
+const textDecoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
 
 export class WireWriter {
   private buf: Uint8Array

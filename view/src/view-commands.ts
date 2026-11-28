@@ -3,6 +3,7 @@ import { type Scene } from './painter.ts'
 import { type CellSpan, type CommandRecord, type PackedRow } from './source.ts'
 import { type Viewport } from './viewport.ts'
 import { buildFoldRow, firstAfter, markColor, type Fold } from './view-types.ts'
+import { MAX_COMMANDS } from './wire/constants.ts'
 
 interface CommandLine {
   readonly line: number
@@ -98,15 +99,22 @@ export class CommandFoldController {
   }
 
   setCommands(commands: readonly CommandRecord[]): void {
-    this.commandList = [...commands]
+    this.commandList =
+      commands.length > MAX_COMMANDS ? commands.slice(commands.length - MAX_COMMANDS) : [...commands]
     this.rebuildCommandIndex()
     this.onCommands?.(this.commandList)
   }
 
   upsertCommand(record: CommandRecord): void {
     const idx = this.commandList.findIndex((c) => c.id === record.id)
-    if (idx === -1) this.commandList.push(record)
-    else this.commandList[idx] = record
+    if (idx === -1) {
+      this.commandList.push(record)
+      if (this.commandList.length > MAX_COMMANDS) {
+        this.commandList.splice(0, this.commandList.length - MAX_COMMANDS)
+      }
+    } else {
+      this.commandList[idx] = record
+    }
     this.rebuildCommandIndex()
     this.onCommands?.(this.commandList)
   }

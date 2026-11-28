@@ -332,4 +332,129 @@ describe('ImageCache and TerminalView image placements', () => {
     expect(bitmaps.every((bm) => bm.closed)).toBe(true)
     expect(cache.size).toBe(0)
   })
+
+  it('negative-caches failures per source, isolates throwing onReady, handles sync throws, isolates per-source dedup, and rejects non-finite dimensions', async () => {
+    // 1. Permanent fetch/decode failure negative-caches per source (stops per-paint RPC retry storms!)
+    const sourceFail = new FakeSource()
+    const missingBlob = new Uint8Array(32).fill(0x71)
+    let failAttempts = 0
+    sourceFail.getImageBlob = async () => {
+      failAttempts += 1
+      throw new Error('NoSuchBlob')
+    }
+    const cache = new ImageCache({
+      decode: async () => {
+        const bm = fakeBitmap(8, 8)
+        return { source: bm as unknown as CanvasImageSource, width: 8, height: 8 }
+      },
+    })
+    expect(await cache.ensure(sourceFail, missingBlob)).toBeNull()
+    expect(await cache.ensure(sourceFail, missingBlob)).toBeNull()
+    expect(await cache.ensure(sourceFail, missingBlob)).toBeNull()
+    expect(failAttempts).toBe(1)
+
+    // Healthy second source is NOT poisoned by sourceFail's negative cache!
+    const sourceHealthy = new FakeSource()
+    sourceHealthy.blobs.set(blobHashToHex(missingBlob), { blob: missingBlob, encoding: 'png', bytes: new Uint8Array([1]) })
+    const recovered = await cache.ensure(sourceHealthy, missingBlob)
+    expect(recovered).not.toBeNull()
+    expect(cache.get(missingBlob)).toBe(recovered!)
+
+    // 2. Throwing onReady callback does NOT discard decoded image or starve sibling callbacks
+    const cbBlob = new Uint8Array(32).fill(0x72)
+    sourceHealthy.blobs.set(blobHashToHex(cbBlob), { blob: cbBlob, encoding: 'png', bytes: new Uint8Array([2]) })
+    let siblingRan = false
+    const [resA, resB] = await Promise.all([
+      cache.ensure(sourceHealthy, cbBlob, () => {
+        throw new Error('onReady-boom')
+      }),
+      cache.ensure(sourceHealthy, cbBlob, () => {
+        siblingRan = true
+      }),
+    ])
+    expect(resA).not.toBeNull()
+    expect(resB).toBe(resA)
+    expect(siblingRan).toBe(true)
+    expect(cache.get(cbBlob)).toBe(resA!)
+
+    // 3. Per-source in-flight dedup: a hung sourceA never blocks sourceB for the same blob hash
+    const sharedBlob = new Uint8Array(32).fill(0x73)
+    const hungSource = new FakeSource()
+    hungSource.getImageBlob = () => new Promise(() => {}) // never resolves
+    sourceHealthy.blobs.set(blobHashToHex(sharedBlob), { blob: sharedBlob, encoding: 'png', bytes: new Uint8Array([3]) })
+    void cache.ensure(hungSource, sharedBlob)
+    const fromHealthy = await cache.ensure(sourceHealthy, sharedBlob)
+    expect(fromHealthy).not.toBeNull()
+
+    // 4. Synchronous getImageBlob throw resolves to null without leaking inflight state
+    const syncThrowBlob = new Uint8Array(32).fill(0x74)
+    const syncThrowSource = new FakeSource()
+    let syncCalls = 0
+    syncThrowSource.getImageBlob = () => {
+      syncCalls += 1
+      throw new Error('sync-disposed')
+    }
+    expect(await cache.ensure(syncThrowSource, syncThrowBlob)).toBeNull()
+    expect(await cache.ensure(syncThrowSource, syncThrowBlob)).toBeNull()
+    expect(syncCalls).toBe(1)
+
+    // 5. Non-finite / non-positive decoded dimensions are rejected, bitmap is closed, and bytesUsed stays finite
+    const badDimBitmaps: Array<ReturnType<typeof fakeBitmap>> = []
+    const badDimCache = new ImageCache({
+      decode: async () => {
+        const bm = fakeBitmap(Number.NaN, 16)
+        badDimBitmaps.push(bm)
+        return { source: bm as unknown as CanvasImageSource, width: Number.NaN, height: 16 }
+      },
+    })
+    const badDimBlob = new Uint8Array(32).fill(0x75)
+    sourceHealthy.blobs.set(blobHashToHex(badDimBlob), { blob: badDimBlob, encoding: 'png', bytes: new Uint8Array([4]) })
+    expect(await badDimCache.ensure(sourceHealthy, badDimBlob)).toBeNull()
+    expect(badDimBitmaps[0]!.closed).toBe(true)
+    expect(Number.isFinite(badDimCache.bytesUsed)).toBe(true)
+    expect(badDimCache.bytesUsed).toBe(0)
+    expect(badDimCache.size).toBe(0)
+
+    // 6. ImagePiece bounds/finiteness clamping in ViewRenderer
+    const pieceSource = new FakeSource()
+    const pieceBlob = new Uint8Array(32).fill(0x76)
+    pieceSource.blobs.set(blobHashToHex(pieceBlob), { blob: pieceBlob, encoding: 'png', bytes: new Uint8Array([5]) })
+    const pieceCache = new ImageCache({
+      decode: async () => {
+        const c = document.createElement('canvas')
+        c.width = 16
+        c.height = 16
+        return { source: c, width: 16, height: 16 }
+      },
+    })
+    await pieceCache.ensure(pieceSource, pieceBlob)
+    const { view, painted } = mountedView({ imageCache: pieceCache }, pieceSource)
+    pieceSource.send(
+      frame({
+        seq: 1,
+        rows: [
+          row(0, 'pieces', {
+            pieces: [
+              // Oversized srcRect (8..8+999 -> 8..16) and dstPx (500x500 -> clamped to colLen*10=20, cellHeight=20)
+              { blob: pieceBlob, colStart: 1, colLen: 2, srcRect: [8, -4, 999, 999], dstPx: [500, 500] },
+              // Invalid negative colStart / out-of-bounds srcRect origin must be skipped
+              { blob: pieceBlob, colStart: -1, colLen: 2, srcRect: [0, 0, 16, 16], dstPx: [10, 10] },
+              { blob: pieceBlob, colStart: 3, colLen: 2, srcRect: [999, 0, 16, 16], dstPx: [10, 10] },
+            ],
+          }),
+        ],
+      }),
+    )
+    const scene = painted()
+    expect(scene.images).toHaveLength(1)
+    expect(scene.images![0]!.x).toBe(10)
+    expect(scene.images![0]!.width).toBe(20)
+    expect(scene.images![0]!.height).toBe(20)
+    expect(scene.images![0]!.source).toEqual({ x: 8, y: 0, width: 8, height: 16 })
+
+    view.dispose()
+    pieceCache.dispose()
+    badDimCache.dispose()
+    cache.dispose()
+  })
 })

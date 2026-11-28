@@ -554,4 +554,132 @@ describe('TerminalClient & BrokerSessionSource', () => {
 
     client.close()
   })
+
+  it('replays buffered final frame and terminal event to late subscribe()rs and coalesces >8 unsubscribed deltas losslessly', async () => {
+    const pipe = new MockBrokerPipe()
+    const attachCredits: number[] = []
+    pipe.onClientFrame = (streamId, reqId, msg) => {
+      if (msg.kind === 'hello') {
+        pipe.pushBroker(streamId, reqId, {
+          kind: 'helloOk',
+          protocolVersion: PROTOCOL_VERSION,
+          authRequired: false,
+          serverNonce: new Uint8Array(32),
+          wordDelimiters: ' ',
+          capabilities: 0,
+        })
+      } else if (msg.kind === 'attach') {
+        attachCredits.push(msg.initialFrameCredit.maxFrames)
+        pipe.pushBroker(CONTROL_STREAM_ID, reqId, {
+          kind: 'attached',
+          session: msg.session,
+          streamId: msg.streamId,
+          size: { cols: 80, rows: 4 },
+          epoch: 1,
+          firstActiveLine: 0,
+          scrollbackLines: 0,
+          foreground: null,
+          statuses: [],
+        })
+      }
+    }
+
+    const client = await TerminalClient.connect(pipe.stream)
+
+    // 1. Fast-exit race (H2): final FrameUpdate + Exited arrive BEFORE subscribe()
+    const fastExit = await client.attachSession(101, { flags: SubFlags.VIEW | SubFlags.EVENTS })
+    pipe.pushBroker(fastExit.streamId, PUSH_REQ_ID, {
+      kind: 'frame',
+      frame: { ...sampleFrame(1, 'final output'), fullSync: true },
+    })
+    pipe.pushBroker(fastExit.streamId, PUSH_REQ_ID, { kind: 'exited', exitCode: 42, signal: null })
+
+    const lateFrames: FrameUpdate[] = []
+    const lateEvents: string[] = []
+    let lateExitCode: number | null = null
+    const unsubFast = fastExit.subscribe({
+      onFrame: (f) => lateFrames.push(f),
+      onSearchMatches: () => {},
+      onSearchDelta: () => {},
+      onEvent: (ev) => {
+        lateEvents.push(ev.kind)
+        if (ev.kind === 'exited') lateExitCode = ev.exitCode
+      },
+    })
+    expect(lateFrames).toHaveLength(1)
+    expect(lateFrames[0]!.rows[0]!.text).toBe('final output')
+    expect(lateEvents).toEqual(['exited'])
+    expect(lateExitCode).toBe(42)
+    unsubFast()
+
+    // 2. streamClosed before subscribe() also replays cleanly
+    const closedEarly = await client.attachSession(102, { flags: SubFlags.VIEW | SubFlags.EVENTS })
+    pipe.pushBroker(closedEarly.streamId, PUSH_REQ_ID, { kind: 'streamClosed', reason: 'broker shutting down' })
+    const closedEvents: string[] = []
+    closedEarly.subscribe({
+      onFrame: () => {},
+      onSearchMatches: () => {},
+      onSearchDelta: () => {},
+      onEvent: (ev) => {
+        if (ev.kind === 'streamClosed') closedEvents.push(ev.reason)
+      },
+    })
+    expect(closedEvents).toEqual(['broker shutting down'])
+
+    // 3. Unsubscribed frame buffering: initialFrameCredit.maxFrames capped <= 8, and >8 delta frames
+    //    coalesce losslessly without dropping earlier active rows or palette overrides!
+    const burst = await client.attachSession(103, {
+      flags: SubFlags.VIEW | SubFlags.EVENTS,
+      maxInFlightFrames: 32,
+    })
+    expect(attachCredits.at(-1)).toBe(8)
+    // Frame 1 (fullSync) sets row 0 + palette override
+    pipe.pushBroker(burst.streamId, PUSH_REQ_ID, {
+      kind: 'frame',
+      frame: {
+        ...sampleFrame(1, 'row0-base'),
+        size: { cols: 80, rows: 4 },
+        fullSync: true,
+        palette: { fg: 0x112233, bg: null, cursor: null, palette: [] },
+        rows: [
+          packRow({ line: 0, runs: [{ colStart: 0, colLen: 9, text: 'row0-base' }] }),
+          packRow({ line: 1, runs: [{ colStart: 0, colLen: 9, text: 'row1-base' }] }),
+        ],
+      },
+    })
+    // Frames 2..12 are delta frames updating row 2 and row 3 while row 0 and row 1 stay untouched
+    for (let seq = 2; seq <= 12; seq += 1) {
+      const text = `delta-${seq}`
+      pipe.pushBroker(burst.streamId, PUSH_REQ_ID, {
+        kind: 'frame',
+        frame: {
+          ...sampleFrame(seq, text),
+          size: { cols: 80, rows: 4 },
+          fullSync: false,
+          rows: [packRow({ line: seq % 2 === 0 ? 2 : 3, runs: [{ colStart: 0, colLen: text.length, text }] })],
+        },
+      })
+    }
+    const burstFrames: FrameUpdate[] = []
+    burst.subscribe({
+      onFrame: (f) => burstFrames.push(f),
+      onSearchMatches: () => {},
+      onSearchDelta: () => {},
+    })
+    // Coalesced frame must retain row 0, row 1, latest row 2 (delta-12), latest row 3 (delta-11), and palette!
+    const allRows = new Map<number, string>()
+    let sawPaletteFg: number | null = null
+    for (const f of burstFrames) {
+      if (f.palette?.fg !== null && f.palette?.fg !== undefined) sawPaletteFg = f.palette.fg
+      for (const r of f.rows) allRows.set(r.line, r.text)
+    }
+    expect(allRows.get(0)).toBe('row0-base')
+    expect(allRows.get(1)).toBe('row1-base')
+    expect(allRows.get(2)).toBe('delta-12')
+    expect(allRows.get(3)).toBe('delta-11')
+    expect(sawPaletteFg).toBe(0x112233)
+    expect(burstFrames.at(-1)?.seq).toBe(12)
+
+    client.close()
+  })
 })

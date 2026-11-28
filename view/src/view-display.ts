@@ -22,6 +22,7 @@ export interface DisplayHost {
   rows(): number
   isListening(): boolean
   isDisposed(): boolean
+  isEnded(): boolean
   isVisible(): boolean
   isFocused(): boolean
   onFit(fit: FitSize): void
@@ -102,7 +103,7 @@ export class DisplayController {
   }
 
   pushViewportHint(): void {
-    if (!this.host.isListening() || this.host.isDisposed()) return
+    if (!this.host.isListening() || this.host.isDisposed() || this.host.isEnded()) return
     const fit = this.lastFit
     const cols = fit?.columns ?? this.host.columns()
     const rows = fit?.rows ?? this.host.rows()

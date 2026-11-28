@@ -303,8 +303,13 @@ export class PointerController {
     const validButton = event.button >= 0 && event.button <= 2
     const reporting =
       validButton && this.host.frame()?.modes.mouse === true && !event.shiftKey && this.host.viewport.following
+    if (!reporting && event.button !== 0) return
     this.pressed = { pointerId: event.pointerId, button: event.button, reporting, at, moved: false, block: event.altKey }
-    this.host.element.setPointerCapture?.(event.pointerId)
+    try {
+      this.host.element.setPointerCapture?.(event.pointerId)
+    } catch {
+      // Synthetic pointer events in unit tests or detached elements do not register active browser pointer IDs.
+    }
     if (reporting) {
       const input = this.pointerInput(event, 'press', event.button)
       this.reported = {
@@ -315,7 +320,6 @@ export class PointerController {
       this.host.source.sendPointer(input)
       return
     }
-    if (event.button !== 0) return
     if (event.shiftKey && this.host.selection.span) {
       this.host.selection.extendTo(at)
       return
@@ -376,7 +380,11 @@ export class PointerController {
     this.pressed = null
     this.stopDragScroll()
     if (this.host.element.hasPointerCapture?.(event.pointerId)) {
-      this.host.element.releasePointerCapture(event.pointerId)
+      try {
+        this.host.element.releasePointerCapture(event.pointerId)
+      } catch {
+        // Ignore if capture was already released by the browser.
+      }
     }
     if (pressed.reporting) {
       this.reported = null
@@ -476,7 +484,10 @@ export class PointerController {
       if (travel > 0) this.host.scrollToPosition(start.position + ((moved.clientY - start.y) / travel) * (total - shown))
     }
     const up = (ended?: PointerEvent) => {
-      if (ended && ended.pointerId !== pointerId) return
+      if (ended) {
+        if (ended.pointerId !== pointerId) return
+        if (ended.type === 'pointerup' && ended.button !== 0) return
+      }
       window.removeEventListener('pointermove', move)
       window.removeEventListener('pointerup', up)
       window.removeEventListener('pointercancel', up)

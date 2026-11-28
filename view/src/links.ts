@@ -24,13 +24,13 @@ export interface Detector {
   find(text: string): ReadonlyArray<{ readonly start: number; readonly end: number; readonly target?: string }>
 }
 
-/** Schemes a declared OSC 8 hyperlink may never open */
-const UNSAFE_SCHEME = /^(?:javascript|data|vbscript):/i
+/** Explicit allow-list of URI schemes permitted for declared OSC 8 hyperlinks */
+const ALLOWED_SCHEME = /^(?:https?|mailto):/i
 
-/** Whether a declared link target uses a safe scheme (stripping ASCII controls/whitespace that URL parsers ignore) */
+/** Whether a declared link target uses an allowed scheme (stripping ASCII controls/whitespace that URL parsers ignore) */
 function isSafeTarget(target: string): boolean {
   const normalized = target.replace(/[\u0000-\u0020\u007f]+/g, '')
-  return normalized !== '' && !UNSAFE_SCHEME.test(normalized)
+  return ALLOWED_SCHEME.test(normalized)
 }
 
 /**

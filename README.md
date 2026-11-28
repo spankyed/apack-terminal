@@ -39,9 +39,9 @@ deterministically through kernel-enforced ownership when the app exits.
   frames use adaptive BDP `FrameCredit` flow control and dirty-row coalescing; non-conflatable control streams
   use explicit byte credits and bounded queues; overload always reports measured metrics rather than dropping
   silently.
-- **Owned process trees & crash-only safety.** POSIX sessions/process groups (`setsid` + negative-pgid kill)
-  and Windows Job Objects (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) ensure no orphaned shells survive teardown
-  or crashes.
+- **Owned process trees & crash-only safety.** POSIX sessions/process groups (`setsid` + negative-pgid kill
+  and live parent-chain descendant sweeps while the leader is pinned) and Windows Job Objects
+  (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) ensure session process trees tear down cleanly.
 - **Immutable segmented WAL & dual-layer restore.** Crash-safe CRC32C-framed segments with $O(1)$ budget
   eviction and `KeyframeV2` carrying both a version-stable `VisualKeyframe` and an optional ABI-hashed
   `libghostty-vt` binary checkpoint.

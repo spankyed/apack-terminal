@@ -537,10 +537,12 @@ export class TerminalClient {
   async attachSession(session: number, options: AttachOptions = {}): Promise<BrokerSessionSource> {
     const streamId = this.allocStreamId()
     const flags = options.flags ?? (SubFlags.VIEW | SubFlags.EVENTS)
-    const maxFrames = options.maxInFlightFrames ?? options.initialFrameCredit?.maxFrames ?? DEFAULT_MAX_FRAMES
+    const rawMaxFrames = options.maxInFlightFrames ?? options.initialFrameCredit?.maxFrames ?? DEFAULT_MAX_FRAMES
+    const maxFrames = Number.isFinite(rawMaxFrames) ? Math.max(0, Math.floor(rawMaxFrames)) : DEFAULT_MAX_FRAMES
     const maxBytes = options.maxInFlightBytes ?? options.initialFrameCredit?.maxBytes ?? DEFAULT_MAX_BYTES
     const visible = options.initialViewport?.visible ?? true
-    const initialFrameCredit: FrameCredit = { maxFrames: visible ? maxFrames : 0, maxBytes }
+    const initialMaxFrames = visible ? Math.min(maxFrames, MAX_BUFFERED_FRAMES) : 0
+    const initialFrameCredit: FrameCredit = { maxFrames: initialMaxFrames, maxBytes }
 
     const source = new BrokerSessionSource(
       this,
@@ -585,6 +587,38 @@ export class TerminalClient {
 const MAX_BUFFERED_FRAMES = 8
 
 /**
+ * Losslessly coalesces two `FrameUpdate`s into one bounded active-screen frame so unsubscribed
+ * buffering never silently drops delta rows or palette overrides.
+ */
+function coalesceFrameUpdate(prev: FrameUpdate, next: FrameUpdate): FrameUpdate {
+  if (next.fullSync || next.epoch !== prev.epoch) return next
+  const minLine = Math.max(0, next.firstActiveLine)
+  const maxLine = minLine + Math.max(0, next.size.rows)
+  const byLine = new Map<number, FrameUpdate['rows'][number]>()
+  for (const row of prev.rows) {
+    if (row.line >= minLine && row.line < maxLine) byLine.set(row.line, row)
+  }
+  for (const row of next.rows) {
+    if (row.line >= minLine && row.line < maxLine) byLine.set(row.line, row)
+  }
+  const rows = [...byLine.values()].sort((a, b) => a.line - b.line)
+  return {
+    seq: next.seq,
+    epoch: next.epoch,
+    size: next.size,
+    firstActiveLine: next.firstActiveLine,
+    scrollbackLines: next.scrollbackLines,
+    scrollDelta: Math.min(0xffffffff, prev.scrollDelta + next.scrollDelta),
+    cursor: next.cursor,
+    modes: next.modes,
+    palette: next.palette ?? prev.palette,
+    rows,
+    imagesGen: next.imagesGen,
+    fullSync: prev.fullSync,
+  }
+}
+
+/**
  * One multiplexed session attachment implementing `TerminalSource` with byte-bounded BDP
  * `FrameCredit` pacing and pipelined `64 KiB` `GetImageBlob` chunk assembly.
  */
@@ -599,6 +633,7 @@ export class BrokerSessionSource implements TerminalSource {
   private visible: boolean
   private everGrantedCredit: boolean
   private disposed = false
+  private endedEvent: SessionEvent | null = null
   private _initialStatuses: readonly StatusRecord[] = []
 
   constructor(
@@ -638,22 +673,25 @@ export class BrokerSessionSource implements TerminalSource {
     if (!this.visible) return { maxFrames: 0, maxBytes: this.maxBytes }
     // Scale frames smoothly between 1 (tight local) and configured maxFrames (high-RTT SSH)
     const desiredFrames = this.ewmaIntervalMs >= 40 ? Math.min(4, Math.max(2, this.maxFrames)) : this.maxFrames
-    return { maxFrames: desiredFrames, maxBytes: this.maxBytes }
+    const boundedFrames = this.sinks.size === 0 ? Math.min(desiredFrames, MAX_BUFFERED_FRAMES) : desiredFrames
+    return { maxFrames: boundedFrames, maxBytes: this.maxBytes }
   }
 
-  private disposeLocal(): SourceSink[] {
+  private disposeLocal(clearBuffered: boolean): SourceSink[] {
     if (this.disposed) return []
     this.disposed = true
     const currentSinks = [...this.sinks]
     this.sinks.clear()
     this.manualAckSinks.clear()
-    this.bufferedFrames.length = 0
+    if (clearBuffered) this.bufferedFrames.length = 0
     return currentSinks
   }
 
   private markClosed(reason: string): void {
-    const currentSinks = this.disposeLocal()
-    for (const sink of currentSinks) sink.onEvent?.({ kind: 'streamClosed', reason })
+    const event: SessionEvent = { kind: 'streamClosed', reason }
+    if (this.endedEvent === null) this.endedEvent = event
+    const currentSinks = this.disposeLocal(false)
+    for (const sink of currentSinks) sink.onEvent?.(event)
   }
 
   handler(hasRawOutput: boolean): AttachedStream {
@@ -675,10 +713,23 @@ export class BrokerSessionSource implements TerminalSource {
         this.lastFrameAtMs = now
         this.lastSeq = msg.frame.seq
         if (this.sinks.size === 0) {
-          // Conflate & cap buffered frames while unsubscribed; hold ack until a sink subscribes
-          if (msg.frame.fullSync) this.bufferedFrames.length = 0
-          if (this.bufferedFrames.length >= MAX_BUFFERED_FRAMES) this.bufferedFrames.shift()
-          this.bufferedFrames.push(msg.frame)
+          // Coalesce & cap buffered frames while unsubscribed without dropping delta rows;
+          // hold ack until a sink subscribes.
+          const last = this.bufferedFrames.at(-1)
+          if (msg.frame.fullSync || (last !== undefined && last.epoch !== msg.frame.epoch)) {
+            this.bufferedFrames.length = 0
+            this.bufferedFrames.push(msg.frame)
+          } else if (this.bufferedFrames.length >= MAX_BUFFERED_FRAMES) {
+            let merged = this.bufferedFrames[0]!
+            for (let i = 1; i < this.bufferedFrames.length; i += 1) {
+              merged = coalesceFrameUpdate(merged, this.bufferedFrames[i]!)
+            }
+            merged = coalesceFrameUpdate(merged, msg.frame)
+            this.bufferedFrames.length = 0
+            this.bufferedFrames.push(merged)
+          } else {
+            this.bufferedFrames.push(msg.frame)
+          }
         } else {
           for (const sink of this.sinks) sink.onFrame(msg.frame)
           // When a view subscribes with `manualAck`, it calls `ackFrame(seq)` after painting so
@@ -719,9 +770,10 @@ export class BrokerSessionSource implements TerminalSource {
         break
       case 'exited': {
         // Without SUB_RAW_OUTPUT, `exited` is the final frame on this stream (no trailing
-        // `streamClosed` follows): dispose locally so subsequent API calls reject cleanly and
-        // sinks/buffers do not leak, without emitting a duplicate synthetic `streamClosed`.
-        const currentSinks = hasRawOutput ? [...this.sinks] : this.disposeLocal()
+        // `streamClosed` follows): dispose locally while retaining any unconsumed final frame
+        // and `endedEvent` for late `subscribe()` callers, without emitting a synthetic `streamClosed`.
+        this.endedEvent = msg as SessionEvent
+        const currentSinks = hasRawOutput ? [...this.sinks] : this.disposeLocal(false)
         for (const sink of currentSinks) sink.onEvent?.(msg as SessionEvent)
         break
       }
@@ -739,7 +791,14 @@ export class BrokerSessionSource implements TerminalSource {
   }
 
   subscribe(sink: SourceSink, options?: { readonly manualAck?: boolean }): () => void {
-    if (this.disposed) return () => {}
+    if (this.disposed) {
+      if (this.bufferedFrames.length > 0) {
+        const frames = this.bufferedFrames.splice(0, this.bufferedFrames.length)
+        for (const f of frames) sink.onFrame(f)
+      }
+      if (this.endedEvent !== null) sink.onEvent?.(this.endedEvent)
+      return () => {}
+    }
     this.sinks.add(sink)
     if (options?.manualAck) this.manualAckSinks.add(sink)
     if (this.bufferedFrames.length > 0) {
@@ -749,6 +808,7 @@ export class BrokerSessionSource implements TerminalSource {
         this.ackFrame(this.lastSeq)
       }
     }
+    if (this.endedEvent !== null) sink.onEvent?.(this.endedEvent)
     return () => {
       this.sinks.delete(sink)
       const wasManual = this.manualAckSinks.delete(sink)
@@ -996,11 +1056,14 @@ export class BrokerSessionSource implements TerminalSource {
   }
 
   dispose(): void {
+    this.bufferedFrames.length = 0
+    if (this.endedEvent === null) {
+      this.endedEvent = { kind: 'streamClosed', reason: 'stream disposed' }
+    }
     if (this.disposed) return
     this.disposed = true
     this.sinks.clear()
     this.manualAckSinks.clear()
-    this.bufferedFrames.length = 0
     this.client.detachStream(this.streamId)
   }
 }

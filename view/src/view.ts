@@ -181,6 +181,7 @@ export class TerminalView {
       rows: () => this.rows,
       isListening: () => this.listening,
       isDisposed: () => this.disposed,
+      isEnded: () => this.ended,
       isVisible: () => this.visible,
       isFocused: () => this.focused,
       onFit: (fit) => this.options.onFit?.(fit),
@@ -281,6 +282,7 @@ export class TerminalView {
     this.blink.syncActive()
     this.display.pushViewportHint()
     if (!visible) {
+      this.pointer.stopDragScroll()
       this.renderer.cancelMirrorTimer()
       if (this.unacknowledgedSeq !== null && !this.ended) {
         this.source.ackFrame?.(this.unacknowledgedSeq)
@@ -520,9 +522,13 @@ export class TerminalView {
   }
 
   private resume(): void {
-    if (this.unsubscribe || this.disposed) return
-    this.ended = false
+    if (this.listening || this.disposed) return
     this.listening = true
+    if (this.ended) {
+      this.blink.resetCursor()
+      this.schedule()
+      return
+    }
     this.unsubscribe = this.source.subscribe(
       {
         onFrame: (frame) => this.take(frame),
@@ -532,10 +538,12 @@ export class TerminalView {
       },
       { manualAck: true },
     )
-    this.display.pushViewportHint()
-    if (this.focused) this.source.sendFocus(true)
-    this.fetchCommands()
-    this.renderer.wantPicturesInView()
+    if (!this.ended) {
+      this.display.pushViewportHint()
+      if (this.focused) this.source.sendFocus(true)
+      this.fetchCommands()
+      this.renderer.wantPicturesInView()
+    }
     this.blink.resetCursor()
     this.schedule()
   }
