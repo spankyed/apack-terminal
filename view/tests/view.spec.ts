@@ -327,10 +327,37 @@ describe('TerminalView v2 core lifecycle', () => {
     expect(endedReasons).toEqual(['exited (7)'])
     expect(source.hints.length).toBe(hintsBeforeRemount)
     expect(source.imagesAsked).toBe(imagesBeforeRemount)
-    // Final frame still repaints cleanly after remount
+    // Final frame still repaints cleanly after remount, and setFocused after exit sends no focus RPC
+    const focusesBefore = source.focus_.length
+    view.setFocused(true)
+    view.setFocused(false)
+    expect(source.focus_.length).toBe(focusesBefore)
     const remountScene = painted()
     expect(remountScene.rows[0]!.glyphs.map((g) => g.text).join('')).toBe('line-20')
 
     view.dispose()
+
+    // 4. Synchronous onEnded -> view.dispose() during mount()/subscribe() immediately runs unsubscribe (zero sink leak!)
+    const syncSource = new FakeSource()
+    let activeSubscribers = 0
+    let triggerSyncExit = false
+    const origSub = syncSource.subscribe.bind(syncSource)
+    syncSource.subscribe = (sink) => {
+      activeSubscribers += 1
+      const unsub = origSub(sink)
+      if (triggerSyncExit) sink.onEvent?.({ kind: 'exited', exitCode: 2, signal: null })
+      return () => {
+        activeSubscribers -= 1
+        unsub()
+      }
+    }
+    let selfDisposing!: ReturnType<typeof mountedView>['view']
+    const mSync = mountedView({ onEnded: () => selfDisposing.dispose() }, syncSource)
+    selfDisposing = mSync.view
+    selfDisposing.unmount()
+    expect(activeSubscribers).toBe(0)
+    triggerSyncExit = true
+    selfDisposing.mount(mSync.host)
+    expect(activeSubscribers).toBe(0)
   })
 })

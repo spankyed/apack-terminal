@@ -97,6 +97,7 @@ export class ViewRenderer {
   syncFrameImages(frame: FrameUpdate): void {
     if (frame.imagesGen === this.imagesGenSeen) return
     const targetGen = (this.imagesGenSeen = frame.imagesGen)
+    this.host.imageCache.clearFailed(this.host.source)
     const epoch = frame.epoch
     void this.host.source.images().then((reply) => {
       if (this.host.isDisposed() || epoch !== this.host.store.epoch || targetGen !== this.imagesGenSeen) return
@@ -206,7 +207,7 @@ export class ViewRenderer {
         const decoded = this.host.imageCache.get(piece.blob)
         if (!decoded) continue
         if (!Number.isFinite(piece.colStart) || piece.colStart < 0) continue
-        const colLen = Number.isFinite(piece.colLen) && piece.colLen > 0 ? piece.colLen : 0
+        if (!Number.isFinite(piece.colLen) || piece.colLen <= 0) continue
         const [rawSx, rawSy, rawSw, rawSh] = piece.srcRect
         const sx = Number.isFinite(rawSx) ? Math.min(Math.max(0, rawSx), decoded.width) : 0
         const sy = Number.isFinite(rawSy) ? Math.min(Math.max(0, rawSy), decoded.height) : 0
@@ -216,10 +217,10 @@ export class ViewRenderer {
         const sh = Number.isFinite(rawSh) && rawSh > 0 ? Math.min(rawSh, availH) : availH
         if (!(sw > 0) || !(sh > 0)) continue
         const [rawDstW, rawDstH] = piece.dstPx
-        const maxDstW = colLen > 0 ? colLen * cellWidth : 0
+        const maxDstW = piece.colLen * cellWidth
         const dstW = Number.isFinite(rawDstW) && rawDstW > 0 ? rawDstW : 0
         const dstH = Number.isFinite(rawDstH) && rawDstH > 0 ? rawDstH : 0
-        const width = maxDstW > 0 ? (dstW > 0 ? Math.min(dstW, maxDstW) : maxDstW) : dstW
+        const width = dstW > 0 ? Math.min(dstW, maxDstW) : maxDstW
         const height = dstH > 0 ? Math.min(dstH, cellHeight) : cellHeight
         if (!(width > 0) || !(height > 0)) continue
         images.push({

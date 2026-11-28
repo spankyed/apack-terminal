@@ -415,7 +415,7 @@ describe('ImageCache and TerminalView image placements', () => {
     expect(badDimCache.bytesUsed).toBe(0)
     expect(badDimCache.size).toBe(0)
 
-    // 6. ImagePiece bounds/finiteness clamping in ViewRenderer
+    // 6. ImagePiece bounds/finiteness clamping in ViewRenderer (including invalid colLen <= 0 / NaN!)
     const pieceSource = new FakeSource()
     const pieceBlob = new Uint8Array(32).fill(0x76)
     pieceSource.blobs.set(blobHashToHex(pieceBlob), { blob: pieceBlob, encoding: 'png', bytes: new Uint8Array([5]) })
@@ -437,8 +437,10 @@ describe('ImageCache and TerminalView image placements', () => {
             pieces: [
               // Oversized srcRect (8..8+999 -> 8..16) and dstPx (500x500 -> clamped to colLen*10=20, cellHeight=20)
               { blob: pieceBlob, colStart: 1, colLen: 2, srcRect: [8, -4, 999, 999], dstPx: [500, 500] },
-              // Invalid negative colStart / out-of-bounds srcRect origin must be skipped
+              // Invalid negative colStart / colLen <= 0 / NaN colLen / out-of-bounds srcRect origin must be skipped
               { blob: pieceBlob, colStart: -1, colLen: 2, srcRect: [0, 0, 16, 16], dstPx: [10, 10] },
+              { blob: pieceBlob, colStart: 2, colLen: 0, srcRect: [0, 0, 16, 16], dstPx: [1e9, 10] },
+              { blob: pieceBlob, colStart: 2, colLen: Number.NaN, srcRect: [0, 0, 16, 16], dstPx: [1e9, 10] },
               { blob: pieceBlob, colStart: 3, colLen: 2, srcRect: [999, 0, 16, 16], dstPx: [10, 10] },
             ],
           }),
@@ -451,6 +453,63 @@ describe('ImageCache and TerminalView image placements', () => {
     expect(scene.images![0]!.width).toBe(20)
     expect(scene.images![0]!.height).toBe(20)
     expect(scene.images![0]!.source).toEqual({ x: 8, y: 0, width: 8, height: 16 })
+
+    // 7. Concurrent duplicate decode across two sources preserves first entry without firing onEvict and closes duplicate bitmap
+    const dupBlob = new Uint8Array(32).fill(0x77)
+    const dupSource1 = new FakeSource()
+    const dupSource2 = new FakeSource()
+    let resolveDup2!: (d: { blob: Uint8Array; encoding: 'png'; bytes: Uint8Array }) => void
+    dupSource1.blobs.set(blobHashToHex(dupBlob), { blob: dupBlob, encoding: 'png', bytes: new Uint8Array([1]) })
+    dupSource2.getImageBlob = () => new Promise((res) => { resolveDup2 = res })
+    const dupBitmaps: Array<ReturnType<typeof fakeBitmap>> = []
+    const dupEvictions: string[] = []
+    const dupCache = new ImageCache({
+      decode: async () => {
+        const bm = fakeBitmap(8, 8)
+        dupBitmaps.push(bm)
+        return { source: bm as unknown as CanvasImageSource, width: 8, height: 8 }
+      },
+    })
+    dupCache.onEvict((k) => dupEvictions.push(k))
+    const pDup2 = dupCache.ensure(dupSource2, dupBlob)
+    const firstDecoded = await dupCache.ensure(dupSource1, dupBlob)
+    resolveDup2({ blob: dupBlob, encoding: 'png', bytes: new Uint8Array([1]) })
+    const secondDecoded = await pDup2
+    expect(secondDecoded).toBe(firstDecoded)
+    expect(dupEvictions).toEqual([])
+    expect(dupBitmaps).toHaveLength(2)
+    expect(dupBitmaps[0]!.closed).toBe(false)
+    expect(dupBitmaps[1]!.closed).toBe(true)
+
+    // 8. Disposing cache inside onReady stops sibling callbacks and resolves to null, and clearFailed lets retries happen
+    const disposeBlob = new Uint8Array(32).fill(0x78)
+    dupSource1.blobs.set(blobHashToHex(disposeBlob), { blob: disposeBlob, encoding: 'png', bytes: new Uint8Array([2]) })
+    let afterDisposeRan = false
+    const [d1, d2] = await Promise.all([
+      dupCache.ensure(dupSource1, disposeBlob, () => dupCache.dispose()),
+      dupCache.ensure(dupSource1, disposeBlob, () => { afterDisposeRan = true }),
+    ])
+    expect(d1).toBeNull()
+    expect(d2).toBeNull()
+    expect(afterDisposeRan).toBe(false)
+
+    // clearFailed(source) clears negative cache for that source cleanly
+    cache.clearFailed(sourceFail)
+    sourceFail.blobs.set(blobHashToHex(missingBlob), { blob: missingBlob, encoding: 'png', bytes: new Uint8Array([1]) })
+    // Even if missingBlob wasn't in entries (use a fresh blob to test clearFailed directly!)
+    const retryBlob = new Uint8Array(32).fill(0x79)
+    let retryCalls = 0
+    sourceFail.getImageBlob = async () => {
+      retryCalls += 1
+      if (retryCalls === 1) throw new Error('evicted-temporarily')
+      return { blob: retryBlob, encoding: 'png', bytes: new Uint8Array([9]) }
+    }
+    expect(await cache.ensure(sourceFail, retryBlob)).toBeNull()
+    expect(await cache.ensure(sourceFail, retryBlob)).toBeNull()
+    expect(retryCalls).toBe(1)
+    cache.clearFailed(sourceFail)
+    expect(await cache.ensure(sourceFail, retryBlob)).not.toBeNull()
+    expect(retryCalls).toBe(2)
 
     view.dispose()
     pieceCache.dispose()

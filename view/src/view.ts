@@ -476,7 +476,7 @@ export class TerminalView {
     if (focused === this.focused) return
     this.focused = focused
     this.blink.resetCursor()
-    this.source.sendFocus(focused)
+    if (!this.ended && !this.disposed) this.source.sendFocus(focused)
     this.display.pushViewportHint()
     this.schedule()
   }
@@ -529,7 +529,7 @@ export class TerminalView {
       this.schedule()
       return
     }
-    this.unsubscribe = this.source.subscribe(
+    const unsub = this.source.subscribe(
       {
         onFrame: (frame) => this.take(frame),
         onSearchMatches: (snapshot) => this.search.applySnapshot(snapshot, false),
@@ -538,6 +538,11 @@ export class TerminalView {
       },
       { manualAck: true },
     )
+    if (this.disposed || !this.listening) {
+      unsub()
+      return
+    }
+    this.unsubscribe = unsub
     if (!this.ended) {
       this.display.pushViewportHint()
       if (this.focused) this.source.sendFocus(true)

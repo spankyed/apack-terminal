@@ -679,6 +679,87 @@ describe('TerminalClient & BrokerSessionSource', () => {
     expect(allRows.get(3)).toBe('delta-11')
     expect(sawPaletteFg).toBe(0x112233)
     expect(burstFrames.at(-1)?.seq).toBe(12)
+    expect(burstFrames[0]!.fullSync).toBe(true)
+    expect(burstFrames[0]!.scrollDelta).toBe(0)
+
+    // 4. Re-entrant client.close() or source.dispose() inside onFrame during subscribe() replay
+    //    must stop replaying subsequent buffered frames and must NOT deliver duplicate/spurious streamClosed!
+    const reentrantClose = await client.attachSession(104, { flags: SubFlags.VIEW | SubFlags.EVENTS })
+    pipe.pushBroker(reentrantClose.streamId, PUSH_REQ_ID, { kind: 'frame', frame: sampleFrame(1, 'first') })
+    pipe.pushBroker(reentrantClose.streamId, PUSH_REQ_ID, { kind: 'frame', frame: sampleFrame(2, 'second') })
+    const reentrantDisposeFrames: number[] = []
+    const reentrantDisposeEvents: string[] = []
+    reentrantClose.subscribe({
+      onFrame: (f) => {
+        reentrantDisposeFrames.push(f.seq)
+        reentrantClose.dispose()
+      },
+      onSearchMatches: () => {},
+      onSearchDelta: () => {},
+      onEvent: (ev) => reentrantDisposeEvents.push(ev.kind),
+    })
+    expect(reentrantDisposeFrames).toEqual([1])
+    expect(reentrantDisposeEvents).toEqual([])
+
+    // 5. hasRawOutput: true with exited BEFORE subscribe() replays exited once and stays open for trailing streamClosed
+    const rawLate = await client.attachSession(105, {
+      flags: SubFlags.VIEW | SubFlags.EVENTS | SubFlags.RAW_OUTPUT,
+    })
+    pipe.pushBroker(rawLate.streamId, PUSH_REQ_ID, { kind: 'exited', exitCode: 0, signal: null })
+    const rawLateEvents: string[] = []
+    rawLate.subscribe({
+      onFrame: () => {},
+      onSearchMatches: () => {},
+      onSearchDelta: () => {},
+      onEvent: (ev) => rawLateEvents.push(ev.kind),
+    })
+    expect(rawLateEvents).toEqual(['exited'])
+    pipe.pushBroker(rawLate.streamId, PUSH_REQ_ID, { kind: 'streamClosed', reason: 'done' })
+    expect(rawLateEvents).toEqual(['exited', 'streamClosed'])
+
+    // 6. Coalesced non-fullSync delta frames preserve positive scrollDelta floor when firstActiveLine advances
+    //    even if a later frame has negative scrollDelta (so RowStore doubts scrolled-off rows) and clamp signed i32.
+    const scrollBurst = await client.attachSession(106, { flags: SubFlags.VIEW | SubFlags.EVENTS })
+    for (let seq = 1; seq <= 10; seq += 1) {
+      pipe.pushBroker(scrollBurst.streamId, PUSH_REQ_ID, {
+        kind: 'frame',
+        frame: {
+          ...sampleFrame(seq, `line-${seq}`),
+          fullSync: false,
+          firstActiveLine: seq === 1 ? 0 : 2,
+          scrollbackLines: seq === 1 ? 0 : 2,
+          scrollDelta: seq === 2 ? 2 : seq === 3 ? -2 : 0,
+          rows: [packRow({ line: seq === 1 ? 0 : 2, runs: [{ colStart: 0, colLen: 6, text: `line-${seq}` }] })],
+        },
+      })
+    }
+    const scrollCoalesced: FrameUpdate[] = []
+    scrollBurst.subscribe({
+      onFrame: (f) => scrollCoalesced.push(f),
+      onSearchMatches: () => {},
+      onSearchDelta: () => {},
+    })
+    expect(scrollCoalesced[0]!.firstActiveLine).toBe(2)
+    expect(scrollCoalesced[0]!.scrollDelta).toBeGreaterThan(0)
+    expect(scrollCoalesced[0]!.scrollDelta).toBeLessThanOrEqual(0x7fffffff)
+
+    // 7. Re-entrant client.close() inside onFrame during replay delivers streamClosed at most once!
+    const reentrantClientClose = await client.attachSession(107, { flags: SubFlags.VIEW | SubFlags.EVENTS })
+    pipe.pushBroker(reentrantClientClose.streamId, PUSH_REQ_ID, { kind: 'frame', frame: sampleFrame(1, 'f1') })
+    pipe.pushBroker(reentrantClientClose.streamId, PUSH_REQ_ID, { kind: 'frame', frame: sampleFrame(2, 'f2') })
+    const closeFrames: number[] = []
+    const closeEvents: string[] = []
+    reentrantClientClose.subscribe({
+      onFrame: (f) => {
+        closeFrames.push(f.seq)
+        client.close()
+      },
+      onSearchMatches: () => {},
+      onSearchDelta: () => {},
+      onEvent: (ev) => closeEvents.push(ev.kind),
+    })
+    expect(closeFrames).toEqual([1])
+    expect(closeEvents).toEqual(['streamClosed'])
 
     client.close()
   })

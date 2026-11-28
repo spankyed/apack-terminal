@@ -112,6 +112,11 @@ export class ImageCache {
     }
   }
 
+  /** Clears negative-cached failures for `source` (e.g. when a session's `imagesGen` changes). */
+  clearFailed(source: TerminalSource): void {
+    this.failed.delete(source)
+  }
+
   get bytesUsed(): number {
     return this.usedBytes
   }
@@ -198,8 +203,10 @@ export class ImageCache {
         sourceCallbacks.delete(key)
       }
 
+      if (this.disposed) return null
       if (waiting) {
         for (const cb of [...waiting]) {
+          if (this.disposed) return null
           try {
             cb()
           } catch {
@@ -207,7 +214,7 @@ export class ImageCache {
           }
         }
       }
-      return entry
+      return this.disposed ? null : entry
     })()
 
     if (!settled) sourceInflight.set(key, promise)

@@ -602,13 +602,27 @@ function coalesceFrameUpdate(prev: FrameUpdate, next: FrameUpdate): FrameUpdate 
     if (row.line >= minLine && row.line < maxLine) byLine.set(row.line, row)
   }
   const rows = [...byLine.values()].sort((a, b) => a.line - b.line)
+  let scrollDelta = 0
+  if (!prev.fullSync) {
+    const summed = prev.scrollDelta + next.scrollDelta
+    let floored = summed
+    if (next.firstActiveLine > prev.firstActiveLine) {
+      floored = Math.max(floored, next.firstActiveLine - prev.firstActiveLine)
+    }
+    // Preserve positive scrollDelta once any forward scroll occurred so opposing-sign deltas
+    // never cancel out RowStore.apply's stale-scrollback doubting across coalesced frames.
+    if (prev.scrollDelta > 0 && next.firstActiveLine >= prev.firstActiveLine) {
+      floored = Math.max(floored, 1)
+    }
+    scrollDelta = Math.max(-0x80000000, Math.min(0x7fffffff, floored))
+  }
   return {
     seq: next.seq,
     epoch: next.epoch,
     size: next.size,
     firstActiveLine: next.firstActiveLine,
     scrollbackLines: next.scrollbackLines,
-    scrollDelta: Math.min(0xffffffff, prev.scrollDelta + next.scrollDelta),
+    scrollDelta,
     cursor: next.cursor,
     modes: next.modes,
     palette: next.palette ?? prev.palette,
@@ -791,24 +805,30 @@ export class BrokerSessionSource implements TerminalSource {
   }
 
   subscribe(sink: SourceSink, options?: { readonly manualAck?: boolean }): () => void {
+    const pendingEnded = this.endedEvent
     if (this.disposed) {
       if (this.bufferedFrames.length > 0) {
         const frames = this.bufferedFrames.splice(0, this.bufferedFrames.length)
         for (const f of frames) sink.onFrame(f)
       }
-      if (this.endedEvent !== null) sink.onEvent?.(this.endedEvent)
+      if (pendingEnded !== null) sink.onEvent?.(pendingEnded)
       return () => {}
     }
     this.sinks.add(sink)
     if (options?.manualAck) this.manualAckSinks.add(sink)
     if (this.bufferedFrames.length > 0) {
       const frames = this.bufferedFrames.splice(0, this.bufferedFrames.length)
-      for (const f of frames) sink.onFrame(f)
-      if (this.manualAckSinks.size === 0 && this.lastSeq > this.lastAckedSeq) {
+      for (const f of frames) {
+        if (this.disposed || !this.sinks.has(sink)) break
+        sink.onFrame(f)
+      }
+      if (!this.disposed && this.sinks.has(sink) && this.manualAckSinks.size === 0 && this.lastSeq > this.lastAckedSeq) {
         this.ackFrame(this.lastSeq)
       }
     }
-    if (this.endedEvent !== null) sink.onEvent?.(this.endedEvent)
+    if (pendingEnded !== null && !this.disposed && this.sinks.has(sink)) {
+      sink.onEvent?.(pendingEnded)
+    }
     return () => {
       this.sinks.delete(sink)
       const wasManual = this.manualAckSinks.delete(sink)

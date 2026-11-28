@@ -93,6 +93,11 @@ describe('links (OSC 8 declared & URL/custom detectors on PackedRow)', () => {
 
     for (const target of [
       '  java\tscript:alert(1)',
+      'ht tp://evil.example',
+      'h\x00ttp://evil.example',
+      'http://example.com\r\nfoo',
+      'https:relative/path',
+      'http:../secret',
       'data:text/html,<script>alert(1)</script>',
       'vbscript:msgbox(1)',
       'file:///etc/passwd',
