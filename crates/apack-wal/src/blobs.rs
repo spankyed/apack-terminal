@@ -14,7 +14,8 @@ use apack_proto::types::{BlobHash, ImageEncoding};
 use sha2::{Digest, Sha256};
 
 use crate::safe_fs::{
-    check_file_size, create_private_dir, create_private_file, read_regular_file_bounded, sync_dir, verify_real_dir,
+    check_file_size, create_private_dir, create_private_file, read_regular_file_bounded, sync_dir,
+    verify_private_dir_meta, verify_real_dir,
 };
 use crate::{MAX_BLOB_FILE_BYTES, WalError};
 
@@ -192,12 +193,7 @@ fn existing_blobs_dir(recording_dir: &Path) -> Result<Option<std::path::PathBuf>
     let blobs_dir = recording_dir.join("blobs");
     match fs::symlink_metadata(&blobs_dir) {
         Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                return Err(WalError::SymlinkRefused);
-            }
-            if !meta.is_dir() {
-                return Err(WalError::InvalidFormat("blobs path is not a directory"));
-            }
+            verify_private_dir_meta(&meta, WalError::InvalidFormat("blobs path is not a directory"))?;
             Ok(Some(blobs_dir))
         }
         Err(_) => Ok(None),
@@ -248,15 +244,7 @@ pub fn sweep_unreferenced(recording_dir: &Path, live: &HashSet<BlobHash>) -> Res
 
 fn ensure_blobs_dir(blobs_dir: &Path) -> Result<(), WalError> {
     match fs::symlink_metadata(blobs_dir) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                return Err(WalError::SymlinkRefused);
-            }
-            if !meta.is_dir() {
-                return Err(WalError::InvalidFormat("blobs path is not a directory"));
-            }
-            Ok(())
-        }
+        Ok(meta) => verify_private_dir_meta(&meta, WalError::InvalidFormat("blobs path is not a directory")),
         Err(_) => {
             create_private_dir(blobs_dir)?;
             Ok(())

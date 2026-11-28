@@ -37,6 +37,7 @@ pub mod crc32c;
 pub mod directory;
 pub mod format;
 pub mod reader;
+pub mod reaper;
 pub(crate) mod safe_fs;
 pub mod writer;
 
@@ -52,6 +53,7 @@ pub use format::{
     hash_segment_records,
 };
 pub use reader::{SeekSlice, SegmentSummary, WalReader};
+pub use reaper::{MAX_REAP_HANDLES, WalReaper};
 pub use writer::{EvictionReport, RolloverHint, WalConfig, WalHandle, WalWorker, WalWriter};
 
 /// Default target size for sealing an active segment (`2 MiB`).

@@ -224,9 +224,12 @@ impl ShardRunner {
                 bridge.close_master_async();
             }
             sess.pty = None;
+            super::replay::sync_wal_image_blobs(sess, &self.shared.image_store, &self.shared.wal_reaper);
             if let Some(wal) = sess.wal.take() {
-                let _ = wal.seal();
-                let _ = wal.shutdown();
+                if sess.wal_images_gen == sess.machine.vt().generations().images {
+                    let _ = wal.seal();
+                }
+                self.shared.wal_reaper.close_async(wal);
             }
             if sess.rewound {
                 sess.machine.on_rewound_close(&mut effects);
@@ -275,9 +278,12 @@ impl ShardRunner {
             if let Some(mut child) = sess.child.take() {
                 let _ = child.wait();
             }
+            super::replay::sync_wal_image_blobs(&mut sess, &self.shared.image_store, &self.shared.wal_reaper);
             if let Some(wal) = sess.wal.take() {
-                let _ = wal.seal();
-                let _ = wal.shutdown();
+                if sess.wal_images_gen == sess.machine.vt().generations().images {
+                    let _ = wal.seal();
+                }
+                self.shared.wal_reaper.close_async(wal);
             }
         }
     }
@@ -338,7 +344,23 @@ impl ShardRunner {
             }
             self.apply_effects(id, effects);
 
-            // 3. Cooperative idle scrollback compression (4 pages/turn after idle_compress_after).
+            // 3. Retry deferred WAL rollover if backlog cleared while the session is idle.
+            if let Some(sess) = self.sessions.get_mut(&id)
+                && sess.pending_wal_rollover
+                && sess.wal.is_some()
+            {
+                let at_ground = sess.machine.vt().at_ground();
+                super::replay::maybe_rollover_wal(
+                    sess,
+                    crate::now_unix_ms(),
+                    at_ground,
+                    &self.shared.engine_abi_hash,
+                    &self.shared.image_store,
+                    &self.shared.wal_reaper,
+                );
+            }
+
+            // 4. Cooperative idle scrollback compression (4 pages/turn after idle_compress_after).
             if let Some(sess) = self.sessions.get_mut(&id) {
                 maybe_compress_idle(
                     &mut sess.compressed_idle,

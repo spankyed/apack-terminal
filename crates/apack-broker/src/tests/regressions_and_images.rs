@@ -135,6 +135,7 @@ fn review_regressions_env_grace_pipelined_fin_teardown_spawn_and_seek_cell_px() 
     let shared = ShardShared {
         image_store: std::sync::Arc::new(std::sync::Mutex::new(apack_vt_ghostty::ImageStore::default())),
         wal_registry: apack_wal::RecordingRegistry::new(),
+        wal_reaper: apack_wal::WalReaper::new(),
         wal_config: apack_wal::WalConfig::default(),
         idle_compress_after: Duration::from_secs(5),
         kill_escalate_after: Duration::from_millis(50),

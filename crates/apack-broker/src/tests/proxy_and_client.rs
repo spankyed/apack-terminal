@@ -653,12 +653,14 @@ fn shard_direct_handle_load_shutdown_drop_and_no_such_session() {
     let shared = ShardShared {
         image_store: std::sync::Arc::new(std::sync::Mutex::new(apack_vt_ghostty::ImageStore::default())),
         wal_registry: apack_wal::RecordingRegistry::new(),
+        wal_reaper: apack_wal::WalReaper::new(),
         wal_config: apack_wal::WalConfig::default(),
         idle_compress_after: Duration::from_secs(5),
         kill_escalate_after: Duration::from_millis(50),
         engine_abi_hash: engine_abi_hash(),
     };
     let noop_wake: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(|| {});
+    let wal_reaper = shared.wal_reaper.clone();
     let s0 = spawn_shard(0, shared.clone(), tx.clone(), std::sync::Arc::clone(&noop_wake)).unwrap();
     let s1 = spawn_shard(1, shared, tx, noop_wake).unwrap();
 
@@ -711,6 +713,7 @@ fn shard_direct_handle_load_shutdown_drop_and_no_such_session() {
     });
     while !matches!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), ReactorEvent::SessionRegistered { .. }) {}
     drop(s1);
+    assert!(wal_reaper.drain_bounded(Duration::from_secs(3)), "reaper must finish sealing dropped shard's WAL");
     let reg = apack_wal::RecordingRegistry::new();
     let reader = apack_wal::WalReader::open(&rec_drop, &reg).unwrap();
     assert!(reader.segments()[0].sealed, "Drop on ShardHandle must shut down shard and seal active WAL");

@@ -21,7 +21,7 @@ use apack_proto::types::{
     ViewportHint, WaitCondition,
 };
 use apack_vt_ghostty::ImageStore;
-use apack_wal::{RecordingRegistry, WalConfig};
+use apack_wal::{RecordingRegistry, WalConfig, WalReaper};
 
 /// Per-session high-water cap (`2 MiB`) on raw PTY output bytes in flight to the Control Reactor.
 pub(crate) const RAW_OUTPUT_SESSION_HIGH_WATER: usize = 2_097_152;
@@ -524,6 +524,8 @@ pub struct ShardShared {
     pub image_store: Arc<Mutex<ImageStore>>,
     /// Global WAL directory single-writer + rewind pin registry.
     pub wal_registry: RecordingRegistry,
+    /// Bounded non-blocking background reaper for asynchronously closed WAL workers.
+    pub wal_reaper: WalReaper,
     /// WAL defaults for recorded sessions.
     pub wal_config: WalConfig,
     /// Idle delay before cooperative scrollback compression starts.

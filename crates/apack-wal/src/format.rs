@@ -351,11 +351,94 @@ impl KeyframeV2 {
         Ok(())
     }
 
-    fn encode_uncompressed(&self) -> Vec<u8> {
+    pub(crate) fn encode_uncompressed(&self) -> Vec<u8> {
         let mut w = Writer::new();
         self.visual.encode(&mut w);
         w.opt(self.engine.as_ref(), |w, eng| eng.encode(w));
         w.into_bytes()
+    }
+
+    /// Estimates heap/wire memory footprint of this keyframe for async backlog accounting.
+    pub fn estimated_memory_bytes(&self) -> usize {
+        let mut total = 128usize;
+        for row in self.visual.primary_rows.iter().chain(self.visual.alt_rows.iter()) {
+            total = total
+                .saturating_add(row.text.len())
+                .saturating_add(row.runs.len().saturating_mul(16))
+                .saturating_add(row.links.iter().map(|u| u.len().saturating_add(4)).sum::<usize>())
+                .saturating_add(row.pieces.len().saturating_mul(48))
+                .saturating_add(32);
+        }
+        total = total.saturating_add(self.visual.images.len().saturating_mul(64));
+        for cmd in &self.visual.commands {
+            total = total
+                .saturating_add(cmd.command.as_ref().map_or(0, String::len))
+                .saturating_add(cmd.cwd.as_ref().map_or(0, String::len))
+                .saturating_add(48);
+        }
+        if let Some(engine) = &self.engine {
+            total = total.saturating_add(engine.snapshot_bytes.len().saturating_add(32));
+        }
+        total
+    }
+
+    pub(crate) fn fits_limits(&self, max_uncompressed: usize, max_compressed: usize) -> bool {
+        if self.validate_bounds().is_err() {
+            return false;
+        }
+        let raw = self.encode_uncompressed();
+        if raw.len() > max_uncompressed {
+            return false;
+        }
+        compress_to_vec_zlib(&raw, ZLIB_COMPRESSION_LEVEL).len() <= max_compressed
+    }
+
+    /// Deterministically degrades this keyframe in-place so encoding cannot exceed
+    /// `max_uncompressed` or `max_compressed` (preventing permanent `WalWorker` failure on
+    /// dense/hostile viewports).
+    ///
+    /// Degradation priority:
+    /// 1. Trim oldest primary scrollback rows above the active viewport.
+    /// 2. Drop optional `libghostty-vt` binary checkpoint (`engine = None`, preserving visual fallback).
+    /// 3. Trim oldest viewport rows (`primary_rows` / `alt_rows`).
+    /// 4. Trim oldest `images` / `commands`.
+    ///
+    /// Returns `true` if any fields were degraded.
+    pub fn degrade_to_limits(&mut self, max_uncompressed: usize, max_compressed: usize) -> bool {
+        if self.fits_limits(max_uncompressed, max_compressed) {
+            return false;
+        }
+        // 1. Trim oldest history rows above the active viewport first.
+        let vp_rows = usize::from(self.visual.size.rows.get());
+        if !self.visual.active_alt_screen {
+            while self.visual.primary_rows.len() > vp_rows && !self.fits_limits(max_uncompressed, max_compressed) {
+                let drop_n = (self.visual.primary_rows.len() - vp_rows).div_ceil(2);
+                self.visual.primary_rows.drain(..drop_n);
+            }
+        }
+        // 2. Drop optional engine snapshot before sacrificing visible viewport rows.
+        if self.engine.is_some() && !self.fits_limits(max_uncompressed, max_compressed) {
+            self.engine = None;
+        }
+        // 3. Trim oldest viewport rows if hostile dense rows alone exceed limits.
+        while !self.visual.primary_rows.is_empty() && !self.fits_limits(max_uncompressed, max_compressed) {
+            let drop_n = self.visual.primary_rows.len().div_ceil(2);
+            self.visual.primary_rows.drain(..drop_n);
+        }
+        while !self.visual.alt_rows.is_empty() && !self.fits_limits(max_uncompressed, max_compressed) {
+            let drop_n = self.visual.alt_rows.len().div_ceil(2);
+            self.visual.alt_rows.drain(..drop_n);
+        }
+        // 4. Trim oldest image placements / commands as a last resort.
+        while !self.visual.images.is_empty() && !self.fits_limits(max_uncompressed, max_compressed) {
+            let drop_n = self.visual.images.len().div_ceil(2);
+            self.visual.images.drain(..drop_n);
+        }
+        while !self.visual.commands.is_empty() && !self.fits_limits(max_uncompressed, max_compressed) {
+            let drop_n = self.visual.commands.len().div_ceil(2);
+            self.visual.commands.drain(..drop_n);
+        }
+        true
     }
 
     fn decode_uncompressed(bytes: &[u8]) -> Result<Self, WalError> {

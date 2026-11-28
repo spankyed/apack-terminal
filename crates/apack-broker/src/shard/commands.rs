@@ -142,7 +142,7 @@ impl ShardRunner {
             Ok(s) => s,
             Err(err) => {
                 if let Some(w) = wal {
-                    let _ = w.shutdown();
+                    self.shared.wal_reaper.close_async(w);
                 }
                 self.emit(ReactorEvent::SpawnOrRewindFailed);
                 self.send_error(conn, StreamId::CONTROL, req_id, err.error_code(), &err.to_string(), permit);
@@ -175,7 +175,7 @@ impl ShardRunner {
             Ok(pty) => pty,
             Err((code, msg)) => {
                 if let Some(w) = wal {
-                    let _ = w.shutdown();
+                    self.shared.wal_reaper.close_async(w);
                 }
                 #[cfg(windows)]
                 drop(spawned.tree);
@@ -233,7 +233,7 @@ impl ShardRunner {
 
         // Persist any restored image blobs BEFORE capturing initial KeyframeV2 as record 0.
         if live_sess.wal.is_some() {
-            sync_wal_image_blobs(&mut live_sess, &self.shared.image_store);
+            sync_wal_image_blobs(&mut live_sess, &self.shared.image_store, &self.shared.wal_reaper);
             if let Some(handle) = &live_sess.wal {
                 let kf = capture_keyframe(&live_sess.machine, &self.shared.engine_abi_hash);
                 let _ = handle.start_segment(created_ms, kf);

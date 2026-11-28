@@ -100,18 +100,52 @@ impl ShardRunner {
                     if is_query {
                         sess.machine.vt_mut().set_kitty_command_bytes(query_bytes);
                     }
+                    super::replay::detach_failed_wal(sess, &self.shared.wal_reaper);
+                    let wal_max_backlog =
+                        if !is_query { sess.wal.as_ref().map(|w| w.max_backlog_bytes()) } else { None };
+                    let mut wal_chunks: Vec<(Vec<u8>, bool)> = Vec::new();
+                    let mut wal_total_bytes = 0usize;
+                    let mut wal_overflow = false;
                     for piece in body {
                         sess.machine.on_vt_feed_with(now, wall, &mut effects, |vt, evs| vt.feed(&piece, evs));
-                        if !is_query && let Some(wal) = &sess.wal {
-                            // Stream chunks straight to WAL and split on each `\x1b\\` ground
-                            // transition so multi-chunk >4 MiB `t=f`/`t=s` images never exceed
-                            // `WalConfig::max_non_ground_bytes` (`NonGroundCap`).
-                            if let Some((before, after)) = split_st_ground_chunk(&piece) {
-                                let _ = wal.write_output(now_ms, before.to_vec(), true);
-                                let _ = wal.write_output(now_ms, after.to_vec(), false);
-                            } else {
-                                let _ = wal.write_output(now_ms, piece, false);
+                        if let Some(max_backlog) = wal_max_backlog {
+                            // Collect resolved `t=f`/`t=s` chunks up to `max_backlog` and submit
+                            // atomically so trailing `m=0;` terminators can never be shed leaving
+                            // an unclosed `m=1` APC in the WAL. Split on `\x1b\\` ground
+                            // transitions so multi-chunk images stay below `max_non_ground_bytes`.
+                            wal_total_bytes = wal_total_bytes.saturating_add(piece.len());
+                            if !wal_overflow {
+                                if should_shed_wal_image_stream(wal_total_bytes, max_backlog) {
+                                    wal_chunks.clear();
+                                    wal_overflow = true;
+                                } else if let Some((before, after)) = split_st_ground_chunk(&piece) {
+                                    if !before.is_empty() {
+                                        wal_chunks.push((before.to_vec(), true));
+                                    }
+                                    if !after.is_empty() {
+                                        wal_chunks.push((after.to_vec(), false));
+                                    }
+                                } else {
+                                    wal_chunks.push((piece, false));
+                                }
                             }
+                        }
+                    }
+                    if let Some(wal) = &sess.wal
+                        && !is_query
+                    {
+                        let wrote_all = if wal_overflow {
+                            let _ = wal.record_backlog_gap(now_ms, wal_total_bytes as u64);
+                            false
+                        } else if !wal_chunks.is_empty() {
+                            wal.write_output_atomic(now_ms, wal_chunks)
+                        } else {
+                            true
+                        };
+                        if !wrote_all {
+                            // Shed inline APC atomically; force a keyframe rollover at the next
+                            // ground boundary once `sync_wal_image_blobs` persists the image blob.
+                            sess.pending_wal_rollover = true;
                         }
                     }
                     if is_query {
@@ -148,6 +182,12 @@ impl ShardRunner {
         self.sync_pty_interest(session_id);
         self.try_reap_session(session_id);
     }
+}
+
+/// Returns `true` when an inline resolved `t=f`/`t=s` stream exceeds the WAL async backlog cap
+/// and must be shed atomically as a single `BacklogOverflow` gap instead of buffered in RAM.
+pub(crate) const fn should_shed_wal_image_stream(total_bytes: usize, max_backlog: usize) -> bool {
+    total_bytes > max_backlog
 }
 
 /// Splits a resolved Kitty chunk right after its `\x1b\\` String Terminator so the WAL writer
