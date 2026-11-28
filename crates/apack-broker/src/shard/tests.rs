@@ -107,6 +107,8 @@ mod win_shard_tests {
                 rewound: false,
                 created_ms: 0,
                 wal: None,
+                wal_has_segment: false,
+                wal_skip_prefix: 0,
                 pending_wal_rollover: false,
                 wal_images_gen: 0,
                 wal_written_blobs: HashSet::new(),
@@ -363,6 +365,8 @@ mod image_source_shard_tests {
                 rewound: false,
                 created_ms: 0,
                 wal: None,
+                wal_has_segment: false,
+                wal_skip_prefix: 0,
                 pending_wal_rollover: false,
                 wal_images_gen: 0,
                 wal_written_blobs: HashSet::new(),
@@ -1357,6 +1361,7 @@ mod image_source_shard_tests {
             let wal = WalWorker::spawn(writer);
             assert!(wal.start_segment(1_000, kf));
             sess.wal = Some(wal);
+            sess.wal_has_segment = true;
         }
         let virt_png = apack_vt_ghostty::encode_png_rgba(2, 2, &[77u8; 16]).unwrap();
         let virt_b64 = String::from_utf8(apack_os::image_sources::encoded(&virt_png)).unwrap();
@@ -1413,6 +1418,7 @@ mod image_source_shard_tests {
             let wal = WalWorker::spawn(writer);
             assert!(wal.start_segment(1_000, kf));
             sess.wal = Some(wal);
+            sess.wal_has_segment = true;
         }
         let secret_b64 =
             String::from_utf8(apack_os::image_sources::encoded(secret_file.as_os_str().as_encoded_bytes())).unwrap();
@@ -1507,7 +1513,10 @@ mod image_source_shard_tests {
     fn pr4_shard_wal_failed_detach_blob_gated_rollover_seal_and_atomic_tf_overflow() {
         use apack_wal::{GapReason, WalReader, WalRecord, WalWorker, WalWriter};
 
-        // 0. Exact boundary check for `should_shed_wal_image_stream`.
+        // 0. Exact boundary checks for `leading_st_len` and `should_shed_wal_image_stream`.
+        assert_eq!(super::super::images::leading_st_len(b"\x1b\\rest"), 2);
+        assert_eq!(super::super::images::leading_st_len(b"\x9crest"), 1);
+        assert_eq!(super::super::images::leading_st_len(b"plain"), 0);
         assert!(!super::super::images::should_shed_wal_image_stream(100, 100));
         assert!(super::super::images::should_shed_wal_image_stream(101, 100));
         assert!(super::super::images::should_shed_wal_image_stream(200, 100));
@@ -1529,17 +1538,18 @@ mod image_source_shard_tests {
         )
         .unwrap();
         let handle = WalWorker::spawn(w);
-        // Trigger sticky worker failure (recording output with no active segment -> CorruptSegment).
         assert!(handle.write_output(100, b"no-active-segment".to_vec(), true));
         assert!(handle.flush_barrier().is_err());
         assert!(handle.is_failed());
         {
             let sess = runner.sessions.get_mut(&sid_fail).unwrap();
             sess.wal = Some(handle);
+            sess.wal_has_segment = true;
             sess.pending_wal_rollover = true;
             sess.wal_written_blobs.insert(apack_proto::types::BlobHash([0xAA; 32]));
             crate::shard::replay::sync_wal_image_blobs(sess, &runner.shared.image_store, &runner.shared.wal_reaper);
             assert!(sess.wal.is_none(), "failed WAL handle must be detached on sync_wal_image_blobs");
+            assert!(!sess.wal_has_segment);
             assert!(!sess.pending_wal_rollover);
             assert!(sess.wal_written_blobs.is_empty());
         }
@@ -1558,10 +1568,10 @@ mod image_source_shard_tests {
         let handle2 = WalWorker::spawn(w2);
         assert!(handle2.write_output(100, b"boom".to_vec(), true));
         assert!(handle2.flush_barrier().is_err());
-        assert!(handle2.is_failed());
         {
             let sess = runner.sessions.get_mut(&sid_fail).unwrap();
             sess.wal = Some(handle2);
+            sess.wal_has_segment = true;
             sess.pending_wal_rollover = true;
             crate::shard::replay::maybe_rollover_wal(
                 sess,
@@ -1572,12 +1582,43 @@ mod image_source_shard_tests {
                 &runner.shared.wal_reaper,
             );
             assert!(sess.wal.is_none(), "failed WAL handle must be detached on maybe_rollover_wal");
+            assert!(!sess.wal_has_segment);
             assert!(!sess.pending_wal_rollover);
         }
         assert!(runner.shared.wal_reaper.drain_bounded(Duration::from_secs(2)));
 
-        // 2. Blob-gated rollover & seal: when an active image blob cannot be persisted yet,
-        //    `maybe_rollover_wal` must NOT start a new segment referencing the unwritten blob.
+        // Verify `ResizePty` also detaches a failed WAL handle cleanly.
+        let fail_dir3 = tmp.path().join("failed-wal-3");
+        let w3 = WalWriter::open_or_create(
+            &fail_dir3,
+            [0x75; 16],
+            100,
+            WalConfig::default(),
+            runner.shared.wal_registry.clone(),
+        )
+        .unwrap();
+        let handle3 = WalWorker::spawn(w3);
+        assert!(handle3.write_output(100, b"boom".to_vec(), true));
+        assert!(handle3.flush_barrier().is_err());
+        {
+            let sess = runner.sessions.get_mut(&sid_fail).unwrap();
+            sess.wal = Some(handle3);
+            sess.wal_has_segment = true;
+        }
+        runner.apply_effects_inner(
+            sid_fail,
+            vec![apack_core::session::SessionEffect::ResizePty {
+                size: GridSize::new(90, 30).unwrap(),
+                cell_px: CellPx { width: 8, height: 16 },
+            }],
+            false,
+            None,
+        );
+        assert!(runner.sessions[&sid_fail].wal.is_none(), "ResizePty must detach failed WAL handle");
+        assert!(runner.shared.wal_reaper.drain_bounded(Duration::from_secs(2)));
+
+        // 2. Blob-gated rollover & seal refusal when an active blob cannot be persisted, plus
+        //    `wal_has_segment == false` deferral (must not brick WAL on output/resize) & idle timeout clamp.
         let sid_gate = SessionId::new(72).unwrap();
         insert_image_session(&mut runner, sid_gate, false);
         let gate_dir = tmp.path().join("blob-gated-wal");
@@ -1592,13 +1633,60 @@ mod image_source_shard_tests {
         let gate_h = WalWorker::spawn(gate_w);
         {
             let sess = runner.sessions.get_mut(&sid_gate).unwrap();
-            let kf0 = crate::shard::replay::capture_keyframe(&sess.machine, &runner.shared.engine_abi_hash);
-            assert!(gate_h.start_segment(100, kf0));
-            gate_h.flush_barrier().unwrap();
+            sess.compressed_idle = true;
+            sess.pending_wal_rollover = true;
+        }
+        assert_eq!(
+            runner.compute_wait_timeout(TimestampMs::from_millis(10)),
+            Duration::from_secs(5),
+            "pending_wal_rollover without wal must not clamp wait timeout"
+        );
+        {
+            let sess = runner.sessions.get_mut(&sid_gate).unwrap();
             sess.wal = Some(gate_h);
-            // Place a real inline 1x1 RGBA Kitty image into VT, then evict it from ImageStore + simulate
-            // missing blob by clearing ImageStore before sync so `rehydrate` restores it OR test with
-            // `wal_images_gen != cur_gen` after a failed write_blob (closed handle).
+            sess.pending_wal_rollover = false;
+        }
+        assert_eq!(
+            runner.compute_wait_timeout(TimestampMs::from_millis(10)),
+            Duration::from_secs(5),
+            "live wal without pending_wal_rollover must not clamp wait timeout"
+        );
+        // With `wal_has_segment == false`, output & resize must NOT send records before segment 0 starts!
+        runner.sessions.get_mut(&sid_gate).unwrap().pending_wal_rollover = true;
+        assert_eq!(
+            runner.compute_wait_timeout(TimestampMs::from_millis(10)),
+            TERMINATE_POLL_INTERVAL,
+            "pending_wal_rollover with live wal must clamp idle shard wait timeout to TERMINATE_POLL_INTERVAL"
+        );
+        runner.apply_effects_inner(
+            sid_gate,
+            vec![apack_core::session::SessionEffect::ResizePty {
+                size: GridSize::new(82, 25).unwrap(),
+                cell_px: CellPx { width: 8, height: 16 },
+            }],
+            false,
+            None,
+        );
+        {
+            let sess = runner.sessions.get_mut(&sid_gate).unwrap();
+            // Now let `maybe_rollover_wal` start segment 0 cleanly.
+            crate::shard::replay::maybe_rollover_wal(
+                sess,
+                100,
+                true,
+                &runner.shared.engine_abi_hash,
+                &runner.shared.image_store,
+                &runner.shared.wal_reaper,
+            );
+            assert!(sess.wal_has_segment, "maybe_rollover_wal must start segment 0 and set wal_has_segment");
+            assert!(!sess.pending_wal_rollover);
+            sess.wal.as_ref().unwrap().flush_barrier().unwrap();
+            assert!(!sess.wal.as_ref().unwrap().is_failed(), "ResizePty while !wal_has_segment must not brick WAL");
+
+            // Place a real inline 1x1 RGBA Kitty image into VT, then simulate an unpersistable blob
+            // (empty ImageStore + image deleted from VT's rehydration? Actually easier: remove the
+            // active image blob from an unrelated store passed to `maybe_rollover_wal` while leaving
+            // `sess.machine` with `wal_images_gen != cur_gen` via a small closed/unpersisted check).
             let b64_px = String::from_utf8(encoded(&[0xffu8, 0x00, 0x00, 0xff])).unwrap();
             let seq = format!("\x1b_Ga=T,f=32,s=1,v=1,i=72,q=2;{b64_px}\x1b\\");
             sess.machine.on_pty_output(
@@ -1608,9 +1696,22 @@ mod image_source_shard_tests {
                 &mut Vec::new(),
             );
             assert_ne!(sess.wal_images_gen, sess.machine.vt().generations().images);
-            // Calling `maybe_rollover_wal` triggers `sync_wal_image_blobs` first, persists the blob,
-            // and THEN allows segment rollover cleanly!
+            // Calling `maybe_rollover_wal` with a different empty store where rehydrate puts into
+            // `runner.shared.image_store` (NOT `alt_store`) proves rollover REFUSES while `wal_images_gen != cur_gen`!
+            let empty_store = Arc::new(Mutex::new(ImageStore::default()));
             sess.pending_wal_rollover = true;
+            crate::shard::replay::maybe_rollover_wal(
+                sess,
+                150,
+                true,
+                &runner.shared.engine_abi_hash,
+                &empty_store,
+                &runner.shared.wal_reaper,
+            );
+            assert!(sess.pending_wal_rollover, "rollover must refuse while active image blob is unpersisted");
+            assert_ne!(sess.wal_images_gen, sess.machine.vt().generations().images);
+
+            // Now with the real image store, `maybe_rollover_wal` persists the blob and rolls over cleanly!
             crate::shard::replay::maybe_rollover_wal(
                 sess,
                 200,
@@ -1622,7 +1723,7 @@ mod image_source_shard_tests {
             assert!(!sess.pending_wal_rollover, "once active blob persists, rollover succeeds");
             assert_eq!(sess.wal_images_gen, sess.machine.vt().generations().images);
         }
-        // Exercise `ResizePty` effect against a live WAL (verifies `!detach_failed_wal` writes Resize record).
+        // Exercise `ResizePty` effect against a live WAL (verifies `!detach_failed_wal && wal_has_segment`).
         runner.apply_effects_inner(
             sid_gate,
             vec![apack_core::session::SessionEffect::ResizePty {
@@ -1650,9 +1751,83 @@ mod image_source_shard_tests {
         }
         drop(gate_reader);
 
-        // 3. Multi-chunk resolved `t=f` exceeding `max_backlog_bytes` must shed atomically as ONE
-        //    `BacklogOverflow` gap (ZERO partial `m=1` APC chunks in WAL) and trigger rollover so
-        //    the next keyframe preserves the image blob cleanly!
+        // 2b. Verify `close_session_wal` skips `wal.seal()` when active blobs remain unpersisted.
+        let sid_unsealed = SessionId::new(74).unwrap();
+        insert_image_session(&mut runner, sid_unsealed, false);
+        let unsealed_dir = tmp.path().join("unsealed-blob-gate");
+        let uw = WalWriter::open_or_create(
+            &unsealed_dir,
+            [0x76; 16],
+            100,
+            WalConfig::default(),
+            runner.shared.wal_registry.clone(),
+        )
+        .unwrap();
+        let uh = WalWorker::spawn(uw);
+        {
+            let sess = runner.sessions.get_mut(&sid_unsealed).unwrap();
+            let kf0 = crate::shard::replay::capture_keyframe(&sess.machine, &runner.shared.engine_abi_hash);
+            assert!(uh.start_segment(100, kf0));
+            uh.flush_barrier().unwrap();
+            sess.wal = Some(uh);
+            sess.wal_has_segment = true;
+            let b64_px = String::from_utf8(encoded(&[0x00u8, 0xff, 0x00, 0xff])).unwrap();
+            let seq = format!("\x1b_Ga=T,f=32,s=1,v=1,i=74,q=2;{b64_px}\x1b\\");
+            sess.machine.on_pty_output(
+                seq.as_bytes(),
+                TimestampMs::from_millis(10),
+                apack_core::time::WallMs::from_millis(10),
+                &mut Vec::new(),
+            );
+            sess.pending_wal_rollover = true;
+            let empty_store = Arc::new(Mutex::new(ImageStore::default()));
+            crate::shard::replay::close_session_wal(
+                sess,
+                &runner.shared.engine_abi_hash,
+                &empty_store,
+                &runner.shared.wal_reaper,
+            );
+        }
+        assert!(runner.shared.wal_reaper.drain_bounded(Duration::from_secs(3)));
+        let unsealed_reader = WalReader::open(&unsealed_dir, &runner.shared.wal_registry).unwrap();
+        assert_eq!(
+            unsealed_reader.segments().len(),
+            1,
+            "must not start a new segment when active blobs did not persist"
+        );
+        assert!(!unsealed_reader.segments()[0].sealed, "wal.seal() must be skipped when active blobs did not persist");
+        drop(unsealed_reader);
+
+        // 2c. Verify a resolved `t=f` load while `wal_has_segment == false` never writes to WAL or bricks it.
+        let sid_noseg = SessionId::new(75).unwrap();
+        insert_image_session(&mut runner, sid_noseg, true);
+        let noseg_dir = tmp.path().join("tf-no-segment");
+        let nsw = WalWriter::open_or_create(
+            &noseg_dir,
+            [0x77; 16],
+            100,
+            WalConfig::default(),
+            runner.shared.wal_registry.clone(),
+        )
+        .unwrap();
+        let nsh = WalWorker::spawn(nsw);
+        runner.sessions.get_mut(&sid_noseg).unwrap().wal = Some(nsh);
+        let noseg_img = tmp.path().join("noseg.rgba");
+        std::fs::write(&noseg_img, [0x11u8; 16]).unwrap();
+        let noseg_b64 = String::from_utf8(encoded(noseg_img.to_string_lossy().as_bytes())).unwrap();
+        let noseg_cmd = format!("\x1b_Ga=T,f=32,s=2,v=2,i=75,t=f,q=2;{noseg_b64}\x1b\\");
+        runner.ingest_pty_bytes(sid_noseg, noseg_cmd.as_bytes());
+        wait_and_drain_image(&mut runner, sid_noseg);
+        let ns_wal = runner.sessions[&sid_noseg].wal.as_ref().expect("WAL must not detach/fail");
+        ns_wal.flush_barrier().unwrap();
+        assert!(!ns_wal.is_failed(), "t=f load while wal_has_segment == false must not brick WalWorker");
+        runner.finish_and_remove_session(sid_noseg, Some(0), None);
+        assert!(runner.shared.wal_reaper.drain_bounded(Duration::from_secs(3)));
+
+        // 3. Short-lived multi-chunk resolved `t=f` exceeding `max_backlog_bytes` (with NO trailing
+        //    bytes after `\x1b\\` and immediate exit without manual `flush_barrier`/`run_tier2`!):
+        //    must shed inline APC atomically as ONE `BacklogOverflow` gap (ZERO partial `m=1`),
+        //    still preserve the image in segment 2 via `start_segment_on_close`, and seal cleanly!
         let sid_tf = SessionId::new(73).unwrap();
         insert_image_session(&mut runner, sid_tf, true);
         let tf_dir = tmp.path().join("atomic-tf-overflow");
@@ -1666,37 +1841,31 @@ mod image_source_shard_tests {
             assert!(tf_h.start_segment(100, kf0));
             tf_h.flush_barrier().unwrap();
             sess.wal = Some(tf_h);
+            sess.wal_has_segment = true;
         }
-        // Build a 4x4 RGBA image (64 raw bytes -> multi-piece / >128B inline APC) on disk.
         let img_path = tmp.path().join("tf_overflow.rgba");
         let pixels: Vec<u8> = (0..256).map(|i| (i & 0xFF) as u8).collect();
         std::fs::write(&img_path, &pixels).unwrap();
         let path_b64 = String::from_utf8(encoded(img_path.to_string_lossy().as_bytes())).unwrap();
-        let cmd = format!("\x1b_Ga=T,f=32,s=8,v=8,i=73,t=f,q=2;{path_b64}\x1b\\AFTER_TF\r\n");
+        // End right at `\x1b\\` (empty `rest_tail`!) to verify `handle_image_source_loaded`'s empty-tail
+        // sync + `close_session_wal`'s `start_segment_on_close` preserve the image on immediate exit!
+        let cmd = format!("\x1b_Ga=T,f=32,s=8,v=8,i=73,t=f,q=2;{path_b64}\x1b\\");
         runner.ingest_pty_bytes(sid_tf, cmd.as_bytes());
         wait_and_drain_image(&mut runner, sid_tf);
 
-        // Live VT must STILL have placed the image even though WAL shed the inline APC!
         assert!(
             !runner.sessions[&sid_tf].machine.vt().images().is_empty(),
             "live VT must still receive resolved t=f image even when WAL sheds inline APC"
         );
-        // Wait for the background WAL worker to drain the persisted blob (with tiny 128B backlog),
-        // then run Tier-2 so deferred `pending_wal_rollover` starts segment 2 deterministically!
-        if let Some(wal) = runner.sessions[&sid_tf].wal.as_ref() {
-            wal.flush_barrier().unwrap();
-        }
-        runner.run_tier2(TimestampMs::from_millis(500));
         runner.finish_and_remove_session(sid_tf, Some(0), None);
         assert!(runner.shared.wal_reaper.drain_bounded(Duration::from_secs(3)));
 
         let tf_reader = WalReader::open(&tf_dir, &runner.shared.wal_registry).unwrap();
         assert!(
             tf_reader.segments().len() >= 2,
-            "atomic t=f overflow must trigger rollover keyframe at ground boundary, got {} segments",
+            "immediate exit after atomic t=f overflow must commit rollover keyframe, got {} segments",
             tf_reader.segments().len()
         );
-        // Inspect segment 1 directly: must contain Gap(BacklogOverflow) and ZERO partial `m=1` APC payloads!
         let seg1_bytes = std::fs::read(tf_dir.join("seg-000001.apks")).unwrap();
         let seg1_scan = apack_wal::format::scan_segment(&seg1_bytes);
         assert!(
@@ -1713,7 +1882,6 @@ mod image_source_shard_tests {
                 assert!(!s.contains("m=1;"), "must never leave partial m=1 APC chunk in WAL: {s:?}");
             }
         }
-        // Inspect latest segment: its KeyframeV2 must preserve the image and its persisted blob!
         let latest = tf_reader.latest_segment_records().unwrap().unwrap();
         assert!(!latest.keyframe.visual.images.is_empty(), "rollover keyframe must preserve the resolved image");
         for blob in latest.keyframe.referenced_blobs() {

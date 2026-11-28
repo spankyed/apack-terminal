@@ -31,8 +31,8 @@ use crate::{fill_random, now_unix_ms};
 
 use super::protocol::ShardCmdPermit;
 use super::replay::{
-    build_keyframe_engine, build_machine_from_slice, capture_keyframe, hydrate_slice_blobs, restore_machine_from_dir,
-    restore_machine_from_slice, sync_wal_image_blobs,
+    build_keyframe_engine, build_machine_from_slice, hydrate_slice_blobs, maybe_rollover_wal, restore_machine_from_dir,
+    restore_machine_from_slice,
 };
 use super::{DEFAULT_SCROLLBACK_LINES, LivePty, LiveSession, ReactorEvent, ShardRunner};
 
@@ -207,6 +207,8 @@ impl ShardRunner {
             rewound: false,
             created_ms,
             wal,
+            wal_has_segment: false,
+            wal_skip_prefix: 0,
             pending_wal_rollover: false,
             wal_images_gen: 0,
             wal_written_blobs: HashSet::new(),
@@ -231,13 +233,18 @@ impl ShardRunner {
             exit_drain: None,
         };
 
-        // Persist any restored image blobs BEFORE capturing initial KeyframeV2 as record 0.
+        // Persist any restored image blobs BEFORE starting segment 0's KeyframeV2 via the unified
+        // blob-gated rollover path (deferring cleanly if large restored blobs fill WAL backlog).
         if live_sess.wal.is_some() {
-            sync_wal_image_blobs(&mut live_sess, &self.shared.image_store, &self.shared.wal_reaper);
-            if let Some(handle) = &live_sess.wal {
-                let kf = capture_keyframe(&live_sess.machine, &self.shared.engine_abi_hash);
-                let _ = handle.start_segment(created_ms, kf);
-            }
+            live_sess.pending_wal_rollover = true;
+            maybe_rollover_wal(
+                &mut live_sess,
+                created_ms,
+                true,
+                &self.shared.engine_abi_hash,
+                &self.shared.image_store,
+                &self.shared.wal_reaper,
+            );
         }
 
         self.sessions.insert(session_id, live_sess);
@@ -365,6 +372,8 @@ impl ShardRunner {
                 rewound: true,
                 created_ms: reader.meta().created_ms,
                 wal: None,
+                wal_has_segment: false,
+                wal_skip_prefix: 0,
                 pending_wal_rollover: false,
                 wal_images_gen: 0,
                 wal_written_blobs: HashSet::new(),

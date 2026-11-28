@@ -82,6 +82,7 @@ impl ShardRunner {
                             None => {}
                         }
                         if !super::replay::detach_failed_wal(sess, &self.shared.wal_reaper)
+                            && sess.wal_has_segment
                             && let Some(wal) = &sess.wal
                         {
                             let _ = wal.write_resize(now_unix_ms(), size, cell_px);
@@ -389,11 +390,15 @@ impl ShardRunner {
                 let marks_seq = sess.machine.marks_last_seq();
                 let marks_key = sess.machine.marks_key();
                 let at_ground = sess.machine.vt().at_ground();
+                let skip_prefix = std::mem::take(&mut sess.wal_skip_prefix);
                 super::replay::sync_wal_image_blobs(sess, &self.shared.image_store, &self.shared.wal_reaper);
-                if let Some(wal) = &sess.wal {
+                if sess.wal_has_segment
+                    && let Some(wal) = &sess.wal
+                {
                     let wal_chunk = wal_scanner_bytes.unwrap_or_else(|| committed.to_vec());
-                    if !wal_chunk.is_empty() {
-                        let _ = wal.write_output(now_ms, wal_chunk, at_ground);
+                    let wal_payload = wal_chunk.get(skip_prefix..).unwrap_or(&[]);
+                    if !wal_payload.is_empty() {
+                        let _ = wal.write_output(now_ms, wal_payload.to_vec(), at_ground);
                     }
                     if marks_seq != prev_marks_seq {
                         let _ = wal.write_marks(now_ms, marks_key, marks_seq);

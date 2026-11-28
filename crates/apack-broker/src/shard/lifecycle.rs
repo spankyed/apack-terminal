@@ -224,13 +224,12 @@ impl ShardRunner {
                 bridge.close_master_async();
             }
             sess.pty = None;
-            super::replay::sync_wal_image_blobs(sess, &self.shared.image_store, &self.shared.wal_reaper);
-            if let Some(wal) = sess.wal.take() {
-                if sess.wal_images_gen == sess.machine.vt().generations().images {
-                    let _ = wal.seal();
-                }
-                self.shared.wal_reaper.close_async(wal);
-            }
+            super::replay::close_session_wal(
+                sess,
+                &self.shared.engine_abi_hash,
+                &self.shared.image_store,
+                &self.shared.wal_reaper,
+            );
             if sess.rewound {
                 sess.machine.on_rewound_close(&mut effects);
             } else {
@@ -278,13 +277,12 @@ impl ShardRunner {
             if let Some(mut child) = sess.child.take() {
                 let _ = child.wait();
             }
-            super::replay::sync_wal_image_blobs(&mut sess, &self.shared.image_store, &self.shared.wal_reaper);
-            if let Some(wal) = sess.wal.take() {
-                if sess.wal_images_gen == sess.machine.vt().generations().images {
-                    let _ = wal.seal();
-                }
-                self.shared.wal_reaper.close_async(wal);
-            }
+            super::replay::close_session_wal(
+                &mut sess,
+                &self.shared.engine_abi_hash,
+                &self.shared.image_store,
+                &self.shared.wal_reaper,
+            );
         }
     }
 

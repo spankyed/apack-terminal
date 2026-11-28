@@ -15,7 +15,7 @@ use apack_wal::{
     MAX_RECORD_PAYLOAD, RecordingRegistry, SeekSlice, VisualKeyframe, WalHandle, WalReader, WalReaper, WalRecord,
 };
 
-use crate::now_wall_ms;
+use crate::{now_unix_ms, now_wall_ms};
 
 use super::LiveSession;
 
@@ -28,6 +28,7 @@ pub(super) fn detach_failed_wal(sess: &mut LiveSession, wal_reaper: &WalReaper) 
     if let Some(wal) = sess.wal.take() {
         wal_reaper.close_async(wal);
     }
+    sess.wal_has_segment = false;
     sess.pending_wal_rollover = false;
     sess.wal_written_blobs.clear();
     true
@@ -111,8 +112,47 @@ pub(super) fn maybe_rollover_wal(
     };
     let kf = capture_keyframe(&sess.machine, abi_hash);
     if wal.start_segment(now_ms, kf) {
+        sess.wal_has_segment = true;
         sess.pending_wal_rollover = false;
     }
+}
+
+/// Non-blockingly finalizes and detaches a session's [`WalHandle`] on exit/teardown:
+/// 1. Syncs any pending image blobs.
+/// 2. If a rollover keyframe (e.g. from a shed `> 16 MiB` `t=f`/`t=s` image or deferred initial
+///    segment) is pending and all active blobs are persisted, commits one terminal keyframe via
+///    `start_segment_on_close` so short-lived image commands are never lost.
+/// 3. Seals the active segment iff a segment exists and all active blobs were persisted.
+/// 4. Hands the worker thread to `wal_reaper` without blocking the shard thread.
+pub(super) fn close_session_wal(
+    sess: &mut LiveSession,
+    abi_hash: &[u8; 32],
+    image_store: &Arc<Mutex<ImageStore>>,
+    wal_reaper: &WalReaper,
+) {
+    sync_wal_image_blobs(sess, image_store, wal_reaper);
+    let blobs_synced = sess.wal_images_gen == sess.machine.vt().generations().images;
+    if sess.pending_wal_rollover && blobs_synced {
+        let now_ms = now_unix_ms();
+        maybe_rollover_wal(sess, now_ms, true, abi_hash, image_store, wal_reaper);
+        if sess.pending_wal_rollover
+            && let Some(wal) = &sess.wal
+        {
+            let kf = capture_keyframe(&sess.machine, abi_hash);
+            if wal.start_segment_on_close(now_ms, kf) {
+                sess.wal_has_segment = true;
+                sess.pending_wal_rollover = false;
+            }
+        }
+    }
+    if let Some(wal) = sess.wal.take() {
+        if sess.wal_has_segment && sess.wal_images_gen == sess.machine.vt().generations().images {
+            let _ = wal.seal();
+        }
+        wal_reaper.close_async(wal);
+    }
+    sess.wal_has_segment = false;
+    sess.pending_wal_rollover = false;
 }
 
 /// Hard wire-byte budget for history rows extracted into a single WAL `VisualKeyframe` (`16 MiB`).

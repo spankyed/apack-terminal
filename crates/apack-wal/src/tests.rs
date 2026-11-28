@@ -22,10 +22,11 @@ use crate::directory::{
     segment_filename,
 };
 use crate::format::{
-    EngineCheckpoint, FORMAT_VERSION, GapReason, KeyframeV2, MAX_RECORD_PAYLOAD, META_LEN, META_MAGIC, MIN_RECORD_LEN,
+    EngineCheckpoint, FORMAT_VERSION, GapReason, KeyframeV2, MAX_ENGINE_SNAPSHOT_BYTES, MAX_RECORD_PAYLOAD,
+    MAX_VISUAL_ALT_ROWS, MAX_VISUAL_IMAGES, MAX_VISUAL_PRIMARY_ROWS, META_LEN, META_MAGIC, MIN_RECORD_LEN,
     RECORD_FLAG_ZLIB, RECORD_HEADER_LEN, RecordingMeta, SEGMENT_FOOTER_LEN, SEGMENT_FOOTER_MAGIC, SegmentFooter,
     VisualKeyframe, WalRecord, check_payload_limit, decode_one_record, encode_framed_record, hash_segment_records,
-    scan_segment,
+    is_oversized_engine_snapshot, needs_zlib_limit_check, scan_segment,
 };
 use crate::reader::{WalReader, read_sealed_header_and_footer, try_read_footer};
 use crate::reaper::{MAX_REAP_HANDLES, WalReaper, global_reaper};
@@ -643,7 +644,6 @@ fn rollover_budget_eviction_pin_protection_live_blob_safety_and_gc() {
     assert!(!rec_dir.join("seg-000002.apks").exists());
     assert!(!rec_dir.join("blobs").join(blob_filename(blob1, ImageEncoding::Png)).exists());
     assert!(!rec_dir.join("blobs").join(blob_filename(blob2, ImageEncoding::Png)).exists());
-    assert!(!rec_dir.join("blobs").join(blob_filename(blob2, ImageEncoding::Png)).exists());
     assert!(rec_dir.join("blobs").join(blob_filename(blob3, ImageEncoding::Png)).exists());
     assert!(
         rec_dir.join("blobs").join(blob_filename(live_mid, ImageEncoding::Png)).exists(),
@@ -1159,8 +1159,17 @@ fn worker_backlog_accounting_failure_propagation_and_drop_cleanup() {
     let mut blob_q = 0usize;
     assert!(try_reserve_blob_backlog(&mut blob_q, 512, 128), "empty queue admits single blob > max_backlog");
     assert_eq!(blob_q, 512);
-    assert!(!try_reserve_blob_backlog(&mut blob_q, 10, 128), "non-empty queue enforces max_backlog");
+    assert!(!try_reserve_blob_backlog(&mut blob_q, 512, 128), "second oversized blob refused while over budget");
+    assert!(!try_reserve_blob_backlog(&mut blob_q, 10, 128), "non-empty over-budget queue enforces max_backlog");
     assert_eq!(blob_q, 512);
+    // Exact boundary: queued == max_backlog still admits one oversized blob (cost > max_backlog),
+    // whereas cost == max_backlog does NOT bypass when queued > 0.
+    let mut boundary_q = 128usize;
+    assert!(!try_reserve_blob_backlog(&mut boundary_q, 128, 128));
+    assert_eq!(boundary_q, 128);
+    assert!(try_reserve_blob_backlog(&mut boundary_q, 129, 128));
+    assert_eq!(boundary_q, 257);
+    assert!(!try_reserve_blob_backlog(&mut boundary_q, 129, 128));
 }
 
 #[test]
@@ -1667,13 +1676,93 @@ fn pr4_async_close_reaper_panic_guard_backlog_atomic_degrade_and_security() {
     assert!(matches!(panic_res, Err(WalError::WorkerClosed)), "expected WorkerClosed, got {panic_res:?}");
     assert!(t_panic.elapsed() < Duration::from_secs(2), "DoneGuard must unblock immediately on panic");
 
-    // 3. `KeyframeV2::estimated_memory_bytes`, `fits_limits` exact boundary, & `degrade_to_limits` ladder.
+    // 3. `needs_zlib_limit_check`, `estimated_memory_bytes`, `fits_limits`, structural pre-clamping, & `degrade_to_limits`.
+    assert!(!needs_zlib_limit_check(0, 32));
+    assert!(needs_zlib_limit_check(0, 31));
+    assert!(!needs_zlib_limit_check(8_192, 8_192 + 1 + 32));
+    assert!(needs_zlib_limit_check(8_192, 8_192 + 32));
+    assert!(!is_oversized_engine_snapshot(MAX_ENGINE_SNAPSHOT_BYTES));
+    assert!(is_oversized_engine_snapshot(MAX_ENGINE_SNAPSHOT_BYTES + 1));
+    assert!(is_oversized_engine_snapshot(MAX_ENGINE_SNAPSHOT_BYTES + 2));
+
     let small_kf = sample_keyframe(None, None, None);
     let small_est = small_kf.estimated_memory_bytes();
     let small_raw_len = small_kf.encode_uncompressed().len();
     assert!(small_est > 128);
     assert!(small_kf.fits_limits(small_raw_len, 1 << 20), "exact raw.len() == max_uncompressed must fit");
     assert!(!small_kf.fits_limits(small_raw_len - 1, 1 << 20), "raw.len() > max_uncompressed must not fit");
+    // Exercise compressed-size branch when raw.len() > max_compressed (compressible payload still fits!).
+    let mut comp_kf = sample_keyframe(None, None, None);
+    comp_kf.visual.primary_rows = vec![PackedRow {
+        line: 0,
+        text: "A".repeat(4_000),
+        styles: Vec::new(),
+        runs: Vec::new(),
+        flags: 0,
+        links: Vec::new(),
+        pieces: Vec::new(),
+    }];
+    let comp_raw = comp_kf.encode_uncompressed();
+    let comp_zlen = miniz_oxide::deflate::compress_to_vec_zlib(&comp_raw, 4).len();
+    assert!(comp_zlen < comp_raw.len());
+    assert!(comp_kf.fits_limits(comp_raw.len(), comp_zlen), "exact compressed length must fit");
+    assert!(!comp_kf.fits_limits(comp_raw.len(), comp_zlen - 1), "compressed length > max_compressed must fail");
+
+    // Pre-clamping structural bounds (`images`, `commands`, `primary_rows`, `alt_rows`, `engine`)
+    // must NOT wipe valid rows before clamping the over-bound field!
+    let mut over_bound = sample_keyframe(Some(hash_blob(b"keep")), None, Some([0x77; 32]));
+    over_bound.visual.primary_rows = vec![PackedRow {
+        line: 0,
+        text: String::from("MUST_SURVIVE_PRECLAMP"),
+        styles: Vec::new(),
+        runs: Vec::new(),
+        flags: 0,
+        links: Vec::new(),
+        pieces: Vec::new(),
+    }];
+    let base_img = over_bound.visual.images[0];
+    over_bound.visual.images = vec![base_img; MAX_VISUAL_IMAGES + 3];
+    let base_cmd = over_bound.visual.commands[0].clone();
+    over_bound.visual.commands = vec![base_cmd; MAX_COMMANDS + 2];
+    over_bound.engine = Some(EngineCheckpoint {
+        engine_abi_hash: [0x77; 32],
+        snapshot_bytes: vec![0u8; MAX_ENGINE_SNAPSHOT_BYTES + 1],
+    });
+    assert!(over_bound.degrade_to_limits(1 << 24, 1 << 24));
+    assert_eq!(over_bound.visual.images.len(), MAX_VISUAL_IMAGES);
+    assert_eq!(over_bound.visual.commands.len(), MAX_COMMANDS);
+    assert!(over_bound.engine.is_none());
+    assert_eq!(
+        over_bound.visual.primary_rows.len(),
+        1,
+        "pre-clamping over-bound images/commands/engine must preserve valid primary_rows"
+    );
+    assert_eq!(over_bound.visual.primary_rows[0].text, "MUST_SURVIVE_PRECLAMP");
+    // Also cover each structural pre-clamp independently so `|=` vs `&=` is verified on every field.
+    let empty_row = PackedRow {
+        line: 0,
+        text: String::new(),
+        styles: Vec::new(),
+        runs: Vec::new(),
+        flags: 0,
+        links: Vec::new(),
+        pieces: Vec::new(),
+    };
+    let mut over_pri = sample_keyframe(None, None, None);
+    over_pri.visual.primary_rows = vec![empty_row.clone(); MAX_VISUAL_PRIMARY_ROWS + 1];
+    assert!(over_pri.degrade_to_limits(1 << 24, 1 << 24));
+    assert_eq!(over_pri.visual.primary_rows.len(), MAX_VISUAL_PRIMARY_ROWS);
+
+    let mut over_alt = sample_keyframe(None, None, None);
+    over_alt.visual.alt_rows = vec![empty_row; MAX_VISUAL_ALT_ROWS + 1];
+    assert!(over_alt.degrade_to_limits(1 << 24, 1 << 24));
+    assert_eq!(over_alt.visual.alt_rows.len(), MAX_VISUAL_ALT_ROWS);
+
+    let mut over_img_only = sample_keyframe(Some(hash_blob(b"i-only")), None, None);
+    over_img_only.visual.images = vec![base_img; MAX_VISUAL_IMAGES + 1];
+    assert!(over_img_only.degrade_to_limits(1 << 24, 1 << 24));
+    assert_eq!(over_img_only.visual.images.len(), MAX_VISUAL_IMAGES);
+
     let mut unchanged = small_kf.clone();
     assert!(!unchanged.degrade_to_limits(small_raw_len, 1 << 20), "already-fitting keyframe must not degrade");
     assert_eq!(unchanged, small_kf);
@@ -1828,13 +1917,21 @@ fn pr4_async_close_reaper_panic_guard_backlog_atomic_degrade_and_security() {
 
     let bl_reader = WalReader::open(&bl_dir, &registry).unwrap();
     let bl_slice = bl_reader.latest_segment_records().unwrap().unwrap();
-    assert_eq!(bl_slice.tail_records.len(), 3);
+    assert!(
+        bl_slice.tail_records.len() == 3 || bl_slice.tail_records.len() == 4,
+        "expected 2 outputs + 1 coalesced (or 2 separate) BacklogOverflow gaps, got {:?}",
+        bl_slice.tail_records
+    );
     assert_eq!(bl_slice.tail_records[0].record, WalRecord::Output(b"\x1b_Gm=1;AAA".to_vec()));
     assert_eq!(bl_slice.tail_records[1].record, WalRecord::Output(b"\x1b\\\x1b_Gm=0;BBB\x1b\\".to_vec()));
-    assert_eq!(
-        bl_slice.tail_records[2].record,
-        WalRecord::Gap { dropped_bytes: 300, reason: GapReason::BacklogOverflow }
-    );
+    let gap_total: u64 = bl_slice.tail_records[2..]
+        .iter()
+        .map(|r| match r.record {
+            WalRecord::Gap { dropped_bytes, reason: GapReason::BacklogOverflow } => dropped_bytes,
+            ref other => panic!("expected BacklogOverflow gap after outputs, got {other:?}"),
+        })
+        .sum();
+    assert_eq!(gap_total, 300);
     drop(bl_reader);
 
     // Keyframe backlog rejection when queue is non-empty, plus control_queued accounting & closed check!
@@ -1859,7 +1956,8 @@ fn pr4_async_close_reaper_panic_guard_backlog_atomic_degrade_and_security() {
     let _ = block_tx.send(());
     blocked_kf.close_async();
 
-    // Separate blocked handle verifying backlog rejection (with control_queued < cap) and closed rejection.
+    // Separate blocked handle verifying backlog rejection (with control_queued < cap),
+    // `start_segment_on_close` terminal bypass + control_queued/closed/failed bounds.
     let (block_tx2, block_rx2) = mpsc::channel();
     let mut blocked_kf2 = WalHandle::spawn_test_blocked(block_rx2);
     assert!(blocked_kf2.write_output(100, vec![b'z'; 900], true));
@@ -1867,12 +1965,36 @@ fn pr4_async_close_reaper_panic_guard_backlog_atomic_degrade_and_security() {
         !blocked_kf2.start_segment(101, sample_keyframe(None, None, None)),
         "start_segment must reject when queued_bytes + keyframe_cost > max_backlog_bytes"
     );
+    assert!(
+        blocked_kf2.start_segment_on_close(101, sample_keyframe(None, None, None)),
+        "start_segment_on_close must admit a single terminal keyframe despite blob backlog"
+    );
+    for i in 1..MAX_CONTROL_QUEUE_LEN {
+        assert!(blocked_kf2.write_resize(200 + i as u64, GridSize::new(80, 24).unwrap(), CellPx::default()));
+    }
+    assert!(
+        !blocked_kf2.start_segment_on_close(9_999, sample_keyframe(None, None, None)),
+        "start_segment_on_close must still respect MAX_CONTROL_QUEUE_LEN"
+    );
     let _ = block_tx2.send(());
     blocked_kf2.stop_thread();
     assert!(
         !blocked_kf2.start_segment(102, sample_keyframe(None, None, None)),
         "closed handle must reject start_segment"
     );
+    assert!(
+        !blocked_kf2.start_segment_on_close(103, sample_keyframe(None, None, None)),
+        "closed handle must reject start_segment_on_close"
+    );
+    // Also verify `start_segment_on_close` rejects on a sticky-failed worker.
+    let fail_close_dir = tmp.path().join("fail-close-kf");
+    let fcw =
+        WalWriter::open_or_create(&fail_close_dir, [47; 16], 100, WalConfig::default(), registry.clone()).unwrap();
+    let fch = WalWorker::spawn(fcw);
+    assert!(fch.write_output(100, b"boom".to_vec(), true));
+    assert!(fch.flush_barrier().is_err());
+    assert!(!fch.start_segment_on_close(101, sample_keyframe(None, None, None)));
+    fch.close_async();
 
     // 5. Out-of-order `WalRecord::Gap` fix in `record_output_capped`:
     //    chunk 0 (16 MiB) exceeds hard_data_cap; trailing 100 bytes WOULD have fit but must be shed too!
@@ -1898,6 +2020,11 @@ fn pr4_async_close_reaper_panic_guard_backlog_atomic_degrade_and_security() {
     // 6. `.meta.tmp-*` cleanup under `WriterClaim` + Unix owner/mode + Windows reparse checks.
     let race_dir = tmp.path().join("meta-tmp-claim-race");
     fs::create_dir(&race_dir).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&race_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let live_tmp = race_dir.join(".meta.tmp-live-1");
     fs::write(&live_tmp, b"in-flight-meta").unwrap();
     let held_claim = registry.claim_writer(&race_dir).unwrap();

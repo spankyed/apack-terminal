@@ -114,7 +114,9 @@ impl fmt::Display for WalError {
             Self::Io(err) => write!(f, "WAL I/O error: {err}"),
             Self::Wire(err) => write!(f, "WAL wire error: {err}"),
             Self::ChecksumMismatch(what) => write!(f, "WAL CRC32C mismatch in {what}"),
-            Self::ForeignDirectory => write!(f, "refusing pre-existing non-empty directory without meta.apkm"),
+            Self::ForeignDirectory => {
+                write!(f, "refusing foreign, non-private, or non-empty directory without meta.apkm")
+            }
             Self::SymlinkRefused => write!(f, "refusing symlinked recording path"),
             Self::AlreadyClaimed => write!(f, "recording directory is already open for writing"),
             Self::InvalidFormat(what) => write!(f, "invalid WAL format: {what}"),

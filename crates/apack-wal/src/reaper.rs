@@ -194,34 +194,38 @@ impl ReaperProbe {
 
 fn run_reaper_loop(inner: Arc<ReaperInner>) {
     loop {
-        let (finished, exit) = {
+        let (finished, should_sleep, exit) = {
             let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
             while state.pending.is_empty() && !state.shutting_down {
                 state = inner.cv.wait(state).unwrap_or_else(|e| e.into_inner());
             }
             let finished = ReaperInner::take_finished_locked(&mut state);
             if state.pending.is_empty() {
-                inner.cv.notify_all();
                 let shutting_down = state.shutting_down;
                 if shutting_down {
                     state.started = false;
                 }
-                (finished, shutting_down)
+                (finished, false, shutting_down)
             } else if state.shutting_down {
                 // Detach still-stalled handles on reaper shutdown so process exit never hangs.
                 state.pending.clear();
                 state.started = false;
-                (finished, true)
+                (finished, false, true)
             } else {
-                let _ = inner.cv.wait_timeout(state, REAPER_POLL_INTERVAL);
-                (finished, false)
+                (finished, true, false)
             }
         };
+        // Join all finished handles BEFORE notifying `drain_bounded` or sleeping.
         for h in finished {
             let _ = h.join();
         }
+        inner.cv.notify_all();
         if exit {
             return;
+        }
+        if should_sleep {
+            let state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = inner.cv.wait_timeout(state, REAPER_POLL_INTERVAL);
         }
     }
 }

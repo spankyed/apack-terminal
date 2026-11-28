@@ -890,8 +890,11 @@ pub(crate) fn try_reserve_backlog(queued: &mut usize, cost: usize, max_backlog: 
 }
 
 pub(crate) fn try_reserve_blob_backlog(queued: &mut usize, cost: usize, max_backlog: usize) -> bool {
-    if *queued == 0 {
-        *queued = cost;
+    // Allow at most ONE oversized blob/keyframe (`cost > max_backlog`) while the queue is still
+    // within normal budget (`*queued <= max_backlog`), so a tiny trailing `\x1b\\` or prompt chunk
+    // never starves a valid >16 MiB image blob while capping total backlog at `max_backlog + cost`.
+    if cost > max_backlog && *queued <= max_backlog {
+        *queued = queued.saturating_add(cost);
         return true;
     }
     try_reserve_backlog(queued, cost, max_backlog)
@@ -939,6 +942,27 @@ impl WalHandle {
         if !try_reserve_blob_backlog(&mut state.queued_bytes, cost, self.max_backlog) {
             return false;
         }
+        state.control_queued += 1;
+        state.queue.push_back((cost, WorkerCmd::StartSegment { at_ms, keyframe: Box::new(keyframe) }));
+        cv.notify_one();
+        true
+    }
+
+    /// Enqueues a single terminal segment keyframe right before async close (bounded by
+    /// [`MAX_CONTROL_QUEUE_LEN`]), allowing a short-lived session that just persisted a large
+    /// `> max_backlog_bytes` image blob to commit its final keyframe before sealing without
+    /// blocking the shard thread.
+    pub fn start_segment_on_close(&self, at_ms: u64, keyframe: KeyframeV2) -> bool {
+        if self.is_failed() {
+            return false;
+        }
+        let cost = keyframe.estimated_memory_bytes().max(1);
+        let (lock, cv) = &*self.shared;
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closed || state.control_queued >= MAX_CONTROL_QUEUE_LEN {
+            return false;
+        }
+        state.queued_bytes = state.queued_bytes.saturating_add(cost);
         state.control_queued += 1;
         state.queue.push_back((cost, WorkerCmd::StartSegment { at_ms, keyframe: Box::new(keyframe) }));
         cv.notify_one();
