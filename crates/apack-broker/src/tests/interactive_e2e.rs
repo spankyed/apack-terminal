@@ -185,7 +185,8 @@ fn e2e_interactive_write_resize_pause_raw_output_and_multi_shard() {
     #[cfg(unix)]
     {
         client.send_raw(st.as_stream_id(), RequestId::PUSH, &ClientMsg::Pause).unwrap();
-        std::thread::sleep(Duration::from_millis(25));
+        // Barrier: `list_sessions` roundtrips through the shard, ensuring `Pause` is active before `Write`.
+        let _ = client.list_sessions().unwrap();
         client
             .send_raw(st.as_stream_id(), RequestId::PUSH, &ClientMsg::Write { data: b"PAUSED_MARKER_99\n".to_vec() })
             .unwrap();

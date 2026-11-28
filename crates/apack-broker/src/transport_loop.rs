@@ -61,10 +61,6 @@ pub(crate) const MAX_SHARD_EVENTS_PER_TURN: usize = 256;
 /// Maximum client-initiated commands one connection may have queued/executing in shard mailboxes at once.
 pub(crate) const MAX_INFLIGHT_SHARD_CMDS_PER_CONN: usize = 1_024;
 
-/// Maximum wall-clock duration a closing connection may remain in the non-blocking tail drain
-/// set while flushing final replies before being forcibly closed.
-pub(crate) const GRACEFUL_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
-
 #[cfg(unix)]
 const LISTENER_TOKEN: PollToken = PollToken(0);
 
@@ -399,6 +395,7 @@ pub(crate) fn run_control_reactor(
         started_at: Instant::now(),
         start_grace: config.start_grace,
         kill_escalate_after: config.kill_escalate_after,
+        graceful_drain_timeout: config.graceful_drain_timeout,
         shutting_down: false,
         shutdown_deadline: None,
         shutdown_flag,
@@ -535,6 +532,7 @@ pub(crate) struct ReactorState {
     started_at: Instant,
     start_grace: Duration,
     kill_escalate_after: Duration,
+    pub(crate) graceful_drain_timeout: Duration,
     pub(crate) shutting_down: bool,
     shutdown_deadline: Option<Instant>,
     shutdown_flag: Arc<AtomicBool>,
@@ -1127,7 +1125,7 @@ impl ReactorState {
                                     DrainingUnixConn {
                                         stream: c.stream,
                                         write_queue: c.write_queue,
-                                        deadline: Instant::now() + GRACEFUL_DRAIN_TIMEOUT,
+                                        deadline: Instant::now() + self.graceful_drain_timeout,
                                     },
                                 );
                             } else {

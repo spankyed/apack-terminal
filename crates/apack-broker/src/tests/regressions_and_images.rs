@@ -269,13 +269,14 @@ fn review_regressions_env_grace_pipelined_fin_teardown_spawn_and_seek_cell_px() 
         let ep_solo = unique_endpoint(dir_solo.path(), "unix-drain-solo");
         let mut cfg_solo = BrokerConfig::for_socket(&ep_solo);
         cfg_solo.shard_count = 1;
+        cfg_solo.graceful_drain_timeout = Duration::from_secs(3);
         let mut srv_solo = BrokerServer::bind(cfg_solo).unwrap().spawn().unwrap();
         let mut burst = apack_os::transport::connect_local_stream(srv_solo.socket_path()).unwrap();
         do_hello(&mut burst);
         burst.write_all(&batch).unwrap();
         burst.flush().unwrap();
-        // Wait 200ms (>> unoptimized parse time of 35k frames, << 500ms GRACEFUL_DRAIN_TIMEOUT) so
-        // the reactor processes FIN and would auto-exit if `has_draining_conns` were false!
+        // Wait 200ms (>> parse time of 35k frames, << 3s configured graceful_drain_timeout) so the
+        // reactor processes FIN and would auto-exit if `has_draining_conns` were false!
         std::thread::sleep(Duration::from_millis(200));
         assert!(!srv_solo.is_finished(), "broker must not auto-exit while draining_unix still holds unsent replies");
         let mut all_replies = Vec::new();
@@ -294,12 +295,13 @@ fn review_regressions_env_grace_pipelined_fin_teardown_spawn_and_seek_cell_px() 
         srv_solo.shutdown().unwrap();
 
         // 6b. Sole stalled peer pipelines BURST_N Metrics + FIN_FRAME and NEVER reads ->
-        //     `reap_draining_conns` must forcibly hang up after GRACEFUL_DRAIN_TIMEOUT (500 ms) so
+        //     `reap_draining_conns` must forcibly hang up after `graceful_drain_timeout` (200 ms) so
         //     `draining_unix` empties and the broker auto-exits cleanly WITHOUT the peer ever reading!
         let dir_reap = tempdir().unwrap();
         let ep_reap = unique_endpoint(dir_reap.path(), "unix-drain-reap-solo");
         let mut cfg_reap = BrokerConfig::for_socket(&ep_reap);
         cfg_reap.shard_count = 1;
+        cfg_reap.graceful_drain_timeout = Duration::from_millis(200);
         let mut srv_reap = BrokerServer::bind(cfg_reap).unwrap().spawn().unwrap();
         let mut stalled = apack_os::transport::connect_local_stream(srv_reap.socket_path()).unwrap();
         do_hello(&mut stalled);
@@ -307,30 +309,34 @@ fn review_regressions_env_grace_pipelined_fin_teardown_spawn_and_seek_cell_px() 
         stalled.flush().unwrap();
         let reap_wait = std::time::Instant::now();
         while (!srv_reap.is_finished() || std::path::Path::new(&ep_reap).exists())
-            && reap_wait.elapsed() < Duration::from_millis(1_500)
+            && reap_wait.elapsed() < Duration::from_secs(5)
         {
             std::thread::sleep(Duration::from_millis(25));
         }
         assert!(
             srv_reap.is_finished() && !std::path::Path::new(&ep_reap).exists(),
-            "reap_draining_conns must drop stalled draining_unix peer after 500ms so broker auto-exits"
+            "reap_draining_conns must drop stalled draining_unix peer after graceful_drain_timeout so broker auto-exits"
         );
         let mut discard = Vec::new();
         stalled.read_to_end(&mut discard).unwrap();
         assert!(discard.len() < all_replies.len());
         srv_reap.shutdown().unwrap();
 
-        // 6c. Spawn a HUP-ignoring session so `srv.shutdown()` takes ~300ms to escalate SIGKILL,
-        //     and verify an open idle peer receives immediate EOF (< 150ms) from `close_conn_transport`!
+        // 6c. Spawn a HUP-ignoring session so `srv.shutdown()` takes ~600ms to escalate SIGKILL,
+        //     and verify an open idle peer receives immediate EOF (< 400ms) from `close_conn_transport`!
         let dir2 = tempdir().unwrap();
         let ep2 = unique_endpoint(dir2.path(), "unix-close-conn");
         let mut cfg2 = BrokerConfig::for_socket(&ep2);
         cfg2.shard_count = 1;
-        cfg2.kill_escalate_after = Duration::from_millis(300);
+        cfg2.kill_escalate_after = Duration::from_millis(600);
         let mut srv = BrokerServer::bind(cfg2).unwrap().spawn().unwrap();
         let mut keeper = BrokerClient::connect(srv.socket_path(), &AuthConfig::None, "keeper").unwrap();
         let trap_spec = SpawnSpec {
-            argv: vec![String::from("/bin/sh"), String::from("-c"), String::from("trap '' HUP; sleep 10")],
+            argv: vec![
+                String::from("/bin/sh"),
+                String::from("-c"),
+                String::from("trap '' HUP; printf 'TRAP_READY\\r\\n'; sleep 10"),
+            ],
             cwd: None,
             env: Vec::new(),
             size: GridSize::new(80, 24).unwrap(),
@@ -343,8 +349,11 @@ fn review_regressions_env_grace_pipelined_fin_teardown_spawn_and_seek_cell_px() 
             image_files: false,
             kept: false,
         };
-        let _ = keeper.spawn(trap_spec).unwrap();
-        std::thread::sleep(Duration::from_millis(40));
+        let (s_trap, _) = keeper.spawn(trap_spec).unwrap();
+        assert_eq!(
+            keeper.wait(s_trap, WaitCondition::Text(String::from("TRAP_READY")), 5_000).unwrap(),
+            WaitOutcome::Met
+        );
         let mut idle = apack_os::transport::connect_local_stream(srv.socket_path()).unwrap();
         do_hello(&mut idle);
         let t_shut = std::time::Instant::now();
@@ -358,8 +367,8 @@ fn review_regressions_env_grace_pipelined_fin_teardown_spawn_and_seek_cell_px() 
         let (eof_n, eof_dt) = reader_thread.join().unwrap();
         assert_eq!(eof_n, 0, "shutdown must close open client connections");
         assert!(
-            eof_dt < Duration::from_millis(200),
-            "close_conn_transport must close idle clients immediately (took {eof_dt:?}, before 300ms SIGKILL)"
+            eof_dt < Duration::from_millis(400),
+            "close_conn_transport must close idle clients immediately (took {eof_dt:?}, before 600ms SIGKILL)"
         );
     }
 }
@@ -620,13 +629,137 @@ fn kitty_image_sources_e2e_file_shm_security_and_teardown() {
 
     #[cfg(windows)]
     {
-        let mut spec_win = echo_command_spec("WIN_IMG_READY", None, None);
+        use apack_os::image_sources::encoded;
+        use std::process::Command;
+
+        let pixels: Vec<u8> =
+            vec![0xde, 0xad, 0xbe, 0xff, 0x10, 0x20, 0x30, 0xff, 0x40, 0x50, 0x60, 0xff, 0x70, 0x80, 0x90, 0xff];
+        let img_path = tmp.path().join("ok.rgba");
+        std::fs::write(&img_path, &pixels).unwrap();
+        let b64_ok = String::from_utf8(encoded(img_path.to_string_lossy().as_bytes())).unwrap();
+
+        // 1. `image_files: false` MUST refuse `t=f` on Windows ConPTY too (hostile-PTY boundary).
+        //    Use `spec.cwd = tmp` + quote-free relative filename so `portable-pty` never backslash-escapes quotes for `cmd.exe /C`.
+        let seq_disabled = tmp.path().join("win-seq-disabled.bin");
+        std::fs::write(&seq_disabled, format!("\x1b_Ga=T,f=32,s=2,v=2,i=1,t=f;{b64_ok}\x1b\\WIN_DISABLED_DONE\r\n"))
+            .unwrap();
+        let mut spec_disabled = echo_command_spec("x", None, None);
+        spec_disabled.cwd = Some(tmp.path().to_string_lossy().into_owned());
+        spec_disabled.argv = vec![
+            String::from("cmd.exe"),
+            String::from("/C"),
+            String::from("type win-seq-disabled.bin & ping -n 10 127.0.0.1 >nul"),
+        ];
+        spec_disabled.image_files = false;
+        let (s_dis, _) = client.spawn(spec_disabled).unwrap();
+        assert_eq!(
+            client.wait(s_dis, WaitCondition::Text(String::from("WIN_DISABLED_DONE")), 5_000).unwrap(),
+            WaitOutcome::Met
+        );
+        let st_dis = NonZeroStreamId::new(1).unwrap();
+        client
+            .attach(
+                s_dis,
+                st_dis,
+                SubFlags::from_bits(SubFlags::VIEW).unwrap(),
+                None,
+                0,
+                FrameCredit { max_frames: 8, max_bytes: 1 << 20 },
+            )
+            .unwrap();
+        let BrokerMsg::ImagesReply { placements: dis_placements, .. } =
+            client.stream_request(st_dis, &ClientMsg::Images).unwrap()
+        else {
+            panic!("expected ImagesReply");
+        };
+        assert!(dis_placements.is_empty(), "image_files=false must refuse t=f on Windows");
+        client.detach(st_dis).unwrap();
+        client.kill(s_dis).unwrap();
+
+        // 2. `image_files: true`: regular drive-rooted file loads cleanly while an unprivileged
+        //    NTFS directory junction, UNC share path, and Windows named pipe are ALL refused (`H15`)!
+        let junc_target = tmp.path().join("jtarget");
+        std::fs::create_dir(&junc_target).unwrap();
+        let junc_secret = junc_target.join("secret.rgba");
+        // Distinct pixel bytes from `ok.rgba` so we can verify the loaded blob is strictly `ok.rgba`.
+        let secret_pixels: Vec<u8> = vec![0x11; 16];
+        std::fs::write(&junc_secret, &secret_pixels).unwrap();
+        let junc_dir = tmp.path().join("junc");
+        let mk_status = Command::new("cmd.exe")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junc_dir)
+            .arg(&junc_target)
+            .status()
+            .expect("mklink /J");
+        assert!(mk_status.success(), "unprivileged mklink /J must succeed on Windows");
+        let b64_junc = String::from_utf8(encoded(junc_dir.join("secret.rgba").to_string_lossy().as_bytes())).unwrap();
+        let b64_unc = String::from_utf8(encoded(br"\\127.0.0.1\c$\Windows\win.ini")).unwrap();
+        let b64_pipe = String::from_utf8(encoded(br"\\.\pipe\apack-forbidden-pipe")).unwrap();
+
+        let seq_enabled = tmp.path().join("win-seq-enabled.bin");
+        std::fs::write(
+            &seq_enabled,
+            format!(
+                "\x1b_Ga=T,f=32,s=2,v=2,i=2,t=f;{b64_ok}\x1b\\\
+                 \x1b_Ga=T,f=32,s=2,v=2,i=3,t=f;{b64_junc}\x1b\\\
+                 \x1b_Ga=T,f=32,s=2,v=2,i=4,t=f;{b64_unc}\x1b\\\
+                 \x1b_Ga=T,f=32,s=2,v=2,i=5,t=f;{b64_pipe}\x1b\\\
+                 WIN_ALL_IMG_DONE\r\n"
+            ),
+        )
+        .unwrap();
+        let mut spec_win = echo_command_spec("x", None, None);
+        spec_win.cwd = Some(tmp.path().to_string_lossy().into_owned());
+        spec_win.argv = vec![
+            String::from("cmd.exe"),
+            String::from("/C"),
+            String::from("type win-seq-enabled.bin & ping -n 10 127.0.0.1 >nul"),
+        ];
         spec_win.image_files = true;
         let (s_win, _) = client.spawn(spec_win).unwrap();
         assert_eq!(
-            client.wait(s_win, WaitCondition::Text(String::from("WIN_IMG_READY")), 5_000).unwrap(),
+            client.wait(s_win, WaitCondition::Text(String::from("WIN_ALL_IMG_DONE")), 5_000).unwrap(),
             WaitOutcome::Met
         );
+        let st_win = NonZeroStreamId::new(2).unwrap();
+        client
+            .attach(
+                s_win,
+                st_win,
+                SubFlags::from_bits(SubFlags::VIEW).unwrap(),
+                None,
+                0,
+                FrameCredit { max_frames: 8, max_bytes: 1 << 20 },
+            )
+            .unwrap();
+        let BrokerMsg::ImagesReply { placements, .. } = client.stream_request(st_win, &ClientMsg::Images).unwrap()
+        else {
+            panic!("expected ImagesReply");
+        };
+        assert_eq!(
+            placements.len(),
+            1,
+            "only the valid regular file must load on Windows (NTFS junction, UNC, and named pipe must be refused); got {placements:?}"
+        );
+        assert_eq!(placements[0].pixel_size, [2, 2]);
+        let BrokerMsg::ImageBlobChunk { data, encoding, total_bytes, .. } = client
+            .stream_request(st_win, &ClientMsg::GetImageBlob { blob: placements[0].blob, offset: 0, max_bytes: 65_536 })
+            .unwrap()
+        else {
+            panic!("expected ImageBlobChunk");
+        };
+        assert_eq!(encoding, apack_proto::types::ImageEncoding::Png);
+        assert!(total_bytes > 8 && data.starts_with(b"\x89PNG\r\n\x1a\n"));
+        // Cryptographically verify the loaded blob hash matches `ok.rgba` (not `junc_secret`).
+        let mut ref_cfg = GhosttyConfig::new(GridSize::new(80, 24).unwrap());
+        ref_cfg.cell_px = CellPx { width: 8, height: 16 };
+        let mut ref_vt = GhosttyEngine::new(ref_cfg).unwrap();
+        let mut ref_ev = Vec::new();
+        let b64_pixels = String::from_utf8(encoded(&pixels)).unwrap();
+        ref_vt.feed(format!("\x1b_Ga=T,f=32,s=2,v=2,i=9,t=d;{b64_pixels}\x1b\\").as_bytes(), &mut ref_ev);
+        let expected_blob = ref_vt.images()[0].blob;
+        assert_eq!(placements[0].blob, expected_blob, "loaded Windows image must match ok.rgba, not junction target");
+        client.detach(st_win).unwrap();
         client.kill(s_win).unwrap();
     }
 

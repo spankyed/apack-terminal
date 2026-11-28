@@ -9,6 +9,8 @@
 //! - `check-cfg-hygiene`: fails when mutable `#[cfg(windows)]` / `#[cfg(not(unix))]` logic appears outside `.cargo/windows-only`.
 //! - `check-windows`: runs a fast local Windows clippy/type cross-check (`x86_64-pc-windows-msvc` by default).
 //! - `check-safety`: fails when any `unsafe` site lacks a `SAFETY:` comment above it.
+//! - `check-versions`: fails when Rust crate versions, `node/package.json` (plus platform `optionalDependencies`),
+//!   or `view/package.json` drift out of lockstep.
 //! - `clear-mutants`: removes working copies left behind by an interrupted mutation pass.
 //! - `pre-push`: every check CI runs on a change, the change's mutants included, cheapest first, stopping at
 //!   the first that fails: what to run before a push.
@@ -21,7 +23,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use xtask::{
-    bench, cfg_hygiene, fuzz_smoke, generate, leftovers, mutants, notices, pre_push, safety, vt_prebuilt, windows_check,
+    bench, cfg_hygiene, fuzz_smoke, generate, leftovers, mutants, notices, pre_push, safety, versions, vt_prebuilt,
+    windows_check,
 };
 
 fn main() -> ExitCode {
@@ -38,12 +41,14 @@ fn main() -> ExitCode {
         Some("check-cfg-hygiene") => cfg_hygiene::check(&root),
         Some("check-windows") => windows_check::run(&root, &std::env::args().skip(2).collect::<Vec<_>>()),
         Some("check-safety") => safety::check(&root),
+        Some("check-versions") => versions::check(&root),
         Some("clear-mutants") => leftovers::clear(&root),
         Some("vt-prebuilt") => vt_prebuilt::fetch(&root),
         Some("pre-push") => pre_push::pre_push(
             &root,
             &std::env::args().skip(2).collect::<Vec<_>>(),
             &[
+                ("package version lockstep", &|| versions::check(&root)),
                 ("generated protocol", &|| generate::check(&root)),
                 ("mutant exclusions", &|| mutants::check_exclusions(&root)),
                 ("windows cfg hygiene", &|| cfg_hygiene::check(&root)),
@@ -52,7 +57,7 @@ fn main() -> ExitCode {
             ],
         ),
         _ => {
-            Err("usage: cargo xtask <bench | fuzz-smoke | generate | check-generated | notices | check-notices | check-exclusions | check-cfg-hygiene | check-windows | check-safety | clear-mutants | vt-prebuilt | pre-push>"
+            Err("usage: cargo xtask <bench | fuzz-smoke | generate | check-generated | notices | check-notices | check-exclusions | check-cfg-hygiene | check-windows | check-safety | check-versions | clear-mutants | vt-prebuilt | pre-push>"
                 .to_owned())
         }
     };

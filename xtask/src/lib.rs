@@ -9,6 +9,7 @@ pub mod mutants;
 pub mod notices;
 pub mod pre_push;
 pub mod safety;
+pub mod versions;
 pub mod vt_prebuilt;
 pub mod windows_check;
 pub mod wire_codegen;

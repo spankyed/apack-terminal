@@ -25,6 +25,10 @@ pub const DEFAULT_IDLE_COMPRESS: Duration = Duration::from_secs(2);
 /// Default escalation delay after `SIGHUP` before `SIGKILL` of surviving descendants (`2 s`).
 pub const DEFAULT_KILL_ESCALATE: Duration = Duration::from_secs(2);
 
+/// Default wall-clock duration a closing connection may remain in the non-blocking tail drain set
+/// while flushing final replies before being forcibly closed (`500 ms`).
+pub const DEFAULT_GRACEFUL_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// Environment variable supplying the optional mutual-HMAC authentication secret.
 ///
 /// Kept distinct from [`apack_os::pty::MARKS_KEY_ENV`] (`APACK_TERMINAL_KEY`) so stripping
@@ -48,6 +52,8 @@ pub struct BrokerConfig {
     pub idle_compress_after: Duration,
     /// Escalation delay after graceful `SIGHUP` before `SIGKILL` of surviving descendants.
     pub kill_escalate_after: Duration,
+    /// Maximum wall-clock duration a closing connection may spend flushing queued replies.
+    pub graceful_drain_timeout: Duration,
     /// Segmented WAL defaults for recorded sessions.
     pub wal_config: WalConfig,
 }
@@ -64,6 +70,7 @@ impl BrokerConfig {
             max_queue_bytes: MAX_CONTROL_QUEUE_BYTES,
             idle_compress_after: DEFAULT_IDLE_COMPRESS,
             kill_escalate_after: DEFAULT_KILL_ESCALATE,
+            graceful_drain_timeout: DEFAULT_GRACEFUL_DRAIN_TIMEOUT,
             wal_config: WalConfig::default(),
         }
     }

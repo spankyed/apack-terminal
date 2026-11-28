@@ -13,9 +13,11 @@ import {
   PLATFORMS,
   checkOptionalDependencies,
   packAll,
+  packView,
   platformManifest,
   releaseUrl,
   releasedMainManifest,
+  releasedViewManifest,
   tarballName,
 } from '../release/pack.mjs';
 
@@ -126,4 +128,54 @@ test('refuses to pack a platform missing a file it must hold', () => {
   const out = fs.mkdtempSync(path.join(os.tmpdir(), 'apack-terminal-packed-'));
   assert.throws(() => packAll({ commit: COMMIT, files: assets('win32-x64__conpty.dll'), out, repo: REPO }), /win32-x64__conpty\.dll/);
   assert.throws(() => packAll({ commit: COMMIT, files: assets('linux-x64__apack-terminal'), out, repo: REPO }), /linux-x64__apack-terminal/);
+});
+
+test('packs @apackdev/terminal-view with gitHead stamped and refuses missing built assets or version drift', () => {
+  const fakeView = fs.mkdtempSync(path.join(os.tmpdir(), 'apack-terminal-view-'));
+  fs.mkdirSync(path.join(fakeView, 'dist'), { recursive: true });
+  fs.writeFileSync(path.join(fakeView, 'dist', 'index.js'), 'export const TerminalView = () => {};\n');
+  fs.writeFileSync(path.join(fakeView, 'dist', 'index.d.ts'), 'export declare const TerminalView: () => void;\n');
+  fs.writeFileSync(path.join(fakeView, 'README.md'), '# view\n');
+  const viewPkg = {
+    name: '@apackdev/terminal-view',
+    version: MAIN.version,
+    type: 'module',
+    main: './dist/index.js',
+    types: './dist/index.d.ts',
+    files: ['dist', 'README.md'],
+    scripts: { build: 'vite build' },
+    devDependencies: { vite: '^7.0.0' },
+  };
+  fs.writeFileSync(path.join(fakeView, 'package.json'), `${JSON.stringify(viewPkg, null, 2)}\n`);
+
+  const released = releasedViewManifest(viewPkg, COMMIT);
+  assert.equal(released.gitHead, COMMIT);
+  assert.equal(released.scripts, undefined);
+  assert.equal(released.devDependencies, undefined);
+
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'apack-terminal-view-packed-'));
+  const viewTarball = packView({ commit: COMMIT, viewDir: fakeView, out });
+  assert.equal(path.basename(viewTarball), tarballName('@apackdev/terminal-view', MAIN.version));
+  const unpacked = unpack(viewTarball);
+  const manifest = JSON.parse(fs.readFileSync(path.join(unpacked, 'package.json'), 'utf8'));
+  assert.equal(manifest.gitHead, COMMIT);
+  assert.equal(manifest.version, MAIN.version);
+  assert.equal(manifest.scripts, undefined);
+  assert.ok(fs.existsSync(path.join(unpacked, 'dist', 'index.js')));
+  assert.ok(fs.existsSync(path.join(unpacked, 'dist', 'index.d.ts')));
+
+  // Version drift between node/package.json and view/package.json must fail packAll
+  fs.writeFileSync(path.join(fakeView, 'package.json'), `${JSON.stringify({ ...viewPkg, version: '0.0.1' })}\n`);
+  assert.throws(
+    () => packAll({ commit: COMMIT, files: assets(), out, repo: REPO, viewDir: fakeView }),
+    /view\/package\.json is at 0\.0\.1/,
+  );
+
+  // Missing built dist/index.d.ts and dist/index.js must fail packView
+  fs.writeFileSync(path.join(fakeView, 'package.json'), `${JSON.stringify(viewPkg)}\n`);
+  fs.rmSync(path.join(fakeView, 'dist', 'index.d.ts'));
+  assert.throws(() => packView({ commit: COMMIT, viewDir: fakeView, out }), /dist\/index\.d\.ts/);
+  fs.writeFileSync(path.join(fakeView, 'dist', 'index.d.ts'), 'export {};\n');
+  fs.rmSync(path.join(fakeView, 'dist', 'index.js'));
+  assert.throws(() => packView({ commit: COMMIT, viewDir: fakeView, out }), /dist\/index\.js/);
 });
