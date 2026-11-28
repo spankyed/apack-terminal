@@ -95,6 +95,7 @@ dependencies = [
 name = "apack-wal"
 version = "0.2.0"
 dependencies = [
+ "apack-os",
  "apack-proto",
  "libc",
  "miniz_oxide 0.9.1",

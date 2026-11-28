@@ -318,6 +318,26 @@ pub struct KeyframeV2 {
     pub engine: Option<EngineCheckpoint>,
 }
 
+/// Returns `true` when `raw_len` is large enough that worst-case `miniz_oxide` Huffman expansion
+/// (up to +12.5% for 9-bit static Huffman symbols plus zlib framing) could exceed `max_compressed`.
+pub(crate) const fn needs_zlib_limit_check(raw_len: usize, max_compressed: usize) -> bool {
+    raw_len.saturating_add(raw_len / 8).saturating_add(64) > max_compressed
+}
+
+/// Returns `true` when an optional `EngineCheckpoint` snapshot exceeds [`MAX_ENGINE_SNAPSHOT_BYTES`].
+pub(crate) const fn is_oversized_engine_snapshot(len: usize) -> bool {
+    len > MAX_ENGINE_SNAPSHOT_BYTES
+}
+
+fn clamp_front<T>(items: &mut Vec<T>, max_len: usize) -> bool {
+    if items.len() <= max_len {
+        return false;
+    }
+    let excess = items.len() - max_len;
+    items.drain(..excess);
+    true
+}
+
 impl KeyframeV2 {
     /// Returns the raw `libghostty-vt` snapshot bytes iff present AND matching `expected_abi`.
     ///
@@ -351,11 +371,118 @@ impl KeyframeV2 {
         Ok(())
     }
 
-    fn encode_uncompressed(&self) -> Vec<u8> {
+    pub(crate) fn encode_uncompressed(&self) -> Vec<u8> {
         let mut w = Writer::new();
         self.visual.encode(&mut w);
         w.opt(self.engine.as_ref(), |w, eng| eng.encode(w));
         w.into_bytes()
+    }
+
+    /// Estimates heap/wire memory footprint of this keyframe for async backlog accounting.
+    pub fn estimated_memory_bytes(&self) -> usize {
+        let mut total = 128usize;
+        for row in self.visual.primary_rows.iter().chain(self.visual.alt_rows.iter()) {
+            total = total
+                .saturating_add(row.text.len())
+                .saturating_add(row.runs.len().saturating_mul(16))
+                .saturating_add(row.links.iter().map(|u| u.len().saturating_add(4)).sum::<usize>())
+                .saturating_add(row.pieces.len().saturating_mul(48))
+                .saturating_add(32);
+        }
+        total = total.saturating_add(self.visual.images.len().saturating_mul(64));
+        for cmd in &self.visual.commands {
+            total = total
+                .saturating_add(cmd.command.as_ref().map_or(0, String::len))
+                .saturating_add(cmd.cwd.as_ref().map_or(0, String::len))
+                .saturating_add(48);
+        }
+        if let Some(engine) = &self.engine {
+            total = total.saturating_add(engine.snapshot_bytes.len().saturating_add(32));
+        }
+        total
+    }
+
+    pub(crate) fn fits_limits(&self, max_uncompressed: usize, max_compressed: usize) -> bool {
+        if self.validate_bounds().is_err() {
+            return false;
+        }
+        let raw = self.encode_uncompressed();
+        if raw.len() > max_uncompressed {
+            return false;
+        }
+        if needs_zlib_limit_check(raw.len(), max_compressed) {
+            return compress_to_vec_zlib(&raw, ZLIB_COMPRESSION_LEVEL).len() <= max_compressed;
+        }
+        true
+    }
+
+    /// Deterministically degrades this keyframe in-place so encoding cannot exceed
+    /// `max_uncompressed` or `max_compressed` (preventing permanent `WalWorker` failure on
+    /// dense/hostile viewports).
+    ///
+    /// Degradation priority:
+    /// 1. Pre-clamp any field exceeding its structural count/size bound (avoiding destructive wipes).
+    /// 2. Trim oldest primary scrollback rows above the active viewport.
+    /// 3. Drop optional `libghostty-vt` binary checkpoint (`engine = None`, preserving visual fallback).
+    /// 4. Trim oldest viewport rows (`primary_rows` / `alt_rows`).
+    /// 5. Trim oldest `images` / `commands`.
+    ///
+    /// Returns `true` if any fields were degraded.
+    pub fn degrade_to_limits(&mut self, max_uncompressed: usize, max_compressed: usize) -> bool {
+        let mut degraded = false;
+        // 1. Pre-clamp structural bounds first so an oversized optional field never wipes valid rows.
+        degraded |= clamp_front(&mut self.visual.primary_rows, MAX_VISUAL_PRIMARY_ROWS);
+        degraded |= clamp_front(&mut self.visual.alt_rows, MAX_VISUAL_ALT_ROWS);
+        degraded |= clamp_front(&mut self.visual.images, MAX_VISUAL_IMAGES);
+        degraded |= clamp_front(&mut self.visual.commands, MAX_COMMANDS);
+        if self.engine.as_ref().is_some_and(|e| is_oversized_engine_snapshot(e.snapshot_bytes.len())) {
+            self.engine = None;
+            degraded = true;
+        }
+
+        let mut fits = self.fits_limits(max_uncompressed, max_compressed);
+        if fits {
+            return degraded;
+        }
+        degraded = true;
+
+        // 2. Trim oldest history rows above the active viewport first.
+        let vp_rows = usize::from(self.visual.size.rows.get());
+        if !self.visual.active_alt_screen {
+            while !fits && self.visual.primary_rows.len() > vp_rows {
+                let drop_n = (self.visual.primary_rows.len() - vp_rows).div_ceil(2);
+                self.visual.primary_rows.drain(..drop_n);
+                fits = self.fits_limits(max_uncompressed, max_compressed);
+            }
+        }
+        // 3. Drop optional engine snapshot before sacrificing visible viewport rows.
+        if !fits && self.engine.is_some() {
+            self.engine = None;
+            fits = self.fits_limits(max_uncompressed, max_compressed);
+        }
+        // 4. Trim oldest viewport rows if hostile dense rows alone exceed limits.
+        while !fits && !self.visual.primary_rows.is_empty() {
+            let drop_n = self.visual.primary_rows.len().div_ceil(2);
+            self.visual.primary_rows.drain(..drop_n);
+            fits = self.fits_limits(max_uncompressed, max_compressed);
+        }
+        while !fits && !self.visual.alt_rows.is_empty() {
+            let drop_n = self.visual.alt_rows.len().div_ceil(2);
+            self.visual.alt_rows.drain(..drop_n);
+            fits = self.fits_limits(max_uncompressed, max_compressed);
+        }
+        // 5. Trim oldest image placements / commands as a last resort.
+        while !fits && !self.visual.images.is_empty() {
+            let drop_n = self.visual.images.len().div_ceil(2);
+            self.visual.images.drain(..drop_n);
+            fits = self.fits_limits(max_uncompressed, max_compressed);
+        }
+        while !fits && !self.visual.commands.is_empty() {
+            let drop_n = self.visual.commands.len().div_ceil(2);
+            self.visual.commands.drain(..drop_n);
+            fits = self.fits_limits(max_uncompressed, max_compressed);
+        }
+        degraded
     }
 
     fn decode_uncompressed(bytes: &[u8]) -> Result<Self, WalError> {

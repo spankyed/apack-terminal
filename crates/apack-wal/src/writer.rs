@@ -26,13 +26,15 @@ use sha2::{Digest, Sha256};
 
 use crate::blobs::{WalBlob, blobs_total_bytes, sweep_unreferenced, write_blob};
 use crate::directory::{
-    RecordingRegistry, WriterClaim, discover_segments, prepare_recording_dir, segment_filename, write_meta_atomic,
+    RecordingRegistry, WriterClaim, discover_segments, ensure_recording_dir, prepare_claimed_recording_dir,
+    segment_filename, write_meta_atomic,
 };
 use crate::format::{
     GapReason, KeyframeV2, MAX_RECORD_PAYLOAD, RecordingMeta, SegmentFooter, WalRecord, encode_framed_record,
     hash_segment_records, scan_segment,
 };
 use crate::reader::read_sealed_header_and_footer;
+use crate::reaper::{WalReaper, global_reaper};
 use crate::safe_fs::{create_private_file, open_regular_rw, read_regular_file_bounded, sync_dir};
 use crate::{
     DEFAULT_BUDGET_BYTES, DEFAULT_MAX_BACKLOG_BYTES, DEFAULT_MAX_NON_GROUND_BYTES, DEFAULT_SEGMENT_TARGET_BYTES,
@@ -146,8 +148,9 @@ impl WalWriter {
         registry: RecordingRegistry,
     ) -> Result<Self, WalError> {
         let dir = dir.as_ref().to_path_buf();
-        let existing_meta = prepare_recording_dir(&dir)?;
+        ensure_recording_dir(&dir)?;
         let claim = registry.claim_writer(&dir)?;
+        let existing_meta = prepare_claimed_recording_dir(&dir, &claim)?;
         let meta = match existing_meta {
             Some(m) => m,
             None => {
@@ -193,8 +196,11 @@ impl WalWriter {
                 WalRecord::Keyframe(kf) => Some((rec, kf)),
                 _ => None,
             }) else {
-                // Record 0 was torn/empty or not a KeyframeV2: unlink only if no reader holds a pin.
-                // Never leave an unusable/corrupt segment behind to become a non-tail segment.
+                if !is_last {
+                    // Never silently delete a corrupt non-tail segment and create a timeline hole.
+                    return Err(WalError::CorruptSegment("corrupt non-tail segment lacks valid keyframe"));
+                }
+                // Tail segment record 0 was torn/empty mid-creation: unlink only if no reader holds a pin.
                 if !registry.try_unlink_if_unpinned(&canonical, seg_id, || {
                     let _ = fs::remove_file(&path);
                     Ok(())
@@ -213,6 +219,10 @@ impl WalWriter {
                     referenced_blobs: kf.referenced_blobs(),
                 });
                 continue;
+            }
+            if !is_last && scan.had_torn_tail {
+                // Never silently truncate a corrupted non-tail segment; preserve it on disk and report.
+                return Err(WalError::CorruptSegment("corrupt non-tail segment has invalid trailing bytes"));
             }
 
             let seg_last_ms = scan.records.last().map_or(first.at_ms, |r| r.at_ms);
@@ -449,7 +459,7 @@ impl WalWriter {
                     .saturating_add(chunk.len())
                     .saturating_add(crate::RECORD_TRAILER_LEN)) as u64;
                 let cur_size = self.active.as_ref().map_or(0, |a| a.size_bytes);
-                if cur_size.saturating_add(framed_len) > hard_data_cap {
+                if hit_hard_cap || cur_size.saturating_add(framed_len) > hard_data_cap {
                     hit_hard_cap = true;
                     shed_bytes = shed_bytes.saturating_add(chunk.len() as u64);
                     continue;
@@ -626,6 +636,10 @@ impl WalWriter {
                 Ok(false) => {
                     report.skipped_pinned += 1;
                     kept.push(seg);
+                    // Stop eviction at the first pinned segment so newer segments are never
+                    // deleted out of chronological order, leaving a timeline hole.
+                    kept.extend(iter);
+                    break;
                 }
                 Err(err) => {
                     kept.push(seg);
@@ -705,6 +719,14 @@ struct QueueState {
     closed: bool,
 }
 
+struct DoneGuard(Arc<AtomicBool>);
+
+impl Drop for DoneGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 /// Shared background WAL worker thread factory.
 pub struct WalWorker;
 
@@ -725,8 +747,10 @@ impl WalWorker {
         let worker_done = Arc::clone(&done);
         let worker_rollover = Arc::clone(&rollover_needed);
         let thread = thread::spawn(move || {
+            // RAII guard ensures `done` is set even if the worker panics, so `flush_barrier_timeout`
+            // unblocks immediately with `WorkerClosed` instead of waiting for the full 30s deadline.
+            let _done_guard = DoneGuard(worker_done);
             run_worker_loop(writer, worker_shared, worker_failed, worker_rollover);
-            worker_done.store(true, Ordering::Release);
         });
 
         WalHandle { shared, failed, done, rollover_needed, max_backlog, thread: Some(thread) }
@@ -866,14 +890,31 @@ pub(crate) fn try_reserve_backlog(queued: &mut usize, cost: usize, max_backlog: 
 }
 
 pub(crate) fn try_reserve_blob_backlog(queued: &mut usize, cost: usize, max_backlog: usize) -> bool {
-    if *queued == 0 {
-        *queued = cost;
+    // Allow at most ONE oversized blob/keyframe (`cost > max_backlog`) while the queue is still
+    // within normal budget (`*queued <= max_backlog`), so a tiny trailing `\x1b\\` or prompt chunk
+    // never starves a valid >16 MiB image blob while capping total backlog at `max_backlog + cost`.
+    if cost > max_backlog && *queued <= max_backlog {
+        *queued = queued.saturating_add(cost);
         return true;
     }
     try_reserve_backlog(queued, cost, max_backlog)
 }
 
+fn push_backlog_gap_locked(state: &mut QueueState, at_ms: u64, dropped_bytes: u64) {
+    if let Some((_, WorkerCmd::BacklogGap { at_ms: gap_ms, dropped_bytes: prev })) = state.queue.back_mut() {
+        *prev = prev.saturating_add(dropped_bytes);
+        *gap_ms = (*gap_ms).max(at_ms);
+    } else {
+        state.queue.push_back((0, WorkerCmd::BacklogGap { at_ms, dropped_bytes }));
+    }
+}
+
 impl WalHandle {
+    /// Returns the configured maximum async backlog byte cap for this handle.
+    pub fn max_backlog_bytes(&self) -> usize {
+        self.max_backlog
+    }
+
     /// Returns `true` if a disk failure permanently marked this recording failed.
     pub fn is_failed(&self) -> bool {
         self.failed.load(Ordering::Acquire)
@@ -885,9 +926,47 @@ impl WalHandle {
         self.rollover_needed.swap(false, Ordering::AcqRel)
     }
 
-    /// Enqueues a new segment starting with `keyframe` (bounded by [`MAX_CONTROL_QUEUE_LEN`]).
+    /// Enqueues a new segment starting with `keyframe`, bounded by BOTH [`MAX_CONTROL_QUEUE_LEN`]
+    /// and `max_backlog_bytes` (admitting a single keyframe when the queue is empty so rollovers
+    /// never deadlock, while preventing zero-cost rollover cascades from exhausting RAM).
     pub fn start_segment(&self, at_ms: u64, keyframe: KeyframeV2) -> bool {
-        self.push_control(WorkerCmd::StartSegment { at_ms, keyframe: Box::new(keyframe) })
+        if self.is_failed() {
+            return false;
+        }
+        let cost = keyframe.estimated_memory_bytes().max(1);
+        let (lock, cv) = &*self.shared;
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closed || state.control_queued >= MAX_CONTROL_QUEUE_LEN {
+            return false;
+        }
+        if !try_reserve_blob_backlog(&mut state.queued_bytes, cost, self.max_backlog) {
+            return false;
+        }
+        state.control_queued += 1;
+        state.queue.push_back((cost, WorkerCmd::StartSegment { at_ms, keyframe: Box::new(keyframe) }));
+        cv.notify_one();
+        true
+    }
+
+    /// Enqueues a single terminal segment keyframe right before async close (bounded by
+    /// [`MAX_CONTROL_QUEUE_LEN`]), allowing a short-lived session that just persisted a large
+    /// `> max_backlog_bytes` image blob to commit its final keyframe before sealing without
+    /// blocking the shard thread.
+    pub fn start_segment_on_close(&self, at_ms: u64, keyframe: KeyframeV2) -> bool {
+        if self.is_failed() {
+            return false;
+        }
+        let cost = keyframe.estimated_memory_bytes().max(1);
+        let (lock, cv) = &*self.shared;
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closed || state.control_queued >= MAX_CONTROL_QUEUE_LEN {
+            return false;
+        }
+        state.queued_bytes = state.queued_bytes.saturating_add(cost);
+        state.control_queued += 1;
+        state.queue.push_back((cost, WorkerCmd::StartSegment { at_ms, keyframe: Box::new(keyframe) }));
+        cv.notify_one();
+        true
     }
 
     /// Enqueues raw PTY output bytes without blocking; sheds with an in-order
@@ -919,12 +998,7 @@ impl WalHandle {
             return true;
         }
         if !try_reserve_backlog(&mut state.queued_bytes, cost, self.max_backlog) {
-            if let Some((_, WorkerCmd::BacklogGap { at_ms: gap_ms, dropped_bytes })) = state.queue.back_mut() {
-                *dropped_bytes = dropped_bytes.saturating_add(cost as u64);
-                *gap_ms = (*gap_ms).max(at_ms);
-            } else {
-                state.queue.push_back((0, WorkerCmd::BacklogGap { at_ms, dropped_bytes: cost as u64 }));
-            }
+            push_backlog_gap_locked(&mut state, at_ms, cost as u64);
             cv.notify_one();
             return false;
         }
@@ -941,6 +1015,60 @@ impl WalHandle {
             return true;
         }
         state.queue.push_back((cost, WorkerCmd::Output { at_ms, bytes, vt_at_ground }));
+        cv.notify_one();
+        true
+    }
+
+    /// Atomically enqueues a sequence of `(bytes, vt_at_ground)` output chunks under one backlog
+    /// reservation (all-or-nothing), preventing multi-chunk Kitty `t=f`/`t=s` inline APC streams
+    /// from shedding trailing `m=0;` terminators and leaving an unclosed `m=1` APC in the WAL.
+    ///
+    /// If the aggregate non-empty byte size does not fit in `max_backlog_bytes`, writes ZERO
+    /// chunks, records a single coalesced [`GapReason::BacklogOverflow`] gap, and returns `false`.
+    pub fn write_output_atomic(&self, at_ms: u64, chunks: Vec<(Vec<u8>, bool)>) -> bool {
+        if self.is_failed() {
+            return false;
+        }
+        let mut total_cost = 0usize;
+        for (bytes, _) in &chunks {
+            total_cost = total_cost.saturating_add(bytes.len());
+        }
+        if total_cost == 0 {
+            return true;
+        }
+        let (lock, cv) = &*self.shared;
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closed {
+            return false;
+        }
+        if !try_reserve_backlog(&mut state.queued_bytes, total_cost, self.max_backlog) {
+            push_backlog_gap_locked(&mut state, at_ms, total_cost as u64);
+            cv.notify_one();
+            return false;
+        }
+        for (bytes, vt_at_ground) in chunks {
+            let cost = bytes.len();
+            if cost == 0 {
+                continue;
+            }
+            state.queue.push_back((cost, WorkerCmd::Output { at_ms, bytes, vt_at_ground }));
+        }
+        cv.notify_one();
+        true
+    }
+
+    /// Enqueues (or coalesces) an explicit [`GapReason::BacklogOverflow`] marker when an entire
+    /// stream (e.g. a `> 16 MiB` resolved Kitty `t=f`/`t=s` image) exceeds `max_backlog_bytes`.
+    pub fn record_backlog_gap(&self, at_ms: u64, dropped_bytes: u64) -> bool {
+        if self.is_failed() || dropped_bytes == 0 {
+            return false;
+        }
+        let (lock, cv) = &*self.shared;
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closed {
+            return false;
+        }
+        push_backlog_gap_locked(&mut state, at_ms, dropped_bytes);
         cv.notify_one();
         true
     }
@@ -1042,6 +1170,59 @@ impl WalHandle {
         let flush_res = self.flush_barrier();
         self.stop_thread();
         flush_res
+    }
+
+    /// Closes the worker queue without blocking and hands the worker thread to the process-global
+    /// bounded [`WalReaper`], ensuring callers on hot threads never stall on slow or hung disks.
+    pub fn close_async(self) {
+        self.close_async_into(global_reaper());
+    }
+
+    /// Closes the worker queue without blocking and hands the worker thread to `reaper`.
+    pub fn close_async_into(mut self, reaper: &WalReaper) {
+        {
+            let (lock, cv) = &*self.shared;
+            let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+            state.closed = true;
+            cv.notify_all();
+        }
+        if let Some(handle) = self.thread.take() {
+            reaper.reap(handle);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spawn_test_blocked(release: mpsc::Receiver<()>) -> Self {
+        let shared = Arc::new((
+            Mutex::new(QueueState { queue: VecDeque::new(), queued_bytes: 0, control_queued: 0, closed: false }),
+            Condvar::new(),
+        ));
+        let failed = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let rollover_needed = Arc::new(AtomicBool::new(false));
+        let worker_done = Arc::clone(&done);
+        let thread = thread::spawn(move || {
+            let _done_guard = DoneGuard(worker_done);
+            let _ = release.recv();
+        });
+        Self { shared, failed, done, rollover_needed, max_backlog: 1024, thread: Some(thread) }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spawn_test_panicking() -> Self {
+        let shared = Arc::new((
+            Mutex::new(QueueState { queue: VecDeque::new(), queued_bytes: 0, control_queued: 0, closed: false }),
+            Condvar::new(),
+        ));
+        let failed = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let rollover_needed = Arc::new(AtomicBool::new(false));
+        let worker_done = Arc::clone(&done);
+        let thread = thread::spawn(move || {
+            let _done_guard = DoneGuard(worker_done);
+            panic!("simulated wal worker panic");
+        });
+        Self { shared, failed, done, rollover_needed, max_backlog: 1024, thread: Some(thread) }
     }
 
     fn push_control(&self, cmd: WorkerCmd) -> bool {

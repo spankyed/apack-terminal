@@ -37,6 +37,7 @@ pub mod crc32c;
 pub mod directory;
 pub mod format;
 pub mod reader;
+pub mod reaper;
 pub(crate) mod safe_fs;
 pub mod writer;
 
@@ -52,6 +53,7 @@ pub use format::{
     hash_segment_records,
 };
 pub use reader::{SeekSlice, SegmentSummary, WalReader};
+pub use reaper::{MAX_REAP_HANDLES, WalReaper};
 pub use writer::{EvictionReport, RolloverHint, WalConfig, WalHandle, WalWorker, WalWriter};
 
 /// Default target size for sealing an active segment (`2 MiB`).
@@ -112,7 +114,9 @@ impl fmt::Display for WalError {
             Self::Io(err) => write!(f, "WAL I/O error: {err}"),
             Self::Wire(err) => write!(f, "WAL wire error: {err}"),
             Self::ChecksumMismatch(what) => write!(f, "WAL CRC32C mismatch in {what}"),
-            Self::ForeignDirectory => write!(f, "refusing pre-existing non-empty directory without meta.apkm"),
+            Self::ForeignDirectory => {
+                write!(f, "refusing foreign, non-private, or non-empty directory without meta.apkm")
+            }
             Self::SymlinkRefused => write!(f, "refusing symlinked recording path"),
             Self::AlreadyClaimed => write!(f, "recording directory is already open for writing"),
             Self::InvalidFormat(what) => write!(f, "invalid WAL format: {what}"),

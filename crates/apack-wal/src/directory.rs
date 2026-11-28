@@ -17,7 +17,10 @@ use std::sync::{Arc, Mutex};
 
 use crate::WalError;
 use crate::format::{META_LEN, RecordingMeta};
-use crate::safe_fs::{create_private_dir, create_private_file, read_regular_file_bounded, sync_dir, verify_real_dir};
+use crate::safe_fs::{
+    create_private_dir, create_private_file, read_regular_file_bounded, sync_dir, verify_private_dir_meta,
+    verify_real_dir,
+};
 
 /// Canonical filename for recording metadata inside the recording directory.
 pub const META_FILENAME: &str = "meta.apkm";
@@ -45,47 +48,63 @@ pub fn parse_segment_id(name: &str) -> Option<u64> {
     Some(id)
 }
 
+/// Validates that `dir` exists as a private, non-symlink directory (or creates it privately with
+/// `0o700` on Unix) WITHOUT touching or deleting any contents inside `dir`.
+///
+/// Callers opening a writer must acquire a [`WriterClaim`] BEFORE calling
+/// [`prepare_claimed_recording_dir`] so a concurrent writer cannot delete an in-flight `.meta.tmp-*`
+/// staging file before failing with [`WalError::AlreadyClaimed`].
+pub(crate) fn ensure_recording_dir(dir: &Path) -> Result<(), WalError> {
+    match fs::symlink_metadata(dir) {
+        Ok(meta) => verify_private_dir_meta(&meta, WalError::ForeignDirectory),
+        Err(_) => {
+            create_private_dir(dir)?;
+            Ok(())
+        }
+    }
+}
+
+fn inspect_or_clean_recording_dir(dir: &Path) -> Result<Option<RecordingMeta>, WalError> {
+    let meta_path = dir.join(META_FILENAME);
+    if fs::symlink_metadata(&meta_path).is_ok() {
+        return Ok(Some(read_meta(dir)?));
+    }
+    let mut stale_temps = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let is_meta_tmp = entry.file_name().to_str().is_some_and(|s| s.starts_with(".meta.tmp-"))
+            && fs::symlink_metadata(&path).is_ok_and(|m| m.is_file());
+        if is_meta_tmp {
+            stale_temps.push(path);
+        } else {
+            return Err(WalError::ForeignDirectory);
+        }
+    }
+    for tmp in stale_temps {
+        let _ = fs::remove_file(tmp);
+    }
+    Ok(None)
+}
+
+/// Inspects an already-claimed recording directory, returning `Ok(Some(meta))` if `meta.apkm` is
+/// present or cleaning leftover `.meta.tmp-*` staging files strictly under `claim`.
+pub(crate) fn prepare_claimed_recording_dir(
+    dir: &Path,
+    _claim: &WriterClaim,
+) -> Result<Option<RecordingMeta>, WalError> {
+    inspect_or_clean_recording_dir(dir)
+}
+
 /// Validates or creates `dir` for a WAL recording.
 ///
 /// Returns `Ok(Some(meta))` if `dir` already contains a valid `meta.apkm`, `Ok(None)` if `dir`
 /// was newly created or existed empty (or contained only leftover `.meta.tmp-*` crash staging
-/// files, which are cleaned up), or an error if `dir` is a symlink, not a directory, or a
-/// non-empty directory containing foreign files.
+/// files, which are cleaned up), or an error if `dir` is a symlink, not a directory, foreign/world-writable,
+/// or a non-empty directory containing foreign files.
 pub fn prepare_recording_dir(dir: &Path) -> Result<Option<RecordingMeta>, WalError> {
-    match fs::symlink_metadata(dir) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                return Err(WalError::SymlinkRefused);
-            }
-            if !meta.is_dir() {
-                return Err(WalError::ForeignDirectory);
-            }
-            let meta_path = dir.join(META_FILENAME);
-            if fs::symlink_metadata(&meta_path).is_ok() {
-                return Ok(Some(read_meta(dir)?));
-            }
-            let mut stale_temps = Vec::new();
-            for entry in fs::read_dir(dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                let is_meta_tmp = entry.file_name().to_str().is_some_and(|s| s.starts_with(".meta.tmp-"))
-                    && fs::symlink_metadata(&path).is_ok_and(|m| m.is_file());
-                if is_meta_tmp {
-                    stale_temps.push(path);
-                } else {
-                    return Err(WalError::ForeignDirectory);
-                }
-            }
-            for tmp in stale_temps {
-                let _ = fs::remove_file(tmp);
-            }
-            Ok(None)
-        }
-        Err(_) => {
-            create_private_dir(dir)?;
-            Ok(None)
-        }
-    }
+    ensure_recording_dir(dir)?;
+    inspect_or_clean_recording_dir(dir)
 }
 
 /// Reads and CRC32C-verifies `<dir>/meta.apkm`, refusing symlinks, non-regular files, and wrong sizes.

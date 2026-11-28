@@ -18,14 +18,52 @@ pub(crate) fn check_file_size(len: u64, max_bytes: u64, what: &'static str) -> R
     Ok(())
 }
 
-/// Validates that `dir` is a real directory (not a symlink or file).
-pub(crate) fn verify_real_dir(dir: &Path) -> Result<(), WalError> {
-    let meta = fs::symlink_metadata(dir)?;
+/// Rejects Unix directories not owned by the current effective user or writable by group/other.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn validate_unix_dir_owner_mode(uid: u32, euid: u32, mode: u32) -> Result<(), WalError> {
+    if uid != euid || (mode & 0o022) != 0 {
+        return Err(WalError::ForeignDirectory);
+    }
+    Ok(())
+}
+
+/// Validates already-stat'd directory metadata: rejects symlinks, non-directories, and (on Unix)
+/// foreign-owned or group/world-writable directories.
+pub(crate) fn verify_private_dir_meta(meta: &fs::Metadata, non_dir_err: WalError) -> Result<(), WalError> {
     if meta.file_type().is_symlink() {
         return Err(WalError::SymlinkRefused);
     }
     if !meta.is_dir() {
-        return Err(WalError::InvalidFormat("path is not a directory"));
+        return Err(non_dir_err);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        validate_unix_dir_owner_mode(meta.uid(), apack_os::current_euid(), meta.mode())?;
+    }
+    Ok(())
+}
+
+/// Validates that `dir` is a real, user-owned, non-group/world-writable directory (not a symlink or file).
+pub(crate) fn verify_real_dir(dir: &Path) -> Result<(), WalError> {
+    let meta = fs::symlink_metadata(dir)?;
+    verify_private_dir_meta(&meta, WalError::InvalidFormat("path is not a directory"))
+}
+
+/// Windows `FILE_FLAG_OPEN_REPARSE_POINT`: opens a symlink/reparse point itself instead of
+/// following its target, closing the TOCTOU gap between `symlink_metadata` and `CreateFileW`.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const WIN_FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+/// Windows `FILE_ATTRIBUTE_REPARSE_POINT` bit reported by `MetadataExt::file_attributes`.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const WIN_FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+
+/// Rejects an opened Windows handle whose attributes indicate a reparse point / symlink.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn validate_reparse_attributes(file_attributes: u32) -> Result<(), WalError> {
+    if (file_attributes & WIN_FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        return Err(WalError::SymlinkRefused);
     }
     Ok(())
 }
@@ -56,6 +94,11 @@ fn open_regular(path: &Path, write: bool, what: &'static str) -> Result<(File, f
         use std::os::unix::fs::OpenOptionsExt;
         opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.custom_flags(WIN_FILE_FLAG_OPEN_REPARSE_POINT);
+    }
     let file = opts.open(path).map_err(|err| {
         #[cfg(unix)]
         match err.raw_os_error() {
@@ -66,6 +109,11 @@ fn open_regular(path: &Path, write: bool, what: &'static str) -> Result<(File, f
         WalError::Io(err)
     })?;
     let fstat = file.metadata()?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        validate_reparse_attributes(fstat.file_attributes())?;
+    }
     if !fstat.is_file() {
         return Err(WalError::InvalidFormat(what));
     }

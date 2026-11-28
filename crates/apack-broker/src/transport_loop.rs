@@ -441,9 +441,11 @@ pub(crate) fn run_control_reactor(
 
     let (reactor_tx, reactor_rx) = mpsc::channel::<ReactorEvent>();
     let image_store = Arc::new(Mutex::new(ImageStore::default()));
+    let wal_reaper = apack_wal::WalReaper::new();
     let shared = ShardShared {
         image_store: Arc::clone(&image_store),
         wal_registry: apack_wal::RecordingRegistry::new(),
+        wal_reaper: wal_reaper.clone(),
         wal_config: config.wal_config,
         idle_compress_after: config.idle_compress_after,
         kill_escalate_after: config.kill_escalate_after,
@@ -602,6 +604,9 @@ pub(crate) fn run_control_reactor(
     for mut shard in state.shards.drain(..) {
         shard.shutdown();
     }
+    // Give healthy closing WAL workers a bounded window to finish their final segment seal on
+    // broker shutdown without ever hanging on stalled storage (e.g. disconnected NFS/USB).
+    let _ = wal_reaper.drain_bounded(Duration::from_secs(2));
     #[cfg(unix)]
     {
         let _ = std::fs::remove_file(&config.socket_path);

@@ -22,16 +22,21 @@ use crate::directory::{
     segment_filename,
 };
 use crate::format::{
-    EngineCheckpoint, FORMAT_VERSION, GapReason, KeyframeV2, MAX_RECORD_PAYLOAD, META_LEN, META_MAGIC, MIN_RECORD_LEN,
+    EngineCheckpoint, FORMAT_VERSION, GapReason, KeyframeV2, MAX_ENGINE_SNAPSHOT_BYTES, MAX_RECORD_PAYLOAD,
+    MAX_VISUAL_ALT_ROWS, MAX_VISUAL_IMAGES, MAX_VISUAL_PRIMARY_ROWS, META_LEN, META_MAGIC, MIN_RECORD_LEN,
     RECORD_FLAG_ZLIB, RECORD_HEADER_LEN, RecordingMeta, SEGMENT_FOOTER_LEN, SEGMENT_FOOTER_MAGIC, SegmentFooter,
     VisualKeyframe, WalRecord, check_payload_limit, decode_one_record, encode_framed_record, hash_segment_records,
-    scan_segment,
+    is_oversized_engine_snapshot, needs_zlib_limit_check, scan_segment,
 };
 use crate::reader::{WalReader, read_sealed_header_and_footer, try_read_footer};
-use crate::safe_fs::{check_file_size, open_regular_rw, read_regular_file_bounded, sync_dir, validate_lstat};
+use crate::reaper::{MAX_REAP_HANDLES, WalReaper, global_reaper};
+use crate::safe_fs::{
+    WIN_FILE_ATTRIBUTE_REPARSE_POINT, check_file_size, open_regular_rw, read_regular_file_bounded, sync_dir,
+    validate_lstat, validate_reparse_attributes, validate_unix_dir_owner_mode,
+};
 use crate::writer::{
-    MAX_CONTROL_QUEUE_LEN, RolloverHint, WalConfig, WalWorker, WalWriter, should_worker_wait, try_reserve_backlog,
-    try_reserve_blob_backlog,
+    MAX_CONTROL_QUEUE_LEN, RolloverHint, WalConfig, WalHandle, WalWorker, WalWriter, should_worker_wait,
+    try_reserve_backlog, try_reserve_blob_backlog,
 };
 use crate::{
     DEFAULT_BUDGET_BYTES, DEFAULT_MAX_BACKLOG_BYTES, DEFAULT_MAX_NON_GROUND_BYTES, DEFAULT_SEGMENT_TARGET_BYTES,
@@ -525,12 +530,34 @@ fn torn_tail_crash_recovery_at_every_byte_offset_and_earlier_unsealed_repair() {
         assert_eq!(latest.tail_records[1].record, WalRecord::Output(b"recovered-ok".to_vec()));
     }
 
-    // Earlier unsealed segment + corrupt earlier segment are repaired/removed cleanly on reopen!
+    // Corrupt non-tail segments must NEVER be silently deleted or truncated (preserving timeline integrity).
     fs::write(rec_dir.join("seg-000001.apks"), &full_bytes[..clean_len]).unwrap(); // unsealed earlier
-    fs::write(rec_dir.join("seg-000002.apks"), b"corrupt-earlier-seg").unwrap(); // corrupt earlier
+    fs::write(rec_dir.join("seg-000002.apks"), b"corrupt-earlier-seg").unwrap(); // corrupt earlier (bad record 0)
     fs::write(rec_dir.join("seg-000003.apks"), &full_bytes[..clean_len]).unwrap(); // active tail
+    assert!(matches!(
+        WalWriter::open_or_create(&rec_dir, [2; 16], 100, WalConfig::default(), registry.clone()),
+        Err(WalError::CorruptSegment(_))
+    ));
+    assert!(rec_dir.join("seg-000002.apks").exists(), "corrupt non-tail segment must be preserved on disk");
+
+    // Non-tail segment with valid record 0 + trailing garbage must ALSO fail without truncation!
+    let mut corrupt_tail_seg = full_bytes[..clean_len].to_vec();
+    corrupt_tail_seg.extend_from_slice(b"corrupt-trailing-garbage");
+    let corrupt_len = corrupt_tail_seg.len() as u64;
+    fs::write(rec_dir.join("seg-000002.apks"), &corrupt_tail_seg).unwrap();
+    assert!(matches!(
+        WalWriter::open_or_create(&rec_dir, [2; 16], 100, WalConfig::default(), registry.clone()),
+        Err(WalError::CorruptSegment(_))
+    ));
+    assert_eq!(
+        fs::metadata(rec_dir.join("seg-000002.apks")).unwrap().len(),
+        corrupt_len,
+        "corrupt non-tail segment must not be silently truncated"
+    );
+
+    // Once the corrupt middle segment is removed externally, an earlier unsealed segment repairs cleanly.
+    fs::remove_file(rec_dir.join("seg-000002.apks")).unwrap();
     let resumed = WalWriter::open_or_create(&rec_dir, [2; 16], 100, WalConfig::default(), registry.clone()).unwrap();
-    assert!(!rec_dir.join("seg-000002.apks").exists(), "corrupt earlier segment removed");
     assert_eq!(resumed.segment_count(), 2);
     assert_eq!(
         resumed.total_segment_bytes(),
@@ -540,7 +567,7 @@ fn torn_tail_crash_recovery_at_every_byte_offset_and_earlier_unsealed_repair() {
     assert!(try_read_footer(&rec_dir.join("seg-000001.apks")).unwrap().is_some(), "earlier unsealed segment sealed");
     drop(resumed);
 
-    // Corrupting record 0 entirely removes the unusable segment cleanly.
+    // Corrupting record 0 on the active TAIL segment removes the torn tail cleanly.
     fs::remove_file(rec_dir.join("seg-000001.apks")).unwrap();
     fs::write(rec_dir.join("seg-000003.apks"), &full_bytes[..10]).unwrap();
     let resumed2 = WalWriter::open_or_create(&rec_dir, [2; 16], 100, WalConfig::default(), registry.clone()).unwrap();
@@ -593,25 +620,28 @@ fn rollover_budget_eviction_pin_protection_live_blob_safety_and_gc() {
     assert_eq!(ev1.evicted_segments, 0);
     writer.record_output(2_100, &vec![b'B'; 4_500], true).unwrap();
 
-    // Stage blob3 right before rolling to seg-3 -> seg-1 stays pinned, seg-2 evicted, blob2 swept, blob1+blob3 kept!
+    // Stage blob3 right before rolling to seg-3 -> seg-1 is pinned, so eviction MUST STOP at seg-1
+    // and keep seg-2 intact (no timeline hole!), preserving blob1, blob2, and blob3 until unpinned!
     let blob3 = writer.write_blob(ImageEncoding::Png, b"image-blob-seg-3").unwrap();
     let ev2 = writer.start_segment_with_keyframe(3_000, &sample_keyframe(Some(blob3), None, None)).unwrap();
     assert!(rec_dir.join("seg-000001.apks").exists(), "pinned seg-1 must not be unlinked");
+    assert!(rec_dir.join("seg-000002.apks").exists(), "seg-2 must not be evicted past pinned seg-1 (no timeline hole)");
     assert_eq!(ev2.skipped_pinned, 1);
-    assert_eq!(ev2.evicted_segments, 1);
-    assert!(!rec_dir.join("seg-000002.apks").exists(), "unpinned seg-2 evicted");
-    // Note: blob2 was also written during seg-1 so seg-1's referenced_blobs includes it until seg-1 is evicted.
+    assert_eq!(ev2.evicted_segments, 0);
     assert!(rec_dir.join("blobs").join(blob_filename(blob1, ImageEncoding::Png)).exists(), "blob1 kept for seg-1");
+    assert!(rec_dir.join("blobs").join(blob_filename(blob2, ImageEncoding::Png)).exists(), "blob2 kept for seg-2");
     assert!(rec_dir.join("blobs").join(blob_filename(blob3, ImageEncoding::Png)).exists(), "blob3 kept for seg-3");
 
-    // Mid-segment live blob written during seg-3 is NOT deleted when seg-1 is evicted!
+    // Once seg-1 is unpinned, chronological eviction removes seg-1 AND seg-2 and sweeps blob1 + blob2,
+    // while keeping mid-segment live blob written during seg-3!
     let live_mid = writer.write_blob(ImageEncoding::Png, b"mid-segment-live-blob").unwrap();
     drop(reader_pinning_seg1);
     writer.record_output(3_100, &vec![b'C'; 4_500], true).unwrap();
     let ev3 = writer.evict_to_budget().unwrap();
-    assert_eq!(ev3.evicted_segments, 1);
-    assert_eq!(ev3.swept_blobs, 2); // blob1 + blob2 swept once seg-1 is gone!
+    assert_eq!(ev3.evicted_segments, 2);
+    assert_eq!(ev3.swept_blobs, 2); // blob1 + blob2 swept once seg-1 and seg-2 are gone!
     assert!(!rec_dir.join("seg-000001.apks").exists());
+    assert!(!rec_dir.join("seg-000002.apks").exists());
     assert!(!rec_dir.join("blobs").join(blob_filename(blob1, ImageEncoding::Png)).exists());
     assert!(!rec_dir.join("blobs").join(blob_filename(blob2, ImageEncoding::Png)).exists());
     assert!(rec_dir.join("blobs").join(blob_filename(blob3, ImageEncoding::Png)).exists());
@@ -1082,6 +1112,7 @@ fn worker_backlog_accounting_failure_propagation_and_drop_cleanup() {
     let writer1 = WalWriter::open_or_create(&rec1, [11; 16], 100, cfg, registry.clone()).unwrap();
     let h1 = WalWorker::spawn(writer1);
     assert!(h1.start_segment(100, sample_keyframe(None, None, None)));
+    h1.flush_barrier_timeout(Duration::from_secs(2)).unwrap();
     assert!(h1.write_output(110, vec![b'x'; 100], true));
     h1.flush_barrier_timeout(Duration::from_secs(2)).unwrap();
     assert!(h1.write_blob(ImageEncoding::Png, vec![b'p'; 100]));
@@ -1128,8 +1159,17 @@ fn worker_backlog_accounting_failure_propagation_and_drop_cleanup() {
     let mut blob_q = 0usize;
     assert!(try_reserve_blob_backlog(&mut blob_q, 512, 128), "empty queue admits single blob > max_backlog");
     assert_eq!(blob_q, 512);
-    assert!(!try_reserve_blob_backlog(&mut blob_q, 10, 128), "non-empty queue enforces max_backlog");
+    assert!(!try_reserve_blob_backlog(&mut blob_q, 512, 128), "second oversized blob refused while over budget");
+    assert!(!try_reserve_blob_backlog(&mut blob_q, 10, 128), "non-empty over-budget queue enforces max_backlog");
     assert_eq!(blob_q, 512);
+    // Exact boundary: queued == max_backlog still admits one oversized blob (cost > max_backlog),
+    // whereas cost == max_backlog does NOT bypass when queued > 0.
+    let mut boundary_q = 128usize;
+    assert!(!try_reserve_blob_backlog(&mut boundary_q, 128, 128));
+    assert_eq!(boundary_q, 128);
+    assert!(try_reserve_blob_backlog(&mut boundary_q, 129, 128));
+    assert_eq!(boundary_q, 257);
+    assert!(!try_reserve_blob_backlog(&mut boundary_q, 129, 128));
 }
 
 #[test]
@@ -1555,4 +1595,480 @@ fn seam4_sha256_footer_tail_validation_safe_rw_wal_blob_and_control_rollover_hin
         cw.record_output_capped(115, b"ok", true, cur2 + (SEGMENT_FOOTER_LEN as u64) + 5).unwrap(),
         RolloverHint::NeedKeyframe
     );
+}
+
+#[test]
+fn pr4_async_close_reaper_panic_guard_backlog_atomic_degrade_and_security() {
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    let tmp = tempdir().unwrap();
+    let registry = RecordingRegistry::new();
+
+    // 1. H1: Non-blocking `close_async_into` + `WalReaper` bounded cap + background reaping + clean drop.
+    assert!(std::ptr::eq(global_reaper(), global_reaper()), "global_reaper must return the same singleton");
+    let reaper = WalReaper::with_max_handles(2);
+    let reaper_probe = reaper.probe();
+    assert!(format!("{reaper:?}").contains("WalReaper"));
+    let _default_reaper = WalReaper::default();
+    assert_eq!(MAX_REAP_HANDLES, 64);
+
+    let (tx1, rx1) = mpsc::channel();
+    let blocked1 = WalHandle::spawn_test_blocked(rx1);
+    let t0 = Instant::now();
+    reaper.close_async(blocked1);
+    assert!(t0.elapsed() < Duration::from_millis(250), "close_async must return without blocking");
+    assert!(!reaper.drain_bounded(Duration::from_millis(30)), "drain_bounded must return false while worker is hung");
+    assert_eq!(reaper.pending_count(), 1);
+
+    // Enqueue 2 more hung workers -> bounded cap=2 detaches the oldest so pending_count never exceeds 2.
+    let (tx2, rx2) = mpsc::channel();
+    let (tx3, rx3) = mpsc::channel();
+    reaper.close_async(WalHandle::spawn_test_blocked(rx2));
+    reaper.close_async(WalHandle::spawn_test_blocked(rx3));
+    assert_eq!(reaper.pending_count(), 2);
+
+    // Unblock all 3 workers and confirm the background reaper loop itself reaps them (raw_pending_len == 0).
+    let _ = tx1.send(());
+    let _ = tx2.send(());
+    let _ = tx3.send(());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while reaper.raw_pending_len() != 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(reaper.raw_pending_len(), 0, "background reaper thread must join completed workers");
+    assert!(reaper.drain_bounded(Duration::from_millis(100)));
+    assert!(!reaper_probe.is_shutting_down());
+    assert!(reaper_probe.is_started(), "background reaper stays alive waiting while idle");
+    drop(reaper);
+    let stop_dl = Instant::now() + Duration::from_secs(2);
+    while reaper_probe.is_started() && Instant::now() < stop_dl {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(reaper_probe.is_shutting_down(), "ReaperGuard::drop must signal shutting_down");
+    assert!(!reaper_probe.is_started(), "background reaper thread must exit once WalReaper drops");
+
+    // Standalone `WalHandle::close_async` on a blocked worker must return immediately (not join in Drop!).
+    let (gtx, grx) = mpsc::channel();
+    let t_global = Instant::now();
+    WalHandle::spawn_test_blocked(grx).close_async();
+    assert!(t_global.elapsed() < Duration::from_millis(250), "standalone close_async must not block");
+    let _ = gtx.send(());
+
+    // Standalone `WalHandle::close_async` on a real writer seals/finishes and releases WriterClaim asynchronously.
+    let async_dir = tmp.path().join("async-close");
+    let writer = WalWriter::open_or_create(&async_dir, [41; 16], 100, WalConfig::default(), registry.clone()).unwrap();
+    let handle = WalWorker::spawn(writer);
+    assert!(handle.start_segment(100, sample_keyframe(None, None, None)));
+    assert!(handle.write_output(110, b"async-sealed".to_vec(), true));
+    assert!(handle.seal());
+    handle.close_async();
+    let release_dl = Instant::now() + Duration::from_secs(3);
+    while registry.is_claimed(&async_dir) && Instant::now() < release_dl {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!registry.is_claimed(&async_dir), "async closed worker must exit and release WriterClaim");
+
+    // 2. Panic RAII `DoneGuard`: panicking worker unblocks `flush_barrier_timeout` immediately with WorkerClosed.
+    let panicking = WalHandle::spawn_test_panicking();
+    let t_panic = Instant::now();
+    let panic_res = panicking.flush_barrier_timeout(Duration::from_secs(5));
+    assert!(matches!(panic_res, Err(WalError::WorkerClosed)), "expected WorkerClosed, got {panic_res:?}");
+    assert!(t_panic.elapsed() < Duration::from_secs(2), "DoneGuard must unblock immediately on panic");
+
+    // 3. `needs_zlib_limit_check`, `estimated_memory_bytes`, `fits_limits`, structural pre-clamping, & `degrade_to_limits`.
+    assert!(!needs_zlib_limit_check(0, 64));
+    assert!(needs_zlib_limit_check(0, 63));
+    assert!(!needs_zlib_limit_check(80, 80 + 10 + 64));
+    assert!(needs_zlib_limit_check(80, 80 + 10 + 63));
+    assert!(!is_oversized_engine_snapshot(MAX_ENGINE_SNAPSHOT_BYTES));
+    assert!(is_oversized_engine_snapshot(MAX_ENGINE_SNAPSHOT_BYTES + 1));
+    assert!(is_oversized_engine_snapshot(MAX_ENGINE_SNAPSHOT_BYTES + 2));
+
+    let small_kf = sample_keyframe(None, None, None);
+    let small_est = small_kf.estimated_memory_bytes();
+    let small_raw_len = small_kf.encode_uncompressed().len();
+    assert!(small_est > 128);
+    assert!(small_kf.fits_limits(small_raw_len, 1 << 20), "exact raw.len() == max_uncompressed must fit");
+    assert!(!small_kf.fits_limits(small_raw_len - 1, 1 << 20), "raw.len() > max_uncompressed must not fit");
+    // Exercise compressed-size branch when raw.len() > max_compressed (compressible payload still fits!).
+    let mut comp_kf = sample_keyframe(None, None, None);
+    comp_kf.visual.primary_rows = vec![PackedRow {
+        line: 0,
+        text: "A".repeat(4_000),
+        styles: Vec::new(),
+        runs: Vec::new(),
+        flags: 0,
+        links: Vec::new(),
+        pieces: Vec::new(),
+    }];
+    let comp_raw = comp_kf.encode_uncompressed();
+    let comp_zlen = miniz_oxide::deflate::compress_to_vec_zlib(&comp_raw, 4).len();
+    assert!(comp_zlen < comp_raw.len());
+    assert!(comp_kf.fits_limits(comp_raw.len(), comp_zlen), "exact compressed length must fit");
+    assert!(!comp_kf.fits_limits(comp_raw.len(), comp_zlen - 1), "compressed length > max_compressed must fail");
+
+    // Pre-clamping structural bounds (`images`, `commands`, `primary_rows`, `alt_rows`, `engine`)
+    // must NOT wipe valid rows before clamping the over-bound field!
+    let mut over_bound = sample_keyframe(Some(hash_blob(b"keep")), None, Some([0x77; 32]));
+    over_bound.visual.primary_rows = vec![PackedRow {
+        line: 0,
+        text: String::from("MUST_SURVIVE_PRECLAMP"),
+        styles: Vec::new(),
+        runs: Vec::new(),
+        flags: 0,
+        links: Vec::new(),
+        pieces: Vec::new(),
+    }];
+    let base_img = over_bound.visual.images[0];
+    over_bound.visual.images = vec![base_img; MAX_VISUAL_IMAGES + 3];
+    let base_cmd = over_bound.visual.commands[0].clone();
+    over_bound.visual.commands = vec![base_cmd; MAX_COMMANDS + 2];
+    over_bound.engine = Some(EngineCheckpoint {
+        engine_abi_hash: [0x77; 32],
+        snapshot_bytes: vec![0u8; MAX_ENGINE_SNAPSHOT_BYTES + 1],
+    });
+    assert!(over_bound.degrade_to_limits(1 << 24, 1 << 24));
+    assert_eq!(over_bound.visual.images.len(), MAX_VISUAL_IMAGES);
+    assert_eq!(over_bound.visual.commands.len(), MAX_COMMANDS);
+    assert!(over_bound.engine.is_none());
+    assert_eq!(
+        over_bound.visual.primary_rows.len(),
+        1,
+        "pre-clamping over-bound images/commands/engine must preserve valid primary_rows"
+    );
+    assert_eq!(over_bound.visual.primary_rows[0].text, "MUST_SURVIVE_PRECLAMP");
+    // Also cover each structural pre-clamp independently so `|=` vs `&=` is verified on every field.
+    let empty_row = PackedRow {
+        line: 0,
+        text: String::new(),
+        styles: Vec::new(),
+        runs: Vec::new(),
+        flags: 0,
+        links: Vec::new(),
+        pieces: Vec::new(),
+    };
+    let mut over_pri = sample_keyframe(None, None, None);
+    over_pri.visual.primary_rows = vec![empty_row.clone(); MAX_VISUAL_PRIMARY_ROWS + 1];
+    assert!(over_pri.degrade_to_limits(1 << 24, 1 << 24));
+    assert_eq!(over_pri.visual.primary_rows.len(), MAX_VISUAL_PRIMARY_ROWS);
+
+    let mut over_alt = sample_keyframe(None, None, None);
+    over_alt.visual.alt_rows = vec![empty_row; MAX_VISUAL_ALT_ROWS + 1];
+    assert!(over_alt.degrade_to_limits(1 << 24, 1 << 24));
+    assert_eq!(over_alt.visual.alt_rows.len(), MAX_VISUAL_ALT_ROWS);
+
+    let mut over_img_only = sample_keyframe(Some(hash_blob(b"i-only")), None, None);
+    over_img_only.visual.images = vec![base_img; MAX_VISUAL_IMAGES + 1];
+    assert!(over_img_only.degrade_to_limits(1 << 24, 1 << 24));
+    assert_eq!(over_img_only.visual.images.len(), MAX_VISUAL_IMAGES);
+
+    let mut unchanged = small_kf.clone();
+    assert!(!unchanged.degrade_to_limits(small_raw_len, 1 << 20), "already-fitting keyframe must not degrade");
+    assert_eq!(unchanged, small_kf);
+
+    // 3a. History rows above viewport trimmed first (len=3, vp_rows=1 -> (3-1).div_ceil(2)=1 keeps 2 rows,
+    //     whereas mutated (3/1).div_ceil(2)=2 would over-drop to 1 row!).
+    let mut hist_kf = sample_keyframe(None, None, Some([0x33; 32]));
+    hist_kf.visual.size = GridSize::new(80, 1).unwrap();
+    hist_kf.visual.primary_rows = (0..3u64)
+        .map(|i| PackedRow {
+            line: i,
+            text: format!("row-{i:02}-{}", "X".repeat(200)),
+            styles: Vec::new(),
+            runs: Vec::new(),
+            flags: 0,
+            links: Vec::new(),
+            pieces: Vec::new(),
+        })
+        .collect();
+    hist_kf.engine = Some(EngineCheckpoint { engine_abi_hash: [0x33; 32], snapshot_bytes: vec![0xAA; 64] });
+    assert!(hist_kf.estimated_memory_bytes() > small_est);
+    let mut keep_two_kf = hist_kf.clone();
+    keep_two_kf.visual.primary_rows.drain(..1);
+    let exact_two_raw = keep_two_kf.encode_uncompressed().len();
+    assert!(hist_kf.degrade_to_limits(exact_two_raw, 1 << 20));
+    assert_eq!(hist_kf.visual.primary_rows.len(), 2, "must drop exactly 1 history row and keep 2 rows");
+    assert!(hist_kf.visual.primary_rows[0].text.starts_with("row-01-"));
+    assert!(hist_kf.engine.is_some(), "engine snapshot preserved when trimming history suffices");
+
+    // 3b. Engine checkpoint dropped before sacrificing viewport rows.
+    let mut eng_kf = sample_keyframe(None, None, Some([0x44; 32]));
+    eng_kf.visual.size = GridSize::new(80, 2).unwrap();
+    eng_kf.visual.primary_rows = vec![
+        PackedRow {
+            line: 0,
+            text: "P0".repeat(40),
+            styles: Vec::new(),
+            runs: Vec::new(),
+            flags: 0,
+            links: Vec::new(),
+            pieces: Vec::new(),
+        },
+        PackedRow {
+            line: 1,
+            text: "P1".repeat(40),
+            styles: Vec::new(),
+            runs: Vec::new(),
+            flags: 0,
+            links: Vec::new(),
+            pieces: Vec::new(),
+        },
+    ];
+    eng_kf.engine = Some(EngineCheckpoint { engine_abi_hash: [0x44; 32], snapshot_bytes: vec![0xBB; 1024] });
+    let mut no_eng = eng_kf.clone();
+    no_eng.engine = None;
+    let no_eng_raw = no_eng.encode_uncompressed().len();
+    assert!(eng_kf.degrade_to_limits(no_eng_raw, 1 << 20));
+    assert!(eng_kf.engine.is_none());
+    assert_eq!(eng_kf.visual.primary_rows.len(), 2, "viewport rows preserved when dropping engine suffices");
+
+    // 3c. Viewport `primary_rows` trimmed when alone over limit, preserving `images` & `commands`.
+    let mut pri_kf = sample_keyframe(Some(hash_blob(b"i1")), None, None);
+    pri_kf.visual.size = GridSize::new(80, 2).unwrap();
+    pri_kf.visual.primary_rows = (0..2u64)
+        .map(|i| PackedRow {
+            line: i,
+            text: format!("P{i}-{}", "Q".repeat(300)),
+            styles: Vec::new(),
+            runs: Vec::new(),
+            flags: 0,
+            links: Vec::new(),
+            pieces: Vec::new(),
+        })
+        .collect();
+    let mut pri_empty = pri_kf.clone();
+    pri_empty.visual.primary_rows.clear();
+    let pri_empty_raw = pri_empty.encode_uncompressed().len();
+    assert!(pri_kf.degrade_to_limits(pri_empty_raw, 1 << 20));
+    assert!(pri_kf.fits_limits(pri_empty_raw, 1 << 20));
+    assert!(pri_kf.visual.primary_rows.is_empty());
+    assert!(!pri_kf.visual.images.is_empty(), "images preserved when trimming primary_rows suffices");
+    assert!(!pri_kf.visual.commands.is_empty(), "commands preserved when trimming primary_rows suffices");
+
+    // 3d. `alt_rows` trimmed when alone over limit, preserving `images` & `commands`.
+    let mut alt_kf = sample_keyframe(Some(hash_blob(b"i2")), None, None);
+    alt_kf.visual.primary_rows.clear();
+    alt_kf.visual.active_alt_screen = true;
+    alt_kf.visual.alt_rows = (0..2u64)
+        .map(|i| PackedRow {
+            line: i,
+            text: format!("A{i}-{}", "Z".repeat(300)),
+            styles: Vec::new(),
+            runs: Vec::new(),
+            flags: 0,
+            links: Vec::new(),
+            pieces: Vec::new(),
+        })
+        .collect();
+    let mut alt_empty = alt_kf.clone();
+    alt_empty.visual.alt_rows.clear();
+    let alt_empty_raw = alt_empty.encode_uncompressed().len();
+    assert!(alt_kf.degrade_to_limits(alt_empty_raw, 1 << 20));
+    assert!(alt_kf.fits_limits(alt_empty_raw, 1 << 20));
+    assert!(alt_kf.visual.alt_rows.is_empty());
+    assert!(!alt_kf.visual.images.is_empty());
+    assert!(!alt_kf.visual.commands.is_empty());
+
+    // 3e. `images` trimmed when alone over limit, preserving `commands`.
+    let mut img_kf = sample_keyframe(Some(hash_blob(b"i3")), None, None);
+    img_kf.visual.primary_rows.clear();
+    img_kf.visual.alt_rows.clear();
+    let mut img_empty = img_kf.clone();
+    img_empty.visual.images.clear();
+    let img_empty_raw = img_empty.encode_uncompressed().len();
+    assert!(img_kf.degrade_to_limits(img_empty_raw, 1 << 20));
+    assert!(img_kf.fits_limits(img_empty_raw, 1 << 20));
+    assert!(img_kf.visual.images.is_empty());
+    assert!(!img_kf.visual.commands.is_empty(), "commands preserved when trimming images suffices");
+
+    // 3f. `commands` trimmed when alone over limit.
+    let mut cmd_kf = img_empty.clone();
+    let mut cmd_empty = cmd_kf.clone();
+    cmd_empty.visual.commands.clear();
+    let cmd_empty_raw = cmd_empty.encode_uncompressed().len();
+    assert!(cmd_kf.degrade_to_limits(cmd_empty_raw, 1 << 20));
+    assert!(cmd_kf.fits_limits(cmd_empty_raw, 1 << 20));
+    assert!(cmd_kf.visual.commands.is_empty());
+
+    // 4. Keyframe backlog charging (`start_segment`) + `write_output_atomic` + `record_backlog_gap`.
+    let bl_dir = tmp.path().join("backlog-atomic");
+    let bl_cfg = WalConfig { max_backlog_bytes: 200, ..WalConfig::default() };
+    let bl_writer = WalWriter::open_or_create(&bl_dir, [42; 16], 100, bl_cfg, registry.clone()).unwrap();
+    let bl_handle = WalWorker::spawn(bl_writer);
+    assert_eq!(bl_handle.max_backlog_bytes(), 200);
+    // Single keyframe > max_backlog_bytes is admitted on an empty queue.
+    assert!(bl_handle.start_segment(100, sample_keyframe(None, None, None)));
+    bl_handle.flush_barrier().unwrap();
+
+    // Atomic multi-chunk write within cap succeeds completely.
+    assert!(bl_handle.write_output_atomic(110, vec![(vec![], false)]));
+    assert!(bl_handle.write_output_atomic(
+        111,
+        vec![(b"\x1b_Gm=1;AAA".to_vec(), false), (b"\x1b\\\x1b_Gm=0;BBB\x1b\\".to_vec(), true)],
+    ));
+    // Atomic multi-chunk write exceeding cap writes ZERO chunks and emits ONE Gap for the total!
+    assert!(!bl_handle.write_output_atomic(112, vec![(vec![b'1'; 120], false), (vec![b'2'; 120], true)],));
+    // Explicit `record_backlog_gap` ignores 0 and coalesces non-zero gaps.
+    assert!(!bl_handle.record_backlog_gap(113, 0));
+    assert!(bl_handle.record_backlog_gap(114, 60));
+    assert!(bl_handle.seal());
+    bl_handle.shutdown().unwrap();
+
+    let bl_reader = WalReader::open(&bl_dir, &registry).unwrap();
+    let bl_slice = bl_reader.latest_segment_records().unwrap().unwrap();
+    assert!(
+        bl_slice.tail_records.len() == 3 || bl_slice.tail_records.len() == 4,
+        "expected 2 outputs + 1 coalesced (or 2 separate) BacklogOverflow gaps, got {:?}",
+        bl_slice.tail_records
+    );
+    assert_eq!(bl_slice.tail_records[0].record, WalRecord::Output(b"\x1b_Gm=1;AAA".to_vec()));
+    assert_eq!(bl_slice.tail_records[1].record, WalRecord::Output(b"\x1b\\\x1b_Gm=0;BBB\x1b\\".to_vec()));
+    let gap_total: u64 = bl_slice.tail_records[2..]
+        .iter()
+        .map(|r| match r.record {
+            WalRecord::Gap { dropped_bytes, reason: GapReason::BacklogOverflow } => dropped_bytes,
+            ref other => panic!("expected BacklogOverflow gap after outputs, got {other:?}"),
+        })
+        .sum();
+    assert_eq!(gap_total, 300);
+    drop(bl_reader);
+
+    // Keyframe backlog rejection when queue is non-empty, plus control_queued accounting & closed check!
+    let (block_tx, block_rx) = mpsc::channel();
+    let blocked_kf = WalHandle::spawn_test_blocked(block_rx);
+    assert!(blocked_kf.start_segment(100, sample_keyframe(None, None, None)));
+    for i in 1..MAX_CONTROL_QUEUE_LEN {
+        assert!(
+            blocked_kf.write_resize(100 + i as u64, GridSize::new(80, 24).unwrap(), CellPx::default()),
+            "control slot {i} must succeed"
+        );
+    }
+    // `control_queued` is now exactly MAX_CONTROL_QUEUE_LEN (proving `start_segment` incremented it by 1).
+    assert!(
+        !blocked_kf.write_resize(9_999, GridSize::new(80, 24).unwrap(), CellPx::default()),
+        "control queue must reject once start_segment + resizes fill MAX_CONTROL_QUEUE_LEN"
+    );
+    assert!(
+        !blocked_kf.start_segment(10_000, sample_keyframe(None, None, None)),
+        "start_segment must reject when control queue is full"
+    );
+    let _ = block_tx.send(());
+    blocked_kf.close_async();
+
+    // Separate blocked handle verifying backlog rejection (with control_queued < cap),
+    // `start_segment_on_close` terminal bypass + control_queued/closed/failed bounds.
+    let (block_tx2, block_rx2) = mpsc::channel();
+    let mut blocked_kf2 = WalHandle::spawn_test_blocked(block_rx2);
+    assert!(blocked_kf2.write_output(100, vec![b'z'; 900], true));
+    assert!(
+        !blocked_kf2.start_segment(101, sample_keyframe(None, None, None)),
+        "start_segment must reject when queued_bytes + keyframe_cost > max_backlog_bytes"
+    );
+    assert!(
+        blocked_kf2.start_segment_on_close(101, sample_keyframe(None, None, None)),
+        "start_segment_on_close must admit a single terminal keyframe despite blob backlog"
+    );
+    for i in 1..MAX_CONTROL_QUEUE_LEN {
+        assert!(blocked_kf2.write_resize(200 + i as u64, GridSize::new(80, 24).unwrap(), CellPx::default()));
+    }
+    assert!(
+        !blocked_kf2.start_segment_on_close(9_999, sample_keyframe(None, None, None)),
+        "start_segment_on_close must still respect MAX_CONTROL_QUEUE_LEN"
+    );
+    let _ = block_tx2.send(());
+    blocked_kf2.stop_thread();
+    assert!(
+        !blocked_kf2.start_segment(102, sample_keyframe(None, None, None)),
+        "closed handle must reject start_segment"
+    );
+    assert!(
+        !blocked_kf2.start_segment_on_close(103, sample_keyframe(None, None, None)),
+        "closed handle must reject start_segment_on_close"
+    );
+    // Also verify `start_segment_on_close` rejects on a sticky-failed worker.
+    let fail_close_dir = tmp.path().join("fail-close-kf");
+    let fcw =
+        WalWriter::open_or_create(&fail_close_dir, [47; 16], 100, WalConfig::default(), registry.clone()).unwrap();
+    let fch = WalWorker::spawn(fcw);
+    assert!(fch.write_output(100, b"boom".to_vec(), true));
+    assert!(fch.flush_barrier().is_err());
+    assert!(!fch.start_segment_on_close(101, sample_keyframe(None, None, None)));
+    fch.close_async();
+
+    // 5. Out-of-order `WalRecord::Gap` fix in `record_output_capped`:
+    //    chunk 0 (16 MiB) exceeds hard_data_cap; trailing 100 bytes WOULD have fit but must be shed too!
+    let gap_order_dir = tmp.path().join("gap-order");
+    let mut gw =
+        WalWriter::open_or_create(&gap_order_dir, [43; 16], 100, WalConfig::default(), registry.clone()).unwrap();
+    gw.start_segment_with_keyframe(100, &sample_keyframe(None, None, None)).unwrap();
+    let cur_sz = gw.active_segment_size().unwrap();
+    let tight_cap = cur_sz + (SEGMENT_FOOTER_LEN as u64) + 1024 + 500;
+    let payload = vec![b'Q'; MAX_RECORD_PAYLOAD + 100];
+    assert_eq!(gw.record_output_capped(110, &payload, true, tight_cap).unwrap(), RolloverHint::NeedKeyframe);
+    gw.seal_active().unwrap();
+    drop(gw);
+    let gap_reader = WalReader::open(&gap_order_dir, &registry).unwrap();
+    let gap_slice = gap_reader.latest_segment_records().unwrap().unwrap();
+    assert_eq!(gap_slice.tail_records.len(), 1, "trailing small chunk must not be written ahead of Gap");
+    assert_eq!(
+        gap_slice.tail_records[0].record,
+        WalRecord::Gap { dropped_bytes: (MAX_RECORD_PAYLOAD + 100) as u64, reason: GapReason::BacklogOverflow }
+    );
+    drop(gap_reader);
+
+    // 6. `.meta.tmp-*` cleanup under `WriterClaim` + Unix owner/mode + Windows reparse checks.
+    let race_dir = tmp.path().join("meta-tmp-claim-race");
+    fs::create_dir(&race_dir).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&race_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let live_tmp = race_dir.join(".meta.tmp-live-1");
+    fs::write(&live_tmp, b"in-flight-meta").unwrap();
+    let held_claim = registry.claim_writer(&race_dir).unwrap();
+    assert!(matches!(
+        WalWriter::open_or_create(&race_dir, [44; 16], 100, WalConfig::default(), registry.clone()),
+        Err(WalError::AlreadyClaimed)
+    ));
+    assert!(live_tmp.exists(), "unclaimed writer must NEVER delete another writer's .meta.tmp-* file");
+    drop(held_claim);
+    // Once claim is released, stale `.meta.tmp-*` is cleaned cleanly under the new WriterClaim.
+    let w_after = WalWriter::open_or_create(&race_dir, [44; 16], 100, WalConfig::default(), registry.clone()).unwrap();
+    assert!(!live_tmp.exists(), "claimed writer cleans stale .meta.tmp-*");
+    drop(w_after);
+
+    assert!(validate_unix_dir_owner_mode(1000, 1000, 0o700).is_ok());
+    assert!(validate_unix_dir_owner_mode(1000, 1000, 0o755).is_ok());
+    assert!(matches!(validate_unix_dir_owner_mode(1001, 1000, 0o700), Err(WalError::ForeignDirectory)));
+    assert!(matches!(validate_unix_dir_owner_mode(1000, 1000, 0o775), Err(WalError::ForeignDirectory)));
+    assert!(matches!(validate_unix_dir_owner_mode(1000, 1000, 0o757), Err(WalError::ForeignDirectory)));
+    assert!(validate_reparse_attributes(0).is_ok());
+    assert!(matches!(validate_reparse_attributes(WIN_FILE_ATTRIBUTE_REPARSE_POINT), Err(WalError::SymlinkRefused)));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let ww_dir = tmp.path().join("world-writable");
+        fs::create_dir(&ww_dir).unwrap();
+        fs::set_permissions(&ww_dir, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(matches!(
+            WalWriter::open_or_create(&ww_dir, [45; 16], 100, WalConfig::default(), registry.clone()),
+            Err(WalError::ForeignDirectory)
+        ));
+        assert!(matches!(WalReader::open(&ww_dir, &registry), Err(WalError::ForeignDirectory)));
+        fs::set_permissions(&ww_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let bad_blobs_root = tmp.path().join("world-writable-blobs");
+        let bw =
+            WalWriter::open_or_create(&bad_blobs_root, [46; 16], 100, WalConfig::default(), registry.clone()).unwrap();
+        drop(bw);
+        let blobs_dir = bad_blobs_root.join("blobs");
+        fs::create_dir(&blobs_dir).unwrap();
+        fs::set_permissions(&blobs_dir, fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(matches!(write_blob(&bad_blobs_root, ImageEncoding::Png, b"png"), Err(WalError::ForeignDirectory)));
+        assert!(matches!(sweep_unreferenced(&bad_blobs_root, &HashSet::new()), Err(WalError::ForeignDirectory)));
+        fs::set_permissions(&blobs_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
 }

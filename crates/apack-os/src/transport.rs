@@ -203,8 +203,7 @@ pub fn ensure_private_directory(socket: &str) -> Result<(), OsError> {
         } else {
             std::env::current_dir().map_err(|err| OsError::io("resolving socket directory", err))?.join(dir)
         };
-        // SAFETY: `geteuid` takes no arguments and cannot fail.
-        let euid = unsafe { libc::geteuid() };
+        let euid = crate::current_euid();
 
         let mut cur = PathBuf::from("/");
         let root_meta = std::fs::symlink_metadata(&cur).map_err(|err| OsError::io("inspecting root directory", err))?;
@@ -417,8 +416,7 @@ pub fn verify_peer_is_current_user(stream: &Stream) -> io::Result<bool> {
     #[cfg(unix)]
     {
         use interprocess::local_socket::traits::StreamCommon as _;
-        // SAFETY: `geteuid` takes no arguments and cannot fail.
-        let user = unsafe { libc::geteuid() };
+        let user = crate::current_euid();
         Ok(stream.peer_creds()?.euid() == Some(user))
     }
 }

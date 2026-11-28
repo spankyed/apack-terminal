@@ -208,6 +208,13 @@ pub(crate) struct LiveSession {
     rewound: bool,
     created_ms: u64,
     wal: Option<WalHandle>,
+    /// `true` once segment 0's initial `KeyframeV2` has been accepted by `wal`.
+    /// Prevents output/resize/marks/seal calls from bricking `WalWorker` when initial
+    /// keyframe creation was deferred by large restored blobs filling `max_backlog_bytes`.
+    wal_has_segment: bool,
+    /// Leading ST bytes (`\x1b\\` / `\x9c`) of `pending_image_tail` already committed atomically
+    /// with a resolved `t=f`/`t=s` WAL batch so `ingest_pty_bytes` does not duplicate them in WAL.
+    wal_skip_prefix: usize,
     pending_wal_rollover: bool,
     /// Last `VtGenerations::images` observed when syncing image blobs to `wal`.
     wal_images_gen: u64,
@@ -372,7 +379,9 @@ impl ShardRunner {
             timeout = timeout.min(shard_session_wait_timeout(
                 sess.machine.next_deadline(),
                 now_ms,
-                sess.terminating_since.is_some() || sess.exit_drain.is_some(),
+                sess.terminating_since.is_some()
+                    || sess.exit_drain.is_some()
+                    || (sess.pending_wal_rollover && sess.wal.is_some()),
                 sess.is_pty_paused(),
                 pty_eof,
                 sess.compressed_idle,

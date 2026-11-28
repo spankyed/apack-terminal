@@ -11,18 +11,40 @@ use apack_core::vt::VtEngine;
 use apack_proto::types::{CellPx, GridSize, ImageEncoding, MarksKey, PackedRow, ResizePolicy, SessionId};
 use apack_vt_ghostty::{GhosttyConfig, GhosttyEngine, GhosttyError, ImageStore};
 use apack_wal::{
-    EngineCheckpoint, KeyframeV2, MAX_ENGINE_SNAPSHOT_BYTES, MAX_KEYFRAME_HISTORY_ROWS, RecordingRegistry, SeekSlice,
-    VisualKeyframe, WalReader, WalRecord,
+    EngineCheckpoint, KeyframeV2, MAX_ENGINE_SNAPSHOT_BYTES, MAX_KEYFRAME_HISTORY_ROWS, MAX_KEYFRAME_UNCOMPRESSED,
+    MAX_RECORD_PAYLOAD, RecordingRegistry, SeekSlice, VisualKeyframe, WalHandle, WalReader, WalReaper, WalRecord,
 };
 
-use crate::now_wall_ms;
+use crate::{now_unix_ms, now_wall_ms};
 
 use super::LiveSession;
+
+/// Detaches a permanently failed [`WalHandle`] off-shard via `wal_reaper` so hot-shard output
+/// turns never spin locking `ImageStore` or capturing keyframes for a dead recorder.
+pub(super) fn detach_failed_wal(sess: &mut LiveSession, wal_reaper: &WalReaper) -> bool {
+    if !sess.wal.as_ref().is_some_and(WalHandle::is_failed) {
+        return false;
+    }
+    if let Some(wal) = sess.wal.take() {
+        wal_reaper.close_async(wal);
+    }
+    sess.wal_has_segment = false;
+    sess.pending_wal_rollover = false;
+    sess.wal_written_blobs.clear();
+    true
+}
 
 /// Persists any newly created image blobs (direct + virtual `U=1`) referenced by `sess.machine`
 /// into `sess.wal` (`<dir>/blobs/`), rehydrating from `GhosttyEngine` on `ImageStore` eviction
 /// and retrying automatically if `WalWorker` is transiently backlogged.
-pub(super) fn sync_wal_image_blobs(sess: &mut LiveSession, image_store: &Arc<Mutex<ImageStore>>) {
+pub(super) fn sync_wal_image_blobs(
+    sess: &mut LiveSession,
+    image_store: &Arc<Mutex<ImageStore>>,
+    wal_reaper: &WalReaper,
+) {
+    if detach_failed_wal(sess, wal_reaper) {
+        return;
+    }
     let Some(wal) = &sess.wal else {
         return;
     };
@@ -60,20 +82,77 @@ pub(super) fn sync_wal_image_blobs(sess: &mut LiveSession, image_store: &Arc<Mut
     }
 }
 
-/// Checks for pending WAL rollover and starts a fresh keyframe segment once the VT is at ground.
-pub(super) fn maybe_rollover_wal(sess: &mut LiveSession, now_ms: u64, at_ground: bool, abi_hash: &[u8; 32]) {
+/// Checks for pending WAL rollover and starts a fresh keyframe segment once the VT is at ground
+/// and all active image blobs referenced by the keyframe have been persisted to `<dir>/blobs/`.
+pub(super) fn maybe_rollover_wal(
+    sess: &mut LiveSession,
+    now_ms: u64,
+    at_ground: bool,
+    abi_hash: &[u8; 32],
+    image_store: &Arc<Mutex<ImageStore>>,
+    wal_reaper: &WalReaper,
+) {
+    if detach_failed_wal(sess, wal_reaper) {
+        return;
+    }
+    if sess.wal.as_ref().is_some_and(WalHandle::take_rollover_needed) {
+        sess.pending_wal_rollover = true;
+    }
+    if !at_ground || !sess.pending_wal_rollover {
+        return;
+    }
+    if sess.wal_images_gen != sess.machine.vt().generations().images {
+        sync_wal_image_blobs(sess, image_store, wal_reaper);
+        if sess.wal_images_gen != sess.machine.vt().generations().images {
+            return;
+        }
+    }
     let Some(wal) = &sess.wal else {
         return;
     };
-    if wal.take_rollover_needed() {
-        sess.pending_wal_rollover = true;
+    let kf = capture_keyframe(&sess.machine, abi_hash);
+    if wal.start_segment(now_ms, kf) {
+        sess.wal_has_segment = true;
+        sess.pending_wal_rollover = false;
     }
-    if at_ground && sess.pending_wal_rollover {
-        let kf = capture_keyframe(&sess.machine, abi_hash);
-        if wal.start_segment(now_ms, kf) {
-            sess.pending_wal_rollover = false;
+}
+
+/// Non-blockingly finalizes and detaches a session's [`WalHandle`] on exit/teardown:
+/// 1. Syncs any pending image blobs.
+/// 2. If a rollover keyframe (e.g. from a shed `> 16 MiB` `t=f`/`t=s` image or deferred initial
+///    segment) is pending and all active blobs are persisted, commits one terminal keyframe via
+///    `start_segment_on_close` so short-lived image commands are never lost.
+/// 3. Seals the active segment iff a segment exists and all active blobs were persisted.
+/// 4. Hands the worker thread to `wal_reaper` without blocking the shard thread.
+pub(super) fn close_session_wal(
+    sess: &mut LiveSession,
+    abi_hash: &[u8; 32],
+    image_store: &Arc<Mutex<ImageStore>>,
+    wal_reaper: &WalReaper,
+) {
+    sync_wal_image_blobs(sess, image_store, wal_reaper);
+    let blobs_synced = sess.wal_images_gen == sess.machine.vt().generations().images;
+    if sess.pending_wal_rollover && blobs_synced {
+        let now_ms = now_unix_ms();
+        maybe_rollover_wal(sess, now_ms, true, abi_hash, image_store, wal_reaper);
+        if sess.pending_wal_rollover
+            && let Some(wal) = &sess.wal
+        {
+            let kf = capture_keyframe(&sess.machine, abi_hash);
+            if wal.start_segment_on_close(now_ms, kf) {
+                sess.wal_has_segment = true;
+                sess.pending_wal_rollover = false;
+            }
         }
     }
+    if let Some(wal) = sess.wal.take() {
+        if sess.wal_has_segment && sess.wal_images_gen == sess.machine.vt().generations().images {
+            let _ = wal.seal();
+        }
+        wal_reaper.close_async(wal);
+    }
+    sess.wal_has_segment = false;
+    sess.pending_wal_rollover = false;
 }
 
 /// Hard wire-byte budget for history rows extracted into a single WAL `VisualKeyframe` (`16 MiB`).
@@ -119,7 +198,9 @@ pub(crate) fn capture_keyframe(machine: &SessionMachine<GhosttyEngine>, abi_hash
         .ok()
         .map(|snapshot_bytes| EngineCheckpoint { engine_abi_hash: *abi_hash, snapshot_bytes });
 
-    KeyframeV2 { visual, engine }
+    let mut kf = KeyframeV2 { visual, engine };
+    kf.degrade_to_limits(MAX_KEYFRAME_UNCOMPRESSED, MAX_RECORD_PAYLOAD);
+    kf
 }
 
 /// Loads every image blob referenced by `slice.keyframe` (direct placements AND virtual `U=1`

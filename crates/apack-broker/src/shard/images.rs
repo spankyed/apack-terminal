@@ -89,6 +89,7 @@ impl ShardRunner {
                 return;
             }
             let pending = sess.pending_image.take().expect("checked pending_image");
+            let tail = std::mem::take(&mut sess.pending_image_tail);
             let body_res = match loaded {
                 Some(loaded) => loaded.body(),
                 None => Err(ImageRefused::InvalidData),
@@ -100,22 +101,87 @@ impl ShardRunner {
                     if is_query {
                         sess.machine.vt_mut().set_kitty_command_bytes(query_bytes);
                     }
+                    super::replay::detach_failed_wal(sess, &self.shared.wal_reaper);
+                    let st_len = if is_query { 0 } else { leading_st_len(&tail) };
+                    let st_prefix = &tail[..st_len];
+                    let wal_max_backlog = if !is_query && sess.wal_has_segment {
+                        sess.wal.as_ref().map(|w| w.max_backlog_bytes())
+                    } else {
+                        None
+                    };
+                    let mut wal_chunks: Vec<(Vec<u8>, bool)> = Vec::new();
+                    let mut wal_total_bytes = 0usize;
+                    let mut wal_overflow = false;
                     for piece in body {
                         sess.machine.on_vt_feed_with(now, wall, &mut effects, |vt, evs| vt.feed(&piece, evs));
-                        if !is_query && let Some(wal) = &sess.wal {
-                            // Stream chunks straight to WAL and split on each `\x1b\\` ground
-                            // transition so multi-chunk >4 MiB `t=f`/`t=s` images never exceed
-                            // `WalConfig::max_non_ground_bytes` (`NonGroundCap`).
-                            if let Some((before, after)) = split_st_ground_chunk(&piece) {
-                                let _ = wal.write_output(now_ms, before.to_vec(), true);
-                                let _ = wal.write_output(now_ms, after.to_vec(), false);
-                            } else {
-                                let _ = wal.write_output(now_ms, piece, false);
+                        if let Some(max_backlog) = wal_max_backlog {
+                            // Collect resolved `t=f`/`t=s` chunks + closing ST up to `max_backlog`
+                            // and submit atomically so trailing `m=0;` / `\x1b\\` terminators can
+                            // never be shed leaving an unclosed APC in the WAL.
+                            wal_total_bytes = wal_total_bytes.saturating_add(piece.len());
+                            if !wal_overflow {
+                                if should_shed_wal_image_stream(wal_total_bytes, max_backlog) {
+                                    wal_chunks.clear();
+                                    wal_overflow = true;
+                                } else if let Some((before, after)) = split_st_ground_chunk(&piece) {
+                                    if !before.is_empty() {
+                                        wal_chunks.push((before.to_vec(), true));
+                                    }
+                                    if !after.is_empty() {
+                                        wal_chunks.push((after.to_vec(), false));
+                                    }
+                                } else {
+                                    wal_chunks.push((piece, false));
+                                }
                             }
+                        }
+                    }
+                    if let Some(max_backlog) = wal_max_backlog
+                        && !st_prefix.is_empty()
+                    {
+                        wal_total_bytes = wal_total_bytes.saturating_add(st_prefix.len());
+                        if !wal_overflow {
+                            if should_shed_wal_image_stream(wal_total_bytes, max_backlog) {
+                                wal_chunks.clear();
+                                wal_overflow = true;
+                            } else {
+                                wal_chunks.push((st_prefix.to_vec(), true));
+                            }
+                        }
+                    }
+                    if wal_max_backlog.is_some()
+                        && let Some(wal) = &sess.wal
+                    {
+                        let wrote_all = if wal_overflow {
+                            let _ = wal.record_backlog_gap(now_ms, wal_total_bytes as u64);
+                            false
+                        } else if !wal_chunks.is_empty() {
+                            wal.write_output_atomic(now_ms, wal_chunks)
+                        } else {
+                            true
+                        };
+                        if wrote_all {
+                            // Leading ST was committed atomically into WAL with `body`; skip only
+                            // its WAL re-write in `ingest_pty_bytes` while preserving VT & raw output.
+                            sess.wal_skip_prefix = st_len;
+                        } else {
+                            sess.pending_wal_rollover = true;
                         }
                     }
                     if is_query {
                         sess.machine.vt_mut().set_kitty_command_bytes(None);
+                    }
+                    if tail.is_empty() {
+                        let at_ground = sess.machine.vt().at_ground();
+                        super::replay::sync_wal_image_blobs(sess, &self.shared.image_store, &self.shared.wal_reaper);
+                        super::replay::maybe_rollover_wal(
+                            sess,
+                            now_ms,
+                            at_ground,
+                            &self.shared.engine_abi_hash,
+                            &self.shared.image_store,
+                            &self.shared.wal_reaper,
+                        );
                     }
                 }
                 Err(why) => match pending.refusal {
@@ -138,7 +204,7 @@ impl ShardRunner {
                     }
                 },
             }
-            std::mem::take(&mut sess.pending_image_tail)
+            tail
         };
 
         self.apply_effects_inner(session_id, effects, false, None);
@@ -148,6 +214,24 @@ impl ShardRunner {
         self.sync_pty_interest(session_id);
         self.try_reap_session(session_id);
     }
+}
+
+/// Returns the byte length of a leading APC String Terminator (`\x1b\\` or C1 `\x9c`) at the
+/// start of `bytes`, or `0` if none is present.
+pub(crate) fn leading_st_len(bytes: &[u8]) -> usize {
+    if bytes.starts_with(b"\x1b\\") {
+        2
+    } else if bytes.starts_with(b"\x9c") {
+        1
+    } else {
+        0
+    }
+}
+
+/// Returns `true` when an inline resolved `t=f`/`t=s` stream exceeds the WAL async backlog cap
+/// and must be shed atomically as a single `BacklogOverflow` gap instead of buffered in RAM.
+pub(crate) const fn should_shed_wal_image_stream(total_bytes: usize, max_backlog: usize) -> bool {
+    total_bytes > max_backlog
 }
 
 /// Splits a resolved Kitty chunk right after its `\x1b\\` String Terminator so the WAL writer

@@ -40,6 +40,13 @@ pub mod tree;
 #[cfg(windows)]
 mod tree_windows;
 
+/// Returns the current process effective Unix user ID (`geteuid(2)`).
+#[cfg(unix)]
+pub fn current_euid() -> u32 {
+    // SAFETY: `geteuid` takes no arguments and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
 use std::fmt;
 use std::io;
 
@@ -143,5 +150,13 @@ mod tests {
         assert_eq!(io_err.error_code(), ErrorCode::Pty);
         assert!(io_err.to_string().contains("binding"));
         assert!(std::error::Error::source(&io_err).is_some());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let uid = std::fs::metadata(tmp.path()).expect("stat").uid();
+            assert_eq!(current_euid(), uid);
+        }
     }
 }
