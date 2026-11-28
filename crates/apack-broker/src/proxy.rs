@@ -91,7 +91,7 @@ impl ReplayBuffer {
 }
 
 /// Connects to `socket_path`, verifying current-user ownership; if `autostart` is true and no
-/// broker is listening, spawns a detached `apack-terminal serve --socket <socket_path>` and retries.
+/// broker is listening, spawns a detached `apack-terminal serve --detached --socket <socket_path>` and retries.
 pub fn connect_or_autostart(socket_path: &str, autostart: bool) -> io::Result<Stream> {
     connect_or_autostart_with(socket_path, autostart, AUTOSTART_TIMEOUT, |path| spawn_detached_broker(path).map(Some))
 }

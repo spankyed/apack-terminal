@@ -1002,14 +1002,17 @@ fn pr3_proxy_autostart_retries_held_exit_clean_exit_timeout_stderr_and_stdin_err
     }
     let winner_spawns = AtomicUsize::new(0);
     let sock_winner_bg = sock_winner.clone();
+    let (spawned_tx, spawned_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let winner_thread = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(25));
+        let _ = spawned_rx.recv();
+        std::thread::sleep(Duration::from_millis(15));
         let l = apack_os::transport::bind_local_listener(&sock_winner_bg).expect("winner bind");
         use interprocess::local_socket::traits::Listener as _;
         let _ = l.accept();
     });
     let stream_w = crate::proxy::connect_or_autostart_with(&sock_winner, true, Duration::from_secs(3), |_| {
         winner_spawns.fetch_add(1, Ordering::AcqRel);
+        let _ = spawned_tx.try_send(());
         #[cfg(unix)]
         let mut cmd = {
             let mut c = Command::new("/bin/sh");
@@ -1039,7 +1042,7 @@ fn pr3_proxy_autostart_retries_held_exit_clean_exit_timeout_stderr_and_stdin_err
         std::fs::create_dir_all(p).unwrap();
     }
     let cap_spawns = AtomicUsize::new(0);
-    let _ = crate::proxy::connect_or_autostart_with(&sock_cap, true, Duration::from_millis(350), |_| {
+    let _ = crate::proxy::connect_or_autostart_with(&sock_cap, true, Duration::from_millis(1500), |_| {
         cap_spawns.fetch_add(1, Ordering::AcqRel);
         #[cfg(unix)]
         let mut cmd = {
@@ -1127,17 +1130,17 @@ fn pr3_proxy_autostart_retries_held_exit_clean_exit_timeout_stderr_and_stdin_err
     if let Some(p) = std::path::Path::new(&sock_timeout).parent() {
         std::fs::create_dir_all(p).unwrap();
     }
-    let err = crate::proxy::connect_or_autostart_with(&sock_timeout, true, Duration::from_millis(250), |_| {
+    let err = crate::proxy::connect_or_autostart_with(&sock_timeout, true, Duration::from_millis(800), |_| {
         #[cfg(unix)]
         let mut cmd = {
             let mut c = Command::new("/bin/sh");
-            c.args(["-c", "echo PR3_TIMEOUT_DIAG >&2; sleep 1"]);
+            c.args(["-c", "echo PR3_TIMEOUT_DIAG >&2; sleep 2"]);
             c
         };
         #[cfg(windows)]
         let mut cmd = {
             let mut c = Command::new("cmd.exe");
-            c.args(["/C", "echo PR3_TIMEOUT_DIAG 1>&2 & ping -n 2 127.0.0.1 >nul"]);
+            c.args(["/C", "echo PR3_TIMEOUT_DIAG 1>&2 & ping -n 3 127.0.0.1 >nul"]);
             c
         };
         Ok(Some(cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn()?))

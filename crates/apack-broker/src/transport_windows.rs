@@ -473,11 +473,14 @@ impl ReactorState {
         // Only drain the frame slot and retry stalled frames AFTER `bytes` is queued ahead of
         // `BrokerCore::outbound` (either in `c.win.tx` or `c.win.pending_chunk`), preserving strict
         // FIFO frame sequence order!
-        if let Some((att, nz, session_id)) = drained_frame {
+        let skip_att = if let Some((att, nz, session_id)) = drained_frame {
             self.on_outbound_frame_drained(conn, nz, att, session_id);
-        }
+            Some(att)
+        } else {
+            None
+        };
         if sent {
-            self.retry_budget_stalled_frames(conn, now_monotonic_ms());
+            self.retry_budget_stalled_frames(conn, skip_att, now_monotonic_ms());
         }
         sent
     }

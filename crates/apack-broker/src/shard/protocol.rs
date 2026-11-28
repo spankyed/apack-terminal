@@ -96,9 +96,12 @@ impl ShardCmdPermit {
 
 impl Drop for ShardCmdPermit {
     fn drop(&mut self) {
-        let prev = self.counter.fetch_sub(1, Ordering::AcqRel);
+        // SeqCst Dekker pair with `BrokerAction::ClientFin` (`fin_pending.store(true, SeqCst)`
+        // followed by `has_inflight_cmds()` `SeqCst` load) so a fire-and-forget command finishing
+        // concurrently with `ClientFin` can never lose its reactor wakeup on ARM64.
+        let prev = self.counter.fetch_sub(1, Ordering::SeqCst);
         if prev == 1
-            && self.fin_pending.as_ref().is_some_and(|f| f.load(Ordering::Acquire))
+            && self.fin_pending.as_ref().is_some_and(|f| f.load(Ordering::SeqCst))
             && let Some(wake) = &self.wake_reactor
         {
             wake();

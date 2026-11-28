@@ -399,10 +399,13 @@ impl BrokerCore {
         self.conns.get(&conn).map_or(0, |c| c.budget.remaining_bytes())
     }
 
-    /// Charges `bytes` for a reactor-parked stalled view frame against `conn`'s [`MemoryBudget`].
-    /// Returns `false` if `conn` is closed or reserving `bytes` would exceed the budget cap.
+    /// Charges `bytes` for a reactor-parked stalled view frame against `conn`'s [`MemoryBudget`],
+    /// preserving [`MemoryBudget::pending_raw_room`] headroom so droppable stalled frames can never
+    /// starve ordered `Control`/`Event` messages into `CloseReason::SlowReader`.
     pub fn reserve_stalled_frame_bytes(&mut self, conn: ConnId, bytes: usize) -> bool {
-        self.conns.get_mut(&conn).is_some_and(|c| c.budget.reserve(bytes).is_ok())
+        self.conns
+            .get_mut(&conn)
+            .is_some_and(|c| bytes <= c.budget.pending_raw_room() && c.budget.reserve(bytes).is_ok())
     }
 
     /// Releases `bytes` previously reserved for a reactor-parked stalled view frame.
@@ -990,6 +993,7 @@ impl BrokerCore {
             // Drop any stale conflatable P1 frame for this stream before enqueueing the ordered final snapshot.
             state.outbound.remove_stream_frames(stream_id.as_stream_id(), &mut state.budget);
             frame.full_sync = true;
+            frame.scroll_delta = 0;
             frame.seq = pacer.peek_next_seq();
             let encoded_bytes = degrade_frame_to_wire_cap(&mut frame);
             let frame_u32 = u32::try_from(encoded_bytes).unwrap_or(u32::MAX);
@@ -1925,6 +1929,7 @@ fn degrade_frame_to_wire_cap(frame: &mut FrameUpdate) -> usize {
         return encoded;
     }
     frame.full_sync = true;
+    frame.scroll_delta = 0;
     let all_rows = core::mem::take(&mut frame.rows);
     let base_bytes = estimate_frame_encoded_bytes(frame);
     let mut used = 0usize;

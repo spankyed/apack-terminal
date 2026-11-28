@@ -197,19 +197,21 @@ mod win_shard_tests {
         let Some(LivePty::Windows { bridge, .. }) = live_sess.pty.take() else {
             panic!("expected Windows LivePty");
         };
-        // Verify rewound (`pty: None`) session never clamps timeout to 10ms and discards queued writes.
+        // Verify rewound (`pty: None`) session never clamps timeout to 10ms and does not consume queued writes.
         live_sess.machine.on_pty_output(
             b"\x1b[6n",
             TimestampMs::from_millis(1),
             apack_core::time::WallMs::from_millis(1),
             &mut Vec::new(),
         );
-        assert!(live_sess.machine.pty_write_len() > 0);
+        let rewound_pending = live_sess.machine.pty_write_len();
+        assert!(rewound_pending > 0);
         assert_eq!(clamp_win_session_write_timeout(Duration::from_secs(1), &live_sess), Duration::from_secs(1));
         drain_windows_pty_writes(&mut live_sess);
-        assert_eq!(live_sess.machine.pty_write_len(), 0);
+        assert_eq!(live_sess.machine.pty_write_len(), rewound_pending);
+        live_sess.machine.consume_pty_write(rewound_pending);
         // Verify WouldBlock retains bytes without latching write_broken, while closed/broken ConPTY
-        // bridge latches `write_broken = true` and drops undeliverable bytes.
+        // bridge latches `write_broken = true` so timeout is no longer clamped to 10ms.
         live_sess.pty = Some(LivePty::Windows { bridge, eof: false, write_broken: false });
         live_sess.machine.on_pty_output(
             b"\x1b[6n",
@@ -227,7 +229,6 @@ mod win_shard_tests {
         assert!(matches!(live_sess.pty, Some(LivePty::Windows { write_broken: false, .. })));
         assert_eq!(clamp_win_session_write_timeout(Duration::from_secs(1), &live_sess), Duration::from_millis(10));
         drain_windows_pty_writes(&mut live_sess);
-        assert_eq!(live_sess.machine.pty_write_len(), 0);
         assert!(matches!(live_sess.pty, Some(LivePty::Windows { write_broken: true, .. })));
         assert_eq!(clamp_win_session_write_timeout(Duration::from_secs(1), &live_sess), Duration::from_secs(1));
         let Some(LivePty::Windows { bridge, .. }) = live_sess.pty.take() else {

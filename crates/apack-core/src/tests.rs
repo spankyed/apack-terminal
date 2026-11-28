@@ -1583,6 +1583,7 @@ fn broker_fin_drain_filters_frames_and_oversized_messages_enforced() {
 
     let mut huge_frame = sample_frame();
     huge_frame.full_sync = false;
+    huge_frame.scroll_delta = 5;
     huge_frame.rows.push(row0);
     huge_frame.rows.push(row1);
     huge_frame.rows.push(row2);
@@ -1595,6 +1596,7 @@ fn broker_fin_drain_filters_frames_and_oversized_messages_enforced() {
     match degraded.msg {
         BrokerMsg::Frame(f) => {
             assert!(f.full_sync, "degraded oversized frame must force full_sync=true");
+            assert_eq!(f.scroll_delta, 0, "degraded full_sync frame must clear scroll_delta");
             assert_eq!(f.rows.len(), 2, "must keep both exact-fit rows and drop the overflowing 3rd row");
             assert_eq!(f.rows[0].text.len(), 3_000_000);
             assert_eq!(f.rows[1].text.len(), exact_row1_text_len);
@@ -2341,7 +2343,7 @@ fn pr3_final_frame_delivery_stalled_budget_pacer_precheck_and_inspect_client() {
     assert_eq!(err.1, FrameStallReason::Pacer);
     assert_eq!(err.2, 0, "must skip estimate_encoded_bytes when !pacer.can_send_any()");
 
-    // Reserve/release stalled frame bytes against MemoryBudget.
+    // Reserve/release stalled frame bytes against MemoryBudget while preserving Control/Event headroom.
     let approx = estimate_frame_approx_bytes(&err.0);
     assert_eq!(approx, apack_proto::FRAME_HEADER_LEN + 64);
     let used_before = broker.connection_budget_used(conn(1)).unwrap();
@@ -2349,13 +2351,22 @@ fn pr3_final_frame_delivery_stalled_budget_pacer_precheck_and_inspect_client() {
     assert!(broker.reserve_stalled_frame_bytes(conn(1), approx));
     assert_eq!(broker.connection_budget_used(conn(1)).unwrap(), used_before + approx);
     assert_eq!(broker.connection_budget_remaining(conn(1)), rem_before - approx);
-    assert!(!broker.reserve_stalled_frame_bytes(conn(1), broker.max_queue_bytes()));
+    // Attempting to encroach into the 256 KiB Control/Event reserve must fail so Control never triggers SlowReader.
+    let reserve_floor = (broker.max_queue_bytes() / 4).min(crate::flow::RAW_PENDING_BUDGET_HEADROOM);
+    let exact_room = broker.connection_budget_remaining(conn(1)).saturating_sub(reserve_floor);
+    assert!(
+        !broker.reserve_stalled_frame_bytes(conn(1), exact_room + 1),
+        "stalled frames must not encroach on Control/Event headroom reserve"
+    );
+    assert!(broker.reserve_stalled_frame_bytes(conn(1), exact_room));
+    broker.release_stalled_frame_bytes(conn(1), exact_room);
     broker.release_stalled_frame_bytes(conn(1), approx);
     assert_eq!(broker.connection_budget_used(conn(1)).unwrap(), used_before);
 
-    // publish_final_frame bypasses pacer, forces full_sync=true, and queues strictly ahead of Exited!
+    // publish_final_frame bypasses pacer, forces full_sync=true & scroll_delta=0, and queues strictly ahead of Exited!
     let mut final_f = sample_frame();
     final_f.full_sync = false;
+    final_f.scroll_delta = -3;
     final_f.rows.push(apack_proto::types::PackedRow {
         line: 0,
         flags: 0,
@@ -2378,13 +2389,15 @@ fn pr3_final_frame_delivery_stalled_budget_pacer_precheck_and_inspect_client() {
         ts(13),
         &mut actions,
     );
-    // Drain: Frame(seq=1, full_sync=true) MUST come strictly before Exited!
+    // Drain: Frame(seq=1, full_sync=true, scroll_delta=0) MUST come strictly before Exited!
     let mut msgs = Vec::new();
     while let Some(q) = broker.pop_outbound(conn(1)) {
         msgs.push(q.msg);
     }
     assert_eq!(msgs.len(), 2);
-    assert!(matches!(&msgs[0], BrokerMsg::Frame(f) if f.seq == 1 && f.full_sync && f.rows[0].text == "EXIT_SNAPSHOT"));
+    assert!(
+        matches!(&msgs[0], BrokerMsg::Frame(f) if f.seq == 1 && f.full_sync && f.scroll_delta == 0 && f.rows[0].text == "EXIT_SNAPSHOT")
+    );
     assert!(matches!(&msgs[1], BrokerMsg::Exited { exit_code: Some(0), signal: None }));
 
     // Also verify publish_final_frame + Exited + unregister_session on SUB_VIEW | SUB_RAW_OUTPUT:

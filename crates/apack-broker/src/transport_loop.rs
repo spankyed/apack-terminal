@@ -381,7 +381,9 @@ pub(crate) struct ConnState {
 
 impl ConnState {
     pub(crate) fn has_inflight_cmds(&self) -> bool {
-        self.inflight_shard_cmds.load(Ordering::Acquire) != 0 || self.inflight_input_cmds.load(Ordering::Acquire) != 0
+        // SeqCst Dekker pair with `ShardCmdPermit::drop` (`counter.fetch_sub(1, SeqCst)` +
+        // `fin_pending.load(SeqCst)`).
+        self.inflight_shard_cmds.load(Ordering::SeqCst) != 0 || self.inflight_input_cmds.load(Ordering::SeqCst) != 0
     }
 }
 
@@ -962,10 +964,13 @@ impl ReactorState {
                 }
                 // Release the frame slot and retry budget-stalled frames STRICTLY AFTER pushing
                 // `encoded` onto `c.write_queue` so subsequent frames can never overtake this one.
-                if let Some((att, nz, session_id)) = drained_frame {
+                let skip_att = if let Some((att, nz, session_id)) = drained_frame {
                     self.on_outbound_frame_drained(conn, nz, att, session_id);
-                }
-                self.retry_budget_stalled_frames(conn, now_monotonic_ms());
+                    Some(att)
+                } else {
+                    None
+                };
+                self.retry_budget_stalled_frames(conn, skip_att, now_monotonic_ms());
             }
 
             let Some(c) = self.conns.get_mut(&conn) else {
@@ -1058,14 +1063,21 @@ impl ReactorState {
         }
     }
 
-    pub(crate) fn retry_budget_stalled_frames(&mut self, conn: ConnId, now: TimestampMs) {
+    pub(crate) fn retry_budget_stalled_frames(
+        &mut self,
+        conn: ConnId,
+        skip: Option<StreamAttachmentId>,
+        now: TimestampMs,
+    ) {
         let ready_stalled = self
             .conns
             .get(&conn)
             .map(|c| ready_stalled_attachments(&c.stalled_frames, &c.queued_frame_streams))
             .unwrap_or_default();
         for att in ready_stalled {
-            self.retry_stalled_frame(conn, att, now);
+            if skip != Some(att) {
+                self.retry_stalled_frame(conn, att, now);
+            }
         }
     }
 
@@ -1115,6 +1127,9 @@ impl ReactorState {
         if !self.core.is_attachment_active(conn, stream_id, attachment_id) {
             return;
         }
+        // Release any pre-existing parked frame for this attachment BEFORE attempting publication so
+        // its reserved `MemoryBudget` bytes never count against this replacement frame or leak on Ok.
+        let _ = self.take_stalled_frame(conn, attachment_id);
         let mut actions = Vec::new();
         match self.core.try_publish_frame(conn, stream_id, attachment_id, frame, now, &mut actions) {
             Ok(()) => {
@@ -1127,8 +1142,6 @@ impl ReactorState {
                 if reason == FrameStallReason::Stale {
                     return;
                 }
-                // Release any older parked frame for this attachment before charging the replacement.
-                let _ = self.take_stalled_frame(conn, attachment_id);
                 let charge =
                     if encoded_bytes != 0 { encoded_bytes } else { estimate_frame_approx_bytes(&frame).max(1) };
                 if self.core.reserve_stalled_frame_bytes(conn, charge) {
@@ -1141,9 +1154,13 @@ impl ReactorState {
                         self.core.release_stalled_frame_bytes(conn, charge);
                     }
                 } else if let Some(c) = self.conns.get_mut(&conn) {
-                    // MemoryBudget is full: drop the frame payload immediately and defer a fresh
-                    // `full_sync` via `ViewSlotFree` once headroom opens.
-                    let needed_bytes = charge.min(self.core.max_queue_bytes());
+                    // MemoryBudget headroom is full: drop the frame payload immediately and defer a
+                    // fresh `full_sync` via `ViewSlotFree`. Cap `needed_bytes` at the reserved
+                    // headroom (`min(max_queue_bytes / 4, RAW_PENDING_BUDGET_HEADROOM)`) so parked
+                    // frames on sibling streams can never permanently wedge this stream's resync!
+                    let resync_cap =
+                        (self.core.max_queue_bytes() / 4).min(apack_core::flow::RAW_PENDING_BUDGET_HEADROOM);
+                    let needed_bytes = charge.min(resync_cap);
                     c.stalled_frames.insert(
                         attachment_id,
                         StalledFrame::DeferredResync { stream_id, session, reason, needed_bytes },
@@ -1233,7 +1250,7 @@ impl ReactorState {
 
     fn maybe_finish_pending_fin(&mut self, conn: ConnId, now: TimestampMs) {
         let ready_to_close =
-            self.conns.get(&conn).is_some_and(|c| c.fin_pending.load(Ordering::Acquire) && !c.has_inflight_cmds());
+            self.conns.get(&conn).is_some_and(|c| c.fin_pending.load(Ordering::SeqCst) && !c.has_inflight_cmds());
         if ready_to_close {
             self.close_pending_fin_conn(conn, now);
         }
@@ -1243,7 +1260,7 @@ impl ReactorState {
         let ready: Vec<ConnId> = self
             .conns
             .iter()
-            .filter_map(|(&conn, c)| (c.fin_pending.load(Ordering::Acquire) && !c.has_inflight_cmds()).then_some(conn))
+            .filter_map(|(&conn, c)| (c.fin_pending.load(Ordering::SeqCst) && !c.has_inflight_cmds()).then_some(conn))
             .collect();
         for conn in ready {
             self.close_pending_fin_conn(conn, now);
@@ -1355,6 +1372,9 @@ impl ReactorState {
                 }
                 for (conn, freed) in freed_by_conn {
                     self.core.release_stalled_frame_bytes(conn, freed);
+                    if freed != 0 {
+                        self.retry_budget_stalled_frames(conn, None, now);
+                    }
                 }
                 let mut actions = Vec::new();
                 self.core.unregister_session(session, "session ended", now, &mut actions);
@@ -1399,7 +1419,8 @@ impl ReactorState {
                 }
                 BrokerAction::ClientFin(conn) => {
                     let has_inflight = if let Some(c) = self.conns.get(&conn) {
-                        c.fin_pending.store(true, Ordering::Release);
+                        // SeqCst Dekker pair with `ShardCmdPermit::drop`.
+                        c.fin_pending.store(true, Ordering::SeqCst);
                         #[cfg(unix)]
                         {
                             let interest = if c.write_queue.is_empty() { Interest::NONE } else { Interest::WRITE };
@@ -1840,18 +1861,30 @@ mod reactor_unit_tests {
         assert!(matches!(taken, StalledFrame::Buffered { reason: FrameStallReason::Pacer, .. }));
         assert_eq!(state.core.connection_budget_used(conn).unwrap(), 0, "take_stalled_frame must release budget");
 
-        // Stalled frame exceeding 512B budget drops payload immediately into DeferredResync!
+        // Stalled frame exceeding 512B budget drops payload immediately into DeferredResync with
+        // `needed_bytes` capped to the Control/Event headroom reserve (`512 / 4 = 128`) so sibling
+        // paused streams can never permanently wedge this stream!
         let (conn2, st2, att2, _peer2) =
             attach_conn_stream(&sock, &mut state, sid, FrameCredit { max_frames: 4, max_bytes: 65_536 });
-        // Reserve 480 of 512 bytes so a ~200B frame fails both OutboundQueue and reserve_stalled_frame_bytes -> DeferredResync!
-        assert!(state.core.reserve_stalled_frame_bytes(conn2, 480));
+        // Enqueue a ~460B ordered message in OutboundQueue (remaining ~52B < 128B resync cap) so a
+        // ~200B frame fails both OutboundQueue and reserve_stalled_frame_bytes -> DeferredResync!
+        let mut fill_actions = Vec::new();
+        state.core.enqueue_message(
+            conn2,
+            StreamId::CONTROL,
+            RequestId::PUSH,
+            OutboundPriority::Event,
+            BrokerMsg::Title { title: "X".repeat(440) },
+            now,
+            &mut fill_actions,
+        );
         state.try_publish_or_stall_frame(conn2, st2, att2, sid, make_frame(&"A".repeat(150)), now);
         assert!(matches!(
             state.conns[&conn2].stalled_frames.get(&att2),
-            Some(StalledFrame::DeferredResync { reason: FrameStallReason::OutboundOrBudget, .. })
+            Some(StalledFrame::DeferredResync { reason: FrameStallReason::OutboundOrBudget, needed_bytes: 128, .. })
         ));
-        // Still insufficient headroom (remaining=32 < needed): retry keeps DeferredResync as OutboundOrBudget!
-        state.retry_budget_stalled_frames(conn2, now);
+        // Still insufficient headroom (remaining < 128): retry keeps DeferredResync as OutboundOrBudget!
+        state.retry_budget_stalled_frames(conn2, None, now);
         assert!(matches!(
             state.conns[&conn2].stalled_frames.get(&att2),
             Some(StalledFrame::DeferredResync { reason: FrameStallReason::OutboundOrBudget, .. })
@@ -1880,14 +1913,16 @@ mod reactor_unit_tests {
         ));
         state.conns.get_mut(&conn2).unwrap().queued_frame_streams.remove(&att2);
 
-        // Re-open pacer + free budget -> retry_budget_stalled_frames emits ViewSlotFree { force_full_sync: true }!
+        // Re-open pacer + pop OutboundQueue -> skip == Some(att2) skips att2, skip == None emits ViewSlotFree!
         let mut ack_open = Vec::new();
         ClientMsg::FrameAck { seq: 0, credit: FrameCredit { max_frames: 4, max_bytes: 65_536 } }
             .encode_to_frame(st2.as_stream_id(), RequestId::PUSH, &mut ack_open)
             .unwrap();
         state.core.feed_bytes(conn2, &ack_open, now, &mut ack_actions);
-        state.core.release_stalled_frame_bytes(conn2, 480);
-        state.retry_budget_stalled_frames(conn2, now);
+        assert!(state.core.pop_outbound(conn2).is_some());
+        state.retry_budget_stalled_frames(conn2, Some(att2), now);
+        assert!(state.conns[&conn2].stalled_frames.contains_key(&att2), "skip=Some(att2) must skip att2");
+        state.retry_budget_stalled_frames(conn2, None, now);
         assert!(!state.conns[&conn2].stalled_frames.contains_key(&att2));
         let cmd = mailbox.lock().unwrap().queue.pop_front().expect("ViewSlotFree sent").0;
         assert!(
@@ -1918,7 +1953,7 @@ mod reactor_unit_tests {
                 if *charged_bytes > 0
         ));
         assert!(state.core.pop_outbound(conn2).is_some());
-        state.retry_budget_stalled_frames(conn2, now);
+        state.retry_budget_stalled_frames(conn2, None, now);
         assert!(!state.conns[&conn2].stalled_frames.contains_key(&att2));
 
         // Pacer byte-window stall with `encoded_bytes != 0`: in-flight frame 1 consumes 65_530 of
@@ -2007,13 +2042,112 @@ mod reactor_unit_tests {
         state.reap_pending_fin_conns(now);
         assert!(!state.conns.contains_key(&conn_busy), "fin_pending closes once permit drops");
 
-        // 5. `ReactorEvent::SessionEnded` prunes stalled frames and releases charged MemoryBudget bytes.
+        // 5. `ReactorEvent::SessionEnded` prunes stalled frames, releases charged MemoryBudget bytes,
+        //    AND retries budget-stalled frames on surviving sibling streams of the same connection!
+        let sid_keep = SessionId::new(2).unwrap();
+        state.session_shard.insert(sid_keep, 0);
+        state.core.register_session(sid_keep, SessionLifetime::Kept, false, &mut Vec::new());
         let (conn_end, st_end, att_end, _p6) =
             attach_conn_stream(&sock, &mut state, sid, FrameCredit { max_frames: 0, max_bytes: 65_536 });
-        state.try_publish_or_stall_frame(conn_end, st_end, att_end, sid, make_frame("parked"), now);
-        assert!(state.core.connection_budget_used(conn_end).unwrap() > 0);
+        let st_sib = NonZeroStreamId::new(2).unwrap();
+        let mut sib_wire = Vec::new();
+        ClientMsg::Attach {
+            session: sid_keep,
+            stream_id: st_sib,
+            flags: SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(),
+            initial_viewport: None,
+            initial_output_credit: 0,
+            initial_frame_credit: FrameCredit { max_frames: 4, max_bytes: 65_536 },
+        }
+        .encode_to_frame(StreamId::CONTROL, RequestId::from_raw(3), &mut sib_wire)
+        .unwrap();
+        state.core.feed_bytes(conn_end, &sib_wire, now, &mut Vec::new());
+        let att_sib = state.core.stream_attachment(conn_end, st_sib).expect("sibling attached");
+
+        // Park a 350B stalled frame on `sid` (fills almost all of 512B budget), plus a DeferredResync on `sid_keep`.
+        state.try_publish_or_stall_frame(conn_end, st_end, att_end, sid, make_frame(&"S".repeat(220)), now);
+        let used_with_parked = state.core.connection_budget_used(conn_end).unwrap();
+        assert!(used_with_parked > 220);
+        state.conns.get_mut(&conn_end).unwrap().stalled_frames.insert(
+            att_sib,
+            StalledFrame::DeferredResync {
+                stream_id: st_sib,
+                session: sid_keep,
+                reason: FrameStallReason::OutboundOrBudget,
+                needed_bytes: 512 - used_with_parked + 10,
+            },
+        );
+        mailbox.lock().unwrap().queue.clear();
         state.handle_shard_event(ReactorEvent::SessionEnded { session: sid });
         assert!(state.conns[&conn_end].stalled_frames.is_empty());
         assert_eq!(state.core.connection_budget_used(conn_end).unwrap(), 0);
+        let sib_cmd = mailbox.lock().unwrap().queue.pop_front().expect("SessionEnded must retry sibling resync").0;
+        assert!(
+            matches!(sib_cmd, ShardCmd::ViewSlotFree { attachment_id, force_full_sync: true, .. } if attachment_id == att_sib)
+        );
+
+        // 6. Runtime interactive input permit isolation (`inflight_input_cmds` vs `inflight_shard_cmds`):
+        //    Saturating bulk RPC permits must NOT reject interactive `Text` with Busy, and vice versa!
+        let (conn_iso, st_iso, att_iso, mut peer_iso) =
+            attach_conn_stream(&sock, &mut state, sid_keep, FrameCredit { max_frames: 1, max_bytes: 65_536 });
+        set_stream_nonblocking(&peer_iso, true).unwrap();
+        mailbox.lock().unwrap().queue.clear();
+        state.conns[&conn_iso].inflight_shard_cmds.store(MAX_INFLIGHT_SHARD_CMDS_PER_CONN, Ordering::SeqCst);
+        // Bulk RPC (`Commands`) is rejected with Busy while interactive `Text` is still admitted!
+        state.execute_actions(
+            vec![
+                BrokerAction::DispatchToSession {
+                    conn: conn_iso,
+                    stream_id: st_iso,
+                    attachment_id: att_iso,
+                    req_id: RequestId::from_raw(70),
+                    session: sid_keep,
+                    msg: ClientMsg::Commands,
+                },
+                BrokerAction::DispatchToSession {
+                    conn: conn_iso,
+                    stream_id: st_iso,
+                    attachment_id: att_iso,
+                    req_id: RequestId::PUSH,
+                    session: sid_keep,
+                    msg: ClientMsg::Text { text: String::from("ok") },
+                },
+            ],
+            now,
+        );
+        let dispatched_input = mailbox.lock().unwrap().queue.pop_front().expect("interactive input admitted").0;
+        assert!(matches!(dispatched_input, ShardCmd::StreamMsg { msg: ClientMsg::Text { .. }, .. }));
+        assert!(mailbox.lock().unwrap().queue.is_empty(), "saturated bulk RPC must not be dispatched");
+        // Verify Busy error was flushed to peer for the bulk RPC.
+        let mut busy_bytes = [0u8; 256];
+        let n = peer_iso.read(&mut busy_bytes).expect("Busy reply for saturated bulk RPC");
+        assert!(n > 0);
+        // Now reverse: saturate interactive input permits and verify bulk RPC (`Commands`) IS still admitted!
+        state.conns[&conn_iso].inflight_shard_cmds.store(0, Ordering::SeqCst);
+        state.conns[&conn_iso].inflight_input_cmds.store(MAX_INFLIGHT_INPUT_CMDS_PER_CONN, Ordering::SeqCst);
+        state.execute_actions(
+            vec![
+                BrokerAction::DispatchToSession {
+                    conn: conn_iso,
+                    stream_id: st_iso,
+                    attachment_id: att_iso,
+                    req_id: RequestId::PUSH,
+                    session: sid_keep,
+                    msg: ClientMsg::Text { text: String::from("blocked") },
+                },
+                BrokerAction::DispatchToSession {
+                    conn: conn_iso,
+                    stream_id: st_iso,
+                    attachment_id: att_iso,
+                    req_id: RequestId::from_raw(71),
+                    session: sid_keep,
+                    msg: ClientMsg::Commands,
+                },
+            ],
+            now,
+        );
+        let dispatched_bulk = mailbox.lock().unwrap().queue.pop_front().expect("bulk RPC admitted").0;
+        assert!(matches!(dispatched_bulk, ShardCmd::StreamMsg { msg: ClientMsg::Commands, .. }));
+        assert!(mailbox.lock().unwrap().queue.is_empty(), "saturated interactive input must not be dispatched");
     }
 }

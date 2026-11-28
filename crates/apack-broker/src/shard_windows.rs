@@ -119,24 +119,17 @@ pub(crate) fn apply_win_write_result(
             if let Some(LivePty::Windows { write_broken, .. }) = sess.pty.as_mut() {
                 *write_broken = true;
             }
-            let pending = sess.machine.pty_write_len();
-            sess.machine.consume_pty_write(pending);
             false
         }
     }
 }
 
 /// Writes pending PTY input bytes into a Windows `ConPtyBridge`, retrying on `WouldBlock` and
-/// latching `write_broken` / discarding undeliverable bytes on broken pipes or rewound sessions.
+/// latching `write_broken` on broken pipes (matching Unix `drain_pty_writes_for` without consuming
+/// undelivered bytes when `pty` is absent).
 pub(crate) fn drain_windows_pty_writes(sess: &mut LiveSession) {
     let mut scratch = Vec::new();
     while sess.machine.pty_write_len() != 0 {
-        let can_write = matches!(sess.pty, Some(LivePty::Windows { eof: false, write_broken: false, .. }));
-        if !can_write {
-            let pending = sess.machine.pty_write_len();
-            sess.machine.consume_pty_write(pending);
-            break;
-        }
         sess.machine.peek_pty_write(WIN_PTY_WRITE_CHUNK_BYTES, &mut scratch);
         let written_len = scratch.len();
         let res = match &sess.pty {
