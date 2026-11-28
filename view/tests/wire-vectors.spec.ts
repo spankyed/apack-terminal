@@ -763,4 +763,161 @@ describe('v2 golden wire vectors (Rust <-> TypeScript parity)', () => {
     rawSpawnOver.varU32(MAX_SCROLLBACK_LINES + 1) // scrollbackLimit (over limit)
     expectWireErr(() => decodeClientMsg(MsgType.SPAWN, rawSpawnOver.toBytes()), 'LimitExceeded')
   })
+
+  it('preserves leading UTF-8 BOM (U+FEFF) in strings and PackedRow without stripping', () => {
+    const bomStr = '\uFEFFhello'
+    const w = new WireWriter()
+    w.str(bomStr)
+    const r = new WireReader(w.toBytes())
+    expect(r.str()).toBe(bomStr)
+    expect(r.remaining).toBe(0)
+
+    // PackedRow starting with U+FEFF must preserve exact text and run byte/code-unit slices
+    const rowText = '\uFEFFhi'
+    const wRow = new WireWriter()
+    encodePackedRow(wRow, {
+      line: 7,
+      flags: 0,
+      text: rowText,
+      // PackedRow runs in JS store UTF-16 code-unit offsets/lengths (`\uFEFF` is 1 code unit, 'hi' is 2)
+      // while wire encoding converts them to UTF-8 byte offsets (3 bytes + 2 bytes = 5 bytes).
+      runs: new Uint32Array([
+        0 | (1 << 16),
+        0 | (1 << 16),
+        0,
+        0,
+        1 | (2 << 16),
+        1 | (2 << 16),
+        0,
+        0,
+      ]),
+      styles: new Uint32Array([0, 0, 0, 0]),
+      links: [],
+    })
+    const decodedRow = decodePackedRow(new WireReader(wRow.toBytes()))
+    expect(decodedRow.line).toBe(7)
+    expect(decodedRow.text).toBe(rowText)
+    expect(decodedRow.text.charCodeAt(0)).toBe(0xfeff)
+    expect(decodedRow.runs[1]).toBe(0 | (1 << 16))
+    expect(decodedRow.runs[5]).toBe(1 | (2 << 16))
+  })
+
+  it('verifies decoded field values on representative ClientMsg and BrokerMsg golden vectors', () => {
+    const decodeGoldenClient = (name: string) => {
+      const vec = golden.client.find((v) => v.name === name)
+      expect(vec, `missing client vector ${name}`).toBeDefined()
+      const frames = new FrameDecoder().push(fromHex(vec!.hex))
+      expect(frames).toHaveLength(1)
+      const f = frames[0]!
+      if (f.kind !== 'frame') throw new Error('expected frame')
+      return decodeClientMsg(f.header.msgType, f.payload)
+    }
+    const decodeGoldenBroker = (name: string) => {
+      const vec = golden.broker.find((v) => v.name === name)
+      expect(vec, `missing broker vector ${name}`).toBeDefined()
+      const frames = new FrameDecoder().push(fromHex(vec!.hex))
+      expect(frames).toHaveLength(1)
+      const f = frames[0]!
+      if (f.kind !== 'frame') throw new Error('expected frame')
+      return decodeBrokerMsg(f.header.msgType, f.payload)
+    }
+
+    const hello = decodeGoldenClient('hello')
+    expect(hello.kind).toBe('hello')
+    if (hello.kind === 'hello') {
+      expect(hello.protocolVersion).toBe(golden.protocolVersion)
+      expect(hello.clientName).toBe('terminal-view-v2')
+      expect(hello.clientNonce[0]).toBe(0x11)
+      expect(hello.clientNonce).toHaveLength(32)
+    }
+
+    const spawn = decodeGoldenClient('spawn')
+    expect(spawn.kind).toBe('spawn')
+    if (spawn.kind === 'spawn') {
+      expect(spawn.spec.argv).toEqual(['/bin/sh', '-i'])
+      expect(spawn.spec.cwd).toBe('/tmp')
+      expect(spawn.spec.env).toEqual([['TERM', 'xterm-256color']])
+      expect(spawn.spec.size).toEqual({ cols: 120, rows: 40 })
+      expect(spawn.spec.cellPx).toEqual({ width: 9, height: 18 })
+      expect(spawn.spec.scrollbackLimit).toBe(10_000)
+      expect(spawn.spec.resizePolicy).toBe('minFit')
+      expect(spawn.spec.recordDir).toBe('/tmp/rec')
+      expect(spawn.spec.kept).toBe(true)
+    }
+
+    const sig = decodeGoldenClient('signal_pid')
+    expect(sig).toEqual({
+      kind: 'signal',
+      session: 7,
+      signal: 'term',
+      scope: { kind: 'pid', pid: 4242 },
+    })
+
+    const helloOk = decodeGoldenBroker('hello_ok')
+    expect(helloOk.kind).toBe('helloOk')
+    if (helloOk.kind === 'helloOk') {
+      expect(helloOk.protocolVersion).toBe(golden.protocolVersion)
+      expect(helloOk.authRequired).toBe(true)
+      expect(helloOk.capabilities).toBe(0x07)
+      expect(helloOk.serverNonce[0]).toBe(0x44)
+    }
+
+    const errMsg = decodeGoldenBroker('error')
+    expect(errMsg).toEqual({ kind: 'error', code: 'staleEpoch', message: 'epoch changed' })
+
+    const metrics = decodeGoldenBroker('metrics_reply')
+    expect(metrics.kind).toBe('metricsReply')
+    if (metrics.kind === 'metricsReply') {
+      expect(metrics.metrics).toEqual({
+        liveSessions: 2,
+        rewoundSessions: 1,
+        connections: 3,
+        activeTimers: 5,
+        scrollbackBytes: 1_048_576,
+        imageStoreBytes: 524_288,
+        totalPtyBytes: 9_999_999,
+        totalThrottledUs: 12_345,
+      })
+    }
+
+    const attached = decodeGoldenBroker('attached')
+    expect(attached.kind).toBe('attached')
+    if (attached.kind === 'attached') {
+      expect(attached.session).toBe(7)
+      expect(attached.streamId).toBe(3)
+      expect(attached.epoch).toBe(4)
+      expect(attached.firstActiveLine).toBe(100)
+      expect(attached.scrollbackLines).toBe(80)
+      expect(attached.foreground).toEqual({ pid: 4243, name: 'zsh' })
+      expect(attached.statuses).toHaveLength(1)
+      expect(attached.statuses[0]!.state).toBe('working')
+      expect(attached.statuses[0]!.app).toBe('codex')
+      expect(attached.statuses[0]!.confirmed).toBe('matched')
+    }
+
+    const frameMsg = decodeGoldenBroker('frame')
+    expect(frameMsg.kind).toBe('frame')
+    if (frameMsg.kind === 'frame') {
+      expect(frameMsg.frame.seq).toBe(15)
+      expect(frameMsg.frame.epoch).toBe(4)
+      expect(frameMsg.frame.size).toEqual({ cols: 80, rows: 24 })
+      expect(frameMsg.frame.firstActiveLine).toBe(42)
+      expect(frameMsg.frame.scrollbackLines).toBe(30)
+      expect(frameMsg.frame.scrollDelta).toBe(2)
+      expect(frameMsg.frame.cursor).toEqual({ col: 7, row: 0, shape: 'block', blinking: true, hidden: false })
+      expect(frameMsg.frame.modes).toEqual({ altScreen: false, mouse: true, reverseVideo: false, bracketedPaste: true })
+      expect(frameMsg.frame.imagesGen).toBe(9)
+      expect(frameMsg.frame.fullSync).toBe(true)
+      expect(frameMsg.frame.rows).toHaveLength(1)
+      const row0 = frameMsg.frame.rows[0]!
+      expect(row0.line).toBe(42)
+      expect(row0.text).toBe('Hi 世界🚀')
+      expect(row0.links).toEqual(['', 'https://example.com/docs'])
+      expect(row0.pieces).toHaveLength(1)
+      expect(row0.pieces![0]!.colStart).toBe(10)
+      expect(row0.pieces![0]!.colLen).toBe(4)
+      expect(row0.pieces![0]!.srcRect).toEqual([0, 16, 64, 32])
+      expect(row0.pieces![0]!.dstPx).toEqual([32, 16])
+    }
+  })
 })

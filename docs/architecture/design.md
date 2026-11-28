@@ -118,7 +118,10 @@ Session lifetimes are explicitly modeled by `SessionLifetime` (`Kept`, `LeaseBou
 - On POSIX (`crates/apack-os/src/tree.rs`, `signal.rs`), every spawned shell calls `setsid()` in `pre_exec`,
   making the child the leader of its own session and process group. Teardown probes exit via
   `waitid(P_PID, pid, ..., WEXITED | WNOHANG | WNOWAIT)` so the zombie pins the PID while signaling both
-  `sid == leader` and deepest-first `setsid()` descendants, then reaps once.
+  `sid == leader` processes and deepest-first `setsid()` descendants still reachable via the live parent chain,
+  then reaps once. (As with standard POSIX process-tree tracking without OS-specific cgroups or subreapers,
+  a grandchild that calls `setsid()` and whose intermediate parent exits before discovery—reparenting it to
+  PID 1 under a new SID—cannot be traced back to the session.)
 - On Windows (`crates/apack-os/src/tree_windows.rs`), every spawned ConPTY process is attached to a dedicated
   Win32 Job Object configured with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` via its OS child `HANDLE`. Closing
   the handle terminates the entire process tree in the kernel.

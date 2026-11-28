@@ -324,19 +324,22 @@ pub fn probe_child_exit_unreaped(pid: u32) -> ChildExitProbe {
     }
 }
 
-/// Sends `SIGHUP` to every non-leader descendant belonging to any session or process tree led by `leaders`.
+/// Sends `SIGHUP` to every non-leader descendant belonging to any session or reachable process tree led by `leaders`.
 ///
 /// Must be called **while the session leaders are still alive or unreaped zombies** so both
-/// background job-control process groups (`sid == leader`) and `setsid()` descendants (reachable
-/// via the parent chain) are discovered before reparenting or PID reuse.
+/// background job-control process groups (`sid == leader`) and `setsid()` descendants still
+/// reachable via the live parent chain are discovered before reparenting or PID reuse. (A grandchild
+/// that calls `setsid()` and is reparented to PID 1 after its intermediate parent exits prior to
+/// discovery is outside standard POSIX parent-chain tracking.)
 pub fn hang_up_session_descendants(leaders: &[u32]) {
     signal_session_descendants(leaders, SignalKind::Hup);
 }
 
-/// Sends `SIGKILL` to every non-leader descendant belonging to any session or process tree led by `leaders`.
+/// Sends `SIGKILL` to every non-leader descendant belonging to any session or reachable process tree led by `leaders`.
 ///
 /// Must be called **while the session leaders are still alive or unreaped zombies** so `SIGHUP`-ignoring
-/// background jobs and `setsid()` descendants are terminated before reparenting or PID reuse.
+/// background jobs and `setsid()` descendants still reachable via the live parent chain are
+/// terminated before reparenting or PID reuse.
 pub fn kill_session_descendants(leaders: &[u32]) {
     signal_session_descendants(leaders, SignalKind::Kill);
 }

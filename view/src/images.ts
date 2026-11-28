@@ -25,6 +25,7 @@ export interface ImageCacheOptions {
 }
 
 const DEFAULT_MAX_BYTES = 64 * 1024 * 1024
+const MAX_FAILED_PER_SOURCE = 1024
 
 async function defaultDecodeBlob(
   blob: ImageBlobData,
@@ -45,8 +46,9 @@ async function defaultDecodeBlob(
 
 export class ImageCache {
   private readonly entries = new Map<string, DecodedImage>()
-  private readonly inflight = new Map<string, Promise<DecodedImage | null>>()
-  private readonly inflightCallbacks = new Map<string, Set<() => void>>()
+  private inflight = new WeakMap<TerminalSource, Map<string, Promise<DecodedImage | null>>>()
+  private inflightCallbacks = new WeakMap<TerminalSource, Map<string, Set<() => void>>>()
+  private failed = new WeakMap<TerminalSource, Set<string>>()
   private readonly evictListeners = new Set<(key: string) => void>()
   private readonly maxBytes: number
   private readonly decode: NonNullable<ImageCacheOptions['decode']>
@@ -76,6 +78,45 @@ export class ImageCache {
     }
   }
 
+  private inflightFor(source: TerminalSource): Map<string, Promise<DecodedImage | null>> {
+    let map = this.inflight.get(source)
+    if (!map) {
+      map = new Map()
+      this.inflight.set(source, map)
+    }
+    return map
+  }
+
+  private callbacksFor(source: TerminalSource): Map<string, Set<() => void>> {
+    let map = this.inflightCallbacks.get(source)
+    if (!map) {
+      map = new Map()
+      this.inflightCallbacks.set(source, map)
+    }
+    return map
+  }
+
+  private recordFailed(source: TerminalSource, key: string): void {
+    if (this.disposed) return
+    let set = this.failed.get(source)
+    if (!set) {
+      set = new Set()
+      this.failed.set(source, set)
+    }
+    set.delete(key)
+    set.add(key)
+    while (set.size > MAX_FAILED_PER_SOURCE) {
+      const oldest = set.values().next().value
+      if (oldest === undefined) break
+      set.delete(oldest)
+    }
+  }
+
+  /** Clears negative-cached failures for `source` (e.g. when a session's `imagesGen` changes). */
+  clearFailed(source: TerminalSource): void {
+    this.failed.delete(source)
+  }
+
   get bytesUsed(): number {
     return this.usedBytes
   }
@@ -94,24 +135,30 @@ export class ImageCache {
     return hit
   }
 
-  /** Requests & decodes `blob` once (deduplicating concurrent callers), calling `onReady` when loaded. */
+  /** Requests & decodes `blob` once per source (deduplicating concurrent callers), calling `onReady` when loaded. */
   ensure(source: TerminalSource, blob: Uint8Array, onReady?: () => void): Promise<DecodedImage | null> {
     if (this.disposed) return Promise.resolve(null)
     const key = blobHashToHex(blob)
     const cached = this.entries.get(key)
     if (cached) return Promise.resolve(cached)
+    if (this.failed.get(source)?.has(key)) return Promise.resolve(null)
 
-    const existing = this.inflight.get(key)
+    const sourceInflight = this.inflightFor(source)
+    const sourceCallbacks = this.callbacksFor(source)
+    const existing = sourceInflight.get(key)
     if (existing) {
-      if (onReady) this.inflightCallbacks.get(key)?.add(onReady)
+      if (onReady) sourceCallbacks.get(key)?.add(onReady)
       return existing
     }
 
     const callbacks = new Set<() => void>()
     if (onReady) callbacks.add(onReady)
-    this.inflightCallbacks.set(key, callbacks)
+    sourceCallbacks.set(key, callbacks)
 
+    let settled = false
     const promise = (async (): Promise<DecodedImage | null> => {
+      let entry: DecodedImage | null = null
+      let waiting: Set<() => void> | undefined
       try {
         const data = await source.getImageBlob(blob)
         if (this.disposed) return null
@@ -120,30 +167,57 @@ export class ImageCache {
           closeIfBitmap(decoded.source)
           return null
         }
-        const byteSize = Math.max(data.bytes.length, decoded.width * decoded.height * 4)
-        const entry: DecodedImage = {
-          key,
-          source: decoded.source,
-          width: decoded.width,
-          height: decoded.height,
-          byteSize,
+        const validDims =
+          Number.isFinite(decoded.width)
+          && Number.isFinite(decoded.height)
+          && decoded.width > 0
+          && decoded.height > 0
+        const pixelBytes = validDims ? decoded.width * decoded.height * 4 : Number.NaN
+        if (!validDims || !Number.isFinite(pixelBytes) || pixelBytes > Number.MAX_SAFE_INTEGER) {
+          closeIfBitmap(decoded.source)
+          this.recordFailed(source, key)
+          return null
         }
-        this.insert(entry)
-        const waiting = this.inflightCallbacks.get(key)
-        this.inflightCallbacks.delete(key)
-        if (waiting) {
-          for (const cb of waiting) cb()
+        const existingEntry = this.entries.get(key)
+        if (existingEntry) {
+          closeIfBitmap(decoded.source)
+          entry = existingEntry
+        } else {
+          const byteSize = Math.max(data.bytes.length, pixelBytes)
+          entry = {
+            key,
+            source: decoded.source,
+            width: decoded.width,
+            height: decoded.height,
+            byteSize,
+          }
+          this.insert(entry)
         }
-        return entry
+        waiting = sourceCallbacks.get(key)
       } catch {
+        this.recordFailed(source, key)
         return null
       } finally {
-        this.inflight.delete(key)
-        this.inflightCallbacks.delete(key)
+        settled = true
+        sourceInflight.delete(key)
+        sourceCallbacks.delete(key)
       }
+
+      if (this.disposed) return null
+      if (waiting) {
+        for (const cb of [...waiting]) {
+          if (this.disposed) return null
+          try {
+            cb()
+          } catch {
+            // Isolate callback failures so a decoded entry stays cached and sibling callers still run.
+          }
+        }
+      }
+      return this.disposed ? null : entry
     })()
 
-    this.inflight.set(key, promise)
+    if (!settled) sourceInflight.set(key, promise)
     return promise
   }
 
@@ -173,8 +247,9 @@ export class ImageCache {
     const keys = [...this.entries.keys()]
     const sources = [...this.entries.values()].map((e) => e.source)
     this.entries.clear()
-    this.inflight.clear()
-    this.inflightCallbacks.clear()
+    this.inflight = new WeakMap()
+    this.inflightCallbacks = new WeakMap()
+    this.failed = new WeakMap()
     this.usedBytes = 0
     for (const key of keys) this.notifyEvict(key)
     for (const source of sources) closeIfBitmap(source)

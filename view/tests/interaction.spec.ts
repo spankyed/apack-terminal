@@ -211,5 +211,45 @@ describe('pointer, selection, wheel, links, and layout caching', () => {
     // Subsequent move after release does not scroll further
     dispatchPointer(window, 'pointermove', 10, 20, 0)
     expect(view.viewport.extent.position).toBe(draggedPos)
+
+    // Thumb drag ignores non-left pointerup on the same pointerId, and still releases on button=0 or pointercancel
+    dispatchPointer(thumb, 'pointerdown', 180, 30, 0)
+    const posBeforeRightUp = view.viewport.extent.position
+    dispatchPointer(window, 'pointerup', 120, 30, 2)
+    dispatchPointer(window, 'pointermove', 120, 30, 0)
+    expect(view.viewport.extent.position).not.toBe(posBeforeRightUp)
+    const posBeforeCancel = view.viewport.extent.position
+    dispatchPointer(window, 'pointercancel', 120, 30, 2)
+    dispatchPointer(window, 'pointermove', 20, 30, 0)
+    expect(view.viewport.extent.position).toBe(posBeforeCancel)
+  })
+
+  it('guards throwing setPointerCapture and ignores non-left pointerdown when not mouse-reporting', () => {
+    const { source, view, painted, point } = mountedView()
+    source.send(
+      frame({
+        size: { cols: 20, rows: 2 },
+        rows: [row(0, 'abcdefghij'), row(1, 'klmnopqrst')],
+      }),
+    )
+    painted()
+
+    // Simulate browser throwing DOMException from setPointerCapture
+    let captureAttempts = 0
+    view.element.setPointerCapture = () => {
+      captureAttempts += 1
+      throw new DOMException('Invalid pointerId', 'NotFoundError')
+    }
+
+    // Right-click (button 2) without mouse reporting must return early WITHOUT setting pressed or calling setPointerCapture
+    point('pointerdown', 1, 0, { button: 2, pointerId: 40, at: 100 })
+    expect(captureAttempts).toBe(0)
+
+    // Subsequent left-click drag still works immediately (not wedged by the un-released right-click!)
+    point('pointerdown', 1, 0, { button: 0, pointerId: 41, at: 120 })
+    expect(captureAttempts).toBe(1)
+    point('pointermove', 5, 0, { button: 0, pointerId: 41, at: 140 })
+    point('pointerup', 5, 0, { button: 0, pointerId: 41, at: 160 })
+    expect(view.selection.span).toEqual({ start: { line: 0, col: 1 }, end: { line: 0, col: 5 } })
   })
 })

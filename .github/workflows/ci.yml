@@ -250,10 +250,33 @@ jobs:
           path: fuzz/artifacts
           if-no-files-found: ignore
 
+  # The broker's suite under AddressSanitizer on a native x86_64 Linux runner. `-Zsanitizer=address`
+  # instruments the Rust broker and its unsafe FFI boundary (the prebuilt `libghostty-vt` static
+  # library linked on Linux is not ASAN-instrumented).
+  asan:
+    name: AddressSanitizer (Linux x64)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - id: nightly-version
+        run: echo "key=$(rustc +nightly -Vv | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: asan-nightly-${{ steps.nightly-version.outputs.key }}
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: the suite under AddressSanitizer
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+        run: cargo +nightly test --locked --target x86_64-unknown-linux-gnu --workspace --exclude xtask --lib --tests --no-fail-fast
+
   # The one check a merge waits on: every job above passed or was skipped (a documentation-only change)
   ci-pass:
     if: always()
-    needs: [changes, checks, platforms, view, view-e2e, node, fuzz-smoke]
+    needs: [changes, checks, platforms, view, view-e2e, node, fuzz-smoke, asan]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

@@ -97,6 +97,7 @@ export class ViewRenderer {
   syncFrameImages(frame: FrameUpdate): void {
     if (frame.imagesGen === this.imagesGenSeen) return
     const targetGen = (this.imagesGenSeen = frame.imagesGen)
+    this.host.imageCache.clearFailed(this.host.source)
     const epoch = frame.epoch
     void this.host.source.images().then((reply) => {
       if (this.host.isDisposed() || epoch !== this.host.store.epoch || targetGen !== this.imagesGenSeen) return
@@ -205,21 +206,31 @@ export class ViewRenderer {
       for (const piece of row.pieces) {
         const decoded = this.host.imageCache.get(piece.blob)
         if (!decoded) continue
-        const [sx, sy, sw, sh] = piece.srcRect
-        const [dstW, dstH] = piece.dstPx
+        if (!Number.isFinite(piece.colStart) || piece.colStart < 0) continue
+        if (!Number.isFinite(piece.colLen) || piece.colLen <= 0) continue
+        const [rawSx, rawSy, rawSw, rawSh] = piece.srcRect
+        const sx = Number.isFinite(rawSx) ? Math.min(Math.max(0, rawSx), decoded.width) : 0
+        const sy = Number.isFinite(rawSy) ? Math.min(Math.max(0, rawSy), decoded.height) : 0
+        const availW = decoded.width - sx
+        const availH = decoded.height - sy
+        const sw = Number.isFinite(rawSw) && rawSw > 0 ? Math.min(rawSw, availW) : availW
+        const sh = Number.isFinite(rawSh) && rawSh > 0 ? Math.min(rawSh, availH) : availH
+        if (!(sw > 0) || !(sh > 0)) continue
+        const [rawDstW, rawDstH] = piece.dstPx
+        const maxDstW = piece.colLen * cellWidth
+        const dstW = Number.isFinite(rawDstW) && rawDstW > 0 ? rawDstW : 0
+        const dstH = Number.isFinite(rawDstH) && rawDstH > 0 ? rawDstH : 0
+        const width = dstW > 0 ? Math.min(dstW, maxDstW) : maxDstW
+        const height = dstH > 0 ? Math.min(dstH, cellHeight) : cellHeight
+        if (!(width > 0) || !(height > 0)) continue
         images.push({
           key: decoded.key,
           picture: decoded.source,
           x: piece.colStart * cellWidth,
           y: top,
-          width: dstW > 0 ? dstW : piece.colLen * cellWidth,
-          height: dstH > 0 ? dstH : cellHeight,
-          source: {
-            x: sx,
-            y: sy,
-            width: sw > 0 ? sw : decoded.width,
-            height: sh > 0 ? sh : decoded.height,
-          },
+          width,
+          height,
+          source: { x: sx, y: sy, width: sw, height: sh },
           above: false,
           z: -1,
         })

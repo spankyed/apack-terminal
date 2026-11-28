@@ -79,13 +79,39 @@ describe('links (OSC 8 declared & URL/custom detectors on PackedRow)', () => {
       to: 9,
     })
 
-    // Unsafe javascript: / data: / vbscript: schemes (even with control chars) are rejected
-    const bad = packRow({
+    // Explicit allow-list for OSC 8 declared links: allow http:/https:/mailto:, reject everything else
+    const allowedMailto = packRow({
       line: 2,
-      links: ['', '  java\tscript:alert(1)'],
-      runs: [{ colStart: 0, colLen: 4, text: 'evil', linkIdx: 1 }],
+      links: ['', '  MAILTO:ops@example.com', 'http://example.com/ok'],
+      runs: [
+        { colStart: 0, colLen: 4, text: 'mail', linkIdx: 1 },
+        { colStart: 5, colLen: 4, text: 'http', linkIdx: 2 },
+      ],
     })
-    expect(linkAt(bad, 1, [urls])).toBeNull()
+    expect(linkAt(allowedMailto, 1, [urls])?.target).toBe('  MAILTO:ops@example.com')
+    expect(linkAt(allowedMailto, 6, [urls])?.target).toBe('http://example.com/ok')
+
+    for (const target of [
+      '  java\tscript:alert(1)',
+      'ht tp://evil.example',
+      'h\x00ttp://evil.example',
+      'http://example.com\r\nfoo',
+      'https:relative/path',
+      'http:../secret',
+      'data:text/html,<script>alert(1)</script>',
+      'vbscript:msgbox(1)',
+      'file:///etc/passwd',
+      'ftp://files.example.com/a',
+      'ssh://user@host',
+      '/relative/path',
+    ]) {
+      const bad = packRow({
+        line: 3,
+        links: ['', target],
+        runs: [{ colStart: 0, colLen: 4, text: 'evil', linkIdx: 1 }],
+      })
+      expect(linkAt(bad, 1, [urls]), `should reject ${target}`).toBeNull()
+    }
   })
 
   it('supports custom host detectors', () => {

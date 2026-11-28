@@ -2,8 +2,9 @@
 // blinking cursor/text on TestClock, CommandRecord gutter marks & jumping, and numeric cache keys.
 import { beforeEach, describe, expect, it } from 'vitest'
 import { BLINK_MS, PackedStyleFlag, type CommandRecord } from '../src/index.ts'
+import { MAX_COMMANDS } from '../src/wire/constants.ts'
 import { TestClock } from './_clock.ts'
-import { installFrames, runFrames } from './_frames.ts'
+import { framesWaiting, installFrames, runFrames } from './_frames.ts'
 import { FakeSource } from './_source.ts'
 import { frame, row } from './_support.ts'
 import { mountedView, settled } from './_view.ts'
@@ -266,5 +267,97 @@ describe('TerminalView v2 core lifecycle', () => {
     expect(endedReasons).toEqual(['exited (0)'])
 
     view.dispose()
+  })
+
+  it('preserves ended state across unmount/remount, bounds commands to MAX_COMMANDS, and stops drag-scroll on setVisible(false)', async () => {
+    const source = new FakeSource()
+    const endedReasons: Array<string | undefined> = []
+    const { view, host, painted, point } = mountedView({ onEnded: (r) => endedReasons.push(r) }, source)
+    source.send(
+      frame({
+        seq: 1,
+        size: { cols: 20, rows: 4 },
+        firstActiveLine: 20,
+        scrollbackLines: 20,
+        rows: [row(20, 'line-20'), row(21, 'line-21'), row(22, 'line-22'), row(23, 'line-23')],
+      }),
+    )
+    painted()
+
+    // 1. setVisible(false) cancels active drag-scroll rAF immediately
+    point('pointerdown', 2, 1, { button: 0, pointerId: 1, at: 100 })
+    // Move pointer above the canvas (row -3 => clientY < canvas top) to start drag-scroll rAF
+    point('pointermove', 2, -3, { button: 0, pointerId: 1, at: 120 })
+    expect(framesWaiting()).toBeGreaterThan(0)
+    view.setVisible(false)
+    expect(framesWaiting()).toBe(0)
+    point('pointerup', 2, -3, { button: 0, pointerId: 1, at: 140 })
+    view.setVisible(true)
+    painted()
+
+    // 2. Command list stays bounded at MAX_COMMANDS (retaining newest) across live upserts & snapshots
+    for (let id = 1; id <= MAX_COMMANDS + 25; id += 1) {
+      source.pushEvent({
+        kind: 'commandStarted',
+        record: {
+          id,
+          command: `cmd-${id}`,
+          cwd: '/tmp',
+          startedMs: id * 10,
+          finishedMs: null,
+          outcome: { kind: 'running' },
+          promptLine: id,
+          outputLine: null,
+          endLine: null,
+        },
+      })
+    }
+    expect(view.commands).toHaveLength(MAX_COMMANDS)
+    expect(view.commands[0]!.id).toBe(26)
+    expect(view.commands.at(-1)!.id).toBe(MAX_COMMANDS + 25)
+
+    // 3. Unmounting and remounting after session exit preserves `ended` without duplicate `onEnded` or dead RPCs
+    source.pushEvent({ kind: 'exited', exitCode: 7, signal: null })
+    expect(endedReasons).toEqual(['exited (7)'])
+    const hintsBeforeRemount = source.hints.length
+    const imagesBeforeRemount = source.imagesAsked
+    view.unmount()
+    view.mount(host)
+    await settled()
+    expect(endedReasons).toEqual(['exited (7)'])
+    expect(source.hints.length).toBe(hintsBeforeRemount)
+    expect(source.imagesAsked).toBe(imagesBeforeRemount)
+    // Final frame still repaints cleanly after remount, and setFocused after exit sends no focus RPC
+    const focusesBefore = source.focus_.length
+    view.setFocused(true)
+    view.setFocused(false)
+    expect(source.focus_.length).toBe(focusesBefore)
+    const remountScene = painted()
+    expect(remountScene.rows[0]!.glyphs.map((g) => g.text).join('')).toBe('line-20')
+
+    view.dispose()
+
+    // 4. Synchronous onEnded -> view.dispose() during mount()/subscribe() immediately runs unsubscribe (zero sink leak!)
+    const syncSource = new FakeSource()
+    let activeSubscribers = 0
+    let triggerSyncExit = false
+    const origSub = syncSource.subscribe.bind(syncSource)
+    syncSource.subscribe = (sink) => {
+      activeSubscribers += 1
+      const unsub = origSub(sink)
+      if (triggerSyncExit) sink.onEvent?.({ kind: 'exited', exitCode: 2, signal: null })
+      return () => {
+        activeSubscribers -= 1
+        unsub()
+      }
+    }
+    let selfDisposing!: ReturnType<typeof mountedView>['view']
+    const mSync = mountedView({ onEnded: () => selfDisposing.dispose() }, syncSource)
+    selfDisposing = mSync.view
+    selfDisposing.unmount()
+    expect(activeSubscribers).toBe(0)
+    triggerSyncExit = true
+    selfDisposing.mount(mSync.host)
+    expect(activeSubscribers).toBe(0)
   })
 })

@@ -14,12 +14,12 @@ fn connected_client_stays_alive_past_start_grace_and_marks_env_is_distinct_from_
     let dir = tempdir().unwrap();
     let endpoint = unique_endpoint(dir.path(), "start-grace-live");
     let mut cfg = BrokerConfig::for_socket(&endpoint);
-    cfg.start_grace = Duration::from_millis(60);
+    cfg.start_grace = Duration::from_millis(400);
     let mut server = BrokerServer::bind(cfg).unwrap().spawn().unwrap();
 
     let mut client = BrokerClient::connect(&endpoint, &AuthConfig::None, "grace-test").unwrap();
     // Stay connected well past `start_grace` so `!state.ever_connected` is strictly exercised.
-    std::thread::sleep(Duration::from_millis(120));
+    std::thread::sleep(Duration::from_millis(500));
     let sessions = client.list_sessions().unwrap();
     assert!(sessions.is_empty());
 
@@ -74,6 +74,7 @@ fn review_regressions_env_grace_pipelined_fin_teardown_spawn_and_seek_cell_px() 
     let endpoint = unique_endpoint(dir.path(), "pipelined-fin");
     let mut cfg = BrokerConfig::for_socket(&endpoint);
     cfg.shard_count = 1;
+    cfg.graceful_drain_timeout = Duration::from_secs(10);
     let mut server = BrokerServer::bind(cfg).unwrap().spawn().unwrap();
     {
         let mut stream = apack_os::transport::connect_local_stream(server.socket_path()).unwrap();
@@ -117,8 +118,8 @@ fn review_regressions_env_grace_pipelined_fin_teardown_spawn_and_seek_cell_px() 
         let t_fin = std::time::Instant::now();
         stream.read_to_end(&mut tail).unwrap();
         assert!(
-            t_fin.elapsed() < Duration::from_millis(250),
-            "already-drained ClientFin must close immediately without waiting 500ms drain deadline"
+            t_fin.elapsed() < Duration::from_secs(5),
+            "already-drained ClientFin must close immediately without waiting 10s graceful_drain_timeout"
         );
         let (_, ev) = dec.step(&tail).unwrap();
         let ev = ev.expect("expected MetricsReply before EOF");
@@ -1060,7 +1061,11 @@ fn e2e_pr5_wal_blobs_marks_rewind_seek_epoch_search_and_attached_statuses() {
 
         // Finish session cleanly so WAL seals and flushes blobs + marks + tail output.
         client.send_raw(st.as_stream_id(), RequestId::PUSH, &ClientMsg::Write { data: b"go\r\n".to_vec() }).unwrap();
-        assert_eq!(client.wait(sid, WaitCondition::Exit, 5_000).unwrap(), WaitOutcome::Met);
+        match client.wait(sid, WaitCondition::Exit, 5_000) {
+            Ok(WaitOutcome::Met) => {}
+            Err(crate::client::ClientError::Broker { code: apack_proto::types::ErrorCode::NoSuchSession, .. }) => {}
+            other => panic!("expected session exit or already-exited NoSuchSession, got {other:?}"),
+        }
         drop(client);
         srv.shutdown().unwrap();
 

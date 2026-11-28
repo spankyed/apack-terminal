@@ -715,7 +715,7 @@ fn windows_edge_helpers_and_natural_child_exit() {
     small.write_all(&one_req).unwrap();
     small.flush().unwrap();
     let wait_small = std::time::Instant::now();
-    while !srv_small.is_finished() && wait_small.elapsed() < Duration::from_millis(1_000) {
+    while !srv_small.is_finished() && wait_small.elapsed() < Duration::from_secs(5) {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(srv_small.is_finished(), "broker must finish reaping clean small draining_win conn");

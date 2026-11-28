@@ -98,7 +98,7 @@ Windows runner for `.cargo/windows-only` files (`.github/workflows/mutants.yml`)
 
 ## 5. AddressSanitizer, Fuzz Corpora & Continuous Fuzzing
 
-- **ASAN (`.github/workflows/asan.yml`):** Every code PR runs the workspace suite under
+- **ASAN (`.github/workflows/ci.yml`, `AddressSanitizer (Linux x64)` gated by `ci-pass`):** Every code PR runs the workspace suite under
   `RUSTFLAGS=-Zsanitizer=address` on x86_64 Linux to verify the `libghostty-vt` FFI and OS boundaries.
 - **Committed Fuzz Seed Corpora (`fuzz/seeds/`):** Compact seed corpora committed for all four fuzz targets:
   `v2_wire`, `v2_wal`, `v2_vt`, and `v2_kitty_apc`. Every seed is deterministically replayed on stable Rust
