@@ -2186,7 +2186,7 @@ fn pr2_unauth_conn_does_not_pin_attached_unpin_survives_and_backpressure_flushes
         "pending BACKPRESSURE_PTY bytes must flush as Output strictly before StreamClosed"
     );
 
-    // Direct multi-chunk `RawOutputFlow::flush_on_exit` check (4-byte chunks + budget release):
+    // Direct multi-chunk `RawOutputFlow::flush_on_exit` check (4-byte chunks + budget release + best-effort credit gate):
     let mut budget = MemoryBudget::new(1024);
     let mut flow = RawOutputFlow::with_limits(0, true, 64, 4);
     let _ = flow.ingest(b"abcdefghij", ts(1), &mut budget);
@@ -2194,4 +2194,11 @@ fn pr2_unauth_conn_does_not_pin_attached_unpin_survives_and_backpressure_flushes
     let flushed = flow.flush_on_exit(&mut budget);
     assert_eq!(flushed, vec!["abcd", "efgh", "ij"]);
     assert_eq!(budget.used_bytes(), 0);
+
+    let mut be_zero = RawOutputFlow::with_limits(0, false, 64, 4);
+    let _ = be_zero.ingest(&[0xE2, 0x82], ts(1), &mut budget);
+    assert!(be_zero.flush_on_exit(&mut budget).is_empty(), "best-effort with 0 credit must not emit U+FFFD on exit");
+    let mut be_credit = RawOutputFlow::with_limits(4, false, 64, 4);
+    let _ = be_credit.ingest(&[0xE2, 0x82], ts(1), &mut budget);
+    assert_eq!(be_credit.flush_on_exit(&mut budget), vec!["\u{FFFD}"]);
 }

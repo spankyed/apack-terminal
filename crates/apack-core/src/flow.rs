@@ -336,7 +336,9 @@ impl RawOutputFlow {
         }
         if self.utf8_tail_len != 0 {
             self.utf8_tail_len = 0;
-            chunks.push(String::from("\u{FFFD}"));
+            if self.backpressure_pty || self.credit_bytes > 0 {
+                chunks.push(String::from("\u{FFFD}"));
+            }
         }
         chunks
     }

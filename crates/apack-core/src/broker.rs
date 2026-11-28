@@ -383,9 +383,6 @@ impl BrokerCore {
         self.leases.is_session_pinned(session)
     }
 
-    /// Registers a live or rewound session with an explicit [`SessionLifetime`] in the broker's
-    /// session table, immediately scheduling teardown if its owner or last unleased client already
-    /// disconnected while creation was in flight.
     fn has_ready_connections(&self) -> bool {
         self.conns.values().any(|c| matches!(c.phase, ConnPhase::Ready { .. }))
     }
@@ -396,7 +393,9 @@ impl BrokerCore {
             .any(|c| matches!(c.phase, ConnPhase::Ready { .. }) && c.streams.values().any(|st| st.session == session))
     }
 
-    /// Registers a newly spawned or rewound session with its explicit [`SessionLifetime`].
+    /// Registers a live or rewound session with an explicit [`SessionLifetime`] in the broker's
+    /// session table, immediately scheduling teardown if its owner or last unleased client already
+    /// disconnected while creation was in flight.
     pub fn register_session(
         &mut self,
         session: SessionId,
