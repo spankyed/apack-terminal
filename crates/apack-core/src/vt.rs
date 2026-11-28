@@ -175,7 +175,10 @@ pub trait VtEngine {
 
     /// Resizes the terminal grid and cell pixel geometry, incrementing `epoch` if reflow occurred
     /// and appending any synchronous side effects (e.g. mode 2048 size reports or sync-hold release).
-    fn resize(&mut self, size: GridSize, cell_px: CellPx, events: &mut Vec<VtEvent>);
+    ///
+    /// Returns `true` if the resize committed (or was already a no-op), or `false` if the engine
+    /// failed (e.g. OOM) and rolled back its grid geometry.
+    fn resize(&mut self, size: GridSize, cell_px: CellPx, events: &mut Vec<VtEvent>) -> bool;
 
     /// Returns lightweight current screen metadata.
     fn meta(&self) -> VtSnapshotMeta;

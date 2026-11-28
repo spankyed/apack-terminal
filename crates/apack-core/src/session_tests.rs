@@ -55,6 +55,7 @@ struct StubVt {
     last_search_range: core::cell::Cell<(u64, u64)>,
     use_row_text_of: bool,
     text_of_spans: core::cell::RefCell<Vec<(u64, u64)>>,
+    fail_next_resize: bool,
 }
 
 impl StubVt {
@@ -74,6 +75,7 @@ impl StubVt {
             last_search_range: core::cell::Cell::new((0, 0)),
             use_row_text_of: false,
             text_of_spans: core::cell::RefCell::new(Vec::new()),
+            fail_next_resize: false,
         }
     }
 }
@@ -171,9 +173,13 @@ impl VtEngine for StubVt {
         }
     }
 
-    fn resize(&mut self, size: GridSize, _cell_px: CellPx, events: &mut Vec<VtEvent>) {
+    fn resize(&mut self, size: GridSize, _cell_px: CellPx, events: &mut Vec<VtEvent>) -> bool {
+        if self.fail_next_resize {
+            self.fail_next_resize = false;
+            return false;
+        }
         if size == self.size {
-            return;
+            return true;
         }
         self.size = size;
         self.epoch += 1;
@@ -181,6 +187,7 @@ impl VtEngine for StubVt {
         events.push(VtEvent::DeviceResponse(b"\x1b[48;10;20t".to_vec()));
         self.rows.resize(usize::from(size.rows.get()), String::new());
         self.dirty.full_dirty = true;
+        true
     }
 
     fn meta(&self) -> VtSnapshotMeta {
@@ -3150,7 +3157,7 @@ fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
 
 #[test]
 fn text_matches_in_range_chunked_halves_on_max_string_truncation() {
-    use crate::session::text_matches_in_range_chunked;
+    use crate::session::{ReplayRecord, RestoreKeyframe, text_matches_in_range_chunked};
     use apack_proto::MAX_STRING_BYTES;
 
     // A VT whose line 0 holds nearly `MAX_STRING_BYTES` and line 1 holds the target needle:
@@ -3164,8 +3171,8 @@ fn text_matches_in_range_chunked_halves_on_max_string_truncation() {
         fn feed(&mut self, bytes: &[u8], events: &mut Vec<VtEvent>) {
             self.inner.feed(bytes, events);
         }
-        fn resize(&mut self, size: GridSize, cell_px: CellPx, events: &mut Vec<VtEvent>) {
-            self.inner.resize(size, cell_px, events);
+        fn resize(&mut self, size: GridSize, cell_px: CellPx, events: &mut Vec<VtEvent>) -> bool {
+            self.inner.resize(size, cell_px, events)
         }
         fn meta(&self) -> VtSnapshotMeta {
             self.inner.meta()
@@ -3261,7 +3268,88 @@ fn text_matches_in_range_chunked_halves_on_max_string_truncation() {
         vec![(0, 3), (0, 1), (0, 0), (1, 3)],
         "halving must shrink step 4 -> 2 -> 1 instead of jumping via modulo"
     );
+    // Near `end_line` with large `step = 128` over 2 rows: must halve clamped span length immediately (3 calls, not 8).
+    vt.spans_requested.borrow_mut().clear();
+    assert!(text_matches_in_range_chunked(&vt, 0, 2, "NEEDLE_ON_ROW_1", 128));
+    assert_eq!(*vt.spans_requested.borrow(), vec![(0, 1), (0, 0), (1, 1)]);
     assert!(!text_matches_in_range_chunked(&vt, 0, 2, "ABSENT_NEEDLE", 4));
+
+    // Failed `VtEngine::resize` rollback: `SessionMachine::apply_resize` and `restore_from_replay`
+    // must NOT commit `current_size`/`current_cell_px` or emit `ResizePty`/`ViewsDirty`, and a
+    // subsequent retry with the same target size must succeed once VT resize succeeds.
+    let orig_size = GridSize::new(80, 24).unwrap();
+    let target_size = GridSize::new(120, 40).unwrap();
+    let orig_px = CellPx { width: 8, height: 16 };
+    let target_px = CellPx { width: 9, height: 18 };
+    let mut sess =
+        SessionMachine::new(sid(77), StubVt::new(80, 24), ResizePolicy::ExplicitOverride, MarksMode::Claimed, orig_px);
+    let k1 = (conn(1), nz_stream(1));
+    let mut fx = Vec::new();
+    sess.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, &mut fx);
+    let _ = sess.try_publish_view(k1, |_| true);
+    fx.clear();
+
+    sess.vt_mut().fail_next_resize = true;
+    sess.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(1),
+        ClientMsg::ExplicitResize { size: target_size, cell_px: target_px },
+        &mut fx,
+    );
+    assert_eq!(sess.current_size(), orig_size, "failed VT resize must not update current_size");
+    assert_eq!(sess.current_cell_px(), orig_px, "failed VT resize must not update current_cell_px");
+    assert!(!fx.iter().any(|e| matches!(e, SessionEffect::ResizePty { .. })), "must not resize OS PTY on VT rollback");
+    assert!(!fx.contains(&SessionEffect::ViewsDirty), "must not dirty views on VT rollback");
+    assert!(
+        fx.iter().any(|e| matches!(
+            e,
+            SessionEffect::Send {
+                req_id,
+                msg: BrokerMsg::Error { code: ErrorCode::ResourceLimit, .. },
+                ..
+            } if *req_id == RequestId::from_raw(1)
+        )),
+        "failed ExplicitResize must return ResourceLimit error, not Ok"
+    );
+
+    // Retrying the exact same target size now succeeds cleanly!
+    fx.clear();
+    sess.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(2),
+        ClientMsg::ExplicitResize { size: target_size, cell_px: target_px },
+        &mut fx,
+    );
+    assert_eq!(sess.current_size(), target_size);
+    assert_eq!(sess.current_cell_px(), target_px);
+    assert!(fx.iter().any(
+        |e| matches!(e, SessionEffect::ResizePty { size, cell_px } if *size == target_size && *cell_px == target_px)
+    ));
+    assert!(fx.iter().any(
+        |e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Ok, .. } if *req_id == RequestId::from_raw(2))
+    ));
+
+    // Same rollback guard inside `restore_from_replay` (`ReplayRecord::Resize`):
+    let mut fresh = StubVt::new(80, 24);
+    fresh.fail_next_resize = true;
+    fx.clear();
+    sess.restore_from_replay(
+        fresh,
+        RestoreKeyframe {
+            cell_px: orig_px,
+            marks_mode: MarksMode::Claimed,
+            marks_last_seq: 0,
+            marks_refused: 0,
+            commands: vec![],
+        },
+        &[ReplayRecord::Resize { size: target_size, cell_px: target_px }],
+        false,
+        &mut fx,
+    );
+    assert_eq!(sess.current_size(), orig_size, "failed ReplayRecord::Resize must not update current_size");
+    assert_eq!(sess.current_cell_px(), orig_px, "failed ReplayRecord::Resize must not update current_cell_px");
 
     // Direct return-value contract of `StatusTable::apply_confirmation`:
     // returns `true` iff `id == ""` AND `confirmed == Confirmed::Matched`.

@@ -291,9 +291,9 @@ impl VtEngine for MockVt {
         }
     }
 
-    fn resize(&mut self, size: GridSize, _cell_px: CellPx, _events: &mut Vec<VtEvent>) {
+    fn resize(&mut self, size: GridSize, _cell_px: CellPx, _events: &mut Vec<VtEvent>) -> bool {
         if size == self.size {
-            return;
+            return true;
         }
         self.size = size;
         self.epoch += 1;
@@ -306,6 +306,7 @@ impl VtEngine for MockVt {
         self.dirty_rows.clear();
         self.scroll_delta = 0;
         self.gens.grid += 1;
+        true
     }
 
     fn meta(&self) -> VtSnapshotMeta {

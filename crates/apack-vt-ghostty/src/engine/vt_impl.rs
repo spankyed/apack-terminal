@@ -28,10 +28,10 @@ impl VtEngine for GhosttyEngine {
         let _ = self.feed_inner(bytes, false, events);
     }
 
-    fn resize(&mut self, size: GridSize, cell_px: CellPx, events: &mut Vec<VtEvent>) {
+    fn resize(&mut self, size: GridSize, cell_px: CellPx, events: &mut Vec<VtEvent>) -> bool {
         let grid_changed = size != self.size;
         if !grid_changed && cell_px == self.cell_px {
-            return;
+            return true;
         }
         let prev_size = self.size;
         let prev_cell_px = self.cell_px;
@@ -57,7 +57,7 @@ impl VtEngine for GhosttyEngine {
                 cb.rows = prev_size.rows.get();
                 cb.cell_px = prev_cell_px;
             });
-            return;
+            return false;
         };
         self.size = committed_size;
         self.cell_px = committed_cell_px;
@@ -89,6 +89,7 @@ impl VtEngine for GhosttyEngine {
                 self.gens.images = self.gens.images.saturating_add(1);
             }
         }
+        true
     }
 
     fn meta(&self) -> VtSnapshotMeta {

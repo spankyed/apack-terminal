@@ -565,11 +565,12 @@ impl<V: VtEngine> SessionMachine<V> {
                 }
                 ReplayRecord::Resize { size, cell_px } => {
                     let before_epoch = self.vt.meta().epoch;
-                    self.current_size = *size;
-                    self.current_cell_px = *cell_px;
-                    self.vt.resize(*size, *cell_px, &mut vt_events);
-                    if self.vt.meta().epoch != before_epoch {
-                        self.marks.on_epoch_change();
+                    if self.vt.resize(*size, *cell_px, &mut vt_events) {
+                        self.current_size = *size;
+                        self.current_cell_px = *cell_px;
+                        if self.vt.meta().epoch != before_epoch {
+                            self.marks.on_epoch_change();
+                        }
                     }
                 }
                 ReplayRecord::Marks { key, last_seq } => {
@@ -1046,15 +1047,26 @@ impl<V: VtEngine> SessionMachine<V> {
                 self.recompute_viewport_geometry(effects);
             }
             ClientMsg::ExplicitResize { size, cell_px } => {
-                self.apply_resize(size, cell_px, effects);
-                effects.push(SessionEffect::Send {
-                    conn,
-                    stream_id: wire_stream,
-                    attachment: att,
-                    req_id,
-                    priority: OutboundPriority::Control,
-                    msg: BrokerMsg::Ok,
-                });
+                if self.apply_resize(size, cell_px, effects) {
+                    effects.push(SessionEffect::Send {
+                        conn,
+                        stream_id: wire_stream,
+                        attachment: att,
+                        req_id,
+                        priority: OutboundPriority::Control,
+                        msg: BrokerMsg::Ok,
+                    });
+                } else {
+                    send_stream_error(
+                        conn,
+                        wire_stream,
+                        att,
+                        req_id,
+                        ErrorCode::ResourceLimit,
+                        "terminal resize failed",
+                        effects,
+                    );
+                }
             }
             ClientMsg::SetCursorDefaults { shape, blinking } => {
                 self.vt.set_cursor_defaults(shape, blinking);
@@ -1499,18 +1511,20 @@ impl<V: VtEngine> SessionMachine<V> {
             }
             ResizePolicy::ExplicitOverride => return,
         };
-        self.apply_resize(target_size, target_cell_px, effects);
+        let _ = self.apply_resize(target_size, target_cell_px, effects);
     }
 
-    fn apply_resize(&mut self, size: GridSize, cell_px: CellPx, effects: &mut Vec<SessionEffect>) {
+    fn apply_resize(&mut self, size: GridSize, cell_px: CellPx, effects: &mut Vec<SessionEffect>) -> bool {
         if size == self.current_size && cell_px == self.current_cell_px {
-            return;
+            return true;
         }
         let prev_epoch = self.vt.meta().epoch;
+        let mut vt_events = Vec::new();
+        if !self.vt.resize(size, cell_px, &mut vt_events) {
+            return false;
+        }
         self.current_size = size;
         self.current_cell_px = cell_px;
-        let mut vt_events = Vec::new();
-        self.vt.resize(size, cell_px, &mut vt_events);
         for ev in vt_events {
             match ev {
                 VtEvent::SyncOutput(false) => {
@@ -1548,6 +1562,7 @@ impl<V: VtEngine> SessionMachine<V> {
         }
         effects.push(SessionEffect::ResizePty { size, cell_px });
         self.notify_views_dirty(effects);
+        true
     }
 
     fn apply_mark_effects(
@@ -1879,10 +1894,11 @@ pub(crate) fn text_matches_in_range_chunked<V: VtEngine>(
             return true;
         }
         // If a multi-row chunk hit `MAX_STRING_BYTES` (accounting for up to 3 bytes dropped at a
-        // UTF-8 char boundary), halve `cur_step` and retry from `cur` so trailing rows in the
-        // chunk are never silently skipped.
+        // UTF-8 char boundary), halve the actual clamped span length and retry from `cur` so
+        // trailing rows are never silently skipped and near-`end_line` spans shrink immediately.
         if chunk_end > cur && chunk.len() >= MAX_STRING_BYTES.saturating_sub(3) {
-            cur_step = (cur_step / 2).max(1);
+            let span_len = chunk_end.saturating_sub(cur).saturating_add(1);
+            cur_step = (span_len / 2).max(1);
             continue;
         }
         if chunk_end >= end_line {

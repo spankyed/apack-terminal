@@ -749,5 +749,18 @@ describe('v2 golden wire vectors (Rust <-> TypeScript parity)', () => {
     if (decodedSpawn.kind === 'spawn') expect(decodedSpawn.spec.scrollbackLimit).toBe(MAX_SCROLLBACK_LINES)
     expectWireErr(() => encodeClientPayload(spawnBase(MAX_SCROLLBACK_LINES + 1)), 'LimitExceeded')
     expectWireErr(() => encodeClientPayload(spawnBase(-1)), 'LimitExceeded')
+    expectWireErr(() => encodeClientPayload(spawnBase(Number.NaN)), 'LimitExceeded')
+    expectWireErr(() => encodeClientPayload(spawnBase(1.5)), 'LimitExceeded')
+    // Decode-side boundary rejection on a raw wire payload with scrollbackLimit = MAX_SCROLLBACK_LINES + 1.
+    const rawSpawnOver = new WireWriter()
+    rawSpawnOver.varU32(0) // argv
+    rawSpawnOver.bool(false) // cwd
+    rawSpawnOver.varU32(0) // env
+    rawSpawnOver.u16(80) // size.cols
+    rawSpawnOver.u16(24) // size.rows
+    rawSpawnOver.u16(0) // cellPx.width
+    rawSpawnOver.u16(0) // cellPx.height
+    rawSpawnOver.varU32(MAX_SCROLLBACK_LINES + 1) // scrollbackLimit (over limit)
+    expectWireErr(() => decodeClientMsg(MsgType.SPAWN, rawSpawnOver.toBytes()), 'LimitExceeded')
   })
 })
