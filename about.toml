@@ -11,6 +11,10 @@ accepted = ["MIT", "Apache-2.0", "BSD-3-Clause", "Zlib", "Unicode-3.0", "0BSD"]
 ignore-build-dependencies = true
 ignore-dev-dependencies = true
 
+# Internal workspace member crates (`publish = false`) share this repository's MIT OR Apache-2.0 license,
+# which `apack-terminal` below already declares and ships alongside every release binary.
+private = { ignore = true }
+
 # A clarification names what a crate's declared license leaves out, each file held to its checksum: a new version
 # whose file differs fails the notices, and `notices` with it, until the clarification is read again.
 #

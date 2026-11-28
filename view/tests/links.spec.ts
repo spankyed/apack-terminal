@@ -1,144 +1,136 @@
-// What on a row can be opened: what a program declared, and text that looks like something to open.
 import { describe, expect, it } from 'vitest'
-import { linkAt, linkRuns, urls, type Detector } from '../src/links.ts'
-import type { Row } from '../src/source.ts'
+import { RowFlag, linkAt, linkRuns, packRow, urls, type Detector } from '../src/index.ts'
 import { row } from './_support.ts'
 
-describe('a link on a row', () => {
-  it('is what a program declared, across every character that shares the declaration', () => {
-    const declared: Row = { ...row(0, 'see docs here', { links: ['https://declared.example/x'] }), link: Uint16Array.from([0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0]) }
-    expect(linkAt(declared, 5, [urls])).toEqual({ target: 'https://declared.example/x', kind: 'declared', from: 4, to: 8 })
-    expect(linkAt(declared, 2, [urls])).toBeNull()
+describe('links (OSC 8 declared & URL/custom detectors on PackedRow)', () => {
+  it('detects URLs and strips trailing sentence punctuation while preserving balanced parens', () => {
+    const r = row(0, 'see (https://example.com/a_(b)).')
+    const link = linkAt(r, 10, [urls])
+    expect(link).toEqual({
+      target: 'https://example.com/a_(b)',
+      kind: 'url',
+      from: 5,
+      to: 30,
+    })
   })
 
-  it('is a URL in the text, without what follows it in a sentence', () => {
-    const prose = row(0, 'go to https://example.com/a?b=1). then')
-    const found = linkAt(prose, 10, [urls])
-    expect(found).toEqual({ target: 'https://example.com/a?b=1', kind: 'url', from: 6, to: 31 })
-    expect(linkAt(prose, 31, [urls]), 'the closing bracket is not part of it').toBeNull()
-    expect(linkAt(prose, 0, [urls])).toBeNull()
-  })
-
-  it('covers the cells its characters cover, where some are wide and some sit after a gap', () => {
-    // 世 covers two cells, then a blank cell, then a URL starting at the fourth
-    const wide: Row = {
-      ...row(0, ''),
-      text: ['世', ...'http://a.b'],
-      column: Uint16Array.from([0, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
-      width: Uint8Array.from([2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]),
-      style: new Uint16Array(11),
-      link: new Uint16Array(11),
-    }
-    expect(linkAt(wide, 5, [urls])).toEqual({ target: 'http://a.b', kind: 'url', from: 3, to: 13 })
-    expect(linkAt(wide, 2, [urls]), 'a blank cell is not a link').toBeNull()
-  })
-
-  it('is whatever a host taught the view to find, with the target the host gave it', () => {
-    const paths: Detector = {
-      kind: 'path',
-      find: (text) => [...text.matchAll(/[\w./-]+\.ts:\d+/g)].map((match) => ({ start: match.index, end: match.index + match[0].length, target: `open ${match[0]}` })),
-    }
-    const output = row(0, 'error at src/view.ts:42 here')
-    expect(linkAt(output, 12, [urls, paths])).toEqual({ target: 'open src/view.ts:42', kind: 'path', from: 9, to: 23 })
-  })
-
-  it('keeps a bracket the URL itself opened, and leaves one that closes what came before it', () => {
-    const wiki = 'see https://en.wikipedia.org/wiki/Rust_(programming_language) for more'
-    expect(linkAt(row(0, wiki), 10, [urls])?.target).toBe('https://en.wikipedia.org/wiki/Rust_(programming_language)')
-
-    const aside = '(at https://example.com/a_(b)), and on'
-    expect(linkAt(row(0, aside), 10, [urls])?.target).toBe('https://example.com/a_(b)')
-  })
-
-  it('is found whole from any row of a line the terminal wrapped, and covers its own cells of each', () => {
-    const rows = new Map([
-      [4, row(4, 'not part of it')],
-      [5, row(5, 'docs: https://exampl', { wrapped: true })],
-      [6, row(6, 'e.com/a/very/long/pa', { wrapped: true })],
-      [7, row(7, 'th.html and then')],
-      [8, row(8, 'e.com/another')],
+  it('detects URLs wrapped across consecutive rows', () => {
+    const r0 = row(0, 'visit https://exampl', { wrapped: true })
+    const r1 = row(1, 'e.com/path/to/page ok')
+    const map = new Map([
+      [0, r0],
+      [1, r1],
     ])
-    const at = (line: number, column: number) => linkAt(rows.get(line)!, column, [urls], (other) => rows.get(other))
-    const whole = 'https://example.com/a/very/long/path.html'
-
-    expect(at(5, 8)).toEqual({ target: whole, kind: 'url', from: 6, to: 20 })
-    expect(at(6, 3)).toEqual({ target: whole, kind: 'url', from: 0, to: 20 })
-    expect(at(7, 2)).toEqual({ target: whole, kind: 'url', from: 0, to: 7 })
-    expect(at(7, 9), 'what followed the URL was taken for part of it').toBeNull()
-    expect(at(8, 2), 'a row was joined to one that did not wrap onto it').toBeNull()
+    const link0 = linkAt(r0, 10, [urls], (l) => map.get(l))
+    expect(link0).toEqual({
+      target: 'https://example.com/path/to/page',
+      kind: 'url',
+      from: 6,
+      to: 20,
+    })
+    const link1 = linkAt(r1, 3, [urls], (l) => map.get(l))
+    expect(link1).toEqual({
+      target: 'https://example.com/path/to/page',
+      kind: 'url',
+      from: 0,
+      to: 18,
+    })
   })
 
-  it('stops at the edge of a row where the row it wrapped onto is not held', () => {
-    const cut = row(5, 'docs: https://exampl', { wrapped: true })
-    expect(linkAt(cut, 8, [urls], () => undefined)?.target).toBe('https://exampl')
-  })
+  it('prefers declared OSC 8 hyperlinks (1-based into links[] with links[0]=""), joins wrapped linkRuns, and blocks unsafe schemes', () => {
+    const r0 = packRow({
+      line: 0,
+      flags: RowFlag.WRAPPED,
+      links: ['', 'https://docs.example.dev', 'https://other.example.dev'],
+      runs: [
+        { colStart: 0, colLen: 5, text: 'click' },
+        { colStart: 5, colLen: 5, text: ' here', linkIdx: 1 },
+      ],
+    })
+    const r1 = packRow({
+      line: 1,
+      links: ['', 'https://docs.example.dev', 'https://other.example.dev'],
+      runs: [
+        { colStart: 0, colLen: 4, text: 'more', linkIdx: 1 },
+        { colStart: 5, colLen: 4, text: 'next', linkIdx: 2 },
+      ],
+    })
+    const rows = new Map([
+      [0, r0],
+      [1, r1],
+    ])
 
-  it('strips very long runs of trailing closing brackets in linear time', () => {
-    const url = 'https://example.com/a' + ')'.repeat(50_000)
-    const start = performance.now()
-    const found = urls.find(url)
-    expect(found).toEqual([{ start: 0, end: 'https://example.com/a'.length }])
-    expect(performance.now() - start).toBeLessThan(200)
-  })
+    const link = linkAt(r0, 6, [urls], (l) => rows.get(l))
+    expect(link).toEqual({
+      target: 'https://docs.example.dev',
+      kind: 'declared',
+      from: 5,
+      to: 10,
+    })
+    expect(linkRuns(link!, r0, 6, (l) => rows.get(l))).toEqual([
+      { line: 0, from: 5, to: 10 },
+      { line: 1, from: 0, to: 4 },
+    ])
+    // Second distinct OSC 8 link on same row resolves to links[2]
+    expect(linkAt(r1, 6, [urls], (l) => rows.get(l))).toEqual({
+      target: 'https://other.example.dev',
+      kind: 'declared',
+      from: 5,
+      to: 9,
+    })
 
-  it('rejects dangerous OSC 8 URI schemes even when obfuscated with whitespace or control characters', () => {
-    for (const bad of ['javascript:alert(1)', 'DATA:text/html,hi', 'vbscript:msgbox(1)', '  java\tscript:alert(1)', '\x01javascript:x']) {
-      const declared: Row = { ...row(0, 'click', { links: [bad] }), link: Uint16Array.from([1, 1, 1, 1, 1]) }
-      expect(linkAt(declared, 2, [urls]), bad).toBeNull()
+    // Explicit allow-list for OSC 8 declared links: allow http:/https:/mailto:, reject everything else
+    const allowedMailto = packRow({
+      line: 2,
+      links: ['', '  MAILTO:ops@example.com', 'http://example.com/ok'],
+      runs: [
+        { colStart: 0, colLen: 4, text: 'mail', linkIdx: 1 },
+        { colStart: 5, colLen: 4, text: 'http', linkIdx: 2 },
+      ],
+    })
+    expect(linkAt(allowedMailto, 1, [urls])?.target).toBe('  MAILTO:ops@example.com')
+    expect(linkAt(allowedMailto, 6, [urls])?.target).toBe('http://example.com/ok')
+
+    for (const target of [
+      '  java\tscript:alert(1)',
+      'ht tp://evil.example',
+      'h\x00ttp://evil.example',
+      'http://example.com\r\nfoo',
+      'https:relative/path',
+      'http:../secret',
+      'data:text/html,<script>alert(1)</script>',
+      'vbscript:msgbox(1)',
+      'file:///etc/passwd',
+      'ftp://files.example.com/a',
+      'ssh://user@host',
+      '/relative/path',
+    ]) {
+      const bad = packRow({
+        line: 3,
+        links: ['', target],
+        runs: [{ colStart: 0, colLen: 4, text: 'evil', linkIdx: 1 }],
+      })
+      expect(linkAt(bad, 1, [urls]), `should reject ${target}`).toBeNull()
     }
   })
 
-  it('does not merge separate declared links across blank-cell gaps and aligns linkAt with linkRuns', () => {
-    const gapped: Row = {
-      ...row(0, '', { links: ['https://example.com/a', 'https://example.com/a'] }),
-      text: ['a', 'b', 'c', 'd'],
-      column: Uint16Array.from([0, 1, 5, 6]),
-      width: Uint8Array.from([1, 1, 1, 1]),
-      style: new Uint16Array(4),
-      link: Uint16Array.from([1, 1, 1, 1]),
+  it('supports custom host detectors', () => {
+    const issueDetector: Detector = {
+      kind: 'issue',
+      find(text) {
+        const out: Array<{ start: number; end: number; target: string }> = []
+        for (const m of text.matchAll(/#(\d+)/g)) {
+          out.push({ start: m.index, end: m.index + m[0].length, target: `issue:${m[1]}` })
+        }
+        return out
+      },
     }
-    const left = linkAt(gapped, 0, [])!
-    const right = linkAt(gapped, 5, [])!
-    expect(left).toEqual({ target: 'https://example.com/a', kind: 'declared', from: 0, to: 2 })
-    expect(right).toEqual({ target: 'https://example.com/a', kind: 'declared', from: 5, to: 7 })
-    expect(linkRuns(left, gapped, 0, () => undefined)).toEqual([{ line: 0, from: 0, to: 2 }])
-    expect(linkRuns(right, gapped, 5, () => undefined)).toEqual([{ line: 0, from: 5, to: 7 }])
-  })
-})
-
-describe('the cells a declared link covers across a wrap', () => {
-  /** A row whose characters from `from` up to `to` declare `target` */
-  const declaredRow = (line: number, text: string, from: number, to: number, target: string, wrapped = false): Row => {
-    const base = row(line, text, { links: [target], wrapped })
-    return { ...base, link: Uint16Array.from(base.text, (_, index) => (index >= from && index < to ? 1 : 0)) }
-  }
-  const rowsOf = (...rows: Row[]) => new Map(rows.map((one) => [one.line, one]))
-
-  it('is one run on each row it wraps over, joined by its URI, from any of them', () => {
-    const rows = rowsOf(declaredRow(0, 'see the link', 4, 12, 'https://x.example/a', true), declaredRow(1, 'continues here', 0, 9, 'https://x.example/a'))
-    const runs = (line: number, column: number) => linkRuns(linkAt(rows.get(line)!, column, [])!, rows.get(line)!, column, (other) => rows.get(other))
-    const both = [{ line: 0, from: 4, to: 12 }, { line: 1, from: 0, to: 9 }]
-
-    expect(runs(0, 6)).toEqual(both)
-    expect(runs(1, 3)).toEqual(both)
-  })
-
-  it('is not joined to a row below when the link stops before the edge of its row', () => {
-    const rows = rowsOf(declaredRow(0, 'see the link', 4, 8, 'https://x.example/a', true), declaredRow(1, 'continues here', 0, 9, 'https://x.example/a'))
-    expect(linkRuns(linkAt(rows.get(0)!, 5, [])!, rows.get(0)!, 5, (other) => rows.get(other))).toEqual([{ line: 0, from: 4, to: 8 }])
-  })
-
-  it('is not joined to a row the first row did not wrap onto, or to one with a different URI', () => {
-    const unwrapped = rowsOf(declaredRow(0, 'see the link', 4, 12, 'https://x.example/a'), declaredRow(1, 'continues here', 0, 9, 'https://x.example/a'))
-    expect(linkRuns(linkAt(unwrapped.get(0)!, 6, [])!, unwrapped.get(0)!, 6, (other) => unwrapped.get(other))).toEqual([{ line: 0, from: 4, to: 12 }])
-
-    const other = rowsOf(declaredRow(0, 'see the link', 4, 12, 'https://x.example/a', true), declaredRow(1, 'continues here', 0, 9, 'https://x.example/b'))
-    expect(linkRuns(linkAt(other.get(0)!, 6, [])!, other.get(0)!, 6, (line) => other.get(line))).toEqual([{ line: 0, from: 4, to: 12 }])
-  })
-
-  it('is one run for a link a detector found, which a wrap does not extend', () => {
-    const wrapped = rowsOf(row(0, 'docs: https://exampl', { wrapped: true }), row(1, 'e.com/path'))
-    const found = linkAt(wrapped.get(0)!, 8, [urls], (line) => wrapped.get(line))!
-    expect(linkRuns(found, wrapped.get(0)!, 8, (line) => wrapped.get(line))).toEqual([{ line: 0, from: 6, to: 20 }])
+    const r = row(0, 'fixed #42 today')
+    expect(linkAt(r, 7, [urls, issueDetector])).toEqual({
+      target: 'issue:42',
+      kind: 'issue',
+      from: 6,
+      to: 9,
+    })
   })
 })

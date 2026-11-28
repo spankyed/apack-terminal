@@ -1,0 +1,435 @@
+//! Session termination, SIGHUP/SIGKILL escalation, child reaping, and Tier-2 idle compression.
+
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
+
+use apack_core::time::TimestampMs;
+use apack_core::vt::VtEngine;
+use apack_os::image_sources::Scanner as ImageScanner;
+#[cfg(unix)]
+use apack_os::signal::{ChildExitProbe, hang_up_session_descendants, probe_child_exit_unreaped};
+use apack_os::signal::{deliver_signal, kill_session_descendants, signal_name_from_description};
+use apack_proto::types::{SessionId, SignalKind, SignalScope};
+
+use crate::now_wall_ms;
+
+#[cfg(unix)]
+use super::PTY_READ_BUF_BYTES;
+#[cfg(unix)]
+use super::pty_io::drain_unix_pty_nonblocking;
+use super::{
+    COMPRESS_PAGES_PER_TURN, LivePty, PTY_READ_QUANTUM_BYTES, ReactorEvent, ShardRunner, TERMINATE_POLL_INTERVAL,
+};
+
+impl ShardRunner {
+    pub(super) fn initiate_session_termination(&mut self, session_id: SessionId) {
+        let Some(sess) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        if sess.rewound {
+            self.finish_and_remove_session(session_id, None, None);
+            return;
+        }
+        if sess.terminating_since.is_some() {
+            return;
+        }
+        sess.terminating_since = Some(Instant::now());
+        // If `libghostty-vt` is currently sitting inside an open APC (either awaiting an off-shard
+        // image load or mid-scan), abort it with CAN (0x18) so subsequent teardown output is not
+        // swallowed inside the unclosed APC string.
+        if sess.pending_image.is_some() || sess.image_scanner.as_ref().is_some_and(ImageScanner::reading) {
+            let mut evs = Vec::new();
+            sess.machine.vt_mut().feed(&[0x18], &mut evs);
+        }
+        // Cancel any in-flight named-source read immediately so Kill / teardown never stalls on a
+        // stuck mount, and stop scanning new named sources while draining teardown bytes.
+        sess.image_scanner = None;
+        sess.image_ticket = sess.image_ticket.wrapping_add(1);
+        sess.pending_image = None;
+        sess.pending_image_tail.clear();
+        // Unpause PTY reads during teardown so macOS/BSD kernel `ttydrain()` cannot wedge an
+        // exiting child in `?Es` state waiting for unread master PTY bytes!
+        sess.paused_by_stream = false;
+        sess.paused_by_raw_flow = false;
+        sess.paused_by_raw_inflight = false;
+        #[cfg(unix)]
+        let raw_pid = sess.pid.map(|p| p.pid() as u32);
+        self.sync_pty_interest(session_id);
+
+        #[cfg(unix)]
+        {
+            if let Some(raw) = raw_pid {
+                // Signal non-leader descendants WHILE the leader is still alive, then SIGHUP leader group!
+                hang_up_session_descendants(&[raw]);
+                let _ = deliver_signal(raw, SignalKind::Hup, SignalScope::Group);
+            }
+        }
+        #[cfg(windows)]
+        {
+            if let Some(sess) = self.sessions.get_mut(&session_id) {
+                // Dropping TreeGuard closes the Windows Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`),
+                // terminating the entire process tree atomically; close ConPTY master asynchronously.
+                sess.tree = None;
+                if let Some(killer) = sess.killer.as_mut() {
+                    let _ = killer.kill();
+                }
+                if let Some(LivePty::Windows { bridge, .. }) = &sess.pty {
+                    bridge.close_master_async();
+                }
+            }
+        }
+
+        self.try_reap_session(session_id);
+    }
+
+    pub(crate) fn try_reap_session(&mut self, session_id: SessionId) {
+        let now_instant = Instant::now();
+        let exit_opt = {
+            let Some(sess) = self.sessions.get_mut(&session_id) else {
+                return;
+            };
+            // Defer natural exit while an off-shard Kitty named-source load is still in flight;
+            // explicit termination clears `pending_image` before calling `try_reap_session`.
+            if sess.pending_image.is_some() {
+                return;
+            }
+            if sess.exit_drain.is_some() {
+                let pty_at_eof = match &sess.pty {
+                    #[cfg(unix)]
+                    Some(LivePty::Unix { eof, .. }) => *eof,
+                    #[cfg(windows)]
+                    Some(LivePty::Windows { eof, .. }) => *eof,
+                    None => true,
+                };
+                match take_ready_exit_drain(&mut sess.exit_drain, pty_at_eof, now_instant) {
+                    Some(exit) => Some(exit),
+                    None => return,
+                }
+            } else if let Some(exit) = sess.reaped_exit.take() {
+                Some(exit)
+            } else {
+                // On Unix explicit teardown, probe leader exit via `waitid(..., WNOHANG | WNOWAIT)`
+                // FIRST so the zombie leader pins its PID (preventing PID reuse) while we `SIGKILL`
+                // any surviving `sid == leader` session descendants; `setsid()` descendants are
+                // signaled pre-exit via `hang_up_session_descendants` / escalation. Then reap and
+                // clear `sess.pid = None` immediately.
+                #[cfg(unix)]
+                if sess.terminating_since.is_some()
+                    && let Some(pid) = sess.pid
+                {
+                    let raw = pid.pid() as u32;
+                    match probe_child_exit_unreaped(raw) {
+                        ChildExitProbe::StillRunning => return,
+                        ChildExitProbe::ExitedZombie => {
+                            kill_session_descendants(&[raw]);
+                        }
+                        ChildExitProbe::NotChild => {}
+                    }
+                }
+                let Some(child) = sess.child.as_mut() else {
+                    return;
+                };
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let parsed = parse_exit_status(&status);
+                        // Clear reaped child handles and PID immediately so a PID recycled by the OS
+                        // can never be signalled by a late `Kill`/`Signal`/shutdown.
+                        sess.child = None;
+                        sess.killer = None;
+                        sess.pid = None;
+                        #[cfg(unix)]
+                        {
+                            sess.tree = None;
+                        }
+                        #[cfg(windows)]
+                        let ready_exit =
+                            crate::shard_windows::finish_or_begin_win_exit_drain(sess, parsed, now_instant);
+                        #[cfg(unix)]
+                        let ready_exit = Some(parsed);
+                        ready_exit
+                    }
+                    _ => None,
+                }
+            }
+        };
+
+        let Some((code, signal)) = exit_opt else {
+            return;
+        };
+
+        // Drain tail PTY bytes BEFORE finalizing exit so both ordinary tail output and short-lived
+        // commands that print a `t=f` / `t=s` APC and exit immediately are ingested before `Exited`.
+        // Explicit termination clears `image_scanner` upfront so it never starts a new image load.
+        self.drain_tail_pty_bytes(session_id);
+        if let Some(sess) = self.sessions.get_mut(&session_id)
+            && sess.pending_image.is_some()
+        {
+            sess.reaped_exit = Some((code, signal));
+            return;
+        }
+
+        self.finish_and_remove_session(session_id, code, signal);
+    }
+
+    pub(super) fn drain_tail_pty_bytes(&mut self, session_id: SessionId) {
+        let mut tail = Vec::new();
+        #[cfg(unix)]
+        {
+            // Use a fresh buffer instead of taking `self.read_buf` so re-entrant calls from
+            // `read_unix_pty_quantum -> apply_effects -> drain_pty_writes_for -> try_reap_session`
+            // never see a 0-length `self.read_buf`.
+            let mut buf = vec![0u8; PTY_READ_BUF_BYTES];
+            if let Some(LivePty::Unix { master, eof: false, .. }) =
+                self.sessions.get(&session_id).and_then(|s| s.pty.as_ref())
+            {
+                drain_unix_pty_nonblocking(master, &mut buf, PTY_READ_QUANTUM_BYTES, |chunk| {
+                    tail.extend_from_slice(chunk);
+                });
+            }
+        }
+        #[cfg(windows)]
+        {
+            if let Some(LivePty::Windows { bridge, eof: false, .. }) =
+                self.sessions.get(&session_id).and_then(|s| s.pty.as_ref())
+            {
+                let _ = crate::shard_windows::drain_conpty_quantum(bridge, PTY_READ_QUANTUM_BYTES, |b| {
+                    tail.extend_from_slice(b);
+                });
+            }
+        }
+        if !tail.is_empty() {
+            self.ingest_pty_bytes(session_id, &tail);
+        }
+    }
+
+    pub(super) fn finish_and_remove_session(
+        &mut self,
+        session_id: SessionId,
+        code: Option<i32>,
+        signal: Option<String>,
+    ) {
+        self.fg_pending.remove(&session_id);
+        self.fg_inflight.remove(&session_id);
+        let mut effects = Vec::new();
+        if let Some(sess) = self.sessions.get_mut(&session_id) {
+            #[cfg(unix)]
+            {
+                if let Some(LivePty::Unix { token, .. }) = sess.pty {
+                    let _ = self.poller.deregister(token);
+                    self.token_to_session.remove(&token);
+                }
+            }
+            #[cfg(windows)]
+            if let Some(LivePty::Windows { ref bridge, .. }) = sess.pty {
+                bridge.close_master_async();
+            }
+            sess.pty = None;
+            super::replay::close_session_wal(
+                sess,
+                &self.shared.engine_abi_hash,
+                &self.shared.image_store,
+                &self.shared.wal_reaper,
+            );
+            if sess.rewound {
+                sess.machine.on_rewound_close(&mut effects);
+            } else {
+                sess.machine.on_process_exit(code, signal, now_wall_ms(), &mut effects);
+            }
+        }
+        // Apply exit effects while `sess` is still in `self.sessions` (after WAL seal/shutdown and
+        // descendant teardown) so final dirty views flush strictly before `Exited` / `Waited`.
+        self.apply_effects(session_id, effects);
+        self.sessions.remove(&session_id);
+        self.load.store(self.sessions.len(), Ordering::Relaxed);
+        self.emit(ReactorEvent::SessionEnded { session: session_id });
+    }
+
+    pub(super) fn force_drop_session(&mut self, session_id: SessionId) {
+        self.fg_pending.remove(&session_id);
+        self.fg_inflight.remove(&session_id);
+        if let Some(mut sess) = self.sessions.remove(&session_id) {
+            #[cfg(unix)]
+            {
+                if let Some(LivePty::Unix { token, .. }) = sess.pty {
+                    let _ = self.poller.deregister(token);
+                    self.token_to_session.remove(&token);
+                }
+                if let Some(pid) = sess.pid {
+                    let raw = pid.pid() as u32;
+                    // SIGKILL non-leader descendants BEFORE killing the leader!
+                    kill_session_descendants(&[raw]);
+                    let _ = deliver_signal(raw, SignalKind::Kill, SignalScope::Group);
+                }
+            }
+            #[cfg(windows)]
+            {
+                sess.tree = None;
+                if let Some(LivePty::Windows { ref bridge, .. }) = sess.pty {
+                    bridge.close_master_async();
+                }
+            }
+            if let Some(mut killer) = sess.killer.take() {
+                let _ = killer.kill();
+            }
+            // Drop the master PTY fd BEFORE `child.wait()` so macOS/BSD kernel `ttydrain()`
+            // releases any child waiting for unread master bytes instead of wedging `wait()`.
+            sess.pty = None;
+            if let Some(mut child) = sess.child.take() {
+                let _ = child.wait();
+            }
+            super::replay::close_session_wal(
+                &mut sess,
+                &self.shared.engine_abi_hash,
+                &self.shared.image_store,
+                &self.shared.wal_reaper,
+            );
+        }
+    }
+
+    pub(super) fn run_tier2(&mut self, now: TimestampMs) {
+        let ids: Vec<SessionId> = self.sessions.keys().copied().collect();
+        let now_instant = Instant::now();
+
+        for id in ids {
+            // 0. Liveness safety check: if in-flight raw-output bytes drained below caps, unpause PTY.
+            let should_resume_raw = self.sessions.get(&id).is_some_and(|s| {
+                s.paused_by_raw_inflight
+                    && !super::protocol::should_pause_raw_inflight(
+                        s.raw_output_inflight.load(Ordering::Acquire),
+                        self.raw_output_inflight.load(Ordering::Acquire),
+                    )
+            });
+            if should_resume_raw {
+                if let Some(sess) = self.sessions.get_mut(&id) {
+                    sess.paused_by_raw_inflight = false;
+                }
+                self.sync_pty_interest(id);
+                // Wake the shard (crucial on Windows, where Tier 2 runs after Tier 1 ConPTY drain)
+                // so any buffered ConPTY output drains immediately instead of sleeping up to 5s.
+                self.self_wake.wake();
+            }
+
+            // 1. Child reap & 2-second SIGKILL escalation BEFORE firing timers so tail PTY bytes
+            //    from an exited child satisfy pending `Wait` conditions before any deadline expires.
+            let is_live = self
+                .sessions
+                .get(&id)
+                .is_some_and(|s| s.child.is_some() || s.reaped_exit.is_some() || s.exit_drain.is_some());
+            if is_live {
+                if let Some(sess) = self.sessions.get_mut(&id)
+                    && let Some(since) = sess.terminating_since
+                    && !sess.escalated_sigkill
+                    && now_instant.saturating_duration_since(since) >= self.shared.kill_escalate_after
+                {
+                    sess.escalated_sigkill = true;
+                    if let Some(pid) = sess.pid {
+                        let raw = pid.pid() as u32;
+                        // SIGKILL non-leader descendants BEFORE killing the leader!
+                        kill_session_descendants(&[raw]);
+                        let _ = deliver_signal(raw, SignalKind::Kill, SignalScope::Group);
+                    }
+                    if let Some(killer) = sess.killer.as_mut() {
+                        let _ = killer.kill();
+                    }
+                }
+                self.try_reap_session(id);
+            }
+
+            // 2. Session timers (DEC 2026 hold cap, search debounce, Wait deadlines).
+            let mut effects = Vec::new();
+            if let Some(sess) = self.sessions.get_mut(&id) {
+                sess.machine.poll_timers(now, &mut effects);
+            }
+            self.apply_effects(id, effects);
+
+            // 3. Retry deferred WAL rollover if backlog cleared while the session is idle.
+            if let Some(sess) = self.sessions.get_mut(&id)
+                && sess.pending_wal_rollover
+                && sess.wal.is_some()
+            {
+                let at_ground = sess.machine.vt().at_ground();
+                super::replay::maybe_rollover_wal(
+                    sess,
+                    crate::now_unix_ms(),
+                    at_ground,
+                    &self.shared.engine_abi_hash,
+                    &self.shared.image_store,
+                    &self.shared.wal_reaper,
+                );
+            }
+
+            // 4. Cooperative idle scrollback compression (4 pages/turn after idle_compress_after).
+            if let Some(sess) = self.sessions.get_mut(&id) {
+                maybe_compress_idle(
+                    &mut sess.compressed_idle,
+                    now_instant.saturating_duration_since(sess.last_activity),
+                    self.shared.idle_compress_after,
+                    || sess.machine.vt_mut().compress_step(COMPRESS_PAGES_PER_TURN),
+                );
+            }
+        }
+    }
+
+    pub(super) fn refresh_telemetry_atomics(&self) {
+        let scrollback_bytes: u64 = self.sessions.values().map(|s| s.machine.vt().scrollback_bytes()).sum();
+        self.telemetry.scrollback_bytes.store(scrollback_bytes, Ordering::Relaxed);
+        self.telemetry.total_pty_bytes.store(self.total_pty_bytes, Ordering::Relaxed);
+    }
+}
+
+/// Runs one cooperative idle-compression step once `idle_elapsed >= idle_after`.
+pub(crate) fn maybe_compress_idle(
+    compressed_idle: &mut bool,
+    idle_elapsed: Duration,
+    idle_after: Duration,
+    compress_fn: impl FnOnce() -> apack_core::vt::CompressStep,
+) {
+    if !*compressed_idle && idle_elapsed >= idle_after && compress_fn() == apack_core::vt::CompressStep::Done {
+        *compressed_idle = true;
+    }
+}
+
+/// Computes the next shard wait timeout contribution for a single session.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn shard_session_wait_timeout(
+    next_deadline: Option<TimestampMs>,
+    now: TimestampMs,
+    terminating: bool,
+    pty_paused: bool,
+    pty_eof: bool,
+    compressed_idle: bool,
+    idle_elapsed: Duration,
+    idle_compress_after: Duration,
+) -> Duration {
+    let mut timeout = Duration::from_secs(5);
+    if let Some(dl) = next_deadline {
+        timeout = timeout.min(Duration::from_millis(dl.saturating_sub(now)));
+    }
+    if terminating || pty_paused || pty_eof {
+        timeout = timeout.min(TERMINATE_POLL_INTERVAL);
+    } else if !compressed_idle {
+        if idle_elapsed >= idle_compress_after {
+            timeout = timeout.min(Duration::from_millis(5));
+        } else {
+            timeout = timeout.min(idle_compress_after - idle_elapsed);
+        }
+    }
+    timeout
+}
+
+pub(crate) fn take_ready_exit_drain(
+    exit_drain: &mut Option<super::ExitDrainState>,
+    pty_at_eof: bool,
+    now: Instant,
+) -> Option<(Option<i32>, Option<String>)> {
+    let ready = exit_drain.as_ref().is_some_and(|d| pty_at_eof || now >= d.deadline);
+    if ready { exit_drain.take().map(|d| (d.code, d.signal)) } else { None }
+}
+
+pub(crate) fn parse_exit_status(status: &portable_pty::ExitStatus) -> (Option<i32>, Option<String>) {
+    if let Some(desc) = status.signal() {
+        (None, Some(signal_name_from_description(desc)))
+    } else {
+        (Some(status.exit_code() as i32), None)
+    }
+}

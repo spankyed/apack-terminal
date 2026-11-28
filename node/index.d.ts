@@ -1,9 +1,10 @@
 /**
- * Every message of the broker's protocol, **generated** from `src/protocol.rs` by ts-rs and shipped here, so
- * a consumer reads the types without building Rust. `cargo xtask generate` re-derives it;
- * `cargo xtask check-generated` fails when it has fallen behind.
+ * `@apackdev/terminal`: locates the platform-specific `apack-terminal` v2 broker binary shipped in
+ * `@apackdev/terminal-<platform>`.
+ *
+ * For the TypeScript v2 binary protocol codec, `TerminalClient`, `BrokerSessionSource`, `TerminalView`,
+ * `CanvasPainter`, and `WebGL2AtlasPainter`, import from `@apackdev/terminal-view`.
  */
-export type * from './protocol.js';
 
 /** Node's `${process.platform}-${process.arch}` for this process, which is how the platform packages are named */
 export declare const PLATFORM: string;

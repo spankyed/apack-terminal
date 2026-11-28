@@ -84,7 +84,7 @@ const MATCHES_NOTHING: &str = r"[^\s\S]";
 /// cannot hide itself.
 fn listed(root: &Path, pattern: &str) -> Result<Vec<String>, String> {
     let output = Command::new("cargo")
-        .args(["mutants", "--list", "--no-config", "--re", pattern])
+        .args(["mutants", "--workspace", "--list", "--no-config", "--re", pattern])
         .current_dir(root)
         .output()
         .map_err(|error| format!("cargo mutants didn't start: {error}"))?;

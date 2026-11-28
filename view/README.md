@@ -1,23 +1,22 @@
 # @apackdev/terminal-view
 
-Draws a terminal from rows something else interpreted.
+Thin TypeScript terminal renderer for `apack-terminal` v2: paints style-run rows, Kitty graphics images,
+decorations, selection, links, search highlights, and command gutters without running a terminal emulator.
 
-A package of the [`apack-terminal`](..) repository, beside the broker whose rows it draws.
-
-A view here has no terminal core. It is handed rows of characters with their styles by a `TerminalSource`,
-which is whatever owns the terminal — in apack, the broker at this repository's root — and it owns the rest:
-painting, scrolling, selection, text input, links and what a screen reader hears. Input goes back to the
-source as key and pointer events, not bytes, because what a key sends depends on modes only the terminal's
-owner knows.
-
-`src/source.ts` is the contract.
+A package of the [`apack-terminal`](..) repository alongside the Rust broker. The broker's `libghostty-vt`
+core is the sole VT authority; `@apackdev/terminal-view` interprets zero VT bytes and communicates over the
+v2 multiplexed binary protocol (`PROTOCOL_VERSION = 2`).
 
 ```ts
-import { BrokerViews, TerminalView } from '@apackdev/terminal-view'
+import { TerminalClient, TerminalView, createPainter } from '@apackdev/terminal-view'
 
-// `stream` is a connection to a broker that has already greeted it as a view
-const views = new BrokerViews(stream)
-const view = new TerminalView(views.open(sessionId), { font, theme })
+const client = await TerminalClient.connect(stream, { authSecret })
+const source = await client.attachSession(sessionId)
+const view = new TerminalView(source, {
+  font,
+  theme,
+  painter: (f) => createPainter(f), // prefers WebGL2 with automatic Canvas 2D fallback
+})
 view.mount(element)
 ```
 
@@ -30,86 +29,50 @@ npm test
 npm run build        # dist/, which is what a consumer bundles
 ```
 
-The repository's CI runs those four as its `view` job, and `cargo xtask pre-push` at the root runs them
-after the broker's suites.
+## Architecture & Modules
 
-## Using it
-
-Publishable to npm under the owner's scope, and not yet published: `npm publish` from this directory checks,
-tests and builds it first (`prepublishOnly`), then publishes it public. Until then a consumer installs the
-release tarball (`@apackdev/terminal-view`) or links a local checkout after building `dist/`, which is not
-tracked. There is no WebAssembly and nothing to load at runtime: one ES module and its declarations, the
-package's one entry point.
-
-## What is where
-
-| | |
+| Path | What it is |
 |---|---|
-| `src/source.ts` | what a view is drawn from: frames, rows, input, the questions it may ask. Plain objects, so a view is driven by a broker, a recording or a test alike |
-| `src/broker/` | a broker as a source: the view protocol's bytes (`wire.ts`) and the sessions on one connection (`source.ts`) |
-| `src/row-store.ts`, `src/viewport.ts` | the rows a view holds, by line number, and where it is scrolled to among them |
-| `src/draw.ts`, `src/painter.ts`, `src/canvas-painter.ts` | a row as what to paint, and the painter that paints a scene on a 2D canvas. A painter is behind an interface, so another can replace it |
-| `src/input.ts`, `src/selection.ts`, `src/links.ts` | the keyboard and the input method; what is selected; URLs and whatever else a host's detectors find |
-| `src/view.ts` | the view: it owns the element, asks for history as it is scrolled to, and acknowledges each frame once it is painted |
+| `src/wire/` | canonical LEB128 + binary v2 codec (`codec.ts`, `frame.ts`, `auth.ts`, `messages.ts`, `types.ts`) matching `crates/apack-proto` and verified against `node/wire-vectors-v2.json` |
+| `src/broker/client.ts` | multiplexed `TerminalClient` and `BrokerSessionSource` (mutual HMAC-SHA256 handshake, `spawn`, `attachSession`, BDP `FrameCredit` `FrameAck`s, incremental `setSearch`, SHA-256-verified `getImageBlob`, leases, signals) |
+| `src/source.ts` | pure `TerminalSource` contract so views can be driven by a live broker, WAL playback, or unit tests |
+| `src/row-store.ts`, `src/viewport.ts`, `src/local-query.ts` | bounded line-indexed row cache, scrollback paging, local word/line queries, and epoch invalidation |
+| `src/draw.ts`, `src/painter.ts` | row-to-scene preparation and the pluggable `Painter` interface |
+| `src/canvas-painter.ts` | `CanvasPainter`: default 2D canvas renderer with row-shift scroll blitting and image compositing |
+| `src/webgl-painter.ts` | `WebGL2AtlasPainter`, `ShelfPacker`, and `createPainter` (`preferWebGL: true` default, seamless fallback to `CanvasPainter`) |
+| `src/input.ts`, `src/selection.ts`, `src/links.ts`, `src/images.ts` | keyboard/IME/mouse encoding, selection, OSC 8 + URL link detection, and decoded image cache |
+| `src/view.ts` | `TerminalView`: DOM lifecycle, resize fitting, history paging, `FrameAck` pacing, accessibility mirror (`[data-terminal-text]`) |
 
-## What a view does
+## Key Properties
 
-- **Draws only what it is sent, and says when it has.** A source sends the next frame once the last was
-  acknowledged, and a view acknowledges a frame when it has painted it — so a view that is hidden or busy
-  is sent nothing, and a program that prints faster than a window paints is drawn at the window's rate.
-- **Holds the lines it has been shown.** History is asked for by line number as it is scrolled to, and
-  dropped when the screen is reflowed and the numbers no longer mean what they did.
-- **Asks the source what only it knows**: the word or line at a cell, the text of a selection, where a
-  string appears (`find`, `findNext`), the commands a shell marked (`commands`, `scrollToCommand`,
-  `selectOutput`) and where images are.
-- **Marks commands** in a gutter where the host gives it one, coloured by how each ended: blue while
-  running, green for a vouched exit status of zero, red for any other vouched exit status, yellow for a
-  claimed status regardless of code, and grey where a command has not started or nothing reported its end.
-  A command's `outcome` carries the same distinction for whatever reads it.
-- **Draws images** a program placed: their pixels are fetched once per generation and drawn under or over
-  the text as the program asked, scaled from the cell the terminal measured them in to the cell drawn. One
-  shown through placeholder cells comes with the rows that hold the cells, and is drawn under their text
-  wherever they are. One placed relative to another comes with the frame while it is on the screen, and
-  is not drawn once its parent has scrolled into the history.
-- **Puts its input where the cursor is, drawn or not.** A program that draws its own cursor hides the
-  terminal's and still moves it to where typing goes; an input method composes there.
-- **Confirms a paste** the source says could run a command, through the host's `confirmPaste`.
-- **Says what is on screen as text**, in an element a screen reader and a test read
-  (`[data-terminal-text]`), and which frame it last painted (`data-terminal-drawn`).
+- **Dual painter pipeline (`WebGL2AtlasPainter` + `CanvasPainter`).** `TerminalView` defaults to
+  `CanvasPainter`; pass `painter: (f) => createPainter(f)` to prefer `WebGL2AtlasPainter` (`preferWebGL !== false`),
+  which renders runs through a premultiplied RGBA8 shelf-packed glyph atlas, single-pass shader-driven
+  dotted/dashed/curly underlines, instanced quads, and a bounded 64 MiB GPU texture LRU for Kitty images —
+  falling back cleanly to `CanvasPainter` when WebGL2 is unavailable or disabled (`preferWebGL: false`).
+- **Adaptive BDP backpressure.** A view acknowledges each rendered frame with `FrameAck { seq, credit: { maxFrames, maxBytes } }`,
+  computing adaptive byte credits from EWMA RTT and sending `maxFrames = 0` when hidden so off-screen or slow
+  tabs never accumulate stale frames.
+- **Authoritative broker queries.** Selection across scrollback (`textOf`, `textOfRect`), word/line
+  boundaries (`wordAt`, `lineAt`), incremental server-side search (`setSearch`), command navigation
+  (`commands`, `commandOutput`, `scrollToCommand`, `selectOutput`), and content-addressed Kitty image blobs
+  (`getImageBlob`, verified against the requested SHA-256 digest before returning) all resolve against the
+  broker's VT state.
+- **Vouched vs claimed command gutter.** Commands render in the gutter by trust outcome: blue (running),
+  green (vouched exit 0), red (vouched non-zero exit), yellow (claimed exit regardless of code), grey
+  (unknown/not started).
+- **Zero runtime dependencies & optional `clock`.** Ships one ES module + `.d.ts` with no WebAssembly or Node
+  globals (strict DOM-only types). Pass an optional structural `{ after(ms, run): () => void }` `clock` to
+  share timers or drive blink/debounce deterministically in tests.
 
-## What a host says to it
+## Golden Wire Vector Contract
 
-- **`setTheme(theme)` and `setFont(font)`** change what a view is drawn in after it was made. Every row it
-  holds is drawn again and none is asked for; a font is measured, and `onFit` says what fits now.
-- **`followOnInput`** (on unless turned off): typing, composed text and a paste bring a view that is
-  scrolled back down to the screen, where what was typed appears.
-- **`onPasteRefused`** hears of a paste too large for the source to carry, of which none was sent. `paste()`
-  called by the host rejects with the same `TooLarge` instead.
-- **`optionIsAlt`** (off unless turned on): a Mac's option key is alt, as a person who set their terminal
-  that way expects, rather than the key that composes characters. A key held with it is then sent as what
-  the key types without it. Left off, a character option typed is sent as that character, marked as
-  `composed`.
-- **`BrokerViews.onClose(listener)`** hears, once, that a connection has stopped — it was closed, its stream
-  ended, or what arrived was not the protocol — which is when an owner that keeps one per broker makes
-  another.
-- **`clock`** (optional): a structural `{ after(ms, run): () => void }` timer source for cursor/text blink,
-  search refresh, and input dedupe timers — letting a host share one timer queue across open views (or drive
-  timers deterministically in tests) with no runtime dependency. Dispose views before closing a shared clock.
-  Left out, uses `setTimeout`/`clearTimeout`.
-- **`onEnded(reason)`** hears that no more frames will come: with no reason the session is over, and with
-  one it is there and the broker could not show it.
-
-## The protocol's two halves
-
-`src/broker/wire.ts` is the view's half of the broker's view protocol; the other half is in Rust, at this
-repository's root (`src/view/wire.rs`). Neither suite can run both, so they are held together by
-`node/view-vectors.json`, which the broker's suite writes from its encoder: `tests/wire.spec.ts` reads that
-file where it lies, decodes every vector for a view and encodes every one for the broker. When the
-protocol changes, the re-recorded file fails this suite until the codec reads it — in the same commit,
-since both halves are in it.
+`src/wire/` (`codec.ts`, `frame.ts`, `auth.ts`, `messages.ts`, `types.ts`) is the TypeScript half of
+`crates/apack-proto`. `node/wire-vectors-v2.json` is generated by the Rust test suite (`cargo xtask generate`)
+and verified by `tests/wire-vectors.spec.ts` on every test run so Rust and TypeScript codecs can never
+silently drift.
 
 ## License
 
-MIT OR Apache-2.0, the repository's ([LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE)). The
-input handling draws on [coder/ghostty-web](https://github.com/coder/ghostty-web), under MIT, whose notice
-[NOTICE](NOTICE) carries and the package ships.
+MIT OR Apache-2.0 ([LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE)). Input handling draws on
+[coder/ghostty-web](https://github.com/coder/ghostty-web) under MIT ([NOTICE](NOTICE)).

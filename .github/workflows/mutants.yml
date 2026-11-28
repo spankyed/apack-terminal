@@ -12,7 +12,7 @@ name: mutants
 #
 # **It runs on a push too, and that is not belt and braces.** This repository's work lands on `master`
 # directly, so a gate that fires only on a pull request had never fired at all — and `.cargo/mutants.toml`
-# says this job is what answers `src/tree.rs`. A claim about where a check is made has to be true of the
+# says this job is what answers `crates/apack-os/src/tree_windows.rs`. A claim about where a check is made has to be true of the
 # record and not only of the design. The Linux half duplicates `cargo xtask pre-push` and is cheap; the
 # Windows half is the one no developer here can run, which is the point of having it.
 #
@@ -27,7 +27,7 @@ on:
     inputs:
       files:
         description: The files to mutate on Windows, space separated
-        default: src/tree.rs
+        default: crates/apack-os/src/tree_windows.rs
         required: true
 
 permissions:
@@ -89,16 +89,16 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-mutants@27.1.0,cargo-nextest@0.9.148
-      # Exit 3 is a timeout, which is the suite's deadline catching a mutant rather than a survivor — the
-      # credit-accounting mutants in `output.rs` hang the writer by design. It is also what a run with a
-      # timeout *and* a survivor exits with, so the survivors are read from the list rather than the code.
+      # Exit 3 is a timeout, which is the suite's deadline catching a mutant rather than a survivor — codec
+      # and flow-control mutants hang by design. It is also what a run with a timeout *and* a survivor exits
+      # with, so the survivors are read from the list rather than the code.
       # Two at a time: a runner has four cores, and the suite under one mutant uses more than one
       - if: steps.scope.outputs.code == 'true'
         env:
           SHARD: ${{ matrix.shard }}
         run: |
           status=0
-          cargo mutants --in-diff change.diff --shard "$SHARD/8" --sharding round-robin --jobs 2 || status=$?
+          cargo mutants --workspace --in-diff change.diff --shard "$SHARD/8" --sharding round-robin --jobs 2 || status=$?
           if [ -s target/mutants.out/missed.txt ]; then cat target/mutants.out/missed.txt; fi
           if { [ "$status" != 0 ] && [ "$status" != 3 ]; } || [ -s target/mutants.out/missed.txt ]; then exit 1; fi
       - uses: actions/upload-artifact@v4
@@ -159,13 +159,12 @@ jobs:
             exit 0
           fi
           base="$(bash .github/base.sh)"
-          # **The files whose mutants only Windows can answer**, which is what this job is for. A file like
-          # `src/session.rs` holds Windows arms and POSIX code together, and `#[cfg(unix)]` code is not
-          # compiled here — so a mutation of it changes nothing, the suite passes, and the mutant is
-          # reported missed. A job scoped to the whole change is red whenever POSIX-only code moves, and
-          # says nothing about Windows either way.
+          # **The files whose mutants only Windows can answer**, which is what this job is for. A mixed file
+          # holds Windows arms and POSIX code together, and `#[cfg(unix)]` code is not compiled here — so a
+          # mutation of it changes nothing, the suite passes, and the mutant is reported missed. A job scoped
+          # to the whole change is red whenever POSIX-only code moves, and says nothing about Windows either way.
           #
-          # A mixed file's Windows arms are answered by a dispatch (`-f files=src/session.rs`): nothing here
+          # A mixed file's Windows arms are answered by a dispatch (`-f files=crates/apack-os/src/pty.rs`): nothing here
           # can tell a Windows mutant from a POSIX one inside one file, and a developer naming the file is
           # the claim being made deliberately rather than by a grep.
           # `base` is git arguments (`--merge-base HEAD^1` on a pull request), so it is split here as the Linux
@@ -214,7 +213,7 @@ jobs:
           set -f
           read -r -a args <<< "$ARGS"
           status=0
-          cargo mutants "${args[@]}" || status=$?
+          cargo mutants --workspace "${args[@]}" || status=$?
           if [ -s target/mutants.out/missed.txt ]; then cat target/mutants.out/missed.txt; fi
           if { [ "$status" != 0 ] && [ "$status" != 3 ]; } || [ -s target/mutants.out/missed.txt ]; then exit 1; fi
       - uses: actions/upload-artifact@v4

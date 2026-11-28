@@ -1,0 +1,12 @@
+# Enforce deterministic sans-IO purity in `apack-sim` (no wall clocks, OS I/O, or threads).
+disallowed-types = [
+    { path = "std::time::Instant", reason = "apack-sim is deterministic; use TimestampMs" },
+    { path = "std::time::SystemTime", reason = "apack-sim is deterministic; use TimestampMs" },
+    { path = "std::fs::File", reason = "apack-sim is deterministic; no filesystem access" },
+    { path = "std::net::TcpStream", reason = "apack-sim is deterministic; no network I/O" },
+]
+
+disallowed-methods = [
+    { path = "std::thread::spawn", reason = "apack-sim is deterministic; single-threaded simulation" },
+    { path = "std::thread::sleep", reason = "apack-sim is deterministic; advance virtual clock" },
+]

@@ -2,11 +2,6 @@
 # derives its subject from the `vendor/*` links rather than naming a checkout), so it is rebuildable by design.
 /target
 
-# ts-rs' default export directory. The protocol's home is `node/protocol.d.ts`, inside the package that ships
-# it, which `cargo xtask generate` writes; a bare `cargo test` writes here instead, and a second copy of a
-# generated contract goes stale without anyone reading it.
-/bindings
-
 mutants.out/
 
 # macOS Finder's per-folder view settings

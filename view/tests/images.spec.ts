@@ -1,845 +1,519 @@
-// Images a program placed: asked for when a frame says they changed, their pixels fetched once each, and
-// drawn where they are in the cells this view draws.
-import { beforeEach, describe, expect, it } from 'vitest'
-import { BrokerViews } from '../src/index.ts'
-import { rgbaOf } from '../src/broker/source.ts'
-import { CanvasPainter } from '../src/canvas-painter.ts'
-import { drawRow, type SelectedCells, type Theme } from '../src/draw.ts'
-import { PLAIN, type Anchored, type AnchoredImages, type Picture, type Piece, type Placement, type Row, type Style } from '../src/source.ts'
-import { FakeBroker } from './_broker.ts'
-import { recordingContext } from './_canvas.ts'
-import { installFrames, runFrames } from './_frames.ts'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { ImageCache, blobHashToHex } from '../src/index.ts'
+import { FakeSource } from './_source.ts'
 import { frame, row } from './_support.ts'
-import { mountedView, settled, theme } from './_view.ts'
+import { mountedView, settled } from './_view.ts'
+import { framesWaiting, installFrames } from './_frames.ts'
 
-/** A row drawn with `styles` as its own: the plain one, then whatever its characters name */
-const drawStyled = (row: Row, styles: Style[], theme: Theme, selected?: SelectedCells) => drawRow({ ...row, styles }, theme, selected)
-
-beforeEach(installFrames)
-
-const placement = (parts: Partial<Placement>): Placement => ({
-  image: 1, generation: 1, z: 0, line: 0, column: 0, columns: 4, rows: 3, offsetX: 0, offsetY: 0, width: 40, height: 60,
-  sourceX: 0, sourceY: 0, sourceWidth: 40, sourceHeight: 60, ...parts,
-})
-const pixels = (width: number, height: number): Picture => ({ generation: 1, width, height, pixels: new Uint8ClampedArray(width * height * 4) })
-
-const piece = (parts: Partial<Piece>): Piece => ({
-  image: 1, generation: 1, column: 0, columns: 4, offsetX: 0, offsetY: 0, width: 40, height: 20,
-  sourceX: 0, sourceY: 0, sourceWidth: 40, sourceHeight: 20, ...parts,
-})
-/** A row of blank cells that shows `pieces`, measured in a cell of `cellWidth` by `cellHeight` */
-const showing = (line: number, pieces: Piece[], cellWidth = 10, cellHeight = 20): Row => ({ ...row(line, '    '), images: { cellWidth, cellHeight, pieces } })
-
-/** Runs what a view has waiting until it has nothing: a paint, what the paint asked for, the paint that prompts */
-async function quiet(view: { painted: () => unknown }): Promise<void> {
-  for (let round = 0; round < 6; round += 1) {
-    view.painted()
-    await settled()
+function fakeBitmap(width: number, height: number) {
+  let closed = false
+  return {
+    width,
+    height,
+    get closed() {
+      return closed
+    },
+    close() {
+      closed = true
+    },
   }
 }
 
-/** A view whose pictures are the pixels they were made from, so a case can say which one was drawn */
-function viewing() {
-  const made: Picture[] = []
-  const setup = mountedView({ picture: async (read) => { made.push(read); return read as unknown as CanvasImageSource } })
-  return { ...setup, made }
-}
-
-describe('an image shown through placeholder cells', () => {
-  it('is drawn where its row is, under the text, in this view\'s cells', async () => {
-    const view = viewing()
-    const picture = pixels(40, 40)
-    view.source.pictures.set(7, picture)
-    // The terminal was told a cell is five by ten; this view draws one at ten by twenty
-    view.source.send(frame({
-      rows: [
-        row(0, 'text'),
-        showing(1, [piece({ image: 7, column: 3, offsetX: 2, offsetY: 1, width: 18, height: 9, sourceY: 0 })], 5, 10),
-        showing(2, [piece({ image: 7, column: 3, offsetX: 2, width: 18, height: 10, sourceY: 20 })], 5, 10),
-      ],
-    }))
-    await settled()
-    await settled()
-    expect(view.source.picturesAsked, 'one picture shown by two rows is one picture').toEqual([7])
-    expect(view.painted().images).toEqual([
-      { picture, x: 34, y: 22, width: 36, height: 18, source: { x: 0, y: 0, width: 40, height: 20 }, above: false, z: -1 },
-      { picture, x: 34, y: 40, width: 36, height: 20, source: { x: 0, y: 20, width: 40, height: 20 }, above: false, z: -1 },
-    ])
+describe('ImageCache and TerminalView image placements', () => {
+  beforeEach(() => {
+    installFrames()
+  })
+  afterEach(() => {
+    document.body.innerHTML = ''
   })
 
-  it('moves with its row in the frame that moves the row', async () => {
-    const view = viewing()
-    view.source.pictures.set(7, pixels(40, 20))
-    view.source.send(frame({ rows: [showing(1, [piece({ image: 7 })])] }))
-    await settled()
-    await settled()
-    expect(view.painted().images?.map((image) => image.y)).toEqual([20])
-
-    // The program wrote the cells a row further down, as one that redraws its screen does
-    view.source.send(frame({ sequence: 2, rows: [row(1, ''), showing(2, [piece({ image: 7 })])] }))
-    expect(view.painted().images?.map((image) => image.y), 'drawn where the cells were a frame ago').toEqual([40])
-    expect(view.source.picturesAsked, 'the same picture, wherever it is').toEqual([7])
-  })
-
-  it('has its pixels asked for again when its rows say they are another generation', async () => {
-    const view = viewing()
-    view.source.pictures.set(7, pixels(40, 20))
-    view.source.send(frame({ images: 1, rows: [showing(1, [piece({ image: 7 })])] }))
-    await settled()
-    await settled()
-    expect(view.source.picturesAsked).toEqual([7])
-
-    view.source.pictures.set(7, { ...pixels(40, 20), generation: 2 })
-    view.source.send(frame({ sequence: 2, images: 2, rows: [showing(1, [piece({ image: 7, generation: 2 })])] }))
-    await settled()
-    await settled()
-    expect(view.source.picturesAsked).toEqual([7, 7])
-    expect(view.made.at(-1)?.generation).toBe(2)
-  })
-
-  it('keeps its picture while a row held shows it, and lets it go when none does', async () => {
-    const view = viewing()
-    view.source.pictures.set(7, pixels(40, 20))
-    view.source.send(frame({ images: 1, rows: [showing(1, [piece({ image: 7 })])] }))
-    await settled()
-    await settled()
-    expect(view.painted().images).toHaveLength(1)
-
-    // The images are told again, and none is placed: the one a row shows is still shown
-    view.source.send(frame({ sequence: 2, images: 2 }))
-    await settled()
-    await settled()
-    expect(view.painted().images, 'a picture a row still shows was let go').toHaveLength(1)
-    expect(view.source.picturesAsked).toEqual([7])
-
-    // The row is written over: nothing shows it, and shown again it is asked for again
-    view.source.send(frame({ sequence: 3, images: 3, rows: [row(1, 'text')] }))
-    await settled()
-    await settled()
-    expect(view.painted().images).toEqual([])
-    view.source.send(frame({ sequence: 4, images: 3, rows: [showing(1, [piece({ image: 7 })])] }))
-    await quiet(view)
-    expect(view.source.picturesAsked).toEqual([7, 7])
-  })
-
-  it('is asked after again in the history when the images change, and drawn as it was until told', async () => {
-    const view = viewing()
-    view.source.pictures.set(7, pixels(40, 20))
-    // Scrolled up to a history line that shows the picture
-    view.source.history.set(98, showing(98, [piece({ image: 7 })]))
-    view.source.send(frame({ firstActive: 100, scrollback: 100, images: 1 }))
-    view.view.scrollTo(98)
-    await quiet(view)
-    expect(view.painted().images).toHaveLength(1)
-    const fetched = view.source.fetched.length
-
-    // The image is deleted: the owner holds the row with nothing to show
-    view.source.history.set(98, row(98, '    '))
-    view.source.send(frame({ sequence: 2, firstActive: 100, scrollback: 100, images: 2 }))
-    expect(view.painted().images, 'a row asked for again is blank until the answer comes').toHaveLength(1)
-    await quiet(view)
-    expect(view.source.fetched.length, 'a history row that showed an image was not asked for again').toBeGreaterThan(fetched)
-    expect(view.painted().images).toEqual([])
-  })
-
-  it('is not asked after again where the frame that says the images changed brought the row', async () => {
-    const view = viewing()
-    view.source.pictures.set(7, pixels(40, 20))
-    view.source.history.set(99, showing(99, [piece({ image: 7 })]))
-    view.source.send(frame({ firstActive: 100, scrollback: 100, images: 1 }))
-    await quiet(view)
-    const covers = (line: number) => view.source.fetched.filter(([first, count]) => first <= line && line < first + count).length
-    const asked = covers(99)
-
-    // The line left the screen in this frame, which brings it as it ended up
-    view.source.send(frame({ sequence: 2, firstActive: 100, scrollback: 100, images: 2, rows: [showing(99, [piece({ image: 7, generation: 2 })])] }))
-    await quiet(view)
-    expect(covers(99), 'a row the frame brought was asked for again').toBe(asked)
-  })
-
-  it('is asked for once at its newest generation where two rows in view show it at two', async () => {
-    const view = viewing()
-    view.source.pictures.set(7, { ...pixels(40, 20), generation: 2 })
-    // A history row brought before the image was sent again, beside a screen row brought since
-    view.source.history.set(99, showing(99, [piece({ image: 7, generation: 1 })]))
-    view.source.send(frame({ firstActive: 100, scrollback: 100, images: 1, rows: [showing(100, [piece({ image: 7, generation: 2 })])] }))
-    view.view.scrollTo(98)
-    await quiet(view)
-    await quiet(view)
-    expect(view.source.picturesAsked, 'its pixels were fetched again at every paint').toEqual([7])
-    expect(view.painted().images).toHaveLength(2)
-  })
-
-  it('is asked after again when the answer that brought its row crossed the frame that changed the images', async () => {
-    const view = viewing()
-    view.source.pictures.set(7, pixels(40, 20))
-    view.source.history.set(98, showing(98, [piece({ image: 7, width: 40 })]))
-    view.source.send(frame({ firstActive: 100, scrollback: 100, images: 1 }))
-    view.view.scrollTo(98)
-    // The paint asks for the history; before its answer is taken, the image is replaced and the frame
-    // that says so arrives. The answer holds the row as it was
-    view.painted()
-    view.source.history.set(98, showing(98, [piece({ image: 7, generation: 2, width: 20 })]))
-    view.source.pictures.set(7, { ...pixels(20, 20), generation: 2 })
-    view.source.send(frame({ sequence: 2, firstActive: 100, scrollback: 100, images: 2 }))
-    await quiet(view)
-    await quiet(view)
-    expect(view.painted().images?.map((image) => image.width), 'the row stayed as the older answer had it').toEqual([20])
-  })
-
-  it('is drawn once its image arrives, in a history row whose cells showed nothing', async () => {
-    const view = viewing()
-    view.source.pictures.set(7, pixels(40, 20))
-    view.source.history.set(98, { ...row(98, '    '), images: { cellWidth: 10, cellHeight: 20, pieces: [] } })
-    view.source.send(frame({ firstActive: 100, scrollback: 100, images: 1 }))
-    view.view.scrollTo(98)
-    await quiet(view)
-    expect(view.painted().images).toEqual([])
-
-    view.source.history.set(98, showing(98, [piece({ image: 7 })]))
-    view.source.send(frame({ sequence: 2, firstActive: 100, scrollback: 100, images: 2 }))
-    await quiet(view)
-    await quiet(view)
-    expect(view.painted().images, 'a row whose cells showed nothing was not asked for again').toHaveLength(1)
-  })
-
-  it('is asked after when the images change though asking where they are had failed', async () => {
-    const view = viewing()
-    view.source.pictures.set(7, pixels(40, 20))
-    view.source.history.set(98, showing(98, [piece({ image: 7, width: 40 })]))
-    // Where the images are cannot be asked this once
-    const images = view.source.images.bind(view.source)
-    view.source.images = () => Promise.reject(new Error('not now'))
-    view.source.send(frame({ firstActive: 100, scrollback: 100, images: 1 }))
-    view.view.scrollTo(98)
-    await quiet(view)
-    view.source.images = images
-
-    view.source.history.set(98, showing(98, [piece({ image: 7, width: 20 })]))
-    view.source.send(frame({ sequence: 2, firstActive: 100, scrollback: 100, images: 2 }))
-    await quiet(view)
-    await quiet(view)
-    expect(view.painted().images?.map((image) => image.width)).toEqual([20])
-  })
-})
-
-const anchored = (parts: Partial<Anchored>): Anchored => ({
-  image: 7, generation: 1, z: 0, row: 0, column: 0, columns: 2, rows: 1, offsetX: 0, offsetY: 0, width: 20, height: 20,
-  sourceX: 0, sourceY: 0, sourceWidth: 20, sourceHeight: 20, ...parts,
-})
-/** What a frame says of the images placed relative to another, measured in a cell of ten by twenty unless told */
-const anchoring = (list: Anchored[], cellWidth = 10, cellHeight = 20): AnchoredImages => ({ cellWidth, cellHeight, omitted: 0, list })
-
-describe('an image placed relative to another', () => {
-  it('is drawn where the frame says it is, in this view\'s cells, the ones under the text first', async () => {
-    const view = viewing()
-    const picture = pixels(20, 20)
-    view.source.pictures.set(7, picture)
-    // The terminal was told a cell is five by ten; this view draws one at ten by twenty
-    view.source.send(frame({
-      anchored: anchoring([
-        anchored({ z: 4, row: 1, column: 3, offsetX: 2, offsetY: 1, width: 10, height: 10 }),
-        // One that starts above and left of the screen and reaches into it
-        anchored({ z: -3, row: -1, column: -1, rows: 3, width: 10, height: 30 }),
-      ], 5, 10),
-    }))
-    await settled()
-    await settled()
-    expect(view.source.picturesAsked, 'one picture placed twice is one picture').toEqual([7])
-    expect(view.painted().images).toEqual([
-      { picture, x: -10, y: -20, width: 20, height: 60, source: { x: 0, y: 0, width: 20, height: 20 }, above: false, z: -3 },
-      { picture, x: 34, y: 22, width: 20, height: 20, source: { x: 0, y: 0, width: 20, height: 20 }, above: true, z: 4 },
-    ])
-  })
-
-  it('stays on its line when a frame that says nothing of it moves the screen', async () => {
-    const view = viewing()
-    view.source.pictures.set(7, pixels(20, 20))
-    view.source.send(frame({ firstActive: 5, scrollback: 5, anchored: anchoring([anchored({ row: 2 })]) }))
-    await settled()
-    await settled()
-    expect(view.painted().images?.map((image) => image.y)).toEqual([40])
-
-    // One line left the screen: a row is counted from the first line of the frame that told it
-    view.source.send(frame({ sequence: 2, firstActive: 6, scrollback: 6, rows: [row(9, 'more')] }))
-    expect(view.painted().images?.map((image) => image.y)).toEqual([20])
-  })
-
-  it('moves, and is gone, in the frame that says so', async () => {
-    const view = viewing()
-    view.source.pictures.set(7, pixels(20, 20))
-    view.source.send(frame({ anchored: anchoring([anchored({ row: 1 })]) }))
-    await settled()
-    await settled()
-    view.source.send(frame({ sequence: 2, anchored: anchoring([anchored({ row: 3, column: 5 })]) }))
-    expect(view.painted().images?.map((image) => [image.x, image.y])).toEqual([[50, 60]])
-    expect(view.source.picturesAsked, 'the same picture, wherever it is').toEqual([7])
-
-    view.source.send(frame({ sequence: 3, anchored: anchoring([]) }))
-    expect(view.painted().images).toEqual([])
-  })
-
-  it('keeps its picture while it is told, and lets it go once it is not', async () => {
-    const view = viewing()
-    view.source.pictures.set(7, pixels(20, 20))
-    view.source.send(frame({ images: 1, anchored: anchoring([anchored({})]) }))
-    await settled()
-    await settled()
-    // The images are told again, and none is placed by itself: the one placed relative to another is still shown
-    view.source.send(frame({ sequence: 2, images: 2 }))
-    await settled()
-    await settled()
-    expect(view.painted().images).toHaveLength(1)
-    expect(view.source.picturesAsked).toEqual([7])
-
-    // Gone, and then back: its picture was let go, so it is asked for again
-    view.source.send(frame({ sequence: 3, images: 3, anchored: anchoring([]) }))
-    await settled()
-    await settled()
-    view.source.send(frame({ sequence: 4, images: 4, anchored: anchoring([anchored({})]) }))
-    await settled()
-    await settled()
-    expect(view.source.picturesAsked).toEqual([7, 7])
-    expect(view.painted().images).toHaveLength(1)
-  })
-
-  it('has its pixels asked for again when a frame says they are another generation', async () => {
-    const view = viewing()
-    view.source.pictures.set(7, pixels(20, 20))
-    view.source.send(frame({ anchored: anchoring([anchored({})]) }))
-    await settled()
-    await settled()
-    view.source.pictures.set(7, { ...pixels(20, 20), generation: 2 })
-    view.source.send(frame({ sequence: 2, anchored: anchoring([anchored({ generation: 2 })]) }))
-    await settled()
-    await settled()
-    expect(view.source.picturesAsked).toEqual([7, 7])
-    expect(view.made.at(-1)?.generation).toBe(2)
-  })
-
-  it('loses its place when the screen is reflowed, unless the frame that says so tells it', async () => {
-    const view = viewing()
-    view.source.pictures.set(7, pixels(20, 20))
-    view.source.send(frame({ anchored: anchoring([anchored({ row: 1 })]) }))
-    await settled()
-    await settled()
-    expect(view.painted().images).toHaveLength(1)
-
-    view.source.send(frame({ sequence: 2, epoch: 2 }))
-    expect(view.painted().images).toEqual([])
-    view.source.send(frame({ sequence: 3, epoch: 3, anchored: anchoring([anchored({ row: 2 })]) }))
-    expect(view.painted().images?.map((image) => image.y)).toEqual([40])
-  })
-})
-
-describe('the images of a session', () => {
-  it('are asked for when a frame says they changed, and their pixels once for each picture', async () => {
-    const view = viewing()
-    view.source.placed = { cellWidth: 10, cellHeight: 20, placements: [placement({ image: 7, line: 1 }), placement({ image: 7, line: 9 })] }
-    view.source.pictures.set(7, pixels(40, 60))
-    view.source.send(frame({ images: 1 }))
-    await settled()
-    expect(view.source.imagesAsked).toBe(1)
-    expect(view.source.picturesAsked, 'one picture placed twice is one picture').toEqual([7])
-
-    view.source.send(frame({ sequence: 2, images: 1 }))
-    await settled()
-    expect(view.source.imagesAsked, 'asked again though nothing changed').toBe(1)
-
-    // Placed somewhere else: where they are is asked again, the pixels this view holds are not
-    view.source.placed = { cellWidth: 10, cellHeight: 20, placements: [placement({ image: 7, line: 2 })] }
-    view.source.send(frame({ sequence: 3, images: 2 }))
-    await settled()
-    expect(view.source.imagesAsked).toBe(2)
-    expect(view.source.picturesAsked).toEqual([7])
-
-    // Replaced by another picture under the same number: its pixels are stale
-    view.source.placed = { cellWidth: 10, cellHeight: 20, placements: [placement({ image: 7, line: 2, generation: 2 })] }
-    view.source.send(frame({ sequence: 4, images: 3 }))
-    await settled()
-    expect(view.source.picturesAsked).toEqual([7, 7])
-  })
-
-  it('are drawn where they are, in this view\'s cells, the ones under the text first', async () => {
-    const view = viewing()
-    const under = pixels(40, 60)
-    const over = pixels(8, 8)
-    view.source.pictures.set(1, under)
-    view.source.pictures.set(2, over)
-    // The terminal was told a cell is five by ten; this view draws one at ten by twenty
-    view.source.placed = {
-      cellWidth: 5, cellHeight: 10,
-      placements: [
-        placement({ image: 2, z: 3, line: 2, column: 6, width: 8, height: 8, sourceWidth: 8, sourceHeight: 8, columns: 2, rows: 1 }),
-        placement({ image: 1, z: -1, line: 1, column: 3, offsetX: 2, offsetY: 4, width: 20, height: 30, sourceX: 10, sourceY: 5, sourceWidth: 20, sourceHeight: 20 }),
-      ],
+  it('deduplicates concurrent fetches and evicts least-recently-used entries under byte cap', async () => {
+    const source = new FakeSource()
+    const b1 = new Uint8Array(32).fill(1)
+    const b2 = new Uint8Array(32).fill(2)
+    const b3 = new Uint8Array(32).fill(3)
+    for (const b of [b1, b2, b3]) {
+      source.blobs.set(blobHashToHex(b), { blob: b, encoding: 'png', bytes: new Uint8Array([1, 2, 3]) })
     }
-    view.source.send(frame({ images: 1, rows: [row(0, 'text')] }))
-    await settled()
-    await settled()
-    expect(view.painted().images).toEqual([
-      { picture: under, x: 34, y: 28, width: 40, height: 60, source: { x: 10, y: 5, width: 20, height: 20 }, above: false, z: -1 },
-      { picture: over, x: 60, y: 40, width: 16, height: 16, source: { x: 0, y: 0, width: 8, height: 8 }, above: true, z: 3 },
-    ])
-  })
 
-  it('are drawn only where some of them is in view, and from above the first row when they began there', async () => {
-    const view = viewing()
-    view.source.pictures.set(1, pixels(40, 60))
-    view.source.placed = {
-      cellWidth: 10, cellHeight: 20,
-      placements: [placement({ line: 98, rows: 3 }), placement({ line: 90, rows: 3 }), placement({ line: 104, rows: 3 })],
-    }
-    view.source.send(frame({ firstActive: 100, scrollback: 100, images: 1 }))
-    await settled()
-    await settled()
-    // The screen is lines 100 to 103: one image ends on line 100, one ended before it, one starts after
-    expect(view.painted().images?.map((image) => image.y)).toEqual([-40])
-  })
-
-  it('lose their places when the screen is reflowed, and keep their pixels', async () => {
-    const view = viewing()
-    view.source.pictures.set(1, pixels(40, 60))
-    view.source.placed = { cellWidth: 10, cellHeight: 20, placements: [placement({ line: 1 })] }
-    view.source.send(frame({ images: 1 }))
-    await settled()
-    await settled()
-    expect(view.painted().images).toHaveLength(1)
-
-    view.source.placed = { cellWidth: 10, cellHeight: 20, placements: [placement({ line: 2 })] }
-    view.source.send(frame({ sequence: 2, epoch: 2, images: 1 }))
-    expect(view.painted().images, 'drawn on a line of the epoch before').toEqual([])
-    await settled()
-    expect(view.source.imagesAsked).toBe(2)
-    expect(view.painted().images?.map((image) => image.y)).toEqual([40])
-    expect(view.source.picturesAsked).toEqual([1])
-  })
-})
-
-describe('the pictures a view holds', () => {
-  /** A view whose pictures say when they are closed, as a bitmap must be for its pixels to be given back */
-  function holding() {
-    const made: Array<{ of: Picture; closed: boolean; close(): void }> = []
-    const setup = mountedView({
-      picture: async (read) => {
-        const picture = { of: read, closed: false, close() { this.closed = true } }
-        made.push(picture)
-        return picture as unknown as CanvasImageSource
+    const bitmaps: Array<ReturnType<typeof fakeBitmap>> = []
+    // Each 16x16 RGBA image = 1024 bytes; cap at 2048 bytes => holds at most 2 images
+    const cache = new ImageCache({
+      maxBytes: 2048,
+      decode: async () => {
+        const bm = fakeBitmap(16, 16)
+        bitmaps.push(bm)
+        return { source: bm as unknown as CanvasImageSource, width: 16, height: 16 }
       },
     })
-    const place = async (sequence: number, placements: Placement[]) => {
-      setup.source.placed = { cellWidth: 10, cellHeight: 20, placements }
-      setup.source.send(frame({ sequence, images: sequence }))
-      await settled()
-      await settled()
+
+    // Deduplicate concurrent ensure() calls for b1
+    const [r1a, r1b] = await Promise.all([cache.ensure(source, b1), cache.ensure(source, b1)])
+    expect(r1a).toBe(r1b)
+    expect(source.blobsAsked).toHaveLength(1)
+
+    await cache.ensure(source, b2)
+    // Touch b1 so b2 becomes least-recently-used
+    expect(cache.get(b1)).toBeDefined()
+    await cache.ensure(source, b3)
+
+    expect(cache.size).toBe(2)
+    expect(cache.bytesUsed).toBeLessThanOrEqual(2048)
+    expect(cache.get(b1)).toBeDefined()
+    expect(cache.get(b3)).toBeDefined()
+    expect(cache.get(b2)).toBeUndefined()
+    // Evicted bitmap must be closed!
+    expect(bitmaps[1]!.closed).toBe(true)
+    cache.dispose()
+    expect(cache.size).toBe(0)
+    expect(bitmaps[0]!.closed).toBe(true)
+    expect(bitmaps[2]!.closed).toBe(true)
+  })
+
+  it('fetches placements on imagesGen bump and renders both placements and placeholder pieces in z-order', async () => {
+    const source = new FakeSource()
+    const bgBlob = new Uint8Array(32).fill(0x10)
+    const fgBlob = new Uint8Array(32).fill(0x20)
+    const pieceBlob = new Uint8Array(32).fill(0x30)
+    for (const b of [bgBlob, fgBlob, pieceBlob]) {
+      source.blobs.set(blobHashToHex(b), { blob: b, encoding: 'png', bytes: new Uint8Array([9]) })
     }
-    return { ...setup, made, place }
-  }
+    source.imagesGen = 1
+    source.imagePlacements = [
+      // Large natural pixelSize (2000x1500) placed in 4x1 cells -> drawn at 4*10=40 by 1*20=20 CSS px!
+      {
+        blob: fgBlob,
+        line: 1,
+        col: 2,
+        sourceRect: [0, 0, 2000, 1500],
+        cellOffset: [0, 0],
+        pixelSize: [2000, 1500],
+        cellSpan: [4, 1],
+        zIndex: 5,
+      },
+      {
+        blob: bgBlob,
+        line: 0,
+        col: 0,
+        sourceRect: [0, 0, 800, 600],
+        cellOffset: [0, 0],
+        pixelSize: [800, 600],
+        cellSpan: [2, 1],
+        zIndex: -2,
+      },
+    ]
 
-  it('are closed when nothing places their image any more, and when the view is disposed', async () => {
-    const view = holding()
-    view.source.pictures.set(1, pixels(4, 4))
-    view.source.pictures.set(2, pixels(4, 4))
-    await view.place(1, [placement({ image: 1 }), placement({ image: 2, column: 6 })])
-    expect(view.made.map((picture) => picture.closed)).toEqual([false, false])
+    const pics = new Map<string, CanvasImageSource>()
+    const cache = new ImageCache({
+      decode: async (data) => {
+        const pic = document.createElement('canvas')
+        pic.width = 40
+        pic.height = 20
+        pics.set(blobHashToHex(data.blob), pic)
+        return { source: pic, width: 40, height: 20 }
+      },
+    })
 
-    await view.place(2, [placement({ image: 2, column: 6 })])
-    expect(view.made.map((picture) => picture.closed), 'the picture of an image that was deleted was left open').toEqual([true, false])
-    expect(view.painted().images).toHaveLength(1)
-
-    view.view.dispose()
-    expect(view.made.map((picture) => picture.closed)).toEqual([true, true])
-  })
-
-  it('are closed when the program replaces their image, once the new picture is there to draw instead', async () => {
-    const view = holding()
-    view.source.pictures.set(1, pixels(4, 4))
-    await view.place(1, [placement({ image: 1 })])
-
-    view.source.pictures.set(1, { ...pixels(8, 8), generation: 2 })
-    view.source.placed = { cellWidth: 10, cellHeight: 20, placements: [placement({ image: 1, generation: 2 })] }
-    view.source.send(frame({ sequence: 2, images: 2 }))
-    await Promise.resolve()
-    expect(view.painted().images?.[0]?.picture, 'nothing was drawn while the new pixels were on their way').toBe(view.made[0])
-    await settled()
-    await settled()
-
-    expect(view.made.map((picture) => [picture.of.width, picture.closed])).toEqual([[4, true], [8, false]])
-    expect(view.painted().images?.[0]?.picture).toBe(view.made[1])
-  })
-
-  it('are closed, and never drawn, when their image was deleted while they were being made', async () => {
-    const made: Array<{ closed: boolean; close(): void }> = []
-    let finish = () => {}
-    const view = mountedView({
-      picture: () => new Promise((resolve) => {
-        finish = () => {
-          const picture = { closed: false, close() { this.closed = true } }
-          made.push(picture)
-          resolve(picture as unknown as CanvasImageSource)
-        }
+    const { view, painted } = mountedView({ imageCache: cache }, source)
+    source.send(
+      frame({
+        seq: 1,
+        imagesGen: 1,
+        rows: [
+          row(0, 'top', {
+            pieces: [{ blob: pieceBlob, colStart: 1, colLen: 2, srcRect: [0, 0, 20, 20], dstPx: [20, 20] }],
+          }),
+          row(1, 'mid'),
+        ],
       }),
-    })
-    view.source.pictures.set(1, pixels(4, 4))
-    view.source.placed = { cellWidth: 10, cellHeight: 20, placements: [placement({ image: 1 })] }
-    view.source.send(frame({ images: 1 }))
-    await settled()
-
-    // Deleted while its pixels are being turned into a picture
-    view.source.placed = { cellWidth: 10, cellHeight: 20, placements: [] }
-    view.source.send(frame({ sequence: 2, images: 2 }))
-    await settled()
-    finish()
-    await settled()
-
-    expect(made.map((picture) => picture.closed), 'a picture nothing holds was left open').toEqual([true])
-    expect(view.painted().images).toEqual([])
-  })
-
-  it('are asked for again when the placements are told again, after an answer that was no picture — and not on every paint until then', async () => {
-    const view = holding()
-    // The image is placed, and the source has no pixels for it yet
-    await view.place(1, [placement({ image: 7 })])
-    for (let paint = 0; paint < 3; paint += 1) {
-      view.view.redraw()
-      runFrames()
-      await settled()
-    }
-    expect(view.source.picturesAsked, 'asked again on every paint').toEqual([7])
-
-    view.source.pictures.set(7, pixels(4, 4))
-    await view.place(2, [placement({ image: 7 })])
-    expect(view.source.picturesAsked).toEqual([7, 7])
-    expect(view.painted().images).toHaveLength(1)
-  })
-
-  it('are asked for again when the view is mounted again, after an answer that never came for want of an attachment', async () => {
-    const view = holding()
-    let answer: (read: Picture | null) => void = () => {}
-    view.source.image = (id: number) => {
-      view.source.picturesAsked.push(id)
-      return new Promise((resolve) => { answer = resolve })
-    }
-    view.source.placed = { cellWidth: 10, cellHeight: 20, placements: [placement({ image: 1 })] }
-    view.source.send(frame({ images: 1 }))
-    await settled()
-    expect(view.source.picturesAsked).toEqual([1])
-
-    // Taken off the page while the pixels were on their way: a source with no attachment has no answer
-    view.view.unmount()
-    answer(null)
-    await settled()
-
-    // Back on it in the same numbering, with the same images where they were: nothing says to ask where they are
-    view.view.mount(view.host)
-    view.source.send(frame({ sequence: 2, images: 1, staleFrom: 0 }))
-    await settled()
-    expect(view.source.picturesAsked, 'the image was given up on').toEqual([1, 1])
-    expect(view.source.imagesAsked).toBe(1)
-    answer(pixels(4, 4))
-    await settled()
-    await settled()
-    expect(view.painted().images).toHaveLength(1)
-  })
-
-  it('are asked for when their image is in view or a screenful from it, and not before', async () => {
-    const view = holding()
-    view.source.pictures.set(1, pixels(4, 4))
-    view.source.placed = { cellWidth: 10, cellHeight: 20, placements: [placement({ image: 1, line: 40, rows: 3 })] }
-    view.source.send(frame({ firstActive: 100, scrollback: 100, images: 1 }))
-    await settled()
-    runFrames()
-    expect(view.source.picturesAsked, 'pixels were fetched for an image sixty lines up the history').toEqual([])
-
-    view.view.scrollTo(45)
-    runFrames()
-    await settled()
-    await settled()
-    expect(view.source.picturesAsked).toEqual([1])
-    view.view.scrollTo(41)
-    expect(view.painted().images).toHaveLength(1)
-  })
-})
-
-describe('an image on the canvas', () => {
-  it('is drawn over the backgrounds and under the characters, or over both', () => {
-    const { canvas, drawn } = recordingContext()
-    const painter = new CanvasPainter({ family: 'monospace', size: 14 }, canvas)
-    painter.resize(20, 4, 1, 6)
-    const picture = {} as CanvasImageSource
-    const source = { x: 1, y: 2, width: 3, height: 4 }
-    painter.paint({
-      theme,
-      rows: [drawStyled(row(0, 'ab'), [PLAIN], theme)],
-      offset: 0.5,
-      images: [
-        { picture, x: 10, y: 20, width: 30, height: 40, source, above: false },
-        { picture, x: 50, y: 0, width: 10, height: 10, source, above: true },
-      ],
-    })
-    const kinds = drawn.map((one) => one.kind)
-    const first = kinds.indexOf('image')
-    const last = kinds.lastIndexOf('image')
-    const text = kinds.indexOf('text')
-    expect(first).toBeLessThan(text)
-    expect(last).toBeGreaterThan(text)
-    // Moved clear of the gutter with the rows, and up by the half row the view is scrolled
-    expect(drawn[first]).toMatchObject({ x: 16, y: 10, width: 30, height: 40, source: [1, 2, 3, 4] })
-    expect(drawn[last]).toMatchObject({ x: 56, y: -10, width: 10, height: 10 })
-  })
-})
-
-describe('an image from a broker', () => {
-  function attached() {
-    const broker = new FakeBroker()
-    const source = new BrokerViews(broker).open('s-1')
-    let ended = 0
-    source.attach({ frame: () => {}, ended: () => { ended += 1 } })
-    broker.say({ kind: 'frame', channel: 1, frame: frame({ epoch: 6 }) })
-    broker.taken()
-    return { broker, source, ended: () => ended }
-  }
-  const part = { kind: 'image', channel: 1, image: 7, generation: 3, width: 2, height: 1, channels: 4, total: 8 } as const
-
-  it('is where the broker says, unless the answer is from before a reflow', async () => {
-    const { broker, source } = attached()
-    const placed = [placement({ image: 7, line: 40 })]
-    const asked = source.images()
-    expect(broker.taken()).toEqual([{ kind: 'images', channel: 1, request: 1 }])
-    broker.say({ kind: 'images', channel: 1, request: 1, epoch: 6, cellWidth: 9, cellHeight: 18, placements: placed })
-    expect(await asked).toEqual({ cellWidth: 9, cellHeight: 18, placements: placed })
-
-    const stale = source.images()
-    broker.say(
-      { kind: 'frame', channel: 1, frame: frame({ epoch: 7 }) },
-      { kind: 'images', channel: 1, request: 2, epoch: 6, cellWidth: 9, cellHeight: 18, placements: placed },
     )
-    expect((await stale).placements).toEqual([])
+    painted()
+    await settled()
+    await settled()
+    const scene = painted()
+
+    expect(source.imagesAsked).toBe(1)
+    expect(scene.images?.length).toBe(3)
+    // Sorted by z: bg (-2) -> piece (-1) -> fg (+5)
+    expect(scene.images![0]!.picture).toBe(pics.get(blobHashToHex(bgBlob)))
+    expect(scene.images![0]!.above).toBe(false)
+    expect(scene.images![1]!.picture).toBe(pics.get(blobHashToHex(pieceBlob)))
+    expect(scene.images![1]!.above).toBe(false)
+    expect(scene.images![2]!.picture).toBe(pics.get(blobHashToHex(fgBlob)))
+    expect(scene.images![2]!.above).toBe(true)
+    expect(scene.images![2]!.width).toBe(40)
+    expect(scene.images![2]!.height).toBe(20)
+
+    view.dispose()
+    cache.dispose()
   })
 
-  it('arrives in parts, each asked for from where the last ended', async () => {
-    const { broker, source } = attached()
-    const asked = source.image(7)
-    expect(broker.taken()).toEqual([{ kind: 'image', channel: 1, request: 1, image: 7, offset: 0 }])
-    broker.say({ ...part, request: 1, offset: 0, bytes: Uint8Array.of(1, 2, 3, 4, 5) })
-    await settled()
-    expect(broker.taken()).toEqual([{ kind: 'image', channel: 1, request: 2, image: 7, offset: 5 }])
-    broker.say({ ...part, request: 2, offset: 5, bytes: Uint8Array.of(6, 7, 8) })
-    expect(await asked).toEqual({ generation: 3, width: 2, height: 1, pixels: Uint8ClampedArray.of(1, 2, 3, 4, 5, 6, 7, 8) })
-  })
-
-  it('is read again from its start when the program replaced it between two parts', async () => {
-    const { broker, source } = attached()
-    const asked = source.image(7)
-    broker.say({ ...part, request: 1, offset: 0, bytes: Uint8Array.of(1, 2, 3, 4, 5) })
-    await settled()
-    broker.say({ ...part, generation: 4, request: 2, offset: 5, bytes: Uint8Array.of(9, 9, 9) })
-    await settled()
-    expect(broker.taken().at(-1)).toEqual({ kind: 'image', channel: 1, request: 3, image: 7, offset: 0 })
-    broker.say({ ...part, generation: 4, request: 3, offset: 0, bytes: Uint8Array.of(8, 7, 6, 5, 4, 3, 2, 1) })
-    expect(await asked).toEqual({ generation: 4, width: 2, height: 1, pixels: Uint8ClampedArray.of(8, 7, 6, 5, 4, 3, 2, 1) })
-  })
-
-  it('is nothing when the broker no longer has it', async () => {
-    const { broker, source } = attached()
-    const asked = source.image(7)
-    broker.say({ kind: 'failed', channel: 1, request: 1, message: 'no image 7' })
-    expect(await asked).toBeNull()
-  })
-
-  it('rejects invalid dimensions, bad channel counts, huge totals, bad offsets, empty chunks, and runaway generation restarts', async () => {
-    // 1. Zero dimensions (rejected by SessionSource.image validation, connection stays open)
-    {
-      const { broker, source, ended } = attached()
-      const asked = source.image(1)
-      expect(broker.taken()).toEqual([{ kind: 'image', channel: 1, request: 1, image: 1, offset: 0 }])
-      broker.say({ ...part, request: 1, image: 1, width: 0, height: 1, total: 0, offset: 0, bytes: new Uint8Array(0) })
-      expect(await asked).toBeNull()
-      expect(ended(), 'zero-dimension check should not close the connection').toBe(0)
+  it('notifies painter.releaseImage on ImageCache eviction, honors anchored sourceRect/cellOffset/pixelSize, and reschedules doubted askPage fetches', async () => {
+    const source = new FakeSource()
+    const b1 = new Uint8Array(32).fill(0x51)
+    const b2 = new Uint8Array(32).fill(0x52)
+    const b3 = new Uint8Array(32).fill(0x53)
+    for (const b of [b1, b2, b3]) {
+      source.blobs.set(blobHashToHex(b), { blob: b, encoding: 'png', bytes: new Uint8Array([1, 2, 3]) })
     }
+    source.imagesGen = 1
+    source.imagePlacements = [
+      {
+        blob: b1,
+        line: 0,
+        col: 1,
+        sourceRect: [4, 2, 12, 10],
+        cellOffset: [3, 5],
+        pixelSize: [12, 10],
+        cellSpan: [3, 2],
+        zIndex: 1,
+      },
+    ]
 
-    // 2. Invalid channels (5) closes the wire connection in decodeToView; isolated on its own fixture
-    {
-      const { broker, source, ended } = attached()
-      const asked = source.image(2)
-      expect(broker.taken()).toEqual([{ kind: 'image', channel: 1, request: 1, image: 2, offset: 0 }])
-      broker.say({ ...part, request: 1, image: 2, channels: 5, total: 10, offset: 0, bytes: new Uint8Array(10) })
-      expect(await asked).toBeNull()
-      expect(ended(), 'malformed wire channel count closes the connection').toBe(1)
-    }
-
-    // 3. Dimensions exceeding 64 MiB RGBA cap (rejected by SessionSource.image validation)
-    {
-      const { broker, source, ended } = attached()
-      const asked = source.image(3)
-      expect(broker.taken()).toEqual([{ kind: 'image', channel: 1, request: 1, image: 3, offset: 0 }])
-      broker.say({ ...part, request: 1, image: 3, width: 5000, height: 5000, channels: 4, total: 5000 * 5000 * 4, offset: 0, bytes: Uint8Array.of(1) })
-      expect(await asked).toBeNull()
-      expect(ended()).toBe(0)
-    }
-
-    // 4. Non-zero offset on first chunk (rejected by SessionSource.image validation)
-    {
-      const { broker, source, ended } = attached()
-      const asked = source.image(4)
-      expect(broker.taken()).toEqual([{ kind: 'image', channel: 1, request: 1, image: 4, offset: 0 }])
-      broker.say({ ...part, request: 1, image: 4, offset: 2, bytes: Uint8Array.of(1, 2, 3, 4) })
-      expect(await asked).toBeNull()
-      expect(ended()).toBe(0)
-    }
-
-    // 5. Offset past whole.length on second chunk (returns null, not RangeError)
-    {
-      const { broker, source, ended } = attached()
-      const asked = source.image(5)
-      expect(broker.taken()).toEqual([{ kind: 'image', channel: 1, request: 1, image: 5, offset: 0 }])
-      broker.say({ ...part, request: 1, image: 5, offset: 0, bytes: Uint8Array.of(1, 2, 3, 4) })
-      await settled()
-      expect(broker.taken()).toEqual([{ kind: 'image', channel: 1, request: 2, image: 5, offset: 4 }])
-      broker.say({ ...part, request: 2, image: 5, offset: 99, bytes: Uint8Array.of(5, 6, 7, 8) })
-      expect(await asked).toBeNull()
-      expect(ended()).toBe(0)
-    }
-
-    // 6. Empty chunk before completion returns null instead of a half-zeroed Picture
-    {
-      const { broker, source, ended } = attached()
-      const asked = source.image(6)
-      expect(broker.taken()).toEqual([{ kind: 'image', channel: 1, request: 1, image: 6, offset: 0 }])
-      broker.say({ ...part, request: 1, image: 6, offset: 0, bytes: Uint8Array.of(1, 2, 3, 4) })
-      await settled()
-      expect(broker.taken()).toEqual([{ kind: 'image', channel: 1, request: 2, image: 6, offset: 4 }])
-      broker.say({ ...part, request: 2, image: 6, offset: 4, bytes: new Uint8Array(0) })
-      expect(await asked).toBeNull()
-      expect(ended()).toBe(0)
-    }
-
-    // 7. Runaway generation restarts are capped at 4 (5th restart aborts and returns null)
-    {
-      const { broker, source, ended } = attached()
-      const asked = source.image(7)
-      let req = 1
-      expect(broker.taken()).toEqual([{ kind: 'image', channel: 1, request: req, image: 7, offset: 0 }])
-      broker.say({ ...part, generation: 1, request: req, image: 7, offset: 0, bytes: Uint8Array.of(1, 2, 3, 4) })
-      for (let gen = 2; gen <= 6; gen += 1) {
-        await settled()
-        req += 1
-        expect(broker.taken()).toEqual([{ kind: 'image', channel: 1, request: req, image: 7, offset: 4 }])
-        broker.say({ ...part, generation: gen, request: req, image: 7, offset: 4, bytes: Uint8Array.of(1, 2) })
-        if (gen <= 5) {
-          await settled()
-          req += 1
-          expect(broker.taken()).toEqual([{ kind: 'image', channel: 1, request: req, image: 7, offset: 0 }])
-          broker.say({ ...part, generation: gen, request: req, image: 7, offset: 0, bytes: Uint8Array.of(1, 2, 3, 4) })
-        }
-      }
-      expect(await asked).toBeNull()
-      expect(broker.taken(), 'no further restart request should be sent past the cap').toEqual([])
-      expect(ended()).toBe(0)
-    }
-  })
-
-  it('fetches and renders a newer generation that arrived while an earlier generation was still in flight', async () => {
-    const resolvers: Array<(read: Picture | null) => void> = []
-    const view = viewing()
-    view.source.image = (id: number) => {
-      view.source.picturesAsked.push(id)
-      return new Promise((resolve) => { resolvers.push(resolve) })
-    }
-
-    // Request gen 1 via anchored placement; keep it in flight
-    view.source.send(frame({ sequence: 1, images: 0, anchored: anchoring([anchored({ image: 7, generation: 1 })]) }))
-    await settled()
-    expect(view.source.picturesAsked).toEqual([7])
-    expect(resolvers).toHaveLength(1)
-
-    // Gen 2 arrives while gen 1 is still in flight
-    view.source.send(frame({ sequence: 2, images: 0, anchored: anchoring([anchored({ image: 7, generation: 2 })]) }))
-    await settled()
-    expect(view.source.picturesAsked, 'gen 2 waits for gen 1 request to finish').toEqual([7])
-
-    // Gen 1 resolves with gen 1 pixels -> must NOT blacklist gen 2, and must immediately fetch gen 2
-    const pic1 = { ...pixels(4, 4), generation: 1 }
-    const pic2 = { ...pixels(8, 8), generation: 2 }
-    resolvers[0]!(pic1)
-    await settled()
-    expect(view.source.picturesAsked, 'gen 2 was not fetched after gen 1 resolved').toEqual([7, 7])
-    expect(resolvers).toHaveLength(2)
-
-    resolvers[1]!(pic2)
-    await settled()
-    await settled()
-    expect(view.painted().images?.[0]?.picture).toBe(pic2)
-
-    // Same scenario when gen 3 arrives while gen 2 is missing (resolves null): gen 3 is still fetched
-    view.source.send(frame({ sequence: 3, images: 0, anchored: anchoring([anchored({ image: 9, generation: 1 })]) }))
-    await settled()
-    expect(resolvers).toHaveLength(3)
-    view.source.send(frame({ sequence: 4, images: 0, anchored: anchoring([anchored({ image: 9, generation: 2 })]) }))
-    await settled()
-    resolvers[2]!(null)
-    await settled()
-    expect(resolvers, 'gen 2 was blacklisted by gen 1 returning null').toHaveLength(4)
-    const pic9Gen2 = { ...pixels(6, 6), generation: 2 }
-    resolvers[3]!(pic9Gen2)
-    await settled()
-    await settled()
-    expect(view.painted().images?.[0]?.picture).toBe(pic9Gen2)
-  })
-
-  it('drops pictures when anchored or placeholder rows disappear without images bumping, retries when generation bumps, zeroes fallback canvases, and respects folds in wantPictures', async () => {
-    const made: Array<{ canvas: HTMLCanvasElement }> = []
-    const view = mountedView({
-      picture: async (read) => {
-        const canvas = document.createElement('canvas')
-        canvas.width = read.width
-        canvas.height = read.height
-        made.push({ canvas })
-        return canvas
+    // Cap at 2048 bytes (each 16x16 RGBA = 1024 bytes => inserting b3 evicts b1)
+    const cache = new ImageCache({
+      maxBytes: 2048,
+      decode: async () => {
+        const pic = document.createElement('canvas')
+        pic.width = 16
+        pic.height = 16
+        return { source: pic, width: 16, height: 16 }
       },
     })
-    view.source.pictures.set(7, pixels(4, 4))
-    view.source.send(frame({ images: 0, anchored: anchoring([anchored({ image: 7, generation: 1 })]) }))
+    const { view, painter, painted } = mountedView({ imageCache: cache }, source)
+    source.send(frame({ seq: 1, imagesGen: 1, rows: [row(0, 'anchored'), row(1, 'below')] }))
+    painted()
     await settled()
     await settled()
-    expect(made).toHaveLength(1)
-    expect(made[0]!.canvas.width).toBe(4)
+    const scene = painted()
 
-    // Anchored cleared WITHOUT frame.images bumping -> fallback canvas is released & zeroed
-    view.source.send(frame({ sequence: 2, images: 0, anchored: anchoring([]) }))
-    await settled()
-    expect([made[0]!.canvas.width, made[0]!.canvas.height]).toEqual([0, 0])
+    // H10 (view): anchored placement honors sourceRect, cellOffset, pixelSize (12x10, not stretched to 30x40), and key!
+    expect(scene.images).toHaveLength(1)
+    const img = scene.images![0]!
+    expect(img.key).toBe(blobHashToHex(b1))
+    expect(img.x).toBe(1 * 10 + 3)
+    expect(img.y).toBe(0 * 20 + 5)
+    expect(img.width).toBe(12)
+    expect(img.height).toBe(10)
+    expect(img.source).toEqual({ x: 4, y: 2, width: 12, height: 10 })
 
-    // Missing image at gen 1 is refused, then generation bumps via anchored without placed changing -> retries!
-    view.source.send(frame({ sequence: 3, images: 0, anchored: anchoring([anchored({ image: 9, generation: 1 })]) }))
+    // H10 edge cases: oversized cellOffset clamps inside the cell (max cellWidth-1 / cellHeight-1),
+    // destination width/height never overflow spanCols*cellWidth - offX / spanRows*cellHeight - offY,
+    // and NaN/zero-sized placements are safely skipped!
+    source.imagesGen = 2
+    source.imagePlacements = [
+      {
+        blob: b1,
+        line: 0,
+        col: 0,
+        sourceRect: [0, 0, 16, 16],
+        cellOffset: [999, -5],
+        pixelSize: [500, 500],
+        cellSpan: [2, 1],
+        zIndex: 0,
+      },
+      {
+        blob: b1,
+        line: 0,
+        col: 2,
+        sourceRect: [Number.NaN, 0, 16, 16],
+        cellOffset: [0, 0],
+        pixelSize: [0, 0],
+        cellSpan: [0, 0],
+        zIndex: 0,
+      },
+    ]
+    source.send(frame({ seq: 2, imagesGen: 2, rows: [row(0, 'anchored'), row(1, 'below')] }))
+    painted()
     await settled()
-    await settled()
-    expect(view.source.picturesAsked.filter((id) => id === 9)).toEqual([9])
-    view.source.pictures.set(9, { ...pixels(4, 4), generation: 2 })
-    view.source.send(frame({ sequence: 4, images: 0, anchored: anchoring([anchored({ image: 9, generation: 2 })]) }))
-    await settled()
-    await settled()
-    expect(view.source.picturesAsked.filter((id) => id === 9)).toEqual([9, 9])
+    const clampedScene = painted()
+    expect(clampedScene.images).toHaveLength(1)
+    // cellWidth=10 -> offX clamped to 9, maxW = 2*10 - 9 = 11; cellHeight=20 -> offY clamped to 0, maxH = 1*20 - 0 = 20
+    expect(clampedScene.images![0]!.x).toBe(9)
+    expect(clampedScene.images![0]!.y).toBe(0)
+    expect(clampedScene.images![0]!.width).toBe(11)
+    expect(clampedScene.images![0]!.height).toBe(20)
 
-    // Image visible past a fold (lines 1..10 folded, screen shows lines 0, 1, 11, 12) is requested via layout span
-    view.source.pictures.set(11, pixels(4, 4))
-    view.source.placed = { cellWidth: 10, cellHeight: 20, placements: [placement({ image: 11, line: 12, rows: 1 })] }
-    view.source.send(frame({ sequence: 5, firstActive: 10, scrollback: 10, screenRows: 4, images: 1 }))
-    view.view.scrollTo(0)
-    view.view.setFolds([{ first: 1, last: 10 }])
-    await quiet(view)
-    expect(view.source.picturesAsked).toContain(11)
+    // H14: evicting b1 from ImageCache immediately calls painter.releaseImage(hex(b1))
+    // even when another onEvict listener throws (error isolation prevents bitmap/texture leaks)!
+    const unsubThrow = cache.onEvict(() => { throw new Error('boom') })
+    await cache.ensure(source, b2)
+    await cache.ensure(source, b3)
+    unsubThrow()
+    expect(painter.releasedImages).toEqual([blobHashToHex(b1)])
+
+    // M13: when store.imagesChanged increments while fetchRows is in flight, askPage reschedules
+    // so doubted placeholder rows are refetched automatically!
+    let resolveFetch!: (rows: readonly ReturnType<typeof row>[]) => void
+    let fetchCalls = 0
+    const origFetch = source.fetchRows.bind(source)
+    source.fetchRows = (epoch, from, count) => {
+      fetchCalls += 1
+      if (fetchCalls === 1) {
+        return new Promise((res) => { resolveFetch = res })
+      }
+      return origFetch(epoch, from, count)
+    }
+    const pieceRow = row(0, 'stale-placeholder', {
+      pieces: [{ blob: b2, colStart: 0, colLen: 2, srcRect: [0, 0, 16, 16], dstPx: [16, 16] }],
+    })
+    source.history.set(0, row(0, 'fresh-placeholder'))
+    source.send(
+      frame({
+        seq: 3,
+        epoch: 2,
+        imagesGen: 2,
+        firstActiveLine: 5,
+        scrollbackLines: 5,
+        size: { cols: 20, rows: 2 },
+        rows: [row(5, 'bottom0'), row(6, 'bottom1')],
+      }),
+    )
+    view.scrollTo(0)
+    painted()
+    expect(fetchCalls).toBe(1)
+    // Bump imagesGen while fetchRows #1 is still in flight, then drain syncFrameImages + pending frames
+    // BEFORE resolving fetch #1 so the ONLY trigger for refetch #2 is askPage's M13 reschedule!
+    source.send(
+      frame({
+        seq: 4,
+        epoch: 2,
+        imagesGen: 3,
+        firstActiveLine: 5,
+        scrollbackLines: 5,
+        size: { cols: 20, rows: 2 },
+        rows: [row(5, 'bottom0'), row(6, 'bottom1')],
+      }),
+    )
+    painted()
+    await settled()
+    painted()
+    expect(fetchCalls).toBe(1)
+    expect(framesWaiting()).toBe(0)
+
+    // Complete stale fetch #1 returning a placeholder row (doubted/discarded by RowStore.absorb -> absorbed = [])
+    resolveFetch([pieceRow])
+    await settled()
+    expect(framesWaiting()).toBeGreaterThan(0)
+    painted()
+    await settled()
+    expect(fetchCalls).toBe(2)
+    const refetchedScene = painted()
+    expect(refetchedScene.rows[0]?.glyphs.map((g) => g.text).join('')).toBe('fresh-placeholder')
+
+    view.dispose()
+    cache.dispose()
   })
-})
 
-describe('pixels of fewer than four bytes', () => {
-  it('become red, green, blue and alpha, and reject invalid channel or pixel counts', () => {
-    expect([...rgbaOf(1, Uint8Array.of(10, 200), 2)]).toEqual([10, 10, 10, 255, 200, 200, 200, 255])
-    expect([...rgbaOf(2, Uint8Array.of(10, 128, 200, 0), 2)]).toEqual([10, 10, 10, 128, 200, 200, 200, 0])
-    expect([...rgbaOf(3, Uint8Array.of(1, 2, 3, 4, 5, 6), 2)]).toEqual([1, 2, 3, 255, 4, 5, 6, 255])
-    expect([...rgbaOf(4, Uint8Array.of(1, 2, 3, 4), 1)]).toEqual([1, 2, 3, 4])
-    expect(() => rgbaOf(0, Uint8Array.of(1), 1)).toThrow(RangeError)
-    expect(() => rgbaOf(5, Uint8Array.of(1), 1)).toThrow(RangeError)
-    expect(() => rgbaOf(4, Uint8Array.of(1), (64 << 20))).toThrow(RangeError)
+  it('isolates throwing onEvict listeners so dispose closes every ImageBitmap and notifies siblings', async () => {
+    const bitmaps: Array<ReturnType<typeof fakeBitmap>> = []
+    const cache = new ImageCache({
+      maxBytes: 4096,
+      decode: async () => {
+        const bm = fakeBitmap(8, 8)
+        bitmaps.push(bm)
+        return { source: bm as unknown as CanvasImageSource, width: 8, height: 8 }
+      },
+    })
+    const source = new FakeSource()
+    const b1 = new Uint8Array(32).fill(0x51)
+    const b2 = new Uint8Array(32).fill(0x52)
+    source.blobs.set(blobHashToHex(b1), { blob: b1, encoding: 'png', bytes: new Uint8Array([1]) })
+    source.blobs.set(blobHashToHex(b2), { blob: b2, encoding: 'png', bytes: new Uint8Array([2]) })
+    await cache.ensure(source, b1)
+    await cache.ensure(source, b2)
+
+    const seen: string[] = []
+    cache.onEvict(() => { throw new Error('listener-failure') })
+    cache.onEvict((key) => seen.push(key))
+    cache.dispose()
+
+    expect(seen).toEqual([blobHashToHex(b1), blobHashToHex(b2)])
+    expect(bitmaps.every((bm) => bm.closed)).toBe(true)
+    expect(cache.size).toBe(0)
+  })
+
+  it('negative-caches failures per source, isolates throwing onReady, handles sync throws, isolates per-source dedup, and rejects non-finite dimensions', async () => {
+    // 1. Permanent fetch/decode failure negative-caches per source (stops per-paint RPC retry storms!)
+    const sourceFail = new FakeSource()
+    const missingBlob = new Uint8Array(32).fill(0x71)
+    let failAttempts = 0
+    sourceFail.getImageBlob = async () => {
+      failAttempts += 1
+      throw new Error('NoSuchBlob')
+    }
+    const cache = new ImageCache({
+      decode: async () => {
+        const bm = fakeBitmap(8, 8)
+        return { source: bm as unknown as CanvasImageSource, width: 8, height: 8 }
+      },
+    })
+    expect(await cache.ensure(sourceFail, missingBlob)).toBeNull()
+    expect(await cache.ensure(sourceFail, missingBlob)).toBeNull()
+    expect(await cache.ensure(sourceFail, missingBlob)).toBeNull()
+    expect(failAttempts).toBe(1)
+
+    // Healthy second source is NOT poisoned by sourceFail's negative cache!
+    const sourceHealthy = new FakeSource()
+    sourceHealthy.blobs.set(blobHashToHex(missingBlob), { blob: missingBlob, encoding: 'png', bytes: new Uint8Array([1]) })
+    const recovered = await cache.ensure(sourceHealthy, missingBlob)
+    expect(recovered).not.toBeNull()
+    expect(cache.get(missingBlob)).toBe(recovered!)
+
+    // 2. Throwing onReady callback does NOT discard decoded image or starve sibling callbacks
+    const cbBlob = new Uint8Array(32).fill(0x72)
+    sourceHealthy.blobs.set(blobHashToHex(cbBlob), { blob: cbBlob, encoding: 'png', bytes: new Uint8Array([2]) })
+    let siblingRan = false
+    const [resA, resB] = await Promise.all([
+      cache.ensure(sourceHealthy, cbBlob, () => {
+        throw new Error('onReady-boom')
+      }),
+      cache.ensure(sourceHealthy, cbBlob, () => {
+        siblingRan = true
+      }),
+    ])
+    expect(resA).not.toBeNull()
+    expect(resB).toBe(resA)
+    expect(siblingRan).toBe(true)
+    expect(cache.get(cbBlob)).toBe(resA!)
+
+    // 3. Per-source in-flight dedup: a hung sourceA never blocks sourceB for the same blob hash
+    const sharedBlob = new Uint8Array(32).fill(0x73)
+    const hungSource = new FakeSource()
+    hungSource.getImageBlob = () => new Promise(() => {}) // never resolves
+    sourceHealthy.blobs.set(blobHashToHex(sharedBlob), { blob: sharedBlob, encoding: 'png', bytes: new Uint8Array([3]) })
+    void cache.ensure(hungSource, sharedBlob)
+    const fromHealthy = await cache.ensure(sourceHealthy, sharedBlob)
+    expect(fromHealthy).not.toBeNull()
+
+    // 4. Synchronous getImageBlob throw resolves to null without leaking inflight state
+    const syncThrowBlob = new Uint8Array(32).fill(0x74)
+    const syncThrowSource = new FakeSource()
+    let syncCalls = 0
+    syncThrowSource.getImageBlob = () => {
+      syncCalls += 1
+      throw new Error('sync-disposed')
+    }
+    expect(await cache.ensure(syncThrowSource, syncThrowBlob)).toBeNull()
+    expect(await cache.ensure(syncThrowSource, syncThrowBlob)).toBeNull()
+    expect(syncCalls).toBe(1)
+
+    // 5. Non-finite / non-positive decoded dimensions are rejected, bitmap is closed, and bytesUsed stays finite
+    const badDimBitmaps: Array<ReturnType<typeof fakeBitmap>> = []
+    const badDimCache = new ImageCache({
+      decode: async () => {
+        const bm = fakeBitmap(Number.NaN, 16)
+        badDimBitmaps.push(bm)
+        return { source: bm as unknown as CanvasImageSource, width: Number.NaN, height: 16 }
+      },
+    })
+    const badDimBlob = new Uint8Array(32).fill(0x75)
+    sourceHealthy.blobs.set(blobHashToHex(badDimBlob), { blob: badDimBlob, encoding: 'png', bytes: new Uint8Array([4]) })
+    expect(await badDimCache.ensure(sourceHealthy, badDimBlob)).toBeNull()
+    expect(badDimBitmaps[0]!.closed).toBe(true)
+    expect(Number.isFinite(badDimCache.bytesUsed)).toBe(true)
+    expect(badDimCache.bytesUsed).toBe(0)
+    expect(badDimCache.size).toBe(0)
+
+    // 6. ImagePiece bounds/finiteness clamping in ViewRenderer (including invalid colLen <= 0 / NaN!)
+    const pieceSource = new FakeSource()
+    const pieceBlob = new Uint8Array(32).fill(0x76)
+    pieceSource.blobs.set(blobHashToHex(pieceBlob), { blob: pieceBlob, encoding: 'png', bytes: new Uint8Array([5]) })
+    const pieceCache = new ImageCache({
+      decode: async () => {
+        const c = document.createElement('canvas')
+        c.width = 16
+        c.height = 16
+        return { source: c, width: 16, height: 16 }
+      },
+    })
+    await pieceCache.ensure(pieceSource, pieceBlob)
+    const { view, painted } = mountedView({ imageCache: pieceCache }, pieceSource)
+    pieceSource.send(
+      frame({
+        seq: 1,
+        rows: [
+          row(0, 'pieces', {
+            pieces: [
+              // Oversized srcRect (8..8+999 -> 8..16) and dstPx (500x500 -> clamped to colLen*10=20, cellHeight=20)
+              { blob: pieceBlob, colStart: 1, colLen: 2, srcRect: [8, -4, 999, 999], dstPx: [500, 500] },
+              // Invalid negative colStart / colLen <= 0 / NaN colLen / out-of-bounds srcRect origin must be skipped
+              { blob: pieceBlob, colStart: -1, colLen: 2, srcRect: [0, 0, 16, 16], dstPx: [10, 10] },
+              { blob: pieceBlob, colStart: 2, colLen: 0, srcRect: [0, 0, 16, 16], dstPx: [1e9, 10] },
+              { blob: pieceBlob, colStart: 2, colLen: Number.NaN, srcRect: [0, 0, 16, 16], dstPx: [1e9, 10] },
+              { blob: pieceBlob, colStart: 3, colLen: 2, srcRect: [999, 0, 16, 16], dstPx: [10, 10] },
+            ],
+          }),
+        ],
+      }),
+    )
+    const scene = painted()
+    expect(scene.images).toHaveLength(1)
+    expect(scene.images![0]!.x).toBe(10)
+    expect(scene.images![0]!.width).toBe(20)
+    expect(scene.images![0]!.height).toBe(20)
+    expect(scene.images![0]!.source).toEqual({ x: 8, y: 0, width: 8, height: 16 })
+
+    // 7. Concurrent duplicate decode across two sources preserves first entry without firing onEvict and closes duplicate bitmap
+    const dupBlob = new Uint8Array(32).fill(0x77)
+    const dupSource1 = new FakeSource()
+    const dupSource2 = new FakeSource()
+    let resolveDup2!: (d: { blob: Uint8Array; encoding: 'png'; bytes: Uint8Array }) => void
+    dupSource1.blobs.set(blobHashToHex(dupBlob), { blob: dupBlob, encoding: 'png', bytes: new Uint8Array([1]) })
+    dupSource2.getImageBlob = () => new Promise((res) => { resolveDup2 = res })
+    const dupBitmaps: Array<ReturnType<typeof fakeBitmap>> = []
+    const dupEvictions: string[] = []
+    const dupCache = new ImageCache({
+      decode: async () => {
+        const bm = fakeBitmap(8, 8)
+        dupBitmaps.push(bm)
+        return { source: bm as unknown as CanvasImageSource, width: 8, height: 8 }
+      },
+    })
+    dupCache.onEvict((k) => dupEvictions.push(k))
+    const pDup2 = dupCache.ensure(dupSource2, dupBlob)
+    const firstDecoded = await dupCache.ensure(dupSource1, dupBlob)
+    resolveDup2({ blob: dupBlob, encoding: 'png', bytes: new Uint8Array([1]) })
+    const secondDecoded = await pDup2
+    expect(secondDecoded).toBe(firstDecoded)
+    expect(dupEvictions).toEqual([])
+    expect(dupBitmaps).toHaveLength(2)
+    expect(dupBitmaps[0]!.closed).toBe(false)
+    expect(dupBitmaps[1]!.closed).toBe(true)
+
+    // 8. Disposing cache inside onReady stops sibling callbacks and resolves to null, and clearFailed lets retries happen
+    const disposeBlob = new Uint8Array(32).fill(0x78)
+    dupSource1.blobs.set(blobHashToHex(disposeBlob), { blob: disposeBlob, encoding: 'png', bytes: new Uint8Array([2]) })
+    let afterDisposeRan = false
+    const [d1, d2] = await Promise.all([
+      dupCache.ensure(dupSource1, disposeBlob, () => dupCache.dispose()),
+      dupCache.ensure(dupSource1, disposeBlob, () => { afterDisposeRan = true }),
+    ])
+    expect(d1).toBeNull()
+    expect(d2).toBeNull()
+    expect(afterDisposeRan).toBe(false)
+
+    // clearFailed(source) clears negative cache for that source cleanly
+    cache.clearFailed(sourceFail)
+    sourceFail.blobs.set(blobHashToHex(missingBlob), { blob: missingBlob, encoding: 'png', bytes: new Uint8Array([1]) })
+    // Even if missingBlob wasn't in entries (use a fresh blob to test clearFailed directly!)
+    const retryBlob = new Uint8Array(32).fill(0x79)
+    let retryCalls = 0
+    sourceFail.getImageBlob = async () => {
+      retryCalls += 1
+      if (retryCalls === 1) throw new Error('evicted-temporarily')
+      return { blob: retryBlob, encoding: 'png', bytes: new Uint8Array([9]) }
+    }
+    expect(await cache.ensure(sourceFail, retryBlob)).toBeNull()
+    expect(await cache.ensure(sourceFail, retryBlob)).toBeNull()
+    expect(retryCalls).toBe(1)
+    cache.clearFailed(sourceFail)
+    expect(await cache.ensure(sourceFail, retryBlob)).not.toBeNull()
+    expect(retryCalls).toBe(2)
+
+    view.dispose()
+    pieceCache.dispose()
+    badDimCache.dispose()
+    cache.dispose()
   })
 })

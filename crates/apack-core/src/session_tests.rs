@@ -1,0 +1,3521 @@
+use apack_proto::messages::{BrokerMsg, ClientMsg};
+use apack_proto::types::{
+    BlobHash, BlockedKind, CellPos, CellPx, CellSpan, CommandOutcome, Confirmed, CursorShape, CursorState, ErrorCode,
+    GridSize, ImagePlacement, KeyAction, KeyInput, MarksKey, NonZeroStreamId, PackedRow, PackedRun, PaletteOverrides,
+    PasteOutcome, PointerAction, PointerInput, ProgressState, RequestId, ResizePolicy, SessionId, StatusState,
+    SubFlags, UnknownReason, ViewModes, ViewportHint, VouchedExitCode, WaitCondition, WaitOutcome,
+};
+use apack_proto::{BULK_CHUNK_BYTES, MAX_COMMANDS, MAX_SEARCH_MATCHES, MAX_STATUSES};
+
+use crate::lease::ConnId;
+use crate::marks::{MarkEffect, MarksMode, MarksTracker};
+use crate::session::{SessionEffect, SessionMachine, StreamAttachmentId};
+use crate::status::StatusTable;
+use crate::time::{TimestampMs, WallMs};
+use crate::vt::{CompressStep, DirtyViewport, PasteEncode, VtEngine, VtEvent, VtGenerations, VtSnapshotMeta};
+use crate::{MAX_WAITERS_PER_SESSION, SEARCH_COALESCE_MS, SYNC_HOLD_MAX_MS};
+
+fn ts(ms: u64) -> TimestampMs {
+    TimestampMs::from_millis(ms)
+}
+
+fn wall(ms: u64) -> WallMs {
+    WallMs::from_millis(ms)
+}
+
+fn sid(n: u64) -> SessionId {
+    SessionId::new(n).unwrap()
+}
+
+fn conn(n: u64) -> ConnId {
+    ConnId::new(n).unwrap()
+}
+
+fn nz_stream(n: u32) -> NonZeroStreamId {
+    NonZeroStreamId::new(n).unwrap()
+}
+
+fn att_for(k: (ConnId, NonZeroStreamId)) -> StreamAttachmentId {
+    StreamAttachmentId::new((k.0.get() << 16) | u64::from(k.1.raw())).unwrap()
+}
+
+fn sample_key() -> MarksKey {
+    MarksKey::parse(b"0123456789abcdef0123456789abcdef").unwrap()
+}
+
+/// Scripted `VtEngine` for exercising every `SessionMachine` code path inside `apack-core`.
+struct StubVt {
+    size: GridSize,
+    epoch: u64,
+    first_active_line: u64,
+    scrollback: u64,
+    rows: Vec<String>,
+    cursor: CursorState,
+    modes: ViewModes,
+    gens: VtGenerations,
+    next_events: Vec<VtEvent>,
+    dirty: DirtyViewport,
+    wrapped_logical: Option<(u64, u64)>,
+    last_search_range: core::cell::Cell<(u64, u64)>,
+    use_row_text_of: bool,
+    text_of_spans: core::cell::RefCell<Vec<(u64, u64)>>,
+    fail_next_resize: bool,
+}
+
+impl StubVt {
+    fn new(cols: u16, rows: u16) -> Self {
+        Self {
+            size: GridSize::new(cols, rows).unwrap(),
+            epoch: 1,
+            first_active_line: 0,
+            scrollback: 0,
+            rows: vec![String::new(); usize::from(rows)],
+            cursor: CursorState { col: 0, row: 0, shape: CursorShape::Block, blinking: false, hidden: false },
+            modes: ViewModes::default(),
+            gens: VtGenerations::default(),
+            next_events: Vec::new(),
+            dirty: DirtyViewport { scroll_delta: 0, dirty_rows: Vec::new(), full_dirty: true },
+            wrapped_logical: None,
+            last_search_range: core::cell::Cell::new((0, 0)),
+            use_row_text_of: false,
+            text_of_spans: core::cell::RefCell::new(Vec::new()),
+            fail_next_resize: false,
+        }
+    }
+}
+
+impl VtEngine for StubVt {
+    fn feed(&mut self, bytes: &[u8], events: &mut Vec<VtEvent>) {
+        events.append(&mut self.next_events);
+        let text = core::str::from_utf8(bytes).unwrap_or("");
+        match text {
+            "SCROLL" => {
+                self.first_active_line += 1;
+                self.scrollback += 1;
+                self.rows.remove(0);
+                self.rows.push(String::from("new-line"));
+                self.dirty.scroll_delta += 1;
+                self.dirty.dirty_rows.push(self.size.rows.get() - 1);
+                self.gens.grid += 1;
+            }
+            "EVICT_SB" => {
+                self.first_active_line += 1;
+                // scrollback stays capped -> oldest_line advances by 1!
+                self.gens.grid += 1;
+            }
+            "CLEAR_SB" => {
+                self.scrollback = 0;
+            }
+            "SCROLL_DOWN" => {
+                self.rows.pop();
+                self.rows.insert(0, String::from("top-line"));
+                self.dirty.scroll_delta -= 1;
+                self.dirty.dirty_rows.push(0);
+                self.gens.grid += 1;
+            }
+            "SCROLL_ONLY" => {
+                self.dirty.scroll_delta += 1;
+            }
+            "SCROLL_DOWN_ONLY" => {
+                self.dirty.scroll_delta -= 1;
+            }
+            "FULL_DIRTY" => {
+                self.dirty.full_dirty = true;
+            }
+            "DIRTY_ROW0" => {
+                self.rows[0] = String::from("row-zero");
+                self.dirty.dirty_rows.push(0);
+            }
+            "DIRTY_ROW2" => {
+                self.rows[2] = String::from("row-two");
+                self.dirty.dirty_rows.push(2);
+            }
+            "DIRTY_ROW3" => {
+                self.rows[3] = String::from("row-three");
+                self.dirty.dirty_rows.push(3);
+            }
+            "DIRTY_OOB" => {
+                self.dirty.dirty_rows.push(self.size.rows.get());
+            }
+            "BIG_SCROLL" => {
+                self.dirty.scroll_delta += i32::from(self.size.rows.get());
+            }
+            "CURSOR" => {
+                self.cursor.col += 1;
+            }
+            "CURSOR_HOME" => {
+                self.cursor.row = 0;
+                events.push(VtEvent::Osc133 { payload: "D;0".into(), cursor_line: self.first_active_line });
+            }
+            "MODES" => {
+                self.modes.mouse = !self.modes.mouse;
+                self.gens.modes += 1;
+            }
+            "PALETTE" => {
+                self.gens.palette += 1;
+            }
+            "IMAGES" => {
+                self.gens.images += 1;
+            }
+            "ALT" => {
+                self.epoch += 1;
+                self.modes.alt_screen = !self.modes.alt_screen;
+                self.gens.modes += 1;
+                self.dirty.full_dirty = true;
+            }
+            "SYNC_REARM" => {
+                events.push(VtEvent::SyncOutput(false));
+                events.push(VtEvent::SyncOutput(true));
+            }
+            "NOOP" => {}
+            _ if !text.is_empty() => {
+                self.rows[0] = String::from(text);
+                self.dirty.dirty_rows.push(0);
+                self.gens.grid += 1;
+            }
+            _ => {}
+        }
+    }
+
+    fn resize(&mut self, size: GridSize, _cell_px: CellPx, events: &mut Vec<VtEvent>) -> bool {
+        if self.fail_next_resize {
+            self.fail_next_resize = false;
+            return false;
+        }
+        if size == self.size {
+            return true;
+        }
+        self.size = size;
+        self.epoch += 1;
+        events.push(VtEvent::SyncOutput(false));
+        events.push(VtEvent::DeviceResponse(b"\x1b[48;10;20t".to_vec()));
+        self.rows.resize(usize::from(size.rows.get()), String::new());
+        self.dirty.full_dirty = true;
+        true
+    }
+
+    fn meta(&self) -> VtSnapshotMeta {
+        VtSnapshotMeta {
+            epoch: self.epoch,
+            size: self.size,
+            first_active_line: self.first_active_line,
+            scrollback_lines: self.scrollback,
+            cursor: self.cursor,
+            modes: self.modes,
+            images_gen: self.gens.images,
+        }
+    }
+
+    fn generations(&self) -> VtGenerations {
+        self.gens
+    }
+
+    fn palette_overrides(&self) -> PaletteOverrides {
+        PaletteOverrides::default()
+    }
+
+    fn take_dirty_viewport(&mut self) -> DirtyViewport {
+        core::mem::take(&mut self.dirty)
+    }
+
+    fn extract_viewport_rows(&self, rows: &[u16], out: &mut Vec<PackedRow>) {
+        for &r in rows {
+            assert!(usize::from(r) < self.rows.len(), "out-of-bounds viewport row {r} >= {}", self.rows.len());
+            let t = &self.rows[usize::from(r)];
+            let runs = if t.is_empty() {
+                vec![]
+            } else {
+                vec![PackedRun {
+                    col_start: 0,
+                    col_len: t.len() as u16,
+                    byte_offset: 0,
+                    byte_len: t.len() as u32,
+                    style_idx: 0,
+                    link_idx: 0,
+                    flags: 0,
+                }]
+            };
+            out.push(PackedRow {
+                line: self.first_active_line + u64::from(r),
+                flags: 0,
+                text: t.clone(),
+                runs,
+                styles: vec![],
+                links: vec![],
+                pieces: vec![],
+            });
+        }
+    }
+
+    fn extract_history_rows(&self, from_line: u64, count: u32, _max_bytes: usize, out: &mut Vec<PackedRow>) {
+        for i in 0..u64::from(count) {
+            let line = from_line + i;
+            if line >= self.first_active_line && (line - self.first_active_line) < self.rows.len() as u64 {
+                self.extract_viewport_rows(&[(line - self.first_active_line) as u16], out);
+            }
+        }
+    }
+
+    fn word_at(&self, pos: CellPos, _delimiters: &str) -> Option<CellSpan> {
+        Some(CellSpan { start: pos, end: pos })
+    }
+
+    fn line_at(&self, line: u64) -> Option<CellSpan> {
+        if let Some((start, end)) = self.wrapped_logical
+            && line >= start
+            && line <= end
+        {
+            return Some(CellSpan { start: CellPos { line: start, col: 0 }, end: CellPos { line: end, col: 3 } });
+        }
+        Some(CellSpan { start: CellPos { line, col: 0 }, end: CellPos { line, col: 3 } })
+    }
+
+    fn text_of(&self, span: CellSpan, _max_bytes: usize) -> String {
+        self.text_of_spans.borrow_mut().push((span.start.line, span.end.line));
+        if self.use_row_text_of {
+            let mut out = String::new();
+            for line in span.start.line..=span.end.line {
+                if line > span.start.line {
+                    let prev_wrapped = self.wrapped_logical.is_some_and(|(s, e)| (line - 1) >= s && (line - 1) < e);
+                    if !prev_wrapped {
+                        out.push('\n');
+                    }
+                }
+                if line >= self.first_active_line
+                    && let Some(row) = self.rows.get((line - self.first_active_line) as usize)
+                {
+                    out.push_str(row);
+                }
+            }
+            return out;
+        }
+        format!("{}:{}:{}:{}", span.start.line, span.start.col, span.end.line, span.end.col)
+    }
+
+    fn text_of_rect(&self, span: CellSpan, _max_bytes: usize) -> String {
+        format!("rect:{}:{}", span.start.col, span.end.col)
+    }
+
+    fn search_lines(
+        &self,
+        from_line: u64,
+        to_line: u64,
+        needle: &str,
+        _case_sensitive: bool,
+        limit: usize,
+        out: &mut Vec<CellSpan>,
+    ) -> bool {
+        self.last_search_range.set((from_line, to_line));
+        if needle.contains("__TRUNC__") {
+            return true;
+        }
+        if needle == "__OOB_SPAN__" && from_line < to_line {
+            // One span below from_line, one span at end_line == to_line, and one valid span inside [from_line, to_line)
+            if from_line > 0 {
+                out.push(CellSpan {
+                    start: CellPos { line: from_line - 1, col: 0 },
+                    end: CellPos { line: from_line, col: 0 },
+                });
+            }
+            out.push(CellSpan { start: CellPos { line: from_line, col: 0 }, end: CellPos { line: to_line, col: 0 } });
+            out.push(CellSpan { start: CellPos { line: from_line, col: 0 }, end: CellPos { line: from_line, col: 1 } });
+            return false;
+        }
+        if needle == "__EXACT_LIMIT__" && from_line < to_line {
+            for _ in 0..MAX_SEARCH_MATCHES {
+                out.push(CellSpan {
+                    start: CellPos { line: from_line, col: 0 },
+                    end: CellPos { line: from_line, col: 0 },
+                });
+            }
+            return false;
+        }
+        if needle == "__OVER_LIMIT__" && from_line < to_line {
+            for _ in 0..=MAX_SEARCH_MATCHES {
+                out.push(CellSpan {
+                    start: CellPos { line: from_line, col: 0 },
+                    end: CellPos { line: from_line, col: 0 },
+                });
+            }
+            return false;
+        }
+        for line in from_line..to_line {
+            if line >= self.first_active_line {
+                let idx = (line - self.first_active_line) as usize;
+                if let Some(text) = self.rows.get(idx)
+                    && let Some(pos) = text.find(needle)
+                {
+                    if out.len() >= limit {
+                        return true;
+                    }
+                    out.push(CellSpan {
+                        start: CellPos { line, col: pos as u16 },
+                        end: CellPos { line, col: (pos + needle.len() - 1) as u16 },
+                    });
+                }
+            }
+        }
+        false
+    }
+
+    fn images(&self) -> Vec<ImagePlacement> {
+        Vec::new()
+    }
+
+    fn encode_key(&mut self, key: &KeyInput, out: &mut Vec<u8>) {
+        out.extend_from_slice(key.text.as_bytes());
+    }
+
+    fn encode_pointer(&mut self, ev: &PointerInput, held_buttons: &mut u8, out: &mut Vec<u8>) {
+        if ev.action == PointerAction::Press && ev.button < 3 {
+            *held_buttons |= 1 << ev.button;
+        }
+        out.push(b'M');
+        out.push(b'0' + *held_buttons);
+    }
+
+    fn encode_focus(&mut self, focused: bool, out: &mut Vec<u8>) {
+        out.extend_from_slice(if focused { b"I" } else { b"O" });
+    }
+
+    fn encode_paste(&mut self, text: &str, allow_unsafe: bool) -> PasteEncode {
+        if !allow_unsafe && text.contains('\n') {
+            PasteEncode::Unsafe
+        } else {
+            PasteEncode::Bytes(text.as_bytes().to_vec())
+        }
+    }
+
+    fn set_cursor_defaults(&mut self, shape: CursorShape, blinking: bool) {
+        self.cursor.shape = shape;
+        self.cursor.blinking = blinking;
+    }
+
+    fn compress_step(&mut self, _max_pages: usize) -> CompressStep {
+        CompressStep::Done
+    }
+
+    fn scrollback_bytes(&self) -> u64 {
+        self.scrollback * 100
+    }
+
+    fn ensure_min_epoch(&mut self, min_epoch: u64) {
+        self.epoch = self.epoch.max(min_epoch);
+    }
+}
+
+#[test]
+fn marks_tracker_keyed_immunity_supersede_exit_ring_and_unescape() {
+    let key = sample_key();
+    let mut keyed = MarksTracker::new(MarksMode::Keyed(key));
+    let mut fx = Vec::new();
+    assert!(!keyed.is_idle());
+    assert_eq!(keyed.last_cwd(), None);
+    assert_eq!(keyed.refused(), 0);
+
+    let k = key.as_str();
+    // Unvouched marks, OSC 7 CWD, bad keys, leading-zero/zero/sign seqs are ignored/refused in Keyed mode
+    keyed.on_osc133("A", 0, wall(1), &mut fx);
+    keyed.on_osc633("C", 1, wall(2), &mut fx);
+    keyed.on_osc633("D;0", 2, wall(3), &mut fx);
+    keyed.on_cwd("/untrusted-osc7");
+    assert_eq!(keyed.last_cwd(), None);
+
+    keyed.on_osc633("V", 2, wall(4), &mut fx);
+    keyed.on_osc633("V;S;1;ffffffffffffffffffffffffffffffff;cmd", 2, wall(4), &mut fx);
+    keyed.on_osc633("V;S;1;short;cmd", 2, wall(5), &mut fx);
+    keyed.on_osc633(&format!("V;S;0;{k};cmd"), 2, wall(6), &mut fx);
+    keyed.on_osc633(&format!("V;S;01;{k};cmd"), 2, wall(7), &mut fx);
+    keyed.on_osc633(&format!("V;S;+1;{k};cmd"), 2, wall(8), &mut fx);
+    keyed.on_osc633(&format!("V;S;{};{k};max-seq", u64::MAX), 2, wall(8), &mut fx);
+    keyed.on_osc633(&format!("V;A;1;{k};extra"), 2, wall(9), &mut fx);
+    keyed.on_osc633(&format!("V;X;1;{k};unknown"), 2, wall(9), &mut fx);
+    assert!(fx.is_empty());
+    assert!(keyed.commands().is_empty());
+    assert!(!keyed.is_idle());
+    assert_eq!(keyed.refused(), 9);
+
+    // Valid vouched prompt arrival (seq=1) + replay rejection (seq=1 again!)
+    keyed.on_osc633(&format!("V;A;1;{k}"), 10, wall(10), &mut fx);
+    assert!(keyed.is_idle());
+    assert_eq!(fx, vec![MarkEffect::PromptArrived]);
+    fx.clear();
+    keyed.on_osc633(&format!("V;A;1;{k}"), 10, wall(11), &mut fx);
+    assert!(fx.is_empty());
+    assert_eq!(keyed.refused(), 10);
+
+    // Valid vouched Start (seq=2) with %XX percent-decoding (preserving backslashes!) + replay rejection + mismatched Finish
+    keyed.on_osc633(&format!("V;S;2;{k};echo%20%61%42%20C:\\temp\\x41"), 11, wall(13), &mut fx);
+    assert!(!keyed.is_idle());
+    assert_eq!(keyed.active_vouched_seq(), Some(2));
+    assert!(matches!(
+        &fx[0],
+        MarkEffect::CommandStarted(r)
+            if r.id == 2 && r.command.as_deref() == Some("echo aB C:\\temp\\x41") && r.prompt_line == Some(10)
+    ));
+    assert_eq!(keyed.find_command(2).and_then(|c| c.command.as_deref()), Some("echo aB C:\\temp\\x41"));
+    assert!(keyed.find_command(999).is_none());
+    fx.clear();
+    keyed.on_osc633(&format!("V;S;2;{k};replay"), 12, wall(14), &mut fx);
+    keyed.on_osc633(&format!("V;F;99;{k};0;/tmp"), 12, wall(15), &mut fx);
+    keyed.on_osc633(&format!("V;F;2;{k};+0;/tmp"), 12, wall(16), &mut fx);
+    keyed.on_osc633(&format!("V;F;2;{k};0"), 12, wall(17), &mut fx); // missing cwd semicolon
+    assert!(fx.is_empty());
+    assert_eq!(keyed.refused(), 14);
+
+    // Valid vouched Finish (seq=2) with exit code -7 & %XX CWD (all hex + stray % + Windows UNC backslashes):
+    // MUST also write the finished `cwd` onto CommandRecord #2!
+    keyed.on_osc633(&format!("V;F;2;{k};-7;\\\\server\\share\\a%3bb%3fc%3Fd%4Ae%3g%g3%"), 15, wall(20), &mut fx);
+    assert!(keyed.is_idle());
+    assert_eq!(keyed.active_vouched_seq(), None);
+    let expected_cwd = "\\\\server\\share\\a;b?c?dJe%3g%g3%";
+    assert_eq!(keyed.last_cwd(), Some(expected_cwd));
+    assert_eq!(fx[0], MarkEffect::CwdChanged(expected_cwd.into()));
+    assert!(matches!(
+        &fx[1],
+        MarkEffect::CommandFinished(r)
+            if r.outcome == CommandOutcome::Exited(VouchedExitCode::from_vouched(-7))
+                && r.end_line == Some(15)
+                && r.cwd.as_deref() == Some(expected_cwd)
+    ));
+    assert_eq!(keyed.find_command(2).and_then(|c| c.cwd.as_deref()), Some(expected_cwd));
+    assert_eq!(fx[2], MarkEffect::PromptArrived);
+
+    // Finish without active command is refused
+    fx.clear();
+    keyed.on_osc633(&format!("V;F;2;{k};0;/tmp"), 15, wall(20), &mut fx);
+    assert!(fx.is_empty());
+    assert_eq!(keyed.refused(), 15);
+
+    // Command 3: NoStatus (empty status field, same cwd -> NO duplicate CwdChanged, still records cwd)
+    fx.clear();
+    keyed.on_osc633(&format!("V;S;3;{k};ls"), 16, wall(21), &mut fx);
+    assert!(matches!(&fx[0], MarkEffect::CommandStarted(r) if r.id == 3));
+    fx.clear();
+    keyed.on_osc633(&format!("V;F;3;{k};;\\\\server\\share\\a%3bb%3fc%3Fd%4Ae%3g%g3%"), 17, wall(22), &mut fx);
+    assert!(
+        !fx.iter().any(|e| matches!(e, MarkEffect::CwdChanged(_))),
+        "unchanged CWD on V;F must not emit duplicate CwdChanged"
+    );
+    assert!(matches!(
+        &fx[0],
+        MarkEffect::CommandFinished(r)
+            if r.outcome == CommandOutcome::Unknown(UnknownReason::NoStatus)
+                && r.cwd.as_deref() == Some(expected_cwd)
+    ));
+
+    // Command 4 -> Superseded by Command 5 -> SessionEnded
+    fx.clear();
+    keyed.on_osc633(&format!("V;S;4;{k};sleep"), 18, wall(23), &mut fx);
+    assert!(matches!(&fx[0], MarkEffect::CommandStarted(r) if r.id == 4));
+    fx.clear();
+    keyed.on_osc633(&format!("V;S;5;{k};pwd"), 19, wall(24), &mut fx);
+    assert!(matches!(
+        &fx[0],
+        MarkEffect::CommandFinished(r) if r.outcome == CommandOutcome::Unknown(UnknownReason::Superseded)
+    ));
+    assert!(matches!(&fx[1], MarkEffect::CommandStarted(r) if r.id == 5));
+    fx.clear();
+    keyed.on_epoch_change();
+    assert!(
+        keyed.commands().iter().all(|c| c.prompt_line.is_none() && c.output_line.is_none() && c.end_line.is_none())
+    );
+    keyed.on_session_exit(wall(30), &mut fx);
+    assert!(matches!(
+        &fx[0],
+        MarkEffect::CommandFinished(r) if r.outcome == CommandOutcome::Unknown(UnknownReason::SessionEnded)
+    ));
+
+    // Claimed mode: bare `V` and `V;...` are refused (never read as claim), OSC 7 / P;Cwd dedup, E preserves `;`
+    let mut claimed = MarksTracker::new(MarksMode::Claimed);
+    fx.clear();
+    claimed.on_osc633("V", 0, wall(1), &mut fx);
+    claimed.on_osc633(&format!("V;S;1;{k};nope"), 0, wall(1), &mut fx);
+    assert!(fx.is_empty());
+    assert_eq!(claimed.refused(), 2);
+    assert_eq!(claimed.on_cwd("/from-osc7"), Some(String::from("/from-osc7")));
+    assert_eq!(claimed.on_cwd("/from-osc7"), None, "unchanged OSC 7 CWD must dedup");
+    assert_eq!(claimed.last_cwd(), Some("/from-osc7"));
+    fx.clear();
+    claimed.on_osc633("P;Cwd=/from-633%20dir", 0, wall(2), &mut fx);
+    assert_eq!(claimed.last_cwd(), Some("/from-633 dir"));
+    assert_eq!(fx, vec![MarkEffect::CwdChanged(String::from("/from-633 dir"))]);
+    fx.clear();
+    claimed.on_osc633("P;Cwd=/from-633%20dir", 0, wall(2), &mut fx);
+    assert!(fx.is_empty(), "unchanged P;Cwd must not emit duplicate CwdChanged");
+    claimed.on_osc633("E;echo a; echo%20b", 0, wall(3), &mut fx);
+    claimed.on_osc633("A", 0, wall(4), &mut fx);
+    assert!(claimed.is_idle());
+    fx.clear();
+    claimed.on_osc133("C", 1, wall(5), &mut fx);
+    assert!(matches!(
+        &fx[0],
+        MarkEffect::CommandStarted(r) if r.id == 1 && r.command.as_deref() == Some("echo a; echo b")
+    ));
+    // Empty E; leaves pending_command None, and monotonic id advances 1 -> 2
+    claimed.on_osc633("E;", 1, wall(5), &mut fx);
+    fx.clear();
+    claimed.on_osc133("C", 2, wall(6), &mut fx); // supersede in Claimed mode
+    assert!(matches!(&fx[1], MarkEffect::CommandStarted(r) if r.id == 2 && r.command.is_none()));
+    for i in 0..=(MAX_COMMANDS as u64 + 2) {
+        fx.clear();
+        claimed.on_osc133("C", i, wall(i), &mut fx);
+        claimed.on_osc133("D;7", i + 1, wall(i + 1), &mut fx);
+    }
+    assert_eq!(claimed.commands().len(), MAX_COMMANDS);
+    assert_eq!(claimed.commands().last().unwrap().outcome, CommandOutcome::Claimed(Some(7)));
+
+    fx.clear();
+    claimed.on_osc133("C", 999, wall(999), &mut fx);
+    fx.clear();
+    claimed.on_session_exit(wall(1000), &mut fx);
+    assert!(matches!(&fx[0], MarkEffect::CommandFinished(r) if r.outcome == CommandOutcome::Claimed(None)));
+}
+
+#[test]
+fn status_table_parsing_lru_eviction_and_async_confirmation() {
+    let mut table = StatusTable::default();
+    assert!(table.is_empty());
+    assert_eq!(table.len(), 0);
+    assert_eq!(table.root(), None);
+    let mut fx = Vec::new();
+
+    // Malformed / missing state ignored
+    table.ingest("id=x;message=hi", wall(1), &mut fx);
+    table.ingest("state=bogus", wall(2), &mut fx);
+    assert!(table.is_empty());
+    assert!(fx.is_empty());
+
+    // Root Blocked status with kind, progress, app, title, message
+    table.ingest("state=blocked;kind=permission;progress=50;app=claude;title=Run;message=Allow?", wall(10), &mut fx);
+    assert!(!table.is_empty());
+    assert_eq!(table.len(), 1);
+    let root = table.root().unwrap();
+    assert_eq!(root.state, StatusState::Blocked);
+    assert_eq!(root.kind, Some(BlockedKind::Permission));
+    assert_eq!(root.progress, Some(50));
+    assert_eq!(root.app.as_deref(), Some("claude"));
+    assert_eq!(root.title.as_deref(), Some("Run"));
+    assert_eq!(root.message.as_deref(), Some("Allow?"));
+    assert_eq!(root.since_ms, 10);
+    assert_eq!(root.confirmed, Confirmed::Unknown);
+    assert_eq!(fx.len(), 2);
+    let rev = root.changed;
+    assert_eq!(rev, 1);
+
+    // Stale revision ignored; matching revision updates Confirmed
+    fx.clear();
+    table.apply_confirmation("", rev + 99, Confirmed::Matched, &mut fx);
+    assert!(fx.is_empty());
+    table.apply_confirmation("", rev, Confirmed::Matched, &mut fx);
+    assert_eq!(table.root().unwrap().confirmed, Confirmed::Matched);
+    assert_eq!(fx.len(), 1);
+
+    // Empty app/title/message stay None; question & error variants parsed
+    fx.clear();
+    table.ingest("state=blocked;kind=question;app=;title=;message=;progress=101", wall(25), &mut fx);
+    let root = table.root().unwrap();
+    assert_eq!(root.changed, 2);
+    assert_eq!(root.since_ms, 10);
+    assert_eq!(root.kind, Some(BlockedKind::Question));
+    assert_eq!(root.app, None);
+    assert_eq!(root.title, None);
+    assert_eq!(root.message, None);
+    assert_eq!(root.progress, None);
+
+    table.ingest("state=blocked;kind=auth", wall(26), &mut fx);
+    assert_eq!(table.root().unwrap().kind, Some(BlockedKind::Auth));
+
+    table.ingest("state=error;kind=permission", wall(30), &mut fx);
+    assert_eq!(table.root().unwrap().state, StatusState::Error);
+    assert_eq!(table.root().unwrap().since_ms, 30);
+    assert_eq!(table.root().unwrap().kind, None);
+
+    table.ingest("state=working", wall(32), &mut fx);
+    assert_eq!(table.root().unwrap().state, StatusState::Working);
+
+    // Odd-byte overlong UTF-8 lands mid-char at byte 512 ("a" + 300*"é" -> byte 511 is valid boundary!)
+    let mut long_msg = String::from("a");
+    long_msg.push_str(&"é".repeat(300));
+    table.ingest(&format!("id=long;state=done;message={long_msg}"), wall(35), &mut fx);
+    assert_eq!(table.get("long").unwrap().message.as_ref().unwrap().len(), 511);
+
+    // Exceeding MAX_STATUSES evicts oldest non-root entry while preserving root ""
+    for i in 0..(MAX_STATUSES + 5) {
+        table.ingest(&format!("id=sub-{i};state=idle"), wall(100 + i as u64), &mut fx);
+    }
+    assert_eq!(table.len(), MAX_STATUSES);
+    assert!(table.root().is_some());
+    assert!(table.get("long").is_none());
+}
+
+#[test]
+fn session_machine_view_dirty_tracking_and_individual_publish_triggers() {
+    let vt = StubVt::new(40, 4);
+    let mut sess = SessionMachine::new(sid(1), vt, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    let k1 = (conn(1), nz_stream(1));
+    let mut fx = Vec::new();
+
+    // No views attached -> on_pty_output does NOT emit ViewsDirty
+    sess.on_pty_output(b"NOOP", ts(1), wall(1), &mut fx);
+    assert!(!fx.contains(&SessionEffect::ViewsDirty));
+
+    sess.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
+    assert!(fx.contains(&SessionEffect::ViewsDirty));
+
+    // Initial full sync
+    let mut frames = Vec::new();
+    assert!(!sess.try_publish_view(k1, |_| false)); // rejected -> keeps dirty
+    assert!(sess.try_publish_view(k1, |f| {
+        frames.push(f);
+        true
+    }));
+    assert!(frames.last().unwrap().full_sync);
+    assert!(!sess.try_publish_view(k1, |_| true)); // completely clean
+
+    // 1. Dirty row + scroll_up shifts dirty row index from 2 -> 1 and exposes row 3
+    sess.on_pty_output(b"DIRTY_ROW2", ts(10), wall(10), &mut fx);
+    sess.on_pty_output(b"SCROLL", ts(11), wall(11), &mut fx);
+    assert!(sess.try_publish_view(k1, |f| {
+        assert!(!f.full_sync);
+        assert_eq!(f.scroll_delta, 1);
+        let lines: Vec<u64> = f.rows.iter().map(|r| r.line).collect();
+        // scrollback is now 1, row 2 shifted to viewport row 1 (abs 2), new bottom row is viewport row 3 (abs 4)
+        assert_eq!(lines, vec![2, 4]);
+        true
+    }));
+
+    // 2. Scroll down shifts dirty row 0 -> 1 and exposes row 0; OOB dirty row ignored
+    sess.on_pty_output(b"hello", ts(12), wall(12), &mut fx); // row 0 dirty
+    sess.on_pty_output(b"SCROLL_DOWN", ts(13), wall(13), &mut fx); // shifts row 0 -> row 1, marks row 0
+    sess.on_pty_output(b"DIRTY_OOB", ts(14), wall(14), &mut fx); // row 4 == rows -> ignored
+    assert!(sess.try_publish_view(k1, |f| {
+        assert!(!f.full_sync);
+        assert_eq!(f.scroll_delta, -1);
+        let lines: Vec<u64> = f.rows.iter().map(|r| r.line).collect();
+        assert_eq!(lines, vec![1, 2]); // abs lines scrollback(1)+0 and scrollback(1)+1
+        true
+    }));
+
+    // 3. Scroll >= rows triggers full_sync
+    sess.on_pty_output(b"BIG_SCROLL", ts(15), wall(15), &mut fx);
+    assert!(sess.try_publish_view(k1, |f| {
+        assert!(f.full_sync);
+        assert_eq!(f.scroll_delta, 0);
+        true
+    }));
+
+    // 4. Each individual metadata change triggers a frame when rows are clean:
+    for (cmd, check_palette) in [
+        (&b"SCROLL_ONLY"[..], false),
+        (&b"CURSOR"[..], false),
+        (&b"MODES"[..], false),
+        (&b"PALETTE"[..], true),
+        (&b"IMAGES"[..], false),
+        (&b"ALT"[..], true),
+    ] {
+        sess.on_pty_output(cmd, ts(20), wall(20), &mut fx);
+        assert!(
+            sess.try_publish_view(k1, |f| {
+                assert_eq!(f.palette.is_some(), check_palette);
+                true
+            }),
+            "expected frame publish after {:?}",
+            core::str::from_utf8(cmd)
+        );
+        assert!(!sess.try_publish_view(k1, |_| true));
+    }
+}
+
+#[test]
+fn session_machine_viewport_policies_resizes_and_pty_queue() {
+    let k1 = (conn(1), nz_stream(1));
+    let k2 = (conn(2), nz_stream(2));
+    let mut fx = Vec::new();
+
+    // LatestActive: picks most recently focused visible view, ignoring hidden views
+    let mut s = SessionMachine::with_pty_write_cap(
+        sid(1),
+        StubVt::new(40, 10),
+        ResizePolicy::LatestActive,
+        MarksMode::Claimed,
+        CellPx { width: 8, height: 16 },
+        8,
+    );
+    s.attach_stream(
+        k1,
+        att_for(k1),
+        SubFlags::from_bits(SubFlags::VIEW).unwrap(),
+        Some(ViewportHint {
+            size: GridSize::new(80, 24).unwrap(),
+            cell_px: CellPx { width: 8, height: 16 },
+            visible: true,
+            focused: true,
+        }),
+        &mut fx,
+    );
+    assert_eq!(s.current_size(), GridSize::new(80, 24).unwrap());
+    // Attach k2 focused -> switches to k2 (100x30)
+    s.attach_stream(
+        k2,
+        att_for(k2),
+        SubFlags::from_bits(SubFlags::VIEW).unwrap(),
+        Some(ViewportHint {
+            size: GridSize::new(100, 30).unwrap(),
+            cell_px: CellPx { width: 9, height: 18 },
+            visible: true,
+            focused: true,
+        }),
+        &mut fx,
+    );
+    assert_eq!(s.current_size(), GridSize::new(100, 30).unwrap());
+    // k1 updates ViewportHint (focused=true) -> bumps viewport_seq and wins!
+    fx.clear();
+    s.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(1),
+        ClientMsg::ViewportHint(ViewportHint {
+            size: GridSize::new(90, 25).unwrap(),
+            cell_px: CellPx { width: 8, height: 16 },
+            visible: true,
+            focused: true,
+        }),
+        &mut fx,
+    );
+    assert_eq!(s.current_size(), GridSize::new(90, 25).unwrap());
+    assert!(
+        fx.iter()
+            .any(|e| matches!(e, SessionEffect::ResizePty { size, .. } if *size == GridSize::new(90, 25).unwrap()))
+    );
+
+    // Same-size ExplicitResize with different cell_px still resizes; identical (size, cell_px) is a no-op
+    fx.clear();
+    s.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(2),
+        ClientMsg::ExplicitResize { size: GridSize::new(90, 25).unwrap(), cell_px: CellPx { width: 10, height: 20 } },
+        &mut fx,
+    );
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::ResizePty { .. })));
+    fx.clear();
+    s.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(3),
+        ClientMsg::ExplicitResize { size: GridSize::new(90, 25).unwrap(), cell_px: CellPx { width: 10, height: 20 } },
+        &mut fx,
+    );
+    assert!(!fx.iter().any(|e| matches!(e, SessionEffect::ResizePty { .. })));
+
+    // PTY write queue exact boundary (8 bytes fits; 9th byte returns ErrorCode::Pty)
+    fx.clear();
+    s.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(4),
+        ClientMsg::Write { data: b"12345678".to_vec() },
+        &mut fx,
+    );
+    assert_eq!(s.pty_write_len(), 8);
+    assert!(!fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Error { .. }, .. })));
+    s.handle_stream_msg(k1, att_for(k1), RequestId::from_raw(5), ClientMsg::Write { data: b"x".to_vec() }, &mut fx);
+    assert!(
+        fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Error { code: ErrorCode::Pty, .. }, .. }))
+    );
+    assert_eq!(s.drain_pty_write(8), b"12345678");
+    assert_eq!(s.pty_write_len(), 0);
+
+    // Paste unsafe gate vs confirmed paste
+    fx.clear();
+    s.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(6),
+        ClientMsg::Paste { text: "a\nb".into(), allow_unsafe: false },
+        &mut fx,
+    );
+    assert!(
+        fx.iter()
+            .any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Pasted { outcome: PasteOutcome::Unsafe }, .. }))
+    );
+    fx.clear();
+    s.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(7),
+        ClientMsg::Paste { text: "a\nb".into(), allow_unsafe: true },
+        &mut fx,
+    );
+    assert!(
+        fx.iter()
+            .any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Pasted { outcome: PasteOutcome::Pasted }, .. }))
+    );
+    assert_eq!(s.drain_pty_write(8), b"a\nb");
+
+    // MinFit policy + ExplicitOverride policy
+    let mut min_s =
+        SessionMachine::new(sid(2), StubVt::new(80, 24), ResizePolicy::MinFit, MarksMode::Claimed, CellPx::default());
+    min_s.attach_stream(
+        k1,
+        att_for(k1),
+        SubFlags::from_bits(SubFlags::VIEW).unwrap(),
+        Some(ViewportHint {
+            size: GridSize::new(70, 20).unwrap(),
+            cell_px: CellPx::default(),
+            visible: true,
+            focused: true,
+        }),
+        &mut fx,
+    );
+    min_s.attach_stream(
+        k2,
+        att_for(k2),
+        SubFlags::from_bits(SubFlags::VIEW).unwrap(),
+        Some(ViewportHint {
+            size: GridSize::new(50, 30).unwrap(),
+            cell_px: CellPx::default(),
+            visible: true,
+            focused: false,
+        }),
+        &mut fx,
+    );
+    assert_eq!(min_s.current_size(), GridSize::new(50, 20).unwrap());
+
+    let mut exp_s = SessionMachine::new(
+        sid(3),
+        StubVt::new(80, 24),
+        ResizePolicy::ExplicitOverride,
+        MarksMode::Claimed,
+        CellPx::default(),
+    );
+    exp_s.attach_stream(
+        k1,
+        att_for(k1),
+        SubFlags::from_bits(SubFlags::VIEW).unwrap(),
+        Some(ViewportHint {
+            size: GridSize::new(50, 15).unwrap(),
+            cell_px: CellPx::default(),
+            visible: true,
+            focused: true,
+        }),
+        &mut fx,
+    );
+    assert_eq!(exp_s.current_size(), GridSize::new(80, 24).unwrap());
+}
+
+#[test]
+fn session_machine_marks_search_waiters_command_output_and_exit() {
+    let mut vt = StubVt::new(40, 4);
+    vt.next_events = vec![
+        VtEvent::Title("t1".into()),
+        VtEvent::Bell,
+        VtEvent::Clipboard { selection: "c".into(), data: "clip".into() },
+        VtEvent::Notification { title: "n".into(), body: "b".into() },
+        VtEvent::Progress { state: ProgressState::Running, percent: Some(40) },
+        VtEvent::Cwd("/work".into()),
+        VtEvent::DeviceResponse(b"\x1b[1;1R".to_vec()),
+        VtEvent::Osc133 { payload: "C".into(), cursor_line: 0 },
+        VtEvent::ProgramStatus(crate::status::parse_osc7501("state=working;app=tool").unwrap()),
+    ];
+    let mut sess = SessionMachine::new(sid(1), vt, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    assert_eq!(sess.id(), sid(1));
+    assert!(sess.is_alive());
+
+    let k1 = (conn(1), nz_stream(1));
+    let mut fx = Vec::new();
+    sess.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
+
+    // Initial PTY output emits all VT events + CommandStarted (id=1) + VerifyForeground + DeviceResponse
+    fx.clear();
+    sess.on_pty_output(b"hello needle", ts(100), wall(100), &mut fx);
+    assert_eq!(sess.title(), "t1");
+    assert_eq!(sess.drain_pty_write(32), b"\x1b[1;1R");
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::VerifyForeground { app, .. } if app == "tool")));
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::CommandStarted(_), .. })));
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Bell, .. })));
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Clipboard { .. }, .. })));
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Notification { .. }, .. })));
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Progress { .. }, .. })));
+
+    // Register 2 waiters (tests next_wait_id += 1 vs *= 1): Text waiter wakes reactively on dirty output,
+    // and Idle waiter stays pending until OSC 133;D arrives!
+    fx.clear();
+    sess.register_wait(conn(1), RequestId::from_raw(10), WaitCondition::Text("new-line".into()), 500, ts(110), &mut fx);
+    sess.register_wait(conn(1), RequestId::from_raw(11), WaitCondition::Idle, 500, ts(110), &mut fx);
+    sess.register_wait(
+        conn(1),
+        RequestId::from_raw(12),
+        WaitCondition::Status(vec![StatusState::Done]),
+        500,
+        ts(110),
+        &mut fx,
+    );
+    sess.register_wait(conn(1), RequestId::from_raw(13), WaitCondition::Text("never".into()), 20, ts(110), &mut fx);
+
+    // CommandOutput for active command id=1 returns Some("0:0:3:39"); unknown id=99 returns None
+    fx.clear();
+    sess.handle_stream_msg(k1, att_for(k1), RequestId::from_raw(40), ClientMsg::Commands, &mut fx);
+    sess.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(41),
+        ClientMsg::CommandOutput { command_id: 1 },
+        &mut fx,
+    );
+    sess.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(42),
+        ClientMsg::CommandOutput { command_id: 99 },
+        &mut fx,
+    );
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        SessionEffect::Send { req_id, msg: BrokerMsg::CommandsReply { commands }, .. }
+        if *req_id == RequestId::from_raw(40) && commands.len() == 1
+    )));
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        SessionEffect::Send { req_id, msg: BrokerMsg::CommandOutputReply { text: Some(t) }, .. }
+        if *req_id == RequestId::from_raw(41) && t == "0:0:3:39"
+    )));
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        SessionEffect::Send { req_id, msg: BrokerMsg::CommandOutputReply { text: None }, .. }
+        if *req_id == RequestId::from_raw(42)
+    )));
+
+    // Wait 13 times out at ts(130); other 3 remain pending
+    fx.clear();
+    sess.poll_timers(ts(130), &mut fx);
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Timeout }, .. }
+        if *req_id == RequestId::from_raw(13)
+    )));
+
+    // SetSearch + SCROLL wakes Text waiter (req 10) reactively AND schedules 150ms SearchDelta flush
+    fx.clear();
+    sess.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(50),
+        ClientMsg::SetSearch { query: "new-line".into(), case_sensitive: true },
+        &mut fx,
+    );
+    fx.clear();
+    sess.on_pty_output(b"SCROLL", ts(200), wall(200), &mut fx);
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. }
+        if *req_id == RequestId::from_raw(10)
+    )));
+    sess.poll_timers(ts(200 + SEARCH_COALESCE_MS), &mut fx);
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        SessionEffect::Send { msg: BrokerMsg::SearchDelta { from_line: 0, to_line: 5, added, .. }, .. }
+        if added.len() == 1
+    )));
+
+    // Epoch change via ALT marks search for full refresh on next SearchFlush
+    fx.clear();
+    sess.on_pty_output(b"ALT", ts(400), wall(400), &mut fx);
+    sess.poll_timers(ts(400 + SEARCH_COALESCE_MS), &mut fx);
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::SearchMatches { .. }, .. })));
+
+    // Stream RPCs (WordAt, LineAt, TextOf, TextOfRect, FetchRows, Images, GetImageBlob, Key, Text, Pointer, Focus, SetCursorDefaults)
+    let cur_epoch = sess.vt().meta().epoch;
+    let stale_epoch = cur_epoch + 99;
+    fx.clear();
+    for (req, msg) in [
+        (60, ClientMsg::FetchRows { epoch: stale_epoch, from_line: 0, count: 1 }),
+        (61, ClientMsg::FetchRows { epoch: cur_epoch, from_line: 1, count: 2 }),
+        (62, ClientMsg::WordAt { epoch: stale_epoch, pos: CellPos { line: 0, col: 0 } }),
+        (63, ClientMsg::WordAt { epoch: cur_epoch, pos: CellPos { line: 1, col: 2 } }),
+        (64, ClientMsg::LineAt { epoch: stale_epoch, line: 0 }),
+        (65, ClientMsg::LineAt { epoch: cur_epoch, line: 1 }),
+        (
+            66,
+            ClientMsg::TextOf {
+                epoch: stale_epoch,
+                span: CellSpan { start: CellPos { line: 0, col: 0 }, end: CellPos { line: 0, col: 1 } },
+            },
+        ),
+        (
+            67,
+            ClientMsg::TextOf {
+                epoch: cur_epoch,
+                span: CellSpan { start: CellPos { line: 1, col: 0 }, end: CellPos { line: 1, col: 1 } },
+            },
+        ),
+        (
+            68,
+            ClientMsg::TextOfRect {
+                epoch: stale_epoch,
+                span: CellSpan { start: CellPos { line: 0, col: 0 }, end: CellPos { line: 0, col: 1 } },
+            },
+        ),
+        (
+            69,
+            ClientMsg::TextOfRect {
+                epoch: cur_epoch,
+                span: CellSpan { start: CellPos { line: 1, col: 0 }, end: CellPos { line: 1, col: 2 } },
+            },
+        ),
+        (70, ClientMsg::Images),
+        (71, ClientMsg::GetImageBlob { blob: BlobHash([1; 32]), offset: 0, max_bytes: 1024 }),
+        (
+            72,
+            ClientMsg::Key(KeyInput {
+                code: "KeyA".into(),
+                action: KeyAction::Press,
+                modifiers: 0,
+                text: "a".into(),
+                unshifted_codepoint: 0,
+                composed: false,
+            }),
+        ),
+        (73, ClientMsg::Text { text: "b".into() }),
+        (
+            74,
+            ClientMsg::Pointer(PointerInput {
+                action: PointerAction::Press,
+                button: 0,
+                modifiers: 0,
+                x_px: 0,
+                y_px: 0,
+                cell_px: CellPx::default(),
+            }),
+        ),
+        (75, ClientMsg::Focus { focused: true }),
+        (76, ClientMsg::SetCursorDefaults { shape: CursorShape::Underline, blinking: true }),
+    ] {
+        sess.handle_stream_msg(k1, att_for(k1), RequestId::from_raw(req), msg, &mut fx);
+    }
+    assert_eq!(sess.drain_pty_write(32), b"abM1I");
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Error { code: ErrorCode::StaleEpoch, .. }, .. } if *req_id == RequestId::from_raw(60))));
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Rows { .. }, .. } if *req_id == RequestId::from_raw(61))));
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Error { code: ErrorCode::StaleEpoch, .. }, .. } if *req_id == RequestId::from_raw(62))));
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::SpanReply { span: Some(_) }, .. } if *req_id == RequestId::from_raw(63))));
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Error { code: ErrorCode::StaleEpoch, .. }, .. } if *req_id == RequestId::from_raw(64))));
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::SpanReply { span: Some(_) }, .. } if *req_id == RequestId::from_raw(65))));
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Error { code: ErrorCode::StaleEpoch, .. }, .. } if *req_id == RequestId::from_raw(66))));
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::TextReply { text }, .. } if *req_id == RequestId::from_raw(67) && text == "1:0:1:1")));
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Error { code: ErrorCode::StaleEpoch, .. }, .. } if *req_id == RequestId::from_raw(68))));
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::TextReply { text }, .. } if *req_id == RequestId::from_raw(69) && text == "rect:0:2")));
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::ImagesReply { .. }, .. } if *req_id == RequestId::from_raw(70))));
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::FetchImageBlob { .. })));
+    assert!(fx.iter().any(
+        |e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Ok, .. } if *req_id == RequestId::from_raw(76))
+    ));
+
+    // Process exit: wakes WaitCondition::Exit with Met, remaining non-Exit waiters (Idle=11, Status=12) with Exited,
+    // sets is_alive = false, and calling on_process_exit a second time is a no-op!
+    fx.clear();
+    sess.register_wait(conn(1), RequestId::from_raw(14), WaitCondition::Exit, 500, ts(450), &mut fx);
+    sess.on_process_exit(Some(0), None, wall(460), &mut fx);
+    assert!(!sess.is_alive());
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Exited }, .. } if *req_id == RequestId::from_raw(11))));
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Exited }, .. } if *req_id == RequestId::from_raw(12))));
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. } if *req_id == RequestId::from_raw(14))));
+    fx.clear();
+    sess.on_process_exit(Some(1), None, wall(465), &mut fx);
+    assert!(fx.is_empty());
+
+    // After exit: WaitCondition::Exit resolves Met immediately; WaitCondition::Idle resolves Exited immediately
+    sess.register_wait(conn(1), RequestId::from_raw(15), WaitCondition::Exit, 500, ts(470), &mut fx);
+    sess.register_wait(conn(1), RequestId::from_raw(16), WaitCondition::Idle, 500, ts(470), &mut fx);
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. } if *req_id == RequestId::from_raw(15))));
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Exited }, .. } if *req_id == RequestId::from_raw(16))));
+
+    // DEC 2026 sync hold + Status waiter waking reactively + Idle waiter waking reactively on OSC 633;D
+    let mut vt2 = StubVt::new(40, 4);
+    vt2.next_events = vec![VtEvent::SyncOutput(true)];
+    let mut s2 = SessionMachine::new(sid(2), vt2, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    s2.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
+    fx.clear();
+    s2.on_pty_output(b"x", ts(500), wall(500), &mut fx);
+    assert!(s2.is_sync_held());
+    assert!(!fx.contains(&SessionEffect::ViewsDirty)); // suppressed while sync-held!
+    assert!(!s2.try_publish_view(k1, |_| true));
+    assert_eq!(s2.next_deadline(), Some(ts(500 + SYNC_HOLD_MAX_MS)));
+    s2.poll_timers(ts(500 + SYNC_HOLD_MAX_MS), &mut fx);
+    assert!(!s2.is_sync_held());
+    assert!(fx.contains(&SessionEffect::ViewsDirty));
+
+    // Reactive Idle + Status waiters
+    fx.clear();
+    s2.register_wait(conn(1), RequestId::from_raw(80), WaitCondition::Idle, 500, ts(2_000), &mut fx);
+    s2.register_wait(
+        conn(1),
+        RequestId::from_raw(81),
+        WaitCondition::Status(vec![StatusState::Done]),
+        500,
+        ts(2_000),
+        &mut fx,
+    );
+    s2.register_wait(conn(2), RequestId::from_raw(82), WaitCondition::Exit, 500, ts(2_000), &mut fx);
+    s2.cancel_waiters_for_conn(conn(2));
+
+    let mut vt3 = StubVt::new(40, 4);
+    vt3.next_events = vec![
+        VtEvent::Osc633 { payload: "D;0".into(), cursor_line: 0 },
+        VtEvent::ProgramStatus(crate::status::parse_osc7501("state=done").unwrap()),
+    ];
+    let mut s3 = SessionMachine::new(sid(3), vt3, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    s3.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
+    s3.register_wait(conn(1), RequestId::from_raw(90), WaitCondition::Idle, 500, ts(2_000), &mut fx);
+    s3.register_wait(
+        conn(1),
+        RequestId::from_raw(91),
+        WaitCondition::Status(vec![StatusState::Done]),
+        500,
+        ts(2_000),
+        &mut fx,
+    );
+    fx.clear();
+    s3.on_pty_output(b"done", ts(2_010), wall(2_010), &mut fx);
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. } if *req_id == RequestId::from_raw(90))));
+    // Hostile/unattributed `state=done` without `app=` stays Confirmed::Unknown and MUST NOT wake WaitCondition::Status!
+    assert!(!fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Waited { .. }, .. } if *req_id == RequestId::from_raw(91))));
+    // Verified `state=done;app=agent` confirmed Matched DOES wake the waiting client!
+    fx.clear();
+    s3.vt_mut().next_events =
+        vec![VtEvent::ProgramStatus(crate::status::parse_osc7501("state=done;app=agent").unwrap())];
+    s3.on_pty_output(b"v", ts(2_015), wall(2_015), &mut fx);
+    let ch_s3 = fx
+        .iter()
+        .find_map(|e| match e {
+            SessionEffect::VerifyForeground { changed, .. } => Some(*changed),
+            _ => None,
+        })
+        .expect("expected VerifyForeground");
+    fx.clear();
+    s3.apply_status_confirmation("", ch_s3, Confirmed::Matched, &mut fx);
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. } if *req_id == RequestId::from_raw(91))));
+
+    // Detach cleans up views
+    sess.detach_stream(k1, &mut fx);
+    assert!(sess.view_subscribers().is_empty());
+}
+
+#[test]
+fn session_edge_cases_and_boundary_invariants() {
+    let mut fx = Vec::new();
+
+    // 1. ViewSubscriber::apply_dirty boundaries:
+    //    - same epoch + dirty.full_dirty -> forces full_sync
+    //    - dirty row 0 shifted up by +1 -> dropped (moved == -1)
+    //    - dirty row 3 (rows - 1) shifted down by -1 -> dropped (moved == rows)
+    //    - out-of-bounds dirty row r == rows -> NOT emitted in frame
+    let mut vt = StubVt::new(40, 4);
+    vt.dirty.full_dirty = false;
+    let mut sess = SessionMachine::new(sid(10), vt, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    let k1 = (conn(1), nz_stream(1));
+    sess.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
+    assert!(sess.try_publish_view(k1, |_| true)); // initial full sync establishes last_epoch = Some(1)
+
+    // Same epoch + full_dirty=true -> full_sync frame!
+    sess.on_pty_output(b"FULL_DIRTY", ts(1), wall(1), &mut fx);
+    let mut full_seen = false;
+    assert!(sess.try_publish_view(k1, |f| {
+        full_seen = f.full_sync;
+        true
+    }));
+    assert!(full_seen);
+
+    // Dirty row 0 + scroll +1 -> row 0 shifts to -1 and is dropped (no rows in frame, only scroll_delta = +1)
+    sess.on_pty_output(b"DIRTY_ROW0", ts(2), wall(2), &mut fx);
+    sess.on_pty_output(b"SCROLL_ONLY", ts(3), wall(3), &mut fx);
+    let mut frame_rows = Vec::new();
+    let mut frame_delta = 0;
+    assert!(sess.try_publish_view(k1, |f| {
+        frame_rows = f.rows.iter().map(|r| r.line).collect();
+        frame_delta = f.scroll_delta;
+        true
+    }));
+    assert_eq!(frame_delta, 1);
+    assert!(frame_rows.is_empty());
+
+    // Dirty row 3 (rows - 1) + scroll -1 -> row 3 shifts to 4 (== rows) and is dropped!
+    sess.on_pty_output(b"DIRTY_ROW3", ts(4), wall(4), &mut fx);
+    sess.on_pty_output(b"SCROLL_DOWN_ONLY", ts(5), wall(5), &mut fx);
+    assert!(sess.try_publish_view(k1, |f| {
+        frame_rows = f.rows.iter().map(|r| r.line).collect();
+        frame_delta = f.scroll_delta;
+        true
+    }));
+    assert_eq!(frame_delta, -1);
+    assert!(frame_rows.is_empty());
+
+    // Dirty OOB row (r == rows) must be ignored -> frame must NOT even publish!
+    sess.on_pty_output(b"DIRTY_OOB", ts(6), wall(6), &mut fx);
+    assert!(!sess.try_publish_view(k1, |_| true));
+
+    // 2. attach_stream viewport_seq monotonicity: attaching 2 views with initial_viewport under LatestActive
+    //    must choose the SECOND view's size (kills viewport_seq += 1 -> *= 1).
+    let mut s_vp = SessionMachine::new(
+        sid(11),
+        StubVt::new(40, 10),
+        ResizePolicy::LatestActive,
+        MarksMode::Claimed,
+        CellPx::default(),
+    );
+    let hint1 = ViewportHint {
+        size: GridSize::new(50, 15).unwrap(),
+        cell_px: CellPx::default(),
+        visible: true,
+        focused: false,
+    };
+    let hint2 = ViewportHint {
+        size: GridSize::new(70, 22).unwrap(),
+        cell_px: CellPx::default(),
+        visible: true,
+        focused: false,
+    };
+    s_vp.attach_stream(
+        (conn(2), nz_stream(1)),
+        att_for((conn(2), nz_stream(1))),
+        SubFlags::from_bits(SubFlags::VIEW).unwrap(),
+        Some(hint2),
+        &mut fx,
+    );
+    s_vp.attach_stream(
+        (conn(1), nz_stream(1)),
+        att_for((conn(1), nz_stream(1))),
+        SubFlags::from_bits(SubFlags::VIEW).unwrap(),
+        Some(hint1),
+        &mut fx,
+    );
+    assert_eq!(s_vp.current_size(), GridSize::new(50, 15).unwrap());
+
+    // 3. cancel_waiters_for_conn cancels ONLY the disconnected conn's waiters, keeping other conns' waiters live!
+    let mut s_wait = SessionMachine::new(
+        sid(12),
+        StubVt::new(40, 4),
+        ResizePolicy::LatestActive,
+        MarksMode::Claimed,
+        CellPx::default(),
+    );
+    fx.clear();
+    s_wait.register_wait(conn(1), RequestId::from_raw(1), WaitCondition::Exit, 50, ts(10), &mut fx);
+    s_wait.register_wait(conn(2), RequestId::from_raw(2), WaitCondition::Exit, 50, ts(10), &mut fx);
+    s_wait.cancel_waiters_for_conn(conn(1));
+    s_wait.poll_timers(ts(100), &mut fx);
+    assert!(!fx.iter().any(|e| matches!(e, SessionEffect::Send { conn: c, .. } if *c == conn(1))));
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { conn: c, req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Timeout }, .. } if *c == conn(2) && *req_id == RequestId::from_raw(2))));
+
+    // 4. apply_status_confirmation propagates Confirmed::Matched via ProgramStatus broadcast!
+    let mut vt_st = StubVt::new(40, 4);
+    vt_st.next_events = vec![VtEvent::ProgramStatus(crate::status::parse_osc7501("state=blocked;app=claude").unwrap())];
+    let mut s_st =
+        SessionMachine::new(sid(13), vt_st, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    s_st.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
+    fx.clear();
+    s_st.on_pty_output(b"NOOP", ts(10), wall(10), &mut fx);
+    s_st.apply_status_confirmation("", 1, Confirmed::Matched, &mut fx);
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::ProgramStatus(r), .. } if r.confirmed == Confirmed::Matched)));
+
+    // 5. SearchWatch coalesce & compute_dirty_abs_range:
+    //    - NOOP chunk (scrollback unchanged, dirty_rows empty) must NOT schedule SearchFlush timer!
+    //    - DIRTY_ROW2 (abs = 2 > 0, scrollback unchanged, full_dirty = false) MUST match WaitCondition::Text AND
+    //      schedule SearchFlush once; a second dirty chunk before deadline must NOT postpone the deadline!
+    let mut vt_srch = StubVt::new(40, 4);
+    vt_srch.dirty.full_dirty = false;
+    let mut s_srch =
+        SessionMachine::new(sid(14), vt_srch, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    s_srch.attach_stream(
+        k1,
+        att_for(k1),
+        SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(),
+        None,
+        &mut fx,
+    );
+    fx.clear();
+    s_srch.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(1),
+        ClientMsg::SetSearch { query: "row-two".into(), case_sensitive: true },
+        &mut fx,
+    );
+    assert_eq!(s_srch.next_deadline(), None);
+    s_srch.on_pty_output(b"NOOP", ts(10), wall(10), &mut fx);
+    assert_eq!(s_srch.next_deadline(), None); // kills > -> >= and < -> <= in compute_dirty_abs_range and && -> ||!
+
+    // Register WaitCondition::Text for "row-two" on row 2 (abs = 2): kills abs + 1 -> abs - 1 / abs * 1!
+    fx.clear();
+    s_srch.register_wait(conn(1), RequestId::from_raw(2), WaitCondition::Text("row-two".into()), 500, ts(20), &mut fx);
+    s_srch.on_pty_output(b"DIRTY_ROW2", ts(20), wall(20), &mut fx);
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. } if *req_id == RequestId::from_raw(2))));
+    assert_eq!(s_srch.next_deadline(), Some(ts(20 + SEARCH_COALESCE_MS)));
+    // Second dirty chunk before SearchFlush deadline must preserve the original coalesce deadline!
+    s_srch.on_pty_output(b"DIRTY_ROW3", ts(100), wall(100), &mut fx);
+    assert_eq!(s_srch.next_deadline(), Some(ts(20 + SEARCH_COALESCE_MS)));
+
+    // 6. apply_resize: cell_px-only change (new_epoch == prev_epoch) must NOT clear mark line anchors!
+    //    Whereas grid-size change (new_epoch != prev_epoch) MUST clear mark line anchors AND immediately flush searches!
+    let mut vt_rs = StubVt::new(40, 4);
+    vt_rs.next_events = vec![
+        VtEvent::Osc133 { payload: "C".into(), cursor_line: 0 },
+        VtEvent::Osc133 { payload: "D;0".into(), cursor_line: 0 },
+    ];
+    let mut s_rs =
+        SessionMachine::new(sid(15), vt_rs, ResizePolicy::ExplicitOverride, MarksMode::Claimed, CellPx::default());
+    s_rs.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
+    s_rs.on_pty_output(b"NOOP", ts(10), wall(10), &mut fx);
+    // Single-line command output (start_line == end_line == 0): kills start_line > end_line -> >= and ==!
+    // Also send a subsequent normal NOOP chunk (epoch unchanged) to prove marks are NOT wiped (kills epoch_changed != -> ==)!
+    s_rs.on_pty_output(b"NOOP", ts(11), wall(11), &mut fx);
+    fx.clear();
+    s_rs.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(1),
+        ClientMsg::CommandOutput { command_id: 1 },
+        &mut fx,
+    );
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::CommandOutputReply { text: Some(t) }, .. } if *req_id == RequestId::from_raw(1) && t == "0:0:0:39")));
+
+    // Active search watch flushes immediately on epoch-bumping resize!
+    s_rs.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(10),
+        ClientMsg::SetSearch { query: "foo".into(), case_sensitive: true },
+        &mut fx,
+    );
+    s_rs.on_pty_output(b"DIRTY_ROW2", ts(12), wall(12), &mut fx); // schedules SearchFlush timer
+
+    // CellPx-only resize keeps same epoch -> mark anchors survive!
+    s_rs.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(2),
+        ClientMsg::ExplicitResize { size: GridSize::new(40, 4).unwrap(), cell_px: CellPx { width: 12, height: 24 } },
+        &mut fx,
+    );
+    fx.clear();
+    s_rs.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(3),
+        ClientMsg::CommandOutput { command_id: 1 },
+        &mut fx,
+    );
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::CommandOutputReply { text: Some(_) }, .. } if *req_id == RequestId::from_raw(3))));
+
+    // Grid resize bumps epoch -> mark anchors cleared, SearchMatches flushed immediately, pending timer cancelled!
+    fx.clear();
+    s_rs.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(4),
+        ClientMsg::ExplicitResize { size: GridSize::new(50, 5).unwrap(), cell_px: CellPx { width: 12, height: 24 } },
+        &mut fx,
+    );
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::SearchMatches { .. }, .. })));
+    assert_eq!(s_rs.next_deadline(), None);
+    fx.clear();
+    s_rs.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(5),
+        ClientMsg::CommandOutput { command_id: 1 },
+        &mut fx,
+    );
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::CommandOutputReply { text: None }, .. } if *req_id == RequestId::from_raw(5))));
+
+    // 7. CommandOutput where start_line (2) > end_line (0) while end_line < total_lines (4) must return None!
+    let mut vt_cmd = StubVt::new(40, 4);
+    vt_cmd.cursor.row = 2;
+    vt_cmd.next_events = vec![VtEvent::Osc133 { payload: "C".into(), cursor_line: 2 }];
+    let mut s_cmd =
+        SessionMachine::new(sid(16), vt_cmd, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    s_cmd.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
+    s_cmd.on_pty_output(b"NOOP", ts(10), wall(10), &mut fx);
+    s_cmd.on_pty_output(b"CURSOR_HOME", ts(11), wall(11), &mut fx);
+    fx.clear();
+    s_cmd.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(1),
+        ClientMsg::CommandOutput { command_id: 1 },
+        &mut fx,
+    );
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::CommandOutputReply { text: None }, .. } if *req_id == RequestId::from_raw(1))));
+
+    // 8. Non-prompt mark (Osc133("C")) must NOT wake WaitCondition::Idle; PromptArrived (Osc133("A")) DOES wake it.
+    let mut vt_cmd2 = StubVt::new(40, 4);
+    vt_cmd2.next_events = vec![VtEvent::Osc133 { payload: "C".into(), cursor_line: 0 }];
+    let mut s_idle =
+        SessionMachine::new(sid(17), vt_cmd2, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    fx.clear();
+    s_idle.register_wait(conn(1), RequestId::from_raw(1), WaitCondition::Idle, 500, ts(10), &mut fx);
+    s_idle.on_pty_output(b"NOOP", ts(20), wall(20), &mut fx);
+    assert!(!fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Waited { .. }, .. })));
+}
+
+#[test]
+fn session_security_hardening_and_audit_fixes() {
+    let mut fx = Vec::new();
+    let k1 = (conn(1), nz_stream(1));
+    let k2 = (conn(2), nz_stream(1));
+
+    // 1. Opposing-sign scrolls coalesced before publish degrade to full_sync; scrollback clear triggers publish
+    let mut vt = StubVt::new(40, 4);
+    vt.dirty.full_dirty = false;
+    let mut sess = SessionMachine::new(sid(20), vt, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    sess.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
+    assert!(sess.try_publish_view(k1, |_| true));
+    sess.on_pty_output(b"SCROLL_ONLY", ts(1), wall(1), &mut fx);
+    sess.on_pty_output(b"SCROLL_DOWN_ONLY", ts(2), wall(2), &mut fx);
+    let mut full = false;
+    assert!(sess.try_publish_view(k1, |f| {
+        full = f.full_sync;
+        true
+    }));
+    assert!(full);
+
+    // Scrollback eviction + scrollback clear both trigger frame updates even without dirty viewport rows
+    sess.on_pty_output(b"SCROLL", ts(3), wall(3), &mut fx);
+    assert!(sess.try_publish_view(k1, |_| true));
+    sess.on_pty_output(b"EVICT_SB", ts(4), wall(4), &mut fx);
+    assert!(sess.try_publish_view(k1, |f| {
+        assert_eq!(f.first_active_line, 2);
+        assert_eq!(f.scrollback_lines, 1);
+        true
+    }));
+    sess.on_pty_output(b"CLEAR_SB", ts(5), wall(5), &mut fx);
+    assert!(sess.try_publish_view(k1, |f| {
+        assert_eq!(f.scrollback_lines, 0);
+        true
+    }));
+
+    // 2. Unattached stream rejected (NoSuchStream) and non-VIEW ViewportHint rejected (Malformed)
+    fx.clear();
+    sess.handle_stream_msg(k2, att_for(k2), RequestId::from_raw(1), ClientMsg::Commands, &mut fx);
+    assert!(
+        fx.iter().any(|e| matches!(
+            e,
+            SessionEffect::Send { msg: BrokerMsg::Error { code: ErrorCode::NoSuchStream, .. }, .. }
+        ))
+    );
+
+    sess.attach_stream(k2, att_for(k2), SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
+    fx.clear();
+    sess.handle_stream_msg(
+        k2,
+        att_for(k2),
+        RequestId::from_raw(2),
+        ClientMsg::ViewportHint(ViewportHint {
+            size: GridSize::new(30, 10).unwrap(),
+            cell_px: CellPx::default(),
+            visible: true,
+            focused: true,
+        }),
+        &mut fx,
+    );
+    assert!(
+        fx.iter()
+            .any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Error { code: ErrorCode::Malformed, .. }, .. }))
+    );
+
+    // 3. Pause / Resume reference counting + automatic unpause on detach_stream
+    fx.clear();
+    sess.handle_stream_msg(k1, att_for(k1), RequestId::from_raw(10), ClientMsg::Pause, &mut fx);
+    assert!(fx.contains(&SessionEffect::SetPtyPaused(true)));
+    fx.clear();
+    sess.handle_stream_msg(k2, att_for(k2), RequestId::from_raw(11), ClientMsg::Pause, &mut fx);
+    assert!(!fx.contains(&SessionEffect::SetPtyPaused(true))); // already paused
+    fx.clear();
+    sess.handle_stream_msg(k1, att_for(k1), RequestId::from_raw(12), ClientMsg::Resume, &mut fx);
+    assert!(!fx.contains(&SessionEffect::SetPtyPaused(false))); // k2 still holds pause
+    fx.clear();
+    sess.detach_stream(k2, &mut fx);
+    assert!(fx.contains(&SessionEffect::SetPtyPaused(false))); // last pauser detached -> unpaused!
+
+    // 4. Progress normalization, VerifyForeground batch coalescing, and EpochChanged in stream order
+    let mut vt_ev = StubVt::new(40, 4);
+    vt_ev.next_events = vec![
+        VtEvent::Progress { state: ProgressState::Indeterminate, percent: Some(80) },
+        VtEvent::Progress { state: ProgressState::None, percent: Some(50) },
+        VtEvent::Progress { state: ProgressState::Running, percent: Some(250) },
+        VtEvent::ProgramStatus(crate::status::parse_osc7501("id=a;state=working;app=one").unwrap()),
+        VtEvent::ProgramStatus(crate::status::parse_osc7501("id=a;state=done;app=two").unwrap()),
+        VtEvent::EpochChanged,
+    ];
+    let mut s_ev =
+        SessionMachine::new(sid(21), vt_ev, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    s_ev.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
+    fx.clear();
+    s_ev.on_pty_output(b"NOOP", ts(10), wall(10), &mut fx);
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        SessionEffect::Send { msg: BrokerMsg::Progress { state: ProgressState::Indeterminate, percent: None }, .. }
+    )));
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        SessionEffect::Send { msg: BrokerMsg::Progress { state: ProgressState::None, percent: None }, .. }
+    )));
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        SessionEffect::Send { msg: BrokerMsg::Progress { state: ProgressState::Running, percent: Some(100) }, .. }
+    )));
+    let verify_count = fx.iter().filter(|e| matches!(e, SessionEffect::VerifyForeground { .. })).count();
+    assert_eq!(verify_count, 1);
+    assert!(
+        fx.iter()
+            .any(|e| matches!(e, SessionEffect::VerifyForeground { id, changed: 2, app } if id == "a" && app == "two"))
+    );
+
+    // 5. DEC 2026 anti-starvation: 2026l + 2026h before any frame flushes CANNOT extend SYNC_HOLD_MAX_MS!
+    //    And on_process_exit releases sync hold & clears pty_write_queue & rejects future writes!
+    let mut vt_sync = StubVt::new(40, 4);
+    vt_sync.next_events = vec![VtEvent::SyncOutput(true)];
+    let mut s_sync = SessionMachine::with_pty_write_cap(
+        sid(22),
+        vt_sync,
+        ResizePolicy::LatestActive,
+        MarksMode::Claimed,
+        CellPx::default(),
+        10,
+    );
+    s_sync.attach_stream(
+        k1,
+        att_for(k1),
+        SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(),
+        None,
+        &mut fx,
+    );
+    s_sync.on_pty_output(b"x", ts(1_000), wall(1_000), &mut fx);
+    assert_eq!(s_sync.next_deadline(), Some(ts(1_000 + SYNC_HOLD_MAX_MS)));
+    // Attempt starvation at t=1900 by toggling 2026l + 2026h without publishing a frame
+    s_sync.on_pty_output(b"SYNC_REARM", ts(1_900), wall(1_900), &mut fx);
+    assert_eq!(s_sync.next_deadline(), Some(ts(1_000 + SYNC_HOLD_MAX_MS))); // NOT pushed to 2900!
+    // After expiry at t=2000, trying to re-arm at t=2050 BEFORE publishing still does NOT hold!
+    s_sync.poll_timers(ts(2_000), &mut fx);
+    assert!(!s_sync.is_sync_held());
+    s_sync.on_pty_output(b"SYNC_REARM", ts(2_050), wall(2_050), &mut fx);
+    assert!(!s_sync.is_sync_held());
+    assert!(s_sync.try_publish_view(k1, |_| true)); // publishing resets anti-starvation window!
+    s_sync.on_pty_output(b"SYNC_REARM", ts(2_100), wall(2_100), &mut fx);
+    assert!(s_sync.is_sync_held());
+
+    // DSR sub-quota leaves half the queue free for interactive user input!
+    s_sync.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(1),
+        ClientMsg::Write { data: b"1234".to_vec() },
+        &mut fx,
+    );
+    assert_eq!(s_sync.pty_write_len(), 4);
+    // Queue cap is 10, DSR cap is 5; DSR of 6 bytes (> 5) is dropped, while user write of 8 bytes (<= 10) succeeds!
+    let mut vt_dsr = StubVt::new(40, 4);
+    vt_dsr.next_events = vec![VtEvent::DeviceResponse(b"123456".to_vec())];
+    let mut s_dsr = SessionMachine::with_pty_write_cap(
+        sid(23),
+        vt_dsr,
+        ResizePolicy::LatestActive,
+        MarksMode::Claimed,
+        CellPx::default(),
+        10,
+    );
+    s_dsr.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
+    s_dsr.on_pty_output(b"NOOP", ts(1), wall(1), &mut fx);
+    assert_eq!(s_dsr.pty_write_len(), 0); // 6 > 10/2 rejected!
+    s_dsr.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(1),
+        ClientMsg::Write { data: b"12345678".to_vec() },
+        &mut fx,
+    );
+    assert_eq!(s_dsr.pty_write_len(), 8); // user input still works!
+
+    // on_process_exit releases sync hold, clears pty_write_queue, and rejects subsequent PTY writes
+    fx.clear();
+    s_sync.on_process_exit(Some(0), None, wall(2_200), &mut fx);
+    assert!(!s_sync.is_sync_held());
+    assert_eq!(s_sync.pty_write_len(), 0);
+    assert!(fx.contains(&SessionEffect::ViewsDirty));
+    fx.clear();
+    s_sync.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(2),
+        ClientMsg::Write { data: b"hi".to_vec() },
+        &mut fx,
+    );
+    assert!(
+        fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Error { code: ErrorCode::Pty, .. }, .. }))
+    );
+
+    // 6. MAX_WAITERS_PER_SESSION cap returns ResourceLimit
+    let mut s_lim = SessionMachine::new(
+        sid(24),
+        StubVt::new(40, 4),
+        ResizePolicy::LatestActive,
+        MarksMode::Claimed,
+        CellPx::default(),
+    );
+    for i in 0..MAX_WAITERS_PER_SESSION {
+        s_lim.register_wait(conn(1), RequestId::from_raw(i as u32 + 1), WaitCondition::Exit, 500, ts(1), &mut fx);
+    }
+    fx.clear();
+    s_lim.register_wait(conn(1), RequestId::from_raw(999), WaitCondition::Exit, 500, ts(1), &mut fx);
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        SessionEffect::Send { msg: BrokerMsg::Error { code: ErrorCode::ResourceLimit, .. }, .. }
+    )));
+
+    // 7. SearchWatch eviction delta, OOB span clamp on TextOf/TextOfRect, GetImageBlob max_bytes clamp,
+    //    and SearchFlush timer cancelled when last search cleared or detached!
+    let mut vt_s = StubVt::new(40, 4);
+    vt_s.dirty.full_dirty = false;
+    let mut s_s = SessionMachine::new(sid(25), vt_s, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    s_s.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
+    s_s.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(1),
+        ClientMsg::SetSearch { query: "row".into(), case_sensitive: true },
+        &mut fx,
+    );
+    // Evicting scrollback advances oldest_line -> schedules SearchFlush and emits eviction SearchDelta [0, 1)
+    s_s.on_pty_output(b"SCROLL", ts(10), wall(10), &mut fx);
+    s_s.on_pty_output(b"EVICT_SB", ts(11), wall(11), &mut fx);
+    fx.clear();
+    s_s.poll_timers(ts(10 + SEARCH_COALESCE_MS), &mut fx);
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::SearchDelta { from_line: 0, to_line: 1, added, .. }, .. } if added.is_empty())));
+
+    // Clearing search cancels pending SearchFlush timer
+    s_s.on_pty_output(b"DIRTY_ROW2", ts(300), wall(300), &mut fx);
+    assert!(s_s.next_deadline().is_some());
+    s_s.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(2),
+        ClientMsg::SetSearch { query: String::new(), case_sensitive: true },
+        &mut fx,
+    );
+    assert_eq!(s_s.next_deadline(), None);
+
+    // TextOf / TextOfRect with inverted/OOB spans return empty string; GetImageBlob clamps max_bytes
+    let ep = s_s.vt().meta().epoch;
+    fx.clear();
+    s_s.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(3),
+        ClientMsg::TextOf {
+            epoch: ep,
+            span: CellSpan { start: CellPos { line: 999, col: 0 }, end: CellPos { line: 1000, col: 0 } },
+        },
+        &mut fx,
+    );
+    s_s.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(4),
+        ClientMsg::TextOfRect {
+            epoch: ep,
+            span: CellSpan { start: CellPos { line: 0, col: 0 }, end: CellPos { line: 0, col: 0 } },
+        },
+        &mut fx,
+    );
+    s_s.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(5),
+        ClientMsg::GetImageBlob { blob: BlobHash([2; 32]), offset: 0, max_bytes: u32::MAX },
+        &mut fx,
+    );
+    s_s.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(6),
+        ClientMsg::GetImageBlob { blob: BlobHash([2; 32]), offset: 0, max_bytes: 0 },
+        &mut fx,
+    );
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::TextReply { text }, .. } if *req_id == RequestId::from_raw(3) && text.is_empty())));
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::TextReply { text }, .. } if *req_id == RequestId::from_raw(4) && text.is_empty())));
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::FetchImageBlob { req_id, max_bytes, .. } if *req_id == RequestId::from_raw(5) && *max_bytes == BULK_CHUNK_BYTES as u32)));
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::FetchImageBlob { req_id, max_bytes, .. } if *req_id == RequestId::from_raw(6) && *max_bytes == 1)));
+
+    // Detach cancels pending SearchFlush timer when last search watch leaves
+    s_s.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(7),
+        ClientMsg::SetSearch { query: "row".into(), case_sensitive: true },
+        &mut fx,
+    );
+    s_s.on_pty_output(b"DIRTY_ROW2", ts(400), wall(400), &mut fx);
+    assert!(s_s.next_deadline().is_some());
+    s_s.detach_stream(k1, &mut fx);
+    assert_eq!(s_s.next_deadline(), None);
+    assert!(!fx.contains(&SessionEffect::SetPtyPaused(false))); // non-paused detach must NOT emit SetPtyPaused(false)!
+
+    // 8. Additional exact boundary checks killing remaining mutants:
+    //    - Stream-ordered VtEvent::EpochChanged preserves post-event command anchor (kills !saw_epoch_event)
+    let mut vt_ep = StubVt::new(40, 4);
+    vt_ep.next_events = vec![
+        VtEvent::Osc133 { payload: "C".into(), cursor_line: 0 },
+        VtEvent::EpochChanged,
+        VtEvent::Osc133 { payload: "C".into(), cursor_line: 1 },
+        VtEvent::Osc133 { payload: "D;0".into(), cursor_line: 1 },
+    ];
+    let mut s_ep =
+        SessionMachine::new(sid(26), vt_ep, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    s_ep.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
+    s_ep.on_pty_output(b"ALT", ts(1), wall(1), &mut fx);
+    fx.clear();
+    s_ep.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(1),
+        ClientMsg::CommandOutput { command_id: 1 },
+        &mut fx,
+    );
+    s_ep.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(2),
+        ClientMsg::CommandOutput { command_id: 2 },
+        &mut fx,
+    );
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::CommandOutputReply { text: None }, .. } if *req_id == RequestId::from_raw(1))));
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::CommandOutputReply { text: Some(t) }, .. } if *req_id == RequestId::from_raw(2) && t == "1:0:1:39")));
+
+    //    - SYNC_REARM at exact deadline (now == deadline) must NOT hold!
+    let mut vt_sd = StubVt::new(40, 4);
+    vt_sd.next_events = vec![VtEvent::SyncOutput(true)];
+    let mut s_sd =
+        SessionMachine::new(sid(27), vt_sd, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    s_sd.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, &mut fx);
+    s_sd.on_pty_output(b"NOOP", ts(100), wall(100), &mut fx);
+    s_sd.poll_timers(ts(100 + SYNC_HOLD_MAX_MS), &mut fx);
+    s_sd.on_pty_output(b"SYNC_REARM", ts(100 + SYNC_HOLD_MAX_MS), wall(100 + SYNC_HOLD_MAX_MS), &mut fx);
+    assert!(!s_sd.is_sync_held());
+
+    //    - enqueue_device_response exact boundary (next == dsr_cap succeeds) & rejected when !alive!
+    let mut vt_dr = StubVt::new(40, 4);
+    vt_dr.next_events = vec![VtEvent::DeviceResponse(b"12345".to_vec())];
+    let mut s_dr = SessionMachine::with_pty_write_cap(
+        sid(28),
+        vt_dr,
+        ResizePolicy::LatestActive,
+        MarksMode::Claimed,
+        CellPx::default(),
+        10,
+    );
+    s_dr.on_pty_output(b"NOOP", ts(1), wall(1), &mut fx);
+    assert_eq!(s_dr.pty_write_len(), 5); // exact dsr_cap = 10/2 = 5 succeeds!
+    s_dr.on_process_exit(Some(0), None, wall(2), &mut fx);
+    assert_eq!(s_dr.pty_write_len(), 0);
+    // Feed DeviceResponse after process exit -> must be ignored!
+    let mut vt_dr2 = StubVt::new(40, 4);
+    vt_dr2.next_events = vec![VtEvent::DeviceResponse(b"ok".to_vec())];
+    let mut s_dr2 =
+        SessionMachine::new(sid(29), vt_dr2, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    s_dr2.on_process_exit(Some(0), None, wall(1), &mut fx);
+    s_dr2.on_pty_output(b"NOOP", ts(2), wall(2), &mut fx);
+    assert_eq!(s_dr2.pty_write_len(), 0);
+
+    //    - CLEAR_SB alone (no dirty rows, oldest_line advances 0 -> 1) schedules SearchFlush!
+    //    - Normal DIRTY_ROW2 flush emits EXACTLY 1 SearchDelta (no spurious [oldest, oldest) delta!)
+    //    - Dirty range fully evicted before flush (clamped_from == clamped_to) emits NO second SearchDelta!
+    //    - __OOB_SPAN__, __EXACT_LIMIT__, __OVER_LIMIT__ test SearchDelta filtering and MAX_SEARCH_MATCHES cap!
+    let mut vt_sf = StubVt::new(40, 4);
+    vt_sf.dirty.full_dirty = false;
+    let mut s_sf =
+        SessionMachine::new(sid(30), vt_sf, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    s_sf.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
+    s_sf.on_pty_output(b"SCROLL", ts(1), wall(1), &mut fx); // first_active_line=1, scrollback=1, oldest=0
+    s_sf.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(1),
+        ClientMsg::SetSearch { query: "__OOB_SPAN__".into(), case_sensitive: true },
+        &mut fx,
+    );
+    assert_eq!(s_sf.next_deadline(), None);
+    // CLEAR_SB sets scrollback=0 -> oldest advances 0 -> 1 with NO dirty rows -> schedules SearchFlush!
+    s_sf.on_pty_output(b"CLEAR_SB", ts(10), wall(10), &mut fx);
+    assert_eq!(s_sf.next_deadline(), Some(ts(10 + SEARCH_COALESCE_MS)));
+    fx.clear();
+    s_sf.poll_timers(ts(10 + SEARCH_COALESCE_MS), &mut fx);
+    assert_eq!(
+        fx.iter().filter(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::SearchDelta { .. }, .. })).count(),
+        1
+    );
+
+    // DIRTY_ROW2 on __OOB_SPAN__: retains ONLY the 1 valid span (drops start < from and end == to), emits 1 delta!
+    s_sf.on_pty_output(b"DIRTY_ROW2", ts(300), wall(300), &mut fx);
+    fx.clear();
+    s_sf.poll_timers(ts(300 + SEARCH_COALESCE_MS), &mut fx);
+    let deltas: Vec<_> = fx
+        .iter()
+        .filter_map(|e| match e {
+            SessionEffect::Send { msg: BrokerMsg::SearchDelta { added, truncated, .. }, .. } => {
+                Some((added.len(), *truncated))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(deltas, vec![(1, false)]);
+
+    // __EXACT_LIMIT__ (len == MAX_SEARCH_MATCHES -> truncated == false) vs __OVER_LIMIT__ (len > MAX -> truncated == true)
+    s_sf.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(2),
+        ClientMsg::SetSearch { query: "__EXACT_LIMIT__".into(), case_sensitive: true },
+        &mut fx,
+    );
+    s_sf.on_pty_output(b"DIRTY_ROW2", ts(600), wall(600), &mut fx);
+    fx.clear();
+    s_sf.poll_timers(ts(600 + SEARCH_COALESCE_MS), &mut fx);
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::SearchDelta { added, truncated: false, .. }, .. } if added.len() == MAX_SEARCH_MATCHES)));
+
+    s_sf.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(3),
+        ClientMsg::SetSearch { query: "__OVER_LIMIT__".into(), case_sensitive: true },
+        &mut fx,
+    );
+    s_sf.on_pty_output(b"DIRTY_ROW2", ts(900), wall(900), &mut fx);
+    fx.clear();
+    s_sf.poll_timers(ts(900 + SEARCH_COALESCE_MS), &mut fx);
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::SearchDelta { added, truncated: true, .. }, .. } if added.len() == MAX_SEARCH_MATCHES)));
+
+    // Dirty row 0 evicted before SearchFlush -> clamped_from == clamped_to -> only eviction delta emitted, no empty dirty delta!
+    s_sf.on_pty_output(b"DIRTY_ROW0", ts(1200), wall(1200), &mut fx); // dirty_range = [1, 2)
+    s_sf.on_pty_output(b"EVICT_SB", ts(1201), wall(1201), &mut fx); // first_active=2, scrollback=0, oldest=2!
+    // Wait: EVICT_SB sets first_active=2 > 1 so dirty_range expands to [2, 6); instead use a fresh watch where only CLEAR_SB evicts:
+    let mut vt_cl = StubVt::new(40, 4);
+    vt_cl.dirty.full_dirty = false;
+    let mut s_cl =
+        SessionMachine::new(sid(31), vt_cl, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    s_cl.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
+    s_cl.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(1),
+        ClientMsg::SetSearch { query: "row".into(), case_sensitive: true },
+        &mut fx,
+    );
+    s_cl.on_pty_output(b"DIRTY_ROW0", ts(1), wall(1), &mut fx); // dirty_range = [0, 1)
+    s_cl.on_pty_output(b"SCROLL", ts(2), wall(2), &mut fx); // first_active=1, scrollback=1, oldest=0
+    // Flush first, then mark row 0 dirty at line 1, then advance oldest past line 1 via CLEAR_SB after another scroll:
+    s_cl.poll_timers(ts(200), &mut fx);
+    s_cl.on_pty_output(b"DIRTY_ROW0", ts(300), wall(300), &mut fx); // dirty_range = [1, 2)
+    // Make oldest jump to 2 without expanding dirty_range past 2: first_active=1, scrollback=1 -> SCROLL -> first_active=2, scrollback=2 -> wait, let's test clamp_span & extract_command_output < oldest directly!
+    s_cl.on_pty_output(b"SCROLL", ts(301), wall(301), &mut fx); // first_active=2, scrollback=2
+    s_cl.on_pty_output(b"CLEAR_SB", ts(302), wall(302), &mut fx); // oldest=2, max_line=5, cols=40 (max_col=39)!
+
+    // Command started at line 0 before scrollback eviction -> start_line < oldest (0 < 2) -> None!
+    // Command started at line 3 -> start_line > oldest (3 > 2) -> Some!
+    let mut vt_co = StubVt::new(40, 4);
+    vt_co.next_events = vec![
+        VtEvent::Osc133 { payload: "C".into(), cursor_line: 0 },
+        VtEvent::Osc133 { payload: "D;0".into(), cursor_line: 0 },
+        VtEvent::Osc133 { payload: "C".into(), cursor_line: 3 },
+        VtEvent::Osc133 { payload: "D;0".into(), cursor_line: 3 },
+    ];
+    let mut s_co =
+        SessionMachine::new(sid(32), vt_co, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    s_co.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::EVENTS).unwrap(), None, &mut fx);
+    s_co.on_pty_output(b"SCROLL", ts(1), wall(1), &mut fx);
+    s_co.on_pty_output(b"SCROLL", ts(2), wall(2), &mut fx);
+    s_co.on_pty_output(b"CLEAR_SB", ts(3), wall(3), &mut fx); // oldest = 2, total_lines = 6
+    fx.clear();
+    s_co.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(1),
+        ClientMsg::CommandOutput { command_id: 1 },
+        &mut fx,
+    );
+    s_co.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(2),
+        ClientMsg::CommandOutput { command_id: 2 },
+        &mut fx,
+    );
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::CommandOutputReply { text: None }, .. } if *req_id == RequestId::from_raw(1))));
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::CommandOutputReply { text: Some(t) }, .. } if *req_id == RequestId::from_raw(2) && t == "3:0:3:39")));
+
+    // 9. Exhaustive clamp_span boundary table (oldest = 2, max_line = 5, max_col = 39)
+    let ep_cl = s_cl.vt().meta().epoch;
+    let check_text_of = |s: &mut SessionMachine<StubVt>, span: CellSpan, expected: &str| {
+        let mut local_fx = Vec::new();
+        s.handle_stream_msg(
+            k1,
+            att_for(k1),
+            RequestId::from_raw(1),
+            ClientMsg::TextOf { epoch: ep_cl, span },
+            &mut local_fx,
+        );
+        let got = local_fx
+            .into_iter()
+            .find_map(|e| match e {
+                SessionEffect::Send { msg: BrokerMsg::TextReply { text }, .. } => Some(text),
+                _ => None,
+            })
+            .expect("TextReply");
+        assert_eq!(got, expected, "clamp_span mismatch for {span:?}");
+    };
+    // end.line < oldest (0 < 2, strictly less than oldest and != oldest) -> ""
+    check_text_of(&mut s_cl, CellSpan { start: CellPos { line: 0, col: 0 }, end: CellPos { line: 0, col: 5 } }, "");
+    // end.line == oldest (2 == 2) -> valid!
+    check_text_of(
+        &mut s_cl,
+        CellSpan { start: CellPos { line: 2, col: 0 }, end: CellPos { line: 2, col: 0 } },
+        "2:0:2:0",
+    );
+    // start.line > max_line (7 > 5) -> ""
+    check_text_of(&mut s_cl, CellSpan { start: CellPos { line: 7, col: 0 }, end: CellPos { line: 8, col: 0 } }, "");
+    // start.line == max_line (5 == 5) -> valid!
+    check_text_of(
+        &mut s_cl,
+        CellSpan { start: CellPos { line: 5, col: 2 }, end: CellPos { line: 5, col: 5 } },
+        "5:2:5:5",
+    );
+    // Straddling both oldest and max_line: start_col -> 0, end_col -> max_col (39)
+    check_text_of(
+        &mut s_cl,
+        CellSpan { start: CellPos { line: 0, col: 10 }, end: CellPos { line: 10, col: 10 } },
+        "2:0:5:39",
+    );
+    // Col > max_col clamped to 39
+    check_text_of(
+        &mut s_cl,
+        CellSpan { start: CellPos { line: 3, col: 99 }, end: CellPos { line: 3, col: 99 } },
+        "3:39:3:39",
+    );
+    // Inverted multi-line span (4..3) -> ""
+    check_text_of(&mut s_cl, CellSpan { start: CellPos { line: 4, col: 0 }, end: CellPos { line: 3, col: 5 } }, "");
+    // Inverted single-line span (3:10..3:5) -> ""
+    check_text_of(&mut s_cl, CellSpan { start: CellPos { line: 3, col: 10 }, end: CellPos { line: 3, col: 5 } }, "");
+    // Multi-line non-inverted span where start.col > end.col (3:10..4:5) -> valid!
+    check_text_of(
+        &mut s_cl,
+        CellSpan { start: CellPos { line: 3, col: 10 }, end: CellPos { line: 4, col: 5 } },
+        "3:10:4:5",
+    );
+}
+
+#[test]
+fn status_clear_per_stream_held_buttons_and_resize_side_effects() {
+    use crate::status::StatusTable;
+    use crate::vt::ProgramStatusUpdate;
+
+    // 1. StatusTable Clear + ingest_update invariant enforcement (progress <= 100, non-empty optional strings)
+    let mut table = StatusTable::new();
+    let mut sfx = Vec::new();
+    table.ingest("state=blocked;kind=permission;progress=50;app=claude", wall(10), &mut sfx);
+    assert!(table.root().is_some());
+    table.ingest("state=clear", wall(20), &mut sfx);
+    assert!(table.root().is_none());
+
+    table.ingest_update(
+        ProgramStatusUpdate::Set {
+            id: "sub".into(),
+            state: StatusState::Working,
+            kind: Some(BlockedKind::Auth), // stripped outside Blocked
+            progress: Some(150),           // rejected > 100
+            app: Some(String::new()),      // empty stripped
+            title: Some("ok;with=sep".into()),
+            message: Some("msg;state=done".into()),
+        },
+        wall(30),
+        &mut sfx,
+    );
+    let sub = table.get("sub").unwrap();
+    assert_eq!(sub.kind, None);
+    assert_eq!(sub.progress, None);
+    assert_eq!(sub.app, None);
+    assert_eq!(sub.title.as_deref(), Some("ok;with=sep"));
+    assert_eq!(sub.message.as_deref(), Some("msg;state=done"));
+    table.ingest_update(ProgramStatusUpdate::Clear { id: "sub".into() }, wall(40), &mut sfx);
+    assert!(table.get("sub").is_none());
+
+    // 2. Per-stream held_buttons isolated across streams and cleared on blur & detach
+    let mut sess = SessionMachine::new(
+        sid(40),
+        StubVt::new(40, 4),
+        ResizePolicy::LatestActive,
+        MarksMode::Claimed,
+        CellPx::default(),
+    );
+    let k1 = (conn(1), NonZeroStreamId::new(1).unwrap());
+    let k2 = (conn(2), NonZeroStreamId::new(1).unwrap());
+    let mut fx = Vec::new();
+    sess.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, &mut fx);
+    sess.attach_stream(k2, att_for(k2), SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, &mut fx);
+
+    let press0 = PointerInput {
+        action: PointerAction::Press,
+        button: 0,
+        modifiers: 0,
+        x_px: 0,
+        y_px: 0,
+        cell_px: CellPx::default(),
+    };
+    let move0 = PointerInput {
+        action: PointerAction::Motion,
+        button: 0,
+        modifiers: 0,
+        x_px: 8,
+        y_px: 0,
+        cell_px: CellPx::default(),
+    };
+    sess.handle_stream_msg(k1, att_for(k1), RequestId::from_raw(1), ClientMsg::Pointer(press0), &mut fx);
+    assert_eq!(sess.drain_pty_write(64), b"M1");
+    // Stream k2 still has held_buttons == 0!
+    sess.handle_stream_msg(k2, att_for(k2), RequestId::from_raw(2), ClientMsg::Pointer(move0), &mut fx);
+    assert_eq!(sess.drain_pty_write(64), b"M0");
+    // Blur on k1 clears k1's held_buttons!
+    sess.handle_stream_msg(k1, att_for(k1), RequestId::from_raw(3), ClientMsg::Focus { focused: false }, &mut fx);
+    let _ = sess.drain_pty_write(64);
+    sess.handle_stream_msg(k1, att_for(k1), RequestId::from_raw(4), ClientMsg::Pointer(move0), &mut fx);
+    assert_eq!(sess.drain_pty_write(64), b"M0");
+    // Detach removes held_buttons entry cleanly
+    sess.handle_stream_msg(k1, att_for(k1), RequestId::from_raw(5), ClientMsg::Pointer(press0), &mut fx);
+    let _ = sess.drain_pty_write(64);
+    sess.detach_stream(k1, &mut fx);
+    sess.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, &mut fx);
+    sess.handle_stream_msg(k1, att_for(k1), RequestId::from_raw(6), ClientMsg::Pointer(move0), &mut fx);
+    assert_eq!(sess.drain_pty_write(64), b"M0");
+
+    // 3. Resize drains VtEvent::SyncOutput(false) and VtEvent::DeviceResponse immediately!
+    let mut vt_rs = StubVt::new(40, 4);
+    vt_rs.next_events = vec![VtEvent::SyncOutput(true)];
+    let mut s_rs =
+        SessionMachine::new(sid(41), vt_rs, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    s_rs.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, &mut fx);
+    s_rs.on_pty_output(b"HOLD", ts(100), wall(100), &mut fx);
+    assert!(s_rs.is_sync_held());
+    fx.clear();
+    s_rs.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(7),
+        ClientMsg::ViewportHint(ViewportHint {
+            size: GridSize::new(50, 10).unwrap(),
+            cell_px: CellPx::default(),
+            visible: true,
+            focused: true,
+        }),
+        &mut fx,
+    );
+    assert!(!s_rs.is_sync_held(), "resize emitting SyncOutput(false) must release sync hold");
+    assert_eq!(s_rs.drain_pty_write(64), b"\x1b[48;10;20t");
+}
+
+#[test]
+fn session_machine_runtime_accessors_and_nonblocking_pty_peek_consume() {
+    let key = MarksKey::parse(b"0123456789abcdef0123456789abcdef").unwrap();
+    let cell_px = CellPx { width: 9, height: 18 };
+    let mut sess =
+        SessionMachine::new(sid(50), StubVt::new(40, 4), ResizePolicy::LatestActive, MarksMode::Keyed(key), cell_px);
+    assert_eq!(sess.current_cell_px(), cell_px);
+    assert_eq!(sess.marks_key(), Some(key));
+    assert_eq!(sess.marks_last_seq(), 0);
+    assert_eq!(sess.marks_refused(), 0);
+    assert_eq!(sess.cwd(), None);
+    assert!(sess.commands().is_empty());
+
+    // Claimed session returns None for marks_key
+    let claimed =
+        SessionMachine::new(sid(51), StubVt::new(40, 4), ResizePolicy::LatestActive, MarksMode::Claimed, cell_px);
+    assert_eq!(claimed.marks_key(), None);
+
+    // Feed a vouched start + finish + a forged mark via vt_mut
+    let mut fx = Vec::new();
+    sess.vt_mut().next_events = vec![
+        VtEvent::Osc633 { payload: format!("V;S;1;{};echo hi", key.as_str()), cursor_line: 0 },
+        VtEvent::Osc633 { payload: format!("V;F;1;{};0;/home/me", key.as_str()), cursor_line: 1 },
+        VtEvent::Osc633 { payload: String::from("V;S;2;ffffffffffffffffffffffffffffffff;bad"), cursor_line: 1 },
+    ];
+    sess.on_pty_output(b"run", ts(10), wall(10), &mut fx);
+    assert_eq!(sess.marks_last_seq(), 1);
+    assert_eq!(sess.marks_refused(), 1);
+    assert_eq!(sess.cwd(), Some("/home/me"));
+    assert_eq!(sess.commands().len(), 1);
+
+    // restore_from_replay monotonically advances epoch, forces full_sync, refreshes search watches,
+    // resets/hydrates marks & statuses, and syncs geometry transactionally.
+    let k1 = (conn(1), nz_stream(1));
+    sess.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
+    assert!(sess.try_publish_view(k1, |_| true));
+    assert!(!sess.try_publish_view(k1, |_| true));
+
+    // peek_pty_write + consume_pty_write handle partial writes and VecDeque wraparound cleanly
+    sess.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(1),
+        ClientMsg::Write { data: b"abcdefgh".to_vec() },
+        &mut fx,
+    );
+    let mut buf = Vec::new();
+    sess.peek_pty_write(3, &mut buf);
+    assert_eq!(buf, b"abc");
+    sess.consume_pty_write(3);
+    // Push more to exercise VecDeque wraparound across head + tail slices
+    sess.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(2),
+        ClientMsg::Write { data: b"ijkl".to_vec() },
+        &mut fx,
+    );
+    sess.peek_pty_write(20, &mut buf);
+    assert_eq!(buf, b"defghijkl");
+    sess.consume_pty_write(9);
+    assert_eq!(sess.pty_write_len(), 0);
+
+    // Transactional restore_from_replay replaces VT, advances epoch > prev_epoch, updates geometry, and forces full_sync!
+    let prev_epoch = sess.vt().meta().epoch;
+    let new_sz = GridSize::new(100, 30).unwrap();
+    let new_px = CellPx { width: 10, height: 20 };
+    let mut fresh_vt = StubVt::new(100, 30);
+    fresh_vt.epoch = 1; // lower than prev_epoch -> must be raised to prev_epoch + 1!
+    fx.clear();
+    sess.restore_from_replay(
+        fresh_vt,
+        crate::session::RestoreKeyframe {
+            cell_px: new_px,
+            marks_mode: MarksMode::Keyed(key),
+            marks_last_seq: 5,
+            marks_active_vouched_seq: None,
+            marks_refused: 2,
+            commands: Vec::new(),
+        },
+        &[],
+        true,
+        &mut fx,
+    );
+    assert_eq!(sess.current_size(), new_sz);
+    assert_eq!(sess.current_cell_px(), new_px);
+    assert!(sess.vt().meta().epoch > prev_epoch, "restore_from_replay must bump epoch monotonically");
+    assert_eq!(sess.marks_last_seq(), 5);
+    assert_eq!(sess.marks_refused(), 2);
+    let mut got_full = false;
+    assert!(sess.try_publish_view(k1, |f| {
+        got_full = f.full_sync;
+        true
+    }));
+    assert!(got_full);
+}
+
+#[test]
+fn review_mutants_rows_budget_clamp_rect_and_logical_line_expansion() {
+    use crate::session::{clamp_rect_span, estimate_packed_row_bytes, truncate_rows_to_budget};
+
+    // 1. estimate_packed_row_bytes & truncate_rows_to_budget exact boundaries
+    let r0 = PackedRow {
+        line: 0,
+        flags: 0,
+        text: "hello-world".into(),
+        runs: Vec::new(),
+        styles: Vec::new(),
+        links: Vec::new(),
+        pieces: Vec::new(),
+    };
+    let sz0 = estimate_packed_row_bytes(&r0);
+    assert!(sz0 > 10);
+    // Keep at least 1 row even when row 0 > budget; keep 2 rows when exact == budget; drop 3rd when +1 > budget
+    let mut rows = vec![r0.clone(), r0.clone(), r0.clone()];
+    truncate_rows_to_budget(&mut rows, 1);
+    assert_eq!(rows.len(), 1);
+    let mut rows2 = vec![r0.clone(), r0.clone(), r0.clone()];
+    truncate_rows_to_budget(&mut rows2, 32 + sz0 * 2);
+    assert_eq!(rows2.len(), 2);
+    let mut rows3 = vec![r0.clone(), r0.clone(), r0.clone()];
+    truncate_rows_to_budget(&mut rows3, 32 + sz0 * 2 - 1);
+    assert_eq!(rows3.len(), 1);
+
+    // 2. clamp_rect_span boundaries (cols=10 => max_col=9, total_lines=4 => max_line=3)
+    let meta = VtSnapshotMeta {
+        epoch: 1,
+        size: GridSize::new(10, 4).unwrap(),
+        first_active_line: 0,
+        scrollback_lines: 0,
+        cursor: CursorState { col: 0, row: 0, shape: CursorShape::Block, blinking: false, hidden: false },
+        modes: ViewModes::default(),
+        images_gen: 0,
+    };
+    // Exact max_col boundary (9) is valid; max_col + 1 (10) returns None
+    let at_edge =
+        clamp_rect_span(CellSpan { start: CellPos { line: 1, col: 9 }, end: CellPos { line: 2, col: 9 } }, &meta);
+    assert_eq!(at_edge, Some(CellSpan { start: CellPos { line: 1, col: 9 }, end: CellPos { line: 2, col: 9 } }));
+    let past_edge =
+        clamp_rect_span(CellSpan { start: CellPos { line: 1, col: 10 }, end: CellPos { line: 2, col: 12 } }, &meta);
+    assert_eq!(past_edge, None);
+    // Reversed columns normalized and clamped to max_col; reversed lines -> None
+    let swapped =
+        clamp_rect_span(CellSpan { start: CellPos { line: 1, col: 15 }, end: CellPos { line: 1, col: 3 } }, &meta);
+    assert_eq!(swapped, Some(CellSpan { start: CellPos { line: 1, col: 3 }, end: CellPos { line: 1, col: 9 } }));
+    assert_eq!(
+        clamp_rect_span(CellSpan { start: CellPos { line: 3, col: 0 }, end: CellPos { line: 1, col: 5 } }, &meta),
+        None
+    );
+
+    // 3. Soft-wrapped logical line expansion in SearchDelta & text waiters
+    let mut vt = StubVt::new(10, 4);
+    vt.wrapped_logical = Some((1, 2));
+    let mut s = SessionMachine::new(sid(40), vt, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    let k1 = (ConnId::new(1).unwrap(), NonZeroStreamId::new(1).unwrap());
+    let mut fx = Vec::new();
+    s.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, &mut fx);
+    s.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(1),
+        ClientMsg::SetSearch { query: "foo".into(), case_sensitive: false },
+        &mut fx,
+    );
+    // Dirtying only row 1 must expand the search delta range to [1, 3) (covering wrapped row 2)!
+    s.vt_mut().cursor.row = 1;
+    s.vt_mut().dirty = DirtyViewport { scroll_delta: 0, dirty_rows: vec![1], full_dirty: false };
+    s.on_pty_output(b"NOOP", ts(10), wall(10), &mut fx);
+    fx.clear();
+    s.poll_timers(ts(200), &mut fx);
+    assert_eq!(s.vt().last_search_range.get(), (1, 3));
+    // Dirtying only row 2 must expand backward to [1, 3) as well!
+    s.vt_mut().cursor.row = 2;
+    s.vt_mut().dirty = DirtyViewport { scroll_delta: 0, dirty_rows: vec![2], full_dirty: false };
+    s.on_pty_output(b"NOOP", ts(300), wall(300), &mut fx);
+    fx.clear();
+    s.poll_timers(ts(500), &mut fx);
+    assert_eq!(s.vt().last_search_range.get(), (1, 3));
+    // Empty range (lo == hi) must return (lo, lo) untouched without underflowing `hi - 1`
+    assert_eq!(s.expand_to_logical_lines(2, 2, 0, 4), (2, 2));
+    assert_eq!(s.expand_to_logical_lines(1, 2, 0, 4), (1, 3));
+    assert_eq!(s.expand_to_logical_lines(2, 3, 0, 4), (1, 3));
+
+    // 4. budget_frame_rows keeps at least 1 row even when budget < row0, keeps exact-boundary rows,
+    //    and returns deferred viewport row offsets when over budget!
+    let make_row = |line: u64, n: usize| PackedRow {
+        line,
+        flags: 0,
+        text: "a".repeat(n),
+        runs: Vec::new(),
+        styles: Vec::new(),
+        links: Vec::new(),
+        pieces: Vec::new(),
+    };
+    let r10 = make_row(10, 40);
+    let r11 = make_row(11, 40);
+    let r13 = make_row(13, 40);
+    let exact_two =
+        32 + crate::session::estimate_packed_row_bytes(&r10) + crate::session::estimate_packed_row_bytes(&r11);
+    let mut f_rows_tiny = vec![r10.clone(), r11.clone()];
+    assert_eq!(crate::session::budget_frame_rows(&mut f_rows_tiny, 10, 1), vec![1]);
+    assert_eq!(f_rows_tiny.len(), 1);
+    let mut f_rows_exact = vec![r10.clone(), r11.clone(), r13.clone()];
+    assert_eq!(crate::session::budget_frame_rows(&mut f_rows_exact, 10, exact_two), vec![3]);
+    assert_eq!(f_rows_exact.len(), 2);
+    let mut f_rows_over = vec![r10, r11, r13];
+    assert_eq!(crate::session::budget_frame_rows(&mut f_rows_over, 10, exact_two - 1), vec![1, 3]);
+    assert_eq!(f_rows_over.len(), 1);
+
+    // 5. enqueue_pty_reply queues reply bytes into the PTY write buffer and emits PtyWriteReady.
+    fx.clear();
+    s.enqueue_pty_reply(b"\x1b_Gi=1;OK\x1b\\", &mut fx);
+    assert!(fx.iter().any(|e| matches!(e, SessionEffect::PtyWriteReady)));
+    let mut reply_buf = Vec::new();
+    s.peek_pty_write(64, &mut reply_buf);
+    assert_eq!(reply_buf, b"\x1b_Gi=1;OK\x1b\\");
+
+    // 6. L2: WaitCondition::Text falls back to direct bounded text scan when search_lines truncates!
+    let mut vt_trunc = StubVt::new(40, 200);
+    vt_trunc.use_row_text_of = true;
+    vt_trunc.rows = (0..200).map(|i| format!("line-{i}")).collect();
+    // Place a multi-line needle right across the 128-line chunk boundary (rows 127 & 128)!
+    vt_trunc.rows[127] = String::from("__TRUNC__HALF1");
+    vt_trunc.rows[128] = String::from("HALF2");
+    let mut s_trunc =
+        SessionMachine::new(sid(99), vt_trunc, ResizePolicy::LatestActive, MarksMode::Claimed, CellPx::default());
+    // Immediate wait on multi-line needle spanning chunk boundary meets via fallback!
+    fx.clear();
+    s_trunc.register_wait(
+        conn(1),
+        RequestId::from_raw(1),
+        WaitCondition::Text("__TRUNC__HALF1\nHALF2".into()),
+        500,
+        ts(10),
+        &mut fx,
+    );
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. }
+            if *req_id == RequestId::from_raw(1)
+    )));
+    // Absent truncated needle stays pending, then wakes reactively when it arrives on a dirty line!
+    fx.clear();
+    s_trunc.register_wait(
+        conn(1),
+        RequestId::from_raw(2),
+        WaitCondition::Text("__TRUNC__LATE_MARKER".into()),
+        500,
+        ts(20),
+        &mut fx,
+    );
+    assert!(!fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Waited { .. }, .. })));
+    s_trunc.vt_mut().rows[190] = String::from("prefix __TRUNC__LATE_MARKER suffix");
+    s_trunc.vt_mut().dirty = DirtyViewport { scroll_delta: 0, dirty_rows: vec![190], full_dirty: false };
+    s_trunc.on_pty_output(b"NOOP", ts(30), wall(30), &mut fx);
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. }
+            if *req_id == RequestId::from_raw(2)
+    )));
+
+    // Direct boundary tests on `text_matches_in_range_chunked`:
+    // 1. Empty needle, empty/inverted range, and spurious leading `\n` before `from_line` return false.
+    let mut vt_chunk = StubVt::new(40, 20);
+    vt_chunk.use_row_text_of = true;
+    vt_chunk.rows = (0..20).map(|i| format!("r{i}")).collect();
+    vt_chunk.rows[0] = String::from("__TRUNC__r0");
+    assert!(!crate::session::text_matches_in_range_chunked(&vt_chunk, 0, 5, "", 4));
+    assert!(!crate::session::text_matches_in_range_chunked(&vt_chunk, 5, 5, "__TRUNC__x", 4));
+    assert!(!crate::session::text_matches_in_range_chunked(&vt_chunk, 0, 4, "\n__TRUNC__r0", 4));
+    // 2. Non-overlapping O(N) chunks: exact spans [0..=3], [4..=7], [8..=9].
+    vt_chunk.text_of_spans.borrow_mut().clear();
+    assert!(!crate::session::text_matches_in_range_chunked(&vt_chunk, 0, 10, "__TRUNC__MISSING", 4));
+    assert_eq!(*vt_chunk.text_of_spans.borrow(), vec![(0, 3), (4, 7), (8, 9)]);
+    // 3. Multi-line needle spanning an unwrapped chunk boundary matches in O(N) with zero overlap!
+    vt_chunk.rows[3] = String::from("__TRUNC__A");
+    vt_chunk.rows[4] = String::from("B");
+    vt_chunk.text_of_spans.borrow_mut().clear();
+    assert!(crate::session::text_matches_in_range_chunked(&vt_chunk, 0, 10, "__TRUNC__A\nB", 4));
+    assert_eq!(*vt_chunk.text_of_spans.borrow(), vec![(0, 3), (4, 7)]);
+    // 4. Single-line UTF-8 needle split across a long soft-wrapped logical line (`> chunk_lines` rows)
+    //    matches seamlessly without spurious `\n`!
+    vt_chunk.wrapped_logical = Some((0, 9));
+    vt_chunk.rows[3] = String::from("xxxx__TRUNC__é");
+    vt_chunk.rows[4] = String::from("WORLDyyyy");
+    vt_chunk.text_of_spans.borrow_mut().clear();
+    assert!(crate::session::text_matches_in_range_chunked(&vt_chunk, 0, 10, "__TRUNC__éWORLD", 4));
+    assert_eq!(*vt_chunk.text_of_spans.borrow(), vec![(0, 3), (4, 7)]);
+    // 5. Multi-line needle preceded by a soft-wrapped line (rows 2..=3 wrapped -> row 4 unwrapped) matches!
+    vt_chunk.wrapped_logical = Some((2, 3));
+    vt_chunk.rows[2] = String::from("__TRUNC__WRAPPED_");
+    vt_chunk.rows[3] = String::from("TAIL");
+    vt_chunk.rows[4] = String::from("NEXT");
+    assert!(crate::session::text_matches_in_range_chunked(&vt_chunk, 0, 10, "__TRUNC__WRAPPED_TAIL\nNEXT", 4));
+    // 6. 1-byte needle (`keep == 0`) does not carry across chunks.
+    vt_chunk.wrapped_logical = None;
+    vt_chunk.rows[3] = String::from("abc");
+    vt_chunk.rows[4] = String::from("def");
+    // Using a 1-char needle isn't `__TRUNC__`, so check short carry (`combined.len() <= keep`) too:
+    assert!(!crate::session::text_matches_in_range_chunked(
+        &vt_chunk,
+        0,
+        6,
+        "__TRUNC__VERY_LONG_MISSING_NEEDLE_0123456789",
+        1
+    ));
+}
+
+#[test]
+fn session_machine_attachment_id_tracks_lifecycle_and_drops_stale_stream_msgs() {
+    let mut sess = SessionMachine::new(
+        sid(55),
+        StubVt::new(40, 4),
+        ResizePolicy::LatestActive,
+        MarksMode::Claimed,
+        CellPx::default(),
+    );
+    let k1 = (conn(1), nz_stream(1));
+    let a1 = StreamAttachmentId::new(101).unwrap();
+    let a2 = StreamAttachmentId::new(102).unwrap();
+    let mut fx = Vec::new();
+
+    assert_eq!(sess.attachment_of(k1), None);
+    sess.attach_stream(k1, a1, SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
+    assert_eq!(sess.attachment_of(k1), Some(a1));
+    assert_eq!(sess.view_subscribers(), vec![(k1, a1)]);
+
+    // Mismatched attachment_id on handle_stream_msg is ignored with zero effects!
+    fx.clear();
+    sess.handle_stream_msg(k1, a2, RequestId::from_raw(1), ClientMsg::Commands, &mut fx);
+    assert!(fx.is_empty(), "stale attachment_id must emit zero effects");
+
+    // Matching attachment_id succeeds and tags the reply with `Some(a1)`.
+    sess.handle_stream_msg(k1, a1, RequestId::from_raw(2), ClientMsg::Commands, &mut fx);
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        SessionEffect::Send { attachment: Some(att), msg: BrokerMsg::CommandsReply { .. }, .. } if *att == a1
+    )));
+
+    // Publish initial full-sync frame, then mark_view_full_sync forces the next frame to be full_sync=true.
+    let mut initial_full = false;
+    assert!(sess.try_publish_view(k1, |f| {
+        initial_full = f.full_sync;
+        true
+    }));
+    assert!(initial_full);
+    assert!(!sess.try_publish_view(k1, |_| true), "no changes => nothing to publish");
+    sess.mark_view_full_sync(k1);
+    let mut forced_full = false;
+    assert!(sess.try_publish_view(k1, |f| {
+        forced_full = f.full_sync;
+        true
+    }));
+    assert!(forced_full, "mark_view_full_sync must force a self-contained full_sync frame");
+
+    sess.detach_stream(k1, &mut fx);
+    assert_eq!(sess.attachment_of(k1), None);
+}
+
+#[test]
+fn pr5_osc7501_full_parity_spoofing_rejection_and_transactional_restore() {
+    use apack_proto::types::CommandRecord;
+
+    use crate::session::{ReplayRecord, RestoreKeyframe};
+    use crate::status::{StatusEffect, confirm_foreground_app};
+
+    // 1. confirm_foreground_app: argv[0], login shell `-`, `.exe`, path separators, aliases, interpreters, anti-spoofing.
+    assert_eq!(confirm_foreground_app("claude", Some(&["/usr/local/bin/claude".into()])), Confirmed::Matched);
+    assert_eq!(confirm_foreground_app("claude-code", Some(&["C:\\tools\\CLAUDE.EXE".into()])), Confirmed::Matched);
+    assert_eq!(confirm_foreground_app("zsh", Some(&["-zsh".into()])), Confirmed::Matched);
+    assert_eq!(
+        confirm_foreground_app("codex", Some(&["node".into(), "--no-warnings".into(), "/opt/bin/codex.mjs".into()])),
+        Confirmed::Matched
+    );
+    assert_eq!(
+        confirm_foreground_app("agent", Some(&["/usr/bin/python3".into(), "-u".into(), "agent.py".into()])),
+        Confirmed::Matched
+    );
+    assert_eq!(confirm_foreground_app("bun", Some(&["bun".into(), "--version".into()])), Confirmed::Matched);
+    assert_eq!(confirm_foreground_app("node", Some(&["node".into(), ".hidden".into()])), Confirmed::Matched);
+    // Anti-spoofing: trailing args of non-interpreters must NEVER match, and alias must only apply to aliased `app`!
+    assert_eq!(confirm_foreground_app("claude", Some(&["/bin/cat".into(), "claude".into()])), Confirmed::Mismatched);
+    assert_eq!(confirm_foreground_app("vim", Some(&["claude".into()])), Confirmed::Mismatched);
+    assert_eq!(confirm_foreground_app("claude", None), Confirmed::Unknown);
+    assert_eq!(confirm_foreground_app("", Some(&["claude".into()])), Confirmed::Unknown);
+    assert_eq!(confirm_foreground_app("claude", Some(&["---".into()])), Confirmed::Unknown);
+
+    // 2. Prefix-based hierarchical Clear, ancestor app inheritance & propagation, identical-report dedup, on_session_exit.
+    let mut table = StatusTable::new();
+    let mut sfx = Vec::new();
+    table.ingest("state=working;app=claude;title=Root", wall(10), &mut sfx);
+    assert_eq!(table.root().unwrap().app.as_deref(), Some("claude"));
+    // Identical report is deduplicated -> zero effects, revision unchanged!
+    sfx.clear();
+    let rev_before = table.root().unwrap().changed;
+    table.ingest("state=working;app=claude;title=Root", wall(11), &mut sfx);
+    assert!(sfx.is_empty(), "identical status report must be deduplicated");
+    assert_eq!(table.root().unwrap().changed, rev_before);
+
+    // Child without `app` inherits ancestor `app=claude` AND emits VerifyForeground!
+    sfx.clear();
+    table.ingest("id=build;state=working", wall(12), &mut sfx);
+    assert_eq!(table.get("build").unwrap().app.as_deref(), Some("claude"));
+    assert!(
+        sfx.iter()
+            .any(|e| matches!(e, StatusEffect::VerifyForeground { id, app, .. } if id == "build" && app == "claude"))
+    );
+
+    // Grandchild inherits from nearest ancestor; sibling with explicit own_app stays independent.
+    sfx.clear();
+    table.ingest("id=build/test;state=blocked;kind=permission", wall(13), &mut sfx);
+    assert_eq!(table.get("build/test").unwrap().app.as_deref(), Some("claude"));
+    table.ingest("id=build/own;state=done;app=cargo", wall(14), &mut sfx);
+    assert_eq!(table.get("build/own").unwrap().app.as_deref(), Some("cargo"));
+    table.ingest("id=builder;state=error", wall(15), &mut sfx);
+    assert_eq!(table.get("builder").unwrap().app.as_deref(), Some("claude"));
+
+    // Updating root `own_app` propagates to inheriting descendants (`build`, `build/test`, `builder`) but NOT `build/own`!
+    // Revision counter on descendants must strictly increase, and non-root apply_confirmation returns false!
+    let build_rev_before = table.get("build").unwrap().changed;
+    assert!(!table.apply_confirmation("build", build_rev_before, Confirmed::Unknown, &mut sfx));
+    sfx.clear();
+    table.ingest("state=working;app=codex;title=Root", wall(16), &mut sfx);
+    let root_rev = table.root().unwrap().changed;
+    assert_eq!(table.get("build").unwrap().app.as_deref(), Some("codex"));
+    assert!(table.get("build").unwrap().changed > root_rev, "descendant revision must strictly exceed ancestor");
+    assert_eq!(table.get("build/test").unwrap().app.as_deref(), Some("codex"));
+    assert_eq!(table.get("builder").unwrap().app.as_deref(), Some("codex"));
+    assert_eq!(table.get("build/own").unwrap().app.as_deref(), Some("cargo"));
+
+    // Clearing root `own_app` (app=) clears inherited app on descendants, and setting a non-root
+    // ancestor `own_app` propagates ONLY to its descendants (never to unrelated siblings like `builder`)!
+    sfx.clear();
+    table.ingest("state=working;title=Root", wall(17), &mut sfx);
+    assert_eq!(table.get("build").unwrap().app, None);
+    assert_eq!(table.get("build/test").unwrap().app, None);
+    assert_eq!(table.get("builder").unwrap().app, None);
+    assert_eq!(table.get("build/own").unwrap().app.as_deref(), Some("cargo"));
+    sfx.clear();
+    table.ingest("id=build;state=working;app=make", wall(17), &mut sfx);
+    assert_eq!(table.get("build/test").unwrap().app.as_deref(), Some("make"));
+    assert_eq!(
+        table.get("builder").unwrap().app,
+        None,
+        "non-root ancestor propagation must NOT touch unrelated siblings"
+    );
+
+    // Hierarchical Clear: `id=build` clears `build`, `build/test`, `build/own` but leaves `builder` and root intact!
+    sfx.clear();
+    table.ingest("id=build;state=clear", wall(18), &mut sfx);
+    assert!(table.get("build").is_none());
+    assert!(table.get("build/test").is_none());
+    assert!(table.get("build/own").is_none());
+    assert!(table.get("builder").is_some());
+    assert!(table.root().is_some());
+
+    // on_session_exit clears active (`Working`/`Idle`/`Blocked`) and retains terminal (`Error`/`Done`).
+    sfx.clear();
+    table.ingest("id=done1;state=done", wall(19), &mut sfx);
+    table.ingest("id=idle1;state=idle", wall(19), &mut sfx);
+    sfx.clear();
+    table.on_session_exit(&mut sfx);
+    assert!(table.root().is_none(), "active root Working must clear on exit");
+    assert!(table.get("idle1").is_none(), "active Idle must clear on exit");
+    assert!(table.get("builder").is_some(), "terminal Error stays on exit");
+    assert!(table.get("done1").is_some(), "terminal Done stays on exit");
+
+    // Clear with empty id clears everything.
+    sfx.clear();
+    table.ingest("state=clear", wall(20), &mut sfx);
+    assert!(table.is_empty());
+
+    // 2b. MAX_STATUSES LRU eviction of an ancestor with `own_app` refreshes surviving descendants (`M1`):
+    {
+        let mut ev_table = StatusTable::new();
+        let mut efx = Vec::new();
+        // Oldest non-root entry ("anc") declares `own_app = Some("oldapp")`.
+        ev_table.ingest("id=anc;state=working;app=oldapp", wall(1), &mut efx);
+        // Newer descendant ("anc/child") inherits `app = Some("oldapp")` from "anc".
+        ev_table.ingest("id=anc/child;state=working", wall(2), &mut efx);
+        assert_eq!(ev_table.get("anc/child").unwrap().app.as_deref(), Some("oldapp"));
+        // Fill remaining slots up to MAX_STATUSES, then insert a direct child of "anc" ("anc/new") to evict "anc":
+        // "anc/new" MUST emit ONLY ONE Updated event with `app: None` (no transient double-Updated!).
+        for i in 0..(MAX_STATUSES - 2) {
+            ev_table.ingest(&format!("id=pad{i};state=working"), wall(3 + i as u64), &mut efx);
+        }
+        efx.clear();
+        ev_table.ingest("id=anc/new;state=working", wall(999), &mut efx);
+        assert!(ev_table.get("anc").is_none(), "oldest non-root ancestor must be evicted");
+        assert_eq!(
+            ev_table.get("anc/child").unwrap().app,
+            None,
+            "surviving descendant must drop stale app after ancestor eviction"
+        );
+        let new_updates: Vec<_> = efx
+            .iter()
+            .filter_map(|e| match e {
+                crate::status::StatusEffect::Updated(r) if r.id == "anc/new" => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(new_updates.len(), 1, "newly inserted descendant of evicted ancestor must emit a single Updated");
+        assert_eq!(new_updates[0].app, None);
+    }
+
+    // 2c. Live `CommandFinished` clears active statuses while retaining terminal `Done`/`Error`,
+    //     preserves `pending_verify` on retained `Done` so WaitCondition::Status neither hangs nor bypasses
+    //     spoofing verification, and suppresses redundant VerifyForeground on same-chunk working+D!
+    {
+        let mut live_sess = SessionMachine::new(
+            sid(91),
+            StubVt::new(40, 4),
+            ResizePolicy::ExplicitOverride,
+            MarksMode::Claimed,
+            CellPx::default(),
+        );
+        let mut lfx = Vec::new();
+        live_sess.register_wait(
+            conn(1),
+            RequestId::from_raw(70),
+            WaitCondition::Status(vec![StatusState::Done]),
+            5_000,
+            ts(1),
+            &mut lfx,
+        );
+        assert!(lfx.is_empty());
+        // Emit working (same-chunk cleared by D;0 -> NO VerifyForeground!) + root done;app=claude + D;0:
+        live_sess.vt_mut().next_events = vec![
+            VtEvent::Osc133 { payload: String::from("C"), cursor_line: 0 },
+            VtEvent::ProgramStatus(crate::status::parse_osc7501("id=w;state=working;app=foo").unwrap()),
+            VtEvent::ProgramStatus(crate::status::parse_osc7501("state=done;app=claude").unwrap()),
+            VtEvent::Osc133 { payload: String::from("D;0"), cursor_line: 1 },
+        ];
+        live_sess.on_pty_output(b"a", ts(2), wall(2), &mut lfx);
+        assert_eq!(live_sess.active_statuses().len(), 1, "CommandFinished must clear active `w` and retain `Done`");
+        assert!(
+            !lfx.iter().any(|e| matches!(e, SessionEffect::VerifyForeground { id, .. } if id == "w")),
+            "same-chunk cleared active status must not dispatch redundant VerifyForeground"
+        );
+        assert!(
+            !lfx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Waited { .. }, .. })),
+            "retained Done must remain pending_verify after CommandFinished"
+        );
+        let done_changed = lfx
+            .iter()
+            .find_map(|e| match e {
+                SessionEffect::VerifyForeground { id, changed, app } if id.is_empty() && app == "claude" => {
+                    Some(*changed)
+                }
+                _ => None,
+            })
+            .expect("expected VerifyForeground for retained Done");
+        // Late waiter registered before fg_worker replies MUST also wait (no spoof bypass)!
+        lfx.clear();
+        live_sess.register_wait(
+            conn(1),
+            RequestId::from_raw(71),
+            WaitCondition::Status(vec![StatusState::Done]),
+            5_000,
+            ts(3),
+            &mut lfx,
+        );
+        assert!(lfx.is_empty(), "late waiter must stay gated until foreground verification completes");
+        // When fg_worker resolves as Confirmed::Unknown, waiters MUST NOT wake (only Confirmed::Matched wakes)!
+        live_sess.apply_status_confirmation("", done_changed, Confirmed::Unknown, &mut lfx);
+        assert!(
+            !lfx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Waited { .. }, .. })),
+            "Confirmed::Unknown must NOT wake WaitCondition::Status"
+        );
+        // When fg_worker positively confirms Matched, BOTH waiters wake immediately!
+        lfx.clear();
+        live_sess.apply_status_confirmation("", done_changed, Confirmed::Matched, &mut lfx);
+        assert!(lfx.iter().any(|e| matches!(
+            e,
+            SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. }
+            if *req_id == RequestId::from_raw(70)
+        )));
+        assert!(lfx.iter().any(|e| matches!(
+            e,
+            SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. }
+            if *req_id == RequestId::from_raw(71)
+        )));
+    }
+
+    // 3. WaitCondition::Status defers pending VerifyForeground, rejects Mismatched, wakes on Matched or Unknown!
+    let mut sess = SessionMachine::new(
+        sid(90),
+        StubVt::new(40, 4),
+        ResizePolicy::ExplicitOverride,
+        MarksMode::Claimed,
+        CellPx::default(),
+    );
+    let mut fx = Vec::new();
+    sess.register_wait(
+        conn(1),
+        RequestId::from_raw(1),
+        WaitCondition::Status(vec![StatusState::Blocked]),
+        5_000,
+        ts(1),
+        &mut fx,
+    );
+    assert!(fx.is_empty());
+
+    // Claimed `app=claude` emits VerifyForeground and DEFERS WaitCondition::Status wakeup!
+    sess.vt_mut().next_events =
+        vec![VtEvent::ProgramStatus(crate::status::parse_osc7501("state=blocked;app=claude").unwrap())];
+    sess.on_pty_output(b"x", ts(2), wall(2), &mut fx);
+    assert!(
+        !fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Waited { .. }, .. })),
+        "must defer while pending verify"
+    );
+    let changed1 = fx
+        .iter()
+        .find_map(|e| match e {
+            SessionEffect::VerifyForeground { id, changed, app } if id.is_empty() && app == "claude" => Some(*changed),
+            _ => None,
+        })
+        .expect("expected VerifyForeground");
+    // Late waiter while pending_verify MUST also defer!
+    fx.clear();
+    sess.register_wait(
+        conn(1),
+        RequestId::from_raw(2),
+        WaitCondition::Status(vec![StatusState::Blocked]),
+        5_000,
+        ts(3),
+        &mut fx,
+    );
+    assert!(fx.is_empty(), "late waiter must also defer while pending verify");
+
+    // Confirmed::Mismatched (spoofed!) MUST NOT wake either waiter!
+    fx.clear();
+    sess.apply_status_confirmation("", changed1, Confirmed::Mismatched, &mut fx);
+    assert!(
+        !fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Waited { .. }, .. })),
+        "mismatched must NOT wake status waiters"
+    );
+    // Late waiter after Mismatched must ALSO NOT immediately wake!
+    fx.clear();
+    sess.register_wait(
+        conn(1),
+        RequestId::from_raw(3),
+        WaitCondition::Status(vec![StatusState::Blocked]),
+        5_000,
+        ts(4),
+        &mut fx,
+    );
+    assert!(fx.is_empty(), "late waiter must reject Confirmed::Mismatched");
+
+    // Legitimate update confirmed Matched -> wakes all 3 waiting clients immediately!
+    fx.clear();
+    sess.vt_mut().next_events =
+        vec![VtEvent::ProgramStatus(crate::status::parse_osc7501("state=blocked;kind=auth;app=claude").unwrap())];
+    sess.on_pty_output(b"y", ts(5), wall(5), &mut fx);
+    let changed2 = fx
+        .iter()
+        .find_map(|e| match e {
+            SessionEffect::VerifyForeground { changed, .. } => Some(*changed),
+            _ => None,
+        })
+        .expect("expected VerifyForeground #2");
+    fx.clear();
+    sess.apply_status_confirmation("", changed2, Confirmed::Matched, &mut fx);
+    let woken = fx
+        .iter()
+        .filter(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. }))
+        .count();
+    assert_eq!(woken, 3);
+
+    // Unknown confirmation (e.g. unverified / no foreground pgid) MUST NOT wake WaitCondition::Status!
+    fx.clear();
+    sess.register_wait(
+        conn(1),
+        RequestId::from_raw(4),
+        WaitCondition::Status(vec![StatusState::Working]),
+        5_000,
+        ts(6),
+        &mut fx,
+    );
+    sess.vt_mut().next_events =
+        vec![VtEvent::ProgramStatus(crate::status::parse_osc7501("state=working;app=tool").unwrap())];
+    sess.on_pty_output(b"z", ts(7), wall(7), &mut fx);
+    let changed3 = fx
+        .iter()
+        .find_map(|e| match e {
+            SessionEffect::VerifyForeground { changed, .. } => Some(*changed),
+            _ => None,
+        })
+        .expect("expected VerifyForeground #3");
+    assert!(!fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Waited { .. }, .. })));
+    fx.clear();
+    sess.apply_status_confirmation("", changed3, Confirmed::Unknown, &mut fx);
+    assert!(
+        !fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Waited { .. }, .. })),
+        "Confirmed::Unknown must NOT wake WaitCondition::Status"
+    );
+    // Late waiter registered against an app-less status (`Confirmed::Unknown`) must also NOT wake!
+    fx.clear();
+    sess.vt_mut().next_events = vec![VtEvent::ProgramStatus(crate::status::parse_osc7501("state=done").unwrap())];
+    sess.on_pty_output(b"w", ts(7), wall(7), &mut fx);
+    assert!(!fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Waited { .. }, .. })));
+    fx.clear();
+    sess.register_wait(
+        conn(1),
+        RequestId::from_raw(5),
+        WaitCondition::Status(vec![StatusState::Done]),
+        5_000,
+        ts(7),
+        &mut fx,
+    );
+    assert!(fx.is_empty(), "app-less OSC 7501 must never satisfy WaitCondition::Status");
+
+    // 4. Transactional restore_from_replay: monotonic epoch, marks hydration, status reset/replay, SearchWatch refresh, full_sync!
+    let k1 = (conn(1), nz_stream(1));
+    fx.clear();
+    sess.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW | SubFlags::EVENTS).unwrap(), None, &mut fx);
+    let _ = sess.try_publish_view(k1, |_| true);
+    sess.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(10),
+        ClientMsg::SetSearch { query: String::from("SEEK_TARGET"), case_sensitive: true },
+        &mut fx,
+    );
+    // Start a sync hold before seeking so we verify restore_from_replay cancels it cleanly.
+    sess.vt_mut().next_events = vec![VtEvent::SyncOutput(true)];
+    sess.on_pty_output(b"h", ts(8), wall(8), &mut fx);
+    assert!(sess.is_sync_held());
+
+    let key = MarksKey::parse(b"abcdef0123456789abcdef0123456789").unwrap();
+    let prev_epoch = sess.vt().meta().epoch;
+    let mut fresh = StubVt::new(50, 5);
+    fresh.epoch = 1;
+    fresh.rows[0] = String::from("SEEK_TARGET row");
+    fresh.next_events = vec![
+        VtEvent::Title(String::from("ReplayedTitle")),
+        VtEvent::Osc633 { payload: format!("V;S;11;{};ls", key.as_str()), cursor_line: 2 },
+        VtEvent::Osc633 { payload: format!("V;F;11;{};0;/replayed", key.as_str()), cursor_line: 2 },
+        VtEvent::ProgramStatus(crate::status::parse_osc7501("state=working;app=agent").unwrap()),
+        VtEvent::ProgramStatus(crate::status::parse_osc7501("id=sub;state=done;app=agent").unwrap()),
+    ];
+    let prior_cmd = CommandRecord {
+        id: 1,
+        command: Some(String::from("init")),
+        cwd: Some(String::from("/init")),
+        started_ms: Some(1),
+        finished_ms: Some(2),
+        outcome: CommandOutcome::Exited(VouchedExitCode::from_vouched(0)),
+        prompt_line: None,
+        output_line: None,
+        end_line: None,
+    };
+    let tail = [
+        ReplayRecord::Output { at_ms: wall(100), bytes: b"SEEK_TARGET row" },
+        ReplayRecord::Resize { size: GridSize::new(60, 6).unwrap(), cell_px: CellPx { width: 9, height: 18 } },
+        ReplayRecord::Marks { key: Some(key), last_seq: 15 },
+    ];
+    fx.clear();
+    sess.restore_from_replay(
+        fresh,
+        RestoreKeyframe {
+            cell_px: CellPx { width: 8, height: 16 },
+            marks_mode: MarksMode::Keyed(key),
+            marks_last_seq: 10,
+            marks_active_vouched_seq: None,
+            marks_refused: 1,
+            commands: vec![prior_cmd.clone()],
+        },
+        &tail,
+        true,
+        &mut fx,
+    );
+    assert!(!sess.is_sync_held(), "restore_from_replay must cancel sync hold");
+    assert!(sess.vt().meta().epoch > prev_epoch, "epoch must advance monotonically");
+    assert_eq!(sess.current_size(), GridSize::new(60, 6).unwrap());
+    assert_eq!(sess.current_cell_px(), CellPx { width: 9, height: 18 });
+    assert_eq!(sess.title(), "ReplayedTitle");
+    assert_eq!(sess.marks_last_seq(), 15);
+    assert_eq!(sess.commands().len(), 2);
+    assert_eq!(sess.commands()[1].id, 11);
+    // The Resize tail record bumped epoch, invalidating prior command line anchors!
+    assert_eq!(sess.commands()[1].output_line, None);
+    assert_eq!(sess.cwd(), Some("/replayed"));
+    assert!(
+        fx.iter().any(
+            |e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Title { title }, .. } if title == "ReplayedTitle")
+        ),
+        "Seek with emit_status_events must broadcast changed Title"
+    );
+    // Old root status cleared + replayed root & `sub` statuses emitted & exposed in active_statuses()!
+    assert!(fx.iter().any(
+        |e| matches!(e, SessionEffect::Send { msg: BrokerMsg::ProgramStatusCleared { id }, .. } if id.is_empty())
+    ));
+    assert!(
+        fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::ProgramStatus(r), .. } if r.id == "sub"))
+    );
+    assert_eq!(sess.active_statuses().len(), 2);
+    assert!(sess.active_statuses().iter().any(|r| r.id == "sub"));
+    // Replayed statuses have Confirmed::Unknown (no live process to verify against), so
+    // WaitCondition::Status does not spuriously wake on replayed unverified statuses!
+    fx.clear();
+    sess.register_wait(
+        conn(1),
+        RequestId::from_raw(12),
+        WaitCondition::Status(vec![StatusState::Working]),
+        5_000,
+        ts(101),
+        &mut fx,
+    );
+    assert!(
+        !fx.iter().any(|e| matches!(e, SessionEffect::Send { req_id, .. } if *req_id == RequestId::from_raw(12))),
+        "replayed unverified status must not wake WaitCondition::Status"
+    );
+    // Second seek clearing title (no Title event in tail) broadcasts empty Title when emit_status_events == true (`M3`),
+    // AND CommandFinished during replay clears active statuses (`M1`)!
+    let new_epoch = sess.vt().meta().epoch;
+    let mut fresh2 = StubVt::new(60, 6);
+    fresh2.epoch = 1;
+    fresh2.next_events = vec![
+        VtEvent::ProgramStatus(crate::status::parse_osc7501("state=working").unwrap()),
+        VtEvent::ProgramStatus(crate::status::parse_osc7501("id=keep;state=done").unwrap()),
+        VtEvent::Osc633 { payload: format!("V;S;12;{};echo", key.as_str()), cursor_line: 2 },
+        VtEvent::Osc633 { payload: format!("V;F;12;{};0;/stay", key.as_str()), cursor_line: 2 },
+    ];
+    let tail_no_epoch = [ReplayRecord::Output { at_ms: wall(102), bytes: b"SEEK_TARGET row" }];
+    fx.clear();
+    sess.restore_from_replay(
+        fresh2,
+        RestoreKeyframe {
+            cell_px: CellPx { width: 9, height: 18 },
+            marks_mode: MarksMode::Keyed(key),
+            marks_last_seq: 11,
+            marks_active_vouched_seq: None,
+            marks_refused: 0,
+            commands: vec![prior_cmd.clone()],
+        },
+        &tail_no_epoch,
+        true,
+        &mut fx,
+    );
+    assert!(sess.vt().meta().epoch > new_epoch);
+    assert!(
+        fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Title { title }, .. } if title.is_empty())),
+        "Seek clearing Title must broadcast empty Title"
+    );
+    assert_eq!(sess.active_statuses().len(), 1, "CommandFinished during replay must clear active statuses");
+    assert_eq!(sess.active_statuses()[0].id, "keep");
+    // Without an epoch bump during tail output, the command's output_line anchor is preserved!
+    assert_eq!(sess.commands()[1].output_line, Some(2));
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        SessionEffect::Send { msg: BrokerMsg::SearchMatches { epoch, matches, .. }, .. }
+        if *epoch == sess.vt().meta().epoch && !matches.is_empty()
+    )));
+    // MarksTracker::restore_from_keyframe truncates > MAX_COMMANDS, normalizes multiple Running records,
+    // and resists u64::MAX overflow panics (`B2`)!
+    let mut many_cmds = Vec::with_capacity(MAX_COMMANDS + 3);
+    for i in 0..(MAX_COMMANDS + 3) {
+        many_cmds.push(CommandRecord {
+            id: (i + 1) as u64,
+            command: Some(format!("c{i}")),
+            cwd: None,
+            started_ms: Some(1),
+            finished_ms: if i + 2 >= MAX_COMMANDS + 3 { None } else { Some(2) },
+            outcome: if i + 2 >= MAX_COMMANDS + 3 {
+                CommandOutcome::Running
+            } else {
+                CommandOutcome::Exited(VouchedExitCode::from_vouched(0))
+            },
+            prompt_line: None,
+            output_line: None,
+            end_line: None,
+        });
+    }
+    let mut mt = MarksTracker::new(MarksMode::Claimed);
+    mt.restore_from_keyframe(MarksMode::Keyed(key), 99, Some(99), 4, many_cmds);
+    assert_eq!(mt.commands().len(), MAX_COMMANDS);
+    assert_eq!(mt.commands()[0].id, 4);
+    assert_eq!(mt.commands().last().unwrap().id, (MAX_COMMANDS + 3) as u64);
+    assert_eq!(
+        mt.commands()[MAX_COMMANDS - 2].outcome,
+        CommandOutcome::Unknown(UnknownReason::Superseded),
+        "earlier Running record in keyframe must be normalized"
+    );
+    assert_eq!(mt.commands()[MAX_COMMANDS - 1].outcome, CommandOutcome::Running);
+    assert!(!mt.is_idle(), "running last command means tracker is not idle");
+    assert_eq!(mt.last_seq(), 99);
+    assert_eq!(mt.refused(), 4);
+
+    // Crafted u64::MAX command ID in WAL never panics on subsequent Claimed or Keyed commands!
+    let mut max_mt = MarksTracker::new(MarksMode::Claimed);
+    max_mt.restore_from_keyframe(
+        MarksMode::Claimed,
+        u64::MAX,
+        None,
+        0,
+        vec![
+            CommandRecord {
+                id: 1,
+                command: None,
+                cwd: None,
+                started_ms: None,
+                finished_ms: Some(1),
+                outcome: CommandOutcome::Claimed(Some(0)),
+                prompt_line: None,
+                output_line: None,
+                end_line: None,
+            },
+            CommandRecord {
+                id: u64::MAX,
+                command: None,
+                cwd: None,
+                started_ms: None,
+                finished_ms: Some(2),
+                outcome: CommandOutcome::Claimed(Some(0)),
+                prompt_line: None,
+                output_line: None,
+                end_line: None,
+            },
+        ],
+    );
+    let mut mfx = Vec::new();
+    max_mt.on_osc133("C", 0, wall(1), &mut mfx);
+    assert_eq!(max_mt.commands().last().unwrap().id, 2, "must wrap cleanly past u64::MAX and skip existing id=1");
+
+    // prepare_for_live_after_restore (`B2`): finalizes stuck Running command, clears active statuses,
+    // resets last_seq unconditionally (even for SAME marks_key!), and assigns non-colliding IDs!
+    let mut live_restore = SessionMachine::from_replay(
+        sid(92),
+        StubVt::new(40, 4),
+        ResizePolicy::ExplicitOverride,
+        RestoreKeyframe {
+            cell_px: CellPx { width: 8, height: 16 },
+            marks_mode: MarksMode::Keyed(key),
+            marks_last_seq: 50,
+            marks_active_vouched_seq: None,
+            marks_refused: 0,
+            commands: vec![
+                CommandRecord {
+                    id: 1,
+                    command: Some(String::from("old_done")),
+                    cwd: None,
+                    started_ms: Some(1),
+                    finished_ms: Some(2),
+                    outcome: CommandOutcome::Exited(VouchedExitCode::from_vouched(0)),
+                    prompt_line: None,
+                    output_line: None,
+                    end_line: None,
+                },
+                CommandRecord {
+                    id: 2,
+                    command: Some(String::from("old_running")),
+                    cwd: None,
+                    started_ms: Some(3),
+                    finished_ms: None,
+                    outcome: CommandOutcome::Running,
+                    prompt_line: None,
+                    output_line: None,
+                    end_line: None,
+                },
+            ],
+        },
+        &[],
+    );
+    // Inject an active Working status + terminal Done status before transitioning to live.
+    live_restore.vt_mut().next_events = vec![
+        VtEvent::ProgramStatus(crate::status::parse_osc7501("state=working").unwrap()),
+        VtEvent::ProgramStatus(crate::status::parse_osc7501("id=d;state=done").unwrap()),
+    ];
+    let mut rfx = Vec::new();
+    live_restore.on_pty_output(b"x", ts(10), wall(10), &mut rfx);
+    assert_eq!(live_restore.active_statuses().len(), 2);
+
+    // Transition to live with the SAME `marks_key`:
+    live_restore.prepare_for_live_after_restore(MarksMode::Keyed(key), wall(20));
+    assert_eq!(live_restore.marks_last_seq(), 0, "last_seq must reset unconditionally for new live shell");
+    assert_eq!(
+        live_restore.commands()[1].outcome,
+        CommandOutcome::Unknown(UnknownReason::SessionEnded),
+        "stuck Running command must be finalized before live shell starts"
+    );
+    assert_eq!(live_restore.active_statuses().len(), 1, "active Working status from dead recording must be cleared");
+    assert_eq!(live_restore.active_statuses()[0].id, "d");
+
+    // New shell emits V;A;1 (prompt -> is_idle!), then V;S;2 & V;F;2: NO id collision with historical id=2!
+    rfx.clear();
+    live_restore.vt_mut().next_events =
+        vec![VtEvent::Osc633 { payload: format!("V;A;1;{}", key.as_str()), cursor_line: 0 }];
+    live_restore.on_pty_output(b"p", ts(21), wall(21), &mut rfx);
+    rfx.clear();
+    live_restore.register_wait(conn(1), RequestId::from_raw(55), WaitCondition::Idle, 5_000, ts(21), &mut rfx);
+    assert!(
+        rfx.iter().any(|e| matches!(
+            e,
+            SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. }
+            if *req_id == RequestId::from_raw(55)
+        )),
+        "new live shell prompt must satisfy WaitCondition::Idle after finalizing dead Running cmd"
+    );
+
+    rfx.clear();
+    live_restore.vt_mut().next_events = vec![
+        VtEvent::Osc633 { payload: format!("V;S;2;{};new_cmd", key.as_str()), cursor_line: 1 },
+        VtEvent::Osc633 { payload: format!("V;F;2;{};0;/live", key.as_str()), cursor_line: 2 },
+    ];
+    live_restore.on_pty_output(b"q", ts(22), wall(22), &mut rfx);
+    assert_eq!(live_restore.commands().len(), 3);
+    let live_cmd = &live_restore.commands()[2];
+    assert_eq!(live_cmd.command.as_deref(), Some("new_cmd"));
+    assert!(live_cmd.id > 2, "live command ID ({}) must not collide with historical id=2", live_cmd.id);
+    assert_eq!(live_cmd.outcome, CommandOutcome::Exited(VouchedExitCode::from_vouched(0)));
+
+    // Post-restore WAL rollover keyframe where remapped Running command has `id (11) > last_seq (1)`:
+    // `restore_from_keyframe` must derive `active_vouched_seq = Some(1)` so replaying `V;F;1` succeeds!
+    let mut remapped_mt = MarksTracker::new(MarksMode::Claimed);
+    remapped_mt.restore_from_keyframe(
+        MarksMode::Keyed(key),
+        1,
+        Some(1),
+        0,
+        vec![
+            CommandRecord {
+                id: 10,
+                command: Some(String::from("prior")),
+                cwd: None,
+                started_ms: Some(1),
+                finished_ms: Some(2),
+                outcome: CommandOutcome::Exited(VouchedExitCode::from_vouched(0)),
+                prompt_line: None,
+                output_line: None,
+                end_line: None,
+            },
+            CommandRecord {
+                id: 11,
+                command: Some(String::from("build")),
+                cwd: None,
+                started_ms: Some(3),
+                finished_ms: None,
+                outcome: CommandOutcome::Running,
+                prompt_line: None,
+                output_line: None,
+                end_line: None,
+            },
+        ],
+    );
+    let mut rmt_fx = Vec::new();
+    remapped_mt.on_osc633(&format!("V;F;1;{};0;/proj", key.as_str()), 4, wall(30), &mut rmt_fx);
+    assert_eq!(remapped_mt.refused(), 0, "V;F;1 must match remapped running command id=11");
+    assert_eq!(remapped_mt.commands()[1].outcome, CommandOutcome::Exited(VouchedExitCode::from_vouched(0)));
+    assert_eq!(remapped_mt.last_cwd(), Some("/proj"));
+    // Also verify `last_seq == 0` with Running id > 0 does not invent active_vouched_seq = Some(0),
+    // and verify every boundary guard on `restore_from_keyframe`'s `active_vouched_seq`:
+    let running_cmd = |id: u64| CommandRecord {
+        id,
+        command: None,
+        cwd: None,
+        started_ms: None,
+        finished_ms: None,
+        outcome: CommandOutcome::Running,
+        prompt_line: None,
+        output_line: None,
+        end_line: None,
+    };
+    let finished_cmd = |id: u64| CommandRecord {
+        id,
+        command: None,
+        cwd: None,
+        started_ms: None,
+        finished_ms: Some(1),
+        outcome: CommandOutcome::Exited(VouchedExitCode::from_vouched(0)),
+        prompt_line: None,
+        output_line: None,
+        end_line: None,
+    };
+    let mut zero_seq_mt = MarksTracker::new(MarksMode::Claimed);
+    // 1. Keyed + running + active_vouched_seq = Some(0) -> rejected (None)
+    zero_seq_mt.restore_from_keyframe(MarksMode::Keyed(key), 0, Some(0), 0, vec![running_cmd(5)]);
+    assert_eq!(zero_seq_mt.active_vouched_seq(), None);
+    zero_seq_mt.on_osc633(&format!("V;F;5;{};0;/bad", key.as_str()), 0, wall(31), &mut rmt_fx);
+    assert_eq!(zero_seq_mt.refused(), 1);
+    // 2. Claimed + running + Some(1) -> None
+    zero_seq_mt.restore_from_keyframe(MarksMode::Claimed, 5, Some(1), 0, vec![running_cmd(1)]);
+    assert_eq!(zero_seq_mt.active_vouched_seq(), None);
+    // 3. Keyed + NO running command + Some(1) -> None
+    zero_seq_mt.restore_from_keyframe(MarksMode::Keyed(key), 5, Some(1), 0, vec![finished_cmd(1)]);
+    assert_eq!(zero_seq_mt.active_vouched_seq(), None);
+    // 4. Keyed + running + Some(6) > last_seq(5) -> None
+    zero_seq_mt.restore_from_keyframe(MarksMode::Keyed(key), 5, Some(6), 0, vec![running_cmd(5)]);
+    assert_eq!(zero_seq_mt.active_vouched_seq(), None);
+    // 5. Keyed + running + Some(5) <= last_seq(5) -> Some(5)
+    zero_seq_mt.restore_from_keyframe(MarksMode::Keyed(key), 5, Some(5), 0, vec![running_cmd(5)]);
+    assert_eq!(zero_seq_mt.active_vouched_seq(), Some(5));
+
+    // Also cover `SessionMachine::marks_active_vouched_seq` across None -> Some(2) -> None:
+    let mut k_sess = SessionMachine::new(
+        sid(92),
+        StubVt::new(40, 4),
+        ResizePolicy::ExplicitOverride,
+        MarksMode::Keyed(key),
+        CellPx::default(),
+    );
+    assert_eq!(k_sess.marks_active_vouched_seq(), None);
+    k_sess.vt_mut().next_events =
+        vec![VtEvent::Osc633 { payload: format!("V;S;2;{};echo hi", key.as_str()), cursor_line: 0 }];
+    let mut kfx = Vec::new();
+    k_sess.on_pty_output(b"x", ts(1), wall(1), &mut kfx);
+    assert_eq!(k_sess.marks_active_vouched_seq(), Some(2));
+    k_sess.vt_mut().next_events =
+        vec![VtEvent::Osc633 { payload: format!("V;F;2;{};0;/tmp", key.as_str()), cursor_line: 1 }];
+    k_sess.on_pty_output(b"y", ts(2), wall(2), &mut kfx);
+    assert_eq!(k_sess.marks_active_vouched_seq(), None);
+}
+
+#[test]
+fn text_matches_in_range_chunked_halves_on_max_string_truncation() {
+    use crate::session::{ReplayRecord, RestoreKeyframe, text_matches_in_range_chunked};
+    use apack_proto::MAX_STRING_BYTES;
+
+    // A VT whose line 0 holds nearly `MAX_STRING_BYTES` and line 1 holds the target needle:
+    // asking for lines 0..=1 truncates at `MAX_STRING_BYTES` and drops line 1, so adaptive
+    // halving MUST retry line 0 alone and then scan line 1 without skipping it!
+    struct TruncatingVt {
+        inner: StubVt,
+        spans_requested: core::cell::RefCell<Vec<(u64, u64)>>,
+    }
+    impl VtEngine for TruncatingVt {
+        fn feed(&mut self, bytes: &[u8], events: &mut Vec<VtEvent>) {
+            self.inner.feed(bytes, events);
+        }
+        fn resize(&mut self, size: GridSize, cell_px: CellPx, events: &mut Vec<VtEvent>) -> bool {
+            self.inner.resize(size, cell_px, events)
+        }
+        fn meta(&self) -> VtSnapshotMeta {
+            self.inner.meta()
+        }
+        fn generations(&self) -> VtGenerations {
+            self.inner.generations()
+        }
+        fn palette_overrides(&self) -> PaletteOverrides {
+            self.inner.palette_overrides()
+        }
+        fn take_dirty_viewport(&mut self) -> DirtyViewport {
+            self.inner.take_dirty_viewport()
+        }
+        fn extract_viewport_rows(&self, rows: &[u16], out: &mut Vec<PackedRow>) {
+            self.inner.extract_viewport_rows(rows, out);
+        }
+        fn extract_history_rows(&self, from_line: u64, count: u32, max_bytes: usize, out: &mut Vec<PackedRow>) {
+            self.inner.extract_history_rows(from_line, count, max_bytes, out);
+        }
+        fn word_at(&self, pos: CellPos, delimiters: &str) -> Option<CellSpan> {
+            self.inner.word_at(pos, delimiters)
+        }
+        fn line_at(&self, line: u64) -> Option<CellSpan> {
+            self.inner.line_at(line)
+        }
+        fn text_of(&self, span: CellSpan, max_bytes: usize) -> String {
+            self.spans_requested.borrow_mut().push((span.start.line, span.end.line));
+            let mut full = String::new();
+            for line in span.start.line..=span.end.line {
+                if line > span.start.line {
+                    full.push('\n');
+                }
+                if line == 0 {
+                    full.push_str(&"x".repeat(MAX_STRING_BYTES - 1));
+                } else if line == 1 {
+                    full.push_str("NEEDLE_ON_ROW_1");
+                }
+            }
+            full.truncate(full.floor_char_boundary(max_bytes));
+            full
+        }
+        fn text_of_rect(&self, span: CellSpan, max_bytes: usize) -> String {
+            self.inner.text_of_rect(span, max_bytes)
+        }
+        fn search_lines(
+            &self,
+            _from_line: u64,
+            _to_line: u64,
+            _needle: &str,
+            _case_sensitive: bool,
+            _limit: usize,
+            _out: &mut Vec<CellSpan>,
+        ) -> bool {
+            true // force fallback into `text_matches_in_range_chunked`
+        }
+        fn images(&self) -> Vec<ImagePlacement> {
+            vec![]
+        }
+        fn encode_key(&mut self, key: &KeyInput, out: &mut Vec<u8>) {
+            self.inner.encode_key(key, out);
+        }
+        fn encode_pointer(&mut self, ev: &PointerInput, held_buttons: &mut u8, out: &mut Vec<u8>) {
+            self.inner.encode_pointer(ev, held_buttons, out);
+        }
+        fn encode_focus(&mut self, focused: bool, out: &mut Vec<u8>) {
+            self.inner.encode_focus(focused, out);
+        }
+        fn encode_paste(&mut self, text: &str, allow_unsafe: bool) -> PasteEncode {
+            self.inner.encode_paste(text, allow_unsafe)
+        }
+        fn set_cursor_defaults(&mut self, shape: CursorShape, blinking: bool) {
+            self.inner.set_cursor_defaults(shape, blinking);
+        }
+        fn compress_step(&mut self, max_pages: usize) -> CompressStep {
+            self.inner.compress_step(max_pages)
+        }
+        fn ensure_min_epoch(&mut self, min_epoch: u64) {
+            self.inner.ensure_min_epoch(min_epoch);
+        }
+        fn scrollback_bytes(&self) -> u64 {
+            self.inner.scrollback_bytes()
+        }
+    }
+
+    let vt = TruncatingVt { inner: StubVt::new(80, 4), spans_requested: core::cell::RefCell::new(Vec::new()) };
+    assert!(
+        text_matches_in_range_chunked(&vt, 0, 4, "NEEDLE_ON_ROW_1", 4),
+        "adaptive halving must not skip row 1 when multi-row chunk saturates MAX_STRING_BYTES"
+    );
+    // Step 4 -> halves to 2 (lines 0..=1) -> halves to 1 (line 0), then line 1 matches:
+    assert_eq!(
+        *vt.spans_requested.borrow(),
+        vec![(0, 3), (0, 1), (0, 0), (1, 3)],
+        "halving must shrink step 4 -> 2 -> 1 instead of jumping via modulo"
+    );
+    // Near `end_line` with large `step = 128` over 2 rows: must halve clamped span length immediately (3 calls, not 8).
+    vt.spans_requested.borrow_mut().clear();
+    assert!(text_matches_in_range_chunked(&vt, 0, 2, "NEEDLE_ON_ROW_1", 128));
+    assert_eq!(*vt.spans_requested.borrow(), vec![(0, 1), (0, 0), (1, 1)]);
+    assert!(!text_matches_in_range_chunked(&vt, 0, 2, "ABSENT_NEEDLE", 4));
+
+    // Failed `VtEngine::resize` rollback: `SessionMachine::apply_resize` and `restore_from_replay`
+    // must NOT commit `current_size`/`current_cell_px` or emit `ResizePty`/`ViewsDirty`, and a
+    // subsequent retry with the same target size must succeed once VT resize succeeds.
+    let orig_size = GridSize::new(80, 24).unwrap();
+    let target_size = GridSize::new(120, 40).unwrap();
+    let orig_px = CellPx { width: 8, height: 16 };
+    let target_px = CellPx { width: 9, height: 18 };
+    let mut sess =
+        SessionMachine::new(sid(77), StubVt::new(80, 24), ResizePolicy::ExplicitOverride, MarksMode::Claimed, orig_px);
+    let k1 = (conn(1), nz_stream(1));
+    let mut fx = Vec::new();
+    sess.attach_stream(k1, att_for(k1), SubFlags::from_bits(SubFlags::VIEW).unwrap(), None, &mut fx);
+    let _ = sess.try_publish_view(k1, |_| true);
+    fx.clear();
+
+    sess.vt_mut().fail_next_resize = true;
+    sess.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(1),
+        ClientMsg::ExplicitResize { size: target_size, cell_px: target_px },
+        &mut fx,
+    );
+    assert_eq!(sess.current_size(), orig_size, "failed VT resize must not update current_size");
+    assert_eq!(sess.current_cell_px(), orig_px, "failed VT resize must not update current_cell_px");
+    assert!(!fx.iter().any(|e| matches!(e, SessionEffect::ResizePty { .. })), "must not resize OS PTY on VT rollback");
+    assert!(!fx.contains(&SessionEffect::ViewsDirty), "must not dirty views on VT rollback");
+    assert!(
+        fx.iter().any(|e| matches!(
+            e,
+            SessionEffect::Send {
+                req_id,
+                msg: BrokerMsg::Error { code: ErrorCode::ResourceLimit, .. },
+                ..
+            } if *req_id == RequestId::from_raw(1)
+        )),
+        "failed ExplicitResize must return ResourceLimit error, not Ok"
+    );
+
+    // Retrying the exact same target size now succeeds cleanly!
+    fx.clear();
+    sess.handle_stream_msg(
+        k1,
+        att_for(k1),
+        RequestId::from_raw(2),
+        ClientMsg::ExplicitResize { size: target_size, cell_px: target_px },
+        &mut fx,
+    );
+    assert_eq!(sess.current_size(), target_size);
+    assert_eq!(sess.current_cell_px(), target_px);
+    assert!(fx.iter().any(
+        |e| matches!(e, SessionEffect::ResizePty { size, cell_px } if *size == target_size && *cell_px == target_px)
+    ));
+    assert!(fx.iter().any(
+        |e| matches!(e, SessionEffect::Send { req_id, msg: BrokerMsg::Ok, .. } if *req_id == RequestId::from_raw(2))
+    ));
+
+    // Same rollback guard inside `restore_from_replay` (`ReplayRecord::Resize`):
+    let mut fresh = StubVt::new(80, 24);
+    fresh.fail_next_resize = true;
+    fx.clear();
+    sess.restore_from_replay(
+        fresh,
+        RestoreKeyframe {
+            cell_px: orig_px,
+            marks_mode: MarksMode::Claimed,
+            marks_last_seq: 0,
+            marks_active_vouched_seq: None,
+            marks_refused: 0,
+            commands: vec![],
+        },
+        &[ReplayRecord::Resize { size: target_size, cell_px: target_px }],
+        false,
+        &mut fx,
+    );
+    assert_eq!(sess.current_size(), orig_size, "failed ReplayRecord::Resize must not update current_size");
+    assert_eq!(sess.current_cell_px(), orig_px, "failed ReplayRecord::Resize must not update current_cell_px");
+
+    // 1. Replay `apply_replay_tail` `saw_epoch_event`: epoch change + epoch-2 command in the SAME
+    //    WAL Output chunk must keep epoch-2 command line anchors intact, while keyframe commands
+    //    from the old numbering space have their stale anchors invalidated!
+    let mut ep_vt = StubVt::new(80, 24);
+    ep_vt.next_events = vec![
+        VtEvent::EpochChanged,
+        VtEvent::Osc133 { payload: String::from("A"), cursor_line: 1 },
+        VtEvent::Osc133 { payload: String::from("C"), cursor_line: 2 },
+        VtEvent::Osc133 { payload: String::from("D;0"), cursor_line: 3 },
+    ];
+    let stale_kf_cmd = apack_proto::types::CommandRecord {
+        id: 1,
+        command: Some(String::from("old")),
+        cwd: None,
+        started_ms: Some(1),
+        finished_ms: Some(2),
+        outcome: CommandOutcome::Claimed(Some(0)),
+        prompt_line: Some(50_000),
+        output_line: Some(50_001),
+        end_line: Some(50_002),
+    };
+    fx.clear();
+    sess.restore_from_replay(
+        ep_vt,
+        RestoreKeyframe {
+            cell_px: orig_px,
+            marks_mode: MarksMode::Claimed,
+            marks_last_seq: 0,
+            marks_active_vouched_seq: None,
+            marks_refused: 0,
+            commands: vec![stale_kf_cmd],
+        },
+        &[ReplayRecord::Output { at_ms: wall(50), bytes: b"ALT" }],
+        false,
+        &mut fx,
+    );
+    let cmds = sess.commands();
+    assert_eq!(cmds.len(), 2);
+    assert_eq!(cmds[0].prompt_line, None, "restored keyframe command stale prompt_line must be cleared");
+    assert_eq!(cmds[0].output_line, None, "restored keyframe command stale output_line must be cleared");
+    assert_eq!(cmds[0].end_line, None, "restored keyframe command stale end_line must be cleared");
+    assert_eq!(cmds[1].prompt_line, Some(1), "epoch-2 command after VtEvent::EpochChanged must keep prompt_line");
+    assert_eq!(cmds[1].output_line, Some(2), "epoch-2 command after VtEvent::EpochChanged must keep output_line");
+    assert_eq!(cmds[1].end_line, Some(3), "epoch-2 command after VtEvent::EpochChanged must keep end_line");
+
+    // 2. Rewound session close (`on_rewound_close`) resolves pending waiters cleanly without emitting BrokerMsg::Exited!
+    fx.clear();
+    sess.register_wait(
+        conn(1),
+        RequestId::from_raw(88),
+        WaitCondition::Text(String::from("never")),
+        5_000,
+        ts(1),
+        &mut fx,
+    );
+    sess.register_wait(conn(1), RequestId::from_raw(89), WaitCondition::Exit, 5_000, ts(1), &mut fx);
+    fx.clear();
+    sess.on_rewound_close(&mut fx);
+    assert!(!sess.is_alive());
+    assert!(!fx.iter().any(|e| matches!(e, SessionEffect::Send { msg: BrokerMsg::Exited { .. }, .. })));
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Exited }, .. }
+        if *req_id == RequestId::from_raw(88)
+    )));
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        SessionEffect::Send { req_id, msg: BrokerMsg::Waited { outcome: WaitOutcome::Met }, .. }
+        if *req_id == RequestId::from_raw(89)
+    )));
+    // Idempotent second call emits nothing
+    fx.clear();
+    sess.on_rewound_close(&mut fx);
+    assert!(fx.is_empty());
+
+    // Direct return-value contract of `StatusTable::apply_confirmation`:
+    // returns `true` iff `id == ""` AND `confirmed == Confirmed::Matched`.
+    let mut table = crate::status::StatusTable::new();
+    let mut sfx = Vec::new();
+    table.ingest("state=working;app=claude", wall(1), &mut sfx);
+    table.ingest("id=sub;state=working;app=claude", wall(2), &mut sfx);
+    let root_ch = table.get("").unwrap().changed;
+    let sub_ch = table.get("sub").unwrap().changed;
+    sfx.clear();
+    assert!(!table.apply_confirmation("sub", sub_ch, Confirmed::Matched, &mut sfx), "non-root Matched -> false");
+    assert!(!table.apply_confirmation("", root_ch, Confirmed::Unknown, &mut sfx), "root Unknown -> false");
+    assert!(!table.apply_confirmation("", root_ch, Confirmed::Mismatched, &mut sfx), "root Mismatched -> false");
+    assert!(table.apply_confirmation("", root_ch, Confirmed::Matched, &mut sfx), "root Matched -> true");
+}

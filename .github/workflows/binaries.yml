@@ -132,7 +132,7 @@ jobs:
       - name: SBOM
         shell: bash
         run: cargo cyclonedx --format json --spec-version 1.5 --describe binaries --no-build-deps --target ${{ matrix.target }}
-      # The binary and what `build.rs` placed beside it (the ConPTY on Windows), renamed for a release that has no
+      # The binary and what `crates/apack-os/build.rs` placed beside it (the ConPTY on Windows), renamed for a release that has no
       # folders
       - name: Collect this platform's files
         shell: bash
@@ -197,10 +197,9 @@ jobs:
             echo "packed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          node node/release/pack.mjs --commit "$COMMIT" --files assets --out packages --repo "$GITHUB_REPOSITORY"
           npm --prefix view ci --no-audit --no-fund
           npm --prefix view run build
-          (cd view && npm pack --pack-destination ../packages)
+          node node/release/pack.mjs --commit "$COMMIT" --files assets --view view --out packages --repo "$GITHUB_REPOSITORY"
           ls -l packages
           echo "packed=true" >> "$GITHUB_OUTPUT"
           echo "version=$(node -p 'require("./node/package.json").version')" >> "$GITHUB_OUTPUT"
@@ -245,8 +244,8 @@ jobs:
         run: |
           mkdir smoke-project && cd smoke-project
           echo '{ "name": "smoke", "private": true }' > package.json
-          npm install --no-audit --no-fund "../packages/apackdev-terminal-${{ matrix.platform }}-$VERSION.tgz" "../packages/apackdev-terminal-$VERSION.tgz"
-          node ../node/release/smoke.mjs .
+          npm install --no-audit --no-fund "../packages/apackdev-terminal-${{ matrix.platform }}-$VERSION.tgz" "../packages/apackdev-terminal-$VERSION.tgz" "../packages/apackdev-terminal-view-$VERSION.tgz"
+          node ../node/release/smoke.mjs . --require-view
 
   # From `master` or a dispatch alone: a release is what an app pins, and no other branch's build is one
   publish:
@@ -330,8 +329,8 @@ jobs:
         run: |
           mkdir consume-project && cd consume-project
           echo '{ "name": "consume", "private": true }' > package.json
-          npm install --no-audit --no-fund "https://github.com/$GITHUB_REPOSITORY/releases/download/bin-$COMMIT/apackdev-terminal-$VERSION.tgz"
-          node ../node/release/smoke.mjs .
+          npm install --no-audit --no-fund "https://github.com/$GITHUB_REPOSITORY/releases/download/bin-$COMMIT/apackdev-terminal-$VERSION.tgz" "https://github.com/$GITHUB_REPOSITORY/releases/download/bin-$COMMIT/apackdev-terminal-view-$VERSION.tgz"
+          node ../node/release/smoke.mjs . --require-view
           rm -rf node_modules
           npm ci --no-audit --no-fund
-          node ../node/release/smoke.mjs .
+          node ../node/release/smoke.mjs . --require-view

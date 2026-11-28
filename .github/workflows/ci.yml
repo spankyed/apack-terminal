@@ -1,13 +1,13 @@
 name: CI
 
 # Every push to master and every pull request runs the checks on Linux and the suite on all three platforms.
-# **All three is the point, not thoroughness**: everything in `src/tree.rs`, ConPTY's missing EOF, its
-# cursor-position request and `\r\n` submitting a line are reachable from no Mac, and every one of them was
-# wrong before it was run on Windows (`CLAUDE.md`, "A platform claim is made on that platform"). A change to
-# documentation alone runs nothing past `changes`, and a newer push to the same pull request cancels the run
-# before it; `master` runs never cancel each other so a docs-only follow-up cannot supersede an unverified code
-# commit. `ci-pass` is the one check a merge waits on. Mutants of a pull request's change run beside this in
-# mutants.yml, which a surviving mutant fails.
+# **All three is the point, not thoroughness**: everything in `crates/apack-os/src/tree_windows.rs`, ConPTY's
+# missing EOF, its cursor-position request and `\r\n` submitting a line are reachable from no Mac, and every one
+# of them was wrong before it was run on Windows (`CLAUDE.md`, "A platform claim is made on that platform"). A
+# change to documentation alone runs nothing past `changes`, and a newer push to the same pull request cancels
+# the run before it; `master` runs never cancel each other so a docs-only follow-up cannot supersede an
+# unverified code commit. `ci-pass` is the one check a merge waits on. Mutants of a pull request's change run
+# beside this in mutants.yml, which a surviving mutant fails.
 on:
   push:
     branches: [master]
@@ -75,6 +75,8 @@ jobs:
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo xtask check-generated
       - run: cargo xtask check-safety
+      - run: cargo xtask check-cfg-hygiene
+      - run: cargo xtask check-versions
       # The release's third-party notices, held to the lockfile, libghostty-vt's licenses and the toolchain
       - uses: taiki-e/install-action@v2
         with:
@@ -141,7 +143,7 @@ jobs:
 
   # The view (`view/`): its types, its suite and the build a consumer bundles. One platform, since it is
   # TypeScript drawing on a canvas and nothing in it asks the operating system anything. Its suite reads
-  # `node/view-vectors.json` where the broker's suite writes it, so a change to the wire that taught only
+  # `node/wire-vectors-v2.json` where the broker's suite writes it, so a change to the wire that taught only
   # one half fails here or in `platforms`, in the same run
   view:
     name: view (Linux x64)
@@ -162,6 +164,42 @@ jobs:
       - run: npm test
       - run: npm run build
 
+  # Real-Chromium Playwright E2E suite mounting TerminalView (WebGL2AtlasPainter & CanvasPainter)
+  # against a live apack-terminal v2 broker binary over a local WebSocket bridge.
+  view-e2e:
+    name: view-e2e (Linux x64)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - shell: bash
+        run: echo "GHOSTTY_VT_RS_SYS_OPTIMIZE=fast" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - run: cargo build --locked --bin apack-terminal
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install color emoji font for Chromium WebGL2 emoji verification
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends fonts-noto-color-emoji && fc-cache -f
+      - working-directory: view
+        run: npm ci --no-audit --no-fund
+      - working-directory: view
+        run: npx playwright install --with-deps chromium
+      - working-directory: view
+        run: npm run build
+      - working-directory: view
+        env:
+          APACK_TERMINAL_BIN: ${{ github.workspace }}/target/debug/apack-terminal
+        run: npm run test:e2e
+
   # The broker's npm package (`node/`): its runtime entry, which finds the binary in the platform package
   # installed beside it, and the release's packing of the platform packages, whose versions must be its own
   node:
@@ -180,10 +218,65 @@ jobs:
           node-version: 24
       - run: npm test
 
+  # Deterministic fuzz seed corpus replay + short timed libFuzzer smoke run across every fuzz target.
+  fuzz-smoke:
+    name: fuzz-smoke (Linux x64)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+      - uses: dtolnay/rust-toolchain@nightly
+      - id: nightly-version
+        run: echo "key=$(rustc +nightly -Vv | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: nightly-${{ steps.nightly-version.outputs.key }}
+          workspaces: |
+            . -> target
+            fuzz -> fuzz/target
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - run: cargo xtask fuzz-smoke --target x86_64-unknown-linux-gnu --seconds 10 --rss-limit-mb 2048
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-smoke-crash
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+
+  # The broker's suite under AddressSanitizer on a native x86_64 Linux runner. `-Zsanitizer=address`
+  # instruments the Rust broker and its unsafe FFI boundary (the prebuilt `libghostty-vt` static
+  # library linked on Linux is not ASAN-instrumented).
+  asan:
+    name: AddressSanitizer (Linux x64)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - id: nightly-version
+        run: echo "key=$(rustc +nightly -Vv | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: asan-nightly-${{ steps.nightly-version.outputs.key }}
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: the suite under AddressSanitizer
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+        run: cargo +nightly test --locked --target x86_64-unknown-linux-gnu --workspace --exclude xtask --lib --tests --no-fail-fast
+
   # The one check a merge waits on: every job above passed or was skipped (a documentation-only change)
   ci-pass:
     if: always()
-    needs: [changes, checks, platforms, view, node]
+    needs: [changes, checks, platforms, view, view-e2e, node, fuzz-smoke, asan]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

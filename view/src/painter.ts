@@ -19,10 +19,18 @@ export interface Metrics {
 /** Everything one frame of drawing needs */
 export interface Scene {
   readonly theme: Theme
+  /** Monotonic broker epoch of the rows in this scene (invalidates scroll-blit caches on reset). */
+  readonly epoch?: number
   /** The rows to draw, top to bottom. `null` is a line the view does not hold yet: it is drawn blank */
   readonly rows: ReadonlyArray<RowDrawing | null>
   /** How far the grid is shifted up, as a fraction of a row: the view is between two lines */
   readonly offset: number
+  /**
+   * Monotonic drawn-row scroll position of the top of the viewport (optional). When supplied,
+   * painters like `CanvasPainter` can detect uniform row shifts and blit unchanged pixel bands
+   * in O(1) via `drawImage(canvas, ...)` instead of repainting the whole viewport.
+   */
+  readonly scrollPosition?: number
   /**
    * Rows marked in the gutter, each in a colour: where a command began, coloured by how it ended. Drawn
    * only where the painter was given a gutter to draw them in.
@@ -33,6 +41,8 @@ export interface Scene {
    * top-left of the first row, before `offset` is applied; `source` is the part of the picture drawn.
    */
   readonly images?: ReadonlyArray<{
+    /** Optional content-addressed image key (hex `BlobHash`) for GPU texture ownership & explicit release. */
+    readonly key?: string
     readonly picture: CanvasImageSource
     readonly x: number
     readonly y: number
@@ -75,6 +85,8 @@ export interface Painter {
    * it drew has no need of one.
    */
   whenCleared?(repaint: () => void): void
+  /** Explicitly releases any GPU texture cached under content-addressed image `key`. */
+  releaseImage?(key: string): void
   paint(scene: Scene): void
   dispose(): void
 }

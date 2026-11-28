@@ -16,8 +16,10 @@ export class RecordingPainter implements Painter {
   readonly canvas = document.createElement('canvas')
   readonly metrics = { cellWidth: 10, cellHeight: 20, baseline: 16 }
   readonly scenes: Scene[] = []
+  readonly releasedImages: string[] = []
   resize(): void {}
   setFont(): void {}
+  releaseImage(key: string): void { this.releasedImages.push(key) }
   paint(scene: Scene): void { this.scenes.push(scene) }
   dispose(): void {}
 }
@@ -36,13 +38,13 @@ export function mountedView(options: Partial<ViewOptions> = {}, source = new Fak
    * second after the event before, which is too long after for any two to be one click.
    */
   let clock = 0
-  const point = (type: string, column: number, row: number, init: MouseEventInit & { at?: number } = {}) => {
-    const { at, ...rest } = init
+  const point = (type: string, column: number, row: number, init: MouseEventInit & { at?: number; pointerId?: number } = {}) => {
+    const { at, pointerId, ...rest } = init
     clock = at ?? clock + 1000
     // jsdom has no `PointerEvent`: a mouse event with what a pointer event adds that a view reads
     const event = new MouseEvent(type, { bubbles: true, cancelable: true, clientX: column * 10 + 5, clientY: row * 20 + 10, ...rest, detail: 0 })
     Object.defineProperty(event, 'timeStamp', { value: clock })
-    Object.defineProperty(event, 'pointerId', { value: 1 })
+    Object.defineProperty(event, 'pointerId', { value: pointerId ?? 1 })
     view.element.dispatchEvent(event)
     return event
   }

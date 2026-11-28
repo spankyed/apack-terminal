@@ -1,0 +1,37 @@
+[package]
+name = "apack-os"
+version = "0.2.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "OS drivers for apack-terminal v2: PTYs, non-blocking pollers, process trees, signals, local transports, and sandboxed image sources"
+
+[dependencies]
+apack-proto = { path = "../apack-proto" }
+interprocess = "2.4.7"
+portable-pty = { git = "https://github.com/wez/wezterm", rev = "8afe0ad30739c5aa106c19e8a75b1dfc83bcfb56" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.191"
+sysinfo = { version = "0.40.1", default-features = false, features = ["system"] }
+
+[target.'cfg(windows)'.dependencies]
+widestring = "1.0.2"
+windows-sys = { version = "0.61", features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

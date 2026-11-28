@@ -79,11 +79,11 @@ function withShift(unshifted: number, shift: boolean): string {
 
 function modifiersOf(event: KeyboardEvent | MouseEvent): number {
   return (event.shiftKey ? Modifier.shift : 0)
-    | (event.ctrlKey ? Modifier.control : 0)
+    | (event.ctrlKey ? Modifier.ctrl : 0)
     | (event.altKey ? Modifier.alt : 0)
     | (event.metaKey ? Modifier.super : 0)
-    | (event.getModifierState?.('CapsLock') ? Modifier.capsLock : 0)
-    | (event.getModifierState?.('NumLock') ? Modifier.numLock : 0)
+    | (event.getModifierState?.('CapsLock') ? Modifier.caps : 0)
+    | (event.getModifierState?.('NumLock') ? Modifier.num : 0)
 }
 
 export { modifiersOf }
@@ -103,6 +103,12 @@ export class Input {
   private readonly keyTextTimer: Timer
   /** The keys the source was told went down and has not been told came up */
   private readonly down = new Set<string>()
+  private lastX = Number.NaN
+  private lastY = Number.NaN
+  private lastHeight = Number.NaN
+  private lastFont = ''
+  private lastColor = ''
+  private lastBackground = ''
 
   constructor(private readonly source: TerminalSource, private readonly options: InputOptions) {
     this.keyTextTimer = new Timer(options.clock ?? systemClock)
@@ -135,22 +141,40 @@ export class Input {
 
   /**
    * Puts the field where the cursor is, so an input method's window opens beside what is being typed.
-   * In pixels from the corner of the element the field is in, and one row high.
+   * In pixels from the corner of the element the field is in, and one row high. Dirty-checked so
+   * repeated frames with an unchanged cursor touch zero DOM style properties.
    */
   moveTo(x: number, y: number, height: number): void {
-    this.field.style.left = `${x}px`
-    this.field.style.top = `${y}px`
-    // Some input methods break at zero size, so the field is at least a pixel in each dimension
     const size = Math.max(1, height)
-    this.field.style.height = `${size}px`
-    this.field.style.lineHeight = `${size}px`
+    if (x !== this.lastX) {
+      this.lastX = x
+      this.field.style.left = `${x}px`
+    }
+    if (y !== this.lastY) {
+      this.lastY = y
+      this.field.style.top = `${y}px`
+    }
+    if (size !== this.lastHeight) {
+      this.lastHeight = size
+      this.field.style.height = `${size}px`
+      this.field.style.lineHeight = `${size}px`
+    }
   }
 
   /** What a composition is drawn in: the terminal's own font and colours, over the cells it will replace */
   appearance(appearance: FieldAppearance): void {
-    this.field.style.font = appearance.font
-    this.field.style.color = appearance.color
-    this.field.style.background = appearance.background
+    if (appearance.font !== this.lastFont) {
+      this.lastFont = appearance.font
+      this.field.style.font = appearance.font
+    }
+    if (appearance.color !== this.lastColor) {
+      this.lastColor = appearance.color
+      this.field.style.color = appearance.color
+    }
+    if (appearance.background !== this.lastBackground) {
+      this.lastBackground = appearance.background
+      this.field.style.background = appearance.background
+    }
   }
 
   dispose(): void {
@@ -190,7 +214,7 @@ export class Input {
     const optionAsAlt = this.options.mac && this.options.optionIsAlt === true && event.altKey && !event.ctrlKey
     if (optionAsAlt && !this.composing && !event.isComposing) {
       const release = action === 'release'
-      return { action, code: event.code, modifiers: modifiersOf(event), text: release ? '' : withShift(unshifted, event.shiftKey), unshifted, composed: false }
+      return { action, code: event.code, modifiers: modifiersOf(event), text: release ? '' : withShift(unshifted, event.shiftKey), unshiftedCodepoint: unshifted, composed: false }
     }
     // A key the input method is in the middle of, or one that only starts an accent
     if (this.composing || event.isComposing || event.key === 'Dead' || event.key === 'Process' || event.keyCode === 229) return null
@@ -202,7 +226,7 @@ export class Input {
     if (character && event.getModifierState?.('AltGraph') === true) {
       // The key that reaches a keyboard's third level — `@`, `{`, `\` on most European layouts — is reported
       // by Windows as control and alt together. Those two are how the character was typed, not held with it
-      modifiers &= ~(Modifier.control | Modifier.alt)
+      modifiers &= ~(Modifier.ctrl | Modifier.alt)
       text = event.key
     } else if (this.options.mac && event.altKey && !event.ctrlKey) {
       // A Mac's option key is its third level, and the system has already typed the character by the time
@@ -215,7 +239,7 @@ export class Input {
       text = event.key
     }
     const release = action === 'release'
-    return { action, code: event.code, modifiers, text: release ? '' : text, unshifted, composed: !release && composed }
+    return { action, code: event.code, modifiers, text: release ? '' : text, unshiftedCodepoint: unshifted, composed: !release && composed }
   }
 
   private readonly keyDown = (event: KeyboardEvent) => {
@@ -250,7 +274,7 @@ export class Input {
         this.keyText = null
       })
     }
-    this.source.key(key)
+    this.source.sendKey(key)
     if (!MODIFIER_KEYS.has(event.key)) this.options.typed?.()
   }
 
@@ -258,7 +282,7 @@ export class Input {
   private readonly keyUp = (event: KeyboardEvent) => {
     if (!this.down.delete(event.code)) return
     const key = this.read(event, 'release')
-    if (key) this.source.key(key)
+    if (key) this.source.sendKey(key)
   }
 
   private readonly compositionStart = () => {
@@ -295,7 +319,7 @@ export class Input {
       this.held = { start: end, suffix: suffix }
     }
     if (text === '') return
-    this.source.text(text)
+    this.source.sendText(text)
     this.options.typed?.()
   }
 
@@ -308,7 +332,7 @@ export class Input {
     const sent = text === this.keyText ? '' : text
     this.clearKeyText()
     if (sent === '') return
-    this.source.text(sent)
+    this.source.sendText(sent)
     this.options.typed?.()
   }
 
@@ -323,11 +347,23 @@ export class Input {
     this.options.copy()
   }
 
+  /** Clears all transient keyboard/IME state (used on blur and unmount so remounting starts clean). */
+  reset(): void {
+    this.down.clear()
+    this.clearKeyText()
+    if (this.composing) {
+      this.composing = false
+      this.field.style.opacity = '0'
+      this.field.style.width = '1px'
+    }
+    this.field.value = ''
+    this.held = { start: 0, suffix: 0 }
+  }
+
   private readonly focus = () => this.options.focused(true)
   private readonly blur = () => {
     // Keys let go while something else has the keyboard are never heard of again
-    this.down.clear()
-    this.clearKeyText()
+    this.reset()
     this.options.focused(false)
   }
 }

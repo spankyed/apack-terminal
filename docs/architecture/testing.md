@@ -1,269 +1,142 @@
-# Testing
+# Testing & Verification — apack-terminal v2
+
+Every invariant in `apack-terminal` v2 is backed by an automated gate. Correctness is proven at six layers:
+deterministic sans-IO simulation, Rust → TypeScript wire codegen & golden vectors, cross-platform OS/PTY +
+real-Chromium WebGL2 E2E suites, mutation testing & Windows cfg hygiene, sanitizer/fuzzing coverage, and
+repeatable throughput/latency benchmarks.
+
+## 1. Sans-IO Deterministic Simulation (`crates/apack-sim`)
+
+Because `apack-proto` and `apack-core` are `#![no_std]` + `alloc` with zero OS dependencies, `apack-sim`
+drives the entire broker state machine under a virtual clock (`SimWorld`):
+
+- **Arbitrary Byte-Chunk Invariance:** Wire frames, control RPCs, and marker streams are fed whole, 1 byte
+  at a time, and in seeded random chunk splits, asserting bit-identical state transitions.
+- **Slow-Consumer & Flood Chaos:** Simulates stalled views, credit-starved raw output subscribers, DEC 2026
+  sync holds hitting the `1 s` cap, and `yes`-style output floods, asserting bounded queues, zero silent drops,
+  and exact `FrameCredit` / `OutputCredit` / `Throttled` / `OutputDropped` accounting.
+- **Lease & Reconnect Lifecycle:** Tests `BrokerImmediate`, `BrokerGrace`, and per-session lease handoff,
+  expiry across virtual time advances, and concurrent disconnect races deterministically with zero real sleeps.
+- **Hostile-PTY Security Tests:** Verifies spoofed `OSC 633;V;...` marks with wrong keys or replayed sequence
+  numbers are rejected and counted without ever forging `VouchedExitCode` or `PromptArrived`.
+
+## 2. Rust → TypeScript Wire Codegen & Golden Vectors
+
+`cargo xtask generate` (`xtask/src/wire_codegen.rs` & `xtask/src/generate.rs`) derives both the TypeScript
+wire codec and cross-language test vectors directly from `apack-proto`:
+
+- **Generated TS wire layer:** `view/src/wire/constants.ts`, `view/src/wire/types.ts`, and
+  `view/src/wire/messages.ts` are generated deterministically from `apack-proto` constants, bounds (such as
+  `MAX_SEARCH_NEEDLE_BYTES`), tags, and declarative wire schemas.
+- **Golden wire vectors:** `crates/apack-broker/tests/wire_vectors_v2.rs` encodes every `ClientMsg` and
+  `BrokerMsg` variant (plus mutual HMAC-SHA256 proofs) into `node/wire-vectors-v2.json`.
+- **Drift & release lockstep gates:** `cargo xtask check-generated` fails CI if generated TS wire files or
+  `node/wire-vectors-v2.json` drift from Rust, and `cargo xtask check-versions` fails CI if root `Cargo.toml`,
+  workspace crates, `node/package.json` (plus platform `optionalDependencies`), `view/package.json`, or
+  `view/package-lock.json` drift out of lockstep. `view/tests/wire-vectors.spec.ts` decodes every broker vector
+  and re-encodes every client vector byte-for-byte in TypeScript on every CI run.
+
+## 3. Unit, Integration, Cross-Platform & Real-Chromium E2E Suites
+
+Rust tests run under `cargo nextest run --workspace` (each test in its own process with `.config/nextest.toml`
+deadlines so a lost wake or signal fails fast instead of hanging):
+
+- **`apack-proto`, `apack-core`, `apack-sim`:** Protocol framing, LEB128 canon, state machine, simulation.
+- **`apack-vt-ghostty`:** `libghostty-vt` row extraction, Unicode/grapheme/wide cells, Kitty inline images,
+  blocked file/SHM reads inside the VT core, `ImageStore` LRU eviction, snapshot export/import.
+- **`apack-os`:** PTY/ConPTY spawn & resize, `KillTarget` invariants, POSIX process-group kill (`tree.rs`),
+  Windows Job Objects (`tree_windows.rs`), socket `0o700`/`0o600` + peer UID checks (`transport.rs`), Windows
+  SDDL pipe ACLs and owner SID verification (`security.rs`, `security_windows.rs`, `transport_windows.rs`),
+  and off-shard Kitty named-source (`t=f` / `t=s`) security enforcement (`image_sources/`).
+- **`apack-wal`:** CRC32C framing, SHA-256 `SegmentFooter` authenticity & live-dir verification, `safe_fs`
+  regular-file opens, dual-layer `KeyframeV2`, torn-tail crash recovery, $O(1)$ budget eviction, live blob
+  persistence/sweeping, symlink/foreign-directory refusal, zlib bomb caps, async worker flush barriers.
+- **`apack-broker` & root `tests/cli.rs`:** End-to-end sharded broker, `StreamAttachmentId` isolation,
+  phase-typed pre-Hello size caps, `SessionLifetime` (`Kept`/`LeaseBound`/`ConnBound`), transactional
+  `Rewind`/`Seek` + WAL blob/marks/status hydration, cross-platform WAL rollover & idle compression, `serve`
+  single-instance locking & `-h`/`--help`, `proxy` detached autostart & `--no-autostart`, `inspect --json`,
+  lease grace expiry, Kitty `t=f`/`t=s` broker wiring (including Unix symlinks/FIFOs and Windows NTFS
+  junction/UNC/named-pipe refusal), and real shell integration.
+- **View unit suite (`view/`):** Vitest suite covering `src/wire/*` (`wire-vectors.spec.ts`), `client.ts`,
+  `row-store.ts`, `viewport.ts`, `local-query.ts`, `input.ts`, `selection.ts`, `links.ts`, `draw.ts`, `images.ts`
+  (including `onEvict` GPU release & isolation), `canvas-painter.ts`, `webgl-painter.ts` (content-addressed
+  texture keys, `releaseImage`, closed-bitmap sweeping, `ShelfPacker`, `createPainter`), and `view.ts`
+  (centralized `isActive()` blink/timer suppression, one-shot `onEnded`, `pointerId` isolation), plus strict
+  DOM-only `tsc --noEmit` and Vite bundle build.
+- **Real-Chromium Playwright E2E suite (`view/e2e/`):** Boots a real `apack-terminal serve` v2 broker binary
+  over a local WebSocket bridge and mounts `TerminalView` in real Chromium for both `WebGL2AtlasPainter` and
+  `CanvasPainter`, asserting real rendered pixels (non-blank glyphs, RGB colors, cursor), color emoji vs
+  monochrome tinting, Kitty inline + cropped/cell-offset (`sourceRect`/`cellOffset`/`pixelSize`) image
+  compositing, scrollback `FetchRows`, mouse-drag selection/copy, live search highlights, resize/reflow, and
+  `WEBGL_lose_context` → `webglcontextrestored` recovery. Run locally with `npm --prefix view run test:e2e`
+  and enforced in CI (`view-e2e (Linux x64)`).
+- **Node (`node/`):** `brokerBinary()` resolution, version-locked `packAll`/`packView` (`gitHead`-stamped
+  `@apackdev/terminal-view` tarball), and release smoke verification (`smoke.mjs --require-view`).
+
+CI (`.github/workflows/ci.yml`) runs the full suite on **Linux x64**, **macOS arm64**, and **Windows x64**
+(with `cargo clippy` also run on Windows to catch `cfg(windows)` lint issues).
+
+## 4. Mutation Testing, Windows Cross-Check & `#[cfg]` Hygiene
+
+Every pull request and push runs `cargo mutants --workspace --in-diff` across 8 Linux shards plus a dedicated
+Windows runner for `.cargo/windows-only` files (`.github/workflows/mutants.yml`):
+
+- **Zero surviving mutants:** Any missed mutant fails CI.
+- **Zero dead exclusions:** `cargo xtask check-exclusions` verifies every entry in `.cargo/mutants.toml`
+  matches at least one real mutant and every file in `.cargo/windows-only` exists.
+- **`#[cfg]` mutant-hygiene gate (`cargo xtask check-cfg-hygiene`):** Enforced in `checks (Linux x64)` and
+  `pre-push`. Fails if mutable `#[cfg(windows)]` / `#[cfg(not(unix))]` logic (Windows-only functions, `impl`
+  blocks, inline modules, or conditional/arithmetic/match logic inside Windows-gated blocks) is placed outside
+  `.cargo/windows-only` files, preventing silent blind spots between the Linux and Windows mutation gates.
+- **Fast local Windows cross-check (`cargo xtask check-windows`):** Runs
+  `cargo clippy --locked --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings` locally on
+  macOS/Linux (using an isolated metadata-only `ghostty-vt-rs-sys` stub under `target/windows-check` so no
+  MSVC SDK is required for type/lint checks; pass `--xwin`, `--target`, `--check-only`, or `--no-stub` as
+  needed). Requires `rustup target add x86_64-pc-windows-msvc`.
+- **Process-control safety:** `SignalTarget` and `KillTarget` make `kill(0)`/`kill(-1)` uncompileable under
+  mutation, and the OS kill guard is explicitly excluded in `.cargo/mutants.toml`.
+
+## 5. AddressSanitizer, Fuzz Corpora & Continuous Fuzzing
+
+- **ASAN (`.github/workflows/ci.yml`, `AddressSanitizer (Linux x64)` gated by `ci-pass`):** Every code PR runs the workspace suite under
+  `RUSTFLAGS=-Zsanitizer=address` on x86_64 Linux to verify the `libghostty-vt` FFI and OS boundaries.
+- **Committed Fuzz Seed Corpora (`fuzz/seeds/`):** Compact seed corpora committed for all four fuzz targets:
+  `v2_wire`, `v2_wal`, `v2_vt`, and `v2_kitty_apc`. Every seed is deterministically replayed on stable Rust
+  across Linux, macOS, and Windows via `tests/fuzz_corpus.rs` (part of `cargo nextest run --workspace`).
+- **PR Fuzz Smoke Check (`cargo xtask fuzz-smoke` / CI `fuzz-smoke (Linux x64)`):** Replays all committed
+  seed corpora and runs a bounded nightly ASAN libFuzzer smoke pass across every target on every PR, failing
+  on any crash, panic, sanitizer violation, or OOM.
+- **Nightly Fuzzing (`.github/workflows/fuzz.yml`):** Automatically discovers every `[[bin]]` target in
+  `fuzz/Cargo.toml` (`v2_wire`, `v2_wal`, `v2_vt`, `v2_kitty_apc`) and fuzzes each with libFuzzer + persisted
+  corpora.
+
+## 6. Repeatable Performance & Flood Benchmarks (`cargo xtask bench`)
+
+`cargo xtask bench` builds the release `apack-terminal` binary and executes `benches/v2_bench.rs` covering
+five repeatable scenarios (sustained PTY flood throughput & isolated broker peak RSS, 60/120Hz TUI frame diff
++ wire encode/decode latency, 55k-line scrollback search + cooperative idle compression ratio/pause, WAL
+streaming/rollover/seek latency, and stdio `proxy` RTT overhead). Recorded baselines and methodology live in
+[benchmarks.md](benchmarks.md).
+
+## Local Commands
 
 ```sh
-cargo xtask pre-push                           # before a push: every check CI runs, and the change's mutants
-cargo nextest run --workspace                  # everything, each test in its own process
-cargo clippy --workspace --all-targets -- -D warnings
+cargo xtask pre-push                                  # full pre-push gate + diff mutants
 cargo fmt --all --check
-cargo xtask generate                           # regenerates node/protocol.d.ts; commit it if it moved
-cargo xtask check-generated                    # fails when it has fallen behind
-cargo xtask notices                            # regenerates the release's third-party notices (cargo-about 0.9.3)
-cargo xtask check-notices                      # fails when they have fallen behind
-cargo xtask check-exclusions                   # fails when a mutants exclusion excludes nothing
-cargo xtask clear-mutants                      # removes the working copies a mutants run that was ended left behind
-npm --prefix node test                         # the npm package's runtime entry and the release's packing
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo xtask check-generated
+cargo xtask check-safety
+cargo xtask check-cfg-hygiene
+cargo xtask check-versions
+cargo xtask check-windows                             # local Windows clippy cross-check
+cargo xtask check-notices
+cargo xtask check-exclusions
+cargo test --locked --workspace --doc
+cargo nextest run --locked --workspace --no-fail-fast
+cargo build --release --locked --bin apack-terminal
+cargo xtask fuzz-smoke --runs 1500                    # local seed replay + bounded fuzz smoke
+cargo xtask bench                                     # release throughput/latency benchmarks
+npm --prefix view run typecheck && npm --prefix view test && npm --prefix view run build
+npm --prefix view run test:e2e                        # real-Chromium WebGL2 & Canvas E2E
+npm --prefix node test
 ```
-
-## What each suite is for
-
-| Suite | Subject |
-|---|---|
-| `tests/broker.rs` | the broker driven as a consumer drives it: a real socket, the real binary |
-| `tests/parser.rs` | the VT core as a parser — grid snapshots, and the byte-boundary property |
-| `tests/markers.rs` | what a shell's markers say, read through the screen, including every chunk boundary |
-| `tests/status.rs` | what a session's programs say they are doing (OSC 7501): each rule a record is kept and let go by, the check against the program in front, and what Codex and Claude Code really sent (`tests/fixtures/program-status/`), fed back and held to the states they went through |
-| `tests/vouched.rs` | a session spawned with a key: that its commands are what its keyed marks say and nothing else — over generated streams, that nothing without the key changes them, that its own stream shown again changes nothing, and that a replay from any keyframe rebuilds the commands that were |
-| `tests/view_wire.rs`, `tests/view_vectors.rs` | the view protocol's bytes: the round trip over generated messages, arbitrary bytes, and the vectors the view's suite (`view/`) is held to |
-| `tests/view_model.rs` | the invariant a view rests on: a model that applies every frame it is sent holds exactly the terminal's screen and history, over generated streams |
-| `tests/view_frames.rs`, `tests/view_input.rs`, `tests/view_reads.rs` | what a frame carries and when one is sent; keys, pointer and paste as the core encodes them; words, lines, text and search |
-| `tests/view_sink.rs` | what waits to be written to one view connection, and where that ends |
-| `tests/deadlines.rs` | when a wait nothing met is given up on: once, not before it asked to be, in the order they fall due, and never for one that was met |
-| `tests/feed.rs` | what waits to be written to a client: the order it leaves in, the most that may wait, and that what is dropped is still accounted for |
-| `tests/writer.rs` | what is queued for a session's program: a pty that refused a write told apart from a session that ended, the most that may wait, and the pty's writer let go of only once the program is gone |
-| `tests/view_broker.rs` | a view driven as a window drives one: a real socket, the real binary, a real shell |
-| `tests/effects.rs`, `tests/commands.rs`, `tests/command_rows.rs` | what a program does that is not on its screen; the ring of commands a shell marked, and the lines each is on |
-| `tests/recording.rs`, `tests/keeping.rs` | a recording replayed, bounded and picked up from; sessions kept past their holder, restored and rewound, against the real binary |
-| `tests/keyframes.rs` | a recording's keyframe: that a terminal put back from one goes on as the terminal it was taken from, over generated output and whatever is written next; that a moment is the same screen from whichever keyframe it is replayed; its bound, what is refused, and that a terminal put back is under the settings of the session it is put back in |
-| `tests/images.rs` | images a program places: where each is told to be, and its pixels in parts |
-| `tests/image_sources.rs` | an image named rather than sent, held to the core reading files itself: the replies, image and screen of every spelling of a command, random spellings of a name, sources that are missing, directories, FIFOs, shared memory and long files; a FIFO does not stall the session; filesystems mounted beneath `/proc` and `/sys` are refused; a read is given up on once it goes quiet and not before |
-| `tests/image_source_rules.rs` | the rules a Windows path is held to before and after it is opened, on every platform; and on Windows, what is opened by them |
-| `tests/holds.rs` | the deadlines kept for screens a program is holding still: one a screen, and none left once each has been drawn or its session has ended |
-| `tests/housekeeping.rs` | history compressed once a session has gone quiet |
-| `tests/proxy.rs` | a broker reached through a process's stdin and stdout, proxies arriving together starting one, a connection a leaving broker never answered made again with what was said on it, and the one broker a socket has: its lock, its socket's mode, and when it leaves |
-| `tests/core_features.rs` | that the core this was built against has what the broker uses |
-| `tests/frames.rs` | the frame decoder as a decoder — arbitrary bytes, mutated frames, the round trip |
-| `tests/screen.rs` | what a snapshot answers: the viewport, the history asked for, the alternate screen |
-| `tests/channel.rs` | the bounded output channel and what an overload reports |
-| `tests/coalescing.rs` | output gathered into one event rather than one per read |
-| `tests/security.rs` | the pipe's descriptor as a string, on every platform |
-| `tests/candidates.rs` | the crates that were tried, kept as tests so the answers stay checked |
-| `node/test/` | `@apackdev/terminal` installed beside (or without) a platform package: the binary it answers, and when it answers none; the packing of each `bin-<commit>` release's packages, read back out of the tarballs, and that the platform packages' versions are the main package's. `binaries.yml` installs the real ones on each platform (`smoke`, `consume`) |
-
-`src/lib.rs` exists so the parser can be tested as a parser and the decoder as a decoder. Neither the grid,
-the scanner nor the bytes a stranger sends is a thing you write through a pty and a socket.
-
-## The property that catches what examples do not
-
-Output arrives in whatever sizes a `read` returned, so an escape sequence, a UTF-8 code point or an OSC
-string is routinely delivered in pieces — and that is where VT parsers break.
-
-So both parsing suites **feed the same stream at every boundary and demand the same answer**: exhaustively
-one byte at a time, at every single cut, and at arbitrary cuts with `proptest`. A wrapper that buffered a
-whole chunk, or reset anything per call, passes every test that feeds a stream whole and fails these.
-
-The streams carry UTF-8, CSI, OSC, DCS, APC, an alternate-screen round trip and a scroll region, because
-each is parsed by a different part of the state machine.
-
-The first snapshot of the UTF-8 stream is what found the one defect in the grid read: a wide character
-occupies two cells and the second holds a space, so the row read as text said `日 本 語`. Right to draw,
-wrong to match against — and matching is what a bounded read is for.
-
-## The bytes a stranger sends
-
-The frame decoder (`src/frames.rs`) is the only part of the protocol an unknown sender reaches: everything
-else in the broker runs on a `Request` that already parsed. A panic there ends every terminal the app has
-open, so the claim is not that a bad frame is reported well — it is that **no byte string gets anything
-other than one of five answers**, which is a property rather than a list of the malformed frames whoever
-wrote the test thought of.
-
-Three strategies, in increasing order of what they find:
-
-- **Arbitrary bytes**, which cover the reader: the cap, a newline that never comes, UTF-8 that is not.
-- **A valid frame with one byte changed**, which is the half that reaches the deserializer in a state it has
-  to decide about — `"kind":"spaw"`, a number where a string belongs, a string cut off mid-escape. Random
-  bytes are never nearly-valid JSON, so without this the deserializer is barely exercised.
-- **Every request serialized and read back**, which is the app's half of the seam: a `Serialize` and a
-  `Deserialize` that disagree is a frame the app can send and the broker cannot read, and no amount of
-  fuzzing the broker's side would show it. `node/protocol.d.ts` is generated from the same derives.
-
-Beside them the cap's boundary is asserted by example, because it is one byte and not a distribution: a
-frame whose line is exactly `MAX_FRAME_BYTES` is read, and one byte longer is refused. That is what the
-reader's `take(cap + 1)` is for, and nothing had asserted it.
-
-## Snapshots
-
-`insta` holds the grid a stream produces, so a change in what the parser does to a stream is a reviewable
-diff rather than an assertion someone has to word. `cargo insta review` accepts or rejects one.
-
-## Killing a session's tree
-
-`killing_a_session_takes_the_whole_tree_with_it` spawns a grandchild that outlives its shell and asks the OS
-whether it is gone — with a pid captured at spawn, never by matching a process by name.
-
-**It runs on both platforms**, which is what makes X1 a claim about Windows and not only about POSIX: the
-grandchild is `sleep 300 &` on POSIX and a hidden detached PowerShell started with `Start-Process -PassThru`
-on Windows, and the first Windows mutation of `src/tree.rs` showed the assertion is load-bearing there —
-break the Job Object in any of the ways that matter and this case fails.
-
-**Its two waits are different kinds, and only one of them can be bound by progress.** Waiting for the shell
-to run a line and write a file is a wait on another process's *work*, and output arriving on the session is
-the signal that it is still happening, so that is the bound. Waiting for a killed tree to be reaped has no
-such signal — a process being torn down reports nothing and the only observable is its absence — so it stays
-a counted grace, said out loud rather than converted. On Windows each probe runs `tasklist`, so that grace
-stretches with load by itself.
-
-On Windows that is the Job Object doing it (`tree.rs`); on POSIX it is the kernel's SIGHUP to the pty's
-foreground group. **The Windows half is claimed on a Windows run or not at all**, which is why the suite
-runs there rather than being reasoned about from a Mac.
-
-## Two cases are POSIX-only, and say why
-
-`cmd.exe` has no `printf` and no way to write an escape byte that is not also echoed, so the Windows form of
-a marker case would assert the echo rather than the shell's report. PowerShell can, and arranging markers
-there is work that belongs to a Windows session.
-
-## A disconnect has to be made to happen
-
-Dropping the test's handles does not reliably close a connection: the events reader holds a clone of the
-socket and is blocked in `read`, so it cannot notice its channel is gone until something wakes it. A case
-that drained the output first and then dropped would wait for ever for a broker that was behaving
-correctly.
-
-`disconnect` wakes it on purpose — the receiver goes, then one malformed frame the broker is certain to
-answer. This is worth knowing before writing a case about a client going away.
-
-## A wait for the broker says what it waited for
-
-**Every case that waits on the broker or a process it started while it runs listens through
-`tests/_support/heard.rs`.**
-A thread reads and a channel hands over what it read, so a wait is bounded by silence (`QUIET`): everything
-heard resets it, a slow machine makes a wait longer and never fails it, and one that runs out fails as the
-case's own panic — at the line that waited, with the last few things heard — before the run's deadline would
-end the case with nothing but how long it took. A lost signal is then a message saying where output stopped.
-
-**Read at the case's pace where the subject is not reading** (`Heard::paced`): nothing is read until the case
-asks, so a case about backpressure fills the channel it means to. Everywhere else the reader runs ahead, so a
-case whose subject is a reader that keeps up has one.
-
-## A case nextest calls leaky on a busy machine
-
-**`LEAK` on a case that starts no process is the machine, not the case.** nextest calls a case leaky when its
-output pipes are still open 100 ms after the process exits. Under twenty busy loops on ten cores, each full run
-flagged from one to nine cases. All of them were cases that start no process (`images`, `placeholders`,
-`recording`, `view_frames`, `view_input`, `view_reads`, `vouched`, `keyframes`, `coalescing`), and the set was
-different in every run.
-Run alone under the same load, two of them were flagged in none of two hundred runs. With nextest's window
-raised to a second for a diagnostic run, most of the flags went, though `coalescing`'s in-process cases were
-still flagged once. So these flags mark how long a saturated machine took to tear a process down or to tell
-nextest so, not something left running (2026-11-17).
-
-What would be a finding is a case that **does** start the broker or a shell being flagged when the machine is
-quiet: that is a process outliving its case, which the reaper (`tests/reaper.rs`) exists to stop. List what
-is running from the worktree's `target/` after the run before concluding either way.
-
-## A test runs in its own process, and has a deadline
-
-`cargo nextest run` runs each test in a process of its own, so a test that has stopped ending is killed at
-its deadline and the rest run on. That matters more here than in most suites: nearly every case waits for a
-frame the broker sends *when something happened*, so the shape of a lost signal is a `read` that never
-returns rather than a wrong answer — and under `cargo test` one such case holds the whole run.
-
-The deadlines are in [`.config/nextest.toml`](../../.config/nextest.toml). Each is several times the slowest
-reading rather than near it, because what it is for is a test that has stopped ending at all: the whole
-suite is 16 s on an Apple-silicon laptop at a load average of 60 (599 tests, 2026-11-17), and its slowest
-case 6.2 s against the default deadline of 20 s. **The deadline is a clock**, so a case's own work counts
-against it: on a machine busy enough, a case that does real work can time out though nothing is wrong. That
-is why a case's work is kept small and a wait is bounded by silence rather than by time, and why a timeout
-under load is read as a possible lost signal first — the ones found so far were.
-
-**The suite is one program** (`tests/suite.rs`), whose modules are the files beside it: a file of its own
-under `tests/` would be a binary of its own, linked against the whole library, and thirty of those were
-most of what a changed line cost to build. **Its cases run cheapest first** (the priorities in
-`.config/nextest.toml`): the ones that are a function call before the ones that start the broker and a
-shell, with the three longest started at the beginning so the run does not end waiting for them. **A case
-names its shell.** A spawn that names none runs the login shell of whoever ran the suite, with their
-configuration, which is seconds where `/bin/sh` is milliseconds and is what made cases go quiet on a busy
-machine. `tests/channel.rs` and `tests/candidates.rs` are where the default program is run, and they name
-it too: `portable-pty` chooses it from the spawn's own `SHELL`, which they set to `/bin/sh`. **A case about a wait gives the broker a short
-one** (`APACK_TERMINAL_START_GRACE_MS`): that a broker nothing connects to leaves when its grace is over
-is the same claim at half a second as at ten.
-
-## Mutation testing
-
-**`src/tree.rs` is answered on Windows, and only there.** It is `#[cfg(windows)]` in its entirety, so a
-Mac or a Linux run compiles none of it and cannot kill any of its mutants — which is why it is excluded
-from no run and why `mutants.yml` takes a dispatch: `gh workflow run mutants.yml -f files=src/tree.rs`.
-The first such run, 2026-11-09, tested 7 and reported 5 caught, 1 unviable and 1 missed. The missed one is
-the POSIX arm of `Tree::owning`, which Windows does not compile and which does not build off Windows
-either, and it is excluded by name with that reading.
-
-**Every exclusion excludes something**, which `cargo xtask check-exclusions` asks cargo-mutants rather than
-deciding for itself (`--re` filters by the same matching `--exclude-re` uses). A pattern that matches no
-mutant is worse than no pattern: the gate goes on reporting the survivor it was written for while the comment
-above it reads as a settled question. It has happened twice — `security.rs`'s patterns were written as
-`in <fn>`, which cargo-mutants prints only for a mutant inside a function, and `tree.rs`'s was written with
-one backslash, which is not a TOML escape and stopped the file parsing at all. Both were found by CI rather
-than by the author. `xtask/tests/exclusions.rs` drives the check's decision with counts of its own, so it can
-be watched failing without a dead pattern committed to the file it reads.
-
-`cargo xtask pre-push` ends with the change's mutants: cargo-mutants edits each line the change touched into
-something that still compiles, and a mutant the suite still passes is a line no case holds. The run is
-scoped to the change (`--in-diff`) rather than the repository, because a survivor nobody edited is not this
-push's to answer for, and a whole-repository run is minutes of them.
-
-A survivor is answered one of two ways, and never left:
-
-- **killed** — the case that should have caught it is written, which is the normal answer.
-- **excluded** — in [`.cargo/mutants.toml`](../../.cargo/mutants.toml) with the reason, for a mutant that
-  answers exactly what the code answers. There is one: `sendable`'s ASCII arm returns 1 and so does the `_`
-  fallback, so deleting the arm changes no answer. It is kept because it says ASCII is one byte, where `_`
-  says *not a lead byte at all* — removing it to kill the mutant would make that comment wrong.
-
-**A property that can fail by chance makes the run's verdicts false.** `proptest` saves a failing case
-beside the test and replays it first on every later run, and cargo-mutants tests every mutant in one copy of
-the tree per job. So a property that fails once for an input the code handles correctly fails again for
-every mutant after it in that copy, and each of those is reported caught by a case that never looked at it.
-A property here holds for every input its strategy can produce; when a run's logs show one test failing
-across mutants it cannot reach, that test is the defect and the run is not a result.
-
-**What a mutant costs is a build and the suite up to its first failure**, and each of those is kept
-small on purpose: one test program to link, the cheap cases first, and a run that ends at the first case
-to fail rather than waiting for the ones in flight (`additional_cargo_test_args`, `.cargo/mutants.toml`).
-Measured on one sample of 51 mutants, four at a time (2026-11-11): a mutant the suite caught took 3.2 s
-to test, where it had taken 21.4 s, and a pass over a branch of 1,505 had run for three hours without
-finishing. **Run one pass at a time on a machine**: two at once left real-process cases waiting ten
-seconds on a shell, and they failed for mutants in code they never reach — which reads as *caught*.
-
-`.github/workflows/mutants.yml` runs the same thing on a pull request and fails on a survivor, dealt across
-eight runners, and a pass that has started finishes rather than being cancelled by the next push. It runs twice:
-Windows-only code compiles on no other platform, so a Linux run reports every mutant of `src/tree.rs` and of
-every `cfg(windows)` arm as unviable, and the Windows job is where those are actually tested.
-
-## The suite runs on all three platforms
-
-[`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) runs the whole suite on Linux, macOS and
-Windows, and the cheap checks — format, clippy, the generated protocol, the doc tests — on Linux alone.
-Three platforms is the point rather than thoroughness: a pty, a process tree and a shell's own reports are
-each the platform's answer, and the rule above holds for every one of them.
-
-## Native numbers: the baseline
-
-`cargo bench --bench broker` (`benches/broker.rs`) drives the release broker as a client and reports; it never fails.
-Recorded 2026-11-12 on the developer's Mac (Apple Silicon, macOS), load average about 8 during the run:
-
-| Measurement | Result |
-|---|---|
-| Output throughput, `seq 1 1000000` (7.9 MB) | 7.24 MB/s, 1.09 s |
-| Keystroke echo, back to back (300 round trips), median | 22.65 ms |
-| Keystroke echo, spaced 60 ms apart (300), median | 0.16 ms |
-| Broker resident memory, 1 / 10 / 50 idle sessions | 10.6 / 12.0 / 15.7 MB |
-
-Bytes arriving within a window of the last flush wait out the rest of it, so a burst that pauses is still one
-message a window, unless the session was typed at since the last flush began: then what arrives is its answer and
-leaves at once (`output::Wrote`), which is what the back-to-back figure measures. On 2026-11-17, alternating with
-the commit before, at load averages of 131–189, the back-to-back median was 0.05–0.14 ms against 1.39–2.93 ms.
-
-The throughput figure is not the broker's alone. The benchmark's client parses each output event as JSON, and that
-parsing is on the same thread that times the run, so this number is the floor of what a client that reads the broker
-can see, not the broker's ceiling. It is close to the 7.7 MB/s the evaluation measured through Node, which says Node
-was not the only limit.

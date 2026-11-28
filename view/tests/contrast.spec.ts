@@ -1,10 +1,9 @@
-// What a character is drawn in against what it sits on. The contrast ratio is WCAG 2.x's, so its values are the ones a
-// published checker gives for the same colours; a colour the program chose is kept whenever it is already far enough.
+// What a character is drawn in against what it sits on. The contrast ratio is WCAG 2.x's.
 import { describe, expect, it } from 'vitest'
 import { contrastRatio, ensureContrast, luminance } from '../src/contrast.ts'
 import { drawRow, type Theme } from '../src/draw.ts'
-import { PLAIN, paletteColor, type Style } from '../src/source.ts'
-import { PALETTE, row } from './_support.ts'
+import type { StyleSpec } from '../src/source.ts'
+import { PALETTE, packedPalette, packedRgb, row } from './_support.ts'
 
 const WHITE = 0xffffff
 const BLACK = 0x000000
@@ -36,8 +35,6 @@ describe('the colour a character is drawn in', () => {
   })
 
   it('is moved to the nearest colour that reaches the minimum, not one further along', () => {
-    // The adjustment's path: from the foreground toward whichever of black or white gives more contrast, which is the
-    // target a reader would pick. Each step along it is a blend, so the scan below walks the path a thousandth at a time.
     const along = (foreground: number, target: number, amount: number) => {
       const mix = (shift: number) => Math.round(((foreground >> shift) & 0xff) * (1 - amount) + ((target >> shift) & 0xff) * amount)
       return (mix(16) << 16) | (mix(8) << 8) | mix(0)
@@ -61,27 +58,28 @@ describe('the colour a character is drawn in', () => {
           }
           const reach = nearest(foreground, background, minimum)
           if (reach === null) {
-            // Not reachable even at black or white: the most contrast the colour can have is drawn
             const best = Math.max(contrastRatio(BLACK, background), contrastRatio(WHITE, background))
             expect(contrastRatio(drawn, background), label).toBeCloseTo(best, 2)
             continue
           }
           expect(contrastRatio(drawn, background), label).toBeGreaterThanOrEqual(minimum)
-          // Within a channel unit of the nearest colour on the path, so neither less nor further adjusted was chosen
-          for (const shift of [16, 8, 0]) expect(Math.abs(((drawn >> shift) & 0xff) - ((reach.colour >> shift) & 0xff)), label).toBeLessThanOrEqual(1)
-          // A little less adjusted than that fails the minimum
-          if (reach.amount >= 0.01) expect(contrastRatio(along(foreground, reach.target, reach.amount - 0.01), background), label).toBeLessThan(minimum)
+          for (const shift of [16, 8, 0]) {
+            expect(Math.abs(((drawn >> shift) & 0xff) - ((reach.colour >> shift) & 0xff)), label).toBeLessThanOrEqual(1)
+          }
+          if (reach.amount >= 0.01) {
+            expect(contrastRatio(along(foreground, reach.target, reach.amount - 0.01), background), label).toBeLessThan(minimum)
+          }
         }
       }
     }
   })
 
-  it('goes to black or white when nothing nearer is far enough, which is the most a colour can do', () => {
+  it('goes to black or white when nothing nearer is far enough', () => {
     expect(ensureContrast(0x111111, BLACK, 22)).toBe(WHITE)
     expect(ensureContrast(0xeeeeee, WHITE, 22)).toBe(BLACK)
   })
 
-  it('is the same answer each time it is asked for, whether it was cached or not', () => {
+  it('is the same answer each time it is asked for, whether cached or not', () => {
     const first = ensureContrast(0x2a2a2a, BLACK, 4.5)
     expect(ensureContrast(0x2a2a2a, BLACK, 4.5)).toBe(first)
   })
@@ -89,9 +87,16 @@ describe('the colour a character is drawn in', () => {
 
 describe('a character drawn with a minimum contrast', () => {
   const background = 0x1e1e1e
-  const theme: Theme = { background, foreground: WHITE, palette: PALETTE, cursor: WHITE, cursorText: background, selectionBackground: 0x264f78, selectionForeground: null }
-  // Palette 1 is the program's own dark red: about 2:1 on the theme's background, too close to read
-  const darkRed: Style = { ...PLAIN, fg: paletteColor(1), bg: null }
+  const theme: Theme = {
+    background,
+    foreground: WHITE,
+    palette: PALETTE,
+    cursor: WHITE,
+    cursorText: background,
+    selectionBackground: 0x264f78,
+    selectionForeground: null,
+  }
+  const darkRed: StyleSpec = { fg: packedPalette(1) }
 
   it('is drawn at the minimum where the program chose a colour too close to its background', () => {
     const glyph = drawRow(row(0, 'a', { style: 1, styles: [darkRed] }), { ...theme, minimumContrast: 4.5 }).glyphs[0]!
@@ -105,10 +110,9 @@ describe('a character drawn with a minimum contrast', () => {
   })
 
   it('is measured against the search match it is drawn over, where a search found it', () => {
-    const grey: Style = { ...PLAIN, fg: 0x7a7a7a, bg: null }
+    const grey: StyleSpec = { fg: packedRgb(0x7a7a7a) }
     const black = { ...theme, background: BLACK, minimumContrast: 4.5 }
     const current = 0x9e6a03
-    // On black alone the grey is far enough, so it is kept; on the current match it is not, and must be moved
     expect(drawRow(row(0, 'a', { style: 1, styles: [grey] }), black).glyphs[0]!.color).toBe(0x7a7a7a)
     const found = drawRow(row(0, 'a', { style: 1, styles: [grey] }), black, undefined, false, [{ from: 0, to: 1, color: current }])
     expect(contrastRatio(found.glyphs[0]!.color, current)).toBeGreaterThanOrEqual(4.5)
@@ -116,7 +120,11 @@ describe('a character drawn with a minimum contrast', () => {
 
   it('is measured against the selection where the character is selected', () => {
     const selected = { from: 0, to: 1 }
-    const glyph = drawRow(row(0, 'a', { style: 1, styles: [darkRed] }), { ...theme, minimumContrast: 4.5, selectionBackground: 0xffffff }, selected).glyphs[0]!
+    const glyph = drawRow(
+      row(0, 'a', { style: 1, styles: [darkRed] }),
+      { ...theme, minimumContrast: 4.5, selectionBackground: 0xffffff },
+      selected,
+    ).glyphs[0]!
     expect(contrastRatio(glyph.color, 0xffffff)).toBeGreaterThanOrEqual(4.5)
   })
 })

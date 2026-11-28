@@ -1,0 +1,424 @@
+//! Windows named-pipe transport helpers: per-SID default name, `GetSecurityInfo` owner check,
+//! `CancelIoEx` + `DisconnectNamedPipe` hang-up, and `assume_flushed` non-discarding let-go.
+//!
+//! Listed in `.cargo/windows-only` so Linux mutation shards skip it and Windows CI mutates it.
+
+#![cfg(windows)]
+
+use std::io;
+use std::os::windows::io::{AsHandle, AsRawHandle};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, GetSecurityInfo, SE_KERNEL_OBJECT};
+use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
+use windows_sys::Win32::System::Console::{
+    GetConsoleCP, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCtrlHandler,
+    SetStdHandle,
+};
+use windows_sys::Win32::System::IO::CancelIoEx;
+use windows_sys::Win32::System::Pipes::{DisconnectNamedPipe, GetNamedPipeClientProcessId};
+use windows_sys::Win32::System::Threading::{
+    CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+};
+
+const WINDOWS_DETACHED_FLAGS: u32 = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+
+/// Configures a spawned broker [`std::process::Command`] to run detached from the caller's console.
+pub fn configure_detached_command(cmd: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(WINDOWS_DETACHED_FLAGS);
+}
+
+fn should_close_old_stderr(old: HANDLE, stdin: HANDLE, stdout: HANDLE, new_handle: HANDLE) -> bool {
+    !old.is_null() && old != INVALID_HANDLE_VALUE && old != stdin && old != stdout && old != new_handle
+}
+
+/// Redirects `STD_ERROR_HANDLE` to `NUL` and closes the inherited startup stderr pipe write handle
+/// once a detached background broker (`--detached`) has finished binding, so the proxy's stderr
+/// collector sees EOF cleanly and post-bind `eprintln!` calls cannot panic with `ERROR_BROKEN_PIPE`.
+pub fn prepare_detached_daemon(redirect_stderr: bool) {
+    if !redirect_stderr {
+        return;
+    }
+    // SAFETY: `GetConsoleCP` queries the attached console code page (0 when detached).
+    if unsafe { GetConsoleCP() } != 0 {
+        return;
+    }
+    if let Ok(nul) = std::fs::OpenOptions::new().write(true).open("NUL") {
+        use std::os::windows::io::IntoRawHandle;
+        // SAFETY: `GetStdHandle` fetches the inherited std handles; `SetStdHandle` installs `nul`'s
+        // handle as process stderr before transferring ownership via `into_raw_handle()`, and we
+        // only close `old` when it is valid and not shared with stdin/stdout/new_handle.
+        unsafe {
+            let old = GetStdHandle(STD_ERROR_HANDLE);
+            let stdin = GetStdHandle(STD_INPUT_HANDLE);
+            let stdout = GetStdHandle(STD_OUTPUT_HANDLE);
+            let new_handle = nul.as_raw_handle() as HANDLE;
+            if SetStdHandle(STD_ERROR_HANDLE, new_handle) != 0 {
+                let _ = nul.into_raw_handle();
+                if should_close_old_stderr(old, stdin, stdout, new_handle) {
+                    CloseHandle(old);
+                }
+            }
+        }
+    }
+}
+
+/// Maps Windows named-pipe bind errors indicating an existing instance to [`crate::OsError::AlreadyHeld`].
+pub fn map_bind_error(err: io::Error) -> crate::OsError {
+    if matches!(err.kind(), io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied) {
+        crate::OsError::AlreadyHeld
+    } else {
+        crate::OsError::io("binding local listener", err)
+    }
+}
+
+/// Cancels pending I/O on a named pipe and disconnects it abruptly.
+pub fn hang_up(pipe: &impl AsHandle) -> bool {
+    let handle = pipe.as_handle().as_raw_handle() as HANDLE;
+    // SAFETY: `handle` is borrowed from a live pipe; a null overlapped pointer cancels all pending
+    // I/O on `handle`, followed by disconnecting the pipe instance.
+    unsafe {
+        let cancelled = CancelIoEx(handle, std::ptr::null()) != 0;
+        let disconnected = DisconnectNamedPipe(handle) != 0;
+        cancelled || disconnected
+    }
+}
+
+/// Cancels pending I/O without disconnecting so unread written bytes stay available to the peer,
+/// switches to non-blocking before cancelling, waits for writers via `writers_ended`, and marks
+/// the pipe `assume_flushed` so drop closes the handle immediately without hanging on a silent peer.
+pub fn let_go(
+    pipe: &interprocess::os::windows::named_pipe::local_socket::Stream,
+    writers_ended: impl FnOnce(),
+) -> bool {
+    let handle = pipe.as_handle().as_raw_handle() as HANDLE;
+    let _ = pipe.inner().set_nonblocking(true);
+    // SAFETY: `handle` is borrowed from a live pipe; null overlapped cancels all pending I/O.
+    let cancelled = unsafe { CancelIoEx(handle, std::ptr::null()) != 0 };
+    writers_ended();
+    pipe.inner().assume_flushed();
+    cancelled
+}
+
+/// Returns the default user-scoped Windows named pipe path (`\\.\pipe\apack-terminal-<SID>`).
+pub fn default_pipe_name() -> Option<String> {
+    let sid = crate::security::current_user_sid().ok()?;
+    Some(format!(r"\\.\pipe\apack-terminal-{}", sid.to_string_lossy()))
+}
+
+/// Verifies (client-side) that `pipe` is owned by the current user's SID.
+pub fn owned_by_this_user(pipe: &impl AsHandle) -> io::Result<bool> {
+    owned_by(pipe, &crate::security::current_user_sid()?)
+}
+
+/// Verifies (server-side) that the connected named-pipe client process runs as the current user's SID.
+///
+/// Unlike [`owned_by_this_user`] (which reads the pipe object's own owner SID), this inspects the
+/// connecting client's PID via `GetNamedPipeClientProcessId` and compares its process token user SID
+/// against the current user's SID.
+pub fn client_is_this_user(pipe: &impl AsHandle) -> io::Result<bool> {
+    let expected = crate::security::current_user_sid()?;
+    let handle = pipe.as_handle().as_raw_handle() as HANDLE;
+    let mut client_pid: u32 = 0;
+    // SAFETY: `handle` is borrowed from a live server-side named pipe; `client_pid` is a valid out-pointer.
+    if unsafe { GetNamedPipeClientProcessId(handle, &mut client_pid) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if client_pid == 0 {
+        return Ok(false);
+    }
+    // SAFETY: opens the client process for query-only token inspection and closes the handle before returning.
+    let proc = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, client_pid) };
+    if proc.is_null() {
+        return Ok(false);
+    }
+    let client_sid = crate::security_windows::user_sid_for_process(proc);
+    // SAFETY: `proc` is a valid non-null handle opened by `OpenProcess` above.
+    unsafe { CloseHandle(proc) };
+    Ok(client_sid.is_ok_and(|sid| sid == expected))
+}
+
+struct CtrlHook {
+    flag: Arc<AtomicBool>,
+    wake: Arc<dyn Fn() + Send + Sync>,
+}
+
+static CTRL_HOOK: Mutex<Option<CtrlHook>> = Mutex::new(None);
+
+// SAFETY: Windows calls this handler on a dedicated OS control thread (not an async POSIX signal
+// context); locking a short non-reentrant mutex to clone the hook and dropping the lock BEFORE
+// invoking `wake()` avoids holding a global mutex across caller callbacks.
+unsafe extern "system" fn console_ctrl_handler(_ctrl_type: u32) -> i32 {
+    let cloned = {
+        let guard = CTRL_HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().map(|hook| (Arc::clone(&hook.flag), Arc::clone(&hook.wake)))
+    };
+    if let Some((flag, wake)) = cloned {
+        flag.store(true, Ordering::Release);
+        wake();
+        return 1;
+    }
+    0
+}
+
+/// Guard keeping a Windows `SetConsoleCtrlHandler` registration active until dropped.
+pub struct ShutdownSignalGuard(());
+
+impl Drop for ShutdownSignalGuard {
+    fn drop(&mut self) {
+        let mut guard = CTRL_HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = None;
+        // SAFETY: removes the exact handler registered in `install_shutdown_signals` while holding
+        // `CTRL_HOOK` so a concurrent `install_shutdown_signals` cannot race with unregistration.
+        unsafe {
+            SetConsoleCtrlHandler(Some(console_ctrl_handler), 0);
+        }
+    }
+}
+
+/// Installs a Windows console control handler (`Ctrl+C`, `Ctrl+Break`, close, shutdown) that sets
+/// `flag` and calls `wake` so the broker shuts down cleanly.
+pub fn install_shutdown_signals(
+    flag: Arc<AtomicBool>,
+    wake: impl Fn() + Send + Sync + 'static,
+) -> io::Result<ShutdownSignalGuard> {
+    let mut guard = CTRL_HOOK.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_some() {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, "shutdown signal handler already installed"));
+    }
+    *guard = Some(CtrlHook { flag, wake: Arc::new(wake) });
+    // SAFETY: registers a valid `extern "system"` console control callback while holding `CTRL_HOOK`.
+    let ok = unsafe { SetConsoleCtrlHandler(Some(console_ctrl_handler), 1) } != 0;
+    if !ok {
+        *guard = None;
+        return Err(io::Error::last_os_error());
+    }
+    Ok(ShutdownSignalGuard(()))
+}
+
+fn owned_by(pipe: &impl AsHandle, sid: &widestring::U16CStr) -> io::Result<bool> {
+    let handle = pipe.as_handle().as_raw_handle() as HANDLE;
+    // SAFETY: `handle` is borrowed from a live pipe. `GetSecurityInfo` allocates `descriptor`
+    // and `ConvertSidToStringSidW` allocates `text`; both are wrapped in `LocalMem` RAII guards
+    // immediately on success so every return or unwind path releases them via `LocalFree`.
+    unsafe {
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let rc = GetSecurityInfo(
+            handle,
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        );
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc as i32));
+        }
+        let _descriptor_guard = crate::security_windows::LocalMem(descriptor as HLOCAL);
+        let mut text: windows_sys::core::PWSTR = std::ptr::null_mut();
+        if ConvertSidToStringSidW(owner, &mut text) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let Some(text_nn) = std::ptr::NonNull::new(text) else {
+            return Err(io::Error::other("ConvertSidToStringSidW returned null"));
+        };
+        let _text_guard = crate::security_windows::LocalMem(text_nn.as_ptr().cast::<core::ffi::c_void>() as HLOCAL);
+        Ok(widestring::U16CStr::from_ptr_str(text_nn.as_ptr()) == sid)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+
+    use interprocess::local_socket::prelude::*;
+    use interprocess::local_socket::{GenericFilePath, ListenerOptions, Stream, ToFsName};
+    use interprocess::os::windows::local_socket::ListenerOptionsExt;
+
+    use super::*;
+
+    #[test]
+    fn map_bind_error_classifies_held_vs_other() {
+        assert!(matches!(
+            map_bind_error(io::Error::new(io::ErrorKind::AddrInUse, "in use")),
+            crate::OsError::AlreadyHeld
+        ));
+        assert!(matches!(
+            map_bind_error(io::Error::new(io::ErrorKind::PermissionDenied, "denied")),
+            crate::OsError::AlreadyHeld
+        ));
+        assert!(matches!(
+            map_bind_error(io::Error::new(io::ErrorKind::NotFound, "missing")),
+            crate::OsError::Io { .. }
+        ));
+    }
+
+    #[test]
+    fn pipe_owner_check_let_go_and_hang_up() {
+        let name = format!(r"\\.\pipe\apack-v2-os-test-{}", std::process::id());
+        let listener = ListenerOptions::new()
+            .name(name.clone().to_fs_name::<GenericFilePath>().expect("pipe name"))
+            .security_descriptor(crate::security::owner_only_security_descriptor().expect("owner descriptor"))
+            .create_sync()
+            .expect("create pipe");
+
+        let connect_name = name.clone();
+        let client_th = std::thread::spawn(move || {
+            Stream::connect(connect_name.to_fs_name::<GenericFilePath>().expect("name")).expect("connect")
+        });
+        let server = Arc::new(listener.accept().expect("accept"));
+        let Stream::NamedPipe(client) = client_th.join().expect("join");
+
+        assert!(owned_by_this_user(&client).expect("owner check"));
+        let Stream::NamedPipe(server_pipe) = &*server;
+        assert!(client_is_this_user(server_pipe).expect("client user check"));
+        let system = widestring::U16CString::from_str("S-1-5-18").expect("system sid");
+        assert!(!owned_by(&client, &system).expect("not SYSTEM"));
+
+        (&*server).write_all(b"preserved\n").expect("write");
+
+        let (tx, rx) = channel();
+        std::thread::spawn({
+            let server = Arc::clone(&server);
+            move || {
+                let mut buf = [0u8; 16];
+                let mut reader: &Stream = &server;
+                let _ = tx.send(reader.read(&mut buf).map_err(|e| e.raw_os_error()));
+            }
+        });
+
+        let mut cancelled = false;
+        let start = std::time::Instant::now();
+        let outcome = loop {
+            assert!(start.elapsed() < Duration::from_secs(10));
+            let Stream::NamedPipe(pipe) = &*server;
+            cancelled |= let_go(pipe, || {});
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(res) => break res,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(e) => panic!("reader exited unexpectedly: {e}"),
+            }
+        };
+        assert!(cancelled);
+        assert_eq!(outcome, Err(Some(995)));
+        drop(server);
+
+        let mut got = String::new();
+        let _ = (&client).read_to_string(&mut got);
+        assert_eq!(got, "preserved\n");
+
+        // Second pipe: let_go on an idle pipe with no pending I/O cancels nothing (returns false),
+        // and hang_up disconnects a connected idle pipe (returns true) then false on repeat.
+        let idle_name = format!(r"\\.\pipe\apack-v2-os-hangup-{}", std::process::id());
+        let idle_listener = ListenerOptions::new()
+            .name(idle_name.clone().to_fs_name::<GenericFilePath>().expect("name"))
+            .create_sync()
+            .expect("idle pipe");
+        let idle_th = std::thread::spawn(move || {
+            Stream::connect(idle_name.to_fs_name::<GenericFilePath>().expect("name")).expect("connect idle")
+        });
+        let Stream::NamedPipe(idle_server) = idle_listener.accept().expect("accept idle");
+        let _idle_client = idle_th.join().expect("join idle");
+        assert!(!let_go(&idle_server, || {}));
+        assert!(hang_up(&idle_server));
+        assert!(!hang_up(&idle_server));
+        assert!(client_is_this_user(&idle_server).is_err(), "disconnected pipe must fail client_is_this_user");
+    }
+
+    #[test]
+    fn shutdown_signal_guard_registers_invokes_and_unregisters() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let woke = Arc::new(AtomicBool::new(false));
+        let woke_cb = Arc::clone(&woke);
+        let guard = install_shutdown_signals(Arc::clone(&flag), move || {
+            woke_cb.store(true, Ordering::Release);
+        })
+        .expect("install console ctrl handler");
+        let dup = install_shutdown_signals(Arc::new(AtomicBool::new(false)), || {});
+        assert_eq!(dup.err().map(|e| e.kind()), Some(io::ErrorKind::AlreadyExists));
+        // SAFETY: invoking the registered callback directly simulates an OS console control event.
+        assert_eq!(unsafe { console_ctrl_handler(0) }, 1);
+        assert!(flag.load(Ordering::Acquire));
+        assert!(woke.load(Ordering::Acquire));
+        drop(guard);
+        // SAFETY: after dropping the guard, CTRL_HOOK is cleared and the callback returns 0.
+        assert_eq!(unsafe { console_ctrl_handler(0) }, 0);
+    }
+
+    #[test]
+    fn configure_detached_command_detaches_child_from_console() {
+        const CHILD_ENV: &str = "APACK_TEST_CHECK_DETACHED_CONSOLE";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            // SAFETY: `GetConsoleCP` queries the attached console code page (0 when detached).
+            let cp = unsafe { GetConsoleCP() };
+            println!("CONSOLE_CP={cp}");
+            prepare_detached_daemon(false);
+            let _ = std::io::stderr().write_all(b"SUPERVISED_STDERR_KEPT\n");
+            let _ = std::io::stderr().flush();
+            prepare_detached_daemon(true);
+            let _ = std::io::stderr().write_all(b"POST_DETACH_MUST_GO_TO_NUL\n");
+            let mut sink = Vec::new();
+            let _ = std::io::stdin().read_to_end(&mut sink);
+            return;
+        }
+        let h1 = 4usize as HANDLE;
+        let h2 = 8usize as HANDLE;
+        let h3 = 12usize as HANDLE;
+        let h4 = 16usize as HANDLE;
+        assert!(!should_close_old_stderr(std::ptr::null_mut(), h2, h3, h4));
+        assert!(!should_close_old_stderr(INVALID_HANDLE_VALUE, h2, h3, h4));
+        assert!(!should_close_old_stderr(h1, h1, h3, h4));
+        assert!(!should_close_old_stderr(h1, h2, h1, h4));
+        assert!(!should_close_old_stderr(h1, h2, h3, h1));
+        assert!(should_close_old_stderr(h1, h2, h3, h4));
+
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args([
+            "--exact",
+            "transport_windows::tests::configure_detached_command_detaches_child_from_console",
+            "--nocapture",
+        ])
+        .env(CHILD_ENV, "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+        configure_detached_command(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn detached test helper");
+        let mut child_stderr = child.stderr.take().expect("piped stderr");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stderr_reader = std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = child_stderr.read_to_string(&mut buf);
+            let _ = tx.send(buf);
+        });
+        let stderr_buf = match rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(buf) => buf,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stderr_reader.join();
+                panic!("prepare_detached_daemon did not close inherited stderr pipe handle before child exit");
+            }
+        };
+        let _ = stderr_reader.join();
+        assert_eq!(
+            stderr_buf, "SUPERVISED_STDERR_KEPT\n",
+            "prepare_detached_daemon(false) must keep stderr and prepare_detached_daemon(true) must redirect to NUL, got: {stderr_buf:?}"
+        );
+        drop(child.stdin.take());
+        let out = child.wait_with_output().expect("wait detached test helper");
+        assert!(out.status.success(), "helper failed: {:?}", out.status);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("CONSOLE_CP=0"), "expected detached child with no console, got: {stdout:?}");
+    }
+}
